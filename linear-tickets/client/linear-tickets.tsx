@@ -3,7 +3,7 @@ import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { usePaseo, useRpc } from "@getpaseo/plugin/client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Linking, Pressable, ScrollView, Text, TextInput, View } from "react-native";
-import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, getSettingsRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc, type Issue, type RelatedTicket, type TicketDetail } from "../shared/contracts";
+import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, getSettingsRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc, type DispatchSettingsValue, type DispatchStatus, type Issue, type RelatedTicket, type TicketDetail, type WritebackSettingsValue } from "../shared/contracts";
 import { filterIssues, formatIssueDate, formatPriority, formatRelativeDate, hasPriority, issueStatus, statusChangesText, statusCounts, type DependencyFilter, type SortDirection, type SortField } from "./issue-list";
 
 import { ChoicePicker } from "./choice-picker";
@@ -14,6 +14,14 @@ import { openExternalUrl } from "./open-link";
 import { MarkdownPreview } from "./markdown-preview";
 import { restoreLaunchSelection, type LaunchPreference } from "./launch-preferences";
 import { mappedBaseBranch, mappingKey, mappingLabel, resolveMapping, type MappingSource, type ProjectMapping } from "../shared/mapping";
+
+const dispatchDraftFor = (value: DispatchSettingsValue) => ({ label: value.label, teamKeys: value.teamKeys.join(", "), intervalSeconds: String(value.intervalSeconds) });
+const WRITEBACK_OPTIONS: { key: keyof WritebackSettingsValue; on: string; off: string }[] = [
+  { key: "status", on: "Move the ticket to In Progress when its agent starts working", off: "Leave the ticket status alone when work starts" },
+  { key: "summaries", on: "Comment each finished turn's reply on the ticket", off: "No turn summaries" },
+  { key: "blocked", on: "Comment and label the ticket while its agent waits on you", off: "No blocked alerts" },
+  { key: "pullRequests", on: "Attach pull requests the agent opens and move the ticket to review", off: "No pull request links" },
+];
 
 type ThinkingOption = { id: string; label: string; description?: string; isDefault?: boolean };
 type ModelChoice = { id: string; label: string; provider: string; description?: string; thinkingOptions: ThinkingOption[]; defaultThinkingOptionId?: string };
@@ -36,6 +44,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   const searchAll = useRpc(searchIssuesRpc);
   const getTemplate = useRpc(getDefaultPromptRpc), saveTemplate = useRpc(setDefaultPromptRpc);
   const getSettings = useRpc(getSettingsRpc), saveSettings = useRpc(setSettingsRpc);
+  const getDispatchStatus = useRpc(dispatchStatusRpc);
   const [markInProgress, setMarkInProgress] = useState(false);
   const [templateOpen, setTemplateOpen] = useState(false);
   const [templateText, setTemplateText] = useState("");
@@ -86,6 +95,10 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [projectMappings, setProjectMappings] = useState<Record<string, ProjectMapping>>({});
   const [agentLinearAccess, setAgentLinearAccess] = useState(true);
+  const [dispatch, setDispatch] = useState<DispatchSettingsValue | null>(null);
+  const [dispatchDraft, setDispatchDraft] = useState({ label: "", teamKeys: "", intervalSeconds: "" });
+  const [writeback, setWriteback] = useState<WritebackSettingsValue | null>(null);
+  const [dispatchStatus, setDispatchStatus] = useState<DispatchStatus | null>(null);
   const [mappingReason, setMappingReason] = useState<"saved" | "name" | null>(null);
   // The ticket whose mapping was applied or overridden by hand; the branch waits for the list.
   const mappedFor = useRef<string | null>(null);
@@ -205,8 +218,18 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
       setMarkInProgress(value.markInProgress); setShowClosed(value.showClosed);
       setLaunchPreferences(value.launchPreferences); setLastProvider(value.lastProvider);
       setProjectMappings(value.projectMappings); setAgentLinearAccess(value.agentLinearAccess);
+      setDispatch(value.dispatch); setDispatchDraft(dispatchDraftFor(value.dispatch)); setWriteback(value.writeback);
     }, () => {}).finally(() => setSettingsLoaded(true));
   }, [getSettings]);
+
+  // The dispatcher runs on the host; this only mirrors its latest poll while the surface is open.
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => void getDispatchStatus({}).then((value) => { if (!cancelled) setDispatchStatus(value); }, () => {});
+    refresh();
+    const timer = setInterval(refresh, 15_000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [getDispatchStatus]);
 
   useEffect(() => {
     let cancelled = false;
@@ -479,6 +502,42 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
         setAgentLinearAccess((await saveSettings({ agentLinearAccess: next })).agentLinearAccess);
       })} />
     <Text style={t.muted}>On gives each new agent linear_ticket tools that act only on the ticket it started from, using this host's Linear key; canceling or marking duplicate stays with people. It needs a key with write access. Existing agents keep what they started with.</Text>
+    <Divider t={t} spaced />
+    <FieldLabel title="Auto-dispatch" icon="Zap" hint="start agents for labeled tickets" t={t} />
+    {dispatch && <>
+      <Button title={dispatch.enabled ? "Start an agent for every open ticket with the trigger label" : "Auto-dispatch is off"} icon={dispatch.enabled ? "Check" : "CircleDashed"} stretch chosen={dispatch.enabled}
+        onPress={() => void run("Saving setting", async () => {
+          setDispatch((await saveSettings({ dispatch: { enabled: !dispatch.enabled } })).dispatch);
+        })} />
+      <View style={{ flexDirection: layout.compact ? "column" : "row", gap: 8 }}>
+        <TextInput accessibilityLabel="Trigger label" editable={!busy} autoCapitalize="none" autoCorrect={false} value={dispatchDraft.label} onChangeText={(label) => setDispatchDraft((draft) => ({ ...draft, label }))}
+          placeholder="paseo" placeholderTextColor={colors.foregroundMuted} style={{ ...t.input, flex: layout.compact ? undefined : 1 }} />
+        <TextInput accessibilityLabel="Team keys, comma-separated" editable={!busy} autoCapitalize="characters" autoCorrect={false} value={dispatchDraft.teamKeys} onChangeText={(teamKeys) => setDispatchDraft((draft) => ({ ...draft, teamKeys }))}
+          placeholder="ENG, OPS" placeholderTextColor={colors.foregroundMuted} style={{ ...t.input, flex: layout.compact ? undefined : 2 }} />
+        <TextInput accessibilityLabel="Poll interval in seconds" editable={!busy} keyboardType="number-pad" value={dispatchDraft.intervalSeconds} onChangeText={(intervalSeconds) => setDispatchDraft((draft) => ({ ...draft, intervalSeconds }))}
+          placeholder="60" placeholderTextColor={colors.foregroundMuted} style={{ ...t.input, flex: layout.compact ? undefined : 1 }} />
+      </View>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 10 }}>
+        <Button title="Save auto-dispatch" icon="Save" size="sm" disabled={JSON.stringify(dispatchDraft) === JSON.stringify(dispatchDraftFor(dispatch))}
+          onPress={() => void run("Saving setting", async () => {
+            const saved = await saveSettings({ dispatch: {
+              label: dispatchDraft.label.trim(),
+              teamKeys: dispatchDraft.teamKeys.split(",").map((key) => key.trim()).filter(Boolean),
+              intervalSeconds: Number(dispatchDraft.intervalSeconds),
+            } });
+            setDispatch(saved.dispatch); setDispatchDraft(dispatchDraftFor(saved.dispatch));
+          })} />
+      </View>
+      <Text style={t.muted}>Tickets in these teams carrying the label start an agent in their mapped project with your last-used provider, whoever they are assigned to — anyone who can label a ticket can start an agent on this host. The label is swapped for “{dispatch.label}-running” (or “{dispatch.label}-failed” with a comment explaining why). Unmapped projects are not guessed.</Text>
+      {dispatchStatus && <Text style={t.muted}>{dispatchStatus.active ? "Polling" : "Idle"}{dispatchStatus.lastPollAt ? ` · last poll ${formatRelativeDate(dispatchStatus.lastPollAt)}` : " · waiting for first poll"}{dispatchStatus.lastError ? ` · error: ${dispatchStatus.lastError}` : ""}{dispatchStatus.recent.length ? ` · ${dispatchStatus.recent.slice(0, 3).map((item) => `${item.identifier} ${item.outcome}`).join(", ")}` : ""}</Text>}
+    </>}
+    <Divider t={t} spaced />
+    <FieldLabel title="Write back to Linear" icon="MessageSquare" hint="for agents linked to a ticket" t={t} />
+    {writeback && WRITEBACK_OPTIONS.map(({ key, on, off }) => <Button key={key} title={writeback[key] ? on : off} icon={writeback[key] ? "Check" : "CircleDashed"} stretch chosen={writeback[key]}
+      onPress={() => void run("Saving setting", async () => {
+        setWriteback((await saveSettings({ writeback: { [key]: !writeback[key] } })).writeback);
+      })} />)}
+    <Text style={t.muted}>Uses this host's Linear key (write access needed), independent of the agent's own linear_ticket tools. Subagents do not report.</Text>
     <Divider t={t} spaced />
     <FieldLabel title="Project mappings" icon="Folder" hint="Linear project → Paseo project" t={t} />
     {Object.keys(projectMappings).length ? Object.entries(projectMappings).sort((a, b) => a[1].label.localeCompare(b[1].label)).map(([key, mapping]) => {

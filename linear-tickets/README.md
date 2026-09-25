@@ -184,6 +184,8 @@ buttons) holds the plugin's per-host settings:
 - **Tickets shown** — include completed, canceled and duplicated tickets in the list
   and the status counts (off by default, keeping the list focused on open work).
 - **Default prompt** — replace the built-in launch prompt with a template (below).
+- **Auto-dispatch** — start agents for labeled tickets without opening Paseo (off by default; see below).
+- **Write back to Linear** — report ticket-linked agents' progress on the ticket (all off by default; see below).
 
 The last successful model, mode, and reasoning choices are stored in the same per-host
 settings file. They update automatically and do not need a separate settings toggle.
@@ -226,6 +228,52 @@ be made, the agent still starts and the failure appears as a warning with the re
 The transition is made just before the agent is created, so with agent access to Linear on,
 any status change the agent makes itself always comes after it.
 
+## Auto-dispatch
+
+With **Settings → Auto-dispatch** on, the plugin polls Linear (every 60 seconds by default,
+30–3600 allowed) for open tickets that carry the trigger label (`paseo` by default) in the
+listed team keys (for example `ENG, OPS`). No teams means nothing is dispatched. Tickets are
+picked up **whoever they are assigned to**: anyone who can label a ticket in those teams can
+start an agent on this host, with the ticket text as its prompt. Only list teams you trust.
+
+For each ticket the plugin first swaps the trigger label for `<label>-running` — Linear is
+the lock, so a later poll, a plugin reload or a daemon restart never starts a second agent —
+then launches exactly as the sidebar would: the saved project mapping (never a name-match
+guess) and its base branch (or the repository default), your last-used provider, model,
+mode and reasoning level, the default prompt, the In Progress setting and agent access to
+Linear. A short comment on the ticket names the provider and project. If the ticket already
+has an active Paseo agent, no second one starts. When a launch cannot proceed — no mapping,
+no remembered provider, an unavailable project — the ticket gets `<label>-failed` and a
+comment saying why; fix the cause and add the trigger label again.
+
+Paseo gives plugin code its daemon connection only inside RPCs and lifecycle hooks, so
+polling starts at the first of these after the plugin loads: opening the ticket surface,
+saving a setting, or any agent turn on the host. The surface's Settings shows the last poll,
+its error and the most recent dispatches.
+
+## Write back to Linear
+
+For agents carrying the `linear.issueId` label (every agent started from a ticket, manually
+or dispatched), **Settings → Write back to Linear** can report their lifecycle on the ticket
+using this host's key, independently of the agent's own `linear_ticket` tools:
+
+- **Status** — the agent's first turn moves the ticket into its team's In Progress state,
+  following the same rules as the launch-time setting.
+- **Turn summaries** — each completed turn's final reply is posted as a comment (capped at
+  4,000 characters), a failed turn posts its error, and archiving an agent that never linked
+  a pull request says so.
+- **Blocked alerts** — a pending permission, plan approval or question posts a comment and
+  adds `<label>-blocked`; answering it, or the next completed turn, removes the label. A
+  failed turn also adds it.
+- **Pull requests** — GitHub pull request URLs printed by the agent's tools during a turn
+  (for example by `gh pr create`) are attached to the ticket, which then moves to its team's
+  started state named like *In Review*. Completion is left to Linear's GitHub integration.
+
+Archiving a linked agent always removes `<label>-running`. Subagents never report. Paseo
+delivers lifecycle events live and best-effort: events while the plugin is stopped are not
+replayed, and a Linear failure is logged (`paseo plugin logs linear-tickets`) without
+affecting the agent.
+
 ## Connection storage
 
 The API-key form stores the key on the daemon host in
@@ -240,8 +288,8 @@ permission pattern. The ticket snapshot cache lives in `cache.json` with the sam
 private permissions; its credential scope is a one-way hash, never the API key itself.
 
 The plugin talks directly to Linear's official [GraphQL API](https://linear.app/developers/graphql)
-at `https://api.linear.app/graphql`. Its queries are read-only; the only write is the
-optional In Progress transition made when a launch is explicitly opted in. Only the
+at `https://api.linear.app/graphql`. Its queries are read-only unless you opt in: the
+In Progress transition, auto-dispatch and write-back are the only writes. Only the
 server contacts Linear. The key is never added to ticket context, agent configuration,
 or agent labels.
 
