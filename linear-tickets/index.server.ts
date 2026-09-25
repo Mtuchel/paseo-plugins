@@ -1,5 +1,5 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc } from "./shared/contracts";
+import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -7,6 +7,8 @@ import { Settings } from "./server/settings";
 import { DEFAULT_PROMPT_TEMPLATE } from "./shared/contracts";
 import { cacheScope, TicketCache } from "./server/cache";
 import { Credentials } from "./server/credentials";
+import { Dispatcher } from "./server/dispatch";
+import { Writeback } from "./server/writeback";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -14,11 +16,22 @@ export default function contribute(server: PluginServerContext) {
   const launcher = new Launcher(linear);
   const settings = new Settings();
   const cache = new TicketCache();
+  const dispatcher = new Dispatcher({ linear, launcher, settings });
+  const writeback = new Writeback(linear, settings);
   const cacheIdentity = async () => {
     const connection = await credentials.read();
     return connection.key ? cacheScope(connection.key) : null;
   };
-  server.handle(statusRpc, () => linear.status());
+  // The daemon connection is only handed to handlers and hooks; the first one starts the
+  // dispatcher (opening the ticket surface or any agent turn on this host).
+  server.on("agent.turn_started", (event, { paseo }) => { dispatcher.attach(paseo); return writeback.turnStarted(event, paseo); });
+  server.on("agent.turn_ended", (event, { paseo }) => { dispatcher.attach(paseo); return writeback.turnEnded(event, paseo); });
+  server.on("agent.permission_requested", (event, { paseo }) => writeback.permissionRequested(event, paseo));
+  server.on("agent.permission_resolved", (event, { paseo }) => writeback.permissionResolved(event, paseo));
+  server.on("agent.archived", (event, { paseo }) => writeback.archived(event, paseo));
+  server.on("agent.created", (_event, { paseo }) => dispatcher.attach(paseo));
+  server.handle(statusRpc, (_input, { paseo }) => { dispatcher.attach(paseo); return linear.status(); });
+  server.handle(dispatchStatusRpc, (_input, { paseo }) => { dispatcher.attach(paseo); return dispatcher.snapshot(); });
   server.handle(connectRpc, ({ apiKey }) => linear.authenticate(apiKey));
   server.handle(disconnectRpc, () => linear.disconnect());
   server.handle(listIssuesRpc, async ({ cursor, stateNames, relation }) => {
@@ -47,10 +60,15 @@ export default function contribute(server: PluginServerContext) {
   server.handle(getDefaultPromptRpc, async () => ({ template: (await settings.read()).template, builtin: DEFAULT_PROMPT_TEMPLATE }));
   server.handle(setDefaultPromptRpc, ({ template }) => settings.save(template).then((saved) => ({ ...saved, builtin: DEFAULT_PROMPT_TEMPLATE })));
   server.handle(getSettingsRpc, async () => ({ ...(await settings.read()), builtin: DEFAULT_PROMPT_TEMPLATE }));
-  server.handle(setSettingsRpc, async (input) => ({ ...(await settings.patch(input)), builtin: DEFAULT_PROMPT_TEMPLATE }));
+  server.handle(setSettingsRpc, async (input, { paseo }) => {
+    const saved = await settings.patch(input);
+    dispatcher.attach(paseo);
+    if (input.dispatch) dispatcher.wake();
+    return { ...saved, builtin: DEFAULT_PROMPT_TEMPLATE };
+  });
   server.handle(launchAgentRpc, async (input, { paseo }) => {
     const { template, agentLinearAccess } = await settings.read();
     return launcher.start(input, paseo, { promptTemplate: template ?? undefined, markInProgress: input.markInProgress, linearAccess: agentLinearAccess });
   });
-  return () => {};
+  return () => { dispatcher.stop(); };
 }

@@ -177,6 +177,19 @@ export const projectMappingSchema = z.object({
   baseBranch: z.string().min(1).max(500).optional(),
   label: z.string().min(1).max(500),
 });
+// Server-side validation (settings.ts) owns the exact rules; these bound the wire shape.
+const dispatchSettingsSchema = z.object({
+  enabled: z.boolean(),
+  label: z.string().min(1).max(80),
+  teamKeys: z.array(z.string().min(1).max(10)).max(20),
+  intervalSeconds: z.number().int(),
+});
+const writebackSettingsSchema = z.object({
+  status: z.boolean(),
+  summaries: z.boolean(),
+  blocked: z.boolean(),
+  pullRequests: z.boolean(),
+});
 const settingsOutputSchema = z.object({
   template: z.string().nullable(),
   builtin: z.string(),
@@ -186,6 +199,8 @@ const settingsOutputSchema = z.object({
   launchPreferences: launchPreferencesSchema,
   projectMappings: z.record(z.string(), projectMappingSchema),
   agentLinearAccess: z.boolean(),
+  dispatch: dispatchSettingsSchema,
+  writeback: writebackSettingsSchema,
 });
 export const getSettingsRpc = defineRpc({
   name: "linear.get-settings",
@@ -202,6 +217,27 @@ export const setSettingsRpc = defineRpc({
     projectMapping: projectMappingSchema.extend({ key: z.string().regex(/^(project|team):[A-Za-z0-9_-]{1,100}$/) }).optional(),
     forgetProjectMapping: z.string().min(1).max(200).optional(),
     launchPreference: launchPreferenceSchema.extend({ provider: z.string().min(1).max(500) }).optional(),
+    dispatch: dispatchSettingsSchema.partial().optional(),
+    writeback: writebackSettingsSchema.partial().optional(),
   }),
   output: settingsOutputSchema,
+});
+
+// What the auto-dispatcher did most recently, for the ticket surface's status line.
+export const dispatchStatusSchema = z.object({
+  active: z.boolean(),
+  lastPollAt: z.string().nullable(),
+  lastError: z.string().nullable(),
+  recent: z.array(z.object({
+    identifier: z.string(),
+    at: z.string(),
+    outcome: z.enum(["launched", "linked", "failed"]),
+    detail: z.string(),
+  })),
+});
+export type DispatchStatus = z.infer<typeof dispatchStatusSchema>;
+export const dispatchStatusRpc = defineRpc({
+  name: "linear.dispatch-status",
+  input: z.object({}),
+  output: dispatchStatusSchema,
 });

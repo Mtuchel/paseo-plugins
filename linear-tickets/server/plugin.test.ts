@@ -9,8 +9,8 @@ import type { PaseoApi, PaseoWorkspaceAgentCreateOptions, PaseoWorkspaceCreateOp
 import { buildContext, buildPrompt, issuePage, normalizeIssue, connection, relationships, stateHistorySpans, ticketRelations } from "./context";
 import { Credentials } from "./credentials";
 import { Launcher, safeBranchName } from "./launch";
-import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate } from "./settings";
-import { LinearService, postGraphQL, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
+import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_DISPATCH, DEFAULT_WRITEBACK } from "./settings";
+import { LinearService, postGraphQL, ADD_LABEL_QUERY, CREATE_LABEL_QUERY, LABEL_BY_NAME_QUERY, resolveReviewState, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
 import { cachedOverviewRpc, countIssuesRpc, listIssuesRpc, searchIssuesRpc } from "../shared/contracts";
 
 // GraphQL-shaped fixture: workflow state, priority label, label connection,
@@ -37,11 +37,12 @@ const detail = { issue: normalizeIssue(rawIssue), teamId: "team-1", projectId: "
 const input = { id: "ENG-42", projectId: "project-1", provider: "test/model", instructions: "Add a regression check.", markInProgress: false, requestId: "5f6f1154-5838-4439-b981-b3c9d9831488" };
 // Test fakes that do not exercise the state transition: a no-op stub keeps the contract strict.
 const noMark = { markInProgress: async () => ({ changed: false }) };
+const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK };
 
 test("server entrypoint loads and registers valid Paseo RPC contracts", () => {
   const names: string[] = [];
-  const cleanup = contribute({ handle(contract: { name: string }) { names.push(contract.name); } } as unknown as PluginServerContext);
-  assert.deepEqual(names, ["linear.status", "linear.connect", "linear.disconnect", "linear.list-issues", "linear.count-issues", "linear.cached-overview", "linear.search-issues", "linear.issue-context", "linear.project-branches", "linear.get-default-prompt", "linear.set-default-prompt", "linear.get-settings", "linear.set-settings", "linear.launch-agent"]);
+  const cleanup = contribute({ handle(contract: { name: string }) { names.push(contract.name); }, on() { return () => {}; } } as unknown as PluginServerContext);
+  assert.deepEqual(names, ["linear.status", "linear.dispatch-status", "linear.connect", "linear.disconnect", "linear.list-issues", "linear.count-issues", "linear.cached-overview", "linear.search-issues", "linear.issue-context", "linear.project-branches", "linear.get-default-prompt", "linear.set-default-prompt", "linear.get-settings", "linear.set-settings", "linear.launch-agent"]);
   cleanup();
 });
 
@@ -258,14 +259,14 @@ test("settings persist the template with private permissions and reset removes i
   const path = join(directory, "settings.json");
   try {
     const settings = new Settings(path);
-    assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     const saved = await settings.save("Handle {{ticket}}\n{{context}}");
     assert.equal(saved.template, "Handle {{ticket}}\n{{context}}");
     assert.equal((await stat(path)).mode & 0o777, 0o600);
     assert.deepEqual(await settings.read(), saved);
-    assert.deepEqual(await settings.save(""), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.save(""), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     await assert.rejects(readFile(path), { code: "ENOENT" });
-    assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -275,17 +276,17 @@ test("the mark-in-progress setting round-trips without disturbing the saved temp
   try {
     const settings = new Settings(path);
     await settings.patch({ markInProgress: true });
-    assert.deepEqual(await settings.read(), { template: null, markInProgress: true, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: null, markInProgress: true, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     await settings.save("Handle {{ticket}}\n{{context}}");
-    assert.deepEqual(await settings.read(), { template: "Handle {{ticket}}\n{{context}}", markInProgress: true, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: "Handle {{ticket}}\n{{context}}", markInProgress: true, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     // The closed-states setting round-trips the same way and never disturbs the other fields.
     await settings.patch({ showClosed: true });
-    assert.deepEqual(await settings.read(), { template: "Handle {{ticket}}\n{{context}}", markInProgress: true, showClosed: true, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: "Handle {{ticket}}\n{{context}}", markInProgress: true, showClosed: true, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     // Clearing the template keeps the flags; clearing the last flag with no template removes the file.
     await settings.patch({ template: "" });
-    assert.deepEqual(await settings.read(), { template: null, markInProgress: true, showClosed: true, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: null, markInProgress: true, showClosed: true, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     await settings.patch({ markInProgress: false, showClosed: false });
-    assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     await assert.rejects(readFile(path), { code: "ENOENT" });
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
@@ -303,7 +304,7 @@ test("settings remember the last successful launch choices per provider", async 
         codex: { model: "codex/gpt-5", modeId: "code", thinkingOptionId: "high" },
         claude: { model: "claude/sonnet" },
       },
-      projectMappings: {}, agentLinearAccess: true,
+      projectMappings: {}, agentLinearAccess: true, ...automationDefaults,
     });
     assert.equal((await stat(path)).mode & 0o777, 0o600);
   } finally { await rm(directory, { recursive: true, force: true }); }
@@ -864,4 +865,52 @@ test("launch marks the ticket in progress only when opted in, and demotes failur
   const mutations = calls.filter(([query]) => query === UPDATE_ISSUE_STATE_QUERY);
   assert.equal(mutations.length, 1);
   assert.deepEqual(mutations[0][1], { id: "issue-1", stateId: "ip" });
+});
+
+test("dispatch settings normalize team keys, reject invalid edits, and are forgotten when back to defaults", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-linear-dispatch-settings-"));
+  const path = join(directory, "settings.json");
+  const settings = new Settings(path);
+  try {
+    const saved = await settings.patch({ dispatch: { enabled: true, teamKeys: ["eng", "ENG", " ops "] } });
+    assert.deepEqual(saved.dispatch, { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["ENG", "OPS"] });
+    assert.deepEqual((await settings.read()).dispatch, saved.dispatch);
+    await assert.rejects(settings.patch({ dispatch: { teamKeys: ["not a key"] } }), /"not a key" is not a Linear team key/);
+    await assert.rejects(settings.patch({ dispatch: { intervalSeconds: 5 } }), /between 30 and 3600/);
+    await assert.rejects(settings.patch({ dispatch: { label: "a,b" } }), /without commas/);
+    assert.deepEqual((await settings.read()).dispatch, saved.dispatch);
+    await settings.patch({ writeback: { summaries: true } });
+    assert.deepEqual((await settings.read()).writeback, { ...DEFAULT_WRITEBACK, summaries: true });
+    await settings.patch({ dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK });
+    await assert.rejects(stat(path), { code: "ENOENT" });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a pull request only moves the ticket to a started state named for review", () => {
+  const states: TeamState[] = [
+    { id: "todo", name: "Todo", type: "unstarted", position: 1 },
+    { id: "ip", name: "In Progress", type: "started", position: 2 },
+    { id: "rev", name: "In Review", type: "started", position: 3 },
+    { id: "done", name: "Reviewed", type: "completed", position: 4 },
+  ];
+  assert.equal(resolveReviewState(states)?.id, "rev");
+  assert.equal(resolveReviewState(states.filter((state) => state.id !== "rev")), null);
+});
+
+test("labels are created once when missing and removed by name, case-insensitively", async () => {
+  const calls: unknown[][] = [];
+  const service = new LinearService(new Credentials(join(tmpdir(), `paseo-linear-labels-${process.pid}`), "env-key"), (_key, query, variables) => {
+    calls.push([query, variables]);
+    if (query === LABEL_BY_NAME_QUERY) return Promise.resolve({ issueLabels: { nodes: [] } });
+    if (query === CREATE_LABEL_QUERY) return Promise.resolve({ issueLabelCreate: { success: true, issueLabel: { id: "new-label", name: variables.name } } });
+    if (query === ADD_LABEL_QUERY) return Promise.resolve({ issueAddLabel: { success: true } });
+    return Promise.resolve({ issueRemoveLabel: { success: true } });
+  });
+  await service.addLabel("issue-1", "paseo-running");
+  await service.addLabel("issue-2", "paseo-running");
+  assert.equal(calls.filter(([query]) => query === CREATE_LABEL_QUERY).length, 1);
+  assert.deepEqual(calls.filter(([query]) => query === ADD_LABEL_QUERY).map(([, variables]) => variables), [{ id: "issue-1", labelId: "new-label" }, { id: "issue-2", labelId: "new-label" }]);
+  calls.length = 0;
+  await service.removeLabel("issue-1", "Paseo", [{ id: "a", name: "paseo" }, { id: "b", name: "PASEO" }, { id: "c", name: "paseo-running" }]);
+  assert.deepEqual(calls.map(([, variables]) => variables), [{ id: "issue-1", labelId: "a" }, { id: "issue-1", labelId: "b" }]);
 });

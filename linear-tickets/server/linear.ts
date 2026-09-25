@@ -166,7 +166,7 @@ export const TEAM_STATES_QUERY = `query teamStates($teamId: String!) {
   team(id: $teamId) { states(first: 50) { nodes { id name type position } } }
 }`;
 
-// The plugin's only write: move one ticket into a team's "started" state.
+// Moves one ticket into another state of its team (In Progress at launch, review on a PR).
 export const UPDATE_ISSUE_STATE_QUERY = `mutation issueUpdateState($id: String!, $stateId: String!) {
   issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { id state { name type } } }
 }`;
@@ -183,6 +183,68 @@ export function resolveStartedState(states: TeamState[], preferredId?: string): 
     .filter((state) => state.type.trim().toLowerCase() === "started")
     .sort((a, b) => a.position - b.position);
   return started.find((state) => state.name.trim().toLowerCase() === "in progress") ?? started[0] ?? null;
+}
+
+// Where a linked pull request moves the ticket: a "started" state whose name mentions
+// review. Teams without one are left alone rather than guessed at.
+export function resolveReviewState(states: TeamState[]): TeamState | null {
+  return states
+    .filter((state) => state.type.trim().toLowerCase() === "started" && /review/i.test(state.name))
+    .sort((a, b) => a.position - b.position)[0] ?? null;
+}
+
+// Auto-dispatch: open tickets carrying the trigger label in the allowed teams, whoever
+// they are assigned to. Completed and canceled work never launches.
+export const LABELED_ISSUES_QUERY = `query labeledIssues($first: Int!, $filter: IssueFilter) {
+  issues(first: $first, includeArchived: false, orderBy: updatedAt, filter: $filter) {
+    nodes { id identifier team { key } labels(first: 50) { nodes { id name } } }
+  }
+}`;
+
+export function labeledIssueFilter(label: string, teamKeys: string[]): Record<string, unknown> {
+  return {
+    labels: { some: { name: { eqIgnoreCase: label } } },
+    team: { key: { in: [...new Set(teamKeys)].sort() } },
+    state: { type: { nin: ["completed", "canceled"] } },
+  };
+}
+
+export type LabeledIssue = { id: string; identifier: string; teamKey: string; labels: { id: string; name: string }[] };
+
+// The current state, team, labels and attachment links of one ticket: enough for
+// write-back decisions without the comment pagination that `detail` performs.
+export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
+  issue(id: $id) { id state { name type } team { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } } }
+}`;
+
+export type IssueState = { id: string; status: string; statusType: string; teamId: string | null; labels: { id: string; name: string }[]; attachmentUrls: string[] };
+
+export const LABEL_BY_NAME_QUERY = `query labelByName($name: String!) {
+  issueLabels(first: 1, filter: { name: { eqIgnoreCase: $name } }) { nodes { id name } }
+}`;
+export const CREATE_LABEL_QUERY = `mutation labelCreate($name: String!) {
+  issueLabelCreate(input: { name: $name }) { success issueLabel { id name } }
+}`;
+export const ADD_LABEL_QUERY = `mutation addLabel($id: String!, $labelId: String!) {
+  issueAddLabel(id: $id, labelId: $labelId) { success }
+}`;
+export const REMOVE_LABEL_QUERY = `mutation removeLabel($id: String!, $labelId: String!) {
+  issueRemoveLabel(id: $id, labelId: $labelId) { success }
+}`;
+export const CREATE_COMMENT_QUERY = `mutation comment($input: CommentCreateInput!) {
+  commentCreate(input: $input) { success }
+}`;
+export const LINK_URL_QUERY = `mutation link($issueId: String!, $url: String!, $title: String) {
+  attachmentLinkURL(issueId: $issueId, url: $url, title: $title) { success }
+}`;
+
+function labelNodes(value: unknown): { id: string; name: string }[] {
+  return connection(value ?? { nodes: [] }).nodes.map((node) => record(node)).map((node) => ({ id: label(node.id), name: label(node.name) })).filter((node) => node.id && node.name);
+}
+
+function succeeded(data: Record<string, unknown>, field: string, what: string): void {
+  const result = data[field] && typeof data[field] === "object" ? record(data[field]) : {};
+  if (result.success !== true) throw new Error(`Linear did not ${what}.`);
 }
 
 export const COMMENT_QUERY = `query issueComments($id: String!, $first: Int!, $after: String) {
@@ -314,9 +376,9 @@ export class LinearService {
     return states;
   }
 
-  // The plugin's only write. Best-effort by design: callers surface `note` as a warning,
+  // Best-effort by design: callers surface `note` as a warning,
   // and a failure here must never turn into a launch failure.
-  async markInProgress(issue: Issue, teamId: string | null): Promise<{ changed: boolean; note?: string }> {
+  async markInProgress(issue: Pick<Issue, "id" | "status" | "statusType">, teamId: string | null): Promise<{ changed: boolean; note?: string }> {
     // Already in the team's "started" state (e.g. "In Progress"): leave it. A repeat
     // write would only add audit noise to a ticket the agent is about to work on.
     if (issue.statusType.trim().toLowerCase() === "started") return { changed: false };
@@ -341,6 +403,83 @@ export class LinearService {
     if (result.success === false) {
       return { changed: false, note: `Linear reported that the change to ${target.name} was not applied; the ticket is unchanged.` };
     }
+    return { changed: true };
+  }
+
+  async labeledIssues(labelName: string, teamKeys: string[]): Promise<LabeledIssue[]> {
+    if (!teamKeys.length) return [];
+    const data = record(await this.withKey((key) => this.post(key, LABELED_ISSUES_QUERY, { first: 50, filter: labeledIssueFilter(labelName, teamKeys) })));
+    return connection(record(data.issues)).nodes.map((node) => record(node)).map((node) => ({
+      id: label(node.id),
+      identifier: label(node.identifier),
+      teamKey: label(record(node.team ?? {}).key),
+      labels: labelNodes(node.labels),
+    })).filter((issue) => issue.id);
+  }
+
+  async issueState(id: string): Promise<IssueState> {
+    const data = record(await this.withKey((key) => this.post(key, ISSUE_STATE_QUERY, { id })));
+    if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
+    const issue = record(data.issue);
+    const state = record(issue.state ?? {});
+    const attachmentUrls = connection(issue.attachments ?? { nodes: [] }).nodes.map((node) => label(record(node).url)).filter(Boolean);
+    return { id: label(issue.id), status: label(state.name), statusType: label(state.type), teamId: label(record(issue.team ?? {}).id) || null, labels: labelNodes(issue.labels), attachmentUrls };
+  }
+
+  // Label IDs by lowercase name, cached for the plugin's lifetime. A missing label is
+  // created as a workspace label so every team can use it.
+  private readonly labelIds = new Map<string, string>();
+
+  private async labelId(name: string): Promise<string> {
+    const wanted = name.trim().toLowerCase();
+    const cached = this.labelIds.get(wanted);
+    if (cached) return cached;
+    const found = labelNodes(record(await this.withKey((key) => this.post(key, LABEL_BY_NAME_QUERY, { name }))).issueLabels)[0];
+    let id = found?.id;
+    if (!id) {
+      const created = record(await this.withKey((key) => this.post(key, CREATE_LABEL_QUERY, { name })));
+      succeeded(created, "issueLabelCreate", `create the "${name}" label`);
+      id = label(record(record(created.issueLabelCreate).issueLabel ?? {}).id);
+      if (!id) throw new Error(`Linear did not return the new "${name}" label.`);
+    }
+    this.labelIds.set(wanted, id);
+    return id;
+  }
+
+  async addLabel(issueId: string, name: string): Promise<void> {
+    const labelId = await this.labelId(name);
+    succeeded(record(await this.withKey((key) => this.post(key, ADD_LABEL_QUERY, { id: issueId, labelId }))), "issueAddLabel", `add the "${name}" label`);
+  }
+
+  // Removes every label on the ticket with this name (case-insensitive); a team label and
+  // a workspace label can share a name. Missing labels are not an error.
+  async removeLabel(issueId: string, name: string, current?: { id: string; name: string }[]): Promise<void> {
+    const labels = current ?? (await this.issueState(issueId)).labels;
+    const wanted = name.trim().toLowerCase();
+    for (const { id } of labels.filter((item) => item.name.trim().toLowerCase() === wanted)) {
+      succeeded(record(await this.withKey((key) => this.post(key, REMOVE_LABEL_QUERY, { id: issueId, labelId: id }))), "issueRemoveLabel", `remove the "${name}" label`);
+    }
+  }
+
+  async comment(issueId: string, body: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, CREATE_COMMENT_QUERY, { input: { issueId, body } }))), "commentCreate", "create the comment");
+  }
+
+  async linkUrl(issueId: string, url: string, title: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, LINK_URL_QUERY, { issueId, url, title }))), "attachmentLinkURL", "attach the link");
+  }
+
+  // Moves the ticket to its team's review state unless it is already there or past
+  // started work (completed or canceled tickets are left to people and integrations).
+  async moveToReview(issueId: string): Promise<{ changed: boolean; note?: string }> {
+    const state = await this.issueState(issueId);
+    const type = state.statusType.trim().toLowerCase();
+    if (type === "completed" || type === "canceled") return { changed: false };
+    if (/review/i.test(state.status) && type === "started") return { changed: false };
+    if (!state.teamId) return { changed: false, note: "The ticket has no team." };
+    const target = resolveReviewState(await this.teamStates(state.teamId));
+    if (!target) return { changed: false, note: "The ticket's team has no review state." };
+    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: target.id }))), "issueUpdate", `move the ticket to ${target.name}`);
     return { changed: true };
   }
 }
