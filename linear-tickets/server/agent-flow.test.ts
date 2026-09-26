@@ -38,6 +38,7 @@ test("question parts are asked one at a time, and Other is a hint rather than a 
 
 function routerHarness(pending: AgentPermissionRequest[]) {
   const calls: string[] = [];
+  const feeds: ((event: unknown) => void)[] = [];
   const paseo = {
     agents: {
       list: async () => ({ entries: [], pageInfo: { hasMore: false } }),
@@ -45,7 +46,7 @@ function routerHarness(pending: AgentPermissionRequest[]) {
         refresh: async () => ({ agent: { pendingPermissions: pending } }),
         send: async (text: string) => { calls.push(`send ${id}: ${text}`); },
         respondToPermission: async ({ response }: { response: unknown }) => { calls.push(`respond ${JSON.stringify(response)}`); },
-        timeline: { subscribe: () => () => {} },
+        timeline: { subscribe: (handler: (event: unknown) => void) => { feeds.push(handler); return () => {}; } },
       }),
     },
   } as unknown as PaseoApi;
@@ -61,7 +62,7 @@ function routerHarness(pending: AgentPermissionRequest[]) {
   });
   router.attach(paseo);
   router.stop();
-  return { router, store, calls, cleanup: () => rm(directory, { recursive: true, force: true }) };
+  return { router, store, calls, feeds, cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
 
 const link = { sessionId: "s1", agentId: "a1", issueId: "i1", identifier: "TUC-1", createdAt: "2026-01-01T00:00:00Z", handled: [], review: null, offer: null };
@@ -84,6 +85,25 @@ test("after Stop, a turn the provider starts on its own is stopped again until t
   assert.deepEqual(h.calls.filter((call) => call.startsWith("stop")), ["stop a1", "stop a1"]);
   await h.router.prompted("s1", { id: "p2", content: { body: "carry on" } });
   assert.equal(await h.router.holdIfStopped("a1"), false);
+  await h.cleanup();
+});
+
+test("while a question is open the live feed holds its actions, so Linear keeps showing the options", async () => {
+  const h = routerHarness([]);
+  await h.store.put(link);
+  await h.router.follow("a1");
+  const ran = (command: string) => h.feeds[0]({ event: { type: "timeline", item: { type: "tool_call", status: "completed", detail: { type: "shell", command } } } });
+  ran("ls");
+  await h.router.ask("s1", "The plan is ready for review", [{ label: "Approve plan", value: "approve-plan" }]);
+  ran("cat PLAN.md");
+  await h.router.unfollow("a1");
+  assert.deepEqual(h.calls, ["action:", "elicitation:The plan is ready for review"]);
+  await h.router.follow("a1");
+  await h.router.ask("s1", "Which?", [{ label: "A", value: "a" }]);
+  h.feeds[1]({ event: { type: "timeline", item: { type: "tool_call", status: "completed", detail: { type: "shell", command: "pwd" } } } });
+  await h.router.prompted("s1", { id: "p1", content: { body: "A" } });
+  await h.router.unfollow("a1");
+  assert.equal(h.calls.at(-1), "action:");
   await h.cleanup();
 });
 

@@ -201,7 +201,9 @@ export class SessionRouter {
   // Agents the user stopped from Linear: a turn the provider starts on its own is stopped again.
   private readonly held = new Map<string, number>();
   // Live action feed per agent during a turn: the subscription and actions not yet posted.
-  private readonly live = new Map<string, { sessionId: string; stop: () => void; pending: string[]; timer: NodeJS.Timeout | null; posted: number }>();
+  // `asking`: Linear shows an elicitation's options only while it is the newest activity, so the
+  // feed holds its actions from a question until the owner's reply.
+  private readonly live = new Map<string, { sessionId: string; stop: () => void; pending: string[]; timer: NodeJS.Timeout | null; posted: number; asking: boolean }>();
 
   constructor(private readonly deps: Deps) {}
 
@@ -301,6 +303,11 @@ export class SessionRouter {
   }
 
   async prompted(sessionId: string, activity: Record<string, unknown>): Promise<void> {
+    for (const [agentId, state] of this.live) {
+      if (state.sessionId !== sessionId || !state.asking) continue;
+      state.asking = false;
+      state.timer ??= setTimeout(() => { void this.flush(agentId); }, LIVE_FLUSH_MS);
+    }
     const activityId = String(activity.id ?? "");
     const content = (activity.content ?? {}) as { body?: string };
     const body = String(content.body ?? activity.body ?? "").trim();
@@ -442,7 +449,7 @@ export class SessionRouter {
     if (!this.paseo || this.live.has(agentId)) return;
     const link = await this.deps.store.forAgent(agentId);
     if (!link) return;
-    const state = { sessionId: link.sessionId, stop: () => {}, pending: [] as string[], timer: null as NodeJS.Timeout | null, posted: 0 };
+    const state = { sessionId: link.sessionId, stop: () => {}, pending: [] as string[], timer: null as NodeJS.Timeout | null, posted: 0, asking: false };
     this.live.set(agentId, state);
     const unsubscribe = this.paseo.agents.ref(agentId).timeline.subscribe((event) => {
       if (event.event.type !== "timeline") return;
@@ -458,6 +465,7 @@ export class SessionRouter {
     const state = this.live.get(agentId);
     if (!state) return;
     state.timer = null;
+    if (state.asking) return;
     const items = state.pending.splice(0);
     if (!items.length) return;
     state.posted += items.length;
@@ -478,6 +486,12 @@ export class SessionRouter {
   }
 
   async ask(sessionId: string, body: string, options: SelectOption[]): Promise<void> {
+    for (const [agentId, state] of this.live) {
+      if (state.sessionId !== sessionId) continue;
+      if (state.timer) clearTimeout(state.timer);
+      await this.flush(agentId);
+      state.asking = true;
+    }
     await this.deps.api.activity(sessionId, { type: "elicitation", body }, options.length ? { signal: "select", options } : {});
   }
 
