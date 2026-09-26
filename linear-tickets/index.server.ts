@@ -13,7 +13,7 @@ import { Writeback } from "./server/writeback";
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
   const linear = new LinearService(credentials);
-  const launcher = new Launcher(linear);
+  const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url));
   const settings = new Settings();
   const cache = new TicketCache();
   const dispatcher = new Dispatcher({ linear, launcher, settings });

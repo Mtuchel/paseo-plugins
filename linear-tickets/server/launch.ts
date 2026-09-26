@@ -1,6 +1,7 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { RpcInput } from "@getpaseo/plugin";
 import { launchAgentRpc } from "../shared/contracts";
+import { attachmentNote, saveAttachments, type Download } from "./attachments";
 import { buildPrompt } from "./context";
 import type { LinearService } from "./linear";
 import { findProject, readBranches } from "./projects";
@@ -37,6 +38,8 @@ export class Launcher {
     private readonly linear: Pick<LinearService, "detail" | "markInProgress">,
     private readonly branches = readBranches,
     private readonly ticketScript: () => Promise<string> = () => writeTicketMcpScript(),
+    // Downloads Linear uploads with the host's key; without it attachments stay links.
+    private readonly download?: Download,
   ) {}
 
   start(input: Start, paseo: PaseoApi, options: Options = {}): Promise<Result> {
@@ -109,6 +112,18 @@ export class Launcher {
       }
     }
     const warnings = [...detail.warnings];
+    // Before the agent exists, so its first prompt can point at the local copies.
+    let instructions = input.instructions;
+    const cwd = workspace.directory ?? (project.projectKind === "git" ? null : project.projectRootPath);
+    if (this.download && cwd) {
+      try {
+        const saved = await saveAttachments(cwd, detail.issue.identifier, detail.context, this.download);
+        warnings.push(...saved.warnings);
+        instructions = [instructions.trim(), attachmentNote(saved)].filter(Boolean).join("\n\n");
+      } catch (error) {
+        warnings.push(`Could not save the ticket's Linear attachments: ${error instanceof Error ? error.message : "unknown error"}`);
+      }
+    }
     if (options.markInProgress) {
       // Best-effort, and before the agent exists so its own set_status calls always come
       // after this one. A failed transition only warns; the request dedupe above keeps a
@@ -123,7 +138,7 @@ export class Launcher {
     const agent = await workspace.agents.create({
       config: { provider: input.provider, modeId: input.modeId, thinkingOptionId: input.thinkingOptionId, ...(mcpServers ? { mcpServers } : {}) },
       title,
-      prompt: buildPrompt(detail, input.instructions, options.promptTemplate, options.linearAccess ?? false),
+      prompt: buildPrompt(detail, instructions, options.promptTemplate, options.linearAccess ?? false),
       requestId: input.requestId,
       clientMessageId: input.requestId,
       labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url },

@@ -228,6 +228,16 @@ be made, the agent still starts and the failure appears as a warning with the re
 The transition is made just before the agent is created, so with agent access to Linear on,
 any status change the agent makes itself always comes after it.
 
+## Ticket attachments
+
+Files uploaded to Linear (`uploads.linear.app`) need the API key, so an agent cannot open
+them from the ticket's links. Every launch — manual or dispatched — downloads the uploads
+referenced in the description, comments and attachments into the workspace under
+`.linear/<ticket id>/` with their original names, adds `.linear/` to the checkout's git
+exclude list, and lists the local paths in the launch prompt. The key is sent only to
+`uploads.linear.app` and never reaches the agent. At most 20 files, 25 MB each and 100 MB
+in total are downloaded; a failed or skipped file becomes a launch warning, never a failure.
+
 ## Auto-dispatch
 
 With **Settings → Auto-dispatch** on, the plugin polls Linear (every 60 seconds by default,

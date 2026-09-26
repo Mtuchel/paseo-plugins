@@ -1,3 +1,4 @@
+import { MAX_ATTACHMENT_BYTES } from "./attachments";
 import type { Issue, TicketDetail } from "../shared/contracts";
 import { buildContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations } from "./context";
 import { Credentials } from "./credentials";
@@ -467,6 +468,38 @@ export class LinearService {
 
   async linkUrl(issueId: string, url: string, title: string): Promise<void> {
     succeeded(record(await this.withKey((key) => this.post(key, LINK_URL_QUERY, { issueId, url, title }))), "attachmentLinkURL", "attach the link");
+  }
+
+  // Linear's file storage needs the API key. Only uploads.linear.app is ever sent the key;
+  // size is checked from the header and again while reading, so a huge file never buffers.
+  async downloadUpload(url: string, maxBytes = MAX_ATTACHMENT_BYTES): Promise<Uint8Array> {
+    const target = new URL(url);
+    if (target.protocol !== "https:" || target.hostname !== "uploads.linear.app") throw new Error("Only Linear uploads can be downloaded.");
+    return this.withKey(async (key) => {
+      let response: Response;
+      try {
+        response = await fetch(target, { headers: { authorization: key }, signal: AbortSignal.timeout(60_000) });
+      } catch {
+        throw new Error("Could not reach Linear's file storage.");
+      }
+      if (!response.ok) throw new Error(`Linear's file storage answered HTTP ${response.status}.`);
+      const declared = Number(response.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > maxBytes) throw new Error(`The file is larger than ${Math.round(maxBytes / 1024 / 1024)} MB.`);
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      const reader = response.body?.getReader();
+      while (reader) {
+        const next = await reader.read();
+        if (next.done) break;
+        size += next.value.byteLength;
+        if (size > maxBytes) {
+          await reader.cancel();
+          throw new Error(`The file is larger than ${Math.round(maxBytes / 1024 / 1024)} MB.`);
+        }
+        chunks.push(next.value);
+      }
+      return Buffer.concat(chunks);
+    });
   }
 
   // Moves the ticket to its team's review state unless it is already there or past
