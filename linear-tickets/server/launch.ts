@@ -127,8 +127,10 @@ export class Launcher {
       requestId: input.requestId,
       clientMessageId: input.requestId,
       labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url },
-    }).catch(() => {
-      throw new Error("Agent creation could not be confirmed. Check the workspace's agents before reopening this ticket to try again.");
+    }).catch((error: unknown) => {
+      // Keep the daemon's reason (e.g. a provider failing to start with the ticket MCP server).
+      const cause = error instanceof Error && error.message ? ` (${error.message.slice(0, 300)})` : "";
+      throw new Error(`Agent creation could not be confirmed${cause}. Check the workspace's agents before reopening this ticket to try again.`);
     });
     if (mcpServers && agent.capabilities?.supportsMcpServers === false) {
       warnings.push("This provider does not load MCP servers, so the agent has no Linear tools. It was still told about them; choose another provider to let it update the ticket.");
