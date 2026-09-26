@@ -1,4 +1,3 @@
-import { watch, type FSWatcher } from "node:fs";
 import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -8,7 +7,9 @@ import { PLANNOTATOR_OPEN_SOURCE } from "./plannotator-open-source";
 import { paseoHome } from "./ticket-mcp";
 
 export const PLANNOTATOR_KIND = "plannotator";
-const MAX_ATTEMPTS = 3;
+// About a minute of retries at the sweep interval, enough to ride out a Linear hiccup.
+const MAX_ATTEMPTS = 20;
+const SWEEP_MS = 3_000;
 const MAX_PLAN_CHARS = 180_000;
 
 export type PlannotatorRow = { title: string; url?: string; detail?: string };
@@ -82,7 +83,6 @@ export function planDocument(event: DecidedEvent, identifier: string): string {
 // link, and on a decision the plan document on the ticket.
 export class PlannotatorBridge {
   private paseo: PaseoApi | null = null;
-  private watcher: FSWatcher | null = null;
   private timer: NodeJS.Timeout | null = null;
   private draining: Promise<void> | null = null;
   private again = false;
@@ -93,21 +93,14 @@ export class PlannotatorBridge {
   attach(paseo: PaseoApi): void {
     if (this.paseo) return;
     this.paseo = paseo;
-    try {
-      this.watcher = watch(this.events, () => { void this.drain(); });
-    } catch (error) {
-      console.error(`[linear-tickets] watching Plannotator events failed: ${error instanceof Error ? error.message : error}`);
-    }
-    // fs.watch can miss events; a slow sweep catches anything left behind.
-    this.timer = setInterval(() => { void this.drain(); }, 30_000);
+    // A cheap directory sweep; fs.watch proved unreliable for files renamed into place.
+    this.timer = setInterval(() => { void this.drain(); }, SWEEP_MS);
     this.timer.unref?.();
     void this.drain();
   }
 
   stop(): void {
-    this.watcher?.close();
     if (this.timer) clearInterval(this.timer);
-    this.watcher = null;
     this.timer = null;
   }
 

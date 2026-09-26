@@ -238,6 +238,23 @@ exclude list, and lists the local paths in the launch prompt. The key is sent on
 `uploads.linear.app` and never reaches the agent. At most 20 files, 25 MB each and 100 MB
 in total are downloaded; a failed or skipped file becomes a launch warning, never a failure.
 
+## Plannotator reviews
+
+Plannotator shows its review URL only in omp's own status line, which Paseo does not display.
+The plugin sets `PLANNOTATOR_BROWSER` for every agent session to a small hook
+(`$PASEO_HOME/linear-tickets/plannotator/open`). When a review starts, the hook still opens it
+on the host. It also publishes the review port inside your tailnet with `tailscale serve`
+(HTTPS, reachable only from your devices) and removes that route when the review server stops.
+The agent's Paseo chat then gets a “Handed off to Plannotator” row with the link. Agents linked
+to a ticket also get a Linear comment with it, so reviews open on your phone.
+
+When a review is decided, the omp plan extension (`~/.omp/agent/extensions/plannotator-omp-plan.ts`)
+records the plan and your feedback. The plugin then adds a chat row and, for ticket agents,
+replaces the ticket's “Plan: <ticket>” document with the reviewed plan, and comments the outcome
+with a link to it. Plannotator's own plan mode only reports approved hand-offs, so plans sent
+back from that mode are not recorded. Without Tailscale the local link is used. Agents that
+started before this feature need a new session to get the hook.
+
 ## Auto-dispatch
 
 With **Settings → Auto-dispatch** on, the plugin polls Linear (every 60 seconds by default,
