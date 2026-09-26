@@ -365,6 +365,9 @@ export class SessionRouter {
       const decision = approvalDecision(body);
       if (!decision) { await this.say(sessionId, "error", `The agent is waiting for approval of “${approval.title || approval.name}”. Choose Approve or Deny.`); return; }
       await handle.respondToPermission({ requestId: approval.id, response: decision });
+      // Parallel tool calls wait on several approvals; Linear shows only the newest question, so the next one is asked again.
+      const next = pending.find((request) => request.kind !== "question" && request.id !== approval.id);
+      if (next) await this.ask(sessionId, `Approve this action?\n\n${[next.title || next.name, next.description].filter(Boolean).join("\n\n")}`, [{ label: "Approve", value: "approve" }, { label: "Deny", value: "deny" }]);
       return;
     }
     if (!body) return;
