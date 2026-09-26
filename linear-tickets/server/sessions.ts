@@ -388,8 +388,11 @@ export class SessionRouter {
     try {
       const owner = await this.owner();
       for (const session of await this.deps.api.openSessions()) {
-        if (!["pending", "active", "awaitingInput"].includes(session.status)) continue;
+        // Linear marks a session "stale" after about half an hour without activity, which a ticket
+        // waiting for its blockers easily reaches; it still belongs to Paseo.
         const link = await this.deps.store.get(session.id);
+        const waiting = Boolean(link?.queued && !link.agentId);
+        if (!["pending", "active", "awaitingInput", ...(waiting ? ["stale"] : [])].includes(session.status)) continue;
         if (link?.queued && !link.agentId) {
           const admission = await this.deps.starter.admission(link.issueId, this.paseo, await this.deps.settings.read());
           if (admission.ok) await this.startFor(link, false).catch((error: unknown) => this.say(link.sessionId, "error", `Paseo could not start the agent: ${error instanceof Error ? error.message : error}`));
