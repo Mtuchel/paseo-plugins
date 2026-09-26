@@ -238,6 +238,19 @@ export const CREATE_COMMENT_QUERY = `mutation comment($input: CommentCreateInput
 export const LINK_URL_QUERY = `mutation link($issueId: String!, $url: String!, $title: String) {
   attachmentLinkURL(issueId: $issueId, url: $url, title: $title) { success }
 }`;
+export const RELAY_COMMENTS_QUERY = `query relayComments($id: String!, $since: DateTimeOrDuration!, $after: String) {
+  issue(id: $id) {
+    comments(first: 50, after: $after, filter: { createdAt: { gt: $since } }) {
+      nodes { id body createdAt user { id } reactions { emoji user { id } } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}`;
+export const REACTION_QUERY = `mutation react($commentId: String!, $emoji: String!) {
+  reactionCreate(input: { commentId: $commentId, emoji: $emoji }) { success }
+}`;
+
+export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[] };
 
 function labelNodes(value: unknown): { id: string; name: string }[] {
   return connection(value ?? { nodes: [] }).nodes.map((node) => record(node)).map((node) => ({ id: label(node.id), name: label(node.name) })).filter((node) => node.id && node.name);
@@ -468,6 +481,43 @@ export class LinearService {
 
   async linkUrl(issueId: string, url: string, title: string): Promise<void> {
     succeeded(record(await this.withKey((key) => this.post(key, LINK_URL_QUERY, { issueId, url, title }))), "attachmentLinkURL", "attach the link");
+  }
+
+  private viewer: string | null = null;
+
+  // The API key's own user; cached because the key cannot change without a reconnect.
+  async viewerId(): Promise<string> {
+    if (this.viewer) return this.viewer;
+    const id = label(record(record(await this.withKey((key) => this.post(key, VIEWER_QUERY, {}))).viewer ?? {}).id);
+    if (!id) throw new Error("Linear did not return the connected user.");
+    this.viewer = id;
+    return id;
+  }
+
+  // Comments created after `since`, oldest first, with who wrote and reacted to them.
+  async commentsSince(issueId: string, since: string): Promise<RelayComment[]> {
+    const comments: RelayComment[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < 10; page++) {
+      const data = record(await this.withKey((key) => this.post(key, RELAY_COMMENTS_QUERY, { id: issueId, since, after })));
+      const pageData = connection(record(data.issue ?? {}).comments ?? { nodes: [] });
+      for (const node of pageData.nodes.map((item) => record(item))) {
+        comments.push({
+          id: label(node.id),
+          body: label(node.body),
+          createdAt: label(node.createdAt),
+          userId: label(record(node.user ?? {}).id),
+          reactions: (Array.isArray(node.reactions) ? node.reactions : []).map((item) => record(item)).map((reaction) => ({ emoji: label(reaction.emoji), userId: label(record(reaction.user ?? {}).id) })),
+        });
+      }
+      after = pageData.hasNextPage ? pageData.endCursor : null;
+      if (!after) break;
+    }
+    return comments.filter((item) => item.id).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  async react(commentId: string, emoji: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, REACTION_QUERY, { commentId, emoji }))), "reactionCreate", "add the reaction");
   }
 
   // Linear's file storage needs the API key. Only uploads.linear.app is ever sent the key;

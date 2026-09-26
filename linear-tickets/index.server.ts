@@ -8,6 +8,7 @@ import { DEFAULT_PROMPT_TEMPLATE } from "./shared/contracts";
 import { cacheScope, TicketCache } from "./server/cache";
 import { Credentials } from "./server/credentials";
 import { Dispatcher } from "./server/dispatch";
+import { CommentRelay } from "./server/relay";
 import { Writeback } from "./server/writeback";
 
 export default function contribute(server: PluginServerContext) {
@@ -16,7 +17,7 @@ export default function contribute(server: PluginServerContext) {
   const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url));
   const settings = new Settings();
   const cache = new TicketCache();
-  const dispatcher = new Dispatcher({ linear, launcher, settings });
+  const dispatcher = new Dispatcher({ linear, launcher, settings, relay: new CommentRelay(linear) });
   const writeback = new Writeback(linear, settings);
   const cacheIdentity = async () => {
     const connection = await credentials.read();

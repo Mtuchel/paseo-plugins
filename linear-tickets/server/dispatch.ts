@@ -5,6 +5,7 @@ import { mappedBaseBranch, mappingLabel, type ProjectMapping } from "../shared/m
 import type { Launcher } from "./launch";
 import type { LabeledIssue, LinearService } from "./linear";
 import { findProject, readBranches } from "./projects";
+import type { CommentRelay } from "./relay";
 import type { PluginSettings, Settings } from "./settings";
 
 const RECENT_LIMIT = 10;
@@ -16,6 +17,8 @@ type Deps = {
   launcher: Pick<Launcher, "start">;
   settings: Pick<Settings, "read">;
   branches?: typeof readBranches;
+  // Linear → agent comment delivery, run on the same cadence as dispatch.
+  relay?: Pick<CommentRelay, "poll">;
 };
 
 // The labels a dispatched ticket moves through, derived from the trigger label so a
@@ -41,6 +44,20 @@ export class Dispatcher {
 
   constructor(private readonly deps: Deps) {
     this.branches = deps.branches ?? readBranches;
+  }
+
+  private relayError: string | null = null;
+
+  // Relay failures are logged, once per distinct error, and never stop dispatch.
+  private async relayComments(relay: Pick<CommentRelay, "poll">, paseo: PaseoApi): Promise<void> {
+    try {
+      await relay.poll(paseo);
+      this.relayError = null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      if (message !== this.relayError) console.error(`[linear-tickets] comment relay failed: ${message}`);
+      this.relayError = message;
+    }
   }
 
   // Plugin server code only receives the daemon connection inside handler and hook
@@ -85,6 +102,7 @@ export class Dispatcher {
       try {
         const settings = await this.deps.settings.read();
         intervalSeconds = settings.dispatch.intervalSeconds;
+        if (settings.writeback.mentions && this.deps.relay && this.paseo) await this.relayComments(this.deps.relay, this.paseo);
         this.status.active = settings.dispatch.enabled && settings.dispatch.teamKeys.length > 0;
         if (!this.status.active || !this.paseo) return;
         await this.poll(settings, this.paseo);

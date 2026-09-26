@@ -21,6 +21,7 @@ const WRITEBACK_OPTIONS: { key: keyof WritebackSettingsValue; on: string; off: s
   { key: "summaries", on: "Comment each finished turn's reply on the ticket", off: "No turn summaries" },
   { key: "blocked", on: "Comment and label the ticket while its agent waits on you", off: "No blocked alerts" },
   { key: "pullRequests", on: "Attach pull requests the agent opens and move the ticket to review", off: "No pull request links" },
+  { key: "mentions", on: "Deliver your \"@paseo …\" comments to the ticket's agent", off: "Comments stay in Linear" },
 ];
 
 type ThinkingOption = { id: string; label: string; description?: string; isDefault?: boolean };
@@ -532,12 +533,12 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
       {dispatchStatus && <Text style={t.muted}>{dispatchStatus.active ? "Polling" : "Idle"}{dispatchStatus.lastPollAt ? ` · last poll ${formatRelativeDate(dispatchStatus.lastPollAt)}` : " · waiting for first poll"}{dispatchStatus.lastError ? ` · error: ${dispatchStatus.lastError}` : ""}{dispatchStatus.recent.length ? ` · ${dispatchStatus.recent.slice(0, 3).map((item) => `${item.identifier} ${item.outcome}`).join(", ")}` : ""}</Text>}
     </>}
     <Divider t={t} spaced />
-    <FieldLabel title="Write back to Linear" icon="MessageSquare" hint="for agents linked to a ticket" t={t} />
+    <FieldLabel title="Sync with Linear" icon="MessageSquare" hint="for agents linked to a ticket" t={t} />
     {writeback && WRITEBACK_OPTIONS.map(({ key, on, off }) => <Button key={key} title={writeback[key] ? on : off} icon={writeback[key] ? "Check" : "CircleDashed"} stretch chosen={writeback[key]}
       onPress={() => void run("Saving setting", async () => {
         setWriteback((await saveSettings({ writeback: { [key]: !writeback[key] } })).writeback);
       })} />)}
-    <Text style={t.muted}>Uses this host's Linear key (write access needed), independent of the agent's own linear_ticket tools. Subagents do not report.</Text>
+    <Text style={t.muted}>Uses this host's Linear key (write access needed), independent of the agent's own linear_ticket tools. Subagents do not report. Your comments starting with @paseo answer the agent's pending question, approve or deny a pending action (“@paseo approve” / “@paseo deny reason”), or otherwise become a message; 👀 marks delivered comments.</Text>
     <Divider t={t} spaced />
     <FieldLabel title="Project mappings" icon="Folder" hint="Linear project → Paseo project" t={t} />
     {Object.keys(projectMappings).length ? Object.entries(projectMappings).sort((a, b) => a[1].label.localeCompare(b[1].label)).map(([key, mapping]) => {

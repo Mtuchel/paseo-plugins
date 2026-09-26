@@ -11,9 +11,10 @@ export type LaunchPreference = { model: string; modeId?: string; thinkingOptionI
 // whoever it is assigned to. No teams means nothing is dispatched, even when enabled.
 export type DispatchSettings = { enabled: boolean; label: string; teamKeys: string[]; intervalSeconds: number };
 // Which lifecycle events of ticket-linked agents are written back to their Linear ticket.
-export type WritebackSettings = { status: boolean; summaries: boolean; blocked: boolean; pullRequests: boolean };
+// `mentions` is the inbound direction: "@paseo" comments by the key's user reach the agent.
+export type WritebackSettings = { status: boolean; summaries: boolean; blocked: boolean; pullRequests: boolean; mentions: boolean };
 export const DEFAULT_DISPATCH: DispatchSettings = { enabled: false, label: "paseo", teamKeys: [], intervalSeconds: 60 };
-export const DEFAULT_WRITEBACK: WritebackSettings = { status: false, summaries: false, blocked: false, pullRequests: false };
+export const DEFAULT_WRITEBACK: WritebackSettings = { status: false, summaries: false, blocked: false, pullRequests: false, mentions: false };
 export const MIN_DISPATCH_INTERVAL_SECONDS = 30;
 export const MAX_DISPATCH_INTERVAL_SECONDS = 3_600;
 export const MAX_DISPATCH_TEAMS = 20;
@@ -111,6 +112,7 @@ export function normalizeWriteback(value: unknown): WritebackSettings {
     summaries: candidate.summaries === true,
     blocked: candidate.blocked === true,
     pullRequests: candidate.pullRequests === true,
+    mentions: candidate.mentions === true,
   };
 }
 

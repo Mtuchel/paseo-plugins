@@ -3,7 +3,7 @@ import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type { IssueState } from "./linear";
-import { DEFAULT_DISPATCH, type PluginSettings } from "./settings";
+import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { MAX_SUMMARY_LENGTH, turnPullRequests, turnReply, Writeback } from "./writeback";
 
 type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
@@ -11,7 +11,7 @@ type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
 const allOn: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true,
   dispatch: DEFAULT_DISPATCH,
-  writeback: { status: true, summaries: true, blocked: true, pullRequests: true },
+  writeback: { status: true, summaries: true, blocked: true, pullRequests: true, mentions: true },
 };
 const root: PluginHookAgent = { id: "agent-1", workspaceId: "w1", parentAgentId: null, provider: "claude", cwd: "/repo", title: "ENG-1: Fix sign-in" };
 
@@ -81,7 +81,7 @@ test("a completed turn posts its reply, truncated, and links a new pull request 
 
 test("each write-back toggle gates its own effect", async () => {
   const linear = new FakeLinear();
-  const off = { ...allOn, writeback: { status: false, summaries: false, blocked: false, pullRequests: false } };
+  const off = { ...allOn, writeback: DEFAULT_WRITEBACK };
   const writeback = new Writeback(linear, { read: async () => off });
   await writeback.turnStarted({ agent: root, turnId: "t" }, linked);
   await writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "failed", error: { message: "boom" } }, timeline: [toolCall("https://github.com/o/r/pull/9")] }, linked);
@@ -102,7 +102,7 @@ test("a pending question marks the ticket blocked until it is answered", async (
   const writeback = new Writeback(linear, { read: async () => allOn });
   await writeback.permissionRequested({ agent: root, request: { id: "p", provider: "claude", name: "AskUser", kind: "question", title: "Which database?" } }, linked);
   await writeback.permissionResolved({ agent: root, requestId: "p", resolution: { behavior: "allow" } }, linked);
-  assert.deepEqual(linear.writes, ["comment: **ENG-1: Fix sign-in** (Paseo) is waiting for an answer: Which database?", "+paseo-blocked", "-paseo-blocked"]);
+  assert.deepEqual(linear.writes, ["comment: **ENG-1: Fix sign-in** (Paseo) is waiting for an answer: Which database?\n\nReply here with “@paseo <your answer>”.", "+paseo-blocked", "-paseo-blocked"]);
 });
 
 test("archiving clears the running marker and reports only when no pull request was linked", async () => {

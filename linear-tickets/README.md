@@ -280,6 +280,15 @@ using this host's key, independently of the agent's own `linear_ticket` tools:
   commands during a turn (for example `gh pr create`) are attached to the ticket, which then moves to its team's
   started state named like *In Review*. Completion is left to Linear's GitHub integration.
 
+- **Replies from Linear** — your own comments that start with `@paseo` reach the ticket's
+  agent (the newest active one) within one poll interval. If the agent is waiting on a
+  question, the comment is the answer (an option name picks that option). If it is waiting
+  on an approval, `@paseo approve` / `@paseo deny <reason>` decides it. Otherwise the text is
+  sent as a message. Its reply comes back as a turn summary, so the conversation stays in
+  Linear. Delivered comments get a 👀 reaction (Linear is the record, so a restart never
+  delivers twice); undeliverable ones get ❌ and a reply saying why. Comments by other
+  people, and comments without the mention, are ignored. Blocked alerts end with how to reply.
+
 Archiving a linked agent always removes `<label>-running`. Subagents never report. Paseo
 delivers lifecycle events live and best-effort: events while the plugin is stopped are not
 replayed, and a Linear failure is logged (`paseo plugin logs linear-tickets`) without

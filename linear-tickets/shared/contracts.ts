@@ -189,6 +189,7 @@ const writebackSettingsSchema = z.object({
   summaries: z.boolean(),
   blocked: z.boolean(),
   pullRequests: z.boolean(),
+  mentions: z.boolean(),
 });
 export type DispatchSettingsValue = z.infer<typeof dispatchSettingsSchema>;
 export type WritebackSettingsValue = z.infer<typeof writebackSettingsSchema>;

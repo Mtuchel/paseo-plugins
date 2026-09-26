@@ -1,6 +1,7 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { dispatchLabels } from "./dispatch";
+import { questionsOf } from "./relay";
 import type { LinearService } from "./linear";
 import type { PluginSettings, Settings } from "./settings";
 
@@ -110,7 +111,12 @@ export class Writeback {
       const what = request.kind === "question" ? "an answer" : request.kind === "plan" ? "plan approval" : "permission";
       const subject = request.title || request.name;
       const description = request.description ? `\n\n${truncateSummary(request.description)}` : "";
-      await this.linear.comment(issueId, `**${agent.title ?? "Paseo agent"}** (Paseo) is waiting for ${what}: ${subject}${description}`);
+      const choices = (questionsOf(request)[0]?.options ?? []).map((option) => option.label ?? "").filter(Boolean);
+      const options = choices.length ? `\n\nOptions:\n${choices.map((choice) => `- ${choice}`).join("\n")}` : "";
+      const hint = settings.writeback.mentions
+        ? `\n\nReply here with ${request.kind === "question" ? "“@paseo <your answer>”" : "“@paseo approve” or “@paseo deny <reason>”"}.`
+        : "";
+      await this.linear.comment(issueId, `**${agent.title ?? "Paseo agent"}** (Paseo) is waiting for ${what}: ${subject}${description}${options}${hint}`);
       await this.linear.addLabel(issueId, dispatchLabels(settings.dispatch.label).blocked);
     });
   }
