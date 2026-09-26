@@ -179,3 +179,25 @@ test("the progress comment is created once and edited in place; the next agent g
     assert.equal((await handover.read("i1"))?.resumedFrom, "agent-1");
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+test("a permission shows in the agent panel only while still pending, and then without a duplicate ticket comment", async () => {
+  const { Writeback } = await import("./writeback");
+  const request: AgentPermissionRequest = { id: "p1", provider: "omp", name: "bash", kind: "tool", title: "Allow tool: bash", description: "Command: ls" };
+  for (const pending of [[], [request]]) {
+    const calls: string[] = [];
+    const linear = {
+      issueState: async () => ({ id: "i1", status: "Todo", statusType: "unstarted", teamId: "t", labels: [], attachmentUrls: [] }),
+      markInProgress: async () => ({ changed: false }), moveToReview: async () => ({ changed: false }), linkUrl: async () => {},
+      comment: async (_i: string, body: string) => { calls.push(`comment ${body.slice(0, 30)}`); },
+      addLabel: async (_i: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async () => {},
+    };
+    const sessions = {
+      sessionFor: async () => ({ sessionId: "s1" }), say: async () => {}, action: async () => {}, link: async () => {}, offerResume: async () => {}, resumeNow: async () => false,
+      ask: async (_s: string, body: string, options: { value: string }[]) => { calls.push(`ask ${body.split("\n")[0]} [${options.map((o) => o.value).join("|")}]`); },
+    };
+    const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" }, pendingPermissions: pending } }) }) } } as unknown as PaseoApi;
+    const writeback = new Writeback(linear, { read: async () => ({ ...settings, writeback: { ...DEFAULT_WRITEBACK, blocked: true } }) }, { sessions: sessions as never, handover: { update: async () => ({}) as never, finish: async () => ({}) as never } }, 0);
+    await writeback.permissionRequested({ agent: { id: "a1", workspaceId: "w", parentAgentId: null, provider: "omp", cwd: "/x", title: "T" }, request }, paseo);
+    assert.deepEqual(calls, pending.length ? ["ask Approve this action? [approve|deny]", "+paseo-blocked"] : []);
+  }
+});

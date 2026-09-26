@@ -10,7 +10,7 @@ import { cacheScope, TicketCache } from "./server/cache";
 import { Credentials } from "./server/credentials";
 import { Dispatcher } from "./server/dispatch";
 import { CommentRelay } from "./server/relay";
-import { PlannotatorBridge, writeOpenScript } from "./server/plannotator";
+import { PlannotatorBridge, readReviewPlan, recordDecision, writeOpenScript } from "./server/plannotator";
 import { Writeback } from "./server/writeback";
 import { AgentApi, AppAuth } from "./server/agent-app";
 import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
@@ -31,7 +31,13 @@ export default function contribute(server: PluginServerContext) {
   const auth = new AppAuth();
   const handover = new Handover(linear);
   const starter = new TicketStarter({ linear, launcher, handover });
-  const sessions = new SessionRouter({ api: new AgentApi(auth), linear, starter, settings, store: new SessionStore(), decideReview: decidePlannotatorReview });
+  const sessions = new SessionRouter({ api: new AgentApi(auth), linear, starter, settings, store: new SessionStore(),
+    decideReview: async (localUrl, approve, feedback, agentId) => {
+      const planContent = await readReviewPlan(localUrl).catch(() => "");
+      await decidePlannotatorReview(localUrl, approve, feedback);
+      await recordDecision({ type: "decided", agentId, approved: approve, ...(feedback ? { feedback } : {}), planContent, at: new Date().toISOString() });
+    },
+  });
   const openSession = async (issueId: string, identifier: string, agentId: string) => {
     if (await auth.credentials()) await sessions.openFor(issueId, identifier, agentId);
   };

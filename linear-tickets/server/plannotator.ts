@@ -58,6 +58,16 @@ export async function writeOpenScript(paths = plannotatorPaths(), runtime = { ex
   return paths.launcher;
 }
 
+// Records a decision made outside Plannotator's page (the Linear agent panel), so the bridge
+// handles it like one reported by the omp plan extension.
+export async function recordDecision(event: DecidedEvent, events = plannotatorPaths().events): Promise<void> {
+  await mkdir(events, { recursive: true, mode: 0o700 });
+  const name = `${Date.now()}-${randomUUID()}.json`;
+  const temporary = join(events, `.${name}.tmp`);
+  await writeFile(temporary, JSON.stringify(event), { mode: 0o600 });
+  await rename(temporary, join(events, name));
+}
+
 export function parseEvent(raw: string): PlannotatorEvent | null {
   let value: unknown;
   try { value = JSON.parse(raw); } catch { return null; }
@@ -101,6 +111,9 @@ export class PlannotatorBridge {
   private draining: Promise<void> | null = null;
   private again = false;
   private readonly attempts = new Map<string, number>();
+  // A decision taken in Linear is also reported by the omp plan extension; the second report
+  // within this window is the same decision and is skipped.
+  private readonly lastDecision = new Map<string, number>();
 
   constructor(
     private readonly linear: Linear,
@@ -179,6 +192,12 @@ export class PlannotatorBridge {
   }
 
   private async deliver(event: PlannotatorEvent, agentId: string, paseo: PaseoApi): Promise<void> {
+    if (event.type === "decided") {
+      const previous = this.lastDecision.get(agentId);
+      const at = Date.parse(event.at) || Date.now();
+      if (previous !== undefined && Math.abs(at - previous) < 120_000) return;
+      this.lastDecision.set(agentId, at);
+    }
     const handle = paseo.agents.ref(agentId);
     const refreshed = await handle.refresh();
     const labels = refreshed?.agent.labels ?? {};

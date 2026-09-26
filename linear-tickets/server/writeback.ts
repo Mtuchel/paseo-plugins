@@ -23,11 +23,19 @@ type Linear = Pick<LinearService, "issueState" | "markInProgress" | "comment" | 
 
 // The turn's reply: assistant text after the last user message. Streaming providers may
 // split one reply across several items, so the pieces are joined without separators.
+// The final answer is the text after the turn's last tool call; earlier text is narration
+// between tools. Some providers repeat the final message once complete, so a piece equal to
+// the previous one is dropped.
 export function turnReply(timeline: Timeline): string {
   let reply = "";
+  let previous = "";
   for (const item of timeline) {
-    if (item.type === "user_message") reply = "";
-    else if (item.type === "assistant_message") reply += item.text;
+    if (item.type === "user_message" || item.type === "tool_call") { reply = ""; previous = ""; }
+    else if (item.type === "assistant_message") {
+      if (item.text.trim() && item.text.trim() === previous.trim()) continue;
+      reply += item.text;
+      previous = item.text;
+    }
   }
   return reply.trim();
 }
@@ -70,7 +78,7 @@ export class Writeback {
   private readonly links = new Map<string, Link | null>();
   private readonly started = new Set<string>();
 
-  constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly agentBridge?: AgentBridge) {}
+  constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly agentBridge?: AgentBridge, private readonly settleMs = 2_000) {}
 
   // Session activities are best-effort on their own: a panel failure must not skip comments.
   private async session(agentId: string, work: (sessionId: string, sessions: AgentBridge["sessions"]) => Promise<void>): Promise<void> {
@@ -159,13 +167,26 @@ export class Writeback {
 
   permissionRequested({ agent, request }: PluginLifecycleEvents["agent.permission_requested"], paseo: PaseoApi): Promise<void> {
     return this.run("permission_requested", agent, paseo, async ({ issueId }, settings) => {
+      // Providers sometimes resolve a request themselves within moments (for example after a
+      // plan approval switches the mode); only requests still pending after a short wait are shown.
+      await new Promise((resolve) => setTimeout(resolve, this.settleMs));
+      const refreshed = await paseo.agents.ref(agent.id).refresh().catch(() => null);
+      const stillPending = refreshed?.agent.pendingPermissions;
+      if (Array.isArray(stillPending) && !stillPending.some((pending) => pending.id === request.id)) return;
+      let inSession = false;
       await this.session(agent.id, (sessionId, sessions) => {
+        inSession = true;
         const subject = [request.title || request.name, request.description].filter(Boolean).join("\n\n");
         return request.kind === "question"
           ? sessions.ask(sessionId, subject, optionsForQuestion(request))
           : sessions.ask(sessionId, `Approve this action?\n\n${subject}`, [{ label: "Approve", value: "approve" }, { label: "Deny", value: "deny" }]);
       });
       if (!settings.writeback.blocked) return;
+      // The agent panel already asks; the ticket only gets the blocked label, not another comment.
+      if (inSession) {
+        await this.linear.addLabel(issueId, dispatchLabels(settings.dispatch.label).blocked);
+        return;
+      }
       const what = request.kind === "question" ? "an answer" : request.kind === "plan" ? "plan approval" : "permission";
       const subject = request.title || request.name;
       const description = request.description ? `\n\n${truncateSummary(request.description)}` : "";

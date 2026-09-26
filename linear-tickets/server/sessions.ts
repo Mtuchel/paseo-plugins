@@ -138,7 +138,7 @@ type Deps = {
   settings: Pick<Settings, "read">;
   store: SessionStore;
   stop?: (agentId: string) => Promise<void>;
-  decideReview?: (localUrl: string, approve: boolean, feedback: string) => Promise<void>;
+  decideReview?: (localUrl: string, approve: boolean, feedback: string, agentId: string) => Promise<void>;
 };
 
 // Linear agent sessions ↔ Paseo agents. Inbound: `created` starts or links an agent, and
@@ -264,7 +264,7 @@ export class SessionRouter {
     if (link.review && this.deps.decideReview) {
       const approve = body.toLowerCase() === APPROVE_PLAN || /^(approve|approved|yes|ok|looks good)\b/i.test(body);
       const feedback = body.toLowerCase() === SEND_BACK ? "Sent back from Linear." : body;
-      await this.deps.decideReview(link.review.localUrl, approve, approve ? "" : feedback);
+      await this.deps.decideReview(link.review.localUrl, approve, approve ? "" : feedback, link.agentId);
       await this.deps.store.patch(sessionId, { review: null });
       await this.say(sessionId, "thought", approve ? "Plan approved — the agent continues." : "Plan sent back with your feedback.");
       return;
