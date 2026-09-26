@@ -22,16 +22,17 @@ export function turnReply(timeline: Timeline): string {
   return reply.trim();
 }
 
-// Pull request URLs printed by tools during this turn (for example `gh pr create`).
-// Only tool output counts, not prose, and only after the last user message, so earlier
-// turns and pasted references are not re-linked on every turn.
+// Pull request URLs printed by completed shell commands during this turn (for example
+// `gh pr create`). Tool inputs, file writes and prose are ignored — they routinely quote the
+// ticket or other PRs — and only items after the last user message count, so earlier turns
+// are not re-linked on every turn.
 export function turnPullRequests(timeline: Timeline): string[] {
   let start = 0;
   timeline.forEach((item, index) => { if (item.type === "user_message") start = index + 1; });
   const urls = new Set<string>();
   for (const item of timeline.slice(start)) {
-    if (item.type !== "tool_call") continue;
-    for (const match of JSON.stringify(item).matchAll(PULL_REQUEST_URL)) urls.add(match[0]);
+    if (item.type !== "tool_call" || item.status !== "completed" || item.detail.type !== "shell" || !item.detail.output) continue;
+    for (const match of item.detail.output.matchAll(PULL_REQUEST_URL)) urls.add(match[0]);
   }
   return [...urls];
 }

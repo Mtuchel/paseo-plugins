@@ -248,7 +248,8 @@ comment saying why; fix the cause and add the trigger label again.
 
 Paseo gives plugin code its daemon connection only inside RPCs and lifecycle hooks, so
 polling starts at the first of these after the plugin loads: opening the ticket surface,
-saving a setting, or any agent turn on the host. The surface's Settings shows the last poll,
+saving a setting, or any agent or workspace activity on the host (agents resumed after a
+daemon restart count). The surface's Settings shows the last poll,
 its error and the most recent dispatches.
 
 ## Write back to Linear
@@ -265,8 +266,8 @@ using this host's key, independently of the agent's own `linear_ticket` tools:
 - **Blocked alerts** — a pending permission, plan approval or question posts a comment and
   adds `<label>-blocked`; answering it, or the next completed turn, removes the label. A
   failed turn also adds it.
-- **Pull requests** — GitHub pull request URLs printed by the agent's tools during a turn
-  (for example by `gh pr create`) are attached to the ticket, which then moves to its team's
+- **Pull requests** — GitHub pull request URLs printed by the agent's completed shell
+  commands during a turn (for example `gh pr create`) are attached to the ticket, which then moves to its team's
   started state named like *In Review*. Completion is left to Linear's GitHub integration.
 
 Archiving a linked agent always removes `<label>-running`. Subagents never report. Paseo

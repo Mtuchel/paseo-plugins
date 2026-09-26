@@ -23,13 +23,16 @@ export default function contribute(server: PluginServerContext) {
     return connection.key ? cacheScope(connection.key) : null;
   };
   // The daemon connection is only handed to handlers and hooks; the first one starts the
-  // dispatcher (opening the ticket surface or any agent turn on this host).
+  // dispatcher: opening the ticket surface, or any agent or workspace activity on this host
+  // (resumed agents open their sessions right after a daemon restart).
   server.on("agent.turn_started", (event, { paseo }) => { dispatcher.attach(paseo); return writeback.turnStarted(event, paseo); });
   server.on("agent.turn_ended", (event, { paseo }) => { dispatcher.attach(paseo); return writeback.turnEnded(event, paseo); });
   server.on("agent.permission_requested", (event, { paseo }) => writeback.permissionRequested(event, paseo));
   server.on("agent.permission_resolved", (event, { paseo }) => writeback.permissionResolved(event, paseo));
   server.on("agent.archived", (event, { paseo }) => writeback.archived(event, paseo));
   server.on("agent.created", (_event, { paseo }) => dispatcher.attach(paseo));
+  server.on("workspace.created", (_event, { paseo }) => dispatcher.attach(paseo));
+  server.before("agent.session_open", (_input, { paseo }) => { dispatcher.attach(paseo); });
   server.handle(statusRpc, (_input, { paseo }) => { dispatcher.attach(paseo); return linear.status(); });
   server.handle(dispatchStatusRpc, (_input, { paseo }) => { dispatcher.attach(paseo); return dispatcher.snapshot(); });
   server.handle(connectRpc, ({ apiKey }) => linear.authenticate(apiKey));

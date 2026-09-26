@@ -91,8 +91,11 @@ export class Dispatcher {
         this.status.lastPollAt = new Date().toISOString();
         this.status.lastError = null;
       } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        // Logged once per distinct error so a persistent failure does not flood the plugin log.
+        if (message !== this.status.lastError) console.error(`[linear-tickets] auto-dispatch poll failed: ${message}`);
         this.status.lastPollAt = new Date().toISOString();
-        this.status.lastError = error instanceof Error ? error.message : "Unknown error";
+        this.status.lastError = message;
       }
     })();
     try {
@@ -117,6 +120,7 @@ export class Dispatcher {
   private record(identifier: string, outcome: DispatchStatus["recent"][number]["outcome"], detail: string): void {
     this.status.recent.unshift({ identifier, at: new Date().toISOString(), outcome, detail });
     this.status.recent.length = Math.min(this.status.recent.length, RECENT_LIMIT);
+    console.log(`[linear-tickets] auto-dispatch ${identifier}: ${outcome} (${detail})`);
   }
 
   private async dispatch(issue: LabeledIssue, settings: PluginSettings, paseo: PaseoApi): Promise<void> {

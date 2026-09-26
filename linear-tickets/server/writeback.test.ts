@@ -15,7 +15,7 @@ const allOn: PluginSettings = {
 };
 const root: PluginHookAgent = { id: "agent-1", workspaceId: "w1", parentAgentId: null, provider: "claude", cwd: "/repo", title: "ENG-1: Fix sign-in" };
 
-const toolCall = (output: string) => ({ type: "tool_call", callId: "c1", name: "shell", status: "completed", detail: { type: "unknown", input: null, output }, error: null }) as unknown as Timeline[number];
+const toolCall = (output: string): Timeline[number] => ({ type: "tool_call", callId: "c1", name: "bash", status: "completed", detail: { type: "shell", command: "gh pr create", output }, error: null });
 
 class FakeLinear {
   readonly writes: string[] = [];
@@ -46,12 +46,14 @@ test("the turn reply is the assistant text after the last user message, joined a
   assert.equal(turnReply(timeline), "Fixed the bug.");
 });
 
-test("pull requests come only from this turn's tool output, deduplicated", () => {
+test("pull requests come only from this turn's shell output, deduplicated", () => {
   const timeline: Timeline = [
     toolCall("https://github.com/o/r/pull/1"),
     { type: "user_message", text: "see https://github.com/o/r/pull/2" },
     { type: "assistant_message", text: "Compare https://github.com/o/r/pull/3" },
     toolCall("Created https://github.com/o/r/pull/4\nhttps://github.com/o/r/pull/4"),
+    // A file write quoting the ticket (seen live: an agent copying the ticket into PLAN.md).
+    { type: "tool_call", callId: "c2", name: "write", status: "completed", detail: { type: "write", filePath: "PLAN.md", content: "see https://github.com/o/r/pull/5" }, error: null },
   ];
   assert.deepEqual(turnPullRequests(timeline), ["https://github.com/o/r/pull/4"]);
 });
