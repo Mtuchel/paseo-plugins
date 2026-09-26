@@ -281,6 +281,16 @@ sessions and replies whose webhook was missed. **Settings → Linear agent** sho
 The prompt marks the ticket as untrusted input and asks only for a plan. Approving the plan
 switches the agent to your usual mode.
 
+**Questions stay answerable.** Linear shows a question's buttons only while it is the newest
+entry in the panel, so the live feed holds the agent's commands until you reply. If an agent
+waits on several approvals at once (parallel tool calls), each is asked in turn.
+
+**After a reload.** The webhook receiver starts about a second after the plugin loads. If no
+agent activity hands the plugin a daemon connection within three seconds, it connects to the
+local daemon itself (only a loopback, password-free daemon), so replies sent while it was
+reloading are picked up by the minute sweep. Plannotator chat rows in Paseo need a hook's
+connection and are skipped until one arrives; Linear still gets the review.
+
 **Waiting their turn.** A ticket blocked by unfinished tickets, or started while *max agents*
 (Settings → Auto-dispatch) are already working, waits. A labelled ticket keeps its label; a
 delegated one says why in its panel. The minute sweep starts it once it is admitted. Labelled
@@ -288,8 +298,9 @@ tickets start most urgent first.
 
 **Split into sub-issues.** A plan with 2–12 steps also offers **Approve & split into N
 sub-issues**. The plan becomes the parent's plan document and the planning agent is closed.
-Each step becomes a sub-issue assigned to Paseo, blocked by the step before, so the steps run one
-after another: each starts when the previous ticket is done.
+Each step becomes a sub-issue in Todo, assigned to Paseo, blocked by the step before, and the
+parent moves to In Progress. The steps run one after another: each starts when the previous
+ticket is done, which for code usually means its pull request was merged.
 
 **Pull request reviews.** Every 2 minutes the plugin reads each ticket's pull request with
 `gh`. Requested changes post a panel update and move the ticket back to In Progress; fixes
