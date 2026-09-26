@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -22,6 +22,10 @@ export type HandoverRecord = {
   lastCommit: string | null;
   summaries: string[];
   links: Record<string, string>;
+  // Where the plan stands, e.g. "under review", "approved", "sent back", "split into 4 sub-issues".
+  plan?: string | null;
+  // Where the pull request review stands, e.g. "changes requested by @alice".
+  review?: string | null;
   status: HandoverStatus;
   progressCommentId: string | null;
   resumedFrom: string | null;
@@ -53,6 +57,8 @@ export function progressBody(record: HandoverRecord): string {
     `**Phase:** ${PHASE[record.status]} · updated ${record.updatedAt.slice(0, 16).replace("T", " ")} UTC`,
     `**Branch:** ${record.branch ? `\`${record.branch}\`` : "—"} · **Last commit:** ${record.lastCommit ? `\`${record.lastCommit}\`` : "—"}`,
     record.worktreePath ? `**Worktree:** \`${record.worktreePath}\`` : "",
+    record.plan ? `**Plan:** ${record.plan}` : "",
+    record.review ? `**Review:** ${record.review}` : "",
     links ? `**Links:** ${links}` : "",
     record.summaries.length ? `**Latest:**\n\n${record.summaries[record.summaries.length - 1]}` : "",
   ].filter(Boolean).join("\n");
@@ -108,7 +114,7 @@ export class Handover {
 
   // Updates the record for this agent (a new agent on the ticket starts a new progress comment)
   // and edits the progress comment. Returns the record.
-  update(issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, change: { status?: HandoverStatus; summary?: string; link?: [string, string] }): Promise<HandoverRecord> {
+  update(issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, change: { status?: HandoverStatus; summary?: string; link?: [string, string]; plan?: string; review?: string }): Promise<HandoverRecord> {
     return this.serialize(async () => {
       const previous = await this.read(issue.id);
       const sameAgent = previous?.agentId === agent.id;
@@ -123,6 +129,8 @@ export class Handover {
         lastCommit: git.lastCommit ?? (sameAgent ? previous.lastCommit : null),
         summaries: [...(sameAgent ? previous.summaries : previous?.summaries ?? []), ...(change.summary ? [clip(change.summary, MAX_SUMMARY)] : [])].slice(-KEPT_SUMMARIES),
         links: { ...(sameAgent ? previous.links : {}), ...(change.link ? { [change.link[0]]: change.link[1] } : {}) },
+        plan: change.plan ?? (sameAgent ? previous.plan ?? null : null),
+        review: change.review ?? (sameAgent ? previous.review ?? null : null),
         status: change.status ?? (sameAgent ? previous.status : "working"),
         progressCommentId: sameAgent ? previous.progressCommentId : null,
         resumedFrom: sameAgent ? previous.resumedFrom : previous?.agentId ?? null,
@@ -146,6 +154,12 @@ export class Handover {
     const record = await this.update(issue, agent, { status });
     await this.linear.comment(issue.id, finalBody(record, reason));
     return record;
+  }
+
+  async all(): Promise<HandoverRecord[]> {
+    const names = await readdir(this.directory).catch(() => [] as string[]);
+    const records = await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readFile(join(this.directory, name), "utf8").then((text) => JSON.parse(text) as HandoverRecord, () => null)));
+    return records.filter((record): record is HandoverRecord => Boolean(record));
   }
 
   async resumeTarget(issueId: string): Promise<ResumeTarget | null> {

@@ -11,7 +11,7 @@ import { agentAppDirectory } from "./agent-app";
 import type { AgentSessionWebhook } from "./agent-webhook";
 import { dispatchLabels } from "./dispatch";
 import type { LinearService } from "./linear";
-import { approvalDecision, questionAnswer, questionsOf } from "./relay";
+import { answerableQuestions, approvalDecision, matchOption, questionAnswer, questionsOf } from "./relay";
 import type { Settings } from "./settings";
 import type { TicketStarter } from "./starter";
 
@@ -21,6 +21,8 @@ const SWEEP_MS = 60_000;
 const ADOPT_WINDOW_MS = 2 * 60 * 60 * 1000;
 export const APPROVE_PLAN = "approve-plan";
 export const SEND_BACK = "send-back";
+export const SPLIT_PLAN = "split-plan";
+export const MAX_SPLIT = 12;
 export const RESUME = "resume";
 export const LEAVE = "leave";
 
@@ -33,7 +35,11 @@ export type SessionLink = {
   handled: string[];
   // What a plain reply in the panel means right now, besides a pending permission.
   review: { localUrl: string } | null;
-  offer: "resume" | null;
+  offer: "resume" | "split" | null;
+  // Waiting for blockers or a free agent slot; the sweep starts it when admitted.
+  queued?: boolean;
+  // A question with several parts, asked one part at a time.
+  questions?: { requestId: string; index: number; answers: Record<string, string> } | null;
 };
 
 // sessionId → Paseo agent, persisted so a reload keeps every conversation connected.
@@ -74,7 +80,7 @@ export class SessionStore {
   }
 
   async put(link: SessionLink): Promise<void> {
-    (await this.load())[link.sessionId] = link;
+    (await this.load())[link.sessionId] = { ...link, handled: [...link.handled] };
     await this.persist();
   }
 
@@ -102,6 +108,13 @@ function paseoCli(): string {
   return "paseo";
 }
 
+// Switches an agent's mode (the plugin SDK cannot), e.g. from plan-first back to the usual mode.
+export async function setAgentMode(agentId: string, modeId: string): Promise<void> {
+  const env = { ...process.env };
+  delete env.PASEO_AGENT_ID;
+  await exec(paseoCli(), ["agent", "mode", agentId, modeId], { timeout: 15_000, env });
+}
+
 // Interrupts the agent's running turn. The plugin SDK has no cancel, so the CLI does it.
 export async function stopAgentTurn(agentId: string): Promise<void> {
   const env = { ...process.env };
@@ -109,10 +122,43 @@ export async function stopAgentTurn(agentId: string): Promise<void> {
   await exec(paseoCli(), ["stop", agentId], { timeout: 15_000, env });
 }
 
+const OTHER_OPTION = /^other\b/i;
+
+// Buttons for one question part. "Other (type your own)" is not a button: typing an answer is.
+export function questionPrompt(request: AgentPermissionRequest, index: number): { body: string; options: SelectOption[] } {
+  const parts = answerableQuestions(request);
+  const part = parts[index]?.question ?? questionsOf(request)[0] ?? {};
+  const labels = (part.options ?? []).map((option) => option.label ?? "").filter(Boolean);
+  const other = labels.some((label) => OTHER_OPTION.test(label)) || Boolean((part as { allowOther?: boolean }).allowOther);
+  const counter = parts.length > 1 ? `(${index + 1}/${parts.length})` : "";
+  const title = index === 0 ? [request.title, request.description].filter(Boolean).join("\n\n") : "";
+  const question = part.question && part.question !== request.title ? part.question : "";
+  return {
+    body: [`${[question || title, counter].filter(Boolean).join(" ")}`, index === 0 && question ? title : "", other ? "Or type your own answer." : ""].filter(Boolean).join("\n\n") || "The agent has a question.",
+    options: labels.filter((label) => !OTHER_OPTION.test(label)).map((label) => ({ label, value: label })),
+  };
+}
+
 // "SFTP" or "sftp" (a clicked option's value) both select the option labelled SFTP.
 export function optionsForQuestion(request: AgentPermissionRequest): SelectOption[] {
-  return (questionsOf(request)[0]?.options ?? []).map((option) => option.label ?? "").filter(Boolean).map((label) => ({ label, value: label }));
+  return questionPrompt(request, 0).options;
 }
+
+// The web app opens the agent directly when this browser is paired with the host.
+export function paseoAgentUrl(serverId: string, agentId: string): string {
+  return `https://app.paseo.sh/h/${encodeURIComponent(serverId)}/agent/${encodeURIComponent(agentId)}`;
+}
+
+let serverIdCache: Promise<string | null> | null = null;
+export function daemonServerId(): Promise<string | null> {
+  serverIdCache ??= exec(paseoCli(), ["daemon", "status", "--json"], { timeout: 15_000 })
+    .then(({ stdout }) => { const id = (JSON.parse(stdout) as { serverId?: unknown }).serverId; return typeof id === "string" ? id : null; })
+    .catch(() => null);
+  return serverIdCache;
+}
+
+const LIVE_FLUSH_MS = 4_000;
+const HOLD_MS = 5 * 60 * 1000;
 
 // Checklist entries from a plan's markdown: "- [ ] step", "1. step" or "- step" under a
 // Steps heading, falling back to all checkbox lines.
@@ -120,7 +166,9 @@ export function planSteps(markdown: string): string[] {
   const lines = markdown.split("\n");
   const checkbox = lines.map((line) => line.match(/^\s*[-*]\s+\[[ xX]\]\s+(.+)$/)?.[1]).filter((text): text is string => Boolean(text));
   if (checkbox.length) return checkbox.slice(0, 30);
-  const start = lines.findIndex((line) => /^#{1,4}\s+(steps|implementation|plan)\b/i.test(line));
+  // A "Steps" section wins over "Implementation", which wins over a general "Plan" heading.
+  const heading = (word: string) => lines.findIndex((line) => new RegExp(`^#{1,4}\\s+${word}\\b`, "i").test(line));
+  const start = [heading("steps"), heading("implementation"), heading("plan")].find((index) => index >= 0) ?? -1;
   if (start < 0) return [];
   const steps: string[] = [];
   for (const line of lines.slice(start + 1)) {
@@ -134,11 +182,12 @@ export function planSteps(markdown: string): string[] {
 type Deps = {
   api: AgentApi;
   linear: Pick<LinearService, "viewerId" | "addLabel" | "removeLabel">;
-  starter: Pick<TicketStarter, "start">;
+  starter: Pick<TicketStarter, "start" | "admission">;
   settings: Pick<Settings, "read">;
   store: SessionStore;
   stop?: (agentId: string) => Promise<void>;
   decideReview?: (localUrl: string, approve: boolean, feedback: string, agentId: string) => Promise<void>;
+  splitPlan?: (link: SessionLink, localUrl: string, paseo: PaseoApi) => Promise<string>;
 };
 
 // Linear agent sessions ↔ Paseo agents. Inbound: `created` starts or links an agent, and
@@ -149,6 +198,10 @@ export class SessionRouter {
   private waiting: AgentSessionWebhook[] = [];
   private timer: NodeJS.Timeout | null = null;
   private sweeping = false;
+  // Agents the user stopped from Linear: a turn the provider starts on its own is stopped again.
+  private readonly held = new Map<string, number>();
+  // Live action feed per agent during a turn: the subscription and actions not yet posted.
+  private readonly live = new Map<string, { sessionId: string; stop: () => void; pending: string[]; timer: NodeJS.Timeout | null; posted: number }>();
 
   constructor(private readonly deps: Deps) {}
 
@@ -164,6 +217,8 @@ export class SessionRouter {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    for (const state of this.live.values()) { if (state.timer) clearTimeout(state.timer); state.stop(); }
+    this.live.clear();
   }
 
   // Entry point for webhooks. Acknowledges `created` right away — Linear marks sessions without
@@ -217,6 +272,12 @@ export class SessionRouter {
       return;
     }
     await this.deps.store.put(link);
+    const admission = await this.deps.starter.admission(issueId, this.paseo!, await this.deps.settings.read());
+    if (!admission.ok) {
+      await this.deps.store.patch(session.id, { queued: true });
+      await this.say(session.id, "thought", admission.reason);
+      return;
+    }
     await this.startFor(link, false);
   }
 
@@ -226,12 +287,13 @@ export class SessionRouter {
     await this.deps.linear.addLabel(link.issueId, running).catch(() => {});
     try {
       const started = await this.deps.starter.start(link.issueId, this.paseo!, settings, { labels: { "linear.sessionId": link.sessionId }, retryHint: "assign Paseo again", fresh });
-      await this.deps.store.patch(link.sessionId, { agentId: started.agentId, offer: null });
+      await this.deps.store.patch(link.sessionId, { agentId: started.agentId, offer: null, queued: false });
       // The stopped agent is closed only after the session points at its successor, so its
       // archive does not offer another resume. Its worktree stays for the new agent.
       if (link.agentId && link.agentId !== started.agentId) await this.paseo!.agents.ref(link.agentId).archive().catch(() => {});
       const warnings = started.warnings.length ? `\n\nWarnings:\n${started.warnings.map((warning) => `- ${warning}`).join("\n")}` : "";
-      await this.say(link.sessionId, "thought", `${started.resumed ? "Resumed the previous agent's work" : "Started"} with ${started.provider} in ${started.target} (Paseo agent ${started.agentId.slice(0, 8)}).${warnings}`);
+      await this.say(link.sessionId, "thought", `${started.resumed ? "Resumed the previous agent's work" : "Started"} with ${started.provider} in ${started.target} (Paseo agent ${started.agentId.slice(0, 8)}).${started.untrusted ? " This ticket is not yours, so the agent only plans until you approve." : ""}${warnings}`);
+      await this.linkToPaseo(link.sessionId, started.agentId);
     } catch (error) {
       await this.deps.linear.removeLabel(link.issueId, running).catch(() => {});
       throw error;
@@ -257,8 +319,17 @@ export class SessionRouter {
     if (!link.agentId) { await this.say(sessionId, "error", "The agent for this session has not started yet."); return; }
     const handle = this.paseo!.agents.ref(link.agentId);
     if (signal === "stop") {
+      this.held.set(link.agentId, Date.now());
       await (this.deps.stop ?? stopAgentTurn)(link.agentId);
       await this.say(sessionId, "response", "Stopped the agent's current turn. Reply here to continue.");
+      return;
+    }
+    if (link.review && body.toLowerCase() === SPLIT_PLAN && this.deps.splitPlan) {
+      // Marked first: the planner is archived during the split, which must not offer a resume.
+      await this.deps.store.patch(sessionId, { offer: "split" });
+      const summary = await this.deps.splitPlan(link, link.review.localUrl, this.paseo!);
+      await this.deps.store.patch(sessionId, { review: null });
+      await this.say(sessionId, "response", summary);
       return;
     }
     if (link.review && this.deps.decideReview) {
@@ -269,11 +340,25 @@ export class SessionRouter {
       await this.say(sessionId, "thought", approve ? "Plan approved — the agent continues." : "Plan sent back with your feedback.");
       return;
     }
+    this.held.delete(link.agentId);
     const pending = (await handle.refresh())?.agent.pendingPermissions ?? [];
     const question = pending.find((request) => request.kind === "question");
     const approval = pending.find((request) => request.kind !== "question");
     if (question) {
-      await handle.respondToPermission({ requestId: question.id, response: questionAnswer(question, body) });
+      const parts = answerableQuestions(question);
+      const progress = link.questions?.requestId === question.id ? link.questions : null;
+      const answers = { ...(progress?.answers ?? {}) };
+      const next = parts.find(({ key }) => answers[key] === undefined);
+      if (next) answers[next.key] = matchOption(next.question, body);
+      const answered = parts.filter(({ key }) => answers[key] !== undefined).length;
+      if (answered < parts.length) {
+        await this.deps.store.patch(sessionId, { questions: { requestId: question.id, index: answered, answers } });
+        const prompt = questionPrompt(question, answered);
+        await this.ask(sessionId, prompt.body, prompt.options);
+        return;
+      }
+      await this.deps.store.patch(sessionId, { questions: null });
+      await handle.respondToPermission({ requestId: question.id, response: questionAnswer(question, "", answers) });
       return;
     }
     if (approval) {
@@ -295,6 +380,11 @@ export class SessionRouter {
       for (const session of await this.deps.api.openSessions()) {
         if (!["pending", "active", "awaitingInput"].includes(session.status)) continue;
         const link = await this.deps.store.get(session.id);
+        if (link?.queued && !link.agentId) {
+          const admission = await this.deps.starter.admission(link.issueId, this.paseo, await this.deps.settings.read());
+          if (admission.ok) await this.startFor(link, false).catch((error: unknown) => this.say(link.sessionId, "error", `Paseo could not start the agent: ${error instanceof Error ? error.message : error}`));
+          continue;
+        }
         if (!link) {
           if (session.status === "pending" && Date.now() - Date.parse(session.createdAt) < ADOPT_WINDOW_MS && session.issueId) {
             await this.handle({ type: "AgentSessionEvent", action: "created", agentSession: { id: session.id, creatorId: session.creatorId, issueId: session.issueId, issue: { id: session.issueId, identifier: session.identifier } } });
@@ -325,6 +415,63 @@ export class SessionRouter {
 
   async action(sessionId: string, action: string, parameter: string, result?: string): Promise<void> {
     await this.deps.api.activity(sessionId, { type: "action", action, parameter, ...(result ? { result } : {}) });
+  }
+
+  // First part of a pending question (later parts follow each answer).
+  async askQuestion(sessionId: string, request: AgentPermissionRequest): Promise<void> {
+    await this.deps.store.patch(sessionId, { questions: null });
+    const prompt = questionPrompt(request, 0);
+    await this.ask(sessionId, prompt.body, prompt.options);
+  }
+
+  // Called when a turn starts: a provider restarting on its own right after a Stop is stopped again.
+  async holdIfStopped(agentId: string): Promise<boolean> {
+    const since = this.held.get(agentId);
+    if (since === undefined || Date.now() - since > HOLD_MS) { this.held.delete(agentId); return false; }
+    await (this.deps.stop ?? stopAgentTurn)(agentId).catch(() => {});
+    const link = await this.deps.store.forAgent(agentId);
+    if (link) await this.say(link.sessionId, "thought", "Kept stopped — reply here to continue.").catch(() => {});
+    return true;
+  }
+
+  // Posts the agent's completed commands and edits while the turn runs, merged at most every 4 s.
+  async follow(agentId: string): Promise<void> {
+    if (!this.paseo || this.live.has(agentId)) return;
+    const link = await this.deps.store.forAgent(agentId);
+    if (!link) return;
+    const state = { sessionId: link.sessionId, stop: () => {}, pending: [] as string[], timer: null as NodeJS.Timeout | null, posted: 0 };
+    this.live.set(agentId, state);
+    const unsubscribe = this.paseo.agents.ref(agentId).timeline.subscribe((event) => {
+      if (event.event.type !== "timeline") return;
+      const description = describeTool(event.event.item);
+      if (!description) return;
+      state.pending.push(description);
+      state.timer ??= setTimeout(() => { void this.flush(agentId); }, LIVE_FLUSH_MS);
+    });
+    state.stop = () => unsubscribe();
+  }
+
+  private async flush(agentId: string): Promise<void> {
+    const state = this.live.get(agentId);
+    if (!state) return;
+    state.timer = null;
+    const items = state.pending.splice(0);
+    if (!items.length) return;
+    state.posted += items.length;
+    const [first] = items;
+    const [action, ...rest] = first.split(" ");
+    await this.action(state.sessionId, items.length === 1 ? action : `${items.length} steps`, items.length === 1 ? rest.join(" ") : items.join("\n").slice(0, 2_000)).catch(() => {});
+  }
+
+  // Ends the live feed at turn end; true when it posted anything, so the turn summary skips its action log.
+  async unfollow(agentId: string): Promise<boolean> {
+    const state = this.live.get(agentId);
+    if (!state) return false;
+    if (state.timer) clearTimeout(state.timer);
+    await this.flush(agentId);
+    state.stop();
+    this.live.delete(agentId);
+    return state.posted > 0;
   }
 
   async ask(sessionId: string, body: string, options: SelectOption[]): Promise<void> {
@@ -358,8 +505,14 @@ export class SessionRouter {
   }
 
   async offerResume(sessionId: string): Promise<void> {
+    if ((await this.deps.store.get(sessionId))?.offer === "split") return;
     await this.deps.store.patch(sessionId, { offer: "resume" });
     await this.ask(sessionId, "The agent stopped. Continue with a new agent on the same branch?", [{ label: "Resume with a new agent", value: RESUME }, { label: "Leave it", value: LEAVE }]);
+  }
+
+  async linkToPaseo(sessionId: string, agentId: string): Promise<void> {
+    const serverId = await daemonServerId();
+    if (serverId) await this.link(sessionId, "Open in Paseo", paseoAgentUrl(serverId, agentId)).catch(() => {});
   }
 
   // A label or sidebar launch gets a session too, so the ticket shows the same agent panel.
@@ -367,6 +520,7 @@ export class SessionRouter {
     try {
       const sessionId = await this.deps.api.createSessionOnIssue(issueId);
       await this.deps.store.put({ sessionId, agentId, issueId, identifier, createdAt: new Date().toISOString(), handled: [], review: null, offer: null });
+      await this.linkToPaseo(sessionId, agentId);
       return sessionId;
     } catch (error) {
       console.error(`[linear-tickets] ${identifier}: could not open an agent session: ${error instanceof Error ? error.message : error}`);
@@ -388,3 +542,11 @@ export async function decidePlannotatorReview(localUrl: string, approve: boolean
   if (!response.ok) throw new Error(`Plannotator answered HTTP ${response.status}; the review may already be closed.`);
 }
 
+
+// One line for the live feed, or null for tools not worth showing (reads, searches, thinking).
+export function describeTool(item: { type: string; status?: string; detail?: { type: string; command?: string; filePath?: string } }): string | null {
+  if (item.type !== "tool_call" || item.status !== "completed" || !item.detail) return null;
+  if (item.detail.type === "shell" && item.detail.command) return `Ran ${item.detail.command.slice(0, 200)}`;
+  if ((item.detail.type === "edit" || item.detail.type === "write") && item.detail.filePath) return `Edited ${item.detail.filePath}`;
+  return null;
+}

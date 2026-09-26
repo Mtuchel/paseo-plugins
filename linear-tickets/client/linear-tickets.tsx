@@ -15,7 +15,7 @@ import { MarkdownPreview } from "./markdown-preview";
 import { restoreLaunchSelection, type LaunchPreference } from "./launch-preferences";
 import { mappedBaseBranch, mappingKey, mappingLabel, resolveMapping, type MappingSource, type ProjectMapping } from "../shared/mapping";
 
-const dispatchDraftFor = (value: DispatchSettingsValue) => ({ label: value.label, teamKeys: value.teamKeys.join(", "), intervalSeconds: String(value.intervalSeconds) });
+const dispatchDraftFor = (value: DispatchSettingsValue) => ({ label: value.label, teamKeys: value.teamKeys.join(", "), intervalSeconds: String(value.intervalSeconds), maxRunning: String(value.maxRunning) });
 const WRITEBACK_OPTIONS: { key: keyof WritebackSettingsValue; on: string; off: string }[] = [
   { key: "status", on: "Move the ticket to In Progress when its agent starts working", off: "Leave the ticket status alone when work starts" },
   { key: "summaries", on: "Comment each finished turn's reply on the ticket", off: "No turn summaries" },
@@ -98,7 +98,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   const [projectMappings, setProjectMappings] = useState<Record<string, ProjectMapping>>({});
   const [agentLinearAccess, setAgentLinearAccess] = useState(true);
   const [dispatch, setDispatch] = useState<DispatchSettingsValue | null>(null);
-  const [dispatchDraft, setDispatchDraft] = useState({ label: "", teamKeys: "", intervalSeconds: "" });
+  const [dispatchDraft, setDispatchDraft] = useState({ label: "", teamKeys: "", intervalSeconds: "", maxRunning: "" });
   const [writeback, setWriteback] = useState<WritebackSettingsValue | null>(null);
   const [dispatchStatus, setDispatchStatus] = useState<DispatchStatus | null>(null);
   const [agentStatus, setAgentStatus] = useState<{ installed: boolean; funnel: boolean; funnelNote: string | null; lastWebhookAt: string | null } | null>(null);
@@ -522,6 +522,8 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
           placeholder="ENG, OPS" placeholderTextColor={colors.foregroundMuted} style={{ ...t.input, flex: layout.compact ? undefined : 2 }} />
         <TextInput accessibilityLabel="Poll interval in seconds" editable={!busy} keyboardType="number-pad" value={dispatchDraft.intervalSeconds} onChangeText={(intervalSeconds) => setDispatchDraft((draft) => ({ ...draft, intervalSeconds }))}
           placeholder="60" placeholderTextColor={colors.foregroundMuted} style={{ ...t.input, flex: layout.compact ? undefined : 1 }} />
+        <TextInput accessibilityLabel="Maximum ticket agents at once, 0 for no limit" editable={!busy} keyboardType="number-pad" value={dispatchDraft.maxRunning} onChangeText={(maxRunning) => setDispatchDraft((draft) => ({ ...draft, maxRunning }))}
+          placeholder="max agents (0 = no limit)" placeholderTextColor={colors.foregroundMuted} style={{ ...t.input, flex: layout.compact ? undefined : 1 }} />
       </View>
       <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 10 }}>
         <Button title="Save auto-dispatch" icon="Save" size="sm" disabled={JSON.stringify(dispatchDraft) === JSON.stringify(dispatchDraftFor(dispatch))}
@@ -530,6 +532,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
               label: dispatchDraft.label.trim(),
               teamKeys: dispatchDraft.teamKeys.split(",").map((key) => key.trim()).filter(Boolean),
               intervalSeconds: Number(dispatchDraft.intervalSeconds),
+              maxRunning: Number(dispatchDraft.maxRunning || 0),
             } });
             setDispatch(saved.dispatch); setDispatchDraft(dispatchDraftFor(saved.dispatch));
           })} />

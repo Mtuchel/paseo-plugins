@@ -198,7 +198,7 @@ export function resolveReviewState(states: TeamState[]): TeamState | null {
 // they are assigned to. Completed and canceled work never launches.
 export const LABELED_ISSUES_QUERY = `query labeledIssues($first: Int!, $filter: IssueFilter) {
   issues(first: $first, includeArchived: false, orderBy: updatedAt, filter: $filter) {
-    nodes { id identifier team { key } labels(first: 50) { nodes { id name } } }
+    nodes { id identifier priority team { key } labels(first: 50) { nodes { id name } } }
   }
 }`;
 
@@ -210,15 +210,35 @@ export function labeledIssueFilter(label: string, teamKeys: string[]): Record<st
   };
 }
 
-export type LabeledIssue = { id: string; identifier: string; teamKey: string; labels: { id: string; name: string }[] };
+// `priority`: Linear's 1 (urgent) … 4 (low); 0 means none and sorts last.
+export type LabeledIssue = { id: string; identifier: string; teamKey: string; priority: number; labels: { id: string; name: string }[] };
 
 // The current state, team, labels and attachment links of one ticket: enough for
 // write-back decisions without the comment pagination that `detail` performs.
 export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
-  issue(id: $id) { id state { name type } team { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } } }
+  issue(id: $id) {
+    id identifier state { name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
+    inverseRelations(first: 50) { nodes { type issue { identifier state { type } } } }
+  }
 }`;
 
-export type IssueState = { id: string; status: string; statusType: string; teamId: string | null; labels: { id: string; name: string }[]; attachmentUrls: string[] };
+// `blockedBy`: identifiers of unfinished tickets that block this one.
+export type IssueState = {
+  id: string; identifier: string; status: string; statusType: string; teamId: string | null; projectId: string | null; creatorId: string | null;
+  labels: { id: string; name: string }[]; attachmentUrls: string[]; blockedBy: string[];
+};
+export const CREATE_ISSUE_QUERY = `mutation issueCreate($input: IssueCreateInput!) {
+  issueCreate(input: $input) { success issue { id identifier url } }
+}`;
+export const DELEGATE_QUERY = `mutation delegate($id: String!, $delegateId: String!) {
+  issueUpdate(id: $id, input: { delegateId: $delegateId }) { success }
+}`;
+export const RELATION_QUERY = `mutation relation($input: IssueRelationCreateInput!) {
+  issueRelationCreate(input: $input) { success }
+}`;
+export const TEAM_BY_KEY_QUERY = `query teamByKey($key: String!) {
+  teams(first: 1, filter: { key: { eq: $key } }) { nodes { id } }
+}`;
 
 export const LABEL_BY_NAME_QUERY = `query labelByName($name: String!) {
   issueLabels(first: 1, filter: { name: { eqIgnoreCase: $name } }) { nodes { id name } }
@@ -440,8 +460,11 @@ export class LinearService {
       id: label(node.id),
       identifier: label(node.identifier),
       teamKey: label(record(node.team ?? {}).key),
+      priority: typeof node.priority === "number" ? node.priority : 0,
       labels: labelNodes(node.labels),
-    })).filter((issue) => issue.id);
+    })).filter((issue) => issue.id)
+      // Most urgent first; tickets without a priority last. Stable otherwise (Linear's order).
+      .sort((a, b) => (a.priority || 5) - (b.priority || 5));
   }
 
   async issueState(id: string): Promise<IssueState> {
@@ -450,7 +473,60 @@ export class LinearService {
     const issue = record(data.issue);
     const state = record(issue.state ?? {});
     const attachmentUrls = connection(issue.attachments ?? { nodes: [] }).nodes.map((node) => label(record(node).url)).filter(Boolean);
-    return { id: label(issue.id), status: label(state.name), statusType: label(state.type), teamId: label(record(issue.team ?? {}).id) || null, labels: labelNodes(issue.labels), attachmentUrls };
+    const blockedBy = connection(issue.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
+      .filter((relation) => label(relation.type) === "blocks")
+      .map((relation) => record(relation.issue ?? {}))
+      .filter((blocker) => !["completed", "canceled", "duplicate"].includes(label(record(blocker.state ?? {}).type)))
+      .map((blocker) => label(blocker.identifier)).filter(Boolean);
+    return {
+      id: label(issue.id), identifier: label(issue.identifier), status: label(state.name), statusType: label(state.type),
+      teamId: label(record(issue.team ?? {}).id) || null, projectId: label(record(issue.project ?? {}).id) || null, creatorId: label(record(issue.creator ?? {}).id) || null,
+      labels: labelNodes(issue.labels), attachmentUrls, blockedBy,
+    };
+  }
+
+  async createIssue(input: { teamId: string; title: string; description: string; parentId?: string; projectId?: string | null; assigneeId?: string; priority?: number }): Promise<{ id: string; identifier: string; url: string }> {
+    const payload: Record<string, unknown> = { teamId: input.teamId, title: input.title, description: input.description };
+    if (input.priority) payload.priority = input.priority;
+    if (input.parentId) payload.parentId = input.parentId;
+    if (input.projectId) payload.projectId = input.projectId;
+    if (input.assigneeId) payload.assigneeId = input.assigneeId;
+    const data = record(await this.withKey((key) => this.post(key, CREATE_ISSUE_QUERY, { input: payload })));
+    succeeded(data, "issueCreate", "create the ticket");
+    const issue = record(record(data.issueCreate).issue ?? {});
+    return { id: label(issue.id), identifier: label(issue.identifier), url: label(issue.url) };
+  }
+
+  async delegate(issueId: string, delegateId: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, DELEGATE_QUERY, { id: issueId, delegateId }))), "issueUpdate", "assign the ticket to Paseo");
+  }
+
+  // `blocker` must be finished before `blocked` can start.
+  async addBlocker(blockerId: string, blockedId: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, RELATION_QUERY, { input: { issueId: blockerId, relatedIssueId: blockedId, type: "blocks" } }))), "issueRelationCreate", "link the tickets");
+  }
+
+  async ping(): Promise<void> {
+    const data = record(await this.withKey((key) => this.post(key, VIEWER_QUERY, {})));
+    if (!label(record(data.viewer ?? {}).id)) throw new Error("Linear did not confirm the API key.");
+  }
+
+  async updateDescription(issueId: string, description: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, `mutation describe($id: String!, $description: String!) { issueUpdate(id: $id, input: { description: $description }) { success } }`, { id: issueId, description }))), "issueUpdate", "update the ticket");
+  }
+
+  // Moves the ticket to its team's first completed state (Done).
+  async complete(issueId: string): Promise<void> {
+    const state = await this.issueState(issueId);
+    if (!state.teamId || state.statusType === "completed") return;
+    const done = (await this.teamStates(state.teamId)).filter((item) => item.type === "completed").sort((a, b) => a.position - b.position)[0];
+    if (!done) return;
+    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: done.id }))), "issueUpdate", "complete the ticket");
+  }
+
+  async teamIdByKey(teamKey: string): Promise<string | null> {
+    const data = record(await this.withKey((key) => this.post(key, TEAM_BY_KEY_QUERY, { key: teamKey })));
+    return connection(record(data.teams ?? {})).nodes.map((node) => label(record(node).id))[0] || null;
   }
 
   // Label IDs by lowercase name, cached for the plugin's lifetime. A missing label is

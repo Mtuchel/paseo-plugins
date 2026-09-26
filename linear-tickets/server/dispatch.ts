@@ -11,10 +11,11 @@ const IDLE_POLL_SECONDS = 60;
 type Linear = Pick<LinearService, "labeledIssues" | "addLabel" | "removeLabel" | "comment">;
 type Deps = {
   linear: Linear;
-  starter: Pick<TicketStarter, "start">;
+  starter: Pick<TicketStarter, "start" | "admission">;
   settings: Pick<Settings, "read">;
   // Called after each launch, e.g. to open the ticket's Linear agent session.
-  afterLaunch?: (issueId: string, identifier: string, agentId: string) => Promise<void>;
+  // Returns true when the launch got a Linear agent session, whose panel replaces the start comment.
+  afterLaunch?: (issueId: string, identifier: string, agentId: string) => Promise<boolean>;
   // Linear → agent comment delivery, run on the same cadence as dispatch.
   relay?: Pick<CommentRelay, "poll">;
 };
@@ -140,6 +141,9 @@ export class Dispatcher {
     const { linear } = this.deps;
     const trigger = settings.dispatch.label;
     const labels = dispatchLabels(trigger);
+    // Blocked tickets and a full agent limit wait with their label in place; the next poll retries.
+    const admission = await this.deps.starter.admission(issue.id, paseo, settings);
+    if (!admission.ok) return;
     // Claim. If the trigger label cannot be removed, nothing else happens: the next poll retries.
     await linear.removeLabel(issue.id, trigger, issue.labels);
     try {
@@ -154,7 +158,8 @@ export class Dispatcher {
       const started = await this.deps.starter.start(issue.id, paseo, settings, { retryHint: `add the "${trigger}" label again` });
       const { provider, target } = started;
       this.record(issue.identifier, "launched", `${provider} in ${target}${started.resumed ? " (resumed)" : ""}`);
-      await this.deps.afterLaunch?.(issue.id, issue.identifier, started.agentId);
+      const inSession = await this.deps.afterLaunch?.(issue.id, issue.identifier, started.agentId).catch(() => false);
+      if (inSession) return;
       const warnings = started.warnings.length ? `\n\nWarnings:\n${started.warnings.map((warning) => `- ${warning}`).join("\n")}` : "";
       await linear.comment(issue.id, `Paseo ${started.resumed ? "resumed the previous agent's work" : "started an agent"} for this ticket (${provider} in ${target}).${warnings}`)
         .catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: start comment failed:`, error instanceof Error ? error.message : error));

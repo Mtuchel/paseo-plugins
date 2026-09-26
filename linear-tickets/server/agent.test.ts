@@ -88,7 +88,7 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
   const router = new SessionRouter({
     api: api as never,
     linear: { viewerId: async () => OWNER, addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); } },
-    starter: { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false }; } },
+    starter: { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false, untrusted: false }; }, admission: async () => ({ ok: true as const }) },
     settings: { read: async () => settings },
     store,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
@@ -186,7 +186,7 @@ test("a permission shows in the agent panel only while still pending, and then w
   for (const pending of [[], [request]]) {
     const calls: string[] = [];
     const linear = {
-      issueState: async () => ({ id: "i1", status: "Todo", statusType: "unstarted", teamId: "t", labels: [], attachmentUrls: [] }),
+      issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusType: "unstarted", teamId: "t", projectId: null, creatorId: OWNER, labels: [], attachmentUrls: [], blockedBy: [] }),
       markInProgress: async () => ({ changed: false }), moveToReview: async () => ({ changed: false }), linkUrl: async () => {},
       comment: async (_i: string, body: string) => { calls.push(`comment ${body.slice(0, 30)}`); },
       addLabel: async (_i: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async () => {},

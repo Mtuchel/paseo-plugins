@@ -183,6 +183,7 @@ const dispatchSettingsSchema = z.object({
   label: z.string().min(1).max(80),
   teamKeys: z.array(z.string().min(1).max(10)).max(20),
   intervalSeconds: z.number().int(),
+  maxRunning: z.number().int(),
 });
 const writebackSettingsSchema = z.object({
   status: z.boolean(),

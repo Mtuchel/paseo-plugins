@@ -5,10 +5,11 @@ import { questionsOf } from "./relay";
 import type { Handover } from "./handover";
 import type { LinearService } from "./linear";
 import type { SessionRouter } from "./sessions";
-import { optionsForQuestion } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
 
 export const MAX_SUMMARY_LENGTH = 4_000;
+const TRANSIENT = /HTTP 50\d|rate-limiting|Could not reach|timed out|ECONNRESET|fetch failed/i;
+const RETRY_DELAYS_MS = [30_000, 120_000];
 const PULL_REQUEST_URL = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/g;
 
 type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
@@ -16,7 +17,7 @@ type Link = { issueId: string; identifier: string };
 // The native Linear agent: the session panel and the durable handover record. Optional, so
 // ticket write-back keeps working without the Paseo Linear app installed.
 export type AgentBridge = {
-  sessions: Pick<SessionRouter, "sessionFor" | "say" | "action" | "ask" | "link" | "offerResume" | "resumeNow">;
+  sessions: Pick<SessionRouter, "sessionFor" | "say" | "action" | "ask" | "askQuestion" | "link" | "offerResume" | "resumeNow" | "holdIfStopped" | "follow" | "unfollow">;
   handover: Pick<Handover, "update" | "finish">;
 };
 type Linear = Pick<LinearService, "issueState" | "markInProgress" | "comment" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview">;
@@ -103,19 +104,32 @@ export class Writeback {
     return link;
   }
 
-  private async run(event: string, agent: PluginHookAgent, paseo: PaseoApi, work: (link: Link, settings: PluginSettings) => Promise<void>): Promise<void> {
+  // Linear outages (HTTP 503, rate limits, network drops) are retried after 30 s and 2 min.
+  private async run(event: string, agent: PluginHookAgent, paseo: PaseoApi, work: (link: Link, settings: PluginSettings) => Promise<void>, attempt = 0): Promise<void> {
     try {
       const link = await this.link(agent, paseo);
       if (!link) return;
       await work(link, await this.settings.read());
     } catch (error) {
-      console.error(`[linear-tickets] write-back for ${event} on agent ${agent.id} failed:`, error instanceof Error ? error.message : error);
+      const message = error instanceof Error ? error.message : String(error);
+      const delay = RETRY_DELAYS_MS[attempt];
+      if (delay !== undefined && TRANSIENT.test(message)) {
+        console.error(`[linear-tickets] write-back for ${event} on agent ${agent.id} failed, retrying in ${delay / 1000} s: ${message}`);
+        setTimeout(() => { void this.run(event, agent, paseo, work, attempt + 1); }, delay).unref?.();
+        return;
+      }
+      console.error(`[linear-tickets] write-back for ${event} on agent ${agent.id} failed:`, message);
     }
   }
 
   turnStarted({ agent }: PluginLifecycleEvents["agent.turn_started"], paseo: PaseoApi): Promise<void> {
     return this.run("turn_started", agent, paseo, async ({ issueId }, settings) => {
-      await this.session(agent.id, (sessionId, sessions) => sessions.say(sessionId, "thought", "Working…", true));
+      const sessions = this.agentBridge?.sessions;
+      if (sessions && await sessions.holdIfStopped(agent.id).catch(() => false)) return;
+      await this.session(agent.id, async (sessionId, live) => {
+        await live.say(sessionId, "thought", "Working…", true);
+        await live.follow(agent.id);
+      });
       if (!settings.writeback.status || this.started.has(agent.id)) return;
       this.started.add(agent.id);
       const state = await this.linear.issueState(issueId);
@@ -134,7 +148,8 @@ export class Writeback {
       if (outcome.kind === "completed") {
         const reply = turnReply(timeline);
         await this.session(agent.id, async (sessionId, sessions) => {
-          for (const command of turnCommands(timeline)) await sessions.action(sessionId, "Ran", command);
+          // The live feed already showed the commands; otherwise post the turn's last few.
+          if (!await sessions.unfollow(agent.id)) for (const command of turnCommands(timeline)) await sessions.action(sessionId, "Ran", command);
           if (reply) await sessions.say(sessionId, "response", truncateSummary(reply));
         });
         // With the handover record, turns update one progress comment instead of adding comments.
@@ -144,7 +159,10 @@ export class Writeback {
         }
         if (writeback.blocked) await this.linear.removeLabel(issueId, blocked);
       } else if (outcome.kind === "failed") {
-        await this.session(agent.id, (sessionId, sessions) => sessions.say(sessionId, "error", `The agent stopped with an error: ${outcome.error.message}`));
+        await this.session(agent.id, async (sessionId, sessions) => {
+          await sessions.unfollow(agent.id);
+          await sessions.say(sessionId, "error", `The agent stopped with an error: ${outcome.error.message}`);
+        });
         if (handover) await handover.finish(issue, agent, "failed", outcome.error.message.slice(0, 500));
         else if (writeback.summaries || writeback.blocked) await this.linear.comment(issueId, `**${title}** (Paseo) stopped with an error: ${outcome.error.message}`);
         if (writeback.blocked) await this.linear.addLabel(issueId, blocked);
@@ -152,6 +170,7 @@ export class Writeback {
           if (!writeback.autoResume || !await sessions.resumeNow(sessionId)) await sessions.offerResume(sessionId);
         });
       }
+      if (outcome.kind === "canceled") await this.session(agent.id, async (_sessionId, sessions) => { await sessions.unfollow(agent.id); });
       if (!writeback.pullRequests) return;
       const urls = turnPullRequests(timeline);
       if (!urls.length) return;
@@ -178,7 +197,7 @@ export class Writeback {
         inSession = true;
         const subject = [request.title || request.name, request.description].filter(Boolean).join("\n\n");
         return request.kind === "question"
-          ? sessions.ask(sessionId, subject, optionsForQuestion(request))
+          ? sessions.askQuestion(sessionId, request)
           : sessions.ask(sessionId, `Approve this action?\n\n${subject}`, [{ label: "Approve", value: "approve" }, { label: "Deny", value: "deny" }]);
       });
       if (!settings.writeback.blocked) return;

@@ -19,7 +19,7 @@ const toolCall = (output: string): Timeline[number] => ({ type: "tool_call", cal
 
 class FakeLinear {
   readonly writes: string[] = [];
-  state: IssueState = { id: "issue-1", status: "Todo", statusType: "unstarted", teamId: "t1", labels: [{ id: "l1", name: "paseo-running" }], attachmentUrls: [] };
+  state: IssueState = { id: "issue-1", identifier: "ENG-1", projectId: null, creatorId: null, blockedBy: [], status: "Todo", statusType: "unstarted", teamId: "t1", labels: [{ id: "l1", name: "paseo-running" }], attachmentUrls: [] };
   async issueState() { this.writes.push("state"); return this.state; }
   async markInProgress(issue: { id: string }) { this.writes.push(`in-progress ${issue.id}`); return { changed: true }; }
   async comment(_id: string, body: string) { this.writes.push(`comment: ${body}`); }

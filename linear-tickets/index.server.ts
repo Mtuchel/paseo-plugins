@@ -15,8 +15,11 @@ import { Writeback } from "./server/writeback";
 import { AgentApi, AppAuth } from "./server/agent-app";
 import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
 import { ensureFunnel, type FunnelStatus } from "./server/funnel";
+import { HealthMonitor } from "./server/health";
+import { PullRequestWatch } from "./server/pr-watch";
 import { Handover } from "./server/handover";
-import { decidePlannotatorReview, SessionRouter, SessionStore } from "./server/sessions";
+import { decidePlannotatorReview, SessionRouter, SessionStore, stopAgentTurn } from "./server/sessions";
+import { splitIntoSubIssues } from "./server/split";
 import { TicketStarter } from "./server/starter";
 
 export default function contribute(server: PluginServerContext) {
@@ -31,24 +34,50 @@ export default function contribute(server: PluginServerContext) {
   const auth = new AppAuth();
   const handover = new Handover(linear);
   const starter = new TicketStarter({ linear, launcher, handover });
-  const sessions = new SessionRouter({ api: new AgentApi(auth), linear, starter, settings, store: new SessionStore(),
+  const agentApi = new AgentApi(auth);
+  const sessions = new SessionRouter({ api: agentApi, linear, starter, settings, store: new SessionStore(),
     decideReview: async (localUrl, approve, feedback, agentId) => {
       const planContent = await readReviewPlan(localUrl).catch(() => "");
       await decidePlannotatorReview(localUrl, approve, feedback);
       await recordDecision({ type: "decided", agentId, approved: approve, ...(feedback ? { feedback } : {}), planContent, at: new Date().toISOString() });
     },
+    splitPlan: (link, localUrl, paseo) => splitIntoSubIssues({
+      linear,
+      appUserId: async () => (await agentApi.viewer()).id,
+      readPlan: readReviewPlan,
+      retirePlanner: async (reviewUrl, agentId, api) => {
+        await decidePlannotatorReview(reviewUrl, false, "The owner split this plan into Linear sub-issues, each handled by its own agent. Stop now and do not implement anything.");
+        await stopAgentTurn(agentId).catch(() => {});
+        await api.agents.ref(agentId).archive().catch(() => {});
+      },
+    }, link, localUrl, paseo),
   });
-  const openSession = async (issueId: string, identifier: string, agentId: string) => {
-    if (await auth.credentials()) await sessions.openFor(issueId, identifier, agentId);
-  };
+  const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
   const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear), afterLaunch: openSession });
   const writeback = new Writeback(linear, settings, { sessions, handover });
-  const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions);
+  const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover);
+  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => sessions.receive(event));
   let funnel: FunnelStatus | null = null;
+  const health = new HealthMonitor(linear, settings, [
+    { name: "Linear API key", run: () => linear.ping() },
+    { name: "Paseo Linear app", run: async () => { if (await auth.credentials()) await agentApi.viewer(); } },
+    { name: "Tailscale Funnel", run: async () => {
+      if (!await auth.credentials()) return;
+      funnel = await ensureFunnel(WEBHOOK_PORT);
+      if (!funnel.active) throw new Error(funnel.note ?? "Funnel is off; Linear webhooks cannot reach this Mac.");
+    } },
+    { name: "Webhook receiver", run: async () => {
+      if (!await auth.credentials()) return;
+      const response = await fetch(`http://127.0.0.1:${WEBHOOK_PORT}/`, { method: "POST", body: "{}", signal: AbortSignal.timeout(5_000) });
+      if (response.status !== 401) throw new Error(`The local receiver answered HTTP ${response.status} instead of refusing an unsigned request.`);
+    } },
+  ]);
   // Started with the first daemon connection, not at load, so loading has no side effects.
   let agentReady: Promise<boolean> | null = null;
   const startAgent = () => agentReady ??= auth.credentials().then(async (app) => {
+    health.start();
+    pullRequests.start();
     if (!app) return false;
     await webhook.start();
     funnel = await ensureFunnel(WEBHOOK_PORT);
@@ -132,5 +161,5 @@ export default function contribute(server: PluginServerContext) {
     const installed = await startAgent();
     return { installed, funnel: funnel?.active ?? false, funnelNote: funnel?.note ?? null, lastWebhookAt: webhook.lastEventAt };
   });
-  return () => { dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); };
+  return () => { dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); health.stop(); pullRequests.stop(); };
 }

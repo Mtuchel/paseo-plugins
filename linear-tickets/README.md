@@ -269,6 +269,39 @@ The plugin receives webhooks on `127.0.0.1:47831` and publishes only `/linear/ag
 timestamp newer than 60 s, answered at once, and deduplicated. A sweep every minute picks up
 sessions and replies whose webhook was missed. **Settings → Linear agent** shows the state.
 
+**In the panel.**
+- The agent's commands and file edits show up while it works, merged at most every 4 seconds.
+- Each session links **Open in Paseo** (the web app at app.paseo.sh opens the agent when that browser is paired with this host).
+- Questions with several parts are asked one part at a time, and are answered together once all parts are in. "Other" options are not buttons: type your own answer instead.
+- **Stop** interrupts the turn and keeps the agent stopped (a turn the provider starts by itself within 5 minutes is stopped again) until you reply.
+- When a session exists, the plan review, its decision and pull-request review changes update the progress comment instead of adding comments. The panel's own messages are copied into the ticket thread by Linear.
+
+**Plan-first for tickets you did not write.** Tickets created by someone else, or labelled
+`feedback`, start in the provider's plan-first mode (`write` for omp, `plan` for Claude).
+The prompt marks the ticket as untrusted input and asks only for a plan. Approving the plan
+switches the agent to your usual mode.
+
+**Waiting their turn.** A ticket blocked by unfinished tickets, or started while *max agents*
+(Settings → Auto-dispatch) are already working, waits. A labelled ticket keeps its label; a
+delegated one says why in its panel. The minute sweep starts it once it is admitted. Labelled
+tickets start most urgent first.
+
+**Split into sub-issues.** A plan with 2–12 steps also offers **Approve & split into N
+sub-issues**. The plan becomes the parent's plan document and the planning agent is closed.
+Each step becomes a sub-issue assigned to Paseo, blocked by the step before, so the steps run one
+after another: each starts when the previous ticket is done.
+
+**Pull request reviews.** Every 2 minutes the plugin reads each ticket's pull request with
+`gh`. Requested changes post a panel update and move the ticket back to In Progress; fixes
+pushed after them move it to In Review again. Approval and merge are noted. The review loop
+itself stays in Paseo; this only shows it on the ticket.
+
+**Health.** Every 5 minutes the plugin checks the Linear key, the Paseo app, Tailscale Funnel
+and the local receiver. A problem confirmed twice opens one urgent ticket, "⚠️ Paseo needs
+attention", assigned to you (in the first auto-dispatch team), so Linear notifies you. The ticket
+is updated while problems change and completed when all checks pass again. Failed Linear writes
+caused by outages (HTTP 5xx, rate limits, network) are retried after 30 s and 2 min.
+
 **Durable record and resume.** Every ticket agent keeps one "Paseo progress" comment, edited
 in place: phase, branch, last commit, links, latest report. When the agent fails or is
 archived while the ticket is open, it also posts a final report. The panel then offers

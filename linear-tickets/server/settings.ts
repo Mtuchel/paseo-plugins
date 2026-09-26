@@ -9,11 +9,13 @@ export const MAX_TEMPLATE_LENGTH = 8_000;
 export type LaunchPreference = { model: string; modeId?: string; thinkingOptionId?: string };
 // Auto-dispatch starts an agent for every open ticket carrying `label` in one of `teamKeys`,
 // whoever it is assigned to. No teams means nothing is dispatched, even when enabled.
-export type DispatchSettings = { enabled: boolean; label: string; teamKeys: string[]; intervalSeconds: number };
+// `maxRunning`: at most this many ticket agents work at once (0 = no limit); others wait their turn.
+export type DispatchSettings = { enabled: boolean; label: string; teamKeys: string[]; intervalSeconds: number; maxRunning: number };
 // Which lifecycle events of ticket-linked agents are written back to their Linear ticket.
 // `mentions` is the inbound direction: "@paseo" comments by the key's user reach the agent.
 export type WritebackSettings = { status: boolean; summaries: boolean; blocked: boolean; pullRequests: boolean; mentions: boolean; autoResume: boolean };
-export const DEFAULT_DISPATCH: DispatchSettings = { enabled: false, label: "paseo", teamKeys: [], intervalSeconds: 60 };
+export const DEFAULT_DISPATCH: DispatchSettings = { enabled: false, label: "paseo", teamKeys: [], intervalSeconds: 60, maxRunning: 0 };
+export const MAX_RUNNING_LIMIT = 20;
 export const DEFAULT_WRITEBACK: WritebackSettings = { status: false, summaries: false, blocked: false, pullRequests: false, mentions: false, autoResume: false };
 export const MIN_DISPATCH_INTERVAL_SECONDS = 30;
 export const MAX_DISPATCH_INTERVAL_SECONDS = 3_600;
@@ -90,6 +92,7 @@ export function normalizeDispatch(value: unknown): DispatchSettings {
     label,
     teamKeys,
     intervalSeconds: Math.min(MAX_DISPATCH_INTERVAL_SECONDS, Math.max(MIN_DISPATCH_INTERVAL_SECONDS, interval)),
+    maxRunning: typeof candidate.maxRunning === "number" && Number.isInteger(candidate.maxRunning) ? Math.min(MAX_RUNNING_LIMIT, Math.max(0, candidate.maxRunning)) : 0,
   };
 }
 
@@ -101,6 +104,9 @@ function validDispatch(value: DispatchSettings): DispatchSettings {
   if (badKey !== undefined) throw new Error(`"${badKey}" is not a Linear team key (for example ENG).`);
   if (!Number.isInteger(value.intervalSeconds) || value.intervalSeconds < MIN_DISPATCH_INTERVAL_SECONDS || value.intervalSeconds > MAX_DISPATCH_INTERVAL_SECONDS) {
     throw new Error(`The poll interval must be a whole number of seconds between ${MIN_DISPATCH_INTERVAL_SECONDS} and ${MAX_DISPATCH_INTERVAL_SECONDS}.`);
+  }
+  if (!Number.isInteger(value.maxRunning) || value.maxRunning < 0 || value.maxRunning > MAX_RUNNING_LIMIT) {
+    throw new Error(`The agent limit must be a whole number from 0 (no limit) to ${MAX_RUNNING_LIMIT}.`);
   }
   return normalizeDispatch(value);
 }

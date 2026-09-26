@@ -21,6 +21,7 @@ const baseSettings: PluginSettings = {
 class FakeLinear {
   readonly writes: string[] = [];
   readonly labels: Map<string, Set<string>>;
+  readonly blocked: Record<string, string[]> = {};
 
   constructor(tickets: Record<string, string[]>, private readonly options: { failRemove?: boolean } = {}) {
     this.labels = new Map(Object.entries(tickets).map(([id, names]) => [id, new Set(names)]));
@@ -29,7 +30,7 @@ class FakeLinear {
   async labeledIssues(label: string, teamKeys: string[]): Promise<LabeledIssue[]> {
     this.writes.push(`query ${label} ${teamKeys.join(",")}`);
     return [...this.labels].filter(([, names]) => [...names].some((name) => name.toLowerCase() === label.toLowerCase()))
-      .map(([id, names]) => ({ id, identifier: id.toUpperCase(), teamKey: "ENG", labels: [...names].map((name) => ({ id: `l-${name}`, name })) }));
+      .map(([id, names]) => ({ id, identifier: id.toUpperCase(), teamKey: "ENG", priority: 0, labels: [...names].map((name) => ({ id: `l-${name}`, name })) }));
   }
 
   async removeLabel(id: string, name: string) {
@@ -44,6 +45,12 @@ class FakeLinear {
   }
 
   async comment(id: string, body: string) { this.writes.push(`comment ${id}: ${body}`); }
+
+  async viewerId() { return "owner"; }
+
+  async issueState(id: string) {
+    return { id, identifier: id.toUpperCase(), status: "Todo", statusType: "unstarted", teamId: "t1", projectId: null, creatorId: "owner", labels: [], attachmentUrls: [], blockedBy: this.blocked[id] ?? [] };
+  }
 
   async detail(id: string): Promise<TicketDetail> {
     // Only the fields dispatch reads; the fixture is not a full Linear snapshot.

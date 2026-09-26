@@ -27,14 +27,31 @@ export function questionsOf(request: AgentPermissionRequest): Question[] {
 // Answers a pending question the way the Paseo app does: `answers` keyed by each
 // question's header. The message fills the first question, matching an option label
 // case-insensitively; later questions (for example omp's optional comment) stay empty.
-export function questionAnswer(request: AgentPermissionRequest, message: string): AgentPermissionResponse {
-  const questions = questionsOf(request);
+export function questionKey(item: Question, index: number): string {
+  return item.header || item.question || `q${index}`;
+}
+
+// The questions that need an answer: optional free-text follow-ups (no options, empty
+// answers allowed — omp's "Optional comment") are left empty.
+export function answerableQuestions(request: AgentPermissionRequest): { key: string; question: Question }[] {
+  return questionsOf(request)
+    .map((question, index) => ({ key: questionKey(question, index), question }))
+    .filter(({ question }) => (question.options?.length ?? 0) > 0 || !(question as { allowEmpty?: boolean }).allowEmpty);
+}
+
+// An answer snaps to an option label (case-insensitive); anything else is free text.
+export function matchOption(question: Question, message: string): string {
+  return question.options?.find((choice) => choice.label?.trim().toLowerCase() === message.trim().toLowerCase())?.label ?? message;
+}
+
+// `given` holds answers already collected for earlier parts; `message` answers the next one.
+export function questionAnswer(request: AgentPermissionRequest, message: string, given: Record<string, string> = {}): AgentPermissionResponse {
   const answers: Record<string, string> = {};
-  questions.forEach((item, index) => {
-    const key = item.header || item.question || `q${index}`;
-    if (index > 0) { answers[key] = ""; return; }
-    const option = item.options?.find((choice) => choice.label?.trim().toLowerCase() === message.trim().toLowerCase());
-    answers[key] = option?.label ?? message;
+  const answerable = answerableQuestions(request);
+  const next = answerable.find(({ key }) => given[key] === undefined);
+  questionsOf(request).forEach((item, index) => {
+    const key = questionKey(item, index);
+    answers[key] = given[key] ?? (next?.key === key ? matchOption(item, message) : "");
   });
   return { behavior: "allow", updatedInput: { answers } };
 }
