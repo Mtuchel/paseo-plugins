@@ -914,3 +914,24 @@ test("labels are created once when missing and removed by name, case-insensitive
   await service.removeLabel("issue-1", "Paseo", [{ id: "a", name: "paseo" }, { id: "b", name: "PASEO" }, { id: "c", name: "paseo-running" }]);
   assert.deepEqual(calls.map(([, variables]) => variables), [{ id: "issue-1", labelId: "a" }, { id: "issue-1", labelId: "b" }]);
 });
+
+test("the planning/coding transitions pick the named started state and leave finished or unchanged tickets alone", async () => {
+  const states = [
+    { id: "plan", name: "Planning", type: "started", position: 1.5 },
+    { id: "ip", name: "In Progress", type: "started", position: 2 },
+    { id: "done", name: "Done", type: "completed", position: 3 },
+  ];
+  const run = async (current: { name: string; type: string }, target: string) => {
+    const updates: unknown[] = [];
+    const service = new LinearService(new Credentials(join(tmpdir(), `paseo-linear-named-${process.pid}`), "env-key"), (_key, query, variables) => {
+      if (query === UPDATE_ISSUE_STATE_QUERY) { updates.push(variables); return Promise.resolve({ issueUpdate: { success: true } }); }
+      if (query === TEAM_STATES_QUERY) return Promise.resolve({ team: { states: { nodes: states } } });
+      return Promise.resolve({ issue: { id: "i1", state: current, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] } } });
+    });
+    return { result: await service.moveToStateNamed("i1", target), updates };
+  };
+  assert.deepEqual(await run({ name: "In Progress", type: "started" }, "Planning"), { result: { changed: true }, updates: [{ id: "i1", stateId: "plan" }] });
+  assert.deepEqual(await run({ name: "Planning", type: "started" }, "planning"), { result: { changed: false }, updates: [] });
+  assert.deepEqual(await run({ name: "Done", type: "completed" }, "In Progress"), { result: { changed: false }, updates: [] });
+  assert.match((await run({ name: "Todo", type: "unstarted" }, "Coding")).result.note ?? "", /no started state named "Coding"/);
+});

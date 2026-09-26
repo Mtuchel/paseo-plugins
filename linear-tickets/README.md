@@ -248,6 +248,11 @@ on the host. It also publishes the review port inside your tailnet with `tailsca
 The agent's Paseo chat then gets a “Handed off to Plannotator” row with the link. Agents linked
 to a ticket also get a Linear comment with it, so reviews open on your phone.
 
+With status write-back on, a ticket moves to its team's started state named **Planning**
+when a plan is handed off (and stays there when it is sent back), and to **In Progress** once
+the plan is approved. Create a “Planning” state of type *started* in the team for this; teams
+without one are left alone.
+
 When a review is decided, the omp plan extension (`~/.omp/agent/extensions/plannotator-omp-plan.ts`)
 records the plan and your feedback. The plugin then adds a chat row and, for ticket agents,
 replaces the ticket's “Plan: <ticket>” document with the reviewed plan, and comments the outcome

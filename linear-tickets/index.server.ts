@@ -21,7 +21,7 @@ export default function contribute(server: PluginServerContext) {
   const cache = new TicketCache();
   const dispatcher = new Dispatcher({ linear, launcher, settings, relay: new CommentRelay(linear) });
   const writeback = new Writeback(linear, settings);
-  const plannotator = new PlannotatorBridge(linear);
+  const plannotator = new PlannotatorBridge(linear, settings);
   // Every agent session gets the Plannotator hook, so plan reviews show up in Paseo and Linear.
   // Written on the first session open, not at load, so loading the plugin has no side effects.
   let plannotatorBrowser: Promise<string | null> | null = null;

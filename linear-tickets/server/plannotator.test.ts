@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import type { PaseoApi } from "@getpaseo/client";
+import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, writeOpenScript } from "./plannotator";
 
 const exec = promisify(execFile);
@@ -46,11 +47,17 @@ test("the plan document states the decision and feedback above the plan", () => 
   assert.ok(document.endsWith("# Plan\n\n- step"));
 });
 
+const settings: PluginSettings = {
+  template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true,
+  dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true },
+};
+
 function setup(labels: Record<string, string>) {
   const calls: string[] = [];
   const linear = {
     async comment(issueId: string, body: string) { calls.push(`comment ${issueId}: ${body}`); },
     async upsertIssueDocument(issueId: string, title: string) { calls.push(`document ${issueId} ${title}`); return "https://linear.app/doc/1"; },
+    async moveToStateNamed(issueId: string, name: string) { calls.push(`state ${issueId} ${name}`); return { changed: true }; },
   };
   const paseo = {
     agents: {
@@ -77,14 +84,16 @@ test("a hand-off shows in the agent's chat and, for a ticket agent, as a Linear 
     { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
     { type: "decided", agentId: "agent-1", approved: true, planContent: "# Plan", at: "2026-01-01T10:05:00Z" },
   ], async (directory) => {
-    const bridge = new PlannotatorBridge(linear, directory);
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
     bridge.attach(paseo);
     await bridge.drain();
     bridge.stop();
     assert.deepEqual(calls, [
       "row agent-1: Handed off to Plannotator for review https://host.ts.net:4000/",
+      "state issue-1 Planning",
       "comment issue-1: 📋 **Plan ready for review in Plannotator**: https://host.ts.net:4000/",
       "row agent-1: Plan approved in Plannotator",
+      "state issue-1 In Progress",
       "document issue-1 Plan: TUC-25",
       "comment issue-1: ✅ **Plan approved** in Plannotator — [plan](https://linear.app/doc/1)",
     ]);
@@ -97,7 +106,7 @@ test("agents without a ticket, and subagents, only get the chat row", async () =
   for (const labels of cases) {
     const { calls, linear, paseo } = setup(labels);
     await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: null, at: "2026-01-01T10:00:00Z" }], async (directory) => {
-      const bridge = new PlannotatorBridge(linear, directory);
+      const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
       bridge.attach(paseo);
       await bridge.drain();
       bridge.stop();

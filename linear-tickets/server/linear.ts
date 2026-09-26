@@ -544,6 +544,20 @@ export class LinearService {
     return label(record(record(result[field]).document ?? {}).url);
   }
 
+  // Moves the ticket into its team's "started" state with this name (for example Planning or
+  // In Progress), unless it is already there or finished. Teams without it are left alone.
+  async moveToStateNamed(issueId: string, name: string): Promise<{ changed: boolean; note?: string }> {
+    const state = await this.issueState(issueId);
+    const type = state.statusType.trim().toLowerCase();
+    if (type === "completed" || type === "canceled" || type === "duplicate") return { changed: false };
+    if (state.status.trim().toLowerCase() === name.toLowerCase()) return { changed: false };
+    if (!state.teamId) return { changed: false, note: "The ticket has no team." };
+    const target = (await this.teamStates(state.teamId)).find((item) => item.type.trim().toLowerCase() === "started" && item.name.trim().toLowerCase() === name.toLowerCase());
+    if (!target) return { changed: false, note: `The ticket's team has no started state named "${name}".` };
+    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: target.id }))), "issueUpdate", `move the ticket to ${target.name}`);
+    return { changed: true };
+  }
+
   // Linear's file storage needs the API key. Only uploads.linear.app is ever sent the key;
   // size is checked from the header and again while reading, so a huge file never buffers.
   async downloadUpload(url: string, maxBytes = MAX_ATTACHMENT_BYTES): Promise<Uint8Array> {

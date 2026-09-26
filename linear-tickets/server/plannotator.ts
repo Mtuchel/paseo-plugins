@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { LinearService } from "./linear";
+import type { Settings } from "./settings";
 import { PLANNOTATOR_OPEN_SOURCE } from "./plannotator-open-source";
 import { paseoHome } from "./ticket-mcp";
 
@@ -16,7 +17,11 @@ export type PlannotatorRow = { title: string; url?: string; detail?: string };
 export type OpenedEvent = { type: "opened"; agentId: string | null; localUrl: string; remoteUrl: string | null; at: string };
 export type DecidedEvent = { type: "decided"; agentId: string | null; approved: boolean; feedback?: string; planUri?: string; planContent?: string; at: string };
 type PlannotatorEvent = OpenedEvent | DecidedEvent;
-type Linear = Pick<LinearService, "comment" | "upsertIssueDocument">;
+type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "moveToStateNamed">;
+
+// Workflow states the review moves a ticket through when status write-back is on.
+export const PLANNING_STATE = "Planning";
+export const CODING_STATE = "In Progress";
 
 export function plannotatorPaths(home = paseoHome()) {
   const directory = join(home, "linear-tickets", "plannotator");
@@ -88,7 +93,7 @@ export class PlannotatorBridge {
   private again = false;
   private readonly attempts = new Map<string, number>();
 
-  constructor(private readonly linear: Linear, private readonly events = plannotatorPaths().events) {}
+  constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly events = plannotatorPaths().events) {}
 
   attach(paseo: PaseoApi): void {
     if (this.paseo) return;
@@ -144,6 +149,11 @@ export class PlannotatorBridge {
       : { title: event.approved ? "Plan approved in Plannotator" : "Plan sent back from Plannotator", ...(event.feedback ? { detail: event.feedback.slice(0, 4_000) } : {}) };
     await handle.timeline.append({ type: "plugin", id: `plannotator-${event.type}-${event.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: row });
     if (!issueId) return;
+    // Planning while a plan is out for review (and after it is sent back); coding once approved.
+    if ((await this.settings.read()).writeback.status) {
+      const moved = await this.linear.moveToStateNamed(issueId, event.type === "decided" && event.approved ? CODING_STATE : PLANNING_STATE);
+      if (moved.note) console.error(`[linear-tickets] ${identifier}: ${moved.note}`);
+    }
     if (event.type === "opened") {
       await this.linear.comment(issueId, `📋 **Plan ready for review in Plannotator**: ${url}${event.remoteUrl ? "" : "\n\n(Local link only: Tailscale was unavailable on the host.)"}`);
       return;
