@@ -1,10 +1,10 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { LinearService } from "./linear";
-import { planDocument } from "./plannotator";
+import { CODING_STATE, planDocument } from "./plannotator";
 import { MAX_SPLIT, planSteps } from "./sessions";
 
 type Deps = {
-  linear: Pick<LinearService, "issueState" | "createIssue" | "addBlocker" | "delegate" | "upsertIssueDocument">;
+  linear: Pick<LinearService, "issueState" | "createIssue" | "addBlocker" | "delegate" | "upsertIssueDocument" | "moveToStateNamed">;
   appUserId: () => Promise<string>;
   readPlan: (localUrl: string) => Promise<string>;
   // Closes the review without implementing, stops the planning agent and archives it.
@@ -34,6 +34,7 @@ export async function splitIntoSubIssues(deps: Deps, link: { issueId: string; id
       teamId: parent.teamId,
       projectId: parent.projectId,
       parentId: link.issueId,
+      ready: true,
       title: subIssueTitle(step),
       description: [`Step ${index + 1} of ${steps.length} of ${link.identifier}.`, `**This step:** ${step}`, `The full approved plan is in the parent's document${documentUrl ? `: ${documentUrl}` : "."} Only do this step.`].join("\n\n"),
     });
@@ -43,5 +44,8 @@ export async function splitIntoSubIssues(deps: Deps, link: { issueId: string; id
   }
   const appUserId = await deps.appUserId();
   for (const issue of created) await deps.linear.delegate(issue.id, appUserId);
+  // The plan is approved; the work now runs in the sub-issues.
+  const moved = await deps.linear.moveToStateNamed(link.issueId, CODING_STATE).catch((error: unknown) => ({ changed: false, note: error instanceof Error ? error.message : String(error) }));
+  if (moved.note) console.error(`[linear-tickets] ${link.identifier}: ${moved.note}`);
   return `Split into ${created.length} sub-issues (${created.map((issue) => issue.identifier).join(", ")}), assigned to Paseo. They run one after another; each starts when the one before it is done.`;
 }

@@ -157,9 +157,10 @@ test("splitting creates one sub-issue per step, each blocked by the previous, al
     linear: {
       issueState: async () => ({ id: "parent", identifier: "TUC-1", status: "Planning", statusType: "started", teamId: "t1", projectId: "p9", creatorId: OWNER, labels: [], attachmentUrls: [], blockedBy: [] }),
       upsertIssueDocument: async () => "https://linear.app/doc/plan",
-      createIssue: async (input: { title: string; parentId?: string; projectId?: string | null }) => { n++; calls.push(`create ${input.title} parent=${input.parentId} project=${input.projectId}`); return { id: `s${n}`, identifier: `TUC-${10 + n}`, url: "" }; },
+      createIssue: async (input: { title: string; parentId?: string; projectId?: string | null; ready?: boolean }) => { n++; calls.push(`create ${input.title} parent=${input.parentId} project=${input.projectId}${input.ready ? " ready" : ""}`); return { id: `s${n}`, identifier: `TUC-${10 + n}`, url: "" }; },
       addBlocker: async (blocker: string, blocked: string) => { calls.push(`${blocker} blocks ${blocked}`); },
       delegate: async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); },
+      moveToStateNamed: async (id: string, name: string) => { calls.push(`move ${id} to ${name}`); return { changed: true }; },
     },
     appUserId: async () => "paseo-app",
     readPlan: async () => "# Plan\n## Steps\n1. Add the domain\n2. Add the migration\n3. Wire the API",
@@ -168,12 +169,13 @@ test("splitting creates one sub-issue per step, each blocked by the previous, al
   const summary = await splitIntoSubIssues(deps, { issueId: "parent", identifier: "TUC-1", agentId: "planner" }, "http://localhost:5000/", {} as PaseoApi);
   assert.deepEqual(calls, [
     "retire planner",
-    "create Add the domain parent=parent project=p9",
-    "create Add the migration parent=parent project=p9",
+    "create Add the domain parent=parent project=p9 ready",
+    "create Add the migration parent=parent project=p9 ready",
     "s1 blocks s2",
-    "create Wire the API parent=parent project=p9",
+    "create Wire the API parent=parent project=p9 ready",
     "s2 blocks s3",
     "delegate s1 to paseo-app", "delegate s2 to paseo-app", "delegate s3 to paseo-app",
+    "move parent to In Progress",
   ]);
   assert.match(summary, /Split into 3 sub-issues \(TUC-11, TUC-12, TUC-13\)/);
   await assert.rejects(splitIntoSubIssues({ ...deps, readPlan: async () => "just prose" }, { issueId: "parent", identifier: "TUC-1", agentId: "planner" }, "http://localhost:5000/", {} as PaseoApi), /fewer than two/);
