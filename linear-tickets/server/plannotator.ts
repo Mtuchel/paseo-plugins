@@ -157,9 +157,12 @@ export class PlannotatorBridge {
     }
   }
 
+  // Called with every hook's connection: the latest one wins, so a plugin session (which may add
+  // chat rows) replaces the plugin's own fallback connection once any hook runs.
   attach(paseo: PaseoApi): void {
-    if (this.paseo) return;
+    const first = !this.paseo;
     this.paseo = paseo;
+    if (!first) return;
     // A cheap directory sweep; fs.watch proved unreliable for files renamed into place.
     this.timer = setInterval(() => { void this.drain(); }, SWEEP_MS);
     this.timer.unref?.();
@@ -215,7 +218,10 @@ export class PlannotatorBridge {
     const row: PlannotatorRow = event.type === "opened"
       ? { title: "Handed off to Plannotator for review", url, detail: event.remoteUrl ? "Opens on any device in your tailnet." : "Local link only: Tailscale was unavailable." }
       : { title: event.approved ? "Plan approved in Plannotator" : "Plan sent back from Plannotator", ...(event.feedback ? { detail: event.feedback.slice(0, 4_000) } : {}) };
-    await handle.timeline.append({ type: "plugin", id: `plannotator-${event.type}-${event.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: row });
+    // Only a plugin session may append chat rows; the plugin's own fallback connection is not one.
+    // The row is a convenience, so Linear still gets the review either way.
+    await handle.timeline.append({ type: "plugin", id: `plannotator-${event.type}-${event.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: row })
+      .catch((error: unknown) => console.error(`[linear-tickets] Plannotator chat row for ${agentId} skipped: ${error instanceof Error ? error.message : error}`));
     const inSession = await this.toSession(event, agentId);
     if (!issueId) return;
     const settings = await this.settings.read();
