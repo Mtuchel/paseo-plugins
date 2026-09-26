@@ -11,7 +11,7 @@ type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
 const allOn: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true,
   dispatch: DEFAULT_DISPATCH,
-  writeback: { status: true, summaries: true, blocked: true, pullRequests: true, mentions: true },
+  writeback: { status: true, summaries: true, blocked: true, pullRequests: true, mentions: true, autoResume: false },
 };
 const root: PluginHookAgent = { id: "agent-1", workspaceId: "w1", parentAgentId: null, provider: "claude", cwd: "/repo", title: "ENG-1: Fix sign-in" };
 
@@ -30,7 +30,7 @@ class FakeLinear {
 }
 
 function paseoWithLabels(labels: Record<string, string>): PaseoApi {
-  return { agents: { ref: () => ({ refresh: async () => ({ agent: { labels } }) }) } } as unknown as PaseoApi;
+  return { agents: { ref: () => ({ refresh: async () => ({ agent: { labels } }) }), list: async () => ({ entries: [] }) } } as unknown as PaseoApi;
 }
 const linked = paseoWithLabels({ "linear.issueId": "issue-1" });
 

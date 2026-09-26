@@ -233,7 +233,10 @@ export const REMOVE_LABEL_QUERY = `mutation removeLabel($id: String!, $labelId: 
   issueRemoveLabel(id: $id, labelId: $labelId) { success }
 }`;
 export const CREATE_COMMENT_QUERY = `mutation comment($input: CommentCreateInput!) {
-  commentCreate(input: $input) { success }
+  commentCreate(input: $input) { success comment { id } }
+}`;
+export const UPDATE_COMMENT_QUERY = `mutation commentUpdate($id: String!, $input: CommentUpdateInput!) {
+  commentUpdate(id: $id, input: $input) { success }
 }`;
 export const LINK_URL_QUERY = `mutation link($issueId: String!, $url: String!, $title: String) {
   attachmentLinkURL(issueId: $issueId, url: $url, title: $title) { success }
@@ -487,6 +490,17 @@ export class LinearService {
 
   async comment(issueId: string, body: string): Promise<void> {
     succeeded(record(await this.withKey((key) => this.post(key, CREATE_COMMENT_QUERY, { input: { issueId, body } }))), "commentCreate", "create the comment");
+  }
+
+  // For comments that are later edited in place (the progress comment): returns the id.
+  async createComment(issueId: string, body: string): Promise<string> {
+    const data = record(await this.withKey((key) => this.post(key, CREATE_COMMENT_QUERY, { input: { issueId, body } })));
+    succeeded(data, "commentCreate", "create the comment");
+    return label(record(record(data.commentCreate).comment ?? {}).id);
+  }
+
+  async updateComment(commentId: string, body: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_COMMENT_QUERY, { id: commentId, input: { body } }))), "commentUpdate", "update the comment");
   }
 
   async linkUrl(issueId: string, url: string, title: string): Promise<void> {

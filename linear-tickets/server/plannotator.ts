@@ -6,6 +6,15 @@ import type { LinearService } from "./linear";
 import type { Settings } from "./settings";
 import { PLANNOTATOR_OPEN_SOURCE } from "./plannotator-open-source";
 import { paseoHome } from "./ticket-mcp";
+import { APPROVE_PLAN, planSteps, SEND_BACK, type SessionRouter } from "./sessions";
+
+// The plan text of a running review, from the same endpoint its page loads.
+export async function readReviewPlan(localUrl: string): Promise<string> {
+  const response = await fetch(`${new URL(localUrl).origin}/api/plan`, { signal: AbortSignal.timeout(5_000) });
+  if (!response.ok) return "";
+  const body: unknown = await response.json();
+  return body && typeof body === "object" && "plan" in body && typeof body.plan === "string" ? body.plan : "";
+}
 
 export const PLANNOTATOR_KIND = "plannotator";
 // About a minute of retries at the sweep interval, enough to ride out a Linear hiccup.
@@ -93,7 +102,39 @@ export class PlannotatorBridge {
   private again = false;
   private readonly attempts = new Map<string, number>();
 
-  constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly events = plannotatorPaths().events) {}
+  constructor(
+    private readonly linear: Linear,
+    private readonly settings: Pick<Settings, "read">,
+    private readonly events = plannotatorPaths().events,
+    private readonly sessions?: Pick<SessionRouter, "sessionFor" | "link" | "plan" | "ask" | "say" | "expectReview">,
+    private readonly fetchPlan: (localUrl: string) => Promise<string> = readReviewPlan,
+  ) {}
+
+  // The ticket's Linear agent panel: review link, plan checklist and Approve / Send back.
+  private async toSession(event: PlannotatorEvent, agentId: string): Promise<void> {
+    const sessions = this.sessions;
+    if (!sessions) return;
+    try {
+      const link = await sessions.sessionFor(agentId);
+      if (!link) return;
+      if (event.type === "opened") {
+        if (event.remoteUrl) await sessions.link(link.sessionId, "Plan review", event.remoteUrl);
+        const steps = planSteps(await this.fetchPlan(event.localUrl).catch(() => ""));
+        if (steps.length) await sessions.plan(link.sessionId, steps.map((content) => ({ content, status: "pending" as const })));
+        await sessions.expectReview(link.sessionId, event.localUrl);
+        await sessions.ask(link.sessionId, `The plan is ready for review${event.remoteUrl ? ` (full view: ${event.remoteUrl})` : ""}. Approve it, or reply with what to change.`, [{ label: "Approve plan", value: APPROVE_PLAN }, { label: "Send back", value: SEND_BACK }]);
+        return;
+      }
+      await sessions.expectReview(link.sessionId, null);
+      if (event.approved && event.planContent) {
+        const steps = planSteps(event.planContent);
+        if (steps.length) await sessions.plan(link.sessionId, steps.map((content, index) => ({ content, status: index === 0 ? "inProgress" as const : "pending" as const })));
+      }
+      await sessions.say(link.sessionId, "thought", event.approved ? "Plan approved — starting on it." : `Plan sent back${event.feedback ? `: ${event.feedback.slice(0, 1_000)}` : ""}.`);
+    } catch (error) {
+      console.error(`[linear-tickets] Plannotator session update for ${agentId} failed: ${error instanceof Error ? error.message : error}`);
+    }
+  }
 
   attach(paseo: PaseoApi): void {
     if (this.paseo) return;
@@ -148,6 +189,7 @@ export class PlannotatorBridge {
       ? { title: "Handed off to Plannotator for review", url, detail: event.remoteUrl ? "Opens on any device in your tailnet." : "Local link only: Tailscale was unavailable." }
       : { title: event.approved ? "Plan approved in Plannotator" : "Plan sent back from Plannotator", ...(event.feedback ? { detail: event.feedback.slice(0, 4_000) } : {}) };
     await handle.timeline.append({ type: "plugin", id: `plannotator-${event.type}-${event.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: row });
+    await this.toSession(event, agentId);
     if (!issueId) return;
     // Planning while a plan is out for review (and after it is sent back); coding once approved.
     if ((await this.settings.read()).writeback.status) {

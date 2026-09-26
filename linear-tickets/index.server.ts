@@ -1,6 +1,6 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc } from "./shared/contracts";
+import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -12,6 +12,12 @@ import { Dispatcher } from "./server/dispatch";
 import { CommentRelay } from "./server/relay";
 import { PlannotatorBridge, writeOpenScript } from "./server/plannotator";
 import { Writeback } from "./server/writeback";
+import { AgentApi, AppAuth } from "./server/agent-app";
+import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
+import { ensureFunnel, type FunnelStatus } from "./server/funnel";
+import { Handover } from "./server/handover";
+import { decidePlannotatorReview, SessionRouter, SessionStore } from "./server/sessions";
+import { TicketStarter } from "./server/starter";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -19,9 +25,33 @@ export default function contribute(server: PluginServerContext) {
   const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url));
   const settings = new Settings();
   const cache = new TicketCache();
-  const dispatcher = new Dispatcher({ linear, launcher, settings, relay: new CommentRelay(linear) });
-  const writeback = new Writeback(linear, settings);
-  const plannotator = new PlannotatorBridge(linear, settings);
+  // The native Linear agent ("Paseo" app): sessions, webhooks through Tailscale Funnel, and the
+  // handover record every agent keeps on its ticket. Without the app installed, only the
+  // handover comments and the comment-based paths run.
+  const auth = new AppAuth();
+  const handover = new Handover(linear);
+  const starter = new TicketStarter({ linear, launcher, handover });
+  const sessions = new SessionRouter({ api: new AgentApi(auth), linear, starter, settings, store: new SessionStore(), decideReview: decidePlannotatorReview });
+  const openSession = async (issueId: string, identifier: string, agentId: string) => {
+    if (await auth.credentials()) await sessions.openFor(issueId, identifier, agentId);
+  };
+  const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear), afterLaunch: openSession });
+  const writeback = new Writeback(linear, settings, { sessions, handover });
+  const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions);
+  const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => sessions.receive(event));
+  let funnel: FunnelStatus | null = null;
+  // Started with the first daemon connection, not at load, so loading has no side effects.
+  let agentReady: Promise<boolean> | null = null;
+  const startAgent = () => agentReady ??= auth.credentials().then(async (app) => {
+    if (!app) return false;
+    await webhook.start();
+    funnel = await ensureFunnel(WEBHOOK_PORT);
+    if (!funnel.active) console.error(`[linear-tickets] Linear agent webhooks are not public: ${funnel.note}`);
+    return true;
+  }).catch((error: unknown) => {
+    console.error(`[linear-tickets] starting the Linear agent receiver failed: ${error instanceof Error ? error.message : error}`);
+    return false;
+  });
   // Every agent session gets the Plannotator hook, so plan reviews show up in Paseo and Linear.
   // Written on the first session open, not at load, so loading the plugin has no side effects.
   let plannotatorBrowser: Promise<string | null> | null = null;
@@ -29,7 +59,7 @@ export default function contribute(server: PluginServerContext) {
     console.error(`[linear-tickets] writing the Plannotator hook failed: ${error instanceof Error ? error.message : error}`);
     return null;
   });
-  const attach = (paseo: PaseoApi) => { dispatcher.attach(paseo); plannotator.attach(paseo); };
+  const attach = (paseo: PaseoApi) => { dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); void startAgent(); };
   const cacheIdentity = async () => {
     const connection = await credentials.read();
     return connection.key ? cacheScope(connection.key) : null;
@@ -87,7 +117,14 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(launchAgentRpc, async (input, { paseo }) => {
     const { template, agentLinearAccess } = await settings.read();
-    return launcher.start(input, paseo, { promptTemplate: template ?? undefined, markInProgress: input.markInProgress, linearAccess: agentLinearAccess });
+    const result = await launcher.start(input, paseo, { promptTemplate: template ?? undefined, markInProgress: input.markInProgress, linearAccess: agentLinearAccess });
+    await openSession(input.id, input.id, result.agentId);
+    return result;
   });
-  return () => { dispatcher.stop(); plannotator.stop(); };
+  server.handle(agentStatusRpc, async (_input, { paseo }) => {
+    attach(paseo);
+    const installed = await startAgent();
+    return { installed, funnel: funnel?.active ?? false, funnelNote: funnel?.note ?? null, lastWebhookAt: webhook.lastEventAt };
+  });
+  return () => { dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); };
 }

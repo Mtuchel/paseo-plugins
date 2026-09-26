@@ -3,7 +3,7 @@ import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { usePaseo, useRpc } from "@getpaseo/plugin/client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Linking, Pressable, ScrollView, Text, TextInput, View } from "react-native";
-import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, getSettingsRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc, type DispatchSettingsValue, type DispatchStatus, type Issue, type RelatedTicket, type TicketDetail, type WritebackSettingsValue } from "../shared/contracts";
+import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, getSettingsRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc, type DispatchSettingsValue, type DispatchStatus, type Issue, type RelatedTicket, type TicketDetail, type WritebackSettingsValue } from "../shared/contracts";
 import { filterIssues, formatIssueDate, formatPriority, formatRelativeDate, hasPriority, issueStatus, statusChangesText, statusCounts, type DependencyFilter, type SortDirection, type SortField } from "./issue-list";
 
 import { ChoicePicker } from "./choice-picker";
@@ -21,6 +21,7 @@ const WRITEBACK_OPTIONS: { key: keyof WritebackSettingsValue; on: string; off: s
   { key: "summaries", on: "Comment each finished turn's reply on the ticket", off: "No turn summaries" },
   { key: "blocked", on: "Comment and label the ticket while its agent waits on you", off: "No blocked alerts" },
   { key: "pullRequests", on: "Attach pull requests the agent opens and move the ticket to review", off: "No pull request links" },
+  { key: "autoResume", on: "Start a new agent automatically when one fails (at most once an hour per ticket)", off: "Offer Resume in Linear when an agent stops" },
   { key: "mentions", on: "Deliver your \"@paseo …\" comments to the ticket's agent", off: "Comments stay in Linear" },
 ];
 
@@ -45,7 +46,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   const searchAll = useRpc(searchIssuesRpc);
   const getTemplate = useRpc(getDefaultPromptRpc), saveTemplate = useRpc(setDefaultPromptRpc);
   const getSettings = useRpc(getSettingsRpc), saveSettings = useRpc(setSettingsRpc);
-  const getDispatchStatus = useRpc(dispatchStatusRpc);
+  const getDispatchStatus = useRpc(dispatchStatusRpc), getAgentStatus = useRpc(agentStatusRpc);
   const [markInProgress, setMarkInProgress] = useState(false);
   const [templateOpen, setTemplateOpen] = useState(false);
   const [templateText, setTemplateText] = useState("");
@@ -100,6 +101,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   const [dispatchDraft, setDispatchDraft] = useState({ label: "", teamKeys: "", intervalSeconds: "" });
   const [writeback, setWriteback] = useState<WritebackSettingsValue | null>(null);
   const [dispatchStatus, setDispatchStatus] = useState<DispatchStatus | null>(null);
+  const [agentStatus, setAgentStatus] = useState<{ installed: boolean; funnel: boolean; funnelNote: string | null; lastWebhookAt: string | null } | null>(null);
   const [mappingReason, setMappingReason] = useState<"saved" | "name" | null>(null);
   // The ticket whose mapping was applied or overridden by hand; the branch waits for the list.
   const mappedFor = useRef<string | null>(null);
@@ -226,11 +228,14 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   // The dispatcher runs on the host; this only mirrors its latest poll while the surface is open.
   useEffect(() => {
     let cancelled = false;
-    const refresh = () => void getDispatchStatus({}).then((value) => { if (!cancelled) setDispatchStatus(value); }, () => {});
+    const refresh = () => {
+      void getDispatchStatus({}).then((value) => { if (!cancelled) setDispatchStatus(value); }, () => {});
+      void getAgentStatus({}).then((value) => { if (!cancelled) setAgentStatus(value); }, () => {});
+    };
     refresh();
     const timer = setInterval(refresh, 15_000);
     return () => { cancelled = true; clearInterval(timer); };
-  }, [getDispatchStatus]);
+  }, [getDispatchStatus, getAgentStatus]);
 
   useEffect(() => {
     let cancelled = false;
@@ -532,6 +537,9 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
       <Text style={t.muted}>Tickets in these teams carrying the label start an agent in their mapped project with your last-used provider, whoever they are assigned to — anyone who can label a ticket can start an agent on this host. The label is swapped for “{dispatch.label}-running” (or “{dispatch.label}-failed” with a comment explaining why). Unmapped projects are not guessed.</Text>
       {dispatchStatus && <Text style={t.muted}>{dispatchStatus.active ? "Polling" : "Idle"}{dispatchStatus.lastPollAt ? ` · last poll ${formatRelativeDate(dispatchStatus.lastPollAt)}` : " · waiting for first poll"}{dispatchStatus.lastError ? ` · error: ${dispatchStatus.lastError}` : ""}{dispatchStatus.recent.length ? ` · ${dispatchStatus.recent.slice(0, 3).map((item) => `${item.identifier} ${item.outcome}`).join(", ")}` : ""}</Text>}
     </>}
+    <Divider t={t} spaced />
+    <FieldLabel title="Linear agent" icon="Bot" hint="assign or @mention Paseo in Linear" t={t} />
+    <Text style={t.muted}>{!agentStatus ? "Checking…" : !agentStatus.installed ? "The Paseo Linear app is not installed on this host (see README: Native Linear agent)." : `Installed · webhooks ${agentStatus.funnel ? "public via Tailscale Funnel" : `not public (${agentStatus.funnelNote ?? "Funnel off"}); missed sessions are picked up within a minute`}${agentStatus.lastWebhookAt ? ` · last event ${formatRelativeDate(agentStatus.lastWebhookAt)}` : ""}`}</Text>
     <Divider t={t} spaced />
     <FieldLabel title="Sync with Linear" icon="MessageSquare" hint="for agents linked to a ticket" t={t} />
     {writeback && WRITEBACK_OPTIONS.map(({ key, on, off }) => <Button key={key} title={writeback[key] ? on : off} icon={writeback[key] ? "Check" : "CircleDashed"} stretch chosen={writeback[key]}

@@ -190,6 +190,7 @@ const writebackSettingsSchema = z.object({
   blocked: z.boolean(),
   pullRequests: z.boolean(),
   mentions: z.boolean(),
+  autoResume: z.boolean(),
 });
 export type DispatchSettingsValue = z.infer<typeof dispatchSettingsSchema>;
 export type WritebackSettingsValue = z.infer<typeof writebackSettingsSchema>;
@@ -243,4 +244,11 @@ export const dispatchStatusRpc = defineRpc({
   name: "linear.dispatch-status",
   input: z.object({}),
   output: dispatchStatusSchema,
+});
+
+// The native Linear agent's health for the settings screen.
+export const agentStatusRpc = defineRpc({
+  name: "linear.agent-status",
+  input: z.object({}),
+  output: z.object({ installed: z.boolean(), funnel: z.boolean(), funnelNote: z.string().nullable(), lastWebhookAt: z.string().nullable() }),
 });

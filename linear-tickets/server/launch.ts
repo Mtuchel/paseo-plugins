@@ -1,6 +1,7 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { RpcInput } from "@getpaseo/plugin";
 import { launchAgentRpc } from "../shared/contracts";
+import { existsSync } from "node:fs";
 import { attachmentNote, saveAttachments, type Download } from "./attachments";
 import { buildPrompt } from "./context";
 import type { LinearService } from "./linear";
@@ -9,7 +10,10 @@ import { TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript } from "./ticket
 
 type Start = RpcInput<typeof launchAgentRpc>;
 type Result = { agentId: string; warnings: string[] };
-type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess?: boolean };
+// `resume` continues another agent's work: same branch (and worktree while it still exists),
+// with the handover text ahead of the ticket prompt. `labels` are added to the agent.
+export type ResumeTarget = { branch: string; worktreePath: string | null; handover: string };
+type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess?: boolean; labels?: Record<string, string>; resume?: ResumeTarget };
 
 // Linear computes the branch name with the workspace's branch-format setting, so it is
 // the name users expect — but a stored value is not guaranteed to be a safe git ref.
@@ -73,12 +77,12 @@ export class Launcher {
 
   private async launch(input: Start, paseo: PaseoApi, options: Options, onCreate: () => void): Promise<Result> {
     const project = await findProject(paseo, input.projectId);
-    if (project.projectKind === "git") {
+    if (project.projectKind === "git" && !options.resume) {
       const available = await this.branches(project.projectRootPath);
       if (!input.baseBranch || !available.branches.some((branch) => branch.id === input.baseBranch)) {
         throw new Error("Select an available base branch for this project.");
       }
-    } else if (input.baseBranch) {
+    } else if (input.baseBranch && project.projectKind !== "git") {
       throw new Error("This project does not support Git branches.");
     }
     const detail = await this.linear.detail(input.id);
@@ -94,7 +98,20 @@ export class Launcher {
     const fallback = `${slug}-${input.requestId.slice(0, 8)}`;
     const branchNames = project.projectKind === "git" ? (canonical ? [canonical, `${canonical}-${input.requestId.slice(0, 8)}`] : [fallback]) : [fallback];
     let workspace;
-    for (let attempt = 0; ; attempt++) {
+    if (options.resume) {
+      const { branch, worktreePath } = options.resume;
+      // The old worktree keeps uncommitted work, so it is reused while it exists; otherwise
+      // the branch is checked out into a new worktree.
+      workspace = await paseo.workspaces.create({
+        title,
+        requestId: `${input.requestId}-workspace`,
+        source: worktreePath && existsSync(worktreePath)
+          ? { kind: "directory", projectId: project.projectId, path: worktreePath }
+          : { kind: "worktree", projectId: project.projectId, cwd: project.projectRootPath, action: "checkout", refName: branch },
+      }).catch((error: unknown) => {
+        throw new Error(`Could not reopen branch ${branch} for the resumed agent: ${error instanceof Error ? error.message : "unknown error"}`);
+      });
+    } else for (let attempt = 0; ; attempt++) {
       try {
         workspace = await paseo.workspaces.create({
           title,
@@ -138,10 +155,10 @@ export class Launcher {
     const agent = await workspace.agents.create({
       config: { provider: input.provider, modeId: input.modeId, thinkingOptionId: input.thinkingOptionId, ...(mcpServers ? { mcpServers } : {}) },
       title,
-      prompt: buildPrompt(detail, instructions, options.promptTemplate, options.linearAccess ?? false),
+      prompt: [options.resume?.handover, buildPrompt(detail, instructions, options.promptTemplate, options.linearAccess ?? false)].filter(Boolean).join("\n\n"),
       requestId: input.requestId,
       clientMessageId: input.requestId,
-      labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url },
+      labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
     }).catch((error: unknown) => {
       // Keep the daemon's reason (e.g. a provider failing to start with the ticket MCP server).
       const cause = error instanceof Error && error.message ? ` (${error.message.slice(0, 300)})` : "";

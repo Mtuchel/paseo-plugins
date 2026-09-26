@@ -238,6 +238,46 @@ exclude list, and lists the local paths in the launch prompt. The key is sent on
 `uploads.linear.app` and never reaches the agent. At most 20 files, 25 MB each and 100 MB
 in total are downloaded; a failed or skipped file becomes a launch warning, never a failure.
 
+## Native Linear agent
+
+With a private Linear OAuth app named **Paseo** installed (`actor=app`), you can assign a ticket
+to Paseo or @mention it, and the whole conversation runs in Linear's agent panel on the ticket:
+- a "thinking" update within a second,
+- the commands the agent ran and its replies,
+- option buttons for its questions, and Approve/Deny for actions that need permission,
+- the plan as a checklist, with Approve plan / Send back deciding the Plannotator review directly,
+- Stop, which interrupts the running turn,
+- links to the plan review and the pull request.
+
+A delegation starts an agent exactly like the label: the saved project mapping and remembered
+provider are used, and the agent gets the label `linear.sessionId` next to `linear.issueId`. A
+mention on a ticket whose agent is running passes the text to that agent instead. Label and
+sidebar launches open a session too. Only the workspace owner (the user of the plugin's
+personal key) can start or steer agents; sessions from anyone or anything else get an error.
+
+**Setup**
+1. In Linear → Settings → API → Applications, create an app "Paseo":
+   - redirect URI `http://localhost:47832/callback`,
+   - webhooks on, URL `https://<machine>.<tailnet>.ts.net:8443/linear/agent`, categories *Agent session events* and *Permission changes*.
+2. Put `{"clientId","clientSecret","webhookSecret"}` into `$PASEO_HOME/linear-tickets/agent-app/app.json` (mode 0600).
+3. Install the app with `actor=app` and the scopes `read,write,app:assignable,app:mentionable`, and store the token response as `token.json` next to it.
+   The plugin refreshes it with the refresh token.
+4. Allow Tailscale Funnel for the machine.
+
+The plugin receives webhooks on `127.0.0.1:47831` and publishes only `/linear/agent` on port
+8443 with `tailscale funnel` (never 443). Each webhook is checked for its HMAC signature and a
+timestamp newer than 60 s, answered at once, and deduplicated. A sweep every minute picks up
+sessions and replies whose webhook was missed. **Settings → Linear agent** shows the state.
+
+**Durable record and resume.** Every ticket agent keeps one "Paseo progress" comment, edited
+in place: phase, branch, last commit, links, latest report. When the agent fails or is
+archived while the ticket is open, it also posts a final report. The panel then offers
+**Resume with a new agent**, which is automatic when *Start a new agent automatically when one
+fails* is on (at most hourly). Assigning Paseo again, @mentioning it or re-adding the label
+also resumes. The new agent continues on the same branch, reusing the old worktree while it
+exists so uncommitted work survives. It starts with a handover of the previous agent's reports,
+and the old agent is archived.
+
 ## Plannotator reviews
 
 Plannotator shows its review URL only in omp's own status line, which Paseo does not display.

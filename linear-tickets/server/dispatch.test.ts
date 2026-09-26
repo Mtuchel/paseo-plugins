@@ -4,6 +4,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { RpcInput } from "@getpaseo/plugin";
 import type { launchAgentRpc, TicketDetail } from "../shared/contracts";
 import { Dispatcher } from "./dispatch";
+import { TicketStarter } from "./starter";
 import type { LabeledIssue } from "./linear";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
@@ -61,12 +62,12 @@ function fakePaseo(activeAgents: { id: string; title: string }[] = []): PaseoApi
 function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = baseSettings, paseo = fakePaseo()) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const launches: RpcInput<typeof launchAgentRpc>[] = [];
-  const dispatcher = new Dispatcher({
+  const starter = new TicketStarter({
     linear,
     launcher: { start: async (input) => { launches.push(input); return { agentId: "agent-1", warnings: [] }; } },
-    settings: { read: async () => settings },
     branches: async () => ({ branches: [{ id: "refs/heads/dev", label: "dev" }, { id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }),
   });
+  const dispatcher = new Dispatcher({ linear, starter, settings: { read: async () => settings } });
   dispatcher.attach(paseo);
   return { dispatcher, launches };
 }

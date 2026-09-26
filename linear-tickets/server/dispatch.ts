@@ -1,22 +1,20 @@
-import { randomUUID } from "node:crypto";
 import type { PaseoApi } from "@getpaseo/client";
 import type { DispatchStatus } from "../shared/contracts";
-import { mappedBaseBranch, mappingLabel, type ProjectMapping } from "../shared/mapping";
-import type { Launcher } from "./launch";
 import type { LabeledIssue, LinearService } from "./linear";
-import { findProject, readBranches } from "./projects";
 import type { CommentRelay } from "./relay";
 import type { PluginSettings, Settings } from "./settings";
+import type { TicketStarter } from "./starter";
 
 const RECENT_LIMIT = 10;
 const IDLE_POLL_SECONDS = 60;
 
-type Linear = Pick<LinearService, "labeledIssues" | "detail" | "addLabel" | "removeLabel" | "comment">;
+type Linear = Pick<LinearService, "labeledIssues" | "addLabel" | "removeLabel" | "comment">;
 type Deps = {
   linear: Linear;
-  launcher: Pick<Launcher, "start">;
+  starter: Pick<TicketStarter, "start">;
   settings: Pick<Settings, "read">;
-  branches?: typeof readBranches;
+  // Called after each launch, e.g. to open the ticket's Linear agent session.
+  afterLaunch?: (issueId: string, identifier: string, agentId: string) => Promise<void>;
   // Linear → agent comment delivery, run on the same cadence as dispatch.
   relay?: Pick<CommentRelay, "poll">;
 };
@@ -28,7 +26,7 @@ export function dispatchLabels(trigger: string) {
 }
 
 // Polls Linear for tickets carrying the trigger label and starts one agent per ticket
-// through the same Launcher the sidebar uses, so auto-dispatched agents get the same
+// through the same TicketStarter as Linear delegation (and the Launcher the sidebar uses), so auto-dispatched agents get the same
 // worktree, labels, composer pill and linear_ticket tools as manual launches.
 //
 // Linear is the lock: the trigger label is swapped for `<trigger>-running` before any
@@ -40,11 +38,8 @@ export class Dispatcher {
   private rerun = false;
   private stopped = false;
   private readonly status: DispatchStatus = { active: false, lastPollAt: null, lastError: null, recent: [] };
-  private readonly branches: typeof readBranches;
 
-  constructor(private readonly deps: Deps) {
-    this.branches = deps.branches ?? readBranches;
-  }
+  constructor(private readonly deps: Deps) {}
 
   private relayError: string | null = null;
 
@@ -156,41 +151,12 @@ export class Dispatcher {
         await linear.comment(issue.id, `Paseo already has an active agent for this ticket (${agent.title ?? agent.id}); no new agent was started.`);
         return;
       }
-      const detail = await linear.detail(issue.id);
-      const source = { projectId: detail.projectId, projectName: detail.issue.project, teamId: detail.teamId, teamName: detail.issue.team };
-      // Only saved mappings dispatch. The sidebar's name-match preselection is a UI hint;
-      // guessing the repository for an unattended launch is not.
-      const mapping: ProjectMapping | undefined = (source.projectId ? settings.projectMappings[`project:${source.projectId}`] : undefined)
-        ?? (source.teamId ? settings.projectMappings[`team:${source.teamId}`] : undefined);
-      if (!mapping) {
-        throw new Error(`No Paseo project is mapped to ${mappingLabel(source)}. Start one agent for it from the Linear tickets sidebar (that saves the mapping), then add the "${trigger}" label again.`);
-      }
-      const preference = settings.lastProvider ? settings.launchPreferences[settings.lastProvider] : undefined;
-      if (!preference) {
-        throw new Error(`No provider has been chosen on this host yet. Start one agent from the Linear tickets sidebar so the plugin remembers the provider and model, then add the "${trigger}" label again.`);
-      }
-      const project = await findProject(paseo, mapping.projectId);
-      let baseBranch: string | undefined;
-      if (project.projectKind === "git") {
-        const available = await this.branches(project.projectRootPath);
-        baseBranch = mappedBaseBranch(mapping.baseBranch, available.branches, available.defaultBranch) || undefined;
-        if (!baseBranch) throw new Error(`Could not pick a base branch in ${mapping.label}. Save a base branch for its project mapping.`);
-      }
-      const result = await this.deps.launcher.start({
-        id: issue.id,
-        projectId: mapping.projectId,
-        baseBranch,
-        provider: preference.model,
-        modeId: preference.modeId,
-        thinkingOptionId: preference.thinkingOptionId,
-        instructions: "",
-        markInProgress: settings.markInProgress,
-        requestId: randomUUID(),
-      }, paseo, { promptTemplate: settings.template ?? undefined, markInProgress: settings.markInProgress, linearAccess: settings.agentLinearAccess });
-      const target = project.projectCustomName || project.projectDisplayName || mapping.label;
-      this.record(issue.identifier, "launched", `${preference.model} in ${target}`);
-      const warnings = result.warnings.length ? `\n\nWarnings:\n${result.warnings.map((warning) => `- ${warning}`).join("\n")}` : "";
-      await linear.comment(issue.id, `Paseo started an agent for this ticket (${preference.model} in ${target}).${warnings}`)
+      const started = await this.deps.starter.start(issue.id, paseo, settings, { retryHint: `add the "${trigger}" label again` });
+      const { provider, target } = started;
+      this.record(issue.identifier, "launched", `${provider} in ${target}${started.resumed ? " (resumed)" : ""}`);
+      await this.deps.afterLaunch?.(issue.id, issue.identifier, started.agentId);
+      const warnings = started.warnings.length ? `\n\nWarnings:\n${started.warnings.map((warning) => `- ${warning}`).join("\n")}` : "";
+      await linear.comment(issue.id, `Paseo ${started.resumed ? "resumed the previous agent's work" : "started an agent"} for this ticket (${provider} in ${target}).${warnings}`)
         .catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: start comment failed:`, error instanceof Error ? error.message : error));
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
