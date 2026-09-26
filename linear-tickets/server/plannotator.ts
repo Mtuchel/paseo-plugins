@@ -1,0 +1,162 @@
+import { watch, type FSWatcher } from "node:fs";
+import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+import type { PaseoApi } from "@getpaseo/client";
+import type { LinearService } from "./linear";
+import { PLANNOTATOR_OPEN_SOURCE } from "./plannotator-open-source";
+import { paseoHome } from "./ticket-mcp";
+
+export const PLANNOTATOR_KIND = "plannotator";
+const MAX_ATTEMPTS = 3;
+const MAX_PLAN_CHARS = 180_000;
+
+export type PlannotatorRow = { title: string; url?: string; detail?: string };
+export type OpenedEvent = { type: "opened"; agentId: string | null; localUrl: string; remoteUrl: string | null; at: string };
+export type DecidedEvent = { type: "decided"; agentId: string | null; approved: boolean; feedback?: string; planUri?: string; planContent?: string; at: string };
+type PlannotatorEvent = OpenedEvent | DecidedEvent;
+type Linear = Pick<LinearService, "comment" | "upsertIssueDocument">;
+
+export function plannotatorPaths(home = paseoHome()) {
+  const directory = join(home, "linear-tickets", "plannotator");
+  return { directory, events: join(directory, "events"), script: join(directory, "open.mjs"), launcher: join(directory, "open") };
+}
+
+// PLANNOTATOR_BROWSER must be one executable path, so a two-line wrapper starts the hook
+// with the daemon's own Node runtime (Electron as Node inside the desktop app).
+export async function writeOpenScript(paths = plannotatorPaths(), runtime = { execPath: process.execPath, electron: Boolean(process.versions.electron) }): Promise<string> {
+  await mkdir(paths.events, { recursive: true, mode: 0o700 });
+  await chmod(paths.directory, 0o700);
+  const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+  const wrapper = [
+    "#!/bin/sh",
+    `${runtime.electron ? "ELECTRON_RUN_AS_NODE=1 " : ""}LINEAR_TICKETS_PLANNOTATOR_EVENTS=${quote(paths.events)} exec ${quote(runtime.execPath)} ${quote(paths.script)} "$@"`,
+    "",
+  ].join("\n");
+  for (const [path, content, mode] of [[paths.script, PLANNOTATOR_OPEN_SOURCE, 0o600], [paths.launcher, wrapper, 0o700]] as const) {
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, content, { mode, flag: "wx" });
+      await rename(temporary, path);
+    } finally { await rm(temporary, { force: true }); }
+  }
+  return paths.launcher;
+}
+
+export function parseEvent(raw: string): PlannotatorEvent | null {
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { return null; }
+  if (!value || typeof value !== "object" || !("type" in value)) return null;
+  const event = value as Record<string, unknown>;
+  const agentId = typeof event.agentId === "string" && event.agentId ? event.agentId : null;
+  const at = typeof event.at === "string" ? event.at : new Date().toISOString();
+  if (event.type === "opened" && typeof event.localUrl === "string") {
+    return { type: "opened", agentId, localUrl: event.localUrl, remoteUrl: typeof event.remoteUrl === "string" ? event.remoteUrl : null, at };
+  }
+  if (event.type === "decided" && typeof event.approved === "boolean") {
+    return {
+      type: "decided", agentId, approved: event.approved, at,
+      ...(typeof event.feedback === "string" && event.feedback.trim() ? { feedback: event.feedback.trim() } : {}),
+      ...(typeof event.planUri === "string" ? { planUri: event.planUri } : {}),
+      ...(typeof event.planContent === "string" ? { planContent: event.planContent } : {}),
+    };
+  }
+  return null;
+}
+
+export function planDocument(event: DecidedEvent, identifier: string): string {
+  const date = event.at.slice(0, 16).replace("T", " ");
+  const plan = (event.planContent ?? "").trim() || "_The plan text was not recorded._";
+  return [
+    `> **${event.approved ? "Approved" : "Sent back with feedback"}** in Plannotator on ${date} UTC for ${identifier}. Replaced on every review round; the decision comments on the ticket keep the history.`,
+    event.feedback ? `\n## Review feedback\n\n${event.feedback}` : "",
+    "\n---\n",
+    plan.length > MAX_PLAN_CHARS ? `${plan.slice(0, MAX_PLAN_CHARS)}\n\n… (truncated)` : plan,
+  ].join("\n");
+}
+
+// Plannotator ↔ Paseo ↔ Linear. Plannotator's review URL only reaches omp's UI notices, which
+// Paseo does not show, so reviews were invisible. The PLANNOTATOR_BROWSER hook and the omp
+// plan extension drop events into a directory; this bridge turns each into a row in the
+// agent's Paseo chat and — for agents linked to a ticket — a Linear comment with the tailnet
+// link, and on a decision the plan document on the ticket.
+export class PlannotatorBridge {
+  private paseo: PaseoApi | null = null;
+  private watcher: FSWatcher | null = null;
+  private timer: NodeJS.Timeout | null = null;
+  private draining: Promise<void> | null = null;
+  private again = false;
+  private readonly attempts = new Map<string, number>();
+
+  constructor(private readonly linear: Linear, private readonly events = plannotatorPaths().events) {}
+
+  attach(paseo: PaseoApi): void {
+    if (this.paseo) return;
+    this.paseo = paseo;
+    try {
+      this.watcher = watch(this.events, () => { void this.drain(); });
+    } catch (error) {
+      console.error(`[linear-tickets] watching Plannotator events failed: ${error instanceof Error ? error.message : error}`);
+    }
+    // fs.watch can miss events; a slow sweep catches anything left behind.
+    this.timer = setInterval(() => { void this.drain(); }, 30_000);
+    this.timer.unref?.();
+    void this.drain();
+  }
+
+  stop(): void {
+    this.watcher?.close();
+    if (this.timer) clearInterval(this.timer);
+    this.watcher = null;
+    this.timer = null;
+  }
+
+  async drain(): Promise<void> {
+    if (this.draining) { this.again = true; return this.draining; }
+    this.draining = (async () => {
+      do {
+        this.again = false;
+        const names = (await readdir(this.events).catch(() => [] as string[])).filter((name) => name.endsWith(".json") && !name.startsWith(".")).sort();
+        for (const name of names) await this.handle(name);
+      } while (this.again);
+    })();
+    try { await this.draining; } finally { this.draining = null; }
+  }
+
+  private async handle(name: string): Promise<void> {
+    const path = join(this.events, name);
+    const paseo = this.paseo;
+    if (!paseo) return;
+    try {
+      const event = parseEvent(await readFile(path, "utf8"));
+      if (event?.agentId) await this.deliver(event, event.agentId, paseo);
+      await rm(path, { force: true });
+      this.attempts.delete(name);
+    } catch (error) {
+      const tries = (this.attempts.get(name) ?? 0) + 1;
+      console.error(`[linear-tickets] Plannotator event ${name} failed (attempt ${tries}): ${error instanceof Error ? error.message : error}`);
+      if (tries >= MAX_ATTEMPTS) { await rm(path, { force: true }); this.attempts.delete(name); } else this.attempts.set(name, tries);
+    }
+  }
+
+  private async deliver(event: PlannotatorEvent, agentId: string, paseo: PaseoApi): Promise<void> {
+    const handle = paseo.agents.ref(agentId);
+    const refreshed = await handle.refresh();
+    const labels = refreshed?.agent.labels ?? {};
+    const issueId = labels["paseo.parent-agent-id"] ? undefined : labels["linear.issueId"];
+    const identifier = labels["linear.identifier"] || "this ticket";
+    const url = event.type === "opened" ? event.remoteUrl ?? event.localUrl : undefined;
+    const row: PlannotatorRow = event.type === "opened"
+      ? { title: "Handed off to Plannotator for review", url, detail: event.remoteUrl ? "Opens on any device in your tailnet." : "Local link only: Tailscale was unavailable." }
+      : { title: event.approved ? "Plan approved in Plannotator" : "Plan sent back from Plannotator", ...(event.feedback ? { detail: event.feedback.slice(0, 4_000) } : {}) };
+    await handle.timeline.append({ type: "plugin", id: `plannotator-${event.type}-${event.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: row });
+    if (!issueId) return;
+    if (event.type === "opened") {
+      await this.linear.comment(issueId, `📋 **Plan ready for review in Plannotator**: ${url}${event.remoteUrl ? "" : "\n\n(Local link only: Tailscale was unavailable on the host.)"}`);
+      return;
+    }
+    const documentUrl = await this.linear.upsertIssueDocument(issueId, `Plan: ${identifier}`, planDocument(event, identifier));
+    const feedback = event.feedback ? `\n\n${event.feedback.slice(0, 4_000)}` : "";
+    await this.linear.comment(issueId, `${event.approved ? "✅ **Plan approved** in Plannotator" : "↩️ **Plan sent back** from Plannotator"}${documentUrl ? ` — [plan](${documentUrl})` : ""}${feedback}`);
+  }
+}

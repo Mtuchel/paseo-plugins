@@ -252,6 +252,16 @@ export const REACTION_QUERY = `mutation react($commentId: String!, $emoji: Strin
 
 export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[] };
 
+export const ISSUE_DOCUMENTS_QUERY = `query issueDocuments($id: String!) {
+  issue(id: $id) { id documents(first: 50) { nodes { id title url } } }
+}`;
+export const CREATE_DOCUMENT_QUERY = `mutation documentCreate($input: DocumentCreateInput!) {
+  documentCreate(input: $input) { success document { id url } }
+}`;
+export const UPDATE_DOCUMENT_QUERY = `mutation documentUpdate($id: String!, $input: DocumentUpdateInput!) {
+  documentUpdate(id: $id, input: $input) { success document { id url } }
+}`;
+
 function labelNodes(value: unknown): { id: string; name: string }[] {
   return connection(value ?? { nodes: [] }).nodes.map((node) => record(node)).map((node) => ({ id: label(node.id), name: label(node.name) })).filter((node) => node.id && node.name);
 }
@@ -518,6 +528,20 @@ export class LinearService {
 
   async react(commentId: string, emoji: string): Promise<void> {
     succeeded(record(await this.withKey((key) => this.post(key, REACTION_QUERY, { commentId, emoji }))), "reactionCreate", "add the reaction");
+  }
+
+  // One document per title on the ticket: replaced when it exists, created otherwise.
+  // Returns the document URL for linking from a comment.
+  async upsertIssueDocument(issueId: string, title: string, content: string): Promise<string> {
+    const data = record(await this.withKey((key) => this.post(key, ISSUE_DOCUMENTS_QUERY, { id: issueId })));
+    const issue = record(data.issue ?? {});
+    const existing = connection(issue.documents ?? { nodes: [] }).nodes.map((node) => record(node)).find((node) => label(node.title) === title);
+    const result = existing
+      ? record(await this.withKey((key) => this.post(key, UPDATE_DOCUMENT_QUERY, { id: label(existing.id), input: { title, content } })))
+      : record(await this.withKey((key) => this.post(key, CREATE_DOCUMENT_QUERY, { input: { title, content, issueId: label(issue.id) || issueId } })));
+    const field = existing ? "documentUpdate" : "documentCreate";
+    succeeded(result, field, existing ? "update the plan document" : "create the plan document");
+    return label(record(record(result[field]).document ?? {}).url);
   }
 
   // Linear's file storage needs the API key. Only uploads.linear.app is ever sent the key;
