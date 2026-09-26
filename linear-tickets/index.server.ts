@@ -1,4 +1,4 @@
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
@@ -15,6 +15,7 @@ import { Writeback } from "./server/writeback";
 import { AgentApi, AppAuth } from "./server/agent-app";
 import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
 import { ensureFunnel, type FunnelStatus } from "./server/funnel";
+import { ownConnection } from "./server/connection";
 import { HealthMonitor } from "./server/health";
 import { PullRequestWatch } from "./server/pr-watch";
 import { Handover } from "./server/handover";
@@ -73,9 +74,13 @@ export default function contribute(server: PluginServerContext) {
       if (response.status !== 401) throw new Error(`The local receiver answered HTTP ${response.status} instead of refusing an unsigned request.`);
     } },
   ]);
-  // Started with the first daemon connection, not at load, so loading has no side effects.
+  // Started shortly after load (so a reload never leaves Linear's webhooks unanswered) or with the
+  // first daemon connection, whichever comes first. Events wait for the connection before they
+  // are handled; a new session is still acknowledged at once.
+  let stopped = false;
   let agentReady: Promise<boolean> | null = null;
   const startAgent = () => agentReady ??= auth.credentials().then(async (app) => {
+    if (stopped) return false;
     health.start();
     pullRequests.start();
     if (!app) return false;
@@ -94,7 +99,8 @@ export default function contribute(server: PluginServerContext) {
     console.error(`[linear-tickets] writing the Plannotator hook failed: ${error instanceof Error ? error.message : error}`);
     return null;
   });
-  const attach = (paseo: PaseoApi) => { dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); void startAgent(); };
+  let attached = false;
+  const attach = (paseo: PaseoApi) => { attached = true; dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); void startAgent(); };
   const cacheIdentity = async () => {
     const connection = await credentials.read();
     return connection.key ? cacheScope(connection.key) : null;
@@ -161,5 +167,18 @@ export default function contribute(server: PluginServerContext) {
     const installed = await startAgent();
     return { installed, funnel: funnel?.active ?? false, funnelNote: funnel?.note ?? null, lastWebhookAt: webhook.lastEventAt };
   });
-  return () => { dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); health.stop(); pullRequests.stop(); };
+  // No hook within a few seconds of loading (typically a reload): use the plugin's own connection.
+  let own: PaseoClient | null = null;
+  const startSoon = setTimeout(() => {
+    void startAgent();
+    if (attached) return;
+    void ownConnection().then((client) => {
+      if (!client) return;
+      if (stopped || attached) { void client.close(); return; }
+      own = client;
+      attach(client);
+    });
+  }, 3_000);
+  startSoon.unref?.();
+  return () => { stopped = true; clearTimeout(startSoon); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); health.stop(); pullRequests.stop(); };
 }
