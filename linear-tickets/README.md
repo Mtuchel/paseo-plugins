@@ -300,6 +300,12 @@ with this host). Its subtitle shows the phase and model; a new agent on the tick
 Every Linear thread linked to an agent has "Open in Paseo" under Links, and the Plan review link
 is there only while the review is open.
 
+**Ticket agents keep the launch model.** Every ticket agent runs the model and thinking level
+chosen for launches in the plugin. Plannotator's plan mode switches back to the model it saved when
+planning began once a plan is approved; the plugin notices within seconds (at most 20 s), restores
+the launch model and says so in the ticket's panel. To use another model for ticket work, change the
+launch model in the plugin; changing it on one agent in Paseo is undone.
+
 **Which model is working.** The progress comment, the final report, the plan review question and
 the plan document ("Planned with") show the model the agent runs, with its thinking level. When
 it changes between turns (you picked another model in Paseo, or Plannotator restored the model it
