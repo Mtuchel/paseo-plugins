@@ -34,7 +34,10 @@ export type HandoverRecord = {
   updatedAt: string;
 };
 export type GitState = { branch: string | null; lastCommit: string | null };
-type Linear = Pick<LinearService, "createComment" | "updateComment" | "comment">;
+type Linear = Pick<LinearService, "createComment" | "updateComment" | "comment" | "upsertAttachment" | "removeAttachments">;
+// Where the web app opens an agent (null when the daemon id is unknown).
+export type AgentUrl = (agentId: string) => Promise<string | null>;
+const PASEO_WEB = "https://app.paseo.sh/h/";
 
 export async function readGitState(cwd: string): Promise<GitState> {
   const git = async (args: string[]) => (await exec("git", ["-C", cwd, ...args], { timeout: 10_000 })).stdout.trim();
@@ -94,7 +97,7 @@ export function handoverPrompt(record: HandoverRecord): string {
 export class Handover {
   private queue: Promise<unknown> = Promise.resolve();
 
-  constructor(private readonly linear: Linear, private readonly directory = join(paseoHome(), "linear-tickets", "handover"), private readonly git = readGitState, private readonly now = () => new Date().toISOString()) {}
+  constructor(private readonly linear: Linear, private readonly directory = join(paseoHome(), "linear-tickets", "handover"), private readonly git = readGitState, private readonly now = () => new Date().toISOString(), private readonly agentUrl?: AgentUrl) {}
 
   private serialize<T>(work: () => Promise<T>): Promise<T> {
     const result = this.queue.then(work, work);
@@ -123,6 +126,7 @@ export class Handover {
       const previous = await this.read(issue.id);
       const sameAgent = previous?.agentId === agent.id;
       const git = await this.git(agent.cwd).catch(() => ({ branch: null, lastCommit: null }));
+      const paseoUrl = await this.agentUrl?.(agent.id).catch(() => null) ?? null;
       const record: HandoverRecord = {
         issueId: issue.id,
         identifier: issue.identifier,
@@ -132,7 +136,7 @@ export class Handover {
         worktreePath: agent.cwd,
         lastCommit: git.lastCommit ?? (sameAgent ? previous.lastCommit : null),
         summaries: [...(sameAgent ? previous.summaries : previous?.summaries ?? []), ...(change.summary ? [clip(change.summary, MAX_SUMMARY)] : [])].slice(-KEPT_SUMMARIES),
-        links: { ...(sameAgent ? previous.links : {}), ...(change.link ? { [change.link[0]]: change.link[1] } : {}) },
+        links: { ...(paseoUrl ? { "Open in Paseo": paseoUrl } : {}), ...(sameAgent ? previous.links : {}), ...(change.link ? { [change.link[0]]: change.link[1] } : {}) },
         plan: change.plan ?? (sameAgent ? previous.plan ?? null : null),
         review: change.review ?? (sameAgent ? previous.review ?? null : null),
         model: change.model ?? (sameAgent ? previous.model ?? null : null),
@@ -148,6 +152,12 @@ export class Handover {
         });
       } else {
         record.progressCommentId = await this.linear.createComment(issue.id, body);
+      }
+      // The ticket's link to the agent (next to its pull requests), kept current and moved to a
+      // new agent when one takes over. Best-effort: the comment above is the record.
+      if (paseoUrl) {
+        await this.linear.upsertAttachment(issue.id, paseoUrl, `Paseo agent · ${record.agentTitle}`, [PHASE[record.status], record.model].filter(Boolean).join(" · ")).catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: Paseo agent link failed: ${error instanceof Error ? error.message : error}`));
+        if (!sameAgent) await this.linear.removeAttachments(issue.id, PASEO_WEB, paseoUrl).catch(() => {});
       }
       await this.save(record);
       return record;

@@ -8,7 +8,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { AgentApi, AppAuth } from "./agent-app";
 import { verifyWebhook } from "./agent-webhook";
-import { Handover, handoverPrompt, type HandoverRecord } from "./handover";
+import { Handover, handoverPrompt, progressBody, type HandoverRecord } from "./handover";
 import { planSteps, SessionRouter, SessionStore, type SessionLink } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
@@ -167,16 +167,19 @@ test("a plan approved for later offers no Resume when the planner is archived, a
 test("the progress comment is created once and edited in place; the next agent gets its own and a resume prompt", async () => {
   const directory = await mkdtemp(join(tmpdir(), "paseo-handover-"));
   const calls: string[] = [];
+  const links: string[] = [];
   try {
     const handover = new Handover({
       createComment: async (_issue: string, body: string) => { calls.push(`create ${body.split("\n")[0]}`); return `c${calls.length}`; },
       updateComment: async (id: string, body: string) => { calls.push(`update ${id} ${body.split("\n")[0]}`); },
       comment: async (_issue: string, body: string) => { calls.push(`final ${body.split("\n")[0]}`); },
-    }, directory, async () => ({ branch: "mtuchel/tuc-1-fix", lastCommit: "abc123 wip" }), () => "2026-01-01T10:00:00Z");
+      upsertAttachment: async (_issue: string, url: string, title: string, subtitle: string) => { links.push(`${url} | ${title} | ${subtitle}`); },
+      removeAttachments: async (_issue: string, prefix: string, keep: string) => { links.push(`remove ${prefix}* except ${keep}`); },
+    }, directory, async () => ({ branch: "mtuchel/tuc-1-fix", lastCommit: "abc123 wip" }), () => "2026-01-01T10:00:00Z", async (agentId) => `https://app.paseo.sh/h/srv/agent/${agentId}`);
     const issue = { id: "i1", identifier: "TUC-1" };
     const first = { id: "agent-1", title: "TUC-1: Fix", cwd: "/wt/tuc-1" };
     await handover.update(issue, first, { summary: "Did step 1" });
-    await handover.update(issue, first, { summary: "Did step 2" });
+    await handover.update(issue, first, { summary: "Did step 2", model: "omp/opus · thinking medium" });
     const record: HandoverRecord = await handover.finish(issue, first, "failed", "provider login expired");
     assert.deepEqual(calls, ["create 🛠 **Paseo progress** — TUC-1: Fix", "update c1 🛠 **Paseo progress** — TUC-1: Fix", "update c1 🛠 **Paseo progress** — TUC-1: Fix", "final 🏁 **Paseo final report** — TUC-1: Fix"]);
     assert.deepEqual(record.summaries, ["Did step 1", "Did step 2"]);
@@ -188,6 +191,16 @@ test("the progress comment is created once and edited in place; the next agent g
     await handover.update(issue, { id: "agent-2", title: "TUC-1: Fix (resumed)", cwd: "/wt/tuc-1" }, { summary: "Continued" });
     assert.equal(calls.at(-1), "create 🛠 **Paseo progress** — TUC-1: Fix (resumed)");
     assert.equal((await handover.read("i1"))?.resumedFrom, "agent-1");
+    // The ticket's agent link: one attachment, its subtitle following the phase and model, moved to the next agent.
+    assert.deepEqual(links, [
+      "https://app.paseo.sh/h/srv/agent/agent-1 | Paseo agent · TUC-1: Fix | Working",
+      "remove https://app.paseo.sh/h/* except https://app.paseo.sh/h/srv/agent/agent-1",
+      "https://app.paseo.sh/h/srv/agent/agent-1 | Paseo agent · TUC-1: Fix | Working · omp/opus · thinking medium",
+      "https://app.paseo.sh/h/srv/agent/agent-1 | Paseo agent · TUC-1: Fix | Stopped with an error · omp/opus · thinking medium",
+      "https://app.paseo.sh/h/srv/agent/agent-2 | Paseo agent · TUC-1: Fix (resumed) | Working",
+      "remove https://app.paseo.sh/h/* except https://app.paseo.sh/h/srv/agent/agent-2",
+    ]);
+    assert.match(progressBody((await handover.read("i1"))!), /\*\*Links:\*\* \[Open in Paseo\]\(https:\/\/app\.paseo\.sh\/h\/srv\/agent\/agent-2\)/);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 

@@ -45,6 +45,8 @@ export type SessionLink = {
   questions?: { requestId: string; index: number; answers: Record<string, string> } | null;
   // Replaced by a newer thread on the same ticket (every @mention opens one); told so and completed.
   closed?: boolean;
+  // The agent the thread's "Open in Paseo" link points at.
+  paseoLinked?: string;
 };
 
 // Every @mention or assignment opens a new Linear thread, so a ticket collects threads while one
@@ -295,6 +297,7 @@ export class SessionRouter {
     const existing = await this.activeAgentFor(issueId);
     if (existing) {
       await this.deps.store.put({ ...link, agentId: existing.id });
+      await this.linkToPaseo(session.id, existing.id);
       const comment = (session.comment ?? {}) as { body?: string };
       const text = typeof comment.body === "string" && !/^This thread is for an agent session/.test(comment.body) ? comment.body.replace(/@paseo\b/gi, "").trim() : "";
       if (text) await this.paseo!.agents.ref(existing.id).send(text);
@@ -321,7 +324,8 @@ export class SessionRouter {
     // Threads Linear already shows as complete are only marked, not told again.
     const open = new Set((await this.deps.api.openSessions()).filter((session) => session.status !== "complete").map((session) => session.id));
     for (const { link, current } of superseded) {
-      await this.deps.store.patch(link.sessionId, { closed: true, review: null, offer: null, questions: null, queued: false });
+      await this.clearReview(link.sessionId);
+      await this.deps.store.patch(link.sessionId, { closed: true, offer: null, questions: null, queued: false });
       if (!open.has(link.sessionId)) continue;
       const title = current.agentId ? (await this.paseo?.agents.ref(current.agentId).refresh().catch(() => null))?.agent.title : null;
       await this.say(link.sessionId, "response", `Continued in the newest Paseo thread on this ticket${title ? ` (agent “${title}”)` : ""}. Follow and reply there; this thread is closed.`).catch(() => {});
@@ -382,14 +386,14 @@ export class SessionRouter {
       // Marked first: the planner is archived during the split, which must not offer a resume.
       await this.deps.store.patch(sessionId, { offer: "split" });
       const summary = await this.deps.splitPlan(link, link.review.localUrl, this.paseo!);
-      await this.deps.store.patch(sessionId, { review: null });
+      await this.clearReview(sessionId);
       await this.say(sessionId, "response", summary);
       return;
     }
     if (link.review && body.toLowerCase() === APPROVE_LATER && this.deps.approveLater) {
       await this.deps.store.patch(sessionId, { offer: "later" });
       const summary = await this.deps.approveLater(link, link.review.localUrl, this.paseo!);
-      await this.deps.store.patch(sessionId, { review: null });
+      await this.clearReview(sessionId);
       await this.say(sessionId, "response", summary);
       return;
     }
@@ -398,13 +402,13 @@ export class SessionRouter {
       const feedback = body.toLowerCase() === SEND_BACK ? "Sent back from Linear." : body;
       try {
         await this.deps.decideReview(link.review.localUrl, approve, approve ? "" : feedback, link.agentId);
-        await this.deps.store.patch(sessionId, { review: null });
+        await this.clearReview(sessionId);
         await this.say(sessionId, "thought", approve ? "Plan approved — the agent continues." : "Plan sent back with your feedback.");
         return;
       } catch (error) {
         if (!(error instanceof ReviewClosedError)) throw error;
         // The review died with its agent process (restart, cancelled turn). The reply still reaches the agent.
-        await this.deps.store.patch(sessionId, { review: null });
+        await this.clearReview(sessionId);
         await this.say(sessionId, "thought", "That plan review had already closed, so your reply goes to the agent, which submits the plan again.");
         body = `Your Plannotator plan review closed before the owner decided (for example after a restart). The owner replied in Linear:\n\n${approve ? "Approved." : feedback}\n\nRevise the plan if needed and submit it for review again.`;
       }
@@ -450,6 +454,8 @@ export class SessionRouter {
     try {
       await this.closeSuperseded();
       await this.settleReviews();
+      // Threads opened before the link existed (or linked to a newer agent) get "Open in Paseo".
+      for (const link of await this.deps.store.all()) if (link.agentId && !link.closed && link.paseoLinked !== link.agentId) await this.linkToPaseo(link.sessionId, link.agentId);
       const owner = await this.owner();
       for (const session of await this.deps.api.openSessions()) {
         // Linear marks a session "stale" after about half an hour without activity, which a ticket
@@ -571,8 +577,19 @@ export class SessionRouter {
     await this.deps.api.updateSession(sessionId, { addedExternalUrls: [{ label, url }] });
   }
 
-  async expectReview(sessionId: string, localUrl: string | null, plan = ""): Promise<void> {
-    await this.deps.store.patch(sessionId, { review: localUrl ? { localUrl, openedAt: new Date().toISOString(), ...(plan.trim() ? { planHash: planHash(plan) } : {}) } : null });
+  // The review a plain reply decides; its tailnet link is shown in the panel while it is open.
+  async expectReview(sessionId: string, localUrl: string | null, plan = "", remoteUrl: string | null = null): Promise<void> {
+    if (!localUrl) { await this.clearReview(sessionId); return; }
+    await this.clearReview(sessionId);
+    await this.deps.store.patch(sessionId, { review: { localUrl, openedAt: new Date().toISOString(), ...(remoteUrl ? { remoteUrl } : {}), ...(plan.trim() ? { planHash: planHash(plan) } : {}) } });
+    if (remoteUrl) await this.link(sessionId, "Plan review", remoteUrl);
+  }
+
+  async clearReview(sessionId: string): Promise<void> {
+    const review = (await this.deps.store.get(sessionId))?.review;
+    if (!review) return;
+    await this.deps.store.patch(sessionId, { review: null });
+    if (review.remoteUrl) await this.deps.api.updateSession(sessionId, { removedExternalUrls: [review.remoteUrl] }).catch(() => {});
   }
 
   // A review whose server is gone was decided on Plannotator's page (or closed without a
@@ -584,7 +601,7 @@ export class SessionRouter {
       if (!link.review || link.closed || !link.agentId) continue;
       const outcome = await reviewOutcome(link.review).catch(() => "open" as const);
       if (outcome === "open") continue;
-      await this.deps.store.patch(link.sessionId, { review: null });
+      await this.clearReview(link.sessionId);
       if (outcome) await recordOutcome(link.agentId, outcome);
       else await this.say(link.sessionId, "thought", "The plan review closed without a decision (for example after a restart). Reply here if the agent should submit the plan again.").catch(() => {});
     }
@@ -612,7 +629,9 @@ export class SessionRouter {
 
   async linkToPaseo(sessionId: string, agentId: string): Promise<void> {
     const serverId = await daemonServerId();
-    if (serverId) await this.link(sessionId, "Open in Paseo", paseoAgentUrl(serverId, agentId)).catch(() => {});
+    if (!serverId) return;
+    await this.link(sessionId, "Open in Paseo", paseoAgentUrl(serverId, agentId)).catch(() => {});
+    await this.deps.store.patch(sessionId, { paseoLinked: agentId });
   }
 
   // A label or sidebar launch gets a session too, so the ticket shows the same agent panel.

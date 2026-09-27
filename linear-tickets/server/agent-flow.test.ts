@@ -156,6 +156,23 @@ test("a review decided or closed outside Linear is settled by the sweep", async 
   await h.cleanup();
 });
 
+test("the panel's Plan review link lives exactly as long as the review", async () => {
+  const updates: unknown[] = [];
+  const h = routerHarness([], { api: { activity: async () => {}, openSessions: async () => [], activities: async () => [], updateSession: async (_s: string, input: unknown) => { updates.push(input); } } as never });
+  await h.store.put(link);
+  await h.router.expectReview("s1", "http://localhost:5000", "# Plan", "https://mac.ts.net:5000");
+  await h.router.expectReview("s1", "http://localhost:6000", "# Plan v2", "https://mac.ts.net:6000");
+  await h.router.expectReview("s1", null);
+  assert.deepEqual(updates, [
+    { addedExternalUrls: [{ label: "Plan review", url: "https://mac.ts.net:5000" }] },
+    { removedExternalUrls: ["https://mac.ts.net:5000"] },
+    { addedExternalUrls: [{ label: "Plan review", url: "https://mac.ts.net:6000" }] },
+    { removedExternalUrls: ["https://mac.ts.net:6000"] },
+  ]);
+  assert.equal((await h.store.get("s1"))?.review, null);
+  await h.cleanup();
+});
+
 test("the live feed shows completed commands and edits only", () => {
   assert.equal(describeTool({ type: "tool_call", status: "completed", detail: { type: "shell", command: "npm test" } }), "Ran npm test");
   assert.equal(describeTool({ type: "tool_call", status: "completed", detail: { type: "edit", filePath: "src/a.ts" } }), "Edited src/a.ts");

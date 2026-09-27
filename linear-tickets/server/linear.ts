@@ -258,6 +258,17 @@ export const CREATE_COMMENT_QUERY = `mutation comment($input: CommentCreateInput
 export const UPDATE_COMMENT_QUERY = `mutation commentUpdate($id: String!, $input: CommentUpdateInput!) {
   commentUpdate(id: $id, input: $input) { success }
 }`;
+// One attachment per ticket links to the Paseo agent working on it; Linear updates an
+// attachment in place when the issue and URL match.
+export const UPSERT_ATTACHMENT_QUERY = `mutation upsertAttachment($input: AttachmentCreateInput!) {
+  attachmentCreate(input: $input) { success }
+}`;
+export const ISSUE_ATTACHMENTS_QUERY = `query issueAttachments($id: String!) {
+  issue(id: $id) { attachments(first: 100) { nodes { id url } } }
+}`;
+export const DELETE_ATTACHMENT_QUERY = `mutation deleteAttachment($id: String!) {
+  attachmentDelete(id: $id) { success }
+}`;
 export const LINK_URL_QUERY = `mutation link($issueId: String!, $url: String!, $title: String) {
   attachmentLinkURL(issueId: $issueId, url: $url, title: $title) { success }
 }`;
@@ -588,6 +599,20 @@ export class LinearService {
 
   async updateComment(commentId: string, body: string): Promise<void> {
     succeeded(record(await this.withKey((key) => this.post(key, UPDATE_COMMENT_QUERY, { id: commentId, input: { body } }))), "commentUpdate", "update the comment");
+  }
+
+  async upsertAttachment(issueId: string, url: string, title: string, subtitle: string, iconUrl?: string): Promise<void> {
+    const input = { issueId, url, title, subtitle, ...(iconUrl ? { iconUrl } : {}) };
+    succeeded(record(await this.withKey((key) => this.post(key, UPSERT_ATTACHMENT_QUERY, { input }))), "attachmentCreate", "update the Paseo agent link");
+  }
+
+  // Removes attachments whose URL starts with `prefix`, except `keep` (a previous agent's link).
+  async removeAttachments(issueId: string, prefix: string, keep: string): Promise<void> {
+    const issue = record(record(await this.withKey((key) => this.post(key, ISSUE_ATTACHMENTS_QUERY, { id: issueId }))).issue ?? {});
+    for (const node of connection(issue.attachments ?? { nodes: [] }).nodes.map((item) => record(item))) {
+      const url = label(node.url);
+      if (url.startsWith(prefix) && url !== keep) succeeded(record(await this.withKey((key) => this.post(key, DELETE_ATTACHMENT_QUERY, { id: label(node.id) }))), "attachmentDelete", "remove the old Paseo agent link");
+    }
   }
 
   async linkUrl(issueId: string, url: string, title: string): Promise<void> {

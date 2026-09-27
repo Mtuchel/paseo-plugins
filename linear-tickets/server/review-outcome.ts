@@ -3,7 +3,8 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export type PendingReview = { localUrl: string; openedAt?: string; planHash?: string };
+// `remoteUrl`: the tailnet link shown in the Linear panel, removed again when the review ends.
+export type PendingReview = { localUrl: string; remoteUrl?: string; openedAt?: string; planHash?: string };
 export type ReviewOutcome = "open" | { approved: boolean; feedback?: string; planContent: string } | null;
 
 export function planHash(plan: string): string {

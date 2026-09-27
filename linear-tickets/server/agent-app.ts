@@ -131,7 +131,7 @@ export class AgentApi {
     if (result.success !== true) throw new Error("Linear did not accept the agent activity.");
   }
 
-  async updateSession(sessionId: string, input: { plan?: SessionPlanStep[]; addedExternalUrls?: ExternalUrl[]; externalUrls?: ExternalUrl[] }): Promise<void> {
+  async updateSession(sessionId: string, input: { plan?: SessionPlanStep[]; addedExternalUrls?: ExternalUrl[]; externalUrls?: ExternalUrl[]; removedExternalUrls?: string[] }): Promise<void> {
     const result = record(record(await this.call(SESSION_UPDATE_MUTATION, { id: sessionId, input })).agentSessionUpdate ?? {});
     if (result.success !== true) throw new Error("Linear did not accept the agent session update.");
   }

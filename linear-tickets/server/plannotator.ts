@@ -124,7 +124,7 @@ export class PlannotatorBridge {
     private readonly linear: Linear,
     private readonly settings: Pick<Settings, "read">,
     private readonly events = plannotatorPaths().events,
-    private readonly sessions?: Pick<SessionRouter, "sessionFor" | "link" | "plan" | "ask" | "say" | "expectReview">,
+    private readonly sessions?: Pick<SessionRouter, "sessionFor" | "plan" | "ask" | "say" | "expectReview">,
     private readonly fetchPlan: (localUrl: string) => Promise<string> = readReviewPlan,
     private readonly handover?: Pick<Handover, "update">,
     private readonly setMode: (agentId: string, modeId: string) => Promise<void> = setAgentMode,
@@ -140,11 +140,10 @@ export class PlannotatorBridge {
       const link = await sessions.sessionFor(agentId);
       if (!link) return false;
       if (event.type === "opened") {
-        if (event.remoteUrl) await sessions.link(link.sessionId, "Plan review", event.remoteUrl);
         const planText = await this.fetchPlan(event.localUrl).catch(() => "");
         const steps = planSteps(planText);
         if (steps.length) await sessions.plan(link.sessionId, steps.map((content) => ({ content, status: "pending" as const })));
-        await sessions.expectReview(link.sessionId, event.localUrl, planText);
+        await sessions.expectReview(link.sessionId, event.localUrl, planText, event.remoteUrl);
         const split = steps.length > 1 ? [{ label: `Approve & split into ${Math.min(steps.length, MAX_SPLIT)} sub-issues`, value: SPLIT_PLAN }] : [];
         await sessions.ask(link.sessionId, `The plan is ready for review${event.remoteUrl ? ` (full view: ${event.remoteUrl})` : ""}. Approve it, or reply with what to change.${model ? `\n\nPlanned with ${model}.` : ""}`, [{ label: "Approve plan", value: APPROVE_PLAN }, { label: "Approve, implement later", value: APPROVE_LATER }, ...split, { label: "Send back", value: SEND_BACK }]);
         return true;

@@ -20,7 +20,7 @@ import { ownConnection } from "./server/connection";
 import { HealthMonitor } from "./server/health";
 import { PullRequestWatch } from "./server/pr-watch";
 import { Handover } from "./server/handover";
-import { decidePlannotatorReview, SessionRouter, SessionStore, stopAgentTurn } from "./server/sessions";
+import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, SessionRouter, SessionStore, stopAgentTurn } from "./server/sessions";
 import { approveForLater, splitIntoSubIssues } from "./server/split";
 import { TicketStarter } from "./server/starter";
 
@@ -34,7 +34,7 @@ export default function contribute(server: PluginServerContext) {
   // handover record every agent keeps on its ticket. Without the app installed, only the
   // handover comments and the comment-based paths run.
   const auth = new AppAuth();
-  const handover = new Handover(linear);
+  const handover = new Handover(linear, undefined, undefined, undefined, async (agentId) => { const serverId = await daemonServerId(); return serverId ? paseoAgentUrl(serverId, agentId) : null; });
   const starter = new TicketStarter({ linear, launcher, handover });
   const agentApi = new AgentApi(auth);
   // The plugin itself closes the review (split, implement later): the extension's report of that
