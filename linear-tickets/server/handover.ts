@@ -131,7 +131,8 @@ export class Handover {
         issueId: issue.id,
         identifier: issue.identifier,
         agentId: agent.id,
-        agentTitle: agent.title ?? "Paseo agent",
+        // Hook events can carry no title; the one seen earlier for this agent stays.
+        agentTitle: agent.title ?? (sameAgent ? previous.agentTitle : null) ?? `Paseo agent on ${issue.identifier}`,
         branch: git.branch ?? (sameAgent ? previous.branch : null),
         worktreePath: agent.cwd,
         lastCommit: git.lastCommit ?? (sameAgent ? previous.lastCommit : null),
@@ -156,7 +157,7 @@ export class Handover {
       // The ticket's link to the agent (next to its pull requests), kept current and moved to a
       // new agent when one takes over. Best-effort: the comment above is the record.
       if (paseoUrl) {
-        await this.linear.upsertAttachment(issue.id, paseoUrl, `Paseo agent · ${record.agentTitle}`, [PHASE[record.status], record.model].filter(Boolean).join(" · ")).catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: Paseo agent link failed: ${error instanceof Error ? error.message : error}`));
+        await this.linear.upsertAttachment(issue.id, paseoUrl, record.agentTitle.startsWith("Paseo agent") ? record.agentTitle : `Paseo agent · ${record.agentTitle}`, [PHASE[record.status], record.model].filter(Boolean).join(" · ")).catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: Paseo agent link failed: ${error instanceof Error ? error.message : error}`));
         if (!sameAgent) await this.linear.removeAttachments(issue.id, PASEO_WEB, paseoUrl).catch(() => {});
       }
       await this.save(record);

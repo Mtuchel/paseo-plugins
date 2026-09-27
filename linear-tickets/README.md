@@ -294,6 +294,12 @@ plan is saved as the plan document, the planning agent is closed (no Resume offe
 ticket goes back to Todo with `plan-ready`. Reply in the panel, assign Paseo again or add the
 trigger label to start the implementing agent.
 
+**Link to the agent.** Each ticket gets an attachment "Paseo agent · <agent title>" next to its
+pull requests, linking to the agent in the Paseo web app (app.paseo.sh opens it on devices paired
+with this host). Its subtitle shows the phase and model; a new agent on the ticket replaces it.
+Every Linear thread linked to an agent has "Open in Paseo" under Links, and the Plan review link
+is there only while the review is open.
+
 **Which model is working.** The progress comment, the final report, the plan review question and
 the plan document ("Planned with") show the model the agent runs, with its thinking level. When
 it changes between turns (you picked another model in Paseo, or Plannotator restored the model it

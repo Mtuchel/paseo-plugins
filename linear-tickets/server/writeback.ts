@@ -1,7 +1,7 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { dispatchLabels } from "./dispatch";
-import { agentModel } from "./model";
+import { activeModel } from "./model";
 import { questionsOf } from "./relay";
 import type { Handover } from "./handover";
 import type { LinearService } from "./linear";
@@ -87,6 +87,12 @@ export class Writeback {
 
   constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly agentBridge?: AgentBridge, private readonly settleMs = 2_000) {}
 
+  // The running model, and the agent with its title: hook events can carry none.
+  private async snapshot(agent: PluginHookAgent, paseo: PaseoApi): Promise<{ model: string | null; named: PluginHookAgent }> {
+    const current = (await paseo.agents.ref(agent.id).refresh().catch(() => null))?.agent;
+    return { model: activeModel(current), named: { ...agent, title: agent.title ?? current?.title ?? null } };
+  }
+
   // Session activities are best-effort on their own: a panel failure must not skip comments.
   private async session(agentId: string, work: (sessionId: string, sessions: AgentBridge["sessions"]) => Promise<void>): Promise<void> {
     const sessions = this.agentBridge?.sessions;
@@ -133,7 +139,7 @@ export class Writeback {
     return this.run("turn_started", agent, paseo, async ({ issueId, identifier, planFirst }, settings) => {
       const sessions = this.agentBridge?.sessions;
       if (sessions && await sessions.holdIfStopped(agent.id).catch(() => false)) return;
-      const model = await agentModel(paseo, agent.id);
+      const { model, named } = await this.snapshot(agent, paseo);
       const previous = this.models.get(agent.id);
       if (model) this.models.set(agent.id, model);
       const changed = Boolean(model && previous && model !== previous);
@@ -144,7 +150,7 @@ export class Writeback {
       });
       const handover = this.agentBridge?.handover;
       if (model && (changed || !previous) && handover && settings.writeback.summaries) {
-        await handover.update({ id: issueId, identifier }, agent, { model }).catch(() => {});
+        await handover.update({ id: issueId, identifier }, named, { model }).catch(() => {});
       }
       if (!settings.writeback.status || this.started.has(agent.id)) return;
       this.started.add(agent.id);
@@ -164,7 +170,7 @@ export class Writeback {
       const title = agent.title ?? "Paseo agent";
       const handover = this.agentBridge?.handover;
       const issue = { id: issueId, identifier };
-      const model = await agentModel(paseo, agent.id);
+      const { model, named } = await this.snapshot(agent, paseo);
       if (model) this.models.set(agent.id, model);
       if (outcome.kind === "completed") {
         const reply = turnReply(timeline);
@@ -175,7 +181,7 @@ export class Writeback {
         });
         // With the handover record, turns update one progress comment instead of adding comments.
         if (writeback.summaries && reply) {
-          if (handover) await handover.update(issue, agent, { status: "working", summary: reply, model });
+          if (handover) await handover.update(issue, named, { status: "working", summary: reply, model });
           else await this.linear.comment(issueId, `**${title}** (Paseo) finished a turn:\n\n${truncateSummary(reply)}`);
         }
         if (writeback.blocked) await this.linear.removeLabel(issueId, blocked);
@@ -184,7 +190,7 @@ export class Writeback {
           await sessions.unfollow(agent.id);
           await sessions.say(sessionId, "error", `The agent stopped with an error: ${outcome.error.message}`);
         });
-        if (handover) await handover.finish(issue, agent, "failed", outcome.error.message.slice(0, 500), model);
+        if (handover) await handover.finish(issue, named, "failed", outcome.error.message.slice(0, 500), model);
         else if (writeback.summaries || writeback.blocked) await this.linear.comment(issueId, `**${title}** (Paseo) stopped with an error: ${outcome.error.message}`);
         if (writeback.blocked) await this.linear.addLabel(issueId, blocked);
         await this.session(agent.id, async (sessionId, sessions) => {
@@ -198,7 +204,7 @@ export class Writeback {
       for (const url of urls) {
         await this.linear.linkUrl(issueId, url, "Pull request");
         await this.session(agent.id, (sessionId, sessions) => sessions.link(sessionId, "Pull request", url));
-        if (handover) await handover.update(issue, agent, { link: ["Pull request", url] });
+        if (handover) await handover.update(issue, named, { link: ["Pull request", url] });
       }
       const moved = await this.linear.moveToReview(issueId);
       if (moved.note) console.error(`[linear-tickets] ${issueId}: ${moved.note}`);
