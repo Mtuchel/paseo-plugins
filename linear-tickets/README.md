@@ -278,8 +278,21 @@ sessions and replies whose webhook was missed. **Settings → Linear agent** sho
 
 **Plan-first for tickets you did not write.** Tickets created by someone else, or labelled
 `feedback`, start in the provider's plan-first mode (`write` for omp, `plan` for Claude).
-The prompt marks the ticket as untrusted input and asks only for a plan. Approving the plan
-switches the agent to your usual mode.
+The prompt marks the ticket as untrusted input and asks only for a plan. With status write-back
+on, the ticket starts in **Planning** instead of In Progress. Approving the plan switches the
+agent to your usual mode.
+
+**`plan-ready`.** Every approved plan adds the `plan-ready` label: always for a split or
+“Approve, implement later”, and with status write-back on for Plannotator and panel approvals,
+where a new review round or a plan sent back removes it again.
+A ticket that carries it starts its next agent in your usual mode, with the approved
+“Plan: <ticket>” document in the prompt and the instruction to implement it rather than plan
+again.
+
+**Approve, implement later.** The plan review also offers **Approve, implement later**. The
+plan is saved as the plan document, the planning agent is closed (no Resume offer), and the
+ticket goes back to Todo with `plan-ready`. Reply in the panel, assign Paseo again or add the
+trigger label to start the implementing agent.
 
 **Which model is working.** The progress comment, the final report, the plan review question and
 the plan document ("Planned with") show the model the agent runs, with its thinking level. When
@@ -304,13 +317,15 @@ tickets start most urgent first.
 **Split into sub-issues.** A plan with 2–12 steps also offers **Approve & split into N
 sub-issues**. The plan becomes the parent's plan document and the planning agent is closed.
 Each step becomes a sub-issue in Todo, assigned to Paseo, blocked by the step before, and the
-parent moves to In Progress. The steps run one after another: each starts when the previous
+parent moves to In Progress with `plan-ready`. The steps run one after another: each starts when the previous
 ticket is done, which for code usually means its pull request was merged.
 
 **Pull request reviews.** Every 2 minutes the plugin reads each ticket's pull request with
 `gh`. Requested changes post a panel update and move the ticket back to In Progress; fixes
-pushed after them move it to In Review again. Approval and merge are noted. The review loop
-itself stays in Paseo; this only shows it on the ticket.
+pushed after them move it to In Review again. An approval moves it to the team's started state
+**Ready to merge** (teams without one stay in In Review); commits pushed after the approval move
+it back to In Review. The merge is noted, and Done comes from Linear's GitHub integration. The
+review loop itself stays in Paseo; this only shows it on the ticket.
 
 **Health.** Every 5 minutes the plugin checks the Linear key, the Paseo app, Tailscale Funnel
 and the local receiver. A problem confirmed twice opens one urgent ticket, "⚠️ Paseo needs

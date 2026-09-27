@@ -20,6 +20,7 @@ const HANDLED_LIMIT = 200;
 const SWEEP_MS = 60_000;
 const ADOPT_WINDOW_MS = 2 * 60 * 60 * 1000;
 export const APPROVE_PLAN = "approve-plan";
+export const APPROVE_LATER = "approve-later";
 export const SEND_BACK = "send-back";
 export const SPLIT_PLAN = "split-plan";
 export const MAX_SPLIT = 12;
@@ -35,7 +36,8 @@ export type SessionLink = {
   handled: string[];
   // What a plain reply in the panel means right now, besides a pending permission.
   review: { localUrl: string } | null;
-  offer: "resume" | "split" | null;
+  // "split" / "later": the plugin retired the planner on purpose, so no Resume is offered.
+  offer: "resume" | "split" | "later" | null;
   // Waiting for blockers or a free agent slot; the sweep starts it when admitted.
   queued?: boolean;
   // A question with several parts, asked one part at a time.
@@ -188,6 +190,7 @@ type Deps = {
   stop?: (agentId: string) => Promise<void>;
   decideReview?: (localUrl: string, approve: boolean, feedback: string, agentId: string) => Promise<void>;
   splitPlan?: (link: SessionLink, localUrl: string, paseo: PaseoApi) => Promise<string>;
+  approveLater?: (link: SessionLink, localUrl: string, paseo: PaseoApi) => Promise<string>;
 };
 
 // Linear agent sessions ↔ Paseo agents. Inbound: `created` starts or links an agent, and
@@ -323,6 +326,8 @@ export class SessionRouter {
       await this.deps.store.patch(sessionId, { offer: null });
       if (body.toLowerCase() === LEAVE) { await this.say(sessionId, "response", "Left as it is. Assign Paseo again whenever you want it continued."); return; }
     }
+    // "Approve, implement later": any reply in this session starts the implementing agent.
+    if (link.offer === "later") { await this.startFor(link, false); return; }
     if (!link.agentId) { await this.say(sessionId, "error", "The agent for this session has not started yet."); return; }
     const handle = this.paseo!.agents.ref(link.agentId);
     if (signal === "stop") {
@@ -335,6 +340,13 @@ export class SessionRouter {
       // Marked first: the planner is archived during the split, which must not offer a resume.
       await this.deps.store.patch(sessionId, { offer: "split" });
       const summary = await this.deps.splitPlan(link, link.review.localUrl, this.paseo!);
+      await this.deps.store.patch(sessionId, { review: null });
+      await this.say(sessionId, "response", summary);
+      return;
+    }
+    if (link.review && body.toLowerCase() === APPROVE_LATER && this.deps.approveLater) {
+      await this.deps.store.patch(sessionId, { offer: "later" });
+      const summary = await this.deps.approveLater(link, link.review.localUrl, this.paseo!);
       await this.deps.store.patch(sessionId, { review: null });
       await this.say(sessionId, "response", summary);
       return;
@@ -533,7 +545,8 @@ export class SessionRouter {
   }
 
   async offerResume(sessionId: string): Promise<void> {
-    if ((await this.deps.store.get(sessionId))?.offer === "split") return;
+    const offer = (await this.deps.store.get(sessionId))?.offer;
+    if (offer === "split" || offer === "later") return;
     await this.deps.store.patch(sessionId, { offer: "resume" });
     await this.ask(sessionId, "The agent stopped. Continue with a new agent on the same branch?", [{ label: "Resume with a new agent", value: RESUME }, { label: "Leave it", value: LEAVE }]);
   }

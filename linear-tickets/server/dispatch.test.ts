@@ -48,6 +48,10 @@ class FakeLinear {
 
   async viewerId() { return "owner"; }
 
+  async issueDocument() { return null; }
+
+  async moveToStateNamed() { return { changed: false }; }
+
   async issueState(id: string) {
     return { id, identifier: id.toUpperCase(), status: "Todo", statusType: "unstarted", teamId: "t1", projectId: null, creatorId: "owner", labels: [], attachmentUrls: [], blockedBy: this.blocked[id] ?? [] };
   }

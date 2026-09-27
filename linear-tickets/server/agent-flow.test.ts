@@ -9,7 +9,7 @@ import { HealthMonitor } from "./health";
 import { reviewChange } from "./pr-watch";
 import { decidePlannotatorReview, describeTool, questionPrompt, SessionRouter, SessionStore } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
-import { splitIntoSubIssues } from "./split";
+import { approveForLater, splitIntoSubIssues } from "./split";
 import { isUntrusted, TicketStarter, UNTRUSTED_NOTE } from "./starter";
 
 const OWNER = "owner-1";
@@ -125,21 +125,24 @@ test("the live feed shows completed commands and edits only", () => {
 });
 
 function starterHarness(state: { creatorId: string; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number) {
-  const launches: { modeId?: string; instructions: string; labels?: Record<string, string> }[] = [];
+  const launches: { modeId?: string; instructions: string; labels?: Record<string, string>; markInProgress?: boolean }[] = [];
+  const moves: string[] = [];
   const starter = new TicketStarter({
     linear: {
       detail: async () => ({ issue: { identifier: "TUC-1", project: "", team: "Team" }, projectId: null, teamId: "t1" }) as never,
       issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusType: "unstarted", teamId: "t1", projectId: null, attachmentUrls: [], ...state }),
       viewerId: async () => OWNER,
+      issueDocument: async (_id: string, title: string) => title === "Plan: TUC-1" ? { url: "https://linear.app/doc/plan", content: "# Plan\n1. Add the table" } : null,
+      moveToStateNamed: async (_id: string, name: string) => { moves.push(name); return { changed: true }; },
     },
-    launcher: { start: async (input, _paseo, options) => { launches.push({ modeId: input.modeId, instructions: input.instructions, labels: options?.labels }); return { agentId: "new", warnings: [] }; } },
+    launcher: { start: async (input, _paseo, options) => { launches.push({ modeId: input.modeId, instructions: input.instructions, labels: options?.labels, markInProgress: options?.markInProgress }); return { agentId: "new", warnings: [] }; } },
     branches: async () => ({ branches: [{ id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }),
   });
   const paseo = {
     agents: { list: async () => ({ entries: Array.from({ length: running }, (_, index) => ({ agent: { id: `r${index}`, status: "running", labels: { "linear.issueId": `x${index}` } } })), pageInfo: { hasMore: false } }) },
     projects: { list: async () => ({ projects: [{ projectId: "p1", projectKind: "git", projectRootPath: "/repo", projectDisplayName: "repo" }] }) },
   } as unknown as PaseoApi;
-  return { starter, paseo, launches };
+  return { starter, paseo, launches, moves };
 }
 
 test("admission waits for unfinished blockers and for a free agent slot", async () => {
@@ -159,10 +162,53 @@ test("tickets written by someone else, or from the feedback intake, start plan-f
   const h = starterHarness({ creatorId: "customer", labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, settings, { retryHint: "retry" });
   assert.equal(started.untrusted, true);
-  assert.deepEqual(h.launches[0], { modeId: "write", instructions: UNTRUSTED_NOTE, labels: { "linear.untrusted": "1" } });
+  assert.deepEqual(h.launches[0], { modeId: "write", instructions: UNTRUSTED_NOTE, labels: { "linear.untrusted": "1" }, markInProgress: false });
   const mine = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
   await mine.starter.start("i1", mine.paseo, settings, { retryHint: "retry" });
   assert.equal(mine.launches[0].modeId, "full");
+});
+
+test("a plan-first ticket starts in Planning; once its plan is approved (plan-ready) the next agent implements it in the usual mode", async () => {
+  const syncing = { ...settings, markInProgress: true, writeback: { ...DEFAULT_WRITEBACK, status: true } };
+  const first = starterHarness({ creatorId: "customer", labels: [{ id: "f", name: "feedback" }], blockedBy: [] }, 0);
+  await first.starter.start("i1", first.paseo, syncing, { retryHint: "retry" });
+  assert.equal(first.launches[0].markInProgress, false);
+  assert.deepEqual(first.moves, ["Planning"]);
+  const later = starterHarness({ creatorId: "customer", labels: [{ id: "f", name: "feedback" }, { id: "r", name: "plan-ready" }], blockedBy: [] }, 0);
+  const started = await later.starter.start("i1", later.paseo, syncing, { retryHint: "retry" });
+  assert.equal(started.untrusted, false);
+  assert.equal(later.launches[0].modeId, "full");
+  assert.equal(later.launches[0].markInProgress, true);
+  assert.deepEqual(later.launches[0].labels, {});
+  assert.deepEqual(later.moves, []);
+  assert.match(later.launches[0].instructions, /untrusted input/);
+  assert.doesNotMatch(later.launches[0].instructions, /write a plan only/);
+  assert.match(later.launches[0].instructions, /already approved a plan.*https:\/\/linear\.app\/doc\/plan/);
+  assert.match(later.launches[0].instructions, /1\. Add the table/);
+});
+
+test("approve, implement later: plan recorded, planner retired, ticket back in Todo with plan-ready", async () => {
+  const calls: string[] = [];
+  const summary = await approveForLater({
+    linear: {
+      upsertIssueDocument: async (_id: string, title: string) => { calls.push(`document ${title}`); return "https://linear.app/doc/plan"; },
+      moveToReady: async (id: string) => { calls.push(`todo ${id}`); return { changed: true }; },
+      addLabel: async (id: string, name: string) => { calls.push(`+${name} ${id}`); },
+    },
+    readPlan: async () => "# Plan\n1. Step",
+    retirePlanner: async (_url: string, agentId: string, _paseo: PaseoApi, reason: string) => { calls.push(`retire ${agentId}: ${reason.slice(0, 40)}`); },
+  }, { issueId: "i1", identifier: "TUC-1", agentId: "planner" }, "http://localhost:5000/", { agents: { ref: () => ({ refresh: async () => ({ agent: { model: "omp/opus" } }) }) } } as unknown as PaseoApi);
+  assert.deepEqual(calls, ["document Plan: TUC-1", "retire planner: The owner approved this plan for later i", "todo i1", "+plan-ready i1"]);
+  assert.match(summary, /back in Todo with `plan-ready`/);
+});
+
+test("the review mirror: approval means ready to merge, and commits after it send the ticket back to review", () => {
+  const approved = reviewChange({ state: "OPEN", reviews: [{ author: "ada", state: "APPROVED", submittedAt: "2026-01-01T12:00:00Z" }], lastCommitAt: "2026-01-01T11:00:00Z" }, { reviewedAt: null, decision: null, merged: false });
+  assert.equal(approved.change?.state, "Ready to merge");
+  assert.equal(reviewChange({ state: "OPEN", reviews: [], lastCommitAt: "2026-01-01T11:00:00Z" }, approved.seen).change, null, "nothing new");
+  const pushed = reviewChange({ state: "OPEN", reviews: [], lastCommitAt: "2026-01-01T13:00:00Z" }, approved.seen);
+  assert.equal(pushed.change?.state, "In Review");
+  assert.equal(reviewChange({ state: "OPEN", reviews: [], lastCommitAt: "2026-01-01T13:00:00Z" }, pushed.seen).change, null, "reported once");
 });
 
 test("pull request reviews become ticket updates: changes requested, fixes pushed, approved, merged", () => {
@@ -191,6 +237,7 @@ test("splitting creates one sub-issue per step, each blocked by the previous, al
       addBlocker: async (blocker: string, blocked: string) => { calls.push(`${blocker} blocks ${blocked}`); },
       delegate: async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); },
       moveToStateNamed: async (id: string, name: string) => { calls.push(`move ${id} to ${name}`); return { changed: true }; },
+      addLabel: async (id: string, name: string) => { calls.push(`+${name} ${id}`); },
     },
     appUserId: async () => "paseo-app",
     readPlan: async () => "# Plan\n## Steps\n1. Add the domain\n2. Add the migration\n3. Wire the API",
@@ -208,6 +255,7 @@ test("splitting creates one sub-issue per step, each blocked by the previous, al
     "s2 blocks s3",
     "delegate s1 to paseo-app", "delegate s2 to paseo-app", "delegate s3 to paseo-app",
     "move parent to In Progress",
+    "+plan-ready parent",
   ]);
   assert.match(summary, /Split into 3 sub-issues \(TUC-11, TUC-12, TUC-13\)/);
   await assert.rejects(splitIntoSubIssues({ ...deps, readPlan: async () => "just prose" }, { issueId: "parent", identifier: "TUC-1", agentId: "planner" }, "http://localhost:5000/", {} as PaseoApi), /fewer than two/);

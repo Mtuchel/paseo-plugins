@@ -276,7 +276,7 @@ export const REACTION_QUERY = `mutation react($commentId: String!, $emoji: Strin
 export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[] };
 
 export const ISSUE_DOCUMENTS_QUERY = `query issueDocuments($id: String!) {
-  issue(id: $id) { id documents(first: 50) { nodes { id title url } } }
+  issue(id: $id) { id documents(first: 50) { nodes { id title url content } } }
 }`;
 export const CREATE_DOCUMENT_QUERY = `mutation documentCreate($input: DocumentCreateInput!) {
   documentCreate(input: $input) { success document { id url } }
@@ -626,6 +626,13 @@ export class LinearService {
     succeeded(record(await this.withKey((key) => this.post(key, REACTION_QUERY, { commentId, emoji }))), "reactionCreate", "add the reaction");
   }
 
+  // The ticket's document with this title (for example "Plan: TUC-9"), or null.
+  async issueDocument(issueId: string, title: string): Promise<{ url: string; content: string } | null> {
+    const data = record(await this.withKey((key) => this.post(key, ISSUE_DOCUMENTS_QUERY, { id: issueId })));
+    const found = connection(record(data.issue ?? {}).documents ?? { nodes: [] }).nodes.map((node) => record(node)).find((node) => label(node.title) === title);
+    return found ? { url: label(found.url), content: typeof found.content === "string" ? found.content : "" } : null;
+  }
+
   // One document per title on the ticket: replaced when it exists, created otherwise.
   // Returns the document URL for linking from a comment.
   async upsertIssueDocument(issueId: string, title: string, content: string): Promise<string> {
@@ -650,6 +657,18 @@ export class LinearService {
     if (!state.teamId) return { changed: false, note: "The ticket has no team." };
     const target = (await this.teamStates(state.teamId)).find((item) => item.type.trim().toLowerCase() === "started" && item.name.trim().toLowerCase() === name.toLowerCase());
     if (!target) return { changed: false, note: `The ticket's team has no started state named "${name}".` };
+    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: target.id }))), "issueUpdate", `move the ticket to ${target.name}`);
+    return { changed: true };
+  }
+
+  // Moves the ticket back to its team's first unstarted state (Todo): planned, not being worked on.
+  async moveToReady(issueId: string): Promise<{ changed: boolean; note?: string }> {
+    const state = await this.issueState(issueId);
+    const type = state.statusType.trim().toLowerCase();
+    if (type === "completed" || type === "canceled" || type === "duplicate" || type === "unstarted") return { changed: false };
+    if (!state.teamId) return { changed: false, note: "The ticket has no team." };
+    const target = (await this.teamStates(state.teamId)).filter((item) => item.type === "unstarted").sort((a, b) => a.position - b.position)[0];
+    if (!target) return { changed: false, note: "The ticket's team has no unstarted state." };
     succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: target.id }))), "issueUpdate", `move the ticket to ${target.name}`);
     return { changed: true };
   }

@@ -14,6 +14,8 @@ import { paseoHome } from "./ticket-mcp";
 const exec = promisify(execFile);
 const INTERVAL_MS = 2 * 60 * 1000;
 const REVIEW_STATE = "In Review";
+// Approved and waiting for the merge click; teams without this state stay in In Review.
+const READY_STATE = "Ready to merge";
 
 export type PullRequestView = {
   state: string;
@@ -49,13 +51,16 @@ export function reviewChange(view: PullRequestView, seen: Seen): { change: Chang
   if (latest) {
     const next = { ...seen, reviewedAt: latest.submittedAt, decision: latest.state };
     if (latest.state === "CHANGES_REQUESTED") return { change: { thought: `@${latest.author} requested changes on the pull request — the agent is addressing them in Paseo.`, review: `changes requested by @${latest.author}`, state: CODING_STATE }, seen: next };
-    if (latest.state === "APPROVED") return { change: { thought: `@${latest.author} approved the pull request.`, review: `approved by @${latest.author}` }, seen: next };
+    if (latest.state === "APPROVED") return { change: { thought: `@${latest.author} approved the pull request — ready to merge.`, review: `approved by @${latest.author}`, state: READY_STATE }, seen: next };
     if (latest.state === "COMMENTED") return { change: { thought: `@${latest.author} commented on the pull request — the agent is looking at it in Paseo.`, review: `comments from @${latest.author}` }, seen: next };
     return { change: null, seen: next };
   }
-  // Fixes pushed after a change request send the ticket back to review.
+  // Commits pushed after requested changes, or after an approval, send the ticket back to review.
   if (seen.decision === "CHANGES_REQUESTED" && view.lastCommitAt && seen.reviewedAt && view.lastCommitAt > seen.reviewedAt) {
     return { change: { thought: "New commits were pushed after the requested changes — back in review.", review: "fixes pushed, awaiting review", state: REVIEW_STATE }, seen: { ...seen, decision: "FIXES_PUSHED" } };
+  }
+  if (seen.decision === "APPROVED" && view.lastCommitAt && seen.reviewedAt && view.lastCommitAt > seen.reviewedAt) {
+    return { change: { thought: "New commits were pushed after the approval — back in review.", review: "new commits after approval, awaiting review", state: REVIEW_STATE }, seen: { ...seen, decision: "PUSHED_AFTER_APPROVAL" } };
   }
   return { change: null, seen };
 }

@@ -20,7 +20,7 @@ import { HealthMonitor } from "./server/health";
 import { PullRequestWatch } from "./server/pr-watch";
 import { Handover } from "./server/handover";
 import { decidePlannotatorReview, SessionRouter, SessionStore, stopAgentTurn } from "./server/sessions";
-import { splitIntoSubIssues } from "./server/split";
+import { approveForLater, splitIntoSubIssues } from "./server/split";
 import { TicketStarter } from "./server/starter";
 
 export default function contribute(server: PluginServerContext) {
@@ -36,22 +36,22 @@ export default function contribute(server: PluginServerContext) {
   const handover = new Handover(linear);
   const starter = new TicketStarter({ linear, launcher, handover });
   const agentApi = new AgentApi(auth);
+  // The plugin itself closes the review (split, implement later): the extension's report of that
+  // closing is not the owner's decision, so the bridge skips it.
+  const retirePlanner = async (reviewUrl: string, agentId: string, api: PaseoApi, reason: string) => {
+    plannotator.settled(agentId);
+    await decidePlannotatorReview(reviewUrl, false, reason);
+    await stopAgentTurn(agentId).catch(() => {});
+    await api.agents.ref(agentId).archive().catch(() => {});
+  };
   const sessions = new SessionRouter({ api: agentApi, linear, starter, settings, store: new SessionStore(),
     decideReview: async (localUrl, approve, feedback, agentId) => {
       const planContent = await readReviewPlan(localUrl).catch(() => "");
       await decidePlannotatorReview(localUrl, approve, feedback);
       await recordDecision({ type: "decided", agentId, approved: approve, ...(feedback ? { feedback } : {}), planContent, at: new Date().toISOString() });
     },
-    splitPlan: (link, localUrl, paseo) => splitIntoSubIssues({
-      linear,
-      appUserId: async () => (await agentApi.viewer()).id,
-      readPlan: readReviewPlan,
-      retirePlanner: async (reviewUrl, agentId, api) => {
-        await decidePlannotatorReview(reviewUrl, false, "The owner split this plan into Linear sub-issues, each handled by its own agent. Stop now and do not implement anything.");
-        await stopAgentTurn(agentId).catch(() => {});
-        await api.agents.ref(agentId).archive().catch(() => {});
-      },
-    }, link, localUrl, paseo),
+    splitPlan: (link, localUrl, paseo) => splitIntoSubIssues({ linear, appUserId: async () => (await agentApi.viewer()).id, readPlan: readReviewPlan, retirePlanner }, link, localUrl, paseo),
+    approveLater: (link, localUrl, paseo) => approveForLater({ linear, readPlan: readReviewPlan, retirePlanner }, link, localUrl, paseo),
   });
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
   const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear), afterLaunch: openSession });

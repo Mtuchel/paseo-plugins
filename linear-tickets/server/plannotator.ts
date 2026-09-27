@@ -8,7 +8,7 @@ import { PLANNOTATOR_OPEN_SOURCE } from "./plannotator-open-source";
 import { paseoHome } from "./ticket-mcp";
 import type { Handover } from "./handover";
 import { activeModel } from "./model";
-import { APPROVE_PLAN, MAX_SPLIT, planSteps, SEND_BACK, setAgentMode, SPLIT_PLAN, type SessionRouter } from "./sessions";
+import { APPROVE_LATER, APPROVE_PLAN, MAX_SPLIT, planSteps, SEND_BACK, setAgentMode, SPLIT_PLAN, type SessionRouter } from "./sessions";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -28,11 +28,13 @@ export type PlannotatorRow = { title: string; url?: string; detail?: string };
 export type OpenedEvent = { type: "opened"; agentId: string | null; localUrl: string; remoteUrl: string | null; at: string };
 export type DecidedEvent = { type: "decided"; agentId: string | null; approved: boolean; feedback?: string; planUri?: string; planContent?: string; at: string };
 type PlannotatorEvent = OpenedEvent | DecidedEvent;
-type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "moveToStateNamed">;
+type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "moveToStateNamed" | "addLabel" | "removeLabel">;
 
 // Workflow states the review moves a ticket through when status write-back is on.
 export const PLANNING_STATE = "Planning";
 export const CODING_STATE = "In Progress";
+// Marks a ticket whose plan is approved (TUC-9's feedback intake reads it as "planned").
+export const PLAN_READY_LABEL = "plan-ready";
 
 export function plannotatorPaths(home = paseoHome()) {
   const directory = join(home, "linear-tickets", "plannotator");
@@ -143,7 +145,7 @@ export class PlannotatorBridge {
         if (steps.length) await sessions.plan(link.sessionId, steps.map((content) => ({ content, status: "pending" as const })));
         await sessions.expectReview(link.sessionId, event.localUrl);
         const split = steps.length > 1 ? [{ label: `Approve & split into ${Math.min(steps.length, MAX_SPLIT)} sub-issues`, value: SPLIT_PLAN }] : [];
-        await sessions.ask(link.sessionId, `The plan is ready for review${event.remoteUrl ? ` (full view: ${event.remoteUrl})` : ""}. Approve it, or reply with what to change.${model ? `\n\nPlanned with ${model}.` : ""}`, [{ label: "Approve plan", value: APPROVE_PLAN }, ...split, { label: "Send back", value: SEND_BACK }]);
+        await sessions.ask(link.sessionId, `The plan is ready for review${event.remoteUrl ? ` (full view: ${event.remoteUrl})` : ""}. Approve it, or reply with what to change.${model ? `\n\nPlanned with ${model}.` : ""}`, [{ label: "Approve plan", value: APPROVE_PLAN }, { label: "Approve, implement later", value: APPROVE_LATER }, ...split, { label: "Send back", value: SEND_BACK }]);
         return true;
       }
       await sessions.expectReview(link.sessionId, null);
@@ -174,6 +176,12 @@ export class PlannotatorBridge {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+  }
+
+  // The plugin closed this agent's review itself (split, implement later); the omp extension's
+  // report of that closing is not the owner's decision and is skipped like a duplicate.
+  settled(agentId: string): void {
+    this.lastDecision.set(agentId, Date.now());
   }
 
   async drain(): Promise<void> {
@@ -235,8 +243,11 @@ export class PlannotatorBridge {
     }
     // Planning while a plan is out for review (and after it is sent back); coding once approved.
     if (settings.writeback.status) {
-      const moved = await this.linear.moveToStateNamed(issueId, event.type === "decided" && event.approved ? CODING_STATE : PLANNING_STATE);
+      const approved = event.type === "decided" && event.approved;
+      const moved = await this.linear.moveToStateNamed(issueId, approved ? CODING_STATE : PLANNING_STATE);
       if (moved.note) console.error(`[linear-tickets] ${identifier}: ${moved.note}`);
+      // Approved plans carry the label; a new review round or a sent-back plan removes it.
+      await (approved ? this.linear.addLabel(issueId, PLAN_READY_LABEL) : this.linear.removeLabel(issueId, PLAN_READY_LABEL));
     }
     // With a session the panel shows the review, so the progress comment records it instead of new comments.
     const progress = inSession && this.handover && refreshed?.agent

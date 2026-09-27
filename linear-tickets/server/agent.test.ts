@@ -153,6 +153,17 @@ test("a stopped agent's Resume choice starts its successor and closes the old ag
   await h.cleanup();
 });
 
+test("a plan approved for later offers no Resume when the planner is archived, and any reply starts the implementer", async () => {
+  const h = harness();
+  await h.store.put(link({ offer: "later" }));
+  await h.router.offerResume("s1");
+  assert.ok(!h.calls.some((call) => call.includes("[resume|leave]")));
+  await h.router.prompted("s1", { id: "a1", content: { body: "go ahead" } });
+  assert.ok(h.calls.includes('start {"linear.sessionId":"s1"}'));
+  assert.equal((await h.store.get("s1"))?.offer, null);
+  await h.cleanup();
+});
+
 test("the progress comment is created once and edited in place; the next agent gets its own and a resume prompt", async () => {
   const directory = await mkdtemp(join(tmpdir(), "paseo-handover-"));
   const calls: string[] = [];

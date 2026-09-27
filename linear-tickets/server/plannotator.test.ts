@@ -58,6 +58,8 @@ function setup(labels: Record<string, string>) {
     async comment(issueId: string, body: string) { calls.push(`comment ${issueId}: ${body}`); },
     async upsertIssueDocument(issueId: string, title: string) { calls.push(`document ${issueId} ${title}`); return "https://linear.app/doc/1"; },
     async moveToStateNamed(issueId: string, name: string) { calls.push(`state ${issueId} ${name}`); return { changed: true }; },
+    async addLabel(issueId: string, name: string) { calls.push(`+${name} ${issueId}`); },
+    async removeLabel(issueId: string, name: string) { calls.push(`-${name} ${issueId}`); },
   };
   const paseo = {
     agents: {
@@ -91,12 +93,37 @@ test("a hand-off shows in the agent's chat and, for a ticket agent, as a Linear 
     assert.deepEqual(calls, [
       "row agent-1: Handed off to Plannotator for review https://host.ts.net:4000/",
       "state issue-1 Planning",
+      "-plan-ready issue-1",
       "comment issue-1: 📋 **Plan ready for review in Plannotator**: https://host.ts.net:4000/",
       "row agent-1: Plan approved in Plannotator",
       "state issue-1 In Progress",
+      "+plan-ready issue-1",
       "document issue-1 Plan: TUC-25",
       "comment issue-1: ✅ **Plan approved** in Plannotator — [plan](https://linear.app/doc/1)",
     ]);
+    assert.deepEqual(await readdir(directory), []);
+  });
+});
+
+test("a plan sent back loses plan-ready, and a review the plugin closed itself is not taken as a decision", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: false, feedback: "Split step 2", at: new Date().toISOString() }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+    assert.ok(calls.includes("-plan-ready issue-1"));
+    assert.ok(calls.includes("state issue-1 Planning"));
+    assert.ok(!calls.some((call) => call.startsWith("+plan-ready")));
+  });
+  calls.length = 0;
+  await withEvents([{ type: "decided", agentId: "agent-2", approved: false, feedback: "The owner approved this plan for later implementation", at: new Date().toISOString() }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+    bridge.settled("agent-2");
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+    assert.deepEqual(calls, []);
     assert.deepEqual(await readdir(directory), []);
   });
 });
