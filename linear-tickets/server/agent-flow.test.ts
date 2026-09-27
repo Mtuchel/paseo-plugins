@@ -7,7 +7,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { HealthMonitor } from "./health";
 import { reviewChange } from "./pr-watch";
-import { describeTool, questionPrompt, SessionRouter, SessionStore } from "./sessions";
+import { decidePlannotatorReview, describeTool, questionPrompt, SessionRouter, SessionStore } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { splitIntoSubIssues } from "./split";
 import { isUntrusted, TicketStarter, UNTRUSTED_NOTE } from "./starter";
@@ -36,7 +36,7 @@ test("question parts are asked one at a time, and Other is a hint rather than a 
   assert.match(questionPrompt(twoPart, 1).body, /^Format\? \(2\/2\)/);
 });
 
-function routerHarness(pending: AgentPermissionRequest[]) {
+function routerHarness(pending: AgentPermissionRequest[], extra: Partial<ConstructorParameters<typeof SessionRouter>[0]> = {}) {
   const calls: string[] = [];
   const feeds: ((event: unknown) => void)[] = [];
   const paseo = {
@@ -59,6 +59,7 @@ function routerHarness(pending: AgentPermissionRequest[]) {
     settings: { read: async () => settings },
     store,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
+    ...extra,
   });
   router.attach(paseo);
   router.stop();
@@ -104,6 +105,15 @@ test("while a question is open the live feed holds its actions, so Linear keeps 
   await h.router.prompted("s1", { id: "p1", content: { body: "A" } });
   await h.router.unfollow("a1");
   assert.equal(h.calls.at(-1), "action:");
+  await h.cleanup();
+});
+
+test("feedback for a review whose Plannotator server is gone reaches the agent instead of failing", async () => {
+  const h = routerHarness([], { decideReview: (url, approve, feedback) => decidePlannotatorReview(url, approve, feedback) });
+  await h.store.put({ ...link, review: { localUrl: "http://127.0.0.1:1" } });
+  await h.router.prompted("s1", { id: "p1", content: { body: "Split step 2 in two" } });
+  assert.equal((await h.store.get("s1"))?.review, null);
+  assert.match(h.calls.at(-1) ?? "", /^send a1: Your Plannotator plan review closed[\s\S]*Split step 2 in two/);
   await h.cleanup();
 });
 

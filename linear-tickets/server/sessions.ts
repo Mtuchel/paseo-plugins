@@ -310,7 +310,7 @@ export class SessionRouter {
     }
     const activityId = String(activity.id ?? "");
     const content = (activity.content ?? {}) as { body?: string };
-    const body = String(content.body ?? activity.body ?? "").trim();
+    let body = String(content.body ?? activity.body ?? "").trim();
     const signal = typeof activity.signal === "string" ? activity.signal : null;
     const link = await this.deps.store.get(sessionId);
     if (!link) { await this.say(sessionId, "error", "No Paseo agent is linked to this session. Assign Paseo to the ticket again."); return; }
@@ -342,10 +342,18 @@ export class SessionRouter {
     if (link.review && this.deps.decideReview) {
       const approve = body.toLowerCase() === APPROVE_PLAN || /^(approve|approved|yes|ok|looks good)\b/i.test(body);
       const feedback = body.toLowerCase() === SEND_BACK ? "Sent back from Linear." : body;
-      await this.deps.decideReview(link.review.localUrl, approve, approve ? "" : feedback, link.agentId);
-      await this.deps.store.patch(sessionId, { review: null });
-      await this.say(sessionId, "thought", approve ? "Plan approved — the agent continues." : "Plan sent back with your feedback.");
-      return;
+      try {
+        await this.deps.decideReview(link.review.localUrl, approve, approve ? "" : feedback, link.agentId);
+        await this.deps.store.patch(sessionId, { review: null });
+        await this.say(sessionId, "thought", approve ? "Plan approved — the agent continues." : "Plan sent back with your feedback.");
+        return;
+      } catch (error) {
+        if (!(error instanceof ReviewClosedError)) throw error;
+        // The review died with its agent process (restart, cancelled turn). The reply still reaches the agent.
+        await this.deps.store.patch(sessionId, { review: null });
+        await this.say(sessionId, "thought", "That plan review had already closed, so your reply goes to the agent, which submits the plan again.");
+        body = `Your Plannotator plan review closed before the owner decided (for example after a restart). The owner replied in Linear:\n\n${approve ? "Approved." : feedback}\n\nRevise the plan if needed and submit it for review again.`;
+      }
     }
     this.held.delete(link.agentId);
     const pending = (await handle.refresh())?.agent.pendingPermissions ?? [];
@@ -550,6 +558,9 @@ export class SessionRouter {
 }
 
 // Decides a waiting Plannotator review through its local server (the same endpoints its page uses).
+// The review's server is gone or no longer takes decisions.
+export class ReviewClosedError extends Error {}
+
 export async function decidePlannotatorReview(localUrl: string, approve: boolean, feedback: string): Promise<void> {
   const origin = new URL(localUrl).origin;
   if (!/^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) throw new Error("Only local Plannotator reviews can be decided.");
@@ -558,8 +569,10 @@ export async function decidePlannotatorReview(localUrl: string, approve: boolean
     headers: { "content-type": "application/json" },
     body: JSON.stringify(approve ? {} : { feedback }),
     signal: AbortSignal.timeout(10_000),
+  }).catch((error: unknown) => {
+    throw new ReviewClosedError(`Plannotator is not reachable at ${origin}: ${error instanceof Error ? error.message : error}`);
   });
-  if (!response.ok) throw new Error(`Plannotator answered HTTP ${response.status}; the review may already be closed.`);
+  if (!response.ok) throw new ReviewClosedError(`Plannotator answered HTTP ${response.status}; the review is already closed.`);
 }
 
 
