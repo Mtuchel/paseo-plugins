@@ -2,19 +2,15 @@
 // Plannotator calls it with the review URL (http://localhost:<port>/…). It keeps the normal
 // desktop behaviour — the review opens on this machine — and additionally:
 //   1. publishes the port inside the tailnet with `tailscale serve` (HTTPS, tailnet-only),
-//   2. records {agent, local URL, tailnet URL} as an event for the linear-tickets plugin,
-//   3. forks a watcher that removes the tailscale route once the review server stops.
+//   2. records {agent, local URL, tailnet URL} as an event for the linear-tickets plugin.
+// The plugin's ReviewLinks (review-links.ts) removes the route once the review server stops.
 // It must exit quickly and never fail loudly: Plannotator only needs "a browser was opened".
 export const PLANNOTATOR_OPEN_SOURCE = String.raw`import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
 
 const EVENTS = process.env.LINEAR_TICKETS_PLANNOTATOR_EVENTS;
-const SELF = fileURLToPath(import.meta.url);
-const WATCH_LIMIT_MS = 24 * 60 * 60 * 1000;
 
 // The two env overrides exist for tests.
 function tailscale() {
@@ -50,31 +46,15 @@ function record(event) {
   renameSync(temporary, join(EVENTS, name));
 }
 
-async function watch(port) {
-  const until = Date.now() + WATCH_LIMIT_MS;
-  let misses = 0;
-  while (Date.now() < until && misses < 2) {
-    await sleep(10000);
-    try { await fetch("http://127.0.0.1:" + port + "/", { signal: AbortSignal.timeout(5000) }); misses = 0; } catch { misses++; }
-  }
-  try { execFileSync(tailscale(), ["serve", "--https=" + port, "off"], { timeout: 10000, stdio: "ignore" }); } catch {}
-}
-
-const [flag, value] = process.argv.slice(2);
-if (flag === "--watch") {
-  await watch(Number(value));
-} else if (flag) {
-  const url = flag;
+const url = process.argv[2];
+if (url) {
   openLocally(url);
   let remoteUrl = null;
   const local = localPort(url);
   if (local) {
     try {
       const origin = publish(local.port);
-      if (origin) {
-        remoteUrl = origin + local.path;
-        spawn(process.execPath, [SELF, "--watch", String(local.port)], { detached: true, stdio: "ignore", env: process.env }).unref();
-      }
+      if (origin) remoteUrl = origin + local.path;
     } catch {}
   }
   try {

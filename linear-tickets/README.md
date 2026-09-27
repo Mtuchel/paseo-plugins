@@ -360,9 +360,26 @@ Plannotator shows its review URL only in omp's own status line, which Paseo does
 The plugin sets `PLANNOTATOR_BROWSER` for every agent session to a small hook
 (`$PASEO_HOME/linear-tickets/plannotator/open`). When a review starts, the hook still opens it
 on the host. It also publishes the review port inside your tailnet with `tailscale serve`
-(HTTPS, reachable only from your devices) and removes that route when the review server stops.
-The agent's Paseo chat then gets a “Handed off to Plannotator” row with the link. Agents linked
-to a ticket also get a Linear comment with it, so reviews open on your phone.
+(HTTPS, reachable only from your devices). The agent's Paseo chat then gets a “Handed off to
+Plannotator” row with the link. Agents linked to a ticket also get it in the Linear comment (or
+the panel's “Plan review” link), so reviews open on your phone.
+
+**One stable link per agent.** Each review gets its own port, and Plannotator's server stops
+once the plan is decided or the agent restarts, so a per-review link goes dead with the next
+round. The link the plugin posts is therefore the agent's stable one,
+`https://<machine>.<tailnet>.ts.net:8444/review/<agentId>`, served from `127.0.0.1:47832` with
+`tailscale serve` (tailnet-only; never Funnel — 8443 stays the only public port):
+
+- while the agent's latest review is running it redirects there, so a link already on Linear
+  opens the next review after a re-plan;
+- once that review has ended it shows a small “Review closed” page with the outcome (approved,
+  sent back or ended) and the ticket;
+- an agent the plugin never saw a review for gets 404.
+
+Reviews are tracked in `$PASEO_HOME/linear-tickets/plannotator/reviews.json`. Every 30 s the
+plugin checks each open review's server; after two failed checks it removes that review's
+`tailscale serve` route and marks the review closed. Only ports recorded there are ever turned
+off. When `:8444` cannot be published, the per-review link is posted as before.
 
 With status write-back on, a ticket moves to its team's started state named **Planning**
 when a plan is handed off (and stays there when it is sent back), and to **In Progress** once

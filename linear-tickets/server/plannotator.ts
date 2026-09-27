@@ -9,6 +9,7 @@ import { paseoHome } from "./ticket-mcp";
 import type { Handover } from "./handover";
 import { activeModel } from "./model";
 import { APPROVE_LATER, APPROVE_PLAN, MAX_SPLIT, planSteps, SEND_BACK, setAgentMode, SPLIT_PLAN, type SessionRouter } from "./sessions";
+import type { ReviewLinks } from "./review-links";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -108,8 +109,8 @@ export function planDocument(event: DecidedEvent, identifier: string, model?: st
 // Plannotator ↔ Paseo ↔ Linear. Plannotator's review URL only reaches omp's UI notices, which
 // Paseo does not show, so reviews were invisible. The PLANNOTATOR_BROWSER hook and the omp
 // plan extension drop events into a directory; this bridge turns each into a row in the
-// agent's Paseo chat and — for agents linked to a ticket — a Linear comment with the tailnet
-// link, and on a decision the plan document on the ticket.
+// agent's Paseo chat and — for agents linked to a ticket — a Linear comment with the agent's
+// stable review link (ReviewLinks), and on a decision the plan document on the ticket.
 export class PlannotatorBridge {
   private paseo: PaseoApi | null = null;
   private timer: NodeJS.Timeout | null = null;
@@ -128,12 +129,13 @@ export class PlannotatorBridge {
     private readonly fetchPlan: (localUrl: string) => Promise<string> = readReviewPlan,
     private readonly handover?: Pick<Handover, "update">,
     private readonly setMode: (agentId: string, modeId: string) => Promise<void> = setAgentMode,
+    private readonly reviews?: Pick<ReviewLinks, "opened" | "decided">,
   ) {}
 
   // The ticket's Linear agent panel: review link, plan checklist and Approve / Send back.
   // Returns whether the agent has a session: then the progress comment carries the plan state
   // instead of separate plan comments.
-  private async toSession(event: PlannotatorEvent, agentId: string, model: string | null): Promise<boolean> {
+  private async toSession(event: PlannotatorEvent, agentId: string, model: string | null, reviewLink: string | null): Promise<boolean> {
     const sessions = this.sessions;
     if (!sessions) return false;
     try {
@@ -143,9 +145,9 @@ export class PlannotatorBridge {
         const planText = await this.fetchPlan(event.localUrl).catch(() => "");
         const steps = planSteps(planText);
         if (steps.length) await sessions.plan(link.sessionId, steps.map((content) => ({ content, status: "pending" as const })));
-        await sessions.expectReview(link.sessionId, event.localUrl, planText, event.remoteUrl);
+        await sessions.expectReview(link.sessionId, event.localUrl, planText, reviewLink);
         const split = steps.length > 1 ? [{ label: `Approve & split into ${Math.min(steps.length, MAX_SPLIT)} sub-issues`, value: SPLIT_PLAN }] : [];
-        await sessions.ask(link.sessionId, `The plan is ready for review${event.remoteUrl ? ` (full view: ${event.remoteUrl})` : ""}. Approve it, or reply with what to change.${model ? `\n\nPlanned with ${model}.` : ""}`, [{ label: "Approve plan", value: APPROVE_PLAN }, { label: "Approve, implement later", value: APPROVE_LATER }, ...split, { label: "Send back", value: SEND_BACK }]);
+        await sessions.ask(link.sessionId, `The plan is ready for review${reviewLink ? ` (full view: ${reviewLink})` : ""}. Approve it, or reply with what to change.${model ? `\n\nPlanned with ${model}.` : ""}`, [{ label: "Approve plan", value: APPROVE_PLAN }, { label: "Approve, implement later", value: APPROVE_LATER }, ...split, { label: "Send back", value: SEND_BACK }]);
         return true;
       }
       await sessions.expectReview(link.sessionId, null);
@@ -225,7 +227,9 @@ export class PlannotatorBridge {
     const model = activeModel(refreshed?.agent);
     const issueId = labels["paseo.parent-agent-id"] ? undefined : labels["linear.issueId"];
     const identifier = labels["linear.identifier"] || "this ticket";
-    const url = event.type === "opened" ? event.remoteUrl ?? event.localUrl : undefined;
+    // The agent's stable link when ReviewLinks is up; otherwise this review's own tailnet or local URL.
+    const url = event.type === "opened" ? (await this.reviews?.opened(agentId, event, labels["linear.identifier"] || undefined)) ?? event.remoteUrl ?? event.localUrl : undefined;
+    if (event.type === "decided") await this.reviews?.decided(agentId, event.approved);
     const row: PlannotatorRow = event.type === "opened"
       ? { title: "Handed off to Plannotator for review", url, detail: `${event.remoteUrl ? "Opens on any device in your tailnet." : "Local link only: Tailscale was unavailable."}${model ? ` Planned with ${model}.` : ""}` }
       : { title: event.approved ? "Plan approved in Plannotator" : "Plan sent back from Plannotator", ...(event.feedback ? { detail: event.feedback.slice(0, 4_000) } : {}) };
@@ -233,7 +237,8 @@ export class PlannotatorBridge {
     // The row is a convenience, so Linear still gets the review either way.
     await handle.timeline.append({ type: "plugin", id: `plannotator-${event.type}-${event.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: row })
       .catch((error: unknown) => console.error(`[linear-tickets] Plannotator chat row for ${agentId} skipped: ${error instanceof Error ? error.message : error}`));
-    const inSession = await this.toSession(event, agentId, model);
+    // Tailnet links only: a local-only review has no link worth showing off this machine.
+    const inSession = await this.toSession(event, agentId, model, event.type === "opened" && event.remoteUrl ? url ?? null : null);
     if (!issueId) return;
     const settings = await this.settings.read();
     // A ticket someone else wrote ran plan-first; its approved plan unlocks the usual mode.

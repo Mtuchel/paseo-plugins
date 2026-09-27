@@ -16,6 +16,7 @@ import { Writeback } from "./server/writeback";
 import { AgentApi, AppAuth } from "./server/agent-app";
 import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
 import { ensureFunnel, type FunnelStatus } from "./server/funnel";
+import { ReviewLinks } from "./server/review-links";
 import { closeModelSetter, modelSetter, ownConnection } from "./server/connection";
 import { ModelGuard } from "./server/model-guard";
 import { HealthMonitor } from "./server/health";
@@ -60,7 +61,9 @@ export default function contribute(server: PluginServerContext) {
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
   const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear), afterLaunch: openSession });
   const writeback = new Writeback(linear, settings, { sessions, handover });
-  const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover);
+  // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
+  const reviewLinks = new ReviewLinks();
+  const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks);
   const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => sessions.receive(event));
   let funnel: FunnelStatus | null = null;
@@ -109,7 +112,7 @@ export default function contribute(server: PluginServerContext) {
     const link = await sessions.sessionFor(change.agentId);
     if (link) await sessions.say(link.sessionId, "thought", `Model restored to ${change.to} (it had switched to ${change.from}).`);
   });
-  const attach = (paseo: PaseoApi) => { attached = true; dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); void startAgent(); };
+  const attach = (paseo: PaseoApi) => { attached = true; if (!stopped) void reviewLinks.start(); dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); void startAgent(); };
   const cacheIdentity = async () => {
     const connection = await credentials.read();
     return connection.key ? cacheScope(connection.key) : null;
@@ -189,5 +192,5 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); health.stop(); pullRequests.stop(); modelGuard.stop(); void closeModelSetter(); };
+  return () => { stopped = true; clearTimeout(startSoon); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); modelGuard.stop(); void closeModelSetter(); };
 }
