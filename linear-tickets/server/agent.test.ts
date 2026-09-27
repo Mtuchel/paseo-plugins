@@ -204,24 +204,29 @@ test("the progress comment is created once and edited in place; the next agent g
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("a permission shows in the agent panel only while still pending, and then without a duplicate ticket comment", async () => {
+test("a permission shows in the agent panel only while still pending, and the ticket then mentions the session's owner as the Paseo app", async () => {
   const { Writeback } = await import("./writeback");
   const request: AgentPermissionRequest = { id: "p1", provider: "omp", name: "bash", kind: "tool", title: "Allow tool: bash", description: "Command: ls" };
   for (const pending of [[], [request]]) {
     const calls: string[] = [];
     const linear = {
-      issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusType: "unstarted", teamId: "t", projectId: null, creatorId: OWNER, labels: [], attachmentUrls: [], blockedBy: [] }),
-      markInProgress: async () => ({ changed: false }), moveToStateNamed: async () => ({ changed: false }), moveToReview: async () => ({ changed: false }), linkUrl: async () => {},
+      issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "In Progress", statusId: "ip", statusType: "started", teamId: "t", projectId: null, creatorId: "customer", labels: [], attachmentUrls: [], blockedBy: [] }),
+      markInProgress: async () => ({ changed: false }), moveToReview: async () => ({ changed: false }), linkUrl: async () => {}, moveToState: async () => {},
+      moveToStateNamed: async (_i: string, name: string) => { calls.push(`move ${name}`); return { changed: true }; },
       comment: async (_i: string, body: string) => { calls.push(`comment ${body.slice(0, 30)}`); },
+      createComment: async (): Promise<string> => { throw new Error("the app writes this comment"); }, updateComment: async () => {},
+      viewerId: async () => OWNER, userUrl: async (id: string) => `https://linear.app/ws/profiles/${id}`,
       addLabel: async (_i: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async () => {},
     };
     const sessions = {
       sessionFor: async () => ({ sessionId: "s1" }), say: async () => {}, action: async () => {}, link: async () => {}, offerResume: async () => {}, resumeNow: async () => false,
       ask: async (_s: string, body: string, options: { value: string }[]) => { calls.push(`ask ${body.split("\n")[0]} [${options.map((o) => o.value).join("|")}]`); },
     };
+    const comments = { createComment: async (_i: string, body: string) => { calls.push(`app comment ${body.split("\n")[0]}`); return "c1"; }, updateComment: async () => {} };
+    const handover = { update: async () => ({}) as never, finish: async () => ({}) as never, waiting: async () => null, setWaiting: async () => {} };
     const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" }, pendingPermissions: pending } }) }) } } as unknown as PaseoApi;
-    const writeback = new Writeback(linear, { read: async () => ({ ...settings, writeback: { ...DEFAULT_WRITEBACK, blocked: true } }) }, { sessions: sessions as never, handover: { update: async () => ({}) as never, finish: async () => ({}) as never } }, 0);
+    const writeback = new Writeback(linear, { read: async () => ({ ...settings, writeback: { ...DEFAULT_WRITEBACK, blocked: true } }) }, { sessions: sessions as never, handover, comments }, 0);
     await writeback.permissionRequested({ agent: { id: "a1", workspaceId: "w", parentAgentId: null, provider: "omp", cwd: "/x", title: "T" }, request }, paseo);
-    assert.deepEqual(calls, pending.length ? ["ask Approve this action? [approve|deny]", "+paseo-blocked"] : []);
+    assert.deepEqual(calls, pending.length ? ["ask Approve this action? [approve|deny]", "move Needs input", "+paseo-needs-you", `app comment https://linear.app/ws/profiles/${OWNER} **T** (Paseo) is waiting for permission: Allow tool: bash`] : []);
   }
 });

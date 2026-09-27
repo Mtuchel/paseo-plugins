@@ -22,8 +22,9 @@ type Deps = {
 
 // The labels a dispatched ticket moves through, derived from the trigger label so a
 // custom trigger ("agent") gets matching companions ("agent-running", "agent-failed").
+// `blocked`: the agent stopped with an error; `needsYou`: it waits for the owner's answer or approval.
 export function dispatchLabels(trigger: string) {
-  return { running: `${trigger}-running`, failed: `${trigger}-failed`, blocked: `${trigger}-blocked` };
+  return { running: `${trigger}-running`, failed: `${trigger}-failed`, blocked: `${trigger}-blocked`, needsYou: `${trigger}-needs-you` };
 }
 
 // Polls Linear for tickets carrying the trigger label and starts one agent per ticket

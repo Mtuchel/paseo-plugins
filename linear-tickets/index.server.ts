@@ -60,7 +60,7 @@ export default function contribute(server: PluginServerContext) {
   });
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
   const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear), afterLaunch: openSession });
-  const writeback = new Writeback(linear, settings, { sessions, handover });
+  const writeback = new Writeback(linear, settings, { sessions, handover, comments: agentApi });
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   const reviewLinks = new ReviewLinks();
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks);

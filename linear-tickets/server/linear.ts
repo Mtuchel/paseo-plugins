@@ -217,14 +217,14 @@ export type LabeledIssue = { id: string; identifier: string; teamKey: string; pr
 // write-back decisions without the comment pagination that `detail` performs.
 export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
   issue(id: $id) {
-    id identifier state { name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
+    id identifier state { id name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
     inverseRelations(first: 50) { nodes { type issue { identifier state { type } } } }
   }
 }`;
 
 // `blockedBy`: identifiers of unfinished tickets that block this one.
 export type IssueState = {
-  id: string; identifier: string; status: string; statusType: string; teamId: string | null; projectId: string | null; creatorId: string | null;
+  id: string; identifier: string; status: string; statusId: string; statusType: string; teamId: string | null; projectId: string | null; creatorId: string | null;
   labels: { id: string; name: string }[]; attachmentUrls: string[]; blockedBy: string[];
 };
 export const CREATE_ISSUE_QUERY = `mutation issueCreate($input: IssueCreateInput!) {
@@ -243,8 +243,13 @@ export const TEAM_BY_KEY_QUERY = `query teamByKey($key: String!) {
 export const LABEL_BY_NAME_QUERY = `query labelByName($name: String!) {
   issueLabels(first: 1, filter: { name: { eqIgnoreCase: $name } }) { nodes { id name } }
 }`;
-export const CREATE_LABEL_QUERY = `mutation labelCreate($name: String!) {
-  issueLabelCreate(input: { name: $name }) { success issueLabel { id name } }
+export const CREATE_LABEL_QUERY = `mutation labelCreate($input: IssueLabelCreateInput!) {
+  issueLabelCreate(input: $input) { success issueLabel { id name } }
+}`;
+// A user's profile URL (https://linear.app/<workspace>/profiles/<name>): in a comment, Linear
+// renders it as an @mention and notifies that user.
+export const USER_URL_QUERY = `query userUrl($id: String!) {
+  user(id: $id) { url }
 }`;
 export const ADD_LABEL_QUERY = `mutation addLabel($id: String!, $labelId: String!) {
   issueAddLabel(id: $id, labelId: $labelId) { success }
@@ -490,7 +495,7 @@ export class LinearService {
       .filter((blocker) => !["completed", "canceled", "duplicate"].includes(label(record(blocker.state ?? {}).type)))
       .map((blocker) => label(blocker.identifier)).filter(Boolean);
     return {
-      id: label(issue.id), identifier: label(issue.identifier), status: label(state.name), statusType: label(state.type),
+      id: label(issue.id), identifier: label(issue.identifier), status: label(state.name), statusId: label(state.id), statusType: label(state.type),
       teamId: label(record(issue.team ?? {}).id) || null, projectId: label(record(issue.project ?? {}).id) || null, creatorId: label(record(issue.creator ?? {}).id) || null,
       labels: labelNodes(issue.labels), attachmentUrls, blockedBy,
     };
@@ -547,17 +552,17 @@ export class LinearService {
   }
 
   // Label IDs by lowercase name, cached for the plugin's lifetime. A missing label is
-  // created as a workspace label so every team can use it.
+  // created as a workspace label so every team can use it, in `color` when given.
   private readonly labelIds = new Map<string, string>();
 
-  private async labelId(name: string): Promise<string> {
+  private async labelId(name: string, color?: string): Promise<string> {
     const wanted = name.trim().toLowerCase();
     const cached = this.labelIds.get(wanted);
     if (cached) return cached;
     const found = labelNodes(record(await this.withKey((key) => this.post(key, LABEL_BY_NAME_QUERY, { name }))).issueLabels)[0];
     let id = found?.id;
     if (!id) {
-      const created = record(await this.withKey((key) => this.post(key, CREATE_LABEL_QUERY, { name })));
+      const created = record(await this.withKey((key) => this.post(key, CREATE_LABEL_QUERY, { input: { name, ...(color ? { color } : {}) } })));
       succeeded(created, "issueLabelCreate", `create the "${name}" label`);
       id = label(record(record(created.issueLabelCreate).issueLabel ?? {}).id);
       if (!id) throw new Error(`Linear did not return the new "${name}" label.`);
@@ -566,8 +571,8 @@ export class LinearService {
     return id;
   }
 
-  async addLabel(issueId: string, name: string): Promise<void> {
-    const labelId = await this.labelId(name);
+  async addLabel(issueId: string, name: string, color?: string): Promise<void> {
+    const labelId = await this.labelId(name, color);
     succeeded(record(await this.withKey((key) => this.post(key, ADD_LABEL_QUERY, { id: issueId, labelId }))), "issueAddLabel", `add the "${name}" label`);
   }
 
@@ -630,6 +635,18 @@ export class LinearService {
     return id;
   }
 
+  private readonly userUrls = new Map<string, string>();
+
+  // The user's profile URL, which a comment turns into an @mention.
+  async userUrl(userId: string): Promise<string> {
+    const cached = this.userUrls.get(userId);
+    if (cached) return cached;
+    const url = label(record(record(await this.withKey((key) => this.post(key, USER_URL_QUERY, { id: userId }))).user ?? {}).url);
+    if (!url) throw new Error("Linear did not return the user's profile link.");
+    this.userUrls.set(userId, url);
+    return url;
+  }
+
   // Comments created after `since`, oldest first, with who wrote and reacted to them.
   async commentsSince(issueId: string, since: string): Promise<RelayComment[]> {
     const comments: RelayComment[] = [];
@@ -679,8 +696,9 @@ export class LinearService {
 
   // Moves the ticket into its team's "started" state with this name (for example Planning or
   // In Progress), unless it is already there or finished. Teams without it are left alone.
-  async moveToStateNamed(issueId: string, name: string): Promise<{ changed: boolean; note?: string }> {
-    const state = await this.issueState(issueId);
+  // `current`: the ticket's state when the caller already read it.
+  async moveToStateNamed(issueId: string, name: string, current?: IssueState): Promise<{ changed: boolean; note?: string }> {
+    const state = current ?? await this.issueState(issueId);
     const type = state.statusType.trim().toLowerCase();
     if (type === "completed" || type === "canceled" || type === "duplicate") return { changed: false };
     if (state.status.trim().toLowerCase() === name.toLowerCase()) return { changed: false };
@@ -689,6 +707,11 @@ export class LinearService {
     if (!target) return { changed: false, note: `The ticket's team has no started state named "${name}".` };
     succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: target.id }))), "issueUpdate", `move the ticket to ${target.name}`);
     return { changed: true };
+  }
+
+  // Moves the ticket to one known state of its team (for example back to where it was).
+  async moveToState(issueId: string, stateId: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId }))), "issueUpdate", "move the ticket");
   }
 
   // Moves the ticket back to its team's first unstarted state (Todo): planned, not being worked on.

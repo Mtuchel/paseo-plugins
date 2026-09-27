@@ -85,6 +85,12 @@ const SESSION_UPDATE_MUTATION = `mutation agentSessionUpdate($id: String!, $inpu
 const SESSION_ON_ISSUE_MUTATION = `mutation agentSessionOnIssue($input: AgentSessionCreateOnIssue!) {
   agentSessionCreateOnIssue(input: $input) { success agentSession { id } }
 }`;
+const CREATE_COMMENT_MUTATION = `mutation appComment($input: CommentCreateInput!) {
+  commentCreate(input: $input) { success comment { id } }
+}`;
+const UPDATE_COMMENT_MUTATION = `mutation appCommentUpdate($id: String!, $input: CommentUpdateInput!) {
+  commentUpdate(id: $id, input: $input) { success }
+}`;
 const APP_VIEWER_QUERY = `query appViewer { viewer { id name } }`;
 const OPEN_SESSIONS_QUERY = `query openSessions($first: Int!) {
   agentSessions(first: $first, orderBy: updatedAt) { nodes { id status createdAt creator { id } issue { id identifier } } }
@@ -141,6 +147,19 @@ export class AgentApi {
     const id = String(record(result.agentSession ?? {}).id ?? "");
     if (result.success !== true || !id) throw new Error("Linear did not create an agent session on the ticket.");
     return id;
+  }
+
+  // A ticket comment written by "Paseo": unlike the owner's own key, it notifies the users it mentions.
+  async createComment(issueId: string, body: string): Promise<string> {
+    const result = record(record(await this.call(CREATE_COMMENT_MUTATION, { input: { issueId, body } })).commentCreate ?? {});
+    const id = String(record(result.comment ?? {}).id ?? "");
+    if (result.success !== true || !id) throw new Error("Linear did not create the comment.");
+    return id;
+  }
+
+  async updateComment(commentId: string, body: string): Promise<void> {
+    const result = record(record(await this.call(UPDATE_COMMENT_MUTATION, { id: commentId, input: { body } })).commentUpdate ?? {});
+    if (result.success !== true) throw new Error("Linear did not update the comment.");
   }
 
   async openSessions(first = 50): Promise<OpenSession[]> {

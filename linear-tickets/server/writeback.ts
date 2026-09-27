@@ -3,13 +3,17 @@ import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/se
 import { dispatchLabels } from "./dispatch";
 import { activeModel } from "./model";
 import { questionsOf } from "./relay";
-import type { Handover } from "./handover";
-import type { LinearService } from "./linear";
+import type { AgentApi } from "./agent-app";
+import type { Handover, WaitingPeriod } from "./handover";
+import type { IssueState, LinearService } from "./linear";
 import { PLANNING_STATE } from "./plannotator";
 import type { SessionRouter } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
 
 export const MAX_SUMMARY_LENGTH = 4_000;
+// The workflow state (type started) a ticket waits in while its agent needs the owner.
+export const NEEDS_INPUT_STATE = "Needs input";
+const NEEDS_YOU_COLOR = "#eb5757";
 const TRANSIENT = /HTTP 50\d|rate-limiting|Could not reach|timed out|ECONNRESET|fetch failed/i;
 const RETRY_DELAYS_MS = [30_000, 120_000];
 const PULL_REQUEST_URL = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/g;
@@ -17,13 +21,14 @@ const PULL_REQUEST_URL = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]
 type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
 // `planFirst`: launched plan-first (a ticket you did not write, before its plan is approved).
 type Link = { issueId: string; identifier: string; planFirst: boolean };
-// The native Linear agent: the session panel and the durable handover record. Optional, so
-// ticket write-back keeps working without the Paseo Linear app installed.
+// The native Linear agent: the session panel, the durable handover record and comments written
+// as the Paseo app. Optional, so ticket write-back keeps working without the Paseo Linear app installed.
 export type AgentBridge = {
   sessions: Pick<SessionRouter, "sessionFor" | "say" | "action" | "ask" | "askQuestion" | "link" | "offerResume" | "resumeNow" | "holdIfStopped" | "follow" | "unfollow">;
-  handover: Pick<Handover, "update" | "finish">;
+  handover: Pick<Handover, "update" | "finish" | "waiting" | "setWaiting">;
+  comments?: Pick<AgentApi, "createComment" | "updateComment">;
 };
-type Linear = Pick<LinearService, "issueState" | "markInProgress" | "moveToStateNamed" | "comment" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview">;
+type Linear = Pick<LinearService, "issueState" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "createComment" | "updateComment" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "userUrl">;
 
 // The turn's reply: assistant text after the last user message. Streaming providers may
 // split one reply across several items, so the pieces are joined without separators.
@@ -84,6 +89,11 @@ export class Writeback {
   // Last model shown per agent; a change (another model picked in Paseo, or Plannotator restoring
   // its pre-planning model on approval) is announced in the panel and the progress comment.
   private readonly models = new Map<string, string>();
+  // Waiting periods by issue when there is no handover record to keep them (no Linear app).
+  private readonly waitingPeriods = new Map<string, WaitingPeriod>();
+  // Per-issue queue for the waiting signals: a quick follow-up question must edit the first
+  // question's comment, not race it into a second one.
+  private readonly waitingQueue = new Map<string, Promise<unknown>>();
 
   constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly agentBridge?: AgentBridge, private readonly settleMs = 2_000) {}
 
@@ -115,6 +125,74 @@ export class Writeback {
     const link = issueId ? { issueId, identifier: labels["linear.identifier"] || issueId, planFirst: labels["linear.untrusted"] === "1" } : null;
     this.links.set(agent.id, link);
     return link;
+  }
+
+  private serialize(issueId: string, work: () => Promise<void>): Promise<void> {
+    const result = (this.waitingQueue.get(issueId) ?? Promise.resolve()).then(work, work);
+    this.waitingQueue.set(issueId, result.catch(() => undefined));
+    return result;
+  }
+
+  private async waitingFor(issueId: string): Promise<WaitingPeriod | null> {
+    const handover = this.agentBridge?.handover;
+    return handover ? handover.waiting(issueId) : this.waitingPeriods.get(issueId) ?? null;
+  }
+
+  private async setWaiting(issue: { id: string; identifier: string }, agent: PluginHookAgent, waiting: WaitingPeriod | null): Promise<void> {
+    const handover = this.agentBridge?.handover;
+    if (handover) await handover.setWaiting(issue, agent, waiting);
+    else if (waiting) this.waitingPeriods.set(issue.id, waiting);
+    else this.waitingPeriods.delete(issue.id);
+  }
+
+  // Written as the Paseo app when it is installed: the plugin's key belongs to the owner, and Linear
+  // notifies nobody of their own mentions. The waiting period's comment is edited, not repeated.
+  private async waitingComment(issueId: string, commentId: string | null, body: string): Promise<string> {
+    const app = this.agentBridge?.comments;
+    if (commentId) {
+      for (const author of app ? [app, this.linear] : [this.linear]) {
+        if (await author.updateComment(commentId, body).then(() => true, () => false)) return commentId;
+      }
+    }
+    if (app) {
+      const id = await app.createComment(issueId, body).catch((error: unknown) => {
+        console.error(`[linear-tickets] ${issueId}: comment as the Paseo app failed, posting with the plugin's key: ${error instanceof Error ? error.message : error}`);
+        return null;
+      });
+      if (id) return id;
+    }
+    return this.linear.createComment(issueId, body);
+  }
+
+  // Opens or continues a waiting period: the ticket moves to Needs input (teams without that state
+  // skip it), gets the needs-you label, and one comment mentions the owner, edited per question.
+  private markWaiting(issue: { id: string; identifier: string }, agent: PluginHookAgent, settings: PluginSettings, body: string, inSession: boolean): Promise<void> {
+    return this.serialize(issue.id, async () => {
+      const waiting = await this.waitingFor(issue.id);
+      const state = await this.linear.issueState(issue.id);
+      const moved = await this.linear.moveToStateNamed(issue.id, NEEDS_INPUT_STATE, state);
+      // Remembered before anything else can fail, so a retry still knows where the ticket was.
+      const previousStateId = waiting?.previousStateId ?? (moved.changed ? state.statusId : null);
+      if (previousStateId !== (waiting?.previousStateId ?? null)) await this.setWaiting(issue, agent, { previousStateId, commentId: waiting?.commentId ?? null });
+      const needsYou = dispatchLabels(settings.dispatch.label).needsYou;
+      if (!state.labels.some((item) => item.name.trim().toLowerCase() === needsYou.toLowerCase())) await this.linear.addLabel(issue.id, needsYou, NEEDS_YOU_COLOR);
+      // Only the owner opens Linear sessions; without one, whoever wrote the ticket is asked.
+      const ownerId = (inSession ? null : state.creatorId) ?? await this.linear.viewerId();
+      const commentId = await this.waitingComment(issue.id, waiting?.commentId ?? null, `${await this.linear.userUrl(ownerId)} ${body}`);
+      await this.setWaiting(issue, agent, { previousStateId, commentId });
+    });
+  }
+
+  // Ends the waiting period: the label comes off and the ticket goes back where it was, unless
+  // someone moved it out of Needs input meanwhile. The next period gets a fresh comment.
+  private clearWaiting(issue: { id: string; identifier: string }, agent: PluginHookAgent, settings: PluginSettings, current?: IssueState): Promise<void> {
+    return this.serialize(issue.id, async () => {
+      const waiting = await this.waitingFor(issue.id);
+      const state = current ?? await this.linear.issueState(issue.id);
+      await this.linear.removeLabel(issue.id, dispatchLabels(settings.dispatch.label).needsYou, state.labels);
+      if (waiting?.previousStateId && state.status.trim().toLowerCase() === NEEDS_INPUT_STATE.toLowerCase()) await this.linear.moveToState(issue.id, waiting.previousStateId);
+      if (waiting) await this.setWaiting(issue, agent, null);
+    });
   }
 
   // Linear outages (HTTP 503, rate limits, network drops) are retried after 30 s and 2 min.
@@ -167,6 +245,9 @@ export class Writeback {
     return this.run("turn_ended", agent, paseo, async ({ issueId, identifier }, settings) => {
       const { writeback } = settings;
       const blocked = dispatchLabels(settings.dispatch.label).blocked;
+      // The turn is over, so nothing waits for the owner any more; `paseo-blocked` marks errors only.
+      const state = writeback.blocked ? await this.linear.issueState(issueId) : null;
+      if (state) await this.clearWaiting({ id: issueId, identifier }, agent, settings, state);
       const title = agent.title ?? "Paseo agent";
       const handover = this.agentBridge?.handover;
       const issue = { id: issueId, identifier };
@@ -184,7 +265,7 @@ export class Writeback {
           if (handover) await handover.update(issue, named, { status: "working", summary: reply, model });
           else await this.linear.comment(issueId, `**${title}** (Paseo) finished a turn:\n\n${truncateSummary(reply)}`);
         }
-        if (writeback.blocked) await this.linear.removeLabel(issueId, blocked);
+        if (state) await this.linear.removeLabel(issueId, blocked, state.labels);
       } else if (outcome.kind === "failed") {
         await this.session(agent.id, async (sessionId, sessions) => {
           await sessions.unfollow(agent.id);
@@ -212,7 +293,7 @@ export class Writeback {
   }
 
   permissionRequested({ agent, request }: PluginLifecycleEvents["agent.permission_requested"], paseo: PaseoApi): Promise<void> {
-    return this.run("permission_requested", agent, paseo, async ({ issueId }, settings) => {
+    return this.run("permission_requested", agent, paseo, async ({ issueId, identifier }, settings) => {
       // Providers sometimes resolve a request themselves within moments (for example after a
       // plan approval switches the mode); only requests still pending after a short wait are shown.
       await new Promise((resolve) => setTimeout(resolve, this.settleMs));
@@ -228,11 +309,7 @@ export class Writeback {
           : sessions.ask(sessionId, `Approve this action?\n\n${subject}`, [{ label: "Approve", value: "approve" }, { label: "Deny", value: "deny" }]);
       });
       if (!settings.writeback.blocked) return;
-      // The agent panel already asks; the ticket only gets the blocked label, not another comment.
-      if (inSession) {
-        await this.linear.addLabel(issueId, dispatchLabels(settings.dispatch.label).blocked);
-        return;
-      }
+      // Posted even with the agent panel: only a mention reaches the owner's inbox and phone.
       const what = request.kind === "question" ? "an answer" : request.kind === "plan" ? "plan approval" : "permission";
       const subject = request.title || request.name;
       const description = request.description ? `\n\n${truncateSummary(request.description)}` : "";
@@ -241,14 +318,20 @@ export class Writeback {
       const hint = settings.writeback.mentions
         ? `\n\nReply here with ${request.kind === "question" ? "“@paseo <your answer>”" : "“@paseo approve” or “@paseo deny <reason>”"}.`
         : "";
-      await this.linear.comment(issueId, `**${agent.title ?? "Paseo agent"}** (Paseo) is waiting for ${what}: ${subject}${description}${options}${hint}`);
-      await this.linear.addLabel(issueId, dispatchLabels(settings.dispatch.label).blocked);
+      await this.markWaiting({ id: issueId, identifier }, agent, settings, `**${agent.title ?? "Paseo agent"}** (Paseo) is waiting for ${what}: ${subject}${description}${options}${hint}`, inSession);
     });
   }
 
+  // A follow-up question usually arrives within moments (question 2/5 after 1/5): the waiting
+  // period only ends once nothing is pending after the settle wait.
   permissionResolved({ agent }: PluginLifecycleEvents["agent.permission_resolved"], paseo: PaseoApi): Promise<void> {
-    return this.run("permission_resolved", agent, paseo, async ({ issueId }, settings) => {
-      if (settings.writeback.blocked) await this.linear.removeLabel(issueId, dispatchLabels(settings.dispatch.label).blocked);
+    return this.run("permission_resolved", agent, paseo, async ({ issueId, identifier }, settings) => {
+      if (!settings.writeback.blocked) return;
+      await new Promise((resolve) => setTimeout(resolve, this.settleMs));
+      const refreshed = await paseo.agents.ref(agent.id).refresh().catch(() => null);
+      const pending = refreshed?.agent.pendingPermissions;
+      if (Array.isArray(pending) && pending.length > 0) return;
+      await this.clearWaiting({ id: issueId, identifier }, agent, settings);
     });
   }
 
@@ -265,10 +348,13 @@ export class Writeback {
         await this.agentBridge?.handover.finish({ id: issueId, identifier }, agent, "archived", "handed over to a new agent");
         return;
       }
-      // The running marker belongs to the dispatcher and is always cleared; the blocked
-      // marker only when blocked write-back owns it.
+      // The running marker belongs to the dispatcher and is always cleared; the blocked and
+      // needs-you markers only when blocked write-back owns them.
       await this.linear.removeLabel(issueId, labels.running, state.labels);
-      if (settings.writeback.blocked) await this.linear.removeLabel(issueId, labels.blocked, state.labels);
+      if (settings.writeback.blocked) {
+        await this.linear.removeLabel(issueId, labels.blocked, state.labels);
+        await this.clearWaiting({ id: issueId, identifier }, agent, settings, state);
+      }
       const hasPullRequest = state.attachmentUrls.some((url) => /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(url));
       const open = !["completed", "canceled", "duplicate"].includes(state.statusType.trim().toLowerCase());
       const handover = this.agentBridge?.handover;

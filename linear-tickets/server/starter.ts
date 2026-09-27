@@ -26,6 +26,8 @@ export const UNTRUSTED_NOTE = [
   "Investigate and write a plan only. Do not change code, run installs or make network calls until the owner approves the plan.",
 ].join(" ");
 const MAX_PLAN_NOTE_CHARS = 20_000;
+// Every question moves the ticket to "Needs input" and notifies the owner, so one ask beats five.
+export const QUESTIONS_NOTE = "If you need input from the owner, collect all your questions and ask them together in one question request instead of one at a time.";
 
 // A ticket with the plan-ready label already has an approved plan ("Approve, implement later"
 // or an earlier planner): the new agent implements it instead of planning again.
@@ -108,7 +110,7 @@ export class TicketStarter {
       // Plan-first tickets start in the provider's safe mode; approving the plan restores the usual mode.
       modeId: planFirst ? SAFE_MODES[providerKey] ?? preference.modeId : preference.modeId,
       thinkingOptionId: preference.thinkingOptionId,
-      instructions: [planFirst ? UNTRUSTED_NOTE : untrusted ? UNTRUSTED_TEXT : "", planReady ? approvedPlanNote(detail.issue.identifier, plan) : ""].filter(Boolean).join("\n\n"),
+      instructions: [planFirst ? UNTRUSTED_NOTE : untrusted ? UNTRUSTED_TEXT : "", planReady ? approvedPlanNote(detail.issue.identifier, plan) : "", QUESTIONS_NOTE].filter(Boolean).join("\n\n"),
       // A plan-first ticket goes to Planning on the agent's first turn (write-back), not In Progress.
       markInProgress: settings.markInProgress && !planFirst,
     };

@@ -19,13 +19,24 @@ const toolCall = (output: string): Timeline[number] => ({ type: "tool_call", cal
 
 class FakeLinear {
   readonly writes: string[] = [];
-  state: IssueState = { id: "issue-1", identifier: "ENG-1", projectId: null, creatorId: null, blockedBy: [], status: "Todo", statusType: "unstarted", teamId: "t1", labels: [{ id: "l1", name: "paseo-running" }], attachmentUrls: [] };
+  state: IssueState = { id: "issue-1", identifier: "ENG-1", projectId: null, creatorId: null, blockedBy: [], status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", labels: [{ id: "l1", name: "paseo-running" }], attachmentUrls: [] };
+  private comments = 0;
   async issueState() { this.writes.push("state"); return this.state; }
   async markInProgress(issue: { id: string }) { this.writes.push(`in-progress ${issue.id}`); return { changed: true }; }
-  async moveToStateNamed(id: string, name: string) { this.writes.push(`move ${id} ${name}`); return { changed: true }; }
+  async moveToStateNamed(id: string, name: string) {
+    this.writes.push(`move ${id} ${name}`);
+    if (this.state.status === name) return { changed: false };
+    this.state = { ...this.state, status: name, statusId: name.toLowerCase(), statusType: "started" };
+    return { changed: true };
+  }
+  async moveToState(_id: string, stateId: string) { this.writes.push(`restore ${stateId}`); }
   async comment(_id: string, body: string) { this.writes.push(`comment: ${body}`); }
-  async addLabel(_id: string, name: string) { this.writes.push(`+${name}`); }
-  async removeLabel(_id: string, name: string) { this.writes.push(`-${name}`); }
+  async createComment(_id: string, body: string) { this.writes.push(`new comment: ${body}`); return `c${++this.comments}`; }
+  async updateComment(id: string, body: string) { this.writes.push(`edit ${id}: ${body}`); }
+  async viewerId() { return "owner"; }
+  async userUrl(id: string) { return `https://linear.app/acme/profiles/${id}`; }
+  async addLabel(_id: string, name: string) { this.writes.push(`+${name}`); this.state = { ...this.state, labels: [...this.state.labels, { id: name, name }] }; }
+  async removeLabel(_id: string, name: string) { this.writes.push(`-${name}`); this.state = { ...this.state, labels: this.state.labels.filter((label) => label.name !== name) }; }
   async linkUrl(_id: string, url: string) { this.writes.push(`link ${url}`); }
   async moveToReview() { this.writes.push("review"); return { changed: true }; }
 }
@@ -81,7 +92,7 @@ test("a completed turn posts its reply, truncated, and links a new pull request 
   assert.match(comment, /^comment: \*\*ENG-1: Fix sign-in\*\* \(Paseo\) finished a turn:/);
   assert.match(comment, /truncated; the full reply is in Paseo\)$/);
   assert.ok(comment.length < MAX_SUMMARY_LENGTH + 200);
-  assert.deepEqual(linear.writes.slice(1), ["-paseo-blocked", "link https://github.com/o/r/pull/9", "review"]);
+  assert.deepEqual(linear.writes.filter((write) => write !== comment), ["state", "-paseo-needs-you", "-paseo-blocked", "link https://github.com/o/r/pull/9", "review"]);
 });
 
 test("each write-back toggle gates its own effect", async () => {
@@ -136,19 +147,51 @@ test("a model switch between turns is announced in the panel and recorded in the
   assert.deepEqual(records, [{ model: "anthropic/claude-opus-5-5 · thinking medium" }, { model: "deepseek/deepseek-v4-flash · thinking medium" }]);
 });
 
-test("a pending question marks the ticket blocked until it is answered", async () => {
+test("a question moves the ticket to Needs input, labels it and mentions the owner in one comment per waiting period", async () => {
+  const linear = new FakeLinear();
+  linear.state = { ...linear.state, status: "In Progress", statusId: "ip", statusType: "started", creatorId: "creator" };
+  let pending: { id: string }[] = [];
+  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" }, pendingPermissions: pending } }) }) } } as unknown as PaseoApi;
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
+  const ask = async (id: string, title: string) => {
+    pending = [{ id }];
+    await writeback.permissionRequested({ agent: root, request: { id, provider: "claude", name: "AskUser", kind: "question", title } }, paseo);
+  };
+  const waiting = (question: string) => `https://linear.app/acme/profiles/creator **ENG-1: Fix sign-in** (Paseo) is waiting for an answer: ${question}\n\nReply here with “@paseo <your answer>”.`;
+
+  await ask("q1", "Question 1/2");
+  assert.deepEqual(linear.writes.splice(0), ["state", "move issue-1 Needs input", "+paseo-needs-you", `new comment: ${waiting("Question 1/2")}`]);
+  // The next question arrives before the settle wait ends: the ticket stays in Needs input and the comment is edited.
+  pending = [{ id: "q2" }];
+  await writeback.permissionResolved({ agent: root, requestId: "q1", resolution: { behavior: "allow" } }, paseo);
+  await ask("q2", "Question 2/2");
+  assert.deepEqual(linear.writes.splice(0), ["state", "move issue-1 Needs input", `edit c1: ${waiting("Question 2/2")}`]);
+
+  pending = [];
+  await writeback.permissionResolved({ agent: root, requestId: "q2", resolution: { behavior: "allow" } }, paseo);
+  assert.deepEqual(linear.writes.splice(0), ["state", "-paseo-needs-you", "restore ip"]);
+  // A later wait is a new period with a fresh comment.
+  linear.state = { ...linear.state, status: "In Progress", statusId: "ip" };
+  await ask("q3", "Another one?");
+  assert.deepEqual(linear.writes.splice(0), ["state", "move issue-1 Needs input", "+paseo-needs-you", `new comment: ${waiting("Another one?")}`]);
+});
+
+test("the previous state is not restored when someone moved the ticket out of Needs input meanwhile", async () => {
   const linear = new FakeLinear();
   const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
-  await writeback.permissionRequested({ agent: root, request: { id: "p", provider: "claude", name: "AskUser", kind: "question", title: "Which database?" } }, linked);
-  await writeback.permissionResolved({ agent: root, requestId: "p", resolution: { behavior: "allow" } }, linked);
-  assert.deepEqual(linear.writes, ["comment: **ENG-1: Fix sign-in** (Paseo) is waiting for an answer: Which database?\n\nReply here with “@paseo <your answer>”.", "+paseo-blocked", "-paseo-blocked"]);
+  await writeback.permissionRequested({ agent: root, request: { id: "p", provider: "claude", name: "Bash", kind: "tool", title: "Allow tool: Bash" } }, linked);
+  linear.state = { ...linear.state, status: "Canceled", statusId: "canceled", statusType: "canceled" };
+  linear.writes.length = 0;
+  await writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "failed", error: { message: "boom" } }, timeline: [] }, linked);
+  // Errors, not questions, get the blocked label.
+  assert.deepEqual(linear.writes, ["state", "-paseo-needs-you", "comment: **ENG-1: Fix sign-in** (Paseo) stopped with an error: boom", "+paseo-blocked"]);
 });
 
 test("archiving clears the running marker and reports only when no pull request was linked", async () => {
   const linear = new FakeLinear();
   const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
   await writeback.archived({ agent: root, archivedAt: "now" }, linked);
-  assert.deepEqual(linear.writes, ["state", "-paseo-running", "-paseo-blocked", "comment: **ENG-1: Fix sign-in** (Paseo) was archived without a linked pull request."]);
+  assert.deepEqual(linear.writes, ["state", "-paseo-running", "-paseo-blocked", "-paseo-needs-you", "comment: **ENG-1: Fix sign-in** (Paseo) was archived without a linked pull request."]);
 
   const withPr = new FakeLinear();
   withPr.state = { ...withPr.state, attachmentUrls: ["https://github.com/o/r/pull/9"] };

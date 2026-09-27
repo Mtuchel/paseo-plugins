@@ -11,6 +11,9 @@ const exec = promisify(execFile);
 const MAX_SUMMARY = 1_500;
 const KEPT_SUMMARIES = 3;
 
+// While an agent waits for an answer or approval: the state the ticket left for "Needs input"
+// (restored afterwards) and the mention comment edited for each further question.
+export type WaitingPeriod = { previousStateId: string | null; commentId: string | null };
 export type HandoverStatus = "working" | "waiting" | "finished" | "failed" | "archived";
 export type HandoverRecord = {
   issueId: string;
@@ -28,6 +31,8 @@ export type HandoverRecord = {
   review?: string | null;
   // The model the agent last ran with, e.g. "anthropic/claude-opus-5-5 · thinking medium".
   model?: string | null;
+  // The open waiting period, while the agent waits for the owner (belongs to the ticket, not the agent).
+  waiting?: WaitingPeriod | null;
   status: HandoverStatus;
   progressCommentId: string | null;
   resumedFrom: string | null;
@@ -141,6 +146,7 @@ export class Handover {
         plan: change.plan ?? (sameAgent ? previous.plan ?? null : null),
         review: change.review ?? (sameAgent ? previous.review ?? null : null),
         model: change.model ?? (sameAgent ? previous.model ?? null : null),
+        waiting: previous?.waiting ?? null,
         status: change.status ?? (sameAgent ? previous.status : "working"),
         progressCommentId: sameAgent ? previous.progressCommentId : null,
         resumedFrom: sameAgent ? previous.resumedFrom : previous?.agentId ?? null,
@@ -170,6 +176,24 @@ export class Handover {
     const record = await this.update(issue, agent, { status, model });
     await this.linear.comment(issue.id, finalBody(record, reason));
     return record;
+  }
+
+  async waiting(issueId: string): Promise<WaitingPeriod | null> {
+    return (await this.read(issueId))?.waiting ?? null;
+  }
+
+  // Records the waiting period without touching the progress comment. A ticket without a record
+  // yet (no turn summary so far) gets a minimal one for this agent.
+  setWaiting(issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, waiting: WaitingPeriod | null): Promise<void> {
+    return this.serialize(async () => {
+      const previous = await this.read(issue.id);
+      if (!previous && !waiting) return;
+      const base: HandoverRecord = previous ?? {
+        issueId: issue.id, identifier: issue.identifier, agentId: agent.id, agentTitle: agent.title ?? `Paseo agent on ${issue.identifier}`,
+        branch: null, worktreePath: agent.cwd, lastCommit: null, summaries: [], links: {}, status: "working", progressCommentId: null, resumedFrom: null, updatedAt: this.now(),
+      };
+      await this.save({ ...base, waiting });
+    });
   }
 
   async all(): Promise<HandoverRecord[]> {

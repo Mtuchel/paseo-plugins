@@ -10,7 +10,7 @@ import { reviewChange } from "./pr-watch";
 import { decidePlannotatorReview, describeTool, questionPrompt, SessionRouter, SessionStore } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { approveForLater, splitIntoSubIssues } from "./split";
-import { isUntrusted, TicketStarter, UNTRUSTED_NOTE } from "./starter";
+import { isUntrusted, TicketStarter, QUESTIONS_NOTE, UNTRUSTED_NOTE } from "./starter";
 
 const OWNER = "owner-1";
 const settings: PluginSettings = {
@@ -185,7 +185,7 @@ function starterHarness(state: { creatorId: string; labels: { id: string; name: 
   const starter = new TicketStarter({
     linear: {
       detail: async () => ({ issue: { identifier: "TUC-1", project: "", team: "Team" }, projectId: null, teamId: "t1" }) as never,
-      issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusType: "unstarted", teamId: "t1", projectId: null, attachmentUrls: [], ...state }),
+      issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, attachmentUrls: [], ...state }),
       viewerId: async () => OWNER,
       issueDocument: async (_id: string, title: string) => title === "Plan: TUC-1" ? { url: "https://linear.app/doc/plan", content: "# Plan\n1. Add the table" } : null,
     },
@@ -216,7 +216,7 @@ test("tickets written by someone else, or from the feedback intake, start plan-f
   const h = starterHarness({ creatorId: "customer", labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, settings, { retryHint: "retry" });
   assert.equal(started.untrusted, true);
-  assert.deepEqual(h.launches[0], { modeId: "write", instructions: UNTRUSTED_NOTE, labels: { "linear.untrusted": "1" }, markInProgress: false });
+  assert.deepEqual(h.launches[0], { modeId: "write", instructions: `${UNTRUSTED_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.untrusted": "1" }, markInProgress: false });
   const mine = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
   await mine.starter.start("i1", mine.paseo, settings, { retryHint: "retry" });
   assert.equal(mine.launches[0].modeId, "full");
@@ -283,7 +283,7 @@ test("splitting creates one sub-issue per step, each blocked by the previous, al
   let n = 0;
   const deps = {
     linear: {
-      issueState: async () => ({ id: "parent", identifier: "TUC-1", status: "Planning", statusType: "started", teamId: "t1", projectId: "p9", creatorId: OWNER, labels: [], attachmentUrls: [], blockedBy: [] }),
+      issueState: async () => ({ id: "parent", identifier: "TUC-1", status: "Planning", statusId: "planning", statusType: "started", teamId: "t1", projectId: "p9", creatorId: OWNER, labels: [], attachmentUrls: [], blockedBy: [] }),
       upsertIssueDocument: async (_id: string, _title: string, body: string) => { calls.push(`document ${body.split("\n").find((line) => line.includes("Planned with"))}`); return "https://linear.app/doc/plan"; },
       createIssue: async (input: { title: string; parentId?: string; projectId?: string | null; ready?: boolean }) => { n++; calls.push(`create ${input.title} parent=${input.parentId} project=${input.projectId}${input.ready ? " ready" : ""}`); return { id: `s${n}`, identifier: `TUC-${10 + n}`, url: "" }; },
       addBlocker: async (blocker: string, blocked: string) => { calls.push(`${blocker} blocks ${blocked}`); },
