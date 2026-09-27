@@ -22,6 +22,7 @@ class FakeLinear {
   state: IssueState = { id: "issue-1", identifier: "ENG-1", projectId: null, creatorId: null, blockedBy: [], status: "Todo", statusType: "unstarted", teamId: "t1", labels: [{ id: "l1", name: "paseo-running" }], attachmentUrls: [] };
   async issueState() { this.writes.push("state"); return this.state; }
   async markInProgress(issue: { id: string }) { this.writes.push(`in-progress ${issue.id}`); return { changed: true }; }
+  async moveToStateNamed(id: string, name: string) { this.writes.push(`move ${id} ${name}`); return { changed: true }; }
   async comment(_id: string, body: string) { this.writes.push(`comment: ${body}`); }
   async addLabel(_id: string, name: string) { this.writes.push(`+${name}`); }
   async removeLabel(_id: string, name: string) { this.writes.push(`-${name}`); }
@@ -99,6 +100,17 @@ test("the first turn marks the ticket in progress once per agent", async () => {
   await writeback.turnStarted({ agent: root, turnId: "a" }, linked);
   await writeback.turnStarted({ agent: root, turnId: "b" }, linked);
   assert.deepEqual(linear.writes, ["state", "in-progress issue-1"]);
+});
+
+test("a plan-first agent's first turn moves its ticket to Planning, unless the ticket already started", async () => {
+  const planFirst = paseoWithLabels({ "linear.issueId": "issue-1", "linear.untrusted": "1" });
+  const fresh = new FakeLinear();
+  await new Writeback(fresh, { read: async () => allOn }, undefined, 0).turnStarted({ agent: root, turnId: "a" }, planFirst);
+  assert.deepEqual(fresh.writes, ["state", "move issue-1 Planning"]);
+  const approved = new FakeLinear();
+  approved.state = { ...approved.state, status: "In Progress", statusType: "started" };
+  await new Writeback(approved, { read: async () => allOn }, undefined, 0).turnStarted({ agent: root, turnId: "a" }, planFirst);
+  assert.deepEqual(approved.writes, ["state"]);
 });
 
 test("a model switch between turns is announced in the panel and recorded in the progress comment", async () => {

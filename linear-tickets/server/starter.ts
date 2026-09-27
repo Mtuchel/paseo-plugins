@@ -6,13 +6,13 @@ import type { Handover } from "./handover";
 import type { Launcher } from "./launch";
 import type { LinearService } from "./linear";
 import { findProject, readBranches } from "./projects";
-import { PLAN_READY_LABEL, PLANNING_STATE } from "./plannotator";
+import { PLAN_READY_LABEL } from "./plannotator";
 import type { PluginSettings } from "./settings";
 
 export type Started = { agentId: string; warnings: string[]; provider: string; target: string; resumed: boolean; untrusted: boolean };
 export type Admission = { ok: true } | { ok: false; reason: string };
 type Deps = {
-  linear: Pick<LinearService, "detail" | "issueState" | "viewerId" | "issueDocument" | "moveToStateNamed">;
+  linear: Pick<LinearService, "detail" | "issueState" | "viewerId" | "issueDocument">;
   launcher: Pick<Launcher, "start">;
   handover?: Pick<Handover, "resumeTarget">;
   branches?: typeof readBranches;
@@ -109,19 +109,13 @@ export class TicketStarter {
       modeId: planFirst ? SAFE_MODES[providerKey] ?? preference.modeId : preference.modeId,
       thinkingOptionId: preference.thinkingOptionId,
       instructions: [planFirst ? UNTRUSTED_NOTE : untrusted ? UNTRUSTED_TEXT : "", planReady ? approvedPlanNote(detail.issue.identifier, plan) : ""].filter(Boolean).join("\n\n"),
-      // A plan-first ticket is in Planning, not In Progress (moved below once the agent exists).
+      // A plan-first ticket goes to Planning on the agent's first turn (write-back), not In Progress.
       markInProgress: settings.markInProgress && !planFirst,
     };
     const launchOptions = { promptTemplate: settings.template ?? undefined, markInProgress: base.markInProgress, linearAccess: settings.agentLinearAccess, labels: { ...options.labels, ...(planFirst ? { "linear.untrusted": "1" } : {}) } };
-    const toPlanning = async () => {
-      if (!planFirst || !settings.writeback.status) return;
-      const moved = await this.deps.linear.moveToStateNamed(issueId, PLANNING_STATE).catch((error: unknown) => ({ changed: false, note: error instanceof Error ? error.message : String(error) }));
-      if (moved.note) console.error(`[linear-tickets] ${detail.issue.identifier}: ${moved.note}`);
-    };
     if (resume && project.projectKind === "git") {
       try {
         const result = await this.deps.launcher.start({ ...base, requestId: randomUUID() }, paseo, { ...launchOptions, resume });
-        await toPlanning();
         return { ...result, provider: preference.model, target, resumed: true, untrusted: planFirst };
       } catch (error) {
         // A deleted or merged branch cannot be continued; a fresh start is the useful fallback.
@@ -135,7 +129,6 @@ export class TicketStarter {
       if (!baseBranch) throw new Error(`Could not pick a base branch in ${mapping.label}. Save a base branch for its project mapping.`);
     }
     const result = await this.deps.launcher.start({ ...base, baseBranch, requestId: randomUUID() }, paseo, launchOptions);
-    await toPlanning();
     return { ...result, provider: preference.model, target, resumed: false, untrusted: planFirst };
   }
 }

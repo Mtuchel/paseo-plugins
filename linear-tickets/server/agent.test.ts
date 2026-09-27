@@ -198,7 +198,7 @@ test("a permission shows in the agent panel only while still pending, and then w
     const calls: string[] = [];
     const linear = {
       issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusType: "unstarted", teamId: "t", projectId: null, creatorId: OWNER, labels: [], attachmentUrls: [], blockedBy: [] }),
-      markInProgress: async () => ({ changed: false }), moveToReview: async () => ({ changed: false }), linkUrl: async () => {},
+      markInProgress: async () => ({ changed: false }), moveToStateNamed: async () => ({ changed: false }), moveToReview: async () => ({ changed: false }), linkUrl: async () => {},
       comment: async (_i: string, body: string) => { calls.push(`comment ${body.slice(0, 30)}`); },
       addLabel: async (_i: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async () => {},
     };

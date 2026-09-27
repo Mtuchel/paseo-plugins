@@ -126,14 +126,12 @@ test("the live feed shows completed commands and edits only", () => {
 
 function starterHarness(state: { creatorId: string; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number) {
   const launches: { modeId?: string; instructions: string; labels?: Record<string, string>; markInProgress?: boolean }[] = [];
-  const moves: string[] = [];
   const starter = new TicketStarter({
     linear: {
       detail: async () => ({ issue: { identifier: "TUC-1", project: "", team: "Team" }, projectId: null, teamId: "t1" }) as never,
       issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusType: "unstarted", teamId: "t1", projectId: null, attachmentUrls: [], ...state }),
       viewerId: async () => OWNER,
       issueDocument: async (_id: string, title: string) => title === "Plan: TUC-1" ? { url: "https://linear.app/doc/plan", content: "# Plan\n1. Add the table" } : null,
-      moveToStateNamed: async (_id: string, name: string) => { moves.push(name); return { changed: true }; },
     },
     launcher: { start: async (input, _paseo, options) => { launches.push({ modeId: input.modeId, instructions: input.instructions, labels: options?.labels, markInProgress: options?.markInProgress }); return { agentId: "new", warnings: [] }; } },
     branches: async () => ({ branches: [{ id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }),
@@ -142,7 +140,7 @@ function starterHarness(state: { creatorId: string; labels: { id: string; name: 
     agents: { list: async () => ({ entries: Array.from({ length: running }, (_, index) => ({ agent: { id: `r${index}`, status: "running", labels: { "linear.issueId": `x${index}` } } })), pageInfo: { hasMore: false } }) },
     projects: { list: async () => ({ projects: [{ projectId: "p1", projectKind: "git", projectRootPath: "/repo", projectDisplayName: "repo" }] }) },
   } as unknown as PaseoApi;
-  return { starter, paseo, launches, moves };
+  return { starter, paseo, launches };
 }
 
 test("admission waits for unfinished blockers and for a free agent slot", async () => {
@@ -168,19 +166,17 @@ test("tickets written by someone else, or from the feedback intake, start plan-f
   assert.equal(mine.launches[0].modeId, "full");
 });
 
-test("a plan-first ticket starts in Planning; once its plan is approved (plan-ready) the next agent implements it in the usual mode", async () => {
+test("a plan-first ticket is not marked in progress; once its plan is approved (plan-ready) the next agent implements it in the usual mode", async () => {
   const syncing = { ...settings, markInProgress: true, writeback: { ...DEFAULT_WRITEBACK, status: true } };
   const first = starterHarness({ creatorId: "customer", labels: [{ id: "f", name: "feedback" }], blockedBy: [] }, 0);
   await first.starter.start("i1", first.paseo, syncing, { retryHint: "retry" });
   assert.equal(first.launches[0].markInProgress, false);
-  assert.deepEqual(first.moves, ["Planning"]);
   const later = starterHarness({ creatorId: "customer", labels: [{ id: "f", name: "feedback" }, { id: "r", name: "plan-ready" }], blockedBy: [] }, 0);
   const started = await later.starter.start("i1", later.paseo, syncing, { retryHint: "retry" });
   assert.equal(started.untrusted, false);
   assert.equal(later.launches[0].modeId, "full");
   assert.equal(later.launches[0].markInProgress, true);
   assert.deepEqual(later.launches[0].labels, {});
-  assert.deepEqual(later.moves, []);
   assert.match(later.launches[0].instructions, /untrusted input/);
   assert.doesNotMatch(later.launches[0].instructions, /write a plan only/);
   assert.match(later.launches[0].instructions, /already approved a plan.*https:\/\/linear\.app\/doc\/plan/);

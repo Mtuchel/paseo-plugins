@@ -5,6 +5,7 @@ import { agentModel } from "./model";
 import { questionsOf } from "./relay";
 import type { Handover } from "./handover";
 import type { LinearService } from "./linear";
+import { PLANNING_STATE } from "./plannotator";
 import type { SessionRouter } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
 
@@ -14,14 +15,15 @@ const RETRY_DELAYS_MS = [30_000, 120_000];
 const PULL_REQUEST_URL = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/g;
 
 type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
-type Link = { issueId: string; identifier: string };
+// `planFirst`: launched plan-first (a ticket you did not write, before its plan is approved).
+type Link = { issueId: string; identifier: string; planFirst: boolean };
 // The native Linear agent: the session panel and the durable handover record. Optional, so
 // ticket write-back keeps working without the Paseo Linear app installed.
 export type AgentBridge = {
   sessions: Pick<SessionRouter, "sessionFor" | "say" | "action" | "ask" | "askQuestion" | "link" | "offerResume" | "resumeNow" | "holdIfStopped" | "follow" | "unfollow">;
   handover: Pick<Handover, "update" | "finish">;
 };
-type Linear = Pick<LinearService, "issueState" | "markInProgress" | "comment" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview">;
+type Linear = Pick<LinearService, "issueState" | "markInProgress" | "moveToStateNamed" | "comment" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview">;
 
 // The turn's reply: assistant text after the last user message. Streaming providers may
 // split one reply across several items, so the pieces are joined without separators.
@@ -102,8 +104,9 @@ export class Writeback {
     const known = this.links.get(agent.id);
     if (known !== undefined) return known;
     const refreshed = await paseo.agents.ref(agent.id).refresh();
-    const issueId = refreshed?.agent.labels?.["linear.issueId"];
-    const link = issueId ? { issueId, identifier: refreshed?.agent.labels?.["linear.identifier"] || issueId } : null;
+    const labels = refreshed?.agent.labels ?? {};
+    const issueId = labels["linear.issueId"];
+    const link = issueId ? { issueId, identifier: labels["linear.identifier"] || issueId, planFirst: labels["linear.untrusted"] === "1" } : null;
     this.links.set(agent.id, link);
     return link;
   }
@@ -127,7 +130,7 @@ export class Writeback {
   }
 
   turnStarted({ agent }: PluginLifecycleEvents["agent.turn_started"], paseo: PaseoApi): Promise<void> {
-    return this.run("turn_started", agent, paseo, async ({ issueId, identifier }, settings) => {
+    return this.run("turn_started", agent, paseo, async ({ issueId, identifier, planFirst }, settings) => {
       const sessions = this.agentBridge?.sessions;
       if (sessions && await sessions.holdIfStopped(agent.id).catch(() => false)) return;
       const model = await agentModel(paseo, agent.id);
@@ -146,7 +149,10 @@ export class Writeback {
       if (!settings.writeback.status || this.started.has(agent.id)) return;
       this.started.add(agent.id);
       const state = await this.linear.issueState(issueId);
-      const outcome = await this.linear.markInProgress(state, state.teamId);
+      // A plan-first agent only plans: its ticket goes to Planning, not In Progress. A ticket
+      // already started (for example after the plan was approved) is left where it is.
+      const outcome = !planFirst ? await this.linear.markInProgress(state, state.teamId)
+        : state.statusType.trim().toLowerCase() === "started" ? { changed: false } : await this.linear.moveToStateNamed(issueId, PLANNING_STATE);
       if (outcome.note) console.error(`[linear-tickets] ${issueId}: ${outcome.note}`);
     });
   }
