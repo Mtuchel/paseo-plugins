@@ -117,6 +117,33 @@ test("feedback for a review whose Plannotator server is gone reaches the agent i
   await h.cleanup();
 });
 
+test("a ticket keeps one open Paseo thread: older threads are closed once a newer one has the agent", async () => {
+  const calls: string[] = [];
+  const h = routerHarness([], {
+    api: {
+      activity: async (sessionId: string, content: { type: string; body?: string }) => { calls.push(`${sessionId} ${content.type}: ${(content.body ?? "").slice(0, 40)}`); },
+      openSessions: async () => [{ id: "old", status: "active" }, { id: "older", status: "complete" }, { id: "current", status: "active" }],
+      activities: async () => [],
+    } as never,
+  });
+  const at = (hour: number) => `2026-01-01T${String(hour).padStart(2, "0")}:00:00Z`;
+  await h.store.put({ ...link, sessionId: "older", agentId: "a0", createdAt: at(8) });
+  await h.store.put({ ...link, sessionId: "old", agentId: "a1", createdAt: at(9), review: { localUrl: "http://localhost:5000" } });
+  await h.store.put({ ...link, sessionId: "current", agentId: "a1", createdAt: at(10) });
+  await h.store.put({ ...link, sessionId: "waiting", agentId: null, createdAt: at(11), queued: true });
+  await h.store.put({ ...link, sessionId: "elsewhere", issueId: "i2", agentId: "a2", createdAt: at(7) });
+  await h.router.closeSuperseded();
+  assert.deepEqual(calls, ["old response: Continued in the newest Paseo thread on "]);
+  assert.equal((await h.store.get("old"))?.closed, true);
+  assert.equal((await h.store.get("old"))?.review, null);
+  assert.equal((await h.store.get("older"))?.closed, true, "already complete in Linear: marked, not told again");
+  for (const id of ["current", "waiting", "elsewhere"]) assert.equal((await h.store.get(id))?.closed, undefined, id);
+  assert.equal((await h.store.forAgent("a1"))?.sessionId, "current");
+  await h.router.closeSuperseded();
+  assert.equal(calls.length, 1, "closing happens once");
+  await h.cleanup();
+});
+
 test("the live feed shows completed commands and edits only", () => {
   assert.equal(describeTool({ type: "tool_call", status: "completed", detail: { type: "shell", command: "npm test" } }), "Ran npm test");
   assert.equal(describeTool({ type: "tool_call", status: "completed", detail: { type: "edit", filePath: "src/a.ts" } }), "Edited src/a.ts");

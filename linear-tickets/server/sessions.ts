@@ -42,19 +42,36 @@ export type SessionLink = {
   queued?: boolean;
   // A question with several parts, asked one part at a time.
   questions?: { requestId: string; index: number; answers: Record<string, string> } | null;
+  // Replaced by a newer thread on the same ticket (every @mention opens one); told so and completed.
+  closed?: boolean;
 };
+
+// Every @mention or assignment opens a new Linear thread, so a ticket collects threads while one
+// agent works. Only the newest thread with an agent stays open; older ones on that ticket
+// (and their stale review links or resume offers) are superseded.
+export function supersededSessions(links: SessionLink[]): { link: SessionLink; current: SessionLink }[] {
+  const result: { link: SessionLink; current: SessionLink }[] = [];
+  const byIssue = new Map<string, SessionLink[]>();
+  for (const link of links) byIssue.set(link.issueId, [...(byIssue.get(link.issueId) ?? []), link]);
+  for (const group of byIssue.values()) {
+    const current = group.filter((link) => link.agentId).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+    if (!current) continue;
+    for (const link of group) if (link !== current && !link.closed && link.createdAt < current.createdAt) result.push({ link, current });
+  }
+  return result;
+}
 
 // sessionId → Paseo agent, persisted so a reload keeps every conversation connected.
 export class SessionStore {
   private links: Record<string, SessionLink> | null = null;
+  private loading: Promise<Record<string, SessionLink>> | null = null;
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly path = join(agentAppDirectory(), "sessions.json")) {}
 
-  private async load(): Promise<Record<string, SessionLink>> {
-    if (this.links) return this.links;
-    try { this.links = JSON.parse(await readFile(this.path, "utf8")); } catch { this.links = {}; }
-    return this.links!;
+  // One shared read: two concurrent first loads would each replace the map and drop the other's writes.
+  private load(): Promise<Record<string, SessionLink>> {
+    return this.loading ??= readFile(this.path, "utf8").then((text) => JSON.parse(text) as Record<string, SessionLink>, () => ({})).then((links) => (this.links = links));
   }
 
   private persist(): Promise<void> {
@@ -79,6 +96,10 @@ export class SessionStore {
   async forAgent(agentId: string): Promise<SessionLink | null> {
     const links = Object.values(await this.load()).filter((link) => link.agentId === agentId);
     return links.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ?? null;
+  }
+
+  async all(): Promise<SessionLink[]> {
+    return Object.values(await this.load());
   }
 
   async put(link: SessionLink): Promise<void> {
@@ -274,6 +295,7 @@ export class SessionRouter {
       const text = typeof comment.body === "string" && !/^This thread is for an agent session/.test(comment.body) ? comment.body.replace(/@paseo\b/gi, "").trim() : "";
       if (text) await this.paseo!.agents.ref(existing.id).send(text);
       await this.say(session.id, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.${text ? " Your message was passed on." : ""}`);
+      await this.closeSuperseded();
       return;
     }
     await this.deps.store.put(link);
@@ -284,6 +306,22 @@ export class SessionRouter {
       return;
     }
     await this.startFor(link, false);
+    await this.closeSuperseded();
+  }
+
+  // Completes older threads on a ticket once a newer one has the agent, so the ticket shows one
+  // live Paseo thread. A reply in a closed thread still reaches the agent.
+  async closeSuperseded(): Promise<void> {
+    const superseded = supersededSessions(await this.deps.store.all());
+    if (!superseded.length) return;
+    // Threads Linear already shows as complete are only marked, not told again.
+    const open = new Set((await this.deps.api.openSessions()).filter((session) => session.status !== "complete").map((session) => session.id));
+    for (const { link, current } of superseded) {
+      await this.deps.store.patch(link.sessionId, { closed: true, review: null, offer: null, questions: null, queued: false });
+      if (!open.has(link.sessionId)) continue;
+      const title = current.agentId ? (await this.paseo?.agents.ref(current.agentId).refresh().catch(() => null))?.agent.title : null;
+      await this.say(link.sessionId, "response", `Continued in the newest Paseo thread on this ticket${title ? ` (agent “${title}”)` : ""}. Follow and reply there; this thread is closed.`).catch(() => {});
+    }
   }
 
   private async startFor(link: SessionLink, fresh: boolean): Promise<void> {
@@ -406,6 +444,7 @@ export class SessionRouter {
     if (this.sweeping || !this.paseo) return;
     this.sweeping = true;
     try {
+      await this.closeSuperseded();
       const owner = await this.owner();
       for (const session of await this.deps.api.openSessions()) {
         // Linear marks a session "stale" after about half an hour without activity, which a ticket
