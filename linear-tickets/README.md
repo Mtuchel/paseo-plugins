@@ -281,6 +281,11 @@ sessions and replies whose webhook was missed. **Settings → Linear agent** sho
 The prompt marks the ticket as untrusted input and asks only for a plan. Approving the plan
 switches the agent to your usual mode.
 
+**Which model is working.** The progress comment, the final report, the plan review question and
+the plan document ("Planned with") show the model the agent runs, with its thinking level. When
+it changes between turns (you picked another model in Paseo, or Plannotator restored the model it
+saved before planning), the panel says so: `Model changed: A → B`.
+
 **Questions stay answerable.** Linear shows a question's buttons only while it is the newest
 entry in the panel, so the live feed holds the agent's commands until you reply. If an agent
 waits on several approvals at once (parallel tool calls), each is asked in turn.
