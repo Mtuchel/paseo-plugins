@@ -101,6 +101,29 @@ test("the first turn marks the ticket in progress once per agent", async () => {
   assert.deepEqual(linear.writes, ["state", "in-progress issue-1"]);
 });
 
+test("a model switch between turns is announced in the panel and recorded in the progress comment", async () => {
+  const linear = new FakeLinear();
+  const panel: string[] = [];
+  const records: unknown[] = [];
+  const bridge = {
+    sessions: { sessionFor: async () => ({ sessionId: "s1" }), holdIfStopped: async () => false, follow: async () => {}, say: async (_s: string, type: string, body: string) => { panel.push(`${type}: ${body}`); } },
+    handover: { update: async (_issue: unknown, _agent: unknown, change: unknown) => { records.push(change); } },
+  };
+  const writeback = new Writeback(linear, { read: async () => allOn }, bridge as never, 0);
+  // Plannotator restores its pre-planning model inside the provider; the runtime report wins.
+  let runtime = "anthropic/claude-opus-5-5";
+  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1", "linear.identifier": "ENG-1" }, model: "anthropic/claude-opus-5-5", runtimeInfo: { model: runtime, thinkingOptionId: "medium" } } }) }) } } as unknown as PaseoApi;
+  await writeback.turnStarted({ agent: root, turnId: "a" }, paseo);
+  runtime = "deepseek/deepseek-v4-flash";
+  await writeback.turnStarted({ agent: root, turnId: "b" }, paseo);
+  assert.deepEqual(panel, [
+    "thought: Working… (anthropic/claude-opus-5-5 · thinking medium)",
+    "thought: Model changed: anthropic/claude-opus-5-5 · thinking medium → deepseek/deepseek-v4-flash · thinking medium",
+    "thought: Working… (deepseek/deepseek-v4-flash · thinking medium)",
+  ]);
+  assert.deepEqual(records, [{ model: "anthropic/claude-opus-5-5 · thinking medium" }, { model: "deepseek/deepseek-v4-flash · thinking medium" }]);
+});
+
 test("a pending question marks the ticket blocked until it is answered", async () => {
   const linear = new FakeLinear();
   const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);

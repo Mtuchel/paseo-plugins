@@ -1,6 +1,7 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { dispatchLabels } from "./dispatch";
+import { agentModel } from "./model";
 import { questionsOf } from "./relay";
 import type { Handover } from "./handover";
 import type { LinearService } from "./linear";
@@ -78,6 +79,9 @@ export function truncateSummary(text: string): string {
 export class Writeback {
   private readonly links = new Map<string, Link | null>();
   private readonly started = new Set<string>();
+  // Last model shown per agent; a change (another model picked in Paseo, or Plannotator restoring
+  // its pre-planning model on approval) is announced in the panel and the progress comment.
+  private readonly models = new Map<string, string>();
 
   constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly agentBridge?: AgentBridge, private readonly settleMs = 2_000) {}
 
@@ -123,13 +127,22 @@ export class Writeback {
   }
 
   turnStarted({ agent }: PluginLifecycleEvents["agent.turn_started"], paseo: PaseoApi): Promise<void> {
-    return this.run("turn_started", agent, paseo, async ({ issueId }, settings) => {
+    return this.run("turn_started", agent, paseo, async ({ issueId, identifier }, settings) => {
       const sessions = this.agentBridge?.sessions;
       if (sessions && await sessions.holdIfStopped(agent.id).catch(() => false)) return;
+      const model = await agentModel(paseo, agent.id);
+      const previous = this.models.get(agent.id);
+      if (model) this.models.set(agent.id, model);
+      const changed = Boolean(model && previous && model !== previous);
       await this.session(agent.id, async (sessionId, live) => {
-        await live.say(sessionId, "thought", "Working…", true);
+        if (changed) await live.say(sessionId, "thought", `Model changed: ${previous} → ${model}`);
+        await live.say(sessionId, "thought", model ? `Working… (${model})` : "Working…", true);
         await live.follow(agent.id);
       });
+      const handover = this.agentBridge?.handover;
+      if (model && (changed || !previous) && handover && settings.writeback.summaries) {
+        await handover.update({ id: issueId, identifier }, agent, { model }).catch(() => {});
+      }
       if (!settings.writeback.status || this.started.has(agent.id)) return;
       this.started.add(agent.id);
       const state = await this.linear.issueState(issueId);
@@ -145,6 +158,8 @@ export class Writeback {
       const title = agent.title ?? "Paseo agent";
       const handover = this.agentBridge?.handover;
       const issue = { id: issueId, identifier };
+      const model = await agentModel(paseo, agent.id);
+      if (model) this.models.set(agent.id, model);
       if (outcome.kind === "completed") {
         const reply = turnReply(timeline);
         await this.session(agent.id, async (sessionId, sessions) => {
@@ -154,7 +169,7 @@ export class Writeback {
         });
         // With the handover record, turns update one progress comment instead of adding comments.
         if (writeback.summaries && reply) {
-          if (handover) await handover.update(issue, agent, { status: "working", summary: reply });
+          if (handover) await handover.update(issue, agent, { status: "working", summary: reply, model });
           else await this.linear.comment(issueId, `**${title}** (Paseo) finished a turn:\n\n${truncateSummary(reply)}`);
         }
         if (writeback.blocked) await this.linear.removeLabel(issueId, blocked);
@@ -163,7 +178,7 @@ export class Writeback {
           await sessions.unfollow(agent.id);
           await sessions.say(sessionId, "error", `The agent stopped with an error: ${outcome.error.message}`);
         });
-        if (handover) await handover.finish(issue, agent, "failed", outcome.error.message.slice(0, 500));
+        if (handover) await handover.finish(issue, agent, "failed", outcome.error.message.slice(0, 500), model);
         else if (writeback.summaries || writeback.blocked) await this.linear.comment(issueId, `**${title}** (Paseo) stopped with an error: ${outcome.error.message}`);
         if (writeback.blocked) await this.linear.addLabel(issueId, blocked);
         await this.session(agent.id, async (sessionId, sessions) => {

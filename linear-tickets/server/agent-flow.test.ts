@@ -186,7 +186,7 @@ test("splitting creates one sub-issue per step, each blocked by the previous, al
   const deps = {
     linear: {
       issueState: async () => ({ id: "parent", identifier: "TUC-1", status: "Planning", statusType: "started", teamId: "t1", projectId: "p9", creatorId: OWNER, labels: [], attachmentUrls: [], blockedBy: [] }),
-      upsertIssueDocument: async () => "https://linear.app/doc/plan",
+      upsertIssueDocument: async (_id: string, _title: string, body: string) => { calls.push(`document ${body.split("\n").find((line) => line.includes("Planned with"))}`); return "https://linear.app/doc/plan"; },
       createIssue: async (input: { title: string; parentId?: string; projectId?: string | null; ready?: boolean }) => { n++; calls.push(`create ${input.title} parent=${input.parentId} project=${input.projectId}${input.ready ? " ready" : ""}`); return { id: `s${n}`, identifier: `TUC-${10 + n}`, url: "" }; },
       addBlocker: async (blocker: string, blocked: string) => { calls.push(`${blocker} blocks ${blocked}`); },
       delegate: async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); },
@@ -196,8 +196,10 @@ test("splitting creates one sub-issue per step, each blocked by the previous, al
     readPlan: async () => "# Plan\n## Steps\n1. Add the domain\n2. Add the migration\n3. Wire the API",
     retirePlanner: async (_url: string, agentId: string) => { calls.push(`retire ${agentId}`); },
   };
-  const summary = await splitIntoSubIssues(deps, { issueId: "parent", identifier: "TUC-1", agentId: "planner" }, "http://localhost:5000/", {} as PaseoApi);
+  const planner = { agents: { ref: () => ({ refresh: async () => ({ agent: { model: "omp/opus", effectiveThinkingOptionId: "medium" } }) }) } } as unknown as PaseoApi;
+  const summary = await splitIntoSubIssues(deps, { issueId: "parent", identifier: "TUC-1", agentId: "planner" }, "http://localhost:5000/", planner);
   assert.deepEqual(calls, [
+    "document > **Planned with:** `omp/opus · thinking medium`",
     "retire planner",
     "create Add the domain parent=parent project=p9 ready",
     "create Add the migration parent=parent project=p9 ready",

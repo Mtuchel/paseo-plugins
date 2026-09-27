@@ -26,6 +26,8 @@ export type HandoverRecord = {
   plan?: string | null;
   // Where the pull request review stands, e.g. "changes requested by @alice".
   review?: string | null;
+  // The model the agent last ran with, e.g. "anthropic/claude-opus-5-5 · thinking medium".
+  model?: string | null;
   status: HandoverStatus;
   progressCommentId: string | null;
   resumedFrom: string | null;
@@ -55,6 +57,7 @@ export function progressBody(record: HandoverRecord): string {
   return [
     `🛠 **Paseo progress** — ${record.agentTitle}`,
     `**Phase:** ${PHASE[record.status]} · updated ${record.updatedAt.slice(0, 16).replace("T", " ")} UTC`,
+    record.model ? `**Model:** \`${record.model}\`` : "",
     `**Branch:** ${record.branch ? `\`${record.branch}\`` : "—"} · **Last commit:** ${record.lastCommit ? `\`${record.lastCommit}\`` : "—"}`,
     record.worktreePath ? `**Worktree:** \`${record.worktreePath}\`` : "",
     record.plan ? `**Plan:** ${record.plan}` : "",
@@ -68,6 +71,7 @@ export function finalBody(record: HandoverRecord, reason: string): string {
   return [
     `🏁 **Paseo final report** — ${record.agentTitle}`,
     `**Outcome:** ${PHASE[record.status]}${reason ? ` — ${reason}` : ""}`,
+    ...(record.model ? [`**Model:** \`${record.model}\``] : []),
     `**Branch:** ${record.branch ? `\`${record.branch}\`` : "—"} · **Last commit:** ${record.lastCommit ? `\`${record.lastCommit}\`` : "—"}`,
     record.summaries.length ? `**Last report:**\n\n${record.summaries[record.summaries.length - 1]}` : "**Last report:** none",
     `**Continue:** assign Paseo again, @mention it, or re-add the \`paseo\` label — the next agent picks up on ${record.branch ? `\`${record.branch}\`` : "this ticket"} with this record.`,
@@ -114,7 +118,7 @@ export class Handover {
 
   // Updates the record for this agent (a new agent on the ticket starts a new progress comment)
   // and edits the progress comment. Returns the record.
-  update(issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, change: { status?: HandoverStatus; summary?: string; link?: [string, string]; plan?: string; review?: string }): Promise<HandoverRecord> {
+  update(issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, change: { status?: HandoverStatus; summary?: string; link?: [string, string]; plan?: string; review?: string; model?: string | null }): Promise<HandoverRecord> {
     return this.serialize(async () => {
       const previous = await this.read(issue.id);
       const sameAgent = previous?.agentId === agent.id;
@@ -131,6 +135,7 @@ export class Handover {
         links: { ...(sameAgent ? previous.links : {}), ...(change.link ? { [change.link[0]]: change.link[1] } : {}) },
         plan: change.plan ?? (sameAgent ? previous.plan ?? null : null),
         review: change.review ?? (sameAgent ? previous.review ?? null : null),
+        model: change.model ?? (sameAgent ? previous.model ?? null : null),
         status: change.status ?? (sameAgent ? previous.status : "working"),
         progressCommentId: sameAgent ? previous.progressCommentId : null,
         resumedFrom: sameAgent ? previous.resumedFrom : previous?.agentId ?? null,
@@ -150,8 +155,8 @@ export class Handover {
   }
 
   // Marks the agent as stopped and posts the final report.
-  async finish(issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, status: "finished" | "failed" | "archived", reason: string): Promise<HandoverRecord> {
-    const record = await this.update(issue, agent, { status });
+  async finish(issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, status: "finished" | "failed" | "archived", reason: string, model?: string | null): Promise<HandoverRecord> {
+    const record = await this.update(issue, agent, { status, model });
     await this.linear.comment(issue.id, finalBody(record, reason));
     return record;
   }

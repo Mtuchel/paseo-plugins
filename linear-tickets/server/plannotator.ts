@@ -7,6 +7,7 @@ import type { Settings } from "./settings";
 import { PLANNOTATOR_OPEN_SOURCE } from "./plannotator-open-source";
 import { paseoHome } from "./ticket-mcp";
 import type { Handover } from "./handover";
+import { activeModel } from "./model";
 import { APPROVE_PLAN, MAX_SPLIT, planSteps, SEND_BACK, setAgentMode, SPLIT_PLAN, type SessionRouter } from "./sessions";
 
 // The plan text of a running review, from the same endpoint its page loads.
@@ -90,11 +91,12 @@ export function parseEvent(raw: string): PlannotatorEvent | null {
   return null;
 }
 
-export function planDocument(event: DecidedEvent, identifier: string): string {
+export function planDocument(event: DecidedEvent, identifier: string, model?: string | null): string {
   const date = event.at.slice(0, 16).replace("T", " ");
   const plan = (event.planContent ?? "").trim() || "_The plan text was not recorded._";
   return [
     `> **${event.approved ? "Approved" : "Sent back with feedback"}** in Plannotator on ${date} UTC for ${identifier}. Replaced on every review round; the decision comments on the ticket keep the history.`,
+    model ? `> **Planned with:** \`${model}\`` : "",
     event.feedback ? `\n## Review feedback\n\n${event.feedback}` : "",
     "\n---\n",
     plan.length > MAX_PLAN_CHARS ? `${plan.slice(0, MAX_PLAN_CHARS)}\n\n… (truncated)` : plan,
@@ -129,7 +131,7 @@ export class PlannotatorBridge {
   // The ticket's Linear agent panel: review link, plan checklist and Approve / Send back.
   // Returns whether the agent has a session: then the progress comment carries the plan state
   // instead of separate plan comments.
-  private async toSession(event: PlannotatorEvent, agentId: string): Promise<boolean> {
+  private async toSession(event: PlannotatorEvent, agentId: string, model: string | null): Promise<boolean> {
     const sessions = this.sessions;
     if (!sessions) return false;
     try {
@@ -141,7 +143,7 @@ export class PlannotatorBridge {
         if (steps.length) await sessions.plan(link.sessionId, steps.map((content) => ({ content, status: "pending" as const })));
         await sessions.expectReview(link.sessionId, event.localUrl);
         const split = steps.length > 1 ? [{ label: `Approve & split into ${Math.min(steps.length, MAX_SPLIT)} sub-issues`, value: SPLIT_PLAN }] : [];
-        await sessions.ask(link.sessionId, `The plan is ready for review${event.remoteUrl ? ` (full view: ${event.remoteUrl})` : ""}. Approve it, or reply with what to change.`, [{ label: "Approve plan", value: APPROVE_PLAN }, ...split, { label: "Send back", value: SEND_BACK }]);
+        await sessions.ask(link.sessionId, `The plan is ready for review${event.remoteUrl ? ` (full view: ${event.remoteUrl})` : ""}. Approve it, or reply with what to change.${model ? `\n\nPlanned with ${model}.` : ""}`, [{ label: "Approve plan", value: APPROVE_PLAN }, ...split, { label: "Send back", value: SEND_BACK }]);
         return true;
       }
       await sessions.expectReview(link.sessionId, null);
@@ -212,17 +214,18 @@ export class PlannotatorBridge {
     const handle = paseo.agents.ref(agentId);
     const refreshed = await handle.refresh();
     const labels = refreshed?.agent.labels ?? {};
+    const model = activeModel(refreshed?.agent);
     const issueId = labels["paseo.parent-agent-id"] ? undefined : labels["linear.issueId"];
     const identifier = labels["linear.identifier"] || "this ticket";
     const url = event.type === "opened" ? event.remoteUrl ?? event.localUrl : undefined;
     const row: PlannotatorRow = event.type === "opened"
-      ? { title: "Handed off to Plannotator for review", url, detail: event.remoteUrl ? "Opens on any device in your tailnet." : "Local link only: Tailscale was unavailable." }
+      ? { title: "Handed off to Plannotator for review", url, detail: `${event.remoteUrl ? "Opens on any device in your tailnet." : "Local link only: Tailscale was unavailable."}${model ? ` Planned with ${model}.` : ""}` }
       : { title: event.approved ? "Plan approved in Plannotator" : "Plan sent back from Plannotator", ...(event.feedback ? { detail: event.feedback.slice(0, 4_000) } : {}) };
     // Only a plugin session may append chat rows; the plugin's own fallback connection is not one.
     // The row is a convenience, so Linear still gets the review either way.
     await handle.timeline.append({ type: "plugin", id: `plannotator-${event.type}-${event.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: row })
       .catch((error: unknown) => console.error(`[linear-tickets] Plannotator chat row for ${agentId} skipped: ${error instanceof Error ? error.message : error}`));
-    const inSession = await this.toSession(event, agentId);
+    const inSession = await this.toSession(event, agentId, model);
     if (!issueId) return;
     const settings = await this.settings.read();
     // A ticket someone else wrote ran plan-first; its approved plan unlocks the usual mode.
@@ -237,14 +240,14 @@ export class PlannotatorBridge {
     }
     // With a session the panel shows the review, so the progress comment records it instead of new comments.
     const progress = inSession && this.handover && refreshed?.agent
-      ? (change: { plan: string; link?: [string, string] }) => this.handover!.update({ id: issueId, identifier }, { id: agentId, title: refreshed.agent.title ?? null, cwd: refreshed.agent.cwd }, change)
+      ? (change: { plan: string; link?: [string, string] }) => this.handover!.update({ id: issueId, identifier }, { id: agentId, title: refreshed.agent.title ?? null, cwd: refreshed.agent.cwd }, { ...change, model })
       : null;
     if (event.type === "opened") {
       if (progress) { await progress({ plan: "under review", ...(url ? { link: ["Plan review", url] as [string, string] } : {}) }); return; }
-      await this.linear.comment(issueId, `📋 **Plan ready for review in Plannotator**: ${url}${event.remoteUrl ? "" : "\n\n(Local link only: Tailscale was unavailable on the host.)"}`);
+      await this.linear.comment(issueId, `📋 **Plan ready for review in Plannotator**${model ? ` (planned with \`${model}\`)` : ""}: ${url}${event.remoteUrl ? "" : "\n\n(Local link only: Tailscale was unavailable on the host.)"}`);
       return;
     }
-    const documentUrl = await this.linear.upsertIssueDocument(issueId, `Plan: ${identifier}`, planDocument(event, identifier));
+    const documentUrl = await this.linear.upsertIssueDocument(issueId, `Plan: ${identifier}`, planDocument(event, identifier, model));
     if (progress) {
       await progress({ plan: event.approved ? "approved" : `sent back${event.feedback ? ` — ${event.feedback.slice(0, 300)}` : ""}`, ...(documentUrl ? { link: ["Plan", documentUrl] as [string, string] } : {}) });
       return;

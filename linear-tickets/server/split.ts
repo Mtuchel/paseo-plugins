@@ -2,6 +2,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { LinearService } from "./linear";
 import { CODING_STATE, planDocument } from "./plannotator";
 import { MAX_SPLIT, planSteps } from "./sessions";
+import { agentModel } from "./model";
 
 type Deps = {
   linear: Pick<LinearService, "issueState" | "createIssue" | "addBlocker" | "delegate" | "upsertIssueDocument" | "moveToStateNamed">;
@@ -26,7 +27,8 @@ export async function splitIntoSubIssues(deps: Deps, link: { issueId: string; id
   if (steps.length > MAX_SPLIT) throw new Error(`The plan has ${steps.length} steps; at most ${MAX_SPLIT} sub-issues are created. Merge steps in the plan, or approve it as one ticket.`);
   const parent = await deps.linear.issueState(link.issueId);
   if (!parent.teamId) throw new Error("The ticket has no team.");
-  const documentUrl = await deps.linear.upsertIssueDocument(link.issueId, `Plan: ${link.identifier}`, planDocument({ type: "decided", agentId: link.agentId, approved: true, planContent: planText, at: new Date().toISOString() }, link.identifier));
+  const model = link.agentId ? await agentModel(paseo, link.agentId) : null;
+  const documentUrl = await deps.linear.upsertIssueDocument(link.issueId, `Plan: ${link.identifier}`, planDocument({ type: "decided", agentId: link.agentId, approved: true, planContent: planText, at: new Date().toISOString() }, link.identifier, model));
   if (link.agentId) await deps.retirePlanner(localUrl, link.agentId, paseo);
   const created: { id: string; identifier: string }[] = [];
   for (const [index, step] of steps.entries()) {
