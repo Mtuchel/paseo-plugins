@@ -141,9 +141,10 @@ export class PlannotatorBridge {
       if (!link) return false;
       if (event.type === "opened") {
         if (event.remoteUrl) await sessions.link(link.sessionId, "Plan review", event.remoteUrl);
-        const steps = planSteps(await this.fetchPlan(event.localUrl).catch(() => ""));
+        const planText = await this.fetchPlan(event.localUrl).catch(() => "");
+        const steps = planSteps(planText);
         if (steps.length) await sessions.plan(link.sessionId, steps.map((content) => ({ content, status: "pending" as const })));
-        await sessions.expectReview(link.sessionId, event.localUrl);
+        await sessions.expectReview(link.sessionId, event.localUrl, planText);
         const split = steps.length > 1 ? [{ label: `Approve & split into ${Math.min(steps.length, MAX_SPLIT)} sub-issues`, value: SPLIT_PLAN }] : [];
         await sessions.ask(link.sessionId, `The plan is ready for review${event.remoteUrl ? ` (full view: ${event.remoteUrl})` : ""}. Approve it, or reply with what to change.${model ? `\n\nPlanned with ${model}.` : ""}`, [{ label: "Approve plan", value: APPROVE_PLAN }, { label: "Approve, implement later", value: APPROVE_LATER }, ...split, { label: "Send back", value: SEND_BACK }]);
         return true;

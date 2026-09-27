@@ -11,6 +11,7 @@ import { Credentials } from "./server/credentials";
 import { Dispatcher } from "./server/dispatch";
 import { CommentRelay } from "./server/relay";
 import { PlannotatorBridge, readReviewPlan, recordDecision, writeOpenScript } from "./server/plannotator";
+import { reviewOutcome } from "./server/review-outcome";
 import { Writeback } from "./server/writeback";
 import { AgentApi, AppAuth } from "./server/agent-app";
 import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
@@ -50,6 +51,8 @@ export default function contribute(server: PluginServerContext) {
       await decidePlannotatorReview(localUrl, approve, feedback);
       await recordDecision({ type: "decided", agentId, approved: approve, ...(feedback ? { feedback } : {}), planContent, at: new Date().toISOString() });
     },
+    reviewOutcome: (review) => reviewOutcome(review),
+    recordOutcome: (agentId, outcome) => recordDecision({ type: "decided", agentId, ...outcome, at: new Date().toISOString() }),
     splitPlan: (link, localUrl, paseo) => splitIntoSubIssues({ linear, appUserId: async () => (await agentApi.viewer()).id, readPlan: readReviewPlan, retirePlanner }, link, localUrl, paseo),
     approveLater: (link, localUrl, paseo) => approveForLater({ linear, readPlan: readReviewPlan, retirePlanner }, link, localUrl, paseo),
   });

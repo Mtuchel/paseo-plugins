@@ -144,6 +144,18 @@ test("a ticket keeps one open Paseo thread: older threads are closed once a newe
   await h.cleanup();
 });
 
+test("a review decided or closed outside Linear is settled by the sweep", async () => {
+  const recorded: unknown[] = [];
+  const outcomes: Record<string, "open" | null | { approved: boolean; planContent: string }> = { "http://localhost:1": "open", "http://localhost:2": { approved: true, planContent: "# Plan" }, "http://localhost:3": null };
+  const h = routerHarness([], { reviewOutcome: async (review) => outcomes[review.localUrl], recordOutcome: async (agentId, outcome) => { recorded.push([agentId, outcome]); } });
+  for (const n of [1, 2, 3]) await h.store.put({ ...link, sessionId: `s${n}`, agentId: `a${n}`, issueId: `i${n}`, review: { localUrl: `http://localhost:${n}` } });
+  await h.router.settleReviews();
+  assert.deepEqual(recorded, [["a2", { approved: true, planContent: "# Plan" }]]);
+  assert.deepEqual(h.calls, ["thought:The plan review closed without a decision (for example after a restart). Reply here if the agent should submit the plan again."]);
+  assert.deepEqual([(await h.store.get("s1"))?.review?.localUrl, (await h.store.get("s2"))?.review, (await h.store.get("s3"))?.review], ["http://localhost:1", null, null]);
+  await h.cleanup();
+});
+
 test("the live feed shows completed commands and edits only", () => {
   assert.equal(describeTool({ type: "tool_call", status: "completed", detail: { type: "shell", command: "npm test" } }), "Ran npm test");
   assert.equal(describeTool({ type: "tool_call", status: "completed", detail: { type: "edit", filePath: "src/a.ts" } }), "Edited src/a.ts");

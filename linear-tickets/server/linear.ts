@@ -566,7 +566,12 @@ export class LinearService {
     const labels = current ?? (await this.issueState(issueId)).labels;
     const wanted = name.trim().toLowerCase();
     for (const { id } of labels.filter((item) => item.name.trim().toLowerCase() === wanted)) {
-      succeeded(record(await this.withKey((key) => this.post(key, REMOVE_LABEL_QUERY, { id: issueId, labelId: id }))), "issueRemoveLabel", `remove the "${name}" label`);
+      try {
+        succeeded(record(await this.withKey((key) => this.post(key, REMOVE_LABEL_QUERY, { id: issueId, labelId: id }))), "issueRemoveLabel", `remove the "${name}" label`);
+      } catch (error) {
+        // `current` can be stale: another write removed the label meanwhile, which is the goal anyway.
+        if (!/Label not on issue/i.test(error instanceof Error ? error.message : String(error))) throw error;
+      }
     }
   }
 

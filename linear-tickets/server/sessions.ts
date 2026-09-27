@@ -9,6 +9,7 @@ import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { AgentApi, SelectOption, SessionPlanStep } from "./agent-app";
 import { agentAppDirectory } from "./agent-app";
 import type { AgentSessionWebhook } from "./agent-webhook";
+import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
 import { dispatchLabels } from "./dispatch";
 import type { LinearService } from "./linear";
 import { answerableQuestions, approvalDecision, matchOption, questionAnswer, questionsOf } from "./relay";
@@ -35,7 +36,7 @@ export type SessionLink = {
   createdAt: string;
   handled: string[];
   // What a plain reply in the panel means right now, besides a pending permission.
-  review: { localUrl: string } | null;
+  review: PendingReview | null;
   // "split" / "later": the plugin retired the planner on purpose, so no Resume is offered.
   offer: "resume" | "split" | "later" | null;
   // Waiting for blockers or a free agent slot; the sweep starts it when admitted.
@@ -212,6 +213,9 @@ type Deps = {
   decideReview?: (localUrl: string, approve: boolean, feedback: string, agentId: string) => Promise<void>;
   splitPlan?: (link: SessionLink, localUrl: string, paseo: PaseoApi) => Promise<string>;
   approveLater?: (link: SessionLink, localUrl: string, paseo: PaseoApi) => Promise<string>;
+  // A review decided on Plannotator's own page, found after its server is gone.
+  reviewOutcome?: (review: PendingReview) => Promise<ReviewOutcome>;
+  recordOutcome?: (agentId: string, outcome: Exclude<ReviewOutcome, "open" | null>) => Promise<void>;
 };
 
 // Linear agent sessions ↔ Paseo agents. Inbound: `created` starts or links an agent, and
@@ -445,6 +449,7 @@ export class SessionRouter {
     this.sweeping = true;
     try {
       await this.closeSuperseded();
+      await this.settleReviews();
       const owner = await this.owner();
       for (const session of await this.deps.api.openSessions()) {
         // Linear marks a session "stale" after about half an hour without activity, which a ticket
@@ -566,8 +571,23 @@ export class SessionRouter {
     await this.deps.api.updateSession(sessionId, { addedExternalUrls: [{ label, url }] });
   }
 
-  async expectReview(sessionId: string, localUrl: string | null): Promise<void> {
-    await this.deps.store.patch(sessionId, { review: localUrl ? { localUrl } : null });
+  async expectReview(sessionId: string, localUrl: string | null, plan = ""): Promise<void> {
+    await this.deps.store.patch(sessionId, { review: localUrl ? { localUrl, openedAt: new Date().toISOString(), ...(plan.trim() ? { planHash: planHash(plan) } : {}) } : null });
+  }
+
+  // A review whose server is gone was decided on Plannotator's page (or closed without a
+  // decision, e.g. by a restart). Its saved decision is recorded like one taken in Linear.
+  async settleReviews(): Promise<void> {
+    const { reviewOutcome, recordOutcome } = this.deps;
+    if (!reviewOutcome || !recordOutcome) return;
+    for (const link of await this.deps.store.all()) {
+      if (!link.review || link.closed || !link.agentId) continue;
+      const outcome = await reviewOutcome(link.review).catch(() => "open" as const);
+      if (outcome === "open") continue;
+      await this.deps.store.patch(link.sessionId, { review: null });
+      if (outcome) await recordOutcome(link.agentId, outcome);
+      else await this.say(link.sessionId, "thought", "The plan review closed without a decision (for example after a restart). Reply here if the agent should submit the plan again.").catch(() => {});
+    }
   }
 
   // Automatic retry after a failure, at most once an hour per ticket.
