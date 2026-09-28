@@ -173,10 +173,14 @@ export class ReviewLinks {
     for (const entry of dead) {
       const port = entry.remoteUrl ? Number(new URL(entry.remoteUrl).port) : 0;
       if (port && port !== FUNNEL_PORT && port !== REVIEW_SERVE_PORT) {
-        // Left open on failure, so the next sweep retries.
+        // Left open on failure, so the next sweep retries. A route that no longer exists (removed
+        // by hand, or by a restart of Tailscale) is what this step wants, not a failure.
         try { await this.unserve(port); } catch (error) {
-          console.error(`[linear-tickets] removing the tailnet route for review port ${port} failed: ${error instanceof Error ? error.message.split("\n")[0] : error}`);
-          continue;
+          const message = error instanceof Error ? error.message : String(error);
+          if (!/handler does not exist/i.test(message)) {
+            console.error(`[linear-tickets] removing the tailnet route for review port ${port} failed: ${message.split("\n")[0]}`);
+            continue;
+          }
         }
       }
       closed.add(entry.localUrl);

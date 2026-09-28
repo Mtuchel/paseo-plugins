@@ -13,7 +13,7 @@ function opened(port: number): OpenedEvent {
 }
 
 // `live` holds the local ports whose Plannotator server answers; `unserved` the routes turned off.
-async function withLinks(run: (links: ReviewLinks, get: (path: string, method?: string) => Promise<Response>, live: Set<number>, unserved: number[]) => Promise<void>) {
+async function withLinks(run: (links: ReviewLinks, get: (path: string, method?: string) => Promise<Response>, live: Set<number>, unserved: number[]) => Promise<void>, unserveError?: (port: number) => Error | null) {
   const directory = await mkdtemp(join(tmpdir(), "paseo-review-links-"));
   const live = new Set<number>();
   const unserved: number[] = [];
@@ -23,7 +23,11 @@ async function withLinks(run: (links: ReviewLinks, get: (path: string, method?: 
     now: () => new Date(clock += 1_000),
     alive: async (localUrl) => live.has(Number(new URL(localUrl).port)),
     serve: async () => ORIGIN,
-    unserve: async (port) => { unserved.push(port); },
+    unserve: async (port) => {
+      unserved.push(port);
+      const error = unserveError?.(port);
+      if (error) throw error;
+    },
   });
   try {
     await links.start();
@@ -82,6 +86,21 @@ test("the sweep removes only dead review routes, and only after two misses", asy
     assert.equal((await get("/review/agent-1")).status, 200);
     assert.equal((await get("/review/agent-2")).status, 302);
   });
+});
+
+test("a route that is already gone counts as removed; any other failure is retried on the next sweep", async () => {
+  const gone = new Error("Command failed: tailscale serve --https=50001 off\nerror: failed to remove web serve: handler does not exist");
+  const down = new Error("Command failed: tailscale serve --https=50002 off\nfailed to connect to local tailscaled");
+  await withLinks(async (links, _get, _live, unserved) => {
+    await links.opened("agent-1", opened(50_001));
+    await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" });
+    await links.sweep();
+    await links.sweep();
+    assert.deepEqual(unserved.sort(), [50_001, 50_002]);
+    unserved.length = 0;
+    await links.sweep();
+    assert.deepEqual(unserved, [50_002], "the missing route is closed; the failed one is tried again");
+  }, (port) => (port === 50_001 ? gone : down));
 });
 
 test("unknown agents and malformed ids are 404; other methods are refused", async () => {
