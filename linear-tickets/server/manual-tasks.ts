@@ -90,7 +90,7 @@ export class ManualTasks {
   async tasks(): Promise<ManualTask[]> {
     const names = await readdir(this.directory).catch(() => [] as string[]);
     const tasks = await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readFile(join(this.directory, name), "utf8").then((text) => JSON.parse(text) as ManualTask, () => null)));
-    return tasks.filter((task): task is ManualTask => Boolean(task?.id && task.parentId));
+    return tasks.filter((task): task is ManualTask => Boolean(task?.id && task.parentId)).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   private async save(task: ManualTask): Promise<void> {
