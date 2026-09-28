@@ -457,14 +457,43 @@ using this host's key, independently of the agent's own `linear_ticket` tools:
   question, the comment is the answer (an option name picks that option). If it is waiting
   on an approval, `@paseo approve` / `@paseo deny <reason>` decides it. Otherwise the text is
   sent as a message. Its reply comes back as a turn summary, so the conversation stays in
-  Linear. Delivered comments get a 👀 reaction (Linear is the record, so a restart never
-  delivers twice); undeliverable ones get ❌ and a reply saying why. Comments by other
-  people, and comments without the mention, are ignored. Blocked alerts end with how to reply.
+  Linear. Delivered comments get a 👀 reaction; undeliverable ones get ❌ and a reply saying
+  why. All linked tickets are read in one request per poll, each from a cursor kept in
+  `$PASEO_HOME/linear-tickets/relay-cursors.json`, so neither a restart nor a long pause
+  delivers a comment twice or skips one. Comments by other people, and comments without the
+  mention, are ignored. Blocked alerts end with how to reply.
 
 Archiving a linked agent always removes `<label>-running`. Subagents never report. Paseo
 delivers lifecycle events live and best-effort: events while the plugin is stopped are not
 replayed, and a Linear failure is logged (`paseo plugin logs linear-tickets`) without
-affecting the agent.
+affecting the agent. A write-back that hits Linear's rate limit waits for the quota instead
+(see [Rate limits](#rate-limits)).
+
+## Rate limits
+
+Linear meters requests per credential and hour: **2,500** for the personal API key (shared by
+every key of the same Linear user) and **5,000** for the Paseo app's token. Both refill
+steadily, so the plugin estimates each pool's room from the `X-RateLimit-Requests-Remaining`
+header of the last answer plus the refill since then.
+
+- **Reads that pollers repeat use the app's pool** when the Paseo app is installed: the relay's
+  comment read, the auto-dispatch label query, ticket state and manual-task status. The key
+  reads them only when the app is not installed, its token cannot be refreshed, or it cannot
+  see a ticket. An app rate limit never falls back to the key. Writes always use the key,
+  so nothing changes author.
+- **Background work stops at a 15% reserve** of the pool it needs: auto-dispatch, the relay,
+  manual tasks, the pull request watch and the health check. It resumes on its own as the pool
+  refills. Session prompts, write-backs, agents' `linear_ticket` tools and the sidebar still
+  use the reserve. The **Auto-dispatch** status shows `paused: …` with the estimated time, and
+  the plugin log records each pause once.
+- **When Linear answers `RATELIMITED`**, requests on that pool wait until the estimate reaches
+  the reserve again (at least a minute). Then exactly one request tries, and a second limit
+  doubles the wait, up to 15 minutes. Session errors and agent tools say when to try again.
+- **Write-backs are not dropped.** A rate-limited write-back is retried when the pool refills,
+  for up to 6 hours. A retry that a newer event for the same agent overtook only links its
+  pull requests: those are kept in `$PASEO_HOME/linear-tickets/writeback-outbox.json` until
+  they are linked on the ticket, in the agent panel and in the handover record, even across
+  restarts. Retries never repeat a comment or panel activity that already went out.
 
 ## Manual tasks
 
