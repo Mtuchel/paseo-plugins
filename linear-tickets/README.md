@@ -461,7 +461,10 @@ using this host's key, independently of the agent's own `linear_ticket` tools:
   why. All linked tickets are read in one request per poll, each from a cursor kept in
   `$PASEO_HOME/linear-tickets/relay-cursors.json`, so neither a restart nor a long pause
   delivers a comment twice or skips one. Comments by other people, and comments without the
-  mention, are ignored. Blocked alerts end with how to reply.
+  mention, are ignored. Blocked alerts end with how to reply. With the Paseo app installed,
+  Linear turns a typed `@paseo` into a mention of the app: that comment reaches the agent
+  through its agent session right away, with the same question and approval rules, and the
+  relay leaves it alone.
 
 Archiving a linked agent always removes `<label>-running`. Subagents never report. Paseo
 delivers lifecycle events live and best-effort: events while the plugin is stopped are not
