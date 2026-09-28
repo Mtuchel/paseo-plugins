@@ -2,7 +2,7 @@
 // by `node`, so it is plain dependency-free ESM; it must not contain backticks or "${".
 export const TICKET_MCP_SOURCE = String.raw`
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const argv = process.argv.slice(2);
@@ -75,16 +75,23 @@ function states(issue) {
 const MANUAL_WHEN = ["before_merge", "after_merge", "anytime"];
 const WHEN_TEXT = { before_merge: "due before the pull request is merged", after_merge: "due once the pull request is merged", anytime: "due now, independent of the merge" };
 const MANUAL = "query manual($id: String!) { viewer { id } issue(id: $id) { id identifier team { id states(first: 50) { nodes { id name type position } } } children(first: 100) { nodes { id identifier url title state { type } } } } }";
+const MANUAL_DIRECTORY = join(paseoHome, "linear-tickets", "manual-tasks");
+const FINISHED_TYPES = ["completed", "canceled", "duplicate"];
 
 async function recordManualTask(task) {
-  const directory = join(paseoHome, "linear-tickets", "manual-tasks");
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const path = join(directory, task.id + ".json");
+  await mkdir(MANUAL_DIRECTORY, { recursive: true, mode: 0o700 });
+  const path = join(MANUAL_DIRECTORY, task.id + ".json");
   const temporary = path + "." + randomUUID() + ".tmp";
   try {
     await writeFile(temporary, JSON.stringify(task, null, 2), { mode: 0o600, flag: "wx" });
     await rename(temporary, path);
   } finally { await rm(temporary, { force: true }); }
+}
+
+async function recordedManualTasks() {
+  const names = await readdir(MANUAL_DIRECTORY).catch(() => []);
+  const tasks = await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readFile(join(MANUAL_DIRECTORY, name), "utf8").then(JSON.parse, () => null)));
+  return tasks.filter((task) => task && typeof task.title === "string");
 }
 
 const tools = [
@@ -173,7 +180,11 @@ const tools = [
       const viewer = data.viewer && data.viewer.id;
       if (!viewer) throw new Error("Linear did not return the connected user.");
       const wanted = title.toLowerCase();
-      const existing = ((issue.children && issue.children.nodes) || []).find((child) => child.title.trim().toLowerCase() === wanted && !["completed", "canceled", "duplicate"].includes(child.state && child.state.type));
+      const children = (issue.children && issue.children.nodes) || [];
+      const finished = (child) => FINISHED_TYPES.includes(child.state && child.state.type);
+      // Linear's children list can lag behind a task created a moment ago; the local record does not.
+      const existing = children.find((child) => child.title.trim().toLowerCase() === wanted && !finished(child))
+        || (await recordedManualTasks()).find((task) => task.parentId === issue.id && task.title.trim().toLowerCase() === wanted && !children.some((child) => child.id === task.id && finished(child)));
       if (existing) return { identifier: existing.identifier, url: existing.url, deduped: true };
       const all = states(issue);
       const unstarted = all.find((s) => s.type === "unstarted");

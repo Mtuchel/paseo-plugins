@@ -241,6 +241,9 @@ test("add_manual_task creates an assigned sub-issue, blocks the ticket only befo
     const createAfter = linear.calls.filter((c) => c.query.includes("issueCreate"))[1].variables.input as Record<string, unknown>;
     assert.equal(createAfter.stateId, "s-backlog");
     assert.equal(linear.calls.filter((c) => c.query.includes("issueRelationCreate")).length, 1);
+    // Linear's children list (static here) has not caught up with ENG-52 yet; the local record has.
+    const again = JSON.parse((await mcp.call("add_manual_task", { title: "register the webhook", steps: "retry", when: "after_merge" })).text);
+    assert.deepEqual(again, { identifier: "ENG-52", url: "https://linear.app/x/issue/ENG-52", deduped: true });
 
     const dup = JSON.parse((await mcp.call("add_manual_task", { title: "  set api_key on STAGING ", steps: "x", when: "anytime" })).text);
     assert.deepEqual(dup, { identifier: "ENG-40", url: "https://linear.app/x/issue/ENG-40", deduped: true });
