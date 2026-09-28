@@ -279,7 +279,10 @@ sessions and replies whose webhook was missed. **Settings → Linear agent** sho
 - When a session exists, the plan review, its decision and pull-request review changes update the progress comment instead of adding comments. The panel's own messages are copied into the ticket thread by Linear.
 
 **Plan-first for tickets you did not write.** Tickets created by someone else, or labelled
-`feedback`, start in the provider's plan-first mode (`write` for omp, `plan` for Claude).
+`feedback`, start plan-first: `plan` mode for Claude, `auto` for Codex. omp keeps your usual
+mode, because its ticket agents already start in Plannotator's planning phase, which blocks edits
+until the plan is approved; omp's `write` mode would ask you before every shell command, reads
+included, so the planner could not investigate on its own.
 The prompt marks the ticket as untrusted input and asks only for a plan. With status write-back
 on, the ticket starts in **Planning** instead of In Progress. Approving the plan switches the
 agent to your usual mode.

@@ -209,14 +209,14 @@ test("admission waits for unfinished blockers and for a free agent slot", async 
   assert.deepEqual(await room.starter.admission("i1", room.paseo, { ...settings, dispatch: { ...settings.dispatch, maxRunning: 0 } }), { ok: true });
 });
 
-test("tickets written by someone else, or from the feedback intake, start plan-first", async () => {
+test("tickets written by someone else, or from the feedback intake, start plan-first; omp keeps the usual mode so the planner never waits for approvals", async () => {
   assert.equal(isUntrusted({ creatorId: OWNER, labels: [] }, OWNER), false);
   assert.equal(isUntrusted({ creatorId: "customer", labels: [] }, OWNER), true);
   assert.equal(isUntrusted({ creatorId: OWNER, labels: [{ name: "Feedback" }] }, OWNER), true);
   const h = starterHarness({ creatorId: "customer", labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, settings, { retryHint: "retry" });
   assert.equal(started.untrusted, true);
-  assert.deepEqual(h.launches[0], { modeId: "write", instructions: `${UNTRUSTED_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.untrusted": "1" }, markInProgress: false });
+  assert.deepEqual(h.launches[0], { modeId: "full", instructions: `${UNTRUSTED_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.untrusted": "1" }, markInProgress: false });
   const mine = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
   await mine.starter.start("i1", mine.paseo, settings, { retryHint: "retry" });
   assert.equal(mine.launches[0].modeId, "full");
