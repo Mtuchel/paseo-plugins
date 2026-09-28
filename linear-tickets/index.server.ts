@@ -29,17 +29,18 @@ import { TicketStarter } from "./server/starter";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
-  const linear = new LinearService(credentials);
+  // The native Linear agent ("Paseo" app): sessions, webhooks through Tailscale Funnel, and the
+  // handover record every agent keeps on its ticket. Without the app installed, only the
+  // handover comments and the comment-based paths run. Its token also serves the reads pollers
+  // repeat, so they use the app's request pool instead of the owner's key.
+  const auth = new AppAuth();
+  const agentApi = new AgentApi(auth);
+  const linear = new LinearService(credentials, undefined, agentApi);
   const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url));
   const settings = new Settings();
   const cache = new TicketCache();
-  // The native Linear agent ("Paseo" app): sessions, webhooks through Tailscale Funnel, and the
-  // handover record every agent keeps on its ticket. Without the app installed, only the
-  // handover comments and the comment-based paths run.
-  const auth = new AppAuth();
   const handover = new Handover(linear, undefined, undefined, undefined, async (agentId) => { const serverId = await daemonServerId(); return serverId ? paseoAgentUrl(serverId, agentId) : null; });
   const starter = new TicketStarter({ linear, launcher, handover });
-  const agentApi = new AgentApi(auth);
   // The plugin itself closes the review (split, implement later): the extension's report of that
   // closing is not the owner's decision, so the bridge skips it.
   const retirePlanner = async (reviewUrl: string, agentId: string, api: PaseoApi, reason: string) => {

@@ -121,6 +121,21 @@ export class AgentApi {
     }
   }
 
+  // Reads on the app's own request pool for LinearService. Null when the app cannot be used here
+  // (not installed, token not refreshable, token revoked), so the caller reads with the owner's key;
+  // rate limits and every other failure propagate.
+  async query(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+    try {
+      await this.auth.accessToken();
+    } catch {
+      return null;
+    }
+    return this.call(query, variables).catch((error: unknown) => {
+      if (error instanceof Error && /rejected this API key|cannot be refreshed|refused to refresh|no access token/.test(error.message)) return null;
+      throw error;
+    });
+  }
+
   async viewer(): Promise<{ id: string; name: string }> {
     const viewer = record(record(await this.call(APP_VIEWER_QUERY, {})).viewer ?? {});
     return { id: String(viewer.id ?? ""), name: String(viewer.name ?? "") };

@@ -6,6 +6,8 @@ import { poolOf, rateBudget, RateLimitedError, type RateBudget } from "./rate-bu
 
 const endpoint = "https://api.linear.app/graphql";
 export type Post = (key: string, query: string, variables: Record<string, unknown>) => Promise<Record<string, unknown>>;
+// Reads with the Paseo app's token (AgentApi.query); null when the app cannot be used on this host.
+export type Reader = { query(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown> | null> };
 
 // GraphQL error payloads carry a user-facing message, sometimes clearer than the HTTP status alone.
 function apiMessage(payload: unknown): string {
@@ -334,7 +336,7 @@ export const COMMENT_QUERY = `query issueComments($id: String!, $first: Int!, $a
 }`;
 
 export class LinearService {
-  constructor(readonly credentials = new Credentials(), private readonly post: Post = postGraphQL) {}
+  constructor(readonly credentials = new Credentials(), private readonly post: Post = postGraphQL, private readonly reader?: Reader) {}
 
   async status() {
     const { key, source } = await this.credentials.read();
@@ -360,6 +362,18 @@ export class LinearService {
     const { key } = await this.credentials.read();
     if (!key) throw new Error("Connect Linear before loading tickets.");
     return work(key);
+  }
+
+  // The reads pollers repeat go to the Paseo app's own request pool. The key reads instead when the
+  // app cannot be used (`reader` returns null) or cannot see everything asked for (`complete` is
+  // false); an app rate limit is not a reason: it propagates, so background work pauses instead of
+  // draining the key.
+  private async read(query: string, variables: Record<string, unknown>, complete: (data: Record<string, unknown>) => boolean = () => true): Promise<Record<string, unknown>> {
+    const data = this.reader ? await this.reader.query(query, variables).catch((error: unknown) => {
+      if (error instanceof Error && /Entity not found/i.test(error.message)) return null;
+      throw error;
+    }) : null;
+    return data && complete(data) ? data : this.withKey((key) => this.post(key, query, variables));
   }
 
   async issues(cursor?: string, stateNames?: string[], showClosed?: boolean, relation?: "blocking" | "blocked") {
@@ -485,7 +499,7 @@ export class LinearService {
 
   async labeledIssues(labelName: string, teamKeys: string[]): Promise<LabeledIssue[]> {
     if (!teamKeys.length) return [];
-    const data = record(await this.withKey((key) => this.post(key, LABELED_ISSUES_QUERY, { first: 50, filter: labeledIssueFilter(labelName, teamKeys) })));
+    const data = record(await this.read(LABELED_ISSUES_QUERY, { first: 50, filter: labeledIssueFilter(labelName, teamKeys) }));
     return connection(record(data.issues)).nodes.map((node) => record(node)).map((node) => ({
       id: label(node.id),
       identifier: label(node.identifier),
@@ -498,7 +512,7 @@ export class LinearService {
   }
 
   async issueState(id: string): Promise<IssueState> {
-    const data = record(await this.withKey((key) => this.post(key, ISSUE_STATE_QUERY, { id })));
+    const data = record(await this.read(ISSUE_STATE_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object")));
     if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
     const issue = record(data.issue);
     const state = record(issue.state ?? {});
@@ -751,11 +765,12 @@ export class LinearService {
   }
 
   // State type and completion time of several issues in one request. Deleted or invisible issues are
-  // absent from the result.
+  // absent from the result. Issues the app cannot see are read again with the key.
   async issueStatuses(ids: string[]): Promise<Map<string, IssueStatus>> {
     const result = new Map<string, IssueStatus>();
     for (let start = 0; start < ids.length; start += 100) {
-      const data = record(await this.withKey((key) => this.post(key, ISSUE_STATUSES_QUERY, { ids: ids.slice(start, start + 100) })));
+      const chunk = ids.slice(start, start + 100);
+      const data = record(await this.read(ISSUE_STATUSES_QUERY, { ids: chunk }, (found) => connection(record(found.issues ?? {})).nodes.length === new Set(chunk).size));
       for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) {
         result.set(label(node.id), { statusType: label(record(node.state ?? {}).type), completedAt: label(node.completedAt) || null });
       }
