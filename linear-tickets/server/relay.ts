@@ -1,6 +1,11 @@
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import type { LinearService, RelayComment } from "./linear";
+import { RateLimitedError } from "./rate-budget";
+import { paseoHome } from "./ticket-mcp";
 
 // A comment addressed to the agent: "@paseo" first, then the message. Linear may render the
 // mention as a link, so a markdown-wrapped "[@paseo](…)" counts too.
@@ -8,7 +13,7 @@ const MENTION = /^\s*(?:\[@paseo\]\([^)]*\)|@paseo\b)[:,]?\s*/i;
 export const ACK_EMOJI = "eyes";
 export const FAILED_EMOJI = "x";
 
-type Linear = Pick<LinearService, "viewerId" | "commentsSince" | "comment" | "react">;
+type Linear = Pick<LinearService, "viewerId" | "relayComments" | "comment" | "react">;
 type LinkedAgent = { id: string; issueId: string; createdAt: string };
 type Question = { header?: string; question?: string; options?: { label?: string }[] };
 
@@ -69,26 +74,102 @@ export function approvalDecision(message: string): AgentPermissionResponse | nul
 // tickets with an active linked agent are delivered to that agent: as the answer to its
 // pending question, as an approve/deny decision for a pending approval, or as a new message.
 // The agent's reply comes back through turn-summary write-back, so the conversation stays in
-// Linear. A 👀 reaction marks a delivered comment — Linear is the record, so a restart never
-// delivers twice — and ❌ plus a reply marks one that could not be delivered.
+// Linear. A 👀 reaction marks a delivered comment and ❌ plus a reply one that could not be
+// delivered.
+//
+// All linked tickets are read in one request (see LinearService.relayComments), each from its own
+// cursor: the creation time of the last comment the relay handled, persisted, so a pause of any
+// length or a restart loses nothing. The cursor only moves past a comment once it is handled; a
+// failed read moves nothing. Reactions are queued (`acks`, persisted with the cursors) and sent
+// when the key has room, so a paused key never makes a comment deliver twice.
+type Cursor = { agentId: string; since: string; boundaryIds: string[] };
+type Ack = { commentId: string; issueId: string; emoji: string; reacted: boolean; reply: string | null };
+type RelayState = { cursors: Record<string, Cursor>; acks: Ack[] };
+
 export class CommentRelay {
-  constructor(private readonly linear: Linear) {}
+  private state: RelayState | null = null;
+  private saved = "";
+  // Tickets neither credential could read (deleted, no access); skipped until the plugin restarts.
+  private readonly unseen = new Set<string>();
+
+  constructor(private readonly linear: Linear, private readonly path = join(paseoHome(), "linear-tickets", "relay-cursors.json")) {}
 
   async poll(paseo: PaseoApi): Promise<void> {
-    const agents = await this.linkedAgents(paseo);
-    if (!agents.length) return;
-    const viewerId = await this.linear.viewerId();
+    const state = await this.load();
+    await this.acknowledge(state);
+    const agents = (await this.linkedAgents(paseo)).filter((agent) => !this.unseen.has(agent.issueId));
+    // A new agent on a ticket starts from its own start: comments before it were in its first prompt.
+    const cursors: Record<string, Cursor> = {};
     for (const agent of agents) {
-      // Comments before the agent started were in its first prompt.
-      const comments = await this.linear.commentsSince(agent.issueId, agent.createdAt);
-      for (const comment of comments) {
-        if (comment.userId !== viewerId) continue;
-        if (comment.reactions.some((reaction) => reaction.userId === viewerId && (reaction.emoji === ACK_EMOJI || reaction.emoji === FAILED_EMOJI))) continue;
-        const message = mentionMessage(comment.body);
-        if (message === null) continue;
-        await this.deliver(paseo, agent, comment, message);
+      const known = state.cursors[agent.issueId];
+      cursors[agent.issueId] = known?.agentId === agent.id ? known : { agentId: agent.id, since: agent.createdAt, boundaryIds: [] };
+    }
+    state.cursors = cursors;
+    if (agents.length) {
+      const viewerId = await this.linear.viewerId();
+      const { comments, unseen } = await this.linear.relayComments(viewerId, agents.map((agent) => ({ issueId: agent.issueId, since: cursors[agent.issueId].since })));
+      for (const issueId of unseen) this.unseen.add(issueId);
+      for (const agent of agents) {
+        const cursor = cursors[agent.issueId];
+        for (const comment of comments.get(agent.issueId) ?? []) {
+          if (comment.createdAt < cursor.since || (comment.createdAt === cursor.since && cursor.boundaryIds.includes(comment.id))) continue;
+          const handled = comment.userId !== viewerId
+            || comment.reactions.some((reaction) => reaction.userId === viewerId && (reaction.emoji === ACK_EMOJI || reaction.emoji === FAILED_EMOJI))
+            || state.acks.some((ack) => ack.commentId === comment.id);
+          const message = handled ? null : mentionMessage(comment.body);
+          if (message !== null) state.acks.push({ commentId: comment.id, issueId: agent.issueId, reacted: false, ...await this.deliver(paseo, agent, comment, message) });
+          if (comment.createdAt === cursor.since) cursor.boundaryIds.push(comment.id);
+          else Object.assign(cursor, { since: comment.createdAt, boundaryIds: [comment.id] });
+          // Recorded before the reaction: a restart in between must not deliver the comment again.
+          if (message !== null) await this.save(state);
+        }
       }
     }
+    await this.acknowledge(state);
+    await this.save(state);
+  }
+
+  // Sends the queued reactions (and failure replies). A rate limit or a network failure leaves the
+  // rest for the next poll; a reaction Linear refuses (the comment was deleted) is dropped.
+  private async acknowledge(state: RelayState): Promise<void> {
+    while (state.acks.length) {
+      const ack = state.acks[0];
+      try {
+        if (!ack.reacted) {
+          await this.linear.react(ack.commentId, ack.emoji);
+          ack.reacted = true;
+        }
+        if (ack.reply) await this.linear.comment(ack.issueId, ack.reply);
+      } catch (error) {
+        if (error instanceof RateLimitedError || (error instanceof Error && /Could not reach/.test(error.message))) return;
+        console.error(`[linear-tickets] marking comment ${ack.commentId} failed: ${error instanceof Error ? error.message : error}`);
+      }
+      state.acks.shift();
+    }
+  }
+
+  private async load(): Promise<RelayState> {
+    if (this.state) return this.state;
+    try {
+      const stored = JSON.parse(await readFile(this.path, "utf8"));
+      this.state = { cursors: stored.cursors && typeof stored.cursors === "object" ? stored.cursors : {}, acks: Array.isArray(stored.acks) ? stored.acks : [] };
+    } catch {
+      this.state = { cursors: {}, acks: [] };
+    }
+    this.saved = JSON.stringify(this.state);
+    return this.state;
+  }
+
+  private async save(state: RelayState): Promise<void> {
+    const text = JSON.stringify(state);
+    if (text === this.saved) return;
+    await mkdir(join(this.path, ".."), { recursive: true, mode: 0o700 });
+    const temporary = `${this.path}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, text, { mode: 0o600, flag: "wx" });
+      await rename(temporary, this.path);
+      this.saved = text;
+    } finally { await rm(temporary, { force: true }); }
   }
 
   // The newest active root agent per ticket; older agents on the same ticket stay quiet.
@@ -108,7 +189,8 @@ export class CommentRelay {
     return [...byIssue.values()];
   }
 
-  private async deliver(paseo: PaseoApi, agent: LinkedAgent, comment: RelayComment, message: string): Promise<void> {
+  // Hands the comment to the agent; the outcome is the reaction (and, on failure, the reply) to queue.
+  private async deliver(paseo: PaseoApi, agent: LinkedAgent, comment: RelayComment, message: string): Promise<{ emoji: string; reply: string | null }> {
     try {
       const handle = paseo.agents.ref(agent.id);
       const refreshed = await handle.refresh();
@@ -127,12 +209,11 @@ export class CommentRelay {
         if (!message) throw new Error("Write the message after @paseo.");
         await handle.send(message);
       }
-      await this.linear.react(comment.id, ACK_EMOJI);
+      return { emoji: ACK_EMOJI, reply: null };
     } catch (error) {
       const reason = error instanceof Error ? error.message : "unknown error";
       console.error(`[linear-tickets] relaying comment ${comment.id} to agent ${agent.id} failed: ${reason}`);
-      await this.linear.react(comment.id, FAILED_EMOJI).catch(() => {});
-      await this.linear.comment(agent.issueId, `Paseo could not deliver that comment to the agent: ${reason}`).catch(() => {});
+      return { emoji: FAILED_EMOJI, reply: `Paseo could not deliver that comment to the agent: ${reason}` };
     }
   }
 }

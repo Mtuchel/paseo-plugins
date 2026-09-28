@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import type { RelayComment } from "./linear";
+import { RateLimitedError } from "./rate-budget";
 import { approvalDecision, CommentRelay, mentionMessage, questionAnswer } from "./relay";
 
 const ME = "user-me";
@@ -36,14 +40,32 @@ test("approval replies are recognised, with an optional deny reason; other text 
 
 type AgentFixture = { id: string; issueId: string; createdAt: string; updatedAt: string; parent?: string; pending?: AgentPermissionRequest[] };
 
-function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>) {
+type Fake = { comments: Record<string, RelayComment[]>; failRead?: Error | null; failReact?: Error | null };
+
+// A throwaway cursor file per setup; pass `path` to reuse one (a plugin restart).
+function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>, path = join(mkdtempSync(join(tmpdir(), "relay-")), "cursors.json")) {
   const events: string[] = [];
   const since: string[] = [];
+  const reads: number[] = [];
+  const fake: Fake = { comments };
   const linear = {
     async viewerId() { return ME; },
-    async commentsSince(issueId: string, from: string) { since.push(`${issueId}@${from}`); return comments[issueId] ?? []; },
+    // Like Linear: comments at or after each ticket's cursor.
+    async relayComments(_userId: string, cursors: { issueId: string; since: string }[]) {
+      reads.push(cursors.length);
+      if (fake.failRead) throw fake.failRead;
+      const found = new Map<string, RelayComment[]>();
+      for (const cursor of cursors) {
+        since.push(`${cursor.issueId}@${cursor.since}`);
+        found.set(cursor.issueId, (fake.comments[cursor.issueId] ?? []).filter((item) => item.createdAt >= cursor.since));
+      }
+      return { comments: found, unseen: [] };
+    },
     async comment(issueId: string, body: string) { events.push(`comment ${issueId}: ${body}`); },
-    async react(commentId: string, emoji: string) { events.push(`react ${commentId} ${emoji}`); },
+    async react(commentId: string, emoji: string) {
+      if (fake.failReact) throw fake.failReact;
+      events.push(`react ${commentId} ${emoji}`);
+    },
   };
   const paseo = {
     agents: {
@@ -58,10 +80,10 @@ function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>)
       }),
     },
   } as unknown as PaseoApi;
-  return { relay: new CommentRelay(linear), paseo, events, since };
+  return { relay: new CommentRelay(linear, path), paseo, events, since, reads, fake, path };
 }
 
-const comment = (id: string, body: string, extra: Partial<RelayComment> = {}): RelayComment => ({ id, body, createdAt: `2026-01-01T00:00:0${id.length}Z`, userId: ME, reactions: [], ...extra });
+const comment = (id: string, body: string, extra: Partial<RelayComment> = {}): RelayComment => ({ id, body, createdAt: `2026-02-01T00:00:0${id.length}Z`, userId: ME, reactions: [], ...extra });
 
 test("my @paseo comments reach the newest agent on the ticket and are marked delivered; everything else is ignored", async () => {
   const { relay, paseo, events, since } = setup([
@@ -100,4 +122,59 @@ test("a comment that cannot be delivered is marked failed and explained on the t
   await relay.poll(paseo);
   assert.equal(events[0], "react c1 x");
   assert.match(events[1], /^comment i1: Paseo could not deliver that comment to the agent: The agent is waiting for approval of "Allow tool: bash"\. Reply "@paseo approve"/);
+});
+
+test("all linked tickets are read in one call, each from its own agent's start", async () => {
+  const { relay, paseo, reads, since } = setup([
+    { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" },
+    { id: "b", issueId: "i2", createdAt: "2026-01-05T00:00:00Z", updatedAt: "2026-01-05T00:00:00Z" },
+  ], {});
+  await relay.poll(paseo);
+  assert.deepEqual(reads, [2]);
+  assert.deepEqual(since, ["i1@2026-01-01T00:00:00Z", "i2@2026-01-05T00:00:00Z"]);
+});
+
+test("a failed read moves no cursor: the next poll delivers everything", async () => {
+  const agent = { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
+  const { relay, paseo, events, fake } = setup([agent], { i1: [comment("c1", "@paseo first"), comment("c22", "@paseo second")] });
+  fake.failRead = new Error("The Linear API request failed: Internal error");
+  await assert.rejects(relay.poll(paseo), /Internal error/);
+  assert.deepEqual(events, []);
+  fake.failRead = null;
+  await relay.poll(paseo);
+  assert.deepEqual(events, ["send a: first", "send a: second", "react c1 eyes", "react c22 eyes"]);
+});
+
+test("after a long pause and a restart, every comment written meanwhile arrives once, and handled ones never again", async () => {
+  const agent = { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
+  const comments: Record<string, RelayComment[]> = { i1: [comment("c1", "@paseo before", { createdAt: "2026-01-01T01:00:00Z" })] };
+  const first = setup([agent], comments);
+  await first.relay.poll(first.paseo);
+  assert.deepEqual(first.events, ["send a: before", "react c1 eyes"]);
+
+  // Three hours of comments while the relay was paused; the new instance reads the saved cursor.
+  comments.i1.push(
+    comment("c2", "@paseo during one", { createdAt: "2026-01-01T02:00:00Z" }),
+    // Same instant as c2: the inclusive cursor must still deliver it exactly once.
+    comment("c3", "@paseo during two", { createdAt: "2026-01-01T02:00:00Z" }),
+    comment("c4", "@paseo during three", { createdAt: "2026-01-01T04:00:00Z" }),
+  );
+  const second = setup([agent], comments, first.path);
+  await second.relay.poll(second.paseo);
+  assert.deepEqual(second.since, ["i1@2026-01-01T01:00:00Z"]);
+  assert.deepEqual(second.events, ["send a: during one", "send a: during two", "send a: during three", "react c2 eyes", "react c3 eyes", "react c4 eyes"]);
+  await second.relay.poll(second.paseo);
+  assert.equal(second.events.length, 6);
+});
+
+test("a reaction the key cannot send yet stays queued; the comment is not delivered twice", async () => {
+  const agent = { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
+  const { relay, paseo, events, fake, path } = setup([agent], { i1: [comment("c1", "@paseo go")] });
+  fake.failReact = new RateLimitedError("key", Date.now() + 60_000);
+  await relay.poll(paseo);
+  assert.deepEqual(events, ["send a: go"]);
+  // Still queued after a restart.
+  const restarted = setup([agent], { i1: [comment("c1", "@paseo go")] }, path);
+  await restarted.relay.poll(restarted.paseo);
+  assert.deepEqual(restarted.events, ["react c1 eyes"]);
 });

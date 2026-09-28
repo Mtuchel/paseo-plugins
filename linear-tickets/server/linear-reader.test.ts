@@ -85,3 +85,49 @@ test("AgentApi.query: null when the app cannot be used, errors otherwise", async
   assert.deepEqual(await working.query("q", {}), { viewer: { id: "app" } });
   assert.deepEqual(auth, ["Bearer token"]);
 });
+
+// A fake Linear for the aliased relay query: `visible` tickets have `comments`, served 50 per page.
+function relayServer(visible: Record<string, number>) {
+  const requests: Record<string, unknown>[] = [];
+  const answer = (query: string, variables: Record<string, unknown>) => {
+    assert.match(query, /^query relayComments/);
+    requests.push(variables);
+    const data: Record<string, unknown> = {};
+    for (let index = 0; `i${index}` in variables; index++) {
+      const id = variables[`i${index}`] as string;
+      if (!(id in visible)) { data[`t${index}`] = { nodes: [] }; continue; }
+      const offset = Number(variables[`a${index}`] ?? 0);
+      const all = Array.from({ length: visible[id] }, (_, n) => ({ id: `${id}-c${n}`, body: `@paseo ${n}`, createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, n)).toISOString(), user: { id: "me" }, reactions: [] }));
+      const nodes = all.slice(offset, offset + 50);
+      data[`t${index}`] = { nodes: [{ id, comments: { nodes, pageInfo: { hasNextPage: offset + 50 < all.length, endCursor: String(offset + 50) } } }] };
+    }
+    return data;
+  };
+  return { requests, answer };
+}
+
+test("relay comments: one request for many tickets, every page of a busy ticket, and the key only for tickets the app cannot see", async () => {
+  const ID_C = "9d1c2a44-1f7e-4c55-9a53-6a0f2e8b7c31";
+  const ID_GONE = "5e2b8f00-7a1d-4b3c-8e9f-112233445566";
+  const app = relayServer({ [ID_A]: 2, [ID_B]: 120 });
+  const key = relayServer({ [ID_C]: 1 });
+  const { linear, keyCalls } = service({ query: (query, variables) => Promise.resolve(app.answer(query, variables)) }, (query, variables) => key.answer(query, variables));
+  const cursors = [ID_A, ID_B, ID_C, ID_GONE, "not-a-linear-id"].map((issueId) => ({ issueId, since: "2026-01-01T00:00:00Z" }));
+  const { comments, unseen } = await linear.relayComments("me", cursors);
+  // Round 1 reads all four real tickets; rounds 2 and 3 page through the busy one alone.
+  assert.deepEqual(app.requests.map((variables) => Object.keys(variables).filter((name) => name.startsWith("i")).length), [4, 1, 1]);
+  assert.equal(comments.get(ID_B)?.length, 120);
+  assert.deepEqual(comments.get(ID_B)?.slice(0, 2).map((item) => item.id), [`${ID_B}-c0`, `${ID_B}-c1`]);
+  assert.equal(comments.get(ID_A)?.length, 2);
+  // The key is asked once, for the two tickets the app could not see.
+  assert.equal(keyCalls.length, 1);
+  assert.deepEqual([key.requests[0].i0, key.requests[0].i1], [ID_C, ID_GONE]);
+  assert.equal(comments.get(ID_C)?.length, 1);
+  assert.deepEqual(unseen.sort(), [ID_GONE, "not-a-linear-id"].sort());
+});
+
+test("relay comments: an app rate limit fails the read without falling back to the key", async () => {
+  const { linear, keyCalls } = service({ query: () => Promise.reject(new RateLimitedError("app", Date.now() + 60_000)) }, () => ({}));
+  await assert.rejects(linear.relayComments("me", [{ issueId: ID_A, since: "2026-01-01T00:00:00Z" }]), RateLimitedError);
+  assert.deepEqual(keyCalls, []);
+});
