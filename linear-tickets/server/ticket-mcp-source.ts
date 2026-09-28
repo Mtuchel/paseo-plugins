@@ -51,6 +51,9 @@ async function linear(query, variables) {
   let payload = null;
   try { payload = await response.json(); } catch {}
   if (response.status === 401 || response.status === 403) throw new Error("Linear rejected the host's API key. Reconnect Linear in the Linear tickets plugin.");
+  // Linear answers a spent hourly budget with HTTP 400 and the RATELIMITED code (429 from proxies).
+  const rateLimited = response.status === 429 || (payload && Array.isArray(payload.errors) && payload.errors.some((e) => e && e.extensions && e.extensions.code === "RATELIMITED"));
+  if (rateLimited) throw new Error("Linear's hourly request limit is reached for the Linear API key; try again in about 10 minutes.");
   const errors = payload && Array.isArray(payload.errors) ? redact(payload.errors.map((e) => (e && (e.extensions && e.extensions.userPresentableMessage || e.message)) || "").filter((m) => typeof m === "string" && m).join("; "), key).slice(0, 300) : "";
   if (!response.ok || errors) throw new Error("The Linear request failed" + (errors ? ": " + errors : " (HTTP " + response.status + ")."));
   return (payload && payload.data) || {};

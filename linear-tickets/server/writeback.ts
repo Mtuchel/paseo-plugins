@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { dispatchLabels } from "./dispatch";
@@ -7,25 +10,38 @@ import type { AgentApi } from "./agent-app";
 import type { Handover, WaitingPeriod } from "./handover";
 import type { IssueState, LinearService } from "./linear";
 import { PLANNING_STATE } from "./plannotator";
+import { RateLimitedError } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
+import { paseoHome } from "./ticket-mcp";
 
 export const MAX_SUMMARY_LENGTH = 4_000;
 // The workflow state (type started) a ticket waits in while its agent needs the owner.
 export const NEEDS_INPUT_STATE = "Needs input";
 const NEEDS_YOU_COLOR = "#eb5757";
-const TRANSIENT = /HTTP 50\d|rate-limiting|Could not reach|timed out|ECONNRESET|fetch failed/i;
+const TRANSIENT = /HTTP 50\d|Could not reach|timed out|ECONNRESET|fetch failed/i;
 const RETRY_DELAYS_MS = [30_000, 120_000];
+// Rate-limited write-backs wait for the pool to refill however often it takes, up to this long.
+const RATE_LIMIT_GIVE_UP_MS = 6 * 60 * 60 * 1000;
+const MIN_RATE_LIMIT_DELAY_MS = 5_000;
 const PULL_REQUEST_URL = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/g;
 
 type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
 // `planFirst`: launched plan-first (a ticket you did not write, before its plan is approved).
 type Link = { issueId: string; identifier: string; planFirst: boolean };
+// Steps that must not repeat when a failed write-back is retried (comments, session activities):
+// a retry of the same event skips the steps that already succeeded and gets their earlier result.
+export type WritebackContext = { once<T>(step: string, fn: () => Promise<T>): Promise<T | undefined> };
+type Work = (link: Link, settings: PluginSettings, context: WritebackContext) => Promise<void>;
+type Delivery = { event: string; agent: PluginHookAgent; paseo: PaseoApi; work: Work; seq: number; attempt: number; firstFailureAt: number | null; transientRetries: number };
+// A pull request found at the end of a turn, kept on disk until every place links it, so a
+// rate limit, a superseding event or a plugin restart cannot lose it.
+type OutboxEntry = { agentId: string; agentTitle: string | null; cwd: string; issueId: string; identifier: string; url: string; done: { linear: boolean; session: boolean; handover: boolean } };
 // The native Linear agent: the session panel, the durable handover record and comments written
 // as the Paseo app. Optional, so ticket write-back keeps working without the Paseo Linear app installed.
 export type AgentBridge = {
   sessions: Pick<SessionRouter, "sessionFor" | "say" | "action" | "ask" | "askQuestion" | "link" | "offerResume" | "resumeNow" | "holdIfStopped" | "follow" | "unfollow">;
-  handover: Pick<Handover, "update" | "finish" | "waiting" | "setWaiting">;
+  handover: Pick<Handover, "read" | "update" | "finish" | "waiting" | "setWaiting">;
   comments?: Pick<AgentApi, "createComment" | "updateComment">;
 };
 type Linear = Pick<LinearService, "issueState" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "createComment" | "updateComment" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "userUrl">;
@@ -81,14 +97,20 @@ export function truncateSummary(text: string): string {
 
 // Written as the Paseo app when it is installed: the plugin's key belongs to the owner, and Linear
 // notifies nobody of their own mentions. `commentId` edits that comment instead of posting a new one.
+// A rate limit is rethrown, never retried on the other credential: its pool must not absorb the load.
 export async function appComment(linear: Pick<LinearService, "createComment" | "updateComment">, app: Pick<AgentApi, "createComment" | "updateComment"> | undefined, issueId: string, body: string, commentId: string | null = null): Promise<string> {
   if (commentId) {
     for (const author of app ? [app, linear] : [linear]) {
-      if (await author.updateComment(commentId, body).then(() => true, () => false)) return commentId;
+      const edited = await author.updateComment(commentId, body).then(() => true, (error: unknown) => {
+        if (error instanceof RateLimitedError) throw error;
+        return false;
+      });
+      if (edited) return commentId;
     }
   }
   if (app) {
     const id = await app.createComment(issueId, body).catch((error: unknown) => {
+      if (error instanceof RateLimitedError) throw error;
       console.error(`[linear-tickets] ${issueId}: comment as the Paseo app failed, posting with the plugin's key: ${error instanceof Error ? error.message : error}`);
       return null;
     });
@@ -112,8 +134,17 @@ export class Writeback {
   // Per-issue queue for the waiting signals: a quick follow-up question must edit the first
   // question's comment, not race it into a second one.
   private readonly waitingQueue = new Map<string, Promise<unknown>>();
+  // Newest event per agent: a retry older than it is superseded and must not overwrite newer state.
+  private readonly latest = new Map<string, number>();
+  // Steps already done per (agent, event sequence), until that event's write-back ends.
+  private readonly ledgers = new Map<string, Map<string, unknown>>();
+  // The one scheduled retry per (agent, event kind).
+  private readonly pending = new Map<string, { seq: number; timer: NodeJS.Timeout }>();
+  private outboxQueue: Promise<unknown> = Promise.resolve();
+  private drainQueue: Promise<unknown> = Promise.resolve();
+  private recovered = false;
 
-  constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly agentBridge?: AgentBridge, private readonly settleMs = 2_000) {}
+  constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly agentBridge?: AgentBridge, private readonly settleMs = 2_000, private readonly outboxPath = join(paseoHome(), "linear-tickets", "writeback-outbox.json")) {}
 
   // The running model, and the agent with its title: hook events can carry none.
   private async snapshot(agent: PluginHookAgent, paseo: PaseoApi): Promise<{ model: string | null; named: PluginHookAgent }> {
@@ -122,15 +153,83 @@ export class Writeback {
   }
 
   // Session activities are best-effort on their own: a panel failure must not skip comments.
-  private async session(agentId: string, work: (sessionId: string, sessions: AgentBridge["sessions"]) => Promise<void>): Promise<void> {
+  // `strict` lets a rate limit through, for callers that keep the activity to retry it.
+  private async session(agentId: string, work: (sessionId: string, sessions: AgentBridge["sessions"]) => Promise<void>, strict = false): Promise<void> {
     const sessions = this.agentBridge?.sessions;
     if (!sessions) return;
     try {
       const link = await sessions.sessionFor(agentId);
       if (link) await work(link.sessionId, sessions);
     } catch (error) {
+      if (strict && error instanceof RateLimitedError) throw error;
       console.error(`[linear-tickets] agent session update for ${agentId} failed:`, error instanceof Error ? error.message : error);
     }
+  }
+
+  private async readOutbox(): Promise<OutboxEntry[]> {
+    try {
+      const entries: unknown = JSON.parse(await readFile(this.outboxPath, "utf8"));
+      return Array.isArray(entries) ? entries as OutboxEntry[] : [];
+    } catch { return []; }
+  }
+
+  private changeOutbox(change: (entries: OutboxEntry[]) => OutboxEntry[]): Promise<void> {
+    const run = async () => {
+      const entries = change(await this.readOutbox());
+      await mkdir(join(this.outboxPath, ".."), { recursive: true, mode: 0o700 });
+      const temporary = `${this.outboxPath}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(temporary, JSON.stringify(entries), { mode: 0o600, flag: "wx" });
+        await rename(temporary, this.outboxPath);
+      } finally { await rm(temporary, { force: true }); }
+    };
+    const result = this.outboxQueue.then(run, run);
+    this.outboxQueue = result.catch(() => undefined);
+    return result;
+  }
+
+  private markDelivered(entry: OutboxEntry, place: keyof OutboxEntry["done"]): Promise<void> {
+    entry.done[place] = true;
+    return this.changeOutbox((entries) => entries.flatMap((known) => {
+      if (known.agentId !== entry.agentId || known.url !== entry.url) return [known];
+      const done = { ...known.done, [place]: true };
+      return done.linear && done.session && done.handover ? [] : [{ ...known, done }];
+    }));
+  }
+
+  // Links one pull request everywhere it is not linked yet; each place is recorded once done.
+  private async deliver(entry: OutboxEntry): Promise<void> {
+    if (!entry.done.linear) {
+      await this.linear.linkUrl(entry.issueId, entry.url, "Pull request");
+      await this.markDelivered(entry, "linear");
+    }
+    if (!entry.done.session) {
+      await this.session(entry.agentId, (sessionId, sessions) => sessions.link(sessionId, "Pull request", entry.url), true);
+      await this.markDelivered(entry, "session");
+    }
+    if (!entry.done.handover) {
+      const handover = this.agentBridge?.handover;
+      // A successor already owns the ticket's record: the old agent must not take it back.
+      const record = handover ? await handover.read(entry.issueId) : null;
+      if (handover && (!record || record.agentId === entry.agentId)) {
+        await handover.update({ id: entry.issueId, identifier: entry.identifier }, { id: entry.agentId, title: entry.agentTitle, cwd: entry.cwd }, { link: ["Pull request", entry.url] });
+      }
+      await this.markDelivered(entry, "handover");
+    }
+  }
+
+  // One agent's pending pull requests (failures propagate), or everyone's (failures are logged).
+  private drainOutbox(agentId?: string): Promise<void> {
+    const run = async () => {
+      for (const entry of await this.readOutbox()) {
+        if (agentId === undefined) {
+          await this.deliver(entry).catch((error: unknown) => console.error(`[linear-tickets] linking ${entry.url} to ${entry.identifier} failed, kept for later: ${error instanceof Error ? error.message : error}`));
+        } else if (entry.agentId === agentId) await this.deliver(entry);
+      }
+    };
+    const result = this.drainQueue.then(run, run);
+    this.drainQueue = result.catch(() => undefined);
+    return result;
   }
 
   private async link(agent: PluginHookAgent, paseo: PaseoApi): Promise<Link | null> {
@@ -165,7 +264,7 @@ export class Writeback {
 
   // Opens or continues a waiting period: the ticket moves to Needs input (teams without that state
   // skip it), gets the needs-you label, and one comment mentions the owner, edited per question.
-  private markWaiting(issue: { id: string; identifier: string }, agent: PluginHookAgent, settings: PluginSettings, body: string, inSession: boolean): Promise<void> {
+  private markWaiting(issue: { id: string; identifier: string }, agent: PluginHookAgent, settings: PluginSettings, body: string, inSession: boolean, { once }: WritebackContext): Promise<void> {
     return this.serialize(issue.id, async () => {
       const waiting = await this.waitingFor(issue.id);
       const state = await this.linear.issueState(issue.id);
@@ -178,7 +277,7 @@ export class Writeback {
       // Only the owner opens Linear sessions; without one, whoever wrote the ticket is asked.
       const ownerId = (inSession ? null : state.creatorId) ?? await this.linear.viewerId();
       // The waiting period's comment is edited, not repeated.
-      const commentId = await appComment(this.linear, this.agentBridge?.comments, issue.id, `${await this.linear.userUrl(ownerId)} ${body}`, waiting?.commentId ?? null);
+      const commentId = await once("waiting-comment", async () => appComment(this.linear, this.agentBridge?.comments, issue.id, `${await this.linear.userUrl(ownerId)} ${body}`, waiting?.commentId ?? null)) ?? null;
       await this.setWaiting(issue, agent, { previousStateId, commentId });
     });
   }
@@ -195,37 +294,112 @@ export class Writeback {
     });
   }
 
-  // Linear outages (HTTP 503, rate limits, network drops) are retried after 30 s and 2 min.
-  private async run(event: string, agent: PluginHookAgent, paseo: PaseoApi, work: (link: Link, settings: PluginSettings) => Promise<void>, attempt = 0): Promise<void> {
+  // Each event takes the agent's next sequence number; a newer event of the same kind cancels the
+  // older one's scheduled retry (its pull requests are safe in the outbox).
+  private run(event: string, agent: PluginHookAgent, paseo: PaseoApi, work: Work): Promise<void> {
+    const seq = (this.latest.get(agent.id) ?? 0) + 1;
+    this.latest.set(agent.id, seq);
+    const older = this.pending.get(`${agent.id}\n${event}`);
+    if (older) {
+      clearTimeout(older.timer);
+      this.pending.delete(`${agent.id}\n${event}`);
+      this.ledgers.delete(`${agent.id}\n${older.seq}`);
+      console.error(`[linear-tickets] write-back for ${event} on agent ${agent.id} superseded by a newer event`);
+    }
+    return this.attempt({ event, agent, paseo, work, seq, attempt: 0, firstFailureAt: null, transientRetries: 0 });
+  }
+
+  private async attempt(delivery: Delivery): Promise<void> {
+    const { event, agent, paseo, work, seq } = delivery;
+    const ledgerKey = `${agent.id}\n${seq}`;
     try {
-      const link = await this.link(agent, paseo);
-      if (!link) return;
-      await work(link, await this.settings.read());
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const delay = RETRY_DELAYS_MS[attempt];
-      if (delay !== undefined && TRANSIENT.test(message)) {
-        console.error(`[linear-tickets] write-back for ${event} on agent ${agent.id} failed, retrying in ${delay / 1000} s: ${message}`);
-        setTimeout(() => { void this.run(event, agent, paseo, work, attempt + 1); }, delay).unref?.();
+      // Pull requests left over from before a restart.
+      if (!this.recovered) {
+        this.recovered = true;
+        await this.drainOutbox();
+      }
+      // A retry that a newer event overtook only links its pull requests; its state is stale.
+      if (delivery.attempt > 0 && (this.latest.get(agent.id) ?? 0) > seq) {
+        await this.drainOutbox(agent.id);
+        console.error(`[linear-tickets] write-back for ${event} on agent ${agent.id} superseded by a newer event`);
+        this.ledgers.delete(ledgerKey);
         return;
       }
-      console.error(`[linear-tickets] write-back for ${event} on agent ${agent.id} failed:`, message);
+      const link = await this.link(agent, paseo);
+      if (link) {
+        let ledger = this.ledgers.get(ledgerKey);
+        if (!ledger) this.ledgers.set(ledgerKey, ledger = new Map());
+        const steps = ledger;
+        await work(link, await this.settings.read(), {
+          once: async <T>(step: string, fn: () => Promise<T>) => {
+            if (steps.has(step)) return steps.get(step) as T;
+            const value = await fn();
+            steps.set(step, value);
+            return value;
+          },
+        });
+      }
+      this.ledgers.delete(ledgerKey);
+    } catch (error) {
+      if (!this.retry(delivery, error)) this.ledgers.delete(ledgerKey);
     }
   }
 
+  // Rate limits are retried once Linear's pool refills, for up to 6 h; other outages (HTTP 503,
+  // network drops) after 30 s and 2 min. Returns whether a retry is scheduled.
+  private retry(delivery: Delivery, error: unknown): boolean {
+    const { event, agent, seq } = delivery;
+    const message = error instanceof Error ? error.message : String(error);
+    const now = Date.now();
+    const firstFailureAt = delivery.firstFailureAt ?? now;
+    let transientRetries = delivery.transientRetries;
+    let delay: number | undefined;
+    if (error instanceof RateLimitedError) {
+      if (now - firstFailureAt >= RATE_LIMIT_GIVE_UP_MS) {
+        console.error(`[linear-tickets] write-back for ${event} on agent ${agent.id} gave up after 6 h of Linear rate limits`);
+        return false;
+      }
+      delay = Math.max(error.resumeAt - now, MIN_RATE_LIMIT_DELAY_MS);
+    } else if (TRANSIENT.test(message)) {
+      delay = RETRY_DELAYS_MS[transientRetries++];
+    }
+    if (delay === undefined) {
+      console.error(`[linear-tickets] write-back for ${event} on agent ${agent.id} failed:`, message);
+      return false;
+    }
+    const key = `${agent.id}\n${event}`;
+    const other = this.pending.get(key);
+    if (other && other.seq > seq) {
+      console.error(`[linear-tickets] write-back for ${event} on agent ${agent.id} superseded by a newer event`);
+      return false;
+    }
+    if (other) {
+      clearTimeout(other.timer);
+      this.ledgers.delete(`${agent.id}\n${other.seq}`);
+    }
+    console.error(`[linear-tickets] write-back for ${event} on agent ${agent.id} failed, retrying in ${Math.round(delay / 1000)} s: ${message}`);
+    const timer = setTimeout(() => {
+      if (this.pending.get(key)?.timer === timer) this.pending.delete(key);
+      void this.attempt({ ...delivery, attempt: delivery.attempt + 1, firstFailureAt, transientRetries });
+    }, delay);
+    timer.unref?.();
+    this.pending.set(key, { seq, timer });
+    return true;
+  }
+
   turnStarted({ agent }: PluginLifecycleEvents["agent.turn_started"], paseo: PaseoApi): Promise<void> {
-    return this.run("turn_started", agent, paseo, async ({ issueId, identifier, planFirst }, settings) => {
+    return this.run("turn_started", agent, paseo, async ({ issueId, identifier, planFirst }, settings, { once }) => {
       const sessions = this.agentBridge?.sessions;
       if (sessions && await sessions.holdIfStopped(agent.id).catch(() => false)) return;
       const { model, named } = await this.snapshot(agent, paseo);
       const previous = this.models.get(agent.id);
       if (model) this.models.set(agent.id, model);
       const changed = Boolean(model && previous && model !== previous);
-      await this.session(agent.id, async (sessionId, live) => {
+      await once("session:working", () => this.session(agent.id, async (sessionId, live) => {
         if (changed) await live.say(sessionId, "thought", `Model changed: ${previous} → ${model}`);
         await live.say(sessionId, "thought", model ? `Working… (${model})` : "Working…", true);
         await live.follow(agent.id);
-      });
+      }));
       const handover = this.agentBridge?.handover;
       if (model && (changed || !previous) && handover && settings.writeback.summaries) {
         await handover.update({ id: issueId, identifier }, named, { model }).catch(() => {});
@@ -242,8 +416,16 @@ export class Writeback {
   }
 
   turnEnded({ agent, outcome, timeline }: PluginLifecycleEvents["agent.turn_ended"], paseo: PaseoApi): Promise<void> {
-    return this.run("turn_ended", agent, paseo, async ({ issueId, identifier }, settings) => {
+    return this.run("turn_ended", agent, paseo, async ({ issueId, identifier }, settings, { once }) => {
       const { writeback } = settings;
+      const { model, named } = await this.snapshot(agent, paseo);
+      if (model) this.models.set(agent.id, model);
+      // Recorded before any Linear call, so a failure below cannot lose the turn's pull requests.
+      const urls = writeback.pullRequests ? turnPullRequests(timeline) : [];
+      if (urls.length) {
+        const added = urls.map((url): OutboxEntry => ({ agentId: agent.id, agentTitle: named.title, cwd: agent.cwd, issueId, identifier, url, done: { linear: false, session: false, handover: false } }));
+        await once("outbox", () => this.changeOutbox((entries) => [...entries, ...added.filter((entry) => !entries.some((known) => known.agentId === entry.agentId && known.url === entry.url))]));
+      }
       const blocked = dispatchLabels(settings.dispatch.label).blocked;
       // The turn is over, so nothing waits for the owner any more; `paseo-blocked` marks errors only.
       const state = writeback.blocked ? await this.linear.issueState(issueId) : null;
@@ -251,63 +433,58 @@ export class Writeback {
       const title = agent.title ?? "Paseo agent";
       const handover = this.agentBridge?.handover;
       const issue = { id: issueId, identifier };
-      const { model, named } = await this.snapshot(agent, paseo);
-      if (model) this.models.set(agent.id, model);
       if (outcome.kind === "completed") {
         const reply = turnReply(timeline);
-        await this.session(agent.id, async (sessionId, sessions) => {
+        await once("session:response", () => this.session(agent.id, async (sessionId, sessions) => {
           // The live feed already showed the commands; otherwise post the turn's last few.
           if (!await sessions.unfollow(agent.id)) for (const command of turnCommands(timeline)) await sessions.action(sessionId, "Ran", command);
           if (reply) await sessions.say(sessionId, "response", truncateSummary(reply));
-        });
+        }));
         // With the handover record, turns update one progress comment instead of adding comments.
         if (writeback.summaries && reply) {
           if (handover) await handover.update(issue, named, { status: "working", summary: reply, model });
-          else await this.linear.comment(issueId, `**${title}** (Paseo) finished a turn:\n\n${truncateSummary(reply)}`);
+          else await once("comment", () => this.linear.comment(issueId, `**${title}** (Paseo) finished a turn:\n\n${truncateSummary(reply)}`));
         }
         if (state) await this.linear.removeLabel(issueId, blocked, state.labels);
       } else if (outcome.kind === "failed") {
-        await this.session(agent.id, async (sessionId, sessions) => {
+        await once("session:error", () => this.session(agent.id, async (sessionId, sessions) => {
           await sessions.unfollow(agent.id);
           await sessions.say(sessionId, "error", `The agent stopped with an error: ${outcome.error.message}`);
-        });
-        if (handover) await handover.finish(issue, named, "failed", outcome.error.message.slice(0, 500), model);
-        else if (writeback.summaries || writeback.blocked) await this.linear.comment(issueId, `**${title}** (Paseo) stopped with an error: ${outcome.error.message}`);
+        }));
+        if (handover) await once("finish", () => handover.finish(issue, named, "failed", outcome.error.message.slice(0, 500), model));
+        else if (writeback.summaries || writeback.blocked) await once("comment", () => this.linear.comment(issueId, `**${title}** (Paseo) stopped with an error: ${outcome.error.message}`));
         if (writeback.blocked) await this.linear.addLabel(issueId, blocked);
-        await this.session(agent.id, async (sessionId, sessions) => {
+        await once("session:resume", () => this.session(agent.id, async (sessionId, sessions) => {
           if (!writeback.autoResume || !await sessions.resumeNow(sessionId)) await sessions.offerResume(sessionId);
-        });
+        }));
       }
       if (outcome.kind === "canceled") await this.session(agent.id, async (_sessionId, sessions) => { await sessions.unfollow(agent.id); });
-      if (!writeback.pullRequests) return;
-      const urls = turnPullRequests(timeline);
       if (!urls.length) return;
-      for (const url of urls) {
-        await this.linear.linkUrl(issueId, url, "Pull request");
-        await this.session(agent.id, (sessionId, sessions) => sessions.link(sessionId, "Pull request", url));
-        if (handover) await handover.update(issue, named, { link: ["Pull request", url] });
-      }
+      await this.drainOutbox(agent.id);
       const moved = await this.linear.moveToReview(issueId);
       if (moved.note) console.error(`[linear-tickets] ${issueId}: ${moved.note}`);
     });
   }
 
   permissionRequested({ agent, request }: PluginLifecycleEvents["agent.permission_requested"], paseo: PaseoApi): Promise<void> {
-    return this.run("permission_requested", agent, paseo, async ({ issueId, identifier }, settings) => {
+    return this.run("permission_requested", agent, paseo, async ({ issueId, identifier }, settings, context) => {
       // Providers sometimes resolve a request themselves within moments (for example after a
       // plan approval switches the mode); only requests still pending after a short wait are shown.
       await new Promise((resolve) => setTimeout(resolve, this.settleMs));
       const refreshed = await paseo.agents.ref(agent.id).refresh().catch(() => null);
       const stillPending = refreshed?.agent.pendingPermissions;
       if (Array.isArray(stillPending) && !stillPending.some((pending) => pending.id === request.id)) return;
-      let inSession = false;
-      await this.session(agent.id, (sessionId, sessions) => {
-        inSession = true;
-        const subject = [request.title || request.name, request.description].filter(Boolean).join("\n\n");
-        return request.kind === "question"
-          ? sessions.askQuestion(sessionId, request)
-          : sessions.ask(sessionId, `Approve this action?\n\n${subject}`, [{ label: "Approve", value: "approve" }, { label: "Deny", value: "deny" }]);
-      });
+      const inSession = await context.once("session:ask", async () => {
+        let asked = false;
+        await this.session(agent.id, (sessionId, sessions) => {
+          asked = true;
+          const subject = [request.title || request.name, request.description].filter(Boolean).join("\n\n");
+          return request.kind === "question"
+            ? sessions.askQuestion(sessionId, request)
+            : sessions.ask(sessionId, `Approve this action?\n\n${subject}`, [{ label: "Approve", value: "approve" }, { label: "Deny", value: "deny" }]);
+        });
+        return asked;
+      }) ?? false;
       if (!settings.writeback.blocked) return;
       // Posted even with the agent panel: only a mention reaches the owner's inbox and phone.
       const what = request.kind === "question" ? "an answer" : request.kind === "plan" ? "plan approval" : "permission";
@@ -318,7 +495,7 @@ export class Writeback {
       const hint = settings.writeback.mentions
         ? `\n\nReply here with ${request.kind === "question" ? "“@paseo <your answer>”" : "“@paseo approve” or “@paseo deny <reason>”"}.`
         : "";
-      await this.markWaiting({ id: issueId, identifier }, agent, settings, `**${agent.title ?? "Paseo agent"}** (Paseo) is waiting for ${what}: ${subject}${description}${options}${hint}`, inSession);
+      await this.markWaiting({ id: issueId, identifier }, agent, settings, `**${agent.title ?? "Paseo agent"}** (Paseo) is waiting for ${what}: ${subject}${description}${options}${hint}`, inSession, context);
     });
   }
 
@@ -336,7 +513,7 @@ export class Writeback {
   }
 
   archived({ agent }: PluginLifecycleEvents["agent.archived"], paseo: PaseoApi): Promise<void> {
-    return this.run("archived", agent, paseo, async ({ issueId, identifier }, settings) => {
+    return this.run("archived", agent, paseo, async ({ issueId, identifier }, settings, { once }) => {
       this.links.delete(agent.id);
       this.started.delete(agent.id);
       const labels = dispatchLabels(settings.dispatch.label);
@@ -344,8 +521,9 @@ export class Writeback {
       // A successor already working on the ticket (a resume) keeps the running marker and the session.
       const others = await paseo.agents.list({ filter: { labels: { "linear.issueId": issueId }, includeArchived: false }, page: { limit: 5 } });
       const succeeded = others.entries.some(({ agent: other }) => other.id !== agent.id);
+      const handover = this.agentBridge?.handover;
       if (succeeded) {
-        await this.agentBridge?.handover.finish({ id: issueId, identifier }, agent, "archived", "handed over to a new agent");
+        if (handover) await once("finish", () => handover.finish({ id: issueId, identifier }, agent, "archived", "handed over to a new agent"));
         return;
       }
       // The running marker belongs to the dispatcher and is always cleared; the blocked and
@@ -357,14 +535,13 @@ export class Writeback {
       }
       const hasPullRequest = state.attachmentUrls.some((url) => /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(url));
       const open = !["completed", "canceled", "duplicate"].includes(state.statusType.trim().toLowerCase());
-      const handover = this.agentBridge?.handover;
       if (handover) {
-        await handover.finish({ id: issueId, identifier }, agent, "archived", hasPullRequest ? "pull request linked" : "no pull request linked");
-        if (open) await this.session(agent.id, (sessionId, sessions) => sessions.offerResume(sessionId));
+        await once("finish", () => handover.finish({ id: issueId, identifier }, agent, "archived", hasPullRequest ? "pull request linked" : "no pull request linked"));
+        if (open) await once("session:resume", () => this.session(agent.id, (sessionId, sessions) => sessions.offerResume(sessionId)));
         return;
       }
       if (settings.writeback.summaries && !hasPullRequest) {
-        await this.linear.comment(issueId, `**${agent.title ?? "Paseo agent"}** (Paseo) was archived without a linked pull request.`);
+        await once("comment", () => this.linear.comment(issueId, `**${agent.title ?? "Paseo agent"}** (Paseo) was archived without a linked pull request.`));
       }
     });
   }

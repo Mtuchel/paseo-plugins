@@ -345,6 +345,19 @@ test("API error text never carries the key back to the agent", async () => {
   } finally { a.stop(); b.stop(); await unauthorized.close(); await failing.close(); await rm(home, { recursive: true, force: true }); }
 });
 
+test("a rate-limited Linear answer tells the agent to try again later instead of a generic failure", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-ratelimit-"));
+  const limited = await fakeLinear(() => ({}), { status: 400, raw: () => ({ errors: [{ message: "Rate limit exceeded", extensions: { code: "RATELIMITED" } }] }) });
+  const script = await writeTicketMcpScript(home);
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: limited.url });
+  try {
+    const result = await mcp.call("get_ticket");
+    assert.equal(result.isError, true);
+    assert.match(result.text, /Linear's hourly request limit is reached for the Linear API key; try again in about 10 minutes\./);
+    assert.equal(limited.calls.length, 1);
+  } finally { mcp.stop(); await limited.close(); await rm(home, { recursive: true, force: true }); }
+});
+
 test("the MCP server validates envelopes, never runs tools for notifications, and bounds input", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-envelope-"));
   const linear = await fakeLinear(() => ({ commentCreate: { success: true, comment: { url: "u" } }, attachmentLinkURL: { success: true } }));

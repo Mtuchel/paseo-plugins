@@ -1,10 +1,21 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+// Not mocked: the tests below mock setTimeout and Date only.
+import { setImmediate as nextTurn } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type { IssueState } from "./linear";
+import { RateLimitedError } from "./rate-budget";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
-import { MAX_SUMMARY_LENGTH, turnPullRequests, turnReply, Writeback } from "./writeback";
+import { appComment, MAX_SUMMARY_LENGTH, turnPullRequests, turnReply, Writeback } from "./writeback";
+
+// Writebacks built without an outbox path keep theirs here, never in the real Paseo home.
+process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-writeback-home-"));
+const outboxPath = () => join(mkdtempSync(join(tmpdir(), "paseo-writeback-outbox-")), "writeback-outbox.json");
 
 type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
 
@@ -206,4 +217,172 @@ test("a Linear failure is logged and never thrown back into the daemon hook", as
   const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
   await writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "done" }] }, linked);
   assert.match(String(errors.mock.calls[0].arguments[1]), /rate limited/);
+});
+
+const PR = "https://github.com/o/r/pull/9";
+const completedWithPr: PluginLifecycleEvents["agent.turn_ended"] = { agent: root, turnId: "t", outcome: { kind: "completed" }, timeline: [toolCall(PR), { type: "assistant_message", text: "done" }] };
+const MINUTE = 60_000;
+
+// Retries fire from mocked timers and run in the background; real I/O (the outbox) needs real turns.
+async function until(condition: () => boolean): Promise<void> {
+  for (let turn = 0; turn < 5_000 && !condition(); turn++) await nextTurn();
+  assert.ok(condition(), "the expected write-back never happened");
+}
+async function settle(): Promise<void> {
+  for (let turn = 0; turn < 200; turn++) await nextTurn();
+}
+
+function fakeBridge() {
+  const calls: string[] = [];
+  const bridge = {
+    sessions: {
+      sessionFor: async () => ({ sessionId: "s1" }), holdIfStopped: async () => false, follow: async () => {}, unfollow: async () => true, action: async () => {}, resumeNow: async () => false,
+      say: async (_s: string, type: string, body: string) => { calls.push(`say ${type}: ${body}`); },
+      link: async (_s: string, _title: string, url: string) => { calls.push(`session link ${url}`); },
+      offerResume: async () => { calls.push("offer resume"); },
+    },
+    handover: {
+      read: async () => null, waiting: async () => null, setWaiting: async () => {},
+      update: async (_issue: unknown, _agent: unknown, change: object) => { calls.push(`handover ${JSON.stringify(change)}`); return {}; },
+      finish: async (_issue: unknown, _agent: unknown, status: string) => { calls.push(`finish ${status}`); return {}; },
+    },
+  };
+  return { calls, bridge: bridge as never };
+}
+
+test("a rate-limited turn end is retried whenever Linear's pool refills, however often, until it lands", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const errors = t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  const issueState = linear.issueState.bind(linear);
+  let attempts = 0;
+  linear.issueState = async () => { if (++attempts <= 4) throw new RateLimitedError("key", Date.now() + 10 * MINUTE); return issueState(); };
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  await writeback.turnEnded(completedWithPr, linked);
+  for (let retry = 1; retry <= 4; retry++) {
+    t.mock.timers.tick(10 * MINUTE - 1);
+    await settle();
+    assert.equal(attempts, retry, "not retried before the pool refills");
+    t.mock.timers.tick(1);
+    await until(() => attempts === retry + 1);
+  }
+  await until(() => linear.writes.includes("review"));
+  assert.equal(linear.writes.filter((write) => write.startsWith("comment: ")).length, 1);
+  assert.ok(linear.writes.includes(`link ${PR}`));
+  assert.equal(errors.mock.calls.filter((call) => /retrying in 600 s: Linear's hourly request limit/.test(String(call.arguments[0]))).length, 4);
+});
+
+test("a turn end that stays rate-limited gives up after 6 h", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const errors = t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  let attempts = 0;
+  linear.issueState = async () => { attempts++; throw new RateLimitedError("key", Date.now() + 60 * MINUTE); };
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  await writeback.turnEnded(completedWithPr, linked);
+  for (let hour = 1; hour <= 6; hour++) {
+    t.mock.timers.tick(60 * MINUTE);
+    await until(() => attempts === hour + 1);
+  }
+  const gaveUp = () => errors.mock.calls.some((call) => String(call.arguments[0]) === "[linear-tickets] write-back for turn_ended on agent agent-1 gave up after 6 h of Linear rate limits");
+  await until(gaveUp);
+  t.mock.timers.tick(24 * 60 * MINUTE);
+  await settle();
+  assert.equal(attempts, 7);
+  assert.ok(!linear.writes.includes("review"));
+});
+
+test("a delayed retry overtaken by a newer event links its pull request but leaves the newer state alone", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const errors = t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  const issueState = linear.issueState.bind(linear);
+  let limited = true;
+  linear.issueState = async () => { if (limited) { limited = false; throw new RateLimitedError("key", Date.now() + 10 * MINUTE); } return issueState(); };
+  const { calls, bridge } = fakeBridge();
+  const writeback = new Writeback(linear, { read: async () => allOn }, bridge, 0, outboxPath());
+  await writeback.turnEnded(completedWithPr, linked);
+  await writeback.turnStarted({ agent: root, turnId: "next" }, linked);
+  linear.writes.length = 0;
+  calls.length = 0;
+  t.mock.timers.tick(10 * MINUTE);
+  await until(() => errors.mock.calls.some((call) => /turn_ended on agent agent-1 superseded by a newer event/.test(String(call.arguments[0]))));
+  // The stale turn neither clears the waiting state, drops labels, reports nor moves the ticket.
+  assert.deepEqual(linear.writes, [`link ${PR}`]);
+  assert.deepEqual(calls, [`session link ${PR}`, `handover {"link":["Pull request","${PR}"]}`]);
+});
+
+test("a retry after partial success repeats no comment, report or session activity", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  t.mock.method(console, "error", () => {});
+  const plain = new FakeLinear();
+  const removeLabel = plain.removeLabel.bind(plain);
+  let limited = true;
+  plain.removeLabel = async (id: string, name: string) => {
+    if (name === "paseo-blocked" && limited) { limited = false; throw new RateLimitedError("key", Date.now() + MINUTE); }
+    return removeLabel(id, name);
+  };
+  await new Writeback(plain, { read: async () => allOn }, undefined, 0, outboxPath()).turnEnded(completedWithPr, linked);
+  t.mock.timers.tick(MINUTE);
+  await until(() => plain.writes.includes("review"));
+  assert.equal(plain.writes.filter((write) => write.startsWith("comment: ")).length, 1);
+  assert.equal(plain.writes.filter((write) => write === `link ${PR}`).length, 1);
+
+  const native = new FakeLinear();
+  const addLabel = native.addLabel.bind(native);
+  let failing = true;
+  native.addLabel = async (id: string, name: string) => { if (failing) { failing = false; throw new RateLimitedError("key", Date.now() + MINUTE); } return addLabel(id, name); };
+  const { calls, bridge } = fakeBridge();
+  await new Writeback(native, { read: async () => allOn }, bridge, 0, outboxPath()).turnEnded({ agent: root, turnId: "t", outcome: { kind: "failed", error: { message: "boom" } }, timeline: [] }, linked);
+  t.mock.timers.tick(MINUTE);
+  await until(() => calls.includes("offer resume"));
+  assert.deepEqual(calls, ["say error: The agent stopped with an error: boom", "finish failed", "offer resume"]);
+  assert.deepEqual(native.writes.filter((write) => write === "+paseo-blocked"), ["+paseo-blocked"]);
+});
+
+test("a pull request left in the outbox is linked by the next plugin instance on its first write-back", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const path = outboxPath();
+  const before = new FakeLinear();
+  before.linkUrl = async () => { throw new Error("Linear did not link the URL."); };
+  await new Writeback(before, { read: async () => allOn }, undefined, 0, path).turnEnded(completedWithPr, linked);
+  assert.deepEqual(JSON.parse(await readFile(path, "utf8")).map((entry: { url: string; done: object }) => [entry.url, entry.done]), [[PR, { linear: false, session: false, handover: false }]]);
+
+  const after = new FakeLinear();
+  await new Writeback(after, { read: async () => allOn }, undefined, 0, path).turnStarted({ agent: { ...root, id: "agent-2" }, turnId: "t" }, linked);
+  assert.deepEqual(after.writes, [`link ${PR}`, "state", "in-progress issue-1"]);
+  assert.deepEqual(JSON.parse(await readFile(path, "utf8")), []);
+});
+
+test("other Linear outages are retried twice, after 30 s and 2 min, then dropped", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const errors = t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  let attempts = 0;
+  linear.issueState = async () => { attempts++; throw new Error("The Linear API request failed (HTTP 503). Try again."); };
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  await writeback.turnEnded(completedWithPr, linked);
+  t.mock.timers.tick(30_000);
+  await until(() => attempts === 2);
+  t.mock.timers.tick(120_000);
+  await until(() => attempts === 3);
+  await until(() => errors.mock.calls.some((call) => String(call.arguments[0]) === "[linear-tickets] write-back for turn_ended on agent agent-1 failed:"));
+  t.mock.timers.tick(60 * MINUTE);
+  await settle();
+  assert.equal(attempts, 3);
+  assert.deepEqual(errors.mock.calls.map((call) => String(call.arguments[0]).match(/retrying in \d+ s/)?.[0]).filter(Boolean), ["retrying in 30 s", "retrying in 120 s"]);
+});
+
+test("a rate-limited Paseo app comment is not posted with the owner's key instead", async (t) => {
+  const linear = new FakeLinear();
+  const limited = async () => { throw new RateLimitedError("app", Date.now() + MINUTE); };
+  const app = { createComment: limited, updateComment: limited };
+  await assert.rejects(appComment(linear, app, "issue-1", "hello"), RateLimitedError);
+  await assert.rejects(appComment(linear, app, "issue-1", "hello", "c1"), RateLimitedError);
+  assert.deepEqual(linear.writes, []);
+  // Any other app failure still falls back to the key.
+  const broken = async () => { throw new Error("app token revoked"); };
+  t.mock.method(console, "error", () => {});
+  assert.equal(await appComment(linear, { createComment: broken, updateComment: broken }, "issue-1", "hello"), "c1");
+  assert.deepEqual(linear.writes, ["new comment: hello"]);
 });

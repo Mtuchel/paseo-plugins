@@ -223,9 +223,9 @@ test("a permission shows in the agent panel only while still pending, and the ti
       ask: async (_s: string, body: string, options: { value: string }[]) => { calls.push(`ask ${body.split("\n")[0]} [${options.map((o) => o.value).join("|")}]`); },
     };
     const comments = { createComment: async (_i: string, body: string) => { calls.push(`app comment ${body.split("\n")[0]}`); return "c1"; }, updateComment: async () => {} };
-    const handover = { update: async () => ({}) as never, finish: async () => ({}) as never, waiting: async () => null, setWaiting: async () => {} };
+    const handover = { read: async () => null, update: async () => ({}) as never, finish: async () => ({}) as never, waiting: async () => null, setWaiting: async () => {} };
     const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" }, pendingPermissions: pending } }) }) } } as unknown as PaseoApi;
-    const writeback = new Writeback(linear, { read: async () => ({ ...settings, writeback: { ...DEFAULT_WRITEBACK, blocked: true } }) }, { sessions: sessions as never, handover, comments }, 0);
+    const writeback = new Writeback(linear, { read: async () => ({ ...settings, writeback: { ...DEFAULT_WRITEBACK, blocked: true } }) }, { sessions: sessions as never, handover, comments }, 0, join(tmpdir(), `paseo-writeback-outbox-${process.pid}.json`));
     await writeback.permissionRequested({ agent: { id: "a1", workspaceId: "w", parentAgentId: null, provider: "omp", cwd: "/x", title: "T" }, request }, paseo);
     assert.deepEqual(calls, pending.length ? ["ask Approve this action? [approve|deny]", "move Needs input", "+paseo-needs-you", `app comment https://linear.app/ws/profiles/${OWNER} **T** (Paseo) is waiting for permission: Allow tool: bash`] : []);
   }
