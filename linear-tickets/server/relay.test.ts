@@ -83,7 +83,7 @@ function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>,
   return { relay: new CommentRelay(linear, path), paseo, events, since, reads, fake, path };
 }
 
-const comment = (id: string, body: string, extra: Partial<RelayComment> = {}): RelayComment => ({ id, body, createdAt: `2026-02-01T00:00:0${id.length}Z`, userId: ME, reactions: [], ...extra });
+const comment = (id: string, body: string, extra: Partial<RelayComment> = {}): RelayComment => ({ id, body, createdAt: `2026-02-01T00:00:0${id.length}Z`, userId: ME, reactions: [], sessionId: null, ...extra });
 
 test("my @paseo comments reach the newest agent on the ticket and are marked delivered; everything else is ignored", async () => {
   const { relay, paseo, events, since } = setup([
@@ -97,6 +97,8 @@ test("my @paseo comments reach the newest agent on the ticket and are marked del
       comment("c3", "@paseo from someone else", { userId: "user-other" }),
       comment("c4", "@paseo already delivered", { reactions: [{ emoji: "eyes", userId: ME }] }),
       comment("c5", "**TUC-1** (Paseo) finished a turn: @paseo mentioned in a summary"),
+      // A real @mention of the Paseo app: its agent session delivers it, not the relay.
+      comment("c6", "@paseo via the app mention", { sessionId: "session-1" }),
     ],
   });
   await relay.poll(paseo);

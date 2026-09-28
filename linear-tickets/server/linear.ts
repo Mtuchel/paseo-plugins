@@ -302,7 +302,7 @@ export function relayCommentsQuery(count: number): string {
   const declarations = indexes.map((index) => `$i${index}: ID!, $s${index}: DateTimeOrDuration!, $a${index}: String`).join(", ");
   const fields = indexes.map((index) => `t${index}: issues(first: 1, filter: { id: { eq: $i${index} } }) {
     nodes { id comments(first: 50, after: $a${index}, filter: { createdAt: { gte: $s${index} }, user: { id: { eq: $u } }, body: { containsIgnoreCase: "@paseo" } }) {
-      nodes { id body createdAt user { id } reactions { emoji user { id } } }
+      nodes { id body createdAt user { id } reactions { emoji user { id } } agentSession { id } }
       pageInfo { hasNextPage endCursor }
     } }
   }`).join("\n  ");
@@ -314,7 +314,9 @@ export const REACTION_QUERY = `mutation react($commentId: String!, $emoji: Strin
   reactionCreate(input: { commentId: $commentId, emoji: $emoji }) { success }
 }`;
 
-export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[] };
+// `sessionId`: the Paseo agent session the comment opened or replied in (an @mention of the app);
+// those reach the agent through the session webhook, not the relay.
+export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[]; sessionId: string | null };
 
 export const ISSUE_DOCUMENTS_QUERY = `query issueDocuments($id: String!) {
   issue(id: $id) { id documents(first: 50) { nodes { id title url content } } }
@@ -738,6 +740,7 @@ export class LinearService {
             createdAt: label(node.createdAt),
             userId: label(record(node.user ?? {}).id),
             reactions: (Array.isArray(node.reactions) ? node.reactions : []).map((entry) => record(entry)).map((reaction) => ({ emoji: label(reaction.emoji), userId: label(record(reaction.user ?? {}).id) })),
+            sessionId: label(record(node.agentSession ?? {}).id) || null,
           });
         }
         if (found.hasNextPage && found.endCursor) next.push({ ...item, after: found.endCursor });

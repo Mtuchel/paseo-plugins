@@ -113,7 +113,10 @@ export class CommentRelay {
         const cursor = cursors[agent.issueId];
         for (const comment of comments.get(agent.issueId) ?? []) {
           if (comment.createdAt < cursor.since || (comment.createdAt === cursor.since && cursor.boundaryIds.includes(comment.id))) continue;
+          // An @mention of the Paseo app opens (or replies in) an agent session, and the session
+          // webhook delivers it; relaying it too would hand the agent the same message twice.
           const handled = comment.userId !== viewerId
+            || comment.sessionId !== null
             || comment.reactions.some((reaction) => reaction.userId === viewerId && (reaction.emoji === ACK_EMOJI || reaction.emoji === FAILED_EMOJI))
             || state.acks.some((ack) => ack.commentId === comment.id);
           const message = handled ? null : mentionMessage(comment.body);
@@ -192,28 +195,35 @@ export class CommentRelay {
   // Hands the comment to the agent; the outcome is the reaction (and, on failure, the reply) to queue.
   private async deliver(paseo: PaseoApi, agent: LinkedAgent, comment: RelayComment, message: string): Promise<{ emoji: string; reply: string | null }> {
     try {
-      const handle = paseo.agents.ref(agent.id);
-      const refreshed = await handle.refresh();
-      const pending = refreshed?.agent.pendingPermissions ?? [];
-      const question = pending.find((request) => request.kind === "question");
-      const approval = pending.find((request) => request.kind !== "question");
-      const decision = approval ? approvalDecision(message) : null;
-      if (question) {
-        if (!message) throw new Error("The agent is waiting for an answer; write it after @paseo.");
-        await handle.respondToPermission({ requestId: question.id, response: questionAnswer(question, message) });
-      } else if (approval && decision) {
-        await handle.respondToPermission({ requestId: approval.id, response: decision });
-      } else if (approval) {
-        throw new Error(`The agent is waiting for approval of "${approval.title || approval.name}". Reply "@paseo approve" or "@paseo deny <reason>".`);
-      } else {
-        if (!message) throw new Error("Write the message after @paseo.");
-        await handle.send(message);
-      }
+      await deliverToAgent(paseo, agent.id, message);
       return { emoji: ACK_EMOJI, reply: null };
     } catch (error) {
       const reason = error instanceof Error ? error.message : "unknown error";
       console.error(`[linear-tickets] relaying comment ${comment.id} to agent ${agent.id} failed: ${reason}`);
       return { emoji: FAILED_EMOJI, reply: `Paseo could not deliver that comment to the agent: ${reason}` };
     }
+  }
+}
+
+// A message from Linear for a running agent: the answer to its pending question, an approve/deny
+// decision for a pending approval, or otherwise a new message. Throws the reason, for the person
+// who wrote it, when the message cannot be used.
+export async function deliverToAgent(paseo: PaseoApi, agentId: string, message: string): Promise<void> {
+  const handle = paseo.agents.ref(agentId);
+  const refreshed = await handle.refresh();
+  const pending = refreshed?.agent.pendingPermissions ?? [];
+  const question = pending.find((request) => request.kind === "question");
+  const approval = pending.find((request) => request.kind !== "question");
+  const decision = approval ? approvalDecision(message) : null;
+  if (question) {
+    if (!message) throw new Error("The agent is waiting for an answer; write it after @paseo.");
+    await handle.respondToPermission({ requestId: question.id, response: questionAnswer(question, message) });
+  } else if (approval && decision) {
+    await handle.respondToPermission({ requestId: approval.id, response: decision });
+  } else if (approval) {
+    throw new Error(`The agent is waiting for approval of "${approval.title || approval.name}". Reply "@paseo approve" or "@paseo deny <reason>".`);
+  } else {
+    if (!message) throw new Error("Write the message after @paseo.");
+    await handle.send(message);
   }
 }

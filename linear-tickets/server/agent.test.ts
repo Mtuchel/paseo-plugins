@@ -122,6 +122,14 @@ test("a mention on a ticket with a running agent is passed to that agent instead
   await h.cleanup();
 });
 
+test("a mention to a running agent that waits on a question answers it, like a relayed comment", async () => {
+  const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Format?", header: "Response", options: [{ label: "CSV" }] }] } };
+  const h = harness({ activeAgent: { id: "agent-1", title: "TUC-1: Fix" }, pending: [question] });
+  await h.router.created({ id: "s3", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" }, comment: { body: "@paseo csv" } });
+  assert.equal(h.calls[0], `respond q ${JSON.stringify({ behavior: "allow", updatedInput: { answers: { Response: "CSV" } } })}`);
+  await h.cleanup();
+});
+
 test("replies route to stop, question, approval, plan review or message, and each is handled once", async () => {
   const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Transfer?", header: "Response", options: [{ label: "SFTP" }, { label: "Mail" }] }] } };
   const tool: AgentPermissionRequest = { id: "t", provider: "omp", name: "bash", kind: "tool", title: "Allow tool: bash" };

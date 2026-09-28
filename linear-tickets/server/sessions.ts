@@ -12,7 +12,7 @@ import type { AgentSessionWebhook } from "./agent-webhook";
 import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
 import { dispatchLabels } from "./dispatch";
 import type { LinearService } from "./linear";
-import { answerableQuestions, approvalDecision, matchOption, questionAnswer, questionsOf } from "./relay";
+import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, questionAnswer, questionsOf } from "./relay";
 import type { Settings } from "./settings";
 import type { TicketStarter } from "./starter";
 
@@ -300,7 +300,8 @@ export class SessionRouter {
       await this.linkToPaseo(session.id, existing.id);
       const comment = (session.comment ?? {}) as { body?: string };
       const text = typeof comment.body === "string" && !/^This thread is for an agent session/.test(comment.body) ? comment.body.replace(/@paseo\b/gi, "").trim() : "";
-      if (text) await this.paseo!.agents.ref(existing.id).send(text);
+      // Same as a relayed comment: answers a pending question or decides a pending approval.
+      if (text) await deliverToAgent(this.paseo!, existing.id, text);
       await this.say(session.id, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.${text ? " Your message was passed on." : ""}`);
       await this.closeSuperseded();
       return;
