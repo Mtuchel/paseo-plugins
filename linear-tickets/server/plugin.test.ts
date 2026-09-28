@@ -11,6 +11,7 @@ import { Credentials } from "./credentials";
 import { Launcher, safeBranchName } from "./launch";
 import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_DISPATCH, DEFAULT_WRITEBACK } from "./settings";
 import { LinearService, postGraphQL, ADD_LABEL_QUERY, CREATE_LABEL_QUERY, LABEL_BY_NAME_QUERY, resolveReviewState, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
+import { RateBudget, RateLimitedError } from "./rate-budget";
 import { cachedOverviewRpc, countIssuesRpc, listIssuesRpc, searchIssuesRpc } from "../shared/contracts";
 
 // GraphQL-shaped fixture: workflow state, priority label, label connection,
@@ -75,15 +76,35 @@ test("authentication, rate-limit and server failures map to user-actionable erro
   const cases: Array<{ status: number; body: unknown; message: RegExp }> = [
     { status: 401, body: { errors: [{ message: "Authentication required" }] }, message: /rejected this API key. Authentication required/ },
     { status: 403, body: { errors: [{ message: "forbidden" }] }, message: /rejected this API key. forbidden/ },
-    { status: 429, body: { errors: [{ message: "rate limited" }] }, message: /rate-limiting/ },
+    { status: 429, body: { errors: [{ message: "rate limited" }] }, message: /hourly request limit is reached for the Linear API key/ },
+    // What Linear actually sends when the hourly limit is used up.
+    { status: 400, body: { errors: [{ message: "Rate limit exceeded. Only 2500 requests are allowed per 1 hour.", extensions: { code: "RATELIMITED" } }] }, message: /hourly request limit is reached for the Linear API key/ },
     { status: 400, body: { errors: [{ message: "Remove the Bearer prefix from the Authorization header." }] }, message: /request failed: Remove the Bearer prefix/ },
     { status: 500, body: { errors: [{ message: "boom" }] }, message: /request failed: boom/ },
     { status: 502, body: "gateway html", message: /HTTP 502/ },
   ];
   for (const { status, body, message } of cases) {
     mockFetch(t, () => new Response(typeof body === "string" ? body : JSON.stringify(body), { status, headers: { "content-type": "application/json" } }));
-    await assert.rejects(postGraphQL("key", "query q { viewer { id } }", {}), message);
+    await assert.rejects(postGraphQL("key", "query q { viewer { id } }", {}, new RateBudget()), message);
   }
+});
+
+test("a RATELIMITED answer blocks only its own pool, and later calls on it fail without reaching Linear", async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", (() => {
+    calls++;
+    return Promise.resolve(new Response(JSON.stringify({ data: null, errors: [{ message: "Rate limit exceeded.", extensions: { code: "RATELIMITED" } }] }), {
+      status: 200, headers: { "content-type": "application/json", "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": "0" },
+    }));
+  }) as typeof fetch);
+  const budget = new RateBudget();
+  const error = await postGraphQL("Bearer app-token", "q", {}, budget).then(() => null, (failure: unknown) => failure);
+  assert.ok(error instanceof RateLimitedError);
+  assert.equal(error.pool, "app");
+  assert.ok(error.resumeAt > Date.now());
+  await assert.rejects(postGraphQL("Bearer app-token", "q", {}, budget), RateLimitedError);
+  assert.equal(calls, 1);
+  assert.equal(budget.pausedUntil("key"), null);
 });
 
 test("GraphQL error payloads fail visibly with the API message", async (t) => {

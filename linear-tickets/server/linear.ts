@@ -2,6 +2,7 @@ import { MAX_ATTACHMENT_BYTES } from "./attachments";
 import type { Issue, TicketDetail } from "../shared/contracts";
 import { buildContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations } from "./context";
 import { Credentials } from "./credentials";
+import { poolOf, rateBudget, RateLimitedError, type RateBudget } from "./rate-budget";
 
 const endpoint = "https://api.linear.app/graphql";
 export type Post = (key: string, query: string, variables: Record<string, unknown>) => Promise<Record<string, unknown>>;
@@ -19,7 +20,10 @@ function apiMessage(payload: unknown): string {
   return messages.length > 300 ? messages.slice(0, 300) + "…" : messages;
 }
 
-export const postGraphQL: Post = async (key, query, variables) => {
+// Every request passes the pool's budget first (see rate-budget.ts); the response headers update it.
+export async function postGraphQL(key: string, query: string, variables: Record<string, unknown>, budget: RateBudget = rateBudget): Promise<Record<string, unknown>> {
+  const pool = poolOf(key);
+  const ticket = budget.acquire(pool);
   let response: Response;
   try {
     response = await fetch(endpoint, {
@@ -31,16 +35,22 @@ export const postGraphQL: Post = async (key, query, variables) => {
       signal: AbortSignal.timeout(30_000),
     });
   } catch {
+    ticket.done(null, false);
     throw new Error("Could not reach the Linear API. Check the host's network connection and try again.");
   }
   let payload: unknown = null;
   try { payload = await response.json(); } catch { /* Mapped by status below. */ }
+  // Linear answers an exhausted limit with HTTP 400 and the RATELIMITED code, not with 429.
+  const limited = response.status === 429 || Boolean(payload && typeof payload === "object" && "errors" in payload && Array.isArray(payload.errors)
+    && payload.errors.some((error: unknown) => Boolean(error && typeof error === "object" && "extensions" in error && error.extensions
+      && typeof error.extensions === "object" && "code" in error.extensions && error.extensions.code === "RATELIMITED")));
+  ticket.done(response.headers, limited);
+  if (limited) throw new RateLimitedError(pool, budget.pausedUntil(pool) ?? Date.now());
   if (!response.ok) {
     const message = apiMessage(payload);
     if (response.status === 401 || response.status === 403) {
       throw new Error(`Linear rejected this API key.${message ? ` ${message}` : ""} Check it in Linear settings and reconnect.`);
     }
-    if (response.status === 429) throw new Error(`Linear is rate-limiting this host.${message ? ` ${message}` : ""} Try again in a moment.`);
     if (message) throw new Error(`The Linear API request failed: ${message}`);
     throw new Error(`The Linear API request failed (HTTP ${response.status}). Try again.`);
   }
@@ -53,7 +63,7 @@ export const postGraphQL: Post = async (key, query, variables) => {
     throw new Error(`The Linear API request failed${message ? `: ${message}` : "."} Check your API key and ticket access, then retry.`);
   }
   return record(body.data);
-};
+}
 
 export const VIEWER_QUERY = `query viewerCheck {
   viewer { id }
