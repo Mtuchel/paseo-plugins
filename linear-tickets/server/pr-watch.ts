@@ -8,6 +8,7 @@ import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
 import { CODING_STATE } from "./plannotator";
+import { RateLimitedError, withPriority } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
@@ -70,6 +71,7 @@ export function reviewChange(view: PullRequestView, seen: Seen): { change: Chang
 // Mirrors each ticket's pull request review into Linear every 2 minutes.
 export class PullRequestWatch {
   private timer: NodeJS.Timeout | null = null;
+  private pausedPool: RateLimitedError["pool"] | null = null;
 
   constructor(
     private readonly deps: {
@@ -107,7 +109,13 @@ export class PullRequestWatch {
     } finally { await rm(temporary, { force: true }); }
   }
 
-  async poll(): Promise<void> {
+  // Background priority: requests stop at their pool's reserve. A pause ends the poll (logged once
+  // per pool); unsaved records are retried on the next poll.
+  poll(): Promise<void> {
+    return withPriority("background", () => this.watch());
+  }
+
+  private async watch(): Promise<void> {
     const seenByUrl = await this.load();
     const manual = this.deps.manualTasks;
     const records: HandoverRecord[] = [];
@@ -115,6 +123,7 @@ export class PullRequestWatch {
     for (const record of await this.deps.handover.all()) {
       if (record.links["Pull request"] && (record.status !== "archived" || await manual?.awaitingMerge(record.issueId))) records.push(record);
     }
+    let paused: RateLimitedError | null = null;
     for (const record of records) {
       const url = record.links["Pull request"];
       try {
@@ -125,9 +134,15 @@ export class PullRequestWatch {
         // Saved last, so a failed step is retried on the next poll.
         seenByUrl[url] = seen;
       } catch (error) {
+        if (error instanceof RateLimitedError) {
+          paused = error;
+          break;
+        }
         console.error(`[linear-tickets] ${record.identifier}: reading ${url} failed: ${error instanceof Error ? error.message : error}`);
       }
     }
+    if (paused && paused.pool !== this.pausedPool) console.error(`[linear-tickets] pull request watch paused: ${paused.message}`);
+    this.pausedPool = paused?.pool ?? null;
     await this.save(seenByUrl);
   }
 
@@ -147,10 +162,12 @@ export class PullRequestWatch {
     return { change: { thought: "The manual tasks due before merge are done — ready to merge.", review: "approved; manual tasks done", state: READY_STATE }, seen: { ...seen, held: false } };
   }
 
+  // The session line comes last: a step that fails is retried on the next poll, and the thought
+  // must not repeat with it.
   private async apply(record: HandoverRecord, change: Change): Promise<void> {
-    const link = await this.deps.sessions.sessionFor(record.agentId);
-    if (link) await this.deps.sessions.say(link.sessionId, "thought", change.thought).catch(() => {});
     if (change.state && (await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(record.issueId, change.state);
     await this.deps.handover.update({ id: record.issueId, identifier: record.identifier }, { id: record.agentId, title: record.agentTitle, cwd: record.worktreePath ?? "" }, { review: change.review });
+    const link = await this.deps.sessions.sessionFor(record.agentId);
+    if (link) await this.deps.sessions.say(link.sessionId, "thought", change.thought).catch(() => {});
   }
 }

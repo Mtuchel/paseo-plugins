@@ -134,17 +134,17 @@ test("an approval waits for before-merge tasks, then moves to Ready to merge; ar
   }, join(home, "pr-watch.json"));
   try {
     await watch.poll();
-    assert.deepEqual(calls, ["say @ada approved the pull request, but a manual task is due before merge: TUC-9.", "review approved by @ada; waiting on manual tasks TUC-9"]);
+    assert.deepEqual(calls, ["review approved by @ada; waiting on manual tasks TUC-9", "say @ada approved the pull request, but a manual task is due before merge: TUC-9."]);
     calls.length = 0;
     await watch.poll();
     assert.deepEqual(calls, [], "still held, nothing new");
     open = [];
     await watch.poll();
-    assert.deepEqual(calls, ["say The manual tasks due before merge are done — ready to merge.", "move Ready to merge", "review approved; manual tasks done"]);
+    assert.deepEqual(calls, ["move Ready to merge", "review approved; manual tasks done", "say The manual tasks due before merge are done — ready to merge."]);
     calls.length = 0;
     view = { ...view, state: "MERGED" };
     await watch.poll();
-    assert.deepEqual(calls, ["say The pull request was merged.", "review merged", "merged parent"]);
+    assert.deepEqual(calls, ["review merged", "say The pull request was merged.", "merged parent"]);
     calls.length = 0;
     await watch.poll();
     assert.deepEqual(calls, [], "archived and nothing awaiting the merge: no longer watched");

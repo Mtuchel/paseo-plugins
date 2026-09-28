@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { inBackground, RateBudget, RateLimitedError } from "./rate-budget";
+import { RateBudget, RateLimitedError, withPriority } from "./rate-budget";
 
 const HOUR = 60 * 60 * 1000;
 
@@ -41,7 +41,7 @@ test("background work stops at the 15% reserve and resumes once the refill passe
 test("concurrent background requests near the reserve: only the requests above it get through", async () => {
   const { budget } = clock();
   budget.acquire("key").done(headers(1000, 150 + 5), false);
-  const results = await Promise.all(Array.from({ length: 20 }, () => inBackground(async () => {
+  const results = await Promise.all(Array.from({ length: 20 }, () => withPriority("background", async () => {
     try {
       return budget.acquire("key");
     } catch {
@@ -51,10 +51,10 @@ test("concurrent background requests near the reserve: only the requests above i
   assert.equal(results.filter(Boolean).length, 5);
 });
 
-test("inBackground marks every request inside it as background, including awaited ones", async () => {
+test("withPriority marks every request inside it as background, including awaited ones", async () => {
   const { budget } = clock();
   budget.acquire("app").done(headers(1000, 100), false);
-  await inBackground(async () => {
+  await withPriority("background", async () => {
     await Promise.resolve();
     assert.throws(() => budget.acquire("app"), RateLimitedError);
   });

@@ -58,10 +58,10 @@ const UNKNOWN: PoolState = { limit: null, remaining: 0, at: 0, inFlight: 0, bloc
 
 const priority = new AsyncLocalStorage<Priority>();
 
-// Everything `work` sends to Linear, including awaited calls deep inside it, runs at background
-// priority: pollers and sweeps, which pause before the pool's reserve is touched.
-export function inBackground<T>(work: () => Promise<T>): Promise<T> {
-  return priority.run("background", work);
+// Everything `work` sends to Linear, including awaited calls deep inside it, runs at this priority.
+// Pollers and sweeps run at background priority, which pauses before a pool's reserve is touched.
+export function withPriority<T>(level: Priority, work: () => Promise<T>): Promise<T> {
+  return priority.run(level, work);
 }
 
 export class RateBudget {

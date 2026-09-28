@@ -1,12 +1,16 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { DispatchStatus } from "../shared/contracts";
 import type { LabeledIssue, LinearService } from "./linear";
+import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
 import type { CommentRelay } from "./relay";
 import type { PluginSettings, Settings } from "./settings";
 import type { TicketStarter } from "./starter";
 
 const RECENT_LIMIT = 10;
 const IDLE_POLL_SECONDS = 60;
+// A launch sends about a dozen requests with the key (claim, ticket, comments, state); it only
+// starts when the key has that much room above its reserve, so it does not stop half-way.
+const LAUNCH_ROOM = 20;
 
 type Linear = Pick<LinearService, "labeledIssues" | "addLabel" | "removeLabel" | "comment">;
 type Deps = {
@@ -18,6 +22,7 @@ type Deps = {
   afterLaunch?: (issueId: string, identifier: string, agentId: string) => Promise<boolean>;
   // Linear → agent comment delivery, run on the same cadence as dispatch.
   relay?: Pick<CommentRelay, "poll">;
+  budget?: Pick<RateBudget, "pausedUntil">;
 };
 
 // The labels a dispatched ticket moves through, derived from the trigger label so a
@@ -45,16 +50,18 @@ export class Dispatcher {
   constructor(private readonly deps: Deps) {}
 
   private relayError: string | null = null;
+  private pausedPool: RateLimitedError["pool"] | null = null;
 
-  // Relay failures are logged, once per distinct error, and never stop dispatch.
+  // Relay failures are logged, once per distinct error (a rate limit once per pool), and never stop dispatch.
   private async relayComments(relay: Pick<CommentRelay, "poll">, paseo: PaseoApi): Promise<void> {
     try {
       await relay.poll(paseo);
       this.relayError = null;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
-      if (message !== this.relayError) console.error(`[linear-tickets] comment relay failed: ${message}`);
-      this.relayError = message;
+      const kind = error instanceof RateLimitedError ? `rate:${error.pool}:${error.reason}` : message;
+      if (kind !== this.relayError) console.error(`[linear-tickets] comment relay failed: ${message}`);
+      this.relayError = kind;
     }
   }
 
@@ -96,7 +103,8 @@ export class Dispatcher {
       return this.polling;
     }
     let intervalSeconds = IDLE_POLL_SECONDS;
-    this.polling = (async () => {
+    // Background priority: every request stops at its pool's reserve (see rate-budget.ts).
+    this.polling = withPriority("background", async () => {
       try {
         const settings = await this.deps.settings.read();
         intervalSeconds = settings.dispatch.intervalSeconds;
@@ -106,14 +114,17 @@ export class Dispatcher {
         await this.poll(settings, this.paseo);
         this.status.lastPollAt = new Date().toISOString();
         this.status.lastError = null;
+        this.pausedPool = null;
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
-        // Logged once per distinct error so a persistent failure does not flood the plugin log.
-        if (message !== this.status.lastError) console.error(`[linear-tickets] auto-dispatch poll failed: ${message}`);
+        // Logged once per distinct error (a pause once per pool) so a persistent failure does not flood the plugin log.
+        const pool = error instanceof RateLimitedError ? error.pool : null;
+        if (pool ? pool !== this.pausedPool : message !== this.status.lastError) console.error(`[linear-tickets] auto-dispatch poll failed: ${message}`);
+        this.pausedPool = pool;
         this.status.lastPollAt = new Date().toISOString();
-        this.status.lastError = message;
+        this.status.lastError = pool ? `paused: ${message}` : message;
       }
-    })();
+    });
     try {
       await this.polling;
     } finally {
@@ -129,6 +140,8 @@ export class Dispatcher {
     // Sequential on purpose: each launch creates a worktree, and Linear rate-limits writes.
     for (const issue of issues) {
       if (this.stopped) return;
+      const until = (this.deps.budget ?? rateBudget).pausedUntil("key", LAUNCH_ROOM);
+      if (until !== null) throw new RateLimitedError("key", until, "reserve");
       await this.dispatch(issue, settings, paseo);
     }
   }
@@ -169,13 +182,16 @@ export class Dispatcher {
       const message = error instanceof Error ? error.message : "Unknown error";
       this.record(issue.identifier, "failed", message);
       // Best-effort: surface the failure on the ticket; `<trigger>-failed` keeps it out of the next poll.
-      for (const step of [
-        () => linear.removeLabel(issue.id, labels.running),
-        () => linear.addLabel(issue.id, labels.failed),
-        () => linear.comment(issue.id, `Paseo could not start an agent for this ticket: ${message}`),
-      ]) {
-        await step().catch((failure: unknown) => console.error(`[linear-tickets] ${issue.identifier}: failure reporting failed:`, failure instanceof Error ? failure.message : failure));
-      }
+      // Reported at interactive priority: a launch that ran into the key's reserve must still say so.
+      await withPriority("interactive", async () => {
+        for (const step of [
+          () => linear.removeLabel(issue.id, labels.running),
+          () => linear.addLabel(issue.id, labels.failed),
+          () => linear.comment(issue.id, `Paseo could not start an agent for this ticket: ${message}`),
+        ]) {
+          await step().catch((failure: unknown) => console.error(`[linear-tickets] ${issue.identifier}: failure reporting failed:`, failure instanceof Error ? failure.message : failure));
+        }
+      });
     }
   }
 }

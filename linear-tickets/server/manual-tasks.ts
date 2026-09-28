@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { AgentApi } from "./agent-app";
 import { dispatchLabels } from "./dispatch";
 import type { IssueStatus, LinearService } from "./linear";
+import { RateLimitedError, withPriority } from "./rate-budget";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 import { appComment } from "./writeback";
@@ -65,6 +66,7 @@ export function runCheck(command: string, cwd: string): Promise<CheckResult> {
 export class ManualTasks {
   private timer: NodeJS.Timeout | null = null;
   private polling: Promise<void> | null = null;
+  private pausedPool: RateLimitedError["pool"] | null = null;
 
   constructor(
     private readonly deps: {
@@ -146,8 +148,14 @@ export class ManualTasks {
     if (lines.length) await this.mention(issueId, lines.join("\n"));
   }
 
+  // Background priority: requests stop at their pool's reserve; a pause ends the poll quietly
+  // (logged once per pool) and the next poll picks up where this one stopped.
   poll(): Promise<void> {
-    this.polling ??= this.run().finally(() => { this.polling = null; });
+    this.polling ??= withPriority("background", () => this.run()).catch((error: unknown) => {
+      if (!(error instanceof RateLimitedError)) throw error;
+      if (this.pausedPool !== error.pool) console.error(`[linear-tickets] manual tasks paused: ${error.message}`);
+      this.pausedPool = error.pool;
+    }).finally(() => { this.polling = null; });
     return this.polling;
   }
 
@@ -158,6 +166,7 @@ export class ManualTasks {
     try {
       statuses = await this.deps.linear.issueStatuses(tasks.map((task) => task.id));
     } catch (error) {
+      if (error instanceof RateLimitedError) throw error;
       console.error(`[linear-tickets] reading manual tasks failed: ${error instanceof Error ? error.message : error}`);
       return;
     }
@@ -167,9 +176,11 @@ export class ManualTasks {
       try {
         await this.settle(task, statuses.get(task.id));
       } catch (error) {
+        if (error instanceof RateLimitedError) throw error;
         console.error(`[linear-tickets] manual task ${task.identifier} failed: ${error instanceof Error ? error.message : error}`);
       }
     }
+    this.pausedPool = null;
   }
 
   // New tasks get the manual label, and their ticket one comment that mentions the owner.
@@ -183,6 +194,7 @@ export class ManualTasks {
         await this.mention(parentId, [`${group.length === 1 ? "A manual task needs" : `${group.length} manual tasks need`} you on this ticket:`, ...lines].join("\n"));
         for (const task of group) await this.save({ ...task, announced: true });
       } catch (error) {
+        if (error instanceof RateLimitedError) throw error;
         console.error(`[linear-tickets] announcing manual tasks for ${group[0].parentIdentifier} failed: ${error instanceof Error ? error.message : error}`);
       }
     }

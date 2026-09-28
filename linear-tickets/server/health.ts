@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { LinearService } from "./linear";
+import { RateLimitedError, withPriority } from "./rate-budget";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
@@ -51,7 +52,7 @@ export class HealthMonitor {
   }
 
   private async tick(): Promise<void> {
-    await this.check().catch((error: unknown) => console.error(`[linear-tickets] health check failed: ${error instanceof Error ? error.message : error}`));
+    await withPriority("background", () => this.check()).catch((error: unknown) => console.error(`[linear-tickets] health check failed: ${error instanceof Error ? error.message : error}`));
     this.timer = setTimeout(() => { void this.tick(); }, INTERVAL_MS);
     this.timer.unref?.();
   }
@@ -69,7 +70,9 @@ export class HealthMonitor {
     } finally { await rm(temporary, { force: true }); }
   }
 
-  // Runs every check once; returns the confirmed problems.
+  // Runs every check once; returns the confirmed problems. A rate limit (or background work paused
+  // at the reserve) is neither a pass nor a problem: that round is skipped, so the limit neither
+  // opens an urgent ticket nor closes one for a problem that is still there.
   async check(): Promise<Record<string, string>> {
     if (this.running) return {};
     this.running = true;
@@ -80,6 +83,7 @@ export class HealthMonitor {
           await check.run();
           this.strikes.delete(check.name);
         } catch (error) {
+          if (error instanceof RateLimitedError) return {};
           const strikes = (this.strikes.get(check.name) ?? 0) + 1;
           this.strikes.set(check.name, strikes);
           if (strikes >= CONFIRMATIONS) confirmed[check.name] = error instanceof Error ? error.message.slice(0, 300) : "failed";
