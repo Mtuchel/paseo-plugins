@@ -112,6 +112,23 @@ test("GraphQL error payloads fail visibly with the API message", async (t) => {
   await assert.rejects(postGraphQL("key", "query q { issue(id: \"x\") { id } }", {}), /Issue not found/);
 });
 
+// Linear's answer when the pull request is already on the ticket (captured from TUC-96).
+const ALREADY_LINKED = { data: null, errors: [{ message: "Unable to create issue attachment", path: ["attachmentLinkURL"], extensions: { type: "invalid input", code: "INPUT_ERROR", statusCode: 400, userError: true, userPresentableMessage: "This URL has already been linked with TUC-96." } }] };
+
+test("a GraphQL error names Linear's reason, not only its generic message", async (t) => {
+  mockFetch(t, () => new Response(JSON.stringify(ALREADY_LINKED), { status: 200, headers: { "content-type": "application/json" } }));
+  await assert.rejects(postGraphQL("key", "q", {}, new RateBudget()), /Unable to create issue attachment \(This URL has already been linked with TUC-96\.\)/);
+});
+
+test("linking a URL that is already linked succeeds; other link failures still fail", async (t) => {
+  let answer: unknown = ALREADY_LINKED;
+  mockFetch(t, () => new Response(JSON.stringify(answer), { status: 200, headers: { "content-type": "application/json" } }));
+  const service = new LinearService(new Credentials("/unused", "env-key"), (key, query, variables) => postGraphQL(key, query, variables, new RateBudget()));
+  await service.linkUrl("issue-1", "https://github.com/o/r/pull/287", "Pull request");
+  answer = { data: null, errors: [{ message: "Unable to create issue attachment", extensions: { userPresentableMessage: "Invalid URL." } }] };
+  await assert.rejects(service.linkUrl("issue-1", "not a url", "Pull request"), /Invalid URL/);
+});
+
 test("invalid response bodies fail loudly", async (t) => {
   mockFetch(t, () => new Response("not json", { status: 200, headers: { "content-type": "text/plain" } }));
   await assert.rejects(postGraphQL("key", "q", {}), /invalid response/);

@@ -59,8 +59,15 @@ export async function postGraphQL(key: string, query: string, variables: Record<
   if (payload == null) throw new Error("Linear returned an invalid response.");
   const body = record(payload);
   if (Array.isArray(body.errors) && body.errors.length > 0) {
+    // Linear's `message` is often generic ("Unable to create issue attachment"); the reason is in
+    // `userPresentableMessage` ("This URL has already been linked with TUC-96."), so both are kept.
     const message = body.errors
-      .map((error) => (error && typeof error === "object" && "message" in error && typeof error.message === "string" ? error.message : ""))
+      .map((error) => {
+        if (!error || typeof error !== "object" || !("message" in error) || typeof error.message !== "string") return "";
+        const detail = "extensions" in error && error.extensions && typeof error.extensions === "object" && "userPresentableMessage" in error.extensions
+          && typeof error.extensions.userPresentableMessage === "string" && error.extensions.userPresentableMessage !== error.message ? ` (${error.extensions.userPresentableMessage})` : "";
+        return error.message + detail;
+      })
       .filter(Boolean).join("; ");
     throw new Error(`The Linear API request failed${message ? `: ${message}` : "."} Check your API key and ticket access, then retry.`);
   }
@@ -659,8 +666,15 @@ export class LinearService {
     }
   }
 
+  // Linear refuses a URL that is already linked to this ticket (its GitHub integration often links
+  // the pull request first) or, for a pull request, to another one. Retrying cannot change either,
+  // so "already been linked" ends the step instead of failing the write-back on every turn.
   async linkUrl(issueId: string, url: string, title: string): Promise<void> {
-    succeeded(record(await this.withKey((key) => this.post(key, LINK_URL_QUERY, { issueId, url, title }))), "attachmentLinkURL", "attach the link");
+    try {
+      succeeded(record(await this.withKey((key) => this.post(key, LINK_URL_QUERY, { issueId, url, title }))), "attachmentLinkURL", "attach the link");
+    } catch (error) {
+      if (!(error instanceof Error && /already been linked/i.test(error.message))) throw error;
+    }
   }
 
   private viewer: string | null = null;
