@@ -79,6 +79,24 @@ export function truncateSummary(text: string): string {
   return text.length <= MAX_SUMMARY_LENGTH ? text : `${text.slice(0, MAX_SUMMARY_LENGTH).trimEnd()}\n\n… (truncated; the full reply is in Paseo)`;
 }
 
+// Written as the Paseo app when it is installed: the plugin's key belongs to the owner, and Linear
+// notifies nobody of their own mentions. `commentId` edits that comment instead of posting a new one.
+export async function appComment(linear: Pick<LinearService, "createComment" | "updateComment">, app: Pick<AgentApi, "createComment" | "updateComment"> | undefined, issueId: string, body: string, commentId: string | null = null): Promise<string> {
+  if (commentId) {
+    for (const author of app ? [app, linear] : [linear]) {
+      if (await author.updateComment(commentId, body).then(() => true, () => false)) return commentId;
+    }
+  }
+  if (app) {
+    const id = await app.createComment(issueId, body).catch((error: unknown) => {
+      console.error(`[linear-tickets] ${issueId}: comment as the Paseo app failed, posting with the plugin's key: ${error instanceof Error ? error.message : error}`);
+      return null;
+    });
+    if (id) return id;
+  }
+  return linear.createComment(issueId, body);
+}
+
 // Writes the lifecycle of ticket-linked agents back to their Linear ticket. Agents are
 // linked by the `linear.issueId` label every launch (manual or dispatched) sets. Only
 // root agents report; subagents work on behalf of their parent. Every write is
@@ -145,25 +163,6 @@ export class Writeback {
     else this.waitingPeriods.delete(issue.id);
   }
 
-  // Written as the Paseo app when it is installed: the plugin's key belongs to the owner, and Linear
-  // notifies nobody of their own mentions. The waiting period's comment is edited, not repeated.
-  private async waitingComment(issueId: string, commentId: string | null, body: string): Promise<string> {
-    const app = this.agentBridge?.comments;
-    if (commentId) {
-      for (const author of app ? [app, this.linear] : [this.linear]) {
-        if (await author.updateComment(commentId, body).then(() => true, () => false)) return commentId;
-      }
-    }
-    if (app) {
-      const id = await app.createComment(issueId, body).catch((error: unknown) => {
-        console.error(`[linear-tickets] ${issueId}: comment as the Paseo app failed, posting with the plugin's key: ${error instanceof Error ? error.message : error}`);
-        return null;
-      });
-      if (id) return id;
-    }
-    return this.linear.createComment(issueId, body);
-  }
-
   // Opens or continues a waiting period: the ticket moves to Needs input (teams without that state
   // skip it), gets the needs-you label, and one comment mentions the owner, edited per question.
   private markWaiting(issue: { id: string; identifier: string }, agent: PluginHookAgent, settings: PluginSettings, body: string, inSession: boolean): Promise<void> {
@@ -178,7 +177,8 @@ export class Writeback {
       if (!state.labels.some((item) => item.name.trim().toLowerCase() === needsYou.toLowerCase())) await this.linear.addLabel(issue.id, needsYou, NEEDS_YOU_COLOR);
       // Only the owner opens Linear sessions; without one, whoever wrote the ticket is asked.
       const ownerId = (inSession ? null : state.creatorId) ?? await this.linear.viewerId();
-      const commentId = await this.waitingComment(issue.id, waiting?.commentId ?? null, `${await this.linear.userUrl(ownerId)} ${body}`);
+      // The waiting period's comment is edited, not repeated.
+      const commentId = await appComment(this.linear, this.agentBridge?.comments, issue.id, `${await this.linear.userUrl(ownerId)} ${body}`, waiting?.commentId ?? null);
       await this.setWaiting(issue, agent, { previousStateId, commentId });
     });
   }

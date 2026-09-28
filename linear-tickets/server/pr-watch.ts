@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService } from "./linear";
+import type { ManualTasks } from "./manual-tasks";
 import { CODING_STATE } from "./plannotator";
 import type { SessionRouter } from "./sessions";
 import type { Settings } from "./settings";
@@ -22,7 +23,8 @@ export type PullRequestView = {
   reviews: { author: string; state: string; submittedAt: string }[];
   lastCommitAt: string | null;
 };
-type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean };
+// `held`: approved, but kept out of Ready to merge while manual tasks due before merge are open.
+type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean };
 type Change = { thought: string; review: string; state?: string };
 
 function gh(): string {
@@ -74,6 +76,7 @@ export class PullRequestWatch {
       handover: Pick<Handover, "all" | "update">;
       sessions: Pick<SessionRouter, "sessionFor" | "say">;
       linear: Pick<LinearService, "moveToStateNamed">;
+      manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge">;
       settings: Pick<Settings, "read">;
       view?: (url: string) => Promise<PullRequestView>;
     },
@@ -106,18 +109,42 @@ export class PullRequestWatch {
 
   async poll(): Promise<void> {
     const seenByUrl = await this.load();
-    const records = (await this.deps.handover.all()).filter((record) => record.links["Pull request"] && record.status !== "archived");
+    const manual = this.deps.manualTasks;
+    const records: HandoverRecord[] = [];
+    // Archived agents stay watched while after-merge tasks wait for their merge.
+    for (const record of await this.deps.handover.all()) {
+      if (record.links["Pull request"] && (record.status !== "archived" || await manual?.awaitingMerge(record.issueId))) records.push(record);
+    }
     for (const record of records) {
       const url = record.links["Pull request"];
       try {
-        const { change, seen } = reviewChange(await (this.deps.view ?? viewPullRequest)(url), seenByUrl[url] ?? { reviewedAt: null, decision: null, merged: false });
-        seenByUrl[url] = seen;
+        const result = reviewChange(await (this.deps.view ?? viewPullRequest)(url), seenByUrl[url] ?? { reviewedAt: null, decision: null, merged: false });
+        const { change, seen } = manual ? await this.gate(record, result, manual) : result;
         if (change) await this.apply(record, change);
+        if (change?.review === "merged" && manual) await manual.merged(record.issueId);
+        // Saved last, so a failed step is retried on the next poll.
+        seenByUrl[url] = seen;
       } catch (error) {
         console.error(`[linear-tickets] ${record.identifier}: reading ${url} failed: ${error instanceof Error ? error.message : error}`);
       }
     }
     await this.save(seenByUrl);
+  }
+
+  // The soft merge gate: an approval moves the ticket to Ready to merge only once its before-merge
+  // manual tasks are done; merging on GitHub still works.
+  private async gate(record: HandoverRecord, { change, seen }: { change: Change | null; seen: Seen }, manual: Pick<ManualTasks, "openBlockers">): Promise<{ change: Change | null; seen: Seen }> {
+    if (seen.merged || seen.decision !== "APPROVED") return { change, seen: { ...seen, held: false } };
+    if (change && change.state !== READY_STATE) return { change, seen };
+    if (!change && !seen.held) return { change, seen };
+    const open = await manual.openBlockers(record.issueId);
+    if (open.length) {
+      if (!change) return { change, seen };
+      const list = open.map((task) => task.identifier).join(", ");
+      return { change: { thought: `${change.thought.replace(/ — ready to merge\.$/, "")}, but ${open.length === 1 ? "a manual task is" : `${open.length} manual tasks are`} due before merge: ${list}.`, review: `${change.review}; waiting on manual tasks ${list}` }, seen: { ...seen, held: true } };
+    }
+    if (change) return { change, seen: { ...seen, held: false } };
+    return { change: { thought: "The manual tasks due before merge are done — ready to merge.", review: "approved; manual tasks done", state: READY_STATE }, seen: { ...seen, held: false } };
   }
 
   private async apply(record: HandoverRecord, change: Change): Promise<void> {

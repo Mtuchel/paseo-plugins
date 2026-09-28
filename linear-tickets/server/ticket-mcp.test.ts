@@ -188,7 +188,7 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "add_comment", "set_status", "link_url"]);
+    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "add_comment", "set_status", "link_url", "add_manual_task"]);
 
     const ticket = JSON.parse((await mcp.call("get_ticket")).text);
     assert.equal(ticket.identifier, "ENG-42");
@@ -213,6 +213,46 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     assert.equal(((await mcp.request("tools/call", { name: "delete_everything" })).error as { code: number }).code, -32602);
     assert.equal(((await mcp.request("resources/list")).error as { code: number }).code, -32601);
     assert.ok(linear.calls.every((c) => !JSON.stringify(c.variables).includes("saved-key")));
+  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("add_manual_task creates an assigned sub-issue, blocks the ticket only before merge, dedups by title and records the check locally", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-manual-"));
+  const withBacklog = [{ id: "s-backlog", name: "Backlog", type: "backlog", position: 0 }, ...states];
+  let created = 0;
+  const children = [{ id: "c-old", identifier: "ENG-40", url: "https://linear.app/x/issue/ENG-40", title: "Set API_KEY on staging", state: { type: "unstarted" } }];
+  const linear = await fakeLinear((call) => {
+    if (call.query.includes("query manual")) return { viewer: { id: "me" }, issue: { ...issue, team: { id: "team-1", states: { nodes: withBacklog } }, children: { nodes: children } } };
+    if (call.query.includes("issueCreate")) { created++; return { issueCreate: { success: true, issue: { id: `task-${created}`, identifier: `ENG-5${created}`, url: `https://linear.app/x/issue/ENG-5${created}` } } }; }
+    if (call.query.includes("issueRelationCreate")) return { issueRelationCreate: { success: true } };
+    return {};
+  });
+  const script = await writeTicketMcpScript(home);
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: linear.url });
+  try {
+    const before = JSON.parse((await mcp.call("add_manual_task", { title: "Set LINEAR_API_KEY on batch-service (staging)", steps: "Railway → batch-service → Variables", when: "before_merge", check: "true" })).text);
+    assert.equal(before.identifier, "ENG-51");
+    const createBefore = linear.calls.filter((c) => c.query.includes("issueCreate"))[0].variables.input as Record<string, unknown>;
+    assert.deepEqual({ ...createBefore, description: undefined }, { teamId: "team-1", title: "Set LINEAR_API_KEY on batch-service (staging)", description: undefined, parentId: ISSUE_ID, assigneeId: "me", stateId: "s-todo" });
+    assert.match(String(createBefore.description), /ENG-42, due before the pull request is merged[\s\S]*\n {4}true$/);
+    assert.deepEqual(linear.calls.find((c) => c.query.includes("issueRelationCreate"))!.variables, { input: { issueId: "task-1", relatedIssueId: ISSUE_ID, type: "blocks" } });
+
+    await mcp.call("add_manual_task", { title: "Register the webhook", steps: "Linear → Settings → API", when: "after_merge" });
+    const createAfter = linear.calls.filter((c) => c.query.includes("issueCreate"))[1].variables.input as Record<string, unknown>;
+    assert.equal(createAfter.stateId, "s-backlog");
+    assert.equal(linear.calls.filter((c) => c.query.includes("issueRelationCreate")).length, 1);
+
+    const dup = JSON.parse((await mcp.call("add_manual_task", { title: "  set api_key on STAGING ", steps: "x", when: "anytime" })).text);
+    assert.deepEqual(dup, { identifier: "ENG-40", url: "https://linear.app/x/issue/ENG-40", deduped: true });
+    assert.equal(created, 2);
+
+    assert.match((await mcp.call("add_manual_task", { title: "x", steps: "y", when: "someday" })).text, /when must be one of/);
+
+    const directory = join(home, "linear-tickets", "manual-tasks");
+    const file = JSON.parse(await readFile(join(directory, "task-1.json"), "utf8"));
+    assert.deepEqual({ ...file, createdAt: undefined, cwd: undefined }, { id: "task-1", identifier: "ENG-51", url: "https://linear.app/x/issue/ENG-51", title: "Set LINEAR_API_KEY on batch-service (staging)", parentId: ISSUE_ID, parentIdentifier: "ENG-42", when: "before_merge", check: "true", createdAt: undefined, cwd: undefined, announced: false, activated: true, verifiedAt: null });
+    assert.equal((await stat(join(directory, "task-1.json"))).mode & 0o777, 0o600);
+    assert.equal(JSON.parse(await readFile(join(directory, "task-2.json"), "utf8")).activated, false);
   } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 

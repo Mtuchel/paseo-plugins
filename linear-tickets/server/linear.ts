@@ -221,6 +221,10 @@ export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
     inverseRelations(first: 50) { nodes { type issue { identifier state { type } } } }
   }
 }`;
+export type IssueStatus = { statusType: string; completedAt: string | null };
+export const ISSUE_STATUSES_QUERY = `query issueStatuses($ids: [ID!]!) {
+  issues(first: 100, filter: { id: { in: $ids } }) { nodes { id state { type } completedAt } }
+}`;
 
 // `blockedBy`: identifiers of unfinished tickets that block this one.
 export type IssueState = {
@@ -724,6 +728,29 @@ export class LinearService {
     if (!target) return { changed: false, note: "The ticket's team has no unstarted state." };
     succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: target.id }))), "issueUpdate", `move the ticket to ${target.name}`);
     return { changed: true };
+  }
+
+  // Moves a finished ticket back to its team's first unstarted state (Todo), for example a manual
+  // task whose check failed after it was marked done.
+  async reopen(issueId: string): Promise<void> {
+    const state = await this.issueState(issueId);
+    if (!state.teamId) return;
+    const target = (await this.teamStates(state.teamId)).filter((item) => item.type === "unstarted").sort((a, b) => a.position - b.position)[0];
+    if (!target || target.id === state.statusId) return;
+    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: target.id }))), "issueUpdate", `move the ticket to ${target.name}`);
+  }
+
+  // State type and completion time of several issues in one request. Deleted or invisible issues are
+  // absent from the result.
+  async issueStatuses(ids: string[]): Promise<Map<string, IssueStatus>> {
+    const result = new Map<string, IssueStatus>();
+    for (let start = 0; start < ids.length; start += 100) {
+      const data = record(await this.withKey((key) => this.post(key, ISSUE_STATUSES_QUERY, { ids: ids.slice(start, start + 100) })));
+      for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) {
+        result.set(label(node.id), { statusType: label(record(node.state ?? {}).type), completedAt: label(node.completedAt) || null });
+      }
+    }
+    return result;
   }
 
   // Linear's file storage needs the API key. Only uploads.linear.app is ever sent the key;

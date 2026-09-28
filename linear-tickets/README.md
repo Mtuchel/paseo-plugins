@@ -151,16 +151,18 @@ forget them. Mappings are stored per host in `settings.json`.
 ## Agent access to Linear
 
 Agents started from a ticket get a `linear_ticket` MCP server (on by default, **Settings →
-Agent access to Linear** turns it off). Its tools act only on the ticket the agent started from:
+Agent access to Linear** turns it off). Its tools act only on the ticket the agent started from
+and its manual tasks:
 
 - `get_ticket` — fresh title, description, status, the team's workflow states, comments, links;
 - `add_comment` — post a Markdown comment;
 - `set_status` — move to another state of the ticket's team by name (canceled and duplicate
   states are left to people);
-- `link_url` — attach an https link, such as the pull request.
+- `link_url` — attach an https link, such as the pull request;
+- `add_manual_task` — register a step only a person can do; see [Manual tasks](#manual-tasks).
 
-The launch prompt tells the agent to comment when it starts and finishes, link its pull request
-and move the ticket to review; custom templates can place that note with `{{linear_access}}`,
+The launch prompt tells the agent to comment when it starts and finishes, link its pull request,
+move the ticket to review and register every manual step as a manual task; custom templates can place that note with `{{linear_access}}`,
 and it is appended when they do not. The server is a dependency-free script written to
 `$PASEO_HOME/linear-tickets/ticket-mcp-<hash>.mjs` and run with the daemon's own Node runtime
 (the desktop app's bundled runtime included), so it does not depend on `node` being on the
@@ -335,7 +337,8 @@ ticket is done, which for code usually means its pull request was merged.
 **Pull request reviews.** Every 2 minutes the plugin reads each ticket's pull request with
 `gh`. Requested changes post a panel update and move the ticket back to In Progress; fixes
 pushed after them move it to In Review again. An approval moves it to the team's started state
-**Ready to merge** (teams without one stay in In Review); commits pushed after the approval move
+**Ready to merge** (teams without one stay in In Review), once no [manual task](#manual-tasks)
+due before merge is open; commits pushed after the approval move
 it back to In Review. The merge is noted, and Done comes from Linear's GitHub integration. The
 review loop itself stays in Paseo; this only shows it on the ticket.
 
@@ -462,6 +465,40 @@ Archiving a linked agent always removes `<label>-running`. Subagents never repor
 delivers lifecycle events live and best-effort: events while the plugin is stopped are not
 replayed, and a Linear failure is logged (`paseo plugin logs linear-tickets`) without
 affecting the agent.
+
+## Manual tasks
+
+Some steps only a person can do: environment variables and secrets, Railway, Linear, GitHub or
+Paseo settings, webhooks, integrations. Agents register each one with `add_manual_task` instead
+of leaving it in a comment. Each task is a **sub-issue of the ticket, assigned to you** (the
+owner of the plugin's key), with the steps in its description and one of three due points:
+
+| `when` | Created in | Effect |
+|---|---|---|
+| `before_merge` | Todo | Blocks the ticket. An approved pull request keeps the ticket in *In Review* instead of *Ready to merge* until the task is done |
+| `after_merge` | Backlog (Todo on teams without one) | Moves to Todo when the ticket's pull request merges |
+| `anytime` | Todo | Due now, never gates anything (for example "before the production release") |
+
+A task with the same title as an open sub-issue is not created twice. Within about a minute,
+new tasks get the orange `<label>-manual` label and the ticket gets one comment that @mentions
+you and lists them, written as the Paseo app so it reaches your inbox and phone. Once the pull
+request merges, one more mention lists what is due now and any before-merge task that was
+still open. Merging on GitHub is never blocked; the gate is the ticket state only. Archived
+agents stay watched until their after-merge tasks are due.
+
+**Checks.** A task can carry a shell command that exits 0 once the step is done, for example a
+script that confirms a Railway variable exists. When you mark the task done, the plugin runs it
+(no stdin, 60 s timeout, in the agent's worktree, or your home directory when that is gone):
+a pass comments "✓ Verified", a failure moves the task back to Todo and mentions you. The
+output only goes to `paseo plugin logs linear-tickets`, never to Linear, since it could hold a
+secret. A before-merge task marked done still gates until its check passes. The command is
+read only from `$PASEO_HOME/linear-tickets/manual-tasks/<task>.json` (private, written by the
+agent's MCP server); editing the Linear description never changes what runs. Checks run as the
+daemon's user, the same trust as the agent's own shell.
+
+A saved Linear view of label `<label>-manual`, assignee *me*, status not completed or canceled
+lists everything waiting on you. Keep the team setting that closes a parent when all its
+sub-issues are done **off**, or finishing the tasks closes the ticket.
 
 ## Connection storage
 

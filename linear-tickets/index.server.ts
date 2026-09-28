@@ -21,6 +21,7 @@ import { closeModelSetter, modelSetter, ownConnection } from "./server/connectio
 import { ModelGuard } from "./server/model-guard";
 import { HealthMonitor } from "./server/health";
 import { PullRequestWatch } from "./server/pr-watch";
+import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
 import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, SessionRouter, SessionStore, stopAgentTurn } from "./server/sessions";
 import { approveForLater, splitIntoSubIssues } from "./server/split";
@@ -64,7 +65,8 @@ export default function contribute(server: PluginServerContext) {
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   const reviewLinks = new ReviewLinks();
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks);
-  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings });
+  const manualTasks = new ManualTasks({ linear, settings, comments: agentApi });
+  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => sessions.receive(event));
   let funnel: FunnelStatus | null = null;
   const health = new HealthMonitor(linear, settings, [
@@ -90,6 +92,7 @@ export default function contribute(server: PluginServerContext) {
     if (stopped) return false;
     health.start();
     pullRequests.start();
+    manualTasks.start();
     if (!app) return false;
     await webhook.start();
     funnel = await ensureFunnel(WEBHOOK_PORT);
@@ -192,5 +195,5 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); modelGuard.stop(); void closeModelSetter(); };
+  return () => { stopped = true; clearTimeout(startSoon); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); manualTasks.stop(); modelGuard.stop(); void closeModelSetter(); };
 }
