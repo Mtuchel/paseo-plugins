@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { PaseoApi } from "@getpaseo/client";
 import type { TicketDetail } from "../shared/contracts";
+import { advisorSteps } from "../shared/plan-advisor";
 import { mappedBaseBranch, mappingLabel, type ProjectMapping } from "../shared/mapping";
 import type { Handover } from "./handover";
 import type { Launcher } from "./launch";
@@ -29,6 +30,11 @@ export const UNTRUSTED_NOTE = [
   "Investigate and write a plan only. Do not change code, run installs or make network calls until the owner approves the plan.",
 ].join(" ");
 export const PLAN_REQUIRED_NOTE = "The owner asked for a plan first. Investigate and write a plan; do not change code until the owner approves it.";
+// Every plan a ticket agent writes gets a second opinion before the owner sees it (README, "Plan
+// advisor"). omp planners have the extension's record tool and submission gate.
+export function advisorNote(providerKey: string): string {
+  return advisorSteps({ contextPath: null, omp: providerKey === "omp" });
+}
 const PLAN_RULES = "Plan if any of these apply: a database schema or migration change; authentication, authorization or permissions; more than one app or service; a change to a public or cross-service API; acceptance criteria that are unclear or contradict each other; or more than about three files. Skip the plan only when none apply; when unsure, plan.";
 // omp agents start in Plannotator's planning phase and leave it through the extension's
 // `skip_plan` tool; other providers get the same rules as instructions only.
@@ -74,6 +80,7 @@ export async function planSetup(linear: Pick<LinearService, "issueState" | "view
     notes: [
       policy === "required" ? (untrusted ? UNTRUSTED_NOTE : PLAN_REQUIRED_NOTE) : untrusted ? UNTRUSTED_TEXT : "",
       policy === "agent" ? planDecisionNote(providerKey) : "",
+      policy ? advisorNote(providerKey) : "",
       planReady ? approvedPlanNote(state.identifier, plan) : "",
     ].filter(Boolean),
     labels: policy ? { [PLAN_POLICY_LABEL]: policy } : {},

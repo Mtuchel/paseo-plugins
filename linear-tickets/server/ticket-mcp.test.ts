@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdtempSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -13,6 +14,9 @@ import { buildPrompt, normalizeIssue } from "./context";
 import { Launcher } from "./launch";
 import { Settings } from "./settings";
 import { ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
+
+// Launches save the ticket prompt for the plan advisor under PASEO_HOME; keep it out of the real one.
+process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-ticket-mcp-home-"));
 
 const ISSUE_ID = "6b1f0c2a-1111-4222-8333-444455556666";
 const detail = { issue: normalizeIssue({ id: ISSUE_ID, identifier: "ENG-42", title: "Fix sign-in", url: "https://linear.app/x/issue/ENG-42" }), teamId: "team-1", projectId: "lp-1", context: "{}", warnings: [], relations: { parent: null, subissues: [], related: [] } };

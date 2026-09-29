@@ -308,7 +308,25 @@ plugin asks the agent for a plan. An omp agent enters the planning phase at its 
 `skip_plan` afterwards. Other providers only get the message. A label that was there when the
 agent started does nothing; remove and add it again to ask once more.
 
-**The omp extension.** The planning phase and `skip_plan` come from
+**Plan advisor.** Every plan a ticket agent writes gets a second opinion before it reaches you.
+The planner (the model you launch tickets with; the model guard keeps it there) creates a GPT-6
+Astra advisor (`omp/openai-codex/gpt-6-astra`, thinking `medium`) with Paseo's `create_agent`, in
+its own workspace, so the advisor can read the same code. Both work from the same ticket context:
+each launch saves the agent's first prompt to `$PASEO_HOME/linear-tickets/plan-context/<request>.md`
+and passes the path in `LINEAR_TICKETS_CONTEXT`, and the advisor reads that file first. The
+planner adopts or answers each point and sends changes back to the same advisor with
+`send_agent_prompt` until they agree, at most three rounds. The plan then ends with an
+`## Advisor review` section: the advisor's model, the rounds, what changed, and every point still
+disputed with both positions, for you to decide in Plannotator.
+
+omp planners cannot skip this: the extension blocks `plannotator_submit_plan` (and omp's
+`xd://propose`) until `record_plan_advice` has recorded the review for exactly the plan text being
+submitted. The tool checks with `paseo inspect` that the advisor runs GPT-6 Astra at medium and
+was created by this agent; any later edit to the plan needs a new record. An advisor that cannot
+be created (quota, provider error) is recorded as `unavailable` with its reason, which the plan's
+advisor section must state. Other providers get the steps as instructions only.
+
+**The omp extension.** The planning phase, `skip_plan` and the plan advisor gate come from
 [`omp/linear-tickets-plan-first.ts`](omp/linear-tickets-plan-first.ts), which omp loads from its
 extensions directory. Install it once with a symlink, so plugin updates reach it:
 
