@@ -325,11 +325,12 @@ and for those agents the extension blocks `plannotator_submit_plan`, its `xd://`
 `xd://propose` until `record_plan_advice` has recorded the review for exactly the plan text being
 submitted; a plan the gate cannot read is blocked too. The tool checks with `paseo inspect` that
 the advisor runs GPT-6 Astra at medium, was created by this agent and has finished its latest
-turn; any later edit to the plan needs a new record. It cannot check what the advisor said: the
+turn; any later edit to the plan needs a new record, and the record follows the session branch
+(resume, `/tree` and branch switches rebuild it). It cannot check what the advisor said: the
 plan's advisor section is your record of that. An advisor that cannot be created (quota, provider
-error) is recorded as `unavailable` with its reason, and only when the plan's advisor section says
-so. Claude and Codex planners get the steps as instructions when they launch in a planning policy,
-without the gate.
+error) is recorded as `unavailable` only when the plan's advisor section says so and gives the
+same reason. Claude and Codex planners get the steps as instructions when they launch in a
+planning policy, without the gate.
 
 **The omp extension.** The planning phase, `skip_plan` and the plan advisor gate come from
 [`omp/linear-tickets-plan-first.ts`](omp/linear-tickets-plan-first.ts), which omp loads from its

@@ -27,7 +27,7 @@ export function advisorSteps(options: { contextPath?: string | null; omp: boolea
     `2. Adopt each point into the plan or answer it with a reason. Send your changes and answers to the same advisor with \`send_agent_prompt\` (it keeps its context) until you agree, at most ${ADVISOR_MAX_ROUNDS} rounds.`,
     `3. End the plan with a \`## ${ADVISOR_SECTION}\` section: the advisor's model, the number of rounds, what changed because of it, and every point you still disagree on with both positions, so the owner decides.`,
     options.omp
-      ? `4. Call \`${RECORD_ADVICE_TOOL}\` with the plan file, the advisor's agent id and the verdict, then submit the plan without editing it again. If the advisor cannot be created, explain why in the \`## ${ADVISOR_SECTION}\` section and call \`${RECORD_ADVICE_TOOL}\` with verdict \`unavailable\` and the reason.`
+      ? `4. Call \`${RECORD_ADVICE_TOOL}\` with the plan file, the advisor's agent id and the verdict, then submit the plan without editing it again. If the advisor cannot be created, state in the \`## ${ADVISOR_SECTION}\` section that it was unavailable and why, and call \`${RECORD_ADVICE_TOOL}\` with verdict \`unavailable\` and that same reason.`
       : `If the advisor cannot be created, explain why in the \`## ${ADVISOR_SECTION}\` section.`,
   ];
   return steps.join("\n");

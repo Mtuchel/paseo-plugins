@@ -36,7 +36,7 @@ type Schema = {
   enum(values: [string, ...string[]]): unknown;
 };
 type ExtensionApi = {
-  on(event: "session_start" | "before_agent_start", handler: (event: unknown, ctx: Context) => Promise<void> | void): void;
+  on(event: "session_start" | "session_switch" | "session_branch" | "session_tree" | "before_agent_start", handler: (event: unknown, ctx: Context) => Promise<void> | void): void;
   on(event: "tool_call", handler: (event: { toolName: string; input?: Record<string, unknown> }, ctx: Context) => Promise<{ block: true; reason: string } | undefined>): void;
   events: { emit(channel: string, data: unknown): void };
   appendEntry(customType: string, data: unknown): void;
@@ -170,17 +170,24 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     return "entered";
   }
 
+  // Advice is rebuilt from the active branch only: another branch's or session's must not carry over.
+  function restoreAdvice(entries: Entry[]): void {
+    advised.clear();
+    for (const entry of entries) {
+      if (entry.type === "custom" && entry.customType === ADVICE_MARKER && entry.data?.path && entry.data.hash) advised.set(entry.data.path, entry.data.hash);
+    }
+  }
+
   pi.on("session_start", (_event, ctx) => {
     const entries = ctx.sessionManager.getBranch();
     const marks = entries.filter((entry) => entry.type === "custom" && entry.customType === MARKER);
     launched = marks.length > 0 || entries.some((entry) => entry.type === "message" && entry.message?.role === "assistant");
     ownerAsked = marks.some((entry) => entry.data?.reason === "owner");
-    // Rebuilt from the active branch only: another branch's advice must not carry over.
-    advised.clear();
-    for (const entry of entries) {
-      if (entry.type === "custom" && entry.customType === ADVICE_MARKER && entry.data?.path && entry.data.hash) advised.set(entry.data.path, entry.data.hash);
-    }
+    restoreAdvice(entries);
   });
+  for (const event of ["session_switch", "session_branch", "session_tree"] as const) {
+    pi.on(event, (_event, ctx) => restoreAdvice(ctx.sessionManager.getBranch()));
+  }
 
   pi.on("before_agent_start", async () => {
     if (await takeOwnerRequest()) { launched = true; return; }
@@ -245,9 +252,10 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       }
       const verdict = params.verdict;
       if (verdict === "unavailable") {
-        if (!params.reason?.trim()) return text("Give the reason the advisor could not be created.");
-        if (!/unavailable|could not be created|couldn't be created/i.test(section[1])) {
-          return text(`The plan's "## ${ADVISOR_SECTION}" section must tell the owner that the advisor was unavailable and why. Say so there, then record again.`);
+        const reason = params.reason?.trim();
+        if (!reason) return text("Give the reason the advisor could not be created.");
+        if (!/unavailable|could not be created|couldn't be created/i.test(section[1]) || !section[1].toLowerCase().includes(reason.toLowerCase())) {
+          return text(`The plan's "## ${ADVISOR_SECTION}" section must tell the owner that the advisor was unavailable and why, with the reason you pass here word for word. Say so there, then record again.`);
         }
       } else if (verdict === "agreed" || verdict === "disagreements") {
         const advisorId = params.advisorAgentId?.trim();

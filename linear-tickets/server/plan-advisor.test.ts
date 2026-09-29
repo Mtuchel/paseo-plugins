@@ -30,13 +30,14 @@ type Start = (event: unknown, ctx: { sessionManager: { getBranch(): Entry[] } })
 
 function load() {
   const tools: Tool[] = [];
-  const handlers: { gate?: Gate; start?: Start } = {};
+  const handlers: { gate?: Gate; start?: Start; tree?: Start } = {};
   const entries: Entry[] = [];
   const schema = { object: () => ({}), string: () => ({ optional: () => ({}) }), enum: () => ({}) };
   extension({
     on: (event: string, handler: Gate & Start) => {
       if (event === "tool_call") handlers.gate = handler;
       if (event === "session_start") handlers.start = handler;
+      if (event === "session_tree") handlers.tree = handler;
     },
     events: { emit: () => {} },
     appendEntry: (customType: string, data: unknown) => { entries.push({ type: "custom", customType, data }); },
@@ -49,8 +50,8 @@ function load() {
   const ctx = { cwd, sessionManager: { getBranch: () => [], getArtifactsDir: () => artifacts } };
   const record = tools.find((tool) => tool.name === "record_plan_advice");
   assert.ok(record, "ticket agents get the record tool");
-  assert.ok(handlers.gate && handlers.start);
-  const gate = handlers.gate, start = handlers.start;
+  assert.ok(handlers.gate && handlers.start && handlers.tree);
+  const gate = handlers.gate, start = handlers.start, tree = handlers.tree;
   return {
     cwd,
     entries,
@@ -58,6 +59,7 @@ function load() {
     submit: (filePath: string) => gate({ toolName: "plannotator_submit_plan", input: { filePath } }, ctx),
     record: async (params: Record<string, string>) => (await record.execute("call", params, undefined, undefined, ctx)).content[0].text,
     resume: (branch: Entry[]) => start({}, { sessionManager: { getBranch: () => branch } }),
+    navigate: (branch: Entry[]) => tree({}, { sessionManager: { getBranch: () => branch } }),
   };
 }
 
@@ -87,7 +89,7 @@ test("a ticket plan cannot reach the owner until a finished GPT-6 Astra advisor 
   assert.match(changed.reason, /changed after its advisor review was recorded/);
 });
 
-test("a resumed session keeps the advice of its own branch only", async () => {
+test("a resumed session or a navigated tree keeps the advice of its own branch only", async () => {
   const h = load();
   writeFileSync(join(h.cwd, "PLAN.md"), PLAN);
   await h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" });
@@ -95,7 +97,11 @@ test("a resumed session keeps the advice of its own branch only", async () => {
   h.resume(recorded);
   assert.equal(await h.submit("PLAN.md"), undefined, "the recorded advice survives a resume");
   h.resume([]);
-  assert.equal((await h.submit("PLAN.md"))?.block, true, "a branch without the record does not inherit it");
+  assert.equal((await h.submit("PLAN.md"))?.block, true, "a session without the record does not inherit it");
+  h.navigate(recorded);
+  assert.equal(await h.submit("PLAN.md"), undefined, "navigating back to the advised branch restores it");
+  h.navigate([]);
+  assert.equal((await h.submit("PLAN.md"))?.block, true, "a /tree switch to a branch without the record drops it");
 });
 
 test("an unavailable advisor is recorded only with a reason the plan itself tells the owner", async () => {
@@ -104,10 +110,12 @@ test("an unavailable advisor is recorded only with a reason the plan itself tell
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" }), /no "## Advisor review" section/);
   writeFileSync(join(h.cwd, "PLAN.md"), PLAN);
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable" }), /Give the reason/);
-  assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "Astra quota exhausted" }), /must tell the owner that the advisor was unavailable/);
+  assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "quota exhausted" }), /must tell the owner that the advisor was unavailable/);
   assert.equal((await h.submit("PLAN.md"))?.block, true);
+  writeFileSync(join(h.cwd, "PLAN.md"), "# Plan\n\nDo the thing.\n\n## Advisor review\n\nThe advisor was unavailable.\n");
+  assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "quota exhausted" }), /with the reason you pass here/, "the owner must see why, not only that");
   writeFileSync(join(h.cwd, "PLAN.md"), "# Plan\n\nDo the thing.\n\n## Advisor review\n\nThe GPT-6 Astra advisor was unavailable: quota exhausted.\n\n## Out of scope\n\nNothing.\n");
-  assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "Astra quota exhausted" }), /recorded/);
+  assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "quota exhausted" }), /recorded/);
   assert.equal(await h.submit("PLAN.md"), undefined, "an explained unavailable advisor lets the owner decide");
 });
 
