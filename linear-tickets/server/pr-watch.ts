@@ -156,11 +156,14 @@ export async function viewPullRequest(url: string): Promise<PullRequestView> {
   };
 }
 
-const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(first: 100) { nodes {
-    isResolved path line
-    comments(first: 20) { nodes { author { login __typename } body createdAt url } }
-  } } } }
+const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      isResolved path line
+      comments(first: 20) { nodes { author { login __typename } body createdAt url } }
+    }
+  } } }
 }`;
 
 export const githubReader: GitHubReader = {
@@ -180,24 +183,37 @@ export const githubReader: GitHubReader = {
     return runs.filter((run) => !PASSING_CONCLUSIONS.includes(run.conclusion ?? ""))
       .map((run) => ({ name: run.name ?? "check", url: run.html_url ?? "", conclusion: run.conclusion ?? run.status ?? "unknown" }));
   },
+  // Every page: a thread left out could hide a finding or hold a merge.
   async reviewThreads(repo, number) {
     const [owner, name] = repo.split("/");
-    const data = await ghJson<{ data?: { repository?: { pullRequest?: { reviewThreads?: { nodes?: {
-      isResolved?: boolean; path?: string | null; line?: number | null;
-      comments?: { nodes?: { author?: { login?: string; __typename?: string } | null; body?: string; createdAt?: string; url?: string }[] };
-    }[] } } } } }>(["api", "graphql", "-f", `query=${THREADS_QUERY}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-F", `number=${number}`]);
-    return (data.data?.repository?.pullRequest?.reviewThreads?.nodes ?? []).map((thread) => ({
-      resolved: thread.isResolved ?? false,
-      path: thread.path ?? null,
-      line: thread.line ?? null,
-      comments: (thread.comments?.nodes ?? []).map((comment) => ({
-        author: comment.author?.login ?? "someone",
-        bot: comment.author?.__typename === "Bot" || /\[bot\]$/.test(comment.author?.login ?? ""),
-        body: comment.body ?? "",
-        createdAt: comment.createdAt ?? "",
-        url: comment.url ?? "",
-      })),
-    }));
+    const threads: ReviewThread[] = [];
+    let cursor: string | null = null;
+    do {
+      const data: { data?: { repository?: { pullRequest?: { reviewThreads?: {
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+        nodes?: {
+          isResolved?: boolean; path?: string | null; line?: number | null;
+          comments?: { nodes?: { author?: { login?: string; __typename?: string } | null; body?: string; createdAt?: string; url?: string }[] };
+        }[];
+      } } } } } = await ghJson(["api", "graphql", "-f", `query=${THREADS_QUERY}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-F", `number=${number}`, ...(cursor ? ["-f", `cursor=${cursor}`] : [])]);
+      const page = data.data?.repository?.pullRequest?.reviewThreads;
+      for (const thread of page?.nodes ?? []) {
+        threads.push({
+          resolved: thread.isResolved ?? false,
+          path: thread.path ?? null,
+          line: thread.line ?? null,
+          comments: (thread.comments?.nodes ?? []).map((comment) => ({
+            author: comment.author?.login ?? "someone",
+            bot: comment.author?.__typename === "Bot" || /\[bot\]$/.test(comment.author?.login ?? ""),
+            body: comment.body ?? "",
+            createdAt: comment.createdAt ?? "",
+            url: comment.url ?? "",
+          })),
+        });
+      }
+      cursor = page?.pageInfo?.hasNextPage ? page.pageInfo.endCursor ?? null : null;
+    } while (cursor);
+    return threads;
   },
 };
 
@@ -324,11 +340,27 @@ export class PullRequestWatch {
       return drafts.get(repo)!;
     };
     const save = () => this.save(seenByUrl);
-    let paused: RateLimitedError | null = null;
-    let throttled: GitHubRateLimitedError | null = null;
+    // Agents that got a message this poll: one instruction per agent and poll, so the pull
+    // requests of one stack do not each send it one.
+    const reserved = new Set<string>();
+    const stopped: { paused: RateLimitedError | null; throttled: GitHubRateLimitedError | null } = { paused: null, throttled: null };
+    // A failure for one pull request is logged and the rest go on; a rate limit ends the poll.
+    const step = async (record: HandoverRecord, url: string, work: () => Promise<void>): Promise<boolean> => {
+      try {
+        await work();
+      } catch (error) {
+        if (error instanceof RateLimitedError) stopped.paused = error;
+        else if (error instanceof GitHubRateLimitedError) stopped.throttled = error;
+        else console.error(`[linear-tickets] ${record.identifier}: reading ${url} failed: ${error instanceof Error ? error.message : error}`);
+      }
+      return !stopped.paused && !stopped.throttled;
+    };
+    // Stalled pull requests are nudged after every drop was handled: a drop's fix request comes
+    // first when both are for the same agent.
+    const nudges: { record: HandoverRecord; url: string; view: PullRequestView }[] = [];
     for (const record of records) {
       const url = record.links["Pull request"];
-      try {
+      const going = await step(record, url, async () => {
         const view = await (this.deps.view ?? viewPullRequest)(url);
         const result = reviewChange(view, seenByUrl[url] ?? { reviewedAt: null, decision: null, merged: false });
         const { change, seen } = manual ? await this.gate(record, result, manual) : result;
@@ -340,7 +372,7 @@ export class PullRequestWatch {
         if (view.state !== "OPEN") {
           if (seenByUrl[url].pending) console.error(`[linear-tickets] ${record.identifier}: ${url} is no longer open; the merge queue drop is not reported`);
           seenByUrl[url] = { ...seenByUrl[url], pending: null };
-          continue;
+          return;
         }
         let dropped = Boolean(seenByUrl[url].pending);
         if (!dropped) {
@@ -356,24 +388,19 @@ export class PullRequestWatch {
         }
         const pending = seenByUrl[url].pending;
         // Recorded as delivered as soon as the message went out, before any session line.
-        if (pending) await this.deliver(record, url, pending, save, async () => {
+        if (pending) await this.deliver(record, url, pending, save, reserved, async () => {
           seenByUrl[url] = { ...seenByUrl[url], pending: null };
           await save();
         });
         // A stalled pull request gets its next step, but never in a poll that handles a drop.
-        if (!dropped) await this.nudge(record, url, view, seenByUrl, save, listDrafts);
-      } catch (error) {
-        if (error instanceof RateLimitedError) {
-          paused = error;
-          break;
-        }
-        if (error instanceof GitHubRateLimitedError) {
-          throttled = error;
-          break;
-        }
-        console.error(`[linear-tickets] ${record.identifier}: reading ${url} failed: ${error instanceof Error ? error.message : error}`);
-      }
+        if (!dropped) nudges.push({ record, url, view });
+      });
+      if (!going) break;
     }
+    for (const { record, url, view } of stopped.paused || stopped.throttled ? [] : nudges) {
+      if (!await step(record, url, () => this.nudge(record, url, view, seenByUrl, save, listDrafts, reserved))) break;
+    }
+    const { paused, throttled } = stopped;
     if (paused && paused.pool !== this.pausedPool) console.error(`[linear-tickets] pull request watch paused: ${paused.message}`);
     this.pausedPool = paused?.pool ?? null;
     if (throttled && !this.githubThrottled) console.error(`[linear-tickets] pull request watch paused until the next poll: ${throttled.message}`);
@@ -446,10 +473,11 @@ export class PullRequestWatch {
 
   // Delivers a claimed drop: the fix request to the agent while it exists, otherwise to the ticket,
   // which goes back to coding for the next agent; an escalation to the owner. It waits for a later
-  // poll while the agent is in a turn or Paseo is not connected. `sending` is saved right before a
-  // message goes out, so one whose result was lost (a restart) is never sent again; `delivered`
-  // records it right after, before the best-effort session line.
-  private async deliver(record: HandoverRecord, url: string, pending: PendingDrop, save: () => Promise<void>, delivered: () => Promise<void>): Promise<void> {
+  // poll while the agent is in a turn, Paseo is not connected, or the agent already got a message
+  // this poll (`reserved`). `sending` is saved right before a message goes out, so one whose
+  // result was lost (a restart) is never sent again; `delivered` records it right after, before
+  // the best-effort session line.
+  private async deliver(record: HandoverRecord, url: string, pending: PendingDrop, save: () => Promise<void>, reserved: Set<string>, delivered: () => Promise<void>): Promise<void> {
     if (pending.sending) {
       console.error(`[linear-tickets] ${record.identifier}: the message about the merge queue drop of ${url} may already have gone out; it is not sent again`);
       await delivered();
@@ -458,6 +486,10 @@ export class PullRequestWatch {
     const dispatch = async () => {
       pending.sending = true;
       await save();
+    };
+    const toAgent = async () => {
+      reserved.add(record.agentId);
+      await dispatch();
     };
     const { fix } = pending;
     try {
@@ -468,15 +500,16 @@ export class PullRequestWatch {
         await this.tell(record, "response", `The merge queue dropped the pull request three times; the owner was asked to take over.\n\n${pending.facts}`);
         return;
       }
+      if (reserved.has(record.agentId)) return;
       if (record.status !== "archived") {
-        const outcome = await this.deps.sessions.prompt(record.agentId, fix, dispatch);
+        const outcome = await this.deps.sessions.prompt(record.agentId, fix, toAgent);
         if (outcome === "sent") {
           await delivered();
           await this.tell(record, "thought", `The merge queue dropped the pull request (${pending.reason}). The agent was asked to fix it.`);
         }
         if (outcome !== "gone") return;
       }
-      await this.handBack(record, fix, dispatch);
+      await this.handBack(record, fix, toAgent);
       await delivered();
       await this.tell(record, "response", `The merge queue dropped the pull request and the agent is no longer running; the ticket is back in ${CODING_STATE}.\n\n${pending.facts}`);
     } finally {
@@ -486,31 +519,36 @@ export class PullRequestWatch {
   }
 
   // The next lifecycle step of a stalled open pull request (see pr-nudge.ts), for its idle agent.
-  // Nothing while the owner vetoes merging (`do-not-merge`), manual tasks due before the merge are
-  // open, or the merge queue has (or just landed) the pull request. A stage is claimed per head
-  // right before its message goes out: at most STAGE_NUDGES per stage and pull request, then one
-  // escalation to the owner, then only the log. A busy agent or a disconnected Paseo claims
+  // Nothing while the owner vetoes merging (`do-not-merge`), the merge queue has (or just landed)
+  // the pull request, manual tasks due before the merge are open, or the agent already got a
+  // message this poll; these are settled before review threads are read. A stage is claimed per
+  // head right before its message goes out: at most STAGE_NUDGES per stage and pull request, then
+  // one escalation to the owner, then only the log. A busy agent or a disconnected Paseo claims
   // nothing; the next poll decides again.
-  private async nudge(record: HandoverRecord, url: string, view: PullRequestView, seenByUrl: Record<string, Seen>, save: () => Promise<void>, drafts: (repo: string) => Promise<QueueDraft[]>): Promise<void> {
+  private async nudge(record: HandoverRecord, url: string, view: PullRequestView, seenByUrl: Record<string, Seen>, save: () => Promise<void>, drafts: (repo: string) => Promise<QueueDraft[]>, reserved: Set<string>): Promise<void> {
     const source = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
     const last = activityBullets(view.mergeActivity).at(-1);
-    if (!source || view.labels.includes(DO_NOT_MERGE_LABEL) || (last && last.kind !== "dropped")) return;
+    if (!source || reserved.has(record.agentId) || view.labels.includes(DO_NOT_MERGE_LABEL) || (last && last.kind !== "dropped")) return;
     const [, repo, number] = source;
+    const listed = `](https://app.graphite.com/github/pr/${repo}/${number})`;
+    if ((await drafts(repo)).some((draft) => draft.state === "OPEN" && draft.title.startsWith(QUEUE_DRAFT_TITLE) && draft.body.includes(listed))) return;
+    if ((await this.deps.manualTasks?.openBlockers(record.issueId))?.length) return;
     const before = seenByUrl[url].nudges ?? {};
     const heads = (stage: Stage) => before[stage] ?? [];
     const github = this.deps.github ?? githubReader;
     const found = await stalledStage(view, url, Date.now(), (stage) => heads(stage).includes(view.headSha), () => github.reviewThreads(repo, Number(number)));
     if (!found || heads(found.stage).includes(view.headSha)) return;
     const { stage, text } = found;
-    const listed = `](https://app.graphite.com/github/pr/${repo}/${number})`;
-    if ((await drafts(repo)).some((draft) => draft.state === "OPEN" && draft.title.startsWith(QUEUE_DRAFT_TITLE) && draft.body.includes(listed))) return;
-    if ((await this.deps.manualTasks?.openBlockers(record.issueId))?.length) return;
     const sent = heads(stage).length;
     let claimed = false;
     const claim = async () => {
       seenByUrl[url] = { ...seenByUrl[url], nudges: { ...before, [stage]: [...heads(stage), view.headSha] }, activeAt: new Date().toISOString() };
       claimed = true;
       await save();
+    };
+    const toAgent = async () => {
+      reserved.add(record.agentId);
+      await claim();
     };
     try {
       if (sent > STAGE_NUDGES) {
@@ -526,11 +564,11 @@ export class PullRequestWatch {
       }
       const prompt = `${text}\n\nThis is nudge ${sent + 1} of ${STAGE_NUDGES} for this step; after that the owner takes over.`;
       if (record.status !== "archived") {
-        const outcome = await this.deps.sessions.prompt(record.agentId, prompt, claim);
+        const outcome = await this.deps.sessions.prompt(record.agentId, prompt, toAgent);
         if (outcome === "sent") await this.tell(record, "thought", `The pull request is waiting for the agent to ${STAGE_STEP[stage]}; it was asked to.`);
         if (outcome !== "gone") return;
       }
-      await this.handBack(record, prompt, claim);
+      await this.handBack(record, prompt, toAgent);
       await this.tell(record, "response", `The pull request is waiting for the agent to ${STAGE_STEP[stage]}, and the agent is no longer running; the ticket is back in ${CODING_STATE}.`);
     } catch (error) {
       // A message that failed outright was not sent: the next poll sends it again.

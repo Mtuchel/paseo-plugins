@@ -374,19 +374,21 @@ new message, the first that applies:
 |---|---|---|
 | Draft | a draft with no new commit and no pull request activity for 30 minutes | run the background Sol review if not done, then `gt submit --stack --publish` |
 | Failed checks | a ready pull request whose latest run of a check failed (pending runs and `Graphite / mergeability_check` do not count) | the failed checks with links; fix, then `gt submit --stack` |
-| Changes requested | the latest approving or change-requesting review asks for changes on the current head | the review and the unresolved review threads; address them, then `gt submit --stack` |
+| Changes requested | a reviewer's latest approving, change-requesting or dismissed review asks for changes (on any commit), or GitHub's review decision is "changes requested" | each such review and the unresolved review threads; address them, then `gt submit --stack` (for a review on an earlier commit: reply on its threads and re-request the review) |
 | Findings | unresolved review threads a bot started (Greptile, any bot reviewer) | the findings; run the AGENTS.md review loop |
-| Merge | checks green (except Graphite's mergeability check), no unresolved thread, GitHub's review decision not "changes requested", Greptile has reviewed the current head when the pull request has `complex-review` | `gt merge`, then `node tools/ci/wait-queue.mjs <top PR>` |
+| Merge | `PR code` and `PR metadata` ran on the head and succeeded or were skipped (so did `Label queued PRs for Linear` when it ran), every other check is green (except Graphite's mergeability check), no change request is open, no review thread is unresolved, and Greptile has reviewed the current head when the pull request has `complex-review` | `gt merge`, then `node tools/ci/wait-queue.mjs <top PR>` |
 
 Nothing is sent for a pull request labelled `do-not-merge`, while [manual tasks](#manual-tasks)
 due before the merge are open, while the merge queue has it (its last Merge activity bullet
 queues it, runs its CI or merged it, or an open queue draft lists it), or while a merge queue
-drop is being handled. Each stage is claimed per head right before it goes out: a new head can be
-nudged again, at most twice per stage and pull request. The next time that stage stalls, you get
-one comment instead ("Paseo asked the agent 2 times to …"), and after that only the log. A busy
-or disconnected agent is asked on a later poll; a gone or archived agent's nudge goes to the
-ticket like a drop's fix request (it counts toward the same two). Review threads are read (one
-GraphQL request) only when a stage needs them.
+drop is being handled; these are settled before review threads are read. An agent gets at most
+one message per poll: merge queue drops of all its pull requests come first, then nudges, so the
+pull requests of one stack take turns. Each stage is claimed per head right before it goes out:
+a new head can be nudged again, at most twice per stage and pull request. The next time that
+stage stalls, you get one comment instead ("Paseo asked the agent 2 times to …"), and after
+that only the log. A busy or disconnected agent is asked on a later poll; a gone or archived
+agent's nudge goes to the ticket like a drop's fix request (it counts toward the same two).
+Review threads are read (GraphQL, every page) only when a stage needs them.
 
 **Health.** Every 5 minutes the plugin checks the Linear key, the Paseo app, Tailscale Funnel
 and the local receiver. A problem confirmed twice opens one urgent ticket, "⚠️ Paseo needs

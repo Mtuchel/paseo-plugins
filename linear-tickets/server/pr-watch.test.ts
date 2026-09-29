@@ -319,7 +319,9 @@ const MINUTE = 60_000;
 const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
 const GREEN: CheckRun = { ...RUNNING_CI, state: "passed", conclusion: "success" };
 const failing = (name: string): CheckRun => ({ name, url: `https://github.com/tuchel-sohn/tuchel-platform/actions/runs/2/job/${name.length}`, state: "failed", conclusion: "failure" });
-const READY: PullRequestView = { ...OPEN_PR, checks: [GREEN] };
+const passing = (name: string, conclusion = "success"): CheckRun => ({ name, url: "", state: "passed", conclusion });
+// The repo's required checks passed on the head, and the rest of CI is green.
+const READY: PullRequestView = { ...OPEN_PR, checks: [GREEN, passing("PR code"), passing("PR metadata")] };
 const FINDING: ReviewThread = {
   resolved: false, path: "server/upload.ts", line: 42,
   comments: [{ author: "greptile-apps", bot: true, body: '<a href="#"><img alt="P2" src="https://greptile-static-assets.s3.amazonaws.com/badges/p2.svg"></a> The retry loop never gives up.', createdAt: ago(MINUTE), url: `${PR}#discussion_r1` }],
@@ -347,21 +349,70 @@ test("failed checks on a ready pull request are listed with links, ignoring pend
   assert.equal(h.github.threadReads, 0);
 });
 
-test("changes requested on the current head are sent with the review and its open threads, next to the ticket update", async (t) => {
+test("each reviewer's outstanding change request is sent with the open threads, also after new commits, next to the ticket update", async (t) => {
   const h = harness(t);
   const human: ReviewThread = { resolved: false, path: "db/migrate.sql", line: null, comments: [
     { author: "Mtuchel", bot: false, body: "Split this   migration.", createdAt: ago(MINUTE), url: `${PR}#discussion_r2` },
     { author: "paseo-agent", bot: false, body: "Will do.", createdAt: ago(MINUTE), url: `${PR}#discussion_r3` },
   ] };
   h.github.threads = [human, { ...FINDING, resolved: true }];
-  h.github.view = { ...READY, reviews: [{ author: "Mtuchel", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T08:00:00Z", body: "Two things before this can land.", commit: "0ld" }] };
-  const older = await h.poll();
-  assert.deepEqual(older.slice(0, 3), ["move In Progress", "review changes requested by @Mtuchel", "say thought @Mtuchel requested changes on the pull request — the agent is addressing them in Paseo."]);
-  assert.equal(promptOf(older), undefined, "the review was on an earlier head");
-  h.github.view = { ...h.github.view, reviews: [{ author: "Mtuchel", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T09:00:00Z", body: "Two things before this can land.", commit: HEAD }] };
+  h.github.view = { ...READY, reviews: [
+    { author: "Mtuchel", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T08:00:00Z", body: "Two things before this can land.", commit: HEAD },
+    { author: "ada", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T08:10:00Z", body: "Nit.", commit: HEAD },
+    { author: "ada", state: "APPROVED", submittedAt: "2026-09-29T08:20:00Z", body: "", commit: HEAD },
+    { author: "bob", state: "DISMISSED", submittedAt: "2026-09-29T08:30:00Z", body: "Stale.", commit: HEAD },
+  ] };
   const calls = await h.poll();
-  assert.equal(promptOf(calls), `@Mtuchel requested changes on [the pull request](${PR}):\n> Two things before this can land.\n\nUnresolved review threads:\n- [db/migrate.sql](${PR}#discussion_r2) @Mtuchel: Split this migration. (1 reply)\n\nNext step: address them, then \`gt submit --stack\`.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+  assert.equal(calls.length, 2);
+  assert.equal(promptOf(calls), `@Mtuchel requested changes on [the pull request](${PR}):\n> Two things before this can land.\n\nUnresolved review threads:\n- [db/migrate.sql](${PR}#discussion_r2) @Mtuchel: Split this migration. (1 reply)\n\nNext step: address them, then \`gt submit --stack\`.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`, "ada approved since, bob's review was dismissed");
   assert.equal(calls.at(-1), "say thought The pull request is waiting for the agent to address the requested changes; it was asked to.");
+  h.github.threads = [];
+  assert.deepEqual(await h.poll(), [], "claimed for this head; no merge nudge while a change request is open");
+  h.github.view = { ...h.github.view, headSha: "f00dfeed1234" };
+  const later = promptOf(await h.poll()) ?? "";
+  assert.match(later, /^@Mtuchel requested changes on \[the pull request\]\([^)]*\) at `a1b2c3d`, before the latest commits:\n/);
+  assert.match(later, /Where the new commits already address a review, reply on its threads and re-request a review from @Mtuchel\.\n\nThis is nudge 2 of 2/);
+});
+
+test("GitHub's changes-requested decision alone is a change request, and holds the merge", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...READY, reviewDecision: "CHANGES_REQUESTED" };
+  assert.equal(promptOf(await h.poll()), `GitHub reports changes requested on [the pull request](${PR}).\n\nNext step: address them, then \`gt submit --stack\`.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+});
+
+test("the merge nudge needs PR code and PR metadata finished on the head; an empty or incomplete rollup is not green", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...READY, checks: [] };
+  assert.deepEqual(await h.poll(), [], "no checks reported yet");
+  h.github.view = { ...READY, checks: [GREEN, passing("PR code")] };
+  assert.deepEqual(await h.poll(), [], "PR metadata missing");
+  h.github.view = { ...READY, checks: [GREEN, passing("PR code"), { ...RUNNING_CI, name: "PR metadata" }] };
+  assert.deepEqual(await h.poll(), [], "PR metadata still running");
+  h.github.view = { ...READY, checks: [...READY.checks, passing("Label queued PRs for Linear", "neutral")] };
+  assert.deepEqual(await h.poll(), [], "the labelling check must succeed or be skipped");
+  h.github.view = { ...READY, checks: [...READY.checks, passing("Label queued PRs for Linear", "skipped"), passing("PR code", "skipped")] };
+  assert.match(promptOf(await h.poll()) ?? "", /is ready: its checks are green/);
+});
+
+test("one instruction per agent and poll: the pull requests of one stack take turns", async (t) => {
+  const h = harness(t);
+  h.records.push({ ...h.records[0], issueId: "i2", identifier: "TUC-2", links: { "Pull request": "https://github.com/tuchel-sohn/tuchel-platform/pull/420" } });
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  const first = await h.poll();
+  assert.equal(first.filter((call) => call.startsWith("prompt")).length, 1);
+  assert.match(promptOf(first) ?? "", /pull\/419/);
+  const second = await h.poll();
+  assert.equal(second.filter((call) => call.startsWith("prompt")).length, 1);
+  assert.match(promptOf(second) ?? "", /pull\/420/);
+  assert.deepEqual(await h.poll(), []);
+
+  const dropped = harness(t);
+  dropped.records.push({ ...dropped.records[0], issueId: "i2", identifier: "TUC-2", links: { "Pull request": "https://github.com/tuchel-sohn/tuchel-platform/pull/420" } });
+  dropped.github.view = { ...READY, checks: [failing("PR code")], mergeActivity: activity(QUEUED, CONFLICT) };
+  const calls = await dropped.poll();
+  assert.equal(calls.filter((call) => call.startsWith("prompt")).length, 1);
+  assert.match(promptOf(calls) ?? "", /^The Graphite merge queue dropped \[the pull request\]\([^)]*419\)/, "the drop of the first pull request; the second one's drop waits");
+  assert.match(promptOf(await dropped.poll()) ?? "", /^The Graphite merge queue dropped \[the pull request\]\([^)]*420\)/);
 });
 
 test("unresolved bot review findings are sent for the review loop", async (t) => {
@@ -391,7 +442,7 @@ test("a ready, green, reviewed pull request outside the queue is told to merge; 
   assert.deepEqual(await h.poll(), [], "an open queue draft lists it");
   h.github.drafts = [];
   h.github.view = { ...h.github.view, reviewDecision: "CHANGES_REQUESTED" };
-  assert.deepEqual(await h.poll(), [], "GitHub still reports changes requested");
+  assert.match(promptOf(await h.poll()) ?? "", /^GitHub reports changes requested/, "no merge while GitHub reports changes requested");
   h.github.view = { ...h.github.view, reviewDecision: "", checks: [...h.github.view.checks, { ...RUNNING_CI, name: "Graphite / mergeability_check" }] };
   assert.equal(promptOf(await h.poll()), `[The pull request](${PR}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.\nNext step: \`gt merge\`, then \`node tools/ci/wait-queue.mjs <top PR>\` with the top pull request of your stack (419 if this one is the top).\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
 });
@@ -404,7 +455,7 @@ test("the first matching stage wins: draft, then failed checks, then requested c
   assert.match(promptOf(await h.poll()) ?? "", /still a draft/);
   h.github.view = { ...h.github.view, isDraft: false };
   assert.match(promptOf(await h.poll()) ?? "", /^Checks failed/);
-  h.github.view = { ...h.github.view, checks: [GREEN] };
+  h.github.view = { ...h.github.view, checks: READY.checks };
   assert.match(promptOf(await h.poll()) ?? "", /requested changes/);
   h.github.view = { ...h.github.view, reviews: [] };
   assert.match(promptOf(await h.poll()) ?? "", /unresolved findings/);
@@ -422,6 +473,12 @@ test("do-not-merge and open manual tasks keep every nudge and escalation away", 
   h.github.view = { ...READY, checks: [failing("PR code")] };
   h.blockers.push("TUC-9");
   assert.deepEqual(await h.poll(), [], "a manual task is due before the merge");
+  for (const view of [READY, { ...READY, labels: ["do-not-merge"] }]) {
+    h.github.view = view;
+    assert.deepEqual(await h.poll(), []);
+    assert.equal(h.github.threadReads, 0, "blocked pull requests are settled before review threads are read");
+  }
+  h.github.view = { ...READY, checks: [failing("PR code")] };
   h.blockers.length = 0;
   assert.match(promptOf(await h.poll()) ?? "", /nudge 1 of 2/, "the veto and the task claimed nothing");
 });

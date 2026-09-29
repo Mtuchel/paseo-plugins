@@ -18,6 +18,11 @@ const QUEUE_CHECK = "Graphite / mergeability_check";
 // Pull requests with this label need Greptile's review of the current head before they merge.
 const GREPTILE_LABEL = "complex-review";
 const GREPTILE = /^greptile-apps(\[bot\])?$/;
+// The repo's required checks: a merge nudge needs each on the head (the optional one only when it
+// ran), finished as a success or skipped. Other checks only have to be green when they are there.
+const REQUIRED_CHECKS = ["PR code", "PR metadata"];
+const REQUIRED_WHEN_PRESENT = ["Label queued PRs for Linear"];
+const DECISIVE = ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"];
 
 // The step, for a panel line and the owner's escalation: "… the agent to <step>".
 export const STAGE_STEP: Record<Stage, string> = {
@@ -65,21 +70,36 @@ export async function stalledStage(view: PullRequestView, url: string, now: numb
       "Next step: fix them, then `gt submit --stack`.",
     ].join("\n") };
   }
-  const decision = view.reviews.filter((review) => ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(review.state)).sort((a, b) => a.submittedAt.localeCompare(b.submittedAt)).at(-1);
-  if (decision?.state === "CHANGES_REQUESTED" && decision.commit === view.headSha) {
+  // Each reviewer's latest decisive review counts (a dismissed one reads DISMISSED), on any commit:
+  // new commits do not settle a change request, the reviewer does.
+  const latestByAuthor = new Map<string, PullRequestView["reviews"][number]>();
+  for (const review of [...view.reviews].sort((a, b) => a.submittedAt.localeCompare(b.submittedAt))) {
+    if (DECISIVE.includes(review.state)) latestByAuthor.set(review.author, review);
+  }
+  const requested = [...latestByAuthor.values()].filter((review) => review.state === "CHANGES_REQUESTED");
+  if (requested.length || view.reviewDecision === "CHANGES_REQUESTED") {
     const open = claimed("changes") ? [] : (await readThreads()).filter((thread) => !thread.resolved && thread.comments.length);
+    const summaries = requested.flatMap((review) => [
+      `@${review.author} requested changes on [the pull request](${url})${review.commit && review.commit !== view.headSha ? ` at \`${review.commit.slice(0, 7)}\`, before the latest commits` : ""}:`,
+      ...(review.body.trim() ? [`> ${excerpt(review.body, 1500)}`] : []),
+    ]);
+    const earlier = requested.filter((review) => review.commit && review.commit !== view.headSha).map((review) => `@${review.author}`);
     return { stage: "changes", text: [
-      `@${decision.author} requested changes on [the pull request](${url}):`,
-      ...(decision.body.trim() ? [excerpt(decision.body, 1500).replace(/^/, "> ")] : []),
+      ...(summaries.length ? summaries : [`GitHub reports changes requested on [the pull request](${url}).`]),
       ...(open.length ? ["", "Unresolved review threads:", ...threadLines(open)] : []),
       "",
       "Next step: address them, then `gt submit --stack`.",
+      ...(earlier.length ? [`Where the new commits already address a review, reply on its threads and re-request a review from ${earlier.join(", ")}.`] : []),
     ].join("\n") };
   }
-  // Green: every check but the queue's own finished and passed.
-  const green = view.checks.every((check) => check.state === "passed" || check.name === QUEUE_CHECK);
+  // Green: the required checks ran on the head and passed, and every other check but the
+  // queue's own finished and passed. An empty or incomplete rollup is not green.
+  const named = (name: string) => view.checks.filter((check) => check.name === name);
+  const green = view.checks.every((check) => check.state === "passed" || check.name === QUEUE_CHECK)
+    && REQUIRED_CHECKS.every((name) => named(name).length > 0)
+    && [...REQUIRED_CHECKS, ...REQUIRED_WHEN_PRESENT].every((name) => named(name).every((check) => check.conclusion === "success" || check.conclusion === "skipped"));
   const reviewed = !view.labels.includes(GREPTILE_LABEL) || view.reviews.some((review) => GREPTILE.test(review.author) && review.commit === view.headSha);
-  const mergeable = green && reviewed && view.reviewDecision !== "CHANGES_REQUESTED";
+  const mergeable = green && reviewed;
   if (claimed("findings") && (claimed("merge") || !mergeable)) return null;
   const open = (await readThreads()).filter((thread) => !thread.resolved && thread.comments.length);
   const findings = open.filter((thread) => thread.comments[0].bot);
