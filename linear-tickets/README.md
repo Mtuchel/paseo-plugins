@@ -278,14 +278,48 @@ sessions and replies whose webhook was missed. **Settings → Linear agent** sho
 - **Stop** interrupts the turn and keeps the agent stopped (a turn the provider starts by itself within 5 minutes is stopped again) until you reply.
 - When a session exists, the plan review, its decision and pull-request review changes update the progress comment instead of adding comments. The panel's own messages are copied into the ticket thread by Linear.
 
-**Plan-first for tickets you did not write.** Tickets created by someone else, or labelled
-`feedback`, start plan-first: `plan` mode for Claude, `auto` for Codex. omp keeps your usual
-mode, because its ticket agents already start in Plannotator's planning phase, which blocks edits
-until the plan is approved; omp's `write` mode would ask you before every shell command, reads
-included, so the planner could not investigate on its own.
-The prompt marks the ticket as untrusted input and asks only for a plan. With status write-back
-on, the ticket starts in **Planning** instead of In Progress. Approving the plan switches the
-agent to your usual mode.
+**Plan-first.** Every launch (sidebar, auto-dispatch, delegation, mention) picks one of three
+plan policies, first match wins:
+
+| Ticket | Policy |
+|---|---|
+| Carries `plan-ready` | No plan: the approved plan is implemented (below). |
+| Written by someone else, or labelled `feedback` | **Plan required**; `no-plan` does not apply, so the ticket's own text cannot skip its review. |
+| Labelled `plan`, or started with **Plan first** in the sidebar | **Plan required**. |
+| Labelled `no-plan` | No plan. |
+| Anything else | **The agent decides**. |
+
+*Plan required*: Claude starts in `plan` mode and Codex in `auto`; omp keeps your usual mode
+(its `write` mode asks before every shell command, reads included) and starts in Plannotator's
+planning phase instead. The prompt asks only for a plan and, for someone else's ticket, marks
+its text as untrusted input. With status write-back on, the ticket starts in **Planning** instead
+of In Progress. Approving the plan switches the agent to your usual mode.
+
+*The agent decides*: the prompt says to plan for a schema or migration change, auth or
+permissions, more than one app or service, a public or cross-service API change, unclear or
+conflicting acceptance criteria, or more than about three files, and to plan when unsure. omp
+agents start in the planning phase and leave it only through `skip_plan` with a one-sentence
+reason, which the ticket gets as a "No plan" note (the panel and progress comment with a Linear
+agent session). Other providers get the same rules as instructions.
+
+**Plan on a running agent.** Add `plan` to the ticket while its agent works: within a minute the
+plugin asks the agent for a plan. An omp agent enters the planning phase at its next tool call
+(that call is stopped and the reason follows as a message) or prompt, from implementing an approved plan too, and cannot
+`skip_plan` afterwards. Other providers only get the message. A label that was there when the
+agent started does nothing; remove and add it again to ask once more.
+
+**The omp extension.** The planning phase and `skip_plan` come from
+[`omp/linear-tickets-plan-first.ts`](omp/linear-tickets-plan-first.ts), which omp loads from its
+extensions directory. Install it once with a symlink, so plugin updates reach it:
+
+```sh
+ln -s "$PWD/omp/linear-tickets-plan-first.ts" ~/.omp/agent/extensions/
+```
+
+It needs the Plannotator omp plugin (`@plannotator/pi-extension`). The plugin gives ticket agents
+the policy in `LINEAR_TICKETS_PLAN` (also after a daemon restart) and writes mid-run requests to
+`$PASEO_HOME/linear-tickets/plan-requests/<agent id>`. Only fresh sessions start in planning; a
+resumed agent keeps its phase.
 
 **`plan-ready`.** Every approved plan adds the `plan-ready` label: always for a split or
 “Approve, implement later”, and with status write-back on for Plannotator and panel approvals,

@@ -124,8 +124,8 @@ test("the first turn marks the ticket in progress once per agent", async () => {
   assert.deepEqual(linear.writes, ["state", "in-progress issue-1"]);
 });
 
-test("a plan-first agent's first turn moves its ticket to Planning, unless the ticket already started", async () => {
-  const planFirst = paseoWithLabels({ "linear.issueId": "issue-1", "linear.untrusted": "1" });
+test("a required-plan agent's first turn moves its ticket to Planning, unless the ticket already started", async () => {
+  const planFirst = paseoWithLabels({ "linear.issueId": "issue-1", "linear.plan": "required" });
   const fresh = new FakeLinear();
   await new Writeback(fresh, { read: async () => allOn }, undefined, 0).turnStarted({ agent: root, turnId: "a" }, planFirst);
   assert.deepEqual(fresh.writes, ["state", "move issue-1 Planning"]);

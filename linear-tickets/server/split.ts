@@ -1,6 +1,7 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { LinearService } from "./linear";
-import { CODING_STATE, PLAN_READY_LABEL, planDocument } from "./plannotator";
+import { CODING_STATE, planDocument } from "./plannotator";
+import { PLAN_READY_LABEL } from "./plan-policy";
 import { MAX_SPLIT, planSteps } from "./sessions";
 import { agentModel } from "./model";
 

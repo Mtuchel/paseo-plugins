@@ -88,7 +88,7 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
   const router = new SessionRouter({
     api: api as never,
     linear: { viewerId: async () => OWNER, addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); } },
-    starter: { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false, untrusted: false }; }, admission: async () => ({ ok: true as const }) },
+    starter: { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false, untrusted: false, plan: null }; }, admission: async () => ({ ok: true as const }) },
     settings: { read: async () => settings },
     store,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },

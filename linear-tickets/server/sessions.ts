@@ -344,7 +344,10 @@ export class SessionRouter {
       // archive does not offer another resume. Its worktree stays for the new agent.
       if (link.agentId && link.agentId !== started.agentId) await this.paseo!.agents.ref(link.agentId).archive().catch(() => {});
       const warnings = started.warnings.length ? `\n\nWarnings:\n${started.warnings.map((warning) => `- ${warning}`).join("\n")}` : "";
-      await this.say(link.sessionId, "thought", `${started.resumed ? "Resumed the previous agent's work" : "Started"} with ${started.provider} in ${started.target} (Paseo agent ${started.agentId.slice(0, 8)}).${started.untrusted ? " This ticket is not yours, so the agent only plans until you approve." : ""}${warnings}`);
+      const plan = started.plan === "required"
+        ? started.untrusted ? " This ticket is not yours, so the agent only plans until you approve." : " The agent plans first and starts coding once you approve."
+        : started.plan === "agent" ? " The agent decides whether the ticket needs a plan; a skipped plan is noted here with its reason." : "";
+      await this.say(link.sessionId, "thought", `${started.resumed ? "Resumed the previous agent's work" : "Started"} with ${started.provider} in ${started.target} (Paseo agent ${started.agentId.slice(0, 8)}).${plan}${warnings}`);
       await this.linkToPaseo(link.sessionId, started.agentId);
     } catch (error) {
       await this.deps.linear.removeLabel(link.issueId, running).catch(() => {});

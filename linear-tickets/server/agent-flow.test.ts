@@ -10,7 +10,8 @@ import { reviewChange, type PullRequestView } from "./pr-watch";
 import { decidePlannotatorReview, describeTool, questionPrompt, SessionRouter, SessionStore } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { approveForLater, splitIntoSubIssues } from "./split";
-import { isUntrusted, TicketStarter, QUESTIONS_NOTE, UNTRUSTED_NOTE } from "./starter";
+import { isUntrusted, planDecisionNote, PLAN_REQUIRED_NOTE, TicketStarter, QUESTIONS_NOTE, UNTRUSTED_NOTE } from "./starter";
+import { planPolicy } from "./plan-policy";
 
 const OWNER = "owner-1";
 const settings: PluginSettings = {
@@ -181,7 +182,7 @@ test("the live feed shows completed commands and edits only", () => {
 });
 
 function starterHarness(state: { creatorId: string; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number) {
-  const launches: { modeId?: string; instructions: string; labels?: Record<string, string>; markInProgress?: boolean }[] = [];
+  const launches: { modeId?: string; instructions: string; labels?: Record<string, string>; env?: Record<string, string>; markInProgress?: boolean }[] = [];
   const starter = new TicketStarter({
     linear: {
       detail: async () => ({ issue: { identifier: "TUC-1", project: "", team: "Team" }, projectId: null, teamId: "t1" }) as never,
@@ -189,7 +190,7 @@ function starterHarness(state: { creatorId: string; labels: { id: string; name: 
       viewerId: async () => OWNER,
       issueDocument: async (_id: string, title: string) => title === "Plan: TUC-1" ? { url: "https://linear.app/doc/plan", content: "# Plan\n1. Add the table" } : null,
     },
-    launcher: { start: async (input, _paseo, options) => { launches.push({ modeId: input.modeId, instructions: input.instructions, labels: options?.labels, markInProgress: options?.markInProgress }); return { agentId: "new", warnings: [] }; } },
+    launcher: { start: async (input, _paseo, options) => { launches.push({ modeId: input.modeId, instructions: input.instructions, labels: options?.labels, env: options?.env, markInProgress: options?.markInProgress }); return { agentId: "new", warnings: [] }; } },
     branches: async () => ({ branches: [{ id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }),
   });
   const paseo = {
@@ -216,10 +217,31 @@ test("tickets written by someone else, or from the feedback intake, start plan-f
   const h = starterHarness({ creatorId: "customer", labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, settings, { retryHint: "retry" });
   assert.equal(started.untrusted, true);
-  assert.deepEqual(h.launches[0], { modeId: "full", instructions: `${UNTRUSTED_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.untrusted": "1" }, markInProgress: false });
+  assert.equal(started.plan, "required");
+  assert.deepEqual(h.launches[0], { modeId: "full", instructions: `${UNTRUSTED_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
   const mine = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
-  await mine.starter.start("i1", mine.paseo, settings, { retryHint: "retry" });
-  assert.equal(mine.launches[0].modeId, "full");
+  const own = await mine.starter.start("i1", mine.paseo, settings, { retryHint: "retry" });
+  assert.equal(own.plan, "agent");
+  assert.deepEqual(mine.launches[0], { modeId: "full", instructions: `${planDecisionNote("omp")}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "agent" }, env: { LINEAR_TICKETS_PLAN: "agent" }, markInProgress: false });
+});
+
+test("plan policy: an approved plan is implemented, someone else's ticket always plans, then the plan label or toggle, then no-plan, else the agent decides", () => {
+  const labels = (...names: string[]) => names.map((name) => ({ name }));
+  assert.equal(planPolicy({ untrusted: true, labels: labels("no-plan") }), "required");
+  assert.equal(planPolicy({ untrusted: true, labels: labels("plan-ready") }), null);
+  assert.equal(planPolicy({ untrusted: false, labels: labels("Plan") }), "required");
+  assert.equal(planPolicy({ untrusted: false, labels: labels("no-plan"), planFirst: true }), "required");
+  assert.equal(planPolicy({ untrusted: false, labels: labels("plan", "no-plan") }), "required");
+  assert.equal(planPolicy({ untrusted: false, labels: labels("no-plan") }), null);
+  assert.equal(planPolicy({ untrusted: false, labels: labels("plan-ready", "plan") }), null);
+  assert.equal(planPolicy({ untrusted: false, labels: [] }), "agent");
+});
+
+test("the plan label on the owner's ticket starts it plan-first in the provider's safe mode, and not in progress", async () => {
+  const h = starterHarness({ creatorId: OWNER, labels: [{ id: "p", name: "plan" }], blockedBy: [] }, 0);
+  const started = await h.starter.start("i1", h.paseo, { ...settings, markInProgress: true, lastProvider: "claude", launchPreferences: { claude: { model: "claude/opus", modeId: "default" } } }, { retryHint: "retry" });
+  assert.deepEqual({ untrusted: started.untrusted, plan: started.plan }, { untrusted: false, plan: "required" });
+  assert.deepEqual(h.launches[0], { modeId: "plan", instructions: `${PLAN_REQUIRED_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
 });
 
 test("a plan-first ticket is not marked in progress; once its plan is approved (plan-ready) the next agent implements it in the usual mode", async () => {
@@ -229,7 +251,7 @@ test("a plan-first ticket is not marked in progress; once its plan is approved (
   assert.equal(first.launches[0].markInProgress, false);
   const later = starterHarness({ creatorId: "customer", labels: [{ id: "f", name: "feedback" }, { id: "r", name: "plan-ready" }], blockedBy: [] }, 0);
   const started = await later.starter.start("i1", later.paseo, syncing, { retryHint: "retry" });
-  assert.equal(started.untrusted, false);
+  assert.equal(started.plan, null);
   assert.equal(later.launches[0].modeId, "full");
   assert.equal(later.launches[0].markInProgress, true);
   assert.deepEqual(later.launches[0].labels, {});

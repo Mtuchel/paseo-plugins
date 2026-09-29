@@ -128,6 +128,21 @@ test("a plan sent back loses plan-ready, and a review the plugin closed itself i
   });
 });
 
+test("a skipped plan is noted on the ticket with the agent's reason and leaves its state and labels alone", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  await withEvents([{ type: "skipped", agentId: "agent-1", reason: "One-line fix in format.ts, no schema or API change.", at: "2026-01-01T10:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+    assert.deepEqual(calls, [
+      "row agent-1: Plan skipped by the agent",
+      "comment issue-1: ⏭️ **No plan**: the agent judged this ticket small enough to implement directly. Its reason: One-line fix in format.ts, no schema or API change.\n\nAdd the `plan` label to make it plan first.",
+    ]);
+    assert.deepEqual(await readdir(directory), []);
+  });
+});
+
 test("agents without a ticket, and subagents, only get the chat row", async () => {
   const cases: Record<string, string>[] = [{}, { "linear.issueId": "issue-1", "paseo.parent-agent-id": "root" }];
   for (const labels of cases) {

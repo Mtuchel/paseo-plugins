@@ -229,6 +229,14 @@ export function labeledIssueFilter(label: string, teamKeys: string[]): Record<st
   };
 }
 
+// The labels of the tickets running agents work on, for mid-run plan requests (plan-requests.ts).
+export const ISSUE_LABELS_QUERY = `query issueLabels($first: Int!, $ids: [ID!]) {
+  issues(first: $first, includeArchived: true, filter: { id: { in: $ids } }) {
+    nodes { id labels(first: 50) { nodes { id name } } }
+  }
+}`;
+const ISSUE_LABELS_BATCH = 50;
+
 // `priority`: Linear's 1 (urgent) … 4 (low); 0 means none and sorts last.
 export type LabeledIssue = { id: string; identifier: string; teamKey: string; priority: number; labels: { id: string; name: string }[] };
 
@@ -527,6 +535,22 @@ export class LinearService {
     })).filter((issue) => issue.id)
       // Most urgent first; tickets without a priority last. Stable otherwise (Linear's order).
       .sort((a, b) => (a.priority || 5) - (b.priority || 5));
+  }
+
+  // Label names by ticket id, lower-cased. The Paseo app's pool first; the key when the app cannot
+  // see every ticket asked for. Ids Linear does not return are missing from the map.
+  async issueLabels(ids: string[]): Promise<Map<string, string[]>> {
+    const labels = new Map<string, string[]>();
+    const valid = [...new Set(ids)].filter((id) => UUID.test(id));
+    for (let start = 0; start < valid.length; start += ISSUE_LABELS_BATCH) {
+      const batch = valid.slice(start, start + ISSUE_LABELS_BATCH);
+      const data = record(await this.read(ISSUE_LABELS_QUERY, { first: batch.length, ids: batch }, (found) => connection(record(found.issues)).nodes.length === batch.length));
+      for (const node of connection(record(data.issues)).nodes.map((item) => record(item))) {
+        const id = label(node.id);
+        if (id) labels.set(id, labelNodes(node.labels).map((item) => item.name.trim().toLowerCase()));
+      }
+    }
+    return labels;
   }
 
   async issueState(id: string): Promise<IssueState> {

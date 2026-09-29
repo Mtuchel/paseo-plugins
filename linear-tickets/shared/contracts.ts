@@ -138,6 +138,8 @@ export const launchAgentRpc = defineRpc({
     thinkingOptionId: z.string().min(1).optional(),
     instructions: z.string().max(10_000).default(""),
     markInProgress: z.boolean().default(false),
+    // "Plan first": the agent plans and waits for approval (README, Plan-first).
+    planFirst: z.boolean().default(false),
     requestId: z.string().uuid(),
   }),
   output: z.object({ agentId: z.string(), warnings: z.array(z.string()) }),

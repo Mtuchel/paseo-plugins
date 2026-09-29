@@ -10,6 +10,7 @@ import type { AgentApi } from "./agent-app";
 import type { Handover, WaitingPeriod } from "./handover";
 import type { IssueState, LinearService } from "./linear";
 import { PLANNING_STATE } from "./plannotator";
+import { PLAN_POLICY_LABEL } from "./plan-policy";
 import { RateLimitedError } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
@@ -239,7 +240,7 @@ export class Writeback {
     const refreshed = await paseo.agents.ref(agent.id).refresh();
     const labels = refreshed?.agent.labels ?? {};
     const issueId = labels["linear.issueId"];
-    const link = issueId ? { issueId, identifier: labels["linear.identifier"] || issueId, planFirst: labels["linear.untrusted"] === "1" } : null;
+    const link = issueId ? { issueId, identifier: labels["linear.identifier"] || issueId, planFirst: labels[PLAN_POLICY_LABEL] === "required" } : null;
     this.links.set(agent.id, link);
     return link;
   }

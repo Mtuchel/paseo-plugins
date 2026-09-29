@@ -108,6 +108,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   const [optionsLoading, setOptionsLoading] = useState(true);
   const [optionsError, setOptionsError] = useState<string | null>(null);
   const [instructions, setInstructions] = useState("");
+  const [planFirst, setPlanFirst] = useState(false);
   const [showContext, setShowContext] = useState(false);
   const [showRelatedTickets, setShowRelatedTickets] = useState(false);
   const [contextCopied, setContextCopied] = useState(false);
@@ -391,7 +392,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
     void run("Loading tickets", async () => { await loadIssues(undefined, { status: statusRef.current, dependency: value }); });
   };
   const choose = (issue: Issue) => {
-    setSelected(issue); setAgent(null); setError(null); setInstructions(""); launchRequest.current = null;
+    setSelected(issue); setAgent(null); setError(null); setInstructions(""); setPlanFirst(false); launchRequest.current = null;
     mappedFor.current = null; setWantedBranch(null); setMappingReason(null);
   };
   const chooseRelated = (ticket: RelatedTicket) => choose({
@@ -402,9 +403,9 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   });
   const launch = () => void run("Starting agent", async () => {
     if (!selected || !canLaunch) return;
-    const fingerprint = JSON.stringify([selected.id, projectId, baseBranch, provider, modeId, thinkingOptionId, instructions, markInProgress]);
+    const fingerprint = JSON.stringify([selected.id, projectId, baseBranch, provider, modeId, thinkingOptionId, instructions, markInProgress, planFirst]);
     if (launchRequest.current?.fingerprint !== fingerprint) launchRequest.current = { fingerprint, id: requestId() };
-    const result = await start({ id: selected.id, projectId, baseBranch: project?.projectKind === "git" ? baseBranch : undefined, provider, modeId: modeId || undefined, thinkingOptionId: thinkingOptionId || undefined, instructions, markInProgress, requestId: launchRequest.current.id });
+    const result = await start({ id: selected.id, projectId, baseBranch: project?.projectKind === "git" ? baseBranch : undefined, provider, modeId: modeId || undefined, thinkingOptionId: thinkingOptionId || undefined, instructions, markInProgress, planFirst, requestId: launchRequest.current.id });
     setAgent(result);
     const launchPreference = { model: provider, ...(modeId ? { modeId } : {}), ...(thinkingOptionId ? { thinkingOptionId } : {}) };
     setLaunchPreferences((previous) => ({ ...previous, [providerGroup]: launchPreference }));
@@ -785,6 +786,11 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
             <FieldLabel title="A little extra direction" icon="MessageSquare" hint="optional" t={t} />
             <TextInput accessibilityLabel="Additional instructions for the agent" editable={!busy} multiline maxLength={10000} value={instructions} onChangeText={setInstructions}
               placeholder="Anything the agent should know before it starts…" placeholderTextColor={colors.foregroundMuted} style={{ ...t.input, minHeight: 84, textAlignVertical: "top" }} />
+
+            <FieldLabel title="Plan" icon="ListChecks" t={t} />
+            <Button title={planFirst ? "Plan first: the agent plans and waits for your approval" : "The agent decides whether this ticket needs a plan"} icon={planFirst ? "Check" : "CircleDashed"} stretch chosen={planFirst} disabled={Boolean(busy)}
+              onPress={() => setPlanFirst((value) => !value)} />
+            <Text style={t.muted}>Tickets someone else wrote, or labelled feedback or plan, always plan first; no-plan skips it on your own tickets.</Text>
 
             <Divider t={t} spaced />
             <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 }}>

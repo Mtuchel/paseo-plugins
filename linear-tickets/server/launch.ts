@@ -8,12 +8,14 @@ import type { LinearService } from "./linear";
 import { findProject, readBranches } from "./projects";
 import { TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
 
-type Start = RpcInput<typeof launchAgentRpc>;
+// planFirst is resolved into mode, instructions, labels and env before a launch (planSetup).
+type Start = Omit<RpcInput<typeof launchAgentRpc>, "planFirst">;
 type Result = { agentId: string; warnings: string[] };
 // `resume` continues another agent's work: same branch (and worktree while it still exists),
-// with the handover text ahead of the ticket prompt. `labels` are added to the agent.
+// with the handover text ahead of the ticket prompt. `labels` are added to the agent, `env` to
+// its provider process.
 export type ResumeTarget = { branch: string; worktreePath: string | null; handover: string };
-type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess?: boolean; labels?: Record<string, string>; resume?: ResumeTarget };
+type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess?: boolean; labels?: Record<string, string>; env?: Record<string, string>; resume?: ResumeTarget };
 
 // Linear computes the branch name with the workspace's branch-format setting, so it is
 // the name users expect — but a stored value is not guaranteed to be a safe git ref.
@@ -159,6 +161,7 @@ export class Launcher {
       requestId: input.requestId,
       clientMessageId: input.requestId,
       labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
+      ...(options.env && Object.keys(options.env).length ? { env: options.env } : {}),
     }).catch((error: unknown) => {
       // Keep the daemon's reason (e.g. a provider failing to start with the ticket MCP server).
       const cause = error instanceof Error && error.message ? ` (${error.message.slice(0, 300)})` : "";

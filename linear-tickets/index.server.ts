@@ -25,7 +25,9 @@ import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
 import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, SessionRouter, SessionStore, stopAgentTurn } from "./server/sessions";
 import { approveForLater, splitIntoSubIssues } from "./server/split";
-import { TicketStarter } from "./server/starter";
+import { planSetup, TicketStarter } from "./server/starter";
+import { isPlanPolicy, PLAN_POLICY_ENV, PLAN_POLICY_LABEL } from "./server/plan-policy";
+import { PlanRequests } from "./server/plan-requests";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -68,6 +70,7 @@ export default function contribute(server: PluginServerContext) {
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks);
   const manualTasks = new ManualTasks({ linear, settings, comments: agentApi });
   const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, comments: agentApi });
+  const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => sessions.receive(event));
   let funnel: FunnelStatus | null = null;
   const health = new HealthMonitor(linear, settings, [
@@ -116,7 +119,7 @@ export default function contribute(server: PluginServerContext) {
     const link = await sessions.sessionFor(change.agentId);
     if (link) await sessions.say(link.sessionId, "thought", `Model restored to ${change.to} (it had switched to ${change.from}).`);
   });
-  const attach = (paseo: PaseoApi) => { attached = true; if (!stopped) void reviewLinks.start(); dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); void startAgent(); };
+  const attach = (paseo: PaseoApi) => { attached = true; if (!stopped) void reviewLinks.start(); dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); void startAgent(); };
   const cacheIdentity = async () => {
     const connection = await credentials.read();
     return connection.key ? cacheScope(connection.key) : null;
@@ -134,7 +137,12 @@ export default function contribute(server: PluginServerContext) {
   server.before("agent.session_open", async ({ request }, { paseo }) => {
     attach(paseo);
     const browser = await plannotatorHook();
-    return browser ? { ...request, env: { ...request.env, PLANNOTATOR_BROWSER: browser } } : undefined;
+    // A new ticket agent gets its plan policy with its create request; a resumed one from its label,
+    // so the omp extension keeps the same rules (skip_plan) after a daemon restart.
+    const policy = request.env[PLAN_POLICY_ENV] ? null : await paseo.agents.ref(request.agentId).refresh()
+      .then((found) => found?.agent.labels?.[PLAN_POLICY_LABEL], () => undefined);
+    const env = { ...(browser ? { PLANNOTATOR_BROWSER: browser } : {}), ...(isPlanPolicy(policy) ? { [PLAN_POLICY_ENV]: policy } : {}) };
+    return Object.keys(env).length ? { ...request, env: { ...request.env, ...env } } : undefined;
   });
   server.handle(statusRpc, (_input, { paseo }) => { attach(paseo); return linear.status(); });
   server.handle(dispatchStatusRpc, (_input, { paseo }) => { attach(paseo); return dispatcher.snapshot(); });
@@ -174,7 +182,10 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(launchAgentRpc, async (input, { paseo }) => {
     const { template, agentLinearAccess } = await settings.read();
-    const result = await launcher.start(input, paseo, { promptTemplate: template ?? undefined, markInProgress: input.markInProgress, linearAccess: agentLinearAccess });
+    const setup = await planSetup(linear, input.id, input.provider, input.modeId, input.planFirst);
+    const launch = { ...input, modeId: setup.modeId, instructions: [...setup.notes, input.instructions.trim()].filter(Boolean).join("\n\n") };
+    const markInProgress = input.markInProgress && setup.policy !== "required";
+    const result = await launcher.start(launch, paseo, { promptTemplate: template ?? undefined, markInProgress, linearAccess: agentLinearAccess, labels: setup.labels, env: setup.env });
     await openSession(input.id, input.id, result.agentId);
     return result;
   });
@@ -196,5 +207,5 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); manualTasks.stop(); modelGuard.stop(); void closeModelSetter(); };
+  return () => { stopped = true; clearTimeout(startSoon); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); void closeModelSetter(); };
 }

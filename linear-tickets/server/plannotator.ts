@@ -9,6 +9,7 @@ import { paseoHome } from "./ticket-mcp";
 import type { Handover } from "./handover";
 import { activeModel } from "./model";
 import { APPROVE_LATER, APPROVE_PLAN, MAX_SPLIT, planSteps, SEND_BACK, setAgentMode, SPLIT_PLAN, type SessionRouter } from "./sessions";
+import { PLAN_POLICY_LABEL, PLAN_READY_LABEL } from "./plan-policy";
 import type { ReviewLinks } from "./review-links";
 
 // The plan text of a running review, from the same endpoint its page loads.
@@ -28,14 +29,14 @@ const MAX_PLAN_CHARS = 180_000;
 export type PlannotatorRow = { title: string; url?: string; detail?: string };
 export type OpenedEvent = { type: "opened"; agentId: string | null; localUrl: string; remoteUrl: string | null; at: string };
 export type DecidedEvent = { type: "decided"; agentId: string | null; approved: boolean; feedback?: string; planUri?: string; planContent?: string; at: string };
-type PlannotatorEvent = OpenedEvent | DecidedEvent;
+// The agent left planning through the omp extension's skip_plan tool, with its reason.
+export type SkippedEvent = { type: "skipped"; agentId: string | null; reason: string; at: string };
+type PlannotatorEvent = OpenedEvent | DecidedEvent | SkippedEvent;
 type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "moveToStateNamed" | "addLabel" | "removeLabel">;
 
 // Workflow states the review moves a ticket through when status write-back is on.
 export const PLANNING_STATE = "Planning";
 export const CODING_STATE = "In Progress";
-// Marks a ticket whose plan is approved (TUC-9's feedback intake reads it as "planned").
-export const PLAN_READY_LABEL = "plan-ready";
 
 export function plannotatorPaths(home = paseoHome()) {
   const directory = join(home, "linear-tickets", "plannotator");
@@ -91,6 +92,9 @@ export function parseEvent(raw: string): PlannotatorEvent | null {
       ...(typeof event.planContent === "string" ? { planContent: event.planContent } : {}),
     };
   }
+  if (event.type === "skipped" && typeof event.reason === "string") {
+    return { type: "skipped", agentId, reason: event.reason.trim().slice(0, 1_000) || "No reason given.", at };
+  }
   return null;
 }
 
@@ -135,7 +139,7 @@ export class PlannotatorBridge {
   // The ticket's Linear agent panel: review link, plan checklist and Approve / Send back.
   // Returns whether the agent has a session: then the progress comment carries the plan state
   // instead of separate plan comments.
-  private async toSession(event: PlannotatorEvent, agentId: string, model: string | null, reviewLink: string | null): Promise<boolean> {
+  private async toSession(event: OpenedEvent | DecidedEvent, agentId: string, model: string | null, reviewLink: string | null): Promise<boolean> {
     const sessions = this.sessions;
     if (!sessions) return false;
     try {
@@ -215,6 +219,7 @@ export class PlannotatorBridge {
   }
 
   private async deliver(event: PlannotatorEvent, agentId: string, paseo: PaseoApi): Promise<void> {
+    if (event.type === "skipped") return this.deliverSkip(event, agentId, paseo);
     if (event.type === "decided") {
       const previous = this.lastDecision.get(agentId);
       const at = Date.parse(event.at) || Date.now();
@@ -241,8 +246,8 @@ export class PlannotatorBridge {
     const inSession = await this.toSession(event, agentId, model, event.type === "opened" && event.remoteUrl ? url ?? null : null);
     if (!issueId) return;
     const settings = await this.settings.read();
-    // A ticket someone else wrote ran plan-first; its approved plan unlocks the usual mode.
-    if (event.type === "decided" && event.approved && labels["linear.untrusted"]) {
+    // A required plan started in the provider's safe mode; its approved plan unlocks the usual mode.
+    if (event.type === "decided" && event.approved && labels[PLAN_POLICY_LABEL] === "required") {
       const preference = settings.lastProvider ? settings.launchPreferences[settings.lastProvider] : undefined;
       if (preference?.modeId) await this.setMode(agentId, preference.modeId).catch((error: unknown) => console.error(`[linear-tickets] ${identifier}: restoring the agent mode failed: ${error instanceof Error ? error.message : error}`));
     }
@@ -270,5 +275,25 @@ export class PlannotatorBridge {
     }
     const feedback = event.feedback ? `\n\n${event.feedback.slice(0, 4_000)}` : "";
     await this.linear.comment(issueId, `${event.approved ? "✅ **Plan approved** in Plannotator" : "↩️ **Plan sent back** from Plannotator"}${documentUrl ? ` — [plan](${documentUrl})` : ""}${feedback}`);
+  }
+
+  // A skipped plan changes nothing on the ticket but is recorded with its reason, so the owner
+  // can check each skip and add the `plan` label when they disagree.
+  private async deliverSkip(event: SkippedEvent, agentId: string, paseo: PaseoApi): Promise<void> {
+    const handle = paseo.agents.ref(agentId);
+    const refreshed = await handle.refresh();
+    const labels = refreshed?.agent.labels ?? {};
+    const issueId = labels["paseo.parent-agent-id"] ? undefined : labels["linear.issueId"];
+    const identifier = labels["linear.identifier"] || "this ticket";
+    await handle.timeline.append({ type: "plugin", id: `plannotator-skipped-${event.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: { title: "Plan skipped by the agent", detail: event.reason } satisfies PlannotatorRow })
+      .catch((error: unknown) => console.error(`[linear-tickets] Plannotator chat row for ${agentId} skipped: ${error instanceof Error ? error.message : error}`));
+    if (!issueId) return;
+    const link = await this.sessions?.sessionFor(agentId);
+    if (link) await this.sessions!.say(link.sessionId, "thought", `No plan: ${event.reason}`);
+    if (link && this.handover && refreshed?.agent) {
+      await this.handover.update({ id: issueId, identifier }, { id: agentId, title: refreshed.agent.title ?? null, cwd: refreshed.agent.cwd }, { plan: `skipped — ${event.reason.slice(0, 300)}`, model: activeModel(refreshed.agent) });
+      return;
+    }
+    await this.linear.comment(issueId, `⏭️ **No plan**: the agent judged this ticket small enough to implement directly. Its reason: ${event.reason}\n\nAdd the \`plan\` label to make it plan first.`);
   }
 }

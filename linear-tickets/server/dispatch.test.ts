@@ -4,7 +4,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { RpcInput } from "@getpaseo/plugin";
 import type { launchAgentRpc, TicketDetail } from "../shared/contracts";
 import { Dispatcher } from "./dispatch";
-import { QUESTIONS_NOTE, TicketStarter } from "./starter";
+import { planDecisionNote, QUESTIONS_NOTE, TicketStarter } from "./starter";
 import type { LabeledIssue } from "./linear";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
@@ -72,7 +72,7 @@ function fakePaseo(activeAgents: { id: string; title: string }[] = []): PaseoApi
 
 function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = baseSettings, paseo = fakePaseo()) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const launches: RpcInput<typeof launchAgentRpc>[] = [];
+  const launches: Omit<RpcInput<typeof launchAgentRpc>, "planFirst">[] = [];
   const starter = new TicketStarter({
     linear,
     launcher: { start: async (input) => { launches.push(input); return { agentId: "agent-1", warnings: [] }; } },
@@ -90,7 +90,7 @@ test("a labeled ticket is claimed before its agent launches, and is not launched
   assert.equal(launches.length, 1);
   assert.deepEqual(launches[0], {
     id: "eng-1", projectId: "p1", baseBranch: "refs/heads/dev", provider: "claude/opus", modeId: "default", thinkingOptionId: undefined,
-    instructions: QUESTIONS_NOTE, markInProgress: false, requestId: launches[0].requestId,
+    instructions: `${planDecisionNote("claude")}\n\n${QUESTIONS_NOTE}`, markInProgress: false, requestId: launches[0].requestId,
   });
   assert.deepEqual(linear.writes.slice(1, 3), ["-paseo eng-1", "+paseo-running eng-1"]);
   assert.deepEqual([...linear.labels.get("eng-1")!].sort(), ["bug", "paseo-running"]);
