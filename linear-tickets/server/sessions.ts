@@ -497,7 +497,8 @@ export class SessionRouter {
   // a stopped agent and starts a turn. Nothing is sent while the agent is in a turn or waiting for
   // an answer (Paseo would interrupt the turn or drop the question): `busy`. `gone`: the agent no
   // longer exists or is archived; `unavailable`: Paseo is not connected, try again later.
-  async prompt(agentId: string, text: string): Promise<"sent" | "busy" | "gone" | "unavailable"> {
+  // `onDispatch` runs once the agent is known to take it, right before the message is sent.
+  async prompt(agentId: string, text: string, onDispatch?: () => Promise<void>): Promise<"sent" | "busy" | "gone" | "unavailable"> {
     if (!this.paseo) return "unavailable";
     const handle = this.paseo.agents.ref(agentId);
     const refreshed = await handle.refresh().catch((error: unknown) => {
@@ -507,6 +508,7 @@ export class SessionRouter {
     if (!refreshed || refreshed.agent.archivedAt) return "gone";
     const { activeTurn, status, pendingPermissions } = refreshed.agent;
     if (activeTurn || status === "running" || status === "initializing" || pendingPermissions?.length) return "busy";
+    await onDispatch?.();
     await handle.send(text);
     return "sent";
   }

@@ -250,8 +250,8 @@ test("an automatic prompt reaches only an idle agent; busy, gone and disconnecte
   ];
   for (const [expected, options, why] of cases) {
     const h = harness(options);
-    assert.equal(await h.router.prompt("agent-1", "fix it"), expected, why);
-    assert.deepEqual(h.calls, expected === "sent" ? ["send agent-1: fix it"] : [], why);
+    assert.equal(await h.router.prompt("agent-1", "fix it", async () => { h.calls.push("dispatch"); }), expected, why);
+    assert.deepEqual(h.calls, expected === "sent" ? ["dispatch", "send agent-1: fix it"] : [], why);
     await h.cleanup();
   }
 });

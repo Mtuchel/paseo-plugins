@@ -36,19 +36,27 @@ type Outcome = "sent" | "busy" | "gone" | "unavailable";
 function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string } = {}) {
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   const github = { view: { state: "OPEN", labels: [], mergeActivity: null, reviews: [], lastCommitAt: null } as PullRequestView, drafts: [] as QueueDraft[], landed: [] as number[], checks: [] as FailedCheck[], reads: [] as string[], throttled: false };
-  // What the agent does with a prompt; "sent" records it.
-  const paseo: { answer: () => Promise<Outcome> } = { answer: async () => (agent.live ?? true) ? "sent" : "gone" };
+  // `answer`: what Paseo finds before sending (only "sent" dispatches); `send`: the send itself,
+  // after the dispatch was recorded; `session`: the agent's session lookup.
+  const paseo: { answer: () => Promise<Outcome>; send: () => Promise<void>; session: () => Promise<unknown> } = {
+    answer: async () => (agent.live ?? true) ? "sent" : "gone",
+    send: async () => {},
+    session: async () => ({ sessionId: "s" }),
+  };
   const calls: string[] = [];
   const directory = mkdtemp(join(tmpdir(), "paseo-pr-watch-"));
   t.after(async () => rm(await directory, { recursive: true, force: true }));
   const create = () => directory.then((home) => new PullRequestWatch({
     handover: { all: async () => records, update: async (_issue, _agent, patch) => { calls.push(`review ${patch.review}`); return null as never; } },
     sessions: {
-      sessionFor: async () => ({ sessionId: "s" }) as never,
+      sessionFor: () => paseo.session() as never,
       say: async (_id, kind, text) => { calls.push(`say ${kind} ${text.split("\n")[0]}`); },
-      prompt: async (agentId, text) => {
+      prompt: async (agentId, text, onDispatch) => {
         const outcome = await paseo.answer();
-        if (outcome === "sent") calls.push(`prompt ${agentId}\n${text}`);
+        if (outcome !== "sent") return outcome;
+        await onDispatch?.();
+        await paseo.send();
+        calls.push(`prompt ${agentId}\n${text}`);
         return outcome;
       },
     },
@@ -199,16 +207,40 @@ test("a drop is claimed before the prompt goes out: overlapping polls and a rest
   restarted.github.view = { ...restarted.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
   let reached!: () => void;
   const sending = new Promise<void>((resolve) => { reached = resolve; });
-  // The first instance never learns whether its prompt went out.
-  restarted.paseo.answer = () => { reached(); return new Promise<Outcome>(() => {}); };
+  // The first instance dispatches and never learns whether its prompt went out.
+  restarted.paseo.send = () => { reached(); return new Promise<void>(() => {}); };
   void (await restarted.watch()).poll();
   await sending;
-  restarted.paseo.answer = async () => "sent";
+  restarted.paseo.send = async () => {};
   const log = t.mock.method(console, "error", () => {});
   await restarted.restart();
   assert.deepEqual(await restarted.poll(), [], "not sent again after the restart");
   assert.match(String(log.mock.calls[0]?.arguments[0]), /may already have gone out; it is not sent again/);
   assert.deepEqual(await restarted.poll(), []);
+});
+
+test("a restart while the agent was busy keeps the drop pending, and it is delivered once the agent is idle", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  h.paseo.answer = async () => "busy";
+  assert.deepEqual(await h.poll(), []);
+  await h.restart();
+  h.paseo.answer = async () => "sent";
+  assert.match((await h.poll())[0], /^prompt a1\n/);
+  assert.deepEqual(await h.poll(), []);
+});
+
+test("a session line that fails after the prompt went out never sends the prompt again", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  const log = t.mock.method(console, "error", () => {});
+  h.paseo.session = async () => { throw new Error("session store unreadable"); };
+  const calls = await h.poll();
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /^prompt a1\n/);
+  assert.match(String(log.mock.calls[0]?.arguments[0]), /session line failed: session store unreadable/);
+  await h.restart();
+  assert.deepEqual(await h.poll(), []);
 });
 
 test("a prompt that fails is retried on the next poll, then not sent again", async (t) => {
@@ -218,6 +250,9 @@ test("a prompt that fails is retried on the next poll, then not sent again", asy
   h.paseo.answer = async () => { throw new Error("daemon went away"); };
   assert.deepEqual(await h.poll(), []);
   h.paseo.answer = async () => "sent";
+  h.paseo.send = async () => { throw new Error("connection lost while sending"); };
+  assert.deepEqual(await h.poll(), [], "a send that failed outright");
+  h.paseo.send = async () => {};
   assert.match((await h.poll())[0], /^prompt a1\n/);
   assert.deepEqual(await h.poll(), []);
 });

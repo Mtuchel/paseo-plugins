@@ -276,10 +276,11 @@ export class PullRequestWatch {
           }
         }
         const pending = seenByUrl[url].pending;
-        if (pending && await this.deliver(record, url, pending, save)) {
+        // Recorded as delivered as soon as the message went out, before any session line.
+        if (pending) await this.deliver(record, url, pending, save, async () => {
           seenByUrl[url] = { ...seenByUrl[url], pending: null };
           await save();
-        }
+        });
       } catch (error) {
         if (error instanceof RateLimitedError) {
           paused = error;
@@ -363,37 +364,46 @@ export class PullRequestWatch {
   }
 
   // Delivers a claimed drop: the fix request to the agent while it exists, otherwise to the ticket,
-  // which goes back to coding for the next agent; an escalation to the owner. False while it has
-  // to wait: the agent is in a turn or Paseo is not connected. Each message is marked `sending`
-  // (saved) before it goes out, so one whose result was lost is never sent again.
-  private async deliver(record: HandoverRecord, url: string, pending: PendingDrop, save: () => Promise<void>): Promise<boolean> {
+  // which goes back to coding for the next agent; an escalation to the owner. It waits for a later
+  // poll while the agent is in a turn or Paseo is not connected. `sending` is saved right before a
+  // message goes out, so one whose result was lost (a restart) is never sent again; `delivered`
+  // records it right after, before the best-effort session line.
+  private async deliver(record: HandoverRecord, url: string, pending: PendingDrop, save: () => Promise<void>, delivered: () => Promise<void>): Promise<void> {
     if (pending.sending) {
       console.error(`[linear-tickets] ${record.identifier}: the message about the merge queue drop of ${url} may already have gone out; it is not sent again`);
-      return true;
+      await delivered();
+      return;
     }
-    const send = async <T>(step: () => Promise<T>): Promise<T> => {
+    const dispatch = async () => {
       pending.sending = true;
       await save();
-      try { return await step(); } finally { pending.sending = false; }
     };
     const { fix } = pending;
-    if (fix === null) {
-      await send(() => this.mention(record.issueId, `The merge queue dropped this stack three times, so Paseo stops asking the agent to fix it. Please take over.\n\n${pending.facts}`));
-      await this.tell(record, "response", `The merge queue dropped the pull request three times; the owner was asked to take over.\n\n${pending.facts}`);
-      return true;
-    }
-    if (record.status !== "archived") {
-      const outcome = await send(() => this.deps.sessions.prompt(record.agentId, fix));
-      if (outcome === "sent") {
-        await this.tell(record, "thought", `The merge queue dropped the pull request (${pending.reason}). The agent was asked to fix it.`);
-        return true;
+    try {
+      if (fix === null) {
+        await dispatch();
+        await this.mention(record.issueId, `The merge queue dropped this stack three times, so Paseo stops asking the agent to fix it. Please take over.\n\n${pending.facts}`);
+        await delivered();
+        await this.tell(record, "response", `The merge queue dropped the pull request three times; the owner was asked to take over.\n\n${pending.facts}`);
+        return;
       }
-      if (outcome !== "gone") return false;
+      if (record.status !== "archived") {
+        const outcome = await this.deps.sessions.prompt(record.agentId, fix, dispatch);
+        if (outcome === "sent") {
+          await delivered();
+          await this.tell(record, "thought", `The merge queue dropped the pull request (${pending.reason}). The agent was asked to fix it.`);
+        }
+        if (outcome !== "gone") return;
+      }
+      if ((await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(record.issueId, CODING_STATE);
+      await dispatch();
+      await this.mention(record.issueId, `The agent that worked on this ticket is no longer running, so the ticket is back in ${CODING_STATE} for the next one.\n\n${fix}`);
+      await delivered();
+      await this.tell(record, "response", `The merge queue dropped the pull request and the agent is no longer running; the ticket is back in ${CODING_STATE}.\n\n${pending.facts}`);
+    } finally {
+      // A send that failed outright is retried on the next poll (saved with the rest of the state).
+      pending.sending = false;
     }
-    if ((await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(record.issueId, CODING_STATE);
-    await send(() => this.mention(record.issueId, `The agent that worked on this ticket is no longer running, so the ticket is back in ${CODING_STATE} for the next one.\n\n${fix}`));
-    await this.tell(record, "response", `The merge queue dropped the pull request and the agent is no longer running; the ticket is back in ${CODING_STATE}.\n\n${pending.facts}`);
-    return true;
   }
 
   private async mention(issueId: string, body: string): Promise<void> {
@@ -401,10 +411,15 @@ export class PullRequestWatch {
     await appComment(linear, this.deps.comments, issueId, `${await linear.userUrl(await linear.viewerId())} ${body}`);
   }
 
-  // Best effort: the ticket's agent session, when it has one, shows the line too.
+  // Best effort: the ticket's agent session, when it has one, shows the line too. A failure here
+  // never undoes (or repeats) what was already sent.
   private async tell(record: HandoverRecord, type: "thought" | "response", text: string): Promise<void> {
-    const link = await this.deps.sessions.sessionFor(record.agentId);
-    if (link) await this.deps.sessions.say(link.sessionId, type, text).catch(() => {});
+    try {
+      const link = await this.deps.sessions.sessionFor(record.agentId);
+      if (link) await this.deps.sessions.say(link.sessionId, type, text);
+    } catch (error) {
+      console.error(`[linear-tickets] ${record.identifier}: the agent session line failed: ${error instanceof Error ? error.message : error}`);
+    }
   }
 
   // The soft merge gate: an approval moves the ticket to Ready to merge only once its before-merge
