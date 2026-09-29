@@ -493,18 +493,22 @@ export class SessionRouter {
     return this.deps.store.forAgent(agentId);
   }
 
-  // Sends the agent a new message, the same way a reply in its Linear thread does: Paseo loads a
-  // stopped agent and starts a turn. False when the agent is gone or archived.
-  async prompt(agentId: string, text: string): Promise<boolean> {
-    if (!this.paseo) throw new Error("Paseo is not connected yet.");
+  // Sends an idle agent a new message, the same way a reply in its Linear thread does: Paseo loads
+  // a stopped agent and starts a turn. Nothing is sent while the agent is in a turn or waiting for
+  // an answer (Paseo would interrupt the turn or drop the question): `busy`. `gone`: the agent no
+  // longer exists or is archived; `unavailable`: Paseo is not connected, try again later.
+  async prompt(agentId: string, text: string): Promise<"sent" | "busy" | "gone" | "unavailable"> {
+    if (!this.paseo) return "unavailable";
     const handle = this.paseo.agents.ref(agentId);
     const refreshed = await handle.refresh().catch((error: unknown) => {
       if (error instanceof Error && /not found/i.test(error.message)) return null;
       throw error;
     });
-    if (!refreshed || refreshed.agent.archivedAt) return false;
+    if (!refreshed || refreshed.agent.archivedAt) return "gone";
+    const { activeTurn, status, pendingPermissions } = refreshed.agent;
+    if (activeTurn || status === "running" || status === "initializing" || pendingPermissions?.length) return "busy";
     await handle.send(text);
-    return true;
+    return "sent";
   }
 
   async say(sessionId: string, type: "thought" | "response" | "error", body: string, ephemeral = false): Promise<void> {

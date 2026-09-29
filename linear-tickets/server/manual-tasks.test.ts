@@ -122,7 +122,7 @@ test("an approval waits for before-merge tasks, then moves to Ready to merge; ar
   const calls: string[] = [];
   const watch = new PullRequestWatch({
     handover: { all: async () => [record], update: async (_issue, _agent, patch) => { calls.push(`review ${patch.review}`); return null as never; } },
-    sessions: { sessionFor: async () => ({ sessionId: "s" }) as never, say: async (_id, _kind, text) => { calls.push(`say ${text}`); }, prompt: async () => false },
+    sessions: { sessionFor: async () => ({ sessionId: "s" }) as never, say: async (_id, _kind, text) => { calls.push(`say ${text}`); }, prompt: async () => "gone" as const },
     linear: { moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; }, createComment: async () => "c", updateComment: async () => {}, viewerId: async () => "u", userUrl: async () => "u" },
     settings: { read: async () => settings },
     manualTasks: {

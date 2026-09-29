@@ -350,16 +350,21 @@ the pull requests instead of merging them. A closed pull request labelled `exter
 (or whose last Graphite "Merge activity" bullet is "Merged by the Graphite merge queue") counts
 as merged, including its after-merge [manual tasks](#manual-tasks). A queue drop is noticed on
 an open pull request when Graphite's last Merge activity bullet ends the attempt (a conflict,
-"merge when ready" turned off, a failed check), or when the newest `[Graphite MQ] Draft PR`
-listing it was closed without its head reaching the base branch. The ticket's agent gets the
-reason, the checks that did not pass on the draft and the runbook (`gt sync && gt restack` in
-the stack's worktree, fix, `gt submit --stack`, `gt merge`; one plain `gt merge` retry for an
-obviously flaky failure) as a new message; Paseo resumes it if it is idle. When the agent is
-gone or archived, the same text becomes a ticket comment mentioning you, and the ticket moves
-back to In Progress (when status write-back is on). Each drop is handled once (by its draft, or by the bullet when there is no
-draft, kept in `$PASEO_HOME/linear-tickets/pr-watch.json`). After two fix requests for a pull
-request, the third drop only mentions you ("the merge queue dropped this stack three times"),
-and later drops are only logged.
+"merge when ready" turned off, a failed check), or when the draft its latest "CI is running"
+bullet names was closed without its head reaching the base branch and no newer queue draft for
+the pull request is open. Without Merge activity, drafts alone never count. The ticket's agent
+gets the reason, the checks that did not pass on the draft and the runbook (`gt sync && gt
+restack` in the stack's worktree, fix, `gt submit --stack`, `gt merge`; one plain `gt merge`
+retry for an obviously flaky failure) as a new message once it is idle; Paseo resumes it if it
+has stopped. While the agent is in a turn or waiting for an answer, or Paseo is not connected,
+the message waits for a later poll. When the agent is gone or archived, the same text becomes a
+ticket comment mentioning you, and the ticket moves back to In Progress (when status write-back
+is on). Each drop is claimed in `$PASEO_HOME/linear-tickets/pr-watch.json` (by its draft, or by
+the bullet when there is none) before anything is sent, so it is delivered at most once, also
+across restarts. After two fix requests for a pull request, the third drop only mentions you
+("the merge queue dropped this stack three times"), and later drops are only logged. An
+archived agent's open pull request stays watched until that escalation or 14 days without
+activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
 
 **Health.** Every 5 minutes the plugin checks the Linear key, the Paseo app, Tailscale Funnel
 and the local receiver. A problem confirmed twice opens one urgent ticket, "⚠️ Paseo needs

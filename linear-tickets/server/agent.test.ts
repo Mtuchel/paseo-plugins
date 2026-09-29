@@ -63,7 +63,7 @@ test("plan checklists come from checkboxes, or numbered steps under a Steps head
 });
 
 type Call = string;
-function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null } = {}) {
+function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -76,7 +76,7 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
     agents: {
       list: async () => ({ entries: options.activeAgent ? [{ agent: { ...options.activeAgent, labels: {} } }] : [] }),
       ref: (id: string) => ({
-        refresh: async () => ({ agent: { pendingPermissions: options.pending ?? [] } }),
+        refresh: options.snapshot ?? (async () => ({ agent: { pendingPermissions: options.pending ?? [] } })),
         send: async (text: string) => { calls.push(`send ${id}: ${text}`); },
         respondToPermission: async ({ requestId, response }: { requestId: string; response: unknown }) => { calls.push(`respond ${requestId} ${JSON.stringify(response)}`); },
         archive: async () => { calls.push(`archive ${id}`); return { archivedAt: "now" }; },
@@ -94,7 +94,7 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     decideReview: async (url, approve, feedback) => { calls.push(`review ${url} ${approve ? "approve" : `deny:${feedback}`}`); },
   });
-  router.attach(paseo);
+  if (options.attach ?? true) router.attach(paseo);
   router.stop();
   return { router, store, calls, cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
@@ -236,5 +236,22 @@ test("a permission shows in the agent panel only while still pending, and the ti
     const writeback = new Writeback(linear, { read: async () => ({ ...settings, writeback: { ...DEFAULT_WRITEBACK, blocked: true } }) }, { sessions: sessions as never, handover, comments }, 0, join(tmpdir(), `paseo-writeback-outbox-${process.pid}.json`));
     await writeback.permissionRequested({ agent: { id: "a1", workspaceId: "w", parentAgentId: null, provider: "omp", cwd: "/x", title: "T" }, request }, paseo);
     assert.deepEqual(calls, pending.length ? ["ask Approve this action? [approve|deny]", "move Needs input", "+paseo-needs-you", `app comment https://linear.app/ws/profiles/${OWNER} **T** (Paseo) is waiting for permission: Allow tool: bash`] : []);
+  }
+});
+
+test("an automatic prompt reaches only an idle agent; busy, gone and disconnected are told apart", async () => {
+  const cases: [string, Parameters<typeof harness>[0], string][] = [
+    ["sent", { snapshot: async () => ({ agent: { status: "closed", pendingPermissions: [] } }) }, "a stopped agent is loaded and prompted"],
+    ["busy", { snapshot: async () => ({ agent: { status: "running", activeTurn: { id: "t" }, pendingPermissions: [] } }) }, "a running turn is not interrupted"],
+    ["busy", { snapshot: async () => ({ agent: { status: "idle", pendingPermissions: [{ id: "q", kind: "question" }] } }) }, "a pending question is not dropped"],
+    ["gone", { snapshot: async () => ({ agent: { status: "idle", archivedAt: "2026-09-01T00:00:00Z", pendingPermissions: [] } }) }, "archived"],
+    ["gone", { snapshot: async () => { throw new Error("Agent not found: agent-1"); } }, "deleted"],
+    ["unavailable", { attach: false }, "Paseo not connected"],
+  ];
+  for (const [expected, options, why] of cases) {
+    const h = harness(options);
+    assert.equal(await h.router.prompt("agent-1", "fix it"), expected, why);
+    assert.deepEqual(h.calls, expected === "sent" ? ["send agent-1: fix it"] : [], why);
+    await h.cleanup();
   }
 });

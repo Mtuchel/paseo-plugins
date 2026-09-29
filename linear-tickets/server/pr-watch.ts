@@ -26,6 +26,8 @@ const QUEUE_MERGED_LABEL = "externally-merged";
 const QUEUE_DRAFT_TITLE = "[Graphite MQ] Draft PR";
 // Automatic fix prompts per pull request; the next drop goes to the owner instead.
 const DROP_PROMPTS = 2;
+// An archived agent's open pull request stops being watched after this long without activity.
+const ARCHIVED_WATCH_MS = 14 * 24 * 60 * 60 * 1000;
 
 export type PullRequestView = {
   state: string;
@@ -36,9 +38,14 @@ export type PullRequestView = {
   lastCommitAt: string | null;
 };
 // `held`: approved, but kept out of Ready to merge while manual tasks due before merge are open.
-// `closed`: closed without merging. `drops`: merge queue drops already handled, by draft (`#123`)
-// or, for drops before any draft, by the Merge activity bullet.
-type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[] };
+// `closed`: closed without merging. `drops`: merge queue drops already claimed, by draft (`#123`)
+// or, for drops before any draft, by the Merge activity bullet. `pending`: the claimed drop still
+// to be delivered. `activeAt`: the last change or drop seen.
+type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; pending?: PendingDrop | null; activeAt?: string };
+// A claimed drop, saved before anything is sent. `fix` goes to the agent (or, when it is gone, to
+// the ticket); without it, `facts` escalate to the owner. `sending`: a message went out and its
+// result was not recorded (a restart or a failed save), so it is not sent again.
+type PendingDrop = { key: string; reason: string; facts: string; fix: string | null; sending?: boolean };
 type Change = { thought: string; review: string; state?: string };
 
 // A draft pull request the merge queue tests a stack on; `base` is the branch it lands on.
@@ -53,6 +60,15 @@ export type MergeQueueReader = {
 };
 // `repo` is the pull request's `owner/name`; `draft.headSha` is null when the draft is no longer listed.
 type Drop = { key: string; reason: string; repo: string; draft: { number: number; url: string; headSha: string | null } | null };
+
+// gh reports GitHub's throttling (HTTP 429, primary or secondary rate limit); the poll's GitHub
+// reads stop until the next one.
+export class GitHubRateLimitedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GitHubRateLimitedError";
+  }
+}
 type Bullet = { text: string; kind: "queued" | "running" | "merged" | "dropped"; draft: number | null };
 
 function gh(): string {
@@ -61,8 +77,14 @@ function gh(): string {
 }
 
 async function ghJson<T>(args: string[]): Promise<T> {
-  const { stdout } = await exec(gh(), args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
-  return JSON.parse(stdout) as T;
+  try {
+    const { stdout } = await exec(gh(), args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
+    return JSON.parse(stdout) as T;
+  } catch (error) {
+    const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr) : "";
+    if (/HTTP 429|rate limit/i.test(stderr)) throw new GitHubRateLimitedError(`GitHub is throttling gh: ${stderr.trim().split("\n")[0]}`);
+    throw error;
+  }
 }
 
 export async function viewPullRequest(url: string): Promise<PullRequestView> {
@@ -192,21 +214,31 @@ export class PullRequestWatch {
     } finally { await rm(temporary, { force: true }); }
   }
 
+  private running: Promise<void> | null = null;
+  private githubThrottled = false;
+
   // Background priority: requests stop at their pool's reserve. A pause ends the poll (logged once
-  // per pool); unsaved records are retried on the next poll.
+  // per pool); unsaved records are retried on the next poll. One poll at a time: a tick while the
+  // last one still runs joins it.
   poll(): Promise<void> {
-    return withPriority("background", () => this.watch());
+    this.running ??= withPriority("background", () => this.watch()).finally(() => { this.running = null; });
+    return this.running;
   }
 
   private async watch(): Promise<void> {
     const seenByUrl = await this.load();
     const manual = this.deps.manualTasks;
     const records: HandoverRecord[] = [];
-    // Archived agents stay watched while the pull request is open, so a merge queue drop still
-    // reaches the ticket, and while after-merge tasks wait for the merge.
     for (const record of await this.deps.handover.all()) {
       const url = record.links["Pull request"];
-      if (url && (record.status !== "archived" || (!seenByUrl[url]?.merged && !seenByUrl[url]?.closed) || await manual?.awaitingMerge(record.issueId))) records.push(record);
+      if (!url) continue;
+      const seen = seenByUrl[url];
+      // An archived agent's open pull request stays watched, so a merge queue drop still reaches
+      // the ticket: until a drop escalated to the owner, or 14 days without activity. After-merge
+      // tasks keep it watched until the merge.
+      const quiet = Date.now() - Math.max(Date.parse(record.updatedAt) || 0, Date.parse(seen?.activeAt ?? "") || 0) > ARCHIVED_WATCH_MS;
+      const watched = !seen?.merged && !seen?.closed && (seen?.drops?.length ?? 0) <= DROP_PROMPTS && !quiet;
+      if (record.status !== "archived" || seen?.pending || watched || await manual?.awaitingMerge(record.issueId)) records.push(record);
     }
     // Graphite's drafts are listed once per repo and poll.
     const drafts = new Map<string, Promise<QueueDraft[]>>();
@@ -214,7 +246,9 @@ export class PullRequestWatch {
       if (!drafts.has(repo)) drafts.set(repo, (this.deps.mergeQueue ?? githubMergeQueue).drafts(repo));
       return drafts.get(repo)!;
     };
+    const save = () => this.save(seenByUrl);
     let paused: RateLimitedError | null = null;
+    let throttled: GitHubRateLimitedError | null = null;
     for (const record of records) {
       const url = record.links["Pull request"];
       try {
@@ -223,17 +257,36 @@ export class PullRequestWatch {
         const { change, seen } = manual ? await this.gate(record, result, manual) : result;
         if (change) await this.apply(record, change);
         if (change?.review === "merged" && manual) await manual.merged(record.issueId);
-        // Each step's state is saved after it, so a failed step is retried on the next poll.
-        seenByUrl[url] = { ...seen, closed: view.state === "CLOSED" && !seen.merged };
-        if (view.state !== "OPEN") continue;
-        const handled = seenByUrl[url].drops ?? [];
-        const drop = await this.queueDrop(url, view, handled, listDrafts);
-        if (!drop) continue;
-        await this.route(record, url, drop, handled.length);
-        seenByUrl[url] = { ...seenByUrl[url], drops: [...handled, drop.key] };
+        // Each step's state is recorded after it, so a failed step is retried on the next poll.
+        const now = new Date().toISOString();
+        seenByUrl[url] = { ...seen, closed: view.state === "CLOSED" && !seen.merged, ...(change ? { activeAt: now } : {}) };
+        if (view.state !== "OPEN") {
+          if (seenByUrl[url].pending) console.error(`[linear-tickets] ${record.identifier}: ${url} is no longer open; the merge queue drop is not reported`);
+          seenByUrl[url] = { ...seenByUrl[url], pending: null };
+          continue;
+        }
+        if (!seenByUrl[url].pending) {
+          const handled = seenByUrl[url].drops ?? [];
+          const drop = await this.queueDrop(url, view, handled, listDrafts);
+          if (drop) {
+            // Claimed and saved before anything is sent: a later failure, a restart or another
+            // poll never sends it twice.
+            seenByUrl[url] = { ...seenByUrl[url], drops: [...handled, drop.key], pending: await this.claim(record, url, drop, handled.length), activeAt: now };
+            await save();
+          }
+        }
+        const pending = seenByUrl[url].pending;
+        if (pending && await this.deliver(record, url, pending, save)) {
+          seenByUrl[url] = { ...seenByUrl[url], pending: null };
+          await save();
+        }
       } catch (error) {
         if (error instanceof RateLimitedError) {
           paused = error;
+          break;
+        }
+        if (error instanceof GitHubRateLimitedError) {
+          throttled = error;
           break;
         }
         console.error(`[linear-tickets] ${record.identifier}: reading ${url} failed: ${error instanceof Error ? error.message : error}`);
@@ -241,55 +294,50 @@ export class PullRequestWatch {
     }
     if (paused && paused.pool !== this.pausedPool) console.error(`[linear-tickets] pull request watch paused: ${paused.message}`);
     this.pausedPool = paused?.pool ?? null;
-    await this.save(seenByUrl);
+    if (throttled && !this.githubThrottled) console.error(`[linear-tickets] pull request watch paused until the next poll: ${throttled.message}`);
+    this.githubThrottled = throttled !== null;
+    await save();
   }
 
-  // A merge queue attempt that ended without landing and is not handled yet. Either Graphite's
-  // last Merge activity bullet ended it (a conflict can drop a pull request before any draft
-  // exists), or, while that bullet still says CI is running, the newest queue draft listing this
-  // pull request was closed without its head reaching the base branch. Keyed by the draft's
-  // number (by the bullet when there is none), so both signs of one drop count once.
+  // The current merge queue attempt, when it ended without landing and is not claimed yet. Its
+  // draft is the one its "CI is running" bullet names: Graphite's last bullet while CI runs, the
+  // one before the outcome after it. Either Graphite's last bullet ended the attempt (a conflict
+  // can drop a pull request before any draft exists), or, while that bullet still says CI is
+  // running, that very draft was closed without its head reaching the base branch and no newer
+  // queue draft for this pull request is open. Without Merge activity nothing counts: an older
+  // closed draft says nothing about the current attempt. Keyed by the draft's number (by the
+  // bullet when there is none), so both signs of one drop count once.
   private async queueDrop(url: string, view: PullRequestView, handled: string[], drafts: (repo: string) => Promise<QueueDraft[]>): Promise<Drop | null> {
     const source = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
     if (!source) return null;
     const [, repo, number] = source;
     const bullets = activityBullets(view.mergeActivity);
     const last = bullets.at(-1);
-    if (last && last.kind !== "running" && last.kind !== "dropped") return null;
-    let draftNumber = last?.kind === "running" ? last.draft : null;
-    if (last?.kind === "dropped") {
-      // The attempt's draft is the one its "CI is running" bullet names, after the previous outcome.
-      for (const bullet of bullets.slice(0, -1).reverse()) {
-        if (bullet.kind === "merged" || bullet.kind === "dropped") break;
-        if (bullet.kind === "running") { draftNumber = bullet.draft; break; }
-      }
-      if (handled.includes(draftNumber === null ? last.text : `#${draftNumber}`)) return null;
-      if (draftNumber === null) return { key: last.text, reason: last.text, repo, draft: null };
-    } else if (draftNumber !== null && handled.includes(`#${draftNumber}`)) return null;
-    const listing = (await drafts(repo))
-      .filter((draft) => draft.title.startsWith(QUEUE_DRAFT_TITLE) && draft.body.includes(`](https://app.graphite.com/github/pr/${repo}/${number})`))
-      .sort((a, b) => b.number - a.number);
-    const draft = last?.kind === "dropped" ? listing.find((item) => item.number === draftNumber) : listing[0];
-    if (last?.kind !== "dropped") {
-      if (!draft || draft.state !== "CLOSED" || (last && last.draft !== draft.number) || handled.includes(`#${draft.number}`)) return null;
-      if (await (this.deps.mergeQueue ?? githubMergeQueue).landed(repo, draft)) return null;
+    if (last?.kind !== "running" && last?.kind !== "dropped") return null;
+    const running = last.kind === "running" ? last : bullets.at(-2);
+    const draftNumber = running?.kind === "running" ? running.draft : null;
+    const key = draftNumber === null ? last.text : `#${draftNumber}`;
+    if (handled.includes(key)) return null;
+    const draftUrl = `https://github.com/${repo}/pull/${draftNumber}`;
+    if (last.kind === "dropped") {
+      if (draftNumber === null) return { key, reason: last.text, repo, draft: null };
+      const draft = (await drafts(repo)).find((item) => item.number === draftNumber);
+      return { key, reason: last.text, repo, draft: { number: draftNumber, url: draftUrl, headSha: draft?.headSha || null } };
     }
-    const drafted = draft?.number ?? draftNumber!;
-    return {
-      key: `#${drafted}`,
-      reason: last?.kind === "dropped" ? last.text : `The merge queue closed its draft pull request #${drafted} without landing it.`,
-      repo,
-      draft: { number: drafted, url: `https://github.com/${repo}/pull/${drafted}`, headSha: draft?.headSha || null },
-    };
+    if (draftNumber === null) return null;
+    const listing = (await drafts(repo)).filter((draft) => draft.title.startsWith(QUEUE_DRAFT_TITLE) && draft.body.includes(`](https://app.graphite.com/github/pr/${repo}/${number})`));
+    const draft = listing.find((item) => item.number === draftNumber);
+    if (!draft || draft.state !== "CLOSED" || listing.some((item) => item.number > draftNumber && item.state === "OPEN")) return null;
+    if (await (this.deps.mergeQueue ?? githubMergeQueue).landed(repo, draft)) return null;
+    return { key, reason: `The merge queue closed its draft pull request #${draftNumber} without landing it.`, repo, draft: { number: draftNumber, url: draftUrl, headSha: draft.headSha || null } };
   }
 
-  // Up to DROP_PROMPTS fix requests per pull request: to its agent while that exists, otherwise on
-  // the ticket, which goes back to coding for the next agent. The drop after them (the third)
-  // goes to the owner, and later ones only to the log.
-  private async route(record: HandoverRecord, url: string, drop: Drop, handled: number): Promise<void> {
+  // What a drop sends: up to DROP_PROMPTS fix requests per pull request, then (the third drop) an
+  // escalation to the owner; later drops only reach the log.
+  private async claim(record: HandoverRecord, url: string, drop: Drop, handled: number): Promise<PendingDrop | null> {
     if (handled > DROP_PROMPTS) {
       console.error(`[linear-tickets] ${record.identifier}: the merge queue dropped ${url} again; already escalated to the owner`);
-      return;
+      return null;
     }
     const checks = drop.draft?.headSha ? await (this.deps.mergeQueue ?? githubMergeQueue).failedChecks(drop.repo, drop.draft.headSha) : [];
     const facts = [
@@ -299,11 +347,7 @@ export class PullRequestWatch {
         ? [`Checks that did not pass on the queue's draft [#${drop.draft.number}](${drop.draft.url}):`, ...checks.map((check) => `- [${check.name}](${check.url}) — ${check.conclusion}`)]
         : [`No check failed on the queue's draft [#${drop.draft.number}](${drop.draft.url}).`]),
     ].join("\n");
-    if (handled === DROP_PROMPTS) {
-      await this.mention(record.issueId, `The merge queue dropped this stack three times, so Paseo stops asking the agent to fix it. Please take over.\n\n${facts}`);
-      await this.tell(record, "response", `The merge queue dropped the pull request three times; the owner was asked to take over.\n\n${facts}`);
-      return;
-    }
+    if (handled === DROP_PROMPTS) return { key: drop.key, reason: drop.reason, facts, fix: null };
     const fix = [
       facts,
       "",
@@ -315,13 +359,41 @@ export class PullRequestWatch {
       "An obviously flaky failure (unrelated to the change) gets one plain `gt merge` retry instead.",
       `This is automatic fix request ${handled + 1} of ${DROP_PROMPTS} for this pull request; after that the owner takes over.`,
     ].join("\n");
-    if (record.status !== "archived" && await this.deps.sessions.prompt(record.agentId, fix)) {
-      await this.tell(record, "thought", `The merge queue dropped the pull request (${drop.reason}). The agent was asked to fix it.`);
-      return;
+    return { key: drop.key, reason: drop.reason, facts, fix };
+  }
+
+  // Delivers a claimed drop: the fix request to the agent while it exists, otherwise to the ticket,
+  // which goes back to coding for the next agent; an escalation to the owner. False while it has
+  // to wait: the agent is in a turn or Paseo is not connected. Each message is marked `sending`
+  // (saved) before it goes out, so one whose result was lost is never sent again.
+  private async deliver(record: HandoverRecord, url: string, pending: PendingDrop, save: () => Promise<void>): Promise<boolean> {
+    if (pending.sending) {
+      console.error(`[linear-tickets] ${record.identifier}: the message about the merge queue drop of ${url} may already have gone out; it is not sent again`);
+      return true;
+    }
+    const send = async <T>(step: () => Promise<T>): Promise<T> => {
+      pending.sending = true;
+      await save();
+      try { return await step(); } finally { pending.sending = false; }
+    };
+    const { fix } = pending;
+    if (fix === null) {
+      await send(() => this.mention(record.issueId, `The merge queue dropped this stack three times, so Paseo stops asking the agent to fix it. Please take over.\n\n${pending.facts}`));
+      await this.tell(record, "response", `The merge queue dropped the pull request three times; the owner was asked to take over.\n\n${pending.facts}`);
+      return true;
+    }
+    if (record.status !== "archived") {
+      const outcome = await send(() => this.deps.sessions.prompt(record.agentId, fix));
+      if (outcome === "sent") {
+        await this.tell(record, "thought", `The merge queue dropped the pull request (${pending.reason}). The agent was asked to fix it.`);
+        return true;
+      }
+      if (outcome !== "gone") return false;
     }
     if ((await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(record.issueId, CODING_STATE);
-    await this.mention(record.issueId, `The agent that worked on this ticket is no longer running, so the ticket is back in ${CODING_STATE} for the next one.\n\n${fix}`);
-    await this.tell(record, "response", `The merge queue dropped the pull request and the agent is no longer running; the ticket is back in ${CODING_STATE}.\n\n${facts}`);
+    await send(() => this.mention(record.issueId, `The agent that worked on this ticket is no longer running, so the ticket is back in ${CODING_STATE} for the next one.\n\n${fix}`));
+    await this.tell(record, "response", `The merge queue dropped the pull request and the agent is no longer running; the ticket is back in ${CODING_STATE}.\n\n${pending.facts}`);
+    return true;
   }
 
   private async mention(issueId: string, body: string): Promise<void> {
