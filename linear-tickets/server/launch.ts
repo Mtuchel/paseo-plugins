@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { attachmentNote, saveAttachments, type Download } from "./attachments";
 import { buildPrompt } from "./context";
 import type { LinearService } from "./linear";
-import { PLAN_CONTEXT_ENV } from "./plan-policy";
+import { PLAN_CONTEXT_ENV, PLAN_TICKET_ENV } from "./plan-policy";
 import { findProject, readBranches } from "./projects";
 import { paseoHome, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
 
@@ -169,7 +169,8 @@ export class Launcher {
       }
     }
     const prompt = [options.resume?.handover, buildPrompt(detail, instructions, options.promptTemplate, options.linearAccess ?? false)].filter(Boolean).join("\n\n");
-    let env = options.env ?? {};
+    // The ticket marks the agent for the plan advisor gate even when its context cannot be saved.
+    let env: Record<string, string> = { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier };
     try {
       env = { ...env, [PLAN_CONTEXT_ENV]: await this.planContext(input.requestId, prompt) };
     } catch (error) {
@@ -182,7 +183,7 @@ export class Launcher {
       requestId: input.requestId,
       clientMessageId: input.requestId,
       labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
-      ...(Object.keys(env).length ? { env } : {}),
+      env,
     }).catch((error: unknown) => {
       // Keep the daemon's reason (e.g. a provider failing to start with the ticket MCP server).
       const cause = error instanceof Error && error.message ? ` (${error.message.slice(0, 300)})` : "";

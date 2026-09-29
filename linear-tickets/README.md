@@ -313,18 +313,23 @@ The planner (the model you launch tickets with; the model guard keeps it there) 
 Astra advisor (`omp/openai-codex/gpt-6-astra`, thinking `medium`) with Paseo's `create_agent`, in
 its own workspace, so the advisor can read the same code. Both work from the same ticket context:
 each launch saves the agent's first prompt to `$PASEO_HOME/linear-tickets/plan-context/<request>.md`
-and passes the path in `LINEAR_TICKETS_CONTEXT`, and the advisor reads that file first. The
+and passes the path in `LINEAR_TICKETS_CONTEXT`, and the advisor reads that file first (when the
+save fails, the launch warns and the planner pastes the ticket into the advisor's prompt). The
 planner adopts or answers each point and sends changes back to the same advisor with
 `send_agent_prompt` until they agree, at most three rounds. The plan then ends with an
 `## Advisor review` section: the advisor's model, the rounds, what changed, and every point still
 disputed with both positions, for you to decide in Plannotator.
 
-omp planners cannot skip this: the extension blocks `plannotator_submit_plan` (and omp's
-`xd://propose`) until `record_plan_advice` has recorded the review for exactly the plan text being
-submitted. The tool checks with `paseo inspect` that the advisor runs GPT-6 Astra at medium and
-was created by this agent; any later edit to the plan needs a new record. An advisor that cannot
-be created (quota, provider error) is recorded as `unavailable` with its reason, which the plan's
-advisor section must state. Other providers get the steps as instructions only.
+omp planners cannot skip this. Every ticket agent carries its ticket in `LINEAR_TICKETS_ISSUE`,
+and for those agents the extension blocks `plannotator_submit_plan`, its `xd://` device and omp's
+`xd://propose` until `record_plan_advice` has recorded the review for exactly the plan text being
+submitted; a plan the gate cannot read is blocked too. The tool checks with `paseo inspect` that
+the advisor runs GPT-6 Astra at medium, was created by this agent and has finished its latest
+turn; any later edit to the plan needs a new record. It cannot check what the advisor said: the
+plan's advisor section is your record of that. An advisor that cannot be created (quota, provider
+error) is recorded as `unavailable` with its reason, and only when the plan's advisor section says
+so. Claude and Codex planners get the steps as instructions when they launch in a planning policy,
+without the gate.
 
 **The omp extension.** The planning phase, `skip_plan` and the plan advisor gate come from
 [`omp/linear-tickets-plan-first.ts`](omp/linear-tickets-plan-first.ts), which omp loads from its

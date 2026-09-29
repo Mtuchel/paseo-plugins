@@ -11,11 +11,12 @@
 //   the `plan` label while the agent works): the agent enters planning at its next tool call, which
 //   is blocked and followed by a message with the reason, or at its next prompt. `skip_plan` is
 //   refused from then on.
-// - LINEAR_TICKETS_CONTEXT=<saved ticket prompt> (set by the plugin for every ticket agent): plan
-//   advisor (README, "Plan advisor"). Submitting a plan (`plannotator_submit_plan`, its xd://
-//   device, or omp's `xd://propose`) is blocked until `record_plan_advice` recorded a GPT-6 Astra
-//   review for exactly that plan text. The block reason carries the steps. `xd://propose` is
-//   only caught when this extension's handler runs before plannotator-omp-plan.ts.
+// - LINEAR_TICKETS_ISSUE=<ticket> (set by the plugin for every ticket agent): plan advisor
+//   (README, "Plan advisor"). Submitting a plan (`plannotator_submit_plan`, its xd:// device, or
+//   omp's `xd://propose`) is blocked until `record_plan_advice` recorded a GPT-6 Astra review for
+//   exactly that plan text. The block reason carries the steps, pointing the advisor at the saved
+//   ticket prompt in LINEAR_TICKETS_CONTEXT when the launch could save it. `xd://propose` is only
+//   caught when this extension's handler runs before plannotator-omp-plan.ts.
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -45,7 +46,9 @@ type ExtensionApi = {
 };
 
 const POLICY = process.env.LINEAR_TICKETS_PLAN;
-const CONTEXT = process.env.LINEAR_TICKETS_CONTEXT;
+// Every ticket agent carries its ticket; the saved ticket prompt is optional (its save can fail).
+const TICKET = process.env.LINEAR_TICKETS_ISSUE;
+const CONTEXT = process.env.LINEAR_TICKETS_CONTEXT || null;
 const AGENT_ID = process.env.PASEO_AGENT_ID;
 const PASEO_CLI = process.env.PASEO_CLI || "paseo";
 const HOME = process.env.PASEO_HOME?.replace(/^~(?=\/|$)/, homedir()) || join(homedir(), ".paseo");
@@ -98,11 +101,14 @@ function readPlan(path: string | null): string | null {
   }
 }
 
-// Why the advisor agent does not count, or null when it is this agent's GPT-6 Astra advisor.
-export function advisorProblem(agent: { Model?: unknown; Thinking?: unknown; ParentAgentId?: unknown }, parentId: string): string | null {
+// Why the advisor agent does not count, or null when it is this agent's GPT-6 Astra advisor and
+// has finished its latest turn. It cannot prove what the advisor said about which plan version:
+// the plan's advisor section, which the owner reads, carries that.
+export function advisorProblem(agent: { Model?: unknown; Thinking?: unknown; ParentAgentId?: unknown; Status?: unknown }, parentId: string): string | null {
   if (agent.Model !== ADVISOR_MODEL) return `it runs ${String(agent.Model ?? "an unknown model")}, not ${ADVISOR_MODEL}`;
   if (agent.Thinking !== ADVISOR_THINKING) return `its thinking level is ${String(agent.Thinking ?? "unset")}, not ${ADVISOR_THINKING}`;
   if (agent.ParentAgentId !== parentId) return "it was not created by this agent";
+  if (agent.Status !== "idle") return `it is ${String(agent.Status ?? "in an unknown state")}, not idle: wait for its answer to your latest message`;
   return null;
 }
 
@@ -116,8 +122,17 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
   // Plannotator did not answer once: without it there is no planning phase to enter, so the
   // request file is not checked again on every tool call (each check would wait for the timeout).
   let unanswered = false;
-  // Plan file (absolute path) → sha256 of the text the advisor's review was recorded for.
+  // Plan (absolute path, or local:// URI) → sha256 of the text the advisor's review was recorded for.
   const advised = new Map<string, string>();
+  // omp's local:// plans as last written: the Plannotator bridge submits them from the same cache
+  // when the artifact is not on disk yet, so the gate reads what the bridge would send.
+  const writtenPlans = new Map<string, string>();
+  // The plan a submission or record names: its key and current text (null: unreadable).
+  function planText(ctx: Context | undefined, file: string): { key: string; content: string | null } {
+    const local = /^local:\/\/[^/]+$/.test(file);
+    const path = planPath(ctx, file);
+    return { key: local ? file : path ?? file, content: readPlan(path) ?? (local ? writtenPlans.get(file) ?? null : null) };
+  }
   // Plannotator's plan-mode control (plannotator:request). null: Plannotator did not answer.
   // Executor form: the plugin's TypeScript lib, which typechecks this file, predates Promise.withResolvers.
   function planMode(mode: "enter" | "exit" | "status"): Promise<Phase | null> {
@@ -160,6 +175,8 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const marks = entries.filter((entry) => entry.type === "custom" && entry.customType === MARKER);
     launched = marks.length > 0 || entries.some((entry) => entry.type === "message" && entry.message?.role === "assistant");
     ownerAsked = marks.some((entry) => entry.data?.reason === "owner");
+    // Rebuilt from the active branch only: another branch's advice must not carry over.
+    advised.clear();
     for (const entry of entries) {
       if (entry.type === "custom" && entry.customType === ADVICE_MARKER && entry.data?.path && entry.data.hash) advised.set(entry.data.path, entry.data.hash);
     }
@@ -180,14 +197,22 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       pi.sendMessage({ customType: MARKER, content: OWNER_ASKED, display: true }, { deliverAs: "aside" });
       return { block: true, reason: "Stopped by the linear-tickets plugin: the owner asked for a plan before further changes (see its message)." };
     }
-    if (!CONTEXT) return undefined;
-    const file = submittedPlan(event.toolName, event.input);
+    if (!TICKET) return undefined;
+    const input = event.input;
+    if (event.toolName === "write" && typeof input?.path === "string" && /^local:\/\/[^/]+-plan\.md$/.test(input.path.trim()) && typeof input.content === "string") {
+      writtenPlans.set(input.path.trim(), input.content);
+      return undefined;
+    }
+    const file = submittedPlan(event.toolName, input);
     if (!file) return undefined;
-    const path = planPath(ctx, file);
-    const content = readPlan(path);
-    // A missing plan file is the submit tool's own error to report.
-    if (!path || content === null) return undefined;
-    const recorded = advised.get(path);
+    const { key, content } = planText(ctx, file);
+    if (content === null) {
+      // Plannotator's submit tool reads the file itself and reports a missing one; every other
+      // submission path could still find a plan this gate cannot read, so it fails closed.
+      if (event.toolName === SUBMIT_TOOL) return undefined;
+      return { block: true, reason: `Stopped by the linear-tickets plugin: ${file} could not be read, so its advisor review cannot be checked. Write the plan with the write tool, then submit it again.` };
+    }
+    const recorded = advised.get(key);
     if (recorded === createHash("sha256").update(content).digest("hex")) return undefined;
     return {
       block: true,
@@ -197,7 +222,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     };
   });
 
-  if (CONTEXT) pi.registerTool({
+  if (TICKET) pi.registerTool({
     name: RECORD_ADVICE_TOOL,
     label: "Record Plan Advice",
     description: `Record that your GPT-6 Astra plan advisor reviewed the plan file in its current form, so it can be submitted to the owner. Verdict: agreed (no open points), disagreements (open points listed in the plan's "## ${ADVISOR_SECTION}" section) or unavailable (the advisor could not be created; give the reason). Call it after the last edit to the plan; any later edit needs a new review and record.`,
@@ -212,15 +237,18 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const file = params.filePath?.trim();
       if (!file) return text("Pass the plan file you are about to submit (the same path you give the submit tool).");
-      const path = planPath(ctx, file);
-      const content = readPlan(path);
-      if (!path || content === null) return text(`${file} could not be read. Pass the plan file you are about to submit.`);
-      if (!new RegExp(`^#{1,6}\\s+${ADVISOR_SECTION}\\b`, "im").test(content)) {
+      const { key, content } = planText(ctx, file);
+      if (content === null) return text(`${file} could not be read. Pass the plan file you are about to submit.`);
+      const section = new RegExp(`^#{1,6}\\s+${ADVISOR_SECTION}\\b[^\\n]*\\n([\\s\\S]*?)(?=^#{1,2}\\s|(?![\\s\\S]))`, "im").exec(content);
+      if (!section) {
         return text(`${file} has no "## ${ADVISOR_SECTION}" section. Add it (the advisor's model, the rounds, what changed because of it, and every open point with both positions), then record again.`);
       }
       const verdict = params.verdict;
       if (verdict === "unavailable") {
         if (!params.reason?.trim()) return text("Give the reason the advisor could not be created.");
+        if (!/unavailable|could not be created|couldn't be created/i.test(section[1])) {
+          return text(`The plan's "## ${ADVISOR_SECTION}" section must tell the owner that the advisor was unavailable and why. Say so there, then record again.`);
+        }
       } else if (verdict === "agreed" || verdict === "disagreements") {
         const advisorId = params.advisorAgentId?.trim();
         if (!advisorId) return text("Pass the advisor's Paseo agent id (from `create_agent`).");
@@ -231,13 +259,13 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
           return text(`Could not look up advisor ${advisorId} with \`paseo inspect\`: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
         }
         const problem = advisorProblem(agent, AGENT_ID);
-        if (problem) return text(`Agent ${advisorId} is not your plan advisor: ${problem}. Create the advisor as the steps describe, then record again.`);
+        if (problem) return text(`Agent ${advisorId} does not count as your plan advisor: ${problem}. Fix that, then record again.`);
       } else {
         return text(`Verdict must be one of: ${VERDICTS.join(", ")}.`);
       }
       const hash = createHash("sha256").update(content).digest("hex");
-      advised.set(path, hash);
-      pi.appendEntry(ADVICE_MARKER, { path, hash, verdict, advisorAgentId: params.advisorAgentId ?? null, reason: params.reason ?? null, at: new Date().toISOString() });
+      advised.set(key, hash);
+      pi.appendEntry(ADVICE_MARKER, { path: key, hash, verdict, advisorAgentId: params.advisorAgentId ?? null, reason: params.reason ?? null, at: new Date().toISOString() });
       return text(`Advisor review recorded for ${file} (${verdict}). Submit the plan now, without editing it again.`, { verdict });
     },
   });

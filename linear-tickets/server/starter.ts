@@ -33,7 +33,7 @@ export const PLAN_REQUIRED_NOTE = "The owner asked for a plan first. Investigate
 // Every plan a ticket agent writes gets a second opinion before the owner sees it (README, "Plan
 // advisor"). omp planners have the extension's record tool and submission gate.
 export function advisorNote(providerKey: string): string {
-  return advisorSteps({ contextPath: null, omp: providerKey === "omp" });
+  return advisorSteps({ omp: providerKey === "omp" });
 }
 const PLAN_RULES = "Plan if any of these apply: a database schema or migration change; authentication, authorization or permissions; more than one app or service; a change to a public or cross-service API; acceptance criteria that are unclear or contradict each other; or more than about three files. Skip the plan only when none apply; when unsure, plan.";
 // omp agents start in Plannotator's planning phase and leave it through the extension's

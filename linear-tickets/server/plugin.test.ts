@@ -679,12 +679,12 @@ test("the plan advisor reads the same ticket prompt the agent starts with", asyn
   assert.equal((await stat(path)).mode & 0o777, 0o600);
 });
 
-test("a ticket context that cannot be saved warns and still launches, without the path", async () => {
+test("a ticket context that cannot be saved warns and still launches a gated ticket agent, without the path", async () => {
   let options: PaseoWorkspaceAgentCreateOptions | undefined;
   const launcher = new Launcher({ ...noMark, detail: async () => detail }, undefined, undefined, undefined, async () => { throw new Error("disk full"); });
   const result = await launcher.start({ ...input, requestId: "8a1f2c3d-0000-4000-8000-000000000002" }, mockPaseo(async (created) => { options = created; return { id: "agent-1" }; }));
   assert.equal(result.agentId, "agent-1");
-  assert.equal(options?.env, undefined);
+  assert.deepEqual(options?.env, { LINEAR_TICKETS_ISSUE: "ENG-42" });
   assert.ok(result.warnings.some((warning) => warning.includes("disk full")));
 });
 
