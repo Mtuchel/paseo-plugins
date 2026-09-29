@@ -131,8 +131,9 @@ test("a queue drop prompts the live agent once with the reason, the failed check
   assert.match(prompt, /^prompt a1\n/);
   assert.match(prompt, /Reason: The merge queue closed its draft pull request #437 without landing it\./);
   assert.match(prompt, /- \[Code validation \/ Core \(core-web\)\]\(https:\/\/github\.com\/tuchel-sohn\/tuchel-platform\/actions\/runs\/1\/job\/2\) — failure/);
-  assert.match(prompt, /worktree \(`\/wt\/tuc-1`\), run `gt sync && gt restack`/);
-  assert.match(prompt, /`gt submit --stack`, then `gt merge`/);
+  assert.match(prompt, /worktree \(`\/wt\/tuc-1`\), on the top branch of the stack, run `git fetch origin main && git rebase --update-refs --onto origin\/main "\$\(git merge-base HEAD origin\/main\)"`/);
+  assert.match(prompt, /`gt submit --stack --ignore-out-of-sync-trunk`, then `gt merge`/);
+  assert.doesNotMatch(prompt, /run `gt sync/);
   assert.match(prompt, /one plain `gt merge` retry/);
   assert.match(said, /^say thought The merge queue dropped the pull request/);
   assert.deepEqual(await h.poll(), [], "not prompted again on the next poll");
@@ -150,7 +151,7 @@ test("a queue drop with no live agent comments on Linear and moves the ticket ba
     assert.equal(calls[0], "move In Progress");
     assert.match(calls[1], new RegExp(`^comment ${OWNER} The agent that worked on this ticket is no longer running, so the ticket is back in In Progress`));
     assert.match(calls[1], /Reason: Sep 29, 7:01 AM UTC: The Graphite merge queue couldn't merge this PR because it had merge conflicts\./);
-    assert.match(calls[1], /`gt sync && gt restack`/);
+    assert.match(calls[1], /`git fetch origin main && git rebase --update-refs --onto origin\/main/);
     assert.match(calls[2], /^say response The merge queue dropped the pull request and the agent is no longer running/);
     assert.equal(calls.length, 3, JSON.stringify(agent));
     assert.deepEqual(await h.poll(), []);

@@ -387,8 +387,10 @@ an open pull request when Graphite's last Merge activity bullet ends the attempt
 "merge when ready" turned off, a failed check), or when the draft its latest "CI is running"
 bullet names was closed without its head reaching the base branch and no newer queue draft for
 the pull request is open. Without Merge activity, drafts alone never count. The ticket's agent
-gets the reason, the checks that did not pass on the draft and the runbook (`gt sync && gt
-restack` in the stack's worktree, fix, `gt submit --stack`, `gt merge`; one plain `gt merge`
+gets the reason, the checks that did not pass on the draft and the runbook (on the stack's top
+branch `git fetch origin main && git rebase --update-refs --onto origin/main "$(git merge-base
+HEAD origin/main)"`, which moves only its own branches, never `gt sync`/`gt restack`; fix,
+`gt submit --stack --ignore-out-of-sync-trunk`, `gt merge`; one plain `gt merge`
 retry for an obviously flaky failure) as a new message once it is idle; Paseo resumes it if it
 has stopped. While the agent is in a turn or waiting for an answer, or Paseo is not connected,
 the message waits for a later poll. When the agent is gone or archived, the same text becomes a
