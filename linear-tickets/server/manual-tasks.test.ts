@@ -116,7 +116,7 @@ test("before-merge tasks block until done and verified; a merge makes after-merg
 test("an approval waits for before-merge tasks, then moves to Ready to merge; archived agents stay watched until the merge", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-pr-watch-"));
   const record = { issueId: "parent", identifier: "TUC-1", agentId: "a1", agentTitle: "T", links: { "Pull request": "https://github.com/o/r/pull/1" }, status: "archived" } as unknown as HandoverRecord;
-  let view: PullRequestView = { state: "OPEN", labels: [], mergeActivity: null, reviews: [{ author: "ada", state: "APPROVED", submittedAt: "2026-01-01T12:00:00Z" }], lastCommitAt: "2026-01-01T11:00:00Z" };
+  let view: PullRequestView = { state: "OPEN", isDraft: false, headSha: "h", updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, reviews: [{ author: "ada", state: "APPROVED", submittedAt: "2026-01-01T12:00:00Z", body: "", commit: null }], lastCommitAt: "2026-01-01T11:00:00Z", checks: [{ name: "ci", url: "", state: "pending", conclusion: "pending" }] };
   let open = ["TUC-9"];
   let awaiting = true;
   const calls: string[] = [];
@@ -131,7 +131,7 @@ test("an approval waits for before-merge tasks, then moves to Ready to merge; ar
       merged: async (issueId) => { calls.push(`merged ${issueId}`); awaiting = false; },
     },
     view: async () => view,
-    mergeQueue: { drafts: async () => [], landed: async () => false, failedChecks: async () => [] },
+    github: { drafts: async () => [], landed: async () => false, failedChecks: async () => [], reviewThreads: async () => [] },
   }, join(home, "pr-watch.json"));
   try {
     await watch.poll();

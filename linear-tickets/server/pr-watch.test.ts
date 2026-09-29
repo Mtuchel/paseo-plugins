@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import type { HandoverRecord } from "./handover";
-import { GitHubRateLimitedError, PullRequestWatch, type FailedCheck, type PullRequestView, type QueueDraft } from "./pr-watch";
+import type { ReviewThread } from "./pr-nudge";
+import { GitHubRateLimitedError, PullRequestWatch, type CheckRun, type FailedCheck, type PullRequestView, type QueueDraft } from "./pr-watch";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
 const settings = { dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true } } as unknown as PluginSettings;
@@ -33,9 +34,15 @@ function draft(number: number, prs: number[], state = "CLOSED"): QueueDraft {
 
 type Outcome = "sent" | "busy" | "gone" | "unavailable";
 
+const HEAD = "a1b2c3d4e5f6";
+const RUNNING_CI: CheckRun = { name: "Code validation / Core (core-web)", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/1/job/1", state: "pending", conclusion: "pending" };
+// An open, ready pull request whose CI still runs: no lifecycle stage applies to it.
+const OPEN_PR: PullRequestView = { state: "OPEN", isDraft: false, headSha: HEAD, updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, reviews: [], lastCommitAt: null, checks: [RUNNING_CI] };
+
 function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string } = {}) {
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
-  const github = { view: { state: "OPEN", labels: [], mergeActivity: null, reviews: [], lastCommitAt: null } as PullRequestView, drafts: [] as QueueDraft[], landed: [] as number[], checks: [] as FailedCheck[], reads: [] as string[], throttled: false };
+  const github = { view: OPEN_PR, drafts: [] as QueueDraft[], landed: [] as number[], checks: [] as FailedCheck[], threads: [] as ReviewThread[], reads: [] as string[], threadReads: 0, throttled: false };
+  const blockers: string[] = [];
   // `answer`: what Paseo finds before sending (only "sent" dispatches); `send`: the send itself,
   // after the dispatch was recorded; `session`: the agent's session lookup.
   const paseo: { answer: () => Promise<Outcome>; send: () => Promise<void>; session: () => Promise<unknown> } = {
@@ -67,29 +74,31 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       viewerId: async () => "me",
       userUrl: async () => OWNER,
     },
-    manualTasks: { openBlockers: async () => [], awaitingMerge: async () => false, merged: async (issueId) => { calls.push(`merged ${issueId}`); } },
+    manualTasks: { openBlockers: async () => blockers.map((identifier) => ({ identifier }) as never), awaitingMerge: async () => false, merged: async (issueId) => { calls.push(`merged ${issueId}`); } },
     settings: { read: async () => settings },
     view: async (url) => {
       github.reads.push(url);
       if (github.throttled) throw new GitHubRateLimitedError("GitHub is throttling gh: HTTP 403: API rate limit exceeded");
       return github.view;
     },
-    mergeQueue: {
+    github: {
       drafts: async () => github.drafts,
       landed: async (_repo, item) => github.landed.includes(item.number),
       failedChecks: async () => github.checks,
+      reviewThreads: async () => { github.threadReads++; return github.threads; },
     },
   }, join(home, "pr-watch.json")));
   let watch = create();
   const poll = async () => {
     calls.length = 0;
     github.reads.length = 0;
+    github.threadReads = 0;
     await (await watch).poll();
     return [...calls];
   };
   // A new plugin instance on the same state file.
   const restart = () => { watch = create(); return watch; };
-  return { github, paseo, records, calls, poll, restart, watch: () => watch };
+  return { github, paseo, records, blockers, calls, poll, restart, watch: () => watch };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -304,4 +313,165 @@ test("GitHub throttling ends the poll, is logged once, and the next poll reads e
   h.github.throttled = false;
   await h.poll();
   assert.equal(h.github.reads.length, 2);
+});
+
+const MINUTE = 60_000;
+const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+const GREEN: CheckRun = { ...RUNNING_CI, state: "passed", conclusion: "success" };
+const failing = (name: string): CheckRun => ({ name, url: `https://github.com/tuchel-sohn/tuchel-platform/actions/runs/2/job/${name.length}`, state: "failed", conclusion: "failure" });
+const READY: PullRequestView = { ...OPEN_PR, checks: [GREEN] };
+const FINDING: ReviewThread = {
+  resolved: false, path: "server/upload.ts", line: 42,
+  comments: [{ author: "greptile-apps", bot: true, body: '<a href="#"><img alt="P2" src="https://greptile-static-assets.s3.amazonaws.com/badges/p2.svg"></a> The retry loop never gives up.', createdAt: ago(MINUTE), url: `${PR}#discussion_r1` }],
+};
+const promptOf = (calls: string[]) => calls.find((call) => call.startsWith("prompt a1\n"))?.slice("prompt a1\n".length);
+
+test("a draft with no commit or activity for 30 minutes is told to run the Sol review and publish", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...OPEN_PR, isDraft: true, updatedAt: ago(10 * MINUTE), lastCommitAt: ago(40 * MINUTE), checks: [failing("PR code")] };
+  assert.deepEqual(await h.poll(), [], "activity 10 minutes ago");
+  h.github.view = { ...h.github.view, updatedAt: ago(31 * MINUTE) };
+  const calls = await h.poll();
+  assert.equal(promptOf(calls), `[The pull request](${PR}) is still a draft, with no new commit or pull request activity for 30 minutes.\nNext step: run the background Sol review if you have not yet, then \`gt submit --stack --publish\`.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+  assert.equal(calls.at(-1), "say thought The pull request is waiting for the agent to publish the draft; it was asked to.");
+  assert.equal(h.github.threadReads, 0, "a draft needs no review threads");
+  assert.deepEqual(await h.poll(), [], "claimed for this head");
+});
+
+test("failed checks on a ready pull request are listed with links, ignoring pending runs and Graphite's mergeability check", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...READY, checks: [GREEN, RUNNING_CI, failing("Graphite / mergeability_check")] };
+  assert.deepEqual(await h.poll(), [], "only the queue's own check failed");
+  h.github.view = { ...READY, checks: [GREEN, RUNNING_CI, failing("Graphite / mergeability_check"), failing("Code validation / Platform gate")] };
+  assert.equal(promptOf(await h.poll()), `Checks failed on the head of [the pull request](${PR}) (\`a1b2c3d\`):\n- [Code validation / Platform gate](https://github.com/tuchel-sohn/tuchel-platform/actions/runs/2/job/31) — failure\nNext step: fix them, then \`gt submit --stack\`.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+  assert.equal(h.github.threadReads, 0);
+});
+
+test("changes requested on the current head are sent with the review and its open threads, next to the ticket update", async (t) => {
+  const h = harness(t);
+  const human: ReviewThread = { resolved: false, path: "db/migrate.sql", line: null, comments: [
+    { author: "Mtuchel", bot: false, body: "Split this   migration.", createdAt: ago(MINUTE), url: `${PR}#discussion_r2` },
+    { author: "paseo-agent", bot: false, body: "Will do.", createdAt: ago(MINUTE), url: `${PR}#discussion_r3` },
+  ] };
+  h.github.threads = [human, { ...FINDING, resolved: true }];
+  h.github.view = { ...READY, reviews: [{ author: "Mtuchel", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T08:00:00Z", body: "Two things before this can land.", commit: "0ld" }] };
+  const older = await h.poll();
+  assert.deepEqual(older.slice(0, 3), ["move In Progress", "review changes requested by @Mtuchel", "say thought @Mtuchel requested changes on the pull request — the agent is addressing them in Paseo."]);
+  assert.equal(promptOf(older), undefined, "the review was on an earlier head");
+  h.github.view = { ...h.github.view, reviews: [{ author: "Mtuchel", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T09:00:00Z", body: "Two things before this can land.", commit: HEAD }] };
+  const calls = await h.poll();
+  assert.equal(promptOf(calls), `@Mtuchel requested changes on [the pull request](${PR}):\n> Two things before this can land.\n\nUnresolved review threads:\n- [db/migrate.sql](${PR}#discussion_r2) @Mtuchel: Split this migration. (1 reply)\n\nNext step: address them, then \`gt submit --stack\`.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+  assert.equal(calls.at(-1), "say thought The pull request is waiting for the agent to address the requested changes; it was asked to.");
+});
+
+test("unresolved bot review findings are sent for the review loop", async (t) => {
+  const h = harness(t);
+  h.github.view = READY;
+  h.github.threads = [FINDING];
+  assert.equal(promptOf(await h.poll()), `Reviewers left unresolved findings on [the pull request](${PR}):\n- [server/upload.ts:42](${PR}#discussion_r1) @greptile-apps: P2 The retry loop never gives up.\n\nNext step: run the AGENTS.md review loop on them.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+});
+
+test("a ready, green, reviewed pull request outside the queue is told to merge; a human's open thread, a missing Greptile review or the queue (running or just landed) hold it, Graphite's pending mergeability check does not", async (t) => {
+  const h = harness(t);
+  const human: ReviewThread = { resolved: false, path: null, line: null, comments: [{ author: "Mtuchel", bot: false, body: "Why?", createdAt: ago(MINUTE), url: `${PR}#discussion_r4` }] };
+  h.github.threads = [human];
+  h.github.view = READY;
+  assert.deepEqual(await h.poll(), [], "a person's thread is open");
+  h.github.threads = [];
+  h.github.view = { ...READY, labels: ["complex-review"], reviews: [{ author: "greptile-apps", state: "COMMENTED", submittedAt: "2026-09-29T08:00:00Z", body: "", commit: "0ld" }] };
+  assert.equal(promptOf(await h.poll()), undefined, "complex-review: Greptile has not reviewed this head");
+  h.github.view = { ...h.github.view, reviews: [{ author: "greptile-apps", state: "COMMENTED", submittedAt: "2026-09-29T09:00:00Z", body: "", commit: HEAD }], mergeActivity: activity(QUEUED) };
+  assert.equal(promptOf(await h.poll()), undefined, "added to the queue");
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(460)) };
+  assert.deepEqual(await h.poll(), [], "the queue's CI runs");
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(460), `Merged by the [Graphite merge queue](https://app.graphite.com/merges) via draft PR: ${graphiteLink(460)}.`) };
+  assert.deepEqual(await h.poll(), [], "landed, about to be closed");
+  h.github.view = { ...h.github.view, mergeActivity: null };
+  h.github.drafts = [draft(461, [418, 419], "OPEN")];
+  assert.deepEqual(await h.poll(), [], "an open queue draft lists it");
+  h.github.drafts = [];
+  h.github.view = { ...h.github.view, reviewDecision: "CHANGES_REQUESTED" };
+  assert.deepEqual(await h.poll(), [], "GitHub still reports changes requested");
+  h.github.view = { ...h.github.view, reviewDecision: "", checks: [...h.github.view.checks, { ...RUNNING_CI, name: "Graphite / mergeability_check" }] };
+  assert.equal(promptOf(await h.poll()), `[The pull request](${PR}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.\nNext step: \`gt merge\`, then \`node tools/ci/wait-queue.mjs <top PR>\` with the top pull request of your stack (419 if this one is the top).\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+});
+
+test("the first matching stage wins: draft, then failed checks, then requested changes, then findings, then merge", async (t) => {
+  const h = harness(t);
+  h.github.threads = [FINDING];
+  const changes = { author: "Mtuchel", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T09:00:00Z", body: "No.", commit: HEAD };
+  h.github.view = { ...READY, isDraft: true, updatedAt: ago(60 * MINUTE), checks: [failing("PR code")], reviews: [changes] };
+  assert.match(promptOf(await h.poll()) ?? "", /still a draft/);
+  h.github.view = { ...h.github.view, isDraft: false };
+  assert.match(promptOf(await h.poll()) ?? "", /^Checks failed/);
+  h.github.view = { ...h.github.view, checks: [GREEN] };
+  assert.match(promptOf(await h.poll()) ?? "", /requested changes/);
+  h.github.view = { ...h.github.view, reviews: [] };
+  assert.match(promptOf(await h.poll()) ?? "", /unresolved findings/);
+  h.github.threads = [];
+  assert.match(promptOf(await h.poll()) ?? "", /is ready: its checks are green/);
+});
+
+test("do-not-merge and open manual tasks keep every nudge and escalation away", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...READY, labels: ["do-not-merge"] };
+  for (let head = 0; head < 4; head++) {
+    h.github.view = { ...h.github.view, headSha: `veto${head}` };
+    assert.deepEqual(await h.poll(), [], "vetoed");
+  }
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.blockers.push("TUC-9");
+  assert.deepEqual(await h.poll(), [], "a manual task is due before the merge");
+  h.blockers.length = 0;
+  assert.match(promptOf(await h.poll()) ?? "", /nudge 1 of 2/, "the veto and the task claimed nothing");
+});
+
+test("a busy agent or a failed send is nudged on a later poll; a gone agent's nudge goes to the ticket", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.paseo.answer = async () => "busy";
+  assert.deepEqual(await h.poll(), [], "in a turn");
+  h.paseo.answer = async () => "unavailable";
+  assert.deepEqual(await h.poll(), [], "Paseo not connected");
+  h.paseo.answer = async () => "sent";
+  h.paseo.send = async () => { throw new Error("connection lost while sending"); };
+  t.mock.method(console, "error", () => {});
+  assert.deepEqual(await h.poll(), [], "the send failed");
+  h.paseo.send = async () => {};
+  assert.match(promptOf(await h.poll()) ?? "", /nudge 1 of 2/, "still the first nudge");
+
+  const gone = harness(t, { live: false });
+  gone.github.view = { ...READY, checks: [failing("PR code")] };
+  const calls = await gone.poll();
+  assert.equal(calls[0], "move In Progress");
+  assert.match(calls[1], new RegExp(`^comment ${OWNER} The agent that worked on this ticket is no longer running, so the ticket is back in In Progress for the next one\\.\n\nChecks failed on the head`));
+  assert.match(calls[1], /This is nudge 1 of 2 for this step/);
+  assert.equal(calls[2], "say response The pull request is waiting for the agent to fix the failing checks, and the agent is no longer running; the ticket is back in In Progress.");
+  assert.equal(calls.length, 3);
+  assert.deepEqual(await gone.poll(), []);
+});
+
+test("two nudges per stage across heads, then one owner escalation, then only the log; other stages keep their own budget", async (t) => {
+  const h = harness(t, { live: false });
+  const log = t.mock.method(console, "error", () => {});
+  const red = (head: string) => ({ ...READY, headSha: head, checks: [failing("PR code")] });
+  h.github.view = red("h1");
+  assert.match((await h.poll())[1], /nudge 1 of 2/, "a gone agent's hand-back counts as a nudge");
+  assert.deepEqual(await h.poll(), [], "same head");
+  h.paseo.answer = async () => "sent";
+  h.github.view = red("h2");
+  assert.match(promptOf(await h.poll()) ?? "", /nudge 2 of 2/, "a new head re-nudges within the budget");
+  h.github.view = red("h3");
+  const third = await h.poll();
+  assert.equal(promptOf(third), undefined);
+  assert.match(third[0], new RegExp(`^comment ${OWNER} Paseo asked the agent 2 times to fix the failing checks on \\[the pull request\\]\\(${PR.replace(/[/.]/g, "\\$&")}\\), and it is stuck there again, so Paseo stops asking\\. Please take over\\.\n\nChecks failed`));
+  assert.equal(third[1], "say response The pull request is stuck again waiting for the agent to fix the failing checks; the owner was asked to take over.");
+  h.github.view = red("h4");
+  assert.deepEqual(await h.poll(), []);
+  assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /waiting for the agent to fix the failing checks again; already escalated to the owner/);
+  const logged = log.mock.callCount();
+  assert.deepEqual(await h.poll(), []);
+  assert.equal(log.mock.callCount(), logged, "logged once per head");
+  h.github.view = { ...READY, headSha: "h4" };
+  assert.match(promptOf(await h.poll()) ?? "", /is ready[^]*nudge 1 of 2/, "the merge stage starts its own budget");
 });

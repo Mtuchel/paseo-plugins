@@ -342,8 +342,8 @@ ticket is done, which for code usually means its pull request was merged.
 pushed after them move it to In Review again. An approval moves it to the team's started state
 **Ready to merge** (teams without one stay in In Review), once no [manual task](#manual-tasks)
 due before merge is open; commits pushed after the approval move
-it back to In Review. The merge is noted, and Done comes from Linear's GitHub integration. The
-review loop itself stays in Paseo; this only shows it on the ticket.
+it back to In Review. The merge is noted, and Done comes from Linear's GitHub integration.
+Requested changes on the current head also reach the agent itself; see the nudges below.
 
 **Graphite merge queue.** The queue lands a stack by fast-forwarding the base branch and closes
 the pull requests instead of merging them. A closed pull request labelled `externally-merged`
@@ -365,6 +365,28 @@ across restarts. After two fix requests for a pull request, the third drop only 
 ("the merge queue dropped this stack three times"), and later drops are only logged. An
 archived agent's open pull request stays watched until that escalation or 14 days without
 activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
+
+**Stalled pull requests.** Agents often stop before their pull request reaches the merge queue.
+On each poll, an open pull request whose agent is idle gets the next step of its lifecycle as a
+new message, the first that applies:
+
+| Stage | When | Next step sent |
+|---|---|---|
+| Draft | a draft with no new commit and no pull request activity for 30 minutes | run the background Sol review if not done, then `gt submit --stack --publish` |
+| Failed checks | a ready pull request whose latest run of a check failed (pending runs and `Graphite / mergeability_check` do not count) | the failed checks with links; fix, then `gt submit --stack` |
+| Changes requested | the latest approving or change-requesting review asks for changes on the current head | the review and the unresolved review threads; address them, then `gt submit --stack` |
+| Findings | unresolved review threads a bot started (Greptile, any bot reviewer) | the findings; run the AGENTS.md review loop |
+| Merge | checks green (except Graphite's mergeability check), no unresolved thread, GitHub's review decision not "changes requested", Greptile has reviewed the current head when the pull request has `complex-review` | `gt merge`, then `node tools/ci/wait-queue.mjs <top PR>` |
+
+Nothing is sent for a pull request labelled `do-not-merge`, while [manual tasks](#manual-tasks)
+due before the merge are open, while the merge queue has it (its last Merge activity bullet
+queues it, runs its CI or merged it, or an open queue draft lists it), or while a merge queue
+drop is being handled. Each stage is claimed per head right before it goes out: a new head can be
+nudged again, at most twice per stage and pull request. The next time that stage stalls, you get
+one comment instead ("Paseo asked the agent 2 times to …"), and after that only the log. A busy
+or disconnected agent is asked on a later poll; a gone or archived agent's nudge goes to the
+ticket like a drop's fix request (it counts toward the same two). Review threads are read (one
+GraphQL request) only when a stage needs them.
 
 **Health.** Every 5 minutes the plugin checks the Linear key, the Paseo app, Tailscale Funnel
 and the local receiver. A problem confirmed twice opens one urgent ticket, "⚠️ Paseo needs

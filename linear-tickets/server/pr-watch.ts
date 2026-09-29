@@ -9,6 +9,7 @@ import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
 import { CODING_STATE } from "./plannotator";
+import { STAGE_STEP, stalledStage, type ReviewThread, type Stage } from "./pr-nudge";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
 import type { Settings } from "./settings";
@@ -26,22 +27,39 @@ const QUEUE_MERGED_LABEL = "externally-merged";
 const QUEUE_DRAFT_TITLE = "[Graphite MQ] Draft PR";
 // Automatic fix prompts per pull request; the next drop goes to the owner instead.
 const DROP_PROMPTS = 2;
+// Nudges per pull request and lifecycle stage; the next time that stage stalls goes to the owner.
+const STAGE_NUDGES = 2;
+// The owner's veto: such a pull request is never nudged.
+const DO_NOT_MERGE_LABEL = "do-not-merge";
+// Check conclusions that do not fail a pull request.
+const PASSING_CONCLUSIONS = ["success", "skipped", "neutral"];
 // An archived agent's open pull request stops being watched after this long without activity.
 const ARCHIVED_WATCH_MS = 14 * 24 * 60 * 60 * 1000;
 
+// A check on the pull request's head: the latest run of each check, pending until it completes.
+export type CheckRun = { name: string; url: string; state: "pending" | "passed" | "failed"; conclusion: string };
 export type PullRequestView = {
   state: string;
+  isDraft: boolean;
+  headSha: string;
+  // The last change of any kind: a commit, comment, review, label.
+  updatedAt: string;
+  // GitHub's aggregate review decision ("" without required reviews).
+  reviewDecision: string;
   labels: string[];
   // The body of Graphite's "Merge activity" comment, one bullet per merge queue event.
   mergeActivity: string | null;
-  reviews: { author: string; state: string; submittedAt: string }[];
+  // `commit`: the head the review was submitted on.
+  reviews: { author: string; state: string; submittedAt: string; body: string; commit: string | null }[];
   lastCommitAt: string | null;
+  checks: CheckRun[];
 };
 // `held`: approved, but kept out of Ready to merge while manual tasks due before merge are open.
 // `closed`: closed without merging. `drops`: merge queue drops already claimed, by draft (`#123`)
 // or, for drops before any draft, by the Merge activity bullet. `pending`: the claimed drop still
-// to be delivered. `activeAt`: the last change or drop seen.
-type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; pending?: PendingDrop | null; activeAt?: string };
+// to be delivered. `nudges`: per stage, the heads a nudge (or the escalation after them) was
+// claimed for. `activeAt`: the last change, drop or nudge seen.
+type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; pending?: PendingDrop | null; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string };
 // A claimed drop, saved before anything is sent. `fix` goes to the agent (or, when it is gone, to
 // the ticket); without it, `facts` escalate to the owner. `sending`: a message went out and its
 // result was not recorded (a restart or a failed save), so it is not sent again.
@@ -51,12 +69,14 @@ type Change = { thought: string; review: string; state?: string };
 // A draft pull request the merge queue tests a stack on; `base` is the branch it lands on.
 export type QueueDraft = { number: number; title: string; body: string; state: string; headSha: string; base: string };
 export type FailedCheck = { name: string; url: string; conclusion: string };
-export type MergeQueueReader = {
-  // Graphite's recent draft pull requests in the repo (`owner/name`).
+// The GitHub reads beyond the pull request itself; `repo` is `owner/name`.
+export type GitHubReader = {
+  // Graphite's recent draft pull requests in the repo.
   drafts(repo: string): Promise<QueueDraft[]>;
   // Whether the draft's head reached its base branch.
   landed(repo: string, draft: QueueDraft): Promise<boolean>;
   failedChecks(repo: string, sha: string): Promise<FailedCheck[]>;
+  reviewThreads(repo: string, number: number): Promise<ReviewThread[]>;
 };
 // `repo` is the pull request's `owner/name`; `draft.headSha` is null when the draft is no longer listed.
 type Drop = { key: string; reason: string; repo: string; draft: { number: number; url: string; headSha: string | null } | null };
@@ -87,25 +107,63 @@ async function ghJson<T>(args: string[]): Promise<T> {
   }
 }
 
+type RollupItem = {
+  __typename?: string;
+  name?: string; status?: string; conclusion?: string | null; detailsUrl?: string; workflowName?: string;
+  context?: string; state?: string; targetUrl?: string;
+  startedAt?: string;
+};
+
+// One read per pull request and poll: everything the review mirror, the drop detection and the
+// nudges need except review threads.
 export async function viewPullRequest(url: string): Promise<PullRequestView> {
   const data = await ghJson<{
     state?: string;
+    isDraft?: boolean;
+    headRefOid?: string;
+    updatedAt?: string;
+    reviewDecision?: string | null;
     labels?: { name?: string }[];
     comments?: { author?: { login?: string }; body?: string }[];
-    reviews?: { author?: { login?: string }; state?: string; submittedAt?: string }[];
+    reviews?: { author?: { login?: string }; state?: string; submittedAt?: string; body?: string; commit?: { oid?: string } | null }[];
     commits?: { committedDate?: string }[];
-  }>(["pr", "view", url, "--json", "state,labels,comments,reviews,commits"]);
+    statusCheckRollup?: RollupItem[];
+  }>(["pr", "view", url, "--json", "state,isDraft,headRefOid,updatedAt,reviewDecision,labels,comments,reviews,commits,statusCheckRollup"]);
   const activity = (data.comments ?? []).filter((comment) => /^graphite-app(\[bot\])?$/.test(comment.author?.login ?? "") && comment.body?.startsWith("### Merge activity")).at(-1);
+  // A check re-run (or run again for another event) appears once per run; the latest one counts.
+  const latest = new Map<string, { at: string; check: CheckRun }>();
+  for (const item of data.statusCheckRollup ?? []) {
+    const status = item.__typename === "StatusContext";
+    const name = (status ? item.context : item.name) ?? "check";
+    const result = ((status ? item.state : item.conclusion) ?? "").toLowerCase();
+    const done = status ? !["pending", "expected", ""].includes(result) : item.status === "COMPLETED";
+    const key = `${item.workflowName ?? ""}\n${name}`;
+    const at = item.startedAt ?? "";
+    if ((latest.get(key)?.at ?? "") > at) continue;
+    latest.set(key, { at, check: { name, url: (status ? item.targetUrl : item.detailsUrl) ?? "", state: !done ? "pending" : PASSING_CONCLUSIONS.includes(result) ? "passed" : "failed", conclusion: done ? result : "pending" } });
+  }
   return {
     state: data.state ?? "",
+    isDraft: data.isDraft ?? false,
+    headSha: data.headRefOid ?? "",
+    updatedAt: data.updatedAt ?? "",
+    reviewDecision: data.reviewDecision ?? "",
     labels: (data.labels ?? []).map((item) => item.name ?? "").filter(Boolean),
     mergeActivity: activity?.body ?? null,
-    reviews: (data.reviews ?? []).map((review) => ({ author: review.author?.login ?? "someone", state: review.state ?? "", submittedAt: review.submittedAt ?? "" })).filter((review) => review.submittedAt),
+    reviews: (data.reviews ?? []).map((review) => ({ author: review.author?.login ?? "someone", state: review.state ?? "", submittedAt: review.submittedAt ?? "", body: review.body ?? "", commit: review.commit?.oid ?? null })).filter((review) => review.submittedAt),
     lastCommitAt: data.commits?.at(-1)?.committedDate ?? null,
+    checks: [...latest.values()].map((entry) => entry.check),
   };
 }
 
-export const githubMergeQueue: MergeQueueReader = {
+const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(first: 100) { nodes {
+    isResolved path line
+    comments(first: 20) { nodes { author { login __typename } body createdAt url } }
+  } } } }
+}`;
+
+export const githubReader: GitHubReader = {
   async drafts(repo) {
     const drafts = await ghJson<{ number: number; title?: string; body?: string; state?: string; headRefOid?: string; baseRefName?: string }[]>(
       ["pr", "list", "-R", repo, "--state", "all", "--author", "app/graphite-app", "--limit", "30", "--json", "number,title,body,state,headRefOid,baseRefName"]);
@@ -119,8 +177,27 @@ export const githubMergeQueue: MergeQueueReader = {
   async failedChecks(repo, sha) {
     const { check_runs: runs = [] } = await ghJson<{ check_runs?: { name?: string; html_url?: string; status?: string; conclusion?: string | null }[] }>(
       ["api", `repos/${repo}/commits/${sha}/check-runs?per_page=100`, "--jq", "{check_runs: [.check_runs[] | {name, html_url, status, conclusion}]}"]);
-    return runs.filter((run) => !["success", "skipped", "neutral"].includes(run.conclusion ?? ""))
+    return runs.filter((run) => !PASSING_CONCLUSIONS.includes(run.conclusion ?? ""))
       .map((run) => ({ name: run.name ?? "check", url: run.html_url ?? "", conclusion: run.conclusion ?? run.status ?? "unknown" }));
+  },
+  async reviewThreads(repo, number) {
+    const [owner, name] = repo.split("/");
+    const data = await ghJson<{ data?: { repository?: { pullRequest?: { reviewThreads?: { nodes?: {
+      isResolved?: boolean; path?: string | null; line?: number | null;
+      comments?: { nodes?: { author?: { login?: string; __typename?: string } | null; body?: string; createdAt?: string; url?: string }[] };
+    }[] } } } } }>(["api", "graphql", "-f", `query=${THREADS_QUERY}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-F", `number=${number}`]);
+    return (data.data?.repository?.pullRequest?.reviewThreads?.nodes ?? []).map((thread) => ({
+      resolved: thread.isResolved ?? false,
+      path: thread.path ?? null,
+      line: thread.line ?? null,
+      comments: (thread.comments?.nodes ?? []).map((comment) => ({
+        author: comment.author?.login ?? "someone",
+        bot: comment.author?.__typename === "Bot" || /\[bot\]$/.test(comment.author?.login ?? ""),
+        body: comment.body ?? "",
+        createdAt: comment.createdAt ?? "",
+        url: comment.url ?? "",
+      })),
+    }));
   },
 };
 
@@ -170,8 +247,8 @@ export function reviewChange(view: PullRequestView, seen: Seen): { change: Chang
   return { change: null, seen };
 }
 
-// Mirrors each ticket's pull request review into Linear every 2 minutes, and sends pull requests the
-// Graphite merge queue dropped back to be fixed.
+// Mirrors each ticket's pull request review into Linear every 2 minutes, sends pull requests the
+// Graphite merge queue dropped back to be fixed, and nudges stalled ones to their next step.
 export class PullRequestWatch {
   private timer: NodeJS.Timeout | null = null;
   private pausedPool: RateLimitedError["pool"] | null = null;
@@ -185,7 +262,7 @@ export class PullRequestWatch {
       manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge">;
       settings: Pick<Settings, "read">;
       view?: (url: string) => Promise<PullRequestView>;
-      mergeQueue?: MergeQueueReader;
+      github?: GitHubReader;
     },
     private readonly path = join(paseoHome(), "linear-tickets", "pr-watch.json"),
   ) {}
@@ -243,7 +320,7 @@ export class PullRequestWatch {
     // Graphite's drafts are listed once per repo and poll.
     const drafts = new Map<string, Promise<QueueDraft[]>>();
     const listDrafts = (repo: string) => {
-      if (!drafts.has(repo)) drafts.set(repo, (this.deps.mergeQueue ?? githubMergeQueue).drafts(repo));
+      if (!drafts.has(repo)) drafts.set(repo, (this.deps.github ?? githubReader).drafts(repo));
       return drafts.get(repo)!;
     };
     const save = () => this.save(seenByUrl);
@@ -265,10 +342,12 @@ export class PullRequestWatch {
           seenByUrl[url] = { ...seenByUrl[url], pending: null };
           continue;
         }
-        if (!seenByUrl[url].pending) {
+        let dropped = Boolean(seenByUrl[url].pending);
+        if (!dropped) {
           const handled = seenByUrl[url].drops ?? [];
           const drop = await this.queueDrop(url, view, handled, listDrafts);
           if (drop) {
+            dropped = true;
             // Claimed and saved before anything is sent: a later failure, a restart or another
             // poll never sends it twice.
             seenByUrl[url] = { ...seenByUrl[url], drops: [...handled, drop.key], pending: await this.claim(record, url, drop, handled.length), activeAt: now };
@@ -281,6 +360,8 @@ export class PullRequestWatch {
           seenByUrl[url] = { ...seenByUrl[url], pending: null };
           await save();
         });
+        // A stalled pull request gets its next step, but never in a poll that handles a drop.
+        if (!dropped) await this.nudge(record, url, view, seenByUrl, save, listDrafts);
       } catch (error) {
         if (error instanceof RateLimitedError) {
           paused = error;
@@ -329,7 +410,7 @@ export class PullRequestWatch {
     const listing = (await drafts(repo)).filter((draft) => draft.title.startsWith(QUEUE_DRAFT_TITLE) && draft.body.includes(`](https://app.graphite.com/github/pr/${repo}/${number})`));
     const draft = listing.find((item) => item.number === draftNumber);
     if (!draft || draft.state !== "CLOSED" || listing.some((item) => item.number > draftNumber && item.state === "OPEN")) return null;
-    if (await (this.deps.mergeQueue ?? githubMergeQueue).landed(repo, draft)) return null;
+    if (await (this.deps.github ?? githubReader).landed(repo, draft)) return null;
     return { key, reason: `The merge queue closed its draft pull request #${draftNumber} without landing it.`, repo, draft: { number: draftNumber, url: draftUrl, headSha: draft.headSha || null } };
   }
 
@@ -340,7 +421,7 @@ export class PullRequestWatch {
       console.error(`[linear-tickets] ${record.identifier}: the merge queue dropped ${url} again; already escalated to the owner`);
       return null;
     }
-    const checks = drop.draft?.headSha ? await (this.deps.mergeQueue ?? githubMergeQueue).failedChecks(drop.repo, drop.draft.headSha) : [];
+    const checks = drop.draft?.headSha ? await (this.deps.github ?? githubReader).failedChecks(drop.repo, drop.draft.headSha) : [];
     const facts = [
       `The Graphite merge queue dropped [the pull request](${url}) without merging it.`,
       `Reason: ${drop.reason}`,
@@ -395,15 +476,75 @@ export class PullRequestWatch {
         }
         if (outcome !== "gone") return;
       }
-      if ((await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(record.issueId, CODING_STATE);
-      await dispatch();
-      await this.mention(record.issueId, `The agent that worked on this ticket is no longer running, so the ticket is back in ${CODING_STATE} for the next one.\n\n${fix}`);
+      await this.handBack(record, fix, dispatch);
       await delivered();
       await this.tell(record, "response", `The merge queue dropped the pull request and the agent is no longer running; the ticket is back in ${CODING_STATE}.\n\n${pending.facts}`);
     } finally {
       // A send that failed outright is retried on the next poll (saved with the rest of the state).
       pending.sending = false;
     }
+  }
+
+  // The next lifecycle step of a stalled open pull request (see pr-nudge.ts), for its idle agent.
+  // Nothing while the owner vetoes merging (`do-not-merge`), manual tasks due before the merge are
+  // open, or the merge queue has (or just landed) the pull request. A stage is claimed per head
+  // right before its message goes out: at most STAGE_NUDGES per stage and pull request, then one
+  // escalation to the owner, then only the log. A busy agent or a disconnected Paseo claims
+  // nothing; the next poll decides again.
+  private async nudge(record: HandoverRecord, url: string, view: PullRequestView, seenByUrl: Record<string, Seen>, save: () => Promise<void>, drafts: (repo: string) => Promise<QueueDraft[]>): Promise<void> {
+    const source = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
+    const last = activityBullets(view.mergeActivity).at(-1);
+    if (!source || view.labels.includes(DO_NOT_MERGE_LABEL) || (last && last.kind !== "dropped")) return;
+    const [, repo, number] = source;
+    const before = seenByUrl[url].nudges ?? {};
+    const heads = (stage: Stage) => before[stage] ?? [];
+    const github = this.deps.github ?? githubReader;
+    const found = await stalledStage(view, url, Date.now(), (stage) => heads(stage).includes(view.headSha), () => github.reviewThreads(repo, Number(number)));
+    if (!found || heads(found.stage).includes(view.headSha)) return;
+    const { stage, text } = found;
+    const listed = `](https://app.graphite.com/github/pr/${repo}/${number})`;
+    if ((await drafts(repo)).some((draft) => draft.state === "OPEN" && draft.title.startsWith(QUEUE_DRAFT_TITLE) && draft.body.includes(listed))) return;
+    if ((await this.deps.manualTasks?.openBlockers(record.issueId))?.length) return;
+    const sent = heads(stage).length;
+    let claimed = false;
+    const claim = async () => {
+      seenByUrl[url] = { ...seenByUrl[url], nudges: { ...before, [stage]: [...heads(stage), view.headSha] }, activeAt: new Date().toISOString() };
+      claimed = true;
+      await save();
+    };
+    try {
+      if (sent > STAGE_NUDGES) {
+        console.error(`[linear-tickets] ${record.identifier}: ${url} is waiting for the agent to ${STAGE_STEP[stage]} again; already escalated to the owner`);
+        await claim();
+        return;
+      }
+      if (sent === STAGE_NUDGES) {
+        await claim();
+        await this.mention(record.issueId, `Paseo asked the agent ${STAGE_NUDGES} times to ${STAGE_STEP[stage]} on [the pull request](${url}), and it is stuck there again, so Paseo stops asking. Please take over.\n\n${text}`);
+        await this.tell(record, "response", `The pull request is stuck again waiting for the agent to ${STAGE_STEP[stage]}; the owner was asked to take over.`);
+        return;
+      }
+      const prompt = `${text}\n\nThis is nudge ${sent + 1} of ${STAGE_NUDGES} for this step; after that the owner takes over.`;
+      if (record.status !== "archived") {
+        const outcome = await this.deps.sessions.prompt(record.agentId, prompt, claim);
+        if (outcome === "sent") await this.tell(record, "thought", `The pull request is waiting for the agent to ${STAGE_STEP[stage]}; it was asked to.`);
+        if (outcome !== "gone") return;
+      }
+      await this.handBack(record, prompt, claim);
+      await this.tell(record, "response", `The pull request is waiting for the agent to ${STAGE_STEP[stage]}, and the agent is no longer running; the ticket is back in ${CODING_STATE}.`);
+    } catch (error) {
+      // A message that failed outright was not sent: the next poll sends it again.
+      if (claimed) seenByUrl[url] = { ...seenByUrl[url], nudges: before };
+      throw error;
+    }
+  }
+
+  // A message for an agent that is gone goes to the ticket: back to coding (when status write-back
+  // is on) and a comment mentioning the owner. `dispatch` records it right before the comment.
+  private async handBack(record: HandoverRecord, text: string, dispatch: () => Promise<void>): Promise<void> {
+    if ((await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(record.issueId, CODING_STATE);
+    await dispatch();
+    await this.mention(record.issueId, `The agent that worked on this ticket is no longer running, so the ticket is back in ${CODING_STATE} for the next one.\n\n${text}`);
   }
 
   private async mention(issueId: string, body: string): Promise<void> {
