@@ -462,7 +462,7 @@ export class PullRequestWatch {
       facts,
       "",
       "To land it:",
-      `1. In your stack's worktree${record.worktreePath ? ` (\`${record.worktreePath}\`)` : ""}, on the top branch of the stack, run \`git fetch origin main && git rebase --update-refs --onto origin/main "$(git merge-base HEAD origin/main)"\`. It moves only your own branches; never \`gt sync\` or \`gt restack\`, which move the shared \`main\` and other agents' branches.`,
+      `1. In your stack's worktree${record.worktreePath ? ` (\`${record.worktreePath}\`)` : ""}, on the top branch of the stack, run \`git fetch origin main && git rebase --update-refs --onto origin/main "$(git merge-base HEAD origin/main)"\`. It moves only your own branches; never \`gt sync\` or \`gt restack\`, which move the shared \`main\` and other agents' branches. If your stack sits on a PR that has already landed, or your PR was auto-closed, follow docs/automation/merge-queue.md instead.`,
       "2. Fix the cause.",
       "3. Run `gt submit --stack --ignore-out-of-sync-trunk`, then `gt merge`.",
       "",

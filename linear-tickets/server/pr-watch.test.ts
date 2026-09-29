@@ -134,6 +134,7 @@ test("a queue drop prompts the live agent once with the reason, the failed check
   assert.match(prompt, /worktree \(`\/wt\/tuc-1`\), on the top branch of the stack, run `git fetch origin main && git rebase --update-refs --onto origin\/main "\$\(git merge-base HEAD origin\/main\)"`/);
   assert.match(prompt, /`gt submit --stack --ignore-out-of-sync-trunk`, then `gt merge`/);
   assert.doesNotMatch(prompt, /run `gt sync/);
+  assert.match(prompt, /If your stack sits on a PR that has already landed, or your PR was auto-closed, follow docs\/automation\/merge-queue\.md instead\.\n2\. Fix the cause\./);
   assert.match(prompt, /one plain `gt merge` retry/);
   assert.match(said, /^say thought The merge queue dropped the pull request/);
   assert.deepEqual(await h.poll(), [], "not prompted again on the next poll");
