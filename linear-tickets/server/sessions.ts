@@ -493,6 +493,20 @@ export class SessionRouter {
     return this.deps.store.forAgent(agentId);
   }
 
+  // Sends the agent a new message, the same way a reply in its Linear thread does: Paseo loads a
+  // stopped agent and starts a turn. False when the agent is gone or archived.
+  async prompt(agentId: string, text: string): Promise<boolean> {
+    if (!this.paseo) throw new Error("Paseo is not connected yet.");
+    const handle = this.paseo.agents.ref(agentId);
+    const refreshed = await handle.refresh().catch((error: unknown) => {
+      if (error instanceof Error && /not found/i.test(error.message)) return null;
+      throw error;
+    });
+    if (!refreshed || refreshed.agent.archivedAt) return false;
+    await handle.send(text);
+    return true;
+  }
+
   async say(sessionId: string, type: "thought" | "response" | "error", body: string, ephemeral = false): Promise<void> {
     await this.deps.api.activity(sessionId, { type, body }, { ephemeral });
   }

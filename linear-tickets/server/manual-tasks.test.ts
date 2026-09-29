@@ -116,14 +116,14 @@ test("before-merge tasks block until done and verified; a merge makes after-merg
 test("an approval waits for before-merge tasks, then moves to Ready to merge; archived agents stay watched until the merge", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-pr-watch-"));
   const record = { issueId: "parent", identifier: "TUC-1", agentId: "a1", agentTitle: "T", links: { "Pull request": "https://github.com/o/r/pull/1" }, status: "archived" } as unknown as HandoverRecord;
-  let view: PullRequestView = { state: "OPEN", reviews: [{ author: "ada", state: "APPROVED", submittedAt: "2026-01-01T12:00:00Z" }], lastCommitAt: "2026-01-01T11:00:00Z" };
+  let view: PullRequestView = { state: "OPEN", labels: [], mergeActivity: null, reviews: [{ author: "ada", state: "APPROVED", submittedAt: "2026-01-01T12:00:00Z" }], lastCommitAt: "2026-01-01T11:00:00Z" };
   let open = ["TUC-9"];
   let awaiting = true;
   const calls: string[] = [];
   const watch = new PullRequestWatch({
     handover: { all: async () => [record], update: async (_issue, _agent, patch) => { calls.push(`review ${patch.review}`); return null as never; } },
-    sessions: { sessionFor: async () => ({ sessionId: "s" }) as never, say: async (_id, _kind, text) => { calls.push(`say ${text}`); } },
-    linear: { moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; } },
+    sessions: { sessionFor: async () => ({ sessionId: "s" }) as never, say: async (_id, _kind, text) => { calls.push(`say ${text}`); }, prompt: async () => false },
+    linear: { moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; }, createComment: async () => "c", updateComment: async () => {}, viewerId: async () => "u", userUrl: async () => "u" },
     settings: { read: async () => settings },
     manualTasks: {
       openBlockers: async () => open.map((identifier) => ({ identifier }) as ManualTask),
@@ -131,6 +131,7 @@ test("an approval waits for before-merge tasks, then moves to Ready to merge; ar
       merged: async (issueId) => { calls.push(`merged ${issueId}`); awaiting = false; },
     },
     view: async () => view,
+    mergeQueue: { drafts: async () => [], landed: async () => false, failedChecks: async () => [] },
   }, join(home, "pr-watch.json"));
   try {
     await watch.poll();

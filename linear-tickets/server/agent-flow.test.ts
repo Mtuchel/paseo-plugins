@@ -255,27 +255,27 @@ test("approve, implement later: plan recorded, planner retired, ticket back in T
 });
 
 test("the review mirror: approval means ready to merge, and commits after it send the ticket back to review", () => {
-  const approved = reviewChange({ state: "OPEN", reviews: [{ author: "ada", state: "APPROVED", submittedAt: "2026-01-01T12:00:00Z" }], lastCommitAt: "2026-01-01T11:00:00Z" }, { reviewedAt: null, decision: null, merged: false });
+  const approved = reviewChange({ state: "OPEN", labels: [], mergeActivity: null, reviews: [{ author: "ada", state: "APPROVED", submittedAt: "2026-01-01T12:00:00Z" }], lastCommitAt: "2026-01-01T11:00:00Z" }, { reviewedAt: null, decision: null, merged: false });
   assert.equal(approved.change?.state, "Ready to merge");
-  assert.equal(reviewChange({ state: "OPEN", reviews: [], lastCommitAt: "2026-01-01T11:00:00Z" }, approved.seen).change, null, "nothing new");
-  const pushed = reviewChange({ state: "OPEN", reviews: [], lastCommitAt: "2026-01-01T13:00:00Z" }, approved.seen);
+  assert.equal(reviewChange({ state: "OPEN", labels: [], mergeActivity: null, reviews: [], lastCommitAt: "2026-01-01T11:00:00Z" }, approved.seen).change, null, "nothing new");
+  const pushed = reviewChange({ state: "OPEN", labels: [], mergeActivity: null, reviews: [], lastCommitAt: "2026-01-01T13:00:00Z" }, approved.seen);
   assert.equal(pushed.change?.state, "In Review");
-  assert.equal(reviewChange({ state: "OPEN", reviews: [], lastCommitAt: "2026-01-01T13:00:00Z" }, pushed.seen).change, null, "reported once");
+  assert.equal(reviewChange({ state: "OPEN", labels: [], mergeActivity: null, reviews: [], lastCommitAt: "2026-01-01T13:00:00Z" }, pushed.seen).change, null, "reported once");
 });
 
 test("pull request reviews become ticket updates: changes requested, fixes pushed, approved, merged", () => {
   const start = { reviewedAt: null, decision: null, merged: false };
-  const requested = reviewChange({ state: "OPEN", reviews: [{ author: "ada", state: "CHANGES_REQUESTED", submittedAt: "2026-01-01T10:00:00Z" }], lastCommitAt: "2026-01-01T09:00:00Z" }, start);
+  const requested = reviewChange({ state: "OPEN", labels: [], mergeActivity: null, reviews: [{ author: "ada", state: "CHANGES_REQUESTED", submittedAt: "2026-01-01T10:00:00Z" }], lastCommitAt: "2026-01-01T09:00:00Z" }, start);
   assert.equal(requested.change?.state, "In Progress");
   assert.equal(requested.change?.review, "changes requested by @ada");
-  assert.equal(reviewChange({ state: "OPEN", reviews: [{ author: "ada", state: "CHANGES_REQUESTED", submittedAt: "2026-01-01T10:00:00Z" }], lastCommitAt: "2026-01-01T09:00:00Z" }, requested.seen).change, null, "nothing new");
-  const pushed = reviewChange({ state: "OPEN", reviews: [{ author: "ada", state: "CHANGES_REQUESTED", submittedAt: "2026-01-01T10:00:00Z" }], lastCommitAt: "2026-01-01T11:00:00Z" }, requested.seen);
+  assert.equal(reviewChange({ state: "OPEN", labels: [], mergeActivity: null, reviews: [{ author: "ada", state: "CHANGES_REQUESTED", submittedAt: "2026-01-01T10:00:00Z" }], lastCommitAt: "2026-01-01T09:00:00Z" }, requested.seen).change, null, "nothing new");
+  const pushed = reviewChange({ state: "OPEN", labels: [], mergeActivity: null, reviews: [{ author: "ada", state: "CHANGES_REQUESTED", submittedAt: "2026-01-01T10:00:00Z" }], lastCommitAt: "2026-01-01T11:00:00Z" }, requested.seen);
   assert.equal(pushed.change?.state, "In Review");
-  const approved = reviewChange({ state: "OPEN", reviews: [{ author: "ada", state: "APPROVED", submittedAt: "2026-01-01T12:00:00Z" }], lastCommitAt: "2026-01-01T11:00:00Z" }, pushed.seen);
+  const approved = reviewChange({ state: "OPEN", labels: [], mergeActivity: null, reviews: [{ author: "ada", state: "APPROVED", submittedAt: "2026-01-01T12:00:00Z" }], lastCommitAt: "2026-01-01T11:00:00Z" }, pushed.seen);
   assert.equal(approved.change?.review, "approved by @ada");
-  const merged = reviewChange({ state: "MERGED", reviews: [], lastCommitAt: null }, approved.seen);
+  const merged = reviewChange({ state: "MERGED", labels: [], mergeActivity: null, reviews: [], lastCommitAt: null }, approved.seen);
   assert.equal(merged.change?.review, "merged");
-  assert.equal(reviewChange({ state: "MERGED", reviews: [], lastCommitAt: null }, merged.seen).change, null);
+  assert.equal(reviewChange({ state: "MERGED", labels: [], mergeActivity: null, reviews: [], lastCommitAt: null }, merged.seen).change, null);
 });
 
 test("splitting creates one sub-issue per step, each blocked by the previous, all assigned to Paseo", async () => {

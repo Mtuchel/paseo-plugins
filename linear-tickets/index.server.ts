@@ -67,7 +67,7 @@ export default function contribute(server: PluginServerContext) {
   const reviewLinks = new ReviewLinks();
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks);
   const manualTasks = new ManualTasks({ linear, settings, comments: agentApi });
-  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks });
+  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, comments: agentApi });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => sessions.receive(event));
   let funnel: FunnelStatus | null = null;
   const health = new HealthMonitor(linear, settings, [
