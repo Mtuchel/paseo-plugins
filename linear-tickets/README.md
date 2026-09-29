@@ -384,7 +384,9 @@ queues it, runs its CI or merged it, or an open queue draft lists it), or while 
 drop is being handled; these are settled before review threads are read. An agent gets at most
 one message per poll: merge queue drops of all its pull requests come first, then nudges, so the
 pull requests of one stack take turns. Each stage is claimed per head right before it goes out:
-a new head can be nudged again, at most twice per stage and pull request. The next time that
+a new head can be nudged again, at most twice per stage and pull request. Requested changes are
+claimed per review instead: a change request is sent once, however many commits follow it (it
+keeps holding the merge until the reviewer settles it), and a new request is sent again. The next time that
 stage stalls, you get one comment instead ("Paseo asked the agent 2 times to …"), and after
 that only the log. A busy or disconnected agent is asked on a later poll; a gone or archived
 agent's nudge goes to the ticket like a drop's fix request (it counts toward the same two).

@@ -57,8 +57,9 @@ export type PullRequestView = {
 // `held`: approved, but kept out of Ready to merge while manual tasks due before merge are open.
 // `closed`: closed without merging. `drops`: merge queue drops already claimed, by draft (`#123`)
 // or, for drops before any draft, by the Merge activity bullet. `pending`: the claimed drop still
-// to be delivered. `nudges`: per stage, the heads a nudge (or the escalation after them) was
-// claimed for. `activeAt`: the last change, drop or nudge seen.
+// to be delivered. `nudges`: per stage, one key per nudge (or the escalation after them): the
+// head, or for requested changes the reviews it covered, space-separated (see stalledStage).
+// `activeAt`: the last change, drop or nudge seen.
 type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; pending?: PendingDrop | null; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string };
 // A claimed drop, saved before anything is sent. `fix` goes to the agent (or, when it is gone, to
 // the ticket); without it, `facts` escalate to the owner. `sending`: a message went out and its
@@ -536,13 +537,13 @@ export class PullRequestWatch {
     const before = seenByUrl[url].nudges ?? {};
     const heads = (stage: Stage) => before[stage] ?? [];
     const github = this.deps.github ?? githubReader;
-    const found = await stalledStage(view, url, Date.now(), (stage) => heads(stage).includes(view.headSha), () => github.reviewThreads(repo, Number(number)));
-    if (!found || heads(found.stage).includes(view.headSha)) return;
+    const found = await stalledStage(view, url, Date.now(), (stage, key) => heads(stage).some((entry) => entry.split(" ").includes(key)), () => github.reviewThreads(repo, Number(number)));
+    if (!found || heads(found.stage).includes(found.key)) return;
     const { stage, text } = found;
     const sent = heads(stage).length;
     let claimed = false;
     const claim = async () => {
-      seenByUrl[url] = { ...seenByUrl[url], nudges: { ...before, [stage]: [...heads(stage), view.headSha] }, activeAt: new Date().toISOString() };
+      seenByUrl[url] = { ...seenByUrl[url], nudges: { ...before, [stage]: [...heads(stage), found.key] }, activeAt: new Date().toISOString() };
       claimed = true;
       await save();
     };

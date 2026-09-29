@@ -349,7 +349,7 @@ test("failed checks on a ready pull request are listed with links, ignoring pend
   assert.equal(h.github.threadReads, 0);
 });
 
-test("each reviewer's outstanding change request is sent with the open threads, also after new commits, next to the ticket update", async (t) => {
+test("each reviewer's outstanding change request is sent once with the open threads, next to the ticket update", async (t) => {
   const h = harness(t);
   const human: ReviewThread = { resolved: false, path: "db/migrate.sql", line: null, comments: [
     { author: "Mtuchel", bot: false, body: "Split this   migration.", createdAt: ago(MINUTE), url: `${PR}#discussion_r2` },
@@ -367,17 +367,34 @@ test("each reviewer's outstanding change request is sent with the open threads, 
   assert.equal(promptOf(calls), `@Mtuchel requested changes on [the pull request](${PR}):\n> Two things before this can land.\n\nUnresolved review threads:\n- [db/migrate.sql](${PR}#discussion_r2) @Mtuchel: Split this migration. (1 reply)\n\nNext step: address them, then \`gt submit --stack\`.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`, "ada approved since, bob's review was dismissed");
   assert.equal(calls.at(-1), "say thought The pull request is waiting for the agent to address the requested changes; it was asked to.");
   h.github.threads = [];
-  assert.deepEqual(await h.poll(), [], "claimed for this head; no merge nudge while a change request is open");
-  h.github.view = { ...h.github.view, headSha: "f00dfeed1234" };
-  const later = promptOf(await h.poll()) ?? "";
-  assert.match(later, /^@Mtuchel requested changes on \[the pull request\]\([^)]*\) at `a1b2c3d`, before the latest commits:\n/);
-  assert.match(later, /Where the new commits already address a review, reply on its threads and re-request a review from @Mtuchel\.\n\nThis is nudge 2 of 2/);
+  assert.deepEqual(await h.poll(), [], "sent; no merge nudge while a change request is open");
 });
 
-test("GitHub's changes-requested decision alone is a change request, and holds the merge", async (t) => {
+test("a change request is sent once however many heads follow it; a new request on a later head is sent again", async (t) => {
+  const h = harness(t);
+  const mtuchel = { author: "Mtuchel", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T08:00:00Z", body: "Two things before this can land.", commit: HEAD };
+  h.github.view = { ...READY, reviews: [mtuchel] };
+  assert.match(promptOf(await h.poll()) ?? "", /^@Mtuchel requested changes[^]*nudge 1 of 2/);
+  for (const head of ["h2", "h3", "h4"]) {
+    h.github.view = { ...h.github.view, headSha: head };
+    assert.deepEqual(await h.poll(), [], `pushed ${head} without a new review: no prompt, no escalation, no merge nudge`);
+  }
+  h.github.view = { ...h.github.view, reviews: [mtuchel, { author: "ada", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T09:00:00Z", body: "Nit.", commit: "h4" }] };
+  const later = promptOf(await h.poll()) ?? "";
+  assert.match(later, /^@Mtuchel requested changes on \[the pull request\]\([^)]*\) at `a1b2c3d`, before the latest commits:\n> Two things before this can land\.\n@ada requested changes on \[the pull request\]\([^)]*\):\n> Nit\.\n/);
+  assert.match(later, /Where the new commits already address a review, reply on its threads and re-request a review from @Mtuchel\.\n\nThis is nudge 2 of 2/);
+  h.github.view = { ...h.github.view, headSha: "h5", reviews: [...h.github.view.reviews, { ...mtuchel, submittedAt: "2026-09-29T10:00:00Z", commit: "h5" }] };
+  const third = await h.poll();
+  assert.equal(promptOf(third), undefined);
+  assert.match(third.find((call) => call.startsWith("comment")) ?? "", new RegExp(`^comment ${OWNER} Paseo asked the agent 2 times to address the requested changes`), "a third request goes to the owner");
+});
+
+test("GitHub's changes-requested decision alone is a change request, sent once, and holds the merge", async (t) => {
   const h = harness(t);
   h.github.view = { ...READY, reviewDecision: "CHANGES_REQUESTED" };
   assert.equal(promptOf(await h.poll()), `GitHub reports changes requested on [the pull request](${PR}).\n\nNext step: address them, then \`gt submit --stack\`.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+  h.github.view = { ...h.github.view, headSha: "h2" };
+  assert.deepEqual(await h.poll(), [], "once per pull request, not per head");
 });
 
 test("the merge nudge needs PR code and PR metadata finished on the head; an empty or incomplete rollup is not green", async (t) => {
