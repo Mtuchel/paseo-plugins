@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -98,9 +98,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   };
   // A new plugin instance on the same state file.
   const restart = () => { watch = create(); return watch; };
-  // Replaces the state file, e.g. with records written by an earlier plugin version.
-  const seed = async (state: unknown) => { await writeFile(join(await directory, "pr-watch.json"), JSON.stringify(state)); return restart(); };
-  return { github, paseo, records, blockers, calls, poll, restart, seed, watch: () => watch };
+  return { github, paseo, records, blockers, calls, poll, restart, watch: () => watch };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -389,22 +387,6 @@ test("a change request is sent once however many heads follow it; a new request 
   const third = await h.poll();
   assert.equal(promptOf(third), undefined);
   assert.match(third.find((call) => call.startsWith("comment")) ?? "", new RegExp(`^comment ${OWNER} Paseo asked the agent 2 times to address the requested changes`), "a third request goes to the owner");
-});
-
-test("change requests nudged by an older version (claimed per head) are not sent again after the upgrade", async (t) => {
-  const h = harness(t);
-  const old = "0123456789abcdef0123456789abcdef01234567";
-  const stale = { author: "Mtuchel", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T08:00:00Z", body: "Two things before this can land.", commit: HEAD };
-  // As the old version left it: the review mirror saw Mtuchel's request, and its nudge was claimed per head.
-  const seen = (changes: string[]) => ({ [PR]: { reviewedAt: stale.submittedAt, decision: "CHANGES_REQUESTED", merged: false, nudges: { changes }, activeAt: "2026-09-29T08:30:00Z" } });
-  h.github.view = { ...READY, headSha: "h2", reviews: [stale] };
-  await h.seed(seen([old]));
-  assert.deepEqual(await h.poll(), [], "the request an old nudge covered is not re-sent");
-  await h.seed(seen([old, "fedcba9876543210fedcba9876543210fedcba98"]));
-  assert.deepEqual(await h.poll(), [], "two old nudges and an unchanged request: no escalation either");
-  await h.seed(seen([old]));
-  h.github.view = { ...h.github.view, reviews: [stale, { author: "ada", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T09:00:00Z", body: "Nit.", commit: "h2" }] };
-  assert.match(promptOf(await h.poll()) ?? "", /@ada requested changes[^]*nudge 2 of 2/, "a request after the old nudge is new and counts as the second");
 });
 
 test("GitHub's changes-requested decision alone is a change request, sent once, and holds the merge", async (t) => {

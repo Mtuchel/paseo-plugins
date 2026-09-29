@@ -58,8 +58,7 @@ export type PullRequestView = {
 // `closed`: closed without merging. `drops`: merge queue drops already claimed, by draft (`#123`)
 // or, for drops before any draft, by the Merge activity bullet. `pending`: the claimed drop still
 // to be delivered. `nudges`: per stage, one key per nudge (or the escalation after them): the
-// head, or for requested changes the reviews it covered, space-separated (see stalledStage), or
-// `before:<time>` for one from before per-review claims (see migrateLegacyChanges).
+// head, or for requested changes the reviews it covered, space-separated (see stalledStage).
 // `activeAt`: the last change, drop or nudge seen.
 type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; pending?: PendingDrop | null; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string };
 // A claimed drop, saved before anything is sent. `fix` goes to the agent (or, when it is gone, to
@@ -267,26 +266,6 @@ export function reviewChange(view: PullRequestView, seen: Seen): { change: Chang
 
 // Mirrors each ticket's pull request review into Linear every 2 minutes, sends pull requests the
 // Graphite merge queue dropped back to be fixed, and nudges stalled ones to their next step.
-// Before change requests were claimed per review, each changes nudge stored its head SHA. On load
-// such an entry becomes `before:<time>`, frozen from `activeAt` (stamped by that claim) before this
-// poll can move it. It still counts toward the budget and covers every request submitted up to that
-// time, so an upgrade never re-sends or escalates an unchanged request; a later request is new.
-// Without `activeAt` it covers every request.
-const LEGACY_HEAD = /^[0-9a-f]{40}$/;
-const LEGACY_PREFIX = "before:";
-
-function migrateLegacyChanges(seen: Seen): void {
-  const changes = seen.nudges?.changes;
-  if (!changes?.some((entry) => LEGACY_HEAD.test(entry))) return;
-  const until = `${LEGACY_PREFIX}${seen.activeAt ?? "\uffff"}`;
-  seen.nudges = { ...seen.nudges, changes: changes.map((entry) => (LEGACY_HEAD.test(entry) ? until : entry)) };
-}
-
-function coveredByLegacy(entry: string, key: string): boolean {
-  if (!entry.startsWith(LEGACY_PREFIX)) return false;
-  return key === "review-decision" || key.slice(key.lastIndexOf("@") + 1) <= entry.slice(LEGACY_PREFIX.length);
-}
-
 export class PullRequestWatch {
   private timer: NodeJS.Timeout | null = null;
   private pausedPool: RateLimitedError["pool"] | null = null;
@@ -317,10 +296,7 @@ export class PullRequestWatch {
   }
 
   private async load(): Promise<Record<string, Seen>> {
-    let state: Record<string, Seen>;
-    try { state = JSON.parse(await readFile(this.path, "utf8")); } catch { return {}; }
-    for (const seen of Object.values(state)) migrateLegacyChanges(seen);
-    return state;
+    try { return JSON.parse(await readFile(this.path, "utf8")); } catch { return {}; }
   }
 
   private async save(value: Record<string, Seen>): Promise<void> {
@@ -561,9 +537,7 @@ export class PullRequestWatch {
     const before = seenByUrl[url].nudges ?? {};
     const heads = (stage: Stage) => before[stage] ?? [];
     const github = this.deps.github ?? githubReader;
-    const covered = (stage: Stage, key: string) =>
-      heads(stage).some((entry) => entry.split(" ").includes(key) || (stage === "changes" && coveredByLegacy(entry, key)));
-    const found = await stalledStage(view, url, Date.now(), covered, () => github.reviewThreads(repo, Number(number)));
+    const found = await stalledStage(view, url, Date.now(), (stage, key) => heads(stage).some((entry) => entry.split(" ").includes(key)), () => github.reviewThreads(repo, Number(number)));
     if (!found || heads(found.stage).includes(found.key)) return;
     const { stage, text } = found;
     const sent = heads(stage).length;
