@@ -562,8 +562,17 @@ using this host's key, independently of the agent's own `linear_ticket` tools:
   As a fallback, a completed turn whose final reply ends by asking you (a question, or a
   phrase such as "needs your OK", "once you decide" or "reply "yes" and I'll") opens a
   wait too; the comment quotes that part of the reply. It lasts until the agent's next turn
-  starts. Plan approval requests are left to the plan review. Completed or canceled tickets
-  keep their state and only get the label and the comment.
+  starts. Plan approval requests are left to the plan review.
+- **Waits after the ticket closed** — a merge commit's `Closes` moves the ticket to Done while
+  its agent may still need you (a deploy decision, a step after merge). A closed ticket stays
+  closed: the wait opens a **"Needs you: …" sub-issue** instead, in Needs input (Todo on teams
+  without it), assigned to you, with the `<label>-needs-you` label and the mention comment.
+  Further questions in the same wait edit that comment, and while the sub-issue is open the
+  agent's later waits on the ticket reuse it. It is closed for you when the question or
+  approval is answered (in Paseo or in Linear), or when you reply on it with `@paseo …`, which
+  goes to the agent that asked. A wait that ended otherwise (for example the agent's next turn
+  started) may be a manual step, so that sub-issue stays open until you close it. Archiving the
+  agent leaves its open sub-issues for you; replies there no longer reach anyone.
 - **Pull requests** — GitHub pull request URLs printed by the agent's completed shell
   commands during a turn (for example `gh pr create`) are attached to the ticket, which then moves to its team's
   started state named like *In Review*. Completion is left to Linear's GitHub integration.

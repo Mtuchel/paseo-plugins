@@ -12,8 +12,9 @@ const MAX_SUMMARY = 1_500;
 const KEPT_SUMMARIES = 3;
 
 // While an agent waits for an answer or approval: the state the ticket left for "Needs input"
-// (restored afterwards) and the mention comment edited for each further question.
-export type WaitingPeriod = { previousStateId: string | null; commentId: string | null };
+// (restored afterwards) and the mention comment edited for each further question. A ticket already
+// closed stays closed: the wait lives in a "Needs you" sub-issue (`subIssueId`), which holds the comment.
+export type WaitingPeriod = { previousStateId: string | null; commentId: string | null; subIssueId?: string | null };
 export type HandoverStatus = "working" | "waiting" | "finished" | "failed" | "archived";
 export type HandoverRecord = {
   issueId: string;

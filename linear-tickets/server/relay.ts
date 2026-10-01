@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import type { LinearService, RelayComment } from "./linear";
+import type { NeedsYouIssues } from "./needs-you";
 import { RateLimitedError } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
 
@@ -13,8 +14,9 @@ const MENTION = /^\s*(?:\[@paseo\]\([^)]*\)|@paseo\b)[:,]?\s*/i;
 export const ACK_EMOJI = "eyes";
 export const FAILED_EMOJI = "x";
 
-type Linear = Pick<LinearService, "viewerId" | "relayComments" | "comment" | "react">;
-type LinkedAgent = { id: string; issueId: string; createdAt: string };
+type Linear = Pick<LinearService, "viewerId" | "relayComments" | "comment" | "react" | "complete">;
+// `needsYou`: a "Needs you" sub-issue of the agent's ticket; a delivered reply there closes it.
+type LinkedAgent = { id: string; issueId: string; createdAt: string; needsYou?: boolean };
 type Question = { header?: string; question?: string; options?: { label?: string }[] };
 
 // The message after the mention, or null when the comment is not addressed to Paseo.
@@ -92,12 +94,18 @@ export class CommentRelay {
   // Tickets neither credential could read (deleted, no access); skipped until the plugin restarts.
   private readonly unseen = new Set<string>();
 
-  constructor(private readonly linear: Linear, private readonly path = join(paseoHome(), "linear-tickets", "relay-cursors.json")) {}
+  // `needsYou`: the open "Needs you" sub-issues, whose replies go to the agent that asked.
+  constructor(private readonly linear: Linear, private readonly path = join(paseoHome(), "linear-tickets", "relay-cursors.json"), private readonly needsYou?: NeedsYouIssues) {}
 
   async poll(paseo: PaseoApi): Promise<void> {
     const state = await this.load();
     await this.acknowledge(state);
-    const agents = (await this.linkedAgents(paseo)).filter((agent) => !this.unseen.has(agent.issueId));
+    const linked = await this.linkedAgents(paseo);
+    for (const entry of await this.needsYou?.all() ?? []) {
+      const agent = linked.find((known) => known.id === entry.agentId);
+      if (agent) linked.push({ id: agent.id, issueId: entry.id, createdAt: agent.createdAt, needsYou: true });
+    }
+    const agents = linked.filter((agent) => !this.unseen.has(agent.issueId));
     // A new agent on a ticket starts from its own start: comments before it were in its first prompt.
     const cursors: Record<string, Cursor> = {};
     for (const agent of agents) {
@@ -120,7 +128,11 @@ export class CommentRelay {
             || comment.reactions.some((reaction) => reaction.userId === viewerId && (reaction.emoji === ACK_EMOJI || reaction.emoji === FAILED_EMOJI))
             || state.acks.some((ack) => ack.commentId === comment.id);
           const message = handled ? null : mentionMessage(comment.body);
-          if (message !== null) state.acks.push({ commentId: comment.id, issueId: agent.issueId, reacted: false, ...await this.deliver(paseo, agent, comment, message) });
+          if (message !== null) {
+            const outcome = await this.deliver(paseo, agent, comment, message);
+            state.acks.push({ commentId: comment.id, issueId: agent.issueId, reacted: false, ...outcome });
+            if (agent.needsYou && outcome.emoji === ACK_EMOJI) await this.answered(agent.issueId);
+          }
           if (comment.createdAt === cursor.since) cursor.boundaryIds.push(comment.id);
           else Object.assign(cursor, { since: comment.createdAt, boundaryIds: [comment.id] });
           // Recorded before the reaction: a restart in between must not deliver the comment again.
@@ -202,6 +214,12 @@ export class CommentRelay {
       console.error(`[linear-tickets] relaying comment ${comment.id} to agent ${agent.id} failed: ${reason}`);
       return { emoji: FAILED_EMOJI, reply: `Paseo could not deliver that comment to the agent: ${reason}` };
     }
+  }
+
+  // The owner answered on a "Needs you" sub-issue: it is done, and later comments there stay put.
+  private async answered(issueId: string): Promise<void> {
+    await this.needsYou?.remove(issueId);
+    await this.linear.complete(issueId).catch((error: unknown) => console.error(`[linear-tickets] closing answered sub-issue ${issueId} failed: ${error instanceof Error ? error.message : error}`));
   }
 }
 

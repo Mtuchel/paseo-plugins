@@ -9,6 +9,7 @@ import { questionsOf } from "./relay";
 import type { AgentApi } from "./agent-app";
 import type { Handover, WaitingPeriod } from "./handover";
 import type { IssueState, LinearService } from "./linear";
+import type { NeedsYouIssues } from "./needs-you";
 import { PLANNING_STATE } from "./plannotator";
 import { PLAN_POLICY_LABEL } from "./plan-policy";
 import { RateLimitedError } from "./rate-budget";
@@ -20,6 +21,8 @@ export const MAX_SUMMARY_LENGTH = 4_000;
 // The workflow state (type started) a ticket waits in while its agent needs the owner.
 export const NEEDS_INPUT_STATE = "Needs input";
 const NEEDS_YOU_COLOR = "#eb5757";
+const CLOSED_TYPES = ["completed", "canceled", "duplicate"];
+const MAX_NEEDS_YOU_TITLE = 80;
 const TRANSIENT = /HTTP 50\d|Could not reach|timed out|ECONNRESET|fetch failed/i;
 const RETRY_DELAYS_MS = [30_000, 120_000];
 // Rate-limited write-backs wait for the pool to refill however often it takes, up to this long.
@@ -45,7 +48,7 @@ export type AgentBridge = {
   handover: Pick<Handover, "read" | "update" | "finish" | "waiting" | "setWaiting">;
   comments?: Pick<AgentApi, "createComment" | "updateComment">;
 };
-type Linear = Pick<LinearService, "issueState" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "createComment" | "updateComment" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "userUrl">;
+type Linear = Pick<LinearService, "issueState" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "createComment" | "updateComment" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "userUrl" | "createIssue" | "complete">;
 
 // The turn's reply: assistant text after the last user message. Streaming providers may
 // split one reply across several items, so the pieces are joined without separators.
@@ -192,7 +195,9 @@ export class Writeback {
   private drainQueue: Promise<unknown> = Promise.resolve();
   private recovered = false;
 
-  constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly agentBridge?: AgentBridge, private readonly settleMs = 2_000, private readonly outboxPath = join(paseoHome(), "linear-tickets", "writeback-outbox.json")) {}
+  // `needsYou`: where waits on closed tickets keep their sub-issues; without it such a wait only
+  // labels and comments on the closed ticket.
+  constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly agentBridge?: AgentBridge, private readonly settleMs = 2_000, private readonly outboxPath = join(paseoHome(), "linear-tickets", "writeback-outbox.json"), private readonly needsYou?: NeedsYouIssues) {}
 
   // The running model, and the agent with its title: hook events can carry none.
   private async snapshot(agent: PluginHookAgent, paseo: PaseoApi): Promise<{ model: string | null; named: PluginHookAgent }> {
@@ -312,32 +317,77 @@ export class Writeback {
 
   // Opens or continues a waiting period: the ticket moves to Needs input (teams without that state
   // skip it), gets the needs-you label, and one comment mentions the owner, edited per question.
-  private markWaiting(issue: { id: string; identifier: string }, agent: PluginHookAgent, settings: PluginSettings, body: string, inSession: boolean, { once }: WritebackContext): Promise<void> {
+  // A closed ticket stays closed: a "Needs you" sub-issue in Needs input carries the label and the
+  // comment instead. `subject` (one line) titles that sub-issue.
+  private markWaiting(issue: { id: string; identifier: string }, agent: PluginHookAgent, settings: PluginSettings, subject: string, body: string, inSession: boolean, { once }: WritebackContext): Promise<void> {
     return this.serialize(issue.id, async () => {
       const waiting = await this.waitingFor(issue.id);
       const state = await this.linear.issueState(issue.id);
-      const moved = await this.linear.moveToStateNamed(issue.id, NEEDS_INPUT_STATE, state);
-      // Remembered before anything else can fail, so a retry still knows where the ticket was.
-      const previousStateId = waiting?.previousStateId ?? (moved.changed ? state.statusId : null);
-      if (previousStateId !== (waiting?.previousStateId ?? null)) await this.setWaiting(issue, agent, { previousStateId, commentId: waiting?.commentId ?? null });
       const needsYou = dispatchLabels(settings.dispatch.label).needsYou;
-      if (!state.labels.some((item) => item.name.trim().toLowerCase() === needsYou.toLowerCase())) await this.linear.addLabel(issue.id, needsYou, NEEDS_YOU_COLOR);
       // Only the owner opens Linear sessions; without one, whoever wrote the ticket is asked.
       const ownerId = (inSession ? null : state.creatorId) ?? await this.linear.viewerId();
+      const closed = CLOSED_TYPES.includes(state.statusType.trim().toLowerCase());
+      let subIssueId = waiting?.subIssueId ?? null;
+      let previousStateId = waiting?.previousStateId ?? null;
+      if (!subIssueId && closed && this.needsYou && state.teamId) {
+        // The agent's sub-issue from an earlier wait, while still open, takes the new one too.
+        for (const known of (await this.needsYou.all()).filter((entry) => entry.parentId === issue.id && entry.agentId === agent.id)) {
+          // A deleted sub-issue is gone; outages and rate limits retry the whole write-back.
+          const found = subIssueId ? null : await this.linear.issueState(known.id).catch((error: unknown) => {
+            if (error instanceof RateLimitedError || (error instanceof Error && TRANSIENT.test(error.message))) throw error;
+            return null;
+          });
+          const open = Boolean(found && !CLOSED_TYPES.includes(found.statusType.trim().toLowerCase()));
+          if (open) subIssueId = known.id;
+          else await this.needsYou.remove(known.id);
+        }
+        if (!subIssueId) {
+          // Plain text: bold and code marks, and a leading heading, quote or list marker, go.
+          const title = subject.split("\n")[0].replace(/[*`]+/g, "").replace(/^\s*(?:#+|>|[-+]|\d+\.)\s+/, "").trim();
+          const created = await once("needs-you-issue", () => this.linear.createIssue({
+            teamId: state.teamId!,
+            parentId: issue.id,
+            assigneeId: ownerId,
+            startedState: NEEDS_INPUT_STATE,
+            ready: true,
+            title: `Needs you: ${title.length <= MAX_NEEDS_YOU_TITLE ? title : `${title.slice(0, MAX_NEEDS_YOU_TITLE - 1).trimEnd()}…`}`,
+            description: `${body}\n\n${issue.identifier} was already closed when its agent asked, so the wait is tracked here. A reply starting with “@paseo” goes to the agent and closes this issue; otherwise close it once handled.`,
+          }));
+          if (!created) return;
+          subIssueId = created.id;
+          // Remembered before anything else can fail, so a retry continues this sub-issue.
+          await this.setWaiting(issue, agent, { previousStateId, commentId: null, subIssueId });
+          await this.needsYou?.add({ id: created.id, identifier: created.identifier, parentId: issue.id, agentId: agent.id });
+          await once("needs-you-label", () => this.linear.addLabel(created.id, needsYou, NEEDS_YOU_COLOR));
+        }
+      }
+      if (!subIssueId) {
+        const moved = await this.linear.moveToStateNamed(issue.id, NEEDS_INPUT_STATE, state);
+        // Remembered before anything else can fail, so a retry still knows where the ticket was.
+        previousStateId ??= moved.changed ? state.statusId : null;
+        if (previousStateId !== (waiting?.previousStateId ?? null)) await this.setWaiting(issue, agent, { previousStateId, commentId: waiting?.commentId ?? null });
+        if (!state.labels.some((item) => item.name.trim().toLowerCase() === needsYou.toLowerCase())) await this.linear.addLabel(issue.id, needsYou, NEEDS_YOU_COLOR);
+      }
       // The waiting period's comment is edited, not repeated.
-      const commentId = await once("waiting-comment", async () => appComment(this.linear, this.agentBridge?.comments, issue.id, `${await this.linear.userUrl(ownerId)} ${body}`, waiting?.commentId ?? null)) ?? null;
-      await this.setWaiting(issue, agent, { previousStateId, commentId });
+      const commentId = await once("waiting-comment", async () => appComment(this.linear, this.agentBridge?.comments, subIssueId ?? issue.id, `${await this.linear.userUrl(ownerId)} ${body}`, waiting?.commentId ?? null)) ?? null;
+      await this.setWaiting(issue, agent, { previousStateId, commentId, subIssueId });
     });
   }
 
   // Ends the waiting period: the label comes off and the ticket goes back where it was, unless
-  // someone moved it out of Needs input meanwhile. The next period gets a fresh comment.
-  private clearWaiting(issue: { id: string; identifier: string }, agent: PluginHookAgent, settings: PluginSettings, current?: IssueState): Promise<void> {
+  // someone moved it out of Needs input meanwhile. The next period gets a fresh comment. A "Needs
+  // you" sub-issue is closed only when `answered` (the question or approval was resolved); a wait
+  // that ended otherwise may be a manual step, which the owner closes.
+  private clearWaiting(issue: { id: string; identifier: string }, agent: PluginHookAgent, settings: PluginSettings, current?: IssueState, answered = false): Promise<void> {
     return this.serialize(issue.id, async () => {
       const waiting = await this.waitingFor(issue.id);
       const state = current ?? await this.linear.issueState(issue.id);
       await this.linear.removeLabel(issue.id, dispatchLabels(settings.dispatch.label).needsYou, state.labels);
       if (waiting?.previousStateId && state.status.trim().toLowerCase() === NEEDS_INPUT_STATE.toLowerCase()) await this.linear.moveToState(issue.id, waiting.previousStateId);
+      if (waiting?.subIssueId && answered) {
+        await this.linear.complete(waiting.subIssueId);
+        await this.needsYou?.remove(waiting.subIssueId);
+      }
       if (waiting) await this.setWaiting(issue, agent, null);
     });
   }
@@ -502,7 +552,7 @@ export class Writeback {
         if (request) {
           const inSession = Boolean(await this.agentBridge?.sessions.sessionFor(agent.id).catch(() => null));
           const hint = writeback.mentions ? "\n\nReply here with “@paseo <your answer>”." : "";
-          await this.markWaiting(issue, agent, settings, `**${title}** (Paseo) finished its turn and is waiting for you:\n\n${truncateSummary(request)}${hint}`, inSession, context);
+          await this.markWaiting(issue, agent, settings, request, `**${title}** (Paseo) finished its turn and is waiting for you:\n\n${truncateSummary(request)}${hint}`, inSession, context);
         }
       } else if (outcome.kind === "failed") {
         await once("session:error", () => this.session(agent.id, async (sessionId, sessions) => {
@@ -553,7 +603,7 @@ export class Writeback {
       const hint = settings.writeback.mentions
         ? `\n\nReply here with ${request.kind === "question" ? "“@paseo <your answer>”" : "“@paseo approve” or “@paseo deny <reason>”"}.`
         : "";
-      await this.markWaiting({ id: issueId, identifier }, agent, settings, `**${agent.title ?? "Paseo agent"}** (Paseo) is waiting for ${what}: ${subject}${description}${options}${hint}`, inSession, context);
+      await this.markWaiting({ id: issueId, identifier }, agent, settings, subject, `**${agent.title ?? "Paseo agent"}** (Paseo) is waiting for ${what}: ${subject}${description}${options}${hint}`, inSession, context);
     });
   }
 
@@ -566,7 +616,7 @@ export class Writeback {
       const refreshed = await paseo.agents.ref(agent.id).refresh().catch(() => null);
       const pending = refreshed?.agent.pendingPermissions;
       if (Array.isArray(pending) && pending.length > 0) return;
-      await this.clearWaiting({ id: issueId, identifier }, agent, settings);
+      await this.clearWaiting({ id: issueId, identifier }, agent, settings, undefined, true);
     });
   }
 
@@ -574,6 +624,9 @@ export class Writeback {
     return this.run("archived", agent, paseo, async ({ issueId, identifier }, settings, { once }) => {
       this.links.delete(agent.id);
       this.started.delete(agent.id);
+      // Replies on its open "Needs you" sub-issues have nobody to reach any more; the sub-issues
+      // stay open for the owner.
+      if (this.needsYou) for (const entry of (await this.needsYou.all()).filter((known) => known.agentId === agent.id)) await this.needsYou.remove(entry.id);
       const labels = dispatchLabels(settings.dispatch.label);
       const state = await this.linear.issueState(issueId);
       // A successor already working on the ticket (a resume) keeps the running marker and the session.

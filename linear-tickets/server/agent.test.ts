@@ -225,6 +225,7 @@ test("a permission shows in the agent panel only while still pending, and the ti
       createComment: async (): Promise<string> => { throw new Error("the app writes this comment"); }, updateComment: async () => {},
       viewerId: async () => OWNER, userUrl: async (id: string) => `https://linear.app/ws/profiles/${id}`,
       addLabel: async (_i: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async () => {},
+      createIssue: async (): Promise<{ id: string; identifier: string; url: string }> => { throw new Error("an open ticket gets no sub-issue"); }, complete: async () => {},
     };
     const sessions = {
       sessionFor: async () => ({ sessionId: "s1" }), say: async () => {}, action: async () => {}, link: async () => {}, offerResume: async () => {}, resumeNow: async () => false,

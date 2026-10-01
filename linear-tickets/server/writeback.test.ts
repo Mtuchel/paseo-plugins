@@ -11,6 +11,7 @@ import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/se
 import type { IssueState } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { NeedsYouIssues } from "./needs-you";
 import { appComment, MAX_SUMMARY_LENGTH, ownerRequest, turnPullRequests, turnReply, Writeback } from "./writeback";
 
 // Writebacks built without an outbox path keep theirs here, never in the real Paseo home.
@@ -31,8 +32,23 @@ const toolCall = (output: string): Timeline[number] => ({ type: "tool_call", cal
 class FakeLinear {
   readonly writes: string[] = [];
   state: IssueState = { id: "issue-1", identifier: "ENG-1", projectId: null, creatorId: null, blockedBy: [], status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", labels: [{ id: "l1", name: "paseo-running" }], attachmentUrls: [] };
+  // Other issues by id (the "Needs you" sub-issues); `state` is the ticket itself.
+  readonly others = new Map<string, IssueState>();
   private comments = 0;
-  async issueState() { this.writes.push("state"); return this.state; }
+  async issueState(id = "issue-1") {
+    this.writes.push(id === this.state.id ? "state" : `state ${id}`);
+    const found = id === this.state.id ? this.state : this.others.get(id);
+    if (!found) throw new Error("Linear did not return this issue. Check that you have access to it.");
+    return found;
+  }
+  async createIssue(input: { title: string; parentId?: string; assigneeId?: string; startedState?: string }) {
+    const id = `sub-${this.others.size + 1}`;
+    const identifier = `ENG-${this.others.size + 2}`;
+    this.writes.push(`create ${id} "${input.title}" under ${input.parentId} for ${input.assigneeId} in ${input.startedState}`);
+    this.others.set(id, { ...this.state, id, identifier, status: input.startedState ?? "Todo", statusId: "ni", statusType: "started", labels: [] });
+    return { id, identifier, url: "" };
+  }
+  async complete(id: string) { this.writes.push(`complete ${id}`); this.others.set(id, { ...this.others.get(id)!, status: "Done", statusType: "completed" }); }
   async markInProgress(issue: { id: string }) { this.writes.push(`in-progress ${issue.id}`); return { changed: true }; }
   async moveToStateNamed(id: string, name: string) {
     this.writes.push(`move ${id} ${name}`);
@@ -42,11 +58,15 @@ class FakeLinear {
   }
   async moveToState(_id: string, stateId: string) { this.writes.push(`restore ${stateId}`); }
   async comment(_id: string, body: string) { this.writes.push(`comment: ${body}`); }
-  async createComment(_id: string, body: string) { this.writes.push(`new comment: ${body}`); return `c${++this.comments}`; }
+  async createComment(id: string, body: string) { this.writes.push(id === this.state.id ? `new comment: ${body}` : `new comment on ${id}: ${body}`); return `c${++this.comments}`; }
   async updateComment(id: string, body: string) { this.writes.push(`edit ${id}: ${body}`); }
   async viewerId() { return "owner"; }
   async userUrl(id: string) { return `https://linear.app/acme/profiles/${id}`; }
-  async addLabel(_id: string, name: string) { this.writes.push(`+${name}`); this.state = { ...this.state, labels: [...this.state.labels, { id: name, name }] }; }
+  async addLabel(id: string, name: string) {
+    if (id !== this.state.id) { this.writes.push(`+${name} on ${id}`); return; }
+    this.writes.push(`+${name}`);
+    this.state = { ...this.state, labels: [...this.state.labels, { id: name, name }] };
+  }
   async removeLabel(_id: string, name: string) { this.writes.push(`-${name}`); this.state = { ...this.state, labels: this.state.labels.filter((label) => label.name !== name) }; }
   async linkUrl(_id: string, url: string) { this.writes.push(`link ${url}`); }
   async moveToReview() { this.writes.push("review"); return { changed: true }; }
@@ -212,6 +232,57 @@ test("only replies that hand the next step to the owner count as waiting, and pl
   assert.equal(ownerRequest("Done.\n\nThe `approved-test-change` label needs your OK, then I merge.\n\nPLAN.md is untracked."), "The `approved-test-change` label needs your OK, then I merge.\n\nPLAN.md is untracked.");
   // A question far above the closing report is history, not the open ask.
   assert.equal(ownerRequest(`Should I start?\n\n${"Report line.\n\n".repeat(150)}All checks pass.`), null);
+});
+
+test("a wait on a closed ticket opens a Needs you sub-issue instead; follow-ups edit its comment and the answer closes it", async () => {
+  const linear = new FakeLinear();
+  linear.state = { ...linear.state, status: "Done", statusId: "done", statusType: "completed", creatorId: "creator" };
+  const needsYou = new NeedsYouIssues(mkdtempSync(join(tmpdir(), "needs-you-")));
+  let pending: { id: string }[] = [];
+  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" }, pendingPermissions: pending } }) }) } } as unknown as PaseoApi;
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), needsYou);
+  const ask = async (id: string, title: string) => {
+    pending = [{ id }];
+    await writeback.permissionRequested({ agent: root, request: { id, provider: "claude", name: "AskUser", kind: "question", title } }, paseo);
+  };
+  const waiting = (question: string) => `https://linear.app/acme/profiles/creator **ENG-1: Fix sign-in** (Paseo) is waiting for an answer: ${question}\n\nReply here with “@paseo <your answer>”.`;
+
+  await ask("q1", "Enqueue #850 yourself?");
+  assert.deepEqual(linear.writes.splice(0), ['state', 'create sub-1 "Needs you: Enqueue #850 yourself?" under issue-1 for creator in Needs input', "+paseo-needs-you on sub-1", `new comment on sub-1: ${waiting("Enqueue #850 yourself?")}`]);
+  assert.deepEqual(await needsYou.all(), [{ id: "sub-1", identifier: "ENG-2", parentId: "issue-1", agentId: "agent-1" }]);
+  // The closed ticket itself is never moved or labelled; a follow-up question edits the comment.
+  pending = [{ id: "q2" }];
+  await writeback.permissionResolved({ agent: root, requestId: "q1", resolution: { behavior: "allow" } }, paseo);
+  await ask("q2", "And watch the deploy?");
+  assert.deepEqual(linear.writes.splice(0), ["state", `edit c1: ${waiting("And watch the deploy?")}`]);
+  pending = [];
+  await writeback.permissionResolved({ agent: root, requestId: "q2", resolution: { behavior: "allow" } }, paseo);
+  assert.deepEqual(linear.writes.splice(0), ["state", "-paseo-needs-you", "complete sub-1"]);
+  assert.deepEqual(await needsYou.all(), []);
+});
+
+test("a turn-end wait on a closed ticket keeps its sub-issue open for the owner and reuses it until the owner closes it", async () => {
+  const linear = new FakeLinear();
+  linear.state = { ...linear.state, status: "Done", statusId: "done", statusType: "completed", creatorId: "creator" };
+  const needsYou = new NeedsYouIssues(mkdtempSync(join(tmpdir(), "needs-you-")));
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), needsYou);
+  const end = (text: string) => writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text }] }, linked);
+  const created = () => linear.writes.splice(0).filter((write) => write.startsWith("create "));
+
+  await end("Merged.\n\n**Someone has to send a test mail to `purchases@`.** Only you can do that.");
+  assert.deepEqual(created(), ['create sub-1 "Needs you: Someone has to send a test mail to purchases@. Only you can do that." under issue-1 for creator in Needs input']);
+  // The next turn may be a nudge, not the step being done: the sub-issue stays open.
+  await writeback.turnStarted({ agent: root, turnId: "t2" }, linked);
+  assert.ok(!linear.writes.includes("complete sub-1"));
+  await end("Still waiting: should I run the smoke test once the mail arrived?");
+  assert.deepEqual(created(), []);
+  assert.equal(linear.others.size, 1);
+
+  linear.others.set("sub-1", { ...linear.others.get("sub-1")!, status: "Done", statusType: "completed" });
+  await writeback.turnStarted({ agent: root, turnId: "t3" }, linked);
+  await end("Should I close the epic?");
+  assert.deepEqual(created(), ['create sub-2 "Needs you: Should I close the epic?" under issue-1 for creator in Needs input']);
+  assert.deepEqual((await needsYou.all()).map((entry) => entry.id), ["sub-2"]);
 });
 
 test("the previous state is not restored when someone moved the ticket out of Needs input meanwhile", async () => {

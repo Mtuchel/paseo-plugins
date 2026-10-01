@@ -46,7 +46,7 @@ export function planDecisionNote(providerKey: string): string {
 const MAX_PLAN_NOTE_CHARS = 20_000;
 // A question request moves the ticket to "Needs input" and notifies the owner, so one ask beats
 // five, and an ask only written into the final reply is easy to miss.
-export const QUESTIONS_NOTE = "Anything you need from the owner (an answer, a decision, an approval such as to push or to add a label, a secret or setting, or a manual step only they can do) goes into a question request, never only into your final message: the question request is what moves the ticket to Needs input and notifies the owner. Collect all of it and ask together in one question request instead of one at a time. Plan approval goes through the plan review, not a question.";
+export const QUESTIONS_NOTE = "Anything you need from the owner (an answer, a decision, an approval such as to push or to add a label, a secret or setting, or a manual step only they can do) goes into a question request, never only into your final message: the question request is what moves the ticket to Needs input and notifies the owner. When you have the linear_ticket tool add_manual_task, register manual steps (secrets, settings, actions in other systems) with it instead. Collect all of it and ask together in one question request instead of one at a time. Plan approval goes through the plan review, not a question.";
 
 // A ticket with the plan-ready label already has an approved plan ("Approve, implement later"
 // or an earlier planner): the new agent implements it instead of planning again.
