@@ -21,7 +21,7 @@ process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-ticket-mcp-home-"));
 const ISSUE_ID = "6b1f0c2a-1111-4222-8333-444455556666";
 const detail = { issue: normalizeIssue({ id: ISSUE_ID, identifier: "ENG-42", title: "Fix sign-in", url: "https://linear.app/x/issue/ENG-42" }), teamId: "team-1", projectId: "lp-1", context: "{}", warnings: [], relations: { parent: null, subissues: [], related: [] } };
 const input = { id: ISSUE_ID, projectId: "project-1", provider: "test/model", instructions: "", markInProgress: false, requestId: "5f6f1154-5838-4439-b981-b3c9d9831488" };
-const noMark = { markInProgress: async () => ({ changed: false }) };
+const noMark = { markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] };
 
 function capturePaseo(onCreate: (options: PaseoWorkspaceAgentCreateOptions) => void) {
   return {
@@ -75,7 +75,7 @@ test("a provider that reports no MCP support gets a launch warning", async () =>
 
 test("marking in progress happens before the agent exists, so the agent's own status changes come later", async () => {
   const order: string[] = [];
-  const launcher = new Launcher({ detail: async () => detail, markInProgress: async () => { order.push("mark"); return { changed: true }; } }, undefined, async () => "/s.mjs");
+  const launcher = new Launcher({ ...noMark, detail: async () => detail, markInProgress: async () => { order.push("mark"); return { changed: true }; } }, undefined, async () => "/s.mjs");
   await launcher.start({ ...input, markInProgress: true }, capturePaseo(() => { order.push("create"); }), { linearAccess: true, markInProgress: true });
   assert.deepEqual(order, ["mark", "create"]);
 });

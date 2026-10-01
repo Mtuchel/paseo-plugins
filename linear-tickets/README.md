@@ -121,6 +121,16 @@ returned links. Linked documents and attachments are not downloaded. If comments
 are unavailable, the preview and agent prompt say so. Context over 200,000 characters
 is rejected rather than silently truncated.
 
+**Finished blockers.** When a ticket starts after blockers that are Done, its prompt gets a
+**Finished blockers** section after the instructions: for each one, its links (pull requests,
+plan documents; not the Paseo agent link) and its latest comments, newest first, up to 6,000
+characters per blocker and 24,000 in total. The plugin's progress and final-report cards,
+Linear's agent-thread stub and plan-approval questions are left out, so the room goes to the
+agents' own summaries. The agent is told to build on that work and to check that its base
+branch contains the merged changes. Blockers still In Review never reach this point, since
+they keep the ticket waiting. If Linear cannot be read, the agent starts without the section
+and the launch warns.
+
 The ticket preview shows the ticket's project, team, labels, priority, dates (including
 due date and estimate when set), a status-history line, and a **Related tickets** section.
 That section includes the parent, subissues, blockers, blocked tickets, duplicates, and
