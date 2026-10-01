@@ -260,8 +260,12 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     if (!TICKET) return undefined;
     const input = event.input;
     if (event.toolName === "write" || event.toolName === "edit") {
-      // omp gives an edit's targets as `paths` (hashline patches) or `path`.
-      const targets = Array.isArray(input?.paths) ? input.paths : [input?.path];
+      // omp gives an edit's targets as `paths` (hashline patches) or `path`; an apply_patch edit
+      // names them only in its `input` headers (`*** Update File: PLAN.md`, `*** Move to: …`).
+      const targets: unknown[] = Array.isArray(input?.paths) ? [...input.paths] : [input?.path];
+      if (typeof input?.input === "string") {
+        for (const match of input.input.matchAll(/^\*\*\* (?:(?:Update|Add|Delete) File|Move to): (.+)$/gm)) targets.push(match[1]);
+      }
       for (const target of targets) {
         if (typeof target === "string" && /^(local:\/\/[^/]+|.*\.mdx?)$/i.test(target.trim())) queuedEdits.add(planText(ctx, target.trim()).key);
       }

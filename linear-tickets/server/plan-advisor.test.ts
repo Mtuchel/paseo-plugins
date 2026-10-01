@@ -201,6 +201,14 @@ test("a plan write or edit queued in the same message keeps that message's recor
   assert.equal(await h.hook("edit", "e1", { input: "[PLAN.md#ABCD]\n…", paths: ["PLAN.md"], path: "PLAN.md" }), undefined);
   assert.equal((await h.hook("plannotator_submit_plan", "s2", { filePath: "PLAN.md" }))?.block, true);
   h.turn();
+  // So does an apply_patch edit, which names its targets only in the patch headers.
+  assert.equal(await h.hook("record_plan_advice", "r9", astra), undefined);
+  assert.equal(await h.hook("edit", "e2", { input: "*** Begin Patch\n*** Update File: PLAN.md\n@@\n-Do the thing.\n+Do it.\n*** End Patch" }), undefined);
+  assert.match((await h.hook("plannotator_submit_plan", "s7", { filePath: "PLAN.md" }))?.reason ?? "", /changed after its advisor review was recorded/);
+  h.turn();
+  assert.equal(await h.hook("edit", "e3", { input: "*** Begin Patch\n*** Update File: draft.txt\n*** Move to: PLAN.md\n*** End Patch" }), undefined);
+  assert.equal((await h.hook("plannotator_submit_plan", "s8", { filePath: "PLAN.md" }))?.block, true);
+  h.turn();
   // Writes to other files do not.
   assert.equal(await h.hook("write", "w2", { path: "notes.txt", content: "x" }), undefined);
   assert.equal(await h.hook("plannotator_submit_plan", "s3", { filePath: "PLAN.md" }), undefined);
