@@ -121,14 +121,14 @@ returned links. Linked documents and attachments are not downloaded. If comments
 are unavailable, the preview and agent prompt say so. Context over 200,000 characters
 is rejected rather than silently truncated.
 
-**Finished blockers.** When a ticket starts after blockers that are Done, its prompt gets a
+**Finished blockers.** When a ticket starts after blockers that are finished (see *Waiting their turn*), its prompt gets a
 **Finished blockers** section after the instructions: for each one, its links (pull requests,
 plan documents; not the Paseo agent link) and its latest comments, newest first, up to 6,000
 characters per blocker and 24,000 in total. The plugin's progress and final-report cards,
 Linear's agent-thread stub and plan-approval questions are left out, so the room goes to the
 agents' own summaries. The agent is told to build on that work and to check that its base
-branch contains the merged changes. Blockers still In Review never reach this point, since
-they keep the ticket waiting. If Linear cannot be read, the agent starts without the section
+branch contains the merged changes. Blockers that still hold the ticket back never reach this
+point. If Linear cannot be read, the agent starts without the section
 and the launch warns.
 
 The ticket preview shows the ticket's project, team, labels, priority, dates (including
@@ -303,7 +303,10 @@ personal key) can start or steer agents; sessions from anyone or anything else g
 The plugin receives webhooks on `127.0.0.1:47831` and publishes only `/linear/agent` on port
 8443 with `tailscale funnel` (never 443). Each webhook is checked for its HMAC signature and a
 timestamp newer than 60 s, answered at once, and deduplicated. A sweep every minute picks up
-sessions and replies whose webhook was missed. **Settings → Linear agent** shows the state.
+sessions and replies whose webhook was missed. Each of its parts (waiting tickets, superseded
+threads, reviews, "Open in Paseo" links, missed replies) and each thread's replies are handled on
+their own: a failed Linear request skips only what it hit until the next minute.
+**Settings → Linear agent** shows the state.
 
 **In the panel.**
 - The agent's commands and file edits show up while it works, merged at most every 4 seconds.
@@ -421,19 +424,24 @@ local daemon itself (only a loopback, password-free daemon), so replies sent whi
 reloading are picked up by the minute sweep. Plannotator chat rows in Paseo need a hook's
 connection and are skipped until one arrives; Linear still gets the review.
 
-**Waiting their turn.** A ticket blocked by unfinished tickets (anything not Done or Canceled,
-so a blocker In Review still blocks), or started while *max agents* (Settings → Auto-dispatch)
+**Waiting their turn.** A ticket blocked by unfinished tickets, or started while *max agents*
+(Settings → Auto-dispatch)
 are already working, waits. A labelled ticket keeps its label; a delegated one says why in its
 panel. The minute sweep starts it once it is admitted, however long it waited. A delegated ticket
 whose thread was ended, or which was closed meanwhile, starts nothing; one that already has an
 agent (from its label, say) is linked to it; a failed start is reported in the panel once.
 Labelled tickets start most urgent first.
+A blocker is finished when it is Done or Canceled, or when it is in review (a started state named
+like *In Review* or *Ready to merge*) and its pull requests are merged: at least one merged and
+none open or draft, as Linear's GitHub integration reports them. Links added by hand or by
+`link_url` carry no status and do not count. A blocker In Progress, Needs input or In Review with
+an open pull request still holds the ticket back.
 
 **Split into sub-issues.** A plan with 2–12 steps also offers **Approve & split into N
 sub-issues**. The plan becomes the parent's plan document and the planning agent is closed.
 Each step becomes a sub-issue in Todo, assigned to Paseo, blocked by the step before, and the
 parent moves to In Progress with `plan-ready`. The steps run one after another: each starts when the previous
-ticket is done, which for code usually means its pull request was merged.
+one is finished, which for code means Done or in review with its pull requests merged.
 
 **Pull request reviews.** Every 2 minutes the plugin reads each ticket's pull request with
 `gh`. Requested changes post a panel update and move the ticket back to In Progress; fixes

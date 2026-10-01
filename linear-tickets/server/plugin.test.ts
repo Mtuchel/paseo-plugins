@@ -691,7 +691,8 @@ test("a ticket context that cannot be saved warns and still launches a gated tic
 test("an agent starting after its blockers gets what the finished ones left: links and their latest real comments, newest first", async () => {
   const blocked = { ...rawIssue, inverseRelations: { nodes: [
     { type: "blocks", issue: { id: "issue-5", identifier: "ENG-46", title: "Add the table", state: { name: "Done", type: "completed" } }, relatedIssue: { id: "issue-1" } },
-    { type: "blocks", issue: { id: "issue-6", identifier: "ENG-47", title: "Still open", state: { name: "In Review", type: "started" } }, relatedIssue: { id: "issue-1" } },
+    { type: "blocks", issue: { id: "issue-6", identifier: "ENG-47", title: "In review", state: { name: "In Review", type: "started" } }, relatedIssue: { id: "issue-1" } },
+    { type: "blocks", issue: { id: "issue-7", identifier: "ENG-48", title: "Still in progress", state: { name: "In Progress", type: "started" } }, relatedIssue: { id: "issue-1" } },
   ] } };
   const blockedDetail = { ...detail, context: buildContext(blocked, []), relations: ticketRelations(blocked) };
   const asked: string[][] = [];
@@ -713,7 +714,7 @@ test("an agent starting after its blockers gets what the finished ones left: lin
   } });
   let prompt: string | undefined;
   const result = await launcher.start({ ...input, requestId: "8a1f2c3d-0000-4000-8000-000000000003" }, mockPaseo(async (created) => { prompt = created.prompt; return { id: "agent-1" }; }));
-  assert.deepEqual(asked, [["issue-5"]], "only finished blockers are read");
+  assert.deepEqual(asked, [["issue-5", "issue-6"]], "Done and in-review blockers are read (the read keeps a review only when merged); work in progress is not");
   assert.deepEqual(result.warnings, []);
   const note = prompt!.slice(prompt!.indexOf("Finished blockers:"));
   assert.ok(note.includes("### ENG-46: Add the table (Done 2026-10-01)\nhttps://linear.app/x/issue/ENG-46\nLinks:\n- Pull request: https://github.com/o/r/pull/7\n- Plan: ENG-46: https://linear.app/x/document/plan"));
@@ -725,21 +726,42 @@ test("an agent starting after its blockers gets what the finished ones left: lin
   const failing = new Launcher({ ...noMark, detail: async () => blockedDetail, finishedBlockers: async () => { throw new Error("Linear unavailable"); } });
   const degraded = await failing.start({ ...input, requestId: "8a1f2c3d-0000-4000-8000-000000000004" }, mockPaseo(async () => ({ id: "agent-2" })));
   assert.equal(degraded.agentId, "agent-2", "a failed read never stops the launch");
-  assert.deepEqual(degraded.warnings, ["Could not read what the finished blockers (ENG-46) left behind: Linear unavailable"]);
+  assert.deepEqual(degraded.warnings, ["Could not read what the finished blockers (ENG-46, ENG-47) left behind: Linear unavailable"]);
 });
 
-test("finished blockers come back in the asked order, without the Paseo agent links", async () => {
+test("finished blockers are the Done ones and reviews with merged pull requests, in the asked order, without the Paseo agent links", async () => {
+  const pr = (n: number, status: string) => ({ title: `PR ${n}`, url: `https://github.com/o/r/pull/${n}`, sourceType: "github", metadata: { status } });
+  const review = (id: string, identifier: string, name: string, prs: unknown[]) => ({ id, identifier, title: identifier, url: id, completedAt: null, state: { name, type: "started" }, attachments: { nodes: prs }, documents: { nodes: [] }, comments: { nodes: [] } });
   const post: Post = async () => ({ issues: { nodes: [
-    { id: "b", identifier: "ENG-2", title: "Second", url: "u2", completedAt: null, state: { name: "Done" }, attachments: { nodes: [] }, documents: { nodes: [] }, comments: { nodes: [] } },
-    { id: "a", identifier: "ENG-1", title: "First", url: "u1", completedAt: "2026-10-01T00:00:00Z", state: { name: "Done" },
+    { id: "b", identifier: "ENG-2", title: "Second", url: "u2", completedAt: null, state: { name: "Done", type: "completed" }, attachments: { nodes: [] }, documents: { nodes: [] }, comments: { nodes: [] } },
+    { id: "a", identifier: "ENG-1", title: "First", url: "u1", completedAt: "2026-10-01T00:00:00Z", state: { name: "Done", type: "completed" },
       attachments: { nodes: [{ title: "Pull request", url: "https://github.com/o/r/pull/1" }, { title: "Paseo agent · ENG-1", url: "https://app.paseo.sh/h/srv/agent/x" }] },
       documents: { nodes: [{ title: "Plan: ENG-1", url: "https://linear.app/doc" }] },
       comments: { nodes: [{ body: "Done.", createdAt: "2026-10-01T00:00:00Z" }] } },
+    review("c", "ENG-3", "In Review", [pr(3, "merged")]),
+    review("d", "ENG-4", "In Review", [pr(4, "merged"), pr(5, "open")]),
   ] } });
-  const blockers = await new LinearService(new Credentials("/unused", "key"), post).finishedBlockers(["a", "b"]);
-  assert.deepEqual(blockers.map((blocker) => blocker.identifier), ["ENG-1", "ENG-2"]);
+  const blockers = await new LinearService(new Credentials("/unused", "key"), post).finishedBlockers(["a", "c", "d", "b"]);
+  assert.deepEqual(blockers.map((blocker) => blocker.identifier), ["ENG-1", "ENG-3", "ENG-2"]);
   assert.deepEqual(blockers[0].links.map((link) => link.url), ["https://github.com/o/r/pull/1", "https://linear.app/doc"]);
   assert.deepEqual(blockers[0].comments, [{ body: "Done.", createdAt: "2026-10-01T00:00:00Z" }]);
+});
+
+test("a blocker in review whose pull requests are merged no longer holds the ticket back; open, draft, untracked or in-progress work does", async () => {
+  const pr = (n: number, status: string, sourceType = "github") => ({ url: `https://github.com/o/r/pull/${n}`, sourceType, metadata: sourceType === "github" ? { status } : {} });
+  const blocker = (identifier: string, name: string, type: string, prs: unknown[]) => ({ type: "blocks", issue: { identifier, state: { name, type }, attachments: { nodes: prs } } });
+  const post: Post = async () => ({ issue: { id: "i1", identifier: "ENG-1", state: { id: "s", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [
+    blocker("ENG-2", "In Review", "started", [pr(1, "merged"), pr(2, "merged")]),
+    blocker("ENG-3", "In Review", "started", [pr(3, "merged"), pr(4, "open")]),
+    blocker("ENG-4", "In Review", "started", [pr(5, "draft")]),
+    blocker("ENG-5", "In Review", "started", [pr(6, "", "api")]),
+    blocker("ENG-6", "In Progress", "started", [pr(7, "merged")]),
+    blocker("ENG-7", "Ready to merge", "started", [pr(8, "merged"), pr(9, "closed")]),
+    blocker("ENG-8", "Done", "completed", []),
+    blocker("ENG-9", "In Review", "started", []),
+  ] } } });
+  const state = await new LinearService(new Credentials("/unused", "key"), post).issueState("i1");
+  assert.deepEqual(state.blockedBy, ["ENG-3", "ENG-4", "ENG-5", "ENG-6", "ENG-9"]);
 });
 
 test("pre-launch errors can retry, but uncertain agent creation is never automatically repeated", async () => {

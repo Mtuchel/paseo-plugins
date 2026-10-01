@@ -245,7 +245,7 @@ export type LabeledIssue = { id: string; identifier: string; teamKey: string; pr
 export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
   issue(id: $id) {
     id identifier state { id name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
-    inverseRelations(first: 50) { nodes { type issue { identifier state { type } } } }
+    inverseRelations(first: 50) { nodes { type issue { identifier state { name type } attachments(first: 25) { nodes { url sourceType metadata } } } } }
   }
 }`;
 // `status`: the workflow state's name ("In Review"); `statusType` its kind ("started").
@@ -257,7 +257,20 @@ export const ISSUE_STATUSES_QUERY = `query issueStatuses($ids: [ID!]!) {
 // A state the plugin itself just moved a ticket into, from the mutation's own answer.
 export type WrittenState = { name: string; type: string };
 
-// `blockedBy`: identifiers of unfinished tickets that block this one.
+// A blocker in review (In Review, Ready to merge) whose pull requests are merged has its code in:
+// the tickets waiting on it may start before someone marks it Done. Only pull requests Linear's
+// GitHub integration tracks have a status; at least one must be merged and none open or draft.
+export function inReviewState(name: string, type: string): boolean {
+  return type === "started" && /review|merge/i.test(name);
+}
+function pullRequestsMerged(attachments: unknown): boolean {
+  const statuses = connection(attachments ?? { nodes: [] }).nodes.map((node) => record(node))
+    .filter((node) => label(node.sourceType) === "github" && /\/pull\/\d+/.test(label(node.url)) && node.metadata && typeof node.metadata === "object")
+    .map((node) => label(record(node.metadata).status));
+  return statuses.includes("merged") && !statuses.some((status) => status === "open" || status === "draft");
+}
+
+// `blockedBy`: identifiers of unfinished tickets that block this one (merged reviews count as finished).
 export type IssueState = {
   id: string; identifier: string; status: string; statusId: string; statusType: string; teamId: string | null; projectId: string | null; creatorId: string | null;
   labels: { id: string; name: string }[]; attachmentUrls: string[]; blockedBy: string[];
@@ -367,10 +380,11 @@ export const COMMENT_QUERY = `query issueComments($id: String!, $first: Int!, $a
 
 // What finished blockers left behind, for the agent that starts after them: links (pull requests,
 // plan documents) and the latest comments (the agents' summaries), oldest first as Linear returns them.
+// State and pull request status tell a merged review apart from one still open.
 export const FINISHED_BLOCKERS_QUERY = `query finishedBlockers($ids: [ID!]!) {
   issues(first: 50, filter: { id: { in: $ids } }) { nodes {
-    id identifier title url completedAt state { name }
-    attachments(first: 20) { nodes { title url } }
+    id identifier title url completedAt state { name type }
+    attachments(first: 20) { nodes { title url sourceType metadata } }
     documents(first: 10) { nodes { title url } }
     comments(last: 20) { nodes { body createdAt } }
   } }
@@ -502,11 +516,15 @@ export class LinearService {
     });
   }
 
+  // The blockers among `ids` that are finished: Done, or in review with their pull requests merged.
   // Read on the app's pool; tickets the app cannot see are read again with the key. Returned in the order of `ids`.
   async finishedBlockers(ids: string[]): Promise<FinishedBlocker[]> {
     if (!ids.length) return [];
     const data = await this.read(FINISHED_BLOCKERS_QUERY, { ids }, (result) => connection(record(result.issues)).nodes.length === ids.length);
-    const nodes = connection(record(data.issues)).nodes.map((node) => record(node));
+    const nodes = connection(record(data.issues)).nodes.map((node) => record(node)).filter((node) => {
+      const state = record(node.state ?? {});
+      return label(state.type) === "completed" || (inReviewState(label(state.name), label(state.type)) && pullRequestsMerged(node.attachments));
+    });
     return nodes.sort((a, b) => ids.indexOf(label(a.id)) - ids.indexOf(label(b.id))).map((node) => ({
       identifier: label(node.identifier),
       title: label(node.title),
@@ -612,7 +630,11 @@ export class LinearService {
     const blockedBy = connection(issue.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
       .filter((relation) => label(relation.type) === "blocks")
       .map((relation) => record(relation.issue ?? {}))
-      .filter((blocker) => !["completed", "canceled", "duplicate"].includes(label(record(blocker.state ?? {}).type)))
+      .filter((blocker) => {
+        const state = record(blocker.state ?? {});
+        if (["completed", "canceled", "duplicate"].includes(label(state.type))) return false;
+        return !(inReviewState(label(state.name), label(state.type)) && pullRequestsMerged(blocker.attachments));
+      })
       .map((blocker) => label(blocker.identifier)).filter(Boolean);
     return {
       id: label(issue.id), identifier: label(issue.identifier), status: label(state.name), statusId: label(state.id), statusType: label(state.type),
