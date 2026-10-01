@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -9,7 +9,9 @@ const root = mkdtempSync(join(tmpdir(), "paseo-plan-advisor-"));
 const cli = join(root, "paseo");
 // Stand-in for `paseo inspect <id> --json`: "astra" is a proper advisor that has answered,
 // "busy" one still working, "sol" the wrong model, "stranger" someone else's Astra agent.
+// Every lookup is logged, so a test can tell whether a record was checked again.
 writeFileSync(cli, `#!/bin/sh
+echo "$2" >> "$PASEO_HOME/inspect.log"
 case "$2" in
   astra) echo '{"Model":"openai-codex/gpt-6-astra","Thinking":"medium","ParentAgentId":"planner-1","Status":"idle"}' ;;
   busy) echo '{"Model":"openai-codex/gpt-6-astra","Thinking":"medium","ParentAgentId":"planner-1","Status":"running"}' ;;
@@ -25,12 +27,14 @@ const { default: extension, submittedPlan } = await import("../omp/linear-ticket
 type Result = { content: { text: string }[] };
 type Entry = { type: string; customType?: string; data?: unknown };
 type Tool = { name: string; execute(id: string, params: Record<string, string>, signal?: unknown, onUpdate?: unknown, ctx?: unknown): Promise<Result> };
-type Gate = (event: { toolName: string; input?: Record<string, unknown> }, ctx: unknown) => Promise<{ block: true; reason: string } | undefined>;
+type Gate = (event: { toolName: string; toolCallId?: string; input?: Record<string, unknown> }, ctx: unknown) => Promise<{ block: true; reason: string } | undefined>;
 type Start = (event: unknown, ctx: { sessionManager: { getBranch(): Entry[] } }) => void;
+
+const inspections = () => (existsSync(join(root, "inspect.log")) ? readFileSync(join(root, "inspect.log"), "utf8").split("\n").filter(Boolean).length : 0);
 
 function load() {
   const tools: Tool[] = [];
-  const handlers: { gate?: Gate; start?: Start; tree?: Start } = {};
+  const handlers: { gate?: Gate; start?: Start; tree?: Start; turn?: () => void } = {};
   const entries: Entry[] = [];
   const schema = { object: () => ({}), string: () => ({ optional: () => ({}) }), enum: () => ({}) };
   extension({
@@ -38,6 +42,7 @@ function load() {
       if (event === "tool_call") handlers.gate = handler;
       if (event === "session_start") handlers.start = handler;
       if (event === "session_tree") handlers.tree = handler;
+      if (event === "turn_start") handlers.turn = handler as unknown as () => void;
     },
     events: { emit: () => {} },
     appendEntry: (customType: string, data: unknown) => { entries.push({ type: "custom", customType, data }); },
@@ -50,14 +55,18 @@ function load() {
   const ctx = { cwd, sessionManager: { getBranch: () => [], getArtifactsDir: () => artifacts } };
   const record = tools.find((tool) => tool.name === "record_plan_advice");
   assert.ok(record, "ticket agents get the record tool");
-  assert.ok(handlers.gate && handlers.start && handlers.tree);
-  const gate = handlers.gate, start = handlers.start, tree = handlers.tree;
+  assert.ok(handlers.gate && handlers.start && handlers.tree && handlers.turn);
+  const gate = handlers.gate, start = handlers.start, tree = handlers.tree, turn = handlers.turn;
   return {
     cwd,
     entries,
     call: (toolName: string, input: Record<string, unknown>) => gate({ toolName, input }, ctx),
     submit: (filePath: string) => gate({ toolName: "plannotator_submit_plan", input: { filePath } }, ctx),
     record: async (params: Record<string, string>) => (await record.execute("call", params, undefined, undefined, ctx)).content[0].text,
+    // omp's dispatch of one assistant message: every call's tool_call handler in order, then the tools.
+    hook: (toolName: string, toolCallId: string, input: Record<string, unknown>, agent?: { kind: string }) => gate({ toolName, toolCallId, input }, { ...ctx, agent }),
+    run: async (toolCallId: string, params: Record<string, string>) => (await record.execute(toolCallId, params, undefined, undefined, ctx)).content[0].text,
+    turn,
     resume: (branch: Entry[]) => start({}, { sessionManager: { getBranch: () => branch } }),
     navigate: (branch: Entry[]) => tree({}, { sessionManager: { getBranch: () => branch } }),
   };
@@ -126,9 +135,100 @@ test("omp's local plan proposals are checked against the text the bridge would s
   assert.match(unreadable.reason, /could not be read/);
   // Written but not flushed to disk yet: the gate reads the same cached text the bridge would.
   assert.equal(await h.call("write", { path: "local://rework-plan.md", content: PLAN }), undefined);
+  h.turn();
   assert.match((await h.call("write", { path: "xd://propose", content: "rework" }))?.reason ?? "", /no recorded advisor review/);
   assert.match(await h.record({ filePath: "local://rework-plan.md", verdict: "agreed", advisorAgentId: "astra" }), /recorded/);
   assert.equal(await h.call("write", { path: "xd://propose", content: "rework" }), undefined);
+});
+
+test("a record and a submission in the same message count in that order: omp runs every call's handler before any tool", async () => {
+  const h = load();
+  const astra = { filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" };
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN);
+  writeFileSync(join(h.cwd, "OTHER.md"), PLAN.replace("Do the thing.", "Do another thing."));
+
+  // Submission first: the review is not recorded yet when its handler runs.
+  assert.match((await h.hook("plannotator_submit_plan", "s1", { filePath: "PLAN.md" }))?.reason ?? "", /no recorded advisor review/);
+  h.turn();
+
+  // Record first: its handler checks it, so the submission's handler already sees the review,
+  // and the record's execute returns that result without looking the advisor up again.
+  const before = inspections();
+  assert.equal(await h.hook("record_plan_advice", "r1", astra), undefined);
+  assert.equal(await h.hook("plannotator_submit_plan", "s2", { filePath: "PLAN.md" }), undefined);
+  assert.match(await h.run("r1", astra), /Advisor review recorded for PLAN.md/);
+  assert.equal(inspections(), before + 1);
+  assert.equal(h.entries.filter((entry) => entry.customType === "linear-tickets.plan-advice").length, 1);
+  // A review of one plan does not cover another.
+  assert.equal((await h.hook("plannotator_submit_plan", "s3", { filePath: "OTHER.md" }))?.block, true);
+  h.turn();
+
+  // A refused record opens nothing new and keeps the earlier review of the same text.
+  assert.equal(await h.hook("record_plan_advice", "r2", { ...astra, advisorAgentId: "sol" }), undefined);
+  assert.equal(await h.hook("plannotator_submit_plan", "s4", { filePath: "PLAN.md" }), undefined);
+  assert.match(await h.run("r2", astra), /does not count as your plan advisor/);
+  h.turn();
+  assert.equal(await h.hook("record_plan_advice", "r3", { ...astra, filePath: "OTHER.md", advisorAgentId: "sol" }), undefined);
+  assert.equal((await h.hook("plannotator_submit_plan", "s5", { filePath: "OTHER.md" }))?.block, true);
+  h.turn();
+
+  // The file changed on disk between the record's handler and the submission's.
+  assert.equal(await h.hook("record_plan_advice", "r4", astra), undefined);
+  writeFileSync(join(h.cwd, "PLAN.md"), `${PLAN}\nOne more step.\n`);
+  assert.match((await h.hook("plannotator_submit_plan", "s6", { filePath: "PLAN.md" }))?.reason ?? "", /changed after its advisor review was recorded/);
+
+  // A checked record whose execute never ran in its turn is checked again when it does run.
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN);
+  assert.equal(await h.hook("record_plan_advice", "r5", astra), undefined);
+  h.turn();
+  const stale = inspections();
+  assert.match(await h.run("r5", astra), /recorded/);
+  assert.equal(inspections(), stale + 1);
+});
+
+test("a plan write or edit queued in the same message keeps that message's record and submission from vouching for it", async () => {
+  const h = load();
+  const astra = { filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" };
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN);
+
+  // Record, then a queued write of the plan, then the submission: the file on disk is still the
+  // reviewed text when the submission's handler runs, but the write would change it before it is sent.
+  assert.equal(await h.hook("record_plan_advice", "r1", astra), undefined);
+  assert.equal(await h.hook("write", "w1", { path: "PLAN.md", content: `${PLAN}\nMore.\n` }), undefined);
+  assert.match((await h.hook("plannotator_submit_plan", "s1", { filePath: "PLAN.md" }))?.reason ?? "", /changed after its advisor review was recorded/);
+  h.turn();
+  // An edit (omp passes a hashline patch's targets as `paths`) holds it back the same way.
+  assert.equal(await h.hook("edit", "e1", { input: "[PLAN.md#ABCD]\n…", paths: ["PLAN.md"], path: "PLAN.md" }), undefined);
+  assert.equal((await h.hook("plannotator_submit_plan", "s2", { filePath: "PLAN.md" }))?.block, true);
+  h.turn();
+  // Writes to other files do not.
+  assert.equal(await h.hook("write", "w2", { path: "notes.txt", content: "x" }), undefined);
+  assert.equal(await h.hook("plannotator_submit_plan", "s3", { filePath: "PLAN.md" }), undefined);
+  h.turn();
+
+  // A queued write before the record: the record refuses, with or without an earlier review,
+  // and the submission is held back.
+  for (const fresh of [false, true]) {
+    const g = fresh ? load() : h;
+    writeFileSync(join(g.cwd, "PLAN.md"), PLAN);
+    assert.equal(await g.hook("write", "w3", { path: "PLAN.md", content: PLAN }), undefined);
+    assert.equal(await g.hook("record_plan_advice", "r2", astra), undefined);
+    assert.equal((await g.hook("plannotator_submit_plan", "s4", { filePath: "PLAN.md" }))?.block, true);
+    assert.match(await g.run("r2", astra), /queued in this step/);
+    g.turn();
+    // Next message: the write has run, so record and submit go through.
+    assert.equal(await g.hook("record_plan_advice", "r3", astra), undefined);
+    assert.equal(await g.hook("plannotator_submit_plan", "s5", { filePath: "PLAN.md" }), undefined);
+    assert.match(await g.run("r3", astra), /recorded/);
+  }
+});
+
+test("subagents are not held to the advisor rule; the ticket agent is", async () => {
+  const h = load();
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN);
+  assert.equal(await h.hook("plannotator_submit_plan", "s1", { filePath: "PLAN.md" }, { kind: "sub" }), undefined);
+  assert.equal((await h.hook("plannotator_submit_plan", "s2", { filePath: "PLAN.md" }, { kind: "main" }))?.block, true);
+  assert.equal((await h.hook("plannotator_submit_plan", "s3", { filePath: "PLAN.md" }))?.block, true);
 });
 
 test("every plan submission form is recognized, and nothing else", () => {

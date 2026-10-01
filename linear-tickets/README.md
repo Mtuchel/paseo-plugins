@@ -351,9 +351,12 @@ submitted; a plan the gate cannot read is blocked too. The tool checks with `pas
 the advisor runs GPT-6 Astra at medium, was created by this agent and has finished its latest
 turn; any later edit to the plan needs a new record, and the record follows the session branch
 (resume, `/tree` and branch switches rebuild it). It cannot check what the advisor said: the
-plan's advisor section is your record of that. An advisor that cannot be created (quota, provider
-error) is recorded as `unavailable` only when the plan's advisor section says so and gives the
-same reason. Claude and Codex planners get the steps as instructions when they launch in a
+plan's advisor section is your record of that. Recording and submitting in one step works when the
+record comes first: the record is checked before any tool of that step runs, and a plan edit queued
+in the same step holds both back. Subagents of a ticket agent (`task` children) are not gated; the
+plan you review always comes from the ticket agent. An advisor that cannot be created (quota,
+provider error) is recorded as `unavailable` only when the plan's advisor section says so and gives
+the same reason. Claude and Codex planners get the steps as instructions when they launch in a
 planning policy, without the gate.
 
 **The omp extension.** The planning phase, `skip_plan` and the plan advisor gate come from

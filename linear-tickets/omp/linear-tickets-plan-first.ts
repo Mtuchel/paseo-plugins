@@ -16,7 +16,11 @@
 //   omp's `xd://propose`) is blocked until `record_plan_advice` recorded a GPT-6 Astra review for
 //   exactly that plan text. The block reason carries the steps, pointing the advisor at the saved
 //   ticket prompt in LINEAR_TICKETS_CONTEXT when the launch could save it. `xd://propose` is only
-//   caught when this extension's handler runs before plannotator-omp-plan.ts.
+//   caught when this extension's handler runs before plannotator-omp-plan.ts. omp runs the
+//   tool_call handlers of every call in a message, in order, before any of them executes: the
+//   record is therefore checked in its own handler, so a record listed before the submit in the
+//   same message counts, and a plan write or edit queued in that message holds both back. Subagents
+//   (`task` children, which share the environment but cannot create an advisor) are not gated.
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -27,7 +31,7 @@ import { ADVISOR_MODEL, ADVISOR_SECTION, ADVISOR_THINKING, advisorSteps, RECORD_
 
 type Phase = "idle" | "planning" | "executing";
 type Entry = { type: string; customType?: string; data?: { reason?: string; path?: string; hash?: string }; message?: { role?: string } };
-type Context = { cwd?: string; sessionManager: { getBranch(): Entry[]; getArtifactsDir?(): string } };
+type Context = { cwd?: string; agent?: { kind?: string }; sessionManager: { getBranch(): Entry[]; getArtifactsDir?(): string } };
 type ToolResult = { content: { type: "text"; text: string }[]; details?: Record<string, unknown> };
 type Params = Record<string, string | undefined>;
 type Schema = {
@@ -36,8 +40,8 @@ type Schema = {
   enum(values: [string, ...string[]]): unknown;
 };
 type ExtensionApi = {
-  on(event: "session_start" | "session_switch" | "session_branch" | "session_tree" | "before_agent_start", handler: (event: unknown, ctx: Context) => Promise<void> | void): void;
-  on(event: "tool_call", handler: (event: { toolName: string; input?: Record<string, unknown> }, ctx: Context) => Promise<{ block: true; reason: string } | undefined>): void;
+  on(event: "session_start" | "session_switch" | "session_branch" | "session_tree" | "before_agent_start" | "turn_start", handler: (event: unknown, ctx: Context) => Promise<void> | void): void;
+  on(event: "tool_call", handler: (event: { toolName: string; toolCallId?: string; input?: Record<string, unknown> }, ctx: Context) => Promise<{ block: true; reason: string } | undefined>): void;
   events: { emit(channel: string, data: unknown): void };
   appendEntry(customType: string, data: unknown): void;
   sendMessage(message: { customType: string; content: string; display: boolean }, options: { deliverAs: "aside" }): void;
@@ -127,12 +131,56 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
   // omp's local:// plans as last written: the Plannotator bridge submits them from the same cache
   // when the artifact is not on disk yet, so the gate reads what the bridge would send.
   const writtenPlans = new Map<string, string>();
-  // The plan a submission or record names: its key and current text (null: unreadable).
+  // Within the current turn (one assistant message): records already checked in their tool_call
+  // handler, by tool call id, for their execute to return; and plans a queued write or edit is
+  // about to change, which no record or submission in the same message may vouch for.
+  const recordOutcomes = new Map<string, ToolResult>();
+  const queuedEdits = new Set<string>();
+  // The plan a submission, record or edit names: its key and current text (null: unreadable).
   function planText(ctx: Context | undefined, file: string): { key: string; content: string | null } {
     const local = /^local:\/\/[^/]+$/.test(file);
     const path = planPath(ctx, file);
     return { key: local ? file : path ?? file, content: readPlan(path) ?? (local ? writtenPlans.get(file) ?? null : null) };
   }
+  // Checks a record_plan_advice call and, when it holds, records the review for the plan's
+  // current text. Runs in the call's tool_call handler (see the header) or, for calls dispatched
+  // without one, in its execute.
+  const recordAdvice = async (params: Params, ctx: Context | undefined): Promise<ToolResult> => {
+    const file = params.filePath?.trim();
+    if (!file) return text("Pass the plan file you are about to submit (the same path you give the submit tool).");
+    const { key, content } = planText(ctx, file);
+    if (content === null) return text(`${file} could not be read. Pass the plan file you are about to submit.`);
+    if (queuedEdits.has(key)) return text(`A change to ${file} is queued in this step, so the review cannot be recorded for it yet. Record after that change has run, in your next step.`);
+    const section = new RegExp(`^#{1,6}\\s+${ADVISOR_SECTION}\\b[^\\n]*\\n([\\s\\S]*?)(?=^#{1,2}\\s|(?![\\s\\S]))`, "im").exec(content);
+    if (!section) {
+      return text(`${file} has no "## ${ADVISOR_SECTION}" section. Add it (the advisor's model, the rounds, what changed because of it, and every open point with both positions), then record again.`);
+    }
+    const verdict = params.verdict;
+    if (verdict === "unavailable") {
+      const reason = params.reason?.trim();
+      if (!reason) return text("Give the reason the advisor could not be created.");
+      if (!/unavailable|could not be created|couldn't be created/i.test(section[1]) || !section[1].toLowerCase().includes(reason.toLowerCase())) {
+        return text(`The plan's "## ${ADVISOR_SECTION}" section must tell the owner that the advisor was unavailable and why, with the reason you pass here word for word. Say so there, then record again.`);
+      }
+    } else if (verdict === "agreed" || verdict === "disagreements") {
+      const advisorId = params.advisorAgentId?.trim();
+      if (!advisorId) return text("Pass the advisor's Paseo agent id (from `create_agent`).");
+      let agent: Record<string, unknown>;
+      try {
+        agent = JSON.parse((await run(PASEO_CLI, ["inspect", advisorId, "--json"], { timeout: INSPECT_TIMEOUT_MS })).stdout) as Record<string, unknown>;
+      } catch (error) {
+        return text(`Could not look up advisor ${advisorId} with \`paseo inspect\`: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
+      }
+      const problem = advisorProblem(agent, AGENT_ID);
+      if (problem) return text(`Agent ${advisorId} does not count as your plan advisor: ${problem}. Fix that, then record again.`);
+    } else {
+      return text(`Verdict must be one of: ${VERDICTS.join(", ")}.`);
+    }
+    const hash = createHash("sha256").update(content).digest("hex");
+    advised.set(key, hash);
+    pi.appendEntry(ADVICE_MARKER, { path: key, hash, verdict, advisorAgentId: params.advisorAgentId ?? null, reason: params.reason ?? null, at: new Date().toISOString() });
+    return text(`Advisor review recorded for ${file} (${verdict}). Submit the plan now, without editing it again.`, { verdict });
+  };
   // Plannotator's plan-mode control (plannotator:request). null: Plannotator did not answer.
   // Executor form: the plugin's TypeScript lib, which typechecks this file, predates Promise.withResolvers.
   function planMode(mode: "enter" | "exit" | "status"): Promise<Phase | null> {
@@ -188,6 +236,11 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
   for (const event of ["session_switch", "session_branch", "session_tree"] as const) {
     pi.on(event, (_event, ctx) => restoreAdvice(ctx.sessionManager.getBranch()));
   }
+  // omp starts a turn before each assistant message; the previous message's tools have all run.
+  pi.on("turn_start", () => {
+    recordOutcomes.clear();
+    queuedEdits.clear();
+  });
 
   pi.on("before_agent_start", async () => {
     if (await takeOwnerRequest()) { launched = true; return; }
@@ -206,12 +259,27 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     }
     if (!TICKET) return undefined;
     const input = event.input;
+    if (event.toolName === "write" || event.toolName === "edit") {
+      // omp gives an edit's targets as `paths` (hashline patches) or `path`.
+      const targets = Array.isArray(input?.paths) ? input.paths : [input?.path];
+      for (const target of targets) {
+        if (typeof target === "string" && /^(local:\/\/[^/]+|.*\.mdx?)$/i.test(target.trim())) queuedEdits.add(planText(ctx, target.trim()).key);
+      }
+    }
     if (event.toolName === "write" && typeof input?.path === "string" && /^local:\/\/[^/]+-plan\.md$/.test(input.path.trim()) && typeof input.content === "string") {
       writtenPlans.set(input.path.trim(), input.content);
       return undefined;
     }
+    if (event.toolName === RECORD_ADVICE_TOOL) {
+      const params: Params = {};
+      for (const [name, value] of Object.entries(input ?? {})) params[name] = typeof value === "string" ? value : undefined;
+      const outcome = await recordAdvice(params, ctx);
+      if (event.toolCallId) recordOutcomes.set(event.toolCallId, outcome);
+      return undefined;
+    }
     const file = submittedPlan(event.toolName, input);
     if (!file) return undefined;
+    if (ctx?.agent?.kind === "sub") return undefined;
     const { key, content } = planText(ctx, file);
     if (content === null) {
       // Plannotator's submit tool reads the file itself and reports a missing one; every other
@@ -220,7 +288,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       return { block: true, reason: `Stopped by the linear-tickets plugin: ${file} could not be read, so its advisor review cannot be checked. Write the plan with the write tool, then submit it again.` };
     }
     const recorded = advised.get(key);
-    if (recorded === createHash("sha256").update(content).digest("hex")) return undefined;
+    if (!queuedEdits.has(key) && recorded === createHash("sha256").update(content).digest("hex")) return undefined;
     return {
       block: true,
       reason: recorded
@@ -241,40 +309,10 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     }),
     // A direct tool: Plannotator's planning phase blocks xd:// writes to discoverable tools.
     loadMode: "essential",
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      const file = params.filePath?.trim();
-      if (!file) return text("Pass the plan file you are about to submit (the same path you give the submit tool).");
-      const { key, content } = planText(ctx, file);
-      if (content === null) return text(`${file} could not be read. Pass the plan file you are about to submit.`);
-      const section = new RegExp(`^#{1,6}\\s+${ADVISOR_SECTION}\\b[^\\n]*\\n([\\s\\S]*?)(?=^#{1,2}\\s|(?![\\s\\S]))`, "im").exec(content);
-      if (!section) {
-        return text(`${file} has no "## ${ADVISOR_SECTION}" section. Add it (the advisor's model, the rounds, what changed because of it, and every open point with both positions), then record again.`);
-      }
-      const verdict = params.verdict;
-      if (verdict === "unavailable") {
-        const reason = params.reason?.trim();
-        if (!reason) return text("Give the reason the advisor could not be created.");
-        if (!/unavailable|could not be created|couldn't be created/i.test(section[1]) || !section[1].toLowerCase().includes(reason.toLowerCase())) {
-          return text(`The plan's "## ${ADVISOR_SECTION}" section must tell the owner that the advisor was unavailable and why, with the reason you pass here word for word. Say so there, then record again.`);
-        }
-      } else if (verdict === "agreed" || verdict === "disagreements") {
-        const advisorId = params.advisorAgentId?.trim();
-        if (!advisorId) return text("Pass the advisor's Paseo agent id (from `create_agent`).");
-        let agent: Record<string, unknown>;
-        try {
-          agent = JSON.parse((await run(PASEO_CLI, ["inspect", advisorId, "--json"], { timeout: INSPECT_TIMEOUT_MS })).stdout) as Record<string, unknown>;
-        } catch (error) {
-          return text(`Could not look up advisor ${advisorId} with \`paseo inspect\`: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
-        }
-        const problem = advisorProblem(agent, AGENT_ID);
-        if (problem) return text(`Agent ${advisorId} does not count as your plan advisor: ${problem}. Fix that, then record again.`);
-      } else {
-        return text(`Verdict must be one of: ${VERDICTS.join(", ")}.`);
-      }
-      const hash = createHash("sha256").update(content).digest("hex");
-      advised.set(key, hash);
-      pi.appendEntry(ADVICE_MARKER, { path: key, hash, verdict, advisorAgentId: params.advisorAgentId ?? null, reason: params.reason ?? null, at: new Date().toISOString() });
-      return text(`Advisor review recorded for ${file} (${verdict}). Submit the plan now, without editing it again.`, { verdict });
+    async execute(id, params, _signal, _onUpdate, ctx) {
+      const checked = recordOutcomes.get(id);
+      recordOutcomes.delete(id);
+      return checked ?? recordAdvice(params, ctx);
     },
   });
 
