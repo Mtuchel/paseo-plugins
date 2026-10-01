@@ -541,9 +541,9 @@ using this host's key, independently of the agent's own `linear_ticket` tools:
 - **Turn summaries** — each completed turn's final reply is posted as a comment (capped at
   4,000 characters), a failed turn posts its error, and archiving an agent that never linked
   a pull request says so.
-- **Blocked alerts** — when the agent waits for you (a question, a plan approval or a
-  permission still pending after a moment), the ticket shows it three ways, also when the
-  agent panel asks:
+- **Blocked alerts** — when the agent waits for you (a question, a plan approval, a
+  permission still pending after a moment, or a turn that ends by asking you), the ticket
+  shows it three ways, also when the agent panel asks:
   - it moves to the team's **Needs input** workflow state (type Started; create it in the
     team's workflow settings, teams without it skip this step),
   - it gets the red `<label>-needs-you` label (created on first use), handy for a saved
@@ -557,7 +557,13 @@ using this host's key, independently of the agent's own `linear_ticket` tools:
   is archived, the label comes off and the ticket returns to its previous state, unless
   someone moved it out of Needs input meanwhile. The next wait gets a fresh comment. A
   failed turn adds `<label>-blocked`, which marks errors only; the next completed turn
-  removes it. Started agents are asked to batch their questions into one ask.
+  removes it. Started agents are asked to put everything they need from you (answers,
+  decisions, approvals, secrets, manual steps) into one question request.
+  As a fallback, a completed turn whose final reply ends by asking you (a question, or a
+  phrase such as "needs your OK", "once you decide" or "reply "yes" and I'll") opens a
+  wait too; the comment quotes that part of the reply. It lasts until the agent's next turn
+  starts. Plan approval requests are left to the plan review. Completed or canceled tickets
+  keep their state and only get the label and the comment.
 - **Pull requests** — GitHub pull request URLs printed by the agent's completed shell
   commands during a turn (for example `gh pr create`) are attached to the ticket, which then moves to its team's
   started state named like *In Review*. Completion is left to Linear's GitHub integration.

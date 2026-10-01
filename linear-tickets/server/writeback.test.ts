@@ -11,7 +11,7 @@ import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/se
 import type { IssueState } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
-import { appComment, MAX_SUMMARY_LENGTH, turnPullRequests, turnReply, Writeback } from "./writeback";
+import { appComment, MAX_SUMMARY_LENGTH, ownerRequest, turnPullRequests, turnReply, Writeback } from "./writeback";
 
 // Writebacks built without an outbox path keep theirs here, never in the real Paseo home.
 process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-writeback-home-"));
@@ -141,7 +141,7 @@ test("a model switch between turns is announced in the panel and recorded in the
   const records: unknown[] = [];
   const bridge = {
     sessions: { sessionFor: async () => ({ sessionId: "s1" }), holdIfStopped: async () => false, follow: async () => {}, say: async (_s: string, type: string, body: string) => { panel.push(`${type}: ${body}`); } },
-    handover: { update: async (_issue: unknown, _agent: unknown, change: unknown) => { records.push(change); } },
+    handover: { update: async (_issue: unknown, _agent: unknown, change: unknown) => { records.push(change); }, waiting: async () => null },
   };
   const writeback = new Writeback(linear, { read: async () => allOn }, bridge as never, 0);
   // Plannotator restores its pre-planning model inside the provider; the runtime report wins.
@@ -185,6 +185,33 @@ test("a question moves the ticket to Needs input, labels it and mentions the own
   linear.state = { ...linear.state, status: "In Progress", statusId: "ip" };
   await ask("q3", "Another one?");
   assert.deepEqual(linear.writes.splice(0), ["state", "move issue-1 Needs input", "+paseo-needs-you", `new comment: ${waiting("Another one?")}`]);
+});
+
+test("a turn that ends asking the owner waits in Needs input until the agent's next turn starts", async () => {
+  const linear = new FakeLinear();
+  linear.state = { ...linear.state, status: "In Progress", statusId: "ip", statusType: "started", creatorId: "creator" };
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
+  const end = (text: string) => writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text }] }, linked);
+
+  await end("The stack is ready.\n\nShould I push it and open the draft PRs?");
+  const comment = `new comment: https://linear.app/acme/profiles/creator **ENG-1: Fix sign-in** (Paseo) finished its turn and is waiting for you:\n\nShould I push it and open the draft PRs?\n\nReply here with “@paseo <your answer>”.`;
+  assert.deepEqual(linear.writes.splice(0).filter((write) => !write.startsWith("comment: ")), ["state", "-paseo-blocked", "state", "move issue-1 Needs input", "+paseo-needs-you", comment]);
+  // The owner's reply starts the next turn: the ticket goes back where it was.
+  await writeback.turnStarted({ agent: root, turnId: "t2" }, linked);
+  assert.deepEqual(linear.writes.splice(0).filter((write) => write !== "in-progress issue-1"), ["state", "-paseo-needs-you", "restore ip", "state"]);
+  await writeback.turnStarted({ agent: root, turnId: "t3" }, linked);
+  assert.deepEqual(linear.writes.splice(0), []);
+  await end("Pushed; the PRs are #4 and #5.");
+  assert.ok(!linear.writes.includes("move issue-1 Needs input"));
+});
+
+test("only replies that hand the next step to the owner count as waiting, and plan approval never does", () => {
+  assert.equal(ownerRequest("Merged #12 and the staging deploy succeeded."), null);
+  assert.equal(ownerRequest("Run `curl 'https://x/api?q=1'` to check.\n\n```ts\nconst a = b ? c : d;\n```"), null);
+  assert.equal(ownerRequest("Approve or annotate the plan in Plannotator. Should I split AC-3 out?"), null);
+  assert.equal(ownerRequest("Done.\n\nThe `approved-test-change` label needs your OK, then I merge.\n\nPLAN.md is untracked."), "The `approved-test-change` label needs your OK, then I merge.\n\nPLAN.md is untracked.");
+  // A question far above the closing report is history, not the open ask.
+  assert.equal(ownerRequest(`Should I start?\n\n${"Report line.\n\n".repeat(150)}All checks pass.`), null);
 });
 
 test("the previous state is not restored when someone moved the ticket out of Needs input meanwhile", async () => {

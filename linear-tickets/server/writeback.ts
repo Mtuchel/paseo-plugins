@@ -96,6 +96,53 @@ export function truncateSummary(text: string): string {
   return text.length <= MAX_SUMMARY_LENGTH ? text : `${text.slice(0, MAX_SUMMARY_LENGTH).trimEnd()}\n\n… (truncated; the full reply is in Paseo)`;
 }
 
+// How far back from the end of a turn's reply a request to the owner is looked for.
+const OWNER_REQUEST_WINDOW = 1_200;
+// The agent hands the next step to the owner in its final reply instead of a question request:
+// a sentence ending in a question mark, or a phrase that waits for the owner's answer or action.
+const OWNER_REQUEST = new RegExp([
+  String.raw`[^\s?]\?(?=\s|$|[)*_"”'’])`,
+  String.raw`\bneed(?:s|ing)?\s+your\s+(?:ok|okay|yes|go-ahead|approval|decisions?|answers?|input|confirmation|authori[sz]ation)\b`,
+  String.raw`\bwait(?:s|ing)?\s+(?:for|on)\s+your\s+(?:ok|okay|yes|go-ahead|approval|decisions?|answers?|input|reply|confirmation)\b`,
+  String.raw`\b(?:after|once|when)\s+you\s+(?:answer|decide|confirm|reply|approve|say\s+go)\b`,
+  String.raw`\bafter\s+your\s+(?:answer|decision|reply|ok|okay|go-ahead)\b`,
+  String.raw`\bif\s+you\s+say\s+go\b`,
+  String.raw`\b(?:for\s+you\s+to\s+decide|decisions?\s+for\s+you|please\s+decide)\b`,
+  String.raw`\bonly\s+you\s+can\b`,
+  String.raw`\byours\s+to\s+authori[sz]e\b`,
+  String.raw`\b(?:reply|say)\s+["“][^"”\n]{1,40}["”]\s+and\s+I(?:'|’)ll\b`,
+  String.raw`\btell\s+me\s+(?:when|once|whether|which|if)\b[^.?!\n]*\band\s+I(?:'|’)ll\b`,
+].join("|"), "i");
+// Plan approval has its own flow (Planning, Plannotator) and never means Needs input.
+const PLAN_REVIEW = /\bplannotator\b|\b(?:approve|annotate)\b[^.\n]{0,60}\bplan\b/i;
+
+// Code, commands and links are not questions to the owner (`?q=`, `a ? b : c`).
+const prose = (text: string) => text.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, "code").replace(/https?:\/\/\S+/g, "link");
+
+// Paragraphs of a reply; a fenced code block with blank lines in it stays one paragraph.
+function paragraphs(text: string): string[] {
+  const result: string[] = [];
+  for (const piece of text.split(/\n\s*\n/)) {
+    const last = result.at(-1);
+    if (last !== undefined && (last.match(/```/g)?.length ?? 0) % 2 === 1) result[result.length - 1] = `${last}\n\n${piece}`;
+    else result.push(piece);
+  }
+  return result;
+}
+
+// The part of a turn's final reply that asks the owner for an answer, decision, approval or
+// action (from the first asking paragraph near the end), or null when the agent is not waiting
+// on the owner. Plan approval requests are left to the plan review.
+export function ownerRequest(reply: string): string | null {
+  const all = paragraphs(reply.trim());
+  let start = all.length;
+  for (let length = 0; start > 0 && length < OWNER_REQUEST_WINDOW;) length += all[--start].length;
+  const window = all.slice(start);
+  if (PLAN_REVIEW.test(prose(window.join("\n\n")))) return null;
+  const first = window.findIndex((paragraph) => OWNER_REQUEST.test(prose(paragraph)));
+  return first === -1 ? null : window.slice(first).join("\n\n");
+}
+
 // Written as the Paseo app when it is installed: the plugin's key belongs to the owner, and Linear
 // notifies nobody of their own mentions. `commentId` edits that comment instead of posting a new one.
 // A rate limit is rethrown, never retried on the other credential: its pool must not absorb the load.
@@ -405,6 +452,8 @@ export class Writeback {
       if (model && (changed || !previous) && handover && settings.writeback.summaries) {
         await handover.update({ id: issueId, identifier }, named, { model }).catch(() => {});
       }
+      // The agent works again, so a wait it ended its last turn with is over.
+      if (settings.writeback.blocked && await this.waitingFor(issueId)) await this.clearWaiting({ id: issueId, identifier }, agent, settings);
       if (!settings.writeback.status || this.started.has(agent.id)) return;
       this.started.add(agent.id);
       const state = await this.linear.issueState(issueId);
@@ -417,7 +466,8 @@ export class Writeback {
   }
 
   turnEnded({ agent, outcome, timeline }: PluginLifecycleEvents["agent.turn_ended"], paseo: PaseoApi): Promise<void> {
-    return this.run("turn_ended", agent, paseo, async ({ issueId, identifier }, settings, { once }) => {
+    return this.run("turn_ended", agent, paseo, async ({ issueId, identifier }, settings, context) => {
+      const { once } = context;
       const { writeback } = settings;
       const { model, named } = await this.snapshot(agent, paseo);
       if (model) this.models.set(agent.id, model);
@@ -428,14 +478,16 @@ export class Writeback {
         await once("outbox", () => this.changeOutbox((entries) => [...entries, ...added.filter((entry) => !entries.some((known) => known.agentId === entry.agentId && known.url === entry.url))]));
       }
       const blocked = dispatchLabels(settings.dispatch.label).blocked;
-      // The turn is over, so nothing waits for the owner any more; `paseo-blocked` marks errors only.
       const state = writeback.blocked ? await this.linear.issueState(issueId) : null;
-      if (state) await this.clearWaiting({ id: issueId, identifier }, agent, settings, state);
+      const reply = outcome.kind === "completed" ? turnReply(timeline) : "";
+      // A reply that asks the owner keeps (or opens) the waiting period until the next turn starts;
+      // otherwise the turn is over and nothing waits for the owner. `paseo-blocked` marks errors only.
+      const request = state ? ownerRequest(reply) : null;
+      if (state && !request) await this.clearWaiting({ id: issueId, identifier }, agent, settings, state);
       const title = agent.title ?? "Paseo agent";
       const handover = this.agentBridge?.handover;
       const issue = { id: issueId, identifier };
       if (outcome.kind === "completed") {
-        const reply = turnReply(timeline);
         await once("session:response", () => this.session(agent.id, async (sessionId, sessions) => {
           // The live feed already showed the commands; otherwise post the turn's last few.
           if (!await sessions.unfollow(agent.id)) for (const command of turnCommands(timeline)) await sessions.action(sessionId, "Ran", command);
@@ -447,6 +499,11 @@ export class Writeback {
           else await once("comment", () => this.linear.comment(issueId, `**${title}** (Paseo) finished a turn:\n\n${truncateSummary(reply)}`));
         }
         if (state) await this.linear.removeLabel(issueId, blocked, state.labels);
+        if (request) {
+          const inSession = Boolean(await this.agentBridge?.sessions.sessionFor(agent.id).catch(() => null));
+          const hint = writeback.mentions ? "\n\nReply here with “@paseo <your answer>”." : "";
+          await this.markWaiting(issue, agent, settings, `**${title}** (Paseo) finished its turn and is waiting for you:\n\n${truncateSummary(request)}${hint}`, inSession, context);
+        }
       } else if (outcome.kind === "failed") {
         await once("session:error", () => this.session(agent.id, async (sessionId, sessions) => {
           await sessions.unfollow(agent.id);
