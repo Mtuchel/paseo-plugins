@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
+import { mkdtempSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,7 @@ import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { AgentApi, AppAuth } from "./agent-app";
 import { verifyWebhook } from "./agent-webhook";
 import { Handover, handoverPrompt, progressBody, type HandoverRecord } from "./handover";
+import { NeedsYouIssues } from "./needs-you";
 import { planSteps, SessionRouter, SessionStore, type SessionLink } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
@@ -63,7 +65,7 @@ test("plan checklists come from checkboxes, or numbered steps under a Steps head
 });
 
 type Call = string;
-function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean } = {}) {
+function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -87,10 +89,11 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
   const store = new SessionStore(join(directory, "sessions.json"));
   const router = new SessionRouter({
     api: api as never,
-    linear: { viewerId: async () => OWNER, addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); } },
+    linear: { viewerId: async () => OWNER, addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); }, complete: async (id: string) => { calls.push(`complete ${id}`); } },
     starter: { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false, untrusted: false, plan: null }; }, admission: async () => ({ ok: true as const }) },
     settings: { read: async () => settings },
     store,
+    needsYou: options.needsYou,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     decideReview: async (url, approve, feedback) => { calls.push(`review ${url} ${approve ? "approve" : `deny:${feedback}`}`); },
   });
@@ -119,6 +122,17 @@ test("a mention on a ticket with a running agent is passed to that agent instead
   await h.router.created({ id: "s2", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" }, comment: { body: "@paseo also cover returns" } });
   assert.equal(h.calls[0], "send agent-1: also cover returns");
   assert.equal((await h.store.get("s2"))?.agentId, "agent-1");
+  await h.cleanup();
+});
+
+test("a mention on a Needs you sub-issue goes to the agent that asked on the parent ticket and closes the sub-issue", async () => {
+  const needsYou = new NeedsYouIssues(mkdtempSync(join(tmpdir(), "needs-you-")));
+  await needsYou.add({ id: "sub-1", identifier: "TUC-2", parentId: "i1", agentId: "agent-1" });
+  const h = harness({ needsYou });
+  await h.router.created({ id: "s2", creatorId: OWNER, issueId: "sub-1", issue: { identifier: "TUC-2" }, comment: { body: "@paseo mail is sent" } });
+  assert.deepEqual(h.calls.slice(0, 2), ["send agent-1: mail is sent", "complete sub-1"]);
+  assert.ok(!h.calls.some((call) => call.startsWith("start ")), "no new agent for the sub-issue");
+  assert.deepEqual(await needsYou.all(), []);
   await h.cleanup();
 });
 

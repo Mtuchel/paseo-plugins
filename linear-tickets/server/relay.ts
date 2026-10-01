@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import type { LinearService, RelayComment } from "./linear";
-import type { NeedsYouIssues } from "./needs-you";
+import { closeAnswered, type NeedsYouIssues } from "./needs-you";
 import { RateLimitedError } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
 
@@ -131,7 +131,7 @@ export class CommentRelay {
           if (message !== null) {
             const outcome = await this.deliver(paseo, agent, comment, message);
             state.acks.push({ commentId: comment.id, issueId: agent.issueId, reacted: false, ...outcome });
-            if (agent.needsYou && outcome.emoji === ACK_EMOJI) await this.answered(agent.issueId);
+            if (agent.needsYou && outcome.emoji === ACK_EMOJI && this.needsYou) await closeAnswered(this.needsYou, this.linear, agent.issueId);
           }
           if (comment.createdAt === cursor.since) cursor.boundaryIds.push(comment.id);
           else Object.assign(cursor, { since: comment.createdAt, boundaryIds: [comment.id] });
@@ -214,12 +214,6 @@ export class CommentRelay {
       console.error(`[linear-tickets] relaying comment ${comment.id} to agent ${agent.id} failed: ${reason}`);
       return { emoji: FAILED_EMOJI, reply: `Paseo could not deliver that comment to the agent: ${reason}` };
     }
-  }
-
-  // The owner answered on a "Needs you" sub-issue: it is done, and later comments there stay put.
-  private async answered(issueId: string): Promise<void> {
-    await this.needsYou?.remove(issueId);
-    await this.linear.complete(issueId).catch((error: unknown) => console.error(`[linear-tickets] closing answered sub-issue ${issueId} failed: ${error instanceof Error ? error.message : error}`));
   }
 }
 

@@ -52,7 +52,10 @@ export default function contribute(server: PluginServerContext) {
     await stopAgentTurn(agentId).catch(() => {});
     await api.agents.ref(agentId).archive().catch(() => {});
   };
-  const sessions = new SessionRouter({ api: agentApi, linear, starter, settings, store: new SessionStore(),
+  // Waits on tickets already closed live in "Needs you" sub-issues; replies there (a relayed
+  // comment or an @mention of the app) go to the agent that asked.
+  const needsYou = new NeedsYouIssues();
+  const sessions = new SessionRouter({ api: agentApi, linear, starter, settings, store: new SessionStore(), needsYou,
     decideReview: async (localUrl, approve, feedback, agentId) => {
       const planContent = await readReviewPlan(localUrl).catch(() => "");
       await decidePlannotatorReview(localUrl, approve, feedback);
@@ -64,8 +67,6 @@ export default function contribute(server: PluginServerContext) {
     approveLater: (link, localUrl, paseo) => approveForLater({ linear, readPlan: readReviewPlan, retirePlanner }, link, localUrl, paseo),
   });
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
-  // Waits on tickets already closed live in "Needs you" sub-issues; the relay routes their replies.
-  const needsYou = new NeedsYouIssues();
   const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession });
   const writeback = new Writeback(linear, settings, { sessions, handover, comments: agentApi }, undefined, undefined, needsYou);
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.

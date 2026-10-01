@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { LinearService } from "./linear";
 import { paseoHome } from "./ticket-mcp";
 
 // A "Needs you" sub-issue: what an agent waits for after its ticket was already closed (a merge
@@ -32,4 +33,11 @@ export class NeedsYouIssues {
   async remove(id: string): Promise<void> {
     await rm(join(this.directory, `${id}.json`), { force: true });
   }
+}
+
+// The owner answered on the sub-issue (a relayed comment or an @mention of the Paseo app): it is
+// done, and later comments there stay put.
+export async function closeAnswered(needsYou: NeedsYouIssues, linear: Pick<LinearService, "complete">, id: string): Promise<void> {
+  await needsYou.remove(id);
+  await linear.complete(id).catch((error: unknown) => console.error(`[linear-tickets] closing answered sub-issue ${id} failed: ${error instanceof Error ? error.message : error}`));
 }
