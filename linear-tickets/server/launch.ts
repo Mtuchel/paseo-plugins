@@ -9,6 +9,7 @@ import { buildPrompt } from "./context";
 import type { LinearService } from "./linear";
 import { PLAN_CONTEXT_ENV, PLAN_TICKET_ENV } from "./plan-policy";
 import { findProject, readBranches } from "./projects";
+import { repoOrientation } from "./repo-orientation";
 import { paseoHome, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
 
 // planFirst is resolved into mode, instructions, labels and env before a launch (planSetup).
@@ -157,6 +158,10 @@ export class Launcher {
         warnings.push(`Could not save the ticket's Linear attachments: ${error instanceof Error ? error.message : "unknown error"}`);
       }
     }
+    // Never fails the launch: without a readable checkout only the scout sentence is added.
+    const orientation = await repoOrientation({ cwd, git: project.projectKind === "git", provider: input.provider, detail });
+    warnings.push(...orientation.warnings);
+    instructions = [instructions.trim(), orientation.note].filter(Boolean).join("\n\n");
     if (options.markInProgress) {
       // Best-effort, and before the agent exists so its own set_status calls always come
       // after this one. A failed transition only warns; the request dedupe above keeps a

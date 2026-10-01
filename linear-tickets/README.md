@@ -203,7 +203,9 @@ plan before coding, run the test suite, or open a pull request in a specific for
 Placeholders are substituted at launch time:
 
 - `{{ticket}}` — the ticket's ID and title
-- `{{instructions}}` — the per-launch "A little extra direction" text
+- `{{instructions}}` — the per-launch "A little extra direction" text plus the plugin's own notes
+  (plan policy, attachments, [repository orientation](#repository-orientation)); a template
+  without it gets it inserted just before `{{context}}`
 - `{{context}}` — the ticket snapshot (required; a template without it is rejected)
 
 Templates are limited to 8,000 characters, stored per host with the other plugin settings,
@@ -239,6 +241,28 @@ referenced in the description, comments and attachments into the workspace under
 exclude list, and lists the local paths in the launch prompt. The key is sent only to
 `uploads.linear.app` and never reaches the agent. At most 20 files, 25 MB each and 100 MB
 in total are downloaded; a failed or skipped file becomes a launch warning, never a failure.
+
+## Repository orientation
+
+Every launch adds two things to the instructions, so the agent neither hunts for the
+repository's area guides nor fills its own context with exploration:
+
+- **Domain guides.** In a Git project, the plugin lists the checkout's tracked `AGENTS.md`
+  files (all but the root one) with each guide's first `# ` heading. Guides the ticket names are
+  listed first: `named in this ticket:` when the title, description or a comment contains the
+  guide's folder path (`apps/…/domains/sales` or `domains/sales`; the guides above it count too)
+  or a label equals the folder name; `possible match:` when only the folder name appears as a
+  word (`sales`, `demand planning`). Names only count for guides with sibling guides in the same
+  parent folder, such as the `domains/*` set. Matches are always listed; the remaining guides fill
+  up to 40 lines, and any further ones are counted. Only repository paths and headings are
+  written, never ticket text.
+- **Scout delegation.** After brief inline scoping, the agent delegates broad exploration to
+  read-only subagents in the same workspace (omp: `task` with the `scout` agent; Claude: the
+  Explore subagent; others: whatever their harness offers) and reads the files it changes itself.
+
+A guide that cannot be read is listed without its heading, and a failed `git ls-files` drops
+the list; both become a launch warning, never a failure. Non-Git projects get the scout
+sentence only.
 
 ## Native Linear agent
 
@@ -685,7 +709,8 @@ start again. This retry cache does not survive a plugin or daemon restart.
 
 `npm run typecheck` checks both entrypoints against Paseo's SDK. `npm test` covers
 GraphQL response parsing, pagination, context preservation, prompt template rendering
-and validation, credential and settings persistence, ticket retrieval, state-transition
+and validation, repository orientation (guide matching, ranking and the cap), credential and
+settings persistence, ticket retrieval, state-transition
 resolution and failure handling, and agent creation/retries with mocked Linear and Paseo
 calls.
 Live account authentication and agent execution require your configured host and key.

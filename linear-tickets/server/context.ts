@@ -238,7 +238,10 @@ export function buildPrompt(detail: string | TicketDetail, instructions: string,
   // it becomes the placeholder so the toggle decides, and a template without one gets it appended.
   const current = template.includes("{{linear_access}}") ? template : template.replace(NO_LINEAR_ACCESS_NOTE, "{{linear_access}}");
   const withAccess = current.includes("{{linear_access}}") ? current : `${current}\n\n{{linear_access}}`;
-  const rendered = withAccess
+  // Only {{context}} is required, but plan, advisor and orientation notes travel in the
+  // instructions: a template without the slot gets it just before the snapshot.
+  const withInstructions = withAccess.includes("{{instructions}}") ? withAccess : withAccess.replace("{{context}}", "{{instructions}}\n\n{{context}}");
+  const rendered = withInstructions
     .replaceAll("{{linear_access}}", accessNote)
     .replaceAll("{{ticket}}", ticket)
     .replaceAll("{{instructions}}", instructions.trim())
