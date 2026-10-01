@@ -1,6 +1,6 @@
 import { MAX_ATTACHMENT_BYTES } from "./attachments";
 import type { Issue, TicketDetail } from "../shared/contracts";
-import { buildContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations } from "./context";
+import { buildContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations, type FinishedBlocker } from "./context";
 import { Credentials } from "./credentials";
 import { poolOf, rateBudget, RateLimitedError, type RateBudget } from "./rate-budget";
 
@@ -365,6 +365,17 @@ export const COMMENT_QUERY = `query issueComments($id: String!, $first: Int!, $a
   }
 }`;
 
+// What finished blockers left behind, for the agent that starts after them: links (pull requests,
+// plan documents) and the latest comments (the agents' summaries), oldest first as Linear returns them.
+export const FINISHED_BLOCKERS_QUERY = `query finishedBlockers($ids: [ID!]!) {
+  issues(first: 50, filter: { id: { in: $ids } }) { nodes {
+    id identifier title url completedAt state { name }
+    attachments(first: 20) { nodes { title url } }
+    documents(first: 10) { nodes { title url } }
+    comments(last: 20) { nodes { body createdAt } }
+  } }
+}`;
+
 export class LinearService {
   private stateWritten: ((issueId: string, state: WrittenState) => void) | null = null;
 
@@ -489,6 +500,25 @@ export class LinearService {
       }
       return { issue, teamId, projectId, warnings, relations: ticketRelations(issueData, viewerId), context: buildContext(issueData, comments, stateHistorySpans(issueData)) };
     });
+  }
+
+  // Read on the app's pool; tickets the app cannot see are read again with the key. Returned in the order of `ids`.
+  async finishedBlockers(ids: string[]): Promise<FinishedBlocker[]> {
+    if (!ids.length) return [];
+    const data = await this.read(FINISHED_BLOCKERS_QUERY, { ids }, (result) => connection(record(result.issues)).nodes.length === ids.length);
+    const nodes = connection(record(data.issues)).nodes.map((node) => record(node));
+    return nodes.sort((a, b) => ids.indexOf(label(a.id)) - ids.indexOf(label(b.id))).map((node) => ({
+      identifier: label(node.identifier),
+      title: label(node.title),
+      url: label(node.url),
+      status: label(record(node.state ?? {}).name),
+      completedAt: label(node.completedAt) || null,
+      links: [...connection(node.attachments ?? { nodes: [] }).nodes, ...connection(node.documents ?? { nodes: [] }).nodes]
+        .map((link) => ({ title: label(record(link).title), url: label(record(link).url) }))
+        // The Paseo agent's own link points at an agent session, not at the work.
+        .filter((link) => link.url && !link.url.startsWith("https://app.paseo.sh/")),
+      comments: connection(node.comments ?? { nodes: [] }).nodes.map((comment) => ({ body: label(record(comment).body), createdAt: label(record(comment).createdAt) })),
+    }));
   }
 
   // The team's workflow states, cached for the plugin's lifetime; they rarely change.

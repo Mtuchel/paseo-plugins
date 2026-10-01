@@ -40,8 +40,8 @@ const comment = {
 };
 const detail = { issue: normalizeIssue(rawIssue), teamId: "team-1", projectId: "project-1", context: buildContext(rawIssue, [comment]), warnings: [], relations: ticketRelations(rawIssue) };
 const input = { id: "ENG-42", projectId: "project-1", provider: "test/model", instructions: "Add a regression check.", markInProgress: false, requestId: "5f6f1154-5838-4439-b981-b3c9d9831488" };
-// Test fakes that do not exercise the state transition: a no-op stub keeps the contract strict.
-const noMark = { markInProgress: async () => ({ changed: false }) };
+// Test fakes that exercise neither the state transition nor finished blockers: no-op stubs keep the contract strict.
+const noMark = { markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] };
 const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK };
 
 test("server entrypoint loads and registers valid Paseo RPC contracts", () => {
@@ -686,6 +686,60 @@ test("a ticket context that cannot be saved warns and still launches a gated tic
   assert.equal(result.agentId, "agent-1");
   assert.deepEqual(options?.env, { LINEAR_TICKETS_ISSUE: "ENG-42" });
   assert.ok(result.warnings.some((warning) => warning.includes("disk full")));
+});
+
+test("an agent starting after its blockers gets what the finished ones left: links and their latest real comments, newest first", async () => {
+  const blocked = { ...rawIssue, inverseRelations: { nodes: [
+    { type: "blocks", issue: { id: "issue-5", identifier: "ENG-46", title: "Add the table", state: { name: "Done", type: "completed" } }, relatedIssue: { id: "issue-1" } },
+    { type: "blocks", issue: { id: "issue-6", identifier: "ENG-47", title: "Still open", state: { name: "In Review", type: "started" } }, relatedIssue: { id: "issue-1" } },
+  ] } };
+  const blockedDetail = { ...detail, context: buildContext(blocked, []), relations: ticketRelations(blocked) };
+  const asked: string[][] = [];
+  const long = "x".repeat(7_000);
+  const launcher = new Launcher({ ...noMark, detail: async () => blockedDetail, finishedBlockers: async (ids: string[]) => {
+    asked.push(ids);
+    return [{
+      identifier: "ENG-46", title: "Add the table", url: "https://linear.app/x/issue/ENG-46", status: "Done", completedAt: "2026-10-01T09:41:07.677Z",
+      links: [{ title: "Pull request", url: "https://github.com/o/r/pull/7" }, { title: "Plan: ENG-46", url: "https://linear.app/x/document/plan" }],
+      comments: [
+        { body: "Started on the table.", createdAt: "2026-10-01T08:00:00Z" },
+        { body: "Done. The table is `orders_v2`; the old one stays until ENG-50.", createdAt: "2026-10-01T09:00:00Z" },
+        { body: long, createdAt: "2026-10-01T08:30:00Z" },
+        { body: "🏁 **Paseo final report** — ENG-46: Add the table", createdAt: "2026-10-01T10:00:00Z" },
+        { body: "🛠 **Paseo progress** — ENG-46", createdAt: "2026-10-01T07:00:00Z" },
+        { body: "Please reply with an option:\n- Approve plan (approve-plan)", createdAt: "2026-10-01T09:30:00Z" },
+      ],
+    }];
+  } });
+  let prompt: string | undefined;
+  const result = await launcher.start({ ...input, requestId: "8a1f2c3d-0000-4000-8000-000000000003" }, mockPaseo(async (created) => { prompt = created.prompt; return { id: "agent-1" }; }));
+  assert.deepEqual(asked, [["issue-5"]], "only finished blockers are read");
+  assert.deepEqual(result.warnings, []);
+  const note = prompt!.slice(prompt!.indexOf("Finished blockers:"));
+  assert.ok(note.includes("### ENG-46: Add the table (Done 2026-10-01)\nhttps://linear.app/x/issue/ENG-46\nLinks:\n- Pull request: https://github.com/o/r/pull/7\n- Plan: ENG-46: https://linear.app/x/document/plan"));
+  assert.ok(note.indexOf("orders_v2") < note.indexOf("xxx"), "newest first");
+  assert.ok(!note.includes("Started on the table."), "older comments beyond the 6,000-character budget are left out");
+  assert.ok(!note.includes("Paseo final report") && !note.includes("Paseo progress") && !note.includes("approve-plan"), "status cards and plan-approval questions are not the work");
+  assert.ok(prompt!.indexOf("Add a regression check.") < prompt!.indexOf("Finished blockers:"));
+
+  const failing = new Launcher({ ...noMark, detail: async () => blockedDetail, finishedBlockers: async () => { throw new Error("Linear unavailable"); } });
+  const degraded = await failing.start({ ...input, requestId: "8a1f2c3d-0000-4000-8000-000000000004" }, mockPaseo(async () => ({ id: "agent-2" })));
+  assert.equal(degraded.agentId, "agent-2", "a failed read never stops the launch");
+  assert.deepEqual(degraded.warnings, ["Could not read what the finished blockers (ENG-46) left behind: Linear unavailable"]);
+});
+
+test("finished blockers come back in the asked order, without the Paseo agent links", async () => {
+  const post: Post = async () => ({ issues: { nodes: [
+    { id: "b", identifier: "ENG-2", title: "Second", url: "u2", completedAt: null, state: { name: "Done" }, attachments: { nodes: [] }, documents: { nodes: [] }, comments: { nodes: [] } },
+    { id: "a", identifier: "ENG-1", title: "First", url: "u1", completedAt: "2026-10-01T00:00:00Z", state: { name: "Done" },
+      attachments: { nodes: [{ title: "Pull request", url: "https://github.com/o/r/pull/1" }, { title: "Paseo agent · ENG-1", url: "https://app.paseo.sh/h/srv/agent/x" }] },
+      documents: { nodes: [{ title: "Plan: ENG-1", url: "https://linear.app/doc" }] },
+      comments: { nodes: [{ body: "Done.", createdAt: "2026-10-01T00:00:00Z" }] } },
+  ] } });
+  const blockers = await new LinearService(new Credentials("/unused", "key"), post).finishedBlockers(["a", "b"]);
+  assert.deepEqual(blockers.map((blocker) => blocker.identifier), ["ENG-1", "ENG-2"]);
+  assert.deepEqual(blockers[0].links.map((link) => link.url), ["https://github.com/o/r/pull/1", "https://linear.app/doc"]);
+  assert.deepEqual(blockers[0].comments, [{ body: "Done.", createdAt: "2026-10-01T00:00:00Z" }]);
 });
 
 test("pre-launch errors can retry, but uncertain agent creation is never automatically repeated", async () => {

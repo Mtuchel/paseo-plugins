@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { attachmentNote, saveAttachments, type Download } from "./attachments";
-import { buildPrompt } from "./context";
+import { buildPrompt, finishedBlockersNote } from "./context";
 import type { LinearService } from "./linear";
 import { PLAN_CONTEXT_ENV, PLAN_TICKET_ENV } from "./plan-policy";
 import { findProject, readBranches } from "./projects";
@@ -55,7 +55,7 @@ export class Launcher {
   private readonly active = new Map<string, Promise<Result>>();
 
   constructor(
-    private readonly linear: Pick<LinearService, "detail" | "markInProgress">,
+    private readonly linear: Pick<LinearService, "detail" | "markInProgress" | "finishedBlockers">,
     private readonly branches = readBranches,
     private readonly ticketScript: () => Promise<string> = () => writeTicketMcpScript(),
     // Downloads Linear uploads with the host's key; without it attachments stay links.
@@ -162,6 +162,15 @@ export class Launcher {
     const orientation = await repoOrientation({ cwd, git: project.projectKind === "git", provider: input.provider, detail });
     warnings.push(...orientation.warnings);
     instructions = [instructions.trim(), orientation.note].filter(Boolean).join("\n\n");
+    // The agent that starts after its blockers builds on what they did. Never fails the launch.
+    const finished = detail.relations.related.filter((ticket) => ticket.direction === "blocked by" && ticket.statusType === "completed");
+    if (finished.length) {
+      try {
+        instructions = [instructions.trim(), finishedBlockersNote(await this.linear.finishedBlockers(finished.map((ticket) => ticket.id)))].filter(Boolean).join("\n\n");
+      } catch (error) {
+        warnings.push(`Could not read what the finished blockers (${finished.map((ticket) => ticket.identifier).join(", ")}) left behind: ${error instanceof Error ? error.message : "unknown error"}`);
+      }
+    }
     if (options.markInProgress) {
       // Best-effort, and before the agent exists so its own set_status calls always come
       // after this one. A failed transition only warns; the request dedupe above keeps a
