@@ -13,7 +13,7 @@ import type { PluginSettings } from "./settings";
 export type Started = { agentId: string; warnings: string[]; provider: string; target: string; resumed: boolean; untrusted: boolean; plan: PlanPolicy | null };
 export type Admission = { ok: true } | { ok: false; reason: string };
 type Deps = {
-  linear: Pick<LinearService, "detail" | "issueState" | "viewerId" | "issueDocument">;
+  linear: Pick<LinearService, "detail" | "issueState" | "viewerId" | "appUserId" | "issueDocument">;
   launcher: Pick<Launcher, "start">;
   handover?: Pick<Handover, "resumeTarget">;
   branches?: typeof readBranches;
@@ -58,17 +58,20 @@ export function approvedPlanNote(identifier: string, plan: { url: string; conten
   ].join("\n\n");
 }
 
-export function isUntrusted(state: { creatorId: string | null; labels: { name: string }[] }, ownerId: string): boolean {
-  return state.creatorId !== ownerId || hasLabel(state.labels, "feedback");
+// Tickets the owner wrote, or the Paseo app wrote in a flow the owner started (split sub-issues,
+// needs-you sub-issues, manual tasks), are trusted unless they carry the feedback label. `appId` is
+// null when the app cannot be used here; an unknown app never widens trust.
+export function isUntrusted(state: { creatorId: string | null; labels: { name: string }[] }, ownerId: string, appId: string | null): boolean {
+  return !state.creatorId || (state.creatorId !== ownerId && state.creatorId !== appId) || hasLabel(state.labels, "feedback");
 }
 
 export type PlanSetup = { untrusted: boolean; policy: PlanPolicy | null; modeId: string | undefined; notes: string[]; labels: Record<string, string>; env: Record<string, string> };
 
 // What a ticket's launch looks like under its plan policy: mode, instructions, and the agent
 // label and environment the omp extension and write-back read. Shared by every launch path.
-export async function planSetup(linear: Pick<LinearService, "issueState" | "viewerId" | "issueDocument">, issueId: string, provider: string, usualModeId: string | undefined, planFirst = false): Promise<PlanSetup> {
+export async function planSetup(linear: Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "issueDocument">, issueId: string, provider: string, usualModeId: string | undefined, planFirst = false): Promise<PlanSetup> {
   const state = await linear.issueState(issueId);
-  const untrusted = isUntrusted(state, await linear.viewerId());
+  const untrusted = isUntrusted(state, await linear.viewerId(), await linear.appUserId());
   const policy = planPolicy({ untrusted, labels: state.labels, planFirst });
   const planReady = hasLabel(state.labels, PLAN_READY_LABEL);
   const plan = planReady ? await linear.issueDocument(issueId, `Plan: ${state.identifier}`).catch(() => null) : null;

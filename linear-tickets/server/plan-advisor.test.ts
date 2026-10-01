@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 // The omp extension reads its environment when it loads, so it is imported after this setup.
 const root = mkdtempSync(join(tmpdir(), "paseo-plan-advisor-"));
@@ -246,4 +249,42 @@ test("every plan submission form is recognized, and nothing else", () => {
   assert.equal(submittedPlan("write", { path: "PLAN.md", content: "# Plan" }), null);
   assert.equal(submittedPlan("write", { path: "xd://plannotator_submit_plan", content: "not json" }), null);
   assert.equal(submittedPlan("bash", { command: "ls" }), null);
+});
+
+test("ticket agents and their subagents change Linear only through the linear_ticket tools", async () => {
+  const h = load();
+  const blocked = [
+    h.call("mcp__linear_save_comment", { issueId: "ENG-1", body: "x" }),
+    h.call("write", { path: "xd://mcp__linear_save_issue", content: "{}" }),
+    h.call("mcp__linear_new_tool", {}),
+    h.hook("mcp__linear_save_comment", "s1", { issueId: "ENG-1", body: "x" }, { kind: "sub" }),
+  ];
+  const names = ["mcp__linear_save_comment", "mcp__linear_save_issue", "mcp__linear_new_tool", "mcp__linear_save_comment"];
+  for (const [index, result] of (await Promise.all(blocked)).entries()) {
+    assert.equal(result?.block, true, names[index]);
+    assert.match(result.reason, /^Stopped by the linear-tickets plugin: ticket agents change Linear only through the linear_ticket tools/);
+    assert.ok(result.reason.includes(names[index]));
+  }
+  assert.equal(await h.call("mcp__linear_get_issue", { id: "ENG-1" }), undefined);
+  assert.equal(await h.call("write", { path: "xd://mcp__linear_list_issues", content: "{}" }), undefined);
+  assert.equal(await h.call("mcp__linear_ticket_add_comment", { body: "x" }), undefined);
+});
+
+test("outside ticket agents the Linear tools are not blocked", async () => {
+  // The extension reads LINEAR_TICKETS_ISSUE when it loads, so each case loads it in its own
+  // process with an environment built from scratch (the test's own may name a ticket).
+  const script = `
+    const { default: extension } = await import(process.env.EXTENSION);
+    let gate;
+    extension({ on: (event, handler) => { if (event === "tool_call") gate = handler; }, events: { emit() {} }, appendEntry() {}, sendMessage() {}, registerTool() {}, zod: { object: () => ({}), string: () => ({ optional: () => ({}) }), enum: () => ({}) } });
+    const result = await gate({ toolName: "mcp__linear_save_comment", input: { issueId: "ENG-1", body: "x" } }, { sessionManager: { getBranch: () => [] } });
+    process.stdout.write(JSON.stringify(result ?? null));
+  `;
+  const outcome = async (extra: Record<string, string>) => {
+    const env = { PATH: process.env.PATH ?? "", PASEO_AGENT_ID: "solo-1", PASEO_HOME: root, EXTENSION: new URL("../omp/linear-tickets-plan-first.ts", import.meta.url).href, ...extra };
+    const { stdout } = await promisify(execFile)(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], { cwd: fileURLToPath(new URL("..", import.meta.url)), env });
+    return JSON.parse(stdout) as { block?: boolean } | null;
+  };
+  assert.equal(await outcome({}), null);
+  assert.equal((await outcome({ LINEAR_TICKETS_ISSUE: "ENG-1" }))?.block, true, "the same load blocks it for a ticket agent");
 });

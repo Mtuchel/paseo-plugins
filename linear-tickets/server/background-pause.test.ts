@@ -72,25 +72,25 @@ test("with the app at its reserve, the dispatch poll reads nothing and does not 
   assert.match(dispatch.snapshot().lastError ?? "", /^paused: .*the Paseo Linear app/);
 });
 
-test("a key that reaches its reserve during a poll stops the remaining writes; the pause is logged once", async (t) => {
+test("the app reaching its reserve during a poll stops the remaining writes without falling back to the key; the pause is logged once", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "paseo-pause-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const task = (id: string, parentId: string): ManualTask => ({ id, identifier: id.toUpperCase(), url: `https://linear.app/x/issue/${id}`, title: `Do ${id}`, parentId, parentIdentifier: parentId.toUpperCase(), when: "anytime", check: null, cwd: "/nowhere", createdAt: `2026-09-28T00:00:0${id.length}Z`, announced: false, activated: true, verifiedAt: null });
   const tasks = [task("a", "p1"), task("bb", "p2")];
   for (const item of tasks) await writeFile(join(directory, `${item.id}.json`), JSON.stringify(item));
-  // The key starts 5 requests above its reserve (375 of 2,500) and loses one per request.
-  let keyRemaining = 380;
+  // The plugin's writes go out as the app, which starts 3 requests above its reserve (750 of 5,000)
+  // and loses one per request; the owner's reads stay on the key, which has plenty left.
+  let appRemaining = 753;
   const { calls, linear } = fakeLinear(t, (call, variables) => {
-    if (call.pool === "app") return { data: { issues: { nodes: (variables.ids as string[]).map((id) => ({ id, state: { type: "unstarted" }, completedAt: null })) } }, remaining: 4900 };
-    const remaining = keyRemaining--;
     const data: Record<string, Record<string, unknown>> = {
+      issueStatuses: { issues: { nodes: ((variables.ids ?? []) as string[]).map((id) => ({ id, state: { type: "unstarted" }, completedAt: null })) } },
       labelByName: { issueLabels: { nodes: [{ id: "l-manual", name: "paseo-manual" }] } },
       addLabel: { issueAddLabel: { success: true } },
       viewerCheck: { viewer: { id: "me" } },
       userUrl: { user: { url: "https://linear.app/ws/profiles/me" } },
       comment: { commentCreate: { success: true, comment: { id: "c1" } } },
     };
-    return { data: data[call.operation], remaining };
+    return { data: data[call.operation], remaining: call.pool === "app" ? appRemaining-- : 2400 };
   });
   const errors: string[] = [];
   t.mock.method(console, "error", (...args: unknown[]) => { errors.push(args.join(" ")); });
@@ -99,15 +99,16 @@ test("a key that reaches its reserve during a poll stops the remaining writes; t
   await manual.poll();
   assert.deepEqual(calls.map((call) => `${call.pool} ${call.operation}`), [
     "app issueStatuses",
-    "key labelByName", "key addLabel", "key viewerCheck", "key userUrl", "key comment",
-    // The second ticket's label goes out; its mention would dip into the reserve and waits.
-    "key addLabel",
+    "key labelByName", "app addLabel", "key viewerCheck", "key userUrl", "app comment",
+    // The second ticket's label goes out; its mention would dip into the app's reserve and waits
+    // instead of going out with the key.
+    "app addLabel",
   ]);
   assert.equal(JSON.parse(await readFile(join(directory, "a.json"), "utf8")).announced, true);
   assert.equal(JSON.parse(await readFile(join(directory, "bb.json"), "utf8")).announced, false);
 
   calls.length = 0;
   await manual.poll();
-  assert.deepEqual(calls.map((call) => `${call.pool} ${call.operation}`), ["app issueStatuses"]);
+  assert.deepEqual(calls, [], "the app stays paused; nothing moves to the key");
   assert.equal(errors.filter((line) => line.includes("manual tasks paused")).length, 1);
 });

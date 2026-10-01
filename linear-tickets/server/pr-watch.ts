@@ -4,7 +4,6 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import type { AgentApi } from "./agent-app";
 import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
@@ -14,7 +13,6 @@ import { RateLimitedError, withPriority } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
-import { appComment } from "./writeback";
 
 const exec = promisify(execFile);
 const INTERVAL_MS = 2 * 60 * 1000;
@@ -274,8 +272,7 @@ export class PullRequestWatch {
     private readonly deps: {
       handover: Pick<Handover, "all" | "update">;
       sessions: Pick<SessionRouter, "sessionFor" | "say" | "prompt">;
-      linear: Pick<LinearService, "moveToStateNamed" | "createComment" | "updateComment" | "viewerId" | "userUrl">;
-      comments?: Pick<AgentApi, "createComment" | "updateComment">;
+      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "viewerId" | "userUrl">;
       manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge">;
       settings: Pick<Settings, "read">;
       view?: (url: string) => Promise<PullRequestView>;
@@ -588,7 +585,7 @@ export class PullRequestWatch {
 
   private async mention(issueId: string, body: string): Promise<void> {
     const { linear } = this.deps;
-    await appComment(linear, this.deps.comments, issueId, `${await linear.userUrl(await linear.viewerId())} ${body}`);
+    await linear.comment(issueId, `${await linear.userUrl(await linear.viewerId())} ${body}`);
   }
 
   // Best effort: the ticket's agent session, when it has one, shows the line too. A failure here

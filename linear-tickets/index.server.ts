@@ -69,12 +69,12 @@ export default function contribute(server: PluginServerContext) {
   });
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
   const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession });
-  const writeback = new Writeback(linear, settings, { sessions, handover, comments: agentApi }, undefined, undefined, needsYou);
+  const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   const reviewLinks = new ReviewLinks();
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks);
-  const manualTasks = new ManualTasks({ linear, settings, comments: agentApi });
-  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, comments: agentApi });
+  const manualTasks = new ManualTasks({ linear, settings });
+  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => sessions.receive(event));
   // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").
@@ -100,6 +100,9 @@ export default function contribute(server: PluginServerContext) {
   // are handled; a new session is still acknowledged at once.
   let stopped = false;
   let agentReady: Promise<boolean> | null = null;
+  // Refreshes the app token in the background while the plugin runs, so the agents' linear_ticket
+  // servers, which only read token.json, keep writing as Paseo.
+  let stopKeepingFresh = () => {};
   const startAgent = () => agentReady ??= auth.credentials().then(async (app) => {
     if (stopped) return false;
     health.start();
@@ -107,6 +110,7 @@ export default function contribute(server: PluginServerContext) {
     manualTasks.start();
     stateLabels.start();
     if (!app) return false;
+    stopKeepingFresh = auth.keepFresh();
     await webhook.start();
     funnel = await ensureFunnel(WEBHOOK_PORT);
     if (!funnel.active) console.error(`[linear-tickets] Linear agent webhooks are not public: ${funnel.note}`);
@@ -216,5 +220,5 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); void closeInternalDaemon(); };
+  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); void closeInternalDaemon(); };
 }

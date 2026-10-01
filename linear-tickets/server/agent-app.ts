@@ -2,12 +2,12 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { record } from "./context";
-import { postGraphQL, type Post } from "./linear";
+import { AuthenticationError, LinearApiError, postGraphQL, type Post } from "./linear";
 import { paseoHome } from "./ticket-mcp";
 
 // The "Paseo" Linear app (actor=app): its credentials and tokens live next to the plugin's
-// other state, private to the daemon user. Everything the agent says in Linear is posted
-// with this token, so it appears as "Paseo" rather than as the workspace owner.
+// other state, private to the daemon user. Everything the plugin and its agents write in Linear is
+// sent with this token, so it appears as "Paseo" rather than as the workspace owner.
 export type AppCredentials = { applicationId?: string; clientId: string; clientSecret: string; webhookSecret: string };
 type StoredToken = { access_token: string; refresh_token?: string; expires_in?: number; expires_at?: number };
 export type SessionPlanStep = { content: string; status: "pending" | "inProgress" | "completed" | "canceled" };
@@ -28,8 +28,15 @@ async function writePrivate(path: string, value: unknown): Promise<void> {
   } finally { await rm(temporary, { force: true }); }
 }
 
+// Refreshes this long before the token expires, so the agents' `linear_ticket` servers, which read
+// token.json but never refresh it (refresh tokens rotate; only the daemon may use them), find a
+// valid token between two keep-fresh ticks.
+const REFRESH_MARGIN_MS = 10 * 60 * 1000;
+const KEEP_FRESH_MS = 5 * 60 * 1000;
+
 export class AppAuth {
   private refreshing: Promise<string> | null = null;
+  private keeping: NodeJS.Timeout | null = null;
 
   constructor(private readonly directory = agentAppDirectory(), private readonly fetchImpl: typeof fetch = fetch, private readonly now = () => Date.now()) {}
 
@@ -47,14 +54,31 @@ export class AppAuth {
     } catch { return null; }
   }
 
-  // A usable access token, refreshed a minute before it expires. `force` refreshes after a 401.
+  // A usable access token, refreshed ten minutes before it expires. `force` refreshes after a 401.
   async accessToken(force = false): Promise<string> {
     const token = await this.stored();
     if (!token) throw new Error("The Paseo Linear app is not installed on this host.");
     const expiresAt = token.expires_at ?? 0;
-    if (!force && (!expiresAt || expiresAt - 60_000 > this.now())) return token.access_token;
+    if (!force && (!expiresAt || expiresAt - REFRESH_MARGIN_MS > this.now())) return token.access_token;
     this.refreshing ??= this.refresh(token).finally(() => { this.refreshing = null; });
     return this.refreshing;
+  }
+
+  // Refreshes the token when due, now and every few minutes, until the returned stop is called.
+  // One timer per instance: a second call keeps the running one.
+  keepFresh(intervalMs = KEEP_FRESH_MS): () => void {
+    if (!this.keeping) {
+      const tick = () => {
+        this.accessToken().catch((error: unknown) => console.error(`[linear-tickets] keeping the Paseo app token fresh failed: ${error instanceof Error ? error.message : error}`));
+      };
+      tick();
+      this.keeping = setInterval(tick, intervalMs);
+      this.keeping.unref();
+    }
+    return () => {
+      clearInterval(this.keeping ?? undefined);
+      this.keeping = null;
+    };
   }
 
   private async refresh(token: StoredToken): Promise<string> {
@@ -85,12 +109,6 @@ const SESSION_UPDATE_MUTATION = `mutation agentSessionUpdate($id: String!, $inpu
 const SESSION_ON_ISSUE_MUTATION = `mutation agentSessionOnIssue($input: AgentSessionCreateOnIssue!) {
   agentSessionCreateOnIssue(input: $input) { success agentSession { id } }
 }`;
-const CREATE_COMMENT_MUTATION = `mutation appComment($input: CommentCreateInput!) {
-  commentCreate(input: $input) { success comment { id } }
-}`;
-const UPDATE_COMMENT_MUTATION = `mutation appCommentUpdate($id: String!, $input: CommentUpdateInput!) {
-  commentUpdate(id: $id, input: $input) { success }
-}`;
 const APP_VIEWER_QUERY = `query appViewer { viewer { id name } }`;
 const OPEN_SESSIONS_QUERY = `query openSessions($first: Int!) {
   agentSessions(first: $first, orderBy: updatedAt) { nodes { id status createdAt creator { id } issue { id identifier } } }
@@ -119,22 +137,38 @@ export class AgentApi {
     try {
       return await this.post(`Bearer ${token}`, query, variables);
     } catch (error) {
-      if (!(error instanceof Error) || !/rejected this API key/.test(error.message)) throw error;
+      if (!(error instanceof AuthenticationError)) throw error;
       return this.post(`Bearer ${await this.auth.accessToken(true)}`, query, variables);
     }
   }
 
-  // Reads on the app's own request pool for LinearService. Null when the app cannot be used here
-  // (not installed, token not refreshable, token revoked), so the caller reads with the owner's key;
-  // rate limits and every other failure propagate.
-  async query(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown> | null> {
-    try {
-      await this.auth.accessToken();
-    } catch {
-      return null;
+  // A request authenticated as the app, or null when Linear authenticated nothing: no token before
+  // sending (not installed, refresh refused or failed), or a rejected token whose refresh then failed
+  // or was rejected too. Nothing ran then, so LinearService may send it with the owner's key instead.
+  // Every other failure propagates: the request may have run, and must not run again as the owner.
+  async mutate(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+    for (const force of [false, true]) {
+      let token: string;
+      try {
+        token = await this.auth.accessToken(force);
+      } catch {
+        return null;
+      }
+      try {
+        return await this.post(`Bearer ${token}`, query, variables);
+      } catch (error) {
+        if (!(error instanceof AuthenticationError)) throw error;
+      }
     }
-    return this.call(query, variables).catch((error: unknown) => {
-      if (error instanceof Error && /rejected this API key|cannot be refreshed|refused to refresh|no access token/.test(error.message)) return null;
+    return null;
+  }
+
+  // Reads on the app's own request pool for LinearService: null as for `mutate`, and when Linear
+  // refuses the app this read (HTTP 403), so the caller reads with the owner's key; rate limits and
+  // every other failure propagate.
+  async query(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+    return this.mutate(query, variables).catch((error: unknown) => {
+      if (error instanceof LinearApiError && error.status === 403) return null;
       throw error;
     });
   }
@@ -165,19 +199,6 @@ export class AgentApi {
     const id = String(record(result.agentSession ?? {}).id ?? "");
     if (result.success !== true || !id) throw new Error("Linear did not create an agent session on the ticket.");
     return id;
-  }
-
-  // A ticket comment written by "Paseo": unlike the owner's own key, it notifies the users it mentions.
-  async createComment(issueId: string, body: string): Promise<string> {
-    const result = record(record(await this.call(CREATE_COMMENT_MUTATION, { input: { issueId, body } })).commentCreate ?? {});
-    const id = String(record(result.comment ?? {}).id ?? "");
-    if (result.success !== true || !id) throw new Error("Linear did not create the comment.");
-    return id;
-  }
-
-  async updateComment(commentId: string, body: string): Promise<void> {
-    const result = record(record(await this.call(UPDATE_COMMENT_MUTATION, { id: commentId, input: { body } })).commentUpdate ?? {});
-    if (result.success !== true) throw new Error("Linear did not update the comment.");
   }
 
   async openSessions(first = 50): Promise<OpenSession[]> {

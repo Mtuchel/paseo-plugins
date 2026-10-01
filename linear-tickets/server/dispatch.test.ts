@@ -48,6 +48,8 @@ class FakeLinear {
 
   async viewerId() { return "owner"; }
 
+  async appUserId() { return "paseo-app"; }
+
   async issueDocument() { return null; }
 
   async moveToStateNamed() { return { changed: false }; }

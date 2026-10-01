@@ -38,9 +38,10 @@ paseo plugin reload linear-tickets
 
 ## Connect and start work
 
-1. Create a personal Linear API key in Settings → Security & access. Read permission
-   and access to the relevant teams are sufficient; write permission is only needed
-   for the optional "mark the ticket In Progress" step (see below).
+1. Create a personal Linear API key in Settings → Security & access, with access to the
+   relevant teams. Browsing tickets needs read permission only; the plugin's writes need write
+   permission (with the [Paseo app](#native-linear-agent) installed, the key writes only in the
+   cases listed under [Who Linear shows as the author](#who-linear-shows-as-the-author)).
 2. Paste it into **Connect Linear**. Alternatively, set `LINEAR_API_KEY` in the
    Paseo daemon's environment before starting the daemon.
 3. Select an assigned ticket. Preview the ticket context and choose a Paseo project.
@@ -185,13 +186,49 @@ and it is appended when they do not. The server is a dependency-free script writ
 (the desktop app's bundled runtime included), so it does not depend on `node` being on the
 agent's PATH. If the selected provider reports that it cannot load MCP servers, the launch
 returns a warning, since that agent has no Linear tools.
-The agent configuration carries only that path and the issue ID; the server reads the key at
-call time from `LINEAR_API_KEY` or the saved connection, so it needs a key with write access.
-Agents run as the same user as the daemon, so this scopes the tools, not the key: an agent
-that reads the credentials file directly is not prevented from using it. When the host sets
-`LINEAR_API_KEY` in the daemon's environment, agents and their MCP servers may inherit it, so
-an agent that reads its own environment can see the key; prefer the saved connection if that
-matters to you.
+The agent configuration carries only that path and the issue ID; no credential is put into the
+agent's configuration or environment.
+
+### Who Linear shows as the author
+
+Everything the plugin and the `linear_ticket` tools write (comments, status moves, labels, links,
+new sub-issues, reactions, plan documents) is sent with the [Paseo Linear app](#native-linear-agent)'s
+token, so Linear's history shows **Paseo**, not you. Your own comments stay yours, so `@paseo`
+replies still steer agents. The `linear_ticket` server reads the app's token from
+`agent-app/token.json` on every call; only the daemon refreshes it (ten minutes before it expires,
+checked every five minutes), so a running agent always picks up the current one. Manual tasks are
+still assigned to you: the server reads your user ID with the API key, whoever writes.
+
+The API key still writes in three cases:
+
+- **Handing a ticket to Paseo** (delegation) stays your instruction, because Paseo only accepts
+  Linear agent sessions that you start.
+- **Editing a comment the key wrote** before this change: Linear lets only a comment's author edit
+  it. Attachments and documents the key wrote, the app may change.
+- **Fallback when the app cannot be used** on this host: it is not installed, its token cannot be
+  refreshed, or Linear rejects it even after a refresh. Linear authenticated nothing then, so the
+  write goes out with the key and shows your name; the daemon logs `the Paseo app is not usable on
+  this host; Linear writes appear as the key's owner` once, and the plugin's health check (see
+  **Health** under [Native Linear agent](#native-linear-agent)) raises its alert ticket while the
+  installed app is broken. Every other failure (a refusal, rate limit, invalid input, outage) is
+  reported and never retried with the key, so nothing is written twice or under your name by
+  mistake.
+
+So the key needs write access. Agents run as the same user as the daemon, so this scopes the
+tools, not the credentials: an agent that reads the credentials or token file directly is not
+prevented from using it. When the host sets `LINEAR_API_KEY` in the daemon's environment, agents
+and their MCP servers may inherit it, so an agent that reads its own environment can see the key;
+prefer the saved connection if that matters to you.
+
+### Other Linear tools
+
+A coding tool's own Linear connection (for example omp's Linear MCP server, signed in as you)
+writes as you. Ticket agents running omp may use only its read tools (`get_*`, `list_*`,
+`search_documentation`, `extract_images`, listed by name in
+`omp/linear-tickets-plan-first.ts`): the plugin's omp extension blocks every other tool of that
+server, called directly or through its `xd://` device, and tells the agent to use the
+`linear_ticket` tools instead. It guards against mistakes, not against an agent that sets out to
+get around it; other providers are not covered.
 
 ## Settings
 
@@ -298,6 +335,8 @@ mention on a ticket whose agent is running passes the text to that agent instead
 sidebar launches open a session too and then delegate the ticket to Paseo, so every ticket with
 an agent names Paseo however it started. Only the workspace owner (the user of the plugin's
 personal key) can start or steer agents; sessions from anyone or anything else get an error.
+The app is also the author of everything the plugin and its agents write in Linear; see
+[Who Linear shows as the author](#who-linear-shows-as-the-author).
 
 **Setup**
 1. In Linear → Settings → API → Applications, create an app "Paseo":
@@ -591,7 +630,8 @@ its error and the most recent dispatches.
 
 For agents carrying the `linear.issueId` label (every agent started from a ticket, manually
 or dispatched), **Settings → Write back to Linear** can report their lifecycle on the ticket
-using this host's key, independently of the agent's own `linear_ticket` tools:
+written as the Paseo app (see [Who Linear shows as the author](#who-linear-shows-as-the-author)),
+independently of the agent's own `linear_ticket` tools:
 
 - **Status** — the agent's first turn moves the ticket into its team's In Progress state,
   following the same rules as the launch-time setting. A completed or canceled ticket is left
@@ -607,9 +647,9 @@ using this host's key, independently of the agent's own `linear_ticket` tools:
   - it gets the red `<label>-needs-you` label (created on first use), handy for a saved
     "Waiting on me" view,
   - one comment @mentions you, so Linear notifies your inbox and phone. It names the
-    question, its options and how to reply. It is written as the Paseo app when installed
-    (Linear does not notify you of your own mentions, and the plugin's key is yours), and it
-    mentions whoever opened the agent's Linear session, else the ticket's creator.
+    question, its options and how to reply. Like every plugin write it comes from the Paseo app,
+    so Linear notifies you (it does not notify you of your own mentions). It mentions whoever
+    opened the agent's Linear session, else the ticket's creator when a person wrote it, else you.
   Further questions in the same wait edit that comment. Once nothing is pending (a follow-up
   question arriving within seconds keeps the wait open), and when the turn ends or the agent
   is archived, the label comes off and the ticket returns to its previous state, unless
@@ -686,8 +726,10 @@ header of the last answer plus the refill since then.
 - **Reads that pollers repeat use the app's pool** when the Paseo app is installed: the relay's
   comment read, the auto-dispatch label query, ticket state, manual-task status and the sidebar
   state labels. The key reads them only when the app is not installed, its token cannot be
-  refreshed, or it cannot see a ticket. An app rate limit never falls back to the key. Writes
-  always use the key, so nothing changes author.
+  refreshed, or it cannot see a ticket. An app rate limit never falls back to the key. Writes use
+  the app's pool too; the key writes only in the cases listed under [Who Linear shows as the
+  author](#who-linear-shows-as-the-author). The agents' `linear_ticket` servers send their own
+  requests, which the daemon's estimate does not count.
 - **Background work stops at a 15% reserve** of the pool it needs: auto-dispatch, the relay,
   manual tasks, the pull request watch, the state labels and the health check. It resumes on its
   own as the pool refills. Session prompts, write-backs, agents' `linear_ticket` tools and the
@@ -751,9 +793,17 @@ private permissions; its credential scope is a one-way hash, never the API key i
 
 The plugin talks directly to Linear's official [GraphQL API](https://linear.app/developers/graphql)
 at `https://api.linear.app/graphql`. Its queries are read-only unless you opt in: the
-In Progress transition, auto-dispatch and write-back are the only writes. Only the
-server contacts Linear. The key is never added to ticket context, agent configuration,
-or agent labels.
+In Progress transition, auto-dispatch and write-back are the only writes, sent as the Paseo app
+when it is installed. Only the server and the agents' `linear_ticket` servers contact Linear.
+The key and the app's token are never added to ticket context, agent configuration, agent
+environment or agent labels.
+
+The key still needs write permission with the app installed: handing a ticket to Paseo, editing
+comments the key wrote before writes moved to the app, and every write while the app cannot be
+used on this host (not installed, token not refreshable, or rejected after a refresh) go out with
+it. Such a fallback is logged once per daemon run (`the Paseo app is not usable on this host;
+Linear writes appear as the key's owner`); any other failed write is reported, never repeated
+with the key.
 
 Repeated launch requests reuse their result for the lifetime of the loaded plugin.
 If agent creation returns an uncertain failure, the same request is not retried

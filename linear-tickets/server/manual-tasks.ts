@@ -4,13 +4,11 @@ import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { AgentApi } from "./agent-app";
 import { dispatchLabels } from "./dispatch";
 import type { IssueStatus, LinearService } from "./linear";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
-import { appComment } from "./writeback";
 
 const INTERVAL_MS = 60 * 1000;
 const MANUAL_COLOR = "#f2994a";
@@ -40,7 +38,7 @@ export type ManualTask = {
   verifiedFor?: string | null;
 };
 export type CheckResult = { ok: boolean; code: number | null; output: string; cwd: string };
-type Linear = Pick<LinearService, "addLabel" | "comment" | "createComment" | "updateComment" | "moveToReady" | "reopen" | "issueStatuses" | "viewerId" | "userUrl">;
+type Linear = Pick<LinearService, "addLabel" | "comment" | "moveToReady" | "reopen" | "issueStatuses" | "viewerId" | "userUrl">;
 
 // Runs a check with no stdin, a timeout and capped output. Tools such as gh and railway live in
 // Homebrew, which a daemon's PATH often lacks.
@@ -72,7 +70,6 @@ export class ManualTasks {
     private readonly deps: {
       linear: Linear;
       settings: Pick<Settings, "read">;
-      comments?: Pick<AgentApi, "createComment" | "updateComment">;
       check?: (command: string, cwd: string) => Promise<CheckResult>;
     },
     private readonly directory = join(paseoHome(), "linear-tickets", "manual-tasks"),
@@ -110,7 +107,7 @@ export class ManualTasks {
   }
 
   private async mention(issueId: string, body: string): Promise<void> {
-    await appComment(this.deps.linear, this.deps.comments, issueId, `${await this.deps.linear.userUrl(await this.deps.linear.viewerId())} ${body}`);
+    await this.deps.linear.comment(issueId, `${await this.deps.linear.userUrl(await this.deps.linear.viewerId())} ${body}`);
   }
 
   // After-merge tasks still waiting for the merge keep the ticket's pull request watched.

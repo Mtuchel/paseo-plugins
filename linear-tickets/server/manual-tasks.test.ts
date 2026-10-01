@@ -22,8 +22,6 @@ class FakeLinear {
   async issueStatuses(ids: string[]) { return new Map(ids.filter((id) => this.statuses.has(id)).map((id) => [id, this.statuses.get(id)!])); }
   async addLabel(issueId: string, name: string) { this.writes.push(`+${name} ${issueId}`); }
   async comment(issueId: string, body: string) { this.writes.push(`comment ${issueId}: ${body}`); }
-  async createComment(issueId: string, body: string) { this.writes.push(`comment ${issueId}: ${body}`); return "c"; }
-  async updateComment() {}
   async moveToReady(issueId: string) { this.writes.push(`ready ${issueId}`); return { changed: true }; }
   async reopen(issueId: string) { this.writes.push(`reopen ${issueId}`); this.statuses.set(issueId, { status: "Todo", statusType: "unstarted", completedAt: null }); }
   async viewerId() { return "me"; }
@@ -123,7 +121,7 @@ test("an approval waits for before-merge tasks, then moves to Ready to merge; ar
   const watch = new PullRequestWatch({
     handover: { all: async () => [record], update: async (_issue, _agent, patch) => { calls.push(`review ${patch.review}`); return null as never; } },
     sessions: { sessionFor: async () => ({ sessionId: "s" }) as never, say: async (_id, _kind, text) => { calls.push(`say ${text}`); }, prompt: async () => "gone" as const },
-    linear: { moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; }, createComment: async () => "c", updateComment: async () => {}, viewerId: async () => "u", userUrl: async () => "u" },
+    linear: { moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; }, comment: async () => {}, viewerId: async () => "u", userUrl: async () => "u" },
     settings: { read: async () => settings },
     manualTasks: {
       openBlockers: async () => open.map((identifier) => ({ identifier }) as ManualTask),
