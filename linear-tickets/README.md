@@ -561,7 +561,8 @@ or dispatched), **Settings → Write back to Linear** can report their lifecycle
 using this host's key, independently of the agent's own `linear_ticket` tools:
 
 - **Status** — the agent's first turn moves the ticket into its team's In Progress state,
-  following the same rules as the launch-time setting.
+  following the same rules as the launch-time setting. A completed or canceled ticket is left
+  as it is: an agent still working after its merge closed the ticket does not reopen it.
 - **Turn summaries** — each completed turn's final reply is posted as a comment (capped at
   4,000 characters), a failed turn posts its error, and archiving an agent that never linked
   a pull request says so.

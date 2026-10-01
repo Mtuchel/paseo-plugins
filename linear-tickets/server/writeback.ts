@@ -507,6 +507,9 @@ export class Writeback {
       if (!settings.writeback.status || this.started.has(agent.id)) return;
       this.started.add(agent.id);
       const state = await this.linear.issueState(issueId);
+      // A closed ticket stays closed: its agent still working after the merge (a deploy watch, a
+      // step after merge) is often first seen after a plugin restart, and is not new work.
+      if (CLOSED_TYPES.includes(state.statusType.trim().toLowerCase())) return;
       // A plan-first agent only plans: its ticket goes to Planning, not In Progress. A ticket
       // already started (for example after the plan was approved) is left where it is.
       const outcome = !planFirst ? await this.linear.markInProgress(state, state.teamId)

@@ -271,9 +271,11 @@ test("a turn-end wait on a closed ticket keeps its sub-issue open for the owner 
 
   await end("Merged.\n\n**Someone has to send a test mail to `purchases@`.** Only you can do that.");
   assert.deepEqual(created(), ['create sub-1 "Needs you: Someone has to send a test mail to purchases@. Only you can do that." under issue-1 for creator in Needs input']);
-  // The next turn may be a nudge, not the step being done: the sub-issue stays open.
+  // The next turn may be a nudge, not the step being done: the sub-issue stays open, and the
+  // closed ticket is not reopened by the agent's first turn this plugin instance sees.
   await writeback.turnStarted({ agent: root, turnId: "t2" }, linked);
   assert.ok(!linear.writes.includes("complete sub-1"));
+  assert.ok(!linear.writes.some((write) => write.startsWith("in-progress")));
   await end("Still waiting: should I run the smoke test once the mail arrived?");
   assert.deepEqual(created(), []);
   assert.equal(linear.others.size, 1);
