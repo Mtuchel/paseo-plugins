@@ -15,7 +15,8 @@ if (!issueId || !/^[A-Za-z0-9-]{1,100}$/.test(issueId) || !paseoHome) {
 }
 const override = process.env.LINEAR_TICKET_MCP_ENDPOINT;
 const endpoint = override && /^http:\/\/127\.0\.0\.1:\d+\//.test(override) ? override : "https://api.linear.app/graphql";
-const BLOCKED_TYPES = ["canceled", "duplicate"];
+// Closing a ticket without its work needs a reason, posted on the ticket before the move.
+const REASON_TYPES = ["canceled", "duplicate"];
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_IN_FLIGHT = 4;
 let inFlight = 0;
@@ -109,7 +110,7 @@ const tools = [
       return {
         identifier: issue.identifier, title: issue.title, url: issue.url, status: issue.state, priority: issue.priorityLabel,
         assignee: issue.assignee ? issue.assignee.name : null, team: issue.team ? issue.team.name : null,
-        availableStatuses: states(issue).filter((s) => !BLOCKED_TYPES.includes(s.type)).map((s) => ({ name: s.name, type: s.type })),
+        availableStatuses: states(issue).map((s) => ({ name: s.name, type: s.type })),
         description: issue.description, comments, links: (issue.attachments && issue.attachments.nodes) || [],
       };
     },
@@ -128,17 +129,21 @@ const tools = [
   },
   {
     name: "set_status",
-    description: "Move this agent's Linear ticket to another workflow state of its team, by exact state name (see get_ticket availableStatuses). Canceled and duplicate states are reserved for people.",
-    inputSchema: { type: "object", properties: { status: { type: "string", minLength: 1, maxLength: 200 } }, required: ["status"], additionalProperties: false },
+    description: "Move this agent's Linear ticket to another workflow state of its team, by exact state name (see get_ticket availableStatuses). A canceled or duplicate state needs a reason, which is posted on the ticket first.",
+    inputSchema: { type: "object", properties: { status: { type: "string", minLength: 1, maxLength: 200 }, reason: { type: "string", minLength: 1, maxLength: 2000 } }, required: ["status"], additionalProperties: false },
     async run(input) {
       const wanted = text(input.status, "status", 200).toLowerCase();
       const issue = await loadIssue();
       const all = states(issue);
       const target = all.find((s) => s.name.trim().toLowerCase() === wanted);
-      const allowed = all.filter((s) => !BLOCKED_TYPES.includes(s.type)).map((s) => s.name);
-      if (!target) throw new Error("Unknown status. Choose one of: " + allowed.join(", "));
-      if (BLOCKED_TYPES.includes(target.type)) throw new Error("Only a person can move a ticket to " + target.name + ".");
+      if (!target) throw new Error("Unknown status. Choose one of: " + all.map((s) => s.name).join(", "));
       if (issue.state && issue.state.name === target.name) return { changed: false, status: target.name };
+      if (REASON_TYPES.includes(target.type)) {
+        if (input.reason === undefined) throw new Error("Moving the ticket to " + target.name + " closes it without its work: give the reason.");
+        const reason = text(input.reason, "reason", 2000);
+        const posted = await linear("mutation comment($input: CommentCreateInput!) { commentCreate(input: $input) { success } }", { input: { issueId, body: "Moved to " + target.name + " by its agent: " + reason } });
+        if (!posted.commentCreate || !posted.commentCreate.success) throw new Error("Linear did not post the reason; the status is unchanged.");
+      }
       const data = await linear("mutation status($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { state { name } } } }", { id: issueId, stateId: target.id });
       if (!data.issueUpdate || !data.issueUpdate.success) throw new Error("Linear did not apply the status change.");
       return { changed: true, from: issue.state ? issue.state.name : null, status: target.name };

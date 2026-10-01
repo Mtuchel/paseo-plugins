@@ -65,12 +65,13 @@ test("plan checklists come from checkboxes, or numbered steps under a Steps head
 });
 
 type Call = string;
-function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues } = {}) {
+function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void> } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
     updateSession: async () => {},
     createSessionOnIssue: async () => "s-new",
+    viewer: async () => ({ id: "paseo-app", name: "Paseo" }),
     openSessions: async () => [],
     activities: async () => [],
   };
@@ -89,7 +90,7 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
   const store = new SessionStore(join(directory, "sessions.json"));
   const router = new SessionRouter({
     api: api as never,
-    linear: { viewerId: async () => OWNER, addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); }, complete: async (id: string) => { calls.push(`complete ${id}`); }, issueState: async () => { throw new Error("unused"); } },
+    linear: { viewerId: async () => OWNER, addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); }, complete: async (id: string) => { calls.push(`complete ${id}`); }, issueState: async () => { throw new Error("unused"); }, delegate: options.delegate ?? (async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); }) },
     starter: { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false, untrusted: false, plan: null }; }, admission: async () => ({ ok: true as const }) },
     settings: { read: async () => settings },
     store,
@@ -134,6 +135,21 @@ test("a mention on a Needs you sub-issue goes to the agent that asked on the par
   assert.ok(!h.calls.some((call) => call.startsWith("start ")), "no new agent for the sub-issue");
   assert.deepEqual(await needsYou.all(), []);
   await h.cleanup();
+});
+
+test("a label or sidebar launch delegates its ticket to the Paseo app once the session links the agent; a failed delegation keeps the session", async () => {
+  const seen: { store?: SessionStore; delegated?: string; linkedAgent?: string | null } = {};
+  const h = harness({ delegate: async (id, to) => { seen.delegated = `${id} to ${to}`; seen.linkedAgent = (await seen.store!.get("s-new"))?.agentId; } });
+  seen.store = h.store;
+  assert.equal(await h.router.openFor("i1", "TUC-1", "agent-1"), "s-new");
+  assert.equal(seen.delegated, "i1 to paseo-app");
+  assert.equal(seen.linkedAgent, "agent-1", "the delegation's own session event finds the agent, never starts a second one");
+  await h.cleanup();
+
+  const failing = harness({ delegate: async () => { throw new Error("HTTP 503"); } });
+  assert.equal(await failing.router.openFor("i1", "TUC-1", "agent-1"), "s-new");
+  assert.equal((await failing.store.get("s-new"))?.agentId, "agent-1");
+  await failing.cleanup();
 });
 
 test("a mention to a running agent that waits on a question answers it, like a relayed comment", async () => {

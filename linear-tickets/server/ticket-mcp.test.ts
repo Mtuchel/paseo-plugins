@@ -196,7 +196,7 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
 
     const ticket = JSON.parse((await mcp.call("get_ticket")).text);
     assert.equal(ticket.identifier, "ENG-42");
-    assert.deepEqual(ticket.availableStatuses.map((s: { name: string }) => s.name), ["Todo", "In Progress", "In Review"]);
+    assert.deepEqual(ticket.availableStatuses.map((s: { name: string }) => s.name), ["Todo", "In Progress", "In Review", "Canceled"]);
 
     assert.equal((await mcp.call("add_comment", { body: "Started." })).isError, false);
     const comment = linear.calls.find((c) => c.query.includes("commentCreate"))!;
@@ -204,11 +204,15 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     assert.equal(comment.authorization, "saved-key");
 
     assert.match((await mcp.call("set_status", { status: "Shipped" })).text, /Unknown status.*In Review/);
-    assert.match((await mcp.call("set_status", { status: "canceled" })).text, /Only a person/);
+    assert.match((await mcp.call("set_status", { status: "canceled" })).text, /give the reason/);
     assert.equal((await mcp.call("set_status", { status: "in progress" })).text.includes("\"changed\": false"), true);
     const moved = await mcp.call("set_status", { status: "in review" });
     assert.equal(moved.isError, false);
-    assert.deepEqual(linear.calls.filter((c) => c.query.includes("issueUpdate")).map((c) => c.variables), [{ id: ISSUE_ID, stateId: "s-review" }]);
+    assert.deepEqual(linear.calls.filter((c) => c.query.includes("issueUpdate")).map((c) => c.variables), [{ id: ISSUE_ID, stateId: "s-review" }], "a cancel without a reason changes nothing");
+    assert.equal((await mcp.call("set_status", { status: "Canceled", reason: "ENG-7 already shipped this." })).isError, false);
+    const reason = linear.calls.findIndex((c) => JSON.stringify(c.variables) === JSON.stringify({ input: { issueId: ISSUE_ID, body: "Moved to Canceled by its agent: ENG-7 already shipped this." } }));
+    const canceled = linear.calls.findIndex((c) => JSON.stringify(c.variables) === JSON.stringify({ id: ISSUE_ID, stateId: "s-canceled" }));
+    assert.ok(reason >= 0 && canceled > reason, "the reason is on the ticket before it closes");
 
     assert.equal((await mcp.call("link_url", { url: "http://example.com/pr/1" })).isError, true);
     assert.equal((await mcp.call("link_url", { url: "https://github.com/o/r/pull/1", title: "PR" })).isError, false);
