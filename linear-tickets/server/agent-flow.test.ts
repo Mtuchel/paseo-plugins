@@ -146,6 +146,30 @@ test("a ticket keeps one open Paseo thread: older threads are closed once a newe
   await h.cleanup();
 });
 
+test("one failed Linear read skips only its part of the sweep: a reply in another thread still reaches its agent", async () => {
+  let lists = 0;
+  const h = routerHarness([], {
+    api: {
+      activity: async () => {},
+      // The first list (closing superseded threads) fails, the way Linear's 503s do; so does one thread's read.
+      openSessions: async () => { if (++lists === 1) throw new Error("HTTP 503"); return [{ id: "s1", status: "active" }, { id: "s2", status: "active" }]; },
+      activities: async (id: string) => {
+        if (id === "s1") throw new Error("HTTP 503");
+        return [{ id: "p1", type: "prompt", userId: OWNER, createdAt: "2026-01-02T00:00:00Z", body: "Also update the README" }];
+      },
+    } as never,
+  });
+  // `old` is superseded by `s1`, so closing it lists the sessions first, and that list fails.
+  await h.store.put({ ...link, sessionId: "old", agentId: "a0", createdAt: "2025-12-31T00:00:00Z", paseoLinked: "a0" });
+  await h.store.put({ ...link, sessionId: "s1", agentId: "a1", paseoLinked: "a1" });
+  await h.store.put({ ...link, sessionId: "s2", agentId: "a2", issueId: "i2", paseoLinked: "a2" });
+  await h.router.sweep();
+  assert.ok(h.calls.some((call) => call.startsWith("send a2:") && call.includes("Also update the README")), JSON.stringify(h.calls));
+  assert.ok(!h.calls.some((call) => call.startsWith("send a1")));
+  assert.equal(lists, 2);
+  await h.cleanup();
+});
+
 test("a queued thread starts once its blockers finish, even after it dropped out of Linear's recent sessions", async () => {
   const events: string[] = [];
   const blocked = new Set(["i1", "i2", "i3", "i4", "i5"]);

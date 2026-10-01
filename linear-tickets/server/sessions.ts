@@ -507,18 +507,41 @@ export class SessionRouter {
     }
   }
 
-  // Catch-up for missed webhooks: queued threads now admitted, new sessions nobody started, and prompts not yet handled.
+  // Catch-up for missed webhooks: queued threads now admitted, new sessions nobody started, and prompts
+  // not yet handled. Each part runs on its own, so one failed Linear request skips only the part it hit.
   async sweep(): Promise<void> {
     if (this.sweeping || !this.paseo) return;
     this.sweeping = true;
     try {
-      await this.startQueued();
-      await this.closeSuperseded();
-      await this.settleReviews();
+      await this.sweepPart("queued threads", () => this.startQueued());
+      await this.sweepPart("superseded threads", () => this.closeSuperseded());
+      await this.sweepPart("reviews", () => this.settleReviews());
       // Threads opened before the link existed (or linked to a newer agent) get "Open in Paseo".
-      for (const link of await this.deps.store.all()) if (link.agentId && !link.closed && link.paseoLinked !== link.agentId) await this.linkToPaseo(link.sessionId, link.agentId);
-      const owner = await this.owner();
-      for (const session of await this.deps.api.openSessions()) {
+      await this.sweepPart("Open in Paseo links", async () => {
+        for (const link of await this.deps.store.all()) if (link.agentId && !link.closed && link.paseoLinked !== link.agentId) await this.linkToPaseo(link.sessionId, link.agentId);
+      });
+      await this.sweepPart("missed replies", () => this.catchUp());
+    } finally {
+      this.sweeping = false;
+    }
+  }
+
+  private async sweepPart(part: string, run: () => Promise<void>): Promise<void> {
+    try {
+      await run();
+    } catch (error) {
+      console.error(`[linear-tickets] agent session sweep (${part}) failed: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+
+  // New sessions nobody started and prompts not yet handled. A thread whose read fails is tried
+  // again next minute; the threads after it go ahead.
+  private async catchUp(): Promise<void> {
+    const owner = await this.owner();
+    const sessions = await this.deps.api.openSessions();
+    const failures: string[] = [];
+    for (const session of sessions) {
+      try {
         const link = await this.deps.store.get(session.id);
         // Still waiting: `startQueued` owns it.
         if (link?.queued && !link.agentId) continue;
@@ -533,12 +556,11 @@ export class SessionRouter {
           if (activity.type !== "prompt" || activity.userId !== owner || activity.createdAt < link.createdAt || link.handled.includes(activity.id)) continue;
           await this.handle({ type: "AgentSessionEvent", action: "prompted", agentSession: { id: session.id }, agentActivity: { id: activity.id, content: { body: activity.body }, signal: activity.signal, userId: activity.userId } });
         }
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
       }
-    } catch (error) {
-      console.error(`[linear-tickets] agent session sweep failed: ${error instanceof Error ? error.message : error}`);
-    } finally {
-      this.sweeping = false;
     }
+    if (failures.length) throw new Error(`${failures.length} of ${sessions.length} threads skipped until the next sweep: ${failures[0]}`);
   }
 
   // ---- outbound -------------------------------------------------------------------------

@@ -6,7 +6,7 @@ import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { attachmentNote, saveAttachments, type Download } from "./attachments";
 import { buildPrompt, finishedBlockersNote } from "./context";
-import type { LinearService } from "./linear";
+import { inReviewState, type LinearService } from "./linear";
 import { PLAN_CONTEXT_ENV, PLAN_TICKET_ENV } from "./plan-policy";
 import { findProject, readBranches } from "./projects";
 import { repoOrientation } from "./repo-orientation";
@@ -162,8 +162,9 @@ export class Launcher {
     const orientation = await repoOrientation({ cwd, git: project.projectKind === "git", provider: input.provider, detail });
     warnings.push(...orientation.warnings);
     instructions = [instructions.trim(), orientation.note].filter(Boolean).join("\n\n");
-    // The agent that starts after its blockers builds on what they did. Never fails the launch.
-    const finished = detail.relations.related.filter((ticket) => ticket.direction === "blocked by" && ticket.statusType === "completed");
+    // The agent that starts after its blockers builds on what they did. Blockers in review are kept
+    // only when their pull requests are merged (`finishedBlockers` checks). Never fails the launch.
+    const finished = detail.relations.related.filter((ticket) => ticket.direction === "blocked by" && (ticket.statusType === "completed" || inReviewState(ticket.status, ticket.statusType)));
     if (finished.length) {
       try {
         instructions = [instructions.trim(), finishedBlockersNote(await this.linear.finishedBlockers(finished.map((ticket) => ticket.id)))].filter(Boolean).join("\n\n");
