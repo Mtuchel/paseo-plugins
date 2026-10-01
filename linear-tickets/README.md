@@ -166,13 +166,20 @@ and its manual tasks:
 
 - `get_ticket` — fresh title, description, status, the team's workflow states, comments, links;
 - `add_comment` — post a Markdown comment;
-- `set_status` — move to another state of the ticket's team by name (canceled and duplicate
-  states are left to people);
+- `set_status` — move to another state of the ticket's team by name; a canceled or duplicate
+  state needs a `reason`, posted on the ticket before the move;
 - `link_url` — attach an https link, such as the pull request;
 - `add_manual_task` — register a step only a person can do; see [Manual tasks](#manual-tasks).
 
+The agent closes its own ticket, so finished work never waits on you: once the ticket meets its
+definition of done it moves it to Done, unless a merged pull request already closed it. That
+covers work outside a repository and pull requests that only mention the ticket ("Part of"),
+which close nothing on their own. A step left for a person becomes a manual task and does not
+keep the ticket open. Work that turns out unnecessary (already done, obsolete, a duplicate) is
+moved to Canceled or Duplicate with the reason. Agents limited to planning never close a ticket.
+
 The launch prompt tells the agent to comment when it starts and finishes, link its pull request,
-move the ticket to review and register every manual step as a manual task; custom templates can place that note with `{{linear_access}}`,
+move the ticket to review, register every manual step as a manual task and close the ticket as above; custom templates can place that note with `{{linear_access}}`,
 and it is appended when they do not. The server is a dependency-free script written to
 `$PASEO_HOME/linear-tickets/ticket-mcp-<hash>.mjs` and run with the daemon's own Node runtime
 (the desktop app's bundled runtime included), so it does not depend on `node` being on the
@@ -449,7 +456,8 @@ one is finished, which for code means Done or in review with its pull requests m
 pushed after them move it to In Review again. An approval moves it to the team's started state
 **Ready to merge** (teams without one stay in In Review), once no [manual task](#manual-tasks)
 due before merge is open; commits pushed after the approval move
-it back to In Review. The merge is noted, and Done comes from Linear's GitHub integration.
+it back to In Review. The merge is noted, and Done comes from Linear's GitHub integration, or from
+the agent when no pull request closes the ticket ([Agent access to Linear](#agent-access-to-linear)).
 Requested changes on the current head also reach the agent itself; see the nudges below.
 
 **Graphite merge queue.** The queue lands a stack by fast-forwarding the base branch and closes
@@ -625,7 +633,8 @@ using this host's key, independently of the agent's own `linear_ticket` tools:
   agent leaves its open sub-issues for you; replies there no longer reach anyone.
 - **Pull requests** — GitHub pull request URLs printed by the agent's completed shell
   commands during a turn (for example `gh pr create`) are attached to the ticket, which then moves to its team's
-  started state named like *In Review*. Completion is left to Linear's GitHub integration.
+  started state named like *In Review*. Completion is left to Linear's GitHub integration and to
+  the agent itself ([Agent access to Linear](#agent-access-to-linear)).
 
 - **Replies from Linear** — your own comments that start with `@paseo` reach the ticket's
   agent (the newest active one) within one poll interval. If the agent is waiting on a

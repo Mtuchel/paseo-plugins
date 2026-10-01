@@ -508,7 +508,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
         setAgentLinearAccess(next);
         setAgentLinearAccess((await saveSettings({ agentLinearAccess: next })).agentLinearAccess);
       })} />
-    <Text style={t.muted}>On gives each new agent linear_ticket tools that act only on the ticket it started from, using this host's Linear key; canceling or marking duplicate stays with people. It needs a key with write access. Existing agents keep what they started with.</Text>
+    <Text style={t.muted}>On gives each new agent linear_ticket tools that act only on the ticket it started from, using this host's Linear key. Agents close their own ticket: Done once it is finished, or Canceled or Duplicate with the reason posted first. It needs a key with write access. Existing agents keep what they started with.</Text>
     <Divider t={t} spaced />
     <FieldLabel title="Auto-dispatch" icon="Zap" hint="start agents for labeled tickets" t={t} />
     {dispatch && <>
