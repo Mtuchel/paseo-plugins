@@ -89,7 +89,7 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
   const store = new SessionStore(join(directory, "sessions.json"));
   const router = new SessionRouter({
     api: api as never,
-    linear: { viewerId: async () => OWNER, addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); }, complete: async (id: string) => { calls.push(`complete ${id}`); } },
+    linear: { viewerId: async () => OWNER, addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); }, complete: async (id: string) => { calls.push(`complete ${id}`); }, issueState: async () => { throw new Error("unused"); } },
     starter: { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false, untrusted: false, plan: null }; }, admission: async () => ({ ok: true as const }) },
     settings: { read: async () => settings },
     store,

@@ -37,12 +37,12 @@ test("question parts are asked one at a time, and Other is a hint rather than a 
   assert.match(questionPrompt(twoPart, 1).body, /^Format\? \(2\/2\)/);
 });
 
-function routerHarness(pending: AgentPermissionRequest[], extra: Partial<ConstructorParameters<typeof SessionRouter>[0]> = {}) {
+function routerHarness(pending: AgentPermissionRequest[], extra: Partial<ConstructorParameters<typeof SessionRouter>[0]> = {}, listed: { id: string; title: string }[] = []) {
   const calls: string[] = [];
   const feeds: ((event: unknown) => void)[] = [];
   const paseo = {
     agents: {
-      list: async () => ({ entries: [], pageInfo: { hasMore: false } }),
+      list: async () => ({ entries: listed.map((agent) => ({ agent: { ...agent, labels: {} } })), pageInfo: { hasMore: false } }),
       ref: (id: string) => ({
         refresh: async () => ({ agent: { pendingPermissions: pending } }),
         send: async (text: string) => { calls.push(`send ${id}: ${text}`); },
@@ -55,15 +55,16 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
   const store = new SessionStore(join(directory, "sessions.json"));
   const router = new SessionRouter({
     api: { activity: async (_s: string, content: { type: string; body?: string }) => { calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); }, openSessions: async () => [], activities: async () => [] } as never,
-    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {} },
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueState: async () => { throw new Error("unused"); } },
     starter: { start: async () => { throw new Error("unused"); }, admission: async () => ({ ok: true as const }) },
     settings: { read: async () => settings },
     store,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     ...extra,
   });
-  router.attach(paseo);
-  router.stop();
+  // Connected without attach(): its startup sweep would run alongside the test and, once the
+  // daemon's server id is cached, post "Open in Paseo" links mid-test. Tests call sweep() themselves.
+  Object.assign(router, { paseo });
   return { router, store, calls, feeds, cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
 
@@ -142,6 +143,60 @@ test("a ticket keeps one open Paseo thread: older threads are closed once a newe
   assert.equal((await h.store.forAgent("a1"))?.sessionId, "current");
   await h.router.closeSuperseded();
   assert.equal(calls.length, 1, "closing happens once");
+  await h.cleanup();
+});
+
+test("a queued thread starts once its blockers finish, even after it dropped out of Linear's recent sessions", async () => {
+  const events: string[] = [];
+  const blocked = new Set(["i1", "i2", "i3", "i4", "i5"]);
+  const sessionStatus: Record<string, string | null> = { q1: "stale", q2: "complete", q3: "stale", q4: "stale", q5: "awaitingInput" };
+  const h = routerHarness([], {
+    // Linear's session list no longer contains any of the waiting threads.
+    api: { activity: async (sessionId: string, content: { type: string; body?: string }) => { if (content.type !== "thought") events.push(`${sessionId} ${content.type}: ${content.body}`); }, openSessions: async () => [], activities: async () => [], sessionStatus: async (id: string) => sessionStatus[id] } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueState: async (id: string) => ({ statusType: id === "i3" ? "canceled" : "unstarted", status: id === "i3" ? "Canceled" : "Todo" }) } as never,
+    starter: {
+      admission: async (id: string) => (blocked.has(id) ? { ok: false as const, reason: "Waiting for TUC-9 to finish." } : { ok: true as const }),
+      start: async (id: string) => {
+        if (id === "i4") throw new Error("No Paseo project is mapped");
+        events.push(`start ${id}`);
+        return { agentId: `agent-${id}`, warnings: [], provider: "omp", target: "repo", resumed: false, untrusted: false, plan: null };
+      },
+    },
+  });
+  for (const n of [1, 2, 3, 4, 5]) await h.store.put({ ...link, sessionId: `q${n}`, issueId: `i${n}`, identifier: `TUC-${n}`, agentId: null, queued: true });
+
+  await h.router.sweep();
+  assert.deepEqual(events, [], "nothing starts while the blockers are open");
+
+  blocked.clear();
+  await h.router.sweep();
+  assert.deepEqual(events, [
+    "start i1",
+    "q3 response: TUC-3 was moved to Canceled while it waited, so no agent was started. Assign Paseo again to start one.",
+    "q4 error: Paseo could not start the agent: No Paseo project is mapped",
+    "start i5",
+  ]);
+  assert.equal((await h.store.get("q1"))?.agentId, "agent-i1");
+  assert.equal((await h.store.get("q5"))?.agentId, "agent-i5");
+  for (const id of ["q1", "q2", "q3", "q4", "q5"]) assert.equal((await h.store.get(id))?.queued, false, id);
+  assert.equal((await h.store.get("q2"))?.agentId, null, "a thread the owner ended starts nothing");
+
+  await h.router.sweep();
+  assert.equal(events.length, 4, "an ended, closed or failed wait is not tried again");
+  await h.cleanup();
+});
+
+test("a queued thread whose ticket already has a running agent is linked to it instead of starting a second", async () => {
+  const starts: string[] = [];
+  const h = routerHarness([], {
+    api: { activity: async () => {}, openSessions: async () => [], activities: async () => [], sessionStatus: async () => "stale" } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueState: async () => ({ statusType: "unstarted", status: "Todo" }) } as never,
+    starter: { admission: async () => ({ ok: true as const }), start: async (id: string) => { starts.push(id); throw new Error("unused"); } },
+  }, [{ id: "labelled", title: "Started by the paseo label" }]);
+  await h.store.put({ ...link, sessionId: "q1", agentId: null, queued: true });
+  await h.router.startQueued();
+  assert.deepEqual(starts, []);
+  assert.deepEqual([(await h.store.get("q1"))?.agentId, (await h.store.get("q1"))?.queued], ["labelled", false]);
   await h.cleanup();
 });
 
