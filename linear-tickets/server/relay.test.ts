@@ -7,6 +7,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import type { RelayComment } from "./linear";
 import { RateLimitedError } from "./rate-budget";
+import { NeedsYouIssues } from "./needs-you";
 import { approvalDecision, CommentRelay, mentionMessage, questionAnswer } from "./relay";
 
 const ME = "user-me";
@@ -43,7 +44,7 @@ type AgentFixture = { id: string; issueId: string; createdAt: string; updatedAt:
 type Fake = { comments: Record<string, RelayComment[]>; failRead?: Error | null; failReact?: Error | null };
 
 // A throwaway cursor file per setup; pass `path` to reuse one (a plugin restart).
-function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>, path = join(mkdtempSync(join(tmpdir(), "relay-")), "cursors.json")) {
+function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>, path = join(mkdtempSync(join(tmpdir(), "relay-")), "cursors.json"), needsYou?: NeedsYouIssues) {
   const events: string[] = [];
   const since: string[] = [];
   const reads: number[] = [];
@@ -62,6 +63,7 @@ function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>,
       return { comments: found, unseen: [] };
     },
     async comment(issueId: string, body: string) { events.push(`comment ${issueId}: ${body}`); },
+    async complete(issueId: string) { events.push(`complete ${issueId}`); },
     async react(commentId: string, emoji: string) {
       if (fake.failReact) throw fake.failReact;
       events.push(`react ${commentId} ${emoji}`);
@@ -80,7 +82,7 @@ function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>,
       }),
     },
   } as unknown as PaseoApi;
-  return { relay: new CommentRelay(linear, path), paseo, events, since, reads, fake, path };
+  return { relay: new CommentRelay(linear, path, needsYou), paseo, events, since, reads, fake, path };
 }
 
 const comment = (id: string, body: string, extra: Partial<RelayComment> = {}): RelayComment => ({ id, body, createdAt: `2026-02-01T00:00:0${id.length}Z`, userId: ME, reactions: [], sessionId: null, ...extra });
@@ -116,6 +118,20 @@ test("a pending question is answered and a pending approval is decided from the 
   const approving = setup([{ id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", pending: [tool] }], { i1: [comment("c1", "@paseo deny not on prod")] });
   await approving.relay.poll(approving.paseo);
   assert.deepEqual(approving.events, [`respond a t ${JSON.stringify({ behavior: "deny", message: "not on prod" })}`, "react c1 eyes"]);
+});
+
+test("a reply on a Needs you sub-issue reaches the agent that asked and closes the sub-issue", async () => {
+  const needsYou = new NeedsYouIssues(mkdtempSync(join(tmpdir(), "needs-you-")));
+  await needsYou.add({ id: "sub-1", identifier: "TUC-2", parentId: "i1", agentId: "a" });
+  // An entry whose agent is gone (archived) routes nothing.
+  await needsYou.add({ id: "sub-9", identifier: "TUC-9", parentId: "i9", agentId: "gone" });
+  const { relay, paseo, events } = setup([{ id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }], {
+    "sub-1": [comment("c1", "@paseo yes, enqueue it")],
+    "sub-9": [comment("c9", "@paseo hello?")],
+  }, undefined, needsYou);
+  await relay.poll(paseo);
+  assert.deepEqual(events, ["send a: yes, enqueue it", "complete sub-1", "react c1 eyes"]);
+  assert.deepEqual((await needsYou.all()).map((entry) => entry.id), ["sub-9"]);
 });
 
 test("a comment that cannot be delivered is marked failed and explained on the ticket", async () => {

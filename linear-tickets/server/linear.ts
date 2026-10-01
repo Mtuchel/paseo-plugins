@@ -572,12 +572,15 @@ export class LinearService {
   }
 
   // `ready` puts the ticket into the team's first unstarted state (Todo) instead of Triage, for
-  // tickets the plugin creates as planned work.
-  async createIssue(input: { teamId: string; title: string; description: string; parentId?: string; projectId?: string | null; assigneeId?: string; priority?: number; ready?: boolean }): Promise<{ id: string; identifier: string; url: string }> {
+  // tickets the plugin creates as planned work; `startedState` into the started state of that name.
+  async createIssue(input: { teamId: string; title: string; description: string; parentId?: string; projectId?: string | null; assigneeId?: string; priority?: number; ready?: boolean; startedState?: string }): Promise<{ id: string; identifier: string; url: string }> {
     const payload: Record<string, unknown> = { teamId: input.teamId, title: input.title, description: input.description };
-    if (input.ready) {
-      const todo = (await this.teamStates(input.teamId)).filter((state) => state.type === "unstarted").sort((a, b) => a.position - b.position)[0];
-      if (todo) payload.stateId = todo.id;
+    if (input.ready || input.startedState) {
+      const states = await this.teamStates(input.teamId);
+      const wanted = input.startedState?.trim().toLowerCase();
+      const target = (wanted ? states.find((state) => state.type === "started" && state.name.trim().toLowerCase() === wanted) : undefined)
+        ?? (input.ready ? states.filter((state) => state.type === "unstarted").sort((a, b) => a.position - b.position)[0] : undefined);
+      if (target) payload.stateId = target.id;
     }
     if (input.priority) payload.priority = input.priority;
     if (input.parentId) payload.parentId = input.parentId;

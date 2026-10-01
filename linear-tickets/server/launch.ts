@@ -2,11 +2,15 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { RpcInput } from "@getpaseo/plugin";
 import { launchAgentRpc } from "../shared/contracts";
 import { existsSync } from "node:fs";
+import { mkdir, rename, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { attachmentNote, saveAttachments, type Download } from "./attachments";
 import { buildPrompt } from "./context";
 import type { LinearService } from "./linear";
+import { PLAN_CONTEXT_ENV, PLAN_TICKET_ENV } from "./plan-policy";
 import { findProject, readBranches } from "./projects";
-import { TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
+import { repoOrientation } from "./repo-orientation";
+import { paseoHome, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
 
 // planFirst is resolved into mode, instructions, labels and env before a launch (planSetup).
 type Start = Omit<RpcInput<typeof launchAgentRpc>, "planFirst">;
@@ -36,6 +40,16 @@ function isBranchCollision(error: unknown): boolean {
   return error instanceof Error && /already exists/i.test(error.message);
 }
 
+// Saves the prompt a ticket agent starts with, so the plan advisor it consults reads the same
+// ticket context (README, "Plan advisor"). One file per launch request; returns its path.
+export async function writePlanContext(requestId: string, prompt: string, directory = join(paseoHome(), "linear-tickets", "plan-context")): Promise<string> {
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const path = join(directory, `${requestId.replace(/[^A-Za-z0-9-]/g, "_")}.md`);
+  await writeFile(`${path}.tmp`, prompt, { mode: 0o600 });
+  await rename(`${path}.tmp`, path);
+  return path;
+}
+
 export class Launcher {
   private readonly requests = new Map<string, { fingerprint: string; result: Promise<Result> }>();
   private readonly active = new Map<string, Promise<Result>>();
@@ -46,6 +60,7 @@ export class Launcher {
     private readonly ticketScript: () => Promise<string> = () => writeTicketMcpScript(),
     // Downloads Linear uploads with the host's key; without it attachments stay links.
     private readonly download?: Download,
+    private readonly planContext: (requestId: string, prompt: string) => Promise<string> = writePlanContext,
   ) {}
 
   start(input: Start, paseo: PaseoApi, options: Options = {}): Promise<Result> {
@@ -143,6 +158,10 @@ export class Launcher {
         warnings.push(`Could not save the ticket's Linear attachments: ${error instanceof Error ? error.message : "unknown error"}`);
       }
     }
+    // Never fails the launch: without a readable checkout only the scout sentence is added.
+    const orientation = await repoOrientation({ cwd, git: project.projectKind === "git", provider: input.provider, detail });
+    warnings.push(...orientation.warnings);
+    instructions = [instructions.trim(), orientation.note].filter(Boolean).join("\n\n");
     if (options.markInProgress) {
       // Best-effort, and before the agent exists so its own set_status calls always come
       // after this one. A failed transition only warns; the request dedupe above keeps a
@@ -154,14 +173,22 @@ export class Launcher {
         warnings.push(`Could not mark the ticket in progress: ${error instanceof Error ? error.message : "unknown error"}`);
       }
     }
+    const prompt = [options.resume?.handover, buildPrompt(detail, instructions, options.promptTemplate, options.linearAccess ?? false)].filter(Boolean).join("\n\n");
+    // The ticket marks the agent for the plan advisor gate even when its context cannot be saved.
+    let env: Record<string, string> = { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier };
+    try {
+      env = { ...env, [PLAN_CONTEXT_ENV]: await this.planContext(input.requestId, prompt) };
+    } catch (error) {
+      warnings.push(`Could not save the ticket context for the plan advisor: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
     const agent = await workspace.agents.create({
       config: { provider: input.provider, modeId: input.modeId, thinkingOptionId: input.thinkingOptionId, ...(mcpServers ? { mcpServers } : {}) },
       title,
-      prompt: [options.resume?.handover, buildPrompt(detail, instructions, options.promptTemplate, options.linearAccess ?? false)].filter(Boolean).join("\n\n"),
+      prompt,
       requestId: input.requestId,
       clientMessageId: input.requestId,
       labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
-      ...(options.env && Object.keys(options.env).length ? { env: options.env } : {}),
+      env,
     }).catch((error: unknown) => {
       // Keep the daemon's reason (e.g. a provider failing to start with the ticket MCP server).
       const cause = error instanceof Error && error.message ? ` (${error.message.slice(0, 300)})` : "";

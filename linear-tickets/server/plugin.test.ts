@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,9 @@ import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_DISPATCH, DEF
 import { LinearService, postGraphQL, ADD_LABEL_QUERY, CREATE_LABEL_QUERY, LABEL_BY_NAME_QUERY, resolveReviewState, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
 import { RateBudget, RateLimitedError } from "./rate-budget";
 import { cachedOverviewRpc, countIssuesRpc, listIssuesRpc, searchIssuesRpc } from "../shared/contracts";
+
+// Launches save the ticket prompt for the plan advisor under PASEO_HOME; keep it out of the real one.
+process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-plugin-home-"));
 
 // GraphQL-shaped fixture: workflow state, priority label, label connection,
 // and the relationship fields the detail query requests.
@@ -662,6 +666,26 @@ test("a saved default prompt template shapes the agent's first prompt", async ()
   assert.ok(captured?.includes("Regression on mobile"));
   // Changing the template is a new launch, not a retry of the same request.
   await assert.rejects(launcher.start({ ...input, instructions: "" }, paseo, { promptTemplate: "other {{context}}" }), /already been used/);
+});
+
+test("the plan advisor reads the same ticket prompt the agent starts with", async () => {
+  let options: PaseoWorkspaceAgentCreateOptions | undefined;
+  const launcher = new Launcher({ ...noMark, detail: async () => detail });
+  await launcher.start({ ...input, requestId: "8a1f2c3d-0000-4000-8000-000000000001" }, mockPaseo(async (created) => { options = created; return { id: "agent-1" }; }), { env: { LINEAR_TICKETS_PLAN: "required" } });
+  const path = options?.env?.LINEAR_TICKETS_CONTEXT;
+  assert.ok(path, "every ticket agent gets the context path");
+  assert.equal(options?.env?.LINEAR_TICKETS_PLAN, "required", "the plan policy env is kept");
+  assert.equal(await readFile(path, "utf8"), options?.prompt);
+  assert.equal((await stat(path)).mode & 0o777, 0o600);
+});
+
+test("a ticket context that cannot be saved warns and still launches a gated ticket agent, without the path", async () => {
+  let options: PaseoWorkspaceAgentCreateOptions | undefined;
+  const launcher = new Launcher({ ...noMark, detail: async () => detail }, undefined, undefined, undefined, async () => { throw new Error("disk full"); });
+  const result = await launcher.start({ ...input, requestId: "8a1f2c3d-0000-4000-8000-000000000002" }, mockPaseo(async (created) => { options = created; return { id: "agent-1" }; }));
+  assert.equal(result.agentId, "agent-1");
+  assert.deepEqual(options?.env, { LINEAR_TICKETS_ISSUE: "ENG-42" });
+  assert.ok(result.warnings.some((warning) => warning.includes("disk full")));
 });
 
 test("pre-launch errors can retry, but uncertain agent creation is never automatically repeated", async () => {

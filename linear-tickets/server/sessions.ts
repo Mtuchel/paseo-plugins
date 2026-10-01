@@ -12,6 +12,7 @@ import type { AgentSessionWebhook } from "./agent-webhook";
 import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
 import { dispatchLabels } from "./dispatch";
 import type { LinearService } from "./linear";
+import { closeAnswered, type NeedsYouIssues } from "./needs-you";
 import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, questionAnswer, questionsOf } from "./relay";
 import type { Settings } from "./settings";
 import type { TicketStarter } from "./starter";
@@ -207,7 +208,7 @@ export function planSteps(markdown: string): string[] {
 
 type Deps = {
   api: AgentApi;
-  linear: Pick<LinearService, "viewerId" | "addLabel" | "removeLabel">;
+  linear: Pick<LinearService, "viewerId" | "addLabel" | "removeLabel" | "complete">;
   starter: Pick<TicketStarter, "start" | "admission">;
   settings: Pick<Settings, "read">;
   store: SessionStore;
@@ -218,6 +219,8 @@ type Deps = {
   // A review decided on Plannotator's own page, found after its server is gone.
   reviewOutcome?: (review: PendingReview) => Promise<ReviewOutcome>;
   recordOutcome?: (agentId: string, outcome: Exclude<ReviewOutcome, "open" | null>) => Promise<void>;
+  // Open "Needs you" sub-issues: an @mention there goes to the agent that asked, not a new one.
+  needsYou?: NeedsYouIssues;
 };
 
 // Linear agent sessions ↔ Paseo agents. Inbound: `created` starts or links an agent, and
@@ -294,7 +297,10 @@ export class SessionRouter {
       return;
     }
     const link: SessionLink = { sessionId: session.id, agentId: null, issueId, identifier, createdAt: new Date().toISOString(), handled: [], review: null, offer: null };
-    const existing = await this.activeAgentFor(issueId);
+    const asked = (await this.deps.needsYou?.all())?.find((entry) => entry.id === issueId);
+    const existing = asked
+      ? { id: asked.agentId, title: (await this.paseo!.agents.ref(asked.agentId).refresh().catch(() => null))?.agent.title ?? null }
+      : await this.activeAgentFor(issueId);
     if (existing) {
       await this.deps.store.put({ ...link, agentId: existing.id });
       await this.linkToPaseo(session.id, existing.id);
@@ -302,6 +308,7 @@ export class SessionRouter {
       const text = typeof comment.body === "string" && !/^This thread is for an agent session/.test(comment.body) ? comment.body.replace(/@paseo\b/gi, "").trim() : "";
       // Same as a relayed comment: answers a pending question or decides a pending approval.
       if (text) await deliverToAgent(this.paseo!, existing.id, text);
+      if (text && asked) await closeAnswered(this.deps.needsYou!, this.deps.linear, issueId);
       await this.say(session.id, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.${text ? " Your message was passed on." : ""}`);
       await this.closeSuperseded();
       return;

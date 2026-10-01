@@ -203,7 +203,9 @@ plan before coding, run the test suite, or open a pull request in a specific for
 Placeholders are substituted at launch time:
 
 - `{{ticket}}` — the ticket's ID and title
-- `{{instructions}}` — the per-launch "A little extra direction" text
+- `{{instructions}}` — the per-launch "A little extra direction" text plus the plugin's own notes
+  (plan policy, attachments, [repository orientation](#repository-orientation)); a template
+  without it gets it inserted just before `{{context}}`
 - `{{context}}` — the ticket snapshot (required; a template without it is rejected)
 
 Templates are limited to 8,000 characters, stored per host with the other plugin settings,
@@ -239,6 +241,28 @@ referenced in the description, comments and attachments into the workspace under
 exclude list, and lists the local paths in the launch prompt. The key is sent only to
 `uploads.linear.app` and never reaches the agent. At most 20 files, 25 MB each and 100 MB
 in total are downloaded; a failed or skipped file becomes a launch warning, never a failure.
+
+## Repository orientation
+
+Every launch adds two things to the instructions, so the agent neither hunts for the
+repository's area guides nor fills its own context with exploration:
+
+- **Domain guides.** In a Git project, the plugin lists the checkout's tracked `AGENTS.md`
+  files (all but the root one) with each guide's first `# ` heading. Guides the ticket names are
+  listed first: `named in this ticket:` when the title, description or a comment contains the
+  guide's folder path (`apps/…/domains/sales` or `domains/sales`; the guides above it count too)
+  or a label equals the folder name; `possible match:` when only the folder name appears as a
+  word (`sales`, `demand planning`). Names only count for guides with sibling guides in the same
+  parent folder, such as the `domains/*` set. Matches are always listed; the remaining guides fill
+  up to 40 lines, and any further ones are counted. Only repository paths and headings are
+  written, never ticket text.
+- **Scout delegation.** After brief inline scoping, the agent delegates broad exploration to
+  read-only subagents in the same workspace (omp: `task` with the `scout` agent; Claude: the
+  Explore subagent; others: whatever their harness offers) and reads the files it changes itself.
+
+A guide that cannot be read is listed without its heading, and a failed `git ls-files` drops
+the list; both become a launch warning, never a failure. Non-Git projects get the scout
+sentence only.
 
 ## Native Linear agent
 
@@ -308,7 +332,34 @@ plugin asks the agent for a plan. An omp agent enters the planning phase at its 
 `skip_plan` afterwards. Other providers only get the message. A label that was there when the
 agent started does nothing; remove and add it again to ask once more.
 
-**The omp extension.** The planning phase and `skip_plan` come from
+**Plan advisor.** Every plan a ticket agent writes gets a second opinion before it reaches you.
+The planner (the model you launch tickets with; the model guard keeps it there) creates a GPT-6
+Astra advisor (`omp/openai-codex/gpt-6-astra`, thinking `medium`) with Paseo's `create_agent`, in
+its own workspace, so the advisor can read the same code. Both work from the same ticket context:
+each launch saves the agent's first prompt to `$PASEO_HOME/linear-tickets/plan-context/<request>.md`
+and passes the path in `LINEAR_TICKETS_CONTEXT`, and the advisor reads that file first (when the
+save fails, the launch warns and the planner pastes the ticket into the advisor's prompt). The
+planner adopts or answers each point and sends changes back to the same advisor with
+`send_agent_prompt` until they agree, at most three rounds. The plan then ends with an
+`## Advisor review` section: the advisor's model, the rounds, what changed, and every point still
+disputed with both positions, for you to decide in Plannotator.
+
+omp planners cannot skip this. Every ticket agent carries its ticket in `LINEAR_TICKETS_ISSUE`,
+and for those agents the extension blocks `plannotator_submit_plan`, its `xd://` device and omp's
+`xd://propose` until `record_plan_advice` has recorded the review for exactly the plan text being
+submitted; a plan the gate cannot read is blocked too. The tool checks with `paseo inspect` that
+the advisor runs GPT-6 Astra at medium, was created by this agent and has finished its latest
+turn; any later edit to the plan needs a new record, and the record follows the session branch
+(resume, `/tree` and branch switches rebuild it). It cannot check what the advisor said: the
+plan's advisor section is your record of that. Recording and submitting in one step works when the
+record comes first: the record is checked before any tool of that step runs, and a plan edit queued
+in the same step holds both back. Subagents of a ticket agent (`task` children) are not gated; the
+plan you review always comes from the ticket agent. An advisor that cannot be created (quota,
+provider error) is recorded as `unavailable` only when the plan's advisor section says so and gives
+the same reason. Claude and Codex planners get the steps as instructions when they launch in a
+planning policy, without the gate.
+
+**The omp extension.** The planning phase, `skip_plan` and the plan advisor gate come from
 [`omp/linear-tickets-plan-first.ts`](omp/linear-tickets-plan-first.ts), which omp loads from its
 extensions directory. Install it once with a symlink, so plugin updates reach it:
 
@@ -513,13 +564,14 @@ or dispatched), **Settings → Write back to Linear** can report their lifecycle
 using this host's key, independently of the agent's own `linear_ticket` tools:
 
 - **Status** — the agent's first turn moves the ticket into its team's In Progress state,
-  following the same rules as the launch-time setting.
+  following the same rules as the launch-time setting. A completed or canceled ticket is left
+  as it is: an agent still working after its merge closed the ticket does not reopen it.
 - **Turn summaries** — each completed turn's final reply is posted as a comment (capped at
   4,000 characters), a failed turn posts its error, and archiving an agent that never linked
   a pull request says so.
-- **Blocked alerts** — when the agent waits for you (a question, a plan approval or a
-  permission still pending after a moment), the ticket shows it three ways, also when the
-  agent panel asks:
+- **Blocked alerts** — when the agent waits for you (a question, a plan approval, a
+  permission still pending after a moment, or a turn that ends by asking you), the ticket
+  shows it three ways, also when the agent panel asks:
   - it moves to the team's **Needs input** workflow state (type Started; create it in the
     team's workflow settings, teams without it skip this step),
   - it gets the red `<label>-needs-you` label (created on first use), handy for a saved
@@ -533,7 +585,22 @@ using this host's key, independently of the agent's own `linear_ticket` tools:
   is archived, the label comes off and the ticket returns to its previous state, unless
   someone moved it out of Needs input meanwhile. The next wait gets a fresh comment. A
   failed turn adds `<label>-blocked`, which marks errors only; the next completed turn
-  removes it. Started agents are asked to batch their questions into one ask.
+  removes it. Started agents are asked to put everything they need from you (answers,
+  decisions, approvals, secrets, manual steps) into one question request.
+  As a fallback, a completed turn whose final reply ends by asking you (a question, or a
+  phrase such as "needs your OK", "once you decide" or "reply "yes" and I'll") opens a
+  wait too; the comment quotes that part of the reply. It lasts until the agent's next turn
+  starts. Plan approval requests are left to the plan review.
+- **Waits after the ticket closed** — a merge commit's `Closes` moves the ticket to Done while
+  its agent may still need you (a deploy decision, a step after merge). A closed ticket stays
+  closed: the wait opens a **"Needs you: …" sub-issue** instead, in Needs input (Todo on teams
+  without it), assigned to you, with the `<label>-needs-you` label and the mention comment.
+  Further questions in the same wait edit that comment, and while the sub-issue is open the
+  agent's later waits on the ticket reuse it. It is closed for you when the question or
+  approval is answered (in Paseo or in Linear), or when you reply on it with `@paseo …`, which
+  goes to the agent that asked. A wait that ended otherwise (for example the agent's next turn
+  started) may be a manual step, so that sub-issue stays open until you close it. Archiving the
+  agent leaves its open sub-issues for you; replies there no longer reach anyone.
 - **Pull requests** — GitHub pull request URLs printed by the agent's completed shell
   commands during a turn (for example `gh pr create`) are attached to the ticket, which then moves to its team's
   started state named like *In Review*. Completion is left to Linear's GitHub integration.
@@ -646,7 +713,8 @@ start again. This retry cache does not survive a plugin or daemon restart.
 
 `npm run typecheck` checks both entrypoints against Paseo's SDK. `npm test` covers
 GraphQL response parsing, pagination, context preservation, prompt template rendering
-and validation, credential and settings persistence, ticket retrieval, state-transition
+and validation, repository orientation (guide matching, ranking and the cap), credential and
+settings persistence, ticket retrieval, state-transition
 resolution and failure handling, and agent creation/retries with mocked Linear and Paseo
 calls.
 Live account authentication and agent execution require your configured host and key.

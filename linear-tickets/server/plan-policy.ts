@@ -11,6 +11,12 @@ export const NO_PLAN_LABEL = "no-plan";
 // The agent label and provider environment variable carrying the policy.
 export const PLAN_POLICY_LABEL = "linear.plan";
 export const PLAN_POLICY_ENV = "LINEAR_TICKETS_PLAN";
+// Every ticket agent carries its ticket identifier here; the omp extension gates plan submission
+// on the plan advisor's review for these agents (README, "Plan advisor").
+export const PLAN_TICKET_ENV = "LINEAR_TICKETS_ISSUE";
+// Path of the ticket prompt the agent was started with, when the launch could save it. The plan
+// advisor reads it so both models plan from the same ticket context.
+export const PLAN_CONTEXT_ENV = "LINEAR_TICKETS_CONTEXT";
 // "required": the agent plans and waits for the owner's approval. "agent": the agent decides.
 export type PlanPolicy = "required" | "agent";
 

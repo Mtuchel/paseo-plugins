@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { PaseoApi } from "@getpaseo/client";
 import type { TicketDetail } from "../shared/contracts";
+import { advisorSteps } from "../shared/plan-advisor";
 import { mappedBaseBranch, mappingLabel, type ProjectMapping } from "../shared/mapping";
 import type { Handover } from "./handover";
 import type { Launcher } from "./launch";
@@ -29,6 +30,11 @@ export const UNTRUSTED_NOTE = [
   "Investigate and write a plan only. Do not change code, run installs or make network calls until the owner approves the plan.",
 ].join(" ");
 export const PLAN_REQUIRED_NOTE = "The owner asked for a plan first. Investigate and write a plan; do not change code until the owner approves it.";
+// Every plan a ticket agent writes gets a second opinion before the owner sees it (README, "Plan
+// advisor"). omp planners have the extension's record tool and submission gate.
+export function advisorNote(providerKey: string): string {
+  return advisorSteps({ omp: providerKey === "omp" });
+}
 const PLAN_RULES = "Plan if any of these apply: a database schema or migration change; authentication, authorization or permissions; more than one app or service; a change to a public or cross-service API; acceptance criteria that are unclear or contradict each other; or more than about three files. Skip the plan only when none apply; when unsure, plan.";
 // omp agents start in Plannotator's planning phase and leave it through the extension's
 // `skip_plan` tool; other providers get the same rules as instructions only.
@@ -38,8 +44,9 @@ export function planDecisionNote(providerKey: string): string {
     : `Before your first change, decide whether this ticket needs a plan the owner reviews. ${PLAN_RULES} If it needs one, write the plan and ask the owner to approve it before changing code; otherwise say in one sentence why no plan is needed, then implement.`;
 }
 const MAX_PLAN_NOTE_CHARS = 20_000;
-// Every question moves the ticket to "Needs input" and notifies the owner, so one ask beats five.
-export const QUESTIONS_NOTE = "If you need input from the owner, collect all your questions and ask them together in one question request instead of one at a time.";
+// A question request moves the ticket to "Needs input" and notifies the owner, so one ask beats
+// five, and an ask only written into the final reply is easy to miss.
+export const QUESTIONS_NOTE = "Anything you need from the owner (an answer, a decision, an approval such as to push or to add a label, a secret or setting, or a manual step only they can do) goes into a question request, never only into your final message: the question request is what moves the ticket to Needs input and notifies the owner. When you have the linear_ticket tool add_manual_task, register manual steps (secrets, settings, actions in other systems) with it instead. Collect all of it and ask together in one question request instead of one at a time. Plan approval goes through the plan review, not a question.";
 
 // A ticket with the plan-ready label already has an approved plan ("Approve, implement later"
 // or an earlier planner): the new agent implements it instead of planning again.
@@ -74,6 +81,7 @@ export async function planSetup(linear: Pick<LinearService, "issueState" | "view
     notes: [
       policy === "required" ? (untrusted ? UNTRUSTED_NOTE : PLAN_REQUIRED_NOTE) : untrusted ? UNTRUSTED_TEXT : "",
       policy === "agent" ? planDecisionNote(providerKey) : "",
+      policy ? advisorNote(providerKey) : "",
       planReady ? approvedPlanNote(state.identifier, plan) : "",
     ].filter(Boolean),
     labels: policy ? { [PLAN_POLICY_LABEL]: policy } : {},
