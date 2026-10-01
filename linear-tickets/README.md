@@ -516,11 +516,23 @@ has stopped. While the agent is in a turn or waiting for an answer, or Paseo is 
 the message waits for a later poll. When the agent is gone or archived, the same text becomes a
 ticket comment mentioning you, and the ticket moves back to In Progress (when status write-back
 is on). Each drop is claimed in `$PASEO_HOME/linear-tickets/pr-watch.json` (by its draft, or by
-the bullet when there is none) before anything is sent, so it is delivered at most once, also
-across restarts. After two fix requests for a pull request, the third drop only mentions you
-("the merge queue dropped this stack three times"), and later drops are only logged. An
-archived agent's open pull request stays watched until that escalation or 14 days without
-activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
+the bullet when there is none) before anything is sent, so one queue round counts once and is
+delivered at most once, also across restarts. A drop is conflict-only when Graphite names a merge
+conflict and nothing on the queue's draft failed or still runs: there is no draft, or every check
+run on its known head completed with success, skipped or neutral (the repository's rule in
+`tools/ci/wait-queue.mjs`; Graphite says "merge conflicts" for real failures too). A conflict-only
+drop asks the agent to restack instead (resolve the conflicts, regenerate generated files with the
+repository generators, run the focused checks, submit, wait for green checks with
+`tools/ci/wait-checks.mjs`, check for `do-not-merge`, `gt merge`), up to five times per pull
+request; the sixth conflict-only drop only mentions you ("dropped this stack six times for merge
+conflicts only"). Any other drop gets one fix request per pull request; the second one only
+mentions you ("dropped this stack twice for reasons other than a plain merge conflict"). The two
+limits count separately, and whichever is reached first stops the automatic messages of both for
+every pull request of the ticket, including one opened later; later drops are only logged. Drops
+recorded before this split count as other drops. No fix request goes out while the pull request
+is labelled `do-not-merge`, and a restack waits while an open queue draft carries the pull request
+again. An archived agent's open pull request stays watched until the ticket's escalation or 14
+days without activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
 
 **Stalled pull requests.** Agents often stop before their pull request reaches the merge queue.
 On each poll, an open pull request whose agent is idle gets the next step of its lifecycle as a

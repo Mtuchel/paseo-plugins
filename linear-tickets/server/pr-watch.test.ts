@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -20,6 +20,9 @@ function activity(...events: string[]): string {
 const QUEUED = "`Mtuchel` added this pull request to the [Graphite merge queue](https://app.graphite.com/merges?org=tuchel-sohn&repo=tuchel-platform).";
 const running = (draft: number) => `CI is running for this pull request on a draft pull request (${graphiteLink(draft)}) due to your merge queue CI optimization settings.`;
 const CONFLICT = "The [Graphite merge queue](https://app.graphite.com/merges?org=tuchel-sohn&repo=tuchel-platform) couldn't merge this PR because **it had merge conflicts**.";
+const NOT_ADDED = "This pull request can not be added to the [Graphite merge queue](https://app.graphite.com/merges?org=tuchel-sohn&repo=tuchel-platform). Please try rebasing and resubmitting to merge when ready.";
+const MWR_OFF = "[Graphite](https://app.graphite.com) disabled \"merge when ready\" on this PR due to: a merge conflict with the target branch; resolve the conflict and try again..";
+const CHECK_FAILED = "The Graphite merge queue removed this PR because a required check failed.";
 
 function draft(number: number, prs: number[], state = "CLOSED"): QueueDraft {
   return {
@@ -41,7 +44,8 @@ const OPEN_PR: PullRequestView = { state: "OPEN", isDraft: false, headSha: HEAD,
 
 function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string } = {}) {
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
-  const github = { view: OPEN_PR, drafts: [] as QueueDraft[], landed: [] as number[], checks: [] as FailedCheck[], threads: [] as ReviewThread[], reads: [] as string[], threadReads: 0, throttled: false };
+  // `views`: per pull request, for tickets with more than one; the rest read `view`.
+  const github = { view: OPEN_PR, views: {} as Record<string, PullRequestView>, drafts: [] as QueueDraft[], landed: [] as number[], checks: [] as FailedCheck[], threads: [] as ReviewThread[], reads: [] as string[], threadReads: 0, throttled: false };
   const blockers: string[] = [];
   // `answer`: what Paseo finds before sending (only "sent" dispatches); `send`: the send itself,
   // after the dispatch was recorded; `session`: the agent's session lookup.
@@ -78,7 +82,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     view: async (url) => {
       github.reads.push(url);
       if (github.throttled) throw new GitHubRateLimitedError("GitHub is throttling gh: HTTP 403: API rate limit exceeded");
-      return github.view;
+      return github.views[url] ?? github.view;
     },
     github: {
       drafts: async () => github.drafts,
@@ -97,7 +101,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   };
   // A new plugin instance on the same state file.
   const restart = () => { watch = create(); return watch; };
-  return { github, paseo, records, blockers, calls, poll, restart, watch: () => watch };
+  return { github, paseo, records, blockers, calls, poll, restart, watch: () => watch, state: async () => join(await directory, "pr-watch.json") };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -158,24 +162,25 @@ test("a queue drop with no live agent comments on Linear and moves the ticket ba
   }
 });
 
-test("the third queue drop escalates to the owner instead of prompting, and later drops stay quiet", async (t) => {
+test("the second drop for another reason than a plain conflict escalates to the owner instead of prompting, and later drops stay quiet", async (t) => {
   const h = harness(t);
-  const events = [QUEUED, CONFLICT];
-  h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
-  assert.match((await h.poll())[0], /fix request 1 of 2/);
-  events.push(QUEUED, running(440), "The Graphite merge queue removed this PR because a required check failed.");
+  const log = t.mock.method(console, "error", () => {});
+  const events = [QUEUED, running(440), CHECK_FAILED];
   h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
   h.github.drafts = [draft(440, [418, 419])];
-  assert.match((await h.poll())[0], /fix request 2 of 2/);
-  events.push(QUEUED, CONFLICT);
+  h.github.checks = [{ name: "PR code", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/3/job/3", conclusion: "failure" }];
+  assert.match((await h.poll())[0], /\nThis is automatic fix request 1 of 1 for this pull request; after that the owner takes over\.$/);
+  events.push(QUEUED, NOT_ADDED);
   h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
-  const third = await h.poll();
-  assert.ok(!third.some((call) => call.startsWith("prompt")));
-  assert.match(third[0], new RegExp(`^comment ${OWNER} The merge queue dropped this stack three times`));
-  assert.match(third[1], /^say response The merge queue dropped the pull request three times/);
-  events.push(QUEUED, CONFLICT);
+  const second = await h.poll();
+  assert.ok(!second.some((call) => call.startsWith("prompt")));
+  assert.match(second[0], new RegExp(`^comment ${OWNER} The merge queue dropped this stack twice for reasons other than a plain merge conflict, so Paseo stops asking the agent to fix it\\. Please take over\\.\n`));
+  assert.match(second[1], /^say response The merge queue dropped the pull request twice for reasons other than a plain merge conflict; the owner was asked to take over\./);
+  assert.equal(second.length, 2);
+  events.push(QUEUED, NOT_ADDED);
   h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
-  assert.deepEqual(await h.poll(), [], "a fourth drop neither prompts nor comments");
+  assert.deepEqual(await h.poll(), [], "a third drop neither prompts nor comments");
+  assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /already escalated to the owner/);
 });
 
 test("a queue draft for other pull requests, an earlier attempt's draft, a still-open or newer draft, or a landed draft is not a drop", async (t) => {
@@ -287,13 +292,13 @@ test("an archived agent's open pull request stops being watched after the escala
   assert.deepEqual(stale.github.reads, []);
 
   const h = harness(t, { status: "archived" });
-  const events = [QUEUED, CONFLICT];
-  for (let drop = 1; drop <= 3; drop++) {
+  const events = [QUEUED, NOT_ADDED];
+  for (let drop = 1; drop <= 2; drop++) {
     h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
     const calls = await h.poll();
     assert.ok(!calls.some((call) => call.startsWith("prompt")), "an archived agent is never prompted");
-    assert.match(calls.find((call) => call.startsWith("comment")) ?? "", drop === 3 ? /dropped this stack three times/ : /no longer running/);
-    events.push(QUEUED, CONFLICT);
+    assert.match(calls.find((call) => call.startsWith("comment")) ?? "", drop === 2 ? /dropped this stack twice/ : /no longer running/);
+    events.push(QUEUED, NOT_ADDED);
   }
   h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
   await h.poll();
@@ -549,4 +554,169 @@ test("two nudges per stage across heads, then one owner escalation, then only th
   assert.equal(log.mock.callCount(), logged, "logged once per head");
   h.github.view = { ...READY, headSha: "h4" };
   assert.match(promptOf(await h.poll()) ?? "", /is ready[^]*nudge 1 of 2/, "the merge stage starts its own budget");
+});
+
+const lastLine = (text: string | undefined) => text?.split("\n").at(-1) ?? "";
+const restack = (round: number) => `This is automatic conflict restack ${round} of 5 for this pull request; after that the owner takes over.`;
+const FIX_1_OF_1 = "This is automatic fix request 1 of 1 for this pull request; after that the owner takes over.";
+const CONFLICT_ESCALATION = [`comment ${OWNER} The merge queue dropped this stack six times for merge conflicts only, so Paseo stops asking the agent to restack it. Please take over.`, "say response The merge queue dropped the pull request six times for merge conflicts; the owner was asked to take over."];
+const OTHER_ESCALATION = [`comment ${OWNER} The merge queue dropped this stack twice for reasons other than a plain merge conflict, so Paseo stops asking the agent to fix it. Please take over.`, "say response The merge queue dropped the pull request twice for reasons other than a plain merge conflict; the owner was asked to take over."];
+const firstLines = (calls: string[]) => calls.map((call) => call.split("\n")[0]);
+
+test("a drop is conflict-only when Graphite names a merge conflict and nothing on the queue's draft failed or still runs", async (t) => {
+  const run = (conclusion: string): FailedCheck => ({ name: "PR code", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/3/job/3", conclusion });
+  const onDraft = [QUEUED, running(437), CONFLICT];
+  const cases: { name: string; events: string[]; drafts?: QueueDraft[]; checks?: FailedCheck[]; conflictOnly: boolean }[] = [
+    { name: "conflict before any draft", events: [QUEUED, CONFLICT], conflictOnly: true },
+    { name: "'merge when ready' disabled for a merge conflict", events: [QUEUED, MWR_OFF], conflictOnly: true },
+    { name: "conflict, every run on the draft completed green", events: onDraft, drafts: [draft(437, [419])], conflictOnly: true },
+    { name: "conflict, a run on the draft still pending", events: onDraft, drafts: [draft(437, [419])], checks: [run("in_progress")], conflictOnly: false },
+    { name: "conflict, a run on the draft cancelled", events: onDraft, drafts: [draft(437, [419])], checks: [run("cancelled")], conflictOnly: false },
+    { name: "conflict, PR code failed on the draft", events: onDraft, drafts: [draft(437, [419])], checks: [run("failure")], conflictOnly: false },
+    { name: "conflict, the draft's head is unknown", events: onDraft, drafts: [{ ...draft(437, [419]), headSha: "" }], conflictOnly: false },
+    { name: "can not be added", events: [QUEUED, NOT_ADDED], conflictOnly: false },
+    { name: "draft closed without landing", events: [QUEUED, running(437)], drafts: [draft(437, [419])], conflictOnly: false },
+  ];
+  for (const item of cases) {
+    const h = harness(t);
+    h.github.view = { ...h.github.view, mergeActivity: activity(...item.events) };
+    h.github.drafts = item.drafts ?? [];
+    h.github.checks = item.checks ?? [];
+    assert.equal(lastLine(promptOf(await h.poll())), item.conflictOnly ? restack(1) : FIX_1_OF_1, item.name);
+  }
+});
+
+test("five conflict restacks per pull request, then the sixth conflict-only drop escalates to the owner and the seventh is only logged", async (t) => {
+  const h = harness(t);
+  const log = t.mock.method(console, "error", () => {});
+  const events: string[] = [];
+  for (let round = 1; round <= 5; round++) {
+    events.push(QUEUED, CONFLICT);
+    h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
+    const calls = await h.poll();
+    const prompt = promptOf(calls) ?? "";
+    assert.equal(lastLine(prompt), restack(round));
+    assert.match(calls[1], /^say thought The merge queue dropped the pull request \(.*\)\. The agent was asked to restack it\.$/);
+    if (round > 1) continue;
+    assert.match(prompt, /never `gt sync` or `gt restack`[^\n]*\n2\. Resolve the conflicts; regenerate generated files with the repository generators instead of hand-merging them \(docs\/automation\/merge-queue\.md#conflict-only-drops\), run the focused checks, then `gt submit --stack --ignore-out-of-sync-trunk`, wait for green checks with `node tools\/ci\/wait-checks\.mjs <pr>`, check that the PR has no `do-not-merge` label, and run `gt merge`\.\n/);
+    assert.doesNotMatch(prompt, /Fix the cause|flaky/);
+  }
+  events.push(QUEUED, CONFLICT);
+  h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
+  assert.deepEqual(firstLines(await h.poll()), CONFLICT_ESCALATION);
+  events.push(QUEUED, CONFLICT);
+  h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
+  assert.deepEqual(await h.poll(), []);
+  assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /already escalated to the owner/);
+});
+
+test("conflict-only and other drops keep separate budgets, and either escalation stops both", async (t) => {
+  const h = harness(t);
+  t.mock.method(console, "error", () => {});
+  const events: string[] = [];
+  for (let round = 1; round <= 3; round++) {
+    events.push(QUEUED, CONFLICT);
+    h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
+    assert.equal(lastLine(promptOf(await h.poll())), restack(round));
+  }
+  events.push(QUEUED, NOT_ADDED);
+  h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
+  const fix = promptOf(await h.poll()) ?? "";
+  assert.equal(lastLine(fix), FIX_1_OF_1, "three restacks leave the other budget untouched");
+  assert.match(fix, /\n2\. Fix the cause\.\n3\. Run `gt submit --stack --ignore-out-of-sync-trunk`, then `gt merge`\./);
+  events.push(QUEUED, running(440), CHECK_FAILED);
+  h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
+  h.github.drafts = [draft(440, [419])];
+  h.github.checks = [{ name: "PR code", url: "", conclusion: "failure" }];
+  assert.deepEqual(firstLines(await h.poll()), OTHER_ESCALATION);
+  events.push(QUEUED, CONFLICT);
+  h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
+  assert.deepEqual(await h.poll(), [], "after the escalation a conflict-only drop is not restacked either");
+});
+
+test("one queue round counts once, whichever sign of it is seen and however often", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(437)) };
+  h.github.drafts = [draft(437, [419])];
+  assert.equal(lastLine(promptOf(await h.poll())), FIX_1_OF_1, "the draft closed without landing");
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(437), CONFLICT) };
+  assert.deepEqual(await h.poll(), [], "Graphite's bullet for draft #437 is the same round");
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(437), CONFLICT, QUEUED, NOT_ADDED) };
+  assert.deepEqual(firstLines(await h.poll()), OTHER_ESCALATION, "the next round is the second other drop, not the third");
+
+  const conflicts = harness(t);
+  conflicts.github.view = { ...conflicts.github.view, mergeActivity: activity(QUEUED, running(437), CONFLICT) };
+  conflicts.github.drafts = [draft(437, [419])];
+  assert.equal(lastLine(promptOf(await conflicts.poll())), restack(1));
+  assert.deepEqual(await conflicts.poll(), []);
+  conflicts.github.view = { ...conflicts.github.view, mergeActivity: activity(QUEUED, running(437), CONFLICT, QUEUED, CONFLICT) };
+  assert.equal(lastLine(promptOf(await conflicts.poll())), restack(2));
+});
+
+test("drops recorded before conflict-only drops were told apart count as other drops", async (t) => {
+  const h = harness(t);
+  await writeFile(await h.state(), JSON.stringify({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#400"] } }));
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  assert.equal(lastLine(promptOf(await h.poll())), restack(1), "a conflict-only drop has its own budget");
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT, QUEUED, NOT_ADDED) };
+  assert.deepEqual(firstLines(await h.poll()), OTHER_ESCALATION, "the stored drop was the first other drop");
+
+  const escalated = harness(t);
+  t.mock.method(console, "error", () => {});
+  await writeFile(await escalated.state(), JSON.stringify({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#400", "#401", "#402"] } }));
+  escalated.github.view = { ...escalated.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  assert.deepEqual(await escalated.poll(), [], "the old policy's third drop already went to the owner");
+});
+
+test("a conflict restack waits while an open queue draft carries the pull request again", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  h.github.drafts = [draft(445, [418, 419], "OPEN")];
+  assert.deepEqual(await h.poll(), [], "re-enqueued: nothing is claimed");
+  h.github.drafts = [draft(445, [418, 419])];
+  assert.equal(lastLine(promptOf(await h.poll())), restack(1));
+
+  const busy = harness(t);
+  busy.github.view = { ...busy.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  busy.paseo.answer = async () => "busy";
+  assert.deepEqual(await busy.poll(), [], "claimed while the agent is in a turn");
+  busy.paseo.answer = async () => "sent";
+  busy.github.drafts = [draft(446, [419], "OPEN")];
+  assert.deepEqual(await busy.poll(), [], "the claimed restack waits while the queue has the pull request");
+  busy.github.drafts = [draft(446, [419])];
+  assert.equal(lastLine(promptOf(await busy.poll())), restack(1));
+});
+
+test("do-not-merge keeps a drop's fix request away until the label is removed", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...h.github.view, labels: ["do-not-merge"], mergeActivity: activity(QUEUED, CONFLICT) };
+  assert.deepEqual(await h.poll(), []);
+  assert.deepEqual(await h.poll(), []);
+  h.github.view = { ...h.github.view, labels: [] };
+  assert.equal(lastLine(promptOf(await h.poll())), restack(1));
+});
+
+test("an escalation stops every automatic drop prompt for the ticket, on its other pull requests and on a later replacement", async (t) => {
+  const PR_420 = "https://github.com/tuchel-sohn/tuchel-platform/pull/420";
+  const PR_421 = "https://github.com/tuchel-sohn/tuchel-platform/pull/421";
+  const h = harness(t);
+  t.mock.method(console, "error", () => {});
+  h.records.push({ ...h.records[0], links: { "Pull request": PR_420 } });
+  h.github.views[PR_420] = OPEN_PR;
+  const events: string[] = [];
+  for (let round = 1; round <= 6; round++) {
+    events.push(QUEUED, CONFLICT);
+    h.github.views[PR] = { ...OPEN_PR, mergeActivity: activity(...events) };
+    const calls = await h.poll();
+    if (round <= 5) assert.equal(lastLine(promptOf(calls)), restack(round));
+    else assert.deepEqual(firstLines(calls), CONFLICT_ESCALATION);
+  }
+  h.github.views[PR_420] = { ...OPEN_PR, mergeActivity: activity(QUEUED, CONFLICT) };
+  assert.deepEqual(await h.poll(), [], "no restack for the ticket's other pull request");
+  h.github.views[PR_420] = { ...OPEN_PR, mergeActivity: activity(QUEUED, CONFLICT, QUEUED, NOT_ADDED) };
+  assert.deepEqual(await h.poll(), [], "no fix request either");
+  h.records.splice(0, h.records.length, { ...h.records[0], links: { "Pull request": PR_421 } });
+  h.github.views[PR_421] = { ...OPEN_PR, mergeActivity: activity(QUEUED, NOT_ADDED) };
+  assert.deepEqual(await h.poll(), [], "a replacement pull request of the ticket inherits the escalation");
+  assert.deepEqual(h.github.reads, [PR_421]);
 });
