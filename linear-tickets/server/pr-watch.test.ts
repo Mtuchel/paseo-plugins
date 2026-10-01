@@ -69,8 +69,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     },
     linear: {
       moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; },
-      createComment: async (_id, body) => { calls.push(`comment ${body}`); return "c1"; },
-      updateComment: async () => {},
+      comment: async (_id, body) => { calls.push(`comment ${body}`); },
       viewerId: async () => "me",
       userUrl: async () => OWNER,
     },

@@ -4,12 +4,14 @@ import { mkdtempSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import { setImmediate as setImmediatePromise } from "node:timers/promises";
+import test, { type TestContext } from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { AgentApi, AppAuth } from "./agent-app";
 import { verifyWebhook } from "./agent-webhook";
 import { Handover, handoverPrompt, progressBody, type HandoverRecord } from "./handover";
+import { AuthenticationError, LinearApiError } from "./linear";
 import { NeedsYouIssues } from "./needs-you";
 import { planSteps, SessionRouter, SessionStore, type SessionLink } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
@@ -50,12 +52,116 @@ test("the app token is refreshed before it expires and once more after a 401", a
     const posted: string[] = [];
     const api = new AgentApi(auth, async (key) => {
       posted.push(key);
-      if (key === "Bearer new-1") throw new Error("Linear rejected this API key. Check it in Linear settings and reconnect.");
+      if (key === "Bearer new-1") throw new AuthenticationError("Linear rejected this API key. Check it in Linear settings and reconnect.", 401);
       return { agentActivityCreate: { success: true } };
     });
     await api.activity("session-1", { type: "thought", body: "hi" });
     assert.deepEqual(posted, ["Bearer new-1", "Bearer new-2"]);
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a refused request (403) is not a reason to refresh the app token", async () => {
+  const forces: boolean[] = [];
+  const refused = new LinearApiError("Linear rejected this API key. Check it in Linear settings and reconnect.", 403);
+  const posted: string[] = [];
+  const api = new AgentApi({ accessToken: async (force = false) => { forces.push(force); return "t"; } }, async (key) => { posted.push(key); throw refused; });
+  await assert.rejects(api.activity("session-1", { type: "thought", body: "hi" }), (error: unknown) => error === refused);
+  assert.deepEqual(forces, [false]);
+  assert.deepEqual(posted, ["Bearer t"]);
+});
+
+const NOW = 1_000_000_000_000;
+const MINUTE = 60_000;
+
+// An installed app on a temporary directory; `refreshes` counts Linear's token endpoint calls,
+// `respond` answers them (by default a new token for an hour). `clock` is the app's clock.
+async function installedApp(t: TestContext, token: Record<string, unknown>, respond?: () => Response | Promise<Response>) {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-agent-auth-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(join(directory, "app.json"), JSON.stringify({ clientId: "c", clientSecret: "s", webhookSecret: "w" }));
+  await writeFile(join(directory, "token.json"), JSON.stringify({ access_token: "old", refresh_token: "r1", ...token }));
+  const fixture = { refreshes: 0, clock: NOW, auth: null as unknown as AppAuth, directory };
+  const fakeFetch = (async () => {
+    fixture.refreshes++;
+    return respond ? respond() : new Response(JSON.stringify({ access_token: `new-${fixture.refreshes}`, expires_in: 3600 }), { status: 200 });
+  }) as unknown as typeof fetch;
+  fixture.auth = new AppAuth(directory, fakeFetch, () => fixture.clock);
+  return fixture;
+}
+
+// Lets pending I/O (token file reads and writes) run until `done` holds.
+async function until(done: () => boolean): Promise<void> {
+  for (let turn = 0; turn < 10_000 && !done(); turn++) await setImmediatePromise();
+  assert.ok(done(), "condition not reached");
+}
+
+test("the app token is refreshed only within ten minutes of its expiry", async (t) => {
+  const fresh = await installedApp(t, { expires_at: NOW + 10 * MINUTE + 1 });
+  assert.equal(await fresh.auth.accessToken(), "old");
+  assert.equal(fresh.refreshes, 0);
+
+  const due = await installedApp(t, { expires_at: NOW + 10 * MINUTE });
+  assert.equal(await due.auth.accessToken(), "new-1");
+  assert.equal(due.refreshes, 1);
+  const saved = JSON.parse(await readFile(join(due.directory, "token.json"), "utf8"));
+  assert.equal(saved.expires_at, NOW + 3600 * 1000);
+});
+
+test("callers asking for a due token at the same time share one refresh", async (t) => {
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const app = await installedApp(t, { expires_at: NOW - 1 }, async () => {
+    await gate;
+    return new Response(JSON.stringify({ access_token: "new-1", expires_in: 3600 }), { status: 200 });
+  });
+  const tokens = Promise.all([app.auth.accessToken(), app.auth.accessToken(), app.auth.accessToken()]);
+  await until(() => app.refreshes === 1);
+  release();
+  assert.deepEqual(await tokens, ["new-1", "new-1", "new-1"]);
+  assert.equal(app.refreshes, 1);
+});
+
+test("keepFresh refreshes a nearly expired token at once and then on every tick, with one timer per instance until stopped", async (t) => {
+  const app = await installedApp(t, { expires_at: NOW + 5 * MINUTE });
+  const asked = t.mock.method(app.auth, "accessToken");
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const stop = app.auth.keepFresh();
+  assert.equal(asked.mock.callCount(), 1, "the first tick runs at once");
+  await until(() => app.refreshes === 1);
+  assert.equal(await app.auth.accessToken(), "new-1");
+  asked.mock.resetCalls();
+
+  const stopAgain = app.auth.keepFresh();
+  assert.equal(asked.mock.callCount(), 0, "a second call keeps the running timer");
+  app.clock += 55 * MINUTE;
+  t.mock.timers.tick(5 * MINUTE);
+  assert.equal(asked.mock.callCount(), 1, "one timer, one check per tick");
+  await until(() => app.refreshes === 2);
+  assert.equal(await app.auth.accessToken(), "new-2");
+  asked.mock.resetCalls();
+
+  stop();
+  t.mock.timers.tick(15 * MINUTE);
+  assert.equal(asked.mock.callCount(), 0, "stopped");
+  stopAgain();
+  assert.equal(app.refreshes, 2);
+});
+
+test("a failed keep-fresh refresh is logged, never an unhandled rejection", async (t) => {
+  const app = await installedApp(t, { expires_at: NOW + MINUTE }, () => new Response("{}", { status: 400 }));
+  const errors: string[] = [];
+  t.mock.method(console, "error", (...args: unknown[]) => { errors.push(args.join(" ")); });
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  t.after(() => { process.off("unhandledRejection", onUnhandled); });
+  const stop = app.auth.keepFresh();
+  t.after(stop);
+  await until(() => errors.length === 1);
+  await setImmediatePromise();
+  assert.match(errors[0], /keeping the Paseo app token fresh failed: Linear refused to refresh the Paseo app token \(HTTP 400\)/);
+  assert.deepEqual(unhandled, []);
+  assert.equal(app.refreshes, 1);
 });
 
 test("plan checklists come from checkboxes, or numbered steps under a Steps heading", () => {
@@ -208,8 +314,11 @@ test("the progress comment is created once and edited in place; the next agent g
   const links: string[] = [];
   try {
     const handover = new Handover({
-      createComment: async (_issue: string, body: string) => { calls.push(`create ${body.split("\n")[0]}`); return `c${calls.length}`; },
-      updateComment: async (id: string, body: string) => { calls.push(`update ${id} ${body.split("\n")[0]}`); },
+      upsertComment: async (_issue: string, body: string, id: string | null) => {
+        if (id) { calls.push(`update ${id} ${body.split("\n")[0]}`); return id; }
+        calls.push(`create ${body.split("\n")[0]}`);
+        return `c${calls.length}`;
+      },
       comment: async (_issue: string, body: string) => { calls.push(`final ${body.split("\n")[0]}`); },
       upsertAttachment: async (_issue: string, url: string, title: string, subtitle: string) => { links.push(`${url} | ${title} | ${subtitle}`); },
       removeAttachments: async (_issue: string, prefix: string, keep: string) => { links.push(`remove ${prefix}* except ${keep}`); },
@@ -252,7 +361,9 @@ test("a permission shows in the agent panel only while still pending, and the ti
       markInProgress: async () => ({ changed: false }), moveToReview: async () => ({ changed: false }), linkUrl: async () => {}, moveToState: async () => {},
       moveToStateNamed: async (_i: string, name: string) => { calls.push(`move ${name}`); return { changed: true }; },
       comment: async (_i: string, body: string) => { calls.push(`comment ${body.slice(0, 30)}`); },
-      createComment: async (): Promise<string> => { throw new Error("the app writes this comment"); }, updateComment: async () => {},
+      upsertComment: async (_i: string, body: string, id: string | null) => { calls.push(`app comment ${id ?? "new"} ${body.split("\n")[0]}`); return "c1"; },
+      // In a session the session's owner is asked; the ticket's creator is never looked at.
+      isPerson: async (): Promise<boolean> => { throw new Error("the creator is not consulted in a session"); },
       viewerId: async () => OWNER, userUrl: async (id: string) => `https://linear.app/ws/profiles/${id}`,
       addLabel: async (_i: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async () => {},
       createIssue: async (): Promise<{ id: string; identifier: string; url: string }> => { throw new Error("an open ticket gets no sub-issue"); }, complete: async () => {},
@@ -261,12 +372,11 @@ test("a permission shows in the agent panel only while still pending, and the ti
       sessionFor: async () => ({ sessionId: "s1" }), say: async () => {}, action: async () => {}, link: async () => {}, offerResume: async () => {}, resumeNow: async () => false,
       ask: async (_s: string, body: string, options: { value: string }[]) => { calls.push(`ask ${body.split("\n")[0]} [${options.map((o) => o.value).join("|")}]`); },
     };
-    const comments = { createComment: async (_i: string, body: string) => { calls.push(`app comment ${body.split("\n")[0]}`); return "c1"; }, updateComment: async () => {} };
     const handover = { read: async () => null, update: async () => ({}) as never, finish: async () => ({}) as never, waiting: async () => null, setWaiting: async () => {} };
     const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" }, pendingPermissions: pending } }) }) } } as unknown as PaseoApi;
-    const writeback = new Writeback(linear, { read: async () => ({ ...settings, writeback: { ...DEFAULT_WRITEBACK, blocked: true } }) }, { sessions: sessions as never, handover, comments }, 0, join(tmpdir(), `paseo-writeback-outbox-${process.pid}.json`));
+    const writeback = new Writeback(linear, { read: async () => ({ ...settings, writeback: { ...DEFAULT_WRITEBACK, blocked: true } }) }, { sessions: sessions as never, handover }, 0, join(tmpdir(), `paseo-writeback-outbox-${process.pid}.json`));
     await writeback.permissionRequested({ agent: { id: "a1", workspaceId: "w", parentAgentId: null, provider: "omp", cwd: "/x", title: "T" }, request }, paseo);
-    assert.deepEqual(calls, pending.length ? ["ask Approve this action? [approve|deny]", "move Needs input", "+paseo-needs-you", `app comment https://linear.app/ws/profiles/${OWNER} **T** (Paseo) is waiting for permission: Allow tool: bash`] : []);
+    assert.deepEqual(calls, pending.length ? ["ask Approve this action? [approve|deny]", "move Needs input", "+paseo-needs-you", `app comment new https://linear.app/ws/profiles/${OWNER} **T** (Paseo) is waiting for permission: Allow tool: bash`] : []);
   }
 });
 

@@ -40,7 +40,7 @@ export type HandoverRecord = {
   updatedAt: string;
 };
 export type GitState = { branch: string | null; lastCommit: string | null };
-type Linear = Pick<LinearService, "createComment" | "updateComment" | "comment" | "upsertAttachment" | "removeAttachments">;
+type Linear = Pick<LinearService, "upsertComment" | "comment" | "upsertAttachment" | "removeAttachments">;
 // Where the web app opens an agent (null when the daemon id is unknown).
 export type AgentUrl = (agentId: string) => Promise<string | null>;
 const PASEO_WEB = "https://app.paseo.sh/h/";
@@ -154,13 +154,7 @@ export class Handover {
         updatedAt: this.now(),
       };
       const body = progressBody(record);
-      if (record.progressCommentId) {
-        await this.linear.updateComment(record.progressCommentId, body).catch(async () => {
-          record.progressCommentId = await this.linear.createComment(issue.id, body);
-        });
-      } else {
-        record.progressCommentId = await this.linear.createComment(issue.id, body);
-      }
+      record.progressCommentId = await this.linear.upsertComment(issue.id, body, record.progressCommentId);
       // The ticket's link to the agent (next to its pull requests), kept current and moved to a
       // new agent when one takes over. Best-effort: the comment above is the record.
       if (paseoUrl) {

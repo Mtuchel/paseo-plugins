@@ -21,6 +21,12 @@
 //   record is therefore checked in its own handler, so a record listed before the submit in the
 //   same message counts, and a plan write or edit queued in that message holds both back. Subagents
 //   (`task` children, which share the environment but cannot create an advisor) are not gated.
+// - LINEAR_TICKETS_ISSUE=<ticket>: Linear writes (README, "Agent access to Linear"). The user-level
+//   Linear MCP server acts as the owner, so ticket agents and their subagents may call only its read
+//   tools, named below; every other tool of that server is blocked, whether called directly
+//   (`mcp__linear_<tool>`) or through its xd:// device. The plugin's own `linear_ticket` tools,
+//   which write as the Paseo app, stay open. A guard against mistakes, not isolation: the agent
+//   runs as the owner's user.
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -114,6 +120,28 @@ export function advisorProblem(agent: { Model?: unknown; Thinking?: unknown; Par
   if (agent.ParentAgentId !== parentId) return "it was not created by this agent";
   if (agent.Status !== "idle") return `it is ${String(agent.Status ?? "in an unknown state")}, not idle: wait for its answer to your latest message`;
   return null;
+}
+
+const LINEAR_MCP = "mcp__linear_";
+// The Linear MCP server's tools that only read (checked 2026-10-01). Explicit names, so a tool the
+// server adds later is blocked until someone reviews it and adds it here.
+const LINEAR_READ_TOOLS = new Set([
+  "extract_images", "get_agent_skill", "get_attachment", "get_diff", "get_diff_threads", "get_document", "get_initiative", "get_issue",
+  "get_issue_status", "get_milestone", "get_notifications", "get_project", "get_release", "get_release_note", "get_status_updates",
+  "get_team", "get_template", "get_triage_responsibility", "get_user", "get_workspace", "list_agent_skills", "list_comments",
+  "list_custom_views", "list_cycles", "list_diffs", "list_documents", "list_initiative_labels", "list_initiatives",
+  "list_issue_labels", "list_issue_statuses", "list_issues", "list_milestones", "list_project_labels", "list_projects",
+  "list_release_notes", "list_release_pipelines", "list_releases", "list_teams", "list_templates", "list_users", "search_documentation",
+].map((name) => LINEAR_MCP + name));
+
+// The Linear MCP tool a call would run when it is not one of the read tools, else null: called
+// directly or by writing its arguments to its xd:// device.
+export function linearWrite(toolName: string, input: Record<string, unknown> | undefined): string | null {
+  const path = toolName === "write" && typeof input?.path === "string" ? input.path.trim() : "";
+  const tool = path.startsWith("xd://") ? path.slice("xd://".length) : toolName;
+  // The plugin's own server is named `linear_ticket` (TICKET_MCP_NAME), so its tools share the prefix.
+  if (!tool.startsWith(LINEAR_MCP) || tool.startsWith("mcp__linear_ticket_")) return null;
+  return LINEAR_READ_TOOLS.has(tool) ? null : tool;
 }
 
 export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
@@ -259,6 +287,10 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     }
     if (!TICKET) return undefined;
     const input = event.input;
+    const linearTool = linearWrite(event.toolName, input);
+    if (linearTool) {
+      return { block: true, reason: `Stopped by the linear-tickets plugin: ticket agents change Linear only through the linear_ticket tools, which write as Paseo; ${linearTool} would act as the owner. Reading with the Linear tools is fine. For anything else in Linear, ask the owner (or add a manual task).` };
+    }
     if (event.toolName === "write" || event.toolName === "edit") {
       // omp gives an edit's targets as `paths` (hashline patches) or `path`; an apply_patch edit
       // names them only in its `input` headers (`*** Update File: PLAN.md`, `*** Move to: …`).

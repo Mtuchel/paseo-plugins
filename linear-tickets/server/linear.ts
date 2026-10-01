@@ -6,8 +6,35 @@ import { poolOf, rateBudget, RateLimitedError, type RateBudget } from "./rate-bu
 
 const endpoint = "https://api.linear.app/graphql";
 export type Post = (key: string, query: string, variables: Record<string, unknown>) => Promise<Record<string, unknown>>;
-// Reads with the Paseo app's token (AgentApi.query); null when the app cannot be used on this host.
-export type Reader = { query(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown> | null> };
+// The Paseo app's side of LinearService (AgentApi): reads on its request pool and writes authored as
+// "Paseo". Both return null when the app cannot be used on this host (see AgentApi.query/mutate).
+export type App = {
+  query(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown> | null>;
+  mutate(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown> | null>;
+  viewer(): Promise<{ id: string; name: string }>;
+};
+
+// A Linear request that Linear answered with an error: its HTTP status (200 for GraphQL errors) and
+// the errors' codes and raw messages, so callers decide on the failure, not on its wording.
+export class LinearApiError extends Error {
+  constructor(message: string, readonly status: number, readonly codes: string[] = [], readonly reasons: string[] = []) {
+    super(message);
+  }
+}
+// Linear did not accept the credential (HTTP 401 or AUTHENTICATION_ERROR), so it ran nothing.
+export class AuthenticationError extends LinearApiError {}
+
+function errorDetails(payload: unknown): { codes: string[]; reasons: string[] } {
+  const codes: string[] = [];
+  const reasons: string[] = [];
+  const errors = payload && typeof payload === "object" && "errors" in payload && Array.isArray(payload.errors) ? payload.errors : [];
+  for (const error of errors) {
+    if (!error || typeof error !== "object") continue;
+    if ("message" in error && typeof error.message === "string") reasons.push(error.message);
+    if ("extensions" in error && error.extensions && typeof error.extensions === "object" && "code" in error.extensions && typeof error.extensions.code === "string") codes.push(error.extensions.code);
+  }
+  return { codes, reasons };
+}
 
 // GraphQL error payloads carry a user-facing message, sometimes clearer than the HTTP status alone.
 function apiMessage(payload: unknown): string {
@@ -48,13 +75,17 @@ export async function postGraphQL(key: string, query: string, variables: Record<
       && typeof error.extensions === "object" && "code" in error.extensions && error.extensions.code === "RATELIMITED")));
   ticket.done(response.headers, limited);
   if (limited) throw new RateLimitedError(pool, budget.pausedUntil(pool) ?? Date.now());
+  const { codes, reasons } = errorDetails(payload);
   if (!response.ok) {
     const message = apiMessage(payload);
-    if (response.status === 401 || response.status === 403) {
-      throw new Error(`Linear rejected this API key.${message ? ` ${message}` : ""} Check it in Linear settings and reconnect.`);
+    if (response.status === 401 || response.status === 403 || codes.includes("AUTHENTICATION_ERROR")) {
+      const text = `Linear rejected this API key.${message ? ` ${message}` : ""} Check it in Linear settings and reconnect.`;
+      // A 403 refuses this request, not the credential: it is never a reason to refresh or switch.
+      if (response.status === 403 && !codes.includes("AUTHENTICATION_ERROR")) throw new LinearApiError(text, 403, codes, reasons);
+      throw new AuthenticationError(text, response.status, codes, reasons);
     }
-    if (message) throw new Error(`The Linear API request failed: ${message}`);
-    throw new Error(`The Linear API request failed (HTTP ${response.status}). Try again.`);
+    if (message) throw new LinearApiError(`The Linear API request failed: ${message}`, response.status, codes, reasons);
+    throw new LinearApiError(`The Linear API request failed (HTTP ${response.status}). Try again.`, response.status, codes, reasons);
   }
   if (payload == null) throw new Error("Linear returned an invalid response.");
   const body = record(payload);
@@ -69,7 +100,8 @@ export async function postGraphQL(key: string, query: string, variables: Record<
         return error.message + detail;
       })
       .filter(Boolean).join("; ");
-    throw new Error(`The Linear API request failed${message ? `: ${message}` : "."} Check your API key and ticket access, then retry.`);
+    const text = `The Linear API request failed${message ? `: ${message}` : "."} Check your API key and ticket access, then retry.`;
+    throw codes.includes("AUTHENTICATION_ERROR") ? new AuthenticationError(text, response.status, codes, reasons) : new LinearApiError(text, response.status, codes, reasons);
   }
   return record(body.data);
 }
@@ -299,6 +331,10 @@ export const CREATE_LABEL_QUERY = `mutation labelCreate($input: IssueLabelCreate
 export const USER_URL_QUERY = `query userUrl($id: String!) {
   user(id: $id) { url }
 }`;
+// Whether a user is an app or integration rather than a person.
+export const USER_KIND_QUERY = `query userKind($id: String!) {
+  user(id: $id) { app }
+}`;
 export const ADD_LABEL_QUERY = `mutation addLabel($id: String!, $labelId: String!) {
   issueAddLabel(id: $id, labelId: $labelId) { success }
 }`;
@@ -393,7 +429,7 @@ export const FINISHED_BLOCKERS_QUERY = `query finishedBlockers($ids: [ID!]!) {
 export class LinearService {
   private stateWritten: ((issueId: string, state: WrittenState) => void) | null = null;
 
-  constructor(readonly credentials = new Credentials(), private readonly post: Post = postGraphQL, private readonly reader?: Reader) {}
+  constructor(readonly credentials = new Credentials(), private readonly post: Post = postGraphQL, private readonly app?: App) {}
 
   // Told about every state change the plugin makes (launch, write-back, review, PR watch), so
   // views of the ticket's state can follow at once instead of at the next poll.
@@ -402,7 +438,7 @@ export class LinearService {
   }
 
   private async writeState(issueId: string, stateId: string): Promise<Record<string, unknown>> {
-    const data = record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId })));
+    const data = record(await this.write(UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId }));
     const result = record(data.issueUpdate ?? {});
     const state = record(record(result.issue ?? {}).state ?? {});
     if (result.success !== false && label(state.name)) this.stateWritten?.(issueId, { name: label(state.name), type: label(state.type) });
@@ -436,15 +472,53 @@ export class LinearService {
   }
 
   // The reads pollers repeat go to the Paseo app's own request pool. The key reads instead when the
-  // app cannot be used (`reader` returns null) or cannot see everything asked for (`complete` is
+  // app cannot be used (`app.query` returns null) or cannot see everything asked for (`complete` is
   // false); an app rate limit is not a reason: it propagates, so background work pauses instead of
   // draining the key.
   private async read(query: string, variables: Record<string, unknown>, complete: (data: Record<string, unknown>) => boolean = () => true): Promise<Record<string, unknown>> {
-    const data = this.reader ? await this.reader.query(query, variables).catch((error: unknown) => {
+    const data = this.app ? await this.app.query(query, variables).catch((error: unknown) => {
       if (error instanceof Error && /Entity not found/i.test(error.message)) return null;
       throw error;
     }) : null;
     return data && complete(data) ? data : this.withKey((key) => this.post(key, query, variables));
+  }
+
+  private warnedKeyWrites = false;
+
+  // Every automated write is authored by the Paseo app. The key writes only when the app cannot be
+  // used here (`app.mutate` returns null: Linear authenticated nothing, so nothing ran); every other
+  // failure propagates, so a write is never repeated under the owner's name.
+  private async write(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const data = this.app ? await this.app.mutate(query, variables) : null;
+    if (data) return data;
+    if (!this.warnedKeyWrites) {
+      this.warnedKeyWrites = true;
+      console.error("[linear-tickets] the Paseo app is not usable on this host; Linear writes appear as the key's owner");
+    }
+    return this.withKey((key) => this.post(key, query, variables));
+  }
+
+  private appUser: string | null = null;
+
+  // The Paseo app's own user; null when the app cannot be used here. Cached once known.
+  async appUserId(): Promise<string | null> {
+    if (this.appUser || !this.app) return this.appUser;
+    this.appUser = await this.app.viewer().then((viewer) => viewer.id || null, () => null);
+    return this.appUser;
+  }
+
+  private readonly people = new Map<string, boolean>();
+
+  // Whether the user is a person rather than an app or integration (read with the key, so it works
+  // while the Paseo app is broken). False when Linear does not say.
+  async isPerson(userId: string): Promise<boolean> {
+    if (userId === this.appUser) return false;
+    const known = this.people.get(userId);
+    if (known !== undefined) return known;
+    const person = await this.withKey((key) => this.post(key, USER_KIND_QUERY, { id: userId })).then((data) => record(data.user ?? {}).app === false, () => null);
+    if (person === null) return false;
+    this.people.set(userId, person);
+    return person;
   }
 
   async issues(cursor?: string, stateNames?: string[], showClosed?: boolean, relation?: "blocking" | "blocked") {
@@ -658,19 +732,21 @@ export class LinearService {
     if (input.parentId) payload.parentId = input.parentId;
     if (input.projectId) payload.projectId = input.projectId;
     if (input.assigneeId) payload.assigneeId = input.assigneeId;
-    const data = record(await this.withKey((key) => this.post(key, CREATE_ISSUE_QUERY, { input: payload })));
+    const data = record(await this.write(CREATE_ISSUE_QUERY, { input: payload }));
     succeeded(data, "issueCreate", "create the ticket");
     const issue = record(record(data.issueCreate).issue ?? {});
     return { id: label(issue.id), identifier: label(issue.identifier), url: label(issue.url) };
   }
 
+  // Stays on the key: delegating is the owner's instruction that opens the ticket's Linear agent
+  // session, and SessionRouter only accepts sessions the owner started.
   async delegate(issueId: string, delegateId: string): Promise<void> {
     succeeded(record(await this.withKey((key) => this.post(key, DELEGATE_QUERY, { id: issueId, delegateId }))), "issueUpdate", "assign the ticket to Paseo");
   }
 
   // `blocker` must be finished before `blocked` can start.
   async addBlocker(blockerId: string, blockedId: string): Promise<void> {
-    succeeded(record(await this.withKey((key) => this.post(key, RELATION_QUERY, { input: { issueId: blockerId, relatedIssueId: blockedId, type: "blocks" } }))), "issueRelationCreate", "link the tickets");
+    succeeded(record(await this.write(RELATION_QUERY, { input: { issueId: blockerId, relatedIssueId: blockedId, type: "blocks" } })), "issueRelationCreate", "link the tickets");
   }
 
   async ping(): Promise<void> {
@@ -679,7 +755,7 @@ export class LinearService {
   }
 
   async updateDescription(issueId: string, description: string): Promise<void> {
-    succeeded(record(await this.withKey((key) => this.post(key, `mutation describe($id: String!, $description: String!) { issueUpdate(id: $id, input: { description: $description }) { success } }`, { id: issueId, description }))), "issueUpdate", "update the ticket");
+    succeeded(record(await this.write(`mutation describe($id: String!, $description: String!) { issueUpdate(id: $id, input: { description: $description }) { success } }`, { id: issueId, description })), "issueUpdate", "update the ticket");
   }
 
   // Moves the ticket to its team's first completed state (Done).
@@ -707,7 +783,7 @@ export class LinearService {
     const found = labelNodes(record(await this.withKey((key) => this.post(key, LABEL_BY_NAME_QUERY, { name }))).issueLabels)[0];
     let id = found?.id;
     if (!id) {
-      const created = record(await this.withKey((key) => this.post(key, CREATE_LABEL_QUERY, { input: { name, ...(color ? { color } : {}) } })));
+      const created = record(await this.write(CREATE_LABEL_QUERY, { input: { name, ...(color ? { color } : {}) } }));
       succeeded(created, "issueLabelCreate", `create the "${name}" label`);
       id = label(record(record(created.issueLabelCreate).issueLabel ?? {}).id);
       if (!id) throw new Error(`Linear did not return the new "${name}" label.`);
@@ -718,7 +794,7 @@ export class LinearService {
 
   async addLabel(issueId: string, name: string, color?: string): Promise<void> {
     const labelId = await this.labelId(name, color);
-    succeeded(record(await this.withKey((key) => this.post(key, ADD_LABEL_QUERY, { id: issueId, labelId }))), "issueAddLabel", `add the "${name}" label`);
+    succeeded(record(await this.write(ADD_LABEL_QUERY, { id: issueId, labelId })), "issueAddLabel", `add the "${name}" label`);
   }
 
   // Removes every label on the ticket with this name (case-insensitive); a team label and
@@ -728,7 +804,7 @@ export class LinearService {
     const wanted = name.trim().toLowerCase();
     for (const { id } of labels.filter((item) => item.name.trim().toLowerCase() === wanted)) {
       try {
-        succeeded(record(await this.withKey((key) => this.post(key, REMOVE_LABEL_QUERY, { id: issueId, labelId: id }))), "issueRemoveLabel", `remove the "${name}" label`);
+        succeeded(record(await this.write(REMOVE_LABEL_QUERY, { id: issueId, labelId: id })), "issueRemoveLabel", `remove the "${name}" label`);
       } catch (error) {
         // `current` can be stale: another write removed the label meanwhile, which is the goal anyway.
         if (!/Label not on issue/i.test(error instanceof Error ? error.message : String(error))) throw error;
@@ -737,23 +813,37 @@ export class LinearService {
   }
 
   async comment(issueId: string, body: string): Promise<void> {
-    succeeded(record(await this.withKey((key) => this.post(key, CREATE_COMMENT_QUERY, { input: { issueId, body } }))), "commentCreate", "create the comment");
+    succeeded(record(await this.write(CREATE_COMMENT_QUERY, { input: { issueId, body } })), "commentCreate", "create the comment");
   }
 
-  // For comments that are later edited in place (the progress comment): returns the id.
-  async createComment(issueId: string, body: string): Promise<string> {
-    const data = record(await this.withKey((key) => this.post(key, CREATE_COMMENT_QUERY, { input: { issueId, body } })));
+  // Edits the tracked comment (the progress or waiting comment), or posts a new one when there is
+  // none or Linear no longer has it (deleted); any other failure propagates, so a comment is never
+  // posted twice. Returns its id.
+  async upsertComment(issueId: string, body: string, commentId: string | null): Promise<string> {
+    if (commentId) {
+      const variables = { id: commentId, input: { body } };
+      try {
+        const data = await this.write(UPDATE_COMMENT_QUERY, variables).catch((error: unknown) => {
+          // Linear lets only a comment's author edit it: a comment the key wrote before writes moved
+          // to the app stays the key's. Measured 2026-10-01: the app gets INPUT_ERROR "Cannot modify
+          // Comment"; attachments and documents the key wrote, the app may change.
+          if (!(error instanceof LinearApiError && error.codes.includes("INPUT_ERROR") && error.reasons.some((reason) => /^Cannot modify Comment\b/.test(reason)))) throw error;
+          return this.withKey((key) => this.post(key, UPDATE_COMMENT_QUERY, variables));
+        });
+        succeeded(record(data), "commentUpdate", "update the comment");
+        return commentId;
+      } catch (error) {
+        if (!(error instanceof LinearApiError && error.reasons.some((reason) => /^Entity not found\b/.test(reason)))) throw error;
+      }
+    }
+    const data = record(await this.write(CREATE_COMMENT_QUERY, { input: { issueId, body } }));
     succeeded(data, "commentCreate", "create the comment");
     return label(record(record(data.commentCreate).comment ?? {}).id);
   }
 
-  async updateComment(commentId: string, body: string): Promise<void> {
-    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_COMMENT_QUERY, { id: commentId, input: { body } }))), "commentUpdate", "update the comment");
-  }
-
   async upsertAttachment(issueId: string, url: string, title: string, subtitle: string, iconUrl?: string): Promise<void> {
     const input = { issueId, url, title, subtitle, ...(iconUrl ? { iconUrl } : {}) };
-    succeeded(record(await this.withKey((key) => this.post(key, UPSERT_ATTACHMENT_QUERY, { input }))), "attachmentCreate", "update the Paseo agent link");
+    succeeded(record(await this.write(UPSERT_ATTACHMENT_QUERY, { input })), "attachmentCreate", "update the Paseo agent link");
   }
 
   // Removes attachments whose URL starts with `prefix`, except `keep` (a previous agent's link).
@@ -761,7 +851,7 @@ export class LinearService {
     const issue = record(record(await this.withKey((key) => this.post(key, ISSUE_ATTACHMENTS_QUERY, { id: issueId }))).issue ?? {});
     for (const node of connection(issue.attachments ?? { nodes: [] }).nodes.map((item) => record(item))) {
       const url = label(node.url);
-      if (url.startsWith(prefix) && url !== keep) succeeded(record(await this.withKey((key) => this.post(key, DELETE_ATTACHMENT_QUERY, { id: label(node.id) }))), "attachmentDelete", "remove the old Paseo agent link");
+      if (url.startsWith(prefix) && url !== keep) succeeded(record(await this.write(DELETE_ATTACHMENT_QUERY, { id: label(node.id) })), "attachmentDelete", "remove the old Paseo agent link");
     }
   }
 
@@ -770,7 +860,7 @@ export class LinearService {
   // so "already been linked" ends the step instead of failing the write-back on every turn.
   async linkUrl(issueId: string, url: string, title: string): Promise<void> {
     try {
-      succeeded(record(await this.withKey((key) => this.post(key, LINK_URL_QUERY, { issueId, url, title }))), "attachmentLinkURL", "attach the link");
+      succeeded(record(await this.write(LINK_URL_QUERY, { issueId, url, title })), "attachmentLinkURL", "attach the link");
     } catch (error) {
       if (!(error instanceof Error && /already been linked/i.test(error.message))) throw error;
     }
@@ -807,7 +897,7 @@ export class LinearService {
     const unseen = cursors.filter((cursor) => !UUID.test(cursor.issueId)).map((cursor) => cursor.issueId);
     const valid = cursors.filter((cursor) => UUID.test(cursor.issueId));
     const viaKey = (query: string, variables: Record<string, unknown>) => this.withKey((key) => this.post(key, query, variables));
-    const reader = this.reader;
+    const reader = this.app;
     for (let start = 0; start < valid.length; start += RELAY_BATCH) {
       const batch = valid.slice(start, start + RELAY_BATCH);
       const fromApp = reader ? await this.relayPages(userId, batch, comments, async (query, variables) => {
@@ -864,7 +954,7 @@ export class LinearService {
   }
 
   async react(commentId: string, emoji: string): Promise<void> {
-    succeeded(record(await this.withKey((key) => this.post(key, REACTION_QUERY, { commentId, emoji }))), "reactionCreate", "add the reaction");
+    succeeded(record(await this.write(REACTION_QUERY, { commentId, emoji })), "reactionCreate", "add the reaction");
   }
 
   // The ticket's document with this title (for example "Plan: TUC-9"), or null.
@@ -881,8 +971,8 @@ export class LinearService {
     const issue = record(data.issue ?? {});
     const existing = connection(issue.documents ?? { nodes: [] }).nodes.map((node) => record(node)).find((node) => label(node.title) === title);
     const result = existing
-      ? record(await this.withKey((key) => this.post(key, UPDATE_DOCUMENT_QUERY, { id: label(existing.id), input: { title, content } })))
-      : record(await this.withKey((key) => this.post(key, CREATE_DOCUMENT_QUERY, { input: { title, content, issueId: label(issue.id) || issueId } })));
+      ? record(await this.write(UPDATE_DOCUMENT_QUERY, { id: label(existing.id), input: { title, content } }))
+      : record(await this.write(CREATE_DOCUMENT_QUERY, { input: { title, content, issueId: label(issue.id) || issueId } }));
     const field = existing ? "documentUpdate" : "documentCreate";
     succeeded(result, field, existing ? "update the plan document" : "create the plan document");
     return label(record(record(result[field]).document ?? {}).url);

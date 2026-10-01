@@ -2,25 +2,27 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
-import { ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearService, type Post, type Reader } from "./linear";
+import { AuthenticationError, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, type App, type Post } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 
 const issue = { id: "i1", identifier: "TUC-1", state: { id: "s1", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] } };
 const ID_A = "3b241101-e2bb-4255-8caf-4136c566a962";
 const ID_B = "0c7f5f9e-83a5-4e4b-b7f3-2f7d3c1b5a10";
 
-function service(reader: Reader | undefined, answers: (query: string, variables: Record<string, unknown>) => Record<string, unknown>) {
+// The app's reads only: these tests write nothing, so its writes and viewer must stay unused.
+function service(reader: Pick<App, "query"> | undefined, answers: (query: string, variables: Record<string, unknown>) => Record<string, unknown>) {
   const keyCalls: string[] = [];
   const post: Post = (_key, query, variables) => {
     keyCalls.push(query);
     return Promise.resolve(answers(query, variables));
   };
-  return { keyCalls, linear: new LinearService(new Credentials("/unused", "env-key"), post, reader) };
+  const app: App | undefined = reader && { query: reader.query, mutate: () => Promise.reject(new Error("no writes here")), viewer: () => Promise.reject(new Error("no viewer here")) };
+  return { keyCalls, linear: new LinearService(new Credentials("/unused", "env-key"), post, app) };
 }
 
 test("poller reads go to the app's pool and never touch the key when the app can answer", async () => {
   const appCalls: string[] = [];
-  const reader: Reader = {
+  const reader: Pick<App, "query"> = {
     query: (query, variables) => {
       appCalls.push(query);
       if (query === ISSUE_STATE_QUERY) return Promise.resolve({ issue });
@@ -73,12 +75,18 @@ test("AgentApi.query: null when the app cannot be used, errors otherwise", async
   const notInstalled = new AgentApi({ accessToken: () => Promise.reject(new Error("The Paseo Linear app is not installed on this host.")) }, () => Promise.reject(new Error("unreachable")));
   assert.equal(await notInstalled.query("q", {}), null);
 
-  const revoked = new AgentApi({ accessToken: () => Promise.resolve("token") }, () => Promise.reject(new Error("Linear rejected this API key. Check it in Linear settings and reconnect.")));
+  const revoked = new AgentApi({ accessToken: () => Promise.resolve("token") }, () => Promise.reject(new AuthenticationError("Linear rejected this API key. Check it in Linear settings and reconnect.", 401)));
   assert.equal(await revoked.query("q", {}), null);
 
   const limited = new RateLimitedError("app", Date.now() + 60_000);
   const busy = new AgentApi({ accessToken: () => Promise.resolve("token") }, () => Promise.reject(limited));
   await assert.rejects(busy.query("q", {}), (error: unknown) => error === limited);
+
+  // A refused read falls back to the key; the same refusal of a write propagates.
+  const refused = new LinearApiError("Linear rejected this API key. Check it in Linear settings and reconnect.", 403);
+  const forbidden = new AgentApi({ accessToken: () => Promise.resolve("token") }, () => Promise.reject(refused));
+  assert.equal(await forbidden.query("q", {}), null);
+  await assert.rejects(forbidden.mutate("m", {}), (error: unknown) => error === refused);
 
   const auth: string[] = [];
   const working = new AgentApi({ accessToken: () => Promise.resolve("token") }, (key) => { auth.push(key); return Promise.resolve({ viewer: { id: "app" } }); });

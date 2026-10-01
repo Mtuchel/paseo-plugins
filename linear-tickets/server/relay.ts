@@ -14,7 +14,7 @@ const MENTION = /^\s*(?:\[@paseo\]\([^)]*\)|@paseo\b)[:,]?\s*/i;
 export const ACK_EMOJI = "eyes";
 export const FAILED_EMOJI = "x";
 
-type Linear = Pick<LinearService, "viewerId" | "relayComments" | "comment" | "react" | "complete">;
+type Linear = Pick<LinearService, "viewerId" | "appUserId" | "relayComments" | "comment" | "react" | "complete">;
 // `needsYou`: a "Needs you" sub-issue of the agent's ticket; a delivered reply there closes it.
 type LinkedAgent = { id: string; issueId: string; createdAt: string; needsYou?: boolean };
 type Question = { header?: string; question?: string; options?: { label?: string }[] };
@@ -115,6 +115,9 @@ export class CommentRelay {
     state.cursors = cursors;
     if (agents.length) {
       const viewerId = await this.linear.viewerId();
+      // Reactions are written as the Paseo app (or the owner when the app is not usable, and before
+      // writes moved to the app): either one marks the comment as handled.
+      const appId = await this.linear.appUserId();
       const { comments, unseen } = await this.linear.relayComments(viewerId, agents.map((agent) => ({ issueId: agent.issueId, since: cursors[agent.issueId].since })));
       for (const issueId of unseen) this.unseen.add(issueId);
       for (const agent of agents) {
@@ -125,7 +128,7 @@ export class CommentRelay {
           // webhook delivers it; relaying it too would hand the agent the same message twice.
           const handled = comment.userId !== viewerId
             || comment.sessionId !== null
-            || comment.reactions.some((reaction) => reaction.userId === viewerId && (reaction.emoji === ACK_EMOJI || reaction.emoji === FAILED_EMOJI))
+            || comment.reactions.some((reaction) => (reaction.userId === viewerId || (appId !== null && reaction.userId === appId)) && (reaction.emoji === ACK_EMOJI || reaction.emoji === FAILED_EMOJI))
             || state.acks.some((ack) => ack.commentId === comment.id);
           const message = handled ? null : mentionMessage(comment.body);
           if (message !== null) {
