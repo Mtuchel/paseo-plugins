@@ -1,0 +1,488 @@
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+// Not mocked: the tests below mock setTimeout and Date only.
+import { setImmediate as nextTurn } from "node:timers/promises";
+import type { PaseoApi } from "@getpaseo/client";
+import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/server";
+import type { IssueState } from "./linear";
+import { RateLimitedError } from "./rate-budget";
+import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { NeedsYouIssues } from "./needs-you";
+import { appComment, MAX_SUMMARY_LENGTH, ownerRequest, turnPullRequests, turnReply, Writeback } from "./writeback";
+
+// Writebacks built without an outbox path keep theirs here, never in the real Paseo home.
+process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-writeback-home-"));
+const outboxPath = () => join(mkdtempSync(join(tmpdir(), "paseo-writeback-outbox-")), "writeback-outbox.json");
+
+type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
+
+const allOn: PluginSettings = {
+  template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true,
+  dispatch: DEFAULT_DISPATCH,
+  writeback: { status: true, summaries: true, blocked: true, pullRequests: true, mentions: true, autoResume: false },
+};
+const root: PluginHookAgent = { id: "agent-1", workspaceId: "w1", parentAgentId: null, provider: "claude", cwd: "/repo", title: "ENG-1: Fix sign-in" };
+
+const toolCall = (output: string): Timeline[number] => ({ type: "tool_call", callId: "c1", name: "bash", status: "completed", detail: { type: "shell", command: "gh pr create", output }, error: null });
+
+class FakeLinear {
+  readonly writes: string[] = [];
+  state: IssueState = { id: "issue-1", identifier: "ENG-1", projectId: null, creatorId: null, blockedBy: [], status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", labels: [{ id: "l1", name: "paseo-running" }], attachmentUrls: [] };
+  // Other issues by id (the "Needs you" sub-issues); `state` is the ticket itself.
+  readonly others = new Map<string, IssueState>();
+  private comments = 0;
+  async issueState(id = "issue-1") {
+    this.writes.push(id === this.state.id ? "state" : `state ${id}`);
+    const found = id === this.state.id ? this.state : this.others.get(id);
+    if (!found) throw new Error("Linear did not return this issue. Check that you have access to it.");
+    return found;
+  }
+  async createIssue(input: { title: string; parentId?: string; assigneeId?: string; startedState?: string }) {
+    const id = `sub-${this.others.size + 1}`;
+    const identifier = `ENG-${this.others.size + 2}`;
+    this.writes.push(`create ${id} "${input.title}" under ${input.parentId} for ${input.assigneeId} in ${input.startedState}`);
+    this.others.set(id, { ...this.state, id, identifier, status: input.startedState ?? "Todo", statusId: "ni", statusType: "started", labels: [] });
+    return { id, identifier, url: "" };
+  }
+  async complete(id: string) { this.writes.push(`complete ${id}`); this.others.set(id, { ...this.others.get(id)!, status: "Done", statusType: "completed" }); }
+  async markInProgress(issue: { id: string }) { this.writes.push(`in-progress ${issue.id}`); return { changed: true }; }
+  async moveToStateNamed(id: string, name: string) {
+    this.writes.push(`move ${id} ${name}`);
+    if (this.state.status === name) return { changed: false };
+    this.state = { ...this.state, status: name, statusId: name.toLowerCase(), statusType: "started" };
+    return { changed: true };
+  }
+  async moveToState(_id: string, stateId: string) { this.writes.push(`restore ${stateId}`); }
+  async comment(_id: string, body: string) { this.writes.push(`comment: ${body}`); }
+  async createComment(id: string, body: string) { this.writes.push(id === this.state.id ? `new comment: ${body}` : `new comment on ${id}: ${body}`); return `c${++this.comments}`; }
+  async updateComment(id: string, body: string) { this.writes.push(`edit ${id}: ${body}`); }
+  async viewerId() { return "owner"; }
+  async userUrl(id: string) { return `https://linear.app/acme/profiles/${id}`; }
+  async addLabel(id: string, name: string) {
+    if (id !== this.state.id) { this.writes.push(`+${name} on ${id}`); return; }
+    this.writes.push(`+${name}`);
+    this.state = { ...this.state, labels: [...this.state.labels, { id: name, name }] };
+  }
+  async removeLabel(_id: string, name: string) { this.writes.push(`-${name}`); this.state = { ...this.state, labels: this.state.labels.filter((label) => label.name !== name) }; }
+  async linkUrl(_id: string, url: string) { this.writes.push(`link ${url}`); }
+  async moveToReview() { this.writes.push("review"); return { changed: true }; }
+}
+
+function paseoWithLabels(labels: Record<string, string>): PaseoApi {
+  return { agents: { ref: () => ({ refresh: async () => ({ agent: { labels } }) }), list: async () => ({ entries: [] }) } } as unknown as PaseoApi;
+}
+const linked = paseoWithLabels({ "linear.issueId": "issue-1" });
+
+test("the turn reply is the final answer after the last tool call, streamed pieces joined and repeats dropped", () => {
+  const timeline: Timeline = [
+    { type: "user_message", text: "first" },
+    { type: "assistant_message", text: "old answer" },
+    { type: "user_message", text: "second" },
+    { type: "assistant_message", text: "Let me check." },
+    toolCall("ok"),
+    { type: "assistant_message", text: "Fixed the " },
+    { type: "assistant_message", text: "bug." },
+    { type: "assistant_message", text: "bug." },
+  ];
+  assert.equal(turnReply(timeline), "Fixed the bug.");
+  // Seen live: a provider repeated its final message once complete.
+  assert.equal(turnReply([{ type: "user_message", text: "go" }, toolCall("ok"), { type: "assistant_message", text: "DONE Blue" }, { type: "assistant_message", text: "DONE Blue" }]), "DONE Blue");
+});
+
+test("pull requests come only from this turn's shell output, deduplicated", () => {
+  const timeline: Timeline = [
+    toolCall("https://github.com/o/r/pull/1"),
+    { type: "user_message", text: "see https://github.com/o/r/pull/2" },
+    { type: "assistant_message", text: "Compare https://github.com/o/r/pull/3" },
+    toolCall("Created https://github.com/o/r/pull/4\nhttps://github.com/o/r/pull/4"),
+    // A file write quoting the ticket (seen live: an agent copying the ticket into PLAN.md).
+    { type: "tool_call", callId: "c2", name: "write", status: "completed", detail: { type: "write", filePath: "PLAN.md", content: "see https://github.com/o/r/pull/5" }, error: null },
+  ];
+  assert.deepEqual(turnPullRequests(timeline), ["https://github.com/o/r/pull/4"]);
+});
+
+test("agents without a Linear link and subagents never touch Linear", async () => {
+  const linear = new FakeLinear();
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
+  const event = { turnId: "t", outcome: { kind: "completed" as const }, timeline: [{ type: "assistant_message" as const, text: "done" }] };
+  await writeback.turnEnded({ ...event, agent: root }, paseoWithLabels({}));
+  await writeback.turnEnded({ ...event, agent: { ...root, id: "child", parentAgentId: "agent-1" } }, linked);
+  assert.deepEqual(linear.writes, []);
+});
+
+test("a completed turn posts its reply, truncated, and links a new pull request then moves to review", async () => {
+  const linear = new FakeLinear();
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
+  const long = "x".repeat(MAX_SUMMARY_LENGTH + 50);
+  await writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "completed" }, timeline: [toolCall("https://github.com/o/r/pull/9"), { type: "assistant_message", text: long }] }, linked);
+  const comment = linear.writes.find((write) => write.startsWith("comment: "))!;
+  assert.match(comment, /^comment: \*\*ENG-1: Fix sign-in\*\* \(Paseo\) finished a turn:/);
+  assert.match(comment, /truncated; the full reply is in Paseo\)$/);
+  assert.ok(comment.length < MAX_SUMMARY_LENGTH + 200);
+  assert.deepEqual(linear.writes.filter((write) => write !== comment), ["state", "-paseo-needs-you", "-paseo-blocked", "link https://github.com/o/r/pull/9", "review"]);
+});
+
+test("each write-back toggle gates its own effect", async () => {
+  const linear = new FakeLinear();
+  const off = { ...allOn, writeback: DEFAULT_WRITEBACK };
+  const writeback = new Writeback(linear, { read: async () => off }, undefined, 0);
+  await writeback.turnStarted({ agent: root, turnId: "t" }, linked);
+  await writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "failed", error: { message: "boom" } }, timeline: [toolCall("https://github.com/o/r/pull/9")] }, linked);
+  await writeback.permissionRequested({ agent: root, request: { id: "p", provider: "claude", name: "Bash", kind: "tool" } }, linked);
+  assert.deepEqual(linear.writes, []);
+});
+
+test("the first turn marks the ticket in progress once per agent", async () => {
+  const linear = new FakeLinear();
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
+  await writeback.turnStarted({ agent: root, turnId: "a" }, linked);
+  await writeback.turnStarted({ agent: root, turnId: "b" }, linked);
+  assert.deepEqual(linear.writes, ["state", "in-progress issue-1"]);
+});
+
+test("a required-plan agent's first turn moves its ticket to Planning, unless the ticket already started", async () => {
+  const planFirst = paseoWithLabels({ "linear.issueId": "issue-1", "linear.plan": "required" });
+  const fresh = new FakeLinear();
+  await new Writeback(fresh, { read: async () => allOn }, undefined, 0).turnStarted({ agent: root, turnId: "a" }, planFirst);
+  assert.deepEqual(fresh.writes, ["state", "move issue-1 Planning"]);
+  const approved = new FakeLinear();
+  approved.state = { ...approved.state, status: "In Progress", statusType: "started" };
+  await new Writeback(approved, { read: async () => allOn }, undefined, 0).turnStarted({ agent: root, turnId: "a" }, planFirst);
+  assert.deepEqual(approved.writes, ["state"]);
+});
+
+test("a model switch between turns is announced in the panel and recorded in the progress comment", async () => {
+  const linear = new FakeLinear();
+  const panel: string[] = [];
+  const records: unknown[] = [];
+  const bridge = {
+    sessions: { sessionFor: async () => ({ sessionId: "s1" }), holdIfStopped: async () => false, follow: async () => {}, say: async (_s: string, type: string, body: string) => { panel.push(`${type}: ${body}`); } },
+    handover: { update: async (_issue: unknown, _agent: unknown, change: unknown) => { records.push(change); }, waiting: async () => null },
+  };
+  const writeback = new Writeback(linear, { read: async () => allOn }, bridge as never, 0);
+  // Plannotator restores its pre-planning model inside the provider; the runtime report wins.
+  let runtime = "anthropic/claude-opus-5-5";
+  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1", "linear.identifier": "ENG-1" }, model: "anthropic/claude-opus-5-5", runtimeInfo: { model: runtime, thinkingOptionId: "medium" } } }) }) } } as unknown as PaseoApi;
+  await writeback.turnStarted({ agent: root, turnId: "a" }, paseo);
+  runtime = "deepseek/deepseek-v4-flash";
+  await writeback.turnStarted({ agent: root, turnId: "b" }, paseo);
+  assert.deepEqual(panel, [
+    "thought: Working… (anthropic/claude-opus-5-5 · thinking medium)",
+    "thought: Model changed: anthropic/claude-opus-5-5 · thinking medium → deepseek/deepseek-v4-flash · thinking medium",
+    "thought: Working… (deepseek/deepseek-v4-flash · thinking medium)",
+  ]);
+  assert.deepEqual(records, [{ model: "anthropic/claude-opus-5-5 · thinking medium" }, { model: "deepseek/deepseek-v4-flash · thinking medium" }]);
+});
+
+test("a question moves the ticket to Needs input, labels it and mentions the owner in one comment per waiting period", async () => {
+  const linear = new FakeLinear();
+  linear.state = { ...linear.state, status: "In Progress", statusId: "ip", statusType: "started", creatorId: "creator" };
+  let pending: { id: string }[] = [];
+  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" }, pendingPermissions: pending } }) }) } } as unknown as PaseoApi;
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
+  const ask = async (id: string, title: string) => {
+    pending = [{ id }];
+    await writeback.permissionRequested({ agent: root, request: { id, provider: "claude", name: "AskUser", kind: "question", title } }, paseo);
+  };
+  const waiting = (question: string) => `https://linear.app/acme/profiles/creator **ENG-1: Fix sign-in** (Paseo) is waiting for an answer: ${question}\n\nReply here with “@paseo <your answer>”.`;
+
+  await ask("q1", "Question 1/2");
+  assert.deepEqual(linear.writes.splice(0), ["state", "move issue-1 Needs input", "+paseo-needs-you", `new comment: ${waiting("Question 1/2")}`]);
+  // The next question arrives before the settle wait ends: the ticket stays in Needs input and the comment is edited.
+  pending = [{ id: "q2" }];
+  await writeback.permissionResolved({ agent: root, requestId: "q1", resolution: { behavior: "allow" } }, paseo);
+  await ask("q2", "Question 2/2");
+  assert.deepEqual(linear.writes.splice(0), ["state", "move issue-1 Needs input", `edit c1: ${waiting("Question 2/2")}`]);
+
+  pending = [];
+  await writeback.permissionResolved({ agent: root, requestId: "q2", resolution: { behavior: "allow" } }, paseo);
+  assert.deepEqual(linear.writes.splice(0), ["state", "-paseo-needs-you", "restore ip"]);
+  // A later wait is a new period with a fresh comment.
+  linear.state = { ...linear.state, status: "In Progress", statusId: "ip" };
+  await ask("q3", "Another one?");
+  assert.deepEqual(linear.writes.splice(0), ["state", "move issue-1 Needs input", "+paseo-needs-you", `new comment: ${waiting("Another one?")}`]);
+});
+
+test("a turn that ends asking the owner waits in Needs input until the agent's next turn starts", async () => {
+  const linear = new FakeLinear();
+  linear.state = { ...linear.state, status: "In Progress", statusId: "ip", statusType: "started", creatorId: "creator" };
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
+  const end = (text: string) => writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text }] }, linked);
+
+  await end("The stack is ready.\n\nShould I push it and open the draft PRs?");
+  const comment = `new comment: https://linear.app/acme/profiles/creator **ENG-1: Fix sign-in** (Paseo) finished its turn and is waiting for you:\n\nShould I push it and open the draft PRs?\n\nReply here with “@paseo <your answer>”.`;
+  assert.deepEqual(linear.writes.splice(0).filter((write) => !write.startsWith("comment: ")), ["state", "-paseo-blocked", "state", "move issue-1 Needs input", "+paseo-needs-you", comment]);
+  // The owner's reply starts the next turn: the ticket goes back where it was.
+  await writeback.turnStarted({ agent: root, turnId: "t2" }, linked);
+  assert.deepEqual(linear.writes.splice(0).filter((write) => write !== "in-progress issue-1"), ["state", "-paseo-needs-you", "restore ip", "state"]);
+  await writeback.turnStarted({ agent: root, turnId: "t3" }, linked);
+  assert.deepEqual(linear.writes.splice(0), []);
+  await end("Pushed; the PRs are #4 and #5.");
+  assert.ok(!linear.writes.includes("move issue-1 Needs input"));
+});
+
+test("only replies that hand the next step to the owner count as waiting, and plan approval never does", () => {
+  assert.equal(ownerRequest("Merged #12 and the staging deploy succeeded."), null);
+  assert.equal(ownerRequest("Run `curl 'https://x/api?q=1'` to check.\n\n```ts\nconst a = b ? c : d;\n```"), null);
+  assert.equal(ownerRequest("Approve or annotate the plan in Plannotator. Should I split AC-3 out?"), null);
+  assert.equal(ownerRequest("Done.\n\nThe `approved-test-change` label needs your OK, then I merge.\n\nPLAN.md is untracked."), "The `approved-test-change` label needs your OK, then I merge.\n\nPLAN.md is untracked.");
+  // A question far above the closing report is history, not the open ask.
+  assert.equal(ownerRequest(`Should I start?\n\n${"Report line.\n\n".repeat(150)}All checks pass.`), null);
+});
+
+test("a wait on a closed ticket opens a Needs you sub-issue instead; follow-ups edit its comment and the answer closes it", async () => {
+  const linear = new FakeLinear();
+  linear.state = { ...linear.state, status: "Done", statusId: "done", statusType: "completed", creatorId: "creator" };
+  const needsYou = new NeedsYouIssues(mkdtempSync(join(tmpdir(), "needs-you-")));
+  let pending: { id: string }[] = [];
+  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" }, pendingPermissions: pending } }) }) } } as unknown as PaseoApi;
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), needsYou);
+  const ask = async (id: string, title: string) => {
+    pending = [{ id }];
+    await writeback.permissionRequested({ agent: root, request: { id, provider: "claude", name: "AskUser", kind: "question", title } }, paseo);
+  };
+  const waiting = (question: string) => `https://linear.app/acme/profiles/creator **ENG-1: Fix sign-in** (Paseo) is waiting for an answer: ${question}\n\nReply here with “@paseo <your answer>”.`;
+
+  await ask("q1", "Enqueue #850 yourself?");
+  assert.deepEqual(linear.writes.splice(0), ['state', 'create sub-1 "Needs you: Enqueue #850 yourself?" under issue-1 for creator in Needs input', "+paseo-needs-you on sub-1", `new comment on sub-1: ${waiting("Enqueue #850 yourself?")}`]);
+  assert.deepEqual(await needsYou.all(), [{ id: "sub-1", identifier: "ENG-2", parentId: "issue-1", agentId: "agent-1" }]);
+  // The closed ticket itself is never moved or labelled; a follow-up question edits the comment.
+  pending = [{ id: "q2" }];
+  await writeback.permissionResolved({ agent: root, requestId: "q1", resolution: { behavior: "allow" } }, paseo);
+  await ask("q2", "And watch the deploy?");
+  assert.deepEqual(linear.writes.splice(0), ["state", `edit c1: ${waiting("And watch the deploy?")}`]);
+  pending = [];
+  await writeback.permissionResolved({ agent: root, requestId: "q2", resolution: { behavior: "allow" } }, paseo);
+  assert.deepEqual(linear.writes.splice(0), ["state", "-paseo-needs-you", "complete sub-1"]);
+  assert.deepEqual(await needsYou.all(), []);
+});
+
+test("a turn-end wait on a closed ticket keeps its sub-issue open for the owner and reuses it until the owner closes it", async () => {
+  const linear = new FakeLinear();
+  linear.state = { ...linear.state, status: "Done", statusId: "done", statusType: "completed", creatorId: "creator" };
+  const needsYou = new NeedsYouIssues(mkdtempSync(join(tmpdir(), "needs-you-")));
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), needsYou);
+  const end = (text: string) => writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text }] }, linked);
+  const created = () => linear.writes.splice(0).filter((write) => write.startsWith("create "));
+
+  await end("Merged.\n\n**Someone has to send a test mail to `purchases@`.** Only you can do that.");
+  assert.deepEqual(created(), ['create sub-1 "Needs you: Someone has to send a test mail to purchases@. Only you can do that." under issue-1 for creator in Needs input']);
+  // The next turn may be a nudge, not the step being done: the sub-issue stays open, and the
+  // closed ticket is not reopened by the agent's first turn this plugin instance sees.
+  await writeback.turnStarted({ agent: root, turnId: "t2" }, linked);
+  assert.ok(!linear.writes.includes("complete sub-1"));
+  assert.ok(!linear.writes.some((write) => write.startsWith("in-progress")));
+  await end("Still waiting: should I run the smoke test once the mail arrived?");
+  assert.deepEqual(created(), []);
+  assert.equal(linear.others.size, 1);
+
+  linear.others.set("sub-1", { ...linear.others.get("sub-1")!, status: "Done", statusType: "completed" });
+  await writeback.turnStarted({ agent: root, turnId: "t3" }, linked);
+  await end("Should I close the epic?");
+  assert.deepEqual(created(), ['create sub-2 "Needs you: Should I close the epic?" under issue-1 for creator in Needs input']);
+  assert.deepEqual((await needsYou.all()).map((entry) => entry.id), ["sub-2"]);
+});
+
+test("the previous state is not restored when someone moved the ticket out of Needs input meanwhile", async () => {
+  const linear = new FakeLinear();
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
+  await writeback.permissionRequested({ agent: root, request: { id: "p", provider: "claude", name: "Bash", kind: "tool", title: "Allow tool: Bash" } }, linked);
+  linear.state = { ...linear.state, status: "Canceled", statusId: "canceled", statusType: "canceled" };
+  linear.writes.length = 0;
+  await writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "failed", error: { message: "boom" } }, timeline: [] }, linked);
+  // Errors, not questions, get the blocked label.
+  assert.deepEqual(linear.writes, ["state", "-paseo-needs-you", "comment: **ENG-1: Fix sign-in** (Paseo) stopped with an error: boom", "+paseo-blocked"]);
+});
+
+test("archiving clears the running marker and reports only when no pull request was linked", async () => {
+  const linear = new FakeLinear();
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
+  await writeback.archived({ agent: root, archivedAt: "now" }, linked);
+  assert.deepEqual(linear.writes, ["state", "-paseo-running", "-paseo-blocked", "-paseo-needs-you", "comment: **ENG-1: Fix sign-in** (Paseo) was archived without a linked pull request."]);
+
+  const withPr = new FakeLinear();
+  withPr.state = { ...withPr.state, attachmentUrls: ["https://github.com/o/r/pull/9"] };
+  await new Writeback(withPr, { read: async () => allOn }, undefined, 0).archived({ agent: root, archivedAt: "now" }, linked);
+  assert.ok(!withPr.writes.some((write) => write.startsWith("comment")));
+});
+
+test("a Linear failure is logged and never thrown back into the daemon hook", async (t) => {
+  const errors = t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  linear.comment = async () => { throw new Error("rate limited"); };
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
+  await writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "done" }] }, linked);
+  assert.match(String(errors.mock.calls[0].arguments[1]), /rate limited/);
+});
+
+const PR = "https://github.com/o/r/pull/9";
+const completedWithPr: PluginLifecycleEvents["agent.turn_ended"] = { agent: root, turnId: "t", outcome: { kind: "completed" }, timeline: [toolCall(PR), { type: "assistant_message", text: "done" }] };
+const MINUTE = 60_000;
+
+// Retries fire from mocked timers and run in the background; real I/O (the outbox) needs real turns.
+async function until(condition: () => boolean): Promise<void> {
+  for (let turn = 0; turn < 5_000 && !condition(); turn++) await nextTurn();
+  assert.ok(condition(), "the expected write-back never happened");
+}
+async function settle(): Promise<void> {
+  for (let turn = 0; turn < 200; turn++) await nextTurn();
+}
+
+function fakeBridge() {
+  const calls: string[] = [];
+  const bridge = {
+    sessions: {
+      sessionFor: async () => ({ sessionId: "s1" }), holdIfStopped: async () => false, follow: async () => {}, unfollow: async () => true, action: async () => {}, resumeNow: async () => false,
+      say: async (_s: string, type: string, body: string) => { calls.push(`say ${type}: ${body}`); },
+      link: async (_s: string, _title: string, url: string) => { calls.push(`session link ${url}`); },
+      offerResume: async () => { calls.push("offer resume"); },
+    },
+    handover: {
+      read: async () => null, waiting: async () => null, setWaiting: async () => {},
+      update: async (_issue: unknown, _agent: unknown, change: object) => { calls.push(`handover ${JSON.stringify(change)}`); return {}; },
+      finish: async (_issue: unknown, _agent: unknown, status: string) => { calls.push(`finish ${status}`); return {}; },
+    },
+  };
+  return { calls, bridge: bridge as never };
+}
+
+test("a rate-limited turn end is retried whenever Linear's pool refills, however often, until it lands", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const errors = t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  const issueState = linear.issueState.bind(linear);
+  let attempts = 0;
+  linear.issueState = async () => { if (++attempts <= 4) throw new RateLimitedError("key", Date.now() + 10 * MINUTE); return issueState(); };
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  await writeback.turnEnded(completedWithPr, linked);
+  for (let retry = 1; retry <= 4; retry++) {
+    t.mock.timers.tick(10 * MINUTE - 1);
+    await settle();
+    assert.equal(attempts, retry, "not retried before the pool refills");
+    t.mock.timers.tick(1);
+    await until(() => attempts === retry + 1);
+  }
+  await until(() => linear.writes.includes("review"));
+  assert.equal(linear.writes.filter((write) => write.startsWith("comment: ")).length, 1);
+  assert.ok(linear.writes.includes(`link ${PR}`));
+  assert.equal(errors.mock.calls.filter((call) => /retrying in 600 s: Linear's hourly request limit/.test(String(call.arguments[0]))).length, 4);
+});
+
+test("a turn end that stays rate-limited gives up after 6 h", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const errors = t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  let attempts = 0;
+  linear.issueState = async () => { attempts++; throw new RateLimitedError("key", Date.now() + 60 * MINUTE); };
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  await writeback.turnEnded(completedWithPr, linked);
+  for (let hour = 1; hour <= 6; hour++) {
+    t.mock.timers.tick(60 * MINUTE);
+    await until(() => attempts === hour + 1);
+  }
+  const gaveUp = () => errors.mock.calls.some((call) => String(call.arguments[0]) === "[linear-tickets] write-back for turn_ended on agent agent-1 gave up after 6 h of Linear rate limits");
+  await until(gaveUp);
+  t.mock.timers.tick(24 * 60 * MINUTE);
+  await settle();
+  assert.equal(attempts, 7);
+  assert.ok(!linear.writes.includes("review"));
+});
+
+test("a delayed retry overtaken by a newer event links its pull request but leaves the newer state alone", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const errors = t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  const issueState = linear.issueState.bind(linear);
+  let limited = true;
+  linear.issueState = async () => { if (limited) { limited = false; throw new RateLimitedError("key", Date.now() + 10 * MINUTE); } return issueState(); };
+  const { calls, bridge } = fakeBridge();
+  const writeback = new Writeback(linear, { read: async () => allOn }, bridge, 0, outboxPath());
+  await writeback.turnEnded(completedWithPr, linked);
+  await writeback.turnStarted({ agent: root, turnId: "next" }, linked);
+  linear.writes.length = 0;
+  calls.length = 0;
+  t.mock.timers.tick(10 * MINUTE);
+  await until(() => errors.mock.calls.some((call) => /turn_ended on agent agent-1 superseded by a newer event/.test(String(call.arguments[0]))));
+  // The stale turn neither clears the waiting state, drops labels, reports nor moves the ticket.
+  assert.deepEqual(linear.writes, [`link ${PR}`]);
+  assert.deepEqual(calls, [`session link ${PR}`, `handover {"link":["Pull request","${PR}"]}`]);
+});
+
+test("a retry after partial success repeats no comment, report or session activity", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  t.mock.method(console, "error", () => {});
+  const plain = new FakeLinear();
+  const removeLabel = plain.removeLabel.bind(plain);
+  let limited = true;
+  plain.removeLabel = async (id: string, name: string) => {
+    if (name === "paseo-blocked" && limited) { limited = false; throw new RateLimitedError("key", Date.now() + MINUTE); }
+    return removeLabel(id, name);
+  };
+  await new Writeback(plain, { read: async () => allOn }, undefined, 0, outboxPath()).turnEnded(completedWithPr, linked);
+  t.mock.timers.tick(MINUTE);
+  await until(() => plain.writes.includes("review"));
+  assert.equal(plain.writes.filter((write) => write.startsWith("comment: ")).length, 1);
+  assert.equal(plain.writes.filter((write) => write === `link ${PR}`).length, 1);
+
+  const native = new FakeLinear();
+  const addLabel = native.addLabel.bind(native);
+  let failing = true;
+  native.addLabel = async (id: string, name: string) => { if (failing) { failing = false; throw new RateLimitedError("key", Date.now() + MINUTE); } return addLabel(id, name); };
+  const { calls, bridge } = fakeBridge();
+  await new Writeback(native, { read: async () => allOn }, bridge, 0, outboxPath()).turnEnded({ agent: root, turnId: "t", outcome: { kind: "failed", error: { message: "boom" } }, timeline: [] }, linked);
+  t.mock.timers.tick(MINUTE);
+  await until(() => calls.includes("offer resume"));
+  assert.deepEqual(calls, ["say error: The agent stopped with an error: boom", "finish failed", "offer resume"]);
+  assert.deepEqual(native.writes.filter((write) => write === "+paseo-blocked"), ["+paseo-blocked"]);
+});
+
+test("a pull request left in the outbox is linked by the next plugin instance on its first write-back", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const path = outboxPath();
+  const before = new FakeLinear();
+  before.linkUrl = async () => { throw new Error("Linear did not link the URL."); };
+  await new Writeback(before, { read: async () => allOn }, undefined, 0, path).turnEnded(completedWithPr, linked);
+  assert.deepEqual(JSON.parse(await readFile(path, "utf8")).map((entry: { url: string; done: object }) => [entry.url, entry.done]), [[PR, { linear: false, session: false, handover: false }]]);
+
+  const after = new FakeLinear();
+  await new Writeback(after, { read: async () => allOn }, undefined, 0, path).turnStarted({ agent: { ...root, id: "agent-2" }, turnId: "t" }, linked);
+  assert.deepEqual(after.writes, [`link ${PR}`, "state", "in-progress issue-1"]);
+  assert.deepEqual(JSON.parse(await readFile(path, "utf8")), []);
+});
+
+test("other Linear outages are retried twice, after 30 s and 2 min, then dropped", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const errors = t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  let attempts = 0;
+  linear.issueState = async () => { attempts++; throw new Error("The Linear API request failed (HTTP 503). Try again."); };
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  await writeback.turnEnded(completedWithPr, linked);
+  t.mock.timers.tick(30_000);
+  await until(() => attempts === 2);
+  t.mock.timers.tick(120_000);
+  await until(() => attempts === 3);
+  await until(() => errors.mock.calls.some((call) => String(call.arguments[0]) === "[linear-tickets] write-back for turn_ended on agent agent-1 failed:"));
+  t.mock.timers.tick(60 * MINUTE);
+  await settle();
+  assert.equal(attempts, 3);
+  assert.deepEqual(errors.mock.calls.map((call) => String(call.arguments[0]).match(/retrying in \d+ s/)?.[0]).filter(Boolean), ["retrying in 30 s", "retrying in 120 s"]);
+});
+
+test("a rate-limited Paseo app comment is not posted with the owner's key instead", async (t) => {
+  const linear = new FakeLinear();
+  const limited = async () => { throw new RateLimitedError("app", Date.now() + MINUTE); };
+  const app = { createComment: limited, updateComment: limited };
+  await assert.rejects(appComment(linear, app, "issue-1", "hello"), RateLimitedError);
+  await assert.rejects(appComment(linear, app, "issue-1", "hello", "c1"), RateLimitedError);
+  assert.deepEqual(linear.writes, []);
+  // Any other app failure still falls back to the key.
+  const broken = async () => { throw new Error("app token revoked"); };
+  t.mock.method(console, "error", () => {});
+  assert.equal(await appComment(linear, { createComment: broken, updateComment: broken }, "issue-1", "hello"), "c1");
+  assert.deepEqual(linear.writes, ["new comment: hello"]);
+});

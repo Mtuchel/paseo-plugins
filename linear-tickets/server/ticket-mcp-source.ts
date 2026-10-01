@@ -1,7 +1,8 @@
 // Stdio MCP server given to agents launched from a ticket. It is written to disk and run
 // by `node`, so it is plain dependency-free ESM; it must not contain backticks or "${".
 export const TICKET_MCP_SOURCE = String.raw`
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const argv = process.argv.slice(2);
@@ -50,6 +51,9 @@ async function linear(query, variables) {
   let payload = null;
   try { payload = await response.json(); } catch {}
   if (response.status === 401 || response.status === 403) throw new Error("Linear rejected the host's API key. Reconnect Linear in the Linear tickets plugin.");
+  // Linear answers a spent hourly budget with HTTP 400 and the RATELIMITED code (429 from proxies).
+  const rateLimited = response.status === 429 || (payload && Array.isArray(payload.errors) && payload.errors.some((e) => e && e.extensions && e.extensions.code === "RATELIMITED"));
+  if (rateLimited) throw new Error("Linear's hourly request limit is reached for the Linear API key; try again in about 10 minutes.");
   const errors = payload && Array.isArray(payload.errors) ? redact(payload.errors.map((e) => (e && (e.extensions && e.extensions.userPresentableMessage || e.message)) || "").filter((m) => typeof m === "string" && m).join("; "), key).slice(0, 300) : "";
   if (!response.ok || errors) throw new Error("The Linear request failed" + (errors ? ": " + errors : " (HTTP " + response.status + ")."));
   return (payload && payload.data) || {};
@@ -66,6 +70,31 @@ async function loadIssue() {
 function states(issue) {
   const nodes = (issue.team && issue.team.states && issue.team.states.nodes) || [];
   return nodes.slice().sort((a, b) => (a.position || 0) - (b.position || 0));
+}
+
+// Manual tasks: steps only a person can do (env vars, secrets, settings). Each becomes a sub-issue
+// assigned to the key's owner, plus a private file the plugin's watcher reads. The check command
+// lives only in that file: the plugin never runs text taken from Linear.
+const MANUAL_WHEN = ["before_merge", "after_merge", "anytime"];
+const WHEN_TEXT = { before_merge: "due before the pull request is merged", after_merge: "due once the pull request is merged", anytime: "due now, independent of the merge" };
+const MANUAL = "query manual($id: String!) { viewer { id } issue(id: $id) { id identifier team { id states(first: 50) { nodes { id name type position } } } children(first: 100) { nodes { id identifier url title state { type } } } } }";
+const MANUAL_DIRECTORY = join(paseoHome, "linear-tickets", "manual-tasks");
+const FINISHED_TYPES = ["completed", "canceled", "duplicate"];
+
+async function recordManualTask(task) {
+  await mkdir(MANUAL_DIRECTORY, { recursive: true, mode: 0o700 });
+  const path = join(MANUAL_DIRECTORY, task.id + ".json");
+  const temporary = path + "." + randomUUID() + ".tmp";
+  try {
+    await writeFile(temporary, JSON.stringify(task, null, 2), { mode: 0o600, flag: "wx" });
+    await rename(temporary, path);
+  } finally { await rm(temporary, { force: true }); }
+}
+
+async function recordedManualTasks() {
+  const names = await readdir(MANUAL_DIRECTORY).catch(() => []);
+  const tasks = await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readFile(join(MANUAL_DIRECTORY, name), "utf8").then(JSON.parse, () => null)));
+  return tasks.filter((task) => task && typeof task.title === "string");
 }
 
 const tools = [
@@ -127,6 +156,58 @@ const tools = [
       const data = await linear("mutation link($issueId: String!, $url: String!, $title: String) { attachmentLinkURL(issueId: $issueId, url: $url, title: $title) { success } }", { issueId, url: url.href, title });
       if (!data.attachmentLinkURL || !data.attachmentLinkURL.success) throw new Error("Linear did not attach the link.");
       return { linked: true, url: url.href };
+    },
+  },
+  {
+    name: "add_manual_task",
+    description: "Register a step a person must do outside the pull request (environment variables, secrets, Railway/Linear/GitHub/Paseo settings, webhooks, integrations). It becomes a sub-issue of this ticket assigned to the owner, who is notified. Never put secret values in it. Give a check command whenever one can prove the step is done: it runs when the owner marks the task done, and a failing check reopens it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", minLength: 1, maxLength: 200, description: "Short imperative, for example: Set LINEAR_API_KEY on batch-service (staging)" },
+        steps: { type: "string", minLength: 1, maxLength: 10000, description: "Markdown: exact names, commands and UI paths; where to get each secret, never its value." },
+        when: { type: "string", enum: MANUAL_WHEN, description: "before_merge blocks the merge; after_merge becomes due when the pull request is merged; anytime is due now without blocking." },
+        check: { type: "string", minLength: 1, maxLength: 2000, description: "Optional shell command that exits 0 once the step is done. It must not print secret values." },
+      },
+      required: ["title", "steps", "when"],
+      additionalProperties: false,
+    },
+    async run(input) {
+      const title = text(input.title, "title", 200);
+      const steps = text(input.steps, "steps", 10000);
+      if (!MANUAL_WHEN.includes(input.when)) throw new Error("when must be one of: " + MANUAL_WHEN.join(", "));
+      const check = input.check === undefined ? null : text(input.check, "check", 2000);
+      const data = await linear(MANUAL, { id: issueId });
+      const issue = data.issue;
+      if (!issue || !issue.team) throw new Error("Linear did not return this ticket. Check that the host's key can see it.");
+      const viewer = data.viewer && data.viewer.id;
+      if (!viewer) throw new Error("Linear did not return the connected user.");
+      const wanted = title.toLowerCase();
+      const children = (issue.children && issue.children.nodes) || [];
+      const finished = (child) => FINISHED_TYPES.includes(child.state && child.state.type);
+      // Linear's children list can lag behind a task created a moment ago; the local record does not.
+      const existing = children.find((child) => child.title.trim().toLowerCase() === wanted && !finished(child))
+        || (await recordedManualTasks()).find((task) => task.parentId === issue.id && task.title.trim().toLowerCase() === wanted && !children.some((child) => child.id === task.id && finished(child)));
+      if (existing) return { identifier: existing.identifier, url: existing.url, deduped: true };
+      const all = states(issue);
+      const unstarted = all.find((s) => s.type === "unstarted");
+      const target = input.when === "after_merge" ? all.find((s) => s.type === "backlog") || unstarted : unstarted;
+      const description = steps + "\n\n---\nManual task for " + issue.identifier + ", " + WHEN_TEXT[input.when] + "." + (check ? " Marking it done runs this check, and a failing check reopens it:\n\n    " + check.split("\n").join("\n    ") : "");
+      const payload = { teamId: issue.team.id, title, description, parentId: issue.id, assigneeId: viewer };
+      if (target) payload.stateId = target.id;
+      const created = await linear("mutation manualTask($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier url } } }", { input: payload });
+      const task = created.issueCreate && created.issueCreate.success && created.issueCreate.issue;
+      if (!task) throw new Error("Linear did not create the task.");
+      if (input.when === "before_merge") {
+        const related = await linear("mutation manualBlocker($input: IssueRelationCreateInput!) { issueRelationCreate(input: $input) { success } }", { input: { issueId: task.id, relatedIssueId: issue.id, type: "blocks" } });
+        if (!related.issueRelationCreate || !related.issueRelationCreate.success) throw new Error("Created " + task.identifier + " but Linear did not mark it as blocking this ticket.");
+      }
+      try {
+        await recordManualTask({ id: task.id, identifier: task.identifier, url: task.url, title, parentId: issue.id, parentIdentifier: issue.identifier, when: input.when, check, cwd: process.cwd(), createdAt: new Date().toISOString(), announced: false, activated: input.when !== "after_merge", verifiedAt: null });
+      } catch (error) {
+        throw new Error("Created " + task.identifier + " but could not record it for the Paseo plugin: " + (error instanceof Error ? error.message : String(error)));
+      }
+      return { identifier: task.identifier, url: task.url, when: input.when, deduped: false };
     },
   },
 ];

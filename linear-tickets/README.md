@@ -121,6 +121,16 @@ returned links. Linked documents and attachments are not downloaded. If comments
 are unavailable, the preview and agent prompt say so. Context over 200,000 characters
 is rejected rather than silently truncated.
 
+**Finished blockers.** When a ticket starts after blockers that are finished (see *Waiting their turn*), its prompt gets a
+**Finished blockers** section after the instructions: for each one, its links (pull requests,
+plan documents; not the Paseo agent link) and its latest comments, newest first, up to 6,000
+characters per blocker and 24,000 in total. The plugin's progress and final-report cards,
+Linear's agent-thread stub and plan-approval questions are left out, so the room goes to the
+agents' own summaries. The agent is told to build on that work and to check that its base
+branch contains the merged changes. Blockers that still hold the ticket back never reach this
+point. If Linear cannot be read, the agent starts without the section
+and the launch warns.
+
 The ticket preview shows the ticket's project, team, labels, priority, dates (including
 due date and estimate when set), a status-history line, and a **Related tickets** section.
 That section includes the parent, subissues, blockers, blocked tickets, duplicates, and
@@ -151,16 +161,18 @@ forget them. Mappings are stored per host in `settings.json`.
 ## Agent access to Linear
 
 Agents started from a ticket get a `linear_ticket` MCP server (on by default, **Settings →
-Agent access to Linear** turns it off). Its tools act only on the ticket the agent started from:
+Agent access to Linear** turns it off). Its tools act only on the ticket the agent started from
+and its manual tasks:
 
 - `get_ticket` — fresh title, description, status, the team's workflow states, comments, links;
 - `add_comment` — post a Markdown comment;
 - `set_status` — move to another state of the ticket's team by name (canceled and duplicate
   states are left to people);
-- `link_url` — attach an https link, such as the pull request.
+- `link_url` — attach an https link, such as the pull request;
+- `add_manual_task` — register a step only a person can do; see [Manual tasks](#manual-tasks).
 
-The launch prompt tells the agent to comment when it starts and finishes, link its pull request
-and move the ticket to review; custom templates can place that note with `{{linear_access}}`,
+The launch prompt tells the agent to comment when it starts and finishes, link its pull request,
+move the ticket to review and register every manual step as a manual task; custom templates can place that note with `{{linear_access}}`,
 and it is appended when they do not. The server is a dependency-free script written to
 `$PASEO_HOME/linear-tickets/ticket-mcp-<hash>.mjs` and run with the daemon's own Node runtime
 (the desktop app's bundled runtime included), so it does not depend on `node` being on the
@@ -184,6 +196,8 @@ buttons) holds the plugin's per-host settings:
 - **Tickets shown** — include completed, canceled and duplicated tickets in the list
   and the status counts (off by default, keeping the list focused on open work).
 - **Default prompt** — replace the built-in launch prompt with a template (below).
+- **Auto-dispatch** — start agents for labeled tickets without opening Paseo (off by default; see below).
+- **Write back to Linear** — report ticket-linked agents' progress on the ticket (all off by default; see below).
 
 The last successful model, mode, and reasoning choices are stored in the same per-host
 settings file. They update automatically and do not need a separate settings toggle.
@@ -199,7 +213,9 @@ plan before coding, run the test suite, or open a pull request in a specific for
 Placeholders are substituted at launch time:
 
 - `{{ticket}}` — the ticket's ID and title
-- `{{instructions}}` — the per-launch "A little extra direction" text
+- `{{instructions}}` — the per-launch "A little extra direction" text plus the plugin's own notes
+  (plan policy, attachments, [repository orientation](#repository-orientation)); a template
+  without it gets it inserted just before `{{context}}`
 - `{{context}}` — the ticket snapshot (required; a template without it is rejected)
 
 Templates are limited to 8,000 characters, stored per host with the other plugin settings,
@@ -226,6 +242,490 @@ be made, the agent still starts and the failure appears as a warning with the re
 The transition is made just before the agent is created, so with agent access to Linear on,
 any status change the agent makes itself always comes after it.
 
+## Ticket attachments
+
+Files uploaded to Linear (`uploads.linear.app`) need the API key, so an agent cannot open
+them from the ticket's links. Every launch — manual or dispatched — downloads the uploads
+referenced in the description, comments and attachments into the workspace under
+`.linear/<ticket id>/` with their original names, adds `.linear/` to the checkout's git
+exclude list, and lists the local paths in the launch prompt. The key is sent only to
+`uploads.linear.app` and never reaches the agent. At most 20 files, 25 MB each and 100 MB
+in total are downloaded; a failed or skipped file becomes a launch warning, never a failure.
+
+## Repository orientation
+
+Every launch adds two things to the instructions, so the agent neither hunts for the
+repository's area guides nor fills its own context with exploration:
+
+- **Domain guides.** In a Git project, the plugin lists the checkout's tracked `AGENTS.md`
+  files (all but the root one) with each guide's first `# ` heading. Guides the ticket names are
+  listed first: `named in this ticket:` when the title, description or a comment contains the
+  guide's folder path (`apps/…/domains/sales` or `domains/sales`; the guides above it count too)
+  or a label equals the folder name; `possible match:` when only the folder name appears as a
+  word (`sales`, `demand planning`). Names only count for guides with sibling guides in the same
+  parent folder, such as the `domains/*` set. Matches are always listed; the remaining guides fill
+  up to 40 lines, and any further ones are counted. Only repository paths and headings are
+  written, never ticket text.
+- **Scout delegation.** After brief inline scoping, the agent delegates broad exploration to
+  read-only subagents in the same workspace (omp: `task` with the `scout` agent; Claude: the
+  Explore subagent; others: whatever their harness offers) and reads the files it changes itself.
+
+A guide that cannot be read is listed without its heading, and a failed `git ls-files` drops
+the list; both become a launch warning, never a failure. Non-Git projects get the scout
+sentence only.
+
+## Native Linear agent
+
+With a private Linear OAuth app named **Paseo** installed (`actor=app`), you can assign a ticket
+to Paseo or @mention it, and the whole conversation runs in Linear's agent panel on the ticket:
+- a "thinking" update within a second,
+- the commands the agent ran and its replies,
+- option buttons for its questions, and Approve/Deny for actions that need permission,
+- the plan as a checklist, with Approve plan / Send back deciding the Plannotator review directly,
+- Stop, which interrupts the running turn,
+- links to the plan review and the pull request.
+
+A delegation starts an agent exactly like the label: the saved project mapping and remembered
+provider are used, and the agent gets the label `linear.sessionId` next to `linear.issueId`. A
+mention on a ticket whose agent is running passes the text to that agent instead. Label and
+sidebar launches open a session too. Only the workspace owner (the user of the plugin's
+personal key) can start or steer agents; sessions from anyone or anything else get an error.
+
+**Setup**
+1. In Linear → Settings → API → Applications, create an app "Paseo":
+   - redirect URI `http://localhost:47832/callback`,
+   - webhooks on, URL `https://<machine>.<tailnet>.ts.net:8443/linear/agent`, categories *Agent session events* and *Permission changes*.
+2. Put `{"clientId","clientSecret","webhookSecret"}` into `$PASEO_HOME/linear-tickets/agent-app/app.json` (mode 0600).
+3. Install the app with `actor=app` and the scopes `read,write,app:assignable,app:mentionable`, and store the token response as `token.json` next to it.
+   The plugin refreshes it with the refresh token.
+4. Allow Tailscale Funnel for the machine.
+
+The plugin receives webhooks on `127.0.0.1:47831` and publishes only `/linear/agent` on port
+8443 with `tailscale funnel` (never 443). Each webhook is checked for its HMAC signature and a
+timestamp newer than 60 s, answered at once, and deduplicated. A sweep every minute picks up
+sessions and replies whose webhook was missed. Each of its parts (waiting tickets, superseded
+threads, reviews, "Open in Paseo" links, missed replies) and each thread's replies are handled on
+their own: a failed Linear request skips only what it hit until the next minute.
+**Settings → Linear agent** shows the state.
+
+**In the panel.**
+- The agent's commands and file edits show up while it works, merged at most every 4 seconds.
+- Each session links **Open in Paseo** (the web app at app.paseo.sh opens the agent when that browser is paired with this host).
+- Questions with several parts are asked one part at a time, and are answered together once all parts are in. "Other" options are not buttons: type your own answer instead.
+- **Stop** interrupts the turn and keeps the agent stopped (a turn the provider starts by itself within 5 minutes is stopped again) until you reply.
+- When a session exists, the plan review, its decision and pull-request review changes update the progress comment instead of adding comments. The panel's own messages are copied into the ticket thread by Linear.
+
+**Plan-first.** Every launch (sidebar, auto-dispatch, delegation, mention) picks one of three
+plan policies, first match wins:
+
+| Ticket | Policy |
+|---|---|
+| Carries `plan-ready` | No plan: the approved plan is implemented (below). |
+| Written by someone else, or labelled `feedback` | **Plan required**; `no-plan` does not apply, so the ticket's own text cannot skip its review. |
+| Labelled `plan`, or started with **Plan first** in the sidebar | **Plan required**. |
+| Labelled `no-plan` | No plan. |
+| Anything else | **The agent decides**. |
+
+*Plan required*: Claude starts in `plan` mode and Codex in `auto`; omp keeps your usual mode
+(its `write` mode asks before every shell command, reads included) and starts in Plannotator's
+planning phase instead. The prompt asks only for a plan and, for someone else's ticket, marks
+its text as untrusted input. With status write-back on, the ticket starts in **Planning** instead
+of In Progress. Approving the plan switches the agent to your usual mode.
+
+*The agent decides*: the prompt says to plan for a schema or migration change, auth or
+permissions, more than one app or service, a public or cross-service API change, unclear or
+conflicting acceptance criteria, or more than about three files, and to plan when unsure. omp
+agents start in the planning phase and leave it only through `skip_plan` with a one-sentence
+reason, which the ticket gets as a "No plan" note (the panel and progress comment with a Linear
+agent session). Other providers get the same rules as instructions.
+
+**Plan on a running agent.** Add `plan` to the ticket while its agent works: within a minute the
+plugin asks the agent for a plan. An omp agent enters the planning phase at its next tool call
+(that call is stopped and the reason follows as a message) or prompt, from implementing an approved plan too, and cannot
+`skip_plan` afterwards. Other providers only get the message. A label that was there when the
+agent started does nothing; remove and add it again to ask once more.
+
+**Plan advisor.** Every plan a ticket agent writes gets a second opinion before it reaches you.
+The planner (the model you launch tickets with; the model guard keeps it there) creates a GPT-6
+Astra advisor (`omp/openai-codex/gpt-6-astra`, thinking `medium`) with Paseo's `create_agent`, in
+its own workspace, so the advisor can read the same code. Both work from the same ticket context:
+each launch saves the agent's first prompt to `$PASEO_HOME/linear-tickets/plan-context/<request>.md`
+and passes the path in `LINEAR_TICKETS_CONTEXT`, and the advisor reads that file first (when the
+save fails, the launch warns and the planner pastes the ticket into the advisor's prompt). The
+planner adopts or answers each point and sends changes back to the same advisor with
+`send_agent_prompt` until they agree, at most three rounds. The plan then ends with an
+`## Advisor review` section: the advisor's model, the rounds, what changed, and every point still
+disputed with both positions, for you to decide in Plannotator.
+
+omp planners cannot skip this. Every ticket agent carries its ticket in `LINEAR_TICKETS_ISSUE`,
+and for those agents the extension blocks `plannotator_submit_plan`, its `xd://` device and omp's
+`xd://propose` until `record_plan_advice` has recorded the review for exactly the plan text being
+submitted; a plan the gate cannot read is blocked too. The tool checks with `paseo inspect` that
+the advisor runs GPT-6 Astra at medium, was created by this agent and has finished its latest
+turn; any later edit to the plan needs a new record, and the record follows the session branch
+(resume, `/tree` and branch switches rebuild it). It cannot check what the advisor said: the
+plan's advisor section is your record of that. Recording and submitting in one step works when the
+record comes first: the record is checked before any tool of that step runs, and a plan edit queued
+in the same step holds both back. Subagents of a ticket agent (`task` children) are not gated; the
+plan you review always comes from the ticket agent. An advisor that cannot be created (quota,
+provider error) is recorded as `unavailable` only when the plan's advisor section says so and gives
+the same reason. Claude and Codex planners get the steps as instructions when they launch in a
+planning policy, without the gate.
+
+**The omp extension.** The planning phase, `skip_plan` and the plan advisor gate come from
+[`omp/linear-tickets-plan-first.ts`](omp/linear-tickets-plan-first.ts), which omp loads from its
+extensions directory. Install it once with a symlink, so plugin updates reach it:
+
+```sh
+ln -s "$PWD/omp/linear-tickets-plan-first.ts" ~/.omp/agent/extensions/
+```
+
+It needs the Plannotator omp plugin (`@plannotator/pi-extension`). The plugin gives ticket agents
+the policy in `LINEAR_TICKETS_PLAN` (also after a daemon restart) and writes mid-run requests to
+`$PASEO_HOME/linear-tickets/plan-requests/<agent id>`. Only fresh sessions start in planning; a
+resumed agent keeps its phase.
+
+**`plan-ready`.** Every approved plan adds the `plan-ready` label: always for a split or
+“Approve, implement later”, and with status write-back on for Plannotator and panel approvals,
+where a new review round or a plan sent back removes it again.
+A ticket that carries it starts its next agent in your usual mode, with the approved
+“Plan: <ticket>” document in the prompt and the instruction to implement it rather than plan
+again.
+
+**Approve, implement later.** The plan review also offers **Approve, implement later**. The
+plan is saved as the plan document, the planning agent is closed (no Resume offer), and the
+ticket goes back to Todo with `plan-ready`. Reply in the panel, assign Paseo again or add the
+trigger label to start the implementing agent.
+
+**Link to the agent.** Each ticket gets an attachment "Paseo agent · <agent title>" next to its
+pull requests, linking to the agent in the Paseo web app (app.paseo.sh opens it on devices paired
+with this host). Its subtitle shows the phase and model; a new agent on the ticket replaces it.
+Every Linear thread linked to an agent has "Open in Paseo" under Links, and the Plan review link
+is there only while the review is open.
+
+**Ticket agents keep the launch model.** Every ticket agent runs the model and thinking level
+chosen for launches in the plugin. Plannotator's plan mode switches back to the model it saved when
+planning began once a plan is approved; the plugin notices within seconds (at most 20 s), restores
+the launch model and says so in the ticket's panel. To use another model for ticket work, change the
+launch model in the plugin; changing it on one agent in Paseo is undone.
+
+**Which model is working.** The progress comment, the final report, the plan review question and
+the plan document ("Planned with") show the model the agent runs, with its thinking level. When
+it changes between turns (you picked another model in Paseo, or Plannotator restored the model it
+saved before planning), the panel says so: `Model changed: A → B`.
+
+**Questions stay answerable.** Linear shows a question's buttons only while it is the newest
+entry in the panel, so the live feed holds the agent's commands until you reply. If an agent
+waits on several approvals at once (parallel tool calls), each is asked in turn.
+
+**After a reload.** The webhook receiver starts about a second after the plugin loads. If no
+agent activity hands the plugin a daemon connection within three seconds, it connects to the
+local daemon itself (only a loopback, password-free daemon), so replies sent while it was
+reloading are picked up by the minute sweep. Plannotator chat rows in Paseo need a hook's
+connection and are skipped until one arrives; Linear still gets the review.
+
+**Waiting their turn.** A ticket blocked by unfinished tickets, or started while *max agents*
+(Settings → Auto-dispatch)
+are already working, waits. A labelled ticket keeps its label; a delegated one says why in its
+panel. The minute sweep starts it once it is admitted, however long it waited. A delegated ticket
+whose thread was ended, or which was closed meanwhile, starts nothing; one that already has an
+agent (from its label, say) is linked to it; a failed start is reported in the panel once.
+Labelled tickets start most urgent first.
+A blocker is finished when it is Done or Canceled, or when it is in review (a started state named
+like *In Review* or *Ready to merge*) and its pull requests are merged: at least one merged and
+none open or draft, as Linear's GitHub integration reports them. Links added by hand or by
+`link_url` carry no status and do not count. A blocker In Progress, Needs input or In Review with
+an open pull request still holds the ticket back.
+
+**Split into sub-issues.** A plan with 2–12 steps also offers **Approve & split into N
+sub-issues**. The plan becomes the parent's plan document and the planning agent is closed.
+Each step becomes a sub-issue in Todo, assigned to Paseo, blocked by the step before, and the
+parent moves to In Progress with `plan-ready`. The steps run one after another: each starts when the previous
+one is finished, which for code means Done or in review with its pull requests merged.
+
+**Pull request reviews.** Every 2 minutes the plugin reads each ticket's pull request with
+`gh`. Requested changes post a panel update and move the ticket back to In Progress; fixes
+pushed after them move it to In Review again. An approval moves it to the team's started state
+**Ready to merge** (teams without one stay in In Review), once no [manual task](#manual-tasks)
+due before merge is open; commits pushed after the approval move
+it back to In Review. The merge is noted, and Done comes from Linear's GitHub integration.
+Requested changes on the current head also reach the agent itself; see the nudges below.
+
+**Graphite merge queue.** The queue lands a stack by fast-forwarding the base branch and closes
+the pull requests instead of merging them. A closed pull request labelled `externally-merged`
+(or whose last Graphite "Merge activity" bullet is "Merged by the Graphite merge queue") counts
+as merged, including its after-merge [manual tasks](#manual-tasks). A queue drop is noticed on
+an open pull request when Graphite's last Merge activity bullet ends the attempt (a conflict,
+"merge when ready" turned off, a failed check), or when the draft its latest "CI is running"
+bullet names was closed without its head reaching the base branch and no newer queue draft for
+the pull request is open. Without Merge activity, drafts alone never count. The ticket's agent
+gets the reason, the checks that did not pass on the draft and the runbook (on the stack's top
+branch `git fetch origin main && git rebase --update-refs --onto origin/main "$(git merge-base
+HEAD origin/main)"`, which moves only its own branches, never `gt sync`/`gt restack`; fix,
+`gt submit --stack --ignore-out-of-sync-trunk`, `gt merge`; one plain `gt merge`
+retry for an obviously flaky failure) as a new message once it is idle; Paseo resumes it if it
+has stopped. While the agent is in a turn or waiting for an answer, or Paseo is not connected,
+the message waits for a later poll. When the agent is gone or archived, the same text becomes a
+ticket comment mentioning you, and the ticket moves back to In Progress (when status write-back
+is on). Each drop is claimed in `$PASEO_HOME/linear-tickets/pr-watch.json` (by its draft, or by
+the bullet when there is none) before anything is sent, so it is delivered at most once, also
+across restarts. After two fix requests for a pull request, the third drop only mentions you
+("the merge queue dropped this stack three times"), and later drops are only logged. An
+archived agent's open pull request stays watched until that escalation or 14 days without
+activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
+
+**Stalled pull requests.** Agents often stop before their pull request reaches the merge queue.
+On each poll, an open pull request whose agent is idle gets the next step of its lifecycle as a
+new message, the first that applies:
+
+| Stage | When | Next step sent |
+|---|---|---|
+| Draft | a draft with no new commit and no pull request activity for 30 minutes | run the background Sol review if not done, then `gt submit --stack --publish` |
+| Failed checks | a ready pull request whose latest run of a check failed (pending runs and `Graphite / mergeability_check` do not count) | the failed checks with links; fix, then `gt submit --stack` |
+| Changes requested | a reviewer's latest approving, change-requesting or dismissed review asks for changes (on any commit), or GitHub's review decision is "changes requested" | each such review and the unresolved review threads; address them, then `gt submit --stack` (for a review on an earlier commit: reply on its threads and re-request the review) |
+| Findings | unresolved review threads a bot started (Greptile, any bot reviewer) | the findings; run the AGENTS.md review loop |
+| Merge | `PR code` and `PR metadata` ran on the head and succeeded or were skipped (so did `Label queued PRs for Linear` when it ran), every other check is green (except Graphite's mergeability check), no change request is open, no review thread is unresolved, and Greptile has reviewed the current head when the pull request has `complex-review` | `gt merge`, then `node tools/ci/wait-queue.mjs <top PR>` |
+
+Nothing is sent for a pull request labelled `do-not-merge`, while [manual tasks](#manual-tasks)
+due before the merge are open, while the merge queue has it (its last Merge activity bullet
+queues it, runs its CI or merged it, or an open queue draft lists it), or while a merge queue
+drop is being handled; these are settled before review threads are read. An agent gets at most
+one message per poll: merge queue drops of all its pull requests come first, then nudges, so the
+pull requests of one stack take turns. Each stage is claimed per head right before it goes out:
+a new head can be nudged again, at most twice per stage and pull request. Requested changes are
+claimed per review instead: a change request is sent once, however many commits follow it (it
+keeps holding the merge until the reviewer settles it), and a new request is sent again. The next time that
+stage stalls, you get one comment instead ("Paseo asked the agent 2 times to …"), and after
+that only the log. A busy or disconnected agent is asked on a later poll; a gone or archived
+agent's nudge goes to the ticket like a drop's fix request (it counts toward the same two).
+Review threads are read (GraphQL, every page) only when a stage needs them.
+
+**Health.** Every 5 minutes the plugin checks the Linear key, the Paseo app, Tailscale Funnel
+and the local receiver. A problem confirmed twice opens one urgent ticket, "⚠️ Paseo needs
+attention", assigned to you (in the first auto-dispatch team), so Linear notifies you. The ticket
+is updated while problems change and completed when all checks pass again. Failed Linear writes
+caused by outages (HTTP 5xx, rate limits, network) are retried after 30 s and 2 min.
+
+**Durable record and resume.** Every ticket agent keeps one "Paseo progress" comment, edited
+in place: phase, branch, last commit, links, latest report. When the agent fails or is
+archived while the ticket is open, it also posts a final report. The panel then offers
+**Resume with a new agent**, which is automatic when *Start a new agent automatically when one
+fails* is on (at most hourly). Assigning Paseo again, @mentioning it or re-adding the label
+also resumes. The new agent continues on the same branch, reusing the old worktree while it
+exists so uncommitted work survives. It starts with a handover of the previous agent's reports,
+and the old agent is archived.
+
+## Plannotator reviews
+
+Plannotator shows its review URL only in omp's own status line, which Paseo does not display.
+The plugin sets `PLANNOTATOR_BROWSER` for every agent session to a small hook
+(`$PASEO_HOME/linear-tickets/plannotator/open`). When a review starts, the hook still opens it
+on the host. It also publishes the review port inside your tailnet with `tailscale serve`
+(HTTPS, reachable only from your devices). The agent's Paseo chat then gets a “Handed off to
+Plannotator” row with the link. Agents linked to a ticket also get it in the Linear comment (or
+the panel's “Plan review” link), so reviews open on your phone.
+
+**One stable link per agent.** Each review gets its own port, and Plannotator's server stops
+once the plan is decided or the agent restarts, so a per-review link goes dead with the next
+round. The link the plugin posts is therefore the agent's stable one,
+`https://<machine>.<tailnet>.ts.net:8444/review/<agentId>`, served from `127.0.0.1:47832` with
+`tailscale serve` (tailnet-only; never Funnel — 8443 stays the only public port):
+
+- while the agent's latest review is running it redirects there, so a link already on Linear
+  opens the next review after a re-plan;
+- once that review has ended it shows a small “Review closed” page with the outcome (approved,
+  sent back or ended) and the ticket;
+- an agent the plugin never saw a review for gets 404.
+
+Reviews are tracked in `$PASEO_HOME/linear-tickets/plannotator/reviews.json`. Every 30 s the
+plugin checks each open review's server; after two failed checks it removes that review's
+`tailscale serve` route and marks the review closed. Only ports recorded there are ever turned
+off. When `:8444` cannot be published, the per-review link is posted as before.
+
+With status write-back on, a ticket moves to its team's started state named **Planning**
+when a plan is handed off (and stays there when it is sent back), and to **In Progress** once
+the plan is approved. Create a “Planning” state of type *started* in the team for this; teams
+without one are left alone.
+
+When a review is decided, the omp plan extension (`~/.omp/agent/extensions/plannotator-omp-plan.ts`)
+records the plan and your feedback. The plugin then adds a chat row and, for ticket agents,
+replaces the ticket's “Plan: <ticket>” document with the reviewed plan, and comments the outcome
+with a link to it. Plannotator's own plan mode only reports approved hand-offs, so plans sent
+back from that mode are not recorded. Without Tailscale the local link is used. Agents that
+started before this feature need a new session to get the hook.
+
+## Auto-dispatch
+
+With **Settings → Auto-dispatch** on, the plugin polls Linear (every 60 seconds by default,
+30–3600 allowed) for open tickets that carry the trigger label (`paseo` by default) in the
+listed team keys (for example `ENG, OPS`). No teams means nothing is dispatched. Tickets are
+picked up **whoever they are assigned to**: anyone who can label a ticket in those teams can
+start an agent on this host, with the ticket text as its prompt. Only list teams you trust.
+
+For each ticket the plugin first swaps the trigger label for `<label>-running` — Linear is
+the lock, so a later poll, a plugin reload or a daemon restart never starts a second agent —
+then launches exactly as the sidebar would: the saved project mapping (never a name-match
+guess) and its base branch (or the repository default), your last-used provider, model,
+mode and reasoning level, the default prompt, the In Progress setting and agent access to
+Linear. A short comment on the ticket names the provider and project. If the ticket already
+has an active Paseo agent, no second one starts. When a launch cannot proceed — no mapping,
+no remembered provider, an unavailable project — the ticket gets `<label>-failed` and a
+comment saying why; fix the cause and add the trigger label again.
+
+Paseo gives plugin code its daemon connection only inside RPCs and lifecycle hooks, so
+polling starts at the first of these after the plugin loads: opening the ticket surface,
+saving a setting, or any agent or workspace activity on the host (agents resumed after a
+daemon restart count). The surface's Settings shows the last poll,
+its error and the most recent dispatches.
+
+## Write back to Linear
+
+For agents carrying the `linear.issueId` label (every agent started from a ticket, manually
+or dispatched), **Settings → Write back to Linear** can report their lifecycle on the ticket
+using this host's key, independently of the agent's own `linear_ticket` tools:
+
+- **Status** — the agent's first turn moves the ticket into its team's In Progress state,
+  following the same rules as the launch-time setting. A completed or canceled ticket is left
+  as it is: an agent still working after its merge closed the ticket does not reopen it.
+- **Turn summaries** — each completed turn's final reply is posted as a comment (capped at
+  4,000 characters), a failed turn posts its error, and archiving an agent that never linked
+  a pull request says so.
+- **Blocked alerts** — when the agent waits for you (a question, a plan approval, a
+  permission still pending after a moment, or a turn that ends by asking you), the ticket
+  shows it three ways, also when the agent panel asks:
+  - it moves to the team's **Needs input** workflow state (type Started; create it in the
+    team's workflow settings, teams without it skip this step),
+  - it gets the red `<label>-needs-you` label (created on first use), handy for a saved
+    "Waiting on me" view,
+  - one comment @mentions you, so Linear notifies your inbox and phone. It names the
+    question, its options and how to reply. It is written as the Paseo app when installed
+    (Linear does not notify you of your own mentions, and the plugin's key is yours), and it
+    mentions whoever opened the agent's Linear session, else the ticket's creator.
+  Further questions in the same wait edit that comment. Once nothing is pending (a follow-up
+  question arriving within seconds keeps the wait open), and when the turn ends or the agent
+  is archived, the label comes off and the ticket returns to its previous state, unless
+  someone moved it out of Needs input meanwhile. The next wait gets a fresh comment. A
+  failed turn adds `<label>-blocked`, which marks errors only; the next completed turn
+  removes it. Started agents are asked to put everything they need from you (answers,
+  decisions, approvals, secrets, manual steps) into one question request.
+  As a fallback, a completed turn whose final reply ends by asking you (a question, or a
+  phrase such as "needs your OK", "once you decide" or "reply "yes" and I'll") opens a
+  wait too; the comment quotes that part of the reply. It lasts until the agent's next turn
+  starts. Plan approval requests are left to the plan review.
+- **Waits after the ticket closed** — a merge commit's `Closes` moves the ticket to Done while
+  its agent may still need you (a deploy decision, a step after merge). A closed ticket stays
+  closed: the wait opens a **"Needs you: …" sub-issue** instead, in Needs input (Todo on teams
+  without it), assigned to you, with the `<label>-needs-you` label and the mention comment.
+  Further questions in the same wait edit that comment, and while the sub-issue is open the
+  agent's later waits on the ticket reuse it. It is closed for you when the question or
+  approval is answered (in Paseo or in Linear), or when you reply on it with `@paseo …`, which
+  goes to the agent that asked. A wait that ended otherwise (for example the agent's next turn
+  started) may be a manual step, so that sub-issue stays open until you close it. Archiving the
+  agent leaves its open sub-issues for you; replies there no longer reach anyone.
+- **Pull requests** — GitHub pull request URLs printed by the agent's completed shell
+  commands during a turn (for example `gh pr create`) are attached to the ticket, which then moves to its team's
+  started state named like *In Review*. Completion is left to Linear's GitHub integration.
+
+- **Replies from Linear** — your own comments that start with `@paseo` reach the ticket's
+  agent (the newest active one) within one poll interval. If the agent is waiting on a
+  question, the comment is the answer (an option name picks that option). If it is waiting
+  on an approval, `@paseo approve` / `@paseo deny <reason>` decides it. Otherwise the text is
+  sent as a message. Its reply comes back as a turn summary, so the conversation stays in
+  Linear. Delivered comments get a 👀 reaction; undeliverable ones get ❌ and a reply saying
+  why. All linked tickets are read in one request per poll, each from a cursor kept in
+  `$PASEO_HOME/linear-tickets/relay-cursors.json`, so neither a restart nor a long pause
+  delivers a comment twice or skips one. Comments by other people, and comments without the
+  mention, are ignored. Blocked alerts end with how to reply. With the Paseo app installed,
+  Linear turns a typed `@paseo` into a mention of the app: that comment reaches the agent
+  through its agent session right away, with the same question and approval rules, and the
+  relay leaves it alone.
+
+Archiving a linked agent always removes `<label>-running`. Subagents never report. Paseo
+delivers lifecycle events live and best-effort: events while the plugin is stopped are not
+replayed, and a Linear failure is logged (`paseo plugin logs linear-tickets`) without
+affecting the agent. A write-back that hits Linear's rate limit waits for the quota instead
+(see [Rate limits](#rate-limits)).
+
+## Ticket state in the sidebar
+
+Each workspace with a ticket agent carries one workspace label naming its ticket's current Linear
+state, for example `Linear: In Review`. The sidebar shows it as a chip next to the pull request
+badge. Labels that start with `Linear: ` belong to the plugin. When the state changes, the old one
+is removed, and workspaces without a ticket agent lose theirs. Other labels are never touched.
+The colour comes from the state type: triage orange, backlog indigo, unstarted sky, completed
+emerald, canceled red. Started states are split by name: review violet, merge teal, planning blue,
+needs input pink, and anything else, such as In Progress, amber. A workspace whose agents work on
+different tickets shows the ticket its name carries (`TUC-1: …` or a `tuc-1-…` branch). Otherwise
+it shows the ticket of its oldest agent.
+
+States are read about once a minute in one batched Linear request, on the app's pool like the
+other polled reads. A state the plugin sets itself shows at once, and a new agent's workspace is
+labelled within seconds. The plugin SDK cannot set workspace labels, so this uses the daemon's
+internal `workspace.label.*` protocol. It connects to the local daemon the way the `paseo` CLI
+does: the address in `$PASEO_HOME/paseo.pid` and `PASEO_PASSWORD` when the daemon needs one.
+A daemon without that API, or a lost connection, is logged once per cause and affects nothing
+else.
+
+## Rate limits
+
+Linear meters requests per credential and hour: **2,500** for the personal API key (shared by
+every key of the same Linear user) and **5,000** for the Paseo app's token. Both refill
+steadily, so the plugin estimates each pool's room from the `X-RateLimit-Requests-Remaining`
+header of the last answer plus the refill since then.
+
+- **Reads that pollers repeat use the app's pool** when the Paseo app is installed: the relay's
+  comment read, the auto-dispatch label query, ticket state, manual-task status and the sidebar
+  state labels. The key reads them only when the app is not installed, its token cannot be
+  refreshed, or it cannot see a ticket. An app rate limit never falls back to the key. Writes
+  always use the key, so nothing changes author.
+- **Background work stops at a 15% reserve** of the pool it needs: auto-dispatch, the relay,
+  manual tasks, the pull request watch, the state labels and the health check. It resumes on its
+  own as the pool refills. Session prompts, write-backs, agents' `linear_ticket` tools and the
+  sidebar ticket list still use the reserve. The **Auto-dispatch** status shows `paused: …` with
+  the estimated time, and the plugin log records each pause once.
+- **When Linear answers `RATELIMITED`**, requests on that pool wait until the estimate reaches
+  the reserve again (at least a minute). Then exactly one request tries, and a second limit
+  doubles the wait, up to 15 minutes. Session errors and agent tools say when to try again.
+- **Write-backs are not dropped.** A rate-limited write-back is retried when the pool refills,
+  for up to 6 hours. A retry that a newer event for the same agent overtook only links its
+  pull requests: those are kept in `$PASEO_HOME/linear-tickets/writeback-outbox.json` until
+  they are linked on the ticket, in the agent panel and in the handover record, even across
+  restarts. Retries never repeat a comment or panel activity that already went out.
+
+## Manual tasks
+
+Some steps only a person can do: environment variables and secrets, Railway, Linear, GitHub or
+Paseo settings, webhooks, integrations. Agents register each one with `add_manual_task` instead
+of leaving it in a comment. Each task is a **sub-issue of the ticket, assigned to you** (the
+owner of the plugin's key), with the steps in its description and one of three due points:
+
+| `when` | Created in | Effect |
+|---|---|---|
+| `before_merge` | Todo | Blocks the ticket. An approved pull request keeps the ticket in *In Review* instead of *Ready to merge* until the task is done |
+| `after_merge` | Backlog (Todo on teams without one) | Moves to Todo when the ticket's pull request merges |
+| `anytime` | Todo | Due now, never gates anything (for example "before the production release") |
+
+A task with the same title as an open sub-issue is not created twice. Within about a minute,
+new tasks get the orange `<label>-manual` label and the ticket gets one comment that @mentions
+you and lists them, written as the Paseo app so it reaches your inbox and phone. Once the pull
+request merges, one more mention lists what is due now and any before-merge task that was
+still open. Merging on GitHub is never blocked; the gate is the ticket state only. Archived
+agents stay watched until their after-merge tasks are due.
+
+**Checks.** A task can carry a shell command that exits 0 once the step is done, for example a
+script that confirms a Railway variable exists. When you mark the task done, the plugin runs it
+(no stdin, 60 s timeout, in the agent's worktree, or your home directory when that is gone):
+a pass comments "✓ Verified", a failure moves the task back to Todo and mentions you. The
+output only goes to `paseo plugin logs linear-tickets`, never to Linear, since it could hold a
+secret. A before-merge task marked done still gates until its check passes. The command is
+read only from `$PASEO_HOME/linear-tickets/manual-tasks/<task>.json` (private, written by the
+agent's MCP server); editing the Linear description never changes what runs. Checks run as the
+daemon's user, the same trust as the agent's own shell.
+
+A saved Linear view of label `<label>-manual`, assignee *me*, status not completed or canceled
+lists everything waiting on you. Keep the team setting that closes a parent when all its
+sub-issues are done **off**, or finishing the tasks closes the ticket.
+
 ## Connection storage
 
 The API-key form stores the key on the daemon host in
@@ -240,8 +740,8 @@ permission pattern. The ticket snapshot cache lives in `cache.json` with the sam
 private permissions; its credential scope is a one-way hash, never the API key itself.
 
 The plugin talks directly to Linear's official [GraphQL API](https://linear.app/developers/graphql)
-at `https://api.linear.app/graphql`. Its queries are read-only; the only write is the
-optional In Progress transition made when a launch is explicitly opted in. Only the
+at `https://api.linear.app/graphql`. Its queries are read-only unless you opt in: the
+In Progress transition, auto-dispatch and write-back are the only writes. Only the
 server contacts Linear. The key is never added to ticket context, agent configuration,
 or agent labels.
 
@@ -254,7 +754,8 @@ start again. This retry cache does not survive a plugin or daemon restart.
 
 `npm run typecheck` checks both entrypoints against Paseo's SDK. `npm test` covers
 GraphQL response parsing, pagination, context preservation, prompt template rendering
-and validation, credential and settings persistence, ticket retrieval, state-transition
+and validation, repository orientation (guide matching, ranking and the cap), credential and
+settings persistence, ticket retrieval, state-transition
 resolution and failure handling, and agent creation/retries with mocked Linear and Paseo
 calls.
 Live account authentication and agent execution require your configured host and key.

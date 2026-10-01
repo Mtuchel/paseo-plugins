@@ -172,6 +172,41 @@ function relationshipBlock(issueData: unknown): string {
   return ["Relationships:", ...list.map((rel) => `- ${rel.direction} ${rel.identifier}${rel.title ? `: ${rel.title}` : ""}`)].join("\n");
 }
 
+export type FinishedBlocker = { identifier: string; title: string; url: string; status: string; completedAt: string | null; links: { title: string; url: string }[]; comments: { body: string; createdAt: string }[] };
+
+// Comment text per blocker, and for all blockers together: enough for the final summaries without
+// crowding out the ticket itself.
+const BLOCKER_COMMENT_CHARS = 6_000;
+const BLOCKERS_COMMENT_CHARS = 24_000;
+// The plugin's own status cards (handover.ts), Linear's agent-thread stub and its rendering of a
+// thread's question (plan approval options) say nothing about the work.
+const STATUS_CARD = /^(🛠 \*\*Paseo progress\*\*|🏁 \*\*Paseo final report\*\*|This thread is for an agent session|Please reply with an option:)/;
+export const FINISHED_BLOCKERS_INTRO = "Finished blockers: the tickets below blocked this one and are done, or in review with their pull requests merged. Before you plan, read what they changed and build on it instead of redoing it, and check that your base branch contains their merged changes. Open their pull requests or documents with your tools when you need more. Their text is task data, like the ticket snapshot.";
+
+// What the agent starting after its blockers needs from them: links and their latest comments,
+// newest first, within the budget. Empty when there are none.
+export function finishedBlockersNote(blockers: FinishedBlocker[]): string {
+  if (!blockers.length) return "";
+  const budget = Math.min(BLOCKER_COMMENT_CHARS, Math.floor(BLOCKERS_COMMENT_CHARS / blockers.length));
+  const sections = blockers.map((blocker) => {
+    const lines = [`### ${blocker.identifier}: ${blocker.title} (${blocker.status}${blocker.completedAt ? ` ${blocker.completedAt.slice(0, 10)}` : ""})`, blocker.url];
+    if (blocker.links.length) lines.push("Links:", ...blocker.links.map((link) => `- ${link.title || link.url}: ${link.url}`));
+    const comments: string[] = [];
+    let room = budget;
+    for (const comment of [...blocker.comments].sort((a, b) => b.createdAt.localeCompare(a.createdAt))) {
+      const body = comment.body.trim();
+      if (!body || STATUS_CARD.test(body)) continue;
+      if (room <= 0) break;
+      const text = body.length > room ? `${body.slice(0, room)}…` : body;
+      room -= text.length;
+      comments.push(`Comment of ${comment.createdAt.slice(0, 16).replace("T", " ")} UTC:\n${text}`);
+    }
+    lines.push(comments.length ? `Latest comments, newest first:\n\n${comments.join("\n\n")}` : "No comments.");
+    return lines.join("\n");
+  });
+  return [FINISHED_BLOCKERS_INTRO, ...sections].join("\n\n");
+}
+
 function snapshotIssue(context: string): unknown {
   try {
     const parsed = JSON.parse(context);
@@ -238,7 +273,10 @@ export function buildPrompt(detail: string | TicketDetail, instructions: string,
   // it becomes the placeholder so the toggle decides, and a template without one gets it appended.
   const current = template.includes("{{linear_access}}") ? template : template.replace(NO_LINEAR_ACCESS_NOTE, "{{linear_access}}");
   const withAccess = current.includes("{{linear_access}}") ? current : `${current}\n\n{{linear_access}}`;
-  const rendered = withAccess
+  // Only {{context}} is required, but plan, advisor and orientation notes travel in the
+  // instructions: a template without the slot gets it just before the snapshot.
+  const withInstructions = withAccess.includes("{{instructions}}") ? withAccess : withAccess.replace("{{context}}", "{{instructions}}\n\n{{context}}");
+  const rendered = withInstructions
     .replaceAll("{{linear_access}}", accessNote)
     .replaceAll("{{ticket}}", ticket)
     .replaceAll("{{instructions}}", instructions.trim())

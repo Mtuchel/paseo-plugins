@@ -1,9 +1,13 @@
+import { MAX_ATTACHMENT_BYTES } from "./attachments";
 import type { Issue, TicketDetail } from "../shared/contracts";
-import { buildContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations } from "./context";
+import { buildContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations, type FinishedBlocker } from "./context";
 import { Credentials } from "./credentials";
+import { poolOf, rateBudget, RateLimitedError, type RateBudget } from "./rate-budget";
 
 const endpoint = "https://api.linear.app/graphql";
 export type Post = (key: string, query: string, variables: Record<string, unknown>) => Promise<Record<string, unknown>>;
+// Reads with the Paseo app's token (AgentApi.query); null when the app cannot be used on this host.
+export type Reader = { query(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown> | null> };
 
 // GraphQL error payloads carry a user-facing message, sometimes clearer than the HTTP status alone.
 function apiMessage(payload: unknown): string {
@@ -18,7 +22,10 @@ function apiMessage(payload: unknown): string {
   return messages.length > 300 ? messages.slice(0, 300) + "…" : messages;
 }
 
-export const postGraphQL: Post = async (key, query, variables) => {
+// Every request passes the pool's budget first (see rate-budget.ts); the response headers update it.
+export async function postGraphQL(key: string, query: string, variables: Record<string, unknown>, budget: RateBudget = rateBudget): Promise<Record<string, unknown>> {
+  const pool = poolOf(key);
+  const ticket = budget.acquire(pool);
   let response: Response;
   try {
     response = await fetch(endpoint, {
@@ -30,29 +37,42 @@ export const postGraphQL: Post = async (key, query, variables) => {
       signal: AbortSignal.timeout(30_000),
     });
   } catch {
+    ticket.done(null, false);
     throw new Error("Could not reach the Linear API. Check the host's network connection and try again.");
   }
   let payload: unknown = null;
   try { payload = await response.json(); } catch { /* Mapped by status below. */ }
+  // Linear answers an exhausted limit with HTTP 400 and the RATELIMITED code, not with 429.
+  const limited = response.status === 429 || Boolean(payload && typeof payload === "object" && "errors" in payload && Array.isArray(payload.errors)
+    && payload.errors.some((error: unknown) => Boolean(error && typeof error === "object" && "extensions" in error && error.extensions
+      && typeof error.extensions === "object" && "code" in error.extensions && error.extensions.code === "RATELIMITED")));
+  ticket.done(response.headers, limited);
+  if (limited) throw new RateLimitedError(pool, budget.pausedUntil(pool) ?? Date.now());
   if (!response.ok) {
     const message = apiMessage(payload);
     if (response.status === 401 || response.status === 403) {
       throw new Error(`Linear rejected this API key.${message ? ` ${message}` : ""} Check it in Linear settings and reconnect.`);
     }
-    if (response.status === 429) throw new Error(`Linear is rate-limiting this host.${message ? ` ${message}` : ""} Try again in a moment.`);
     if (message) throw new Error(`The Linear API request failed: ${message}`);
     throw new Error(`The Linear API request failed (HTTP ${response.status}). Try again.`);
   }
   if (payload == null) throw new Error("Linear returned an invalid response.");
   const body = record(payload);
   if (Array.isArray(body.errors) && body.errors.length > 0) {
+    // Linear's `message` is often generic ("Unable to create issue attachment"); the reason is in
+    // `userPresentableMessage` ("This URL has already been linked with TUC-96."), so both are kept.
     const message = body.errors
-      .map((error) => (error && typeof error === "object" && "message" in error && typeof error.message === "string" ? error.message : ""))
+      .map((error) => {
+        if (!error || typeof error !== "object" || !("message" in error) || typeof error.message !== "string") return "";
+        const detail = "extensions" in error && error.extensions && typeof error.extensions === "object" && "userPresentableMessage" in error.extensions
+          && typeof error.extensions.userPresentableMessage === "string" && error.extensions.userPresentableMessage !== error.message ? ` (${error.extensions.userPresentableMessage})` : "";
+        return error.message + detail;
+      })
       .filter(Boolean).join("; ");
     throw new Error(`The Linear API request failed${message ? `: ${message}` : "."} Check your API key and ticket access, then retry.`);
   }
   return record(body.data);
-};
+}
 
 export const VIEWER_QUERY = `query viewerCheck {
   viewer { id }
@@ -166,7 +186,7 @@ export const TEAM_STATES_QUERY = `query teamStates($teamId: String!) {
   team(id: $teamId) { states(first: 50) { nodes { id name type position } } }
 }`;
 
-// The plugin's only write: move one ticket into a team's "started" state.
+// Moves one ticket into another state of its team (In Progress at launch, review on a PR).
 export const UPDATE_ISSUE_STATE_QUERY = `mutation issueUpdateState($id: String!, $stateId: String!) {
   issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { id state { name type } } }
 }`;
@@ -185,6 +205,170 @@ export function resolveStartedState(states: TeamState[], preferredId?: string): 
   return started.find((state) => state.name.trim().toLowerCase() === "in progress") ?? started[0] ?? null;
 }
 
+// Where a linked pull request moves the ticket: a "started" state whose name mentions
+// review. Teams without one are left alone rather than guessed at.
+export function resolveReviewState(states: TeamState[]): TeamState | null {
+  return states
+    .filter((state) => state.type.trim().toLowerCase() === "started" && /review/i.test(state.name))
+    .sort((a, b) => a.position - b.position)[0] ?? null;
+}
+
+// Auto-dispatch: open tickets carrying the trigger label in the allowed teams, whoever
+// they are assigned to. Completed and canceled work never launches.
+export const LABELED_ISSUES_QUERY = `query labeledIssues($first: Int!, $filter: IssueFilter) {
+  issues(first: $first, includeArchived: false, orderBy: updatedAt, filter: $filter) {
+    nodes { id identifier priority team { key } labels(first: 50) { nodes { id name } } }
+  }
+}`;
+
+export function labeledIssueFilter(label: string, teamKeys: string[]): Record<string, unknown> {
+  return {
+    labels: { some: { name: { eqIgnoreCase: label } } },
+    team: { key: { in: [...new Set(teamKeys)].sort() } },
+    state: { type: { nin: ["completed", "canceled"] } },
+  };
+}
+
+// The labels of the tickets running agents work on, for mid-run plan requests (plan-requests.ts).
+export const ISSUE_LABELS_QUERY = `query issueLabels($first: Int!, $ids: [ID!]) {
+  issues(first: $first, includeArchived: true, filter: { id: { in: $ids } }) {
+    nodes { id labels(first: 50) { nodes { id name } } }
+  }
+}`;
+const ISSUE_LABELS_BATCH = 50;
+
+// `priority`: Linear's 1 (urgent) … 4 (low); 0 means none and sorts last.
+export type LabeledIssue = { id: string; identifier: string; teamKey: string; priority: number; labels: { id: string; name: string }[] };
+
+// The current state, team, labels and attachment links of one ticket: enough for
+// write-back decisions without the comment pagination that `detail` performs.
+export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
+  issue(id: $id) {
+    id identifier state { id name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
+    inverseRelations(first: 50) { nodes { type issue { identifier state { name type } attachments(first: 25) { nodes { url sourceType metadata } } } } }
+  }
+}`;
+// `status`: the workflow state's name ("In Review"); `statusType` its kind ("started").
+export type IssueStatus = { status: string; statusType: string; completedAt: string | null };
+export const ISSUE_STATUSES_BATCH = 250;
+export const ISSUE_STATUSES_QUERY = `query issueStatuses($ids: [ID!]!) {
+  issues(first: ${ISSUE_STATUSES_BATCH}, filter: { id: { in: $ids } }) { nodes { id state { name type } completedAt } }
+}`;
+// A state the plugin itself just moved a ticket into, from the mutation's own answer.
+export type WrittenState = { name: string; type: string };
+
+// A blocker in review (In Review, Ready to merge) whose pull requests are merged has its code in:
+// the tickets waiting on it may start before someone marks it Done. Only pull requests Linear's
+// GitHub integration tracks have a status; at least one must be merged and none open or draft.
+export function inReviewState(name: string, type: string): boolean {
+  return type === "started" && /review|merge/i.test(name);
+}
+function pullRequestsMerged(attachments: unknown): boolean {
+  const statuses = connection(attachments ?? { nodes: [] }).nodes.map((node) => record(node))
+    .filter((node) => label(node.sourceType) === "github" && /\/pull\/\d+/.test(label(node.url)) && node.metadata && typeof node.metadata === "object")
+    .map((node) => label(record(node.metadata).status));
+  return statuses.includes("merged") && !statuses.some((status) => status === "open" || status === "draft");
+}
+
+// `blockedBy`: identifiers of unfinished tickets that block this one (merged reviews count as finished).
+export type IssueState = {
+  id: string; identifier: string; status: string; statusId: string; statusType: string; teamId: string | null; projectId: string | null; creatorId: string | null;
+  labels: { id: string; name: string }[]; attachmentUrls: string[]; blockedBy: string[];
+};
+export const CREATE_ISSUE_QUERY = `mutation issueCreate($input: IssueCreateInput!) {
+  issueCreate(input: $input) { success issue { id identifier url } }
+}`;
+export const DELEGATE_QUERY = `mutation delegate($id: String!, $delegateId: String!) {
+  issueUpdate(id: $id, input: { delegateId: $delegateId }) { success }
+}`;
+export const RELATION_QUERY = `mutation relation($input: IssueRelationCreateInput!) {
+  issueRelationCreate(input: $input) { success }
+}`;
+export const TEAM_BY_KEY_QUERY = `query teamByKey($key: String!) {
+  teams(first: 1, filter: { key: { eq: $key } }) { nodes { id } }
+}`;
+
+export const LABEL_BY_NAME_QUERY = `query labelByName($name: String!) {
+  issueLabels(first: 1, filter: { name: { eqIgnoreCase: $name } }) { nodes { id name } }
+}`;
+export const CREATE_LABEL_QUERY = `mutation labelCreate($input: IssueLabelCreateInput!) {
+  issueLabelCreate(input: $input) { success issueLabel { id name } }
+}`;
+// A user's profile URL (https://linear.app/<workspace>/profiles/<name>): in a comment, Linear
+// renders it as an @mention and notifies that user.
+export const USER_URL_QUERY = `query userUrl($id: String!) {
+  user(id: $id) { url }
+}`;
+export const ADD_LABEL_QUERY = `mutation addLabel($id: String!, $labelId: String!) {
+  issueAddLabel(id: $id, labelId: $labelId) { success }
+}`;
+export const REMOVE_LABEL_QUERY = `mutation removeLabel($id: String!, $labelId: String!) {
+  issueRemoveLabel(id: $id, labelId: $labelId) { success }
+}`;
+export const CREATE_COMMENT_QUERY = `mutation comment($input: CommentCreateInput!) {
+  commentCreate(input: $input) { success comment { id } }
+}`;
+export const UPDATE_COMMENT_QUERY = `mutation commentUpdate($id: String!, $input: CommentUpdateInput!) {
+  commentUpdate(id: $id, input: $input) { success }
+}`;
+// One attachment per ticket links to the Paseo agent working on it; Linear updates an
+// attachment in place when the issue and URL match.
+export const UPSERT_ATTACHMENT_QUERY = `mutation upsertAttachment($input: AttachmentCreateInput!) {
+  attachmentCreate(input: $input) { success }
+}`;
+export const ISSUE_ATTACHMENTS_QUERY = `query issueAttachments($id: String!) {
+  issue(id: $id) { attachments(first: 100) { nodes { id url } } }
+}`;
+export const DELETE_ATTACHMENT_QUERY = `mutation deleteAttachment($id: String!) {
+  attachmentDelete(id: $id) { success }
+}`;
+export const LINK_URL_QUERY = `mutation link($issueId: String!, $url: String!, $title: String) {
+  attachmentLinkURL(issueId: $issueId, url: $url, title: $title) { success }
+}`;
+// The relay's read: the owner's "@paseo" comments on up to RELAY_BATCH tickets in one request, each
+// ticket from its own cursor (`$sN`, inclusive) and page (`$aN`). `issues(filter: id eq)` rather
+// than `issue(id:)`: a ticket the token cannot see comes back empty instead of failing the query.
+export const RELAY_BATCH = 50;
+export function relayCommentsQuery(count: number): string {
+  const indexes = Array.from({ length: count }, (_, index) => index);
+  const declarations = indexes.map((index) => `$i${index}: ID!, $s${index}: DateTimeOrDuration!, $a${index}: String`).join(", ");
+  const fields = indexes.map((index) => `t${index}: issues(first: 1, filter: { id: { eq: $i${index} } }) {
+    nodes { id comments(first: 50, after: $a${index}, filter: { createdAt: { gte: $s${index} }, user: { id: { eq: $u } }, body: { containsIgnoreCase: "@paseo" } }) {
+      nodes { id body createdAt user { id } reactions { emoji user { id } } agentSession { id } }
+      pageInfo { hasNextPage endCursor }
+    } }
+  }`).join("\n  ");
+  return `query relayComments($u: ID!, ${declarations}) {\n  ${fields}\n}`;
+}
+export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const APP_UNUSABLE = Symbol("app unusable");
+export const REACTION_QUERY = `mutation react($commentId: String!, $emoji: String!) {
+  reactionCreate(input: { commentId: $commentId, emoji: $emoji }) { success }
+}`;
+
+// `sessionId`: the Paseo agent session the comment opened or replied in (an @mention of the app);
+// those reach the agent through the session webhook, not the relay.
+export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[]; sessionId: string | null };
+
+export const ISSUE_DOCUMENTS_QUERY = `query issueDocuments($id: String!) {
+  issue(id: $id) { id documents(first: 50) { nodes { id title url content } } }
+}`;
+export const CREATE_DOCUMENT_QUERY = `mutation documentCreate($input: DocumentCreateInput!) {
+  documentCreate(input: $input) { success document { id url } }
+}`;
+export const UPDATE_DOCUMENT_QUERY = `mutation documentUpdate($id: String!, $input: DocumentUpdateInput!) {
+  documentUpdate(id: $id, input: $input) { success document { id url } }
+}`;
+
+function labelNodes(value: unknown): { id: string; name: string }[] {
+  return connection(value ?? { nodes: [] }).nodes.map((node) => record(node)).map((node) => ({ id: label(node.id), name: label(node.name) })).filter((node) => node.id && node.name);
+}
+
+function succeeded(data: Record<string, unknown>, field: string, what: string): void {
+  const result = data[field] && typeof data[field] === "object" ? record(data[field]) : {};
+  if (result.success !== true) throw new Error(`Linear did not ${what}.`);
+}
+
 export const COMMENT_QUERY = `query issueComments($id: String!, $first: Int!, $after: String) {
   issue(id: $id) {
     comments(first: $first, after: $after) {
@@ -194,8 +378,36 @@ export const COMMENT_QUERY = `query issueComments($id: String!, $first: Int!, $a
   }
 }`;
 
+// What finished blockers left behind, for the agent that starts after them: links (pull requests,
+// plan documents) and the latest comments (the agents' summaries), oldest first as Linear returns them.
+// State and pull request status tell a merged review apart from one still open.
+export const FINISHED_BLOCKERS_QUERY = `query finishedBlockers($ids: [ID!]!) {
+  issues(first: 50, filter: { id: { in: $ids } }) { nodes {
+    id identifier title url completedAt state { name type }
+    attachments(first: 20) { nodes { title url sourceType metadata } }
+    documents(first: 10) { nodes { title url } }
+    comments(last: 20) { nodes { body createdAt } }
+  } }
+}`;
+
 export class LinearService {
-  constructor(readonly credentials = new Credentials(), private readonly post: Post = postGraphQL) {}
+  private stateWritten: ((issueId: string, state: WrittenState) => void) | null = null;
+
+  constructor(readonly credentials = new Credentials(), private readonly post: Post = postGraphQL, private readonly reader?: Reader) {}
+
+  // Told about every state change the plugin makes (launch, write-back, review, PR watch), so
+  // views of the ticket's state can follow at once instead of at the next poll.
+  onStateWritten(listener: (issueId: string, state: WrittenState) => void): void {
+    this.stateWritten = listener;
+  }
+
+  private async writeState(issueId: string, stateId: string): Promise<Record<string, unknown>> {
+    const data = record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId })));
+    const result = record(data.issueUpdate ?? {});
+    const state = record(record(result.issue ?? {}).state ?? {});
+    if (result.success !== false && label(state.name)) this.stateWritten?.(issueId, { name: label(state.name), type: label(state.type) });
+    return data;
+  }
 
   async status() {
     const { key, source } = await this.credentials.read();
@@ -221,6 +433,18 @@ export class LinearService {
     const { key } = await this.credentials.read();
     if (!key) throw new Error("Connect Linear before loading tickets.");
     return work(key);
+  }
+
+  // The reads pollers repeat go to the Paseo app's own request pool. The key reads instead when the
+  // app cannot be used (`reader` returns null) or cannot see everything asked for (`complete` is
+  // false); an app rate limit is not a reason: it propagates, so background work pauses instead of
+  // draining the key.
+  private async read(query: string, variables: Record<string, unknown>, complete: (data: Record<string, unknown>) => boolean = () => true): Promise<Record<string, unknown>> {
+    const data = this.reader ? await this.reader.query(query, variables).catch((error: unknown) => {
+      if (error instanceof Error && /Entity not found/i.test(error.message)) return null;
+      throw error;
+    }) : null;
+    return data && complete(data) ? data : this.withKey((key) => this.post(key, query, variables));
   }
 
   async issues(cursor?: string, stateNames?: string[], showClosed?: boolean, relation?: "blocking" | "blocked") {
@@ -292,6 +516,29 @@ export class LinearService {
     });
   }
 
+  // The blockers among `ids` that are finished: Done, or in review with their pull requests merged.
+  // Read on the app's pool; tickets the app cannot see are read again with the key. Returned in the order of `ids`.
+  async finishedBlockers(ids: string[]): Promise<FinishedBlocker[]> {
+    if (!ids.length) return [];
+    const data = await this.read(FINISHED_BLOCKERS_QUERY, { ids }, (result) => connection(record(result.issues)).nodes.length === ids.length);
+    const nodes = connection(record(data.issues)).nodes.map((node) => record(node)).filter((node) => {
+      const state = record(node.state ?? {});
+      return label(state.type) === "completed" || (inReviewState(label(state.name), label(state.type)) && pullRequestsMerged(node.attachments));
+    });
+    return nodes.sort((a, b) => ids.indexOf(label(a.id)) - ids.indexOf(label(b.id))).map((node) => ({
+      identifier: label(node.identifier),
+      title: label(node.title),
+      url: label(node.url),
+      status: label(record(node.state ?? {}).name),
+      completedAt: label(node.completedAt) || null,
+      links: [...connection(node.attachments ?? { nodes: [] }).nodes, ...connection(node.documents ?? { nodes: [] }).nodes]
+        .map((link) => ({ title: label(record(link).title), url: label(record(link).url) }))
+        // The Paseo agent's own link points at an agent session, not at the work.
+        .filter((link) => link.url && !link.url.startsWith("https://app.paseo.sh/")),
+      comments: connection(node.comments ?? { nodes: [] }).nodes.map((comment) => ({ body: label(record(comment).body), createdAt: label(record(comment).createdAt) })),
+    }));
+  }
+
   // The team's workflow states, cached for the plugin's lifetime; they rarely change.
   private readonly teamStatesCache = new Map<string, TeamState[]>();
 
@@ -314,9 +561,9 @@ export class LinearService {
     return states;
   }
 
-  // The plugin's only write. Best-effort by design: callers surface `note` as a warning,
+  // Best-effort by design: callers surface `note` as a warning,
   // and a failure here must never turn into a launch failure.
-  async markInProgress(issue: Issue, teamId: string | null): Promise<{ changed: boolean; note?: string }> {
+  async markInProgress(issue: Pick<Issue, "id" | "status" | "statusType">, teamId: string | null): Promise<{ changed: boolean; note?: string }> {
     // Already in the team's "started" state (e.g. "In Progress"): leave it. A repeat
     // write would only add audit noise to a ticket the agent is about to work on.
     if (issue.statusType.trim().toLowerCase() === "started") return { changed: false };
@@ -333,7 +580,7 @@ export class LinearService {
     }
     let data: Record<string, unknown>;
     try {
-      data = record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issue.id, stateId: target.id })));
+      data = await this.writeState(issue.id, target.id);
     } catch (error) {
       return { changed: false, note: `Linear rejected the change to ${target.name}: ${error instanceof Error ? error.message : "unknown error"}` };
     }
@@ -341,6 +588,406 @@ export class LinearService {
     if (result.success === false) {
       return { changed: false, note: `Linear reported that the change to ${target.name} was not applied; the ticket is unchanged.` };
     }
+    return { changed: true };
+  }
+
+  async labeledIssues(labelName: string, teamKeys: string[]): Promise<LabeledIssue[]> {
+    if (!teamKeys.length) return [];
+    const data = record(await this.read(LABELED_ISSUES_QUERY, { first: 50, filter: labeledIssueFilter(labelName, teamKeys) }));
+    return connection(record(data.issues)).nodes.map((node) => record(node)).map((node) => ({
+      id: label(node.id),
+      identifier: label(node.identifier),
+      teamKey: label(record(node.team ?? {}).key),
+      priority: typeof node.priority === "number" ? node.priority : 0,
+      labels: labelNodes(node.labels),
+    })).filter((issue) => issue.id)
+      // Most urgent first; tickets without a priority last. Stable otherwise (Linear's order).
+      .sort((a, b) => (a.priority || 5) - (b.priority || 5));
+  }
+
+  // Label names by ticket id, lower-cased. The Paseo app's pool first; the key when the app cannot
+  // see every ticket asked for. Ids Linear does not return are missing from the map.
+  async issueLabels(ids: string[]): Promise<Map<string, string[]>> {
+    const labels = new Map<string, string[]>();
+    const valid = [...new Set(ids)].filter((id) => UUID.test(id));
+    for (let start = 0; start < valid.length; start += ISSUE_LABELS_BATCH) {
+      const batch = valid.slice(start, start + ISSUE_LABELS_BATCH);
+      const data = record(await this.read(ISSUE_LABELS_QUERY, { first: batch.length, ids: batch }, (found) => connection(record(found.issues)).nodes.length === batch.length));
+      for (const node of connection(record(data.issues)).nodes.map((item) => record(item))) {
+        const id = label(node.id);
+        if (id) labels.set(id, labelNodes(node.labels).map((item) => item.name.trim().toLowerCase()));
+      }
+    }
+    return labels;
+  }
+
+  async issueState(id: string): Promise<IssueState> {
+    const data = record(await this.read(ISSUE_STATE_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object")));
+    if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
+    const issue = record(data.issue);
+    const state = record(issue.state ?? {});
+    const attachmentUrls = connection(issue.attachments ?? { nodes: [] }).nodes.map((node) => label(record(node).url)).filter(Boolean);
+    const blockedBy = connection(issue.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
+      .filter((relation) => label(relation.type) === "blocks")
+      .map((relation) => record(relation.issue ?? {}))
+      .filter((blocker) => {
+        const state = record(blocker.state ?? {});
+        if (["completed", "canceled", "duplicate"].includes(label(state.type))) return false;
+        return !(inReviewState(label(state.name), label(state.type)) && pullRequestsMerged(blocker.attachments));
+      })
+      .map((blocker) => label(blocker.identifier)).filter(Boolean);
+    return {
+      id: label(issue.id), identifier: label(issue.identifier), status: label(state.name), statusId: label(state.id), statusType: label(state.type),
+      teamId: label(record(issue.team ?? {}).id) || null, projectId: label(record(issue.project ?? {}).id) || null, creatorId: label(record(issue.creator ?? {}).id) || null,
+      labels: labelNodes(issue.labels), attachmentUrls, blockedBy,
+    };
+  }
+
+  // `ready` puts the ticket into the team's first unstarted state (Todo) instead of Triage, for
+  // tickets the plugin creates as planned work; `startedState` into the started state of that name.
+  async createIssue(input: { teamId: string; title: string; description: string; parentId?: string; projectId?: string | null; assigneeId?: string; priority?: number; ready?: boolean; startedState?: string }): Promise<{ id: string; identifier: string; url: string }> {
+    const payload: Record<string, unknown> = { teamId: input.teamId, title: input.title, description: input.description };
+    if (input.ready || input.startedState) {
+      const states = await this.teamStates(input.teamId);
+      const wanted = input.startedState?.trim().toLowerCase();
+      const target = (wanted ? states.find((state) => state.type === "started" && state.name.trim().toLowerCase() === wanted) : undefined)
+        ?? (input.ready ? states.filter((state) => state.type === "unstarted").sort((a, b) => a.position - b.position)[0] : undefined);
+      if (target) payload.stateId = target.id;
+    }
+    if (input.priority) payload.priority = input.priority;
+    if (input.parentId) payload.parentId = input.parentId;
+    if (input.projectId) payload.projectId = input.projectId;
+    if (input.assigneeId) payload.assigneeId = input.assigneeId;
+    const data = record(await this.withKey((key) => this.post(key, CREATE_ISSUE_QUERY, { input: payload })));
+    succeeded(data, "issueCreate", "create the ticket");
+    const issue = record(record(data.issueCreate).issue ?? {});
+    return { id: label(issue.id), identifier: label(issue.identifier), url: label(issue.url) };
+  }
+
+  async delegate(issueId: string, delegateId: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, DELEGATE_QUERY, { id: issueId, delegateId }))), "issueUpdate", "assign the ticket to Paseo");
+  }
+
+  // `blocker` must be finished before `blocked` can start.
+  async addBlocker(blockerId: string, blockedId: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, RELATION_QUERY, { input: { issueId: blockerId, relatedIssueId: blockedId, type: "blocks" } }))), "issueRelationCreate", "link the tickets");
+  }
+
+  async ping(): Promise<void> {
+    const data = record(await this.withKey((key) => this.post(key, VIEWER_QUERY, {})));
+    if (!label(record(data.viewer ?? {}).id)) throw new Error("Linear did not confirm the API key.");
+  }
+
+  async updateDescription(issueId: string, description: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, `mutation describe($id: String!, $description: String!) { issueUpdate(id: $id, input: { description: $description }) { success } }`, { id: issueId, description }))), "issueUpdate", "update the ticket");
+  }
+
+  // Moves the ticket to its team's first completed state (Done).
+  async complete(issueId: string): Promise<void> {
+    const state = await this.issueState(issueId);
+    if (!state.teamId || state.statusType === "completed") return;
+    const done = (await this.teamStates(state.teamId)).filter((item) => item.type === "completed").sort((a, b) => a.position - b.position)[0];
+    if (!done) return;
+    succeeded(await this.writeState(issueId, done.id), "issueUpdate", "complete the ticket");
+  }
+
+  async teamIdByKey(teamKey: string): Promise<string | null> {
+    const data = record(await this.withKey((key) => this.post(key, TEAM_BY_KEY_QUERY, { key: teamKey })));
+    return connection(record(data.teams ?? {})).nodes.map((node) => label(record(node).id))[0] || null;
+  }
+
+  // Label IDs by lowercase name, cached for the plugin's lifetime. A missing label is
+  // created as a workspace label so every team can use it, in `color` when given.
+  private readonly labelIds = new Map<string, string>();
+
+  private async labelId(name: string, color?: string): Promise<string> {
+    const wanted = name.trim().toLowerCase();
+    const cached = this.labelIds.get(wanted);
+    if (cached) return cached;
+    const found = labelNodes(record(await this.withKey((key) => this.post(key, LABEL_BY_NAME_QUERY, { name }))).issueLabels)[0];
+    let id = found?.id;
+    if (!id) {
+      const created = record(await this.withKey((key) => this.post(key, CREATE_LABEL_QUERY, { input: { name, ...(color ? { color } : {}) } })));
+      succeeded(created, "issueLabelCreate", `create the "${name}" label`);
+      id = label(record(record(created.issueLabelCreate).issueLabel ?? {}).id);
+      if (!id) throw new Error(`Linear did not return the new "${name}" label.`);
+    }
+    this.labelIds.set(wanted, id);
+    return id;
+  }
+
+  async addLabel(issueId: string, name: string, color?: string): Promise<void> {
+    const labelId = await this.labelId(name, color);
+    succeeded(record(await this.withKey((key) => this.post(key, ADD_LABEL_QUERY, { id: issueId, labelId }))), "issueAddLabel", `add the "${name}" label`);
+  }
+
+  // Removes every label on the ticket with this name (case-insensitive); a team label and
+  // a workspace label can share a name. Missing labels are not an error.
+  async removeLabel(issueId: string, name: string, current?: { id: string; name: string }[]): Promise<void> {
+    const labels = current ?? (await this.issueState(issueId)).labels;
+    const wanted = name.trim().toLowerCase();
+    for (const { id } of labels.filter((item) => item.name.trim().toLowerCase() === wanted)) {
+      try {
+        succeeded(record(await this.withKey((key) => this.post(key, REMOVE_LABEL_QUERY, { id: issueId, labelId: id }))), "issueRemoveLabel", `remove the "${name}" label`);
+      } catch (error) {
+        // `current` can be stale: another write removed the label meanwhile, which is the goal anyway.
+        if (!/Label not on issue/i.test(error instanceof Error ? error.message : String(error))) throw error;
+      }
+    }
+  }
+
+  async comment(issueId: string, body: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, CREATE_COMMENT_QUERY, { input: { issueId, body } }))), "commentCreate", "create the comment");
+  }
+
+  // For comments that are later edited in place (the progress comment): returns the id.
+  async createComment(issueId: string, body: string): Promise<string> {
+    const data = record(await this.withKey((key) => this.post(key, CREATE_COMMENT_QUERY, { input: { issueId, body } })));
+    succeeded(data, "commentCreate", "create the comment");
+    return label(record(record(data.commentCreate).comment ?? {}).id);
+  }
+
+  async updateComment(commentId: string, body: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_COMMENT_QUERY, { id: commentId, input: { body } }))), "commentUpdate", "update the comment");
+  }
+
+  async upsertAttachment(issueId: string, url: string, title: string, subtitle: string, iconUrl?: string): Promise<void> {
+    const input = { issueId, url, title, subtitle, ...(iconUrl ? { iconUrl } : {}) };
+    succeeded(record(await this.withKey((key) => this.post(key, UPSERT_ATTACHMENT_QUERY, { input }))), "attachmentCreate", "update the Paseo agent link");
+  }
+
+  // Removes attachments whose URL starts with `prefix`, except `keep` (a previous agent's link).
+  async removeAttachments(issueId: string, prefix: string, keep: string): Promise<void> {
+    const issue = record(record(await this.withKey((key) => this.post(key, ISSUE_ATTACHMENTS_QUERY, { id: issueId }))).issue ?? {});
+    for (const node of connection(issue.attachments ?? { nodes: [] }).nodes.map((item) => record(item))) {
+      const url = label(node.url);
+      if (url.startsWith(prefix) && url !== keep) succeeded(record(await this.withKey((key) => this.post(key, DELETE_ATTACHMENT_QUERY, { id: label(node.id) }))), "attachmentDelete", "remove the old Paseo agent link");
+    }
+  }
+
+  // Linear refuses a URL that is already linked to this ticket (its GitHub integration often links
+  // the pull request first) or, for a pull request, to another one. Retrying cannot change either,
+  // so "already been linked" ends the step instead of failing the write-back on every turn.
+  async linkUrl(issueId: string, url: string, title: string): Promise<void> {
+    try {
+      succeeded(record(await this.withKey((key) => this.post(key, LINK_URL_QUERY, { issueId, url, title }))), "attachmentLinkURL", "attach the link");
+    } catch (error) {
+      if (!(error instanceof Error && /already been linked/i.test(error.message))) throw error;
+    }
+  }
+
+  private viewer: string | null = null;
+
+  // The API key's own user; cached because the key cannot change without a reconnect.
+  async viewerId(): Promise<string> {
+    if (this.viewer) return this.viewer;
+    const id = label(record(record(await this.withKey((key) => this.post(key, VIEWER_QUERY, {}))).viewer ?? {}).id);
+    if (!id) throw new Error("Linear did not return the connected user.");
+    this.viewer = id;
+    return id;
+  }
+
+  private readonly userUrls = new Map<string, string>();
+
+  // The user's profile URL, which a comment turns into an @mention.
+  async userUrl(userId: string): Promise<string> {
+    const cached = this.userUrls.get(userId);
+    if (cached) return cached;
+    const url = label(record(record(await this.withKey((key) => this.post(key, USER_URL_QUERY, { id: userId }))).user ?? {}).url);
+    if (!url) throw new Error("Linear did not return the user's profile link.");
+    this.userUrls.set(userId, url);
+    return url;
+  }
+
+  // The owner's "@paseo" comments since each ticket's cursor (inclusive), oldest first, in one
+  // request per RELAY_BATCH tickets on the app's pool; tickets the app cannot see are read with
+  // the key. `unseen`: tickets neither credential returned (deleted, no access, not a Linear id).
+  async relayComments(userId: string, cursors: { issueId: string; since: string }[]): Promise<{ comments: Map<string, RelayComment[]>; unseen: string[] }> {
+    const comments = new Map<string, RelayComment[]>();
+    const unseen = cursors.filter((cursor) => !UUID.test(cursor.issueId)).map((cursor) => cursor.issueId);
+    const valid = cursors.filter((cursor) => UUID.test(cursor.issueId));
+    const viaKey = (query: string, variables: Record<string, unknown>) => this.withKey((key) => this.post(key, query, variables));
+    const reader = this.reader;
+    for (let start = 0; start < valid.length; start += RELAY_BATCH) {
+      const batch = valid.slice(start, start + RELAY_BATCH);
+      const fromApp = reader ? await this.relayPages(userId, batch, comments, async (query, variables) => {
+        const data = await reader.query(query, variables);
+        if (!data) throw APP_UNUSABLE;
+        return data;
+      }).catch((error: unknown) => {
+        if (error === APP_UNUSABLE) return null;
+        throw error;
+      }) : null;
+      const retry = fromApp === null ? batch : batch.filter((cursor) => fromApp.includes(cursor.issueId));
+      if (retry.length) unseen.push(...await this.relayPages(userId, retry, comments, viaKey));
+    }
+    for (const list of comments.values()) list.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return { comments, unseen };
+  }
+
+  // Pages through the batch, one request per round for every ticket that still has a next page
+  // (at most 10 rounds; the rest comes on the next poll). Returns the tickets that came back empty.
+  private async relayPages(userId: string, batch: { issueId: string; since: string }[], into: Map<string, RelayComment[]>, send: (query: string, variables: Record<string, unknown>) => Promise<Record<string, unknown>>): Promise<string[]> {
+    const empty: string[] = [];
+    let round = batch.map((cursor) => ({ ...cursor, after: null as string | null }));
+    for (let page = 0; page < 10 && round.length; page++) {
+      const variables: Record<string, unknown> = { u: userId };
+      round.forEach((item, index) => Object.assign(variables, { [`i${index}`]: item.issueId, [`s${index}`]: item.since, [`a${index}`]: item.after }));
+      const data = record(await send(relayCommentsQuery(round.length), variables));
+      const next: typeof round = [];
+      round.forEach((item, index) => {
+        const issue = connection(data[`t${index}`] ?? { nodes: [] }).nodes[0];
+        if (!issue) {
+          if (page === 0) empty.push(item.issueId);
+          return;
+        }
+        const found = connection(record(issue).comments ?? { nodes: [] });
+        const list = into.get(item.issueId) ?? [];
+        into.set(item.issueId, list);
+        for (const node of found.nodes.map((entry) => record(entry))) {
+          const id = label(node.id);
+          if (!id) continue;
+          list.push({
+            id,
+            body: label(node.body),
+            createdAt: label(node.createdAt),
+            userId: label(record(node.user ?? {}).id),
+            reactions: (Array.isArray(node.reactions) ? node.reactions : []).map((entry) => record(entry)).map((reaction) => ({ emoji: label(reaction.emoji), userId: label(record(reaction.user ?? {}).id) })),
+            sessionId: label(record(node.agentSession ?? {}).id) || null,
+          });
+        }
+        if (found.hasNextPage && found.endCursor) next.push({ ...item, after: found.endCursor });
+      });
+      round = next;
+    }
+    return empty;
+  }
+
+  async react(commentId: string, emoji: string): Promise<void> {
+    succeeded(record(await this.withKey((key) => this.post(key, REACTION_QUERY, { commentId, emoji }))), "reactionCreate", "add the reaction");
+  }
+
+  // The ticket's document with this title (for example "Plan: TUC-9"), or null.
+  async issueDocument(issueId: string, title: string): Promise<{ url: string; content: string } | null> {
+    const data = record(await this.withKey((key) => this.post(key, ISSUE_DOCUMENTS_QUERY, { id: issueId })));
+    const found = connection(record(data.issue ?? {}).documents ?? { nodes: [] }).nodes.map((node) => record(node)).find((node) => label(node.title) === title);
+    return found ? { url: label(found.url), content: typeof found.content === "string" ? found.content : "" } : null;
+  }
+
+  // One document per title on the ticket: replaced when it exists, created otherwise.
+  // Returns the document URL for linking from a comment.
+  async upsertIssueDocument(issueId: string, title: string, content: string): Promise<string> {
+    const data = record(await this.withKey((key) => this.post(key, ISSUE_DOCUMENTS_QUERY, { id: issueId })));
+    const issue = record(data.issue ?? {});
+    const existing = connection(issue.documents ?? { nodes: [] }).nodes.map((node) => record(node)).find((node) => label(node.title) === title);
+    const result = existing
+      ? record(await this.withKey((key) => this.post(key, UPDATE_DOCUMENT_QUERY, { id: label(existing.id), input: { title, content } })))
+      : record(await this.withKey((key) => this.post(key, CREATE_DOCUMENT_QUERY, { input: { title, content, issueId: label(issue.id) || issueId } })));
+    const field = existing ? "documentUpdate" : "documentCreate";
+    succeeded(result, field, existing ? "update the plan document" : "create the plan document");
+    return label(record(record(result[field]).document ?? {}).url);
+  }
+
+  // Moves the ticket into its team's "started" state with this name (for example Planning or
+  // In Progress), unless it is already there or finished. Teams without it are left alone.
+  // `current`: the ticket's state when the caller already read it.
+  async moveToStateNamed(issueId: string, name: string, current?: IssueState): Promise<{ changed: boolean; note?: string }> {
+    const state = current ?? await this.issueState(issueId);
+    const type = state.statusType.trim().toLowerCase();
+    if (type === "completed" || type === "canceled" || type === "duplicate") return { changed: false };
+    if (state.status.trim().toLowerCase() === name.toLowerCase()) return { changed: false };
+    if (!state.teamId) return { changed: false, note: "The ticket has no team." };
+    const target = (await this.teamStates(state.teamId)).find((item) => item.type.trim().toLowerCase() === "started" && item.name.trim().toLowerCase() === name.toLowerCase());
+    if (!target) return { changed: false, note: `The ticket's team has no started state named "${name}".` };
+    succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
+    return { changed: true };
+  }
+
+  // Moves the ticket to one known state of its team (for example back to where it was).
+  async moveToState(issueId: string, stateId: string): Promise<void> {
+    succeeded(await this.writeState(issueId, stateId), "issueUpdate", "move the ticket");
+  }
+
+  // Moves the ticket back to its team's first unstarted state (Todo): planned, not being worked on.
+  async moveToReady(issueId: string): Promise<{ changed: boolean; note?: string }> {
+    const state = await this.issueState(issueId);
+    const type = state.statusType.trim().toLowerCase();
+    if (type === "completed" || type === "canceled" || type === "duplicate" || type === "unstarted") return { changed: false };
+    if (!state.teamId) return { changed: false, note: "The ticket has no team." };
+    const target = (await this.teamStates(state.teamId)).filter((item) => item.type === "unstarted").sort((a, b) => a.position - b.position)[0];
+    if (!target) return { changed: false, note: "The ticket's team has no unstarted state." };
+    succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
+    return { changed: true };
+  }
+
+  // Moves a finished ticket back to its team's first unstarted state (Todo), for example a manual
+  // task whose check failed after it was marked done.
+  async reopen(issueId: string): Promise<void> {
+    const state = await this.issueState(issueId);
+    if (!state.teamId) return;
+    const target = (await this.teamStates(state.teamId)).filter((item) => item.type === "unstarted").sort((a, b) => a.position - b.position)[0];
+    if (!target || target.id === state.statusId) return;
+    succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
+  }
+
+  // State name, type and completion time of up to 250 issues per request. Deleted, archived or
+  // invisible issues are absent from the result. Issues the app cannot see are read again with the key.
+  async issueStatuses(ids: string[]): Promise<Map<string, IssueStatus>> {
+    const result = new Map<string, IssueStatus>();
+    for (let start = 0; start < ids.length; start += ISSUE_STATUSES_BATCH) {
+      const chunk = ids.slice(start, start + ISSUE_STATUSES_BATCH);
+      const data = record(await this.read(ISSUE_STATUSES_QUERY, { ids: chunk }, (found) => connection(record(found.issues ?? {})).nodes.length === new Set(chunk).size));
+      for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) {
+        const state = record(node.state ?? {});
+        result.set(label(node.id), { status: label(state.name), statusType: label(state.type), completedAt: label(node.completedAt) || null });
+      }
+    }
+    return result;
+  }
+
+  // Linear's file storage needs the API key. Only uploads.linear.app is ever sent the key;
+  // size is checked from the header and again while reading, so a huge file never buffers.
+  async downloadUpload(url: string, maxBytes = MAX_ATTACHMENT_BYTES): Promise<Uint8Array> {
+    const target = new URL(url);
+    if (target.protocol !== "https:" || target.hostname !== "uploads.linear.app") throw new Error("Only Linear uploads can be downloaded.");
+    return this.withKey(async (key) => {
+      let response: Response;
+      try {
+        response = await fetch(target, { headers: { authorization: key }, signal: AbortSignal.timeout(60_000) });
+      } catch {
+        throw new Error("Could not reach Linear's file storage.");
+      }
+      if (!response.ok) throw new Error(`Linear's file storage answered HTTP ${response.status}.`);
+      const declared = Number(response.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > maxBytes) throw new Error(`The file is larger than ${Math.round(maxBytes / 1024 / 1024)} MB.`);
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      const reader = response.body?.getReader();
+      while (reader) {
+        const next = await reader.read();
+        if (next.done) break;
+        size += next.value.byteLength;
+        if (size > maxBytes) {
+          await reader.cancel();
+          throw new Error(`The file is larger than ${Math.round(maxBytes / 1024 / 1024)} MB.`);
+        }
+        chunks.push(next.value);
+      }
+      return Buffer.concat(chunks);
+    });
+  }
+
+  // Moves the ticket to its team's review state unless it is already there or past
+  // started work (completed or canceled tickets are left to people and integrations).
+  async moveToReview(issueId: string): Promise<{ changed: boolean; note?: string }> {
+    const state = await this.issueState(issueId);
+    const type = state.statusType.trim().toLowerCase();
+    if (type === "completed" || type === "canceled") return { changed: false };
+    if (/review/i.test(state.status) && type === "started") return { changed: false };
+    if (!state.teamId) return { changed: false, note: "The ticket has no team." };
+    const target = resolveReviewState(await this.teamStates(state.teamId));
+    if (!target) return { changed: false, note: "The ticket's team has no review state." };
+    succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
     return { changed: true };
   }
 }

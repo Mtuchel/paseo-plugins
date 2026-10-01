@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdtempSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -14,10 +15,13 @@ import { Launcher } from "./launch";
 import { Settings } from "./settings";
 import { ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
 
+// Launches save the ticket prompt for the plan advisor under PASEO_HOME; keep it out of the real one.
+process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-ticket-mcp-home-"));
+
 const ISSUE_ID = "6b1f0c2a-1111-4222-8333-444455556666";
 const detail = { issue: normalizeIssue({ id: ISSUE_ID, identifier: "ENG-42", title: "Fix sign-in", url: "https://linear.app/x/issue/ENG-42" }), teamId: "team-1", projectId: "lp-1", context: "{}", warnings: [], relations: { parent: null, subissues: [], related: [] } };
 const input = { id: ISSUE_ID, projectId: "project-1", provider: "test/model", instructions: "", markInProgress: false, requestId: "5f6f1154-5838-4439-b981-b3c9d9831488" };
-const noMark = { markInProgress: async () => ({ changed: false }) };
+const noMark = { markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] };
 
 function capturePaseo(onCreate: (options: PaseoWorkspaceAgentCreateOptions) => void) {
   return {
@@ -71,7 +75,7 @@ test("a provider that reports no MCP support gets a launch warning", async () =>
 
 test("marking in progress happens before the agent exists, so the agent's own status changes come later", async () => {
   const order: string[] = [];
-  const launcher = new Launcher({ detail: async () => detail, markInProgress: async () => { order.push("mark"); return { changed: true }; } }, undefined, async () => "/s.mjs");
+  const launcher = new Launcher({ ...noMark, detail: async () => detail, markInProgress: async () => { order.push("mark"); return { changed: true }; } }, undefined, async () => "/s.mjs");
   await launcher.start({ ...input, markInProgress: true }, capturePaseo(() => { order.push("create"); }), { linearAccess: true, markInProgress: true });
   assert.deepEqual(order, ["mark", "create"]);
 });
@@ -188,7 +192,7 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "add_comment", "set_status", "link_url"]);
+    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "add_comment", "set_status", "link_url", "add_manual_task"]);
 
     const ticket = JSON.parse((await mcp.call("get_ticket")).text);
     assert.equal(ticket.identifier, "ENG-42");
@@ -213,6 +217,49 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     assert.equal(((await mcp.request("tools/call", { name: "delete_everything" })).error as { code: number }).code, -32602);
     assert.equal(((await mcp.request("resources/list")).error as { code: number }).code, -32601);
     assert.ok(linear.calls.every((c) => !JSON.stringify(c.variables).includes("saved-key")));
+  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("add_manual_task creates an assigned sub-issue, blocks the ticket only before merge, dedups by title and records the check locally", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-manual-"));
+  const withBacklog = [{ id: "s-backlog", name: "Backlog", type: "backlog", position: 0 }, ...states];
+  let created = 0;
+  const children = [{ id: "c-old", identifier: "ENG-40", url: "https://linear.app/x/issue/ENG-40", title: "Set API_KEY on staging", state: { type: "unstarted" } }];
+  const linear = await fakeLinear((call) => {
+    if (call.query.includes("query manual")) return { viewer: { id: "me" }, issue: { ...issue, team: { id: "team-1", states: { nodes: withBacklog } }, children: { nodes: children } } };
+    if (call.query.includes("issueCreate")) { created++; return { issueCreate: { success: true, issue: { id: `task-${created}`, identifier: `ENG-5${created}`, url: `https://linear.app/x/issue/ENG-5${created}` } } }; }
+    if (call.query.includes("issueRelationCreate")) return { issueRelationCreate: { success: true } };
+    return {};
+  });
+  const script = await writeTicketMcpScript(home);
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: linear.url });
+  try {
+    const before = JSON.parse((await mcp.call("add_manual_task", { title: "Set LINEAR_API_KEY on batch-service (staging)", steps: "Railway → batch-service → Variables", when: "before_merge", check: "true" })).text);
+    assert.equal(before.identifier, "ENG-51");
+    const createBefore = linear.calls.filter((c) => c.query.includes("issueCreate"))[0].variables.input as Record<string, unknown>;
+    assert.deepEqual({ ...createBefore, description: undefined }, { teamId: "team-1", title: "Set LINEAR_API_KEY on batch-service (staging)", description: undefined, parentId: ISSUE_ID, assigneeId: "me", stateId: "s-todo" });
+    assert.match(String(createBefore.description), /ENG-42, due before the pull request is merged[\s\S]*\n {4}true$/);
+    assert.deepEqual(linear.calls.find((c) => c.query.includes("issueRelationCreate"))!.variables, { input: { issueId: "task-1", relatedIssueId: ISSUE_ID, type: "blocks" } });
+
+    await mcp.call("add_manual_task", { title: "Register the webhook", steps: "Linear → Settings → API", when: "after_merge" });
+    const createAfter = linear.calls.filter((c) => c.query.includes("issueCreate"))[1].variables.input as Record<string, unknown>;
+    assert.equal(createAfter.stateId, "s-backlog");
+    assert.equal(linear.calls.filter((c) => c.query.includes("issueRelationCreate")).length, 1);
+    // Linear's children list (static here) has not caught up with ENG-52 yet; the local record has.
+    const again = JSON.parse((await mcp.call("add_manual_task", { title: "register the webhook", steps: "retry", when: "after_merge" })).text);
+    assert.deepEqual(again, { identifier: "ENG-52", url: "https://linear.app/x/issue/ENG-52", deduped: true });
+
+    const dup = JSON.parse((await mcp.call("add_manual_task", { title: "  set api_key on STAGING ", steps: "x", when: "anytime" })).text);
+    assert.deepEqual(dup, { identifier: "ENG-40", url: "https://linear.app/x/issue/ENG-40", deduped: true });
+    assert.equal(created, 2);
+
+    assert.match((await mcp.call("add_manual_task", { title: "x", steps: "y", when: "someday" })).text, /when must be one of/);
+
+    const directory = join(home, "linear-tickets", "manual-tasks");
+    const file = JSON.parse(await readFile(join(directory, "task-1.json"), "utf8"));
+    assert.deepEqual({ ...file, createdAt: undefined, cwd: undefined }, { id: "task-1", identifier: "ENG-51", url: "https://linear.app/x/issue/ENG-51", title: "Set LINEAR_API_KEY on batch-service (staging)", parentId: ISSUE_ID, parentIdentifier: "ENG-42", when: "before_merge", check: "true", createdAt: undefined, cwd: undefined, announced: false, activated: true, verifiedAt: null });
+    assert.equal((await stat(join(directory, "task-1.json"))).mode & 0o777, 0o600);
+    assert.equal(JSON.parse(await readFile(join(directory, "task-2.json"), "utf8")).activated, false);
   } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
@@ -300,6 +347,19 @@ test("API error text never carries the key back to the agent", async () => {
     assert.match(second.text, /\[redacted\]/);
     assert.doesNotMatch(second.text, /SECRET/);
   } finally { a.stop(); b.stop(); await unauthorized.close(); await failing.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("a rate-limited Linear answer tells the agent to try again later instead of a generic failure", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-ratelimit-"));
+  const limited = await fakeLinear(() => ({}), { status: 400, raw: () => ({ errors: [{ message: "Rate limit exceeded", extensions: { code: "RATELIMITED" } }] }) });
+  const script = await writeTicketMcpScript(home);
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: limited.url });
+  try {
+    const result = await mcp.call("get_ticket");
+    assert.equal(result.isError, true);
+    assert.match(result.text, /Linear's hourly request limit is reached for the Linear API key; try again in about 10 minutes\./);
+    assert.equal(limited.calls.length, 1);
+  } finally { mcp.stop(); await limited.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 test("the MCP server validates envelopes, never runs tools for notifications, and bounds input", async () => {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,9 +10,13 @@ import type { PaseoApi, PaseoWorkspaceAgentCreateOptions, PaseoWorkspaceCreateOp
 import { buildContext, buildPrompt, issuePage, normalizeIssue, connection, relationships, stateHistorySpans, ticketRelations } from "./context";
 import { Credentials } from "./credentials";
 import { Launcher, safeBranchName } from "./launch";
-import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate } from "./settings";
-import { LinearService, postGraphQL, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
+import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_DISPATCH, DEFAULT_WRITEBACK } from "./settings";
+import { LinearService, postGraphQL, ADD_LABEL_QUERY, CREATE_LABEL_QUERY, LABEL_BY_NAME_QUERY, resolveReviewState, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
+import { RateBudget, RateLimitedError } from "./rate-budget";
 import { cachedOverviewRpc, countIssuesRpc, listIssuesRpc, searchIssuesRpc } from "../shared/contracts";
+
+// Launches save the ticket prompt for the plan advisor under PASEO_HOME; keep it out of the real one.
+process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-plugin-home-"));
 
 // GraphQL-shaped fixture: workflow state, priority label, label connection,
 // and the relationship fields the detail query requests.
@@ -35,13 +40,14 @@ const comment = {
 };
 const detail = { issue: normalizeIssue(rawIssue), teamId: "team-1", projectId: "project-1", context: buildContext(rawIssue, [comment]), warnings: [], relations: ticketRelations(rawIssue) };
 const input = { id: "ENG-42", projectId: "project-1", provider: "test/model", instructions: "Add a regression check.", markInProgress: false, requestId: "5f6f1154-5838-4439-b981-b3c9d9831488" };
-// Test fakes that do not exercise the state transition: a no-op stub keeps the contract strict.
-const noMark = { markInProgress: async () => ({ changed: false }) };
+// Test fakes that exercise neither the state transition nor finished blockers: no-op stubs keep the contract strict.
+const noMark = { markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] };
+const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK };
 
 test("server entrypoint loads and registers valid Paseo RPC contracts", () => {
   const names: string[] = [];
-  const cleanup = contribute({ handle(contract: { name: string }) { names.push(contract.name); } } as unknown as PluginServerContext);
-  assert.deepEqual(names, ["linear.status", "linear.connect", "linear.disconnect", "linear.list-issues", "linear.count-issues", "linear.cached-overview", "linear.search-issues", "linear.issue-context", "linear.project-branches", "linear.get-default-prompt", "linear.set-default-prompt", "linear.get-settings", "linear.set-settings", "linear.launch-agent"]);
+  const cleanup = contribute({ handle(contract: { name: string }) { names.push(contract.name); }, on() { return () => {}; }, before() { return () => {}; } } as unknown as PluginServerContext);
+  assert.deepEqual(names, ["linear.status", "linear.dispatch-status", "linear.connect", "linear.disconnect", "linear.list-issues", "linear.count-issues", "linear.cached-overview", "linear.search-issues", "linear.issue-context", "linear.project-branches", "linear.get-default-prompt", "linear.set-default-prompt", "linear.get-settings", "linear.set-settings", "linear.launch-agent", "linear.agent-status"]);
   cleanup();
 });
 
@@ -74,20 +80,57 @@ test("authentication, rate-limit and server failures map to user-actionable erro
   const cases: Array<{ status: number; body: unknown; message: RegExp }> = [
     { status: 401, body: { errors: [{ message: "Authentication required" }] }, message: /rejected this API key. Authentication required/ },
     { status: 403, body: { errors: [{ message: "forbidden" }] }, message: /rejected this API key. forbidden/ },
-    { status: 429, body: { errors: [{ message: "rate limited" }] }, message: /rate-limiting/ },
+    { status: 429, body: { errors: [{ message: "rate limited" }] }, message: /hourly request limit is reached for the Linear API key/ },
+    // What Linear actually sends when the hourly limit is used up.
+    { status: 400, body: { errors: [{ message: "Rate limit exceeded. Only 2500 requests are allowed per 1 hour.", extensions: { code: "RATELIMITED" } }] }, message: /hourly request limit is reached for the Linear API key/ },
     { status: 400, body: { errors: [{ message: "Remove the Bearer prefix from the Authorization header." }] }, message: /request failed: Remove the Bearer prefix/ },
     { status: 500, body: { errors: [{ message: "boom" }] }, message: /request failed: boom/ },
     { status: 502, body: "gateway html", message: /HTTP 502/ },
   ];
   for (const { status, body, message } of cases) {
     mockFetch(t, () => new Response(typeof body === "string" ? body : JSON.stringify(body), { status, headers: { "content-type": "application/json" } }));
-    await assert.rejects(postGraphQL("key", "query q { viewer { id } }", {}), message);
+    await assert.rejects(postGraphQL("key", "query q { viewer { id } }", {}, new RateBudget()), message);
   }
+});
+
+test("a RATELIMITED answer blocks only its own pool, and later calls on it fail without reaching Linear", async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", (() => {
+    calls++;
+    return Promise.resolve(new Response(JSON.stringify({ data: null, errors: [{ message: "Rate limit exceeded.", extensions: { code: "RATELIMITED" } }] }), {
+      status: 200, headers: { "content-type": "application/json", "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": "0" },
+    }));
+  }) as typeof fetch);
+  const budget = new RateBudget();
+  const error = await postGraphQL("Bearer app-token", "q", {}, budget).then(() => null, (failure: unknown) => failure);
+  assert.ok(error instanceof RateLimitedError);
+  assert.equal(error.pool, "app");
+  assert.ok(error.resumeAt > Date.now());
+  await assert.rejects(postGraphQL("Bearer app-token", "q", {}, budget), RateLimitedError);
+  assert.equal(calls, 1);
+  assert.equal(budget.pausedUntil("key"), null);
 });
 
 test("GraphQL error payloads fail visibly with the API message", async (t) => {
   mockFetch(t, () => new Response(JSON.stringify({ data: null, errors: [{ message: "Issue not found" }] }), { status: 200, headers: { "content-type": "application/json" } }));
   await assert.rejects(postGraphQL("key", "query q { issue(id: \"x\") { id } }", {}), /Issue not found/);
+});
+
+// Linear's answer when the pull request is already on the ticket (captured from TUC-96).
+const ALREADY_LINKED = { data: null, errors: [{ message: "Unable to create issue attachment", path: ["attachmentLinkURL"], extensions: { type: "invalid input", code: "INPUT_ERROR", statusCode: 400, userError: true, userPresentableMessage: "This URL has already been linked with TUC-96." } }] };
+
+test("a GraphQL error names Linear's reason, not only its generic message", async (t) => {
+  mockFetch(t, () => new Response(JSON.stringify(ALREADY_LINKED), { status: 200, headers: { "content-type": "application/json" } }));
+  await assert.rejects(postGraphQL("key", "q", {}, new RateBudget()), /Unable to create issue attachment \(This URL has already been linked with TUC-96\.\)/);
+});
+
+test("linking a URL that is already linked succeeds; other link failures still fail", async (t) => {
+  let answer: unknown = ALREADY_LINKED;
+  mockFetch(t, () => new Response(JSON.stringify(answer), { status: 200, headers: { "content-type": "application/json" } }));
+  const service = new LinearService(new Credentials("/unused", "env-key"), (key, query, variables) => postGraphQL(key, query, variables, new RateBudget()));
+  await service.linkUrl("issue-1", "https://github.com/o/r/pull/287", "Pull request");
+  answer = { data: null, errors: [{ message: "Unable to create issue attachment", extensions: { userPresentableMessage: "Invalid URL." } }] };
+  await assert.rejects(service.linkUrl("issue-1", "not a url", "Pull request"), /Invalid URL/);
 });
 
 test("invalid response bodies fail loudly", async (t) => {
@@ -258,14 +301,14 @@ test("settings persist the template with private permissions and reset removes i
   const path = join(directory, "settings.json");
   try {
     const settings = new Settings(path);
-    assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     const saved = await settings.save("Handle {{ticket}}\n{{context}}");
     assert.equal(saved.template, "Handle {{ticket}}\n{{context}}");
     assert.equal((await stat(path)).mode & 0o777, 0o600);
     assert.deepEqual(await settings.read(), saved);
-    assert.deepEqual(await settings.save(""), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.save(""), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     await assert.rejects(readFile(path), { code: "ENOENT" });
-    assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -275,17 +318,17 @@ test("the mark-in-progress setting round-trips without disturbing the saved temp
   try {
     const settings = new Settings(path);
     await settings.patch({ markInProgress: true });
-    assert.deepEqual(await settings.read(), { template: null, markInProgress: true, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: null, markInProgress: true, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     await settings.save("Handle {{ticket}}\n{{context}}");
-    assert.deepEqual(await settings.read(), { template: "Handle {{ticket}}\n{{context}}", markInProgress: true, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: "Handle {{ticket}}\n{{context}}", markInProgress: true, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     // The closed-states setting round-trips the same way and never disturbs the other fields.
     await settings.patch({ showClosed: true });
-    assert.deepEqual(await settings.read(), { template: "Handle {{ticket}}\n{{context}}", markInProgress: true, showClosed: true, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: "Handle {{ticket}}\n{{context}}", markInProgress: true, showClosed: true, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     // Clearing the template keeps the flags; clearing the last flag with no template removes the file.
     await settings.patch({ template: "" });
-    assert.deepEqual(await settings.read(), { template: null, markInProgress: true, showClosed: true, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: null, markInProgress: true, showClosed: true, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     await settings.patch({ markInProgress: false, showClosed: false });
-    assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true });
+    assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     await assert.rejects(readFile(path), { code: "ENOENT" });
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
@@ -303,7 +346,7 @@ test("settings remember the last successful launch choices per provider", async 
         codex: { model: "codex/gpt-5", modeId: "code", thinkingOptionId: "high" },
         claude: { model: "claude/sonnet" },
       },
-      projectMappings: {}, agentLinearAccess: true,
+      projectMappings: {}, agentLinearAccess: true, ...automationDefaults,
     });
     assert.equal((await stat(path)).mode & 0o777, 0o600);
   } finally { await rm(directory, { recursive: true, force: true }); }
@@ -625,6 +668,102 @@ test("a saved default prompt template shapes the agent's first prompt", async ()
   await assert.rejects(launcher.start({ ...input, instructions: "" }, paseo, { promptTemplate: "other {{context}}" }), /already been used/);
 });
 
+test("the plan advisor reads the same ticket prompt the agent starts with", async () => {
+  let options: PaseoWorkspaceAgentCreateOptions | undefined;
+  const launcher = new Launcher({ ...noMark, detail: async () => detail });
+  await launcher.start({ ...input, requestId: "8a1f2c3d-0000-4000-8000-000000000001" }, mockPaseo(async (created) => { options = created; return { id: "agent-1" }; }), { env: { LINEAR_TICKETS_PLAN: "required" } });
+  const path = options?.env?.LINEAR_TICKETS_CONTEXT;
+  assert.ok(path, "every ticket agent gets the context path");
+  assert.equal(options?.env?.LINEAR_TICKETS_PLAN, "required", "the plan policy env is kept");
+  assert.equal(await readFile(path, "utf8"), options?.prompt);
+  assert.equal((await stat(path)).mode & 0o777, 0o600);
+});
+
+test("a ticket context that cannot be saved warns and still launches a gated ticket agent, without the path", async () => {
+  let options: PaseoWorkspaceAgentCreateOptions | undefined;
+  const launcher = new Launcher({ ...noMark, detail: async () => detail }, undefined, undefined, undefined, async () => { throw new Error("disk full"); });
+  const result = await launcher.start({ ...input, requestId: "8a1f2c3d-0000-4000-8000-000000000002" }, mockPaseo(async (created) => { options = created; return { id: "agent-1" }; }));
+  assert.equal(result.agentId, "agent-1");
+  assert.deepEqual(options?.env, { LINEAR_TICKETS_ISSUE: "ENG-42" });
+  assert.ok(result.warnings.some((warning) => warning.includes("disk full")));
+});
+
+test("an agent starting after its blockers gets what the finished ones left: links and their latest real comments, newest first", async () => {
+  const blocked = { ...rawIssue, inverseRelations: { nodes: [
+    { type: "blocks", issue: { id: "issue-5", identifier: "ENG-46", title: "Add the table", state: { name: "Done", type: "completed" } }, relatedIssue: { id: "issue-1" } },
+    { type: "blocks", issue: { id: "issue-6", identifier: "ENG-47", title: "In review", state: { name: "In Review", type: "started" } }, relatedIssue: { id: "issue-1" } },
+    { type: "blocks", issue: { id: "issue-7", identifier: "ENG-48", title: "Still in progress", state: { name: "In Progress", type: "started" } }, relatedIssue: { id: "issue-1" } },
+  ] } };
+  const blockedDetail = { ...detail, context: buildContext(blocked, []), relations: ticketRelations(blocked) };
+  const asked: string[][] = [];
+  const long = "x".repeat(7_000);
+  const launcher = new Launcher({ ...noMark, detail: async () => blockedDetail, finishedBlockers: async (ids: string[]) => {
+    asked.push(ids);
+    return [{
+      identifier: "ENG-46", title: "Add the table", url: "https://linear.app/x/issue/ENG-46", status: "Done", completedAt: "2026-10-01T09:41:07.677Z",
+      links: [{ title: "Pull request", url: "https://github.com/o/r/pull/7" }, { title: "Plan: ENG-46", url: "https://linear.app/x/document/plan" }],
+      comments: [
+        { body: "Started on the table.", createdAt: "2026-10-01T08:00:00Z" },
+        { body: "Done. The table is `orders_v2`; the old one stays until ENG-50.", createdAt: "2026-10-01T09:00:00Z" },
+        { body: long, createdAt: "2026-10-01T08:30:00Z" },
+        { body: "🏁 **Paseo final report** — ENG-46: Add the table", createdAt: "2026-10-01T10:00:00Z" },
+        { body: "🛠 **Paseo progress** — ENG-46", createdAt: "2026-10-01T07:00:00Z" },
+        { body: "Please reply with an option:\n- Approve plan (approve-plan)", createdAt: "2026-10-01T09:30:00Z" },
+      ],
+    }];
+  } });
+  let prompt: string | undefined;
+  const result = await launcher.start({ ...input, requestId: "8a1f2c3d-0000-4000-8000-000000000003" }, mockPaseo(async (created) => { prompt = created.prompt; return { id: "agent-1" }; }));
+  assert.deepEqual(asked, [["issue-5", "issue-6"]], "Done and in-review blockers are read (the read keeps a review only when merged); work in progress is not");
+  assert.deepEqual(result.warnings, []);
+  const note = prompt!.slice(prompt!.indexOf("Finished blockers:"));
+  assert.ok(note.includes("### ENG-46: Add the table (Done 2026-10-01)\nhttps://linear.app/x/issue/ENG-46\nLinks:\n- Pull request: https://github.com/o/r/pull/7\n- Plan: ENG-46: https://linear.app/x/document/plan"));
+  assert.ok(note.indexOf("orders_v2") < note.indexOf("xxx"), "newest first");
+  assert.ok(!note.includes("Started on the table."), "older comments beyond the 6,000-character budget are left out");
+  assert.ok(!note.includes("Paseo final report") && !note.includes("Paseo progress") && !note.includes("approve-plan"), "status cards and plan-approval questions are not the work");
+  assert.ok(prompt!.indexOf("Add a regression check.") < prompt!.indexOf("Finished blockers:"));
+
+  const failing = new Launcher({ ...noMark, detail: async () => blockedDetail, finishedBlockers: async () => { throw new Error("Linear unavailable"); } });
+  const degraded = await failing.start({ ...input, requestId: "8a1f2c3d-0000-4000-8000-000000000004" }, mockPaseo(async () => ({ id: "agent-2" })));
+  assert.equal(degraded.agentId, "agent-2", "a failed read never stops the launch");
+  assert.deepEqual(degraded.warnings, ["Could not read what the finished blockers (ENG-46, ENG-47) left behind: Linear unavailable"]);
+});
+
+test("finished blockers are the Done ones and reviews with merged pull requests, in the asked order, without the Paseo agent links", async () => {
+  const pr = (n: number, status: string) => ({ title: `PR ${n}`, url: `https://github.com/o/r/pull/${n}`, sourceType: "github", metadata: { status } });
+  const review = (id: string, identifier: string, name: string, prs: unknown[]) => ({ id, identifier, title: identifier, url: id, completedAt: null, state: { name, type: "started" }, attachments: { nodes: prs }, documents: { nodes: [] }, comments: { nodes: [] } });
+  const post: Post = async () => ({ issues: { nodes: [
+    { id: "b", identifier: "ENG-2", title: "Second", url: "u2", completedAt: null, state: { name: "Done", type: "completed" }, attachments: { nodes: [] }, documents: { nodes: [] }, comments: { nodes: [] } },
+    { id: "a", identifier: "ENG-1", title: "First", url: "u1", completedAt: "2026-10-01T00:00:00Z", state: { name: "Done", type: "completed" },
+      attachments: { nodes: [{ title: "Pull request", url: "https://github.com/o/r/pull/1" }, { title: "Paseo agent · ENG-1", url: "https://app.paseo.sh/h/srv/agent/x" }] },
+      documents: { nodes: [{ title: "Plan: ENG-1", url: "https://linear.app/doc" }] },
+      comments: { nodes: [{ body: "Done.", createdAt: "2026-10-01T00:00:00Z" }] } },
+    review("c", "ENG-3", "In Review", [pr(3, "merged")]),
+    review("d", "ENG-4", "In Review", [pr(4, "merged"), pr(5, "open")]),
+  ] } });
+  const blockers = await new LinearService(new Credentials("/unused", "key"), post).finishedBlockers(["a", "c", "d", "b"]);
+  assert.deepEqual(blockers.map((blocker) => blocker.identifier), ["ENG-1", "ENG-3", "ENG-2"]);
+  assert.deepEqual(blockers[0].links.map((link) => link.url), ["https://github.com/o/r/pull/1", "https://linear.app/doc"]);
+  assert.deepEqual(blockers[0].comments, [{ body: "Done.", createdAt: "2026-10-01T00:00:00Z" }]);
+});
+
+test("a blocker in review whose pull requests are merged no longer holds the ticket back; open, draft, untracked or in-progress work does", async () => {
+  const pr = (n: number, status: string, sourceType = "github") => ({ url: `https://github.com/o/r/pull/${n}`, sourceType, metadata: sourceType === "github" ? { status } : {} });
+  const blocker = (identifier: string, name: string, type: string, prs: unknown[]) => ({ type: "blocks", issue: { identifier, state: { name, type }, attachments: { nodes: prs } } });
+  const post: Post = async () => ({ issue: { id: "i1", identifier: "ENG-1", state: { id: "s", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [
+    blocker("ENG-2", "In Review", "started", [pr(1, "merged"), pr(2, "merged")]),
+    blocker("ENG-3", "In Review", "started", [pr(3, "merged"), pr(4, "open")]),
+    blocker("ENG-4", "In Review", "started", [pr(5, "draft")]),
+    blocker("ENG-5", "In Review", "started", [pr(6, "", "api")]),
+    blocker("ENG-6", "In Progress", "started", [pr(7, "merged")]),
+    blocker("ENG-7", "Ready to merge", "started", [pr(8, "merged"), pr(9, "closed")]),
+    blocker("ENG-8", "Done", "completed", []),
+    blocker("ENG-9", "In Review", "started", []),
+  ] } } });
+  const state = await new LinearService(new Credentials("/unused", "key"), post).issueState("i1");
+  assert.deepEqual(state.blockedBy, ["ENG-3", "ENG-4", "ENG-5", "ENG-6", "ENG-9"]);
+});
+
 test("pre-launch errors can retry, but uncertain agent creation is never automatically repeated", async () => {
   let fetches = 0, creates = 0;
   const launcher = new Launcher({ ...noMark, detail: async () => {
@@ -864,4 +1003,73 @@ test("launch marks the ticket in progress only when opted in, and demotes failur
   const mutations = calls.filter(([query]) => query === UPDATE_ISSUE_STATE_QUERY);
   assert.equal(mutations.length, 1);
   assert.deepEqual(mutations[0][1], { id: "issue-1", stateId: "ip" });
+});
+
+test("dispatch settings normalize team keys, reject invalid edits, and are forgotten when back to defaults", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-linear-dispatch-settings-"));
+  const path = join(directory, "settings.json");
+  const settings = new Settings(path);
+  try {
+    const saved = await settings.patch({ dispatch: { enabled: true, teamKeys: ["eng", "ENG", " ops "] } });
+    assert.deepEqual(saved.dispatch, { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["ENG", "OPS"] });
+    assert.deepEqual((await settings.read()).dispatch, saved.dispatch);
+    await assert.rejects(settings.patch({ dispatch: { teamKeys: ["not a key"] } }), /"not a key" is not a Linear team key/);
+    await assert.rejects(settings.patch({ dispatch: { intervalSeconds: 5 } }), /between 30 and 3600/);
+    await assert.rejects(settings.patch({ dispatch: { label: "a,b" } }), /without commas/);
+    assert.deepEqual((await settings.read()).dispatch, saved.dispatch);
+    await settings.patch({ writeback: { summaries: true } });
+    assert.deepEqual((await settings.read()).writeback, { ...DEFAULT_WRITEBACK, summaries: true });
+    await settings.patch({ dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK });
+    await assert.rejects(stat(path), { code: "ENOENT" });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a pull request only moves the ticket to a started state named for review", () => {
+  const states: TeamState[] = [
+    { id: "todo", name: "Todo", type: "unstarted", position: 1 },
+    { id: "ip", name: "In Progress", type: "started", position: 2 },
+    { id: "rev", name: "In Review", type: "started", position: 3 },
+    { id: "done", name: "Reviewed", type: "completed", position: 4 },
+  ];
+  assert.equal(resolveReviewState(states)?.id, "rev");
+  assert.equal(resolveReviewState(states.filter((state) => state.id !== "rev")), null);
+});
+
+test("labels are created once when missing and removed by name, case-insensitively", async () => {
+  const calls: unknown[][] = [];
+  const service = new LinearService(new Credentials(join(tmpdir(), `paseo-linear-labels-${process.pid}`), "env-key"), (_key, query, variables) => {
+    calls.push([query, variables]);
+    if (query === LABEL_BY_NAME_QUERY) return Promise.resolve({ issueLabels: { nodes: [] } });
+    if (query === CREATE_LABEL_QUERY) return Promise.resolve({ issueLabelCreate: { success: true, issueLabel: { id: "new-label", name: variables.name } } });
+    if (query === ADD_LABEL_QUERY) return Promise.resolve({ issueAddLabel: { success: true } });
+    return Promise.resolve({ issueRemoveLabel: { success: true } });
+  });
+  await service.addLabel("issue-1", "paseo-running");
+  await service.addLabel("issue-2", "paseo-running");
+  assert.equal(calls.filter(([query]) => query === CREATE_LABEL_QUERY).length, 1);
+  assert.deepEqual(calls.filter(([query]) => query === ADD_LABEL_QUERY).map(([, variables]) => variables), [{ id: "issue-1", labelId: "new-label" }, { id: "issue-2", labelId: "new-label" }]);
+  calls.length = 0;
+  await service.removeLabel("issue-1", "Paseo", [{ id: "a", name: "paseo" }, { id: "b", name: "PASEO" }, { id: "c", name: "paseo-running" }]);
+  assert.deepEqual(calls.map(([, variables]) => variables), [{ id: "issue-1", labelId: "a" }, { id: "issue-1", labelId: "b" }]);
+});
+
+test("the planning/coding transitions pick the named started state and leave finished or unchanged tickets alone", async () => {
+  const states = [
+    { id: "plan", name: "Planning", type: "started", position: 1.5 },
+    { id: "ip", name: "In Progress", type: "started", position: 2 },
+    { id: "done", name: "Done", type: "completed", position: 3 },
+  ];
+  const run = async (current: { name: string; type: string }, target: string) => {
+    const updates: unknown[] = [];
+    const service = new LinearService(new Credentials(join(tmpdir(), `paseo-linear-named-${process.pid}`), "env-key"), (_key, query, variables) => {
+      if (query === UPDATE_ISSUE_STATE_QUERY) { updates.push(variables); return Promise.resolve({ issueUpdate: { success: true } }); }
+      if (query === TEAM_STATES_QUERY) return Promise.resolve({ team: { states: { nodes: states } } });
+      return Promise.resolve({ issue: { id: "i1", state: current, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] } } });
+    });
+    return { result: await service.moveToStateNamed("i1", target), updates };
+  };
+  assert.deepEqual(await run({ name: "In Progress", type: "started" }, "Planning"), { result: { changed: true }, updates: [{ id: "i1", stateId: "plan" }] });
+  assert.deepEqual(await run({ name: "Planning", type: "started" }, "planning"), { result: { changed: false }, updates: [] });
+  assert.deepEqual(await run({ name: "Done", type: "completed" }, "In Progress"), { result: { changed: false }, updates: [] });
+  assert.match((await run({ name: "Todo", type: "unstarted" }, "Coding")).result.note ?? "", /no started state named "Coding"/);
 });

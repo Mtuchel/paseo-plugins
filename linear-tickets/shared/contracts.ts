@@ -15,7 +15,7 @@ export const DEFAULT_PROMPT_TEMPLATE = [
 
 // What the agent is told about changing Linear. With access on, the agent holds tools that
 // can only act on its own ticket; a template without {{linear_access}} gets this appended.
-export const LINEAR_ACCESS_NOTE = "You can update this ticket through the linear_ticket MCP tools (get_ticket, add_comment, set_status, link_url); they act only on this ticket. Post a short comment when you start, and a final comment with what changed, how it was verified and the pull request link. Attach the pull request with link_url and move the ticket to its review state (for example In Review) once a pull request is open. If you are blocked, say why in a comment. Do not change any other Linear ticket.";
+export const LINEAR_ACCESS_NOTE = "You can update this ticket through the linear_ticket MCP tools (get_ticket, add_comment, set_status, link_url, add_manual_task); they act only on this ticket and its manual tasks. Post a short comment when you start, and a final comment with what changed, how it was verified, the pull request link and the manual tasks still open. Attach the pull request with link_url and move the ticket to its review state (for example In Review) once a pull request is open. Every step a person must do outside the pull request (environment variables, secrets, Railway/Linear/GitHub/Paseo settings, webhooks, integrations) goes through add_manual_task, one task per coherent step, never only into a comment; give it a check command whenever one can prove the step is done. If you are blocked, say why in a comment. Do not change any other Linear ticket.";
 export const NO_LINEAR_ACCESS_NOTE = "Do not post comments or change Linear status unless the user explicitly asks.";
 
 export const issueSchema = z.object({
@@ -138,6 +138,8 @@ export const launchAgentRpc = defineRpc({
     thinkingOptionId: z.string().min(1).optional(),
     instructions: z.string().max(10_000).default(""),
     markInProgress: z.boolean().default(false),
+    // "Plan first": the agent plans and waits for approval (README, Plan-first).
+    planFirst: z.boolean().default(false),
     requestId: z.string().uuid(),
   }),
   output: z.object({ agentId: z.string(), warnings: z.array(z.string()) }),
@@ -177,6 +179,24 @@ export const projectMappingSchema = z.object({
   baseBranch: z.string().min(1).max(500).optional(),
   label: z.string().min(1).max(500),
 });
+// Server-side validation (settings.ts) owns the exact rules; these bound the wire shape.
+const dispatchSettingsSchema = z.object({
+  enabled: z.boolean(),
+  label: z.string().min(1).max(80),
+  teamKeys: z.array(z.string().min(1).max(10)).max(20),
+  intervalSeconds: z.number().int(),
+  maxRunning: z.number().int(),
+});
+const writebackSettingsSchema = z.object({
+  status: z.boolean(),
+  summaries: z.boolean(),
+  blocked: z.boolean(),
+  pullRequests: z.boolean(),
+  mentions: z.boolean(),
+  autoResume: z.boolean(),
+});
+export type DispatchSettingsValue = z.infer<typeof dispatchSettingsSchema>;
+export type WritebackSettingsValue = z.infer<typeof writebackSettingsSchema>;
 const settingsOutputSchema = z.object({
   template: z.string().nullable(),
   builtin: z.string(),
@@ -186,6 +206,8 @@ const settingsOutputSchema = z.object({
   launchPreferences: launchPreferencesSchema,
   projectMappings: z.record(z.string(), projectMappingSchema),
   agentLinearAccess: z.boolean(),
+  dispatch: dispatchSettingsSchema,
+  writeback: writebackSettingsSchema,
 });
 export const getSettingsRpc = defineRpc({
   name: "linear.get-settings",
@@ -202,6 +224,34 @@ export const setSettingsRpc = defineRpc({
     projectMapping: projectMappingSchema.extend({ key: z.string().regex(/^(project|team):[A-Za-z0-9_-]{1,100}$/) }).optional(),
     forgetProjectMapping: z.string().min(1).max(200).optional(),
     launchPreference: launchPreferenceSchema.extend({ provider: z.string().min(1).max(500) }).optional(),
+    dispatch: dispatchSettingsSchema.partial().optional(),
+    writeback: writebackSettingsSchema.partial().optional(),
   }),
   output: settingsOutputSchema,
+});
+
+// What the auto-dispatcher did most recently, for the ticket surface's status line.
+export const dispatchStatusSchema = z.object({
+  active: z.boolean(),
+  lastPollAt: z.string().nullable(),
+  lastError: z.string().nullable(),
+  recent: z.array(z.object({
+    identifier: z.string(),
+    at: z.string(),
+    outcome: z.enum(["launched", "linked", "failed"]),
+    detail: z.string(),
+  })),
+});
+export type DispatchStatus = z.infer<typeof dispatchStatusSchema>;
+export const dispatchStatusRpc = defineRpc({
+  name: "linear.dispatch-status",
+  input: z.object({}),
+  output: dispatchStatusSchema,
+});
+
+// The native Linear agent's health for the settings screen.
+export const agentStatusRpc = defineRpc({
+  name: "linear.agent-status",
+  input: z.object({}),
+  output: z.object({ installed: z.boolean(), funnel: z.boolean(), funnelNote: z.string().nullable(), lastWebhookAt: z.string().nullable() }),
 });
