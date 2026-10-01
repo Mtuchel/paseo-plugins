@@ -17,7 +17,7 @@ import { AgentApi, AppAuth } from "./server/agent-app";
 import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
 import { ensureFunnel, type FunnelStatus } from "./server/funnel";
 import { ReviewLinks } from "./server/review-links";
-import { closeModelSetter, modelSetter, ownConnection } from "./server/connection";
+import { closeInternalDaemon, internalDaemon, modelSetter, ownConnection } from "./server/connection";
 import { ModelGuard } from "./server/model-guard";
 import { HealthMonitor } from "./server/health";
 import { PullRequestWatch } from "./server/pr-watch";
@@ -29,6 +29,7 @@ import { approveForLater, splitIntoSubIssues } from "./server/split";
 import { planSetup, TicketStarter } from "./server/starter";
 import { isPlanPolicy, PLAN_POLICY_ENV, PLAN_POLICY_LABEL } from "./server/plan-policy";
 import { PlanRequests } from "./server/plan-requests";
+import { labelDaemon, StateLabels } from "./server/state-labels";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -76,6 +77,9 @@ export default function contribute(server: PluginServerContext) {
   const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, comments: agentApi });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => sessions.receive(event));
+  // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").
+  const stateLabels = new StateLabels({ linear, daemon: async () => { const client = await internalDaemon(); return client ? labelDaemon(client) : null; } });
+  linear.onStateWritten((issueId, state) => stateLabels.noteState(issueId, state));
   let funnel: FunnelStatus | null = null;
   const health = new HealthMonitor(linear, settings, [
     { name: "Linear API key", run: () => linear.ping() },
@@ -101,6 +105,7 @@ export default function contribute(server: PluginServerContext) {
     health.start();
     pullRequests.start();
     manualTasks.start();
+    stateLabels.start();
     if (!app) return false;
     await webhook.start();
     funnel = await ensureFunnel(WEBHOOK_PORT);
@@ -136,7 +141,7 @@ export default function contribute(server: PluginServerContext) {
   server.on("agent.permission_requested", (event, { paseo }) => { attach(paseo); return writeback.permissionRequested(event, paseo); });
   server.on("agent.permission_resolved", (event, { paseo }) => writeback.permissionResolved(event, paseo));
   server.on("agent.archived", (event, { paseo }) => writeback.archived(event, paseo));
-  server.on("agent.created", (_event, { paseo }) => attach(paseo));
+  server.on("agent.created", (_event, { paseo }) => { attach(paseo); stateLabels.soon(); });
   server.on("workspace.created", (_event, { paseo }) => attach(paseo));
   server.before("agent.session_open", async ({ request }, { paseo }) => {
     attach(paseo);
@@ -211,5 +216,5 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); void closeModelSetter(); };
+  return () => { stopped = true; clearTimeout(startSoon); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); void closeInternalDaemon(); };
 }

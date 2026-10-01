@@ -25,7 +25,7 @@ class FakeLinear {
   async createComment(issueId: string, body: string) { this.writes.push(`comment ${issueId}: ${body}`); return "c"; }
   async updateComment() {}
   async moveToReady(issueId: string) { this.writes.push(`ready ${issueId}`); return { changed: true }; }
-  async reopen(issueId: string) { this.writes.push(`reopen ${issueId}`); this.statuses.set(issueId, { statusType: "unstarted", completedAt: null }); }
+  async reopen(issueId: string) { this.writes.push(`reopen ${issueId}`); this.statuses.set(issueId, { status: "Todo", statusType: "unstarted", completedAt: null }); }
   async viewerId() { return "me"; }
   async userUrl() { return OWNER; }
 }
@@ -47,7 +47,7 @@ test("new manual tasks get the label and one owner mention per ticket, only once
     task("gone", { announced: false }),
   ]);
   try {
-    for (const id of ["a", "b", "c"]) linear.statuses.set(id, { statusType: id === "b" ? "backlog" : "unstarted", completedAt: null });
+    for (const id of ["a", "b", "c"]) linear.statuses.set(id, id === "b" ? { status: "Backlog", statusType: "backlog", completedAt: null } : { status: "Todo", statusType: "unstarted", completedAt: null });
     await manual.poll();
     assert.deepEqual(linear.writes, [
       "+paseo-manual a", "+paseo-manual b",
@@ -72,9 +72,9 @@ test("a done task runs its check once per completion: passing verifies, failing 
     return { ok: pass, code: pass ? 0 : 3, output: "SECRET=hunter2", cwd: "/home/me" };
   });
   try {
-    linear.statuses.set("a", { statusType: "completed", completedAt: "t1" });
-    linear.statuses.set("plain", { statusType: "completed", completedAt: "t1" });
-    linear.statuses.set("dropped", { statusType: "canceled", completedAt: null });
+    linear.statuses.set("a", { status: "Done", statusType: "completed", completedAt: "t1" });
+    linear.statuses.set("plain", { status: "Done", statusType: "completed", completedAt: "t1" });
+    linear.statuses.set("dropped", { status: "Canceled", statusType: "canceled", completedAt: null });
     assert.equal((await manual.openBlockers("parent")).length, 0, "only before-merge tasks gate");
     await manual.poll();
     assert.deepEqual(runs, ["railway variables | grep -q X @ /nowhere"]);
@@ -87,7 +87,7 @@ test("a done task runs its check once per completion: passing verifies, failing 
 
     pass = true;
     linear.writes.length = 0;
-    linear.statuses.set("a", { statusType: "completed", completedAt: "t2" });
+    linear.statuses.set("a", { status: "Done", statusType: "completed", completedAt: "t2" });
     await manual.poll();
     assert.deepEqual(linear.writes, ["comment a: ✓ Verified: the check passed (ran in `/home/me`)."]);
     assert.deepEqual(Object.keys(await stored()), []);
@@ -101,9 +101,9 @@ test("before-merge tasks block until done and verified; a merge makes after-merg
     task("now", { when: "anytime" }),
   ]);
   try {
-    linear.statuses.set("gate", { statusType: "completed", completedAt: "t1" });
-    linear.statuses.set("later", { statusType: "backlog", completedAt: null });
-    linear.statuses.set("now", { statusType: "unstarted", completedAt: null });
+    linear.statuses.set("gate", { status: "Done", statusType: "completed", completedAt: "t1" });
+    linear.statuses.set("later", { status: "Backlog", statusType: "backlog", completedAt: null });
+    linear.statuses.set("now", { status: "Todo", statusType: "unstarted", completedAt: null });
     assert.deepEqual((await manual.openBlockers("parent")).map((item) => item.id), ["gate"], "done but not yet verified still blocks");
     assert.equal(await manual.awaitingMerge("parent"), true);
     await manual.merged("parent");
