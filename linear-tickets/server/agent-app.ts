@@ -95,6 +95,9 @@ const APP_VIEWER_QUERY = `query appViewer { viewer { id name } }`;
 const OPEN_SESSIONS_QUERY = `query openSessions($first: Int!) {
   agentSessions(first: $first, orderBy: updatedAt) { nodes { id status createdAt creator { id } issue { id identifier } } }
 }`;
+const SESSION_STATUS_QUERY = `query sessionStatus($id: String!) {
+  agentSession(id: $id) { status }
+}`;
 const SESSION_ACTIVITIES_QUERY = `query sessionActivities($id: String!) {
   agentSession(id: $id) { activities(first: 50) { nodes { id createdAt signal user { id } content {
     __typename
@@ -188,6 +191,12 @@ export class AgentApi {
       issueId: node.issue ? String(record(node.issue).id ?? "") || null : null,
       identifier: node.issue ? String(record(node.issue).identifier ?? "") || null : null,
     })).filter((session) => session.id);
+  }
+
+  // One session's status ("pending", "active", "awaitingInput", "stale", "complete", "error"); null when Linear has no such session.
+  async sessionStatus(sessionId: string): Promise<string | null> {
+    const session = record(await this.call(SESSION_STATUS_QUERY, { id: sessionId })).agentSession;
+    return session ? String(record(session).status ?? "") || null : null;
   }
 
   async activities(sessionId: string): Promise<AgentActivity[]> {

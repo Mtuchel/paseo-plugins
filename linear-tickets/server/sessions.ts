@@ -208,7 +208,7 @@ export function planSteps(markdown: string): string[] {
 
 type Deps = {
   api: AgentApi;
-  linear: Pick<LinearService, "viewerId" | "addLabel" | "removeLabel" | "complete">;
+  linear: Pick<LinearService, "viewerId" | "addLabel" | "removeLabel" | "complete" | "issueState">;
   starter: Pick<TicketStarter, "start" | "admission">;
   settings: Pick<Settings, "read">;
   store: SessionStore;
@@ -458,27 +458,71 @@ export class SessionRouter {
     await handle.send(body);
   }
 
-  // Catch-up for missed webhooks: new sessions nobody started, and prompts not yet handled.
+  // Threads waiting for blockers or an agent slot. Read from the store, not from `openSessions`:
+  // that is Linear's 50 most recently updated sessions in the whole workspace, and a waiting
+  // thread posts nothing, so it drops out of that list hours before a slow blocker finishes.
+  // Each thread is tried on its own: a failed read leaves it queued for the next sweep, a failed
+  // start ends the wait with an error in the thread (as for a ticket that was never queued).
+  async startQueued(): Promise<void> {
+    for (const link of await this.deps.store.all()) {
+      if (!link.queued || link.agentId || link.closed) continue;
+      try {
+        const admission = await this.deps.starter.admission(link.issueId, this.paseo!, await this.deps.settings.read());
+        if (!admission.ok) continue;
+        // The owner may have ended the thread or closed the ticket while it waited.
+        const status = await this.deps.api.sessionStatus(link.sessionId);
+        if (!status || status === "complete" || status === "error") {
+          await this.deps.store.patch(link.sessionId, { queued: false });
+          console.log(`[linear-tickets] ${link.identifier}: queued thread ended in Linear (${status ?? "gone"}); no agent started`);
+          continue;
+        }
+        const ticket = await this.deps.linear.issueState(link.issueId);
+        if (ticket.statusType === "completed" || ticket.statusType === "canceled") {
+          await this.deps.store.patch(link.sessionId, { queued: false });
+          await this.say(link.sessionId, "response", `${link.identifier} was moved to ${ticket.status} while it waited, so no agent was started. Assign Paseo again to start one.`);
+          continue;
+        }
+        // Another path (the trigger label, a newer thread) may have started the ticket's agent meanwhile.
+        const existing = await this.activeAgentFor(link.issueId);
+        if (existing) {
+          await this.deps.store.patch(link.sessionId, { agentId: existing.id, queued: false });
+          await this.linkToPaseo(link.sessionId, existing.id);
+          await this.say(link.sessionId, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.`);
+          continue;
+        }
+      } catch (error) {
+        console.error(`[linear-tickets] ${link.identifier}: checking the queued thread failed: ${error instanceof Error ? error.message : error}`);
+        continue;
+      }
+      try {
+        await this.startFor(link, false);
+      } catch (error) {
+        if ((await this.deps.store.get(link.sessionId))?.agentId) {
+          console.error(`[linear-tickets] ${link.identifier}: queued agent started, reporting it failed: ${error instanceof Error ? error.message : error}`);
+          continue;
+        }
+        await this.deps.store.patch(link.sessionId, { queued: false });
+        await this.say(link.sessionId, "error", `Paseo could not start the agent: ${error instanceof Error ? error.message : error}`).catch(() => {});
+      }
+    }
+  }
+
+  // Catch-up for missed webhooks: queued threads now admitted, new sessions nobody started, and prompts not yet handled.
   async sweep(): Promise<void> {
     if (this.sweeping || !this.paseo) return;
     this.sweeping = true;
     try {
+      await this.startQueued();
       await this.closeSuperseded();
       await this.settleReviews();
       // Threads opened before the link existed (or linked to a newer agent) get "Open in Paseo".
       for (const link of await this.deps.store.all()) if (link.agentId && !link.closed && link.paseoLinked !== link.agentId) await this.linkToPaseo(link.sessionId, link.agentId);
       const owner = await this.owner();
       for (const session of await this.deps.api.openSessions()) {
-        // Linear marks a session "stale" after about half an hour without activity, which a ticket
-        // waiting for its blockers easily reaches; it still belongs to Paseo.
         const link = await this.deps.store.get(session.id);
-        const waiting = Boolean(link?.queued && !link.agentId);
-        if (!["pending", "active", "awaitingInput", ...(waiting ? ["stale"] : [])].includes(session.status)) continue;
-        if (link?.queued && !link.agentId) {
-          const admission = await this.deps.starter.admission(link.issueId, this.paseo, await this.deps.settings.read());
-          if (admission.ok) await this.startFor(link, false).catch((error: unknown) => this.say(link.sessionId, "error", `Paseo could not start the agent: ${error instanceof Error ? error.message : error}`));
-          continue;
-        }
+        // Still waiting: `startQueued` owns it.
+        if (link?.queued && !link.agentId) continue;
+        if (!["pending", "active", "awaitingInput"].includes(session.status)) continue;
         if (!link) {
           if (session.status === "pending" && Date.now() - Date.parse(session.createdAt) < ADOPT_WINDOW_MS && session.issueId) {
             await this.handle({ type: "AgentSessionEvent", action: "created", agentSession: { id: session.id, creatorId: session.creatorId, issueId: session.issueId, issue: { id: session.issueId, identifier: session.identifier } } });

@@ -411,10 +411,13 @@ local daemon itself (only a loopback, password-free daemon), so replies sent whi
 reloading are picked up by the minute sweep. Plannotator chat rows in Paseo need a hook's
 connection and are skipped until one arrives; Linear still gets the review.
 
-**Waiting their turn.** A ticket blocked by unfinished tickets, or started while *max agents*
-(Settings → Auto-dispatch) are already working, waits. A labelled ticket keeps its label; a
-delegated one says why in its panel. The minute sweep starts it once it is admitted. Labelled
-tickets start most urgent first.
+**Waiting their turn.** A ticket blocked by unfinished tickets (anything not Done or Canceled,
+so a blocker In Review still blocks), or started while *max agents* (Settings → Auto-dispatch)
+are already working, waits. A labelled ticket keeps its label; a delegated one says why in its
+panel. The minute sweep starts it once it is admitted, however long it waited. A delegated ticket
+whose thread was ended, or which was closed meanwhile, starts nothing; one that already has an
+agent (from its label, say) is linked to it; a failed start is reported in the panel once.
+Labelled tickets start most urgent first.
 
 **Split into sub-issues.** A plan with 2–12 steps also offers **Approve & split into N
 sub-issues**. The plan becomes the parent's plan document and the planning agent is closed.
