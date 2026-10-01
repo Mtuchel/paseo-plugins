@@ -628,6 +628,26 @@ replayed, and a Linear failure is logged (`paseo plugin logs linear-tickets`) wi
 affecting the agent. A write-back that hits Linear's rate limit waits for the quota instead
 (see [Rate limits](#rate-limits)).
 
+## Ticket state in the sidebar
+
+Each workspace with a ticket agent carries one workspace label naming its ticket's current Linear
+state, for example `Linear: In Review`. The sidebar shows it as a chip next to the pull request
+badge. Labels that start with `Linear: ` belong to the plugin. When the state changes, the old one
+is removed, and workspaces without a ticket agent lose theirs. Other labels are never touched.
+The colour comes from the state type: triage orange, backlog indigo, unstarted sky, completed
+emerald, canceled red. Started states are split by name: review violet, merge teal, planning blue,
+needs input pink, and anything else, such as In Progress, amber. A workspace whose agents work on
+different tickets shows the ticket its name carries (`TUC-1: …` or a `tuc-1-…` branch). Otherwise
+it shows the ticket of its oldest agent.
+
+States are read about once a minute in one batched Linear request, on the app's pool like the
+other polled reads. A state the plugin sets itself shows at once, and a new agent's workspace is
+labelled within seconds. The plugin SDK cannot set workspace labels, so this uses the daemon's
+internal `workspace.label.*` protocol. It connects to the local daemon the way the `paseo` CLI
+does: the address in `$PASEO_HOME/paseo.pid` and `PASEO_PASSWORD` when the daemon needs one.
+A daemon without that API, or a lost connection, is logged once per cause and affects nothing
+else.
+
 ## Rate limits
 
 Linear meters requests per credential and hour: **2,500** for the personal API key (shared by
@@ -636,15 +656,15 @@ steadily, so the plugin estimates each pool's room from the `X-RateLimit-Request
 header of the last answer plus the refill since then.
 
 - **Reads that pollers repeat use the app's pool** when the Paseo app is installed: the relay's
-  comment read, the auto-dispatch label query, ticket state and manual-task status. The key
-  reads them only when the app is not installed, its token cannot be refreshed, or it cannot
-  see a ticket. An app rate limit never falls back to the key. Writes always use the key,
-  so nothing changes author.
+  comment read, the auto-dispatch label query, ticket state, manual-task status and the sidebar
+  state labels. The key reads them only when the app is not installed, its token cannot be
+  refreshed, or it cannot see a ticket. An app rate limit never falls back to the key. Writes
+  always use the key, so nothing changes author.
 - **Background work stops at a 15% reserve** of the pool it needs: auto-dispatch, the relay,
-  manual tasks, the pull request watch and the health check. It resumes on its own as the pool
-  refills. Session prompts, write-backs, agents' `linear_ticket` tools and the sidebar still
-  use the reserve. The **Auto-dispatch** status shows `paused: …` with the estimated time, and
-  the plugin log records each pause once.
+  manual tasks, the pull request watch, the state labels and the health check. It resumes on its
+  own as the pool refills. Session prompts, write-backs, agents' `linear_ticket` tools and the
+  sidebar ticket list still use the reserve. The **Auto-dispatch** status shows `paused: …` with
+  the estimated time, and the plugin log records each pause once.
 - **When Linear answers `RATELIMITED`**, requests on that pool wait until the estimate reaches
   the reserve again (at least a minute). Then exactly one request tries, and a second limit
   doubles the wait, up to 15 minutes. Session errors and agent tools say when to try again.

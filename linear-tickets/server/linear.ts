@@ -248,10 +248,14 @@ export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
     inverseRelations(first: 50) { nodes { type issue { identifier state { type } } } }
   }
 }`;
-export type IssueStatus = { statusType: string; completedAt: string | null };
+// `status`: the workflow state's name ("In Review"); `statusType` its kind ("started").
+export type IssueStatus = { status: string; statusType: string; completedAt: string | null };
+export const ISSUE_STATUSES_BATCH = 250;
 export const ISSUE_STATUSES_QUERY = `query issueStatuses($ids: [ID!]!) {
-  issues(first: 100, filter: { id: { in: $ids } }) { nodes { id state { type } completedAt } }
+  issues(first: ${ISSUE_STATUSES_BATCH}, filter: { id: { in: $ids } }) { nodes { id state { name type } completedAt } }
 }`;
+// A state the plugin itself just moved a ticket into, from the mutation's own answer.
+export type WrittenState = { name: string; type: string };
 
 // `blockedBy`: identifiers of unfinished tickets that block this one.
 export type IssueState = {
@@ -323,7 +327,7 @@ export function relayCommentsQuery(count: number): string {
   }`).join("\n  ");
   return `query relayComments($u: ID!, ${declarations}) {\n  ${fields}\n}`;
 }
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const APP_UNUSABLE = Symbol("app unusable");
 export const REACTION_QUERY = `mutation react($commentId: String!, $emoji: String!) {
   reactionCreate(input: { commentId: $commentId, emoji: $emoji }) { success }
@@ -362,7 +366,23 @@ export const COMMENT_QUERY = `query issueComments($id: String!, $first: Int!, $a
 }`;
 
 export class LinearService {
+  private stateWritten: ((issueId: string, state: WrittenState) => void) | null = null;
+
   constructor(readonly credentials = new Credentials(), private readonly post: Post = postGraphQL, private readonly reader?: Reader) {}
+
+  // Told about every state change the plugin makes (launch, write-back, review, PR watch), so
+  // views of the ticket's state can follow at once instead of at the next poll.
+  onStateWritten(listener: (issueId: string, state: WrittenState) => void): void {
+    this.stateWritten = listener;
+  }
+
+  private async writeState(issueId: string, stateId: string): Promise<Record<string, unknown>> {
+    const data = record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId })));
+    const result = record(data.issueUpdate ?? {});
+    const state = record(record(result.issue ?? {}).state ?? {});
+    if (result.success !== false && label(state.name)) this.stateWritten?.(issueId, { name: label(state.name), type: label(state.type) });
+    return data;
+  }
 
   async status() {
     const { key, source } = await this.credentials.read();
@@ -512,7 +532,7 @@ export class LinearService {
     }
     let data: Record<string, unknown>;
     try {
-      data = record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issue.id, stateId: target.id })));
+      data = await this.writeState(issue.id, target.id);
     } catch (error) {
       return { changed: false, note: `Linear rejected the change to ${target.name}: ${error instanceof Error ? error.message : "unknown error"}` };
     }
@@ -616,7 +636,7 @@ export class LinearService {
     if (!state.teamId || state.statusType === "completed") return;
     const done = (await this.teamStates(state.teamId)).filter((item) => item.type === "completed").sort((a, b) => a.position - b.position)[0];
     if (!done) return;
-    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: done.id }))), "issueUpdate", "complete the ticket");
+    succeeded(await this.writeState(issueId, done.id), "issueUpdate", "complete the ticket");
   }
 
   async teamIdByKey(teamKey: string): Promise<string | null> {
@@ -827,13 +847,13 @@ export class LinearService {
     if (!state.teamId) return { changed: false, note: "The ticket has no team." };
     const target = (await this.teamStates(state.teamId)).find((item) => item.type.trim().toLowerCase() === "started" && item.name.trim().toLowerCase() === name.toLowerCase());
     if (!target) return { changed: false, note: `The ticket's team has no started state named "${name}".` };
-    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: target.id }))), "issueUpdate", `move the ticket to ${target.name}`);
+    succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
     return { changed: true };
   }
 
   // Moves the ticket to one known state of its team (for example back to where it was).
   async moveToState(issueId: string, stateId: string): Promise<void> {
-    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId }))), "issueUpdate", "move the ticket");
+    succeeded(await this.writeState(issueId, stateId), "issueUpdate", "move the ticket");
   }
 
   // Moves the ticket back to its team's first unstarted state (Todo): planned, not being worked on.
@@ -844,7 +864,7 @@ export class LinearService {
     if (!state.teamId) return { changed: false, note: "The ticket has no team." };
     const target = (await this.teamStates(state.teamId)).filter((item) => item.type === "unstarted").sort((a, b) => a.position - b.position)[0];
     if (!target) return { changed: false, note: "The ticket's team has no unstarted state." };
-    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: target.id }))), "issueUpdate", `move the ticket to ${target.name}`);
+    succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
     return { changed: true };
   }
 
@@ -855,18 +875,19 @@ export class LinearService {
     if (!state.teamId) return;
     const target = (await this.teamStates(state.teamId)).filter((item) => item.type === "unstarted").sort((a, b) => a.position - b.position)[0];
     if (!target || target.id === state.statusId) return;
-    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: target.id }))), "issueUpdate", `move the ticket to ${target.name}`);
+    succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
   }
 
-  // State type and completion time of several issues in one request. Deleted or invisible issues are
-  // absent from the result. Issues the app cannot see are read again with the key.
+  // State name, type and completion time of up to 250 issues per request. Deleted, archived or
+  // invisible issues are absent from the result. Issues the app cannot see are read again with the key.
   async issueStatuses(ids: string[]): Promise<Map<string, IssueStatus>> {
     const result = new Map<string, IssueStatus>();
-    for (let start = 0; start < ids.length; start += 100) {
-      const chunk = ids.slice(start, start + 100);
+    for (let start = 0; start < ids.length; start += ISSUE_STATUSES_BATCH) {
+      const chunk = ids.slice(start, start + ISSUE_STATUSES_BATCH);
       const data = record(await this.read(ISSUE_STATUSES_QUERY, { ids: chunk }, (found) => connection(record(found.issues ?? {})).nodes.length === new Set(chunk).size));
       for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) {
-        result.set(label(node.id), { statusType: label(record(node.state ?? {}).type), completedAt: label(node.completedAt) || null });
+        const state = record(node.state ?? {});
+        result.set(label(node.id), { status: label(state.name), statusType: label(state.type), completedAt: label(node.completedAt) || null });
       }
     }
     return result;
@@ -914,7 +935,7 @@ export class LinearService {
     if (!state.teamId) return { changed: false, note: "The ticket has no team." };
     const target = resolveReviewState(await this.teamStates(state.teamId));
     if (!target) return { changed: false, note: "The ticket's team has no review state." };
-    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId: target.id }))), "issueUpdate", `move the ticket to ${target.name}`);
+    succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
     return { changed: true };
   }
 }
