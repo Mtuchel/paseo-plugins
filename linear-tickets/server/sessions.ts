@@ -208,7 +208,7 @@ export function planSteps(markdown: string): string[] {
 
 type Deps = {
   api: AgentApi;
-  linear: Pick<LinearService, "viewerId" | "addLabel" | "removeLabel" | "complete" | "issueState">;
+  linear: Pick<LinearService, "viewerId" | "addLabel" | "removeLabel" | "complete" | "issueState" | "delegate">;
   starter: Pick<TicketStarter, "start" | "admission">;
   settings: Pick<Settings, "read">;
   store: SessionStore;
@@ -731,17 +731,26 @@ export class SessionRouter {
     await this.deps.store.patch(sessionId, { paseoLinked: agentId });
   }
 
-  // A label or sidebar launch gets a session too, so the ticket shows the same agent panel.
+  // A label or sidebar launch gets a session too, so the ticket shows the same agent panel, and
+  // is delegated to the Paseo app like a ticket assigned in Linear: a ticket with an agent always
+  // names Paseo. Delegated only after the session links the agent, so the delegation cannot start
+  // a second one; a failed delegation keeps the session.
   async openFor(issueId: string, identifier: string, agentId: string): Promise<string | null> {
+    let sessionId: string;
     try {
-      const sessionId = await this.deps.api.createSessionOnIssue(issueId);
+      sessionId = await this.deps.api.createSessionOnIssue(issueId);
       await this.deps.store.put({ sessionId, agentId, issueId, identifier, createdAt: new Date().toISOString(), handled: [], review: null, offer: null });
       await this.linkToPaseo(sessionId, agentId);
-      return sessionId;
     } catch (error) {
       console.error(`[linear-tickets] ${identifier}: could not open an agent session: ${error instanceof Error ? error.message : error}`);
       return null;
     }
+    try {
+      await this.deps.linear.delegate(issueId, (await this.deps.api.viewer()).id);
+    } catch (error) {
+      console.error(`[linear-tickets] ${identifier}: could not delegate the ticket to Paseo: ${error instanceof Error ? error.message : error}`);
+    }
+    return sessionId;
   }
 }
 

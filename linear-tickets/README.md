@@ -288,7 +288,8 @@ to Paseo or @mention it, and the whole conversation runs in Linear's agent panel
 A delegation starts an agent exactly like the label: the saved project mapping and remembered
 provider are used, and the agent gets the label `linear.sessionId` next to `linear.issueId`. A
 mention on a ticket whose agent is running passes the text to that agent instead. Label and
-sidebar launches open a session too. Only the workspace owner (the user of the plugin's
+sidebar launches open a session too and then delegate the ticket to Paseo, so every ticket with
+an agent names Paseo however it started. Only the workspace owner (the user of the plugin's
 personal key) can start or steer agents; sessions from anyone or anything else get an error.
 
 **Setup**

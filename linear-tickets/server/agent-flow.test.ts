@@ -55,7 +55,7 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
   const store = new SessionStore(join(directory, "sessions.json"));
   const router = new SessionRouter({
     api: { activity: async (_s: string, content: { type: string; body?: string }) => { calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); }, openSessions: async () => [], activities: async () => [] } as never,
-    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueState: async () => { throw new Error("unused"); } },
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueState: async () => { throw new Error("unused"); }, delegate: async () => {} },
     starter: { start: async () => { throw new Error("unused"); }, admission: async () => ({ ok: true as const }) },
     settings: { read: async () => settings },
     store,
