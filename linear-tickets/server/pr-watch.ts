@@ -52,6 +52,9 @@ export type PullRequestView = {
   labels: string[];
   // The body of Graphite's "Merge activity" comment, one bullet per merge queue event.
   mergeActivity: string | null;
+  // The conversation's comments (not review comments), as last edited: Greptile's summary comment
+  // names the commit it last reviewed, also for a review without findings, which files no review.
+  comments: { author: string; body: string }[];
   // `commit`: the head the review was submitted on.
   reviews: { author: string; state: string; submittedAt: string; body: string; commit: string | null }[];
   lastCommitAt: string | null;
@@ -195,6 +198,7 @@ export async function viewPullRequest(url: string): Promise<PullRequestView> {
     reviewDecision: data.reviewDecision ?? "",
     labels: (data.labels ?? []).map((item) => item.name ?? "").filter(Boolean),
     mergeActivity: activity?.body ?? null,
+    comments: (data.comments ?? []).map((comment) => ({ author: comment.author?.login ?? "someone", body: comment.body ?? "" })),
     reviews: (data.reviews ?? []).map((review) => ({ author: review.author?.login ?? "someone", state: review.state ?? "", submittedAt: review.submittedAt ?? "", body: review.body ?? "", commit: review.commit?.oid ?? null })).filter((review) => review.submittedAt),
     lastCommitAt: data.commits?.at(-1)?.committedDate ?? null,
     checks: [...latest.values()].map((entry) => entry.check),

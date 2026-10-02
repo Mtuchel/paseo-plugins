@@ -39,7 +39,7 @@ type Outcome = "sent" | "busy" | "gone" | "unavailable";
 const HEAD = "a1b2c3d4e5f6";
 const RUNNING_CI: CheckRun = { name: "Code validation / Core (core-web)", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/1/job/1", state: "pending", conclusion: "pending" };
 // An open, ready pull request whose CI still runs: no lifecycle stage applies to it.
-const OPEN_PR: PullRequestView = { state: "OPEN", isDraft: false, headSha: HEAD, headBranch: "mtuchel/tuc-1-fix", baseBranch: "main", updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, reviews: [], lastCommitAt: null, checks: [RUNNING_CI] };
+const OPEN_PR: PullRequestView = { state: "OPEN", isDraft: false, headSha: HEAD, headBranch: "mtuchel/tuc-1-fix", baseBranch: "main", updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, comments: [], reviews: [], lastCommitAt: null, checks: [RUNNING_CI] };
 // A pull request as the repo's open listing shows it.
 const listed = (url: string, view: PullRequestView, title = "Fix TUC-1 [plugin] Retry the upload"): OpenPull => ({
   number: Number(url.split("/").at(-1)), url, title, headBranch: view.headBranch, headSha: view.headSha, baseBranch: view.baseBranch, trunk: "main", draft: view.isDraft, labels: view.labels,
@@ -489,6 +489,26 @@ test("a ready, green, reviewed pull request outside the queue is told to merge; 
   assert.match(promptOf(await h.poll()) ?? "", /^GitHub reports changes requested/, "no merge while GitHub reports changes requested");
   h.github.view = { ...h.github.view, reviewDecision: "", checks: [...h.github.view.checks, { ...RUNNING_CI, name: "Graphite / mergeability_check" }] };
   assert.equal(promptOf(await h.poll()), `[The pull request](${PR}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.\nNext step: \`gt checkout mtuchel/tuc-1-fix && gt merge\`, then \`node tools/ci/wait-queue.mjs 419\`. The rest of the stack follows once it is reviewed.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+});
+
+test("with complex-review, Greptile's summary comment naming the head as its last reviewed commit counts as its review when it left no findings", async (t) => {
+  const SHA = "93d151619aeebbfcc6d60e587641821a952df3d9";
+  const summary = (sha: string) => `<h3>Greptile Summary</h3>\n\nAdds the upload retry.\n\n<sub>Last reviewed commit: ["Fix TUC-1 [plugin] Retry the upload"](https://github.com/tuchel-sohn/tuchel-platform/commit/${sha}) · [Prompt To Fix All With AI](https://app.greptile.com)</sub>`;
+  const reviewed = { ...READY, headSha: SHA, labels: ["complex-review"] };
+  for (const [comments, ready, why] of [
+    [[{ author: "greptile-apps", body: summary(SHA) }], true, "the summary names the head"],
+    [[{ author: "greptile-apps[bot]", body: summary(SHA) }], true, "the REST login names it too"],
+    [[{ author: "greptile-apps", body: summary("1111111111111111111111111111111111111111") }], false, "the summary names an older commit"],
+    [[{ author: "greptile-apps", body: summary(`${SHA}1`) }], false, "a longer sha is another commit"],
+    [[{ author: "Mtuchel", body: summary(SHA) }], false, "a person quoting the summary is not Greptile"],
+    [[{ author: "greptile-apps", body: `Reviewed https://github.com/tuchel-sohn/tuchel-platform/commit/${SHA}` }], false, "a Greptile comment without the last reviewed commit line"],
+  ] as const) {
+    const h = harness(t);
+    h.github.view = { ...reviewed, comments: [...comments] };
+    const prompt = promptOf(await h.poll());
+    if (ready) assert.match(prompt ?? "", /^\[The pull request\]\([^)]*\) is ready[^]*wait-queue\.mjs 419/, why);
+    else assert.equal(prompt, undefined, why);
+  }
 });
 
 test("the first matching stage wins: draft, then failed checks, then requested changes, then findings, then merge", async (t) => {
