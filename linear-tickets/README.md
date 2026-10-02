@@ -551,7 +551,8 @@ other open pull request of the ticket sits on; ties go to the lower number), the
 and the handover record point at it, and the plugin watches and nudges it from the next poll,
 also for an archived agent. This repeats with each landing until none of the ticket's pull
 requests is open. The ticket's pull requests are the ones whose title names it as a whole word,
-as for the merge nudge.
+as for the merge nudge. A lookup or link move that fails, or a poll that ends before it (a rate
+limit), is retried on the next poll, also across restarts.
 
 **Replacement pull requests.** When the queue lands part of a stack, Graphite deletes the
 landed branch, and GitHub closes the pull request based on it for good (it cannot be reopened

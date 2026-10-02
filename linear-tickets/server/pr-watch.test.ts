@@ -48,8 +48,11 @@ const listed = (url: string, view: PullRequestView, title = "Fix TUC-1 [plugin] 
 function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string } = {}) {
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open; `views`: other pull requests by URL, and
-  // `open` the listing's other entries; `deleted`: branches gone.
-  const github = { view: OPEN_PR, views: {} as Record<string, PullRequestView>, drafts: [] as QueueDraft[], landed: [] as number[], checks: [] as FailedCheck[], threads: [] as ReviewThread[], open: [] as OpenPull[], deleted: [] as string[], reads: [] as string[], threadReads: 0, throttled: false, missing: false };
+  // `open` the listing's other entries; `deleted`: branches gone; `throttle`: pull requests whose
+  // read GitHub throttles; `listFailure`: what listing the open pull requests throws.
+  const github = { view: OPEN_PR, views: {} as Record<string, PullRequestView>, drafts: [] as QueueDraft[], landed: [] as number[], checks: [] as FailedCheck[], threads: [] as ReviewThread[], open: [] as OpenPull[], deleted: [] as string[], reads: [] as string[], threadReads: 0, throttled: false, throttle: [] as string[], missing: false, listFailure: null as Error | null };
+  // `failure`: what linking a URL on the ticket throws.
+  const linear = { failure: null as Error | null };
   const blockers: string[] = [];
   // `answer`: what Paseo finds before sending (only "sent" dispatches); `send`: the send itself,
   // after the dispatch was recorded; `session`: the agent's session lookup.
@@ -86,13 +89,16 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       comment: async (_id, body) => { calls.push(`comment ${body}`); },
       viewerId: async () => "me",
       userUrl: async () => OWNER,
-      linkUrl: async (_id, url, title) => { calls.push(`link ${title} ${url}`); },
+      linkUrl: async (_id, url, title) => {
+        if (linear.failure) throw linear.failure;
+        calls.push(`link ${title} ${url}`);
+      },
     },
     manualTasks: { openBlockers: async () => blockers.map((identifier) => ({ identifier }) as never), awaitingMerge: async () => false, merged: async (issueId) => { calls.push(`merged ${issueId}`); } },
     settings: { read: async () => settings },
     view: async (url) => {
       github.reads.push(url);
-      if (github.throttled) throw new GitHubRateLimitedError("GitHub is throttling gh: HTTP 403: API rate limit exceeded");
+      if (github.throttled || github.throttle.includes(url)) throw new GitHubRateLimitedError("GitHub is throttling gh: HTTP 403: API rate limit exceeded");
       if (github.missing) throw new PullRequestNotFoundError("GraphQL: Could not resolve to a PullRequest with the number of 419. (repository.pullRequest)");
       return github.views[url] ?? github.view;
     },
@@ -101,7 +107,10 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       landed: async (_repo, item) => github.landed.includes(item.number),
       failedChecks: async () => github.checks,
       reviewThreads: async () => { github.threadReads++; return github.threads; },
-      openPullRequests: async () => [...(github.view.state === "OPEN" ? [listed(records[0].links["Pull request"], github.view)] : []), ...github.open],
+      openPullRequests: async () => {
+        if (github.listFailure) throw github.listFailure;
+        return [...(github.view.state === "OPEN" ? [listed(records[0].links["Pull request"], github.view)] : []), ...github.open];
+      },
       branchExists: async (_repo, branch) => !github.deleted.includes(branch),
     },
   }, join(home, "pr-watch.json")));
@@ -117,7 +126,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   const restart = () => { watch = create(); return watch; };
   // The state an earlier plugin version left.
   const state = async (value: unknown) => writeFile(join(await directory, "pr-watch.json"), JSON.stringify(value));
-  return { github, paseo, records, blockers, calls, poll, restart, state, watch: () => watch };
+  return { github, linear, paseo, records, blockers, calls, poll, restart, state, watch: () => watch };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -810,5 +819,35 @@ test("after a partial landing the ticket's lowest open pull request is linked, w
     h.github.open = [listed(pull(1499), other, "Add TUC-10 [plugin] Something else")];
     assert.deepEqual(await h.poll(), ["review merged", "say thought The pull request was merged.", "merged i1"], `${status}: nothing of the ticket is open any more`);
     assert.deepEqual(await h.poll(), [], status);
+  }
+});
+
+test("an archived agent's landing is followed to the ticket's next pull request after the lookup or the move failed, or a rate limit ended the poll first", async (t) => {
+  const pull = (number: number) => `https://github.com/tuchel-sohn/tuchel-platform/pull/${number}`;
+  const step2 = { ...READY, headSha: "s2", headBranch: "mtuchel/tuc-1-b", baseBranch: "main" };
+  t.mock.method(console, "error", () => {});
+  for (const failure of ["lookup", "throttled lookup", "move", "another pull request throttled"] as const) {
+    const h = harness(t, { status: "archived" });
+    h.github.view = { ...READY, state: "CLOSED", labels: ["externally-merged"] };
+    h.github.views = { [pull(1501)]: step2 };
+    h.github.open = [listed(pull(1501), step2, "Add TUC-1 [plugin] Step two")];
+    if (failure === "lookup") h.github.listFailure = new Error("gh: connection reset");
+    if (failure === "throttled lookup") h.github.listFailure = new GitHubRateLimitedError("GitHub is throttling gh: HTTP 403: API rate limit exceeded");
+    if (failure === "move") h.linear.failure = new Error("Linear is unavailable");
+    if (failure === "another pull request throttled") {
+      h.records.push({ ...h.records[0], issueId: "i2", identifier: "TUC-2", agentId: "a2", links: { "Pull request": pull(2000) } });
+      h.github.views[pull(2000)] = OPEN_PR;
+      h.github.throttle = [pull(2000)];
+    }
+    assert.deepEqual(await h.poll(), ["review merged", "say thought The pull request was merged.", "merged i1"], failure);
+    h.github.listFailure = null;
+    h.linear.failure = null;
+    h.github.throttle = [];
+    await h.restart();
+    const recovered = await h.poll();
+    assert.deepEqual(recovered.slice(0, 3), [`link Pull request ${pull(1501)}`, `handover link ${pull(1501)}`, `session link Pull request ${pull(1501)}`], failure);
+    const nudged = await h.poll();
+    assert.equal(h.github.reads[0], pull(1501), failure);
+    assert.ok(nudged.some((call) => call.includes(`[The pull request](${pull(1501)}) is ready`)), `${failure}: the remaining pull request is nudged`);
   }
 });

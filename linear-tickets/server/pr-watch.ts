@@ -68,7 +68,8 @@ export type PullRequestView = {
 // reviews it covered, space-separated (see stalledStage). `activeAt`: the last change, drop or
 // nudge seen. `missing`: GitHub has no pull request at the link (a made-up or mistyped URL); it is
 // never read again, so a later pull request that takes the number is not mistaken for the ticket's.
-type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; conflicts?: string[]; escalated?: boolean; pending?: PendingDrop | null; replay?: "due" | "asked"; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean };
+// `advance`: landed, `due` until the ticket's next open pull request was looked for (see advance).
+type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; conflicts?: string[]; escalated?: boolean; pending?: PendingDrop | null; replay?: "due" | "asked"; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean; advance?: "due" };
 // A claimed drop, saved before anything is sent. `fix` goes to the agent (or, when it is gone, to
 // the ticket); without it, `facts` escalate to the owner. `sending`: a message went out and its
 // result was not recorded (a restart or a failed save), so it is not sent again.
@@ -403,11 +404,12 @@ export class PullRequestWatch {
       if (seen?.missing) continue;
       // An archived agent's open pull request stays watched, so a merge queue drop still reaches
       // the ticket: until a drop escalated to the owner, or 14 days without activity. After-merge
-      // tasks keep it watched until the merge, and a closure until it was looked at; once the
-      // agent was asked to open a replacement, until the replacement is linked or 14 days pass.
+      // tasks keep it watched until the merge, a closure until it was looked at, and a landing until
+      // the ticket's next open pull request was looked for; once the agent was asked to open a
+      // replacement, until the replacement is linked or 14 days pass.
       const quiet = Date.now() - Math.max(Date.parse(record.updatedAt) || 0, Date.parse(seen?.activeAt ?? "") || 0) > ARCHIVED_WATCH_MS;
       const watched = !seen?.merged && (!seen?.closed || seen.replay === "asked") && !escalated(seen) && !quiet;
-      if (record.status !== "archived" || seen?.pending || seen?.replay === "due" || watched || await manual?.awaitingMerge(record.issueId)) records.push(record);
+      if (record.status !== "archived" || seen?.pending || seen?.replay === "due" || seen?.advance === "due" || watched || await manual?.awaitingMerge(record.issueId)) records.push(record);
     }
     // Graphite's drafts and the open pull requests are listed once per repo and poll.
     const drafts = new Map<string, Promise<QueueDraft[]>>();
@@ -459,7 +461,7 @@ export class PullRequestWatch {
         // Each step's state is recorded after it, so a failed step is retried on the next poll.
         const now = new Date().toISOString();
         const closed = view.state === "CLOSED" && !seen.merged;
-        seenByUrl[url] = { ...seen, closed, ...(closed && !seen.closed ? { replay: "due" as const } : {}), ...(change ? { activeAt: now } : {}) };
+        seenByUrl[url] = { ...seen, closed, ...(closed && !seen.closed ? { replay: "due" as const } : {}), ...(change?.review === "merged" ? { advance: "due" as const } : {}), ...(change ? { activeAt: now } : {}) };
         if (view.state !== "OPEN") {
           if (seenByUrl[url].pending) console.error(`[linear-tickets] ${record.identifier}: ${url} is no longer open; the merge queue drop is not reported`);
           seenByUrl[url] = { ...seenByUrl[url], pending: null };
@@ -493,7 +495,7 @@ export class PullRequestWatch {
     }
     for (const { record, url, view } of stopped.paused || stopped.throttled ? [] : nudges) {
       const next = view.state === "OPEN" ? () => this.nudge(record, url, view, seenByUrl, save, listDrafts, listPulls, reserved)
-        : seenByUrl[url].merged ? () => this.advance(record, url, listPulls)
+        : seenByUrl[url].merged ? () => this.advance(record, url, seenByUrl, listPulls)
         : () => this.replace(record, url, view, seenByUrl, save, listPulls, reserved);
       if (!await step(record, url, next)) break;
     }
@@ -773,16 +775,16 @@ export class PullRequestWatch {
   // new pull requests. While the ticket has an open pull request, the record's link moves to the
   // lowest one (the one no other open pull request of the ticket sits below; ties go to the lower
   // number), as for a replacement, and the watch, its nudges and the ticket's merge nudge follow
-  // it from the next poll.
-  private async advance(record: HandoverRecord, url: string, pulls: (repo: string) => Promise<OpenPull[]>): Promise<void> {
+  // it from the next poll. `advance: due` is cleared only once the lookup and the move succeeded,
+  // so a failure, or a poll that ended before it, is retried on the next poll.
+  private async advance(record: HandoverRecord, url: string, seenByUrl: Record<string, Seen>, pulls: (repo: string) => Promise<OpenPull[]>): Promise<void> {
     const source = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
-    if (!source) return;
     const identifier = namesTicket(record.identifier);
-    const open = (await pulls(source[1])).filter((pull) => pull.url !== url && identifier.test(pull.title));
+    const open = source ? (await pulls(source[1])).filter((pull) => pull.url !== url && identifier.test(pull.title)) : [];
     const next = open.filter((pull) => !open.some((other) => other.headBranch === pull.baseBranch)).sort((a, b) => a.number - b.number)[0];
-    if (!next) return;
-    await this.relink(record, next.url);
-    await this.tell(record, "thought", `The pull request landed; Paseo now follows the ticket's next open pull request #${next.number}.`);
+    if (next) await this.relink(record, next.url);
+    seenByUrl[url] = { ...seenByUrl[url], advance: undefined };
+    if (next) await this.tell(record, "thought", `The pull request landed; Paseo now follows the ticket's next open pull request #${next.number}.`);
   }
 
   // A pull request closed without merging. When the merge queue landed the branch below it,
