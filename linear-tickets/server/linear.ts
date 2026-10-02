@@ -2,6 +2,7 @@ import { MAX_ATTACHMENT_BYTES } from "./attachments";
 import type { Issue, TicketDetail } from "../shared/contracts";
 import { buildContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations, type FinishedBlocker } from "./context";
 import { Credentials } from "./credentials";
+import type { LabelEvent, SweptIssue } from "./label-rules";
 import { poolOf, rateBudget, RateLimitedError, type RateBudget } from "./rate-budget";
 
 const endpoint = "https://api.linear.app/graphql";
@@ -326,6 +327,31 @@ export const LABEL_BY_NAME_QUERY = `query labelByName($name: String!) {
 export const CREATE_LABEL_QUERY = `mutation labelCreate($input: IssueLabelCreateInput!) {
   issueLabelCreate(input: $input) { success issueLabel { id name } }
 }`;
+// Label rules (label-sync.ts): the workspace's labels with their groups, a page of the teams'
+// issues with what the rules read, an issue's label history, and the label writes.
+export const LABEL_CATALOG_QUERY = `query labelCatalog($after: String) {
+  issueLabels(first: 250, after: $after, includeArchived: false) { nodes { id name isGroup parent { id } team { id } } pageInfo { hasNextPage endCursor } }
+}`;
+export const LABEL_SWEEP_QUERY = `query labelSweep($first: Int!, $after: String, $filter: IssueFilter) {
+  issues(first: $first, after: $after, includeArchived: false, orderBy: updatedAt, filter: $filter) {
+    nodes { id identifier title description createdAt updatedAt project { name } parent { id labels(first: 25) { nodes { id } } } labels(first: 25) { nodes { id } } attachments(first: 25) { nodes { url } } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export const LABEL_HISTORY_QUERY = `query labelHistory($id: String!, $after: String) {
+  issue(id: $id) { history(first: 100, after: $after) { nodes { createdAt actorId addedLabelIds removedLabelIds } pageInfo { hasNextPage endCursor } } }
+}`;
+export const UPDATE_LABEL_QUERY = `mutation labelUpdate($id: String!, $input: IssueLabelUpdateInput!) {
+  issueLabelUpdate(id: $id, input: $input) { success }
+}`;
+export const CHANGE_LABELS_QUERY = `mutation changeLabels($id: String!, $added: [String!], $removed: [String!]) {
+  issueUpdate(id: $id, input: { addedLabelIds: $added, removedLabelIds: $removed }) { success }
+}`;
+// `teamId` null: a workspace label.
+export type CatalogLabel = { id: string; name: string; isGroup: boolean; parentId: string | null; teamId: string | null };
+export const LABEL_SWEEP_PAGE = 50;
+const HISTORY_PAGES = 5;
+const PULL_REQUEST_URL = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/;
 // A user's profile URL (https://linear.app/<workspace>/profiles/<name>): in a comment, Linear
 // renders it as an @mention and notifies that user.
 export const USER_URL_QUERY = `query userUrl($id: String!) {
@@ -811,6 +837,75 @@ export class LinearService {
         if (!/Label not on issue/i.test(error instanceof Error ? error.message : String(error))) throw error;
       }
     }
+  }
+
+  // Every label of the workspace and its teams, groups included.
+  async labelCatalog(): Promise<CatalogLabel[]> {
+    const labels: CatalogLabel[] = [];
+    let after: string | null = null;
+    do {
+      const page = connection(record(await this.read(LABEL_CATALOG_QUERY, { after })).issueLabels);
+      for (const node of page.nodes.map((item) => record(item))) {
+        const id = label(node.id);
+        if (id) labels.push({ id, name: label(node.name), isGroup: node.isGroup === true, parentId: label(record(node.parent ?? {}).id) || null, teamId: label(record(node.team ?? {}).id) || null });
+      }
+      after = page.hasNextPage ? page.endCursor : null;
+    } while (after);
+    return labels;
+  }
+
+  // A workspace label (a group with `isGroup`, a member of one with `parentId`). Returns its id.
+  async createLabel(input: { name: string; color?: string; description?: string; isGroup?: boolean; parentId?: string }): Promise<string> {
+    const created = record(await this.write(CREATE_LABEL_QUERY, { input }));
+    succeeded(created, "issueLabelCreate", `create the "${input.name}" label`);
+    const id = label(record(record(created.issueLabelCreate).issueLabel ?? {}).id);
+    if (!id) throw new Error(`Linear did not return the new "${input.name}" label.`);
+    return id;
+  }
+
+  async moveLabelIntoGroup(labelId: string, groupId: string, name: string): Promise<void> {
+    succeeded(record(await this.write(UPDATE_LABEL_QUERY, { id: labelId, input: { parentId: groupId } })), "issueLabelUpdate", `move the "${name}" label into its group`);
+  }
+
+  // One page of the teams' issues, most recently updated first; `since` limits it to issues updated after then.
+  async labelSweep(teamKeys: string[], since: string | null, after: string | null): Promise<{ issues: SweptIssue[]; next: string | null }> {
+    const filter = { team: { key: { in: teamKeys } }, ...(since ? { updatedAt: { gt: since } } : {}) };
+    const page = connection(record(await this.read(LABEL_SWEEP_QUERY, { first: LABEL_SWEEP_PAGE, after, filter })).issues);
+    const ids = (value: unknown) => connection(value ?? { nodes: [] }).nodes.map((node) => label(record(node).id)).filter(Boolean);
+    const issues = page.nodes.map((item) => record(item)).map((node): SweptIssue => {
+      const parent = node.parent ? record(node.parent) : null;
+      const urls = connection(node.attachments ?? { nodes: [] }).nodes.map((attachment) => label(record(attachment).url).match(PULL_REQUEST_URL)?.[0]);
+      return {
+        id: label(node.id), identifier: label(node.identifier), title: label(node.title), description: typeof node.description === "string" ? node.description : "",
+        createdAt: label(node.createdAt), updatedAt: label(node.updatedAt), projectName: label(node.project ?? null) || null,
+        parentId: parent ? label(parent.id) || null : null, parentLabelIds: parent ? ids(parent.labels) : [], labelIds: ids(node.labels),
+        pullRequests: [...new Set(urls.filter((url): url is string => Boolean(url)))],
+      };
+    }).filter((issue) => issue.id && issue.createdAt);
+    return { issues, next: page.hasNextPage ? page.endCursor : null };
+  }
+
+  // The issue's label changes, newest first, read until a page holds one `relevant` to the caller.
+  async labelHistory(issueId: string, relevant: (event: LabelEvent) => boolean): Promise<LabelEvent[]> {
+    const events: LabelEvent[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < HISTORY_PAGES; page++) {
+      const history = connection(record(record(await this.read(LABEL_HISTORY_QUERY, { id: issueId, after })).issue ?? {}).history ?? { nodes: [] });
+      const found = history.nodes.map((item) => record(item)).map((node): LabelEvent => ({
+        at: label(node.createdAt), actorId: label(node.actorId) || null,
+        added: Array.isArray(node.addedLabelIds) ? node.addedLabelIds.map(label) : [],
+        removed: Array.isArray(node.removedLabelIds) ? node.removedLabelIds.map(label) : [],
+      })).filter((event) => event.added.length || event.removed.length);
+      events.push(...found);
+      if (found.some(relevant) || !history.hasNextPage) break;
+      after = history.endCursor;
+    }
+    return events;
+  }
+
+  // One write: Linear applies both lists together, so swapping a group's label never leaves two.
+  async changeLabels(issueId: string, added: string[], removed: string[]): Promise<void> {
+    succeeded(record(await this.write(CHANGE_LABELS_QUERY, { id: issueId, added, removed })), "issueUpdate", "change the ticket's labels");
   }
 
   async comment(issueId: string, body: string): Promise<void> {

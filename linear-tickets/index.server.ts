@@ -30,6 +30,7 @@ import { planSetup, TicketStarter } from "./server/starter";
 import { isPlanPolicy, PLAN_POLICY_ENV, PLAN_POLICY_LABEL } from "./server/plan-policy";
 import { PlanRequests } from "./server/plan-requests";
 import { labelDaemon, StateLabels } from "./server/state-labels";
+import { LabelSync, PullRequestFiles } from "./server/label-sync";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -80,6 +81,8 @@ export default function contribute(server: PluginServerContext) {
   // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").
   const stateLabels = new StateLabels({ linear, daemon: async () => { const client = await internalDaemon(); return client ? labelDaemon(client) : null; } });
   linear.onStateWritten((issueId, state) => stateLabels.noteState(issueId, state));
+  // Label groups kept current on every issue of some teams ("Area", "Type"), from label-rules.json.
+  const labelSync = new LabelSync({ linear, pullRequests: new PullRequestFiles() });
   let funnel: FunnelStatus | null = null;
   const health = new HealthMonitor(linear, settings, [
     { name: "Linear API key", run: () => linear.ping() },
@@ -109,6 +112,7 @@ export default function contribute(server: PluginServerContext) {
     pullRequests.start();
     manualTasks.start();
     stateLabels.start();
+    labelSync.start();
     if (!app) return false;
     stopKeepingFresh = auth.keepFresh();
     await webhook.start();
@@ -220,5 +224,5 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); void closeInternalDaemon(); };
+  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); void closeInternalDaemon(); };
 }
