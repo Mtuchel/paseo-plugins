@@ -493,6 +493,31 @@ Each step becomes a sub-issue in Todo, assigned to Paseo, blocked by the step be
 parent moves to In Progress with `plan-ready`. The steps run one after another: each starts when the previous
 one is finished, which for code means Done or in review with its pull requests merged.
 
+**Groups.** Assigning Paseo to a ticket that has open sub-issues, or adding the trigger label
+to it, hands the whole group to Paseo instead of starting an agent on the parent:
+
+- Every open sub-issue that is unassigned or assigned to you, and not handed to Paseo yet, is
+  assigned to Paseo, lowest number first. Each gets its own thread and agent and goes through
+  the rules above: it starts once its blockers are finished and a slot under *max agents* is free.
+  Blocking relations are the only ordering; sub-issues that do not block each other run side by
+  side. A sub-issue that has sub-issues of its own becomes a group too.
+- Sub-issues assigned to someone else are not taken but waited for. Your [manual
+  tasks](#manual-tasks) and "Needs you" sub-issues are neither taken nor waited for.
+- A parent that is itself blocked hands out nothing until its blockers are finished. Once the
+  first sub-issue is handed out, the parent moves to In Progress.
+- The parent's panel lists what each sub-issue waits for and is updated whenever that changes,
+  so a blocker nobody works on ("TUC-88 (not with Paseo …)") shows up. Any reply in the panel
+  posts the current list. Sub-issues added later are handed out within a minute.
+- When every sub-issue is finished (by the blocker rule above), the parent moves to Done, or
+  to Canceled with the reason when all of them were canceled, and the thread completes. Split
+  plans close their parent the same way.
+- Unassigning Paseo from the parent, Stop in its panel, or closing the parent stops handing out.
+  Agents already working continue.
+
+A ticket whose sub-issues are all finished, or are only your manual tasks, starts an agent of
+its own as before. Without a usable Paseo app (no threads), a labelled parent starts an agent
+as before.
+
 **Pull request reviews.** Every 2 minutes the plugin reads each ticket's pull request with
 `gh`. Requested changes post a panel update and move the ticket back to In Progress; fixes
 pushed after them move it to In Review again. An approval moves it to the team's started state

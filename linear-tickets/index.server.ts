@@ -69,7 +69,7 @@ export default function contribute(server: PluginServerContext) {
     approveLater: (link, localUrl, paseo) => approveForLater({ linear, readPlan: readReviewPlan, retirePlanner }, link, localUrl, paseo),
   });
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
-  const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession });
+  const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId) });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   const reviewLinks = new ReviewLinks();

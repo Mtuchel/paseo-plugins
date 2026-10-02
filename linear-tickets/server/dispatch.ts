@@ -20,6 +20,9 @@ type Deps = {
   // Called after each launch, e.g. to open the ticket's Linear agent session.
   // Returns true when the launch got a Linear agent session, whose panel replaces the start comment.
   afterLaunch?: (issueId: string, identifier: string, agentId: string) => Promise<boolean>;
+  // A ticket with open sub-issues is handed to Paseo as a group instead of starting an agent;
+  // true when it was (SessionRouter.handOffGroup).
+  handOff?: (issueId: string) => Promise<boolean>;
   // Linear → agent comment delivery, run on the same cadence as dispatch.
   relay?: Pick<CommentRelay, "poll">;
   budget?: Pick<RateBudget, "pausedUntil">;
@@ -156,6 +159,21 @@ export class Dispatcher {
     const { linear } = this.deps;
     const trigger = settings.dispatch.label;
     const labels = dispatchLabels(trigger);
+    // A ticket with open sub-issues goes to Paseo as a group (README, "Groups"): its thread hands
+    // out the sub-issues, so the label comes off and no agent starts here. A failed check keeps the
+    // label for the next poll.
+    if (issue.openChildren && this.deps.handOff) {
+      try {
+        if (await this.deps.handOff(issue.id)) {
+          await linear.removeLabel(issue.id, trigger, issue.labels);
+          this.record(issue.identifier, "grouped", "assigned to Paseo as a group; its sub-issues are handed out");
+          return;
+        }
+      } catch (error) {
+        this.record(issue.identifier, "failed", `handing it to Paseo as a group: ${error instanceof Error ? error.message : error}`);
+        return;
+      }
+    }
     // Blocked tickets and a full agent limit wait with their label in place; the next poll retries.
     const admission = await this.deps.starter.admission(issue.id, paseo, settings);
     if (!admission.ok) return;

@@ -11,7 +11,7 @@ import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { AgentApi, AppAuth } from "./agent-app";
 import { verifyWebhook } from "./agent-webhook";
 import { Handover, handoverPrompt, progressBody, type HandoverRecord } from "./handover";
-import { AuthenticationError, LinearApiError } from "./linear";
+import { AuthenticationError, LinearApiError, type GroupChild, type IssueGroup, type IssueState } from "./linear";
 import { NeedsYouIssues } from "./needs-you";
 import { planSteps, SessionRouter, SessionStore, type SessionLink } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
@@ -171,7 +171,7 @@ test("plan checklists come from checkboxes, or numbered steps under a Steps head
 });
 
 type Call = string;
-function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void> } = {}) {
+function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]> } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -196,7 +196,15 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
   const store = new SessionStore(join(directory, "sessions.json"));
   const router = new SessionRouter({
     api: api as never,
-    linear: { viewerId: async () => OWNER, addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); }, complete: async (id: string) => { calls.push(`complete ${id}`); }, issueState: async () => { throw new Error("unused"); }, delegate: options.delegate ?? (async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); }) },
+    linear: {
+      viewerId: async () => OWNER, appUserId: async () => "paseo-app",
+      addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); },
+      complete: async (id: string) => { calls.push(`complete ${id}`); }, cancel: async (id: string, reason: string) => { calls.push(`cancel ${id}: ${reason.split("\n")[0]}`); },
+      issueState: async (id: string) => ({ id, status: "Todo", statusType: "unstarted", blockedBy: options.blockedBy?.[id] ?? [] }) as IssueState,
+      issueGroup: async (id: string) => options.groups?.[id] ?? { id, identifier: "TUC-1", status: "Todo", statusType: "unstarted", delegateId: "paseo-app", finished: false, children: [] },
+      moveToStateNamed: async (id: string, name: string) => { calls.push(`move ${id} to ${name}`); return { changed: true }; },
+      delegate: options.delegate ?? (async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); }),
+    },
     starter: { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false, untrusted: false, plan: null }; }, admission: async () => ({ ok: true as const }) },
     settings: { read: async () => settings },
     store,
@@ -204,7 +212,9 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     decideReview: async (url, approve, feedback) => { calls.push(`review ${url} ${approve ? "approve" : `deny:${feedback}`}`); },
   });
-  if (options.attach ?? true) router.attach(paseo);
+  // Group tests drive the sweep themselves: the startup sweep would advance the group alongside them.
+  if (options.groups) Object.assign(router, { paseo });
+  else if (options.attach ?? true) router.attach(paseo);
   router.stop();
   return { router, store, calls, cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
@@ -222,6 +232,76 @@ test("a delegation from someone else is refused; the owner's starts an agent lin
   assert.deepEqual(mine.calls.slice(0, 2), ["+paseo-running", 'start {"linear.sessionId":"s1"}']);
   assert.equal((await mine.store.get("s1"))?.agentId, "agent-new");
   await mine.cleanup();
+});
+
+const child = (identifier: string, change: Partial<GroupChild> = {}): GroupChild => ({ id: identifier.toLowerCase(), identifier, status: "Todo", statusType: "unstarted", delegateId: null, finished: false, assigneeId: null, labels: [], blockers: [], ...change });
+const parent = (children: GroupChild[], change: Partial<IssueGroup> = {}): IssueGroup => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusType: "unstarted", delegateId: "paseo-app", finished: false, children, ...change });
+const blocker = (identifier: string, change: Partial<GroupChild> = {}) => ({ id: identifier.toLowerCase(), identifier, status: "Todo", statusType: "unstarted", delegateId: null, finished: false, ...change });
+
+test("assigning a parent with open sub-issues hands out the open ones nobody else has instead of starting an agent, and says what each waits for", async () => {
+  const group = parent([
+    child("TUC-2"),
+    child("TUC-3", { assigneeId: OWNER, blockers: [blocker("TUC-2")] }),
+    child("TUC-4", { assigneeId: "someone-else" }),
+    child("TUC-5", { status: "Done", statusType: "completed", finished: true }),
+    child("TUC-6", { assigneeId: OWNER, labels: ["paseo-manual"] }),
+    child("TUC-7", { blockers: [blocker("TUC-88")] }),
+  ]);
+  const h = harness({ groups: { i1: group } });
+  await h.router.created({ id: "s1", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" } });
+  assert.ok(!h.calls.some((call) => call.startsWith("start ")), "no agent for the parent");
+  assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")), ["delegate tuc-2 to paseo-app", "delegate tuc-3 to paseo-app", "delegate tuc-7 to paseo-app"]);
+  assert.ok(h.calls.includes("move i1 to In Progress"));
+  assert.equal(h.calls.at(-1), [
+    "thought:1 of 5 sub-issues finished. TUC-1 closes when all are.",
+    "- TUC-2: starting",
+    "- TUC-3: waits for TUC-2",
+    "- TUC-4: assigned to someone else; TUC-1 waits for it",
+    "- TUC-5: Done",
+    "- TUC-7: waits for TUC-88 (not with Paseo, nobody is working on it here)",
+  ].join("\n"));
+  assert.deepEqual((await h.store.get("s1"))?.group?.delegated, true);
+  await h.cleanup();
+});
+
+test("a blocked parent hands out nothing until its blockers finish; unassigning Paseo stops the group", async () => {
+  const blockedBy: Record<string, string[]> = { i1: ["TUC-9"] };
+  const groups = { i1: parent([child("TUC-2")]) };
+  const h = harness({ groups, blockedBy });
+  await h.router.created({ id: "s1", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" } });
+  assert.ok(!h.calls.some((call) => call.startsWith("delegate ")));
+  assert.match(h.calls.at(-1) ?? "", /^thought:TUC-1 is blocked by TUC-9; its sub-issues are handed out once that is finished\./);
+  blockedBy.i1 = [];
+  await h.router.advanceGroups();
+  assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")), ["delegate tuc-2 to paseo-app"]);
+  groups.i1 = parent([child("TUC-2", { delegateId: "paseo-app" })], { delegateId: null });
+  await h.router.advanceGroups();
+  assert.equal(h.calls.at(-1), "response:Paseo was unassigned from TUC-1, so it stopped handing out sub-issues. Agents already working continue.");
+  assert.equal((await h.store.get("s1"))?.closed, true);
+  await h.cleanup();
+});
+
+test("the parent closes when every sub-issue is finished: Done when any was done, Canceled with the reason when all were canceled", async () => {
+  const done = harness({ groups: { i1: parent([child("TUC-2", { status: "Done", statusType: "completed", finished: true }), child("TUC-3", { status: "Canceled", statusType: "canceled", finished: true }), child("TUC-4", { labels: ["paseo-manual"] })]) } });
+  await done.store.put(link({ agentId: null, group: { delegated: true } }));
+  await done.router.advanceGroups();
+  assert.ok(done.calls.includes("complete i1"), "an open manual task does not hold the parent open");
+  assert.match(done.calls.at(-1) ?? "", /^response:All sub-issues are finished, so TUC-1 is done\./);
+  assert.equal((await done.store.get("s1"))?.closed, true);
+  await done.cleanup();
+
+  const canceled = harness({ groups: { i1: parent([child("TUC-2", { status: "Canceled", statusType: "canceled", finished: true })]) } });
+  await canceled.store.put(link({ agentId: null, group: { delegated: true } }));
+  await canceled.router.advanceGroups();
+  assert.deepEqual(canceled.calls.slice(0, 1), ["cancel i1: Every sub-issue was canceled, so TUC-1 is canceled too."]);
+  await canceled.cleanup();
+});
+
+test("a ticket whose sub-issues are all finished, or only the owner's manual tasks, starts an agent of its own", async () => {
+  const h = harness({ groups: { i1: parent([child("TUC-2", { status: "Done", statusType: "completed", finished: true }), child("TUC-3", { assigneeId: OWNER, labels: ["paseo-manual"] })]) } });
+  await h.router.created({ id: "s1", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" } });
+  assert.deepEqual(h.calls.slice(0, 2), ["+paseo-running", 'start {"linear.sessionId":"s1"}']);
+  await h.cleanup();
 });
 
 test("a mention on a ticket with a running agent is passed to that agent instead of starting another", async () => {

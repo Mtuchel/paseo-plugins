@@ -238,7 +238,7 @@ export const dispatchStatusSchema = z.object({
   recent: z.array(z.object({
     identifier: z.string(),
     at: z.string(),
-    outcome: z.enum(["launched", "linked", "failed"]),
+    outcome: z.enum(["launched", "linked", "grouped", "failed"]),
     detail: z.string(),
   })),
 });
