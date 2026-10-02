@@ -678,17 +678,20 @@ independently of the agent's own `linear_ticket` tools:
   started state named like *In Review*. Completion is left to Linear's GitHub integration and to
   the agent itself ([Agent access to Linear](#agent-access-to-linear)).
 
-- **Replies from Linear** — your own comments that start with `@paseo` reach the ticket's
-  agent (the newest active one) within one poll interval. If the agent is waiting on a
-  question, the comment is the answer (an option name picks that option). If it is waiting
-  on an approval, `@paseo approve` / `@paseo deny <reason>` decides it. Otherwise the text is
+- **Replies from Linear** — your own comments that start with `@paseo`, and your replies in a
+  thread started by a Paseo app comment (status, question, summary), reach the ticket's agent
+  (the newest active one) within one poll interval; a reply needs no `@paseo`. If the agent is
+  waiting on a question, the comment is the answer (an option name picks that option). If it is
+  waiting on an approval, `approve` / `deny <reason>` decides it. Otherwise the text is
   sent as a message. Its reply comes back as a turn summary, so the conversation stays in
   Linear. Delivered comments get a 👀 reaction; undeliverable ones get ❌ and a reply saying
   why. All linked tickets are read in one request per poll, each from a cursor kept in
   `$PASEO_HOME/linear-tickets/relay-cursors.json`, so neither a restart nor a long pause
-  delivers a comment twice or skips one. Comments by other people, and comments without the
-  mention, are ignored. Blocked alerts end with how to reply. With the Paseo app installed,
-  Linear turns a typed `@paseo` into a mention of the app: that comment reaches the agent
+  delivers a comment twice or skips one. Comments by other people, and your comments that
+  neither start with the mention nor reply to Paseo, are ignored. Without a usable Paseo app,
+  Paseo's comments are written as you, so only `@paseo` comments count. Blocked alerts end with
+  how to reply. With the Paseo app installed, Linear turns a typed `@paseo` into a mention of
+  the app: that comment, and any reply in that agent session's thread, reaches the agent
   through its agent session right away, with the same question and approval rules, and the
   relay leaves it alone.
 

@@ -22,7 +22,7 @@ const WRITEBACK_OPTIONS: { key: keyof WritebackSettingsValue; on: string; off: s
   { key: "blocked", on: "Comment and label the ticket while its agent waits on you", off: "No blocked alerts" },
   { key: "pullRequests", on: "Attach pull requests the agent opens and move the ticket to review", off: "No pull request links" },
   { key: "autoResume", on: "Start a new agent automatically when one fails (at most once an hour per ticket)", off: "Offer Resume in Linear when an agent stops" },
-  { key: "mentions", on: "Deliver your \"@paseo …\" comments to the ticket's agent", off: "Comments stay in Linear" },
+  { key: "mentions", on: "Deliver your \"@paseo …\" comments and replies to Paseo's comments to the ticket's agent", off: "Comments stay in Linear" },
 ];
 
 type ThinkingOption = { id: string; label: string; description?: string; isDefault?: boolean };
@@ -550,7 +550,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
       onPress={() => void run("Saving setting", async () => {
         setWriteback((await saveSettings({ writeback: { [key]: !writeback[key] } })).writeback);
       })} />)}
-    <Text style={t.muted}>Uses this host's Linear key (write access needed), independent of the agent's own linear_ticket tools. Subagents do not report. Your comments starting with @paseo answer the agent's pending question, approve or deny a pending action (“@paseo approve” / “@paseo deny reason”), or otherwise become a message; 👀 marks delivered comments.</Text>
+    <Text style={t.muted}>Uses this host's Linear key (write access needed), independent of the agent's own linear_ticket tools. Subagents do not report. Your comments starting with @paseo, and your replies to Paseo's comments (no @paseo needed), answer the agent's pending question, approve or deny a pending action (“approve” / “deny reason”), or otherwise become a message; 👀 marks delivered comments.</Text>
     <Divider t={t} spaced />
     <FieldLabel title="Project mappings" icon="Folder" hint="Linear project → Paseo project" t={t} />
     {Object.keys(projectMappings).length ? Object.entries(projectMappings).sort((a, b) => a[1].label.localeCompare(b[1].label)).map(([key, mapping]) => {

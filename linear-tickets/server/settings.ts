@@ -12,7 +12,7 @@ export type LaunchPreference = { model: string; modeId?: string; thinkingOptionI
 // `maxRunning`: at most this many ticket agents work at once (0 = no limit); others wait their turn.
 export type DispatchSettings = { enabled: boolean; label: string; teamKeys: string[]; intervalSeconds: number; maxRunning: number };
 // Which lifecycle events of ticket-linked agents are written back to their Linear ticket.
-// `mentions` is the inbound direction: "@paseo" comments by the key's user reach the agent.
+// `mentions` is the inbound direction: "@paseo" comments and replies to Paseo's comments by the key's user reach the agent.
 export type WritebackSettings = { status: boolean; summaries: boolean; blocked: boolean; pullRequests: boolean; mentions: boolean; autoResume: boolean };
 export const DEFAULT_DISPATCH: DispatchSettings = { enabled: false, label: "paseo", teamKeys: [], intervalSeconds: 60, maxRunning: 0 };
 export const MAX_RUNNING_LIMIT = 20;
