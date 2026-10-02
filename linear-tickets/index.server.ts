@@ -1,6 +1,6 @@
 import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, projectsStatusRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc } from "./shared/contracts";
+import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, searchIssuesRpc, setDefaultPromptRpc, setPresenceRpc, setSettingsRpc, statusRpc } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -32,6 +32,7 @@ import { PlanRequests } from "./server/plan-requests";
 import { labelDaemon, StateLabels } from "./server/state-labels";
 import { LabelSync, PullRequestFiles } from "./server/label-sync";
 import { ProjectFlow } from "./server/project-flow";
+import { Presence } from "./server/presence";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -46,7 +47,9 @@ export default function contribute(server: PluginServerContext) {
   const settings = new Settings();
   const cache = new TicketCache();
   const handover = new Handover(linear, undefined, undefined, undefined, async (agentId) => { const serverId = await daemonServerId(); return serverId ? paseoAgentUrl(serverId, agentId) : null; });
-  const starter = new TicketStarter({ linear, launcher, handover });
+  // Present or away (README, "Present and away"): every start path asks the starter's scheduler.
+  const presence = new Presence();
+  const starter = new TicketStarter({ linear, launcher, handover, presence });
   // The plugin itself closes the review (split, implement later): the extension's report of that
   // closing is not the owner's decision, so the bridge skips it.
   const retirePlanner = async (reviewUrl: string, agentId: string, api: PaseoApi, reason: string) => {
@@ -172,6 +175,8 @@ export default function contribute(server: PluginServerContext) {
   server.handle(dispatchStatusRpc, (_input, { paseo }) => { attach(paseo); return dispatcher.snapshot(); });
   server.handle(projectsStatusRpc, (_input, { paseo }) => { attach(paseo); return projects.status(); });
   server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { attach(paseo); return projects.planNow(projectId, await settings.read()); });
+  server.handle(presenceRpc, () => presence.state());
+  server.handle(setPresenceRpc, (change) => presence.update(change));
   server.handle(connectRpc, ({ apiKey }) => linear.authenticate(apiKey));
   server.handle(disconnectRpc, () => linear.disconnect());
   server.handle(listIssuesRpc, async ({ cursor, stateNames, relation }) => {

@@ -348,7 +348,7 @@ export const LABELED_PROJECTS_QUERY = `query labeledProjects($label: String!) {
 export const PROJECT_ISSUES_QUERY = `query projectIssues($id: String!, $after: String) {
   project(id: $id) { issues(first: 25, after: $after, filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } } }) {
     nodes {
-      id identifier title priority createdAt state { name type } team { id key } assignee { id } delegate { id } labels(first: 20) { nodes { name } }
+      id identifier title priority createdAt state { name type } team { id key } creator { id } assignee { id } delegate { id } labels(first: 20) { nodes { name } }
       parent { id state { type } project { id } }
       inverseRelations(first: 15) { nodes { type issue { id identifier state { name type } delegate { id } attachments(first: 10) { nodes { url sourceType metadata } } } } }
       relations(first: 15) { nodes { type relatedIssue { id state { type } } } }
@@ -364,7 +364,7 @@ export type LabeledProject = { id: string; name: string };
 // `blocks`: ids of open tickets this one blocks.
 export type ProjectIssue = {
   id: string; identifier: string; title: string; priority: number; createdAt: string; status: string; statusType: string;
-  teamId: string; teamKey: string; assigneeId: string | null; delegateId: string | null; labels: string[];
+  teamId: string; teamKey: string; creatorId: string | null; assigneeId: string | null; delegateId: string | null; labels: string[];
   parentId: string | null; blockers: GroupIssue[]; blocks: string[];
 };
 export const CREATE_ISSUE_QUERY = `mutation issueCreate($input: IssueCreateInput!) {
@@ -823,7 +823,7 @@ export class LinearService {
           id: label(node.id), identifier: label(node.identifier), title: label(node.title),
           priority: typeof node.priority === "number" ? node.priority : 0, createdAt: label(node.createdAt),
           status: label(record(node.state ?? {}).name), statusType: label(record(node.state ?? {}).type),
-          teamId: label(team.id), teamKey: label(team.key),
+          teamId: label(team.id), teamKey: label(team.key), creatorId: label(record(node.creator ?? {}).id) || null,
           assigneeId: label(record(node.assignee ?? {}).id) || null, delegateId: label(record(node.delegate ?? {}).id) || null,
           labels: connection(node.labels ?? { nodes: [] }).nodes.map((item) => label(record(item).name)).filter(Boolean),
           parentId: label(parent.id) && label(record(parent.project ?? {}).id) === projectId && !["completed", "canceled", "duplicate"].includes(label(record(parent.state ?? {}).type)) ? label(parent.id) : null,

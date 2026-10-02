@@ -8,6 +8,7 @@ import type { Launcher } from "./launch";
 import type { LinearService } from "./linear";
 import { findProject, readBranches } from "./projects";
 import { hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, planPolicy, type PlanPolicy } from "./plan-policy";
+import { needsOwner, type Presence } from "./presence";
 import { Scheduler, type Admission } from "./scheduler";
 import type { PluginSettings } from "./settings";
 
@@ -18,6 +19,7 @@ type Deps = {
   handover?: Pick<Handover, "resumeTarget">;
   branches?: typeof readBranches;
   scheduler?: Scheduler;
+  presence?: Pick<Presence, "away">;
 };
 
 // Plan-first modes where the provider's plan mode lets the planner read without asking. omp has
@@ -118,14 +120,21 @@ export class TicketStarter {
 
   constructor(private readonly deps: Deps) {
     this.branches = deps.branches ?? readBranches;
-    this.scheduler = deps.scheduler ?? new Scheduler({ running: runningTicketAgents, projectOf: async (issueId) => (await deps.linear.issueState(issueId)).projectId });
+    this.scheduler = deps.scheduler ?? new Scheduler({
+      running: runningTicketAgents,
+      projectOf: async (issueId) => (await deps.linear.issueState(issueId)).projectId,
+      ...(deps.presence ? { away: () => deps.presence!.away() } : {}),
+    });
   }
 
-  // Whether the ticket may start now: its blockers are finished and the scheduler gives it a slot.
+  // Whether the ticket may start now: its blockers are finished, and the scheduler gives it a slot
+  // (none while the owner is away for a ticket that may need them).
   async admission(issueId: string, paseo: PaseoApi, settings: PluginSettings): Promise<Admission> {
     const state = await this.deps.linear.issueState(issueId);
     if (state.blockedBy.length) return { ok: false, reason: `Waiting for ${state.blockedBy.join(", ")} to finish.` };
-    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt }, paseo, settings.dispatch.maxRunning);
+    const untrusted = isUntrusted(state, await this.deps.linear.viewerId(), await this.deps.linear.appUserId());
+    const attended = needsOwner(state.labels.map((item) => item.name), untrusted, settings.dispatch.label);
+    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended }, paseo, settings.dispatch.maxRunning);
   }
 
   async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean }): Promise<Started> {

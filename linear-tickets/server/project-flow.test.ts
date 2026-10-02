@@ -17,7 +17,7 @@ const settings = { dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["T
 
 const issue = (n: number, change: Partial<ProjectIssue> = {}): ProjectIssue => ({
   id: `i${n}`, identifier: `TUC-${n}`, title: `Ticket ${n}`, priority: 3, createdAt: `2026-01-01T00:00:0${n}Z`, status: "Todo", statusType: "unstarted",
-  teamId: "t1", teamKey: "TUC", assigneeId: null, delegateId: null, labels: [], parentId: null, blockers: [], blocks: [], ...change,
+  teamId: "t1", teamKey: "TUC", creatorId: OWNER, assigneeId: null, delegateId: null, labels: [], parentId: null, blockers: [], blocks: [], ...change,
 });
 
 async function room(t: TestContext, issues: ProjectIssue[], running: string[] = []) {
@@ -26,6 +26,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   const calls: string[] = [];
   let now = Date.parse("2026-01-02T00:00:00Z");
   let created = 0;
+  let away = false;
   const linear = {
     labeledProjects: async () => [{ id: "erp", name: "ERP" }],
     projectIssues: async () => issues,
@@ -41,9 +42,9 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
     viewerId: async () => OWNER,
   };
   const store = new ProjectStore(join(directory, "projects.json"));
-  const scheduler = new Scheduler({ running: async () => running, projectOf: async () => "erp", now: () => now });
+  const scheduler = new Scheduler({ running: async () => running, projectOf: async () => "erp", away: async () => away, now: () => now });
   const flow = new ProjectFlow({ linear, scheduler, store, retire: async (agentId) => { calls.push(`retire ${agentId}`); }, now: () => now });
-  return { flow, calls, store, issues, advance: (ms: number) => { now += ms; } };
+  return { flow, calls, store, issues, advance: (ms: number) => { now += ms; }, setAway: (value: boolean) => { away = value; } };
 }
 
 test("a labelled project hands out nothing and files no planner until the owner presses Plan; the status counts what waits", async (t) => {
@@ -83,6 +84,27 @@ test("the approved work order is written to Linear, then planned tickets are han
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);
   assert.deepEqual(r.calls, ["delegate i2"], "one free slot of two: the urgent ticket; blocked and held tickets never");
+});
+
+test("while the owner is away only tickets that need nobody are handed out; back, the attended ones go first", async (t) => {
+  // TUC-1 is marked attended by the plan; TUC-2 was written by someone else, so its plan needs the owner.
+  const r = await room(t, [issue(1), issue(2, { creatorId: "colleague" }), issue(3), issue(4), issue(5, { priority: 1 })]);
+  await r.flow.planNow("erp", settings);
+  r.issues.push(issue(100, { id: "planner1", labels: ["paseo-planner"] }));
+  await r.flow.applyPlan("planner1", "agent-p", "```project-order\nattended TUC-1: pricing is not decided\n```", paseo, settings);
+  assert.ok(r.calls.includes("label i1 +paseo-attended"));
+  r.issues.splice(0, r.issues.length, issue(1, { labels: ["paseo-attended"] }), issue(2, { creatorId: "colleague" }), issue(3), issue(4), issue(5, { priority: 1 }));
+  r.setAway(true);
+  r.calls.length = 0;
+  r.advance(HOUR);
+  await r.flow.tick(paseo, settings);
+  assert.deepEqual(r.calls, ["delegate i3", "delegate i5"], "two slots: the urgent ticket and the oldest that needs nobody; TUC-1 and TUC-2 wait");
+  r.issues.splice(0, r.issues.length, issue(1, { labels: ["paseo-attended"] }), issue(2, { creatorId: "colleague" }), issue(4));
+  r.setAway(false);
+  r.calls.length = 0;
+  r.advance(HOUR);
+  await r.flow.tick(paseo, settings);
+  assert.deepEqual(r.calls, ["delegate i1", "delegate i2"], "present: the attended tickets take the slots before TUC-4");
 });
 
 test("tickets nobody may hand out stay put: started, someone else's, already with Paseo, sub-issues; a parent goes as a group", async (t) => {
@@ -139,5 +161,9 @@ test("the work-order block accepts list markers and case, and ignores other line
     { kind: "blocks", blocker: "TUC-1", blocked: "TUC-2" },
     { kind: "hold", ticket: "TUC-3", reason: "owner decides" },
     { kind: "release", ticket: "TUC-4", reason: "" },
+  ]);
+  assert.deepEqual(parseOrder("```project-order\nAttended tuc-5: wording\nunattended TUC-6\n```"), [
+    { kind: "attended", ticket: "TUC-5", reason: "wording" },
+    { kind: "unattended", ticket: "TUC-6", reason: "" },
   ]);
 });

@@ -6,12 +6,16 @@ import type { PaseoApi } from "@getpaseo/client";
 // the first ones are admitted:
 // 1. the project with the fewest agents working first, so one project takes every slot only
 //    while nothing else waits, and a project that waits gets the next free slot;
-// 2. then priority (urgent first, none last), then the ticket that unblocks the most open tickets,
+// 2. then tickets that may need the owner (`attended`), so the time they are present is used for those;
+// 3. then priority (urgent first, none last), then the ticket that unblocks the most open tickets,
 //    then the oldest.
+// While the owner is away, `attended` tickets are not admitted and take no place in the line.
 // An admitted ticket keeps its slot (a reservation) until its agent shows up or a few minutes pass.
 
 // `blocked` tickets never ask: their blockers are checked before.
-export type Candidate = { issueId: string; identifier: string; projectId: string | null; priority: number; unblocks: number; createdAt: string };
+export type Candidate = { issueId: string; identifier: string; projectId: string | null; priority: number; unblocks: number; createdAt: string; attended?: boolean };
+
+export const AWAY_REASON = "Waits until you are present: it may need you while it runs.";
 export type Admission = { ok: true } | { ok: false; reason: string };
 
 // A waiting ticket that has not asked for this long has started, closed or stopped waiting.
@@ -25,6 +29,8 @@ type Deps = {
   // Issue ids of the ticket agents working right now.
   running: (paseo: PaseoApi) => Promise<string[]>;
   projectOf: (issueId: string) => Promise<string | null>;
+  // Whether the owner is away (presence.ts); absent: always present.
+  away?: () => Promise<boolean>;
   now?: () => number;
 };
 
@@ -34,6 +40,7 @@ export function rankWaiting(waiting: Candidate[], load: Map<string | null, numbe
   const picked: Candidate[] = [];
   while (picked.length < slots && left.length) {
     left.sort((a, b) => (loads.get(a.projectId) ?? 0) - (loads.get(b.projectId) ?? 0)
+      || Number(Boolean(b.attended)) - Number(Boolean(a.attended))
       || (a.priority || 5) - (b.priority || 5)
       || b.unblocks - a.unblocks
       || a.createdAt.localeCompare(b.createdAt)
@@ -72,6 +79,11 @@ export class Scheduler {
   // `limit` 0: no limit. Asking registers the ticket as waiting.
   async admit(candidate: Candidate, paseo: PaseoApi, limit: number): Promise<Admission> {
     if (this.reserved.has(candidate.issueId)) return { ok: true };
+    const away = (await this.deps.away?.()) ?? false;
+    if (away && candidate.attended) {
+      this.waiting.delete(candidate.issueId);
+      return { ok: false, reason: AWAY_REASON };
+    }
     this.note([candidate]);
     const now = (this.deps.now ?? Date.now)();
     if (limit <= 0) return this.reserve(candidate, now);
@@ -88,9 +100,10 @@ export class Scheduler {
       load.set(projectId, (load.get(projectId) ?? 0) + 1);
     }
     for (const { projectId } of this.reserved.values()) load.set(projectId, (load.get(projectId) ?? 0) + 1);
-    const picked = rankWaiting([...this.waiting.values()], load, limit - used);
+    const line = [...this.waiting.values()].filter((item) => !(away && item.attended));
+    const picked = rankWaiting(line, load, limit - used);
     if (picked.some((item) => item.issueId === candidate.issueId)) return this.reserve(candidate, now);
-    const ahead = rankWaiting([...this.waiting.values()], load, this.waiting.size).findIndex((item) => item.issueId === candidate.issueId);
+    const ahead = rankWaiting(line, load, line.length).findIndex((item) => item.issueId === candidate.issueId);
     return { ok: false, reason: `Queued: ${limit - used} free agent slot${limit - used === 1 ? "" : "s"}, ${ahead} ticket${ahead === 1 ? "" : "s"} ahead. It starts when its turn comes.` };
   }
 
