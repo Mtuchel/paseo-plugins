@@ -185,9 +185,12 @@ export const githubReader: GitHubReader = {
     const { status } = await ghJson<{ status?: string }>(["api", `repos/${repo}/compare/${draft.headSha}...${encodeURIComponent(draft.base)}`, "--jq", "{status}"]);
     return status === "identical" || status === "ahead";
   },
+  // Every page: a failed or pending run past the first 100 must never let a drop pass as
+  // conflict-only. A failed page throws, and the drop is judged on a later poll.
   async failedChecks(repo, sha) {
-    const { check_runs: runs = [] } = await ghJson<{ check_runs?: { name?: string; html_url?: string; status?: string; conclusion?: string | null }[] }>(
-      ["api", `repos/${repo}/commits/${sha}/check-runs?per_page=100`, "--jq", "{check_runs: [.check_runs[] | {name, html_url, status, conclusion}]}"]);
+    const pages = await ghJson<{ check_runs?: { name?: string; html_url?: string; status?: string; conclusion?: string | null }[] }[]>(
+      ["api", "--paginate", "--slurp", `repos/${repo}/commits/${sha}/check-runs?per_page=100`]);
+    const runs = pages.flatMap((page) => page.check_runs ?? []);
     return runs.filter((run) => run.status !== "completed" || !PASSING_CONCLUSIONS.includes(run.conclusion ?? ""))
       .map((run) => ({ name: run.name ?? "check", url: run.html_url ?? "", conclusion: run.status === "completed" ? run.conclusion ?? "unknown" : run.status ?? "pending" }));
   },
@@ -428,9 +431,15 @@ export class PullRequestWatch {
             await save();
           }
         }
+        // A pending message is recorded as delivered as soon as it went out, before any session line.
         const pending = seenByUrl[url].pending;
-        // Recorded as delivered as soon as the message went out, before any session line.
-        if (pending) await this.deliver(record, url, pending, save, reserved, async () => vetoed || Boolean(pending.conflict && await queued()), async () => {
+        if (pending && pending.fix !== null && ticketEscalated(seenByUrl, record.issueId, url)) {
+          // Claimed while the agent was busy, then another pull request of the ticket escalated:
+          // the owner has the ticket, so the automatic fix is never sent (also after a restart).
+          console.error(`[linear-tickets] ${record.identifier}: the claimed ${pending.conflict ? "restack" : "fix"} request for ${url} is not sent; the ticket was escalated to the owner`);
+          seenByUrl[url] = { ...seenByUrl[url], pending: null };
+          await save();
+        } else if (pending) await this.deliver(record, url, pending, save, reserved, async () => vetoed || Boolean(pending.conflict && await queued()), async () => {
           seenByUrl[url] = { ...seenByUrl[url], pending: null };
           await save();
         });
@@ -599,7 +608,8 @@ export class PullRequestWatch {
   private async nudge(record: HandoverRecord, url: string, view: PullRequestView, seenByUrl: Record<string, Seen>, save: () => Promise<void>, drafts: (repo: string) => Promise<QueueDraft[]>, reserved: Set<string>): Promise<void> {
     const source = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
     const last = activityBullets(view.mergeActivity).at(-1);
-    if (!source || reserved.has(record.agentId) || view.labels.includes(DO_NOT_MERGE_LABEL) || (last && last.kind !== "dropped")) return;
+    // After a drop escalation the owner has the ticket: no lifecycle step re-enqueues it either.
+    if (!source || reserved.has(record.agentId) || view.labels.includes(DO_NOT_MERGE_LABEL) || (last && last.kind !== "dropped") || ticketEscalated(seenByUrl, record.issueId, url)) return;
     const [, repo, number] = source;
     if (await this.queued(url, drafts)) return;
     if ((await this.deps.manualTasks?.openBlockers(record.issueId))?.length) return;

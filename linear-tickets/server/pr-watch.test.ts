@@ -720,3 +720,38 @@ test("an escalation stops every automatic drop prompt for the ticket, on its oth
   assert.deepEqual(await h.poll(), [], "a replacement pull request of the ticket inherits the escalation");
   assert.deepEqual(h.github.reads, [PR_421]);
 });
+
+test("a restack claimed while the agent was busy is never sent once another pull request of the ticket escalated, also after a restart", async (t) => {
+  const PR_420 = "https://github.com/tuchel-sohn/tuchel-platform/pull/420";
+  const h = harness(t);
+  const log = t.mock.method(console, "error", () => {});
+  h.records.push({ ...h.records[0], links: { "Pull request": PR_420 } });
+  h.github.views[PR] = { ...OPEN_PR, mergeActivity: activity(QUEUED, NOT_ADDED) };
+  h.github.views[PR_420] = OPEN_PR;
+  assert.equal(lastLine(promptOf(await h.poll())), FIX_1_OF_1);
+  h.github.views[PR_420] = { ...OPEN_PR, mergeActivity: activity(QUEUED, CONFLICT) };
+  h.paseo.answer = async () => "busy";
+  assert.deepEqual(await h.poll(), [], "the restack for #420 is claimed and waits for the agent");
+  h.paseo.answer = async () => "sent";
+  h.github.views[PR] = { ...OPEN_PR, mergeActivity: activity(QUEUED, NOT_ADDED, QUEUED, NOT_ADDED) };
+  assert.deepEqual(firstLines(await h.poll()), OTHER_ESCALATION, "only the owner hears of it");
+  assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /claimed restack request for .*\/pull\/420 is not sent; the ticket was escalated/);
+  await h.restart();
+  assert.deepEqual(await h.poll(), [], "nothing is left to send after a restart");
+});
+
+test("after a drop escalation no lifecycle step re-enqueues the ticket's pull request or its replacement", async (t) => {
+  const PR_421 = "https://github.com/tuchel-sohn/tuchel-platform/pull/421";
+  const h = harness(t);
+  t.mock.method(console, "error", () => {});
+  h.github.views[PR] = { ...OPEN_PR, mergeActivity: activity(QUEUED, NOT_ADDED) };
+  assert.equal(lastLine(promptOf(await h.poll())), FIX_1_OF_1);
+  h.github.views[PR] = { ...OPEN_PR, mergeActivity: activity(QUEUED, NOT_ADDED, QUEUED, NOT_ADDED) };
+  assert.deepEqual(firstLines(await h.poll()), OTHER_ESCALATION);
+  h.github.views[PR] = { ...READY, mergeActivity: activity(QUEUED, NOT_ADDED, QUEUED, NOT_ADDED) };
+  assert.deepEqual(await h.poll(), [], "green and ready, but the owner has it");
+  assert.deepEqual(await h.poll(), []);
+  h.records.splice(0, h.records.length, { ...h.records[0], links: { "Pull request": PR_421 } });
+  h.github.views[PR_421] = READY;
+  assert.deepEqual(await h.poll(), [], "a ready replacement pull request is not nudged either");
+});
