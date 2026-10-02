@@ -15,7 +15,7 @@ export type DispatchSettings = { enabled: boolean; label: string; teamKeys: stri
 // `mentions` is the inbound direction: "@paseo" comments and replies to Paseo's comments by the key's user reach the agent.
 export type WritebackSettings = { status: boolean; summaries: boolean; blocked: boolean; pullRequests: boolean; mentions: boolean; autoResume: boolean };
 export const DEFAULT_DISPATCH: DispatchSettings = { enabled: false, label: "paseo", teamKeys: [], intervalSeconds: 60, maxRunning: 0 };
-export const MAX_RUNNING_LIMIT = 20;
+export const MAX_RUNNING_LIMIT = 50;
 export const DEFAULT_WRITEBACK: WritebackSettings = { status: false, summaries: false, blocked: false, pullRequests: false, mentions: false, autoResume: false };
 export const MIN_DISPATCH_INTERVAL_SECONDS = 30;
 export const MAX_DISPATCH_INTERVAL_SECONDS = 3_600;

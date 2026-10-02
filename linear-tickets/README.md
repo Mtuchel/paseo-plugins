@@ -474,7 +474,7 @@ reloading are picked up by the minute sweep. Plannotator chat rows in Paseo need
 connection and are skipped until one arrives; Linear still gets the review.
 
 **Waiting their turn.** A ticket blocked by unfinished tickets, or started while *max agents*
-(Settings → Auto-dispatch)
+(Settings → Auto-dispatch, up to 50; 0 means no limit)
 are already working, waits. A labelled ticket keeps its label; a delegated one says why in its
 panel. The minute sweep starts it once it is admitted, however long it waited. A delegated ticket
 whose thread was ended, or which was closed meanwhile, starts nothing; one that already has an
