@@ -116,11 +116,15 @@ export class ProjectFlow {
       await this.store.put(project.id, record);
     }
     const work = issues.filter((issue) => !issue.labels.some((name) => name.toLowerCase() === labels.planner.toLowerCase()));
+    const owner = await this.deps.linear.viewerId();
     const planned = (issue: ProjectIssue) => record.plannedThrough !== null && issue.createdAt <= record.plannedThrough;
-    const unplanned = work.filter((issue) => !planned(issue));
+    // Only tickets the hand-out could take need a plan: sub-issues (their group hands them out),
+    // tickets already with Paseo or someone else, and started work never start a planner.
+    const unplanned = work.filter((issue) => !planned(issue) && (HAND_OUT_TYPES.has(issue.statusType) || issue.statusType === "triage")
+      && !issue.delegateId && !issue.parentId && (!issue.assigneeId || issue.assigneeId === owner));
     const newest = Math.max(0, ...unplanned.map((issue) => Date.parse(issue.createdAt) || 0));
     if (!record.planner && unplanned.length && this.now() - newest >= SETTLE_MS) await this.plan(project, work, unplanned, appId, settings);
-    await this.handOut(project.id, work, work.filter(planned), appId, paseo, settings);
+    await this.handOut(project.id, work, work.filter(planned), owner, appId, paseo, settings);
   }
 
   private async plan(project: { id: string; name: string }, work: ProjectIssue[], unplanned: ProjectIssue[], appId: string, settings: PluginSettings): Promise<void> {
@@ -141,9 +145,8 @@ export class ProjectFlow {
   // Ranked by the scheduler; each admitted ticket is assigned to Paseo, whose session then starts
   // it in its reserved slot. A ticket with open sub-issues in the project is a group: assigning it
   // takes no slot, its sub-issues are handed out by the group.
-  private async handOut(projectId: string, work: ProjectIssue[], planned: ProjectIssue[], appId: string, paseo: PaseoApi, settings: PluginSettings): Promise<void> {
+  private async handOut(projectId: string, work: ProjectIssue[], planned: ProjectIssue[], owner: string, appId: string, paseo: PaseoApi, settings: PluginSettings): Promise<void> {
     const labels = dispatchLabels(settings.dispatch.label);
-    const owner = await this.deps.linear.viewerId();
     const skip = new Set([labels.hold, labels.manual, labels.needsYou, labels.running, labels.failed, settings.dispatch.label].map((name) => name.toLowerCase()));
     const parents = new Set(work.map((issue) => issue.parentId).filter(Boolean));
     const ready = planned.filter((issue) => HAND_OUT_TYPES.has(issue.statusType) && !issue.delegateId && (!issue.assigneeId || issue.assigneeId === owner)

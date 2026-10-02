@@ -106,7 +106,14 @@ test("tickets filed after the plan wait for the next planner, which starts once 
   await r.flow.applyPlan("planner1", "agent-p", "", paseo, settings);
   r.issues.pop();
   r.issues[0] = issue(1, { delegateId: APP });
-  r.issues.push(issue(2, { createdAt: "2026-01-02T00:59:00Z" }));
+  // Filed after the plan but never handed out by the project, so they start no planner.
+  r.issues.push(issue(3, { createdAt: "2026-01-02T00:30:00Z", parentId: "i1" }), issue(4, { createdAt: "2026-01-02T00:30:00Z", delegateId: APP }),
+    issue(5, { createdAt: "2026-01-02T00:30:00Z", assigneeId: "colleague" }), issue(6, { createdAt: "2026-01-02T00:30:00Z", statusType: "started", status: "In Progress" }));
+  r.calls.length = 0;
+  r.advance(HOUR);
+  await r.flow.tick(paseo, settings);
+  assert.deepEqual(r.calls, []);
+  r.issues.push(issue(2, { createdAt: "2026-01-02T01:59:00Z" }));
   r.calls.length = 0;
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);

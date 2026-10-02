@@ -559,7 +559,10 @@ every 2 minutes.
   takes no slot itself. Removing `paseo-hold` releases a ticket.
 - **New tickets.** Tickets filed after the last planner are not handed out until the next one
   is approved. That planner starts once no new ticket has arrived for 10 minutes, so a batch
-  of tickets gets one planner. There is at most one planner per project at a time.
+  of tickets gets one planner. There is at most one planner per project at a time, so the next
+  one only comes after you approved or closed the current one. Only tickets the project could
+  hand out start a planner: new sub-issues, tickets already with Paseo or someone else, and
+  started ones do not.
 - **Skipping a plan.** Closing or canceling the planner ticket yourself counts its tickets as
   planned: they are handed out without a work order.
 - Removing the label from the project stops new hand-outs; agents already working continue.
