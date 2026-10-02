@@ -361,7 +361,7 @@ export const DELETE_ATTACHMENT_QUERY = `mutation deleteAttachment($id: String!) 
 export const LINK_URL_QUERY = `mutation link($issueId: String!, $url: String!, $title: String) {
   attachmentLinkURL(issueId: $issueId, url: $url, title: $title) { success }
 }`;
-// The relay's read: the owner's "@paseo" comments on up to RELAY_BATCH tickets in one request, each
+// The relay's read: the owner's "@paseo" comments and thread replies on up to RELAY_BATCH tickets in one request, each
 // ticket from its own cursor (`$sN`, inclusive) and page (`$aN`). `issues(filter: id eq)` rather
 // than `issue(id:)`: a ticket the token cannot see comes back empty instead of failing the query.
 export const RELAY_BATCH = 50;
@@ -369,8 +369,8 @@ export function relayCommentsQuery(count: number): string {
   const indexes = Array.from({ length: count }, (_, index) => index);
   const declarations = indexes.map((index) => `$i${index}: ID!, $s${index}: DateTimeOrDuration!, $a${index}: String`).join(", ");
   const fields = indexes.map((index) => `t${index}: issues(first: 1, filter: { id: { eq: $i${index} } }) {
-    nodes { id comments(first: 50, after: $a${index}, filter: { createdAt: { gte: $s${index} }, user: { id: { eq: $u } }, body: { containsIgnoreCase: "@paseo" } }) {
-      nodes { id body createdAt user { id } reactions { emoji user { id } } agentSession { id } }
+    nodes { id comments(first: 50, after: $a${index}, filter: { createdAt: { gte: $s${index} }, user: { id: { eq: $u } }, or: [{ body: { containsIgnoreCase: "@paseo" } }, { parent: { null: false } }] }) {
+      nodes { id body createdAt user { id } reactions { emoji user { id } } agentSession { id } parent { user { id } agentSession { id } } }
       pageInfo { hasNextPage endCursor }
     } }
   }`).join("\n  ");
@@ -383,8 +383,9 @@ export const REACTION_QUERY = `mutation react($commentId: String!, $emoji: Strin
 }`;
 
 // `sessionId`: the Paseo agent session the comment opened or replied in (an @mention of the app);
-// those reach the agent through the session webhook, not the relay.
-export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[]; sessionId: string | null };
+// those reach the agent through the session webhook, not the relay. `parent`: the thread's first
+// comment when this one is a reply (its `sessionId` set when the thread is an agent session's).
+export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[]; sessionId: string | null; parent: { userId: string; sessionId: string | null } | null };
 
 export const ISSUE_DOCUMENTS_QUERY = `query issueDocuments($id: String!) {
   issue(id: $id) { id documents(first: 50) { nodes { id title url content } } }
@@ -889,7 +890,7 @@ export class LinearService {
     return url;
   }
 
-  // The owner's "@paseo" comments since each ticket's cursor (inclusive), oldest first, in one
+  // The owner's "@paseo" comments and thread replies since each ticket's cursor (inclusive), oldest first, in one
   // request per RELAY_BATCH tickets on the app's pool; tickets the app cannot see are read with
   // the key. `unseen`: tickets neither credential returned (deleted, no access, not a Linear id).
   async relayComments(userId: string, cursors: { issueId: string; since: string }[]): Promise<{ comments: Map<string, RelayComment[]>; unseen: string[] }> {
@@ -944,6 +945,7 @@ export class LinearService {
             userId: label(record(node.user ?? {}).id),
             reactions: (Array.isArray(node.reactions) ? node.reactions : []).map((entry) => record(entry)).map((reaction) => ({ emoji: label(reaction.emoji), userId: label(record(reaction.user ?? {}).id) })),
             sessionId: label(record(node.agentSession ?? {}).id) || null,
+            parent: node.parent ? { userId: label(record(record(node.parent).user ?? {}).id), sessionId: label(record(record(node.parent).agentSession ?? {}).id) || null } : null,
           });
         }
         if (found.hasNextPage && found.endCursor) next.push({ ...item, after: found.endCursor });

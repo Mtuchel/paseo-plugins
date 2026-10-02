@@ -26,6 +26,14 @@ export function mentionMessage(body: string): string | null {
   return body.slice(match[0].length).trim();
 }
 
+// A comment is addressed to the agent when it starts with "@paseo" or replies in a thread the
+// Paseo app started (its status, question and summary comments): the whole reply is the message.
+export function addressedMessage(comment: Pick<RelayComment, "body" | "parent">, appId: string | null): string | null {
+  const mentioned = mentionMessage(comment.body);
+  if (mentioned !== null) return mentioned;
+  return appId !== null && comment.parent?.userId === appId ? comment.body.trim() : null;
+}
+
 export function questionsOf(request: AgentPermissionRequest): Question[] {
   const questions = request.input && Array.isArray(request.input.questions) ? request.input.questions : [];
   return questions.filter((item): item is Question => Boolean(item) && typeof item === "object");
@@ -72,9 +80,9 @@ export function approvalDecision(message: string): AgentPermissionResponse | nul
   return { behavior: "deny", ...(match[2].trim() ? { message: match[2].trim() } : {}) };
 }
 
-// Linear → agent. On every poll, comments by the key's own user that start with "@paseo" on
-// tickets with an active linked agent are delivered to that agent: as the answer to its
-// pending question, as an approve/deny decision for a pending approval, or as a new message.
+// Linear → agent. On every poll, comments by the key's own user that start with "@paseo" or reply
+// to a Paseo app comment, on tickets with an active linked agent, are delivered to that agent: as
+// the answer to its pending question, as an approve/deny decision for a pending approval, or as a new message.
 // The agent's reply comes back through turn-summary write-back, so the conversation stays in
 // Linear. A 👀 reaction marks a delivered comment and ❌ plus a reply one that could not be
 // delivered.
@@ -124,13 +132,15 @@ export class CommentRelay {
         const cursor = cursors[agent.issueId];
         for (const comment of comments.get(agent.issueId) ?? []) {
           if (comment.createdAt < cursor.since || (comment.createdAt === cursor.since && cursor.boundaryIds.includes(comment.id))) continue;
-          // An @mention of the Paseo app opens (or replies in) an agent session, and the session
-          // webhook delivers it; relaying it too would hand the agent the same message twice.
+          // An @mention of the Paseo app opens (or replies in) an agent session, and so does a reply
+          // in a session's thread; the session webhook delivers those, and relaying them too would
+          // hand the agent the same message twice.
           const handled = comment.userId !== viewerId
             || comment.sessionId !== null
+            || comment.parent?.sessionId != null
             || comment.reactions.some((reaction) => (reaction.userId === viewerId || (appId !== null && reaction.userId === appId)) && (reaction.emoji === ACK_EMOJI || reaction.emoji === FAILED_EMOJI))
             || state.acks.some((ack) => ack.commentId === comment.id);
-          const message = handled ? null : mentionMessage(comment.body);
+          const message = handled ? null : addressedMessage(comment, appId);
           if (message !== null) {
             const outcome = await this.deliver(paseo, agent, comment, message);
             state.acks.push({ commentId: comment.id, issueId: agent.issueId, reacted: false, ...outcome });
