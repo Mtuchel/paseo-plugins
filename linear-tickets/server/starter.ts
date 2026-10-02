@@ -8,15 +8,16 @@ import type { Launcher } from "./launch";
 import type { LinearService } from "./linear";
 import { findProject, readBranches } from "./projects";
 import { hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, planPolicy, type PlanPolicy } from "./plan-policy";
+import { Scheduler, type Admission } from "./scheduler";
 import type { PluginSettings } from "./settings";
 
 export type Started = { agentId: string; warnings: string[]; provider: string; target: string; resumed: boolean; untrusted: boolean; plan: PlanPolicy | null };
-export type Admission = { ok: true } | { ok: false; reason: string };
 type Deps = {
   linear: Pick<LinearService, "detail" | "issueState" | "viewerId" | "appUserId" | "issueDocument">;
   launcher: Pick<Launcher, "start">;
   handover?: Pick<Handover, "resumeTarget">;
   branches?: typeof readBranches;
+  scheduler?: Scheduler;
 };
 
 // Plan-first modes where the provider's plan mode lets the planner read without asking. omp has
@@ -92,14 +93,15 @@ export async function planSetup(linear: Pick<LinearService, "issueState" | "view
   };
 }
 
-// Counts ticket agents that are working right now (not idle, not archived, not subagents).
-export async function runningTicketAgents(paseo: PaseoApi): Promise<number> {
-  let running = 0;
+// Issue ids of the ticket agents working right now (not idle, not archived, not subagents).
+export async function runningTicketAgents(paseo: PaseoApi): Promise<string[]> {
+  const running: string[] = [];
   let cursor: string | undefined;
   do {
     const page = await paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
     for (const { agent } of page.entries) {
-      if (agent.labels?.["linear.issueId"] && !agent.labels["paseo.parent-agent-id"] && (agent.status === "running" || agent.status === "initializing")) running++;
+      const issueId = agent.labels?.["linear.issueId"];
+      if (issueId && !agent.labels["paseo.parent-agent-id"] && (agent.status === "running" || agent.status === "initializing")) running.push(issueId);
     }
     cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
   } while (cursor);
@@ -111,21 +113,19 @@ export async function runningTicketAgents(paseo: PaseoApi): Promise<number> {
 // handover on this ticket, the same branch and worktree so the new agent continues its work.
 export class TicketStarter {
   private readonly branches: typeof readBranches;
+  // Shared by every start path, so all of them wait in one line (README, "Who starts next").
+  readonly scheduler: Scheduler;
 
   constructor(private readonly deps: Deps) {
     this.branches = deps.branches ?? readBranches;
+    this.scheduler = deps.scheduler ?? new Scheduler({ running: runningTicketAgents, projectOf: async (issueId) => (await deps.linear.issueState(issueId)).projectId });
   }
 
-  // Whether the ticket may start now: its blockers are finished and the agent limit has room.
+  // Whether the ticket may start now: its blockers are finished and the scheduler gives it a slot.
   async admission(issueId: string, paseo: PaseoApi, settings: PluginSettings): Promise<Admission> {
     const state = await this.deps.linear.issueState(issueId);
     if (state.blockedBy.length) return { ok: false, reason: `Waiting for ${state.blockedBy.join(", ")} to finish.` };
-    const limit = settings.dispatch.maxRunning;
-    if (limit > 0) {
-      const running = await runningTicketAgents(paseo);
-      if (running >= limit) return { ok: false, reason: `Queued: ${running} of ${limit} ticket agents are working. It starts when one finishes.` };
-    }
-    return { ok: true };
+    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt }, paseo, settings.dispatch.maxRunning);
   }
 
   async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean }): Promise<Started> {

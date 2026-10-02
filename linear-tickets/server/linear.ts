@@ -278,8 +278,9 @@ export type LabeledIssue = { id: string; identifier: string; teamKey: string; pr
 // write-back decisions without the comment pagination that `detail` performs.
 export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
   issue(id: $id) {
-    id identifier state { id name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
+    id identifier priority createdAt state { id name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
     inverseRelations(first: 50) { nodes { type issue { identifier state { name type } attachments(first: 25) { nodes { url sourceType metadata } } } } }
+    relations(first: 50) { nodes { type relatedIssue { state { type } } } }
   }
 }`;
 // `status`: the workflow state's name ("In Review"); `statusType` its kind ("started").
@@ -333,9 +334,38 @@ function groupIssue(node: Record<string, unknown>): GroupIssue {
 }
 
 // `blockedBy`: identifiers of unfinished tickets that block this one (merged reviews count as finished).
+// `unblocks`: how many open tickets this one blocks. `priority`: Linear's 1 (urgent) … 4 (low), 0 none.
 export type IssueState = {
   id: string; identifier: string; status: string; statusId: string; statusType: string; teamId: string | null; projectId: string | null; creatorId: string | null;
-  labels: { id: string; name: string }[]; attachmentUrls: string[]; blockedBy: string[];
+  labels: { id: string; name: string }[]; attachmentUrls: string[]; blockedBy: string[]; priority: number; createdAt: string; unblocks: number;
+};
+
+// Projects carrying the trigger label (README, "Projects"), and their open tickets with what the
+// project flow reads: state, team, parent, who has it, labels, blockers and what they block.
+export const LABELED_PROJECTS_QUERY = `query labeledProjects($label: String!) {
+  projects(first: 50, filter: { labels: { name: { eqIgnoreCase: $label } } }) { nodes { id name } }
+}`;
+export const PROJECT_ISSUES_QUERY = `query projectIssues($id: String!, $after: String) {
+  project(id: $id) { issues(first: 25, after: $after, filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } } }) {
+    nodes {
+      id identifier title priority createdAt state { name type } team { id key } assignee { id } delegate { id } labels(first: 20) { nodes { name } }
+      parent { id state { type } project { id } }
+      inverseRelations(first: 15) { nodes { type issue { id identifier state { name type } delegate { id } attachments(first: 10) { nodes { url sourceType metadata } } } } }
+      relations(first: 15) { nodes { type relatedIssue { id state { type } } } }
+    }
+    pageInfo { hasNextPage endCursor }
+  } }
+}`;
+export const ISSUE_DESCRIPTIONS_QUERY = `query issueDescriptions($ids: [ID!]!) {
+  issues(first: 50, filter: { id: { in: $ids } }) { nodes { id description } }
+}`;
+export type LabeledProject = { id: string; name: string };
+// `parentId`: the ticket's parent when it is open and in the same project (the parent's group hands it out).
+// `blocks`: ids of open tickets this one blocks.
+export type ProjectIssue = {
+  id: string; identifier: string; title: string; priority: number; createdAt: string; status: string; statusType: string;
+  teamId: string; teamKey: string; assigneeId: string | null; delegateId: string | null; labels: string[];
+  parentId: string | null; blockers: GroupIssue[]; blocks: string[];
 };
 export const CREATE_ISSUE_QUERY = `mutation issueCreate($input: IssueCreateInput!) {
   issueCreate(input: $input) { success issue { id identifier url } }
@@ -763,11 +793,61 @@ export class LinearService {
       .map((relation) => record(relation.issue ?? {}))
       .filter((blocker) => !finishedIssue(blocker))
       .map((blocker) => label(blocker.identifier)).filter(Boolean);
+    const unblocks = connection(issue.relations ?? { nodes: [] }).nodes.map((node) => record(node))
+      .filter((relation) => label(relation.type) === "blocks" && !["completed", "canceled", "duplicate"].includes(label(record(record(relation.relatedIssue ?? {}).state ?? {}).type))).length;
     return {
       id: label(issue.id), identifier: label(issue.identifier), status: label(state.name), statusId: label(state.id), statusType: label(state.type),
       teamId: label(record(issue.team ?? {}).id) || null, projectId: label(record(issue.project ?? {}).id) || null, creatorId: label(record(issue.creator ?? {}).id) || null,
       labels: labelNodes(issue.labels), attachmentUrls, blockedBy,
+      priority: typeof issue.priority === "number" ? issue.priority : 0, createdAt: label(issue.createdAt), unblocks,
     };
+  }
+
+  async labeledProjects(labelName: string): Promise<LabeledProject[]> {
+    const data = record(await this.read(LABELED_PROJECTS_QUERY, { label: labelName }));
+    return connection(record(data.projects ?? {})).nodes.map((node) => record(node)).map((node) => ({ id: label(node.id), name: label(node.name) })).filter((project) => project.id);
+  }
+
+  // Every open ticket of the project, all pages.
+  async projectIssues(projectId: string): Promise<ProjectIssue[]> {
+    const issues: ProjectIssue[] = [];
+    let after: string | null = null;
+    do {
+      const data = record(await this.read(PROJECT_ISSUES_QUERY, { id: projectId, after }, (found) => Boolean(found.project && typeof found.project === "object")));
+      if (!data.project || typeof data.project !== "object") throw new Error("Linear did not return this project. Check that you have access to it.");
+      const page = record(record(data.project).issues ?? {});
+      for (const node of connection(page).nodes.map((item) => record(item))) {
+        const team = record(node.team ?? {});
+        const parent = record(node.parent ?? {});
+        issues.push({
+          id: label(node.id), identifier: label(node.identifier), title: label(node.title),
+          priority: typeof node.priority === "number" ? node.priority : 0, createdAt: label(node.createdAt),
+          status: label(record(node.state ?? {}).name), statusType: label(record(node.state ?? {}).type),
+          teamId: label(team.id), teamKey: label(team.key),
+          assigneeId: label(record(node.assignee ?? {}).id) || null, delegateId: label(record(node.delegate ?? {}).id) || null,
+          labels: connection(node.labels ?? { nodes: [] }).nodes.map((item) => label(record(item).name)).filter(Boolean),
+          parentId: label(parent.id) && label(record(parent.project ?? {}).id) === projectId && !["completed", "canceled", "duplicate"].includes(label(record(parent.state ?? {}).type)) ? label(parent.id) : null,
+          blockers: connection(node.inverseRelations ?? { nodes: [] }).nodes.map((item) => record(item))
+            .filter((relation) => label(relation.type) === "blocks").map((relation) => groupIssue(record(relation.issue ?? {}))).filter((blocker) => blocker.id),
+          blocks: connection(node.relations ?? { nodes: [] }).nodes.map((item) => record(item))
+            .filter((relation) => label(relation.type) === "blocks").map((relation) => record(relation.relatedIssue ?? {}))
+            .filter((related) => !["completed", "canceled", "duplicate"].includes(label(record(related.state ?? {}).type))).map((related) => label(related.id)).filter(Boolean),
+        });
+      }
+      const info = record(page.pageInfo ?? {});
+      after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
+    } while (after);
+    return issues;
+  }
+
+  // Descriptions by ticket id, for the project planner's ticket list.
+  async issueDescriptions(ids: string[]): Promise<Map<string, string>> {
+    const descriptions = new Map<string, string>();
+    for (let start = 0; start < ids.length; start += 50) {
+      const data = record(await this.read(ISSUE_DESCRIPTIONS_QUERY, { ids: ids.slice(start, start + 50) }));
+      for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) descriptions.set(label(node.id), label(node.description));
+    }
+    return descriptions;
   }
 
   async issueGroup(id: string): Promise<IssueGroup> {

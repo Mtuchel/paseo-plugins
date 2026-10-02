@@ -56,7 +56,7 @@ class FakeLinear {
   async moveToStateNamed() { return { changed: false }; }
 
   async issueState(id: string) {
-    return { id, identifier: id.toUpperCase(), status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, creatorId: "owner", labels: [], attachmentUrls: [], blockedBy: this.blocked[id] ?? [] };
+    return { id, identifier: id.toUpperCase(), status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, creatorId: "owner", labels: [], attachmentUrls: [], blockedBy: this.blocked[id] ?? [], priority: 0, createdAt: "", unblocks: 0 };
   }
 
   async detail(id: string): Promise<TicketDetail> {

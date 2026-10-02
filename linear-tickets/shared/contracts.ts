@@ -249,6 +249,27 @@ export const dispatchStatusRpc = defineRpc({
   output: dispatchStatusSchema,
 });
 
+// Labelled projects (README, "Projects"): how many new tickets wait for a plan, and the planner
+// waiting for the owner's approval, if any.
+export const projectStatusSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  toPlan: z.number().int(),
+  planner: z.object({ identifier: z.string(), url: z.string(), tickets: z.number().int() }).nullable(),
+  readAt: z.string(),
+});
+export type ProjectStatus = z.infer<typeof projectStatusSchema>;
+export const projectsStatusRpc = defineRpc({
+  name: "linear.projects-status",
+  input: z.object({}),
+  output: z.array(projectStatusSchema),
+});
+export const planProjectRpc = defineRpc({
+  name: "linear.plan-project",
+  input: z.object({ projectId: z.string().min(1).max(200) }),
+  output: projectStatusSchema,
+});
+
 // The native Linear agent's health for the settings screen.
 export const agentStatusRpc = defineRpc({
   name: "linear.agent-status",

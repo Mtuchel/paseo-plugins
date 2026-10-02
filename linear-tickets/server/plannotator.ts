@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { LinearService } from "./linear";
-import type { Settings } from "./settings";
+import type { PluginSettings, Settings } from "./settings";
 import { PLANNOTATOR_OPEN_SOURCE } from "./plannotator-open-source";
 import { paseoHome } from "./ticket-mcp";
 import type { Handover } from "./handover";
@@ -33,6 +33,7 @@ export type DecidedEvent = { type: "decided"; agentId: string | null; approved: 
 export type SkippedEvent = { type: "skipped"; agentId: string | null; reason: string; at: string };
 type PlannotatorEvent = OpenedEvent | DecidedEvent | SkippedEvent;
 type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "moveToStateNamed" | "addLabel" | "removeLabel">;
+type ProjectPlans = (issueId: string, agentId: string, plan: string, paseo: PaseoApi, settings: PluginSettings) => Promise<boolean>;
 
 // Workflow states the review moves a ticket through when status write-back is on.
 export const PLANNING_STATE = "Planning";
@@ -124,6 +125,8 @@ export class PlannotatorBridge {
   // A decision taken in Linear is also reported by the omp plan extension; the second report
   // within this window is the same decision and is skipped.
   private readonly lastDecision = new Map<string, number>();
+  // Applies an approved plan of a project's planner ticket (project-flow.ts); true when it was one.
+  private projectPlans: ProjectPlans | null = null;
 
   constructor(
     private readonly linear: Linear,
@@ -190,6 +193,10 @@ export class PlannotatorBridge {
     this.lastDecision.set(agentId, Date.now());
   }
 
+  onProjectPlan(apply: ProjectPlans): void {
+    this.projectPlans = apply;
+  }
+
   async drain(): Promise<void> {
     if (this.draining) { this.again = true; return this.draining; }
     this.draining = (async () => {
@@ -246,6 +253,13 @@ export class PlannotatorBridge {
     const inSession = await this.toSession(event, agentId, model, event.type === "opened" && event.remoteUrl ? url ?? null : null);
     if (!issueId) return;
     const settings = await this.settings.read();
+    // A planner's approved work order is applied by the project flow, which closes its ticket and
+    // retires the planner: nothing else of an approval (mode, state, plan-ready) applies to it.
+    if (event.type === "decided" && event.approved && this.projectPlans && await this.projectPlans(issueId, agentId, event.planContent ?? "", paseo, settings)) {
+      await this.linear.upsertIssueDocument(issueId, `Plan: ${identifier}`, planDocument(event, identifier, model))
+        .catch((error: unknown) => console.error(`[linear-tickets] ${identifier}: saving the work-order plan failed: ${error instanceof Error ? error.message : error}`));
+      return;
+    }
     // A required plan started in the provider's safe mode; its approved plan unlocks the usual mode.
     if (event.type === "decided" && event.approved && labels[PLAN_POLICY_LABEL] === "required") {
       const preference = settings.lastProvider ? settings.launchPreferences[settings.lastProvider] : undefined;
