@@ -10,6 +10,7 @@ import { reviewChange, type PullRequestView } from "./pr-watch";
 import { decidePlannotatorReview, describeTool, questionPrompt, SessionRouter, SessionStore } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { approveForLater, splitIntoSubIssues } from "./split";
+import { AWAY_REASON } from "./scheduler";
 import { advisorNote, isUntrusted, planDecisionNote, PLAN_REQUIRED_NOTE, TicketStarter, QUESTIONS_NOTE, UNTRUSTED_NOTE } from "./starter";
 import { planPolicy } from "./plan-policy";
 
@@ -262,7 +263,7 @@ test("the live feed shows completed commands and edits only", () => {
 });
 
 // `appId`: the Paseo app's user, or null when the app is not usable on this host.
-function starterHarness(state: { creatorId: string | null; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number, appId: string | null = APP) {
+function starterHarness(state: { creatorId: string | null; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number, appId: string | null = APP, away = false) {
   const launches: { modeId?: string; instructions: string; labels?: Record<string, string>; env?: Record<string, string>; markInProgress?: boolean }[] = [];
   const starter = new TicketStarter({
     linear: {
@@ -274,6 +275,7 @@ function starterHarness(state: { creatorId: string | null; labels: { id: string;
     },
     launcher: { start: async (input, _paseo, options) => { launches.push({ modeId: input.modeId, instructions: input.instructions, labels: options?.labels, env: options?.env, markInProgress: options?.markInProgress }); return { agentId: "new", warnings: [] }; } },
     branches: async () => ({ branches: [{ id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }),
+    presence: { away: async () => away },
   });
   const paseo = {
     agents: { list: async () => ({ entries: Array.from({ length: running }, (_, index) => ({ agent: { id: `r${index}`, status: "running", labels: { "linear.issueId": `x${index}` } } })), pageInfo: { hasMore: false } }) },
@@ -290,6 +292,22 @@ test("admission waits for unfinished blockers and for a free agent slot", async 
   const room = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 1);
   assert.deepEqual(await room.starter.admission("i1", room.paseo, settings), { ok: true });
   assert.deepEqual(await room.starter.admission("i1", room.paseo, { ...settings, dispatch: { ...settings.dispatch, maxRunning: 0 } }), { ok: true });
+});
+
+test("while the owner is away, every start path holds tickets that may need them, even with no agent limit", async () => {
+  const unlimited = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 0 } };
+  for (const [why, state] of [
+    ["marked attended", { creatorId: OWNER, labels: [{ id: "l1", name: "paseo-attended" }], blockedBy: [] }],
+    ["written by someone else", { creatorId: "colleague", labels: [], blockedBy: [] }],
+    ["plan first", { creatorId: OWNER, labels: [{ id: "l1", name: "plan" }], blockedBy: [] }],
+  ] as const) {
+    const away = starterHarness({ ...state, labels: [...state.labels], blockedBy: [] }, 0, APP, true);
+    assert.deepEqual(await away.starter.admission("i1", away.paseo, unlimited), { ok: false, reason: AWAY_REASON }, why);
+    const present = starterHarness({ ...state, labels: [...state.labels], blockedBy: [] }, 0, APP, false);
+    assert.deepEqual(await present.starter.admission("i1", present.paseo, unlimited), { ok: true }, why);
+  }
+  const plain = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0, APP, true);
+  assert.deepEqual(await plain.starter.admission("i1", plain.paseo, unlimited), { ok: true });
 });
 
 test("tickets written by someone else, or from the feedback intake, start plan-first; omp keeps the usual mode so the planner never waits for approvals", async () => {

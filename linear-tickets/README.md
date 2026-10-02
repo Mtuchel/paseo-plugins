@@ -492,12 +492,29 @@ line. While slots under *max agents* are short, a free slot goes to:
 
 1. the project with the fewest agents working, so one project gets every slot while nothing
    else waits, and a ticket of another project gets the next free slot;
-2. then the higher priority (Urgent first, no priority last);
-3. then the ticket that unblocks the most open tickets;
-4. then the oldest ticket.
+2. then tickets that may need you (see *Present and away*), so the time you are around is used
+   for them;
+3. then the higher priority (Urgent first, no priority last);
+4. then the ticket that unblocks the most open tickets;
+5. then the oldest ticket.
 
 An admitted ticket keeps its slot for 3 minutes while its agent starts. Tickets you start from
 the sidebar skip the line.
+
+**Present and away.** While you are away, tickets that may need you during the run wait; all
+others start as usual. A ticket may need you when it carries `paseo-attended` (the project
+planner marks these, and you can add or remove the label yourself) or when its plan needs your
+approval: someone else wrote it, or it carries `plan` (an approved plan, `plan-ready`, no longer
+counts). A project's planner ticket never waits: its plan is reviewed whenever you are back.
+Waiting tickets keep their place and start within a few minutes of you being present again; agents
+already working continue. A ticket that asks you something anyway stops in Needs input and frees
+its slot.
+
+You switch with the Present/Away toggle of the Paseo Agents menu bar app, or with a schedule
+(off by default; host-local times such as away 22:00–07:00). A toggle holds until the
+schedule's next switch, or, without a schedule, until you toggle again. Changing the schedule
+drops an earlier toggle. Both are kept in `~/.paseo/linear-tickets/presence.json` and are read
+and changed through the `linear.presence` and `linear.set-presence` RPCs.
 
 **Split into sub-issues.** A plan with 2–12 steps also offers **Approve & split into N
 sub-issues**. The plan becomes the parent's plan document and the planning agent is closed.
@@ -542,20 +559,26 @@ every 2 minutes.
 - **Planner.** Planning files a ticket *Plan the work order of <project>* in the project
   (Urgent, labels `paseo-planner` and `plan`) and assigns it to Paseo. Its agent reads the open
   tickets, listed in its description with the new ones marked, and the code, and plans which
-  tickets block which (because one builds on another, or both touch the same files) and which
-  must wait for you. You review that plan like any other. Its last section is a block like:
+  tickets block which (because one builds on another, or both touch the same files), which
+  must wait for you, and which may need you while they run. You review that plan like any other.
+  Its last section is a block like:
 
   ````
   ```project-order
   TUC-12 blocks TUC-15
-  hold TUC-20: needs your decision on pricing
+  hold TUC-20: too big, split it first
   release TUC-21
+  attended TUC-23: which customer groups get the discount is not decided
   ```
   ````
 
   On approval Paseo adds the blocking relations, puts `paseo-hold` on held tickets (removes it
-  from released ones), comments what it applied and skipped, closes the planner ticket and
-  archives its agent. Nothing else of an approval (In Progress, `plan-ready`) applies to it.
+  from released ones) and `paseo-attended` on attended ones (`unattended X` removes it), comments
+  what it applied and skipped, closes the planner ticket and archives its agent. Nothing else of
+  an approval (In Progress, `plan-ready`) applies to it. The planner is told to mark a ticket
+  attended only for an open business decision, acceptance criteria too vague to check,
+  user-facing wording or layout you choose, changes to production data, external accounts or
+  spend, or a step only a person can do; never for size or risk alone.
 - **Hand-out.** Planned tickets in Backlog or Todo that are unassigned or yours, not handed to
   Paseo yet, without `paseo-hold` (or other `paseo-` state labels) and with every blocker
   finished are assigned to Paseo in the *Who starts next* order, one per free slot. Tickets in

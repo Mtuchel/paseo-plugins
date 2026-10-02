@@ -7,6 +7,8 @@ import { dispatchLabels } from "./dispatch";
 import type { LinearService, ProjectIssue } from "./linear";
 import { PLAN_LABEL } from "./plan-policy";
 import type { Scheduler } from "./scheduler";
+import { needsOwner } from "./presence";
+import { isUntrusted } from "./starter";
 import type { PluginSettings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
@@ -51,18 +53,18 @@ export class ProjectStore {
 }
 
 // One line of the planner's `project-order` block.
-export type OrderStep = { kind: "blocks"; blocker: string; blocked: string } | { kind: "hold" | "release"; ticket: string; reason: string };
+export type OrderStep = { kind: "blocks"; blocker: string; blocked: string } | { kind: "hold" | "release" | "attended" | "unattended"; ticket: string; reason: string };
 
 // The approved plan's ```project-order block: `TUC-1 blocks TUC-2`, `hold TUC-3: reason`,
-// `release TUC-4`. Other lines are ignored.
+// `release TUC-4`, `attended TUC-5: reason`, `unattended TUC-6`. Other lines are ignored.
 export function parseOrder(plan: string): OrderStep[] {
   const block = /```project-order\s*\n([\s\S]*?)```/i.exec(plan)?.[1] ?? "";
   const steps: OrderStep[] = [];
   for (const line of block.split("\n").map((item) => item.replace(/^\s*[-*]\s*/, "").trim())) {
     const blocks = /^([A-Z][A-Z0-9]*-\d+)\s+blocks\s+([A-Z][A-Z0-9]*-\d+)\b/i.exec(line);
     if (blocks) { steps.push({ kind: "blocks", blocker: blocks[1].toUpperCase(), blocked: blocks[2].toUpperCase() }); continue; }
-    const hold = /^(hold|release)\s+([A-Z][A-Z0-9]*-\d+)\s*[:—-]?\s*(.*)$/i.exec(line);
-    if (hold) steps.push({ kind: hold[1].toLowerCase() as "hold" | "release", ticket: hold[2].toUpperCase(), reason: hold[3].trim() });
+    const mark = /^(hold|release|attended|unattended)\s+([A-Z][A-Z0-9]*-\d+)\s*[:—-]?\s*(.*)$/i.exec(line);
+    if (mark) steps.push({ kind: mark[1].toLowerCase() as "hold" | "release" | "attended" | "unattended", ticket: mark[2].toUpperCase(), reason: mark[3].trim() });
   }
   return steps;
 }
@@ -156,7 +158,7 @@ export class ProjectFlow {
     for (const issue of read.work) teams.set(issue.teamId, (teams.get(issue.teamId) ?? 0) + 1);
     const teamId = [...teams.entries()].sort((a, b) => b[1] - a[1])[0][0];
     const descriptions = await this.deps.linear.issueDescriptions(read.work.map((issue) => issue.id));
-    const created = await this.deps.linear.createIssue({ teamId, projectId: project.id, ready: true, priority: 1, title: `Plan the work order of ${project.name}`, description: plannerBrief(project.name, read.work, read.unplanned, descriptions, labels.hold) });
+    const created = await this.deps.linear.createIssue({ teamId, projectId: project.id, ready: true, priority: 1, title: `Plan the work order of ${project.name}`, description: plannerBrief(project.name, read.work, read.unplanned, descriptions, labels) });
     await this.deps.linear.addLabel(created.id, labels.planner);
     await this.deps.linear.addLabel(created.id, PLAN_LABEL);
     const planner = { identifier: created.identifier, url: created.url, tickets: read.unplanned.length };
@@ -182,7 +184,10 @@ export class ProjectFlow {
       console.log(`[linear-tickets] project hand-out ${group.identifier}: group`);
     }
     const singles = ready.filter((issue) => !parents.has(issue.id));
-    const candidates = singles.map((issue) => ({ issueId: issue.id, identifier: issue.identifier, projectId, priority: issue.priority, unblocks: issue.blocks.length, createdAt: issue.createdAt }));
+    const candidates = singles.map((issue) => ({
+      issueId: issue.id, identifier: issue.identifier, projectId, priority: issue.priority, unblocks: issue.blocks.length, createdAt: issue.createdAt,
+      attended: needsOwner(issue.labels, isUntrusted({ creatorId: issue.creatorId, labels: issue.labels.map((name) => ({ name })) }, owner, appId), settings.dispatch.label),
+    }));
     this.deps.scheduler.note(candidates);
     for (const candidate of candidates) {
       const admission = await this.deps.scheduler.admit(candidate, paseo, settings.dispatch.maxRunning);
@@ -208,7 +213,7 @@ export class ProjectFlow {
     const done: string[] = [];
     const skipped: string[] = [];
     for (const step of parseOrder(plan)) {
-      const line = step.kind === "blocks" ? `${step.blocker} blocks ${step.blocked}` : `${step.kind} ${step.ticket}`;
+      const line = step.kind === "blocks" ? `${step.blocker} blocks ${step.blocked}` : `${step.kind} ${step.ticket}${step.reason ? `: ${step.reason}` : ""}`;
       try {
         if (step.kind === "blocks") {
           const blocker = byIdentifier.get(step.blocker);
@@ -220,7 +225,9 @@ export class ProjectFlow {
           const ticket = byIdentifier.get(step.ticket);
           if (!ticket) { skipped.push(`${line} (not an open ticket of the project)`); continue; }
           if (step.kind === "hold") await this.deps.linear.addLabel(ticket.id, labels.hold);
-          else await this.deps.linear.removeLabel(ticket.id, labels.hold);
+          else if (step.kind === "release") await this.deps.linear.removeLabel(ticket.id, labels.hold);
+          else if (step.kind === "attended") await this.deps.linear.addLabel(ticket.id, labels.attended);
+          else await this.deps.linear.removeLabel(ticket.id, labels.attended);
         }
         done.push(line);
       } catch (error) {
@@ -241,7 +248,7 @@ export class ProjectFlow {
 }
 
 // The planner ticket's description: what to decide, the answer format, and every open ticket.
-export function plannerBrief(projectName: string, work: ProjectIssue[], unplanned: ProjectIssue[], descriptions: Map<string, string>, holdLabel: string): string {
+export function plannerBrief(projectName: string, work: ProjectIssue[], unplanned: ProjectIssue[], descriptions: Map<string, string>, labels: { hold: string; attended: string }): string {
   const fresh = new Set(unplanned.map((issue) => issue.id));
   const lines = work.map((issue) => {
     const blockers = issue.blockers.filter((blocker) => !blocker.finished).map((blocker) => blocker.identifier);
@@ -252,11 +259,13 @@ export function plannerBrief(projectName: string, work: ProjectIssue[], unplanne
   return [
     `Paseo hands the open tickets of **${projectName}** to agents on its own, up to the agent limit at once. Before it hands out the tickets marked NEW, decide their work order. Do not change code: this ticket only produces the order.`,
     `Read the tickets below and the code they touch, then write a plan whose last section is a fenced block in exactly this format:`,
-    "```project-order\nTUC-12 blocks TUC-15\nhold TUC-20: needs the owner's decision on pricing\nrelease TUC-21\n```",
+    "```project-order\nTUC-12 blocks TUC-15\nhold TUC-20: too big, split it first\nrelease TUC-21\nattended TUC-23: which customer groups get the discount is not decided\n```",
     [
       "- `A blocks B`: B must not start before A is finished. Add one where B builds on A, or where both change the same files and would conflict as parallel pull requests.",
-      `- \`hold X: reason\`: X waits for the owner (unclear, too big, needs a decision). It gets the \`${holdLabel}\` label and is not handed out until the owner removes it.`,
+      `- \`hold X: reason\`: X must not start at all until the owner acts (too big, should be split, waits on a decision outside the code). It gets the \`${labels.hold}\` label and is not handed out until the owner removes it.`,
       "- `release X`: a ticket held earlier may now be handed out.",
+      `- \`attended X: reason\`: an agent can do X, but will very likely have to stop and ask the owner during the work. Paseo starts X only while the owner is present; unmarked tickets also run at night, unattended. Mark a ticket only for one of these: a business decision the ticket leaves open, acceptance criteria too vague to check, user-facing wording or layout the owner must choose, changes to production data, external accounts or spend, or a step only a person can do. Size, difficulty, risk or code review alone are no reason: most tickets stay unmarked. It gets the \`${labels.attended}\` label.`,
+      "- `unattended X`: X no longer needs the owner present (removes an earlier `attended`).",
       "- Tickets not mentioned are handed out as soon as they are unblocked; independent tickets run in parallel.",
     ].join("\n"),
     "Once the owner approves the plan, Paseo writes the order into Linear and closes this ticket. Nothing is left to implement then: stop.",

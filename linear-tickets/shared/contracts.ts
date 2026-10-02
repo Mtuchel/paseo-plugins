@@ -270,6 +270,32 @@ export const planProjectRpc = defineRpc({
   output: projectStatusSchema,
 });
 
+// Present and away (README, "Present and away"): `source` says what decides it now, `until` when
+// that next changes (the schedule's next switch), if ever. Times are host-local HH:MM.
+export const presenceScheduleSchema = z.object({
+  enabled: z.boolean(),
+  awayFrom: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
+  awayUntil: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
+});
+export type PresenceSchedule = z.infer<typeof presenceScheduleSchema>;
+export const presenceSchema = z.object({
+  away: z.boolean(),
+  source: z.enum(["manual", "schedule", "default"]),
+  until: z.string().nullable(),
+  schedule: presenceScheduleSchema,
+});
+export type PresenceState = z.infer<typeof presenceSchema>;
+export const presenceRpc = defineRpc({
+  name: "linear.presence",
+  input: z.object({}),
+  output: presenceSchema,
+});
+export const setPresenceRpc = defineRpc({
+  name: "linear.set-presence",
+  input: z.object({ away: z.boolean().optional(), schedule: presenceScheduleSchema.optional() }),
+  output: presenceSchema,
+});
+
 // The native Linear agent's health for the settings screen.
 export const agentStatusRpc = defineRpc({
   name: "linear.agent-status",
