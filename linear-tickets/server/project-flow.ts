@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
+import type { ProjectStatus } from "../shared/contracts";
 import { dispatchLabels } from "./dispatch";
 import type { LinearService, ProjectIssue } from "./linear";
 import { PLAN_LABEL } from "./plan-policy";
@@ -10,27 +11,26 @@ import type { PluginSettings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
 // Projects carrying the trigger label move forward on their own (README, "Projects"):
-// 1. A planner ticket in the project asks an agent for the work order: which tickets block which,
-//    and which must wait for the owner (hold). The owner approves its plan like any other; the
-//    approved order is written into Linear as blocking relations and `<trigger>-hold` labels.
+// 1. The owner presses "Plan" in the ticket surface: a planner ticket in the project asks an agent
+//    for the work order of the new tickets: which tickets block which, and which must wait for the
+//    owner (hold). The owner approves its plan like any other; the approved order is written into
+//    Linear as blocking relations and `<trigger>-hold` labels.
 // 2. Every poll, the project's planned, unblocked, unheld tickets that nobody has are handed to
 //    Paseo in the scheduler's order, one per free agent slot.
-// Tickets filed after the last plan wait for the next one, which starts once no new ticket has
-// arrived for a while.
+// Tickets filed after the last plan wait until the owner plans them; the surface shows how many.
 
 // How often a project's tickets are read: a project is a few paginated queries.
 const POLL_MS = 2 * 60_000;
-// A new ticket starts the next planner only after this long without another new one, so a batch
-// of tickets gets one planner.
-const SETTLE_MS = 10 * 60_000;
 // Ticket list in the planner's description: each ticket's description is cut to this, which keeps
 // a 200-ticket project near 60,000 characters.
 const DESCRIPTION_CHARS = 160;
 const HAND_OUT_TYPES = new Set(["backlog", "unstarted"]);
 
 // `plannedThrough`: tickets created up to this time are in an approved (or closed) plan.
-// `planner`: the open planner ticket and the time its ticket list was taken.
-export type ProjectRecord = { plannedThrough: string | null; planner: { id: string; identifier: string; listedAt: string } | null };
+// `planner`: the open planner ticket, the time its ticket list was taken and how many new tickets it plans.
+export type ProjectRecord = { plannedThrough: string | null; planner: { id: string; identifier: string; url: string; listedAt: string; tickets: number } | null };
+
+type Read = { work: ProjectIssue[]; record: ProjectRecord; owner: string; planned: (issue: ProjectIssue) => boolean; unplanned: ProjectIssue[]; status: ProjectStatus };
 
 export class ProjectStore {
   constructor(private readonly path = join(paseoHome(), "linear-tickets", "projects.json")) {}
@@ -79,6 +79,7 @@ type Deps = {
 export class ProjectFlow {
   private readonly store: ProjectStore;
   private lastPoll = 0;
+  private statuses: ProjectStatus[] = [];
 
   constructor(private readonly deps: Deps) {
     this.store = deps.store ?? new ProjectStore();
@@ -88,6 +89,11 @@ export class ProjectFlow {
     return (this.deps.now ?? Date.now)();
   }
 
+  // The labelled projects as of the last poll, for the ticket surface.
+  status(): ProjectStatus[] {
+    return this.statuses.map((status) => ({ ...status }));
+  }
+
   // Called on every dispatch poll; reads the projects at most every POLL_MS. Each project runs on
   // its own, so one failing project does not stop the others.
   async tick(paseo: PaseoApi, settings: PluginSettings): Promise<void> {
@@ -95,22 +101,29 @@ export class ProjectFlow {
     this.lastPoll = this.now();
     const appId = await this.deps.linear.appUserId();
     // Hand-outs start through Linear agent sessions; without the Paseo app nothing would start.
-    if (!appId) return;
+    if (!appId) { this.statuses = []; return; }
+    const statuses: ProjectStatus[] = [];
     for (const project of await this.deps.linear.labeledProjects(settings.dispatch.label)) {
       try {
-        await this.advance(project, appId, paseo, settings);
+        const read = await this.read(project, settings);
+        statuses.push(read.status);
+        await this.handOut(project.id, read.work, read.work.filter(read.planned), read.owner, appId, paseo, settings);
       } catch (error) {
         console.error(`[linear-tickets] project ${project.name}: ${error instanceof Error ? error.message : error}`);
       }
     }
+    this.statuses = statuses;
   }
 
-  private async advance(project: { id: string; name: string }, appId: string, paseo: PaseoApi, settings: PluginSettings): Promise<void> {
+  // The project's open tickets and what is planned. Only tickets the hand-out could take need a
+  // plan: sub-issues (their group hands them out), tickets already with Paseo or someone else, and
+  // started work never count.
+  private async read(project: { id: string; name: string }, settings: PluginSettings): Promise<Read> {
     const labels = dispatchLabels(settings.dispatch.label);
     const issues = await this.deps.linear.projectIssues(project.id);
     let record = (await this.store.all())[project.id] ?? { plannedThrough: null, planner: null };
     // A planner closed without an applied plan (the owner canceled or finished it): its tickets
-    // count as planned, so the project does not ask again for the same tickets.
+    // count as planned, so they are not offered for planning again.
     if (record.planner && !issues.some((issue) => issue.id === record.planner!.id)) {
       record = { plannedThrough: record.planner.listedAt, planner: null };
       await this.store.put(project.id, record);
@@ -118,28 +131,41 @@ export class ProjectFlow {
     const work = issues.filter((issue) => !issue.labels.some((name) => name.toLowerCase() === labels.planner.toLowerCase()));
     const owner = await this.deps.linear.viewerId();
     const planned = (issue: ProjectIssue) => record.plannedThrough !== null && issue.createdAt <= record.plannedThrough;
-    // Only tickets the hand-out could take need a plan: sub-issues (their group hands them out),
-    // tickets already with Paseo or someone else, and started work never start a planner.
     const unplanned = work.filter((issue) => !planned(issue) && (HAND_OUT_TYPES.has(issue.statusType) || issue.statusType === "triage")
       && !issue.delegateId && !issue.parentId && (!issue.assigneeId || issue.assigneeId === owner));
-    const newest = Math.max(0, ...unplanned.map((issue) => Date.parse(issue.createdAt) || 0));
-    if (!record.planner && unplanned.length && this.now() - newest >= SETTLE_MS) await this.plan(project, work, unplanned, appId, settings);
-    await this.handOut(project.id, work, work.filter(planned), owner, appId, paseo, settings);
+    // Tickets the open planner already lists are in review, not waiting for a plan.
+    const listedAt = record.planner?.listedAt;
+    const toPlan = unplanned.filter((issue) => !listedAt || issue.createdAt > listedAt).length;
+    const planner = record.planner ? { identifier: record.planner.identifier, url: record.planner.url, tickets: record.planner.tickets } : null;
+    return { work, record, owner, planned, unplanned, status: { id: project.id, name: project.name, toPlan, planner, readAt: new Date(this.now()).toISOString() } };
   }
 
-  private async plan(project: { id: string; name: string }, work: ProjectIssue[], unplanned: ProjectIssue[], appId: string, settings: PluginSettings): Promise<void> {
+  // The surface's "Plan" button: files a planner ticket for the project's unplanned tickets. One
+  // planner per project at a time.
+  async planNow(projectId: string, settings: PluginSettings): Promise<ProjectStatus> {
+    const appId = await this.deps.linear.appUserId();
+    if (!appId) throw new Error("The Paseo Linear app is not installed on this host, so nothing would start the planner.");
+    const project = (await this.deps.linear.labeledProjects(settings.dispatch.label)).find((item) => item.id === projectId);
+    if (!project) throw new Error(`This project no longer carries the "${settings.dispatch.label}" label.`);
+    const read = await this.read(project, settings);
+    if (read.record.planner) throw new Error(`${read.record.planner.identifier} is still waiting for your approval. Approve or close it first.`);
+    if (!read.unplanned.length) throw new Error("No new tickets to plan.");
     const labels = dispatchLabels(settings.dispatch.label);
     const listedAt = new Date(this.now()).toISOString();
     const teams = new Map<string, number>();
-    for (const issue of work) teams.set(issue.teamId, (teams.get(issue.teamId) ?? 0) + 1);
+    for (const issue of read.work) teams.set(issue.teamId, (teams.get(issue.teamId) ?? 0) + 1);
     const teamId = [...teams.entries()].sort((a, b) => b[1] - a[1])[0][0];
-    const descriptions = await this.deps.linear.issueDescriptions(work.map((issue) => issue.id));
-    const created = await this.deps.linear.createIssue({ teamId, projectId: project.id, ready: true, priority: 1, title: `Plan the work order of ${project.name}`, description: plannerBrief(project.name, work, unplanned, descriptions, labels.hold) });
+    const descriptions = await this.deps.linear.issueDescriptions(read.work.map((issue) => issue.id));
+    const created = await this.deps.linear.createIssue({ teamId, projectId: project.id, ready: true, priority: 1, title: `Plan the work order of ${project.name}`, description: plannerBrief(project.name, read.work, read.unplanned, descriptions, labels.hold) });
     await this.deps.linear.addLabel(created.id, labels.planner);
     await this.deps.linear.addLabel(created.id, PLAN_LABEL);
-    await this.store.put(project.id, { plannedThrough: (await this.store.all())[project.id]?.plannedThrough ?? null, planner: { id: created.id, identifier: created.identifier, listedAt } });
+    const planner = { identifier: created.identifier, url: created.url, tickets: read.unplanned.length };
+    await this.store.put(project.id, { plannedThrough: read.record.plannedThrough, planner: { id: created.id, listedAt, ...planner } });
     await this.deps.linear.delegate(created.id, appId);
-    console.log(`[linear-tickets] project ${project.name}: planner ${created.identifier} for ${unplanned.length} new ticket${unplanned.length === 1 ? "" : "s"}`);
+    console.log(`[linear-tickets] project ${project.name}: planner ${created.identifier} for ${read.unplanned.length} new ticket${read.unplanned.length === 1 ? "" : "s"}`);
+    const status: ProjectStatus = { ...read.status, toPlan: 0, planner };
+    this.statuses = [...this.statuses.filter((item) => item.id !== project.id), status];
+    return status;
   }
 
   // Ranked by the scheduler; each admitted ticket is assigned to Paseo, whose session then starts
@@ -202,6 +228,7 @@ export class ProjectFlow {
       }
     }
     await this.store.put(projectId, { plannedThrough: record.planner!.listedAt, planner: null });
+    this.statuses = this.statuses.map((status) => status.id === projectId ? { ...status, planner: null } : status);
     await this.deps.linear.comment(issueId, [
       `**Work order applied** (${done.length} change${done.length === 1 ? "" : "s"}). The project's tickets are now handed to Paseo in order as agent slots free up.`,
       done.length ? `Applied:\n${done.map((line) => `- ${line}`).join("\n")}` : "",

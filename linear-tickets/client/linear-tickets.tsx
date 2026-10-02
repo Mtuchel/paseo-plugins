@@ -3,7 +3,7 @@ import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { usePaseo, useRpc } from "@getpaseo/plugin/client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Linking, Pressable, ScrollView, Text, TextInput, View } from "react-native";
-import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, getSettingsRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc, type DispatchSettingsValue, type DispatchStatus, type Issue, type RelatedTicket, type TicketDetail, type WritebackSettingsValue } from "../shared/contracts";
+import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, getSettingsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, projectsStatusRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc, type DispatchSettingsValue, type DispatchStatus, type Issue, type ProjectStatus, type RelatedTicket, type TicketDetail, type WritebackSettingsValue } from "../shared/contracts";
 import { filterIssues, formatIssueDate, formatPriority, formatRelativeDate, hasPriority, issueStatus, statusChangesText, statusCounts, type DependencyFilter, type SortDirection, type SortField } from "./issue-list";
 
 import { ChoicePicker } from "./choice-picker";
@@ -47,6 +47,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   const getTemplate = useRpc(getDefaultPromptRpc), saveTemplate = useRpc(setDefaultPromptRpc);
   const getSettings = useRpc(getSettingsRpc), saveSettings = useRpc(setSettingsRpc);
   const getDispatchStatus = useRpc(dispatchStatusRpc), getAgentStatus = useRpc(agentStatusRpc);
+  const getProjects = useRpc(projectsStatusRpc), planProject = useRpc(planProjectRpc);
   const [markInProgress, setMarkInProgress] = useState(false);
   const [templateOpen, setTemplateOpen] = useState(false);
   const [templateText, setTemplateText] = useState("");
@@ -101,6 +102,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   const [dispatchDraft, setDispatchDraft] = useState({ label: "", teamKeys: "", intervalSeconds: "", maxRunning: "" });
   const [writeback, setWriteback] = useState<WritebackSettingsValue | null>(null);
   const [dispatchStatus, setDispatchStatus] = useState<DispatchStatus | null>(null);
+  const [projectStatuses, setProjectStatuses] = useState<ProjectStatus[]>([]);
   const [agentStatus, setAgentStatus] = useState<{ installed: boolean; funnel: boolean; funnelNote: string | null; lastWebhookAt: string | null } | null>(null);
   const [mappingReason, setMappingReason] = useState<"saved" | "name" | null>(null);
   // The ticket whose mapping was applied or overridden by hand; the branch waits for the list.
@@ -232,11 +234,12 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
     const refresh = () => {
       void getDispatchStatus({}).then((value) => { if (!cancelled) setDispatchStatus(value); }, () => {});
       void getAgentStatus({}).then((value) => { if (!cancelled) setAgentStatus(value); }, () => {});
+      void getProjects({}).then((value) => { if (!cancelled) setProjectStatuses(value); }, () => {});
     };
     refresh();
     const timer = setInterval(refresh, 15_000);
     return () => { cancelled = true; clearInterval(timer); };
-  }, [getDispatchStatus, getAgentStatus]);
+  }, [getDispatchStatus, getAgentStatus, getProjects]);
 
   useEffect(() => {
     let cancelled = false;
@@ -808,6 +811,24 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
           </View>}
         </View>
       </> : <>
+        {!!projectStatuses.length && <View style={{ ...t.card, gap: 12 }}>
+          <FieldLabel title="Projects" icon="Folder" hint={`labelled "${dispatch?.label ?? "paseo"}" · planned tickets are handed out as agent slots free up`} t={t} />
+          {[...projectStatuses].sort((a, b) => a.name.localeCompare(b.name)).map((project) => <View key={project.id} style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 10 }}>
+            <View style={{ flex: 1, minWidth: 200, gap: 2 }}>
+              <Text style={{ ...t.body, fontWeight: "600" }}>{project.name}</Text>
+              <Text style={t.muted}>{project.planner
+                ? `${project.planner.identifier} plans ${project.planner.tickets} ticket${project.planner.tickets === 1 ? "" : "s"} · waiting for your approval${project.toPlan ? ` · ${project.toPlan} more new since` : ""}`
+                : project.toPlan ? `${project.toPlan} new ticket${project.toPlan === 1 ? "" : "s"} to plan` : "Nothing new to plan"}{` · checked ${formatRelativeDate(project.readAt)}`}</Text>
+            </View>
+            {project.planner
+              ? /^https:\/\/linear\.app\//.test(project.planner.url) && <Button title={`Open ${project.planner.identifier}`} icon="ExternalLink" size="sm" onPress={() => void run("Opening Linear", async () => { await openExternalUrl(project.planner!.url, { platform: layout.platform, linking: Linking }); })} />
+              : <Button title={project.toPlan ? `Plan ${project.toPlan} new ticket${project.toPlan === 1 ? "" : "s"}` : "Plan"} icon="ListChecks" size="sm" primary disabled={!project.toPlan || Boolean(busy)}
+                onPress={() => void run(`Planning ${project.name}`, async () => {
+                  const updated = await planProject({ projectId: project.id });
+                  setProjectStatuses((current) => current.map((item) => item.id === updated.id ? updated : item));
+                })} />}
+          </View>)}
+        </View>}
         <View style={{ ...t.card, gap: 16 }}>
           <View style={{ ...t.input, paddingVertical: 0, flexDirection: "row", alignItems: "center", gap: 10 }}>
             <Icon name="Search" size={17} color={colors.foregroundMuted} />

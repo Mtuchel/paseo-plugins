@@ -534,8 +534,11 @@ as before.
 the whole project without you assigning each ticket. Auto-dispatch must be on; projects are read
 every 2 minutes.
 
-- **Planner first.** Paseo files a ticket *Plan the work order of <project>* in the project
-  (Urgent, labels `paseo-planner` and `plan`) and assigns it to itself. Its agent reads the open
+- **The Projects card.** Above the ticket list, each labelled project shows how many new tickets
+  wait for a plan, or the planner waiting for your approval (with a link to it). Nothing is
+  planned until you press **Plan N new tickets**; planning never starts on its own.
+- **Planner.** The button files a ticket *Plan the work order of <project>* in the project
+  (Urgent, labels `paseo-planner` and `plan`) and assigns it to Paseo. Its agent reads the open
   tickets, listed in its description with the new ones marked, and the code, and plans which
   tickets block which (because one builds on another, or both touch the same files) and which
   must wait for you. You review that plan like any other. Its last section is a block like:
@@ -557,12 +560,10 @@ every 2 minutes.
   Triage or already started, someone else's, and sub-issues (their parent's group hands them
   out) are left alone. A ticket with open sub-issues in the project is assigned as a group and
   takes no slot itself. Removing `paseo-hold` releases a ticket.
-- **New tickets.** Tickets filed after the last planner are not handed out until the next one
-  is approved. That planner starts once no new ticket has arrived for 10 minutes, so a batch
-  of tickets gets one planner. There is at most one planner per project at a time, so the next
-  one only comes after you approved or closed the current one. Only tickets the project could
-  hand out start a planner: new sub-issues, tickets already with Paseo or someone else, and
-  started ones do not.
+- **New tickets.** Tickets filed after the last plan are not handed out until you plan them; the
+  card counts them. Only tickets the project could hand out count: new sub-issues, tickets
+  already with Paseo or someone else, and started ones do not. There is at most one planner per
+  project at a time: tickets filed while one waits for approval are counted for the next.
 - **Skipping a plan.** Closing or canceling the planner ticket yourself counts its tickets as
   planned: they are handed out without a work order.
 - Removing the label from the project stops new hand-outs; agents already working continue.
