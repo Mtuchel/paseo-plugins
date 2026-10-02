@@ -31,6 +31,7 @@ import { isPlanPolicy, PLAN_POLICY_ENV, PLAN_POLICY_LABEL } from "./server/plan-
 import { PlanRequests } from "./server/plan-requests";
 import { labelDaemon, StateLabels } from "./server/state-labels";
 import { LabelSync, PullRequestFiles } from "./server/label-sync";
+import { ProjectFlow } from "./server/project-flow";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -69,11 +70,17 @@ export default function contribute(server: PluginServerContext) {
     approveLater: (link, localUrl, paseo) => approveForLater({ linear, readPlan: readReviewPlan, retirePlanner }, link, localUrl, paseo),
   });
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
-  const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId) });
+  // Labelled projects: a planner ticket sets the work order, then tickets are handed out as slots free up.
+  const projects = new ProjectFlow({ linear, scheduler: starter.scheduler, retire: async (agentId, api) => {
+    await stopAgentTurn(agentId).catch(() => {});
+    await api.agents.ref(agentId).archive().catch(() => {});
+  } });
+  const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   const reviewLinks = new ReviewLinks();
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks);
+  plannotator.onProjectPlan((issueId, agentId, plan, paseo, current) => projects.applyPlan(issueId, agentId, plan, paseo, current));
   const manualTasks = new ManualTasks({ linear, settings });
   const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });

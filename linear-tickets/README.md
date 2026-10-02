@@ -480,12 +480,24 @@ are already working, waits. A labelled ticket keeps its label; a delegated one s
 panel. The minute sweep starts it once it is admitted, however long it waited. A delegated ticket
 whose thread was ended, or which was closed meanwhile, starts nothing; one that already has an
 agent (from its label, say) is linked to it; a failed start is reported in the panel once.
-Labelled tickets start most urgent first.
+See *Who starts next* for the order in which waiting tickets get free slots.
 A blocker is finished when it is Done or Canceled, or when it is in review (a started state named
 like *In Review* or *Ready to merge*) and its pull requests are merged: at least one merged and
 none open or draft, as Linear's GitHub integration reports them. Links added by hand or by
 `link_url` carry no status and do not count. A blocker In Progress, Needs input or In Review with
 an open pull request still holds the ticket back.
+
+**Who starts next.** Every way a ticket starts (label, assignment, group, project) waits in one
+line. While slots under *max agents* are short, a free slot goes to:
+
+1. the project with the fewest agents working, so one project gets every slot while nothing
+   else waits, and a ticket of another project gets the next free slot;
+2. then the higher priority (Urgent first, no priority last);
+3. then the ticket that unblocks the most open tickets;
+4. then the oldest ticket.
+
+An admitted ticket keeps its slot for 3 minutes while its agent starts. Tickets you start from
+the sidebar skip the line.
 
 **Split into sub-issues.** A plan with 2–12 steps also offers **Approve & split into N
 sub-issues**. The plan becomes the parent's plan document and the planning agent is closed.
@@ -517,6 +529,43 @@ to it, hands the whole group to Paseo instead of starting an agent on the parent
 A ticket whose sub-issues are all finished, or are only your manual tasks, starts an agent of
 its own as before. Without a usable Paseo app (no threads), a labelled parent starts an agent
 as before.
+
+**Projects.** Adding the trigger label (`paseo`) to a Linear *project* lets Paseo work through
+the whole project without you assigning each ticket. Auto-dispatch must be on; projects are read
+every 2 minutes.
+
+- **Planner first.** Paseo files a ticket *Plan the work order of <project>* in the project
+  (Urgent, labels `paseo-planner` and `plan`) and assigns it to itself. Its agent reads the open
+  tickets, listed in its description with the new ones marked, and the code, and plans which
+  tickets block which (because one builds on another, or both touch the same files) and which
+  must wait for you. You review that plan like any other. Its last section is a block like:
+
+  ````
+  ```project-order
+  TUC-12 blocks TUC-15
+  hold TUC-20: needs your decision on pricing
+  release TUC-21
+  ```
+  ````
+
+  On approval Paseo adds the blocking relations, puts `paseo-hold` on held tickets (removes it
+  from released ones), comments what it applied and skipped, closes the planner ticket and
+  archives its agent. Nothing else of an approval (In Progress, `plan-ready`) applies to it.
+- **Hand-out.** Planned tickets in Backlog or Todo that are unassigned or yours, not handed to
+  Paseo yet, without `paseo-hold` (or other `paseo-` state labels) and with every blocker
+  finished are assigned to Paseo in the *Who starts next* order, one per free slot. Tickets in
+  Triage or already started, someone else's, and sub-issues (their parent's group hands them
+  out) are left alone. A ticket with open sub-issues in the project is assigned as a group and
+  takes no slot itself. Removing `paseo-hold` releases a ticket.
+- **New tickets.** Tickets filed after the last planner are not handed out until the next one
+  is approved. That planner starts once no new ticket has arrived for 10 minutes, so a batch
+  of tickets gets one planner. There is at most one planner per project at a time.
+- **Skipping a plan.** Closing or canceling the planner ticket yourself counts its tickets as
+  planned: they are handed out without a work order.
+- Removing the label from the project stops new hand-outs; agents already working continue.
+  Without a usable Paseo app (no threads) projects are not worked on.
+
+What has been planned is kept in `~/.paseo/linear-tickets/projects.json`.
 
 **Pull request reviews.** Every 2 minutes the plugin reads each ticket's pull request with
 `gh`. Requested changes post a panel update and move the ticket back to In Progress; fixes

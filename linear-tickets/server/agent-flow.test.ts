@@ -267,7 +267,7 @@ function starterHarness(state: { creatorId: string | null; labels: { id: string;
   const starter = new TicketStarter({
     linear: {
       detail: async () => ({ issue: { identifier: "TUC-1", project: "", team: "Team" }, projectId: null, teamId: "t1" }) as never,
-      issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, attachmentUrls: [], ...state }),
+      issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, attachmentUrls: [], priority: 0, createdAt: "", unblocks: 0, ...state }),
       viewerId: async () => OWNER,
       appUserId: async () => appId,
       issueDocument: async (_id: string, title: string) => title === "Plan: TUC-1" ? { url: "https://linear.app/doc/plan", content: "# Plan\n1. Add the table" } : null,
@@ -404,7 +404,7 @@ test("splitting creates one sub-issue per step, each blocked by the previous, al
   let n = 0;
   const deps = {
     linear: {
-      issueState: async () => ({ id: "parent", identifier: "TUC-1", status: "Planning", statusId: "planning", statusType: "started", teamId: "t1", projectId: "p9", creatorId: OWNER, labels: [], attachmentUrls: [], blockedBy: [] }),
+      issueState: async () => ({ id: "parent", identifier: "TUC-1", status: "Planning", statusId: "planning", statusType: "started", teamId: "t1", projectId: "p9", creatorId: OWNER, labels: [], attachmentUrls: [], blockedBy: [], priority: 0, createdAt: "", unblocks: 0 }),
       upsertIssueDocument: async (_id: string, _title: string, body: string) => { calls.push(`document ${body.split("\n").find((line) => line.includes("Planned with"))}`); return "https://linear.app/doc/plan"; },
       createIssue: async (input: { title: string; parentId?: string; projectId?: string | null; ready?: boolean }) => { n++; calls.push(`create ${input.title} parent=${input.parentId} project=${input.projectId}${input.ready ? " ready" : ""}`); return { id: `s${n}`, identifier: `TUC-${10 + n}`, url: "" }; },
       addBlocker: async (blocker: string, blocked: string) => { calls.push(`${blocker} blocks ${blocked}`); },

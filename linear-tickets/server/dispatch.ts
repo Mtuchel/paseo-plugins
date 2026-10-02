@@ -25,15 +25,18 @@ type Deps = {
   handOff?: (issueId: string) => Promise<boolean>;
   // Linear → agent comment delivery, run on the same cadence as dispatch.
   relay?: Pick<CommentRelay, "poll">;
+  // Labelled projects (README, "Projects"), moved forward after the labelled tickets.
+  projects?: { tick: (paseo: PaseoApi, settings: PluginSettings) => Promise<void> };
   budget?: Pick<RateBudget, "pausedUntil">;
 };
 
 // The labels a dispatched ticket moves through, derived from the trigger label so a
 // custom trigger ("agent") gets matching companions ("agent-running", "agent-failed").
 // `blocked`: the agent stopped with an error; `needsYou`: it waits for the owner's answer or approval;
-// `manual`: a manual task an agent registered for the owner.
+// `manual`: a manual task an agent registered for the owner; `hold`: a project ticket the owner
+// releases before it is handed out; `planner`: a project's work-order ticket.
 export function dispatchLabels(trigger: string) {
-  return { running: `${trigger}-running`, failed: `${trigger}-failed`, blocked: `${trigger}-blocked`, needsYou: `${trigger}-needs-you`, manual: `${trigger}-manual` };
+  return { running: `${trigger}-running`, failed: `${trigger}-failed`, blocked: `${trigger}-blocked`, needsYou: `${trigger}-needs-you`, manual: `${trigger}-manual`, hold: `${trigger}-hold`, planner: `${trigger}-planner` };
 }
 
 // Polls Linear for tickets carrying the trigger label and starts one agent per ticket
@@ -147,6 +150,10 @@ export class Dispatcher {
       if (until !== null) throw new RateLimitedError("key", until, "reserve");
       await this.dispatch(issue, settings, paseo);
     }
+    if (this.stopped || !this.deps.projects) return;
+    const until = (this.deps.budget ?? rateBudget).pausedUntil("key", LAUNCH_ROOM);
+    if (until !== null) throw new RateLimitedError("key", until, "reserve");
+    await this.deps.projects.tick(paseo, settings);
   }
 
   private record(identifier: string, outcome: DispatchStatus["recent"][number]["outcome"], detail: string): void {

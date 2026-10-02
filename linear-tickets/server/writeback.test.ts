@@ -31,7 +31,7 @@ const toolCall = (output: string): Timeline[number] => ({ type: "tool_call", cal
 
 class FakeLinear {
   readonly writes: string[] = [];
-  state: IssueState = { id: "issue-1", identifier: "ENG-1", projectId: null, creatorId: null, blockedBy: [], status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", labels: [{ id: "l1", name: "paseo-running" }], attachmentUrls: [] };
+  state: IssueState = { id: "issue-1", identifier: "ENG-1", projectId: null, creatorId: null, blockedBy: [], status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", labels: [{ id: "l1", name: "paseo-running" }], attachmentUrls: [], priority: 0, createdAt: "", unblocks: 0 };
   // Other issues by id (the "Needs you" sub-issues); `state` is the ticket itself.
   readonly others = new Map<string, IssueState>();
   private comments = 0;
