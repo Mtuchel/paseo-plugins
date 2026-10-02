@@ -312,7 +312,9 @@ repository's area guides nor fills its own context with exploration:
   written, never ticket text.
 - **Scout delegation.** After brief inline scoping, the agent delegates broad exploration to
   read-only subagents in the same workspace (omp: `task` with the `scout` agent; Claude: the
-  Explore subagent; others: whatever their harness offers) and reads the files it changes itself.
+  Explore subagent; others: whatever their harness offers), asks them to cite the file and line
+  behind each claim, checks every claim it acts on in that file, and reads the files it changes
+  itself.
 
 A guide that cannot be read is listed without its heading, and a failed `git ls-files` drops
 the list; both become a launch warning, never a failure. Non-Git projects get the scout
