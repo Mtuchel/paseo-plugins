@@ -509,21 +509,47 @@ as merged, including its after-merge [manual tasks](#manual-tasks). A queue drop
 an open pull request when Graphite's last Merge activity bullet ends the attempt (a conflict,
 "merge when ready" turned off, a failed check), or when the draft its latest "CI is running"
 bullet names was closed without its head reaching the base branch and no newer queue draft for
-the pull request is open. Without Merge activity, drafts alone never count. The ticket's agent
-gets the reason, the checks that did not pass on the draft and the runbook (on the stack's top
-branch `git fetch origin main && git rebase --update-refs --onto origin/main "$(git merge-base
-HEAD origin/main)"`, which moves only its own branches, never `gt sync`/`gt restack`; fix,
-`gt submit --stack --ignore-out-of-sync-trunk`, `gt merge`; one plain `gt merge`
-retry for an obviously flaky failure) as a new message once it is idle; Paseo resumes it if it
-has stopped. While the agent is in a turn or waiting for an answer, or Paseo is not connected,
+the pull request is open. Without Merge activity, drafts alone never count. Each drop is one of
+two kinds, as the repo's `tools/ci/wait-queue.mjs` decides for the agent's own wait
+(`docs/automation/merge-queue.md`). It is **conflict-only** when Graphite names a merge conflict
+and nothing on the queue's draft failed, was cancelled or was still running (every check run on
+its head is read, all pages), or no draft existed; a draft no longer listed counts as unread, so
+the drop is plain. Every other drop is **plain**: Graphite also says "merge conflicts" for real
+failures. The ticket's agent gets the reason, the checks that did not pass on the draft and the
+runbook for the kind. A plain drop: on the stack's top branch `git fetch origin main && git
+rebase --update-refs --onto origin/main "$(git merge-base HEAD origin/main)"`, which moves only
+its own branches, never `gt sync`/`gt restack`; fix, `gt submit --stack
+--ignore-out-of-sync-trunk`, `gt merge`; one plain `gt merge` retry for an obviously flaky
+failure. A conflict-only drop: the same rebase (only when every branch below is the agent's
+own), regenerate generated files instead of merging them, the focused checks, the same
+`gt submit`, then right away `gt merge` and `node tools/ci/wait-queue.mjs <top enqueued PR>`,
+without waiting for the pull request's checks: the queue's draft runs the full suite. The
+message goes out once the agent is idle; Paseo resumes it if it has stopped. While the agent is
+in a turn or waiting for an answer, or Paseo is not connected,
 the message waits for a later poll. When the agent is gone or archived, the same text becomes a
 ticket comment mentioning you, and the ticket moves back to In Progress (when status write-back
 is on). Each drop is claimed in `$PASEO_HOME/linear-tickets/pr-watch.json` (by its draft, or by
 the bullet when there is none) before anything is sent, so it is delivered at most once, also
-across restarts. After two fix requests for a pull request, the third drop only mentions you
-("the merge queue dropped this stack three times"), and later drops are only logged. An
+across restarts. The kinds are counted separately per pull request: one fix request after a
+plain drop and up to five restacks after conflict-only drops. The second plain drop or the sixth
+conflict-only drop, whichever comes first, only mentions you ("the merge queue dropped this
+stack again", with both counts), and after that drops of either kind are only logged. Drops
+claimed before the kinds existed count as plain, and three of them as escalated. An
 archived agent's open pull request stays watched until that escalation or 14 days without
 activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
+
+**Replacement pull requests.** When the queue lands part of a stack, Graphite deletes the
+landed branch, and GitHub closes the pull request based on it for good (it cannot be reopened
+onto a deleted base). For a ticket's pull request closed without merging, the plugin looks for
+an open pull request from the same branch in the repo's open pull requests on every poll; when
+there is one, the ticket links it, the agent panel and the handover record point at it, and the
+plugin watches it from the next poll. Without one, the closure is looked at once: when the base
+branch is gone, the agent is told once to replay the rest of its stack onto
+main from the landed branch (`git fetch origin main && git rebase --update-refs --onto
+origin/main <landed branch>` on the top branch), `git push --force-with-lease` each replayed
+branch, open a new pull request onto main whose body links the old one, and `gt track <branch>
+--parent main`. It is claimed and delivered like a nudge; a gone or archived agent's message goes
+to the ticket.
 
 **Stalled pull requests.** Agents often stop before their pull request reaches the merge queue.
 On each poll, an open pull request whose agent is idle gets the next step of its lifecycle as a
@@ -531,11 +557,19 @@ new message, the first that applies:
 
 | Stage | When | Next step sent |
 |---|---|---|
-| Draft | a draft with no new commit and no pull request activity for 30 minutes | run the background Sol review if not done, then `gt submit --stack --publish` |
+| Draft | a draft with no new commit and no pull request activity for 30 minutes | run the background Sol review if not done, then publish only the reviewed part of the stack, bottom first: `gt submit --publish --no-stack --branch <branch>` once the branch and every branch below it are reviewed |
 | Failed checks | a ready pull request whose latest run of a check failed (pending runs and `Graphite / mergeability_check` do not count) | the failed checks with links; fix, then `gt submit --stack` |
 | Changes requested | a reviewer's latest approving, change-requesting or dismissed review asks for changes (on any commit), or GitHub's review decision is "changes requested" | each such review and the unresolved review threads; address them, then `gt submit --stack` (for a review on an earlier commit: reply on its threads and re-request the review) |
 | Findings | unresolved review threads a bot started (Greptile, any bot reviewer) | the findings; run the AGENTS.md review loop |
-| Merge | `PR code` and `PR metadata` ran on the head and succeeded or were skipped (so did `Label queued PRs for Linear` when it ran), every other check is green (except Graphite's mergeability check), no change request is open, no review thread is unresolved, and Greptile has reviewed the current head when the pull request has `complex-review` | `gt merge`, then `node tools/ci/wait-queue.mjs <top PR>` |
+| Merge | `PR code` and `PR metadata` ran on the head and succeeded or were skipped (so did `Label queued PRs for Linear` when it ran), every other check is green (except Graphite's mergeability check), no change request is open, no review thread is unresolved, and Greptile has reviewed the current head when the pull request has `complex-review` | for the ticket's highest such pull request whose pull requests below it are all such too: `gt checkout <its branch> && gt merge` (which enqueues the ones below it), then `node tools/ci/wait-queue.mjs <its number>`; the rest of the stack follows once it is reviewed |
+
+The first four stages look at the ticket's recorded pull request. The merge stage covers every
+open pull request of the ticket: the recorded one and each whose title names the ticket as a
+whole word (`Add TUC-34 [area] …` is TUC-34's, never TUC-343's). The repo's open pull requests
+are listed once per repo and poll (REST, every page). A stack lands bottom first, so the plugin
+climbs from the default branch through the ticket's pull requests and stops at the first one
+that is not ready; one merge nudge per ticket and poll names the highest ready one. A pull
+request stacked on another ticket's open branch is left to that ticket.
 
 Nothing is sent for a pull request labelled `do-not-merge`, while [manual tasks](#manual-tasks)
 due before the merge are open, while the merge queue has it (its last Merge activity bullet
@@ -564,7 +598,9 @@ archived while the ticket is open, it also posts a final report. The panel then 
 fails* is on (at most hourly). Assigning Paseo again, @mentioning it or re-adding the label
 also resumes. The new agent continues on the same branch, reusing the old worktree while it
 exists so uncommitted work survives. It starts with a handover of the previous agent's reports,
-and the old agent is archived.
+and the old agent is archived. The ticket's links, its pull request among them, stay on the
+record, so the pull request watch keeps following them; only "Open in Paseo" moves to the new
+agent.
 
 ## Plannotator reviews
 

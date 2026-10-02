@@ -351,6 +351,24 @@ test("the progress comment is created once and edited in place; the next agent g
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+test("the ticket's pull request link stays on the record when another agent takes over; the Paseo link is the new agent's", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-handover-"));
+  try {
+    const handover = new Handover({
+      upsertComment: async () => "c1",
+      comment: async () => {},
+      upsertAttachment: async () => {},
+      removeAttachments: async () => {},
+    }, directory, async () => ({ branch: "mtuchel/tuc-1-fix", lastCommit: null }), () => "2026-01-01T10:00:00Z", async (agentId) => `https://app.paseo.sh/h/srv/agent/${agentId}`);
+    const issue = { id: "i1", identifier: "TUC-1" };
+    const pr = "https://github.com/o/r/pull/7";
+    await handover.update(issue, { id: "agent-1", title: "TUC-1: Fix", cwd: "/wt/tuc-1" }, { link: ["Pull request", pr] });
+    await handover.finish(issue, { id: "agent-1", title: "TUC-1: Fix", cwd: "/wt/tuc-1" }, "archived", "archived");
+    const resumed = await handover.update(issue, { id: "agent-2", title: "TUC-1: Fix (resumed)", cwd: "/wt/tuc-1" }, { summary: "Continued" });
+    assert.deepEqual(resumed.links, { "Open in Paseo": "https://app.paseo.sh/h/srv/agent/agent-2", "Pull request": pr });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test("a permission shows in the agent panel only while still pending, and the ticket then mentions the session's owner as the Paseo app", async () => {
   const { Writeback } = await import("./writeback");
   const request: AgentPermissionRequest = { id: "p1", provider: "omp", name: "bash", kind: "tool", title: "Allow tool: bash", description: "Command: ls" };
