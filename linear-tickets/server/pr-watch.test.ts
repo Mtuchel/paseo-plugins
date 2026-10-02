@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import type { HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
-import { GitHubRateLimitedError, PullRequestWatch, type CheckRun, type FailedCheck, type PullRequestView, type QueueDraft } from "./pr-watch";
+import { GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type FailedCheck, type PullRequestView, type QueueDraft } from "./pr-watch";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
 const settings = { dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true } } as unknown as PluginSettings;
@@ -41,7 +41,7 @@ const OPEN_PR: PullRequestView = { state: "OPEN", isDraft: false, headSha: HEAD,
 
 function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string } = {}) {
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
-  const github = { view: OPEN_PR, drafts: [] as QueueDraft[], landed: [] as number[], checks: [] as FailedCheck[], threads: [] as ReviewThread[], reads: [] as string[], threadReads: 0, throttled: false };
+  const github = { view: OPEN_PR, drafts: [] as QueueDraft[], landed: [] as number[], checks: [] as FailedCheck[], threads: [] as ReviewThread[], reads: [] as string[], threadReads: 0, throttled: false, missing: false };
   const blockers: string[] = [];
   // `answer`: what Paseo finds before sending (only "sent" dispatches); `send`: the send itself,
   // after the dispatch was recorded; `session`: the agent's session lookup.
@@ -78,6 +78,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     view: async (url) => {
       github.reads.push(url);
       if (github.throttled) throw new GitHubRateLimitedError("GitHub is throttling gh: HTTP 403: API rate limit exceeded");
+      if (github.missing) throw new PullRequestNotFoundError("GraphQL: Could not resolve to a PullRequest with the number of 419. (repository.pullRequest)");
       return github.view;
     },
     github: {
@@ -314,6 +315,23 @@ test("GitHub throttling ends the poll, is logged once, and the next poll reads e
   h.github.throttled = false;
   await h.poll();
   assert.equal(h.github.reads.length, 2);
+});
+
+test("a link to a pull request GitHub does not have is read once, logged, and never read again, even after a restart or once the number exists", async (t) => {
+  const h = harness(t);
+  const log = t.mock.method(console, "error", () => {});
+  h.github.missing = true;
+  assert.deepEqual(await h.poll(), []);
+  assert.deepEqual(h.github.reads, [PR]);
+  assert.equal(log.mock.callCount(), 1);
+  assert.match(String(log.mock.calls[0].arguments[0]), /TUC-1: .*pull\/419 does not exist .*no longer watched/);
+  // Someone later opens an unrelated pull request that takes the number.
+  h.github.missing = false;
+  h.github.view = { ...READY, mergeActivity: activity(QUEUED, CONFLICT) };
+  await h.restart();
+  assert.deepEqual(await h.poll(), []);
+  assert.deepEqual(h.github.reads, []);
+  assert.equal(log.mock.callCount(), 1);
 });
 
 const MINUTE = 60_000;

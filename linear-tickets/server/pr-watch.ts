@@ -57,8 +57,10 @@ export type PullRequestView = {
 // or, for drops before any draft, by the Merge activity bullet. `pending`: the claimed drop still
 // to be delivered. `nudges`: per stage, one key per nudge (or the escalation after them): the
 // head, or for requested changes the reviews it covered, space-separated (see stalledStage).
-// `activeAt`: the last change, drop or nudge seen.
-type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; pending?: PendingDrop | null; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string };
+// `activeAt`: the last change, drop or nudge seen. `missing`: GitHub has no pull request at the
+// link (a made-up or mistyped URL); it is never read again, so a later pull request that takes the
+// number is not mistaken for the ticket's.
+type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; pending?: PendingDrop | null; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean };
 // A claimed drop, saved before anything is sent. `fix` goes to the agent (or, when it is gone, to
 // the ticket); without it, `facts` escalate to the owner. `sending`: a message went out and its
 // result was not recorded (a restart or a failed save), so it is not sent again.
@@ -88,6 +90,13 @@ export class GitHubRateLimitedError extends Error {
     this.name = "GitHubRateLimitedError";
   }
 }
+// gh found the repository but no pull request with that number.
+export class PullRequestNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PullRequestNotFoundError";
+  }
+}
 type Bullet = { text: string; kind: "queued" | "running" | "merged" | "dropped"; draft: number | null };
 
 function gh(): string {
@@ -102,6 +111,7 @@ async function ghJson<T>(args: string[]): Promise<T> {
   } catch (error) {
     const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr) : "";
     if (/HTTP 429|rate limit/i.test(stderr)) throw new GitHubRateLimitedError(`GitHub is throttling gh: ${stderr.trim().split("\n")[0]}`);
+    if (/Could not resolve to a PullRequest/i.test(stderr)) throw new PullRequestNotFoundError(stderr.trim().split("\n")[0]);
     throw error;
   }
 }
@@ -324,6 +334,7 @@ export class PullRequestWatch {
       const url = record.links["Pull request"];
       if (!url) continue;
       const seen = seenByUrl[url];
+      if (seen?.missing) continue;
       // An archived agent's open pull request stays watched, so a merge queue drop still reaches
       // the ticket: until a drop escalated to the owner, or 14 days without activity. After-merge
       // tasks keep it watched until the merge.
@@ -359,7 +370,15 @@ export class PullRequestWatch {
     for (const record of records) {
       const url = record.links["Pull request"];
       const going = await step(record, url, async () => {
-        const view = await (this.deps.view ?? viewPullRequest)(url);
+        let view: PullRequestView;
+        try {
+          view = await (this.deps.view ?? viewPullRequest)(url);
+        } catch (error) {
+          if (!(error instanceof PullRequestNotFoundError)) throw error;
+          console.error(`[linear-tickets] ${record.identifier}: ${url} does not exist (${error.message}); it is no longer watched`);
+          seenByUrl[url] = { ...(seenByUrl[url] ?? { reviewedAt: null, decision: null, merged: false }), missing: true, pending: null };
+          return;
+        }
         const result = reviewChange(view, seenByUrl[url] ?? { reviewedAt: null, decision: null, merged: false });
         const { change, seen } = manual ? await this.gate(record, result, manual) : result;
         if (change) await this.apply(record, change);
