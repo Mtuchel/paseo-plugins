@@ -721,6 +721,65 @@ does: the address in `$PASEO_HOME/paseo.pid` and `PASEO_PASSWORD` when the daemo
 A daemon without that API, or a lost connection, is logged once per cause and affects nothing
 else.
 
+## Label rules
+
+The plugin can keep label groups current on every issue of some teams, for example an `Area`
+group (`Quality`, `Sales`, …) and a `Type` group (`Bug`, `Feature`, …). Linear allows one label
+per group on an issue, so each issue gets one area and one type. The rules live in
+`$PASEO_HOME/linear-tickets/label-rules.json`. Without that file nothing runs.
+
+```json
+{
+  "teamKeys": ["ENG"],
+  "groups": [
+    { "name": "Area", "inherit": true, "labels": [
+      { "name": "Billing", "color": "#059669", "description": "Invoices and payments.",
+        "paths": ["acme/app/**/billing/**"], "projects": ["Payments v2"],
+        "keywords": ["\\binvoice", "payment"], "title": ["^BILLING:"] }
+    ] },
+    { "name": "Type", "labels": [{ "name": "Bug", "title": ["\\bfails?\\b", "^SENTRY:"] }] }
+  ]
+}
+```
+
+For each issue and group, the first piece of evidence that decides wins:
+
+1. **Pull requests.** The files changed by the GitHub pull requests attached to the issue, as
+   `owner/repo/path`, are matched against each label's `paths` globs. `**` spans directories, `*`
+   and `?` stay within one. Each file counts for the first label, in file order, whose globs match
+   it, so put specific globs in earlier labels. The label with the most files wins. Files no glob
+   matches count for nobody.
+2. **The parent's label** of the group, for sub-issues, when the group has `"inherit": true`.
+3. **The project**, when a label lists the issue's Linear project in `projects`.
+4. **Keywords**: case-insensitive regular expressions. Each `keywords` pattern scores 3 in the
+   title and 1 in the description, and each `title` pattern scores 3 in the title only. The
+   highest score wins.
+
+A tie keeps the label the issue already has when it is among the best. Otherwise the next step
+decides. With no evidence the issue keeps what it has, and nothing is ever removed without a
+replacement. Pull request files are read with `gh`, up to 150 pull requests per cycle. Merged
+and closed ones are kept in `$PASEO_HOME/linear-tickets/pr-files.json`, and open ones are read
+again after 30 minutes.
+
+**Labels people choose stay.** Before it changes an issue's label, the plugin reads the issue's
+history. If the last change to that group's labels was not the Paseo app's, it leaves the issue
+alone. The same goes for an issue that got its label when it was created. To hand an issue back
+to the rules, remove the group's label and let the plugin set it once. That is why it writes only
+as the [Paseo Linear app](#native-linear-agent) and waits while the app is unusable. It also
+leaves issues alone for their first 3 minutes: Linear does not record label changes made in that
+window.
+
+**Groups are made in Linear.** A missing group or label is created as a workspace label with
+the configured colour and description. An ungrouped workspace label with a configured name is
+moved into its group, keeping its issues. A label that already belongs to another group is logged
+and left out. Linear refuses to group labels that share an issue, so remove one of them from such
+issues first.
+
+Every 2 minutes, the plugin reads the issues updated since the last cycle. Every 30 minutes, or
+while issues are still undecided, it reads all of them. All of this runs at background priority on
+the app's pool. Each change is logged as `label rules: TUC-12 Area/Quality (pull requests)`.
+Editing the file takes effect at the next cycle.
+
 ## Rate limits
 
 Linear meters requests per credential and hour: **2,500** for the personal API key (shared by
@@ -729,14 +788,14 @@ steadily, so the plugin estimates each pool's room from the `X-RateLimit-Request
 header of the last answer plus the refill since then.
 
 - **Reads that pollers repeat use the app's pool** when the Paseo app is installed: the relay's
-  comment read, the auto-dispatch label query, ticket state, manual-task status and the sidebar
-  state labels. The key reads them only when the app is not installed, its token cannot be
+  comment read, the auto-dispatch label query, ticket state, manual-task status, the sidebar
+  state labels and the label rules' sweeps. The key reads them only when the app is not installed, its token cannot be
   refreshed, or it cannot see a ticket. An app rate limit never falls back to the key. Writes use
   the app's pool too; the key writes only in the cases listed under [Who Linear shows as the
   author](#who-linear-shows-as-the-author). The agents' `linear_ticket` servers send their own
   requests, which the daemon's estimate does not count.
 - **Background work stops at a 15% reserve** of the pool it needs: auto-dispatch, the relay,
-  manual tasks, the pull request watch, the state labels and the health check. It resumes on its
+  manual tasks, the pull request watch, the state labels, the label rules and the health check. It resumes on its
   own as the pool refills. Session prompts, write-backs, agents' `linear_ticket` tools and the
   sidebar ticket list still use the reserve. The **Auto-dispatch** status shows `paused: …` with
   the estimated time, and the plugin log records each pause once.

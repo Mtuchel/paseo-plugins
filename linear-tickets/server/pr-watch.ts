@@ -104,7 +104,7 @@ function gh(): string {
   return "gh";
 }
 
-async function ghJson<T>(args: string[]): Promise<T> {
+export async function ghJson<T>(args: string[]): Promise<T> {
   try {
     const { stdout } = await exec(gh(), args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
     return JSON.parse(stdout) as T;
