@@ -534,10 +534,12 @@ as before.
 the whole project without you assigning each ticket. Auto-dispatch must be on; projects are read
 every 2 minutes.
 
-- **The Projects card.** Above the ticket list, each labelled project shows how many new tickets
-  wait for a plan, or the planner waiting for your approval (with a link to it). Nothing is
-  planned until you press **Plan N new tickets**; planning never starts on its own.
-- **Planner.** The button files a ticket *Plan the work order of <project>* in the project
+- **Planning on request.** Nothing is planned until you ask; planning never starts on its own.
+  The plugin offers two RPCs for that, used by the Paseo Agents menu bar app:
+  `linear.projects-status` lists each labelled project with how many new tickets wait for a
+  plan and the planner waiting for your approval (with a link to it); `linear.plan-project`
+  plans one project's new tickets.
+- **Planner.** Planning files a ticket *Plan the work order of <project>* in the project
   (Urgent, labels `paseo-planner` and `plan`) and assigns it to Paseo. Its agent reads the open
   tickets, listed in its description with the new ones marked, and the code, and plans which
   tickets block which (because one builds on another, or both touch the same files) and which
@@ -560,8 +562,8 @@ every 2 minutes.
   Triage or already started, someone else's, and sub-issues (their parent's group hands them
   out) are left alone. A ticket with open sub-issues in the project is assigned as a group and
   takes no slot itself. Removing `paseo-hold` releases a ticket.
-- **New tickets.** Tickets filed after the last plan are not handed out until you plan them; the
-  card counts them. Only tickets the project could hand out count: new sub-issues, tickets
+- **New tickets.** Tickets filed after the last plan are not handed out until you plan them;
+  `linear.projects-status` counts them. Only tickets the project could hand out count: new sub-issues, tickets
   already with Paseo or someone else, and started ones do not. There is at most one planner per
   project at a time: tickets filed while one waits for approval are counted for the next.
 - **Skipping a plan.** Closing or canceling the planner ticket yourself counts its tickets as

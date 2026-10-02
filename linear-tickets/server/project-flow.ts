@@ -11,13 +11,13 @@ import type { PluginSettings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
 // Projects carrying the trigger label move forward on their own (README, "Projects"):
-// 1. The owner presses "Plan" in the ticket surface: a planner ticket in the project asks an agent
+// 1. The owner asks for a plan (`linear.plan-project`, the Paseo Agents menu bar's "Plan"): a planner ticket in the project asks an agent
 //    for the work order of the new tickets: which tickets block which, and which must wait for the
 //    owner (hold). The owner approves its plan like any other; the approved order is written into
 //    Linear as blocking relations and `<trigger>-hold` labels.
 // 2. Every poll, the project's planned, unblocked, unheld tickets that nobody has are handed to
 //    Paseo in the scheduler's order, one per free agent slot.
-// Tickets filed after the last plan wait until the owner plans them; the surface shows how many.
+// Tickets filed after the last plan wait until the owner plans them; `linear.projects-status` counts them.
 
 // How often a project's tickets are read: a project is a few paginated queries.
 const POLL_MS = 2 * 60_000;
@@ -89,7 +89,7 @@ export class ProjectFlow {
     return (this.deps.now ?? Date.now)();
   }
 
-  // The labelled projects as of the last poll, for the ticket surface.
+  // The labelled projects as of the last poll (`linear.projects-status`).
   status(): ProjectStatus[] {
     return this.statuses.map((status) => ({ ...status }));
   }
@@ -140,7 +140,7 @@ export class ProjectFlow {
     return { work, record, owner, planned, unplanned, status: { id: project.id, name: project.name, toPlan, planner, readAt: new Date(this.now()).toISOString() } };
   }
 
-  // The surface's "Plan" button: files a planner ticket for the project's unplanned tickets. One
+  // `linear.plan-project`: files a planner ticket for the project's unplanned tickets. One
   // planner per project at a time.
   async planNow(projectId: string, settings: PluginSettings): Promise<ProjectStatus> {
     const appId = await this.deps.linear.appUserId();
