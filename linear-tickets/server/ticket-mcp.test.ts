@@ -73,6 +73,38 @@ test("a provider that reports no MCP support gets a launch warning", async () =>
   assert.ok(!without.warnings.some((warning) => warning.includes("no Linear tools")));
 });
 
+test("a provider the daemon refuses MCP servers for starts once more without the ticket tools", async () => {
+  const calls: PaseoWorkspaceAgentCreateOptions[] = [];
+  const paseo = {
+    projects: { list: async () => ({ projects: [{ projectId: "project-1", projectKind: "directory", projectRootPath: "/repo" }] }) },
+    workspaces: { create: async () => ({ agents: { create: async (options: PaseoWorkspaceAgentCreateOptions) => {
+      calls.push(options);
+      if ("mcpServers" in options.config) throw new Error("Provider 'omp' does not support MCP servers");
+      return { id: "agent-1", capabilities: { supportsMcpServers: false } };
+    } } }) },
+  } as unknown as PaseoApi;
+  const launcher = new Launcher({ ...noMark, detail: async () => detail }, undefined, async () => "/s.mjs");
+  const result = await launcher.start(input, paseo, { linearAccess: true });
+  assert.equal(result.agentId, "agent-1");
+  assert.equal(calls.length, 2);
+  assert.ok(!("mcpServers" in calls[1].config));
+  assert.notEqual(calls[1].requestId, calls[0].requestId);
+  assert.ok(calls[1].prompt?.includes(NO_LINEAR_ACCESS_NOTE));
+  assert.ok(!calls[1].prompt?.includes(LINEAR_ACCESS_NOTE));
+  assert.equal(result.warnings.filter((warning) => warning.includes("does not load MCP servers")).length, 1);
+});
+
+test("any other creation failure is not retried", async () => {
+  let calls = 0;
+  const paseo = {
+    projects: { list: async () => ({ projects: [{ projectId: "project-1", projectKind: "directory", projectRootPath: "/repo" }] }) },
+    workspaces: { create: async () => ({ agents: { create: async () => { calls++; throw new Error("Provider 'omp' failed to start"); } } }) },
+  } as unknown as PaseoApi;
+  const launcher = new Launcher({ ...noMark, detail: async () => detail }, undefined, async () => "/s.mjs");
+  await assert.rejects(launcher.start(input, paseo, { linearAccess: true }), /could not be confirmed \(Provider 'omp' failed to start\)/);
+  assert.equal(calls, 1);
+});
+
 test("marking in progress happens before the agent exists, so the agent's own status changes come later", async () => {
   const order: string[] = [];
   const launcher = new Launcher({ ...noMark, detail: async () => detail, markInProgress: async () => { order.push("mark"); return { changed: true }; } }, undefined, async () => "/s.mjs");

@@ -184,8 +184,9 @@ move the ticket to review, register every manual step as a manual task and close
 and it is appended when they do not. The server is a dependency-free script written to
 `$PASEO_HOME/linear-tickets/ticket-mcp-<hash>.mjs` and run with the daemon's own Node runtime
 (the desktop app's bundled runtime included), so it does not depend on `node` being on the
-agent's PATH. If the selected provider reports that it cannot load MCP servers, the launch
-returns a warning, since that agent has no Linear tools.
+agent's PATH. A provider that cannot load MCP servers (omp: the daemon refuses its launch when
+one is attached) starts once more without the server and with the no-write note instead of
+`{{linear_access}}`, and the launch returns a warning, since that agent has no Linear tools.
 The agent configuration carries only that path and the issue ID; no credential is put into the
 agent's configuration or environment.
 
