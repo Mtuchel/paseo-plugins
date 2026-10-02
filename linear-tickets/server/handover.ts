@@ -143,7 +143,9 @@ export class Handover {
         worktreePath: agent.cwd,
         lastCommit: git.lastCommit ?? (sameAgent ? previous.lastCommit : null),
         summaries: [...(sameAgent ? previous.summaries : previous?.summaries ?? []), ...(change.summary ? [clip(change.summary, MAX_SUMMARY)] : [])].slice(-KEPT_SUMMARIES),
-        links: { ...(paseoUrl ? { "Open in Paseo": paseoUrl } : {}), ...(sameAgent ? previous.links : {}), ...(change.link ? { [change.link[0]]: change.link[1] } : {}) },
+        // The ticket's links (its pull request above all, which the pull request watch follows)
+        // stay when another agent takes over; only the agent's own Paseo link is its own.
+        links: { ...(paseoUrl ? { "Open in Paseo": paseoUrl } : {}), ...Object.fromEntries(Object.entries(previous?.links ?? {}).filter(([name]) => sameAgent || name !== "Open in Paseo")), ...(change.link ? { [change.link[0]]: change.link[1] } : {}) },
         plan: change.plan ?? (sameAgent ? previous.plan ?? null : null),
         review: change.review ?? (sameAgent ? previous.review ?? null : null),
         model: change.model ?? (sameAgent ? previous.model ?? null : null),

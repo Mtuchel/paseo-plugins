@@ -63,10 +63,10 @@ export async function stalledStage(view: PullRequestView, url: string, now: numb
     if (!quiet) return null;
     return { stage: "draft", key, text: [
       `[The pull request](${url}) is still a draft, with no new commit or pull request activity for ${DRAFT_IDLE_MS / 60_000} minutes.`,
-      "Next step: run the background Sol review if you have not yet, then `gt submit --stack --publish`.",
+      `Next step: run the background Sol review if you have not yet. Publish only the reviewed part of your stack, bottom first: \`gt submit --publish --no-stack --branch ${view.headBranch}\` once this branch and every branch below it are reviewed; the branches above stay drafts until they are.`,
     ].join("\n") };
   }
-  const failed = view.checks.filter((check) => check.state === "failed" && check.name !== QUEUE_CHECK);
+  const failed = failedChecks(view);
   if (failed.length) {
     return { stage: "red", key, text: [
       `Checks failed on the head of [the pull request](${url}) (\`${head}\`):`,
@@ -74,13 +74,7 @@ export async function stalledStage(view: PullRequestView, url: string, now: numb
       "Next step: fix them, then `gt submit --stack`.",
     ].join("\n") };
   }
-  // Each reviewer's latest decisive review counts (a dismissed one reads DISMISSED), on any commit:
-  // new commits do not settle a change request, the reviewer does.
-  const latestByAuthor = new Map<string, PullRequestView["reviews"][number]>();
-  for (const review of [...view.reviews].sort((a, b) => a.submittedAt.localeCompare(b.submittedAt))) {
-    if (DECISIVE.includes(review.state)) latestByAuthor.set(review.author, review);
-  }
-  const requested = [...latestByAuthor.values()].filter((review) => review.state === "CHANGES_REQUESTED");
+  const requested = changeRequests(view);
   if (requested.length || view.reviewDecision === "CHANGES_REQUESTED") {
     // A request already sent keeps holding the merge, but is not sent again for a new head.
     const unsent = (requested.length ? requested.map((review) => `${review.author}@${review.submittedAt}`) : ["review-decision"]).filter((id) => !claimed("changes", id));
@@ -99,15 +93,8 @@ export async function stalledStage(view: PullRequestView, url: string, now: numb
       ...(earlier.length ? [`Where the new commits already address a review, reply on its threads and re-request a review from ${earlier.join(", ")}.`] : []),
     ].join("\n") };
   }
-  // Green: the required checks ran on the head and passed, and every other check but the
-  // queue's own finished and passed. An empty or incomplete rollup is not green.
-  const named = (name: string) => view.checks.filter((check) => check.name === name);
-  const green = view.checks.every((check) => check.state === "passed" || check.name === QUEUE_CHECK)
-    && REQUIRED_CHECKS.every((name) => named(name).length > 0)
-    && [...REQUIRED_CHECKS, ...REQUIRED_WHEN_PRESENT].every((name) => named(name).every((check) => check.conclusion === "success" || check.conclusion === "skipped"));
-  const reviewed = !view.labels.includes(GREPTILE_LABEL) || view.reviews.some((review) => GREPTILE.test(review.author) && review.commit === view.headSha);
-  const mergeable = green && reviewed;
-  if (claimed("findings", key) && (claimed("merge", key) || !mergeable)) return null;
+  const ready = mergeable(view);
+  if (claimed("findings", key) && (claimed("merge", key) || !ready)) return null;
   const open = (await readThreads()).filter((thread) => !thread.resolved && thread.comments.length);
   const findings = open.filter((thread) => thread.comments[0].bot);
   if (findings.length) {
@@ -118,10 +105,50 @@ export async function stalledStage(view: PullRequestView, url: string, now: numb
       "Next step: run the AGENTS.md review loop on them.",
     ].join("\n") };
   }
-  if (!mergeable || open.length) return null;
+  if (!ready || open.length) return null;
+  return { stage: "merge", key, text: mergeText(url, view, []) };
+}
+
+function failedChecks(view: PullRequestView): PullRequestView["checks"] {
+  return view.checks.filter((check) => check.state === "failed" && check.name !== QUEUE_CHECK);
+}
+
+// Each reviewer's latest decisive review counts (a dismissed one reads DISMISSED), on any commit:
+// new commits do not settle a change request, the reviewer does.
+function changeRequests(view: PullRequestView): PullRequestView["reviews"] {
+  const latestByAuthor = new Map<string, PullRequestView["reviews"][number]>();
+  for (const review of [...view.reviews].sort((a, b) => a.submittedAt.localeCompare(b.submittedAt))) {
+    if (DECISIVE.includes(review.state)) latestByAuthor.set(review.author, review);
+  }
+  return [...latestByAuthor.values()].filter((review) => review.state === "CHANGES_REQUESTED");
+}
+
+// Ready to merge as far as the pull request itself shows; its review threads must be resolved
+// too. Not a draft, no failed check and no change request; green: the required checks ran on the
+// head and passed, and every other check but the queue's own finished and passed (an empty or
+// incomplete rollup is not green); and with `complex-review`, Greptile reviewed the head: a review
+// on it, or, for a review without findings (Greptile then files no review), its summary comment's
+// `Last reviewed commit: [subject](https://github.com/<repo>/commit/<head>)`.
+export function mergeable(view: PullRequestView): boolean {
+  if (view.isDraft || failedChecks(view).length || changeRequests(view).length || view.reviewDecision === "CHANGES_REQUESTED") return false;
+  const named = (name: string) => view.checks.filter((check) => check.name === name);
+  const green = view.checks.every((check) => check.state === "passed" || check.name === QUEUE_CHECK)
+    && REQUIRED_CHECKS.every((name) => named(name).length > 0)
+    && [...REQUIRED_CHECKS, ...REQUIRED_WHEN_PRESENT].every((name) => named(name).every((check) => check.conclusion === "success" || check.conclusion === "skipped"));
+  if (!green || !view.labels.includes(GREPTILE_LABEL)) return green;
+  if (view.reviews.some((review) => GREPTILE.test(review.author) && review.commit === view.headSha)) return true;
+  if (!/^[0-9a-f]+$/i.test(view.headSha)) return false;
+  const summary = new RegExp(`Last reviewed commit:[^\\n]*/commit/${view.headSha}\\b`);
+  return view.comments.some((comment) => GREPTILE.test(comment.author) && summary.test(comment.body));
+}
+
+// The merge step for the highest ready pull request of a stack; `below`: the ready ones under it,
+// bottom first, which `gt merge` enqueues with it.
+export function mergeText(url: string, view: PullRequestView, below: { number: number; url: string }[]): string {
   const number = /\/pull\/(\d+)/.exec(url)?.[1] ?? "";
-  return { stage: "merge", key, text: [
+  return [
     `[The pull request](${url}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.`,
-    `Next step: \`gt merge\`, then \`node tools/ci/wait-queue.mjs <top PR>\` with the top pull request of your stack (${number} if this one is the top).`,
-  ].join("\n") };
+    ...(below.length ? [`So are the pull requests below it: ${below.map((pull) => `[#${pull.number}](${pull.url})`).join(", ")}.`] : []),
+    `Next step: \`gt checkout ${view.headBranch} && gt merge\`${below.length ? " (it enqueues the pull requests below it too)" : ""}, then \`node tools/ci/wait-queue.mjs ${number}\`. The rest of the stack follows once it is reviewed.`,
+  ].join("\n");
 }
