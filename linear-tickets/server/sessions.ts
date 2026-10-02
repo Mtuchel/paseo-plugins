@@ -9,9 +9,11 @@ import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { AgentApi, SelectOption, SessionPlanStep } from "./agent-app";
 import { agentAppDirectory } from "./agent-app";
 import type { AgentSessionWebhook } from "./agent-webhook";
+import { groupProgress, groupStatus, isGroup } from "./groups";
 import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
 import { dispatchLabels } from "./dispatch";
-import type { LinearService } from "./linear";
+import type { IssueGroup, LinearService } from "./linear";
+import { CODING_STATE } from "./plannotator";
 import { closeAnswered, type NeedsYouIssues } from "./needs-you";
 import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, questionAnswer, questionsOf } from "./relay";
 import type { Settings } from "./settings";
@@ -48,6 +50,10 @@ export type SessionLink = {
   closed?: boolean;
   // The agent the thread's "Open in Paseo" link points at.
   paseoLinked?: string;
+  // Handed to Paseo as a group (groups.ts): no agent of its own; its sub-issues are handed out and
+  // it closes when they are finished. `delegated`: the ticket was assigned to Paseo when the group
+  // started, so unassigning it stops the group. `status`: the last status posted in the panel.
+  group?: { delegated: boolean; status?: string };
 };
 
 // Every @mention or assignment opens a new Linear thread, so a ticket collects threads while one
@@ -208,7 +214,7 @@ export function planSteps(markdown: string): string[] {
 
 type Deps = {
   api: AgentApi;
-  linear: Pick<LinearService, "viewerId" | "addLabel" | "removeLabel" | "complete" | "issueState" | "delegate">;
+  linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueGroup" | "delegate" | "moveToStateNamed">;
   starter: Pick<TicketStarter, "start" | "admission">;
   settings: Pick<Settings, "read">;
   store: SessionStore;
@@ -290,7 +296,8 @@ export class SessionRouter {
     const issueId = String(session.issueId ?? issue.id ?? "");
     const identifier = String(issue.identifier ?? "this ticket");
     if (!issueId) throw new Error("The session has no ticket.");
-    if ((await this.deps.store.get(session.id))?.agentId) return;
+    const known = await this.deps.store.get(session.id);
+    if (known?.agentId || known?.group) return;
     // One-person workspace: other integrations acting in Linear must not start agents here.
     if (String(session.creatorId ?? "") !== await this.owner()) {
       await this.say(session.id, "error", "Only the workspace owner can start Paseo agents.");
@@ -313,6 +320,7 @@ export class SessionRouter {
       await this.closeSuperseded();
       return;
     }
+    if (await this.startGroup(link)) return;
     await this.deps.store.put(link);
     const admission = await this.deps.starter.admission(issueId, this.paseo!, await this.deps.settings.read());
     if (!admission.ok) {
@@ -385,6 +393,17 @@ export class SessionRouter {
     }
     // "Approve, implement later": any reply in this session starts the implementing agent.
     if (link.offer === "later") { await this.startFor(link, false); return; }
+    if (link.group && link.closed) { await this.say(sessionId, "response", `Paseo no longer hands out ${link.identifier}'s sub-issues. Assign Paseo to it again to continue.`); return; }
+    if (link.group && !link.review) {
+      if (signal === "stop") {
+        await this.deps.store.patch(sessionId, { closed: true });
+        await this.say(sessionId, "response", "Stopped handing out sub-issues. Agents already working continue; assign Paseo again to continue.");
+        return;
+      }
+      // Any reply asks for the current status, posted even when it has not changed.
+      await this.advanceGroup({ ...link, group: { ...link.group, status: undefined } });
+      return;
+    }
     if (!link.agentId) { await this.say(sessionId, "error", "The agent for this session has not started yet."); return; }
     const handle = this.paseo!.agents.ref(link.agentId);
     if (signal === "stop") {
@@ -397,6 +416,8 @@ export class SessionRouter {
       // Marked first: the planner is archived during the split, which must not offer a resume.
       await this.deps.store.patch(sessionId, { offer: "split" });
       const summary = await this.deps.splitPlan(link, link.review.localUrl, this.paseo!);
+      // The steps are the parent's sub-issues now: the parent closes when they are finished.
+      await this.deps.store.patch(sessionId, { group: { delegated: false } });
       await this.clearReview(sessionId);
       await this.say(sessionId, "response", summary);
       return;
@@ -507,6 +528,125 @@ export class SessionRouter {
     }
   }
 
+  // A ticket with open sub-issues is worked on through them instead of by an agent of its own:
+  // each open sub-issue nobody else has is assigned to Paseo (its own thread then starts it once
+  // its blockers are finished), and the ticket closes when all of them are finished.
+  private async startGroup(link: SessionLink, read?: { group: IssueGroup; appId: string }): Promise<boolean> {
+    const known = read ?? await this.readGroup(link.issueId);
+    if (!isGroup(groupProgress(known.group, await this.owner(), known.appId, await this.ownLabels()))) return false;
+    const group = { delegated: known.group.delegateId === known.appId };
+    await this.deps.store.put({ ...link, group });
+    for (const other of await this.deps.store.all()) {
+      if (other.issueId !== link.issueId || !other.group || other.closed || other.sessionId === link.sessionId) continue;
+      await this.deps.store.patch(other.sessionId, { closed: true });
+      await this.say(other.sessionId, "response", "Continued in the newest Paseo thread on this ticket. Follow and reply there; this thread is closed.").catch(() => {});
+    }
+    await this.say(link.sessionId, "thought", `${link.identifier} has open sub-issues, so Paseo works on them instead of on ${link.identifier} itself: each one is assigned to Paseo and starts once its blockers are finished. ${link.identifier} closes when they are all finished.`);
+    await this.advanceGroup({ ...link, group }, known);
+    return true;
+  }
+
+  // A labelled ticket with open sub-issues becomes a group too: it is assigned to Paseo, whose
+  // thread hands out the sub-issues. True when the ticket is a group; without a usable Paseo app
+  // there are no threads, so the ticket starts an agent like any other.
+  async handOffGroup(issueId: string): Promise<boolean> {
+    if (!await this.deps.linear.appUserId()) return false;
+    const known = await this.readGroup(issueId);
+    if (!isGroup(groupProgress(known.group, await this.owner(), known.appId, await this.ownLabels()))) return false;
+    // Assigning opens the ticket's thread, which starts the group (`created`).
+    if (known.group.delegateId !== known.appId) { await this.deps.linear.delegate(issueId, known.appId); return true; }
+    if ((await this.deps.store.all()).some((other) => other.issueId === issueId && other.group && !other.closed)) return true;
+    const sessionId = await this.deps.api.createSessionOnIssue(issueId);
+    await this.startGroup({ sessionId, agentId: null, issueId, identifier: known.group.identifier, createdAt: new Date().toISOString(), handled: [], review: null, offer: null }, known);
+    return true;
+  }
+
+  private async readGroup(issueId: string): Promise<{ group: IssueGroup; appId: string }> {
+    const appId = await this.deps.linear.appUserId();
+    if (!appId) throw new Error("The Paseo Linear app is not usable on this host, so sub-issues cannot be assigned to it.");
+    return { group: await this.deps.linear.issueGroup(issueId), appId };
+  }
+
+  // Sub-issues the plugin made for the owner (manual tasks, "Needs you" questions): never group members.
+  private async ownLabels(): Promise<string[]> {
+    const labels = dispatchLabels((await this.deps.settings.read()).dispatch.label);
+    return [labels.manual, labels.needsYou];
+  }
+
+  async advanceGroups(): Promise<void> {
+    for (const link of await this.deps.store.all()) {
+      if (!link.group || link.closed) continue;
+      try {
+        await this.advanceGroup({ ...link, group: link.group });
+      } catch (error) {
+        console.error(`[linear-tickets] ${link.identifier}: advancing the group failed: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  // Hands out the group's new sub-issues once the parent itself is not blocked, closes the parent
+  // when every sub-issue is finished, and posts what each one waits for whenever that changes.
+  // One advance per thread at a time: the minute sweep, a reply and the thread's start can overlap,
+  // and two would close the parent or post the same status twice. A skipped one is redone next minute.
+  private readonly advancing = new Set<string>();
+  private async advanceGroup(link: SessionLink & { group: NonNullable<SessionLink["group"]> }, read?: { group: IssueGroup; appId: string }): Promise<void> {
+    if (this.advancing.has(link.sessionId)) return;
+    this.advancing.add(link.sessionId);
+    try {
+      await this.stepGroup(link, read);
+    } finally {
+      this.advancing.delete(link.sessionId);
+    }
+  }
+
+  private async stepGroup(link: SessionLink & { group: NonNullable<SessionLink["group"]> }, read?: { group: IssueGroup; appId: string }): Promise<void> {
+    const { group, appId } = read ?? await this.readGroup(link.issueId);
+    const end = async (body: string) => {
+      await this.deps.store.patch(link.sessionId, { closed: true });
+      await this.say(link.sessionId, "response", body);
+    };
+    if (["completed", "canceled", "duplicate"].includes(group.statusType)) return end(`${link.identifier} was moved to ${group.status}, so Paseo stopped handing out its sub-issues.`);
+    if (link.group.delegated && group.delegateId !== appId) return end(`Paseo was unassigned from ${link.identifier}, so it stopped handing out sub-issues. Agents already working continue.`);
+    const progress = groupProgress(group, await this.owner(), appId, await this.ownLabels());
+    if (progress.finished) {
+      const list = progress.members.map((child) => `- ${child.identifier}: ${child.status}`).join("\n");
+      if (progress.outcome === "canceled") await this.deps.linear.cancel(link.issueId, `Every sub-issue was canceled, so ${link.identifier} is canceled too.\n\n${list}`);
+      else await this.deps.linear.complete(link.issueId);
+      return end(`All sub-issues are finished, so ${link.identifier} is ${progress.outcome === "canceled" ? "canceled" : "done"}.\n\n${list}`);
+    }
+    let parentBlockers: string[] = [];
+    const failures: string[] = [];
+    if (progress.handOut.length) {
+      const parent = await this.deps.linear.issueState(link.issueId);
+      parentBlockers = parent.blockedBy;
+      if (!parentBlockers.length) {
+        for (const child of progress.handOut) {
+          try {
+            await this.deps.linear.delegate(child.id, appId);
+            child.delegateId = appId;
+          } catch (error) {
+            failures.push(`Could not assign ${child.identifier} to Paseo: ${error instanceof Error ? error.message : error}`);
+          }
+        }
+        if (progress.handOut.some((child) => child.delegateId === appId)) {
+          const moved = await this.deps.linear.moveToStateNamed(link.issueId, CODING_STATE, parent).catch((error: unknown) => ({ changed: false, note: error instanceof Error ? error.message : String(error) }));
+          if (moved.note) console.error(`[linear-tickets] ${link.identifier}: ${moved.note}`);
+        }
+      }
+    }
+    const agents = new Map<string, "working" | "queued" | "group">();
+    for (const other of await this.deps.store.all()) {
+      if (other.closed || agents.get(other.issueId) === "working") continue;
+      if (other.group) agents.set(other.issueId, "group");
+      else if (other.agentId) agents.set(other.issueId, "working");
+      else if (other.queued) agents.set(other.issueId, "queued");
+    }
+    const status = [groupStatus(link.identifier, progress, appId, agents, parentBlockers), ...failures].join("\n");
+    if (status === link.group.status) return;
+    await this.deps.store.patch(link.sessionId, { group: { ...link.group, status } });
+    await this.say(link.sessionId, "thought", status);
+  }
+
   // Catch-up for missed webhooks: queued threads now admitted, new sessions nobody started, and prompts
   // not yet handled. Each part runs on its own, so one failed Linear request skips only the part it hit.
   async sweep(): Promise<void> {
@@ -514,6 +654,7 @@ export class SessionRouter {
     this.sweeping = true;
     try {
       await this.sweepPart("queued threads", () => this.startQueued());
+      await this.sweepPart("groups", () => this.advanceGroups());
       await this.sweepPart("superseded threads", () => this.closeSuperseded());
       await this.sweepPart("reviews", () => this.settleReviews());
       // Threads opened before the link existed (or linked to a newer agent) get "Open in Paseo".

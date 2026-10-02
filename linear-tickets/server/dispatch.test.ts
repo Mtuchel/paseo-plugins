@@ -22,6 +22,7 @@ class FakeLinear {
   readonly writes: string[] = [];
   readonly labels: Map<string, Set<string>>;
   readonly blocked: Record<string, string[]> = {};
+  readonly parents = new Set<string>();
 
   constructor(tickets: Record<string, string[]>, private readonly options: { failRemove?: boolean } = {}) {
     this.labels = new Map(Object.entries(tickets).map(([id, names]) => [id, new Set(names)]));
@@ -30,7 +31,7 @@ class FakeLinear {
   async labeledIssues(label: string, teamKeys: string[]): Promise<LabeledIssue[]> {
     this.writes.push(`query ${label} ${teamKeys.join(",")}`);
     return [...this.labels].filter(([, names]) => [...names].some((name) => name.toLowerCase() === label.toLowerCase()))
-      .map(([id, names]) => ({ id, identifier: id.toUpperCase(), teamKey: "ENG", priority: 0, labels: [...names].map((name) => ({ id: `l-${name}`, name })) }));
+      .map(([id, names]) => ({ id, identifier: id.toUpperCase(), teamKey: "ENG", priority: 0, labels: [...names].map((name) => ({ id: `l-${name}`, name })), openChildren: this.parents.has(id) }));
   }
 
   async removeLabel(id: string, name: string) {
@@ -72,7 +73,7 @@ function fakePaseo(activeAgents: { id: string; title: string }[] = []): PaseoApi
   } as unknown as PaseoApi;
 }
 
-function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = baseSettings, paseo = fakePaseo()) {
+function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = baseSettings, paseo = fakePaseo(), handOff?: (issueId: string) => Promise<boolean>) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const launches: Omit<RpcInput<typeof launchAgentRpc>, "planFirst">[] = [];
   const starter = new TicketStarter({
@@ -80,7 +81,7 @@ function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = ba
     launcher: { start: async (input) => { launches.push(input); return { agentId: "agent-1", warnings: [] }; } },
     branches: async () => ({ branches: [{ id: "refs/heads/dev", label: "dev" }, { id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }),
   });
-  const dispatcher = new Dispatcher({ linear, starter, settings: { read: async () => settings } });
+  const dispatcher = new Dispatcher({ linear, starter, settings: { read: async () => settings }, handOff });
   dispatcher.attach(paseo);
   return { dispatcher, launches };
 }
@@ -100,6 +101,18 @@ test("a labeled ticket is claimed before its agent launches, and is not launched
   await dispatcher.tick();
   assert.equal(launches.length, 1);
   assert.equal(dispatcher.snapshot().recent[0].outcome, "launched");
+});
+
+test("a labelled ticket with open sub-issues is handed to Paseo as a group: the label comes off and no agent starts for it", async (t) => {
+  const linear = new FakeLinear({ "eng-1": ["paseo"], "eng-2": ["paseo"] });
+  linear.parents.add("eng-1");
+  const asked: string[] = [];
+  const { dispatcher, launches } = setup(t, linear, baseSettings, fakePaseo(), async (id) => { asked.push(id); return true; });
+  await dispatcher.tick();
+  assert.deepEqual(asked, ["eng-1"], "tickets without open sub-issues are not looked at");
+  assert.deepEqual([...linear.labels.get("eng-1")!], []);
+  assert.deepEqual(launches.map((launch) => launch.id), ["eng-2"]);
+  assert.deepEqual(dispatcher.snapshot().recent.map((item) => `${item.identifier} ${item.outcome}`), ["ENG-2 launched", "ENG-1 grouped"]);
 });
 
 test("a ticket without a saved project mapping is marked failed with the reason instead of launching", async (t) => {

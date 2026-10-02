@@ -250,7 +250,7 @@ export function resolveReviewState(states: TeamState[]): TeamState | null {
 // they are assigned to. Completed and canceled work never launches.
 export const LABELED_ISSUES_QUERY = `query labeledIssues($first: Int!, $filter: IssueFilter) {
   issues(first: $first, includeArchived: false, orderBy: updatedAt, filter: $filter) {
-    nodes { id identifier priority team { key } labels(first: 50) { nodes { id name } } }
+    nodes { id identifier priority team { key } labels(first: 50) { nodes { id name } } children(first: 1, filter: { state: { type: { nin: ["completed", "canceled"] } } }) { nodes { id } } }
   }
 }`;
 
@@ -271,7 +271,8 @@ export const ISSUE_LABELS_QUERY = `query issueLabels($first: Int!, $ids: [ID!]) 
 const ISSUE_LABELS_BATCH = 50;
 
 // `priority`: Linear's 1 (urgent) … 4 (low); 0 means none and sorts last.
-export type LabeledIssue = { id: string; identifier: string; teamKey: string; priority: number; labels: { id: string; name: string }[] };
+// `openChildren`: the ticket has at least one sub-issue that is not completed or canceled.
+export type LabeledIssue = { id: string; identifier: string; teamKey: string; priority: number; labels: { id: string; name: string }[]; openChildren: boolean };
 
 // The current state, team, labels and attachment links of one ticket: enough for
 // write-back decisions without the comment pagination that `detail` performs.
@@ -301,6 +302,34 @@ function pullRequestsMerged(attachments: unknown): boolean {
     .filter((node) => label(node.sourceType) === "github" && /\/pull\/\d+/.test(label(node.url)) && node.metadata && typeof node.metadata === "object")
     .map((node) => label(record(node.metadata).status));
   return statuses.includes("merged") && !statuses.some((status) => status === "open" || status === "draft");
+}
+
+// Finished as a blocker counts it (README, "Waiting their turn"): Done, Canceled or a duplicate,
+// or in review with its pull requests merged. `node`: an issue with `state` and `attachments`.
+function finishedIssue(node: Record<string, unknown>): boolean {
+  const state = record(node.state ?? {});
+  if (["completed", "canceled", "duplicate"].includes(label(state.type))) return true;
+  return inReviewState(label(state.name), label(state.type)) && pullRequestsMerged(node.attachments);
+}
+
+// A parent and its sub-issues, for handing the group to Paseo (groups.ts): each sub-issue's
+// assignee, delegate (the Paseo app once handed out), labels and blockers.
+export const ISSUE_GROUP_QUERY = `query issueGroup($id: String!) {
+  issue(id: $id) {
+    id identifier state { name type } delegate { id }
+    children(first: 50) { nodes {
+      id identifier state { name type } assignee { id } delegate { id } labels(first: 20) { nodes { name } }
+      attachments(first: 10) { nodes { url sourceType metadata } }
+      inverseRelations(first: 10) { nodes { type issue { id identifier state { name type } delegate { id } attachments(first: 10) { nodes { url sourceType metadata } } } } }
+    } }
+  }
+}`;
+export type GroupIssue = { id: string; identifier: string; status: string; statusType: string; delegateId: string | null; finished: boolean };
+export type GroupChild = GroupIssue & { assigneeId: string | null; labels: string[]; blockers: GroupIssue[] };
+export type IssueGroup = GroupIssue & { children: GroupChild[] };
+function groupIssue(node: Record<string, unknown>): GroupIssue {
+  const state = record(node.state ?? {});
+  return { id: label(node.id), identifier: label(node.identifier), status: label(state.name), statusType: label(state.type), delegateId: label(record(node.delegate ?? {}).id) || null, finished: finishedIssue(node) };
 }
 
 // `blockedBy`: identifiers of unfinished tickets that block this one (merged reviews count as finished).
@@ -701,6 +730,7 @@ export class LinearService {
       teamKey: label(record(node.team ?? {}).key),
       priority: typeof node.priority === "number" ? node.priority : 0,
       labels: labelNodes(node.labels),
+      openChildren: connection(node.children ?? { nodes: [] }).nodes.length > 0,
     })).filter((issue) => issue.id)
       // Most urgent first; tickets without a priority last. Stable otherwise (Linear's order).
       .sort((a, b) => (a.priority || 5) - (b.priority || 5));
@@ -731,17 +761,31 @@ export class LinearService {
     const blockedBy = connection(issue.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
       .filter((relation) => label(relation.type) === "blocks")
       .map((relation) => record(relation.issue ?? {}))
-      .filter((blocker) => {
-        const state = record(blocker.state ?? {});
-        if (["completed", "canceled", "duplicate"].includes(label(state.type))) return false;
-        return !(inReviewState(label(state.name), label(state.type)) && pullRequestsMerged(blocker.attachments));
-      })
+      .filter((blocker) => !finishedIssue(blocker))
       .map((blocker) => label(blocker.identifier)).filter(Boolean);
     return {
       id: label(issue.id), identifier: label(issue.identifier), status: label(state.name), statusId: label(state.id), statusType: label(state.type),
       teamId: label(record(issue.team ?? {}).id) || null, projectId: label(record(issue.project ?? {}).id) || null, creatorId: label(record(issue.creator ?? {}).id) || null,
       labels: labelNodes(issue.labels), attachmentUrls, blockedBy,
     };
+  }
+
+  async issueGroup(id: string): Promise<IssueGroup> {
+    const data = record(await this.read(ISSUE_GROUP_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object")));
+    if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
+    const issue = record(data.issue);
+    const children = connection(issue.children ?? { nodes: [] }).nodes.map((node) => record(node)).map((child) => ({
+      ...groupIssue(child),
+      assigneeId: label(record(child.assignee ?? {}).id) || null,
+      labels: connection(child.labels ?? { nodes: [] }).nodes.map((node) => label(record(node).name)).filter(Boolean),
+      blockers: connection(child.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
+        .filter((relation) => label(relation.type) === "blocks")
+        .map((relation) => groupIssue(record(relation.issue ?? {})))
+        .filter((blocker) => blocker.id),
+    }));
+    // Lowest number first: the order they were filed in, and the order they are handed out.
+    children.sort((a, b) => a.identifier.localeCompare(b.identifier, undefined, { numeric: true }));
+    return { ...groupIssue(issue), children };
   }
 
   // `ready` puts the ticket into the team's first unstarted state (Todo) instead of Triage, for
@@ -792,6 +836,16 @@ export class LinearService {
     const done = (await this.teamStates(state.teamId)).filter((item) => item.type === "completed").sort((a, b) => a.position - b.position)[0];
     if (!done) return;
     succeeded(await this.writeState(issueId, done.id), "issueUpdate", "complete the ticket");
+  }
+
+  // Moves the ticket to its team's first canceled state, with the reason posted first.
+  async cancel(issueId: string, reason: string): Promise<void> {
+    const state = await this.issueState(issueId);
+    if (!state.teamId || ["completed", "canceled", "duplicate"].includes(state.statusType)) return;
+    const canceled = (await this.teamStates(state.teamId)).filter((item) => item.type === "canceled").sort((a, b) => a.position - b.position)[0];
+    if (!canceled) return;
+    await this.comment(issueId, reason);
+    succeeded(await this.writeState(issueId, canceled.id), "issueUpdate", "cancel the ticket");
   }
 
   async teamIdByKey(teamKey: string): Promise<string | null> {
