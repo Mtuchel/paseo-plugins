@@ -151,7 +151,7 @@ test("a queue drop prompts the live agent once with the reason, the failed check
   assert.match(prompt, /Reason: The merge queue closed its draft pull request #437 without landing it\./);
   assert.match(prompt, /- \[Code validation \/ Core \(core-web\)\]\(https:\/\/github\.com\/tuchel-sohn\/tuchel-platform\/actions\/runs\/1\/job\/2\) — failure/);
   assert.match(prompt, /worktree \(`\/wt\/tuc-1`\), on the top branch of the stack, run `git fetch origin main && git rebase --update-refs --onto origin\/main "\$\(git merge-base HEAD origin\/main\)"`/);
-  assert.match(prompt, /`gt submit --stack --ignore-out-of-sync-trunk`, then `gt merge`/);
+  assert.match(prompt, /`gt submit --stack --ignore-out-of-sync-trunk`, then `git switch mtuchel\/tuc-1-fix && gt merge` \(the top branch of the dropped queue range, not the stack's top branch\) and `node tools\/ci\/wait-queue\.mjs 419`/);
   assert.doesNotMatch(prompt, /run `gt sync/);
   assert.match(prompt, /If your stack sits on a PR that has already landed, or your PR was auto-closed, follow docs\/automation\/merge-queue\.md instead\.\n2\. Fix the cause\./);
   assert.match(prompt, /one plain `gt merge` retry/);
@@ -600,7 +600,7 @@ test("a merge conflict before any queue draft, or with nothing failed or running
   assert.match(prompt, /Conflict only: .*\(docs\/automation\/merge-queue\.md#conflict-only-drops\)/);
   assert.match(prompt, /`git fetch origin main && git rebase --update-refs --onto origin\/main "\$\(git merge-base HEAD origin\/main\)"`/);
   assert.match(prompt, /regenerate them; never merge them by hand\. Run the focused checks/);
-  assert.match(prompt, /then right away `gt merge` and `node tools\/ci\/wait-queue\.mjs <top enqueued PR>`\. Do not wait for the pull request's checks/);
+  assert.match(prompt, /then right away `git switch mtuchel\/tuc-1-fix && gt merge` \(the top branch of the dropped queue range, not the stack's top branch\) and `node tools\/ci\/wait-queue\.mjs 419`\. Do not wait for the pull request's checks[^\n]*wait with `node tools\/ci\/wait-checks\.mjs 419` and run `gt merge` once more\./);
   assert.doesNotMatch(prompt, /Fix the cause/);
   assert.match(prompt, /This is automatic restack 1 of 5 for this pull request/);
 
@@ -610,6 +610,34 @@ test("a merge conflict before any queue draft, or with nothing failed or running
   const restack = promptOf(await green.poll()) ?? "";
   assert.match(restack, /No check failed on the queue's draft \[#437\]/);
   assert.match(restack, /restack 1 of 5/);
+});
+
+test("a drop re-enqueues the dropped queue range from its top branch, never from the stack's top above it", async (t) => {
+  const pull = (number: number) => `https://github.com/tuchel-sohn/tuchel-platform/pull/${number}`;
+  // 419 (recorded) <- 1501 <- 1502 (the stack's top); the queue's draft tested 419 and 1501 with
+  // TUC-10's 1600.
+  const step2 = { ...OPEN_PR, headSha: "s2", headBranch: "mtuchel/tuc-1-b", baseBranch: "mtuchel/tuc-1-fix" };
+  const step3 = { ...OPEN_PR, headSha: "s3", headBranch: "mtuchel/tuc-1-c", baseBranch: "mtuchel/tuc-1-b" };
+  const other = { ...OPEN_PR, headSha: "o1", headBranch: "mtuchel/tuc-10-x", baseBranch: "main" };
+  const stack = [listed(pull(1501), step2, "Add TUC-1 [plugin] Step two"), listed(pull(1502), step3, "Add TUC-1 [plugin] Step three"), listed(pull(1600), other, "Add TUC-10 [plugin] Something else")];
+  for (const outcome of [CONFLICT, REMOVED]) {
+    const h = harness(t);
+    h.github.view = { ...OPEN_PR, mergeActivity: activity(QUEUED, running(437), outcome) };
+    h.github.drafts = [draft(437, [419, 1501, 1600])];
+    h.github.open = stack;
+    const prompt = promptOf(await h.poll()) ?? "";
+    assert.match(prompt, outcome === CONFLICT ? /Conflict only/ : /Fix the cause/);
+    assert.match(prompt, /`git switch mtuchel\/tuc-1-b && gt merge` \(the top branch of the dropped queue range, not the stack's top branch\) and `node tools\/ci\/wait-queue\.mjs 1501`/, outcome);
+    assert.doesNotMatch(prompt, /tuc-1-c|1502|tuc-10-x|wait-queue\.mjs 1600/, outcome);
+
+    // Without a draft listing the range, the dropped pull request is its top.
+    const bare = harness(t);
+    bare.github.view = { ...OPEN_PR, mergeActivity: activity(QUEUED, outcome) };
+    bare.github.open = stack;
+    const own = promptOf(await bare.poll()) ?? "";
+    assert.match(own, /`git switch mtuchel\/tuc-1-fix && gt merge` [^\n]* and `node tools\/ci\/wait-queue\.mjs 419`/, outcome);
+    assert.doesNotMatch(own, /tuc-1-c|1502/, outcome);
+  }
 });
 
 test("a merge conflict with a failed, cancelled or still running check on the queue's draft, or a draft no longer listed, is a plain drop", async (t) => {
@@ -736,4 +764,51 @@ test("without a replacement, a pull request closed because its base branch is go
   assert.equal(handedBack[2], "say response The pull request was closed because the branch below it landed, and the agent is no longer running; the ticket is back in In Progress.");
   assert.equal(handedBack.length, 3);
   assert.deepEqual(await gone.poll(), []);
+});
+
+test("an archived agent's closed pull request stays watched after the replay request, so a replacement opened later is linked", async (t) => {
+  const h = harness(t, { status: "archived" });
+  h.github.view = { ...OPEN_PR, state: "CLOSED", baseBranch: PARENT };
+  h.github.deleted = [PARENT];
+  assert.match((await h.poll())[1] ?? "", /^comment [^]*gt track mtuchel\/tuc-1-fix --parent main/);
+  assert.deepEqual(await h.poll(), [], "asked once");
+  assert.deepEqual(h.github.reads, [PR], "still watched for its replacement");
+  h.github.open = [listed(NEXT, OPEN_PR)];
+  assert.deepEqual(await h.poll(), [`link Pull request ${NEXT}`, `handover link ${NEXT}`, `session link Pull request ${NEXT}`, "say thought The pull request was closed without merging; Paseo now follows its replacement #1500 from the same branch."]);
+  h.github.view = OPEN_PR;
+  await h.poll();
+  assert.deepEqual(h.github.reads, [NEXT]);
+
+  const quiet = harness(t, { status: "archived", updatedAt: ago(15 * 24 * 60 * MINUTE) });
+  await quiet.state({ [PR]: { reviewedAt: null, decision: null, merged: false, closed: true, replay: "asked", activeAt: ago(15 * 24 * 60 * MINUTE) } });
+  quiet.github.view = { ...OPEN_PR, state: "CLOSED", baseBranch: PARENT };
+  await quiet.poll();
+  assert.deepEqual(quiet.github.reads, [], "14 days without activity end the watch");
+});
+
+test("after a partial landing the ticket's lowest open pull request is linked, watched and nudged until none is open", async (t) => {
+  const pull = (number: number) => `https://github.com/tuchel-sohn/tuchel-platform/pull/${number}`;
+  const LANDED = ["externally-merged"];
+  for (const status of ["working", "archived"] as const) {
+    const h = harness(t, { status });
+    // 419 landed; 1501 (now on main) <- 1502 stay open, 1502's CI still runs; TUC-10's 1499 is not the ticket's.
+    const step2 = { ...READY, headSha: "s2", headBranch: "mtuchel/tuc-1-b", baseBranch: "main" };
+    const step3 = { ...READY, headSha: "s3", headBranch: "mtuchel/tuc-1-c", baseBranch: "mtuchel/tuc-1-b", checks: [GREEN, passing("PR code"), RUNNING_CI] };
+    const other = { ...READY, headSha: "o1", headBranch: "mtuchel/tuc-10-x", baseBranch: "main" };
+    h.github.view = { ...READY, state: "CLOSED", labels: LANDED };
+    h.github.views = { [pull(1501)]: step2, [pull(1502)]: step3, [pull(1499)]: other };
+    h.github.open = [listed(pull(1499), other, "Add TUC-10 [plugin] Something else"), listed(pull(1502), step3, "Add TUC-1 [plugin] Step three"), listed(pull(1501), step2, "Add TUC-1 [plugin] Step two")];
+    assert.deepEqual(await h.poll(), ["review merged", "say thought The pull request was merged.", "merged i1", `link Pull request ${pull(1501)}`, `handover link ${pull(1501)}`, `session link Pull request ${pull(1501)}`, "say thought The pull request landed; Paseo now follows the ticket's next open pull request #1501."], status);
+    const nudged = await h.poll();
+    assert.equal(h.github.reads[0], pull(1501), status);
+    assert.ok(nudged.some((call) => call.includes(`[The pull request](${pull(1501)}) is ready`) && call.includes("wait-queue.mjs 1501")), `${status}: the remaining pull request gets the merge nudge`);
+
+    h.github.views[pull(1501)] = { ...step2, state: "CLOSED", labels: LANDED };
+    h.github.open = [listed(pull(1499), other, "Add TUC-10 [plugin] Something else"), listed(pull(1502), { ...step3, baseBranch: "main" }, "Add TUC-1 [plugin] Step three")];
+    assert.ok((await h.poll()).includes(`handover link ${pull(1502)}`), `${status}: the next landing moves the link again`);
+    h.github.views[pull(1502)] = { ...step3, state: "CLOSED", labels: LANDED };
+    h.github.open = [listed(pull(1499), other, "Add TUC-10 [plugin] Something else")];
+    assert.deepEqual(await h.poll(), ["review merged", "say thought The pull request was merged.", "merged i1"], `${status}: nothing of the ticket is open any more`);
+    assert.deepEqual(await h.poll(), [], status);
+  }
 });

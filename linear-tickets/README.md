@@ -516,14 +516,20 @@ and nothing on the queue's draft failed, was cancelled or was still running (eve
 its head is read, all pages), or no draft existed; a draft no longer listed counts as unread, so
 the drop is plain. Every other drop is **plain**: Graphite also says "merge conflicts" for real
 failures. The ticket's agent gets the reason, the checks that did not pass on the draft and the
-runbook for the kind. A plain drop: on the stack's top branch `git fetch origin main && git
-rebase --update-refs --onto origin/main "$(git merge-base HEAD origin/main)"`, which moves only
-its own branches, never `gt sync`/`gt restack`; fix, `gt submit --stack
---ignore-out-of-sync-trunk`, `gt merge`; one plain `gt merge` retry for an obviously flaky
-failure. A conflict-only drop: the same rebase (only when every branch below is the agent's
-own), regenerate generated files instead of merging them, the focused checks, the same
-`gt submit`, then right away `gt merge` and `node tools/ci/wait-queue.mjs <top enqueued PR>`,
-without waiting for the pull request's checks: the queue's draft runs the full suite. The
+runbook for the kind. Both re-enqueue the dropped queue range from its top branch, the one `gt
+merge` ran on before the drop: the highest of the ticket's open pull requests the queue's draft
+listed, or the dropped pull request itself when no draft lists it; never the stack's top branch,
+which would enqueue pull requests above the range that are not ready. A plain drop: on the
+stack's top branch `git fetch origin main && git rebase --update-refs --onto origin/main
+"$(git merge-base HEAD origin/main)"`, which moves only its own branches, never `gt
+sync`/`gt restack`; fix, `gt submit --stack --ignore-out-of-sync-trunk`, then `git switch
+<range top> && gt merge` and `node tools/ci/wait-queue.mjs <its PR>`; one plain `gt merge` retry
+on that branch for an obviously flaky failure. A conflict-only drop: the same rebase (only when
+every branch below is the agent's own), regenerate generated files instead of merging them, the
+focused checks, the same `gt submit`, then right away `git switch <range top> && gt merge` and
+`node tools/ci/wait-queue.mjs <its PR>`, without waiting for the pull request's checks: the
+queue's draft runs the full suite (only when `gt merge` refuses because checks still run: `node
+tools/ci/wait-checks.mjs <its PR>`, then `gt merge` once more). The
 message goes out once the agent is idle; Paseo resumes it if it has stopped. While the agent is
 in a turn or waiting for an answer, or Paseo is not connected,
 the message waits for a later poll. When the agent is gone or archived, the same text becomes a
@@ -538,6 +544,15 @@ claimed before the kinds existed count as plain, and three of them as escalated.
 archived agent's open pull request stays watched until that escalation or 14 days without
 activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
 
+**Partial landings.** When the ticket's recorded pull request lands (merged, or closed by the
+queue as above) while other pull requests of the ticket are still open (the rest of its stack,
+or pull requests the agent replayed onto main), the ticket links the lowest of them (the one no
+other open pull request of the ticket sits on; ties go to the lower number), the agent panel
+and the handover record point at it, and the plugin watches and nudges it from the next poll,
+also for an archived agent. This repeats with each landing until none of the ticket's pull
+requests is open. The ticket's pull requests are the ones whose title names it as a whole word,
+as for the merge nudge.
+
 **Replacement pull requests.** When the queue lands part of a stack, Graphite deletes the
 landed branch, and GitHub closes the pull request based on it for good (it cannot be reopened
 onto a deleted base). For a ticket's pull request closed without merging, the plugin looks for
@@ -549,7 +564,8 @@ main from the landed branch (`git fetch origin main && git rebase --update-refs 
 origin/main <landed branch>` on the top branch), `git push --force-with-lease` each replayed
 branch, open a new pull request onto main whose body links the old one, and `gt track <branch>
 --parent main`. It is claimed and delivered like a nudge; a gone or archived agent's message goes
-to the ticket.
+to the ticket. After that request an archived agent's closed pull request stays watched for its
+replacement until 14 days pass without activity.
 
 **Stalled pull requests.** Agents often stop before their pull request reaches the merge queue.
 On each poll, an open pull request whose agent is idle gets the next step of its lifecycle as a
