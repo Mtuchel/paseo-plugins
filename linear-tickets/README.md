@@ -766,6 +766,12 @@ plugin checks each open review's server; after two failed checks it removes that
 `tailscale serve` route and marks the review closed. Only ports recorded there are ever turned
 off. When `:8444` cannot be published, the per-review link is posted as before.
 
+**Review inbox.** `https://<machine>.<tailnet>.ts.net:8444/` lists every review still waiting
+for you, oldest first, with how long it has waited, and the last ten decisions below. A review
+is listed while it is the agent's latest, was published in the tailnet and its server still
+answers; each row opens the agent's stable link. The page refreshes every 30 s. On a phone, use
+“Add to Home Screen” to keep it as an app.
+
 With status write-back on, a ticket moves to its team's started state named **Planning**
 when a plan is handed off (and stays there when it is sent back), and to **In Progress** once
 the plan is approved. Create a “Planning” state of type *started* in the team for this; teams

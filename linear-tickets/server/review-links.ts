@@ -14,6 +14,8 @@ export const REVIEW_SERVE_PORT = 8444;
 const SWEEP_MS = 30_000;
 const MISSES_TO_CLOSE = 2;
 const AGENT_ID = /^[A-Za-z0-9_-]+$/;
+const RECENT_DECISIONS = 10;
+const INBOX_REFRESH_S = 30;
 
 export type ReviewOutcome = "approved" | "sent back";
 export type ReviewEntry = {
@@ -61,18 +63,54 @@ function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
 }
 
+const PAGE_STYLE = `body{font:17px/1.5 -apple-system,system-ui,sans-serif;margin:0;padding:48px 24px;color:#1c1c1e;background:#f2f2f7}main{max-width:32rem;margin:auto}h1{font-size:1.4rem;margin:0 0 .5rem}h2{font-size:.8rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:#8e8e93;margin:2rem 0 .5rem}
+ul{list-style:none;margin:0;padding:0;border-radius:12px;overflow:hidden;background:#fff}li+li{border-top:1px solid #e5e5ea}li a,li>span{display:flex;justify-content:space-between;gap:12px;padding:14px 16px;color:inherit;text-decoration:none}li a:active{background:#e5e5ea}.meta{color:#8e8e93;white-space:nowrap}.empty{color:#8e8e93}
+@media(prefers-color-scheme:dark){body{color:#f2f2f7;background:#000}ul{background:#1c1c1e}li+li{border-color:#38383a}li a:active{background:#2c2c2e}}`;
+
+function page(title: string, body: string, head = ""): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)}</title>${head}<style>${PAGE_STYLE}</style></head>
+<body><main>${body}</main></body></html>`;
+}
+
 function closedPage(entry: ReviewEntry): string {
   const outcome = entry.outcome ?? "ended";
   const subject = entry.identifier ? `The plan review for ${escapeHtml(entry.identifier)}` : "This plan review";
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Review closed</title>
-<style>body{font:17px/1.5 -apple-system,system-ui,sans-serif;margin:0;padding:48px 24px;color:#1c1c1e;background:#f2f2f7}main{max-width:32rem;margin:auto}h1{font-size:1.4rem;margin:0 0 .5rem}@media(prefers-color-scheme:dark){body{color:#f2f2f7;background:#1c1c1e}}</style></head>
-<body><main><h1>Review closed — ${escapeHtml(outcome)}</h1><p>${subject} is no longer running. This link opens the agent's next review once it plans again.</p></main></body></html>`;
+  return page("Review closed", `<h1>Review closed — ${escapeHtml(outcome)}</h1><p>${subject} is no longer running. This link opens the agent's next review once it plans again.</p>`);
+}
+
+function ago(from: string, now: Date): string {
+  const minutes = Math.max(0, Math.floor((now.getTime() - Date.parse(from)) / 60_000));
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 48 ? `${hours} h` : `${Math.floor(hours / 24)} d`;
+}
+
+function reviewName(entry: ReviewEntry): string {
+  return escapeHtml(entry.identifier ?? `Plan review · agent ${entry.agentId.slice(0, 8)}`);
+}
+
+const MANIFEST = JSON.stringify({ name: "Plan reviews", short_name: "Reviews", start_url: "/", display: "standalone", background_color: "#f2f2f7", theme_color: "#f2f2f7" });
+
+// The root of :8444: every review waiting for the owner, oldest first, plus the latest decisions.
+// Rows link to the agent's stable /review/<agentId> link, which shows the closed page if the review
+// ends before it is tapped.
+function inboxPage({ open, decided }: { open: ReviewEntry[]; decided: ReviewEntry[] }, now: Date): string {
+  const waiting = open.length
+    ? `<ul>${open.map((entry) => `<li><a href="/review/${encodeURIComponent(entry.agentId)}"><span>${reviewName(entry)}</span><span class="meta">${ago(entry.openedAt, now)}</span></a></li>`).join("")}</ul>`
+    : `<p class="empty">Nothing to review.</p>`;
+  const recent = decided.length
+    ? `<h2>Recently decided</h2><ul>${decided.map((entry) => `<li><span><span>${reviewName(entry)}</span><span class="meta">${escapeHtml(entry.outcome ?? "ended")} · ${ago(entry.closedAt ?? entry.openedAt, now)} ago</span></span></li>`).join("")}</ul>`
+    : "";
+  const head = `<meta http-equiv="refresh" content="${INBOX_REFRESH_S}"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Reviews"><link rel="manifest" href="/manifest.webmanifest">`;
+  return page(open.length ? `Plan reviews (${open.length})` : "Plan reviews", `<h1>Plan reviews</h1>${waiting}${recent}`, head);
 }
 
 // One stable tailnet link per agent — https://<host>:8444/review/<agentId> — that redirects to
 // the agent's current Plannotator review. Plannotator's page uses absolute /api paths, so each
 // review keeps its own `tailscale serve` port; this server only points at the live one and,
-// once a review's server is gone, removes that port's route (the plugin owns the cleanup).
+// once a review's server is gone, removes that port's route (the plugin owns the cleanup). Its
+// root, https://<host>:8444/, lists every review still waiting for the owner.
 export class ReviewLinks {
   private server: Server | null = null;
   private timer: NodeJS.Timeout | null = null;
@@ -197,7 +235,13 @@ export class ReviewLinks {
   }
 
   private async respond(method: string, url: string): Promise<{ status: number; headers?: Record<string, string>; body?: string }> {
-    const match = /^\/review\/([^/]+)\/?$/.exec(new URL(url, "http://localhost").pathname);
+    const path = new URL(url, "http://localhost").pathname;
+    if (path === "/" || path === "/manifest.webmanifest") {
+      if (method !== "GET") return { status: 405, headers: { allow: "GET" } };
+      if (path === "/manifest.webmanifest") return { status: 200, headers: { "content-type": "application/manifest+json" }, body: MANIFEST };
+      return { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: inboxPage(await this.inbox(), this.now()) };
+    }
+    const match = /^\/review\/([^/]+)\/?$/.exec(path);
     const agentId = match ? decodeURIComponent(match[1]) : null;
     if (!agentId || !AGENT_ID.test(agentId)) return { status: 404 };
     if (method !== "GET") return { status: 405, headers: { allow: "GET" } };
@@ -205,6 +249,20 @@ export class ReviewLinks {
     if (!entry) return { status: 404 };
     if (!entry.closedAt && entry.remoteUrl && await this.alive(entry.localUrl)) return { status: 302, headers: { location: entry.remoteUrl } };
     return { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: closedPage(entry) };
+  }
+
+  // Only each agent's latest review counts. Open means reachable from the tailnet and still
+  // answering now, so a review that died since the last sweep is not listed.
+  private async inbox(): Promise<{ open: ReviewEntry[]; decided: ReviewEntry[] }> {
+    const registry = await this.load();
+    const current = Object.values(registry).filter((entry) => AGENT_ID.test(entry.agentId) && latest(registry, entry.agentId) === entry);
+    const candidates = current.filter((entry) => !entry.closedAt && entry.remoteUrl);
+    const alive = await Promise.all(candidates.map((entry) => this.alive(entry.localUrl)));
+    const open = candidates.filter((_, index) => alive[index]).sort((a, b) => a.openedAt.localeCompare(b.openedAt));
+    const decided = current.filter((entry) => entry.closedAt)
+      .sort((a, b) => (b.closedAt ?? "").localeCompare(a.closedAt ?? ""))
+      .slice(0, RECENT_DECISIONS);
+    return { open, decided };
   }
 
   private async load(): Promise<Registry> {
