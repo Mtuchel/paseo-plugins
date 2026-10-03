@@ -64,7 +64,7 @@ export async function stalledStage(view: PullRequestView, url: string, now: numb
     if (!quiet) return null;
     return { stage: "draft", key, text: [
       `[The pull request](${url}) is still a draft, with no new commit or pull request activity for ${DRAFT_IDLE_MS / 60_000} minutes.`,
-      `Next step: run the background Sol review if you have not yet. Publish only the reviewed part of your stack, bottom first: \`gt submit --publish --no-stack --branch ${view.headBranch}\` once this branch and every branch below it are reviewed; the branches above stay drafts until they are.`,
+      `Next step: run the background Sol review if you have not yet. Publish only the reviewed part of your stack, bottom first: \`git switch ${view.headBranch} && node tools/ci/publish.mjs\` once this branch and every branch below it are reviewed and each passed \`mise exec -- pnpm verify:pre-pr --body-file <body>\` (never a bare \`gt submit --publish\` or \`gh pr ready\`: \`publish.mjs\` refuses until PR metadata is green and prints any owner question); the branches above stay drafts until they are.`,
     ].join("\n") };
   }
   const failed = failedChecks(view);
