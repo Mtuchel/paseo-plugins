@@ -8,7 +8,8 @@ import { promisify } from "node:util";
 import type { PaseoApi } from "@getpaseo/client";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, writeOpenScript } from "./plannotator";
-import { DEFAULT_AUTO_APPROVE, planHash } from "../shared/plan-risk";
+import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
+import { planHash } from "./review-outcome";
 
 const exec = promisify(execFile);
 // Bridges built without an opener use the default one: never open a real browser from the tests.

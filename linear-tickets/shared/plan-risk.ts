@@ -2,17 +2,10 @@
 // carries a `## Risk and impact` section in a fixed format; the omp extension refuses to record the
 // advisor review without it, and the Plannotator bridge approves a plan on the owner's behalf when
 // the rating is within the owner's threshold. The model rates; this module's rule decides.
-// No npm dependencies: the omp extension imports it from outside the plugin's build.
-
-import { createHash } from "node:crypto";
+// No imports: Paseo's shared bundle refuses Node modules, and the omp extension imports it from
+// outside the plugin's build. Plan texts are hashed with server/review-outcome.ts `planHash`.
 
 export const RISK_SECTION = "Risk and impact";
-
-// A plan text's identity: the extension hashes the plan it records the advisor review for, the
-// server the text Plannotator shows the owner and the decisions Plannotator saved.
-export function planHash(plan: string): string {
-  return createHash("sha256").update(plan.trim()).digest("hex");
-}
 
 export const IMPACT_LEVELS = [
   "no business process (agent tooling, CI, docs, refactor without behavior change)",
