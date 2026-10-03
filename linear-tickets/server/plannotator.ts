@@ -215,21 +215,19 @@ export class PlannotatorBridge {
   // The risk policy (README, "Plan risk and auto-approval"): approves the plan on the owner's
   // behalf when its `## Risk and impact` rating is within the threshold, the advisor review the
   // extension recorded is for exactly this text, and nothing about the ticket needs the owner.
-  // null: the plan has no readable rating, or it is a project planner's work order.
+  // A project planner's work order is judged the same way; its approval is applied by the project
+  // flow. null: the plan has no readable rating.
   private async judge(localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
     const rated = parsePlanRisk(planText);
     if ("problem" in rated) return null;
     const rating = `Risk: ${ratingText(rated.risk)}.`;
     try {
       const state = await this.linear.issueState(issueId);
-      const own = dispatchLabels(settings.dispatch.label);
-      // A planner's work order is applied by the project flow, never auto-approved.
-      if (hasLabel(state.labels, own.planner.toLowerCase())) return null;
       const advice = this.advised.get(agentId);
       const outcome = autoApproval(rated.risk, settings.autoApprove, {
         verdict: advice && advice.hash === planHash(planText) ? advice.verdict : null,
         untrusted: isUntrusted(state, await this.linear.viewerId(), await this.linear.appUserId()),
-        attended: hasLabel(state.labels, own.attended.toLowerCase()),
+        attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()),
       });
       if (!outcome.approve) return { approved: false, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.` };
       await this.decide(localUrl, true, `Auto-approved by the risk policy. ${rating}`);

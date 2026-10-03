@@ -226,8 +226,25 @@ test("a plan goes to the owner, with the rating and why, when anything the polic
   }
 });
 
-test("a project planner's work order is never auto-approved and carries no rating", async () => {
-  const { decisions, comment } = await review({ advisedPlan: RISKY(0), ticket: { creatorId: "owner", labels: ["paseo-planner"] } });
-  assert.deepEqual(decisions, []);
-  assert.equal(comment, "comment issue-1: 📋 **Plan ready for review in Plannotator**: https://host.ts.net:4000/");
+test("a project planner's work order within the threshold is approved without the owner and applied by the project flow", async () => {
+  const order = `# Work order\n\n## Work order\n\n\`\`\`project-order\nTUC-12 blocks TUC-15\n\`\`\`\n\n${RISKY(0).replace(/^# Plan\n\n1\. Add the column to the report\.\n\n/, "")}`;
+  const { calls, linear, paseo } = setup({ "linear.issueId": "planner-1", "linear.identifier": "TUC-90" }, { creatorId: "paseo-app", labels: ["paseo-planner", "plan"] });
+  const decisions: string[] = [];
+  await withEvents([
+    { type: "advised", agentId: "agent-1", verdict: "agreed", hash: planHash(order), at: "2026-01-01T09:59:00Z" },
+    { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
+    // What the omp plan extension reports once Plannotator took the approval.
+    { type: "decided", agentId: "agent-1", approved: true, planContent: order, at: "2026-01-01T10:00:05Z" },
+  ], async (directory) => {
+    const decide = async (url: string, approve: boolean) => { decisions.push(`${url} ${approve}`); };
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => order, undefined, undefined, undefined, decide);
+    bridge.onProjectPlan(async (issueId, agentId, plan) => { calls.push(`apply ${issueId} ${agentId} ${plan === order}`); return true; });
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.deepEqual(decisions, ["http://localhost:4000/ true"]);
+  assert.ok(calls.some((call) => call.startsWith("comment planner-1: 🤖 **Plan auto-approved**")));
+  assert.ok(calls.includes("apply planner-1 agent-1 true"));
+  assert.ok(!calls.includes("+plan-ready planner-1") && !calls.includes("state planner-1 In Progress"), "nothing else of an approval applies to a planner");
 });

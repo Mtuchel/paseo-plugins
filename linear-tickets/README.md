@@ -456,8 +456,10 @@ When the review opens, the plugin approves it on your behalf only if all of thes
 - reversibility `revert`, no migration, no auth change, and the planner recommends `auto`;
 - the advisor `agreed`, recorded for exactly the text Plannotator shows (an edited plan, an
   unavailable advisor, open disagreements or a plugin reload in between send it to you);
-- the ticket is yours (not someone else's, not `feedback`), not marked attended, and not a
-  project planner's work order.
+- the ticket is yours (not someone else's, not `feedback`) and not marked attended.
+
+A project planner's work order is judged the same way (the planner rates the order itself, which
+only changes Linear, normally impact 0), so a project's tickets are not left waiting on you.
 
 An auto-approved plan goes through the same approval as yours (state, `plan-ready`, the plan
 document, the agent's usual mode); the agent gets "Auto-approved by the risk policy" with the
@@ -551,7 +553,8 @@ the sidebar skip the line.
 others start as usual. A ticket may need you when it carries `paseo-attended` (the project
 planner marks these, and you can add or remove the label yourself) or when its plan needs your
 approval: someone else wrote it, or it carries `plan` (an approved plan, `plan-ready`, no longer
-counts). A project's planner ticket never waits: its plan is reviewed whenever you are back.
+counts). A project's planner ticket never waits: its work order is auto-approved within your
+threshold, or reviewed whenever you are back.
 Waiting tickets keep their place and start within a few minutes of you being present again; agents
 already working continue. A ticket that asks you something anyway stops in Needs input and frees
 its slot.
@@ -616,8 +619,9 @@ every 2 minutes.
   (Urgent, labels `paseo-planner` and `plan`) and assigns it to Paseo. Its agent reads the open
   tickets, listed in its description with the new ones marked, and the code, and plans which
   tickets block which (because one builds on another, or both touch the same files), which
-  must wait for you, and which may need you while they run. You review that plan like any other.
-  Its last section is a block like:
+  must wait for you, and which may need you while they run. Its plan is approved like any other,
+  automatically when its rating is within your threshold (see **Plan risk and auto-approval**).
+  Its `## Work order` section holds a block like:
 
   ````
   ```project-order
@@ -628,7 +632,7 @@ every 2 minutes.
   ```
   ````
 
-  On approval Paseo adds the blocking relations, puts `paseo-hold` on held tickets (removes it
+  On approval, yours or automatic, Paseo adds the blocking relations, puts `paseo-hold` on held tickets (removes it
   from released ones) and `paseo-attended` on attended ones (`unattended X` removes it), comments
   what it applied and skipped, closes the planner ticket and archives its agent. Nothing else of
   an approval (In Progress, `plan-ready`) applies to it. The planner is told to mark a ticket
