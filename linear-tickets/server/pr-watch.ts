@@ -464,9 +464,9 @@ export class PullRequestWatch {
       "To land it:",
       `1. In your stack's worktree${record.worktreePath ? ` (\`${record.worktreePath}\`)` : ""}, on the top branch of the stack, run \`git fetch origin main && git rebase --update-refs --onto origin/main "$(git merge-base HEAD origin/main)"\`. It moves only your own branches; never \`gt sync\` or \`gt restack\`, which move the shared \`main\` and other agents' branches. If your stack sits on a PR that has already landed, or your PR was auto-closed, follow docs/automation/merge-queue.md instead.`,
       "2. Fix the cause.",
-      "3. Run `gt submit --stack --ignore-out-of-sync-trunk`, then `gt merge`.",
+      "3. Run `gt submit --stack --ignore-out-of-sync-trunk`, then `node tools/ci/enqueue.mjs` on the branch you enqueued before (never a bare `gt merge`; it refuses while the range conflicts with `main` or the queue tip and names the fix).",
       "",
-      "An obviously flaky failure (unrelated to the change) gets one plain `gt merge` retry instead.",
+      "An obviously flaky failure (unrelated to the change) gets one plain `node tools/ci/enqueue.mjs` retry instead.",
       `This is automatic fix request ${handled + 1} of ${DROP_PROMPTS} for this pull request; after that the owner takes over.`,
     ].join("\n");
     return { key: drop.key, reason: drop.reason, facts, fix };
