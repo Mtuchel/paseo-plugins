@@ -8,6 +8,7 @@ import { dispatchLabels } from "./dispatch";
 import type { LinearService, ProjectIssue } from "./linear";
 import type { Scheduler } from "./scheduler";
 import { needsOwner } from "./presence";
+import { PLAN_READY_LABEL } from "./plan-policy";
 import type { PluginSettings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
@@ -19,6 +20,8 @@ import { paseoHome } from "./ticket-mcp";
 //    `linear.plan-project` files it right away instead of at the next poll.
 // 2. Every poll, the project's planned, unblocked, unheld tickets that nobody has are handed to
 //    Paseo in the scheduler's order, one per free agent slot. Each ticket plans on its own.
+// 3. An approved work order is kept with the record before it is written, and every poll writes
+//    one that is not in Linear yet (README, "Projects"), so a failed write never stops the project.
 
 // How often a project's tickets are read: a project is a few paginated queries.
 const POLL_MS = 2 * 60_000;
@@ -26,12 +29,17 @@ const POLL_MS = 2 * 60_000;
 // a 200-ticket project near 60,000 characters.
 const DESCRIPTION_CHARS = 160;
 const HAND_OUT_TYPES = new Set(["backlog", "unstarted"]);
+// Polls a work order is retried while some of its changes fail, before it is closed with them skipped.
+const APPLY_TRIES = 3;
 
 // `plannedThrough`: tickets created up to this time are in an approved (or closed) plan.
-// `planner`: the open planner ticket, the time its ticket list was taken and how many new tickets it plans.
-export type ProjectRecord = { plannedThrough: string | null; planner: { id: string; identifier: string; url: string; listedAt: string; tickets: number } | null };
+// `planner`: the open planner ticket, the time its ticket list was taken and how many new tickets it
+// plans; `approved`: its approved work order, until it is written into Linear.
+// `closedPlanner`: the planner ticket closed last, so a late report of its review is still its own.
+export type PlannerRecord = { id: string; identifier: string; url: string; listedAt: string; tickets: number; approved?: { agentId: string | null; plan: string } };
+export type ProjectRecord = { plannedThrough: string | null; planner: PlannerRecord | null; closedPlanner?: string };
 
-type Read = { work: ProjectIssue[]; record: ProjectRecord; owner: string; planned: (issue: ProjectIssue) => boolean; unplanned: ProjectIssue[]; status: ProjectStatus };
+type Read = { work: ProjectIssue[]; record: ProjectRecord; plannerIssue: ProjectIssue | null; owner: string; planned: (issue: ProjectIssue) => boolean; unplanned: ProjectIssue[]; status: ProjectStatus };
 
 export class ProjectStore {
   constructor(private readonly path = join(paseoHome(), "linear-tickets", "projects.json")) {}
@@ -69,7 +77,7 @@ export function parseOrder(plan: string): OrderStep[] {
 }
 
 type Deps = {
-  linear: Pick<LinearService, "labeledProjects" | "projectIssues" | "issueDescriptions" | "createIssue" | "addLabel" | "removeLabel" | "delegate" | "addBlocker" | "complete" | "comment" | "appUserId" | "viewerId">;
+  linear: Pick<LinearService, "labeledProjects" | "projectIssues" | "issueDescriptions" | "issueDocument" | "createIssue" | "addLabel" | "removeLabel" | "delegate" | "addBlocker" | "complete" | "comment" | "appUserId" | "viewerId">;
   scheduler: Pick<Scheduler, "note" | "admit" | "release">;
   // The cap the starter's start paths admit under (max agents, or a memory lease).
   capacity: Pick<Capacity, "limit">;
@@ -83,6 +91,10 @@ export class ProjectFlow {
   private readonly store: ProjectStore;
   private lastPoll = 0;
   private statuses: ProjectStatus[] = [];
+  // Planner tickets whose work order is being written, so a poll and an approval never write it twice.
+  private readonly applying = new Set<string>();
+  // Per planner ticket, the polls whose write had failing changes.
+  private readonly failedTries = new Map<string, number>();
 
   constructor(private readonly deps: Deps) {
     this.store = deps.store ?? new ProjectStore();
@@ -108,7 +120,11 @@ export class ProjectFlow {
     const statuses: ProjectStatus[] = [];
     for (const project of await this.deps.linear.labeledProjects(settings.dispatch.label)) {
       try {
-        const read = await this.read(project, settings);
+        let read = await this.read(project, settings);
+        // A work order that fails to write is retried next poll; the project's planned tickets still go out.
+        const written = read.record.planner && await this.applyApproved(project.id, read.record.planner, read.plannerIssue, paseo, settings)
+          .catch((error: unknown) => { console.error(`[linear-tickets] ${read.record.planner!.identifier}: writing the work order failed, the next poll retries: ${error instanceof Error ? error.message : error}`); return false; });
+        if (written) read = await this.read(project, settings);
         // Always on: new tickets get a planner as soon as none is open.
         statuses.push(!read.record.planner && read.unplanned.length ? await this.filePlanner(project, read, appId, settings) : read.status);
         await this.handOut(project.id, read.work, read.work.filter(read.planned), read.owner, appId, paseo, settings);
@@ -125,13 +141,14 @@ export class ProjectFlow {
   private async read(project: { id: string; name: string }, settings: PluginSettings): Promise<Read> {
     const labels = dispatchLabels(settings.dispatch.label);
     const issues = await this.deps.linear.projectIssues(project.id);
-    let record = (await this.store.all())[project.id] ?? { plannedThrough: null, planner: null };
+    let record: ProjectRecord = (await this.store.all())[project.id] ?? { plannedThrough: null, planner: null };
     // A planner closed without an applied plan (the owner canceled or finished it): its tickets
     // count as planned, so they are not offered for planning again.
     if (record.planner && !issues.some((issue) => issue.id === record.planner!.id)) {
-      record = { plannedThrough: record.planner.listedAt, planner: null };
+      record = { plannedThrough: record.planner.listedAt, planner: null, closedPlanner: record.planner.id };
       await this.store.put(project.id, record);
     }
+    const plannerIssue = record.planner ? issues.find((issue) => issue.id === record.planner!.id) ?? null : null;
     const work = issues.filter((issue) => !issue.labels.some((name) => name.toLowerCase() === labels.planner.toLowerCase()));
     const owner = await this.deps.linear.viewerId();
     const planned = (issue: ProjectIssue) => record.plannedThrough !== null && issue.createdAt <= record.plannedThrough;
@@ -141,7 +158,7 @@ export class ProjectFlow {
     const listedAt = record.planner?.listedAt;
     const toPlan = unplanned.filter((issue) => !listedAt || issue.createdAt > listedAt).length;
     const planner = record.planner ? { identifier: record.planner.identifier, url: record.planner.url, tickets: record.planner.tickets } : null;
-    return { work, record, owner, planned, unplanned, status: { id: project.id, name: project.name, toPlan, planner, readAt: new Date(this.now()).toISOString() } };
+    return { work, record, plannerIssue, owner, planned, unplanned, status: { id: project.id, name: project.name, toPlan, planner, readAt: new Date(this.now()).toISOString() } };
   }
 
   // `linear.plan-project`: files a planner ticket for the project's unplanned tickets right away
@@ -169,7 +186,7 @@ export class ProjectFlow {
     const descriptions = await this.deps.linear.issueDescriptions(read.work.map((issue) => issue.id));
     const created = await this.deps.linear.createIssue({ teamId, projectId: project.id, ready: true, priority: 1, title: `Plan the work order of ${project.name}`, description: plannerBrief(project.name, read.work, read.unplanned, descriptions, labels) });
     const planner = { identifier: created.identifier, url: created.url, tickets: read.unplanned.length };
-    await this.store.put(project.id, { plannedThrough: read.record.plannedThrough, planner: { id: created.id, listedAt, ...planner } });
+    await this.store.put(project.id, { ...read.record, planner: { id: created.id, listedAt, ...planner } });
     await this.deps.linear.addLabel(created.id, labels.planner);
     await this.deps.linear.delegate(created.id, appId);
     console.log(`[linear-tickets] project ${project.name}: planner ${created.identifier} for ${read.unplanned.length} new ticket${read.unplanned.length === 1 ? "" : "s"}`);
@@ -208,48 +225,91 @@ export class ProjectFlow {
     }
   }
 
-  // An approved plan of a planner ticket: writes its order into Linear, marks its tickets planned,
-  // closes the planner ticket and retires its agent. False when the ticket is no planner.
-  async applyPlan(issueId: string, agentId: string, plan: string, paseo: PaseoApi, settings: PluginSettings): Promise<boolean> {
+  // Whether the ticket is a project's planner: the open one, or the one closed last (a late report
+  // of its review is still a work order, not a ticket plan).
+  async isPlanner(issueId: string): Promise<boolean> {
+    return Object.values(await this.store.all()).some((record) => record.planner?.id === issueId || record.closedPlanner === issueId);
+  }
+
+  // An approved work order of the open planner ticket: kept with the record first, so a write that
+  // fails is retried by the next poll, then written. False when the ticket is no open planner.
+  async applyPlan(issueId: string, agentId: string | null, plan: string, paseo: PaseoApi, settings: PluginSettings): Promise<boolean> {
     const entry = Object.entries(await this.store.all()).find(([, record]) => record.planner?.id === issueId);
     if (!entry) return false;
     const [projectId, record] = entry;
-    const labels = dispatchLabels(settings.dispatch.label);
-    const byIdentifier = new Map((await this.deps.linear.projectIssues(projectId)).map((issue) => [issue.identifier, issue]));
-    const done: string[] = [];
-    const skipped: string[] = [];
-    for (const step of parseOrder(plan)) {
-      const line = step.kind === "blocks" ? `${step.blocker} blocks ${step.blocked}` : `${step.kind} ${step.ticket}${step.reason ? `: ${step.reason}` : ""}`;
-      try {
-        if (step.kind === "blocks") {
-          const blocker = byIdentifier.get(step.blocker);
-          const blocked = byIdentifier.get(step.blocked);
-          if (!blocker || !blocked) { skipped.push(`${line} (not an open ticket of the project)`); continue; }
-          if (blocked.blockers.some((item) => item.id === blocker.id)) continue;
-          await this.deps.linear.addBlocker(blocker.id, blocked.id);
-        } else {
-          const ticket = byIdentifier.get(step.ticket);
-          if (!ticket) { skipped.push(`${line} (not an open ticket of the project)`); continue; }
-          if (step.kind === "hold") await this.deps.linear.addLabel(ticket.id, labels.hold);
-          else if (step.kind === "release") await this.deps.linear.removeLabel(ticket.id, labels.hold);
-          else if (step.kind === "attended") await this.deps.linear.addLabel(ticket.id, labels.attended);
-          else await this.deps.linear.removeLabel(ticket.id, labels.attended);
-        }
-        done.push(line);
-      } catch (error) {
-        skipped.push(`${line} (${error instanceof Error ? error.message : error})`);
-      }
-    }
-    await this.store.put(projectId, { plannedThrough: record.planner!.listedAt, planner: null });
-    this.statuses = this.statuses.map((status) => status.id === projectId ? { ...status, planner: null } : status);
-    await this.deps.linear.comment(issueId, [
-      `**Work order applied** (${done.length} change${done.length === 1 ? "" : "s"}). The project's tickets are now handed to Paseo in order as agent slots free up.`,
-      done.length ? `Applied:\n${done.map((line) => `- ${line}`).join("\n")}` : "",
-      skipped.length ? `Skipped:\n${skipped.map((line) => `- ${line}`).join("\n")}` : "",
-    ].filter(Boolean).join("\n\n"));
-    await this.deps.linear.complete(issueId);
-    await this.deps.retire(agentId, paseo);
+    const planner = { ...record.planner!, approved: { agentId, plan } };
+    await this.store.put(projectId, { ...record, planner });
+    await this.write(projectId, planner, paseo, settings)
+      .catch((error: unknown) => console.error(`[linear-tickets] ${planner.identifier}: writing the work order failed, the next poll retries: ${error instanceof Error ? error.message : error}`));
     return true;
+  }
+
+  // Every poll: the open planner's approved work order, written now if it is not in Linear yet.
+  // A planner ticket carrying plan-ready was approved like a ticket plan (a plugin version that
+  // parked work orders for the owner) and its order is read from its plan document. True when written.
+  private async applyApproved(projectId: string, planner: PlannerRecord, plannerIssue: ProjectIssue | null, paseo: PaseoApi, settings: PluginSettings): Promise<boolean> {
+    let approved = planner.approved ?? null;
+    if (!approved && plannerIssue?.labels.some((name) => name.toLowerCase() === PLAN_READY_LABEL)) {
+      const document = await this.deps.linear.issueDocument(planner.id, `Plan: ${planner.identifier}`);
+      if (document?.content.trim()) approved = { agentId: null, plan: document.content };
+    }
+    if (!approved) return false;
+    return this.write(projectId, { ...planner, approved }, paseo, settings);
+  }
+
+  // Writes the order into Linear, marks its tickets planned, closes the planner ticket and retires
+  // its agent. Every change is safe to repeat, so a failed write is simply written again: while
+  // changes fail it throws for up to APPLY_TRIES polls, then closes with them listed as skipped.
+  private async write(projectId: string, planner: PlannerRecord, paseo: PaseoApi, settings: PluginSettings): Promise<boolean> {
+    if (this.applying.has(planner.id) || !planner.approved) return false;
+    this.applying.add(planner.id);
+    try {
+      const labels = dispatchLabels(settings.dispatch.label);
+      const byIdentifier = new Map((await this.deps.linear.projectIssues(projectId)).map((issue) => [issue.identifier, issue]));
+      const done: string[] = [];
+      const skipped: string[] = [];
+      const failed: string[] = [];
+      for (const step of parseOrder(planner.approved.plan)) {
+        const line = step.kind === "blocks" ? `${step.blocker} blocks ${step.blocked}` : `${step.kind} ${step.ticket}${step.reason ? `: ${step.reason}` : ""}`;
+        try {
+          if (step.kind === "blocks") {
+            const blocker = byIdentifier.get(step.blocker);
+            const blocked = byIdentifier.get(step.blocked);
+            if (!blocker || !blocked) { skipped.push(`${line} (not an open ticket of the project)`); continue; }
+            // Already there (an earlier write of this order, or the owner): counted as applied.
+            if (!blocked.blockers.some((item) => item.id === blocker.id)) await this.deps.linear.addBlocker(blocker.id, blocked.id);
+          } else {
+            const ticket = byIdentifier.get(step.ticket);
+            if (!ticket) { skipped.push(`${line} (not an open ticket of the project)`); continue; }
+            if (step.kind === "hold") await this.deps.linear.addLabel(ticket.id, labels.hold);
+            else if (step.kind === "release") await this.deps.linear.removeLabel(ticket.id, labels.hold);
+            else if (step.kind === "attended") await this.deps.linear.addLabel(ticket.id, labels.attended);
+            else await this.deps.linear.removeLabel(ticket.id, labels.attended);
+          }
+          done.push(line);
+        } catch (error) {
+          failed.push(`${line} (${error instanceof Error ? error.message : error})`);
+        }
+      }
+      if (failed.length) {
+        const tries = (this.failedTries.get(planner.id) ?? 0) + 1;
+        this.failedTries.set(planner.id, tries);
+        if (tries < APPLY_TRIES) throw new Error(`${failed.length} change${failed.length === 1 ? "" : "s"} failed: ${failed.join("; ")}`);
+      }
+      await this.deps.linear.comment(planner.id, [
+        `**Work order applied** (${done.length} change${done.length === 1 ? "" : "s"}). The project's tickets are now handed to Paseo in order as agent slots free up.`,
+        done.length ? `Applied:\n${done.map((line) => `- ${line}`).join("\n")}` : "",
+        skipped.length || failed.length ? `Skipped:\n${[...skipped, ...failed].map((line) => `- ${line}`).join("\n")}` : "",
+      ].filter(Boolean).join("\n\n"));
+      await this.deps.linear.complete(planner.id);
+      await this.store.put(projectId, { plannedThrough: planner.listedAt, planner: null, closedPlanner: planner.id });
+      this.failedTries.delete(planner.id);
+      this.statuses = this.statuses.map((status) => status.id === projectId ? { ...status, planner: null } : status);
+      if (planner.approved.agentId) await this.deps.retire(planner.approved.agentId, paseo);
+      return true;
+    } finally {
+      this.applying.delete(planner.id);
+    }
   }
 }
 

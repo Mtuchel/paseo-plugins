@@ -17,6 +17,7 @@ import { autoApproval, parsePlanRisk, ratingText } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
 import { isUntrusted } from "./starter";
 import { dispatchLabels } from "./dispatch";
+import type { ProjectFlow } from "./project-flow";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -52,7 +53,7 @@ type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "moveToSta
 // What the risk policy made of an opened review: `line` tells the owner, in the panel and on Linear;
 // `reasons` why it needs the owner (empty when approved).
 type Judgement = { approved: boolean; line: string; reasons: string[] };
-type ProjectPlans = (issueId: string, agentId: string, plan: string, paseo: PaseoApi, settings: PluginSettings) => Promise<boolean>;
+type ProjectPlans = Pick<ProjectFlow, "isPlanner" | "applyPlan">;
 // Parked plans (README, "Parked plans"): `available` while the central Plannotator host runs;
 // `retire` closes the agent's own review with the reason, stops and archives the agent.
 export type Parking = {
@@ -152,7 +153,7 @@ export class PlannotatorBridge {
   // A decision taken in Linear is also reported by the omp plan extension; the second report
   // within this window is the same decision and is skipped.
   private readonly lastDecision = new Map<string, number>();
-  // Applies an approved plan of a project's planner ticket (project-flow.ts); true when it was one.
+  // A project's planner tickets and their work orders (project-flow.ts).
   private projectPlans: ProjectPlans | null = null;
   // Per agent, the advisor verdict the omp extension recorded last and the hash of that plan text.
   // In memory: after a plugin reload the next review simply goes to the owner.
@@ -237,25 +238,20 @@ export class PlannotatorBridge {
     this.lastDecision.set(agentId, Date.now());
   }
 
-  onProjectPlan(apply: ProjectPlans): void {
-    this.projectPlans = apply;
+  onProjectPlan(plans: ProjectPlans): void {
+    this.projectPlans = plans;
   }
 
   // The risk policy (README, "Plan risk and auto-approval"): approves the plan on the owner's
   // behalf when its `## Risk and impact` rating is within the threshold, the advisor review the
   // extension recorded is for exactly this text, and nothing about the ticket needs the owner.
-  // A project planner's work order only orders the project's tickets, each of which still plans
-  // on its own: it is always approved, and applied by the project flow (README, "Projects").
+  // A project planner's work order never comes here (deliverWorkOrder).
   // null: the plan has no readable rating.
   private async judge(localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
     const rated = parsePlanRisk(planText);
     const rating = "problem" in rated ? "" : `Risk: ${ratingText(rated.risk)}.`;
     try {
       const state = await this.linear.issueState(issueId);
-      if (hasLabel(state.labels, dispatchLabels(settings.dispatch.label).planner.toLowerCase())) {
-        await this.decide(localUrl, true, "Work order approved automatically: it only orders the project's tickets, each of which plans on its own.");
-        return { approved: true, line: "Work order approved automatically.", reasons: [] };
-      }
       if ("problem" in rated) return null;
       const advice = this.advised.get(agentId);
       const outcome = autoApproval(rated.risk, settings.autoApprove, {
@@ -322,6 +318,7 @@ export class PlannotatorBridge {
     const model = activeModel(refreshed?.agent);
     const issueId = labels["paseo.parent-agent-id"] ? undefined : labels["linear.issueId"];
     const identifier = labels["linear.identifier"] || "this ticket";
+    if (issueId && this.projectPlans && await this.projectPlans.isPlanner(issueId)) return this.deliverWorkOrder(event, agentId, issueId, identifier, paseo);
     // The agent's stable link when ReviewLinks is up; otherwise this review's own tailnet or local URL.
     const url = event.type === "opened" ? (await this.reviews?.opened(agentId, event, labels["linear.identifier"] || undefined)) ?? event.remoteUrl ?? event.localUrl : undefined;
     if (event.type === "decided") await this.reviews?.decided(agentId, event.approved);
@@ -346,13 +343,6 @@ export class PlannotatorBridge {
     // Tailnet links only: a local-only review has no link worth showing off this machine.
     const inSession = await this.toSession(event, agentId, model, event.type === "opened" && event.remoteUrl ? url ?? null : null, planText, judgement);
     if (!issueId) return;
-    // A planner's approved work order is applied by the project flow, which closes its ticket and
-    // retires the planner: nothing else of an approval (mode, state, plan-ready) applies to it.
-    if (event.type === "decided" && event.approved && this.projectPlans && await this.projectPlans(issueId, agentId, event.planContent ?? "", paseo, settings)) {
-      await this.linear.upsertIssueDocument(issueId, `Plan: ${identifier}`, planDocument(event, identifier, model))
-        .catch((error: unknown) => console.error(`[linear-tickets] ${identifier}: saving the work-order plan failed: ${error instanceof Error ? error.message : error}`));
-      return;
-    }
     // A required plan started in the provider's safe mode; its approved plan unlocks the usual mode.
     if (event.type === "decided" && event.approved && labels[PLAN_POLICY_LABEL] === "required") {
       const preference = settings.lastProvider ? settings.launchPreferences[settings.lastProvider] : undefined;
@@ -400,6 +390,30 @@ export class PlannotatorBridge {
       await this.linear.removeLabel(plan.issueId, PLAN_READY_LABEL);
     }
     console.log(`[linear-tickets] ${plan.identifier}: plan parked for the owner (${plan.reasons.join("; ")})`);
+  }
+
+  // A project planner's work order needs nobody (README, "Projects"): it only orders the project's
+  // tickets, each of which plans on its own. It is approved as soon as it is submitted, with no
+  // risk check or Linear read that could fail and send it to the owner, and the project flow writes
+  // it into Linear, retrying on later polls. Nothing of a ticket approval (state, plan-ready, a new
+  // agent) applies to it. A plan that cannot be read is retried and, after that, opens for the
+  // owner like any review; their approval then arrives as a `decided` event.
+  private async deliverWorkOrder(event: OpenedEvent | DecidedEvent, agentId: string, issueId: string, identifier: string, paseo: PaseoApi): Promise<void> {
+    const settings = await this.settings.read();
+    if (event.type === "decided") {
+      // A send-back reaches the agent through Plannotator itself; it submits again.
+      if (!event.approved) return;
+      if (!event.planContent?.trim()) { console.error(`[linear-tickets] ${identifier}: the approved work order arrived without its text, so it was not written`); return; }
+      await this.projectPlans!.applyPlan(issueId, agentId, event.planContent, paseo, settings);
+      return;
+    }
+    const plan = await this.fetchPlan(event.localUrl);
+    if (!plan.trim()) throw new Error(`the work order of ${identifier} could not be read from Plannotator`);
+    // The plugin approves it: the extension's report of that approval is not a second decision.
+    this.settled(agentId);
+    await this.decide(event.localUrl, true, "Work order approved automatically: it only orders the project's tickets, each of which plans on its own. Paseo writes it into Linear; stop now.")
+      .catch((error: unknown) => console.error(`[linear-tickets] ${identifier}: closing the work order's review failed: ${error instanceof Error ? error.message : error}`));
+    await this.projectPlans!.applyPlan(issueId, agentId, plan, paseo, settings);
   }
 
   // A parked plan's events, all from the central host: `opened` binds the stable link, inbox and

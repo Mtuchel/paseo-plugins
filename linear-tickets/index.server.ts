@@ -97,7 +97,7 @@ export default function contribute(server: PluginServerContext) {
     },
   };
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks, undefined, undefined, parking);
-  plannotator.onProjectPlan((issueId, agentId, plan, paseo, current) => projects.applyPlan(issueId, agentId, plan, paseo, current));
+  plannotator.onProjectPlan(projects);
   const manualTasks = new ManualTasks({ linear, settings });
   const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });

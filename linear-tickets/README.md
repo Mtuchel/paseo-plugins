@@ -448,8 +448,9 @@ When the review opens, the plugin approves it on your behalf only if all of thes
   unavailable advisor, open disagreements or a plugin reload in between send it to you);
 - the ticket is yours (not someone else's, not `feedback`) and not marked attended.
 
-A project planner's work order is always approved without you: it only orders the project's
-tickets (blocking relations and labels), and every ticket still plans and is judged on its own.
+A project planner's work order never goes through this policy: it only orders the project's
+tickets (blocking relations and labels), and every ticket still plans and is judged on its own
+(see "Projects").
 
 An auto-approved plan goes through the same approval as yours (state, `plan-ready`, the plan
 document, the agent's usual mode); the agent gets "Auto-approved by the risk policy" with the
@@ -640,10 +641,17 @@ every 2 minutes.
   ```
   ````
 
-  On approval, Paseo adds the blocking relations, puts `paseo-hold` on held tickets (removes it
-  from released ones) and `paseo-attended` on attended ones (`unattended X` removes it), comments
-  what it applied and skipped, closes the planner ticket and archives its agent. Nothing else of
-  an approval (In Progress, `plan-ready`) applies to it. The planner is told to mark a ticket
+  The plan is approved the moment the agent submits it: no risk check, no inbox, no parking, and
+  no Linear read that could fail and send it to you. Paseo then adds the blocking relations,
+  puts `paseo-hold` on held tickets (removes it from released ones) and `paseo-attended` on
+  attended ones (`unattended X` removes it), comments what it applied and skipped, closes the
+  planner ticket and archives its agent. Nothing else of an approval (In Progress, `plan-ready`,
+  a new agent) applies to it. The approved order is kept in `projects.json` before it is
+  written, and every project read writes one that is not in Linear yet, so Linear being down or
+  rate-limited only delays it; a change Linear refuses three reads in a row is listed as skipped
+  and the order closes anyway. A planner ticket that carries `plan-ready` was approved like a
+  ticket plan (by a plugin version that parked work orders for you) and is written from its
+  "Plan:" document the same way. The planner is told to mark a ticket
   attended only for an open business decision, acceptance criteria too vague to check,
   user-facing wording or layout you choose, changes to production data, external accounts or
   spend, or a step only a person can do; never for size or risk alone.
