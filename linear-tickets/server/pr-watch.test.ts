@@ -132,10 +132,10 @@ test("a queue drop prompts the live agent once with the reason, the failed check
   assert.match(prompt, /Reason: The merge queue closed its draft pull request #437 without landing it\./);
   assert.match(prompt, /- \[Code validation \/ Core \(core-web\)\]\(https:\/\/github\.com\/tuchel-sohn\/tuchel-platform\/actions\/runs\/1\/job\/2\) — failure/);
   assert.match(prompt, /worktree \(`\/wt\/tuc-1`\), on the top branch of the stack, run `git fetch origin main && git rebase --update-refs --onto origin\/main "\$\(git merge-base HEAD origin\/main\)"`/);
-  assert.match(prompt, /`gt submit --stack --ignore-out-of-sync-trunk`, then `gt merge`/);
+  assert.match(prompt, /`gt submit --stack --ignore-out-of-sync-trunk`, then `node tools\/ci\/enqueue\.mjs` on the branch you enqueued before \(never a bare `gt merge`/);
   assert.doesNotMatch(prompt, /run `gt sync/);
   assert.match(prompt, /If your stack sits on a PR that has already landed, or your PR was auto-closed, follow docs\/automation\/merge-queue\.md instead\.\n2\. Fix the cause\./);
-  assert.match(prompt, /one plain `gt merge` retry/);
+  assert.match(prompt, /one plain `node tools\/ci\/enqueue\.mjs` retry/);
   assert.match(said, /^say thought The merge queue dropped the pull request/);
   assert.deepEqual(await h.poll(), [], "not prompted again on the next poll");
   // Graphite's bullet for the same attempt arrives later; it is the same drop.
@@ -463,7 +463,7 @@ test("a ready, green, reviewed pull request outside the queue is told to merge; 
   h.github.view = { ...h.github.view, reviewDecision: "CHANGES_REQUESTED" };
   assert.match(promptOf(await h.poll()) ?? "", /^GitHub reports changes requested/, "no merge while GitHub reports changes requested");
   h.github.view = { ...h.github.view, reviewDecision: "", checks: [...h.github.view.checks, { ...RUNNING_CI, name: "Graphite / mergeability_check" }] };
-  assert.equal(promptOf(await h.poll()), `[The pull request](${PR}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.\nNext step: \`gt merge\`, then \`node tools/ci/wait-queue.mjs <top PR>\` with the top pull request of your stack (419 if this one is the top).\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+  assert.equal(promptOf(await h.poll()), `[The pull request](${PR}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.\nNext step: \`node tools/ci/enqueue.mjs\` on the top reviewed branch (never a bare \`gt merge\`; it refuses a range that conflicts with \`main\` or the queue tip and names the fix), then \`node tools/ci/wait-queue.mjs <top PR>\` with the top pull request of your stack (419 if this one is the top).\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
 });
 
 test("the first matching stage wins: draft, then failed checks, then requested changes, then findings, then merge", async (t) => {

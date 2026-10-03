@@ -122,6 +122,6 @@ export async function stalledStage(view: PullRequestView, url: string, now: numb
   const number = /\/pull\/(\d+)/.exec(url)?.[1] ?? "";
   return { stage: "merge", key, text: [
     `[The pull request](${url}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.`,
-    `Next step: \`gt merge\`, then \`node tools/ci/wait-queue.mjs <top PR>\` with the top pull request of your stack (${number} if this one is the top).`,
+    `Next step: \`node tools/ci/enqueue.mjs\` on the top reviewed branch (never a bare \`gt merge\`; it refuses a range that conflicts with \`main\` or the queue tip and names the fix), then \`node tools/ci/wait-queue.mjs <top PR>\` with the top pull request of your stack (${number} if this one is the top).`,
   ].join("\n") };
 }

@@ -462,8 +462,9 @@ the pull request is open. Without Merge activity, drafts alone never count. The 
 gets the reason, the checks that did not pass on the draft and the runbook (on the stack's top
 branch `git fetch origin main && git rebase --update-refs --onto origin/main "$(git merge-base
 HEAD origin/main)"`, which moves only its own branches, never `gt sync`/`gt restack`; fix,
-`gt submit --stack --ignore-out-of-sync-trunk`, `gt merge`; one plain `gt merge`
-retry for an obviously flaky failure) as a new message once it is idle; Paseo resumes it if it
+`gt submit --stack --ignore-out-of-sync-trunk`, `node tools/ci/enqueue.mjs` (never a bare
+`gt merge`: it refuses a range that conflicts with `main` or the queue tip); one plain
+`node tools/ci/enqueue.mjs` retry for an obviously flaky failure) as a new message once it is idle; Paseo resumes it if it
 has stopped. While the agent is in a turn or waiting for an answer, or Paseo is not connected,
 the message waits for a later poll. When the agent is gone or archived, the same text becomes a
 ticket comment mentioning you, and the ticket moves back to In Progress (when status write-back
@@ -484,7 +485,7 @@ new message, the first that applies:
 | Failed checks | a ready pull request whose latest run of a check failed (pending runs and `Graphite / mergeability_check` do not count) | the failed checks with links; fix, then `gt submit --stack` |
 | Changes requested | a reviewer's latest approving, change-requesting or dismissed review asks for changes (on any commit), or GitHub's review decision is "changes requested" | each such review and the unresolved review threads; address them, then `gt submit --stack` (for a review on an earlier commit: reply on its threads and re-request the review) |
 | Findings | unresolved review threads a bot started (Greptile, any bot reviewer) | the findings; run the AGENTS.md review loop |
-| Merge | `PR code` and `PR metadata` ran on the head and succeeded or were skipped (so did `Label queued PRs for Linear` when it ran), every other check is green (except Graphite's mergeability check), no change request is open, no review thread is unresolved, and Greptile has reviewed the current head when the pull request has `complex-review` | `gt merge`, then `node tools/ci/wait-queue.mjs <top PR>` |
+| Merge | `PR code` and `PR metadata` ran on the head and succeeded or were skipped (so did `Label queued PRs for Linear` when it ran), every other check is green (except Graphite's mergeability check), no change request is open, no review thread is unresolved, and Greptile has reviewed the current head when the pull request has `complex-review` | `node tools/ci/enqueue.mjs` on the top reviewed branch, then `node tools/ci/wait-queue.mjs <top PR>` |
 
 Nothing is sent for a pull request labelled `do-not-merge`, while [manual tasks](#manual-tasks)
 due before the merge are open, while the merge queue has it (its last Merge activity bullet
