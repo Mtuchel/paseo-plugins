@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { ProjectIssue } from "./linear";
+import { Capacity } from "./capacity";
 import { parseOrder, ProjectFlow, ProjectStore } from "./project-flow";
 import { Scheduler } from "./scheduler";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
@@ -43,7 +44,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   };
   const store = new ProjectStore(join(directory, "projects.json"));
   const scheduler = new Scheduler({ running: async () => running, projectOf: async () => "erp", away: async () => away, now: () => now });
-  const flow = new ProjectFlow({ linear, scheduler, store, retire: async (agentId) => { calls.push(`retire ${agentId}`); }, now: () => now });
+  const flow = new ProjectFlow({ linear, scheduler, capacity: new Capacity(() => now), store, retire: async (agentId) => { calls.push(`retire ${agentId}`); }, now: () => now });
   return { flow, calls, store, issues, advance: (ms: number) => { now += ms; }, setAway: (value: boolean) => { away = value; } };
 }
 

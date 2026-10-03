@@ -1,6 +1,6 @@
 import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, searchIssuesRpc, setDefaultPromptRpc, setPresenceRpc, setSettingsRpc, statusRpc } from "./shared/contracts";
+import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setPresenceRpc, setSettingsRpc, statusRpc, type CapacityState } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -74,7 +74,7 @@ export default function contribute(server: PluginServerContext) {
   });
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
   // Labelled projects: a planner ticket sets the work order, then tickets are handed out as slots free up.
-  const projects = new ProjectFlow({ linear, scheduler: starter.scheduler, retire: async (agentId, api) => {
+  const projects = new ProjectFlow({ linear, scheduler: starter.scheduler, capacity: starter.capacity, retire: async (agentId, api) => {
     await stopAgentTurn(agentId).catch(() => {});
     await api.agents.ref(agentId).archive().catch(() => {});
   } });
@@ -177,6 +177,16 @@ export default function contribute(server: PluginServerContext) {
   server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { attach(paseo); return projects.planNow(projectId, await settings.read()); });
   server.handle(presenceRpc, () => presence.state());
   server.handle(setPresenceRpc, (change) => presence.update(change));
+  // Memory lease (README, "Memory lease"): the menu bar app's RAM cap on new starts.
+  const capacityState = async (paseo: PaseoApi): Promise<CapacityState> => {
+    const { maxRunning } = (await settings.read()).dispatch;
+    return { maxRunning, ...starter.capacity.limit(maxRunning), ...await starter.scheduler.counts(paseo) };
+  };
+  server.handle(capacityRpc, (_input, { paseo }) => capacityState(paseo));
+  server.handle(setCapacityRpc, ({ lease }, { paseo }) => {
+    starter.capacity.set(lease);
+    return capacityState(paseo);
+  });
   server.handle(connectRpc, ({ apiKey }) => linear.authenticate(apiKey));
   server.handle(disconnectRpc, () => linear.disconnect());
   server.handle(listIssuesRpc, async ({ cursor, stateNames, relation }) => {
