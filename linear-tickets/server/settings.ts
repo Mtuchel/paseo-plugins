@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { MAX_PROJECT_MAPPINGS, type ProjectMapping } from "../shared/mapping";
+import { type AutoApprovePolicy, DEFAULT_AUTO_APPROVE, MAX_IMPACT } from "../shared/plan-risk";
 
 export const MAX_TEMPLATE_LENGTH = 8_000;
 
@@ -12,10 +13,10 @@ export type LaunchPreference = { model: string; modeId?: string; thinkingOptionI
 // `maxRunning`: at most this many ticket agents work at once (0 = no limit); others wait their turn.
 export type DispatchSettings = { enabled: boolean; label: string; teamKeys: string[]; intervalSeconds: number; maxRunning: number };
 // Which lifecycle events of ticket-linked agents are written back to their Linear ticket.
-// `mentions` is the inbound direction: "@paseo" comments by the key's user reach the agent.
+// `mentions` is the inbound direction: "@paseo" comments and replies to Paseo's comments by the key's user reach the agent.
 export type WritebackSettings = { status: boolean; summaries: boolean; blocked: boolean; pullRequests: boolean; mentions: boolean; autoResume: boolean };
 export const DEFAULT_DISPATCH: DispatchSettings = { enabled: false, label: "paseo", teamKeys: [], intervalSeconds: 60, maxRunning: 0 };
-export const MAX_RUNNING_LIMIT = 20;
+export const MAX_RUNNING_LIMIT = 50;
 export const DEFAULT_WRITEBACK: WritebackSettings = { status: false, summaries: false, blocked: false, pullRequests: false, mentions: false, autoResume: false };
 export const MIN_DISPATCH_INTERVAL_SECONDS = 30;
 export const MAX_DISPATCH_INTERVAL_SECONDS = 3_600;
@@ -30,6 +31,8 @@ export type PluginSettings = {
   agentLinearAccess: boolean;
   dispatch: DispatchSettings;
   writeback: WritebackSettings;
+  // Plans rated at or below the threshold are approved without the owner (README, "Plan risk and auto-approval").
+  autoApprove: AutoApprovePolicy;
 };
 
 type SettingsFile = {
@@ -42,6 +45,7 @@ type SettingsFile = {
   agentLinearAccess?: boolean;
   dispatch?: Partial<DispatchSettings>;
   writeback?: Partial<WritebackSettings>;
+  autoApprove?: Partial<AutoApprovePolicy>;
 };
 
 function savedString(value: unknown): string | undefined {
@@ -123,6 +127,15 @@ export function normalizeWriteback(value: unknown): WritebackSettings {
   };
 }
 
+export function normalizeAutoApprove(value: unknown): AutoApprovePolicy {
+  const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const [maxImpact, maxImpactWithFlag] = (["maxImpact", "maxImpactWithFlag"] as const).map((key) => {
+    const raw = candidate[key];
+    return typeof raw === "number" && Number.isInteger(raw) && raw >= 0 && raw <= MAX_IMPACT ? raw : DEFAULT_AUTO_APPROVE[key];
+  });
+  return { enabled: typeof candidate.enabled === "boolean" ? candidate.enabled : DEFAULT_AUTO_APPROVE.enabled, maxImpact, maxImpactWithFlag };
+}
+
 export type SettingsPatch = {
   template?: string;
   markInProgress?: boolean;
@@ -133,6 +146,7 @@ export type SettingsPatch = {
   forgetProjectMapping?: string;
   dispatch?: Partial<DispatchSettings>;
   writeback?: Partial<WritebackSettings>;
+  autoApprove?: Partial<AutoApprovePolicy>;
 };
 
 // Returns null for an empty template (meaning: use the built-in default).
@@ -185,6 +199,7 @@ export class Settings {
       agentLinearAccess: value.agentLinearAccess !== false,
       dispatch: normalizeDispatch(value.dispatch),
       writeback: normalizeWriteback(value.writeback),
+      autoApprove: normalizeAutoApprove(value.autoApprove),
     };
   }
 
@@ -212,6 +227,7 @@ export class Settings {
       agentLinearAccess: patch.agentLinearAccess ?? current.agentLinearAccess,
       dispatch: patch.dispatch ? validDispatch({ ...current.dispatch, ...patch.dispatch }) : current.dispatch,
       writeback: patch.writeback ? normalizeWriteback({ ...current.writeback, ...patch.writeback }) : current.writeback,
+      autoApprove: patch.autoApprove ? normalizeAutoApprove({ ...current.autoApprove, ...patch.autoApprove }) : current.autoApprove,
     };
     if (patch.launchPreference) {
       const { provider, model, modeId, thinkingOptionId } = patch.launchPreference;
@@ -237,7 +253,8 @@ export class Settings {
     const hasMappings = Object.keys(value.projectMappings).length > 0;
     const customDispatch = JSON.stringify(value.dispatch) !== JSON.stringify(DEFAULT_DISPATCH);
     const customWriteback = JSON.stringify(value.writeback) !== JSON.stringify(DEFAULT_WRITEBACK);
-    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback) {
+    const customAutoApprove = JSON.stringify(value.autoApprove) !== JSON.stringify(DEFAULT_AUTO_APPROVE);
+    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customAutoApprove) {
       await rm(this.path, { force: true });
       return value;
     }
@@ -254,6 +271,7 @@ export class Settings {
     if (!value.agentLinearAccess) fileValue.agentLinearAccess = false;
     if (customDispatch) fileValue.dispatch = value.dispatch;
     if (customWriteback) fileValue.writeback = value.writeback;
+    if (customAutoApprove) fileValue.autoApprove = value.autoApprove;
     const temporary = `${this.path}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, JSON.stringify(fileValue), { mode: 0o600, flag: "wx" });

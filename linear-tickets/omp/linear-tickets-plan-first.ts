@@ -3,14 +3,11 @@
 // (user extensions come first), so its before_agent_start runs first and Plannotator's own handler
 // delivers the planning framing on the same prompt.
 //
-// - LINEAR_TICKETS_PLAN=required|agent (set by the plugin for ticket agents): a fresh session
-//   starts in Plannotator's planning phase. With "agent" the model may leave it through
-//   `skip_plan` and a reason, which the plugin posts on the ticket; with "required" there is no
-//   such tool.
+// - LINEAR_TICKETS_PLAN=required (set by the plugin for every ticket agent without an approved
+//   plan): a fresh session starts in Plannotator's planning phase. There is no way to skip it.
 // - <PASEO_HOME>/linear-tickets/plan-requests/<agent id> (written by the plugin when the owner adds
 //   the `plan` label while the agent works): the agent enters planning at its next tool call, which
-//   is blocked and followed by a message with the reason, or at its next prompt. `skip_plan` is
-//   refused from then on.
+//   is blocked and followed by a message with the reason, or at its next prompt.
 // - LINEAR_TICKETS_ISSUE=<ticket> (set by the plugin for every ticket agent): plan advisor
 //   (README, "Plan advisor"). Submitting a plan (`plannotator_submit_plan`, its xd:// device, or
 //   omp's `xd://propose`) is blocked until `record_plan_advice` recorded a GPT-6 Astra review for
@@ -21,6 +18,16 @@
 //   record is therefore checked in its own handler, so a record listed before the submit in the
 //   same message counts, and a plan write or edit queued in that message holds both back. Subagents
 //   (`task` children, which share the environment but cannot create an advisor) are not gated.
+//   The record also needs the plan's `## Risk and impact` section (shared/plan-risk.ts) and drops an
+//   `advised` event with the verdict and the plan text's hash, from which the plugin's Plannotator
+//   bridge decides whether the plan is approved without the owner (README, "Plan risk and
+//   auto-approval").
+// - LINEAR_TICKETS_ISSUE=<ticket>: Linear writes (README, "Agent access to Linear"). The user-level
+//   Linear MCP server acts as the owner, so ticket agents and their subagents may call only its read
+//   tools, named below; every other tool of that server is blocked, whether called directly
+//   (`mcp__linear_<tool>`) or through its xd:// device. The plugin's own `linear_ticket` tools,
+//   which write as the Paseo app, stay open. A guard against mistakes, not isolation: the agent
+//   runs as the owner's user.
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -28,6 +35,7 @@ import { homedir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
 import { ADVISOR_MODEL, ADVISOR_SECTION, ADVISOR_THINKING, advisorSteps, RECORD_ADVICE_TOOL } from "../shared/plan-advisor";
+import { parsePlanRisk } from "../shared/plan-risk";
 
 type Phase = "idle" | "planning" | "executing";
 type Entry = { type: string; customType?: string; data?: { reason?: string; path?: string; hash?: string }; message?: { role?: string } };
@@ -68,6 +76,19 @@ const OWNER_ASKED = "The owner added the `plan` label to this ticket, so you are
 
 function text(message: string, details: Record<string, unknown> = {}): ToolResult {
   return { content: [{ type: "text", text: message }], details };
+}
+
+// Hands an event to the plugin's Plannotator bridge; best-effort, the bridge treats a missing one
+// as "ask the owner".
+function dropEvent(event: Record<string, unknown>): void {
+  try {
+    mkdirSync(EVENTS, { recursive: true, mode: 0o700 });
+    const name = `${Date.now()}-${randomUUID()}.json`;
+    writeFileSync(join(EVENTS, `.${name}.tmp`), JSON.stringify({ ...event, agentId: AGENT_ID, at: new Date().toISOString() }), { mode: 0o600 });
+    renameSync(join(EVENTS, `.${name}.tmp`), join(EVENTS, name));
+  } catch {
+    // See above.
+  }
 }
 
 // The plan file a submission names, as given: a path relative to the working directory, or omp's
@@ -116,13 +137,34 @@ export function advisorProblem(agent: { Model?: unknown; Thinking?: unknown; Par
   return null;
 }
 
+const LINEAR_MCP = "mcp__linear_";
+// The Linear MCP server's tools that only read (checked 2026-10-01). Explicit names, so a tool the
+// server adds later is blocked until someone reviews it and adds it here.
+const LINEAR_READ_TOOLS = new Set([
+  "extract_images", "get_agent_skill", "get_attachment", "get_diff", "get_diff_threads", "get_document", "get_initiative", "get_issue",
+  "get_issue_status", "get_milestone", "get_notifications", "get_project", "get_release", "get_release_note", "get_status_updates",
+  "get_team", "get_template", "get_triage_responsibility", "get_user", "get_workspace", "list_agent_skills", "list_comments",
+  "list_custom_views", "list_cycles", "list_diffs", "list_documents", "list_initiative_labels", "list_initiatives",
+  "list_issue_labels", "list_issue_statuses", "list_issues", "list_milestones", "list_project_labels", "list_projects",
+  "list_release_notes", "list_release_pipelines", "list_releases", "list_teams", "list_templates", "list_users", "search_documentation",
+].map((name) => LINEAR_MCP + name));
+
+// The Linear MCP tool a call would run when it is not one of the read tools, else null: called
+// directly or by writing its arguments to its xd:// device.
+export function linearWrite(toolName: string, input: Record<string, unknown> | undefined): string | null {
+  const path = toolName === "write" && typeof input?.path === "string" ? input.path.trim() : "";
+  const tool = path.startsWith("xd://") ? path.slice("xd://".length) : toolName;
+  // The plugin's own server is named `linear_ticket` (TICKET_MCP_NAME), so its tools share the prefix.
+  if (!tool.startsWith(LINEAR_MCP) || tool.startsWith("mcp__linear_ticket_")) return null;
+  return LINEAR_READ_TOOLS.has(tool) ? null : tool;
+}
+
 export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
   if (!AGENT_ID) return;
   const request = join(HOME, "linear-tickets", "plan-requests", AGENT_ID);
   // `launched`: this session already applied its launch policy, or is a resumed one that must not
-  // be sent back to planning. `ownerAsked`: the owner requested a plan; skip_plan is refused.
+  // be sent back to planning.
   let launched = false;
-  let ownerAsked = false;
   // Plannotator did not answer once: without it there is no planning phase to enter, so the
   // request file is not checked again on every tool call (each check would wait for the timeout).
   let unanswered = false;
@@ -156,6 +198,8 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       return text(`${file} has no "## ${ADVISOR_SECTION}" section. Add it (the advisor's model, the rounds, what changed because of it, and every open point with both positions), then record again.`);
     }
     const verdict = params.verdict;
+    const rated = parsePlanRisk(content);
+    if ("problem" in rated) return text(`${file}: ${rated.problem}\n\nFix the section, then record again.`);
     if (verdict === "unavailable") {
       const reason = params.reason?.trim();
       if (!reason) return text("Give the reason the advisor could not be created.");
@@ -163,6 +207,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
         return text(`The plan's "## ${ADVISOR_SECTION}" section must tell the owner that the advisor was unavailable and why, with the reason you pass here word for word. Say so there, then record again.`);
       }
     } else if (verdict === "agreed" || verdict === "disagreements") {
+      if (!rated.risk.advisor) return text(`The plan's "Advisor rating" says unavailable, but the verdict is ${verdict}. Put the advisor's own impact and reversibility there, then record again.`);
       const advisorId = params.advisorAgentId?.trim();
       if (!advisorId) return text("Pass the advisor's Paseo agent id (from `create_agent`).");
       let agent: Record<string, unknown>;
@@ -179,6 +224,8 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const hash = createHash("sha256").update(content).digest("hex");
     advised.set(key, hash);
     pi.appendEntry(ADVICE_MARKER, { path: key, hash, verdict, advisorAgentId: params.advisorAgentId ?? null, reason: params.reason ?? null, at: new Date().toISOString() });
+    // The Plannotator bridge compares it with server/review-outcome.ts `planHash` of the text it shows.
+    dropEvent({ type: "advised", verdict, hash: createHash("sha256").update(content.trim()).digest("hex") });
     return text(`Advisor review recorded for ${file} (${verdict}). Submit the plan now, without editing it again.`, { verdict });
   };
   // Plannotator's plan-mode control (plannotator:request). null: Plannotator did not answer.
@@ -206,14 +253,12 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     if (phase === null) { unanswered = true; return null; }
     if (phase === "planning") {
       rmSync(request, { force: true });
-      ownerAsked = true;
       return "planning";
     }
     if (phase === "executing") phase = await planMode("exit");
     if (phase === "idle") phase = await planMode("enter");
     if (phase !== "planning") return null;
     rmSync(request, { force: true });
-    ownerAsked = true;
     pi.appendEntry(MARKER, { reason: "owner", at: new Date().toISOString() });
     return "entered";
   }
@@ -230,7 +275,6 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const entries = ctx.sessionManager.getBranch();
     const marks = entries.filter((entry) => entry.type === "custom" && entry.customType === MARKER);
     launched = marks.length > 0 || entries.some((entry) => entry.type === "message" && entry.message?.role === "assistant");
-    ownerAsked = marks.some((entry) => entry.data?.reason === "owner");
     restoreAdvice(entries);
   });
   for (const event of ["session_switch", "session_branch", "session_tree"] as const) {
@@ -246,7 +290,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     if (await takeOwnerRequest()) { launched = true; return; }
     if (launched) return;
     launched = true;
-    if (POLICY !== "required" && POLICY !== "agent") return;
+    if (POLICY !== "required") return;
     if (await planMode("enter") === "planning") pi.appendEntry(MARKER, { reason: "launch", policy: POLICY, at: new Date().toISOString() });
   });
 
@@ -259,6 +303,10 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     }
     if (!TICKET) return undefined;
     const input = event.input;
+    const linearTool = linearWrite(event.toolName, input);
+    if (linearTool) {
+      return { block: true, reason: `Stopped by the linear-tickets plugin: ticket agents change Linear only through the linear_ticket tools, which write as Paseo; ${linearTool} would act as the owner. Reading with the Linear tools is fine. For anything else in Linear, ask the owner (or add a manual task).` };
+    }
     if (event.toolName === "write" || event.toolName === "edit") {
       // omp gives an edit's targets as `paths` (hashline patches) or `path`; an apply_patch edit
       // names them only in its `input` headers (`*** Update File: PLAN.md`, `*** Move to: …`).
@@ -317,35 +365,6 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       const checked = recordOutcomes.get(id);
       recordOutcomes.delete(id);
       return checked ?? recordAdvice(params, ctx);
-    },
-  });
-
-  if (POLICY !== "agent") return;
-  pi.registerTool({
-    name: "skip_plan",
-    label: "Skip Plan",
-    description: "Leave plan mode without a plan review because this ticket is small enough to implement directly: none of the plan rules in your instructions apply. Pass a one-sentence reason; it is posted on the Linear ticket. Then implement the ticket.",
-    parameters: pi.zod.object({ reason: pi.zod.string() }),
-    // A direct tool: discoverable tools are called by writing to xd://skip_plan, which
-    // Plannotator's planning phase blocks like any non-markdown write.
-    loadMode: "essential",
-    async execute(_id, params) {
-      const reason = params.reason?.trim();
-      if (!reason) return text("Give a one-sentence reason why this ticket needs no plan.");
-      if (ownerAsked) return text("The owner asked for a plan on this ticket, so it cannot be skipped. Write the plan and submit it for review.");
-      const phase = await planMode("status");
-      if (phase !== "planning") return text(`Not in plan mode (${phase ?? "Plannotator did not answer"}); there is nothing to skip.`);
-      if (await planMode("exit") !== "idle") return text("Plan mode could not be left. Write the plan and submit it for review instead.");
-      pi.appendEntry(MARKER, { reason: "skipped", at: new Date().toISOString() });
-      try {
-        mkdirSync(EVENTS, { recursive: true, mode: 0o700 });
-        const name = `${Date.now()}-${randomUUID()}.json`;
-        writeFileSync(join(EVENTS, `.${name}.tmp`), JSON.stringify({ type: "skipped", agentId: AGENT_ID, reason, at: new Date().toISOString() }), { mode: 0o600 });
-        renameSync(join(EVENTS, `.${name}.tmp`), join(EVENTS, name));
-      } catch {
-        // The ticket note is a convenience; leaving plan mode already happened.
-      }
-      return text("Plan skipped; your reason is posted on the ticket. Implement the ticket now.", { skipped: true });
     },
   });
 }

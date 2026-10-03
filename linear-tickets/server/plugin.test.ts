@@ -11,6 +11,7 @@ import { buildContext, buildPrompt, issuePage, normalizeIssue, connection, relat
 import { Credentials } from "./credentials";
 import { Launcher, safeBranchName } from "./launch";
 import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_DISPATCH, DEFAULT_WRITEBACK } from "./settings";
+import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { LinearService, postGraphQL, ADD_LABEL_QUERY, CREATE_LABEL_QUERY, LABEL_BY_NAME_QUERY, resolveReviewState, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
 import { RateBudget, RateLimitedError } from "./rate-budget";
 import { cachedOverviewRpc, countIssuesRpc, listIssuesRpc, searchIssuesRpc } from "../shared/contracts";
@@ -42,12 +43,12 @@ const detail = { issue: normalizeIssue(rawIssue), teamId: "team-1", projectId: "
 const input = { id: "ENG-42", projectId: "project-1", provider: "test/model", instructions: "Add a regression check.", markInProgress: false, requestId: "5f6f1154-5838-4439-b981-b3c9d9831488" };
 // Test fakes that exercise neither the state transition nor finished blockers: no-op stubs keep the contract strict.
 const noMark = { markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] };
-const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK };
+const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE };
 
 test("server entrypoint loads and registers valid Paseo RPC contracts", () => {
   const names: string[] = [];
   const cleanup = contribute({ handle(contract: { name: string }) { names.push(contract.name); }, on() { return () => {}; }, before() { return () => {}; } } as unknown as PluginServerContext);
-  assert.deepEqual(names, ["linear.status", "linear.dispatch-status", "linear.connect", "linear.disconnect", "linear.list-issues", "linear.count-issues", "linear.cached-overview", "linear.search-issues", "linear.issue-context", "linear.project-branches", "linear.get-default-prompt", "linear.set-default-prompt", "linear.get-settings", "linear.set-settings", "linear.launch-agent", "linear.agent-status"]);
+  assert.deepEqual(names, ["linear.status", "linear.dispatch-status", "linear.projects-status", "linear.plan-project", "linear.presence", "linear.set-presence", "linear.capacity", "linear.set-capacity", "linear.pull-requests", "linear.label-pulls", "linear.connect", "linear.disconnect", "linear.list-issues", "linear.count-issues", "linear.cached-overview", "linear.search-issues", "linear.issue-context", "linear.project-branches", "linear.get-default-prompt", "linear.set-default-prompt", "linear.get-settings", "linear.set-settings", "linear.launch-agent", "linear.agent-status"]);
   cleanup();
 });
 

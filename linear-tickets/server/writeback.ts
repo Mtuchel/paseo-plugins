@@ -6,7 +6,6 @@ import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/se
 import { dispatchLabels } from "./dispatch";
 import { activeModel } from "./model";
 import { questionsOf } from "./relay";
-import type { AgentApi } from "./agent-app";
 import type { Handover, WaitingPeriod } from "./handover";
 import type { IssueState, LinearService } from "./linear";
 import type { NeedsYouIssues } from "./needs-you";
@@ -31,7 +30,7 @@ const MIN_RATE_LIMIT_DELAY_MS = 5_000;
 const PULL_REQUEST_URL = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/g;
 
 type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
-// `planFirst`: launched plan-first (a ticket you did not write, before its plan is approved).
+// `planFirst`: launched to plan (every ticket until its plan is approved, `plan-ready`).
 type Link = { issueId: string; identifier: string; planFirst: boolean };
 // Steps that must not repeat when a failed write-back is retried (comments, session activities):
 // a retry of the same event skips the steps that already succeeded and gets their earlier result.
@@ -41,14 +40,13 @@ type Delivery = { event: string; agent: PluginHookAgent; paseo: PaseoApi; work: 
 // A pull request found at the end of a turn, kept on disk until every place links it, so a
 // rate limit, a superseding event or a plugin restart cannot lose it.
 type OutboxEntry = { agentId: string; agentTitle: string | null; cwd: string; issueId: string; identifier: string; url: string; done: { linear: boolean; session: boolean; handover: boolean } };
-// The native Linear agent: the session panel, the durable handover record and comments written
-// as the Paseo app. Optional, so ticket write-back keeps working without the Paseo Linear app installed.
+// The native Linear agent: the session panel and the durable handover record. Optional, so ticket
+// write-back keeps working without the Paseo Linear app installed.
 export type AgentBridge = {
   sessions: Pick<SessionRouter, "sessionFor" | "say" | "action" | "ask" | "askQuestion" | "link" | "offerResume" | "resumeNow" | "holdIfStopped" | "follow" | "unfollow">;
   handover: Pick<Handover, "read" | "update" | "finish" | "waiting" | "setWaiting">;
-  comments?: Pick<AgentApi, "createComment" | "updateComment">;
 };
-type Linear = Pick<LinearService, "issueState" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "createComment" | "updateComment" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "userUrl" | "createIssue" | "complete">;
+type Linear = Pick<LinearService, "issueState" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "upsertComment" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "isPerson" | "userUrl" | "createIssue" | "complete">;
 
 // The turn's reply: assistant text after the last user message. Streaming providers may
 // split one reply across several items, so the pieces are joined without separators.
@@ -144,30 +142,6 @@ export function ownerRequest(reply: string): string | null {
   if (PLAN_REVIEW.test(prose(window.join("\n\n")))) return null;
   const first = window.findIndex((paragraph) => OWNER_REQUEST.test(prose(paragraph)));
   return first === -1 ? null : window.slice(first).join("\n\n");
-}
-
-// Written as the Paseo app when it is installed: the plugin's key belongs to the owner, and Linear
-// notifies nobody of their own mentions. `commentId` edits that comment instead of posting a new one.
-// A rate limit is rethrown, never retried on the other credential: its pool must not absorb the load.
-export async function appComment(linear: Pick<LinearService, "createComment" | "updateComment">, app: Pick<AgentApi, "createComment" | "updateComment"> | undefined, issueId: string, body: string, commentId: string | null = null): Promise<string> {
-  if (commentId) {
-    for (const author of app ? [app, linear] : [linear]) {
-      const edited = await author.updateComment(commentId, body).then(() => true, (error: unknown) => {
-        if (error instanceof RateLimitedError) throw error;
-        return false;
-      });
-      if (edited) return commentId;
-    }
-  }
-  if (app) {
-    const id = await app.createComment(issueId, body).catch((error: unknown) => {
-      if (error instanceof RateLimitedError) throw error;
-      console.error(`[linear-tickets] ${issueId}: comment as the Paseo app failed, posting with the plugin's key: ${error instanceof Error ? error.message : error}`);
-      return null;
-    });
-    if (id) return id;
-  }
-  return linear.createComment(issueId, body);
 }
 
 // Writes the lifecycle of ticket-linked agents back to their Linear ticket. Agents are
@@ -324,8 +298,10 @@ export class Writeback {
       const waiting = await this.waitingFor(issue.id);
       const state = await this.linear.issueState(issue.id);
       const needsYou = dispatchLabels(settings.dispatch.label).needsYou;
-      // Only the owner opens Linear sessions; without one, whoever wrote the ticket is asked.
-      const ownerId = (inSession ? null : state.creatorId) ?? await this.linear.viewerId();
+      // Only the owner opens Linear sessions; without one, whoever wrote the ticket is asked, unless
+      // the Paseo app or another integration wrote it.
+      const creator = inSession ? null : state.creatorId;
+      const ownerId = creator && await this.linear.isPerson(creator) ? creator : await this.linear.viewerId();
       const closed = CLOSED_TYPES.includes(state.statusType.trim().toLowerCase());
       let subIssueId = waiting?.subIssueId ?? null;
       let previousStateId = waiting?.previousStateId ?? null;
@@ -369,7 +345,7 @@ export class Writeback {
         if (!state.labels.some((item) => item.name.trim().toLowerCase() === needsYou.toLowerCase())) await this.linear.addLabel(issue.id, needsYou, NEEDS_YOU_COLOR);
       }
       // The waiting period's comment is edited, not repeated.
-      const commentId = await once("waiting-comment", async () => appComment(this.linear, this.agentBridge?.comments, subIssueId ?? issue.id, `${await this.linear.userUrl(ownerId)} ${body}`, waiting?.commentId ?? null)) ?? null;
+      const commentId = await once("waiting-comment", async () => this.linear.upsertComment(subIssueId ?? issue.id, `${await this.linear.userUrl(ownerId)} ${body}`, waiting?.commentId ?? null)) ?? null;
       await this.setWaiting(issue, agent, { previousStateId, commentId, subIssueId });
     });
   }

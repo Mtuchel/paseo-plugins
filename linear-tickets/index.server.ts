@@ -1,6 +1,6 @@
 import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc } from "./shared/contracts";
+import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setPresenceRpc, setSettingsRpc, statusRpc, type CapacityState } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -11,6 +11,7 @@ import { Credentials } from "./server/credentials";
 import { Dispatcher } from "./server/dispatch";
 import { CommentRelay } from "./server/relay";
 import { PlannotatorBridge, readReviewPlan, recordDecision, writeOpenScript } from "./server/plannotator";
+import { ParkedPlans, PlannotatorHost } from "./server/parked";
 import { reviewOutcome } from "./server/review-outcome";
 import { Writeback } from "./server/writeback";
 import { AgentApi, AppAuth } from "./server/agent-app";
@@ -21,6 +22,7 @@ import { closeInternalDaemon, internalDaemon, modelSetter, ownConnection } from 
 import { ModelGuard } from "./server/model-guard";
 import { HealthMonitor } from "./server/health";
 import { PullRequestWatch } from "./server/pr-watch";
+import { PullRequestBoard } from "./server/pull-requests";
 import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
 import { NeedsYouIssues } from "./server/needs-you";
@@ -30,6 +32,9 @@ import { planSetup, TicketStarter } from "./server/starter";
 import { isPlanPolicy, PLAN_POLICY_ENV, PLAN_POLICY_LABEL } from "./server/plan-policy";
 import { PlanRequests } from "./server/plan-requests";
 import { labelDaemon, StateLabels } from "./server/state-labels";
+import { LabelSync, PullRequestFiles } from "./server/label-sync";
+import { ProjectFlow } from "./server/project-flow";
+import { Presence } from "./server/presence";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -44,7 +49,9 @@ export default function contribute(server: PluginServerContext) {
   const settings = new Settings();
   const cache = new TicketCache();
   const handover = new Handover(linear, undefined, undefined, undefined, async (agentId) => { const serverId = await daemonServerId(); return serverId ? paseoAgentUrl(serverId, agentId) : null; });
-  const starter = new TicketStarter({ linear, launcher, handover });
+  // Present or away (README, "Present and away"): every start path asks the starter's scheduler.
+  const presence = new Presence();
+  const starter = new TicketStarter({ linear, launcher, handover, presence });
   // The plugin itself closes the review (split, implement later): the extension's report of that
   // closing is not the owner's decision, so the bridge skips it.
   const retirePlanner = async (reviewUrl: string, agentId: string, api: PaseoApi, reason: string) => {
@@ -68,18 +75,40 @@ export default function contribute(server: PluginServerContext) {
     approveLater: (link, localUrl, paseo) => approveForLater({ linear, readPlan: readReviewPlan, retirePlanner }, link, localUrl, paseo),
   });
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
-  const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession });
-  const writeback = new Writeback(linear, settings, { sessions, handover, comments: agentApi }, undefined, undefined, needsYou);
+  // Labelled projects: a planner ticket sets the work order, then tickets are handed out as slots free up.
+  const projects = new ProjectFlow({ linear, scheduler: starter.scheduler, capacity: starter.capacity, retire: async (agentId, api) => {
+    await stopAgentTurn(agentId).catch(() => {});
+    await api.agents.ref(agentId).archive().catch(() => {});
+  } });
+  const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects });
+  const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   const reviewLinks = new ReviewLinks();
-  const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks);
-  const manualTasks = new ManualTasks({ linear, settings, comments: agentApi });
-  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, comments: agentApi });
+  // Plans that need the owner are parked and served by one central Plannotator host, so their
+  // agents are retired instead of holding a slot until the owner decides (README, "Parked plans").
+  const plannotatorHost = new PlannotatorHost();
+  const parking = {
+    plans: new ParkedPlans(),
+    available: () => plannotatorHost.available(),
+    retire: async (reviewUrl: string, agentId: string, api: PaseoApi, reason: string) => {
+      await decidePlannotatorReview(reviewUrl, false, reason).catch((error: unknown) => console.error(`[linear-tickets] closing the parked plan's own review failed: ${error instanceof Error ? error.message : error}`));
+      await stopAgentTurn(agentId).catch(() => {});
+      await api.agents.ref(agentId).archive().catch(() => {});
+    },
+  };
+  const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks, undefined, undefined, parking);
+  plannotator.onProjectPlan((issueId, agentId, plan, paseo, current) => projects.applyPlan(issueId, agentId, plan, paseo, current));
+  const manualTasks = new ManualTasks({ linear, settings });
+  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => sessions.receive(event));
   // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").
   const stateLabels = new StateLabels({ linear, daemon: async () => { const client = await internalDaemon(); return client ? labelDaemon(client) : null; } });
   linear.onStateWritten((issueId, state) => stateLabels.noteState(issueId, state));
+  // Label groups kept current on every issue of some teams ("Area", "Type"), from label-rules.json.
+  const labelSync = new LabelSync({ linear, pullRequests: new PullRequestFiles() });
+  // The Paseo Agents menu bar's pull request view: polled only while the app asks (README, "Pull request view").
+  const pullBoard = new PullRequestBoard();
   let funnel: FunnelStatus | null = null;
   const health = new HealthMonitor(linear, settings, [
     { name: "Linear API key", run: () => linear.ping() },
@@ -100,13 +129,18 @@ export default function contribute(server: PluginServerContext) {
   // are handled; a new session is still acknowledged at once.
   let stopped = false;
   let agentReady: Promise<boolean> | null = null;
+  // Refreshes the app token in the background while the plugin runs, so the agents' linear_ticket
+  // servers, which only read token.json, keep writing as Paseo.
+  let stopKeepingFresh = () => {};
   const startAgent = () => agentReady ??= auth.credentials().then(async (app) => {
     if (stopped) return false;
     health.start();
     pullRequests.start();
     manualTasks.start();
     stateLabels.start();
+    labelSync.start();
     if (!app) return false;
+    stopKeepingFresh = auth.keepFresh();
     await webhook.start();
     funnel = await ensureFunnel(WEBHOOK_PORT);
     if (!funnel.active) console.error(`[linear-tickets] Linear agent webhooks are not public: ${funnel.note}`);
@@ -128,7 +162,9 @@ export default function contribute(server: PluginServerContext) {
     const link = await sessions.sessionFor(change.agentId);
     if (link) await sessions.say(link.sessionId, "thought", `Model restored to ${change.to} (it had switched to ${change.from}).`);
   });
-  const attach = (paseo: PaseoApi) => { attached = true; if (!stopped) void reviewLinks.start(); dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); void startAgent(); };
+  // The central Plannotator host starts once, after the hook it runs for each parked review exists.
+  const startHost = async () => { if (await plannotatorHook() && !stopped) await plannotatorHost.start(); };
+  const attach = (paseo: PaseoApi) => { const first = !attached; attached = true; if (!stopped) { void reviewLinks.start(); if (first) void startHost(); } dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); void startAgent(); };
   const cacheIdentity = async () => {
     const connection = await credentials.read();
     return connection.key ? cacheScope(connection.key) : null;
@@ -147,7 +183,7 @@ export default function contribute(server: PluginServerContext) {
     attach(paseo);
     const browser = await plannotatorHook();
     // A new ticket agent gets its plan policy with its create request; a resumed one from its label,
-    // so the omp extension keeps the same rules (skip_plan) after a daemon restart.
+    // so the omp extension keeps the same rules after a daemon restart.
     const policy = request.env[PLAN_POLICY_ENV] ? null : await paseo.agents.ref(request.agentId).refresh()
       .then((found) => found?.agent.labels?.[PLAN_POLICY_LABEL], () => undefined);
     const env = { ...(browser ? { PLANNOTATOR_BROWSER: browser } : {}), ...(isPlanPolicy(policy) ? { [PLAN_POLICY_ENV]: policy } : {}) };
@@ -155,6 +191,22 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(statusRpc, (_input, { paseo }) => { attach(paseo); return linear.status(); });
   server.handle(dispatchStatusRpc, (_input, { paseo }) => { attach(paseo); return dispatcher.snapshot(); });
+  server.handle(projectsStatusRpc, (_input, { paseo }) => { attach(paseo); return projects.status(); });
+  server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { attach(paseo); return projects.planNow(projectId, await settings.read()); });
+  server.handle(presenceRpc, () => presence.state());
+  server.handle(setPresenceRpc, (change) => presence.update(change));
+  // Memory lease (README, "Memory lease"): the menu bar app's RAM cap on new starts.
+  const capacityState = async (paseo: PaseoApi): Promise<CapacityState> => {
+    const { maxRunning } = (await settings.read()).dispatch;
+    return { maxRunning, ...starter.capacity.limit(maxRunning), ...await starter.scheduler.counts(paseo) };
+  };
+  server.handle(capacityRpc, (_input, { paseo }) => capacityState(paseo));
+  server.handle(setCapacityRpc, ({ lease }, { paseo }) => {
+    starter.capacity.set(lease);
+    return capacityState(paseo);
+  });
+  server.handle(pullRequestsRpc, ({ repository }) => pullBoard.read(repository));
+  server.handle(labelPullsRpc, ({ repository, label, numbers }) => pullBoard.label(repository, label, numbers));
   server.handle(connectRpc, ({ apiKey }) => linear.authenticate(apiKey));
   server.handle(disconnectRpc, () => linear.disconnect());
   server.handle(listIssuesRpc, async ({ cursor, stateNames, relation }) => {
@@ -191,7 +243,7 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(launchAgentRpc, async (input, { paseo }) => {
     const { template, agentLinearAccess } = await settings.read();
-    const setup = await planSetup(linear, input.id, input.provider, input.modeId, input.planFirst);
+    const setup = await planSetup(linear, input.id, input.provider, input.modeId);
     const launch = { ...input, modeId: setup.modeId, instructions: [...setup.notes, input.instructions.trim()].filter(Boolean).join("\n\n") };
     const markInProgress = input.markInProgress && setup.policy !== "required";
     const result = await launcher.start(launch, paseo, { promptTemplate: template ?? undefined, markInProgress, linearAccess: agentLinearAccess, labels: setup.labels, env: setup.env });
@@ -216,5 +268,5 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); void closeInternalDaemon(); };
+  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); void closeInternalDaemon(); };
 }

@@ -12,8 +12,7 @@ import { findProject, readBranches } from "./projects";
 import { repoOrientation } from "./repo-orientation";
 import { paseoHome, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
 
-// planFirst is resolved into mode, instructions, labels and env before a launch (planSetup).
-type Start = Omit<RpcInput<typeof launchAgentRpc>, "planFirst">;
+type Start = RpcInput<typeof launchAgentRpc>;
 type Result = { agentId: string; warnings: string[] };
 // `resume` continues another agent's work: same branch (and worktree while it still exists),
 // with the handover text ahead of the ticket prompt. `labels` are added to the agent, `env` to
@@ -183,28 +182,40 @@ export class Launcher {
         warnings.push(`Could not mark the ticket in progress: ${error instanceof Error ? error.message : "unknown error"}`);
       }
     }
-    const prompt = [options.resume?.handover, buildPrompt(detail, instructions, options.promptTemplate, options.linearAccess ?? false)].filter(Boolean).join("\n\n");
     // The ticket marks the agent for the plan advisor gate even when its context cannot be saved.
-    let env: Record<string, string> = { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier };
-    try {
-      env = { ...env, [PLAN_CONTEXT_ENV]: await this.planContext(input.requestId, prompt) };
-    } catch (error) {
-      warnings.push(`Could not save the ticket context for the plan advisor: ${error instanceof Error ? error.message : "unknown error"}`);
-    }
-    const agent = await workspace.agents.create({
-      config: { provider: input.provider, modeId: input.modeId, thinkingOptionId: input.thinkingOptionId, ...(mcpServers ? { mcpServers } : {}) },
-      title,
-      prompt,
-      requestId: input.requestId,
-      clientMessageId: input.requestId,
-      labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
-      env,
-    }).catch((error: unknown) => {
+    const create = async (linearAccess: boolean, requestId: string) => {
+      const prompt = [options.resume?.handover, buildPrompt(detail, instructions, options.promptTemplate, linearAccess)].filter(Boolean).join("\n\n");
+      let env: Record<string, string> = { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier };
+      try {
+        env = { ...env, [PLAN_CONTEXT_ENV]: await this.planContext(input.requestId, prompt) };
+      } catch (error) {
+        warnings.push(`Could not save the ticket context for the plan advisor: ${error instanceof Error ? error.message : "unknown error"}`);
+      }
+      return workspace.agents.create({
+        config: { provider: input.provider, modeId: input.modeId, thinkingOptionId: input.thinkingOptionId, ...(linearAccess && mcpServers ? { mcpServers } : {}) },
+        title,
+        prompt,
+        requestId,
+        clientMessageId: requestId,
+        labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
+        env,
+      });
+    };
+    const unconfirmed = (error: unknown) => {
       // Keep the daemon's reason (e.g. a provider failing to start with the ticket MCP server).
       const cause = error instanceof Error && error.message ? ` (${error.message.slice(0, 300)})` : "";
-      throw new Error(`Agent creation could not be confirmed${cause}. Check the workspace's agents before reopening this ticket to try again.`);
+      return new Error(`Agent creation could not be confirmed${cause}. Check the workspace's agents before reopening this ticket to try again.`);
+    };
+    let withTools = Boolean(mcpServers);
+    const agent = await create(withTools, input.requestId).catch(async (error: unknown) => {
+      // The daemon refuses MCP servers for providers that cannot load them (omp) before it creates
+      // anything, so the same ticket starts again without the ticket tools and with the no-write note.
+      if (!withTools || !(error instanceof Error && error.message.includes("does not support MCP servers"))) throw unconfirmed(error);
+      withTools = false;
+      warnings.push("This provider does not load MCP servers, so the agent started without the Linear ticket tools and was told not to change Linear; choose another provider to let it update the ticket.");
+      return create(false, `${input.requestId}-no-mcp`).catch((retryError: unknown) => { throw unconfirmed(retryError); });
     });
-    if (mcpServers && agent.capabilities?.supportsMcpServers === false) {
+    if (withTools && agent.capabilities?.supportsMcpServers === false) {
       warnings.push("This provider does not load MCP servers, so the agent has no Linear tools. It was still told about them; choose another provider to let it update the ticket.");
     }
     return { agentId: agent.id, warnings };

@@ -40,7 +40,7 @@ export type HandoverRecord = {
   updatedAt: string;
 };
 export type GitState = { branch: string | null; lastCommit: string | null };
-type Linear = Pick<LinearService, "createComment" | "updateComment" | "comment" | "upsertAttachment" | "removeAttachments">;
+type Linear = Pick<LinearService, "upsertComment" | "comment" | "upsertAttachment" | "removeAttachments">;
 // Where the web app opens an agent (null when the daemon id is unknown).
 export type AgentUrl = (agentId: string) => Promise<string | null>;
 const PASEO_WEB = "https://app.paseo.sh/h/";
@@ -143,7 +143,9 @@ export class Handover {
         worktreePath: agent.cwd,
         lastCommit: git.lastCommit ?? (sameAgent ? previous.lastCommit : null),
         summaries: [...(sameAgent ? previous.summaries : previous?.summaries ?? []), ...(change.summary ? [clip(change.summary, MAX_SUMMARY)] : [])].slice(-KEPT_SUMMARIES),
-        links: { ...(paseoUrl ? { "Open in Paseo": paseoUrl } : {}), ...(sameAgent ? previous.links : {}), ...(change.link ? { [change.link[0]]: change.link[1] } : {}) },
+        // The ticket's links (its pull request above all, which the pull request watch follows)
+        // stay when another agent takes over; only the agent's own Paseo link is its own.
+        links: { ...(paseoUrl ? { "Open in Paseo": paseoUrl } : {}), ...Object.fromEntries(Object.entries(previous?.links ?? {}).filter(([name]) => sameAgent || name !== "Open in Paseo")), ...(change.link ? { [change.link[0]]: change.link[1] } : {}) },
         plan: change.plan ?? (sameAgent ? previous.plan ?? null : null),
         review: change.review ?? (sameAgent ? previous.review ?? null : null),
         model: change.model ?? (sameAgent ? previous.model ?? null : null),
@@ -154,13 +156,7 @@ export class Handover {
         updatedAt: this.now(),
       };
       const body = progressBody(record);
-      if (record.progressCommentId) {
-        await this.linear.updateComment(record.progressCommentId, body).catch(async () => {
-          record.progressCommentId = await this.linear.createComment(issue.id, body);
-        });
-      } else {
-        record.progressCommentId = await this.linear.createComment(issue.id, body);
-      }
+      record.progressCommentId = await this.linear.upsertComment(issue.id, body, record.progressCommentId);
       // The ticket's link to the agent (next to its pull requests), kept current and moved to a
       // new agent when one takes over. Best-effort: the comment above is the record.
       if (paseoUrl) {

@@ -20,7 +20,8 @@ type Match = "named" | "possible" | null;
 type Guide = { path: string; dir: string; match: Match };
 type Ticket = { text: string; labels: string[] };
 
-const SCOUT_RULES = "in this same workspace, following your harness's delegation rules: give them this workspace's absolute path and do not create another worktree for exploration. Read the files you will change yourself.";
+// TUC-480 spot-check: 2 of 10 scout reports carried a wrong detail the parent would have acted on.
+const SCOUT_RULES = "in this same workspace, following your harness's delegation rules: give them this workspace's absolute path and do not create another worktree for exploration. Ask them to cite the file and line behind each claim, and check every claim you act on in that file before relying on it. Read the files you will change yourself.";
 
 export function scoutNote(provider: string): string {
   const key = provider.split("/")[0];

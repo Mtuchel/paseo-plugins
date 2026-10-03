@@ -1,16 +1,22 @@
+import { spawn } from "node:child_process";
 import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { LinearService } from "./linear";
-import type { Settings } from "./settings";
+import type { PluginSettings, Settings } from "./settings";
 import { PLANNOTATOR_OPEN_SOURCE } from "./plannotator-open-source";
 import { paseoHome } from "./ticket-mcp";
 import type { Handover } from "./handover";
 import { activeModel } from "./model";
-import { APPROVE_LATER, APPROVE_PLAN, MAX_SPLIT, planSteps, SEND_BACK, setAgentMode, SPLIT_PLAN, type SessionRouter } from "./sessions";
-import { PLAN_POLICY_LABEL, PLAN_READY_LABEL } from "./plan-policy";
+import { APPROVE_LATER, APPROVE_PLAN, decidePlannotatorReview, MAX_SPLIT, planSteps, SEND_BACK, setAgentMode, SPLIT_PLAN, type SessionRouter } from "./sessions";
+import { hasLabel, PLAN_POLICY_LABEL, PLAN_READY_LABEL } from "./plan-policy";
+import type { ParkedPlan, ParkedPlans } from "./parked";
 import type { ReviewLinks } from "./review-links";
+import { autoApproval, parsePlanRisk, ratingText } from "../shared/plan-risk";
+import { planHash } from "./review-outcome";
+import { isUntrusted } from "./starter";
+import { dispatchLabels } from "./dispatch";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -18,6 +24,15 @@ export async function readReviewPlan(localUrl: string): Promise<string> {
   if (!response.ok) return "";
   const body: unknown = await response.json();
   return body && typeof body === "object" && "plan" in body && typeof body.plan === "string" ? body.plan : "";
+}
+
+// Opens a review on this machine, as Plannotator would without the hook. LINEAR_TICKETS_OPENER
+// replaces the system opener (tests).
+export function openInBrowser(url: string): void {
+  const opener = process.env.LINEAR_TICKETS_OPENER || (process.platform === "darwin" ? "open" : "xdg-open");
+  try { spawn(opener, [url], { detached: true, stdio: "ignore" }).unref(); } catch (error) {
+    console.error(`[linear-tickets] opening ${url} failed: ${error instanceof Error ? error.message : error}`);
+  }
 }
 
 export const PLANNOTATOR_KIND = "plannotator";
@@ -28,11 +43,23 @@ const MAX_PLAN_CHARS = 180_000;
 
 export type PlannotatorRow = { title: string; url?: string; detail?: string };
 export type OpenedEvent = { type: "opened"; agentId: string | null; localUrl: string; remoteUrl: string | null; at: string };
-export type DecidedEvent = { type: "decided"; agentId: string | null; approved: boolean; feedback?: string; planUri?: string; planContent?: string; at: string };
-// The agent left planning through the omp extension's skip_plan tool, with its reason.
-export type SkippedEvent = { type: "skipped"; agentId: string | null; reason: string; at: string };
-type PlannotatorEvent = OpenedEvent | DecidedEvent | SkippedEvent;
-type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "moveToStateNamed" | "addLabel" | "removeLabel">;
+// `parked`: reported by the central Plannotator host (parked.ts) for a parked plan; only it decides one.
+export type DecidedEvent = { type: "decided"; agentId: string | null; approved: boolean; feedback?: string; planUri?: string; planContent?: string; parked?: true; at: string };
+// The omp extension recorded the plan advisor's review (verdict) for the plan text with this hash.
+export type AdvisedEvent = { type: "advised"; agentId: string | null; verdict: string; hash: string; at: string };
+type PlannotatorEvent = OpenedEvent | DecidedEvent | AdvisedEvent;
+type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "moveToStateNamed" | "moveToReady" | "addLabel" | "removeLabel" | "issueState" | "viewerId" | "appUserId">;
+// What the risk policy made of an opened review: `line` tells the owner, in the panel and on Linear;
+// `reasons` why it needs the owner (empty when approved).
+type Judgement = { approved: boolean; line: string; reasons: string[] };
+type ProjectPlans = (issueId: string, agentId: string, plan: string, paseo: PaseoApi, settings: PluginSettings) => Promise<boolean>;
+// Parked plans (README, "Parked plans"): `available` while the central Plannotator host runs;
+// `retire` closes the agent's own review with the reason, stops and archives the agent.
+export type Parking = {
+  plans: Pick<ParkedPlans, "forAgent" | "put" | "remove">;
+  available: () => boolean;
+  retire: (localUrl: string, agentId: string, paseo: PaseoApi, reason: string) => Promise<void>;
+};
 
 // Workflow states the review moves a ticket through when status write-back is on.
 export const PLANNING_STATE = "Planning";
@@ -90,10 +117,11 @@ export function parseEvent(raw: string): PlannotatorEvent | null {
       ...(typeof event.feedback === "string" && event.feedback.trim() ? { feedback: event.feedback.trim() } : {}),
       ...(typeof event.planUri === "string" ? { planUri: event.planUri } : {}),
       ...(typeof event.planContent === "string" ? { planContent: event.planContent } : {}),
+      ...(event.parked === true ? { parked: true as const } : {}),
     };
   }
-  if (event.type === "skipped" && typeof event.reason === "string") {
-    return { type: "skipped", agentId, reason: event.reason.trim().slice(0, 1_000) || "No reason given.", at };
+  if (event.type === "advised" && typeof event.verdict === "string" && typeof event.hash === "string") {
+    return { type: "advised", agentId, verdict: event.verdict, hash: event.hash, at };
   }
   return null;
 }
@@ -124,34 +152,53 @@ export class PlannotatorBridge {
   // A decision taken in Linear is also reported by the omp plan extension; the second report
   // within this window is the same decision and is skipped.
   private readonly lastDecision = new Map<string, number>();
+  // Applies an approved plan of a project's planner ticket (project-flow.ts); true when it was one.
+  private projectPlans: ProjectPlans | null = null;
+  // Per agent, the advisor verdict the omp extension recorded last and the hash of that plan text.
+  // In memory: after a plugin reload the next review simply goes to the owner.
+  private readonly advised = new Map<string, { verdict: string; hash: string }>();
+  // Reviews already opened on this machine, so a retried event does not open a second tab.
+  private readonly shown = new Set<string>();
 
   constructor(
     private readonly linear: Linear,
     private readonly settings: Pick<Settings, "read">,
     private readonly events = plannotatorPaths().events,
-    private readonly sessions?: Pick<SessionRouter, "sessionFor" | "plan" | "ask" | "say" | "expectReview">,
+    private readonly sessions?: Pick<SessionRouter, "sessionFor" | "plan" | "ask" | "say" | "expectReview" | "parked" | "requeue">,
     private readonly fetchPlan: (localUrl: string) => Promise<string> = readReviewPlan,
     private readonly handover?: Pick<Handover, "update">,
     private readonly setMode: (agentId: string, modeId: string) => Promise<void> = setAgentMode,
-    private readonly reviews?: Pick<ReviewLinks, "opened" | "decided">,
+    private readonly reviews?: Pick<ReviewLinks, "opened" | "decided" | "described">,
+    private readonly decide: (localUrl: string, approve: boolean, feedback: string) => Promise<void> = decidePlannotatorReview,
+    private readonly open: (url: string) => void = openInBrowser,
+    private readonly parking?: Parking,
   ) {}
+
+  // The browser hook leaves opening the review to the bridge, so an auto-approved plan never opens
+  // a tab: every other review opens once, after the risk policy has had its say.
+  private show(localUrl: string): void {
+    if (this.shown.has(localUrl)) return;
+    this.shown.add(localUrl);
+    this.open(localUrl);
+  }
 
   // The ticket's Linear agent panel: review link, plan checklist and Approve / Send back.
   // Returns whether the agent has a session: then the progress comment carries the plan state
   // instead of separate plan comments.
-  private async toSession(event: OpenedEvent | DecidedEvent, agentId: string, model: string | null, reviewLink: string | null): Promise<boolean> {
+  private async toSession(event: OpenedEvent | DecidedEvent, agentId: string, model: string | null, reviewLink: string | null, planText: string, judgement: Judgement | null): Promise<boolean> {
     const sessions = this.sessions;
     if (!sessions) return false;
     try {
       const link = await sessions.sessionFor(agentId);
       if (!link) return false;
       if (event.type === "opened") {
-        const planText = await this.fetchPlan(event.localUrl).catch(() => "");
         const steps = planSteps(planText);
         if (steps.length) await sessions.plan(link.sessionId, steps.map((content) => ({ content, status: "pending" as const })));
+        // An auto-approved plan is decided already; its approval arrives as the next event.
+        if (judgement?.approved) { await sessions.say(link.sessionId, "thought", judgement.line); return true; }
         await sessions.expectReview(link.sessionId, event.localUrl, planText, reviewLink);
         const split = steps.length > 1 ? [{ label: `Approve & split into ${Math.min(steps.length, MAX_SPLIT)} sub-issues`, value: SPLIT_PLAN }] : [];
-        await sessions.ask(link.sessionId, `The plan is ready for review${reviewLink ? ` (full view: ${reviewLink})` : ""}. Approve it, or reply with what to change.${model ? `\n\nPlanned with ${model}.` : ""}`, [{ label: "Approve plan", value: APPROVE_PLAN }, { label: "Approve, implement later", value: APPROVE_LATER }, ...split, { label: "Send back", value: SEND_BACK }]);
+        await sessions.ask(link.sessionId, `The plan is ready for review${reviewLink ? ` (full view: ${reviewLink})` : ""}. Approve it, or reply with what to change.${judgement ? `\n\n${judgement.line}` : ""}${model ? `\n\nPlanned with ${model}.` : ""}`, [{ label: "Approve plan", value: APPROVE_PLAN }, { label: "Approve, implement later", value: APPROVE_LATER }, ...split, { label: "Send back", value: SEND_BACK }]);
         return true;
       }
       await sessions.expectReview(link.sessionId, null);
@@ -190,6 +237,41 @@ export class PlannotatorBridge {
     this.lastDecision.set(agentId, Date.now());
   }
 
+  onProjectPlan(apply: ProjectPlans): void {
+    this.projectPlans = apply;
+  }
+
+  // The risk policy (README, "Plan risk and auto-approval"): approves the plan on the owner's
+  // behalf when its `## Risk and impact` rating is within the threshold, the advisor review the
+  // extension recorded is for exactly this text, and nothing about the ticket needs the owner.
+  // A project planner's work order only orders the project's tickets, each of which still plans
+  // on its own: it is always approved, and applied by the project flow (README, "Projects").
+  // null: the plan has no readable rating.
+  private async judge(localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
+    const rated = parsePlanRisk(planText);
+    const rating = "problem" in rated ? "" : `Risk: ${ratingText(rated.risk)}.`;
+    try {
+      const state = await this.linear.issueState(issueId);
+      if (hasLabel(state.labels, dispatchLabels(settings.dispatch.label).planner.toLowerCase())) {
+        await this.decide(localUrl, true, "Work order approved automatically: it only orders the project's tickets, each of which plans on its own.");
+        return { approved: true, line: "Work order approved automatically.", reasons: [] };
+      }
+      if ("problem" in rated) return null;
+      const advice = this.advised.get(agentId);
+      const outcome = autoApproval(rated.risk, settings.autoApprove, {
+        verdict: advice && advice.hash === planHash(planText) ? advice.verdict : null,
+        untrusted: isUntrusted(state, await this.linear.viewerId(), await this.linear.appUserId()),
+        attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()),
+      });
+      if (!outcome.approve) return { approved: false, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.`, reasons: outcome.reasons };
+      await this.decide(localUrl, true, `Auto-approved by the risk policy. ${rating}`);
+      return { approved: true, line: `Auto-approved within your threshold. ${rating}`, reasons: [] };
+    } catch (error) {
+      console.error(`[linear-tickets] auto-approval check for ${agentId} failed: ${error instanceof Error ? error.message : error}`);
+      return { approved: false, line: [rating, "The auto-approval check failed, so it needs your approval."].filter(Boolean).join(" "), reasons: ["the auto-approval check failed"] };
+    }
+  }
+
   async drain(): Promise<void> {
     if (this.draining) { this.again = true; return this.draining; }
     this.draining = (async () => {
@@ -206,20 +288,28 @@ export class PlannotatorBridge {
     const path = join(this.events, name);
     const paseo = this.paseo;
     if (!paseo) return;
+    let event: PlannotatorEvent | null = null;
     try {
-      const event = parseEvent(await readFile(path, "utf8"));
+      event = parseEvent(await readFile(path, "utf8"));
       if (event?.agentId) await this.deliver(event, event.agentId, paseo);
+      else if (event?.type === "opened") this.show(event.localUrl);
       await rm(path, { force: true });
       this.attempts.delete(name);
     } catch (error) {
       const tries = (this.attempts.get(name) ?? 0) + 1;
       console.error(`[linear-tickets] Plannotator event ${name} failed (attempt ${tries}): ${error instanceof Error ? error.message : error}`);
-      if (tries >= MAX_ATTEMPTS) { await rm(path, { force: true }); this.attempts.delete(name); } else this.attempts.set(name, tries);
+      if (tries < MAX_ATTEMPTS) { this.attempts.set(name, tries); return; }
+      // Given up: the review still opens, so it is not lost.
+      if (event?.type === "opened") this.show(event.localUrl);
+      await rm(path, { force: true });
+      this.attempts.delete(name);
     }
   }
 
   private async deliver(event: PlannotatorEvent, agentId: string, paseo: PaseoApi): Promise<void> {
-    if (event.type === "skipped") return this.deliverSkip(event, agentId, paseo);
+    if (event.type === "advised") { this.advised.set(agentId, { verdict: event.verdict, hash: event.hash }); return; }
+    const parked = this.parking ? await this.parking.plans.forAgent(agentId) : null;
+    if (parked) return this.deliverParked(event, parked);
     if (event.type === "decided") {
       const previous = this.lastDecision.get(agentId);
       const at = Date.parse(event.at) || Date.now();
@@ -235,17 +325,34 @@ export class PlannotatorBridge {
     // The agent's stable link when ReviewLinks is up; otherwise this review's own tailnet or local URL.
     const url = event.type === "opened" ? (await this.reviews?.opened(agentId, event, labels["linear.identifier"] || undefined)) ?? event.remoteUrl ?? event.localUrl : undefined;
     if (event.type === "decided") await this.reviews?.decided(agentId, event.approved);
+    const settings = await this.settings.read();
+    const planText = event.type === "opened" ? await this.fetchPlan(event.localUrl).catch(() => "") : "";
+    const judgement = event.type === "opened" && issueId ? await this.judge(event.localUrl, agentId, issueId, planText, settings) : null;
+    if (event.type === "opened" && issueId && !judgement?.approved && planText.trim() && this.parking?.available()) {
+      await this.park(event, { issueId, identifier, agentId, plan: planText, line: judgement?.line ?? "The plan has no readable risk rating, so it needs your approval.", reasons: judgement?.reasons ?? ["no readable risk rating"], model, parkedAt: new Date().toISOString(), announced: false }, paseo);
+      return;
+    }
+    // The inbox's details are a convenience: a failure must not retry (and repeat) the hand-off.
+    if (event.type === "opened") await this.reviews?.described(event.localUrl, planText, judgement)
+      .catch((error: unknown) => console.error(`[linear-tickets] inbox details for ${agentId} skipped: ${error instanceof Error ? error.message : error}`));
+    if (event.type === "opened" && !judgement?.approved) this.show(event.localUrl);
     const row: PlannotatorRow = event.type === "opened"
-      ? { title: "Handed off to Plannotator for review", url, detail: `${event.remoteUrl ? "Opens on any device in your tailnet." : "Local link only: Tailscale was unavailable."}${model ? ` Planned with ${model}.` : ""}` }
+      ? { title: judgement?.approved ? "Plan auto-approved by the risk policy" : "Handed off to Plannotator for review", url, detail: `${event.remoteUrl ? "Opens on any device in your tailnet." : "Local link only: Tailscale was unavailable."}${model ? ` Planned with ${model}.` : ""}${judgement ? ` ${judgement.line}` : ""}` }
       : { title: event.approved ? "Plan approved in Plannotator" : "Plan sent back from Plannotator", ...(event.feedback ? { detail: event.feedback.slice(0, 4_000) } : {}) };
     // Only a plugin session may append chat rows; the plugin's own fallback connection is not one.
     // The row is a convenience, so Linear still gets the review either way.
     await handle.timeline.append({ type: "plugin", id: `plannotator-${event.type}-${event.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: row })
       .catch((error: unknown) => console.error(`[linear-tickets] Plannotator chat row for ${agentId} skipped: ${error instanceof Error ? error.message : error}`));
     // Tailnet links only: a local-only review has no link worth showing off this machine.
-    const inSession = await this.toSession(event, agentId, model, event.type === "opened" && event.remoteUrl ? url ?? null : null);
+    const inSession = await this.toSession(event, agentId, model, event.type === "opened" && event.remoteUrl ? url ?? null : null, planText, judgement);
     if (!issueId) return;
-    const settings = await this.settings.read();
+    // A planner's approved work order is applied by the project flow, which closes its ticket and
+    // retires the planner: nothing else of an approval (mode, state, plan-ready) applies to it.
+    if (event.type === "decided" && event.approved && this.projectPlans && await this.projectPlans(issueId, agentId, event.planContent ?? "", paseo, settings)) {
+      await this.linear.upsertIssueDocument(issueId, `Plan: ${identifier}`, planDocument(event, identifier, model))
+        .catch((error: unknown) => console.error(`[linear-tickets] ${identifier}: saving the work-order plan failed: ${error instanceof Error ? error.message : error}`));
+      return;
+    }
     // A required plan started in the provider's safe mode; its approved plan unlocks the usual mode.
     if (event.type === "decided" && event.approved && labels[PLAN_POLICY_LABEL] === "required") {
       const preference = settings.lastProvider ? settings.launchPreferences[settings.lastProvider] : undefined;
@@ -264,8 +371,11 @@ export class PlannotatorBridge {
       ? (change: { plan: string; link?: [string, string] }) => this.handover!.update({ id: issueId, identifier }, { id: agentId, title: refreshed.agent.title ?? null, cwd: refreshed.agent.cwd }, { ...change, model })
       : null;
     if (event.type === "opened") {
-      if (progress) { await progress({ plan: "under review", ...(url ? { link: ["Plan review", url] as [string, string] } : {}) }); return; }
-      await this.linear.comment(issueId, `📋 **Plan ready for review in Plannotator**${model ? ` (planned with \`${model}\`)` : ""}: ${url}${event.remoteUrl ? "" : "\n\n(Local link only: Tailscale was unavailable on the host.)"}`);
+      if (progress) { await progress({ plan: judgement ? `${judgement.approved ? "auto-approved" : "under review"} — ${judgement.line}` : "under review", ...(url ? { link: ["Plan review", url] as [string, string] } : {}) }); return; }
+      const risk = judgement ? `\n\n${judgement.line}` : "";
+      await this.linear.comment(issueId, judgement?.approved
+        ? `🤖 **Plan auto-approved** by the risk policy${model ? ` (planned with \`${model}\`)` : ""}: ${url}${risk}`
+        : `📋 **Plan ready for review in Plannotator**${model ? ` (planned with \`${model}\`)` : ""}: ${url}${event.remoteUrl ? "" : "\n\n(Local link only: Tailscale was unavailable on the host.)"}${risk}`);
       return;
     }
     const documentUrl = await this.linear.upsertIssueDocument(issueId, `Plan: ${identifier}`, planDocument(event, identifier, model));
@@ -277,23 +387,65 @@ export class PlannotatorBridge {
     await this.linear.comment(issueId, `${event.approved ? "✅ **Plan approved** in Plannotator" : "↩️ **Plan sent back** from Plannotator"}${documentUrl ? ` — [plan](${documentUrl})` : ""}${feedback}`);
   }
 
-  // A skipped plan changes nothing on the ticket but is recorded with its reason, so the owner
-  // can check each skip and add the `plan` label when they disagree.
-  private async deliverSkip(event: SkippedEvent, agentId: string, paseo: PaseoApi): Promise<void> {
-    const handle = paseo.agents.ref(agentId);
-    const refreshed = await handle.refresh();
-    const labels = refreshed?.agent.labels ?? {};
-    const issueId = labels["paseo.parent-agent-id"] ? undefined : labels["linear.issueId"];
-    const identifier = labels["linear.identifier"] || "this ticket";
-    await handle.timeline.append({ type: "plugin", id: `plannotator-skipped-${event.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: { title: "Plan skipped by the agent", detail: event.reason } satisfies PlannotatorRow })
-      .catch((error: unknown) => console.error(`[linear-tickets] Plannotator chat row for ${agentId} skipped: ${error instanceof Error ? error.message : error}`));
-    if (!issueId) return;
-    const link = await this.sessions?.sessionFor(agentId);
-    if (link) await this.sessions!.say(link.sessionId, "thought", `No plan: ${event.reason}`);
-    if (link && this.handover && refreshed?.agent) {
-      await this.handover.update({ id: issueId, identifier }, { id: agentId, title: refreshed.agent.title ?? null, cwd: refreshed.agent.cwd }, { plan: `skipped — ${event.reason.slice(0, 300)}`, model: activeModel(refreshed.agent) });
+  // Parks a plan the owner has to decide (README, "Parked plans"). The record comes first, so the
+  // agent's own report of its closed review is ignored; then the agent is retired, freeing its
+  // slot. The central host serves the plan, and its `opened` event tells the owner (deliverParked).
+  private async park(event: OpenedEvent, plan: ParkedPlan, paseo: PaseoApi): Promise<void> {
+    await this.parking!.plans.put(plan);
+    await this.sessions?.parked(plan.agentId);
+    await this.parking!.retire(event.localUrl, plan.agentId, paseo, "The owner has to decide this plan. It is parked in the central Plannotator host and you are being closed to free your slot: stop now and do not implement anything. A new agent continues once the owner decides.");
+    if ((await this.settings.read()).writeback.status) {
+      const moved = await this.linear.moveToStateNamed(plan.issueId, PLANNING_STATE);
+      if (moved.note) console.error(`[linear-tickets] ${plan.identifier}: ${moved.note}`);
+      await this.linear.removeLabel(plan.issueId, PLAN_READY_LABEL);
+    }
+    console.log(`[linear-tickets] ${plan.identifier}: plan parked for the owner (${plan.reasons.join("; ")})`);
+  }
+
+  // A parked plan's events, all from the central host: `opened` binds the stable link, inbox and
+  // panel to the host's review (and tells the owner the first time); the owner's `decided` ends
+  // the parking and queues a fresh agent. The retired agent's own report is ignored.
+  private async deliverParked(event: OpenedEvent | DecidedEvent, parked: ParkedPlan): Promise<void> {
+    if (event.type === "opened") {
+      const url = (await this.reviews?.opened(parked.agentId, event, parked.identifier)) ?? event.remoteUrl ?? event.localUrl;
+      await this.reviews?.described(event.localUrl, parked.plan, { approved: false, reasons: parked.reasons })
+        .catch((error: unknown) => console.error(`[linear-tickets] inbox details for ${parked.identifier} skipped: ${error instanceof Error ? error.message : error}`));
+      const reviewLink = event.remoteUrl ? url : null;
+      const link = await this.sessions?.sessionFor(parked.agentId) ?? null;
+      if (link) await this.sessions!.expectReview(link.sessionId, event.localUrl, parked.plan, reviewLink);
+      if (parked.announced) return;
+      this.show(event.localUrl);
+      const model = parked.model ? `\n\nPlanned with ${parked.model}.` : "";
+      if (link) {
+        const steps = planSteps(parked.plan);
+        if (steps.length) await this.sessions!.plan(link.sessionId, steps.map((content) => ({ content, status: "pending" as const })));
+        const split = steps.length > 1 ? [{ label: `Approve & split into ${Math.min(steps.length, MAX_SPLIT)} sub-issues`, value: SPLIT_PLAN }] : [];
+        await this.sessions!.ask(link.sessionId, `The plan waits for your review${reviewLink ? ` (full view: ${reviewLink})` : ""}. Its agent was closed to free the slot; a new one starts once you decide. Approve it, or reply with what to change.\n\n${parked.line}${model}`, [{ label: "Approve plan", value: APPROVE_PLAN }, { label: "Approve, implement later", value: APPROVE_LATER }, ...split, { label: "Send back", value: SEND_BACK }]);
+      } else {
+        await this.linear.comment(parked.issueId, `📋 **Plan waiting for your review in Plannotator**: ${url}${event.remoteUrl ? "" : "\n\n(Local link only: Tailscale was unavailable on the host.)"}\n\n${parked.line}\n\nIts agent was closed to free the slot. Assign Paseo again once you have decided.${model}`);
+      }
+      await this.parking!.plans.put({ ...parked, announced: true });
       return;
     }
-    await this.linear.comment(issueId, `⏭️ **No plan**: the agent judged this ticket small enough to implement directly. Its reason: ${event.reason}\n\nAdd the \`plan\` label to make it plan first.`);
+    if (!event.parked) return;
+    await this.parking!.plans.remove(parked.issueId);
+    await this.reviews?.decided(parked.agentId, event.approved);
+    const at = Date.parse(event.at) || Date.now();
+    const previous = this.lastDecision.get(parked.agentId);
+    this.lastDecision.set(parked.agentId, at);
+    // The plugin closed the review itself (approve later, split), which already moved the ticket on.
+    if (previous !== undefined && Math.abs(at - previous) < 120_000) return;
+    const documentUrl = await this.linear.upsertIssueDocument(parked.issueId, `Plan: ${parked.identifier}`, planDocument({ ...event, planContent: event.planContent ?? parked.plan }, parked.identifier, parked.model));
+    if (event.approved) {
+      await this.linear.addLabel(parked.issueId, PLAN_READY_LABEL);
+      const moved = await this.linear.moveToReady(parked.issueId).catch((error: unknown) => ({ changed: false, note: error instanceof Error ? error.message : String(error) }));
+      if (moved.note) console.error(`[linear-tickets] ${parked.identifier}: ${moved.note}`);
+    }
+    const plan = documentUrl ? ` ([plan](${documentUrl}))` : "";
+    const note = event.approved
+      ? `Plan approved${plan}. A new agent implements it as soon as a slot is free.`
+      : `Plan sent back${plan}${event.feedback ? `: ${event.feedback.slice(0, 1_000)}` : ""}. A new agent plans again with your feedback as soon as a slot is free.`;
+    if (await this.sessions?.requeue(parked.agentId, note)) return;
+    await this.linear.comment(parked.issueId, `${event.approved ? "✅ **Plan approved**" : "↩️ **Plan sent back**"} in Plannotator${plan}${event.feedback ? `\n\n${event.feedback.slice(0, 4_000)}` : ""}\n\nAssign Paseo again to ${event.approved ? "implement it" : "plan it again"}.`);
   }
 }

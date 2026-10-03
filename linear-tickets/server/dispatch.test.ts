@@ -4,9 +4,10 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { RpcInput } from "@getpaseo/plugin";
 import type { launchAgentRpc, TicketDetail } from "../shared/contracts";
 import { Dispatcher } from "./dispatch";
-import { advisorNote, planDecisionNote, QUESTIONS_NOTE, TicketStarter } from "./starter";
+import { advisorNote, PLAN_REQUIRED_NOTE, QUESTIONS_NOTE, TicketStarter } from "./starter";
 import type { LabeledIssue } from "./linear";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 
 const baseSettings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false,
@@ -14,7 +15,7 @@ const baseSettings: PluginSettings = {
   projectMappings: { "project:lp-1": { projectId: "p1", label: "App", baseBranch: "refs/heads/dev" } },
   agentLinearAccess: true,
   dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["ENG"] },
-  writeback: DEFAULT_WRITEBACK,
+  writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE,
 };
 
 // A Linear workspace in memory: tickets with label names, and every write recorded.
@@ -22,6 +23,7 @@ class FakeLinear {
   readonly writes: string[] = [];
   readonly labels: Map<string, Set<string>>;
   readonly blocked: Record<string, string[]> = {};
+  readonly parents = new Set<string>();
 
   constructor(tickets: Record<string, string[]>, private readonly options: { failRemove?: boolean } = {}) {
     this.labels = new Map(Object.entries(tickets).map(([id, names]) => [id, new Set(names)]));
@@ -30,7 +32,7 @@ class FakeLinear {
   async labeledIssues(label: string, teamKeys: string[]): Promise<LabeledIssue[]> {
     this.writes.push(`query ${label} ${teamKeys.join(",")}`);
     return [...this.labels].filter(([, names]) => [...names].some((name) => name.toLowerCase() === label.toLowerCase()))
-      .map(([id, names]) => ({ id, identifier: id.toUpperCase(), teamKey: "ENG", priority: 0, labels: [...names].map((name) => ({ id: `l-${name}`, name })) }));
+      .map(([id, names]) => ({ id, identifier: id.toUpperCase(), teamKey: "ENG", priority: 0, labels: [...names].map((name) => ({ id: `l-${name}`, name })), openChildren: this.parents.has(id) }));
   }
 
   async removeLabel(id: string, name: string) {
@@ -48,12 +50,14 @@ class FakeLinear {
 
   async viewerId() { return "owner"; }
 
+  async appUserId() { return "paseo-app"; }
+
   async issueDocument() { return null; }
 
   async moveToStateNamed() { return { changed: false }; }
 
   async issueState(id: string) {
-    return { id, identifier: id.toUpperCase(), status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, creatorId: "owner", labels: [], attachmentUrls: [], blockedBy: this.blocked[id] ?? [] };
+    return { id, identifier: id.toUpperCase(), status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, creatorId: "owner", labels: [], attachmentUrls: [], blockedBy: this.blocked[id] ?? [], priority: 0, createdAt: "", unblocks: 0 };
   }
 
   async detail(id: string): Promise<TicketDetail> {
@@ -70,15 +74,15 @@ function fakePaseo(activeAgents: { id: string; title: string }[] = []): PaseoApi
   } as unknown as PaseoApi;
 }
 
-function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = baseSettings, paseo = fakePaseo()) {
+function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = baseSettings, paseo = fakePaseo(), handOff?: (issueId: string) => Promise<boolean>) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const launches: Omit<RpcInput<typeof launchAgentRpc>, "planFirst">[] = [];
+  const launches: RpcInput<typeof launchAgentRpc>[] = [];
   const starter = new TicketStarter({
     linear,
     launcher: { start: async (input) => { launches.push(input); return { agentId: "agent-1", warnings: [] }; } },
     branches: async () => ({ branches: [{ id: "refs/heads/dev", label: "dev" }, { id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }),
   });
-  const dispatcher = new Dispatcher({ linear, starter, settings: { read: async () => settings } });
+  const dispatcher = new Dispatcher({ linear, starter, settings: { read: async () => settings }, handOff });
   dispatcher.attach(paseo);
   return { dispatcher, launches };
 }
@@ -89,8 +93,8 @@ test("a labeled ticket is claimed before its agent launches, and is not launched
   await dispatcher.tick();
   assert.equal(launches.length, 1);
   assert.deepEqual(launches[0], {
-    id: "eng-1", projectId: "p1", baseBranch: "refs/heads/dev", provider: "claude/opus", modeId: "default", thinkingOptionId: undefined,
-    instructions: `${planDecisionNote("claude")}\n\n${advisorNote("claude")}\n\n${QUESTIONS_NOTE}`, markInProgress: false, requestId: launches[0].requestId,
+    id: "eng-1", projectId: "p1", baseBranch: "refs/heads/dev", provider: "claude/opus", modeId: "plan", thinkingOptionId: undefined,
+    instructions: `${PLAN_REQUIRED_NOTE}\n\n${advisorNote("claude")}\n\n${QUESTIONS_NOTE}`, markInProgress: false, requestId: launches[0].requestId,
   });
   assert.deepEqual(linear.writes.slice(1, 3), ["-paseo eng-1", "+paseo-running eng-1"]);
   assert.deepEqual([...linear.labels.get("eng-1")!].sort(), ["bug", "paseo-running"]);
@@ -98,6 +102,18 @@ test("a labeled ticket is claimed before its agent launches, and is not launched
   await dispatcher.tick();
   assert.equal(launches.length, 1);
   assert.equal(dispatcher.snapshot().recent[0].outcome, "launched");
+});
+
+test("a labelled ticket with open sub-issues is handed to Paseo as a group: the label comes off and no agent starts for it", async (t) => {
+  const linear = new FakeLinear({ "eng-1": ["paseo"], "eng-2": ["paseo"] });
+  linear.parents.add("eng-1");
+  const asked: string[] = [];
+  const { dispatcher, launches } = setup(t, linear, baseSettings, fakePaseo(), async (id) => { asked.push(id); return true; });
+  await dispatcher.tick();
+  assert.deepEqual(asked, ["eng-1"], "tickets without open sub-issues are not looked at");
+  assert.deepEqual([...linear.labels.get("eng-1")!], []);
+  assert.deepEqual(launches.map((launch) => launch.id), ["eng-2"]);
+  assert.deepEqual(dispatcher.snapshot().recent.map((item) => `${item.identifier} ${item.outcome}`), ["ENG-2 launched", "ENG-1 grouped"]);
 });
 
 test("a ticket without a saved project mapping is marked failed with the reason instead of launching", async (t) => {

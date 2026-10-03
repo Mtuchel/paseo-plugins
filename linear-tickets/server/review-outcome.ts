@@ -7,6 +7,8 @@ import { join } from "node:path";
 export type PendingReview = { localUrl: string; remoteUrl?: string; openedAt?: string; planHash?: string };
 export type ReviewOutcome = "open" | { approved: boolean; feedback?: string; planContent: string } | null;
 
+// A plan text's identity, also for the risk policy: the omp extension hashes the plan it records
+// the advisor review for the same way (omp/linear-tickets-plan-first.ts).
 export function planHash(plan: string): string {
   return createHash("sha256").update(plan.trim()).digest("hex");
 }

@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+// The bridge's hash: the extension's `advised` event must carry the same one.
+import { planHash } from "./review-outcome";
 
 // The omp extension reads its environment when it loads, so it is imported after this setup.
 const root = mkdtempSync(join(tmpdir(), "paseo-plan-advisor-"));
@@ -72,7 +77,9 @@ function load() {
   };
 }
 
-const PLAN = "# Plan\n\nDo the thing.\n\n## Advisor review\n\nGPT-6 Astra, 2 rounds, agreed.\n";
+const RISK = "## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: 1 — read-only\n- Reversibility: revert — nothing written\n- Feature flag: no\n- Migration: no\n- Auth: no\n- Failure mode: a wrong column in the report\n- Advisor rating: impact 1, reversibility revert\n- Recommendation: auto — routine\n\n";
+const UNADVISED_RISK = RISK.replace("impact 1, reversibility revert", "unavailable");
+const PLAN = `# Plan\n\nDo the thing.\n\n${RISK}## Advisor review\n\nGPT-6 Astra, 2 rounds, agreed.\n`;
 
 test("a ticket plan cannot reach the owner until a finished GPT-6 Astra advisor review is recorded for that exact text", async () => {
   const h = load();
@@ -121,11 +128,31 @@ test("an unavailable advisor is recorded only with a reason the plan itself tell
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable" }), /Give the reason/);
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "quota exhausted" }), /must tell the owner that the advisor was unavailable/);
   assert.equal((await h.submit("PLAN.md"))?.block, true);
-  writeFileSync(join(h.cwd, "PLAN.md"), "# Plan\n\nDo the thing.\n\n## Advisor review\n\nThe advisor was unavailable.\n");
+  writeFileSync(join(h.cwd, "PLAN.md"), `# Plan\n\nDo the thing.\n\n${UNADVISED_RISK}## Advisor review\n\nThe advisor was unavailable.\n`);
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "quota exhausted" }), /with the reason you pass here/, "the owner must see why, not only that");
-  writeFileSync(join(h.cwd, "PLAN.md"), "# Plan\n\nDo the thing.\n\n## Advisor review\n\nThe GPT-6 Astra advisor was unavailable: quota exhausted.\n\n## Out of scope\n\nNothing.\n");
+  writeFileSync(join(h.cwd, "PLAN.md"), `# Plan\n\nDo the thing.\n\n${UNADVISED_RISK}## Advisor review\n\nThe GPT-6 Astra advisor was unavailable: quota exhausted.\n\n## Out of scope\n\nNothing.\n`);
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "quota exhausted" }), /recorded/);
   assert.equal(await h.submit("PLAN.md"), undefined, "an explained unavailable advisor lets the owner decide");
+});
+
+test("the record needs a readable risk rating with the advisor's own, and tells the plugin which verdict belongs to which plan text", async () => {
+  const h = load();
+  writeFileSync(join(h.cwd, "PLAN.md"), "# Plan\n\nDo the thing.\n\n## Advisor review\n\nGPT-6 Astra, 1 round, agreed.\n");
+  assert.match(await h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" }), /no "## Risk and impact" section/);
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("- Migration: no\n", ""));
+  assert.match(await h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" }), /unreadable value for: Migration/);
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace(RISK, UNADVISED_RISK));
+  assert.match(await h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" }), /"Advisor rating" says unavailable, but the verdict is agreed/);
+  assert.equal((await h.submit("PLAN.md"))?.block, true);
+
+  const events = join(root, "linear-tickets", "plannotator", "events");
+  const before = new Set(existsSync(events) ? readdirSync(events) : []);
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN);
+  assert.match(await h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" }), /recorded/);
+  const added = readdirSync(events).filter((name) => !before.has(name));
+  assert.equal(added.length, 1);
+  const event = JSON.parse(readFileSync(join(events, added[0]), "utf8"));
+  assert.deepEqual({ ...event, at: "t" }, { type: "advised", verdict: "agreed", hash: planHash(PLAN), agentId: "planner-1", at: "t" });
 });
 
 test("omp's local plan proposals are checked against the text the bridge would submit, and fail closed when unreadable", async () => {
@@ -246,4 +273,42 @@ test("every plan submission form is recognized, and nothing else", () => {
   assert.equal(submittedPlan("write", { path: "PLAN.md", content: "# Plan" }), null);
   assert.equal(submittedPlan("write", { path: "xd://plannotator_submit_plan", content: "not json" }), null);
   assert.equal(submittedPlan("bash", { command: "ls" }), null);
+});
+
+test("ticket agents and their subagents change Linear only through the linear_ticket tools", async () => {
+  const h = load();
+  const blocked = [
+    h.call("mcp__linear_save_comment", { issueId: "ENG-1", body: "x" }),
+    h.call("write", { path: "xd://mcp__linear_save_issue", content: "{}" }),
+    h.call("mcp__linear_new_tool", {}),
+    h.hook("mcp__linear_save_comment", "s1", { issueId: "ENG-1", body: "x" }, { kind: "sub" }),
+  ];
+  const names = ["mcp__linear_save_comment", "mcp__linear_save_issue", "mcp__linear_new_tool", "mcp__linear_save_comment"];
+  for (const [index, result] of (await Promise.all(blocked)).entries()) {
+    assert.equal(result?.block, true, names[index]);
+    assert.match(result.reason, /^Stopped by the linear-tickets plugin: ticket agents change Linear only through the linear_ticket tools/);
+    assert.ok(result.reason.includes(names[index]));
+  }
+  assert.equal(await h.call("mcp__linear_get_issue", { id: "ENG-1" }), undefined);
+  assert.equal(await h.call("write", { path: "xd://mcp__linear_list_issues", content: "{}" }), undefined);
+  assert.equal(await h.call("mcp__linear_ticket_add_comment", { body: "x" }), undefined);
+});
+
+test("outside ticket agents the Linear tools are not blocked", async () => {
+  // The extension reads LINEAR_TICKETS_ISSUE when it loads, so each case loads it in its own
+  // process with an environment built from scratch (the test's own may name a ticket).
+  const script = `
+    const { default: extension } = await import(process.env.EXTENSION);
+    let gate;
+    extension({ on: (event, handler) => { if (event === "tool_call") gate = handler; }, events: { emit() {} }, appendEntry() {}, sendMessage() {}, registerTool() {}, zod: { object: () => ({}), string: () => ({ optional: () => ({}) }), enum: () => ({}) } });
+    const result = await gate({ toolName: "mcp__linear_save_comment", input: { issueId: "ENG-1", body: "x" } }, { sessionManager: { getBranch: () => [] } });
+    process.stdout.write(JSON.stringify(result ?? null));
+  `;
+  const outcome = async (extra: Record<string, string>) => {
+    const env = { PATH: process.env.PATH ?? "", PASEO_AGENT_ID: "solo-1", PASEO_HOME: root, EXTENSION: new URL("../omp/linear-tickets-plan-first.ts", import.meta.url).href, ...extra };
+    const { stdout } = await promisify(execFile)(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], { cwd: fileURLToPath(new URL("..", import.meta.url)), env });
+    return JSON.parse(stdout) as { block?: boolean } | null;
+  };
+  assert.equal(await outcome({}), null);
+  assert.equal((await outcome({ LINEAR_TICKETS_ISSUE: "ENG-1" }))?.block, true, "the same load blocks it for a ticket agent");
 });

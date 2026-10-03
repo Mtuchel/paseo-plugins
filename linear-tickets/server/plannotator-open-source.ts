@@ -1,8 +1,9 @@
 // The PLANNOTATOR_BROWSER hook, run by the daemon's own Node runtime (see plannotator.ts).
-// Plannotator calls it with the review URL (http://localhost:<port>/…). It keeps the normal
-// desktop behaviour — the review opens on this machine — and additionally:
+// Plannotator calls it with the review URL (http://localhost:<port>/…). It
 //   1. publishes the port inside the tailnet with `tailscale serve` (HTTPS, tailnet-only),
-//   2. records {agent, local URL, tailnet URL} as an event for the linear-tickets plugin.
+//   2. records {agent, local URL, tailnet URL} as an event for the linear-tickets plugin, whose
+//      bridge opens the review on this machine unless the risk policy approves it first.
+// When the event cannot be recorded, the hook opens the review itself (the normal desktop behaviour).
 // The plugin's ReviewLinks (review-links.ts) removes the route once the review server stops.
 // It must exit quickly and never fail loudly: Plannotator only needs "a browser was opened".
 export const PLANNOTATOR_OPEN_SOURCE = String.raw`import { execFileSync, spawn } from "node:child_process";
@@ -38,17 +39,17 @@ function publish(port) {
 }
 
 function record(event) {
-  if (!EVENTS) return;
+  if (!EVENTS) return false;
   mkdirSync(EVENTS, { recursive: true, mode: 0o700 });
   const name = Date.now() + "-" + randomUUID() + ".json";
   const temporary = join(EVENTS, "." + name + ".tmp");
   writeFileSync(temporary, JSON.stringify(event), { mode: 0o600 });
   renameSync(temporary, join(EVENTS, name));
+  return true;
 }
 
 const url = process.argv[2];
 if (url) {
-  openLocally(url);
   let remoteUrl = null;
   const local = localPort(url);
   if (local) {
@@ -57,8 +58,10 @@ if (url) {
       if (origin) remoteUrl = origin + local.path;
     } catch {}
   }
+  let recorded = false;
   try {
-    record({ type: "opened", agentId: process.env.PASEO_AGENT_ID ?? null, localUrl: url, remoteUrl, at: new Date().toISOString() });
+    recorded = record({ type: "opened", agentId: process.env.PASEO_AGENT_ID ?? null, localUrl: url, remoteUrl, at: new Date().toISOString() });
   } catch {}
+  if (!recorded) openLocally(url);
 }
 `;

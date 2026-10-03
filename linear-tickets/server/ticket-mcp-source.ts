@@ -15,12 +15,13 @@ if (!issueId || !/^[A-Za-z0-9-]{1,100}$/.test(issueId) || !paseoHome) {
 }
 const override = process.env.LINEAR_TICKET_MCP_ENDPOINT;
 const endpoint = override && /^http:\/\/127\.0\.0\.1:\d+\//.test(override) ? override : "https://api.linear.app/graphql";
-const BLOCKED_TYPES = ["canceled", "duplicate"];
+// Closing a ticket without its work needs a reason, posted on the ticket before the move.
+const REASON_TYPES = ["canceled", "duplicate"];
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_IN_FLIGHT = 4;
 let inFlight = 0;
 
-function redact(text, key) { return key ? text.split(key).join("[redacted]") : text; }
+function redact(text, secrets) { return secrets.reduce((result, secret) => secret ? result.split(secret).join("[redacted]") : result, text); }
 function text(value, name, max) {
   const result = typeof value === "string" ? value.trim() : "";
   if (!result || result.length > max) throw new Error(name + " must be 1 to " + max + " characters.");
@@ -37,33 +38,80 @@ async function apiKey() {
   throw new Error("Linear is not connected on this Paseo host. Ask the user to connect it in the Linear tickets plugin.");
 }
 
-async function linear(query, variables) {
-  const key = await apiKey();
+// The Paseo app's access token, which the plugin keeps fresh in the daemon. Read on every call so a
+// rotated token is picked up; never refreshed or written here (refresh tokens rotate, so only the
+// daemon may use them). Null when the app is not installed or the token is about to expire.
+async function appToken() {
+  try {
+    const saved = JSON.parse(await readFile(join(paseoHome, "linear-tickets", "agent-app", "token.json"), "utf8"));
+    const fresh = typeof saved.expires_at !== "number" || saved.expires_at - 60000 > Date.now();
+    if (typeof saved.access_token === "string" && saved.access_token && fresh) return saved.access_token;
+  } catch {}
+  return null;
+}
+
+async function post(authorization, query, variables) {
   let response;
   try {
     response = await fetch(endpoint, {
       method: "POST", redirect: "error",
-      headers: { authorization: key, "content-type": "application/json" },
+      headers: { authorization, "content-type": "application/json" },
       body: JSON.stringify({ query, variables }),
       signal: AbortSignal.timeout(30000),
     });
   } catch { throw new Error("Could not reach the Linear API."); }
   let payload = null;
   try { payload = await response.json(); } catch {}
-  if (response.status === 401 || response.status === 403) throw new Error("Linear rejected the host's API key. Reconnect Linear in the Linear tickets plugin.");
+  const codes = payload && Array.isArray(payload.errors) ? payload.errors.map((e) => e && e.extensions && e.extensions.code) : [];
+  return { status: response.status, ok: response.ok, payload, codes };
+}
+
+// Linear did not accept the credential, so it ran nothing.
+function unauthenticated(result) { return result.status === 401 || result.codes.includes("AUTHENTICATION_ERROR"); }
+
+function answer(result, secrets, viaKey) {
+  const { payload } = result;
+  const who = viaKey ? "the Linear API key" : "the Paseo app";
+  const errors = payload && Array.isArray(payload.errors) ? redact(payload.errors.map((e) => (e && (e.extensions && e.extensions.userPresentableMessage || e.message)) || "").filter((m) => typeof m === "string" && m).join("; "), secrets).slice(0, 300) : "";
+  if (viaKey && (result.status === 401 || result.status === 403)) throw new Error("Linear rejected the host's API key. Reconnect Linear in the Linear tickets plugin.");
   // Linear answers a spent hourly budget with HTTP 400 and the RATELIMITED code (429 from proxies).
-  const rateLimited = response.status === 429 || (payload && Array.isArray(payload.errors) && payload.errors.some((e) => e && e.extensions && e.extensions.code === "RATELIMITED"));
-  if (rateLimited) throw new Error("Linear's hourly request limit is reached for the Linear API key; try again in about 10 minutes.");
-  const errors = payload && Array.isArray(payload.errors) ? redact(payload.errors.map((e) => (e && (e.extensions && e.extensions.userPresentableMessage || e.message)) || "").filter((m) => typeof m === "string" && m).join("; "), key).slice(0, 300) : "";
-  if (!response.ok || errors) throw new Error("The Linear request failed" + (errors ? ": " + errors : " (HTTP " + response.status + ")."));
+  if (result.status === 429 || result.codes.includes("RATELIMITED")) throw new Error("Linear's hourly request limit is reached for " + who + "; try again in about 10 minutes.");
+  if (result.status === 403) throw new Error("Linear refused this request for " + who + (errors ? ": " + errors : "."));
+  if (!result.ok || errors) throw new Error("The Linear request failed" + (errors ? ": " + errors : " (HTTP " + result.status + ")."));
   return (payload && payload.data) || {};
+}
+
+async function withKey(query, variables, secrets) {
+  const key = await apiKey();
+  return answer(await post(key, query, variables), [...secrets, key], true);
+}
+
+// Every request goes out as the Paseo app, so its writes show "Paseo" in Linear. The owner's key
+// is used only when Linear authenticated nothing for the app: no usable token, or a rejected one
+// that is still rejected (or unchanged) after reading token.json again. Any other failure (a
+// refusal, rate limit, invalid input, outage) goes back to the agent and is never retried with the
+// key, so nothing is written twice or under the owner's name by mistake.
+async function linear(query, variables) {
+  const secrets = [];
+  let token = await appToken();
+  if (token) {
+    secrets.push(token);
+    let result = await post("Bearer " + token, query, variables);
+    if (unauthenticated(result)) {
+      const reread = await appToken();
+      result = reread && reread !== token ? await post("Bearer " + reread, query, variables) : null;
+      if (reread) secrets.push(reread);
+    }
+    if (result && !unauthenticated(result)) return answer(result, secrets, false);
+  }
+  return withKey(query, variables, secrets);
 }
 
 const ISSUE = "query ticket($id: String!) { issue(id: $id) { id identifier title url description priorityLabel state { name type } assignee { name } team { id name states(first: 50) { nodes { id name type position } } } comments(first: 50) { nodes { body createdAt user { name } } } attachments(first: 20) { nodes { title url } } } }";
 
 async function loadIssue() {
   const data = await linear(ISSUE, { id: issueId });
-  if (!data.issue) throw new Error("Linear did not return this ticket. Check that the host's key can see it.");
+  if (!data.issue) throw new Error("Linear did not return this ticket. Check that the host's Linear connection can see it.");
   return data.issue;
 }
 
@@ -73,11 +121,12 @@ function states(issue) {
 }
 
 // Manual tasks: steps only a person can do (env vars, secrets, settings). Each becomes a sub-issue
-// assigned to the key's owner, plus a private file the plugin's watcher reads. The check command
-// lives only in that file: the plugin never runs text taken from Linear.
+// assigned to the owner (the user of the host's key, read with that key, whoever writes), plus a
+// private file the plugin's watcher reads. The check command lives only in that file: the plugin
+// never runs text taken from Linear.
 const MANUAL_WHEN = ["before_merge", "after_merge", "anytime"];
 const WHEN_TEXT = { before_merge: "due before the pull request is merged", after_merge: "due once the pull request is merged", anytime: "due now, independent of the merge" };
-const MANUAL = "query manual($id: String!) { viewer { id } issue(id: $id) { id identifier team { id states(first: 50) { nodes { id name type position } } } children(first: 100) { nodes { id identifier url title state { type } } } } }";
+const MANUAL = "query manual($id: String!) { issue(id: $id) { id identifier team { id states(first: 50) { nodes { id name type position } } } children(first: 100) { nodes { id identifier url title state { type } } } } }";
 const MANUAL_DIRECTORY = join(paseoHome, "linear-tickets", "manual-tasks");
 const FINISHED_TYPES = ["completed", "canceled", "duplicate"];
 
@@ -109,7 +158,7 @@ const tools = [
       return {
         identifier: issue.identifier, title: issue.title, url: issue.url, status: issue.state, priority: issue.priorityLabel,
         assignee: issue.assignee ? issue.assignee.name : null, team: issue.team ? issue.team.name : null,
-        availableStatuses: states(issue).filter((s) => !BLOCKED_TYPES.includes(s.type)).map((s) => ({ name: s.name, type: s.type })),
+        availableStatuses: states(issue).map((s) => ({ name: s.name, type: s.type })),
         description: issue.description, comments, links: (issue.attachments && issue.attachments.nodes) || [],
       };
     },
@@ -128,17 +177,21 @@ const tools = [
   },
   {
     name: "set_status",
-    description: "Move this agent's Linear ticket to another workflow state of its team, by exact state name (see get_ticket availableStatuses). Canceled and duplicate states are reserved for people.",
-    inputSchema: { type: "object", properties: { status: { type: "string", minLength: 1, maxLength: 200 } }, required: ["status"], additionalProperties: false },
+    description: "Move this agent's Linear ticket to another workflow state of its team, by exact state name (see get_ticket availableStatuses). A canceled or duplicate state needs a reason, which is posted on the ticket first.",
+    inputSchema: { type: "object", properties: { status: { type: "string", minLength: 1, maxLength: 200 }, reason: { type: "string", minLength: 1, maxLength: 2000 } }, required: ["status"], additionalProperties: false },
     async run(input) {
       const wanted = text(input.status, "status", 200).toLowerCase();
       const issue = await loadIssue();
       const all = states(issue);
       const target = all.find((s) => s.name.trim().toLowerCase() === wanted);
-      const allowed = all.filter((s) => !BLOCKED_TYPES.includes(s.type)).map((s) => s.name);
-      if (!target) throw new Error("Unknown status. Choose one of: " + allowed.join(", "));
-      if (BLOCKED_TYPES.includes(target.type)) throw new Error("Only a person can move a ticket to " + target.name + ".");
+      if (!target) throw new Error("Unknown status. Choose one of: " + all.map((s) => s.name).join(", "));
       if (issue.state && issue.state.name === target.name) return { changed: false, status: target.name };
+      if (REASON_TYPES.includes(target.type)) {
+        if (input.reason === undefined) throw new Error("Moving the ticket to " + target.name + " closes it without its work: give the reason.");
+        const reason = text(input.reason, "reason", 2000);
+        const posted = await linear("mutation comment($input: CommentCreateInput!) { commentCreate(input: $input) { success } }", { input: { issueId, body: "Moved to " + target.name + " by its agent: " + reason } });
+        if (!posted.commentCreate || !posted.commentCreate.success) throw new Error("Linear did not post the reason; the status is unchanged.");
+      }
       const data = await linear("mutation status($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { state { name } } } }", { id: issueId, stateId: target.id });
       if (!data.issueUpdate || !data.issueUpdate.success) throw new Error("Linear did not apply the status change.");
       return { changed: true, from: issue.state ? issue.state.name : null, status: target.name };
@@ -179,8 +232,9 @@ const tools = [
       const check = input.check === undefined ? null : text(input.check, "check", 2000);
       const data = await linear(MANUAL, { id: issueId });
       const issue = data.issue;
-      if (!issue || !issue.team) throw new Error("Linear did not return this ticket. Check that the host's key can see it.");
-      const viewer = data.viewer && data.viewer.id;
+      if (!issue || !issue.team) throw new Error("Linear did not return this ticket. Check that the host's Linear connection can see it.");
+      const owner = await withKey("query owner { viewer { id } }", {}, []);
+      const viewer = owner.viewer && owner.viewer.id;
       if (!viewer) throw new Error("Linear did not return the connected user.");
       const wanted = title.toLowerCase();
       const children = (issue.children && issue.children.nodes) || [];

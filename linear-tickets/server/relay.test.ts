@@ -11,6 +11,7 @@ import { NeedsYouIssues } from "./needs-you";
 import { approvalDecision, CommentRelay, mentionMessage, questionAnswer } from "./relay";
 
 const ME = "user-me";
+const APP = "paseo-app";
 
 test("only comments that start with @paseo are addressed to the agent", () => {
   assert.equal(mentionMessage("@paseo use SFTP"), "use SFTP");
@@ -41,16 +42,18 @@ test("approval replies are recognised, with an optional deny reason; other text 
 
 type AgentFixture = { id: string; issueId: string; createdAt: string; updatedAt: string; parent?: string; pending?: AgentPermissionRequest[] };
 
-type Fake = { comments: Record<string, RelayComment[]>; failRead?: Error | null; failReact?: Error | null };
+// `appId`: the Paseo app's user, or null when the app is not usable on this host.
+type Fake = { comments: Record<string, RelayComment[]>; appId: string | null; failRead?: Error | null; failReact?: Error | null };
 
 // A throwaway cursor file per setup; pass `path` to reuse one (a plugin restart).
 function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>, path = join(mkdtempSync(join(tmpdir(), "relay-")), "cursors.json"), needsYou?: NeedsYouIssues) {
   const events: string[] = [];
   const since: string[] = [];
   const reads: number[] = [];
-  const fake: Fake = { comments };
+  const fake: Fake = { comments, appId: APP };
   const linear = {
     async viewerId() { return ME; },
+    async appUserId() { return fake.appId; },
     // Like Linear: comments at or after each ticket's cursor.
     async relayComments(_userId: string, cursors: { issueId: string; since: string }[]) {
       reads.push(cursors.length);
@@ -85,7 +88,7 @@ function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>,
   return { relay: new CommentRelay(linear, path, needsYou), paseo, events, since, reads, fake, path };
 }
 
-const comment = (id: string, body: string, extra: Partial<RelayComment> = {}): RelayComment => ({ id, body, createdAt: `2026-02-01T00:00:0${id.length}Z`, userId: ME, reactions: [], sessionId: null, ...extra });
+const comment = (id: string, body: string, extra: Partial<RelayComment> = {}): RelayComment => ({ id, body, createdAt: `2026-02-01T00:00:0${id.length}Z`, userId: ME, reactions: [], sessionId: null, parent: null, ...extra });
 
 test("my @paseo comments reach the newest agent on the ticket and are marked delivered; everything else is ignored", async () => {
   const { relay, paseo, events, since } = setup([
@@ -106,6 +109,49 @@ test("my @paseo comments reach the newest agent on the ticket and are marked del
   await relay.poll(paseo);
   assert.deepEqual(since, ["i1@2026-01-02T00:00:00Z"]);
   assert.deepEqual(events, ["send new: please also handle returns", "react c1 eyes"]);
+});
+
+test("my replies to a Paseo app comment reach the agent without @paseo; replies elsewhere and in agent session threads do not", async () => {
+  const agent = { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
+  const comments = {
+    i1: [
+      comment("c1", "  go with option 2 ", { parent: { userId: APP, sessionId: null } }),
+      comment("c22", "@paseo also mentioned", { parent: { userId: APP, sessionId: null } }),
+      comment("c333", "reply to a teammate", { parent: { userId: "user-other", sessionId: null } }),
+      // The session webhook delivers replies in an agent session's thread.
+      comment("c4444", "in the session thread", { parent: { userId: ME, sessionId: "session-1" } }),
+      comment("c55555", "@paseo in the session thread", { parent: { userId: ME, sessionId: "session-1" } }),
+    ],
+  };
+  const { relay, paseo, events } = setup([agent], comments);
+  await relay.poll(paseo);
+  assert.deepEqual(events, ["send a: go with option 2", "send a: also mentioned", "react c1 eyes", "react c22 eyes"]);
+
+  // Without a usable app, Paseo's comments cannot be told apart from mine: only @paseo counts.
+  const keyOnly = setup([agent], { i1: [comment("c1", "go with option 2", { parent: { userId: APP, sessionId: null } })] });
+  keyOnly.fake.appId = null;
+  await keyOnly.relay.poll(keyOnly.paseo);
+  assert.deepEqual(keyOnly.events, []);
+});
+
+test("a comment the Paseo app already marked is not relayed again, even when the ack record was lost; without a usable app, someone else's reaction does not count", async () => {
+  const agent = { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
+  const comments = {
+    i1: [
+      comment("c1", "@paseo delivered before the cursor file was lost", { reactions: [{ emoji: "eyes", userId: APP }] }),
+      comment("c22", "@paseo failed before", { reactions: [{ emoji: "x", userId: APP }] }),
+      comment("c333", "@paseo new one"),
+    ],
+  };
+  // A fresh cursor file: no saved acks.
+  const known = setup([agent], comments);
+  await known.relay.poll(known.paseo);
+  assert.deepEqual(known.events, ["send a: new one", "react c333 eyes"]);
+
+  const unknown = setup([agent], { i1: [comment("c1", "@paseo marked by an unknown user", { reactions: [{ emoji: "eyes", userId: APP }] })] });
+  unknown.fake.appId = null;
+  await unknown.relay.poll(unknown.paseo);
+  assert.deepEqual(unknown.events, ["send a: marked by an unknown user", "react c1 eyes"]);
 });
 
 test("a pending question is answered and a pending approval is decided from the comment", async () => {

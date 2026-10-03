@@ -3,20 +3,25 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { TicketDetail } from "../shared/contracts";
 import { advisorSteps } from "../shared/plan-advisor";
 import { mappedBaseBranch, mappingLabel, type ProjectMapping } from "../shared/mapping";
+import { Capacity } from "./capacity";
 import type { Handover } from "./handover";
 import type { Launcher } from "./launch";
 import type { LinearService } from "./linear";
 import { findProject, readBranches } from "./projects";
 import { hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, planPolicy, type PlanPolicy } from "./plan-policy";
+import { needsOwner, type Presence } from "./presence";
+import { Scheduler, type Admission } from "./scheduler";
 import type { PluginSettings } from "./settings";
 
 export type Started = { agentId: string; warnings: string[]; provider: string; target: string; resumed: boolean; untrusted: boolean; plan: PlanPolicy | null };
-export type Admission = { ok: true } | { ok: false; reason: string };
 type Deps = {
-  linear: Pick<LinearService, "detail" | "issueState" | "viewerId" | "issueDocument">;
+  linear: Pick<LinearService, "detail" | "issueState" | "viewerId" | "appUserId" | "issueDocument">;
   launcher: Pick<Launcher, "start">;
   handover?: Pick<Handover, "resumeTarget">;
   branches?: typeof readBranches;
+  scheduler?: Scheduler;
+  capacity?: Capacity;
+  presence?: Pick<Presence, "away">;
 };
 
 // Plan-first modes where the provider's plan mode lets the planner read without asking. omp has
@@ -29,19 +34,13 @@ export const UNTRUSTED_NOTE = [
   UNTRUSTED_TEXT,
   "Investigate and write a plan only. Do not change code, run installs or make network calls until the owner approves the plan.",
 ].join(" ");
-export const PLAN_REQUIRED_NOTE = "The owner asked for a plan first. Investigate and write a plan; do not change code until the owner approves it.";
+// Every ticket plans first (README, "Plan-first"); the risk policy approves plans within the
+// owner's threshold, the owner the rest.
+export const PLAN_REQUIRED_NOTE = "Every ticket gets a plan first. Investigate and write a plan; do not change code until it is approved, by the owner or automatically when its risk rating is within the owner's threshold. Keep the plan as short as the ticket allows: a one-line fix needs a few lines of plan, not a document.";
 // Every plan a ticket agent writes gets a second opinion before the owner sees it (README, "Plan
 // advisor"). omp planners have the extension's record tool and submission gate.
 export function advisorNote(providerKey: string): string {
   return advisorSteps({ omp: providerKey === "omp" });
-}
-const PLAN_RULES = "Plan if any of these apply: a database schema or migration change; authentication, authorization or permissions; more than one app or service; a change to a public or cross-service API; acceptance criteria that are unclear or contradict each other; or more than about three files. Skip the plan only when none apply; when unsure, plan.";
-// omp agents start in Plannotator's planning phase and leave it through the extension's
-// `skip_plan` tool; other providers get the same rules as instructions only.
-export function planDecisionNote(providerKey: string): string {
-  return providerKey === "omp"
-    ? `You start in plan mode. First decide whether this ticket needs a plan the owner reviews before you change code. ${PLAN_RULES} To skip, call \`skip_plan\` with a one-sentence reason (it is posted on the ticket), then implement. Otherwise write the plan and submit it for review.`
-    : `Before your first change, decide whether this ticket needs a plan the owner reviews. ${PLAN_RULES} If it needs one, write the plan and ask the owner to approve it before changing code; otherwise say in one sentence why no plan is needed, then implement.`;
 }
 const MAX_PLAN_NOTE_CHARS = 20_000;
 // A question request moves the ticket to "Needs input" and notifies the owner, so one ask beats
@@ -58,45 +57,58 @@ export function approvedPlanNote(identifier: string, plan: { url: string; conten
   ].join("\n\n");
 }
 
-export function isUntrusted(state: { creatorId: string | null; labels: { name: string }[] }, ownerId: string): boolean {
-  return state.creatorId !== ownerId || hasLabel(state.labels, "feedback");
+// A plan the owner sent back (its document starts with planDocument's "Sent back" header): the
+// next agent plans again, starting from that plan and the owner's feedback in it.
+export function sentBackPlanNote(identifier: string, plan: { url: string; content: string } | null): string {
+  const text = plan?.content.trim() ?? "";
+  if (!text.startsWith("> **Sent back with feedback**")) return "";
+  return [
+    `The owner sent the previous plan for this ticket back${plan?.url ? ` (Linear document "Plan: ${identifier}": ${plan.url})` : ""}. Plan again: address every point of their feedback (the "Review feedback" section), and keep what they did not object to.`,
+    `Previous plan and feedback:\n\n${text.length > MAX_PLAN_NOTE_CHARS ? `${text.slice(0, MAX_PLAN_NOTE_CHARS)}\n\n… (truncated; read the full document)` : text}`,
+  ].join("\n\n");
+}
+
+// Tickets the owner wrote, or the Paseo app wrote in a flow the owner started (split sub-issues,
+// needs-you sub-issues, manual tasks), are trusted unless they carry the feedback label. `appId` is
+// null when the app cannot be used here; an unknown app never widens trust.
+export function isUntrusted(state: { creatorId: string | null; labels: { name: string }[] }, ownerId: string, appId: string | null): boolean {
+  return !state.creatorId || (state.creatorId !== ownerId && state.creatorId !== appId) || hasLabel(state.labels, "feedback");
 }
 
 export type PlanSetup = { untrusted: boolean; policy: PlanPolicy | null; modeId: string | undefined; notes: string[]; labels: Record<string, string>; env: Record<string, string> };
 
 // What a ticket's launch looks like under its plan policy: mode, instructions, and the agent
 // label and environment the omp extension and write-back read. Shared by every launch path.
-export async function planSetup(linear: Pick<LinearService, "issueState" | "viewerId" | "issueDocument">, issueId: string, provider: string, usualModeId: string | undefined, planFirst = false): Promise<PlanSetup> {
+export async function planSetup(linear: Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "issueDocument">, issueId: string, provider: string, usualModeId: string | undefined): Promise<PlanSetup> {
   const state = await linear.issueState(issueId);
-  const untrusted = isUntrusted(state, await linear.viewerId());
-  const policy = planPolicy({ untrusted, labels: state.labels, planFirst });
-  const planReady = hasLabel(state.labels, PLAN_READY_LABEL);
-  const plan = planReady ? await linear.issueDocument(issueId, `Plan: ${state.identifier}`).catch(() => null) : null;
+  const untrusted = isUntrusted(state, await linear.viewerId(), await linear.appUserId());
+  const policy = planPolicy(state.labels);
+  const plan = await linear.issueDocument(issueId, `Plan: ${state.identifier}`).catch(() => null);
   const providerKey = provider.split("/")[0];
   return {
     untrusted,
     policy,
     // A required plan starts in the provider's safe mode, if it has one; approving the plan restores the usual mode.
-    modeId: policy === "required" ? SAFE_MODES[providerKey] ?? usualModeId : usualModeId,
+    modeId: policy ? SAFE_MODES[providerKey] ?? usualModeId : usualModeId,
     notes: [
-      policy === "required" ? (untrusted ? UNTRUSTED_NOTE : PLAN_REQUIRED_NOTE) : untrusted ? UNTRUSTED_TEXT : "",
-      policy === "agent" ? planDecisionNote(providerKey) : "",
-      policy ? advisorNote(providerKey) : "",
-      planReady ? approvedPlanNote(state.identifier, plan) : "",
+      policy ? (untrusted ? UNTRUSTED_NOTE : PLAN_REQUIRED_NOTE) : untrusted ? UNTRUSTED_TEXT : "",
+      policy ? advisorNote(providerKey) : approvedPlanNote(state.identifier, plan),
+      policy ? sentBackPlanNote(state.identifier, plan) : "",
     ].filter(Boolean),
     labels: policy ? { [PLAN_POLICY_LABEL]: policy } : {},
     env: policy ? { [PLAN_POLICY_ENV]: policy } : {},
   };
 }
 
-// Counts ticket agents that are working right now (not idle, not archived, not subagents).
-export async function runningTicketAgents(paseo: PaseoApi): Promise<number> {
-  let running = 0;
+// Issue ids of the ticket agents working right now (not idle, not archived, not subagents).
+export async function runningTicketAgents(paseo: PaseoApi): Promise<string[]> {
+  const running: string[] = [];
   let cursor: string | undefined;
   do {
     const page = await paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
     for (const { agent } of page.entries) {
-      if (agent.labels?.["linear.issueId"] && !agent.labels["paseo.parent-agent-id"] && (agent.status === "running" || agent.status === "initializing")) running++;
+      const issueId = agent.labels?.["linear.issueId"];
+      if (issueId && !agent.labels["paseo.parent-agent-id"] && (agent.status === "running" || agent.status === "initializing")) running.push(issueId);
     }
     cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
   } while (cursor);
@@ -108,21 +120,28 @@ export async function runningTicketAgents(paseo: PaseoApi): Promise<number> {
 // handover on this ticket, the same branch and worktree so the new agent continues its work.
 export class TicketStarter {
   private readonly branches: typeof readBranches;
+  // Shared by every start path, so all of them wait in one line (README, "Who starts next")
+  // under one cap (README, "Memory lease").
+  readonly scheduler: Scheduler;
+  readonly capacity: Capacity;
 
   constructor(private readonly deps: Deps) {
     this.branches = deps.branches ?? readBranches;
+    this.capacity = deps.capacity ?? new Capacity();
+    this.scheduler = deps.scheduler ?? new Scheduler({
+      running: runningTicketAgents,
+      projectOf: async (issueId) => (await deps.linear.issueState(issueId)).projectId,
+      ...(deps.presence ? { away: () => deps.presence!.away() } : {}),
+    });
   }
 
-  // Whether the ticket may start now: its blockers are finished and the agent limit has room.
+  // Whether the ticket may start now: its blockers are finished, and the scheduler gives it a slot
+  // (none while the owner is away for an approved plan that may need them).
   async admission(issueId: string, paseo: PaseoApi, settings: PluginSettings): Promise<Admission> {
     const state = await this.deps.linear.issueState(issueId);
     if (state.blockedBy.length) return { ok: false, reason: `Waiting for ${state.blockedBy.join(", ")} to finish.` };
-    const limit = settings.dispatch.maxRunning;
-    if (limit > 0) {
-      const running = await runningTicketAgents(paseo);
-      if (running >= limit) return { ok: false, reason: `Queued: ${running} of ${limit} ticket agents are working. It starts when one finishes.` };
-    }
-    return { ok: true };
+    const attended = needsOwner(state.labels.map((item) => item.name), settings.dispatch.label);
+    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended }, paseo, this.capacity.limit(settings.dispatch.maxRunning));
   }
 
   async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean }): Promise<Started> {

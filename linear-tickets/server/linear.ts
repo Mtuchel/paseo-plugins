@@ -2,12 +2,40 @@ import { MAX_ATTACHMENT_BYTES } from "./attachments";
 import type { Issue, TicketDetail } from "../shared/contracts";
 import { buildContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations, type FinishedBlocker } from "./context";
 import { Credentials } from "./credentials";
+import type { LabelEvent, SweptIssue } from "./label-rules";
 import { poolOf, rateBudget, RateLimitedError, type RateBudget } from "./rate-budget";
 
 const endpoint = "https://api.linear.app/graphql";
 export type Post = (key: string, query: string, variables: Record<string, unknown>) => Promise<Record<string, unknown>>;
-// Reads with the Paseo app's token (AgentApi.query); null when the app cannot be used on this host.
-export type Reader = { query(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown> | null> };
+// The Paseo app's side of LinearService (AgentApi): reads on its request pool and writes authored as
+// "Paseo". Both return null when the app cannot be used on this host (see AgentApi.query/mutate).
+export type App = {
+  query(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown> | null>;
+  mutate(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown> | null>;
+  viewer(): Promise<{ id: string; name: string }>;
+};
+
+// A Linear request that Linear answered with an error: its HTTP status (200 for GraphQL errors) and
+// the errors' codes and raw messages, so callers decide on the failure, not on its wording.
+export class LinearApiError extends Error {
+  constructor(message: string, readonly status: number, readonly codes: string[] = [], readonly reasons: string[] = []) {
+    super(message);
+  }
+}
+// Linear did not accept the credential (HTTP 401 or AUTHENTICATION_ERROR), so it ran nothing.
+export class AuthenticationError extends LinearApiError {}
+
+function errorDetails(payload: unknown): { codes: string[]; reasons: string[] } {
+  const codes: string[] = [];
+  const reasons: string[] = [];
+  const errors = payload && typeof payload === "object" && "errors" in payload && Array.isArray(payload.errors) ? payload.errors : [];
+  for (const error of errors) {
+    if (!error || typeof error !== "object") continue;
+    if ("message" in error && typeof error.message === "string") reasons.push(error.message);
+    if ("extensions" in error && error.extensions && typeof error.extensions === "object" && "code" in error.extensions && typeof error.extensions.code === "string") codes.push(error.extensions.code);
+  }
+  return { codes, reasons };
+}
 
 // GraphQL error payloads carry a user-facing message, sometimes clearer than the HTTP status alone.
 function apiMessage(payload: unknown): string {
@@ -48,13 +76,17 @@ export async function postGraphQL(key: string, query: string, variables: Record<
       && typeof error.extensions === "object" && "code" in error.extensions && error.extensions.code === "RATELIMITED")));
   ticket.done(response.headers, limited);
   if (limited) throw new RateLimitedError(pool, budget.pausedUntil(pool) ?? Date.now());
+  const { codes, reasons } = errorDetails(payload);
   if (!response.ok) {
     const message = apiMessage(payload);
-    if (response.status === 401 || response.status === 403) {
-      throw new Error(`Linear rejected this API key.${message ? ` ${message}` : ""} Check it in Linear settings and reconnect.`);
+    if (response.status === 401 || response.status === 403 || codes.includes("AUTHENTICATION_ERROR")) {
+      const text = `Linear rejected this API key.${message ? ` ${message}` : ""} Check it in Linear settings and reconnect.`;
+      // A 403 refuses this request, not the credential: it is never a reason to refresh or switch.
+      if (response.status === 403 && !codes.includes("AUTHENTICATION_ERROR")) throw new LinearApiError(text, 403, codes, reasons);
+      throw new AuthenticationError(text, response.status, codes, reasons);
     }
-    if (message) throw new Error(`The Linear API request failed: ${message}`);
-    throw new Error(`The Linear API request failed (HTTP ${response.status}). Try again.`);
+    if (message) throw new LinearApiError(`The Linear API request failed: ${message}`, response.status, codes, reasons);
+    throw new LinearApiError(`The Linear API request failed (HTTP ${response.status}). Try again.`, response.status, codes, reasons);
   }
   if (payload == null) throw new Error("Linear returned an invalid response.");
   const body = record(payload);
@@ -69,7 +101,8 @@ export async function postGraphQL(key: string, query: string, variables: Record<
         return error.message + detail;
       })
       .filter(Boolean).join("; ");
-    throw new Error(`The Linear API request failed${message ? `: ${message}` : "."} Check your API key and ticket access, then retry.`);
+    const text = `The Linear API request failed${message ? `: ${message}` : "."} Check your API key and ticket access, then retry.`;
+    throw codes.includes("AUTHENTICATION_ERROR") ? new AuthenticationError(text, response.status, codes, reasons) : new LinearApiError(text, response.status, codes, reasons);
   }
   return record(body.data);
 }
@@ -217,7 +250,7 @@ export function resolveReviewState(states: TeamState[]): TeamState | null {
 // they are assigned to. Completed and canceled work never launches.
 export const LABELED_ISSUES_QUERY = `query labeledIssues($first: Int!, $filter: IssueFilter) {
   issues(first: $first, includeArchived: false, orderBy: updatedAt, filter: $filter) {
-    nodes { id identifier priority team { key } labels(first: 50) { nodes { id name } } }
+    nodes { id identifier priority team { key } labels(first: 50) { nodes { id name } } children(first: 1, filter: { state: { type: { nin: ["completed", "canceled"] } } }) { nodes { id } } }
   }
 }`;
 
@@ -238,14 +271,16 @@ export const ISSUE_LABELS_QUERY = `query issueLabels($first: Int!, $ids: [ID!]) 
 const ISSUE_LABELS_BATCH = 50;
 
 // `priority`: Linear's 1 (urgent) … 4 (low); 0 means none and sorts last.
-export type LabeledIssue = { id: string; identifier: string; teamKey: string; priority: number; labels: { id: string; name: string }[] };
+// `openChildren`: the ticket has at least one sub-issue that is not completed or canceled.
+export type LabeledIssue = { id: string; identifier: string; teamKey: string; priority: number; labels: { id: string; name: string }[]; openChildren: boolean };
 
 // The current state, team, labels and attachment links of one ticket: enough for
 // write-back decisions without the comment pagination that `detail` performs.
 export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
   issue(id: $id) {
-    id identifier state { id name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
+    id identifier priority createdAt state { id name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
     inverseRelations(first: 50) { nodes { type issue { identifier state { name type } attachments(first: 25) { nodes { url sourceType metadata } } } } }
+    relations(first: 50) { nodes { type relatedIssue { state { type } } } }
   }
 }`;
 // `status`: the workflow state's name ("In Review"); `statusType` its kind ("started").
@@ -270,10 +305,67 @@ function pullRequestsMerged(attachments: unknown): boolean {
   return statuses.includes("merged") && !statuses.some((status) => status === "open" || status === "draft");
 }
 
+// Finished as a blocker counts it (README, "Waiting their turn"): Done, Canceled or a duplicate,
+// or in review with its pull requests merged. `node`: an issue with `state` and `attachments`.
+function finishedIssue(node: Record<string, unknown>): boolean {
+  const state = record(node.state ?? {});
+  if (["completed", "canceled", "duplicate"].includes(label(state.type))) return true;
+  return inReviewState(label(state.name), label(state.type)) && pullRequestsMerged(node.attachments);
+}
+
+// A parent and its sub-issues, for handing the group to Paseo (groups.ts): each sub-issue's
+// assignee, delegate (the Paseo app once handed out), labels and blockers.
+export const ISSUE_GROUP_QUERY = `query issueGroup($id: String!) {
+  issue(id: $id) {
+    id identifier state { name type } delegate { id }
+    children(first: 50) { nodes {
+      id identifier state { name type } assignee { id } delegate { id } labels(first: 20) { nodes { name } }
+      attachments(first: 10) { nodes { url sourceType metadata } }
+      inverseRelations(first: 10) { nodes { type issue { id identifier state { name type } delegate { id } attachments(first: 10) { nodes { url sourceType metadata } } } } }
+    } }
+  }
+}`;
+export type GroupIssue = { id: string; identifier: string; status: string; statusType: string; delegateId: string | null; finished: boolean };
+export type GroupChild = GroupIssue & { assigneeId: string | null; labels: string[]; blockers: GroupIssue[] };
+export type IssueGroup = GroupIssue & { children: GroupChild[] };
+function groupIssue(node: Record<string, unknown>): GroupIssue {
+  const state = record(node.state ?? {});
+  return { id: label(node.id), identifier: label(node.identifier), status: label(state.name), statusType: label(state.type), delegateId: label(record(node.delegate ?? {}).id) || null, finished: finishedIssue(node) };
+}
+
 // `blockedBy`: identifiers of unfinished tickets that block this one (merged reviews count as finished).
+// `unblocks`: how many open tickets this one blocks. `priority`: Linear's 1 (urgent) … 4 (low), 0 none.
 export type IssueState = {
   id: string; identifier: string; status: string; statusId: string; statusType: string; teamId: string | null; projectId: string | null; creatorId: string | null;
-  labels: { id: string; name: string }[]; attachmentUrls: string[]; blockedBy: string[];
+  labels: { id: string; name: string }[]; attachmentUrls: string[]; blockedBy: string[]; priority: number; createdAt: string; unblocks: number;
+};
+
+// Projects carrying the trigger label (README, "Projects"), and their open tickets with what the
+// project flow reads: state, team, parent, who has it, labels, blockers and what they block.
+export const LABELED_PROJECTS_QUERY = `query labeledProjects($label: String!) {
+  projects(first: 50, filter: { labels: { name: { eqIgnoreCase: $label } } }) { nodes { id name } }
+}`;
+export const PROJECT_ISSUES_QUERY = `query projectIssues($id: String!, $after: String) {
+  project(id: $id) { issues(first: 25, after: $after, filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } } }) {
+    nodes {
+      id identifier title priority createdAt state { name type } team { id key } creator { id } assignee { id } delegate { id } labels(first: 20) { nodes { name } }
+      parent { id state { type } project { id } }
+      inverseRelations(first: 15) { nodes { type issue { id identifier state { name type } delegate { id } attachments(first: 10) { nodes { url sourceType metadata } } } } }
+      relations(first: 15) { nodes { type relatedIssue { id state { type } } } }
+    }
+    pageInfo { hasNextPage endCursor }
+  } }
+}`;
+export const ISSUE_DESCRIPTIONS_QUERY = `query issueDescriptions($ids: [ID!]!) {
+  issues(first: 50, filter: { id: { in: $ids } }) { nodes { id description } }
+}`;
+export type LabeledProject = { id: string; name: string };
+// `parentId`: the ticket's parent when it is open and in the same project (the parent's group hands it out).
+// `blocks`: ids of open tickets this one blocks.
+export type ProjectIssue = {
+  id: string; identifier: string; title: string; priority: number; createdAt: string; status: string; statusType: string;
+  teamId: string; teamKey: string; creatorId: string | null; assigneeId: string | null; delegateId: string | null; labels: string[];
+  parentId: string | null; blockers: GroupIssue[]; blocks: string[];
 };
 export const CREATE_ISSUE_QUERY = `mutation issueCreate($input: IssueCreateInput!) {
   issueCreate(input: $input) { success issue { id identifier url } }
@@ -294,10 +386,39 @@ export const LABEL_BY_NAME_QUERY = `query labelByName($name: String!) {
 export const CREATE_LABEL_QUERY = `mutation labelCreate($input: IssueLabelCreateInput!) {
   issueLabelCreate(input: $input) { success issueLabel { id name } }
 }`;
+// Label rules (label-sync.ts): the workspace's labels with their groups, a page of the teams'
+// issues with what the rules read, an issue's label history, and the label writes.
+export const LABEL_CATALOG_QUERY = `query labelCatalog($after: String) {
+  issueLabels(first: 250, after: $after, includeArchived: false) { nodes { id name isGroup parent { id } team { id } } pageInfo { hasNextPage endCursor } }
+}`;
+export const LABEL_SWEEP_QUERY = `query labelSweep($first: Int!, $after: String, $filter: IssueFilter) {
+  issues(first: $first, after: $after, includeArchived: false, orderBy: updatedAt, filter: $filter) {
+    nodes { id identifier title description createdAt updatedAt project { name } parent { id labels(first: 25) { nodes { id } } } labels(first: 25) { nodes { id } } attachments(first: 25) { nodes { url } } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export const LABEL_HISTORY_QUERY = `query labelHistory($id: String!, $after: String) {
+  issue(id: $id) { history(first: 100, after: $after) { nodes { createdAt actorId addedLabelIds removedLabelIds } pageInfo { hasNextPage endCursor } } }
+}`;
+export const UPDATE_LABEL_QUERY = `mutation labelUpdate($id: String!, $input: IssueLabelUpdateInput!) {
+  issueLabelUpdate(id: $id, input: $input) { success }
+}`;
+export const CHANGE_LABELS_QUERY = `mutation changeLabels($id: String!, $added: [String!], $removed: [String!]) {
+  issueUpdate(id: $id, input: { addedLabelIds: $added, removedLabelIds: $removed }) { success }
+}`;
+// `teamId` null: a workspace label.
+export type CatalogLabel = { id: string; name: string; isGroup: boolean; parentId: string | null; teamId: string | null };
+export const LABEL_SWEEP_PAGE = 50;
+const HISTORY_PAGES = 5;
+const PULL_REQUEST_URL = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/;
 // A user's profile URL (https://linear.app/<workspace>/profiles/<name>): in a comment, Linear
 // renders it as an @mention and notifies that user.
 export const USER_URL_QUERY = `query userUrl($id: String!) {
   user(id: $id) { url }
+}`;
+// Whether a user is an app or integration rather than a person.
+export const USER_KIND_QUERY = `query userKind($id: String!) {
+  user(id: $id) { app }
 }`;
 export const ADD_LABEL_QUERY = `mutation addLabel($id: String!, $labelId: String!) {
   issueAddLabel(id: $id, labelId: $labelId) { success }
@@ -325,7 +446,7 @@ export const DELETE_ATTACHMENT_QUERY = `mutation deleteAttachment($id: String!) 
 export const LINK_URL_QUERY = `mutation link($issueId: String!, $url: String!, $title: String) {
   attachmentLinkURL(issueId: $issueId, url: $url, title: $title) { success }
 }`;
-// The relay's read: the owner's "@paseo" comments on up to RELAY_BATCH tickets in one request, each
+// The relay's read: the owner's "@paseo" comments and thread replies on up to RELAY_BATCH tickets in one request, each
 // ticket from its own cursor (`$sN`, inclusive) and page (`$aN`). `issues(filter: id eq)` rather
 // than `issue(id:)`: a ticket the token cannot see comes back empty instead of failing the query.
 export const RELAY_BATCH = 50;
@@ -333,8 +454,8 @@ export function relayCommentsQuery(count: number): string {
   const indexes = Array.from({ length: count }, (_, index) => index);
   const declarations = indexes.map((index) => `$i${index}: ID!, $s${index}: DateTimeOrDuration!, $a${index}: String`).join(", ");
   const fields = indexes.map((index) => `t${index}: issues(first: 1, filter: { id: { eq: $i${index} } }) {
-    nodes { id comments(first: 50, after: $a${index}, filter: { createdAt: { gte: $s${index} }, user: { id: { eq: $u } }, body: { containsIgnoreCase: "@paseo" } }) {
-      nodes { id body createdAt user { id } reactions { emoji user { id } } agentSession { id } }
+    nodes { id comments(first: 50, after: $a${index}, filter: { createdAt: { gte: $s${index} }, user: { id: { eq: $u } }, or: [{ body: { containsIgnoreCase: "@paseo" } }, { parent: { null: false } }] }) {
+      nodes { id body createdAt user { id } reactions { emoji user { id } } agentSession { id } parent { user { id } agentSession { id } } }
       pageInfo { hasNextPage endCursor }
     } }
   }`).join("\n  ");
@@ -347,8 +468,9 @@ export const REACTION_QUERY = `mutation react($commentId: String!, $emoji: Strin
 }`;
 
 // `sessionId`: the Paseo agent session the comment opened or replied in (an @mention of the app);
-// those reach the agent through the session webhook, not the relay.
-export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[]; sessionId: string | null };
+// those reach the agent through the session webhook, not the relay. `parent`: the thread's first
+// comment when this one is a reply (its `sessionId` set when the thread is an agent session's).
+export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[]; sessionId: string | null; parent: { userId: string; sessionId: string | null } | null };
 
 export const ISSUE_DOCUMENTS_QUERY = `query issueDocuments($id: String!) {
   issue(id: $id) { id documents(first: 50) { nodes { id title url content } } }
@@ -393,7 +515,7 @@ export const FINISHED_BLOCKERS_QUERY = `query finishedBlockers($ids: [ID!]!) {
 export class LinearService {
   private stateWritten: ((issueId: string, state: WrittenState) => void) | null = null;
 
-  constructor(readonly credentials = new Credentials(), private readonly post: Post = postGraphQL, private readonly reader?: Reader) {}
+  constructor(readonly credentials = new Credentials(), private readonly post: Post = postGraphQL, private readonly app?: App) {}
 
   // Told about every state change the plugin makes (launch, write-back, review, PR watch), so
   // views of the ticket's state can follow at once instead of at the next poll.
@@ -402,7 +524,7 @@ export class LinearService {
   }
 
   private async writeState(issueId: string, stateId: string): Promise<Record<string, unknown>> {
-    const data = record(await this.withKey((key) => this.post(key, UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId })));
+    const data = record(await this.write(UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId }));
     const result = record(data.issueUpdate ?? {});
     const state = record(record(result.issue ?? {}).state ?? {});
     if (result.success !== false && label(state.name)) this.stateWritten?.(issueId, { name: label(state.name), type: label(state.type) });
@@ -436,15 +558,53 @@ export class LinearService {
   }
 
   // The reads pollers repeat go to the Paseo app's own request pool. The key reads instead when the
-  // app cannot be used (`reader` returns null) or cannot see everything asked for (`complete` is
+  // app cannot be used (`app.query` returns null) or cannot see everything asked for (`complete` is
   // false); an app rate limit is not a reason: it propagates, so background work pauses instead of
   // draining the key.
   private async read(query: string, variables: Record<string, unknown>, complete: (data: Record<string, unknown>) => boolean = () => true): Promise<Record<string, unknown>> {
-    const data = this.reader ? await this.reader.query(query, variables).catch((error: unknown) => {
+    const data = this.app ? await this.app.query(query, variables).catch((error: unknown) => {
       if (error instanceof Error && /Entity not found/i.test(error.message)) return null;
       throw error;
     }) : null;
     return data && complete(data) ? data : this.withKey((key) => this.post(key, query, variables));
+  }
+
+  private warnedKeyWrites = false;
+
+  // Every automated write is authored by the Paseo app. The key writes only when the app cannot be
+  // used here (`app.mutate` returns null: Linear authenticated nothing, so nothing ran); every other
+  // failure propagates, so a write is never repeated under the owner's name.
+  private async write(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const data = this.app ? await this.app.mutate(query, variables) : null;
+    if (data) return data;
+    if (!this.warnedKeyWrites) {
+      this.warnedKeyWrites = true;
+      console.error("[linear-tickets] the Paseo app is not usable on this host; Linear writes appear as the key's owner");
+    }
+    return this.withKey((key) => this.post(key, query, variables));
+  }
+
+  private appUser: string | null = null;
+
+  // The Paseo app's own user; null when the app cannot be used here. Cached once known.
+  async appUserId(): Promise<string | null> {
+    if (this.appUser || !this.app) return this.appUser;
+    this.appUser = await this.app.viewer().then((viewer) => viewer.id || null, () => null);
+    return this.appUser;
+  }
+
+  private readonly people = new Map<string, boolean>();
+
+  // Whether the user is a person rather than an app or integration (read with the key, so it works
+  // while the Paseo app is broken). False when Linear does not say.
+  async isPerson(userId: string): Promise<boolean> {
+    if (userId === this.appUser) return false;
+    const known = this.people.get(userId);
+    if (known !== undefined) return known;
+    const person = await this.withKey((key) => this.post(key, USER_KIND_QUERY, { id: userId })).then((data) => record(data.user ?? {}).app === false, () => null);
+    if (person === null) return false;
+    this.people.set(userId, person);
+    return person;
   }
 
   async issues(cursor?: string, stateNames?: string[], showClosed?: boolean, relation?: "blocking" | "blocked") {
@@ -600,6 +760,7 @@ export class LinearService {
       teamKey: label(record(node.team ?? {}).key),
       priority: typeof node.priority === "number" ? node.priority : 0,
       labels: labelNodes(node.labels),
+      openChildren: connection(node.children ?? { nodes: [] }).nodes.length > 0,
     })).filter((issue) => issue.id)
       // Most urgent first; tickets without a priority last. Stable otherwise (Linear's order).
       .sort((a, b) => (a.priority || 5) - (b.priority || 5));
@@ -630,17 +791,81 @@ export class LinearService {
     const blockedBy = connection(issue.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
       .filter((relation) => label(relation.type) === "blocks")
       .map((relation) => record(relation.issue ?? {}))
-      .filter((blocker) => {
-        const state = record(blocker.state ?? {});
-        if (["completed", "canceled", "duplicate"].includes(label(state.type))) return false;
-        return !(inReviewState(label(state.name), label(state.type)) && pullRequestsMerged(blocker.attachments));
-      })
+      .filter((blocker) => !finishedIssue(blocker))
       .map((blocker) => label(blocker.identifier)).filter(Boolean);
+    const unblocks = connection(issue.relations ?? { nodes: [] }).nodes.map((node) => record(node))
+      .filter((relation) => label(relation.type) === "blocks" && !["completed", "canceled", "duplicate"].includes(label(record(record(relation.relatedIssue ?? {}).state ?? {}).type))).length;
     return {
       id: label(issue.id), identifier: label(issue.identifier), status: label(state.name), statusId: label(state.id), statusType: label(state.type),
       teamId: label(record(issue.team ?? {}).id) || null, projectId: label(record(issue.project ?? {}).id) || null, creatorId: label(record(issue.creator ?? {}).id) || null,
       labels: labelNodes(issue.labels), attachmentUrls, blockedBy,
+      priority: typeof issue.priority === "number" ? issue.priority : 0, createdAt: label(issue.createdAt), unblocks,
     };
+  }
+
+  async labeledProjects(labelName: string): Promise<LabeledProject[]> {
+    const data = record(await this.read(LABELED_PROJECTS_QUERY, { label: labelName }));
+    return connection(record(data.projects ?? {})).nodes.map((node) => record(node)).map((node) => ({ id: label(node.id), name: label(node.name) })).filter((project) => project.id);
+  }
+
+  // Every open ticket of the project, all pages.
+  async projectIssues(projectId: string): Promise<ProjectIssue[]> {
+    const issues: ProjectIssue[] = [];
+    let after: string | null = null;
+    do {
+      const data = record(await this.read(PROJECT_ISSUES_QUERY, { id: projectId, after }, (found) => Boolean(found.project && typeof found.project === "object")));
+      if (!data.project || typeof data.project !== "object") throw new Error("Linear did not return this project. Check that you have access to it.");
+      const page = record(record(data.project).issues ?? {});
+      for (const node of connection(page).nodes.map((item) => record(item))) {
+        const team = record(node.team ?? {});
+        const parent = record(node.parent ?? {});
+        issues.push({
+          id: label(node.id), identifier: label(node.identifier), title: label(node.title),
+          priority: typeof node.priority === "number" ? node.priority : 0, createdAt: label(node.createdAt),
+          status: label(record(node.state ?? {}).name), statusType: label(record(node.state ?? {}).type),
+          teamId: label(team.id), teamKey: label(team.key), creatorId: label(record(node.creator ?? {}).id) || null,
+          assigneeId: label(record(node.assignee ?? {}).id) || null, delegateId: label(record(node.delegate ?? {}).id) || null,
+          labels: connection(node.labels ?? { nodes: [] }).nodes.map((item) => label(record(item).name)).filter(Boolean),
+          parentId: label(parent.id) && label(record(parent.project ?? {}).id) === projectId && !["completed", "canceled", "duplicate"].includes(label(record(parent.state ?? {}).type)) ? label(parent.id) : null,
+          blockers: connection(node.inverseRelations ?? { nodes: [] }).nodes.map((item) => record(item))
+            .filter((relation) => label(relation.type) === "blocks").map((relation) => groupIssue(record(relation.issue ?? {}))).filter((blocker) => blocker.id),
+          blocks: connection(node.relations ?? { nodes: [] }).nodes.map((item) => record(item))
+            .filter((relation) => label(relation.type) === "blocks").map((relation) => record(relation.relatedIssue ?? {}))
+            .filter((related) => !["completed", "canceled", "duplicate"].includes(label(record(related.state ?? {}).type))).map((related) => label(related.id)).filter(Boolean),
+        });
+      }
+      const info = record(page.pageInfo ?? {});
+      after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
+    } while (after);
+    return issues;
+  }
+
+  // Descriptions by ticket id, for the project planner's ticket list.
+  async issueDescriptions(ids: string[]): Promise<Map<string, string>> {
+    const descriptions = new Map<string, string>();
+    for (let start = 0; start < ids.length; start += 50) {
+      const data = record(await this.read(ISSUE_DESCRIPTIONS_QUERY, { ids: ids.slice(start, start + 50) }));
+      for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) descriptions.set(label(node.id), label(node.description));
+    }
+    return descriptions;
+  }
+
+  async issueGroup(id: string): Promise<IssueGroup> {
+    const data = record(await this.read(ISSUE_GROUP_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object")));
+    if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
+    const issue = record(data.issue);
+    const children = connection(issue.children ?? { nodes: [] }).nodes.map((node) => record(node)).map((child) => ({
+      ...groupIssue(child),
+      assigneeId: label(record(child.assignee ?? {}).id) || null,
+      labels: connection(child.labels ?? { nodes: [] }).nodes.map((node) => label(record(node).name)).filter(Boolean),
+      blockers: connection(child.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
+        .filter((relation) => label(relation.type) === "blocks")
+        .map((relation) => groupIssue(record(relation.issue ?? {})))
+        .filter((blocker) => blocker.id),
+    }));
+    // Lowest number first: the order they were filed in, and the order they are handed out.
+    children.sort((a, b) => a.identifier.localeCompare(b.identifier, undefined, { numeric: true }));
+    return { ...groupIssue(issue), children };
   }
 
   // `ready` puts the ticket into the team's first unstarted state (Todo) instead of Triage, for
@@ -658,19 +883,21 @@ export class LinearService {
     if (input.parentId) payload.parentId = input.parentId;
     if (input.projectId) payload.projectId = input.projectId;
     if (input.assigneeId) payload.assigneeId = input.assigneeId;
-    const data = record(await this.withKey((key) => this.post(key, CREATE_ISSUE_QUERY, { input: payload })));
+    const data = record(await this.write(CREATE_ISSUE_QUERY, { input: payload }));
     succeeded(data, "issueCreate", "create the ticket");
     const issue = record(record(data.issueCreate).issue ?? {});
     return { id: label(issue.id), identifier: label(issue.identifier), url: label(issue.url) };
   }
 
+  // Stays on the key: delegating is the owner's instruction that opens the ticket's Linear agent
+  // session, and SessionRouter only accepts sessions the owner started.
   async delegate(issueId: string, delegateId: string): Promise<void> {
     succeeded(record(await this.withKey((key) => this.post(key, DELEGATE_QUERY, { id: issueId, delegateId }))), "issueUpdate", "assign the ticket to Paseo");
   }
 
   // `blocker` must be finished before `blocked` can start.
   async addBlocker(blockerId: string, blockedId: string): Promise<void> {
-    succeeded(record(await this.withKey((key) => this.post(key, RELATION_QUERY, { input: { issueId: blockerId, relatedIssueId: blockedId, type: "blocks" } }))), "issueRelationCreate", "link the tickets");
+    succeeded(record(await this.write(RELATION_QUERY, { input: { issueId: blockerId, relatedIssueId: blockedId, type: "blocks" } })), "issueRelationCreate", "link the tickets");
   }
 
   async ping(): Promise<void> {
@@ -679,7 +906,7 @@ export class LinearService {
   }
 
   async updateDescription(issueId: string, description: string): Promise<void> {
-    succeeded(record(await this.withKey((key) => this.post(key, `mutation describe($id: String!, $description: String!) { issueUpdate(id: $id, input: { description: $description }) { success } }`, { id: issueId, description }))), "issueUpdate", "update the ticket");
+    succeeded(record(await this.write(`mutation describe($id: String!, $description: String!) { issueUpdate(id: $id, input: { description: $description }) { success } }`, { id: issueId, description })), "issueUpdate", "update the ticket");
   }
 
   // Moves the ticket to its team's first completed state (Done).
@@ -689,6 +916,16 @@ export class LinearService {
     const done = (await this.teamStates(state.teamId)).filter((item) => item.type === "completed").sort((a, b) => a.position - b.position)[0];
     if (!done) return;
     succeeded(await this.writeState(issueId, done.id), "issueUpdate", "complete the ticket");
+  }
+
+  // Moves the ticket to its team's first canceled state, with the reason posted first.
+  async cancel(issueId: string, reason: string): Promise<void> {
+    const state = await this.issueState(issueId);
+    if (!state.teamId || ["completed", "canceled", "duplicate"].includes(state.statusType)) return;
+    const canceled = (await this.teamStates(state.teamId)).filter((item) => item.type === "canceled").sort((a, b) => a.position - b.position)[0];
+    if (!canceled) return;
+    await this.comment(issueId, reason);
+    succeeded(await this.writeState(issueId, canceled.id), "issueUpdate", "cancel the ticket");
   }
 
   async teamIdByKey(teamKey: string): Promise<string | null> {
@@ -707,7 +944,7 @@ export class LinearService {
     const found = labelNodes(record(await this.withKey((key) => this.post(key, LABEL_BY_NAME_QUERY, { name }))).issueLabels)[0];
     let id = found?.id;
     if (!id) {
-      const created = record(await this.withKey((key) => this.post(key, CREATE_LABEL_QUERY, { input: { name, ...(color ? { color } : {}) } })));
+      const created = record(await this.write(CREATE_LABEL_QUERY, { input: { name, ...(color ? { color } : {}) } }));
       succeeded(created, "issueLabelCreate", `create the "${name}" label`);
       id = label(record(record(created.issueLabelCreate).issueLabel ?? {}).id);
       if (!id) throw new Error(`Linear did not return the new "${name}" label.`);
@@ -718,7 +955,7 @@ export class LinearService {
 
   async addLabel(issueId: string, name: string, color?: string): Promise<void> {
     const labelId = await this.labelId(name, color);
-    succeeded(record(await this.withKey((key) => this.post(key, ADD_LABEL_QUERY, { id: issueId, labelId }))), "issueAddLabel", `add the "${name}" label`);
+    succeeded(record(await this.write(ADD_LABEL_QUERY, { id: issueId, labelId })), "issueAddLabel", `add the "${name}" label`);
   }
 
   // Removes every label on the ticket with this name (case-insensitive); a team label and
@@ -728,7 +965,7 @@ export class LinearService {
     const wanted = name.trim().toLowerCase();
     for (const { id } of labels.filter((item) => item.name.trim().toLowerCase() === wanted)) {
       try {
-        succeeded(record(await this.withKey((key) => this.post(key, REMOVE_LABEL_QUERY, { id: issueId, labelId: id }))), "issueRemoveLabel", `remove the "${name}" label`);
+        succeeded(record(await this.write(REMOVE_LABEL_QUERY, { id: issueId, labelId: id })), "issueRemoveLabel", `remove the "${name}" label`);
       } catch (error) {
         // `current` can be stale: another write removed the label meanwhile, which is the goal anyway.
         if (!/Label not on issue/i.test(error instanceof Error ? error.message : String(error))) throw error;
@@ -736,24 +973,107 @@ export class LinearService {
     }
   }
 
-  async comment(issueId: string, body: string): Promise<void> {
-    succeeded(record(await this.withKey((key) => this.post(key, CREATE_COMMENT_QUERY, { input: { issueId, body } }))), "commentCreate", "create the comment");
+  // Every label of the workspace and its teams, groups included.
+  async labelCatalog(): Promise<CatalogLabel[]> {
+    const labels: CatalogLabel[] = [];
+    let after: string | null = null;
+    do {
+      const page = connection(record(await this.read(LABEL_CATALOG_QUERY, { after })).issueLabels);
+      for (const node of page.nodes.map((item) => record(item))) {
+        const id = label(node.id);
+        if (id) labels.push({ id, name: label(node.name), isGroup: node.isGroup === true, parentId: label(record(node.parent ?? {}).id) || null, teamId: label(record(node.team ?? {}).id) || null });
+      }
+      after = page.hasNextPage ? page.endCursor : null;
+    } while (after);
+    return labels;
   }
 
-  // For comments that are later edited in place (the progress comment): returns the id.
-  async createComment(issueId: string, body: string): Promise<string> {
-    const data = record(await this.withKey((key) => this.post(key, CREATE_COMMENT_QUERY, { input: { issueId, body } })));
+  // A workspace label (a group with `isGroup`, a member of one with `parentId`). Returns its id.
+  async createLabel(input: { name: string; color?: string; description?: string; isGroup?: boolean; parentId?: string }): Promise<string> {
+    const created = record(await this.write(CREATE_LABEL_QUERY, { input }));
+    succeeded(created, "issueLabelCreate", `create the "${input.name}" label`);
+    const id = label(record(record(created.issueLabelCreate).issueLabel ?? {}).id);
+    if (!id) throw new Error(`Linear did not return the new "${input.name}" label.`);
+    return id;
+  }
+
+  async moveLabelIntoGroup(labelId: string, groupId: string, name: string): Promise<void> {
+    succeeded(record(await this.write(UPDATE_LABEL_QUERY, { id: labelId, input: { parentId: groupId } })), "issueLabelUpdate", `move the "${name}" label into its group`);
+  }
+
+  // One page of the teams' issues, most recently updated first; `since` limits it to issues updated after then.
+  async labelSweep(teamKeys: string[], since: string | null, after: string | null): Promise<{ issues: SweptIssue[]; next: string | null }> {
+    const filter = { team: { key: { in: teamKeys } }, ...(since ? { updatedAt: { gt: since } } : {}) };
+    const page = connection(record(await this.read(LABEL_SWEEP_QUERY, { first: LABEL_SWEEP_PAGE, after, filter })).issues);
+    const ids = (value: unknown) => connection(value ?? { nodes: [] }).nodes.map((node) => label(record(node).id)).filter(Boolean);
+    const issues = page.nodes.map((item) => record(item)).map((node): SweptIssue => {
+      const parent = node.parent ? record(node.parent) : null;
+      const urls = connection(node.attachments ?? { nodes: [] }).nodes.map((attachment) => label(record(attachment).url).match(PULL_REQUEST_URL)?.[0]);
+      return {
+        id: label(node.id), identifier: label(node.identifier), title: label(node.title), description: typeof node.description === "string" ? node.description : "",
+        createdAt: label(node.createdAt), updatedAt: label(node.updatedAt), projectName: label(node.project ?? null) || null,
+        parentId: parent ? label(parent.id) || null : null, parentLabelIds: parent ? ids(parent.labels) : [], labelIds: ids(node.labels),
+        pullRequests: [...new Set(urls.filter((url): url is string => Boolean(url)))],
+      };
+    }).filter((issue) => issue.id && issue.createdAt);
+    return { issues, next: page.hasNextPage ? page.endCursor : null };
+  }
+
+  // The issue's label changes, newest first, read until a page holds one `relevant` to the caller.
+  async labelHistory(issueId: string, relevant: (event: LabelEvent) => boolean): Promise<LabelEvent[]> {
+    const events: LabelEvent[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < HISTORY_PAGES; page++) {
+      const history = connection(record(record(await this.read(LABEL_HISTORY_QUERY, { id: issueId, after })).issue ?? {}).history ?? { nodes: [] });
+      const found = history.nodes.map((item) => record(item)).map((node): LabelEvent => ({
+        at: label(node.createdAt), actorId: label(node.actorId) || null,
+        added: Array.isArray(node.addedLabelIds) ? node.addedLabelIds.map(label) : [],
+        removed: Array.isArray(node.removedLabelIds) ? node.removedLabelIds.map(label) : [],
+      })).filter((event) => event.added.length || event.removed.length);
+      events.push(...found);
+      if (found.some(relevant) || !history.hasNextPage) break;
+      after = history.endCursor;
+    }
+    return events;
+  }
+
+  // One write: Linear applies both lists together, so swapping a group's label never leaves two.
+  async changeLabels(issueId: string, added: string[], removed: string[]): Promise<void> {
+    succeeded(record(await this.write(CHANGE_LABELS_QUERY, { id: issueId, added, removed })), "issueUpdate", "change the ticket's labels");
+  }
+
+  async comment(issueId: string, body: string): Promise<void> {
+    succeeded(record(await this.write(CREATE_COMMENT_QUERY, { input: { issueId, body } })), "commentCreate", "create the comment");
+  }
+
+  // Edits the tracked comment (the progress or waiting comment), or posts a new one when there is
+  // none or Linear no longer has it (deleted); any other failure propagates, so a comment is never
+  // posted twice. Returns its id.
+  async upsertComment(issueId: string, body: string, commentId: string | null): Promise<string> {
+    if (commentId) {
+      const variables = { id: commentId, input: { body } };
+      try {
+        const data = await this.write(UPDATE_COMMENT_QUERY, variables).catch((error: unknown) => {
+          // Linear lets only a comment's author edit it: a comment the key wrote before writes moved
+          // to the app stays the key's. Measured 2026-10-01: the app gets INPUT_ERROR "Cannot modify
+          // Comment"; attachments and documents the key wrote, the app may change.
+          if (!(error instanceof LinearApiError && error.codes.includes("INPUT_ERROR") && error.reasons.some((reason) => /^Cannot modify Comment\b/.test(reason)))) throw error;
+          return this.withKey((key) => this.post(key, UPDATE_COMMENT_QUERY, variables));
+        });
+        succeeded(record(data), "commentUpdate", "update the comment");
+        return commentId;
+      } catch (error) {
+        if (!(error instanceof LinearApiError && error.reasons.some((reason) => /^Entity not found\b/.test(reason)))) throw error;
+      }
+    }
+    const data = record(await this.write(CREATE_COMMENT_QUERY, { input: { issueId, body } }));
     succeeded(data, "commentCreate", "create the comment");
     return label(record(record(data.commentCreate).comment ?? {}).id);
   }
 
-  async updateComment(commentId: string, body: string): Promise<void> {
-    succeeded(record(await this.withKey((key) => this.post(key, UPDATE_COMMENT_QUERY, { id: commentId, input: { body } }))), "commentUpdate", "update the comment");
-  }
-
   async upsertAttachment(issueId: string, url: string, title: string, subtitle: string, iconUrl?: string): Promise<void> {
     const input = { issueId, url, title, subtitle, ...(iconUrl ? { iconUrl } : {}) };
-    succeeded(record(await this.withKey((key) => this.post(key, UPSERT_ATTACHMENT_QUERY, { input }))), "attachmentCreate", "update the Paseo agent link");
+    succeeded(record(await this.write(UPSERT_ATTACHMENT_QUERY, { input })), "attachmentCreate", "update the Paseo agent link");
   }
 
   // Removes attachments whose URL starts with `prefix`, except `keep` (a previous agent's link).
@@ -761,7 +1081,7 @@ export class LinearService {
     const issue = record(record(await this.withKey((key) => this.post(key, ISSUE_ATTACHMENTS_QUERY, { id: issueId }))).issue ?? {});
     for (const node of connection(issue.attachments ?? { nodes: [] }).nodes.map((item) => record(item))) {
       const url = label(node.url);
-      if (url.startsWith(prefix) && url !== keep) succeeded(record(await this.withKey((key) => this.post(key, DELETE_ATTACHMENT_QUERY, { id: label(node.id) }))), "attachmentDelete", "remove the old Paseo agent link");
+      if (url.startsWith(prefix) && url !== keep) succeeded(record(await this.write(DELETE_ATTACHMENT_QUERY, { id: label(node.id) })), "attachmentDelete", "remove the old Paseo agent link");
     }
   }
 
@@ -770,7 +1090,7 @@ export class LinearService {
   // so "already been linked" ends the step instead of failing the write-back on every turn.
   async linkUrl(issueId: string, url: string, title: string): Promise<void> {
     try {
-      succeeded(record(await this.withKey((key) => this.post(key, LINK_URL_QUERY, { issueId, url, title }))), "attachmentLinkURL", "attach the link");
+      succeeded(record(await this.write(LINK_URL_QUERY, { issueId, url, title })), "attachmentLinkURL", "attach the link");
     } catch (error) {
       if (!(error instanceof Error && /already been linked/i.test(error.message))) throw error;
     }
@@ -799,7 +1119,7 @@ export class LinearService {
     return url;
   }
 
-  // The owner's "@paseo" comments since each ticket's cursor (inclusive), oldest first, in one
+  // The owner's "@paseo" comments and thread replies since each ticket's cursor (inclusive), oldest first, in one
   // request per RELAY_BATCH tickets on the app's pool; tickets the app cannot see are read with
   // the key. `unseen`: tickets neither credential returned (deleted, no access, not a Linear id).
   async relayComments(userId: string, cursors: { issueId: string; since: string }[]): Promise<{ comments: Map<string, RelayComment[]>; unseen: string[] }> {
@@ -807,7 +1127,7 @@ export class LinearService {
     const unseen = cursors.filter((cursor) => !UUID.test(cursor.issueId)).map((cursor) => cursor.issueId);
     const valid = cursors.filter((cursor) => UUID.test(cursor.issueId));
     const viaKey = (query: string, variables: Record<string, unknown>) => this.withKey((key) => this.post(key, query, variables));
-    const reader = this.reader;
+    const reader = this.app;
     for (let start = 0; start < valid.length; start += RELAY_BATCH) {
       const batch = valid.slice(start, start + RELAY_BATCH);
       const fromApp = reader ? await this.relayPages(userId, batch, comments, async (query, variables) => {
@@ -854,6 +1174,7 @@ export class LinearService {
             userId: label(record(node.user ?? {}).id),
             reactions: (Array.isArray(node.reactions) ? node.reactions : []).map((entry) => record(entry)).map((reaction) => ({ emoji: label(reaction.emoji), userId: label(record(reaction.user ?? {}).id) })),
             sessionId: label(record(node.agentSession ?? {}).id) || null,
+            parent: node.parent ? { userId: label(record(record(node.parent).user ?? {}).id), sessionId: label(record(record(node.parent).agentSession ?? {}).id) || null } : null,
           });
         }
         if (found.hasNextPage && found.endCursor) next.push({ ...item, after: found.endCursor });
@@ -864,7 +1185,7 @@ export class LinearService {
   }
 
   async react(commentId: string, emoji: string): Promise<void> {
-    succeeded(record(await this.withKey((key) => this.post(key, REACTION_QUERY, { commentId, emoji }))), "reactionCreate", "add the reaction");
+    succeeded(record(await this.write(REACTION_QUERY, { commentId, emoji })), "reactionCreate", "add the reaction");
   }
 
   // The ticket's document with this title (for example "Plan: TUC-9"), or null.
@@ -881,8 +1202,8 @@ export class LinearService {
     const issue = record(data.issue ?? {});
     const existing = connection(issue.documents ?? { nodes: [] }).nodes.map((node) => record(node)).find((node) => label(node.title) === title);
     const result = existing
-      ? record(await this.withKey((key) => this.post(key, UPDATE_DOCUMENT_QUERY, { id: label(existing.id), input: { title, content } })))
-      : record(await this.withKey((key) => this.post(key, CREATE_DOCUMENT_QUERY, { input: { title, content, issueId: label(issue.id) || issueId } })));
+      ? record(await this.write(UPDATE_DOCUMENT_QUERY, { id: label(existing.id), input: { title, content } }))
+      : record(await this.write(CREATE_DOCUMENT_QUERY, { input: { title, content, issueId: label(issue.id) || issueId } }));
     const field = existing ? "documentUpdate" : "documentCreate";
     succeeded(result, field, existing ? "update the plan document" : "create the plan document");
     return label(record(record(result[field]).document ?? {}).url);

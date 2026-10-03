@@ -11,8 +11,9 @@ import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/se
 import type { IssueState } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { NeedsYouIssues } from "./needs-you";
-import { appComment, MAX_SUMMARY_LENGTH, ownerRequest, turnPullRequests, turnReply, Writeback } from "./writeback";
+import { MAX_SUMMARY_LENGTH, ownerRequest, turnPullRequests, turnReply, Writeback } from "./writeback";
 
 // Writebacks built without an outbox path keep theirs here, never in the real Paseo home.
 process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-writeback-home-"));
@@ -23,7 +24,7 @@ type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
 const allOn: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true,
   dispatch: DEFAULT_DISPATCH,
-  writeback: { status: true, summaries: true, blocked: true, pullRequests: true, mentions: true, autoResume: false },
+  writeback: { status: true, summaries: true, blocked: true, pullRequests: true, mentions: true, autoResume: false }, autoApprove: DEFAULT_AUTO_APPROVE,
 };
 const root: PluginHookAgent = { id: "agent-1", workspaceId: "w1", parentAgentId: null, provider: "claude", cwd: "/repo", title: "ENG-1: Fix sign-in" };
 
@@ -31,7 +32,7 @@ const toolCall = (output: string): Timeline[number] => ({ type: "tool_call", cal
 
 class FakeLinear {
   readonly writes: string[] = [];
-  state: IssueState = { id: "issue-1", identifier: "ENG-1", projectId: null, creatorId: null, blockedBy: [], status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", labels: [{ id: "l1", name: "paseo-running" }], attachmentUrls: [] };
+  state: IssueState = { id: "issue-1", identifier: "ENG-1", projectId: null, creatorId: null, blockedBy: [], status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", labels: [{ id: "l1", name: "paseo-running" }], attachmentUrls: [], priority: 0, createdAt: "", unblocks: 0 };
   // Other issues by id (the "Needs you" sub-issues); `state` is the ticket itself.
   readonly others = new Map<string, IssueState>();
   private comments = 0;
@@ -58,8 +59,14 @@ class FakeLinear {
   }
   async moveToState(_id: string, stateId: string) { this.writes.push(`restore ${stateId}`); }
   async comment(_id: string, body: string) { this.writes.push(`comment: ${body}`); }
-  async createComment(id: string, body: string) { this.writes.push(id === this.state.id ? `new comment: ${body}` : `new comment on ${id}: ${body}`); return `c${++this.comments}`; }
-  async updateComment(id: string, body: string) { this.writes.push(`edit ${id}: ${body}`); }
+  async upsertComment(id: string, body: string, commentId: string | null) {
+    if (commentId) { this.writes.push(`edit ${commentId}: ${body}`); return commentId; }
+    this.writes.push(id === this.state.id ? `new comment: ${body}` : `new comment on ${id}: ${body}`);
+    return `c${++this.comments}`;
+  }
+  // Users Linear reports as apps (the Paseo app, other integrations); everyone else is a person.
+  readonly apps = new Set(["paseo-app"]);
+  async isPerson(id: string) { return !this.apps.has(id); }
   async viewerId() { return "owner"; }
   async userUrl(id: string) { return `https://linear.app/acme/profiles/${id}`; }
   async addLabel(id: string, name: string) {
@@ -287,6 +294,27 @@ test("a turn-end wait on a closed ticket keeps its sub-issue open for the owner 
   assert.deepEqual((await needsYou.all()).map((entry) => entry.id), ["sub-2"]);
 });
 
+test("a ticket the Paseo app or another integration wrote asks and assigns the owner; a person who wrote it is still asked", async () => {
+  // What a waiting agent writes: the "Needs you" sub-issue (closed tickets) and the mention in its comment.
+  const ask = async (creatorId: string, statusType: "started" | "completed") => {
+    const linear = new FakeLinear();
+    // Another integration: Linear reports it as an app although it is not the Paseo app.
+    linear.apps.add("zapier");
+    linear.state = { ...linear.state, status: statusType === "completed" ? "Done" : "In Progress", statusId: "x", statusType, creatorId };
+    const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), new NeedsYouIssues(mkdtempSync(join(tmpdir(), "needs-you-"))));
+    const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" }, pendingPermissions: [{ id: "q" }] } }) }) } } as unknown as PaseoApi;
+    await writeback.permissionRequested({ agent: root, request: { id: "q", provider: "claude", name: "AskUser", kind: "question", title: "Which bucket?" } }, paseo);
+    return linear.writes.filter((write) => write.startsWith("create ") || write.startsWith("new comment")).map((write) => write.replace(/ \*\*ENG-1[\s\S]*/, ""));
+  };
+  const profile = "https://linear.app/acme/profiles";
+  for (const app of ["paseo-app", "zapier"]) {
+    assert.deepEqual(await ask(app, "started"), [`new comment: ${profile}/owner`], `${app}: the open ticket's comment mentions the owner`);
+    assert.deepEqual(await ask(app, "completed"), ['create sub-1 "Needs you: Which bucket?" under issue-1 for owner in Needs input', `new comment on sub-1: ${profile}/owner`], `${app}: the sub-issue goes to the owner`);
+  }
+  assert.deepEqual(await ask("teammate", "started"), [`new comment: ${profile}/teammate`]);
+  assert.deepEqual(await ask("teammate", "completed"), ['create sub-1 "Needs you: Which bucket?" under issue-1 for teammate in Needs input', `new comment on sub-1: ${profile}/teammate`]);
+});
+
 test("the previous state is not restored when someone moved the ticket out of Needs input meanwhile", async () => {
   const linear = new FakeLinear();
   const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
@@ -471,18 +499,4 @@ test("other Linear outages are retried twice, after 30 s and 2 min, then dropped
   await settle();
   assert.equal(attempts, 3);
   assert.deepEqual(errors.mock.calls.map((call) => String(call.arguments[0]).match(/retrying in \d+ s/)?.[0]).filter(Boolean), ["retrying in 30 s", "retrying in 120 s"]);
-});
-
-test("a rate-limited Paseo app comment is not posted with the owner's key instead", async (t) => {
-  const linear = new FakeLinear();
-  const limited = async () => { throw new RateLimitedError("app", Date.now() + MINUTE); };
-  const app = { createComment: limited, updateComment: limited };
-  await assert.rejects(appComment(linear, app, "issue-1", "hello"), RateLimitedError);
-  await assert.rejects(appComment(linear, app, "issue-1", "hello", "c1"), RateLimitedError);
-  assert.deepEqual(linear.writes, []);
-  // Any other app failure still falls back to the key.
-  const broken = async () => { throw new Error("app token revoked"); };
-  t.mock.method(console, "error", () => {});
-  assert.equal(await appComment(linear, { createComment: broken, updateComment: broken }, "issue-1", "hello"), "c1");
-  assert.deepEqual(linear.writes, ["new comment: hello"]);
 });

@@ -9,15 +9,18 @@ import { HealthMonitor } from "./health";
 import { reviewChange, type PullRequestView } from "./pr-watch";
 import { decidePlannotatorReview, describeTool, questionPrompt, SessionRouter, SessionStore } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { approveForLater, splitIntoSubIssues } from "./split";
-import { advisorNote, isUntrusted, planDecisionNote, PLAN_REQUIRED_NOTE, TicketStarter, QUESTIONS_NOTE, UNTRUSTED_NOTE } from "./starter";
+import { AWAY_REASON } from "./scheduler";
+import { advisorNote, isUntrusted, PLAN_REQUIRED_NOTE, TicketStarter, QUESTIONS_NOTE, UNTRUSTED_NOTE } from "./starter";
 import { planPolicy } from "./plan-policy";
 
 const OWNER = "owner-1";
+const APP = "paseo-app";
 const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: "omp", launchPreferences: { omp: { model: "omp/opus", modeId: "full" } },
   projectMappings: { "team:t1": { projectId: "p1", label: "Team", baseBranch: "refs/heads/main" } }, agentLinearAccess: false,
-  dispatch: { ...DEFAULT_DISPATCH, maxRunning: 2 }, writeback: DEFAULT_WRITEBACK,
+  dispatch: { ...DEFAULT_DISPATCH, maxRunning: 2 }, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE,
 };
 
 const twoPart: AgentPermissionRequest = {
@@ -55,7 +58,7 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
   const store = new SessionStore(join(directory, "sessions.json"));
   const router = new SessionRouter({
     api: { activity: async (_s: string, content: { type: string; body?: string }) => { calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); }, openSessions: async () => [], activities: async () => [] } as never,
-    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueState: async () => { throw new Error("unused"); } },
+    linear: { viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, issueState: async () => { throw new Error("unused"); }, issueGroup: async () => { throw new Error("unused"); }, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {} },
     starter: { start: async () => { throw new Error("unused"); }, admission: async () => ({ ok: true as const }) },
     settings: { read: async () => settings },
     store,
@@ -224,6 +227,30 @@ test("a queued thread whose ticket already has a running agent is linked to it i
   await h.cleanup();
 });
 
+test("a parked plan's thread offers no resume when its agent is retired, and starts a fresh agent once the owner decided", async () => {
+  const starts: string[] = [];
+  const h = routerHarness([], {
+    api: { activity: async (_s: string, content: { type: string; body?: string }) => { h.calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); }, openSessions: async () => [], activities: async () => [], sessionStatus: async () => "stale" } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueState: async () => ({ statusType: "unstarted", status: "Todo" }) } as never,
+    starter: {
+      admission: async () => ({ ok: true as const }),
+      start: async (id: string) => { starts.push(id); return { agentId: "fresh", warnings: [], provider: "omp", target: "repo", resumed: false, untrusted: false, plan: null }; },
+    },
+  });
+  await h.store.put({ ...link, review: { localUrl: "http://localhost:4000/" } });
+  await h.router.parked("a1");
+  assert.deepEqual([(await h.store.get("s1"))?.offer, (await h.store.get("s1"))?.review], ["parked", null]);
+  await h.router.offerResume("s1");
+  assert.ok(!h.calls.some((call) => call.includes("Resume")), "the retired agent offers no resume");
+  assert.equal(await h.router.requeue("a1", "Plan approved. A new agent implements it as soon as a slot is free."), true);
+  assert.ok(h.calls.includes("thought:Plan approved. A new agent implements it as soon as a slot is free."));
+  await h.router.startQueued();
+  assert.deepEqual(starts, ["i1"]);
+  assert.deepEqual([(await h.store.get("s1"))?.agentId, (await h.store.get("s1"))?.queued, (await h.store.get("s1"))?.offer], ["fresh", false, null]);
+  assert.equal(await h.router.requeue("a1", "again"), false, "the retired agent no longer owns the thread");
+  await h.cleanup();
+});
+
 test("a review decided or closed outside Linear is settled by the sweep", async () => {
   const recorded: unknown[] = [];
   const outcomes: Record<string, "open" | null | { approved: boolean; planContent: string }> = { "http://localhost:1": "open", "http://localhost:2": { approved: true, planContent: "# Plan" }, "http://localhost:3": null };
@@ -260,17 +287,20 @@ test("the live feed shows completed commands and edits only", () => {
   assert.equal(describeTool({ type: "tool_call", status: "completed", detail: { type: "read", filePath: "a" } }), null);
 });
 
-function starterHarness(state: { creatorId: string; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number) {
+// `appId`: the Paseo app's user, or null when the app is not usable on this host.
+function starterHarness(state: { creatorId: string | null; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number, appId: string | null = APP, away = false) {
   const launches: { modeId?: string; instructions: string; labels?: Record<string, string>; env?: Record<string, string>; markInProgress?: boolean }[] = [];
   const starter = new TicketStarter({
     linear: {
       detail: async () => ({ issue: { identifier: "TUC-1", project: "", team: "Team" }, projectId: null, teamId: "t1" }) as never,
-      issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, attachmentUrls: [], ...state }),
+      issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, attachmentUrls: [], priority: 0, createdAt: "", unblocks: 0, ...state }),
       viewerId: async () => OWNER,
+      appUserId: async () => appId,
       issueDocument: async (_id: string, title: string) => title === "Plan: TUC-1" ? { url: "https://linear.app/doc/plan", content: "# Plan\n1. Add the table" } : null,
     },
     launcher: { start: async (input, _paseo, options) => { launches.push({ modeId: input.modeId, instructions: input.instructions, labels: options?.labels, env: options?.env, markInProgress: options?.markInProgress }); return { agentId: "new", warnings: [] }; } },
     branches: async () => ({ branches: [{ id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }),
+    presence: { away: async () => away },
   });
   const paseo = {
     agents: { list: async () => ({ entries: Array.from({ length: running }, (_, index) => ({ agent: { id: `r${index}`, status: "running", labels: { "linear.issueId": `x${index}` } } })), pageInfo: { hasMore: false } }) },
@@ -289,35 +319,62 @@ test("admission waits for unfinished blockers and for a free agent slot", async 
   assert.deepEqual(await room.starter.admission("i1", room.paseo, { ...settings, dispatch: { ...settings.dispatch, maxRunning: 0 } }), { ok: true });
 });
 
-test("tickets written by someone else, or from the feedback intake, start plan-first; omp keeps the usual mode so the planner never waits for approvals", async () => {
-  assert.equal(isUntrusted({ creatorId: OWNER, labels: [] }, OWNER), false);
-  assert.equal(isUntrusted({ creatorId: "customer", labels: [] }, OWNER), true);
-  assert.equal(isUntrusted({ creatorId: OWNER, labels: [{ name: "Feedback" }] }, OWNER), true);
+test("while the owner is away, only the implementation of an attended ticket waits; planning never does, even with no agent limit", async () => {
+  const unlimited = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 0 } };
+  const approved = starterHarness({ creatorId: OWNER, labels: [{ id: "l1", name: "paseo-attended" }, { id: "r", name: "plan-ready" }], blockedBy: [] }, 0, APP, true);
+  assert.deepEqual(await approved.starter.admission("i1", approved.paseo, unlimited), { ok: false, reason: AWAY_REASON });
+  const present = starterHarness({ creatorId: OWNER, labels: [{ id: "l1", name: "paseo-attended" }, { id: "r", name: "plan-ready" }], blockedBy: [] }, 0, APP, false);
+  assert.deepEqual(await present.starter.admission("i1", present.paseo, unlimited), { ok: true });
+  for (const [why, state] of [
+    ["attended, still to plan", { creatorId: OWNER, labels: [{ id: "l1", name: "paseo-attended" }] }],
+    ["written by someone else", { creatorId: "colleague", labels: [] }],
+    ["an approved plan, not attended", { creatorId: OWNER, labels: [{ id: "r", name: "plan-ready" }] }],
+    ["plain", { creatorId: OWNER, labels: [] }],
+  ] as const) {
+    const away = starterHarness({ ...state, labels: [...state.labels], blockedBy: [] }, 0, APP, true);
+    assert.deepEqual(await away.starter.admission("i1", away.paseo, unlimited), { ok: true }, why);
+  }
+});
+
+test("every ticket starts plan-first; someone else's ticket is marked untrusted; omp keeps the usual mode so the planner never waits for approvals", async () => {
+  assert.equal(isUntrusted({ creatorId: OWNER, labels: [] }, OWNER, APP), false);
+  assert.equal(isUntrusted({ creatorId: "customer", labels: [] }, OWNER, APP), true);
+  assert.equal(isUntrusted({ creatorId: OWNER, labels: [{ name: "Feedback" }] }, OWNER, APP), true);
   const h = starterHarness({ creatorId: "customer", labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, settings, { retryHint: "retry" });
-  assert.equal(started.untrusted, true);
-  assert.equal(started.plan, "required");
+  assert.deepEqual({ untrusted: started.untrusted, plan: started.plan }, { untrusted: true, plan: "required" });
   assert.deepEqual(h.launches[0], { modeId: "full", instructions: `${UNTRUSTED_NOTE}\n\n${advisorNote("omp")}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
   const mine = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
   const own = await mine.starter.start("i1", mine.paseo, settings, { retryHint: "retry" });
-  assert.equal(own.plan, "agent");
-  assert.deepEqual(mine.launches[0], { modeId: "full", instructions: `${planDecisionNote("omp")}\n\n${advisorNote("omp")}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "agent" }, env: { LINEAR_TICKETS_PLAN: "agent" }, markInProgress: false });
+  assert.deepEqual({ untrusted: own.untrusted, plan: own.plan }, { untrusted: false, plan: "required" });
+  assert.deepEqual(mine.launches[0], { modeId: "full", instructions: `${PLAN_REQUIRED_NOTE}\n\n${advisorNote("omp")}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
 });
 
-test("plan policy: an approved plan is implemented, someone else's ticket always plans, then the plan label or toggle, then no-plan, else the agent decides", () => {
+test("tickets the Paseo app wrote are trusted like the owner's, unless they came from the feedback intake or the app is unknown here", async () => {
+  assert.equal(isUntrusted({ creatorId: APP, labels: [] }, OWNER, APP), false);
+  assert.equal(isUntrusted({ creatorId: APP, labels: [{ name: "feedback" }] }, OWNER, APP), true);
+  assert.equal(isUntrusted({ creatorId: "customer", labels: [] }, OWNER, APP), true);
+  assert.equal(isUntrusted({ creatorId: null, labels: [] }, OWNER, APP), true);
+  assert.equal(isUntrusted({ creatorId: null, labels: [] }, OWNER, null), true, "an unknown creator never matches an unknown app");
+  assert.equal(isUntrusted({ creatorId: APP, labels: [] }, OWNER, null), true);
+  const byApp = starterHarness({ creatorId: APP, labels: [], blockedBy: [] }, 0);
+  const trusted = await byApp.starter.start("i1", byApp.paseo, settings, { retryHint: "retry" });
+  assert.deepEqual({ untrusted: trusted.untrusted, plan: trusted.plan }, { untrusted: false, plan: "required" });
+  const appUnknown = starterHarness({ creatorId: APP, labels: [], blockedBy: [] }, 0, null);
+  const untrusted = await appUnknown.starter.start("i1", appUnknown.paseo, settings, { retryHint: "retry" });
+  assert.deepEqual({ untrusted: untrusted.untrusted, plan: untrusted.plan }, { untrusted: true, plan: "required" });
+});
+
+test("plan policy: an approved plan is implemented, every other ticket plans; the old no-plan label skips nothing", () => {
   const labels = (...names: string[]) => names.map((name) => ({ name }));
-  assert.equal(planPolicy({ untrusted: true, labels: labels("no-plan") }), "required");
-  assert.equal(planPolicy({ untrusted: true, labels: labels("plan-ready") }), null);
-  assert.equal(planPolicy({ untrusted: false, labels: labels("Plan") }), "required");
-  assert.equal(planPolicy({ untrusted: false, labels: labels("no-plan"), planFirst: true }), "required");
-  assert.equal(planPolicy({ untrusted: false, labels: labels("plan", "no-plan") }), "required");
-  assert.equal(planPolicy({ untrusted: false, labels: labels("no-plan") }), null);
-  assert.equal(planPolicy({ untrusted: false, labels: labels("plan-ready", "plan") }), null);
-  assert.equal(planPolicy({ untrusted: false, labels: [] }), "agent");
+  assert.equal(planPolicy(labels()), "required");
+  assert.equal(planPolicy(labels("no-plan")), "required");
+  assert.equal(planPolicy(labels("Plan-Ready")), null);
+  assert.equal(planPolicy(labels("plan-ready", "plan")), null);
 });
 
-test("the plan label on the owner's ticket starts it plan-first in the provider's safe mode, and not in progress", async () => {
-  const h = starterHarness({ creatorId: OWNER, labels: [{ id: "p", name: "plan" }], blockedBy: [] }, 0);
+test("a plan starts in the provider's safe mode, and not in progress", async () => {
+  const h = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, { ...settings, markInProgress: true, lastProvider: "claude", launchPreferences: { claude: { model: "claude/opus", modeId: "default" } } }, { retryHint: "retry" });
   assert.deepEqual({ untrusted: started.untrusted, plan: started.plan }, { untrusted: false, plan: "required" });
   assert.deepEqual(h.launches[0], { modeId: "plan", instructions: `${PLAN_REQUIRED_NOTE}\n\n${advisorNote("claude")}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
@@ -355,7 +412,7 @@ test("approve, implement later: plan recorded, planner retired, ticket back in T
   assert.match(summary, /back in Todo with `plan-ready`/);
 });
 
-const PR: PullRequestView = { state: "OPEN", isDraft: false, headSha: "h", updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, reviews: [], lastCommitAt: null, checks: [] };
+const PR: PullRequestView = { state: "OPEN", isDraft: false, headSha: "h", headBranch: "tuc-1", baseBranch: "main", updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, comments: [], reviews: [], lastCommitAt: null, checks: [] };
 
 test("the review mirror: approval means ready to merge, and commits after it send the ticket back to review", () => {
   const approved = reviewChange({ ...PR, state: "OPEN", reviews: [{ author: "ada", state: "APPROVED", submittedAt: "2026-01-01T12:00:00Z", body: "", commit: null }], lastCommitAt: "2026-01-01T11:00:00Z" }, { reviewedAt: null, decision: null, merged: false });
@@ -386,7 +443,7 @@ test("splitting creates one sub-issue per step, each blocked by the previous, al
   let n = 0;
   const deps = {
     linear: {
-      issueState: async () => ({ id: "parent", identifier: "TUC-1", status: "Planning", statusId: "planning", statusType: "started", teamId: "t1", projectId: "p9", creatorId: OWNER, labels: [], attachmentUrls: [], blockedBy: [] }),
+      issueState: async () => ({ id: "parent", identifier: "TUC-1", status: "Planning", statusId: "planning", statusType: "started", teamId: "t1", projectId: "p9", creatorId: OWNER, labels: [], attachmentUrls: [], blockedBy: [], priority: 0, createdAt: "", unblocks: 0 }),
       upsertIssueDocument: async (_id: string, _title: string, body: string) => { calls.push(`document ${body.split("\n").find((line) => line.includes("Planned with"))}`); return "https://linear.app/doc/plan"; },
       createIssue: async (input: { title: string; parentId?: string; projectId?: string | null; ready?: boolean }) => { n++; calls.push(`create ${input.title} parent=${input.parentId} project=${input.projectId}${input.ready ? " ready" : ""}`); return { id: `s${n}`, identifier: `TUC-${10 + n}`, url: "" }; },
       addBlocker: async (blocker: string, blocked: string) => { calls.push(`${blocker} blocks ${blocked}`); },
@@ -394,7 +451,7 @@ test("splitting creates one sub-issue per step, each blocked by the previous, al
       moveToStateNamed: async (id: string, name: string) => { calls.push(`move ${id} to ${name}`); return { changed: true }; },
       addLabel: async (id: string, name: string) => { calls.push(`+${name} ${id}`); },
     },
-    appUserId: async () => "paseo-app",
+    appUserId: async () => APP,
     readPlan: async () => "# Plan\n## Steps\n1. Add the domain\n2. Add the migration\n3. Wire the API",
     retirePlanner: async (_url: string, agentId: string) => { calls.push(`retire ${agentId}`); },
   };

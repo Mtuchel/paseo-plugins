@@ -22,8 +22,6 @@ class FakeLinear {
   async issueStatuses(ids: string[]) { return new Map(ids.filter((id) => this.statuses.has(id)).map((id) => [id, this.statuses.get(id)!])); }
   async addLabel(issueId: string, name: string) { this.writes.push(`+${name} ${issueId}`); }
   async comment(issueId: string, body: string) { this.writes.push(`comment ${issueId}: ${body}`); }
-  async createComment(issueId: string, body: string) { this.writes.push(`comment ${issueId}: ${body}`); return "c"; }
-  async updateComment() {}
   async moveToReady(issueId: string) { this.writes.push(`ready ${issueId}`); return { changed: true }; }
   async reopen(issueId: string) { this.writes.push(`reopen ${issueId}`); this.statuses.set(issueId, { status: "Todo", statusType: "unstarted", completedAt: null }); }
   async viewerId() { return "me"; }
@@ -116,14 +114,14 @@ test("before-merge tasks block until done and verified; a merge makes after-merg
 test("an approval waits for before-merge tasks, then moves to Ready to merge; archived agents stay watched until the merge", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-pr-watch-"));
   const record = { issueId: "parent", identifier: "TUC-1", agentId: "a1", agentTitle: "T", links: { "Pull request": "https://github.com/o/r/pull/1" }, status: "archived" } as unknown as HandoverRecord;
-  let view: PullRequestView = { state: "OPEN", isDraft: false, headSha: "h", updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, reviews: [{ author: "ada", state: "APPROVED", submittedAt: "2026-01-01T12:00:00Z", body: "", commit: null }], lastCommitAt: "2026-01-01T11:00:00Z", checks: [{ name: "ci", url: "", state: "pending", conclusion: "pending" }] };
+  let view: PullRequestView = { state: "OPEN", isDraft: false, headSha: "h", headBranch: "tuc-1", baseBranch: "main", updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, comments: [], reviews: [{ author: "ada", state: "APPROVED", submittedAt: "2026-01-01T12:00:00Z", body: "", commit: null }], lastCommitAt: "2026-01-01T11:00:00Z", checks: [{ name: "ci", url: "", state: "pending", conclusion: "pending" }] };
   let open = ["TUC-9"];
   let awaiting = true;
   const calls: string[] = [];
   const watch = new PullRequestWatch({
     handover: { all: async () => [record], update: async (_issue, _agent, patch) => { calls.push(`review ${patch.review}`); return null as never; } },
-    sessions: { sessionFor: async () => ({ sessionId: "s" }) as never, say: async (_id, _kind, text) => { calls.push(`say ${text}`); }, prompt: async () => "gone" as const },
-    linear: { moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; }, createComment: async () => "c", updateComment: async () => {}, viewerId: async () => "u", userUrl: async () => "u" },
+    sessions: { sessionFor: async () => ({ sessionId: "s" }) as never, say: async (_id, _kind, text) => { calls.push(`say ${text}`); }, prompt: async () => "gone" as const, link: async () => {} },
+    linear: { moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; }, comment: async () => {}, viewerId: async () => "u", userUrl: async () => "u", linkUrl: async () => {} },
     settings: { read: async () => settings },
     manualTasks: {
       openBlockers: async () => open.map((identifier) => ({ identifier }) as ManualTask),
@@ -131,7 +129,7 @@ test("an approval waits for before-merge tasks, then moves to Ready to merge; ar
       merged: async (issueId) => { calls.push(`merged ${issueId}`); awaiting = false; },
     },
     view: async () => view,
-    github: { drafts: async () => [], landed: async () => false, failedChecks: async () => [], reviewThreads: async () => [] },
+    github: { drafts: async () => [], landed: async () => false, failedChecks: async () => [], reviewThreads: async () => [], openPullRequests: async () => [], branchExists: async () => true },
   }, join(home, "pr-watch.json"));
   try {
     await watch.poll();

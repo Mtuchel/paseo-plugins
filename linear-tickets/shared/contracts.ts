@@ -15,7 +15,7 @@ export const DEFAULT_PROMPT_TEMPLATE = [
 
 // What the agent is told about changing Linear. With access on, the agent holds tools that
 // can only act on its own ticket; a template without {{linear_access}} gets this appended.
-export const LINEAR_ACCESS_NOTE = "You can update this ticket through the linear_ticket MCP tools (get_ticket, add_comment, set_status, link_url, add_manual_task); they act only on this ticket and its manual tasks. Post a short comment when you start, and a final comment with what changed, how it was verified, the pull request link and the manual tasks still open. Attach the pull request with link_url and move the ticket to its review state (for example In Review) once a pull request is open. Every step a person must do outside the pull request (environment variables, secrets, Railway/Linear/GitHub/Paseo settings, webhooks, integrations) goes through add_manual_task, one task per coherent step, never only into a comment; give it a check command whenever one can prove the step is done. If you are blocked, say why in a comment. Do not change any other Linear ticket.";
+export const LINEAR_ACCESS_NOTE = "You can update this ticket through the linear_ticket MCP tools (get_ticket, add_comment, set_status, link_url, add_manual_task); they act only on this ticket and its manual tasks, and write as Paseo. Other Linear tools act as the owner: use them only to read. Post a short comment when you start, and a final comment with what changed, how it was verified, the pull request link and the manual tasks still open. Attach the pull request with link_url and move the ticket to its review state (for example In Review) once a pull request is open. Every step a person must do outside the pull request (environment variables, secrets, Railway/Linear/GitHub/Paseo settings, webhooks, integrations) goes through add_manual_task, one task per coherent step, never only into a comment; give it a check command whenever one can prove the step is done. You close this ticket yourself, so the owner never has to: once it meets its definition of done and your final comment is posted, move it to its completed state (for example Done) with set_status, unless a merged pull request already closed it. Work outside a repository, and pull requests that only mention the ticket (for example \"Part of\"), close nothing on their own. A step left for a person after that goes into add_manual_task and does not keep the ticket open. If the work turns out to be unnecessary (already done elsewhere, obsolete, or a duplicate), move the ticket to its canceled or duplicate state with set_status and the reason instead. Never close the ticket while your instructions limit you to investigating or planning. If you are blocked, say why in a comment. Do not change any other Linear ticket.";
 export const NO_LINEAR_ACCESS_NOTE = "Do not post comments or change Linear status unless the user explicitly asks.";
 
 export const issueSchema = z.object({
@@ -138,8 +138,6 @@ export const launchAgentRpc = defineRpc({
     thinkingOptionId: z.string().min(1).optional(),
     instructions: z.string().max(10_000).default(""),
     markInProgress: z.boolean().default(false),
-    // "Plan first": the agent plans and waits for approval (README, Plan-first).
-    planFirst: z.boolean().default(false),
     requestId: z.string().uuid(),
   }),
   output: z.object({ agentId: z.string(), warnings: z.array(z.string()) }),
@@ -195,6 +193,12 @@ const writebackSettingsSchema = z.object({
   mentions: z.boolean(),
   autoResume: z.boolean(),
 });
+// Plan auto-approval (shared/plan-risk.ts): impact levels 0–4.
+const autoApproveSettingsSchema = z.object({
+  enabled: z.boolean(),
+  maxImpact: z.number().int().min(0).max(4),
+  maxImpactWithFlag: z.number().int().min(0).max(4),
+});
 export type DispatchSettingsValue = z.infer<typeof dispatchSettingsSchema>;
 export type WritebackSettingsValue = z.infer<typeof writebackSettingsSchema>;
 const settingsOutputSchema = z.object({
@@ -208,6 +212,7 @@ const settingsOutputSchema = z.object({
   agentLinearAccess: z.boolean(),
   dispatch: dispatchSettingsSchema,
   writeback: writebackSettingsSchema,
+  autoApprove: autoApproveSettingsSchema,
 });
 export const getSettingsRpc = defineRpc({
   name: "linear.get-settings",
@@ -226,6 +231,7 @@ export const setSettingsRpc = defineRpc({
     launchPreference: launchPreferenceSchema.extend({ provider: z.string().min(1).max(500) }).optional(),
     dispatch: dispatchSettingsSchema.partial().optional(),
     writeback: writebackSettingsSchema.partial().optional(),
+    autoApprove: autoApproveSettingsSchema.partial().optional(),
   }),
   output: settingsOutputSchema,
 });
@@ -238,7 +244,7 @@ export const dispatchStatusSchema = z.object({
   recent: z.array(z.object({
     identifier: z.string(),
     at: z.string(),
-    outcome: z.enum(["launched", "linked", "failed"]),
+    outcome: z.enum(["launched", "linked", "grouped", "failed"]),
     detail: z.string(),
   })),
 });
@@ -249,9 +255,165 @@ export const dispatchStatusRpc = defineRpc({
   output: dispatchStatusSchema,
 });
 
+// Labelled projects (README, "Projects"): how many new tickets wait for a plan, and the planner
+// waiting for the owner's approval, if any.
+export const projectStatusSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  toPlan: z.number().int(),
+  planner: z.object({ identifier: z.string(), url: z.string(), tickets: z.number().int() }).nullable(),
+  readAt: z.string(),
+});
+export type ProjectStatus = z.infer<typeof projectStatusSchema>;
+export const projectsStatusRpc = defineRpc({
+  name: "linear.projects-status",
+  input: z.object({}),
+  output: z.array(projectStatusSchema),
+});
+export const planProjectRpc = defineRpc({
+  name: "linear.plan-project",
+  input: z.object({ projectId: z.string().min(1).max(200) }),
+  output: projectStatusSchema,
+});
+
+// Present and away (README, "Present and away"): `source` says what decides it now, `until` when
+// that next changes (the schedule's next switch), if ever. Times are host-local HH:MM.
+export const presenceScheduleSchema = z.object({
+  enabled: z.boolean(),
+  awayFrom: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
+  awayUntil: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
+});
+export type PresenceSchedule = z.infer<typeof presenceScheduleSchema>;
+export const presenceSchema = z.object({
+  away: z.boolean(),
+  source: z.enum(["manual", "schedule", "default"]),
+  until: z.string().nullable(),
+  schedule: presenceScheduleSchema,
+});
+export type PresenceState = z.infer<typeof presenceSchema>;
+export const presenceRpc = defineRpc({
+  name: "linear.presence",
+  input: z.object({}),
+  output: presenceSchema,
+});
+export const setPresenceRpc = defineRpc({
+  name: "linear.set-presence",
+  input: z.object({ away: z.boolean().optional(), schedule: presenceScheduleSchema.optional() }),
+  output: presenceSchema,
+});
+
+// RAM lease (README, "Memory lease"): the Paseo Agents menu bar app caps new ticket-agent starts
+// by free memory for a short while. `limit` is the cap in effect now (null: no limit); `source`
+// is "ram" while the lease is what applies. Server-side validation (capacity.ts) owns the exact
+// ranges; these bound the wire shape.
+export const capacityLeaseSchema = z.object({ limit: z.number().int(), reason: z.string(), until: z.string() });
+export type CapacityLease = z.infer<typeof capacityLeaseSchema>;
+export const capacityStateSchema = z.object({
+  maxRunning: z.number().int(),
+  limit: z.number().int().nullable(),
+  source: z.enum(["settings", "ram"]),
+  lease: capacityLeaseSchema.nullable(),
+  running: z.number().int(),
+  reserved: z.number().int(),
+  waiting: z.number().int(),
+});
+export type CapacityState = z.infer<typeof capacityStateSchema>;
+export const capacityRpc = defineRpc({
+  name: "linear.capacity",
+  input: z.object({}),
+  output: capacityStateSchema,
+});
+export const setCapacityRpc = defineRpc({
+  name: "linear.set-capacity",
+  input: z.object({ lease: z.object({ limit: z.number().int(), ttlSeconds: z.number().int(), reason: z.string().max(200) }).nullable() }),
+  output: capacityStateSchema,
+});
+
 // The native Linear agent's health for the settings screen.
 export const agentStatusRpc = defineRpc({
   name: "linear.agent-status",
   input: z.object({}),
   output: z.object({ installed: z.boolean(), funnel: z.boolean(), funnelNote: z.string().nullable(), lastWebhookAt: z.string().nullable() }),
+});
+
+// The Paseo Agents menu bar's pull request view (README, "Pull request view"): one GitHub poller
+// in the plugin instead of one in the app. Times are ISO 8601 UTC without fractional seconds.
+export const repositorySchema = z.string().max(200).regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/);
+// CI on a pull request's head: the newest run per check name, superseded suites and Graphite's
+// mergeability check left out. `failures` name the failed jobs, the gates only when no job failed.
+export const checkSummarySchema = z.object({
+  state: z.enum(["passed", "failed", "running", "empty"]),
+  done: z.number().int(),
+  total: z.number().int(),
+  failures: z.array(z.object({ name: z.string(), url: z.string().nullable() })),
+  // Start of the oldest check still running: a gate waiting for hours is stuck.
+  runningSince: z.string().nullable(),
+});
+export type CheckSummary = z.infer<typeof checkSummarySchema>;
+// Where a pull request stands in the Graphite merge queue, from the newest bullet of Graphite's
+// "Merge activity" comment. `draft`: the queue round testing it (0 when unnamed); `reason`: why
+// it was dropped; `dropsToday`: removals in the last 24 hours.
+export const queueActivitySchema = z.object({
+  kind: z.enum(["queued", "testing", "merged", "dropped"]),
+  draft: z.number().int().nullable(),
+  reason: z.string().nullable(),
+  at: z.string().nullable(),
+  dropsToday: z.number().int(),
+  inQueue: z.boolean(),
+});
+export type QueueActivity = z.infer<typeof queueActivitySchema>;
+// GitHub's own field names, so the app decodes the pull request it decoded from REST before.
+// `checks` is null on draft pull requests, `queue` without Merge activity.
+export const pullRequestSchema = z.object({
+  number: z.number().int(),
+  title: z.string(),
+  draft: z.boolean(),
+  htmlUrl: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  user: z.object({ login: z.string() }),
+  head: z.object({ ref: z.string(), sha: z.string() }),
+  base: z.object({ ref: z.string(), sha: z.string() }),
+  labels: z.array(z.object({ name: z.string() })),
+  ticket: z.string().nullable(),
+  shortTitle: z.string(),
+  hasStaleQueueLabel: z.boolean(),
+  checks: checkSummarySchema.nullable(),
+  queue: queueActivitySchema.nullable(),
+});
+export type PullRequestEntry = z.infer<typeof pullRequestSchema>;
+export const landedCommitSchema = z.object({ sha: z.string(), title: z.string(), date: z.string(), ticket: z.string().nullable() });
+export type LandedCommit = z.infer<typeof landedCommitSchema>;
+// `error` (the last poll failed) and `rateLimited` (the last poll was skipped or cut short) are
+// never both set; either way the data stays from `fetchedAt`.
+export const pullRequestsSnapshotSchema = z.object({
+  repository: z.string(),
+  fetchedAt: z.string().nullable(),
+  refreshing: z.boolean(),
+  error: z.string().nullable(),
+  rateLimited: z.object({ reason: z.enum(["budget", "throttled"]), until: z.string(), message: z.string() }).nullable(),
+  rateLimit: z.object({ remaining: z.number().int(), limit: z.number().int(), resetsAt: z.string() }).nullable(),
+  refreshIntervalSeconds: z.number().int(),
+  // Open pull requests except the merge queue's drafts.
+  pulls: z.array(pullRequestSchema),
+  // Open "[Graphite MQ] Draft PR"s: queue rounds testing right now.
+  queueDrafts: z.array(pullRequestSchema),
+  // Commits on the default branch in the last 24 hours, newest first.
+  landedRecently: z.array(landedCommitSchema),
+});
+export type PullRequestsSnapshot = z.infer<typeof pullRequestsSnapshotSchema>;
+export const pullRequestsRpc = defineRpc({
+  name: "linear.pull-requests",
+  input: z.object({ repository: repositorySchema }),
+  output: pullRequestsSnapshotSchema,
+});
+// Adds a label to each pull request with the owner's gh login, stopping at the first one GitHub refuses.
+export const labelPullsRpc = defineRpc({
+  name: "linear.label-pulls",
+  input: z.object({
+    repository: repositorySchema,
+    label: z.string().trim().min(1).max(50).regex(/^[^\u0000-\u001f]+$/),
+    numbers: z.array(z.number().int().positive()).min(1).max(50),
+  }),
+  output: z.object({ labelled: z.array(z.number().int()), error: z.string().nullable(), snapshot: pullRequestsSnapshotSchema }),
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -40,7 +40,7 @@ test("a launch with Linear access injects a ticket-scoped MCP server that carrie
   assert.equal(server.type, "stdio");
   assert.equal(server.command, process.execPath);
   assert.deepEqual(server.args.slice(0, 3), ["/home/.paseo/linear-tickets/ticket-mcp-abc.mjs", "--issue", ISSUE_ID]);
-  assert.ok(!JSON.stringify(options).match(/lin_api|apiKey|LINEAR_API_KEY/));
+  assert.ok(!JSON.stringify(options).match(/lin_api|apiKey|LINEAR_API_KEY|access_token|Bearer/));
   assert.ok(options?.prompt?.includes(LINEAR_ACCESS_NOTE));
   assert.ok(!options?.prompt?.includes(NO_LINEAR_ACCESS_NOTE));
 });
@@ -71,6 +71,38 @@ test("a provider that reports no MCP support gets a launch warning", async () =>
   assert.ok(withAccess.warnings.some((warning) => warning.includes("no Linear tools")));
   const without = await launcher.start({ ...input, requestId: "6f6f1154-5838-4439-b981-b3c9d9831488" }, paseo, { linearAccess: false });
   assert.ok(!without.warnings.some((warning) => warning.includes("no Linear tools")));
+});
+
+test("a provider the daemon refuses MCP servers for starts once more without the ticket tools", async () => {
+  const calls: PaseoWorkspaceAgentCreateOptions[] = [];
+  const paseo = {
+    projects: { list: async () => ({ projects: [{ projectId: "project-1", projectKind: "directory", projectRootPath: "/repo" }] }) },
+    workspaces: { create: async () => ({ agents: { create: async (options: PaseoWorkspaceAgentCreateOptions) => {
+      calls.push(options);
+      if ("mcpServers" in options.config) throw new Error("Provider 'omp' does not support MCP servers");
+      return { id: "agent-1", capabilities: { supportsMcpServers: false } };
+    } } }) },
+  } as unknown as PaseoApi;
+  const launcher = new Launcher({ ...noMark, detail: async () => detail }, undefined, async () => "/s.mjs");
+  const result = await launcher.start(input, paseo, { linearAccess: true });
+  assert.equal(result.agentId, "agent-1");
+  assert.equal(calls.length, 2);
+  assert.ok(!("mcpServers" in calls[1].config));
+  assert.notEqual(calls[1].requestId, calls[0].requestId);
+  assert.ok(calls[1].prompt?.includes(NO_LINEAR_ACCESS_NOTE));
+  assert.ok(!calls[1].prompt?.includes(LINEAR_ACCESS_NOTE));
+  assert.equal(result.warnings.filter((warning) => warning.includes("does not load MCP servers")).length, 1);
+});
+
+test("any other creation failure is not retried", async () => {
+  let calls = 0;
+  const paseo = {
+    projects: { list: async () => ({ projects: [{ projectId: "project-1", projectKind: "directory", projectRootPath: "/repo" }] }) },
+    workspaces: { create: async () => ({ agents: { create: async () => { calls++; throw new Error("Provider 'omp' failed to start"); } } }) },
+  } as unknown as PaseoApi;
+  const launcher = new Launcher({ ...noMark, detail: async () => detail }, undefined, async () => "/s.mjs");
+  await assert.rejects(launcher.start(input, paseo, { linearAccess: true }), /could not be confirmed \(Provider 'omp' failed to start\)/);
+  assert.equal(calls, 1);
 });
 
 test("marking in progress happens before the agent exists, so the agent's own status changes come later", async () => {
@@ -124,7 +156,7 @@ test("the MCP script is written once, privately, under a content hash", async ()
 });
 
 type Call = { authorization: string | undefined; query: string; variables: Record<string, unknown> };
-async function fakeLinear(respond: (call: Call) => unknown, options: { status?: number; delayMs?: number; raw?: (call: Call) => unknown } = {}) {
+async function fakeLinear(respond: (call: Call) => unknown, options: { status?: number | ((call: Call) => number); delayMs?: number; raw?: (call: Call) => unknown; drop?: (call: Call) => boolean } = {}) {
   const calls: Call[] = [];
   const server = createServer(async (request: IncomingMessage, response) => {
     let body = "";
@@ -133,7 +165,8 @@ async function fakeLinear(respond: (call: Call) => unknown, options: { status?: 
     const call = { authorization: request.headers.authorization, query: parsed.query, variables: parsed.variables };
     calls.push(call);
     if (options.delayMs) await new Promise((resolve) => setTimeout(resolve, options.delayMs));
-    response.statusCode = options.status ?? 200;
+    if (options.drop?.(call)) { request.socket.destroy(); return; }
+    response.statusCode = typeof options.status === "function" ? options.status(call) : options.status ?? 200;
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify(options.raw ? options.raw(call) : { data: respond(call) }));
   });
@@ -196,7 +229,7 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
 
     const ticket = JSON.parse((await mcp.call("get_ticket")).text);
     assert.equal(ticket.identifier, "ENG-42");
-    assert.deepEqual(ticket.availableStatuses.map((s: { name: string }) => s.name), ["Todo", "In Progress", "In Review"]);
+    assert.deepEqual(ticket.availableStatuses.map((s: { name: string }) => s.name), ["Todo", "In Progress", "In Review", "Canceled"]);
 
     assert.equal((await mcp.call("add_comment", { body: "Started." })).isError, false);
     const comment = linear.calls.find((c) => c.query.includes("commentCreate"))!;
@@ -204,11 +237,15 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     assert.equal(comment.authorization, "saved-key");
 
     assert.match((await mcp.call("set_status", { status: "Shipped" })).text, /Unknown status.*In Review/);
-    assert.match((await mcp.call("set_status", { status: "canceled" })).text, /Only a person/);
+    assert.match((await mcp.call("set_status", { status: "canceled" })).text, /give the reason/);
     assert.equal((await mcp.call("set_status", { status: "in progress" })).text.includes("\"changed\": false"), true);
     const moved = await mcp.call("set_status", { status: "in review" });
     assert.equal(moved.isError, false);
-    assert.deepEqual(linear.calls.filter((c) => c.query.includes("issueUpdate")).map((c) => c.variables), [{ id: ISSUE_ID, stateId: "s-review" }]);
+    assert.deepEqual(linear.calls.filter((c) => c.query.includes("issueUpdate")).map((c) => c.variables), [{ id: ISSUE_ID, stateId: "s-review" }], "a cancel without a reason changes nothing");
+    assert.equal((await mcp.call("set_status", { status: "Canceled", reason: "ENG-7 already shipped this." })).isError, false);
+    const reason = linear.calls.findIndex((c) => JSON.stringify(c.variables) === JSON.stringify({ input: { issueId: ISSUE_ID, body: "Moved to Canceled by its agent: ENG-7 already shipped this." } }));
+    const canceled = linear.calls.findIndex((c) => JSON.stringify(c.variables) === JSON.stringify({ id: ISSUE_ID, stateId: "s-canceled" }));
+    assert.ok(reason >= 0 && canceled > reason, "the reason is on the ticket before it closes");
 
     assert.equal((await mcp.call("link_url", { url: "http://example.com/pr/1" })).isError, true);
     assert.equal((await mcp.call("link_url", { url: "https://github.com/o/r/pull/1", title: "PR" })).isError, false);
@@ -226,7 +263,8 @@ test("add_manual_task creates an assigned sub-issue, blocks the ticket only befo
   let created = 0;
   const children = [{ id: "c-old", identifier: "ENG-40", url: "https://linear.app/x/issue/ENG-40", title: "Set API_KEY on staging", state: { type: "unstarted" } }];
   const linear = await fakeLinear((call) => {
-    if (call.query.includes("query manual")) return { viewer: { id: "me" }, issue: { ...issue, team: { id: "team-1", states: { nodes: withBacklog } }, children: { nodes: children } } };
+    if (call.query.includes("query owner")) return { viewer: { id: "me" } };
+    if (call.query.includes("query manual")) return { issue: { ...issue, team: { id: "team-1", states: { nodes: withBacklog } }, children: { nodes: children } } };
     if (call.query.includes("issueCreate")) { created++; return { issueCreate: { success: true, issue: { id: `task-${created}`, identifier: `ENG-5${created}`, url: `https://linear.app/x/issue/ENG-5${created}` } } }; }
     if (call.query.includes("issueRelationCreate")) return { issueRelationCreate: { success: true } };
     return {};
@@ -396,4 +434,211 @@ test("the MCP server caps concurrent Linear calls and ignores a non-127.0.0.1 en
     await localhost.call("get_ticket");
     assert.equal(slow.calls.length, 4);
   } finally { mcp.stop(); localhost.stop(); await slow.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+// The Paseo app's token as the daemon keeps it; null leaves expires_at out. Sync, so a fake
+// Linear can rotate it while it answers a request.
+function writeToken(home: string, token: string, expiresAt: number | null = Date.now() + 3_600_000) {
+  mkdirSync(join(home, "linear-tickets", "agent-app"), { recursive: true });
+  writeFileSync(join(home, "linear-tickets", "agent-app", "token.json"), JSON.stringify({ access_token: token, refresh_token: "refresh-1", ...(expiresAt === null ? {} : { expires_at: expiresAt }) }));
+}
+
+// A host with the owner's key saved as "saved-key" and the MCP script written.
+async function host(prefix: string) {
+  const home = await mkdtemp(join(tmpdir(), prefix));
+  await mkdir(join(home, "linear-tickets"), { recursive: true });
+  await writeFile(join(home, "linear-tickets", "credentials.json"), JSON.stringify({ apiKey: "saved-key" }));
+  return { home, script: await writeTicketMcpScript(home) };
+}
+
+function startOn(home: string, script: string, url: string) {
+  return runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_TICKET_MCP_ENDPOINT: url });
+}
+
+function answers(call: Call) {
+  if (call.query.includes("query ticket")) return { issue };
+  if (call.query.includes("commentCreate")) return { commentCreate: { success: true, comment: { url: "https://linear.app/c/1" } } };
+  if (call.query.includes("issueUpdate")) return { issueUpdate: { success: true, issue: { state: { name: "In Review" } } } };
+  if (call.query.includes("attachmentLinkURL")) return { attachmentLinkURL: { success: true } };
+  return {};
+}
+
+const authorizations = (calls: Call[]) => calls.map((call) => call.authorization);
+
+test("every ticket tool acts as the Paseo app while its token is fresh", async () => {
+  const { home, script } = await host("paseo-linear-mcp-app-");
+  writeToken(home, "app-1");
+  const linear = await fakeLinear(answers);
+  const mcp = startOn(home, script, linear.url);
+  try {
+    assert.equal((await mcp.call("get_ticket")).isError, false);
+    assert.equal((await mcp.call("add_comment", { body: "Started." })).isError, false);
+    assert.equal((await mcp.call("set_status", { status: "In Review" })).isError, false);
+    assert.equal((await mcp.call("set_status", { status: "Canceled", reason: "Done elsewhere." })).isError, false);
+    assert.equal((await mcp.call("link_url", { url: "https://github.com/o/r/pull/1" })).isError, false);
+    for (const kind of ["query ticket", "commentCreate", "issueUpdate", "attachmentLinkURL"]) assert.ok(linear.calls.some((call) => call.query.includes(kind)), kind);
+    assert.ok(linear.calls.every((call) => call.authorization === "Bearer app-1"), JSON.stringify(authorizations(linear.calls)));
+  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("a token the daemon rotated between two calls is used for the next one", async () => {
+  const { home, script } = await host("paseo-linear-mcp-rotate-");
+  writeToken(home, "app-1");
+  const linear = await fakeLinear(answers);
+  const mcp = startOn(home, script, linear.url);
+  try {
+    await mcp.call("get_ticket");
+    writeToken(home, "app-2");
+    assert.equal((await mcp.call("add_comment", { body: "x" })).isError, false);
+    assert.deepEqual(authorizations(linear.calls), ["Bearer app-1", "Bearer app-2"]);
+  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("a rejected token is retried once with the token rotated meanwhile, never with the key", async () => {
+  const { home, script } = await host("paseo-linear-mcp-rejected-");
+  writeToken(home, "app-1");
+  const linear = await fakeLinear(answers, { status: (call) => {
+    if (call.authorization !== "Bearer app-1") return 200;
+    writeToken(home, "app-2");
+    return 401;
+  } });
+  const mcp = startOn(home, script, linear.url);
+  try {
+    assert.equal((await mcp.call("add_comment", { body: "x" })).isError, false);
+    assert.deepEqual(authorizations(linear.calls), ["Bearer app-1", "Bearer app-2"]);
+  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("the owner's key is used only when Linear still does not accept the app", async () => {
+  const cases = [
+    { name: "401, token unchanged", rotate: false, status: () => 401, raw: undefined, expected: ["Bearer app-1", "saved-key"] },
+    { name: "AUTHENTICATION_ERROR, token unchanged", rotate: false, status: () => 400, raw: { errors: [{ message: "Authentication required", extensions: { code: "AUTHENTICATION_ERROR" } }] }, expected: ["Bearer app-1", "saved-key"] },
+    { name: "401, rotated token rejected too", rotate: true, status: () => 401, raw: undefined, expected: ["Bearer app-1", "Bearer app-2", "saved-key"] },
+  ];
+  for (const { name, rotate, status, raw, expected } of cases) {
+    const { home, script } = await host("paseo-linear-mcp-fallback-");
+    writeToken(home, "app-1");
+    const linear = await fakeLinear(answers, {
+      status: (call) => {
+        if (call.authorization === "saved-key") return 200;
+        if (rotate && call.authorization === "Bearer app-1") writeToken(home, "app-2");
+        return status();
+      },
+      raw: (call) => (call.authorization === "saved-key" || !raw ? { data: answers(call) } : raw),
+    });
+    const mcp = startOn(home, script, linear.url);
+    try {
+      assert.equal((await mcp.call("add_comment", { body: "x" })).isError, false, name);
+      assert.deepEqual(authorizations(linear.calls), expected, name);
+    } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  }
+});
+
+test("a refusal of the rotated token goes back to the agent, never to the key", async () => {
+  const { home, script } = await host("paseo-linear-mcp-refused-");
+  writeToken(home, "app-1");
+  const linear = await fakeLinear(answers, {
+    status: (call) => {
+      if (call.authorization === "Bearer app-1") { writeToken(home, "app-2"); return 401; }
+      return call.authorization === "Bearer app-2" ? 403 : 200;
+    },
+    raw: (call) => (call.authorization === "Bearer app-2" ? { errors: [{ message: "Forbidden" }] } : { data: answers(call) }),
+  });
+  const mcp = startOn(home, script, linear.url);
+  try {
+    const result = await mcp.call("add_comment", { body: "x" });
+    assert.equal(result.isError, true);
+    assert.match(result.text, /^Linear refused this request for the Paseo app: Forbidden/);
+    assert.deepEqual(authorizations(linear.calls), ["Bearer app-1", "Bearer app-2"]);
+  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("an outage, a lost connection or a spent rate limit on the app is not retried with the key", async () => {
+  const cases = [
+    { name: "HTTP 500", options: { status: 500, raw: () => ({}) }, message: /^The Linear request failed \(HTTP 500\)\.$/ },
+    { name: "network", options: { drop: () => true }, message: /^Could not reach the Linear API\.$/ },
+    { name: "rate limit", options: { status: 400, raw: () => ({ errors: [{ message: "Rate limit exceeded", extensions: { code: "RATELIMITED" } }] }) }, message: /^Linear's hourly request limit is reached for the Paseo app; try again in about 10 minutes\.$/ },
+  ];
+  for (const { name, options, message } of cases) {
+    const { home, script } = await host("paseo-linear-mcp-nofallback-");
+    writeToken(home, "app-1");
+    const linear = await fakeLinear(answers, options);
+    const mcp = startOn(home, script, linear.url);
+    try {
+      const result = await mcp.call("add_comment", { body: "x" });
+      assert.equal(result.isError, true, name);
+      assert.match(result.text, message, name);
+      assert.deepEqual(authorizations(linear.calls), ["Bearer app-1"], name);
+    } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  }
+});
+
+test("without a usable app token the owner's key is used; a token without an expiry counts as fresh", async () => {
+  const cases: { name: string; token: number | null | "none"; expected: string }[] = [
+    { name: "no token.json", token: "none", expected: "saved-key" },
+    { name: "expired", token: Date.now() - 1_000, expected: "saved-key" },
+    { name: "expires within a minute", token: Date.now() + 30_000, expected: "saved-key" },
+    { name: "no expires_at", token: null, expected: "Bearer app-1" },
+  ];
+  const linear = await fakeLinear(answers);
+  try {
+    for (const { name, token, expected } of cases) {
+      const { home, script } = await host("paseo-linear-mcp-stale-");
+      if (token !== "none") writeToken(home, "app-1", token);
+      const mcp = startOn(home, script, linear.url);
+      try {
+        const before = linear.calls.length;
+        assert.equal((await mcp.call("get_ticket")).isError, false, name);
+        assert.deepEqual(authorizations(linear.calls.slice(before)), [expected], name);
+      } finally { mcp.stop(); await rm(home, { recursive: true, force: true }); }
+    }
+  } finally { await linear.close(); }
+});
+
+test("a manual task is assigned to the key's owner but created by the Paseo app", async () => {
+  const { home, script } = await host("paseo-linear-mcp-manual-app-");
+  writeToken(home, "app-1");
+  const linear = await fakeLinear((call) => {
+    if (call.query.includes("query owner")) return { viewer: { id: call.authorization === "saved-key" ? "owner-id" : "paseo-app-id" } };
+    if (call.query.includes("query manual")) return { issue: { ...issue, team: { id: "team-1", states: { nodes: states } }, children: { nodes: [] } } };
+    if (call.query.includes("issueCreate")) return { issueCreate: { success: true, issue: { id: "task-1", identifier: "ENG-51", url: "https://linear.app/x/issue/ENG-51" } } };
+    if (call.query.includes("issueRelationCreate")) return { issueRelationCreate: { success: true } };
+    return {};
+  });
+  const mcp = startOn(home, script, linear.url);
+  try {
+    const result = await mcp.call("add_manual_task", { title: "Set a secret", steps: "Railway → Variables", when: "before_merge" });
+    assert.equal(result.isError, false, result.text);
+    const by = (kind: string) => linear.calls.filter((call) => call.query.includes(kind));
+    assert.deepEqual(authorizations(by("query owner")), ["saved-key"]);
+    assert.deepEqual(authorizations(by("query manual")), ["Bearer app-1"]);
+    assert.deepEqual(authorizations(by("issueCreate")), ["Bearer app-1"]);
+    assert.deepEqual(authorizations(by("issueRelationCreate")), ["Bearer app-1"]);
+    assert.equal((by("issueCreate")[0].variables.input as Record<string, unknown>).assigneeId, "owner-id");
+  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("Linear error text never carries the app's tokens or the key back to the agent", async () => {
+  const echo = (call: Call) => ({ errors: [{ message: "rejected: " + call.authorization }] });
+  const cases = [
+    { name: "app request fails", status: () => 200 },
+    { name: "rotated token refused", status: (call: Call, home: string) => {
+      if (call.authorization === "Bearer app-TOKENSECRET") { writeToken(home, "app-ROTATEDSECRET"); return 401; }
+      return 403;
+    } },
+    { name: "key request fails after the app was rejected", status: (call: Call) => (call.authorization?.startsWith("Bearer") ? 401 : 400) },
+  ];
+  for (const { name, status } of cases) {
+    const { home, script } = await host("paseo-linear-mcp-redact-app-");
+    await writeFile(join(home, "linear-tickets", "credentials.json"), JSON.stringify({ apiKey: "lin_api_KEYSECRET" }));
+    writeToken(home, "app-TOKENSECRET");
+    const linear = await fakeLinear(answers, { status: (call) => status(call, home), raw: echo });
+    const mcp = startOn(home, script, linear.url);
+    try {
+      const result = await mcp.call("add_comment", { body: "x" });
+      assert.equal(result.isError, true, name);
+      assert.match(result.text, /\[redacted\]/, name);
+      assert.doesNotMatch(result.text, /SECRET/, name);
+    } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  }
 });
