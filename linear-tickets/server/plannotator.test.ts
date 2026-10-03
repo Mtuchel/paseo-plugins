@@ -166,23 +166,25 @@ test("agents without a ticket, and subagents, only get the chat row", async () =
   }
 });
 
-test("with review links, the agent's stable link is posted instead of the review's own port", async () => {
+test("with review links, the agent's stable link is posted instead of the review's own port, and the inbox learns the plan and why it needs the owner", async () => {
   const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
   const reviews = {
     async opened(agentId: string, event: { remoteUrl: string | null }, identifier?: string) { calls.push(`opened ${agentId} ${event.remoteUrl} ${identifier}`); return `https://host.ts.net:8444/review/${agentId}`; },
     async decided(agentId: string, approved: boolean) { calls.push(`decided ${agentId} ${approved}`); },
+    async described(localUrl: string, plan: string, judgement: { approved: boolean; reasons: string[] } | null) { calls.push(`described ${localUrl} ${plan === RISKY(2)} ${judgement?.approved} ${judgement?.reasons.join("; ")}`); },
   };
   await withEvents([
     { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
     { type: "decided", agentId: "agent-1", approved: true, planContent: "# Plan", at: "2026-01-01T10:05:00Z" },
   ], async (directory) => {
-    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, undefined, undefined, undefined, reviews);
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, reviews, async () => {}, () => {});
     bridge.attach(paseo);
     await bridge.drain();
     bridge.stop();
     assert.ok(calls.includes("opened agent-1 https://host.ts.net:4000/ TUC-25"));
     assert.ok(calls.includes("row agent-1: Handed off to Plannotator for review https://host.ts.net:8444/review/agent-1"));
     assert.ok(calls.some((call) => call.startsWith("comment issue-1: 📋") && call.includes("https://host.ts.net:8444/review/agent-1") && !call.includes(":4000")));
+    assert.ok(calls.includes("described http://localhost:4000/ true false no advisor review was recorded for this plan text; impact 2 is above the threshold 1"));
     assert.ok(calls.includes("decided agent-1 true"));
   });
 });

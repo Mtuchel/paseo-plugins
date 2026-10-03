@@ -49,8 +49,9 @@ export type SkippedEvent = { type: "skipped"; agentId: string | null; reason: st
 export type AdvisedEvent = { type: "advised"; agentId: string | null; verdict: string; hash: string; at: string };
 type PlannotatorEvent = OpenedEvent | DecidedEvent | SkippedEvent | AdvisedEvent;
 type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "moveToStateNamed" | "addLabel" | "removeLabel" | "issueState" | "viewerId" | "appUserId">;
-// What the risk policy made of an opened review: `line` tells the owner, in the panel and on Linear.
-type Judgement = { approved: boolean; line: string };
+// What the risk policy made of an opened review: `line` tells the owner, in the panel and on Linear;
+// `reasons` why it needs the owner (empty when approved).
+type Judgement = { approved: boolean; line: string; reasons: string[] };
 type ProjectPlans = (issueId: string, agentId: string, plan: string, paseo: PaseoApi, settings: PluginSettings) => Promise<boolean>;
 
 // Workflow states the review moves a ticket through when status write-back is on.
@@ -162,7 +163,7 @@ export class PlannotatorBridge {
     private readonly fetchPlan: (localUrl: string) => Promise<string> = readReviewPlan,
     private readonly handover?: Pick<Handover, "update">,
     private readonly setMode: (agentId: string, modeId: string) => Promise<void> = setAgentMode,
-    private readonly reviews?: Pick<ReviewLinks, "opened" | "decided">,
+    private readonly reviews?: Pick<ReviewLinks, "opened" | "decided" | "described">,
     private readonly decide: (localUrl: string, approve: boolean, feedback: string) => Promise<void> = decidePlannotatorReview,
     private readonly open: (url: string) => void = openInBrowser,
   ) {}
@@ -251,12 +252,12 @@ export class PlannotatorBridge {
         untrusted: isUntrusted(state, await this.linear.viewerId(), await this.linear.appUserId()),
         attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()),
       });
-      if (!outcome.approve) return { approved: false, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.` };
+      if (!outcome.approve) return { approved: false, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.`, reasons: outcome.reasons };
       await this.decide(localUrl, true, `Auto-approved by the risk policy. ${rating}`);
-      return { approved: true, line: `Auto-approved within your threshold. ${rating}` };
+      return { approved: true, line: `Auto-approved within your threshold. ${rating}`, reasons: [] };
     } catch (error) {
       console.error(`[linear-tickets] auto-approval check for ${agentId} failed: ${error instanceof Error ? error.message : error}`);
-      return { approved: false, line: `${rating} The auto-approval check failed, so it needs your approval.` };
+      return { approved: false, line: `${rating} The auto-approval check failed, so it needs your approval.`, reasons: ["the auto-approval check failed"] };
     }
   }
 
@@ -315,6 +316,9 @@ export class PlannotatorBridge {
     const settings = await this.settings.read();
     const planText = event.type === "opened" ? await this.fetchPlan(event.localUrl).catch(() => "") : "";
     const judgement = event.type === "opened" && issueId ? await this.judge(event.localUrl, agentId, issueId, planText, settings) : null;
+    // The inbox's details are a convenience: a failure must not retry (and repeat) the hand-off.
+    if (event.type === "opened") await this.reviews?.described(event.localUrl, planText, judgement)
+      .catch((error: unknown) => console.error(`[linear-tickets] inbox details for ${agentId} skipped: ${error instanceof Error ? error.message : error}`));
     if (event.type === "opened" && !judgement?.approved) this.show(event.localUrl);
     const row: PlannotatorRow = event.type === "opened"
       ? { title: judgement?.approved ? "Plan auto-approved by the risk policy" : "Handed off to Plannotator for review", url, detail: `${event.remoteUrl ? "Opens on any device in your tailnet." : "Local link only: Tailscale was unavailable."}${model ? ` Planned with ${model}.` : ""}${judgement ? ` ${judgement.line}` : ""}` }
