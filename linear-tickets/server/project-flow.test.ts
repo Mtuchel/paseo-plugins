@@ -48,21 +48,25 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   return { flow, calls, store, issues, advance: (ms: number) => { now += ms; }, setAway: (value: boolean) => { away = value; } };
 }
 
-test("a labelled project hands out nothing and files no planner until the owner presses Plan; the status counts what waits", async (t) => {
+test("a labelled project files a planner for its new tickets on its own, and hands them out only once the order is applied", async (t) => {
   const r = await room(t, [issue(1), issue(2)]);
   await r.flow.tick(paseo, settings);
-  assert.deepEqual(r.calls, []);
-  assert.deepEqual(r.flow.status().map(({ name, toPlan, planner }) => ({ name, toPlan, planner })), [{ name: "ERP", toPlan: 2, planner: null }]);
-  const status = await r.flow.planNow("erp", settings);
-  assert.deepEqual(r.calls, ["create Plan the work order of ERP P1", "label planner1 +paseo-planner", "label planner1 +plan", "delegate planner1"]);
-  assert.deepEqual({ toPlan: status.toPlan, planner: status.planner }, { toPlan: 0, planner: { identifier: "TUC-101", url: "", tickets: 2 } });
+  assert.deepEqual(r.calls, ["create Plan the work order of ERP P1", "label planner1 +paseo-planner", "delegate planner1"]);
+  assert.deepEqual(r.flow.status().map(({ name, toPlan, planner }) => ({ name, toPlan, planner })), [{ name: "ERP", toPlan: 0, planner: { identifier: "TUC-101", url: "", tickets: 2 } }]);
   r.calls.length = 0;
-  r.issues.push(issue(100, { id: "planner1", labels: ["paseo-planner", "plan"], delegateId: APP }), issue(3, { createdAt: "2026-01-02T00:30:00Z" }));
+  r.issues.push(issue(100, { id: "planner1", labels: ["paseo-planner"], delegateId: APP }), issue(3, { createdAt: "2026-01-02T00:30:00Z" }));
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);
-  assert.deepEqual(r.calls, [], "its tickets wait for the approval");
+  assert.deepEqual(r.calls, [], "its tickets wait for the order, and one planner at a time");
   assert.equal(r.flow.status()[0].toPlan, 1, "TUC-3 came after the planner's list");
-  await assert.rejects(r.flow.planNow("erp", settings), /TUC-101 is still waiting for your approval/);
+  await assert.rejects(r.flow.planNow("erp", settings), /TUC-101 is still planning the work order/);
+});
+
+test("Plan files the planner right away instead of at the next poll", async (t) => {
+  const r = await room(t, [issue(1)]);
+  const status = await r.flow.planNow("erp", settings);
+  assert.deepEqual(r.calls, ["create Plan the work order of ERP P1", "label planner1 +paseo-planner", "delegate planner1"]);
+  assert.deepEqual({ toPlan: status.toPlan, planner: status.planner }, { toPlan: 0, planner: { identifier: "TUC-101", url: "", tickets: 1 } });
 });
 
 test("the approved work order is written to Linear, then planned tickets are handed out in order up to the agent limit", async (t) => {
@@ -72,7 +76,7 @@ test("the approved work order is written to Linear, then planned tickets are han
   const plan = "# Order\n\n```project-order\n- TUC-3 blocks TUC-4\nhold TUC-5: needs a pricing decision\nTUC-9 blocks TUC-1\n```";
   assert.equal(await r.flow.applyPlan("unrelated", "agent-x", plan, paseo, settings), false);
   assert.equal(await r.flow.applyPlan("planner1", "agent-p", plan, paseo, settings), true);
-  assert.deepEqual(r.calls.slice(4), [
+  assert.deepEqual(r.calls.slice(3), [
     "i3 blocks i4",
     "label i5 +paseo-hold",
     "comment planner1 **Work order applied** (2 changes). The project's tickets are now handed to Paseo in order as agent slots free up.",
@@ -87,25 +91,26 @@ test("the approved work order is written to Linear, then planned tickets are han
   assert.deepEqual(r.calls, ["delegate i2"], "one free slot of two: the urgent ticket; blocked and held tickets never");
 });
 
-test("while the owner is away only tickets that need nobody are handed out; back, the attended ones go first", async (t) => {
-  // TUC-1 is marked attended by the plan; TUC-2 was written by someone else, so its plan needs the owner.
+test("while the owner is away only an attended ticket with an approved plan waits; back, it goes first", async (t) => {
+  // TUC-1 is marked attended by the order and its plan is approved; TUC-2, someone else's, plans like any other.
   const r = await room(t, [issue(1), issue(2, { creatorId: "colleague" }), issue(3), issue(4), issue(5, { priority: 1 })]);
   await r.flow.planNow("erp", settings);
   r.issues.push(issue(100, { id: "planner1", labels: ["paseo-planner"] }));
   await r.flow.applyPlan("planner1", "agent-p", "```project-order\nattended TUC-1: pricing is not decided\n```", paseo, settings);
   assert.ok(r.calls.includes("label i1 +paseo-attended"));
-  r.issues.splice(0, r.issues.length, issue(1, { labels: ["paseo-attended"] }), issue(2, { creatorId: "colleague" }), issue(3), issue(4), issue(5, { priority: 1 }));
+  const attended = () => issue(1, { labels: ["paseo-attended", "plan-ready"] });
+  r.issues.splice(0, r.issues.length, attended(), issue(2, { creatorId: "colleague" }), issue(3), issue(4), issue(5, { priority: 1 }));
   r.setAway(true);
   r.calls.length = 0;
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);
-  assert.deepEqual(r.calls, ["delegate i3", "delegate i5"], "two slots: the urgent ticket and the oldest that needs nobody; TUC-1 and TUC-2 wait");
-  r.issues.splice(0, r.issues.length, issue(1, { labels: ["paseo-attended"] }), issue(2, { creatorId: "colleague" }), issue(4));
+  assert.deepEqual(r.calls, ["delegate i2", "delegate i5"], "two slots: the urgent ticket and the oldest that needs nobody; TUC-1 waits");
+  r.issues.splice(0, r.issues.length, attended(), issue(3, { priority: 2 }), issue(4, { priority: 2 }));
   r.setAway(false);
   r.calls.length = 0;
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);
-  assert.deepEqual(r.calls, ["delegate i1", "delegate i2"], "present: the attended tickets take the slots before TUC-4");
+  assert.deepEqual(r.calls, ["delegate i1", "delegate i3"], "present: the attended ticket goes before higher-priority ones, so TUC-4 waits");
 });
 
 test("tickets nobody may hand out stay put: started, someone else's, already with Paseo, sub-issues; a parent goes as a group", async (t) => {
@@ -128,7 +133,7 @@ test("tickets nobody may hand out stay put: started, someone else's, already wit
   assert.deepEqual(r.calls, ["delegate i4", "delegate i6"]);
 });
 
-test("only new tickets the project could hand out count as waiting for a plan", async (t) => {
+test("only new tickets the project could hand out get a planner", async (t) => {
   const r = await room(t, [issue(1)]);
   await r.flow.planNow("erp", settings);
   r.issues.push(issue(100, { id: "planner1", labels: ["paseo-planner"] }));
@@ -139,12 +144,12 @@ test("only new tickets the project could hand out count as waiting for a plan", 
     issue(5, { createdAt: "2026-01-02T00:30:00Z", assigneeId: "colleague" }), issue(6, { createdAt: "2026-01-02T00:30:00Z", statusType: "started", status: "In Progress" }));
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);
-  assert.equal(r.flow.status()[0].toPlan, 0);
+  assert.deepEqual({ toPlan: r.flow.status()[0].toPlan, planner: r.flow.status()[0].planner }, { toPlan: 0, planner: null });
   await assert.rejects(r.flow.planNow("erp", settings), /No new tickets to plan/);
   r.issues.push(issue(2, { createdAt: "2026-01-02T00:40:00Z" }), issue(7, { createdAt: "2026-01-02T00:40:00Z", assigneeId: OWNER, statusType: "triage", status: "Triage" }));
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);
-  assert.equal(r.flow.status()[0].toPlan, 2);
+  assert.equal(r.flow.status()[0].planner?.tickets, 2);
 });
 
 test("a planner the owner closes without approving counts its tickets as planned", async (t) => {

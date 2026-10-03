@@ -6,21 +6,19 @@ import type { ProjectStatus } from "../shared/contracts";
 import type { Capacity } from "./capacity";
 import { dispatchLabels } from "./dispatch";
 import type { LinearService, ProjectIssue } from "./linear";
-import { PLAN_LABEL } from "./plan-policy";
 import type { Scheduler } from "./scheduler";
 import { needsOwner } from "./presence";
-import { isUntrusted } from "./starter";
 import type { PluginSettings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
 // Projects carrying the trigger label move forward on their own (README, "Projects"):
-// 1. The owner asks for a plan (`linear.plan-project`, the Paseo Agents menu bar's "Plan"): a planner ticket in the project asks an agent
-//    for the work order of the new tickets: which tickets block which, and which must wait for the
-//    owner (hold). The owner approves its plan like any other; the approved order is written into
-//    Linear as blocking relations and `<trigger>-hold` labels.
+// 1. Whenever a project has new tickets and no open planner, a planner ticket asks an agent for the
+//    work order of the new tickets: which tickets block which, which must wait for the owner
+//    (hold), and which may need them while they run (attended). Its plan is approved automatically
+//    and written into Linear as blocking relations and `<trigger>-hold`/`-attended` labels.
+//    `linear.plan-project` files it right away instead of at the next poll.
 // 2. Every poll, the project's planned, unblocked, unheld tickets that nobody has are handed to
-//    Paseo in the scheduler's order, one per free agent slot.
-// Tickets filed after the last plan wait until the owner plans them; `linear.projects-status` counts them.
+//    Paseo in the scheduler's order, one per free agent slot. Each ticket plans on its own.
 
 // How often a project's tickets are read: a project is a few paginated queries.
 const POLL_MS = 2 * 60_000;
@@ -111,7 +109,8 @@ export class ProjectFlow {
     for (const project of await this.deps.linear.labeledProjects(settings.dispatch.label)) {
       try {
         const read = await this.read(project, settings);
-        statuses.push(read.status);
+        // Always on: new tickets get a planner as soon as none is open.
+        statuses.push(!read.record.planner && read.unplanned.length ? await this.filePlanner(project, read, appId, settings) : read.status);
         await this.handOut(project.id, read.work, read.work.filter(read.planned), read.owner, appId, paseo, settings);
       } catch (error) {
         console.error(`[linear-tickets] project ${project.name}: ${error instanceof Error ? error.message : error}`);
@@ -145,16 +144,23 @@ export class ProjectFlow {
     return { work, record, owner, planned, unplanned, status: { id: project.id, name: project.name, toPlan, planner, readAt: new Date(this.now()).toISOString() } };
   }
 
-  // `linear.plan-project`: files a planner ticket for the project's unplanned tickets. One
-  // planner per project at a time.
+  // `linear.plan-project`: files a planner ticket for the project's unplanned tickets right away
+  // instead of at the next poll. One planner per project at a time.
   async planNow(projectId: string, settings: PluginSettings): Promise<ProjectStatus> {
     const appId = await this.deps.linear.appUserId();
     if (!appId) throw new Error("The Paseo Linear app is not installed on this host, so nothing would start the planner.");
     const project = (await this.deps.linear.labeledProjects(settings.dispatch.label)).find((item) => item.id === projectId);
     if (!project) throw new Error(`This project no longer carries the "${settings.dispatch.label}" label.`);
     const read = await this.read(project, settings);
-    if (read.record.planner) throw new Error(`${read.record.planner.identifier} is still waiting for your approval. Approve or close it first.`);
+    if (read.record.planner) throw new Error(`${read.record.planner.identifier} is still planning the work order.`);
     if (!read.unplanned.length) throw new Error("No new tickets to plan.");
+    const status = await this.filePlanner(project, read, appId, settings);
+    this.statuses = [...this.statuses.filter((item) => item.id !== project.id), status];
+    return status;
+  }
+
+  // The record is stored right after the ticket exists, so a later failure never files a second planner.
+  private async filePlanner(project: { id: string; name: string }, read: Read, appId: string, settings: PluginSettings): Promise<ProjectStatus> {
     const labels = dispatchLabels(settings.dispatch.label);
     const listedAt = new Date(this.now()).toISOString();
     const teams = new Map<string, number>();
@@ -162,15 +168,12 @@ export class ProjectFlow {
     const teamId = [...teams.entries()].sort((a, b) => b[1] - a[1])[0][0];
     const descriptions = await this.deps.linear.issueDescriptions(read.work.map((issue) => issue.id));
     const created = await this.deps.linear.createIssue({ teamId, projectId: project.id, ready: true, priority: 1, title: `Plan the work order of ${project.name}`, description: plannerBrief(project.name, read.work, read.unplanned, descriptions, labels) });
-    await this.deps.linear.addLabel(created.id, labels.planner);
-    await this.deps.linear.addLabel(created.id, PLAN_LABEL);
     const planner = { identifier: created.identifier, url: created.url, tickets: read.unplanned.length };
     await this.store.put(project.id, { plannedThrough: read.record.plannedThrough, planner: { id: created.id, listedAt, ...planner } });
+    await this.deps.linear.addLabel(created.id, labels.planner);
     await this.deps.linear.delegate(created.id, appId);
     console.log(`[linear-tickets] project ${project.name}: planner ${created.identifier} for ${read.unplanned.length} new ticket${read.unplanned.length === 1 ? "" : "s"}`);
-    const status: ProjectStatus = { ...read.status, toPlan: 0, planner };
-    this.statuses = [...this.statuses.filter((item) => item.id !== project.id), status];
-    return status;
+    return { ...read.status, toPlan: 0, planner };
   }
 
   // Ranked by the scheduler; each admitted ticket is assigned to Paseo, whose session then starts
@@ -189,7 +192,7 @@ export class ProjectFlow {
     const singles = ready.filter((issue) => !parents.has(issue.id));
     const candidates = singles.map((issue) => ({
       issueId: issue.id, identifier: issue.identifier, projectId, priority: issue.priority, unblocks: issue.blocks.length, createdAt: issue.createdAt,
-      attended: needsOwner(issue.labels, isUntrusted({ creatorId: issue.creatorId, labels: issue.labels.map((name) => ({ name })) }, owner, appId), settings.dispatch.label),
+      attended: needsOwner(issue.labels, settings.dispatch.label),
     }));
     this.deps.scheduler.note(candidates);
     for (const candidate of candidates) {
@@ -267,12 +270,12 @@ export function plannerBrief(projectName: string, work: ProjectIssue[], unplanne
       "- `A blocks B`: B must not start before A is finished. Add one where B builds on A, or where both change the same files and would conflict as parallel pull requests.",
       `- \`hold X: reason\`: X must not start at all until the owner acts (too big, should be split, waits on a decision outside the code). It gets the \`${labels.hold}\` label and is not handed out until the owner removes it.`,
       "- `release X`: a ticket held earlier may now be handed out.",
-      `- \`attended X: reason\`: an agent can do X, but will very likely have to stop and ask the owner during the work. Paseo starts X only while the owner is present; unmarked tickets also run at night, unattended. Mark a ticket only for one of these: a business decision the ticket leaves open, acceptance criteria too vague to check, user-facing wording or layout the owner must choose, changes to production data, external accounts or spend, or a step only a person can do. Size, difficulty, risk or code review alone are no reason: most tickets stay unmarked. It gets the \`${labels.attended}\` label.`,
+      `- \`attended X: reason\`: an agent can do X, but will very likely have to stop and ask the owner during the work. X still plans at any time, but its plan always goes to the owner, and its implementation starts only while the owner is present; unmarked tickets also run at night, unattended. Mark a ticket only for one of these: a business decision the ticket leaves open, acceptance criteria too vague to check, user-facing wording or layout the owner must choose, changes to production data, external accounts or spend, or a step only a person can do. Size, difficulty, risk or code review alone are no reason: most tickets stay unmarked. It gets the \`${labels.attended}\` label.`,
       "- `unattended X`: X no longer needs the owner present (removes an earlier `attended`).",
       "- Tickets not mentioned are handed out as soon as they are unblocked; independent tickets run in parallel.",
     ].join("\n"),
-    "Rate the work order itself in the plan's `## Risk and impact` section, not the tickets: it only changes Linear (blocking relations and labels), and every ticket is still planned and approved on its own. That is impact 0 with reversibility `revert`, unless the order itself affects a business process, for example by holding back a ticket a deadline depends on. Put tickets that need the owner under `hold` or `attended` rather than recommending `owner`; recommend `owner` only when the order needs a decision you cannot make from the tickets, for example two tickets that contradict each other.",
-    "Once the plan is approved (by the owner, or automatically when its rating is within the owner's threshold), Paseo writes the order into Linear and closes this ticket. Nothing is left to implement then: stop.",
+    "Rate the work order itself in the plan's `## Risk and impact` section (the advisor record needs it), not the tickets: it only changes Linear (blocking relations and labels), and every ticket still plans and is approved on its own. That is impact 0 with reversibility `revert`. The work order is applied without the owner, so anything that needs them goes under `hold` or `attended`.",
+    "Once you submit the plan, Paseo approves it automatically, writes the order into Linear and closes this ticket. Nothing is left to implement then: stop.",
     `## Open tickets (${work.length})\n\n${lines.join("\n")}`,
   ].join("\n\n");
 }

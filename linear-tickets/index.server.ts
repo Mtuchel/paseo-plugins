@@ -11,6 +11,7 @@ import { Credentials } from "./server/credentials";
 import { Dispatcher } from "./server/dispatch";
 import { CommentRelay } from "./server/relay";
 import { PlannotatorBridge, readReviewPlan, recordDecision, writeOpenScript } from "./server/plannotator";
+import { ParkedPlans, PlannotatorHost } from "./server/parked";
 import { reviewOutcome } from "./server/review-outcome";
 import { Writeback } from "./server/writeback";
 import { AgentApi, AppAuth } from "./server/agent-app";
@@ -83,7 +84,19 @@ export default function contribute(server: PluginServerContext) {
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   const reviewLinks = new ReviewLinks();
-  const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks);
+  // Plans that need the owner are parked and served by one central Plannotator host, so their
+  // agents are retired instead of holding a slot until the owner decides (README, "Parked plans").
+  const plannotatorHost = new PlannotatorHost();
+  const parking = {
+    plans: new ParkedPlans(),
+    available: () => plannotatorHost.available(),
+    retire: async (reviewUrl: string, agentId: string, api: PaseoApi, reason: string) => {
+      await decidePlannotatorReview(reviewUrl, false, reason).catch((error: unknown) => console.error(`[linear-tickets] closing the parked plan's own review failed: ${error instanceof Error ? error.message : error}`));
+      await stopAgentTurn(agentId).catch(() => {});
+      await api.agents.ref(agentId).archive().catch(() => {});
+    },
+  };
+  const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks, undefined, undefined, parking);
   plannotator.onProjectPlan((issueId, agentId, plan, paseo, current) => projects.applyPlan(issueId, agentId, plan, paseo, current));
   const manualTasks = new ManualTasks({ linear, settings });
   const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks });
@@ -149,7 +162,9 @@ export default function contribute(server: PluginServerContext) {
     const link = await sessions.sessionFor(change.agentId);
     if (link) await sessions.say(link.sessionId, "thought", `Model restored to ${change.to} (it had switched to ${change.from}).`);
   });
-  const attach = (paseo: PaseoApi) => { attached = true; if (!stopped) void reviewLinks.start(); dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); void startAgent(); };
+  // The central Plannotator host starts once, after the hook it runs for each parked review exists.
+  const startHost = async () => { if (await plannotatorHook() && !stopped) await plannotatorHost.start(); };
+  const attach = (paseo: PaseoApi) => { const first = !attached; attached = true; if (!stopped) { void reviewLinks.start(); if (first) void startHost(); } dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); void startAgent(); };
   const cacheIdentity = async () => {
     const connection = await credentials.read();
     return connection.key ? cacheScope(connection.key) : null;
@@ -168,7 +183,7 @@ export default function contribute(server: PluginServerContext) {
     attach(paseo);
     const browser = await plannotatorHook();
     // A new ticket agent gets its plan policy with its create request; a resumed one from its label,
-    // so the omp extension keeps the same rules (skip_plan) after a daemon restart.
+    // so the omp extension keeps the same rules after a daemon restart.
     const policy = request.env[PLAN_POLICY_ENV] ? null : await paseo.agents.ref(request.agentId).refresh()
       .then((found) => found?.agent.labels?.[PLAN_POLICY_LABEL], () => undefined);
     const env = { ...(browser ? { PLANNOTATOR_BROWSER: browser } : {}), ...(isPlanPolicy(policy) ? { [PLAN_POLICY_ENV]: policy } : {}) };
@@ -228,7 +243,7 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(launchAgentRpc, async (input, { paseo }) => {
     const { template, agentLinearAccess } = await settings.read();
-    const setup = await planSetup(linear, input.id, input.provider, input.modeId, input.planFirst);
+    const setup = await planSetup(linear, input.id, input.provider, input.modeId);
     const launch = { ...input, modeId: setup.modeId, instructions: [...setup.notes, input.instructions.trim()].filter(Boolean).join("\n\n") };
     const markInProgress = input.markInProgress && setup.policy !== "required";
     const result = await launcher.start(launch, paseo, { promptTemplate: template ?? undefined, markInProgress, linearAccess: agentLinearAccess, labels: setup.labels, env: setup.env });
@@ -253,5 +268,5 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); void closeInternalDaemon(); };
+  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); void closeInternalDaemon(); };
 }

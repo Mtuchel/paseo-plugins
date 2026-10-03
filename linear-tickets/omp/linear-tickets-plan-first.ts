@@ -3,14 +3,11 @@
 // (user extensions come first), so its before_agent_start runs first and Plannotator's own handler
 // delivers the planning framing on the same prompt.
 //
-// - LINEAR_TICKETS_PLAN=required|agent (set by the plugin for ticket agents): a fresh session
-//   starts in Plannotator's planning phase. With "agent" the model may leave it through
-//   `skip_plan` and a reason, which the plugin posts on the ticket; with "required" there is no
-//   such tool.
+// - LINEAR_TICKETS_PLAN=required (set by the plugin for every ticket agent without an approved
+//   plan): a fresh session starts in Plannotator's planning phase. There is no way to skip it.
 // - <PASEO_HOME>/linear-tickets/plan-requests/<agent id> (written by the plugin when the owner adds
 //   the `plan` label while the agent works): the agent enters planning at its next tool call, which
-//   is blocked and followed by a message with the reason, or at its next prompt. `skip_plan` is
-//   refused from then on.
+//   is blocked and followed by a message with the reason, or at its next prompt.
 // - LINEAR_TICKETS_ISSUE=<ticket> (set by the plugin for every ticket agent): plan advisor
 //   (README, "Plan advisor"). Submitting a plan (`plannotator_submit_plan`, its xd:// device, or
 //   omp's `xd://propose`) is blocked until `record_plan_advice` recorded a GPT-6 Astra review for
@@ -166,9 +163,8 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
   if (!AGENT_ID) return;
   const request = join(HOME, "linear-tickets", "plan-requests", AGENT_ID);
   // `launched`: this session already applied its launch policy, or is a resumed one that must not
-  // be sent back to planning. `ownerAsked`: the owner requested a plan; skip_plan is refused.
+  // be sent back to planning.
   let launched = false;
-  let ownerAsked = false;
   // Plannotator did not answer once: without it there is no planning phase to enter, so the
   // request file is not checked again on every tool call (each check would wait for the timeout).
   let unanswered = false;
@@ -257,14 +253,12 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     if (phase === null) { unanswered = true; return null; }
     if (phase === "planning") {
       rmSync(request, { force: true });
-      ownerAsked = true;
       return "planning";
     }
     if (phase === "executing") phase = await planMode("exit");
     if (phase === "idle") phase = await planMode("enter");
     if (phase !== "planning") return null;
     rmSync(request, { force: true });
-    ownerAsked = true;
     pi.appendEntry(MARKER, { reason: "owner", at: new Date().toISOString() });
     return "entered";
   }
@@ -281,7 +275,6 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const entries = ctx.sessionManager.getBranch();
     const marks = entries.filter((entry) => entry.type === "custom" && entry.customType === MARKER);
     launched = marks.length > 0 || entries.some((entry) => entry.type === "message" && entry.message?.role === "assistant");
-    ownerAsked = marks.some((entry) => entry.data?.reason === "owner");
     restoreAdvice(entries);
   });
   for (const event of ["session_switch", "session_branch", "session_tree"] as const) {
@@ -297,7 +290,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     if (await takeOwnerRequest()) { launched = true; return; }
     if (launched) return;
     launched = true;
-    if (POLICY !== "required" && POLICY !== "agent") return;
+    if (POLICY !== "required") return;
     if (await planMode("enter") === "planning") pi.appendEntry(MARKER, { reason: "launch", policy: POLICY, at: new Date().toISOString() });
   });
 
@@ -372,28 +365,6 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       const checked = recordOutcomes.get(id);
       recordOutcomes.delete(id);
       return checked ?? recordAdvice(params, ctx);
-    },
-  });
-
-  if (POLICY !== "agent") return;
-  pi.registerTool({
-    name: "skip_plan",
-    label: "Skip Plan",
-    description: "Leave plan mode without a plan review because this ticket is small enough to implement directly: none of the plan rules in your instructions apply. Pass a one-sentence reason; it is posted on the Linear ticket. Then implement the ticket.",
-    parameters: pi.zod.object({ reason: pi.zod.string() }),
-    // A direct tool: discoverable tools are called by writing to xd://skip_plan, which
-    // Plannotator's planning phase blocks like any non-markdown write.
-    loadMode: "essential",
-    async execute(_id, params) {
-      const reason = params.reason?.trim();
-      if (!reason) return text("Give a one-sentence reason why this ticket needs no plan.");
-      if (ownerAsked) return text("The owner asked for a plan on this ticket, so it cannot be skipped. Write the plan and submit it for review.");
-      const phase = await planMode("status");
-      if (phase !== "planning") return text(`Not in plan mode (${phase ?? "Plannotator did not answer"}); there is nothing to skip.`);
-      if (await planMode("exit") !== "idle") return text("Plan mode could not be left. Write the plan and submit it for review instead.");
-      pi.appendEntry(MARKER, { reason: "skipped", at: new Date().toISOString() });
-      dropEvent({ type: "skipped", reason });
-      return text("Plan skipped; your reason is posted on the ticket. Implement the ticket now.", { skipped: true });
     },
   });
 }

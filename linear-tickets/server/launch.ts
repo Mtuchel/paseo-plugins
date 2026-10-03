@@ -12,8 +12,7 @@ import { findProject, readBranches } from "./projects";
 import { repoOrientation } from "./repo-orientation";
 import { paseoHome, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
 
-// planFirst is resolved into mode, instructions, labels and env before a launch (planSetup).
-type Start = Omit<RpcInput<typeof launchAgentRpc>, "planFirst">;
+type Start = RpcInput<typeof launchAgentRpc>;
 type Result = { agentId: string; warnings: string[] };
 // `resume` continues another agent's work: same branch (and worktree while it still exists),
 // with the handover text ahead of the ticket prompt. `labels` are added to the agent, `env` to

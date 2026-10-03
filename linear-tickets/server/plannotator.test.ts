@@ -7,7 +7,8 @@ import test from "node:test";
 import { promisify } from "node:util";
 import type { PaseoApi } from "@getpaseo/client";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
-import { parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, writeOpenScript } from "./plannotator";
+import { parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, writeOpenScript, type Parking } from "./plannotator";
+import type { ParkedPlan } from "./parked";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
 
@@ -64,6 +65,7 @@ function setup(labels: Record<string, string>, ticket: { creatorId: string; labe
     async comment(issueId: string, body: string) { calls.push(`comment ${issueId}: ${body}`); },
     async upsertIssueDocument(issueId: string, title: string) { calls.push(`document ${issueId} ${title}`); return "https://linear.app/doc/1"; },
     async moveToStateNamed(issueId: string, name: string) { calls.push(`state ${issueId} ${name}`); return { changed: true }; },
+    async moveToReady(issueId: string) { calls.push(`ready ${issueId}`); return { changed: true }; },
     async addLabel(issueId: string, name: string) { calls.push(`+${name} ${issueId}`); },
     async removeLabel(issueId: string, name: string) { calls.push(`-${name} ${issueId}`); },
     async issueState() { return { creatorId: ticket.creatorId, labels: ticket.labels.map((name, index) => ({ id: `l${index}`, name })) } as never; },
@@ -133,21 +135,6 @@ test("a plan sent back loses plan-ready, and a review the plugin closed itself i
     await bridge.drain();
     bridge.stop();
     assert.deepEqual(calls, []);
-    assert.deepEqual(await readdir(directory), []);
-  });
-});
-
-test("a skipped plan is noted on the ticket with the agent's reason and leaves its state and labels alone", async () => {
-  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
-  await withEvents([{ type: "skipped", agentId: "agent-1", reason: "One-line fix in format.ts, no schema or API change.", at: "2026-01-01T10:00:00Z" }], async (directory) => {
-    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
-    bridge.attach(paseo);
-    await bridge.drain();
-    bridge.stop();
-    assert.deepEqual(calls, [
-      "row agent-1: Plan skipped by the agent",
-      "comment issue-1: ⏭️ **No plan**: the agent judged this ticket small enough to implement directly. Its reason: One-line fix in format.ts, no schema or API change.\n\nAdd the `plan` label to make it plan first.",
-    ]);
     assert.deepEqual(await readdir(directory), []);
   });
 });
@@ -235,12 +222,11 @@ test("a plan goes to the owner, with the rating and why, when anything the polic
   }
 });
 
-test("a project planner's work order within the threshold is approved without the owner and applied by the project flow", async () => {
-  const order = `# Work order\n\n## Work order\n\n\`\`\`project-order\nTUC-12 blocks TUC-15\n\`\`\`\n\n${RISKY(0).replace(/^# Plan\n\n1\. Add the column to the report\.\n\n/, "")}`;
-  const { calls, linear, paseo } = setup({ "linear.issueId": "planner-1", "linear.identifier": "TUC-90" }, { creatorId: "paseo-app", labels: ["paseo-planner", "plan"] });
+test("a project planner's work order is approved without the owner whatever its rating, and applied by the project flow", async () => {
+  const order = `# Work order\n\n## Work order\n\n\`\`\`project-order\nTUC-12 blocks TUC-15\n\`\`\`\n\n${RISKY(3).replace(/^# Plan\n\n1\. Add the column to the report\.\n\n/, "")}`;
+  const { calls, linear, paseo } = setup({ "linear.issueId": "planner-1", "linear.identifier": "TUC-90" }, { creatorId: "paseo-app", labels: ["paseo-planner"] });
   const decisions: string[] = [];
   await withEvents([
-    { type: "advised", agentId: "agent-1", verdict: "agreed", hash: planHash(order), at: "2026-01-01T09:59:00Z" },
     { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
     // What the omp plan extension reports once Plannotator took the approval.
     { type: "decided", agentId: "agent-1", approved: true, planContent: order, at: "2026-01-01T10:00:05Z" },
@@ -256,4 +242,84 @@ test("a project planner's work order within the threshold is approved without th
   assert.ok(calls.some((call) => call.startsWith("comment planner-1: 🤖 **Plan auto-approved**")));
   assert.ok(calls.includes("apply planner-1 agent-1 true"));
   assert.ok(!calls.includes("+plan-ready planner-1") && !calls.includes("state planner-1 In Progress"), "nothing else of an approval applies to a planner");
+});
+
+// In-memory parked plans; `available` is the central host running.
+function parkingFake(calls: string[], available = true) {
+  const plans = new Map<string, ParkedPlan>();
+  const parking: Parking = {
+    plans: {
+      forAgent: async (agentId) => [...plans.values()].find((plan) => plan.agentId === agentId) ?? null,
+      put: async (plan) => { plans.set(plan.issueId, plan); },
+      remove: async (issueId) => { plans.delete(issueId); },
+    },
+    available: () => available,
+    retire: async (localUrl, agentId) => { calls.push(`retire ${agentId} ${localUrl}`); },
+  };
+  return { plans, parking };
+}
+
+test("a plan that needs the owner is parked and its agent retired; the central host's review is announced once, and the decision moves the ticket on", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(calls);
+  const tabs: string[] = [];
+  const decisions: string[] = [];
+  const run = async (events: object[]) => withEvents(events, async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, undefined,
+      async (url, approve) => { decisions.push(`${url} ${approve}`); }, (url) => tabs.push(url), parking);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  await run([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" }]);
+  assert.deepEqual(calls, ["retire agent-1 http://localhost:4000/", "state issue-1 Planning", "-plan-ready issue-1"]);
+  assert.deepEqual({ decisions, tabs }, { decisions: [], tabs: [] }, "the agent's own review is neither decided nor opened");
+  assert.deepEqual({ ...plans.get("issue-1"), parkedAt: "" }, { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "Risk: impact 2/4, revert. Needs your approval: no advisor review was recorded for this plan text; impact 2 is above the threshold 1.", reasons: ["no advisor review was recorded for this plan text", "impact 2 is above the threshold 1"], model: null, parkedAt: "", announced: false });
+
+  // The central host serves it; a restart of the host opens it again without a second announcement.
+  calls.length = 0;
+  const hosted = { type: "opened", agentId: "agent-1", localUrl: "http://localhost:5000/", remoteUrl: "https://host.ts.net:5000/", at: "2026-01-01T10:01:00Z" };
+  await run([hosted]);
+  await run([{ ...hosted, localUrl: "http://localhost:5001/", at: "2026-01-01T11:00:00Z" }]);
+  assert.deepEqual(tabs, ["http://localhost:5000/"]);
+  assert.equal(calls.filter((call) => call.startsWith("comment issue-1: 📋 **Plan waiting for your review in Plannotator**: https://host.ts.net:5000/")).length, 1);
+  assert.equal(plans.get("issue-1")?.announced, true);
+
+  calls.length = 0;
+  await run([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: RISKY(2), at: "2026-01-01T12:00:00Z" }]);
+  assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "+plan-ready issue-1", "ready issue-1", "comment issue-1: ✅ **Plan approved** in Plannotator ([plan](https://linear.app/doc/1))\n\nAssign Paseo again to implement it."]);
+  assert.equal(plans.size, 0);
+});
+
+test("a parked plan sent back keeps no plan-ready and asks for a new plan; the retired agent's own report is ignored", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(calls);
+  plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T10:00:00Z", announced: true });
+  await withEvents([
+    { type: "decided", agentId: "agent-1", approved: false, feedback: "Closed by the plugin", at: "2026-01-01T10:00:01Z" },
+    { type: "decided", agentId: "agent-1", approved: false, parked: true, feedback: "Split step 1", at: "2026-01-01T12:00:00Z" },
+  ], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "comment issue-1: ↩️ **Plan sent back** in Plannotator ([plan](https://linear.app/doc/1))\n\nSplit step 1\n\nAssign Paseo again to plan it again."]);
+  assert.equal(plans.size, 0);
+});
+
+test("without the central host a plan that needs the owner keeps its agent and opens as before", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(calls, false);
+  const tabs: string[] = [];
+  await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: null, at: "2026-01-01T10:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, undefined, async () => {}, (url) => tabs.push(url), parking);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.deepEqual(tabs, ["http://localhost:4000/"]);
+  assert.equal(plans.size, 0);
+  assert.ok(!calls.some((call) => call.startsWith("retire")));
+  assert.ok(calls.some((call) => call.startsWith("comment issue-1: 📋 **Plan ready for review in Plannotator**")));
 });
