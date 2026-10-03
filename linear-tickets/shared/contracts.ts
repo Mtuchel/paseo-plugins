@@ -329,3 +329,85 @@ export const agentStatusRpc = defineRpc({
   input: z.object({}),
   output: z.object({ installed: z.boolean(), funnel: z.boolean(), funnelNote: z.string().nullable(), lastWebhookAt: z.string().nullable() }),
 });
+
+// The Paseo Agents menu bar's pull request view (README, "Pull request view"): one GitHub poller
+// in the plugin instead of one in the app. Times are ISO 8601 UTC without fractional seconds.
+export const repositorySchema = z.string().max(200).regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/);
+// CI on a pull request's head: the newest run per check name, superseded suites and Graphite's
+// mergeability check left out. `failures` name the failed jobs, the gates only when no job failed.
+export const checkSummarySchema = z.object({
+  state: z.enum(["passed", "failed", "running", "empty"]),
+  done: z.number().int(),
+  total: z.number().int(),
+  failures: z.array(z.object({ name: z.string(), url: z.string().nullable() })),
+  // Start of the oldest check still running: a gate waiting for hours is stuck.
+  runningSince: z.string().nullable(),
+});
+export type CheckSummary = z.infer<typeof checkSummarySchema>;
+// Where a pull request stands in the Graphite merge queue, from the newest bullet of Graphite's
+// "Merge activity" comment. `draft`: the queue round testing it (0 when unnamed); `reason`: why
+// it was dropped; `dropsToday`: removals in the last 24 hours.
+export const queueActivitySchema = z.object({
+  kind: z.enum(["queued", "testing", "merged", "dropped"]),
+  draft: z.number().int().nullable(),
+  reason: z.string().nullable(),
+  at: z.string().nullable(),
+  dropsToday: z.number().int(),
+  inQueue: z.boolean(),
+});
+export type QueueActivity = z.infer<typeof queueActivitySchema>;
+// GitHub's own field names, so the app decodes the pull request it decoded from REST before.
+// `checks` is null on draft pull requests, `queue` without Merge activity.
+export const pullRequestSchema = z.object({
+  number: z.number().int(),
+  title: z.string(),
+  draft: z.boolean(),
+  htmlUrl: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  user: z.object({ login: z.string() }),
+  head: z.object({ ref: z.string(), sha: z.string() }),
+  base: z.object({ ref: z.string(), sha: z.string() }),
+  labels: z.array(z.object({ name: z.string() })),
+  ticket: z.string().nullable(),
+  shortTitle: z.string(),
+  hasStaleQueueLabel: z.boolean(),
+  checks: checkSummarySchema.nullable(),
+  queue: queueActivitySchema.nullable(),
+});
+export type PullRequestEntry = z.infer<typeof pullRequestSchema>;
+export const landedCommitSchema = z.object({ sha: z.string(), title: z.string(), date: z.string(), ticket: z.string().nullable() });
+export type LandedCommit = z.infer<typeof landedCommitSchema>;
+// `error` (the last poll failed) and `rateLimited` (the last poll was skipped or cut short) are
+// never both set; either way the data stays from `fetchedAt`.
+export const pullRequestsSnapshotSchema = z.object({
+  repository: z.string(),
+  fetchedAt: z.string().nullable(),
+  refreshing: z.boolean(),
+  error: z.string().nullable(),
+  rateLimited: z.object({ reason: z.enum(["budget", "throttled"]), until: z.string(), message: z.string() }).nullable(),
+  rateLimit: z.object({ remaining: z.number().int(), limit: z.number().int(), resetsAt: z.string() }).nullable(),
+  refreshIntervalSeconds: z.number().int(),
+  // Open pull requests except the merge queue's drafts.
+  pulls: z.array(pullRequestSchema),
+  // Open "[Graphite MQ] Draft PR"s: queue rounds testing right now.
+  queueDrafts: z.array(pullRequestSchema),
+  // Commits on the default branch in the last 24 hours, newest first.
+  landedRecently: z.array(landedCommitSchema),
+});
+export type PullRequestsSnapshot = z.infer<typeof pullRequestsSnapshotSchema>;
+export const pullRequestsRpc = defineRpc({
+  name: "linear.pull-requests",
+  input: z.object({ repository: repositorySchema }),
+  output: pullRequestsSnapshotSchema,
+});
+// Adds a label to each pull request with the owner's gh login, stopping at the first one GitHub refuses.
+export const labelPullsRpc = defineRpc({
+  name: "linear.label-pulls",
+  input: z.object({
+    repository: repositorySchema,
+    label: z.string().trim().min(1).max(50).regex(/^[^\u0000-\u001f]+$/),
+    numbers: z.array(z.number().int().positive()).min(1).max(50),
+  }),
+  output: z.object({ labelled: z.array(z.number().int()), error: z.string().nullable(), snapshot: pullRequestsSnapshotSchema }),
+});

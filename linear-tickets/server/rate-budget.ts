@@ -157,3 +157,61 @@ export class RateBudget {
 }
 
 export const rateBudget = new RateBudget();
+
+// GitHub's REST budget of the shared gh login, which every agent uses too. Unlike Linear's refill it
+// is a fixed window: `x-ratelimit-remaining` requests until `x-ratelimit-reset`, then full again.
+// Background readers stop while fewer than the reserve are left before the reset, so the agents
+// keep the rest; interactive requests stop only after GitHub refused one.
+export const GITHUB_RESERVE = 300;
+// After GitHub refused a request (403/429 rate limit), nothing is sent for this long.
+const GITHUB_THROTTLE_MS = 2 * 60 * 1000;
+
+export type GitHubLimit = { remaining: number; limit: number; resetAt: number };
+
+export class GitHubPausedError extends Error {
+  constructor(readonly resumeAt: number, readonly reason: "budget" | "throttled", readonly remaining: number | null) {
+    super(reason === "budget"
+      ? `Paused until ${clock(resumeAt)}: the shared GitHub budget is low (${remaining} left)`
+      : `GitHub is throttling the shared gh login; paused until ${clock(resumeAt)}`);
+    this.name = "GitHubPausedError";
+  }
+}
+
+export class GitHubBudget {
+  private known: GitHubLimit | null = null;
+  private blockedUntil = 0;
+
+  constructor(private readonly now: () => number = () => Date.now(), readonly reserve = GITHUB_RESERVE) {}
+
+  // A response's headers, lower-case names. Only the `core` resource is this budget.
+  record(headers: ReadonlyMap<string, string>): void {
+    const resource = headers.get("x-ratelimit-resource");
+    if (resource && resource !== "core") return;
+    const remaining = Number(headers.get("x-ratelimit-remaining"));
+    const limit = Number(headers.get("x-ratelimit-limit"));
+    const reset = Number(headers.get("x-ratelimit-reset"));
+    if (!headers.has("x-ratelimit-remaining") || !Number.isFinite(remaining) || !Number.isFinite(reset)) return;
+    this.known = { remaining, limit: Number.isFinite(limit) ? limit : 0, resetAt: reset * 1000 };
+  }
+
+  // GitHub refused a request for its rate limit; the pause that follows.
+  throttled(): GitHubPausedError {
+    this.blockedUntil = this.now() + GITHUB_THROTTLE_MS;
+    return new GitHubPausedError(this.blockedUntil, "throttled", this.current()?.remaining ?? null);
+  }
+
+  // The last known budget; null before any response and once its window reset.
+  current(): GitHubLimit | null {
+    return this.known && this.known.resetAt > this.now() ? this.known : null;
+  }
+
+  // Admission for one request; background requests also stop at the reserve.
+  admit(level: Priority = priority.getStore() ?? "interactive"): void {
+    const now = this.now();
+    if (this.blockedUntil > now) throw new GitHubPausedError(this.blockedUntil, "throttled", this.current()?.remaining ?? null);
+    const known = this.current();
+    if (level === "background" && known && known.remaining < this.reserve) throw new GitHubPausedError(known.resetAt, "budget", known.remaining);
+  }
+}
+
+export const githubBudget = new GitHubBudget();

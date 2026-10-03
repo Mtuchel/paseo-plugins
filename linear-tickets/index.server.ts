@@ -1,6 +1,6 @@
 import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setPresenceRpc, setSettingsRpc, statusRpc, type CapacityState } from "./shared/contracts";
+import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setPresenceRpc, setSettingsRpc, statusRpc, type CapacityState } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -21,6 +21,7 @@ import { closeInternalDaemon, internalDaemon, modelSetter, ownConnection } from 
 import { ModelGuard } from "./server/model-guard";
 import { HealthMonitor } from "./server/health";
 import { PullRequestWatch } from "./server/pr-watch";
+import { PullRequestBoard } from "./server/pull-requests";
 import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
 import { NeedsYouIssues } from "./server/needs-you";
@@ -93,6 +94,8 @@ export default function contribute(server: PluginServerContext) {
   linear.onStateWritten((issueId, state) => stateLabels.noteState(issueId, state));
   // Label groups kept current on every issue of some teams ("Area", "Type"), from label-rules.json.
   const labelSync = new LabelSync({ linear, pullRequests: new PullRequestFiles() });
+  // The Paseo Agents menu bar's pull request view: polled only while the app asks (README, "Pull request view").
+  const pullBoard = new PullRequestBoard();
   let funnel: FunnelStatus | null = null;
   const health = new HealthMonitor(linear, settings, [
     { name: "Linear API key", run: () => linear.ping() },
@@ -187,6 +190,8 @@ export default function contribute(server: PluginServerContext) {
     starter.capacity.set(lease);
     return capacityState(paseo);
   });
+  server.handle(pullRequestsRpc, ({ repository }) => pullBoard.read(repository));
+  server.handle(labelPullsRpc, ({ repository, label, numbers }) => pullBoard.label(repository, label, numbers));
   server.handle(connectRpc, ({ apiKey }) => linear.authenticate(apiKey));
   server.handle(disconnectRpc, () => linear.disconnect());
   server.handle(listIssuesRpc, async ({ cursor, stateNames, relation }) => {
@@ -248,5 +253,5 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); void closeInternalDaemon(); };
+  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); void closeInternalDaemon(); };
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { RateBudget, RateLimitedError, withPriority } from "./rate-budget";
+import { GitHubBudget, GitHubPausedError, RateBudget, RateLimitedError, withPriority } from "./rate-budget";
 
 const HOUR = 60 * 60 * 1000;
 
@@ -105,4 +105,36 @@ test("a probe that never reached Linear frees the probe slot", () => {
   budget.acquire("key").done(null, false);
   budget.acquire("key").done(headers(2500, 2000), false);
   assert.equal(budget.pausedUntil("key"), null);
+});
+
+function githubHeaders(remaining: number, resetAt: number, resource = "core"): Map<string, string> {
+  return new Map([["x-ratelimit-limit", "5000"], ["x-ratelimit-remaining", String(remaining)], ["x-ratelimit-reset", String(resetAt / 1000)], ["x-ratelimit-resource", resource]]);
+}
+
+test("GitHub: background requests stop below the 300-request reserve until the window resets; interactive ones go on", () => {
+  const time = { now: 1_000_000_000 };
+  const budget = new GitHubBudget(() => time.now);
+  const reset = time.now + 20 * 60_000;
+  budget.admit("background");
+  budget.record(githubHeaders(300, reset));
+  budget.admit("background");
+  budget.record(githubHeaders(299, reset));
+  assert.throws(() => budget.admit("background"), (error: unknown) => error instanceof GitHubPausedError && error.reason === "budget" && error.resumeAt === reset);
+  budget.admit("interactive");
+  // Another resource (search) says nothing about the core budget.
+  budget.record(githubHeaders(4999, reset, "search"));
+  assert.throws(() => budget.admit("background"), GitHubPausedError);
+  time.now = reset;
+  assert.equal(budget.current(), null);
+  budget.admit("background");
+});
+
+test("GitHub: after a refusal nothing is sent for two minutes, interactive requests included", async () => {
+  const time = { now: 1_000_000_000 };
+  const budget = new GitHubBudget(() => time.now);
+  const pause = budget.throttled();
+  assert.equal(pause.resumeAt, time.now + 120_000);
+  await withPriority("interactive", async () => assert.throws(() => budget.admit(), (error: unknown) => error instanceof GitHubPausedError && error.reason === "throttled"));
+  time.now += 120_000;
+  budget.admit("interactive");
 });
