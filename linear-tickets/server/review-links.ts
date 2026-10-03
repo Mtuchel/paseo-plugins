@@ -6,10 +6,13 @@ import { promisify } from "node:util";
 import { parsePlanRisk, combinedRating, ratingText } from "../shared/plan-risk";
 import { FUNNEL_PORT } from "./funnel";
 import { plannotatorPaths, readReviewPlan, type OpenedEvent } from "./plannotator";
+import { createReviewProxy } from "./review-proxy";
 import { tailscaleBinary } from "./tailscale";
 
 const exec = promisify(execFile);
 export const REVIEW_PORT = 47_832;
+// The compressing proxy every review's tailnet route points at (review-proxy.ts).
+export const REVIEW_PROXY_PORT = 47_833;
 // Tailnet-only (`tailscale serve`, never Funnel): 8443 stays the public webhook.
 export const REVIEW_SERVE_PORT = 8444;
 const SWEEP_MS = 30_000;
@@ -53,6 +56,9 @@ export type ReviewLinksOptions = {
   serve?: (localPort: number) => Promise<string | null>;
   // Removes one per-review tailnet route.
   unserve?: (port: number) => Promise<void>;
+  // Points one review's tailnet route at the compressing proxy.
+  route?: (port: number, proxyPort: number) => Promise<void>;
+  proxyPort?: number;
   // The plan text of a running review (Plannotator's /api/plan); "" when it cannot be read.
   fetchPlan?: (localUrl: string) => Promise<string>;
 };
@@ -72,6 +78,16 @@ async function serveReviews(localPort: number): Promise<string | null> {
 
 async function unserveReview(port: number): Promise<void> {
   await exec(tailscaleBinary(), ["serve", `--https=${port}`, "off"], { timeout: 12_000 });
+}
+
+async function routeReview(port: number, proxyPort: number): Promise<void> {
+  await exec(tailscaleBinary(), ["serve", "--bg", `--https=${port}`, `http://127.0.0.1:${proxyPort}`], { timeout: 12_000 });
+}
+
+// The tailnet port of a review's route; null for the ports this plugin must never touch.
+function reviewPort(remoteUrl: string | null): number | null {
+  const port = remoteUrl ? Number(new URL(remoteUrl).port) : 0;
+  return port && port !== FUNNEL_PORT && port !== REVIEW_SERVE_PORT ? port : null;
 }
 
 function escapeHtml(text: string): string {
@@ -181,9 +197,11 @@ function inboxPage({ open, decided }: { open: ReviewEntry[]; decided: ReviewEntr
 // the agent's current Plannotator review. Plannotator's page uses absolute /api paths, so each
 // review keeps its own `tailscale serve` port; this server only points at the live one and,
 // once a review's server is gone, removes that port's route (the plugin owns the cleanup). Its
-// root, https://<host>:8444/, lists every review still waiting for the owner.
+// root, https://<host>:8444/, lists every review still waiting for the owner. Each review's
+// route is pointed at the compressing proxy (review-proxy.ts) so its page loads over a relay.
 export class ReviewLinks {
   private server: Server | null = null;
+  private proxy: Server | null = null;
   private timer: NodeJS.Timeout | null = null;
   private starting: Promise<void> | null = null;
   private origin: string | null = null;
@@ -197,6 +215,8 @@ export class ReviewLinks {
   private readonly alive: (localUrl: string) => Promise<boolean>;
   private readonly serve: (localPort: number) => Promise<string | null>;
   private readonly unserve: (port: number) => Promise<void>;
+  private readonly route: (port: number, proxyPort: number) => Promise<void>;
+  private readonly proxyPort: number;
   private readonly fetchPlan: (localUrl: string) => Promise<string>;
 
   constructor(options: ReviewLinksOptions = {}) {
@@ -207,12 +227,19 @@ export class ReviewLinks {
     this.alive = options.alive ?? backendAlive;
     this.serve = options.serve ?? serveReviews;
     this.unserve = options.unserve ?? unserveReview;
+    this.route = options.route ?? routeReview;
+    this.proxyPort = options.proxyPort ?? REVIEW_PROXY_PORT;
     this.fetchPlan = options.fetchPlan ?? readReviewPlan;
   }
 
   // The port actually listened on (differs from the configured one when that is 0).
   get listeningPort(): number | null {
     const address = this.server?.address();
+    return address && typeof address === "object" ? address.port : null;
+  }
+
+  get listeningProxyPort(): number | null {
+    const address = this.proxy?.address();
     return address && typeof address === "object" ? address.port : null;
   }
 
@@ -237,6 +264,7 @@ export class ReviewLinks {
         console.error(`[linear-tickets] publishing review links on :${REVIEW_SERVE_PORT} failed: ${error instanceof Error ? error.message.split("\n")[0] : error}`);
         return null;
       });
+      await this.startProxy();
       this.timer = setInterval(() => { void this.sweep(); }, this.sweepMs);
       this.timer.unref?.();
     })().catch((error: unknown) => {
@@ -249,7 +277,48 @@ export class ReviewLinks {
     this.timer = null;
     this.server?.close();
     this.server = null;
+    this.proxy?.close();
+    this.proxy?.closeAllConnections();
+    this.proxy = null;
     this.starting = null;
+  }
+
+  // Without the proxy (its port taken) reviews keep the direct route the open hook published.
+  // Open reviews published before (by the hook, or by an earlier plugin version) are moved onto it.
+  private async startProxy(): Promise<void> {
+    const proxy = createReviewProxy((port) => this.backendFor(port));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        proxy.once("error", reject);
+        proxy.listen(this.proxyPort, "127.0.0.1", () => { proxy.off("error", reject); resolve(); });
+      });
+    } catch (error) {
+      console.error(`[linear-tickets] the review proxy could not listen on :${this.proxyPort}; reviews are served uncompressed: ${error instanceof Error ? error.message : error}`);
+      return;
+    }
+    this.proxy = proxy;
+    for (const entry of Object.values(await this.load())) {
+      if (!entry.closedAt) await this.routeThroughProxy(entry.remoteUrl);
+    }
+  }
+
+  private async routeThroughProxy(remoteUrl: string | null): Promise<void> {
+    const port = reviewPort(remoteUrl);
+    const proxyPort = this.listeningProxyPort;
+    if (port === null || proxyPort === null) return;
+    await this.route(port, proxyPort).catch((error: unknown) => {
+      console.error(`[linear-tickets] pointing review port ${port} at the compressing proxy failed; it stays uncompressed: ${error instanceof Error ? error.message.split("\n")[0] : error}`);
+    });
+  }
+
+  // The local port of the open review published on tailnet port `port`; null for anything else,
+  // so the proxy never reaches a local port that is not a review.
+  private async backendFor(port: number): Promise<number | null> {
+    for (const entry of Object.values(await this.load())) {
+      if (entry.closedAt || reviewPort(entry.remoteUrl) !== port) continue;
+      return Number(new URL(entry.localUrl).port) || null;
+    }
+    return null;
   }
 
   // Records a new review and returns the agent's stable link, or null when there is none to give
@@ -260,6 +329,8 @@ export class ReviewLinks {
       registry[event.localUrl] = { agentId, localUrl: event.localUrl, remoteUrl: event.remoteUrl, ...(identifier ? { identifier } : {}), openedAt: this.now().toISOString() };
     });
     this.misses.delete(event.localUrl);
+    // Before the link is handed out, so the first tap already gets the compressed page.
+    await this.routeThroughProxy(event.remoteUrl);
     return this.origin && event.remoteUrl && AGENT_ID.test(agentId) ? `${this.origin}/review/${encodeURIComponent(agentId)}` : null;
   }
 
@@ -292,8 +363,8 @@ export class ReviewLinks {
     }
     const closed = new Set<string>();
     for (const entry of dead) {
-      const port = entry.remoteUrl ? Number(new URL(entry.remoteUrl).port) : 0;
-      if (port && port !== FUNNEL_PORT && port !== REVIEW_SERVE_PORT) {
+      const port = reviewPort(entry.remoteUrl);
+      if (port !== null) {
         // Left open on failure, so the next sweep retries. A route that no longer exists (removed
         // by hand, or by a restart of Tailscale) is what this step wants, not a failure.
         try { await this.unserve(port); } catch (error) {

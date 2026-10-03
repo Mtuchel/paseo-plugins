@@ -820,6 +820,15 @@ plugin checks each open review's server; after two failed checks it removes that
 `tailscale serve` route and marks the review closed. Only ports recorded there are ever turned
 off. When `:8444` cannot be published, the per-review link is posted as before.
 
+**Compressed reviews.** Plannotator serves its review page as one ~25 MB uncompressed file. A
+phone outside the Mac's network reaches the Mac through a Tailscale relay, where a transfer that
+size breaks off (Safari: "network connection lost"). Each review's tailnet route therefore points
+at a proxy the plugin runs on `127.0.0.1:47833`: it picks the review by the port the request came
+in on, forwards only to reviews recorded as open, and compresses text responses with brotli (or
+gzip), about 7 MB for the page. Event streams, WebSockets and binary files pass through as they
+are. The route is switched when the review opens, before its link is posted, and on plugin start
+for reviews still open. If the proxy cannot listen, reviews keep their direct, uncompressed route.
+
 **Review inbox.** `https://<machine>.<tailnet>.ts.net:8444/` lists every review still waiting
 for you, oldest first, with how long it has waited, and the last ten decisions below. A review
 is listed while it is the agent's latest, undecided, was published in the tailnet and its server
