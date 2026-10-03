@@ -21,7 +21,7 @@ const REVIEW_STATE = "In Review";
 const READY_STATE = "Ready to merge";
 // The repo's workflow labels pull requests Graphite's merge queue landed: the queue fast-forwards
 // the base branch and closes them instead of merging them.
-const QUEUE_MERGED_LABEL = "externally-merged";
+export const QUEUE_MERGED_LABEL = "externally-merged";
 const QUEUE_DRAFT_TITLE = "[Graphite MQ] Draft PR";
 // Automatic prompts per pull request and drop kind (docs/automation/merge-queue.md in the repo):
 // one fix request after a plain drop, up to five restacks after conflict-only drops. The next drop
@@ -126,7 +126,8 @@ export class PullRequestNotFoundError extends Error {
     this.name = "PullRequestNotFoundError";
   }
 }
-type Bullet = { text: string; kind: "queued" | "running" | "merged" | "dropped"; draft: number | null };
+// `at`: Graphite's time stamp as written ("Sep 29, 7:26 AM UTC"); `event`: the text after it.
+type Bullet = { text: string; event: string; at: string | null; kind: "queued" | "running" | "merged" | "dropped"; draft: number | null };
 
 function gh(): string {
   for (const candidate of ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]) if (existsSync(candidate)) return candidate;
@@ -291,13 +292,14 @@ export function activityBullets(body: string | null): Bullet[] {
   return body.split("\n").map((line) => line.trim()).filter((line) => /^[*-]\s/.test(line)).map((line) => {
     const raw = line.slice(2).trim();
     const plain = (value: string) => value.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/\*\*/g, "").trim();
-    const event = plain(raw.replace(/^\*\*[^*]+\*\*:\s*/, ""));
+    const stamp = /^\*\*([^*]+)\*\*:\s*/.exec(raw);
+    const event = plain(stamp ? raw.slice(stamp[0].length) : raw);
     const draft = /\[#(\d+)\]/.exec(raw);
     const kind = /^CI is running\b/i.test(event) ? "running"
       : /added this pull request to the Graphite merge queue/i.test(event) ? "queued"
       : /^Merged by the Graphite merge queue/i.test(event) ? "merged"
       : "dropped";
-    return { text: plain(raw), kind, draft: kind === "running" && draft ? Number(draft[1]) : null };
+    return { text: plain(raw), event, at: stamp ? stamp[1].trim() : null, kind, draft: kind === "running" && draft ? Number(draft[1]) : null };
   });
 }
 

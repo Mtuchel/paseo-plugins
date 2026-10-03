@@ -47,7 +47,7 @@ const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRIT
 test("server entrypoint loads and registers valid Paseo RPC contracts", () => {
   const names: string[] = [];
   const cleanup = contribute({ handle(contract: { name: string }) { names.push(contract.name); }, on() { return () => {}; }, before() { return () => {}; } } as unknown as PluginServerContext);
-  assert.deepEqual(names, ["linear.status", "linear.dispatch-status", "linear.projects-status", "linear.plan-project", "linear.presence", "linear.set-presence", "linear.connect", "linear.disconnect", "linear.list-issues", "linear.count-issues", "linear.cached-overview", "linear.search-issues", "linear.issue-context", "linear.project-branches", "linear.get-default-prompt", "linear.set-default-prompt", "linear.get-settings", "linear.set-settings", "linear.launch-agent", "linear.agent-status"]);
+  assert.deepEqual(names, ["linear.status", "linear.dispatch-status", "linear.projects-status", "linear.plan-project", "linear.presence", "linear.set-presence", "linear.pull-requests", "linear.label-pulls", "linear.connect", "linear.disconnect", "linear.list-issues", "linear.count-issues", "linear.cached-overview", "linear.search-issues", "linear.issue-context", "linear.project-branches", "linear.get-default-prompt", "linear.set-default-prompt", "linear.get-settings", "linear.set-settings", "linear.launch-agent", "linear.agent-status"]);
   cleanup();
 });
 

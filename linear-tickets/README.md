@@ -965,6 +965,32 @@ header of the last answer plus the refill since then.
   they are linked on the ticket, in the agent panel and in the handover record, even across
   restarts. Retries never repeat a comment or panel activity that already went out.
 
+## Pull request view
+
+The Paseo Agents menu bar app shows a repository's open pull requests, the Graphite merge queue
+and what landed on the default branch. The plugin reads them for it, so the shared `gh` login has
+one GitHub poller instead of two:
+
+- `linear.pull-requests` (`{ repository: "owner/name" }`) answers from memory at once: open pull
+  requests with their labels, a CI summary of each ready one's head (the newest run per check;
+  runs a later run of the same workflow superseded and Graphite's `mergeability_check` left out;
+  a failed gate named only when no job failed; the start of the oldest check still running), its
+  merge queue state from Graphite's Merge activity comment (queued, testing in round `#n`,
+  merged, dropped with Graphite's reason, removals in the last 24 hours), the open queue rounds
+  (`[Graphite MQ] Draft PR`s) with their CI, and the commits of the last 24 hours. Draft pull
+  requests are listed but not read in detail.
+- `linear.label-pulls` (`{ repository, label, numbers }`) adds a label to each pull request with
+  the owner's `gh` login, stopping at the first one GitHub refuses, and returns the snapshot with
+  the new labels.
+- A repository is polled at most every 2 minutes, and only while a client asked for it in the
+  last 10 minutes: with the app closed, the plugin sends GitHub nothing. Reads are REST only
+  (GraphQL stays with `gh pr` and `gt`) and conditional, so an unchanged page answers
+  `304 Not Modified` and costs no budget.
+- Polling runs at background priority: while fewer than 300 REST requests are left before the
+  login's hourly reset, it pauses until the reset and keeps the last data (`rateLimited` in the
+  snapshot). After GitHub refuses a request for its rate limit, nothing is sent for 2 minutes.
+  Labelling is not held back by the reserve.
+
 ## Manual tasks
 
 Some steps only a person can do: environment variables and secrets, Railway, Linear, GitHub or
@@ -1037,6 +1063,7 @@ start again. This retry cache does not survive a plugin or daemon restart.
 GraphQL response parsing, pagination, context preservation, prompt template rendering
 and validation, repository orientation (guide matching, ranking and the cap), credential and
 settings persistence, ticket retrieval, state-transition
-resolution and failure handling, and agent creation/retries with mocked Linear and Paseo
-calls.
+resolution and failure handling, agent creation/retries with mocked Linear and Paseo
+calls, and the pull request view (CI summaries, merge queue parsing, polling cadence, the GitHub
+budget's reserve, labelling) against a fake GitHub.
 Live account authentication and agent execution require your configured host and key.
