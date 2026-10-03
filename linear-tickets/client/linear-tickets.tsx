@@ -3,7 +3,7 @@ import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { usePaseo, useRpc } from "@getpaseo/plugin/client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Linking, Pressable, ScrollView, Text, TextInput, View } from "react-native";
-import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, getSettingsRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setDefaultPromptRpc, setSettingsRpc, statusRpc, type DispatchSettingsValue, type DispatchStatus, type Issue, type RelatedTicket, type TicketDetail, type WritebackSettingsValue } from "../shared/contracts";
+import { branchesRpc, cachedOverviewRpc, connectRpc, countIssuesRpc, issueContextRpc, disconnectRpc, getSettingsRpc, listIssuesRpc, launchAgentRpc, searchIssuesRpc, setSettingsRpc, statusRpc, type Issue, type RelatedTicket, type TicketDetail } from "../shared/contracts";
 import { filterIssues, formatIssueDate, formatPriority, formatRelativeDate, hasPriority, issueStatus, statusChangesText, statusCounts, type DependencyFilter, type SortDirection, type SortField } from "./issue-list";
 
 import { ChoicePicker } from "./choice-picker";
@@ -14,16 +14,6 @@ import { openExternalUrl } from "./open-link";
 import { MarkdownPreview } from "./markdown-preview";
 import { restoreLaunchSelection, type LaunchPreference } from "./launch-preferences";
 import { mappedBaseBranch, mappingKey, mappingLabel, resolveMapping, type MappingSource, type ProjectMapping } from "../shared/mapping";
-
-const dispatchDraftFor = (value: DispatchSettingsValue) => ({ label: value.label, teamKeys: value.teamKeys.join(", "), intervalSeconds: String(value.intervalSeconds), maxRunning: String(value.maxRunning) });
-const WRITEBACK_OPTIONS: { key: keyof WritebackSettingsValue; on: string; off: string }[] = [
-  { key: "status", on: "Move the ticket to In Progress when its agent starts working", off: "Leave the ticket status alone when work starts" },
-  { key: "summaries", on: "Comment each finished turn's reply on the ticket", off: "No turn summaries" },
-  { key: "blocked", on: "Comment and label the ticket while its agent waits on you", off: "No blocked alerts" },
-  { key: "pullRequests", on: "Attach pull requests the agent opens and move the ticket to review", off: "No pull request links" },
-  { key: "autoResume", on: "Start a new agent automatically when one fails (at most once an hour per ticket)", off: "Offer Resume in Linear when an agent stops" },
-  { key: "mentions", on: "Deliver your \"@paseo …\" comments and replies to Paseo's comments to the ticket's agent", off: "Comments stay in Linear" },
-];
 
 type ThinkingOption = { id: string; label: string; description?: string; isDefault?: boolean };
 type ModelChoice = { id: string; label: string; provider: string; description?: string; thinkingOptions: ThinkingOption[]; defaultThinkingOptionId?: string };
@@ -44,14 +34,9 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   const getStatus = useRpc(statusRpc), connect = useRpc(connectRpc), disconnect = useRpc(disconnectRpc);
   const getIssues = useRpc(listIssuesRpc), getIssuesCount = useRpc(countIssuesRpc), getCachedOverview = useRpc(cachedOverviewRpc), getDetail = useRpc(issueContextRpc), start = useRpc(launchAgentRpc);
   const searchAll = useRpc(searchIssuesRpc);
-  const getTemplate = useRpc(getDefaultPromptRpc), saveTemplate = useRpc(setDefaultPromptRpc);
   const getSettings = useRpc(getSettingsRpc), saveSettings = useRpc(setSettingsRpc);
-  const getDispatchStatus = useRpc(dispatchStatusRpc), getAgentStatus = useRpc(agentStatusRpc);
+  // Read-only here: changed in the Paseo Agents menu bar app's Control panel, sent with each launch.
   const [markInProgress, setMarkInProgress] = useState(false);
-  const [templateOpen, setTemplateOpen] = useState(false);
-  const [templateText, setTemplateText] = useState("");
-  const [templateSaved, setTemplateSaved] = useState<string | null>(null);
-  const [builtinTemplate, setBuiltinTemplate] = useState("");
   const [connection, setConnection] = useState<{ connected: boolean; source: "none" | "saved" | "environment" } | null>(null);
   const [key, setKey] = useState("");
   const [issues, setIssues] = useState<Issue[]>([]);
@@ -68,7 +53,6 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   const [showClosed, setShowClosed] = useState(false);
   const [dateField, setDateField] = useState<SortField>("updatedAt");
   const [dateDirection, setDateDirection] = useState<SortDirection>("newest");
-  const [view, setView] = useState<"list" | "settings">("list");
   const [manageConnection, setManageConnection] = useState(false);
   const [selected, setSelected] = useState<Issue | null>(null);
   const [detail, setDetail] = useState<TicketDetail | null>(null);
@@ -96,12 +80,6 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   const [lastProvider, setLastProvider] = useState<string | null>(null);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [projectMappings, setProjectMappings] = useState<Record<string, ProjectMapping>>({});
-  const [agentLinearAccess, setAgentLinearAccess] = useState(true);
-  const [dispatch, setDispatch] = useState<DispatchSettingsValue | null>(null);
-  const [dispatchDraft, setDispatchDraft] = useState({ label: "", teamKeys: "", intervalSeconds: "", maxRunning: "" });
-  const [writeback, setWriteback] = useState<WritebackSettingsValue | null>(null);
-  const [dispatchStatus, setDispatchStatus] = useState<DispatchStatus | null>(null);
-  const [agentStatus, setAgentStatus] = useState<{ installed: boolean; funnel: boolean; funnelNote: string | null; lastWebhookAt: string | null } | null>(null);
   const [mappingReason, setMappingReason] = useState<"saved" | "name" | null>(null);
   // The ticket whose mapping was applied or overridden by hand; the branch waits for the list.
   const mappedFor = useRef<string | null>(null);
@@ -210,33 +188,12 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
   }, [getStatus, getCachedOverview, loadIssues, loadOptions, refreshCounts]);
 
   useEffect(() => {
-    void getTemplate({}).then((result) => {
-      setBuiltinTemplate(result.builtin);
-      setTemplateSaved(result.template);
-      setTemplateText(result.template ?? result.builtin);
-    }, () => { setTemplateOpen(false); });
-  }, [getTemplate]);
-
-  useEffect(() => {
     void getSettings({}).then((value) => {
       setMarkInProgress(value.markInProgress); setShowClosed(value.showClosed);
       setLaunchPreferences(value.launchPreferences); setLastProvider(value.lastProvider);
-      setProjectMappings(value.projectMappings); setAgentLinearAccess(value.agentLinearAccess);
-      setDispatch(value.dispatch); setDispatchDraft(dispatchDraftFor(value.dispatch)); setWriteback(value.writeback);
+      setProjectMappings(value.projectMappings);
     }, () => {}).finally(() => setSettingsLoaded(true));
   }, [getSettings]);
-
-  // The dispatcher runs on the host; this only mirrors its latest poll while the surface is open.
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = () => {
-      void getDispatchStatus({}).then((value) => { if (!cancelled) setDispatchStatus(value); }, () => {});
-      void getAgentStatus({}).then((value) => { if (!cancelled) setAgentStatus(value); }, () => {});
-    };
-    refresh();
-    const timer = setInterval(refresh, 15_000);
-    return () => { cancelled = true; clearInterval(timer); };
-  }, [getDispatchStatus, getAgentStatus]);
 
   useEffect(() => {
     let cancelled = false;
@@ -478,115 +435,6 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
     </Pressable>;
   };
 
-  const settingsCard = <View style={{ ...t.card, gap: 14 }}>
-    <SectionHeading title="Settings" subtitle="Saved on this host and applied to the ticket list and new launches." icon="Settings" t={t} />
-    <FieldLabel title="Ticket status" icon="ListTodo" hint="when the agent starts" t={t} />
-    <Button title={markInProgress ? "Mark the ticket In Progress when the agent starts" : "Keep the ticket in its current state"} icon={markInProgress ? "Check" : "CircleDashed"} stretch chosen={markInProgress}
-      onPress={() => void run("Saving setting", async () => {
-        const next = !markInProgress;
-        setMarkInProgress(next);
-        setMarkInProgress((await saveSettings({ markInProgress: next })).markInProgress);
-      })} />
-    <Text style={t.muted}>Off keeps the plugin read-only. The ticket only moves when its team has an In Progress state and it is not already in one.</Text>
-    <Divider t={t} spaced />
-    <FieldLabel title="Tickets shown" icon="Eye" hint="in the list and the status counts" t={t} />
-    <Button title={showClosed ? "Show completed, canceled and duplicated tickets" : "Hide completed, canceled and duplicated tickets"} icon={showClosed ? "Check" : "CircleDashed"} stretch chosen={showClosed}
-      onPress={() => void run("Updating ticket list", async () => {
-        const next = !showClosed;
-        setShowClosed(next);
-        setShowClosed((await saveSettings({ showClosed: next })).showClosed);
-        setStatus(null); setIssues([]); setCursor(null);
-        await loadIssues(undefined, { status: null });
-        void refreshCounts();
-      })} />
-    <Text style={t.muted}>Off keeps the list focused on open work; finished, canceled and duplicated tickets stay hidden from the list and the counts.</Text>
-    <Divider t={t} spaced />
-    <FieldLabel title="Agent access to Linear" icon="KeyRound" hint="for agents started from a ticket" t={t} />
-    <Button title={agentLinearAccess ? "Agents can comment on, move and link their own ticket" : "Agents cannot change Linear"} icon={agentLinearAccess ? "Check" : "CircleDashed"} stretch chosen={agentLinearAccess}
-      onPress={() => void run("Saving setting", async () => {
-        const next = !agentLinearAccess;
-        setAgentLinearAccess(next);
-        setAgentLinearAccess((await saveSettings({ agentLinearAccess: next })).agentLinearAccess);
-      })} />
-    <Text style={t.muted}>On gives each new agent linear_ticket tools that act only on the ticket it started from, using this host's Linear key. Agents close their own ticket: Done once it is finished, or Canceled or Duplicate with the reason posted first. It needs a key with write access. Existing agents keep what they started with.</Text>
-    <Divider t={t} spaced />
-    <FieldLabel title="Auto-dispatch" icon="Zap" hint="start agents for labeled tickets" t={t} />
-    {dispatch && <>
-      <Button title={dispatch.enabled ? "Start an agent for every open ticket with the trigger label" : "Auto-dispatch is off"} icon={dispatch.enabled ? "Check" : "CircleDashed"} stretch chosen={dispatch.enabled}
-        onPress={() => void run("Saving setting", async () => {
-          setDispatch((await saveSettings({ dispatch: { enabled: !dispatch.enabled } })).dispatch);
-        })} />
-      <View style={{ flexDirection: layout.compact ? "column" : "row", gap: 8 }}>
-        <TextInput accessibilityLabel="Trigger label" editable={!busy} autoCapitalize="none" autoCorrect={false} value={dispatchDraft.label} onChangeText={(label) => setDispatchDraft((draft) => ({ ...draft, label }))}
-          placeholder="paseo" placeholderTextColor={colors.foregroundMuted} style={{ ...t.input, flex: layout.compact ? undefined : 1 }} />
-        <TextInput accessibilityLabel="Team keys, comma-separated" editable={!busy} autoCapitalize="characters" autoCorrect={false} value={dispatchDraft.teamKeys} onChangeText={(teamKeys) => setDispatchDraft((draft) => ({ ...draft, teamKeys }))}
-          placeholder="ENG, OPS" placeholderTextColor={colors.foregroundMuted} style={{ ...t.input, flex: layout.compact ? undefined : 2 }} />
-        <TextInput accessibilityLabel="Poll interval in seconds" editable={!busy} keyboardType="number-pad" value={dispatchDraft.intervalSeconds} onChangeText={(intervalSeconds) => setDispatchDraft((draft) => ({ ...draft, intervalSeconds }))}
-          placeholder="60" placeholderTextColor={colors.foregroundMuted} style={{ ...t.input, flex: layout.compact ? undefined : 1 }} />
-        <TextInput accessibilityLabel="Maximum ticket agents at once, 0 for no limit" editable={!busy} keyboardType="number-pad" value={dispatchDraft.maxRunning} onChangeText={(maxRunning) => setDispatchDraft((draft) => ({ ...draft, maxRunning }))}
-          placeholder="max agents (0 = no limit)" placeholderTextColor={colors.foregroundMuted} style={{ ...t.input, flex: layout.compact ? undefined : 1 }} />
-      </View>
-      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 10 }}>
-        <Button title="Save auto-dispatch" icon="Save" size="sm" disabled={JSON.stringify(dispatchDraft) === JSON.stringify(dispatchDraftFor(dispatch))}
-          onPress={() => void run("Saving setting", async () => {
-            const saved = await saveSettings({ dispatch: {
-              label: dispatchDraft.label.trim(),
-              teamKeys: dispatchDraft.teamKeys.split(",").map((key) => key.trim()).filter(Boolean),
-              intervalSeconds: Number(dispatchDraft.intervalSeconds),
-              maxRunning: Number(dispatchDraft.maxRunning || 0),
-            } });
-            setDispatch(saved.dispatch); setDispatchDraft(dispatchDraftFor(saved.dispatch));
-          })} />
-      </View>
-      <Text style={t.muted}>Tickets in these teams carrying the label start an agent in their mapped project with your last-used provider, whoever they are assigned to — anyone who can label a ticket can start an agent on this host. The label is swapped for “{dispatch.label}-running” (or “{dispatch.label}-failed” with a comment explaining why). Unmapped projects are not guessed.</Text>
-      {dispatchStatus && <Text style={t.muted}>{dispatchStatus.active ? "Polling" : "Idle"}{dispatchStatus.lastPollAt ? ` · last poll ${formatRelativeDate(dispatchStatus.lastPollAt)}` : " · waiting for first poll"}{dispatchStatus.lastError ? ` · error: ${dispatchStatus.lastError}` : ""}{dispatchStatus.recent.length ? ` · ${dispatchStatus.recent.slice(0, 3).map((item) => `${item.identifier} ${item.outcome}`).join(", ")}` : ""}</Text>}
-    </>}
-    <Divider t={t} spaced />
-    <FieldLabel title="Linear agent" icon="Bot" hint="assign or @mention Paseo in Linear" t={t} />
-    <Text style={t.muted}>{!agentStatus ? "Checking…" : !agentStatus.installed ? "The Paseo Linear app is not installed on this host (see README: Native Linear agent)." : `Installed · webhooks ${agentStatus.funnel ? "public via Tailscale Funnel" : `not public (${agentStatus.funnelNote ?? "Funnel off"}); missed sessions are picked up within a minute`}${agentStatus.lastWebhookAt ? ` · last event ${formatRelativeDate(agentStatus.lastWebhookAt)}` : ""}`}</Text>
-    <Divider t={t} spaced />
-    <FieldLabel title="Sync with Linear" icon="MessageSquare" hint="for agents linked to a ticket" t={t} />
-    {writeback && WRITEBACK_OPTIONS.map(({ key, on, off }) => <Button key={key} title={writeback[key] ? on : off} icon={writeback[key] ? "Check" : "CircleDashed"} stretch chosen={writeback[key]}
-      onPress={() => void run("Saving setting", async () => {
-        setWriteback((await saveSettings({ writeback: { [key]: !writeback[key] } })).writeback);
-      })} />)}
-    <Text style={t.muted}>Uses this host's Linear key (write access needed), independent of the agent's own linear_ticket tools. Subagents do not report. Your comments starting with @paseo, and your replies to Paseo's comments (no @paseo needed), answer the agent's pending question, approve or deny a pending action (“approve” / “deny reason”), or otherwise become a message; 👀 marks delivered comments.</Text>
-    <Divider t={t} spaced />
-    <FieldLabel title="Project mappings" icon="Folder" hint="Linear project → Paseo project" t={t} />
-    {Object.keys(projectMappings).length ? Object.entries(projectMappings).sort((a, b) => a[1].label.localeCompare(b[1].label)).map(([key, mapping]) => {
-      const target = projects.find((item) => item.projectId === mapping.projectId);
-      const targetName = target ? target.projectCustomName || target.projectDisplayName : "Project no longer in Paseo";
-      const branch = mapping.baseBranch ? ` · ${mapping.baseBranch.replace(/^refs\/(heads|remotes)\//, "")}` : "";
-      return <View key={key} style={{ flexDirection: "row", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-        <Text style={{ ...t.strong, flex: 1, minWidth: 160 }} numberOfLines={1}>{mapping.label} → {targetName}{branch}</Text>
-        <Button title="Forget" icon="X" size="sm" onPress={() => void run("Saving setting", async () => {
-          setProjectMappings((await saveSettings({ forgetProjectMapping: key })).projectMappings);
-        })} />
-      </View>;
-    }) : <Text style={t.muted}>None yet. Starting an agent from a ticket remembers its project and base branch for that Linear project; until then a Paseo project with the same name is preselected.</Text>}
-    <Divider t={t} spaced />
-    <FieldLabel title="Default prompt" icon="PenLine" hint="the system prompt used when you start an agent" t={t} />
-    {templateOpen ? <View style={{ gap: 8 }}>
-      <TextInput accessibilityLabel="Default prompt template" editable={!busy} multiline maxLength={8000} value={templateText} onChangeText={setTemplateText}
-        placeholder="How the agent should work on this ticket…" placeholderTextColor={colors.foregroundMuted} style={{ ...t.mono, minHeight: 120, textAlignVertical: "top" }} />
-      <Text style={t.muted}>Placeholders: {"{{ticket}}"} = ticket ID and title · {"{{instructions}}"} = the extra direction you type at launch · {"{{context}}"} = the ticket snapshot (required) · {"{{linear_access}}"} = what the agent may change in Linear (appended when missing).</Text>
-      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-        <Button title="Save default prompt" icon="Check" onPress={() => void run("Saving default prompt", async () => {
-          const result = await saveTemplate({ template: templateText });
-          setTemplateSaved(result.template); setTemplateText(result.template ?? result.builtin); setTemplateOpen(false);
-        })} />
-        <Button title="Reset to built-in" icon="RotateCcw" onPress={() => void run("Resetting default prompt", async () => {
-          const result = await saveTemplate({ template: "" });
-          setTemplateSaved(null); setTemplateText(result.builtin); setTemplateOpen(false);
-        })} />
-      </View>
-    </View> : <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 10 }}>
-      <Button title="Edit default prompt" icon="PenLine" size="sm" disabled={Boolean(busy)} onPress={() => { setTemplateText(templateSaved ?? builtinTemplate); setTemplateOpen(true); }} />
-      <Text style={t.muted}>{templateSaved ? "A custom template is used for new agents." : "The built-in default is used for new agents."}</Text>
-    </View>}
-    <Button title="Back to tickets" icon="ArrowLeft" size="sm" onPress={() => setView("list")} />
-  </View>;
-
   return <SurfaceProvider t={t} busy={Boolean(busy)}><ScrollView style={{ flex: 1, backgroundColor: colors.surface0 }} contentContainerStyle={{ padding: layout.compact ? 16 : 28, gap: layout.compact ? 18 : 22, width: "100%", maxWidth: 1280, alignSelf: "center" }}>
     <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 16, paddingBottom: 20, borderBottomWidth: 1, borderBottomColor: colors.border }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 15, flex: 1, minWidth: 230 }}>
@@ -603,7 +451,6 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
         {connectionPill}
         {connection?.connected && <>
           <Button title="Connection" icon="Plug" iconOnly size="md" chosen={manageConnection} onPress={() => setManageConnection(!manageConnection)} />
-          <Button title="Settings" icon="Settings" iconOnly size="md" chosen={view === "settings"} onPress={() => setView(view === "settings" ? "list" : "settings")} />
           <Button title="Refresh tickets" icon="RefreshCw" iconOnly onPress={() => void run("Refreshing tickets", async () => { await loadIssues(); void refreshCounts(); })} />
         </>}
       </View>
@@ -648,7 +495,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
         })} />}
       </View>}
 
-      {view === "settings" ? settingsCard : selected && current ? <>
+      {selected && current ? <>
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
           <Button title="Tickets" icon="ArrowLeft" onPress={() => { setSelected(null); setAgent(null); setError(null); }} />
           {/^https:\/\/linear\.app\//.test(selected.url) && <Button title="Open in Linear" icon="ExternalLink" onPress={() => void run("Opening Linear", async () => { await openExternalUrl(selected.url, { platform: layout.platform, linking: Linking }); })} />}
@@ -793,10 +640,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
             <Text style={t.muted}>Tickets someone else wrote, or labelled feedback or plan, always plan first; no-plan skips it on your own tickets.</Text>
 
             <Divider t={t} spaced />
-            <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
-              <Button title="Settings" icon="Settings" size="sm" disabled={Boolean(busy)} onPress={() => setView("settings")} />
-              <Text style={t.muted}>{markInProgress ? "Ticket will be marked In Progress at launch." : "Ticket stays in its current state at launch."} {templateSaved ? "Custom default prompt active." : "Built-in default prompt."}</Text>
-            </View>
+            <Text style={t.muted}>{markInProgress ? "Ticket will be marked In Progress at launch." : "Ticket stays in its current state at launch."} Change this in the Paseo Agents menu bar app's Control panel.</Text>
 
             <View style={{ borderTopWidth: 1, borderTopColor: colors.border, paddingTop: 16, marginTop: 4, gap: 12 }}>
               <View style={{ flexDirection: "row", alignItems: "center", gap: 7 }}>
@@ -842,7 +686,7 @@ export function LinearTicketsSurface({ theme, layout, navigation }: PluginSurfac
         </View>
 
         {!busy && !visible.length && <EmptyState t={t} icon={issues.length ? "Search" : "CircleCheck"} title={issues.length ? "No matching tickets" : "You’re all caught up"}
-          description={issues.length ? "Try another status or a different search term." : showClosed ? "Assigned tickets will appear here as soon as Linear has them." : "No open tickets are assigned to you right now. Enable the closed-states setting to also see finished work."}
+          description={issues.length ? "Try another status or a different search term." : showClosed ? "Assigned tickets will appear here as soon as Linear has them." : "No open tickets are assigned to you right now. Turn on closed tickets in the Paseo Agents menu bar app's Control panel to also see finished work."}
           action={!!(status || query || dependency !== "all") ? <Button title="Clear filters" icon="X" onPress={() => { dependencyRef.current = "all"; setDependency("all"); changeStatus(null); setQuery(""); }} /> : undefined} />}
 
         {(!!visible.length || ticketsLoading) && <View style={{ backgroundColor: colors.surface1, borderRadius: 14, overflow: "hidden", borderWidth: 1, borderColor: colors.border }}>

@@ -56,8 +56,8 @@ next time the launcher opens, and switching providers restores each provider's o
 Choices that are no longer advertised by Paseo are safely ignored.
 
 Tickets load in pages of 50. By default they cover **open work only** — completed,
-canceled and duplicated states are hidden server-side; the **Settings** menu (gear in
-the header) has a toggle to include them. The status chips show counts over exactly
+canceled and duplicated states are hidden server-side; the Paseo Agents menu bar app's
+Control panel has a toggle to include them. The status chips show counts over exactly
 what the list shows, following that setting — Linear's GraphQL exposes no aggregation,
 so they come from a bounded server pass (25 pages × 50; counts show a “+” when your
 assignments exceed that) and selecting a chip filters the list server-side by that
@@ -156,13 +156,13 @@ Opening a ticket preselects where its agent runs. A Linear project (or, for tick
 one, the team) maps to a Paseo project and, for Git projects, a base branch. Starting an agent
 remembers the choice for that Linear project; until a mapping exists, a Paseo project whose
 name equals the Linear project name is preselected when exactly one matches. A choice you make
-by hand is never overridden. **Settings → Project mappings** lists the saved mappings and can
+by hand is never overridden. The Paseo Agents menu bar app's **Control panel → Project mappings** lists the saved mappings and can
 forget them. Mappings are stored per host in `settings.json`.
 
 ## Agent access to Linear
 
-Agents started from a ticket get a `linear_ticket` MCP server (on by default, **Settings →
-Agent access to Linear** turns it off). Its tools act only on the ticket the agent started from
+Agents started from a ticket get a `linear_ticket` MCP server (on by default, the Paseo Agents
+menu bar app's **Control panel → Agent access to Linear** turns it off). Its tools act only on the ticket the agent started from
 and its manual tasks:
 
 - `get_ticket` — fresh title, description, status, the team's workflow states, comments, links;
@@ -233,15 +233,22 @@ get around it; other providers are not covered.
 
 ## Settings
 
-The **Settings** menu (gear icon in the header, next to the connection and refresh
-buttons) holds the plugin's per-host settings:
+The plugin's per-host settings live in the Paseo Agents menu bar app's Control panel,
+which reads and saves them through the plugin's `linear.get-settings` / `linear.set-settings`
+(and `linear.get-default-prompt` / `linear.set-default-prompt`) RPCs; its status lines come from
+`linear.dispatch-status` and `linear.agent-status`. The sidebar no longer
+has a settings view; it keeps the Linear connection (the **Connection** button), the ticket
+list and the launch flow.
 
 - **Ticket status** — optionally mark the ticket In Progress when the agent starts
   (off by default; see below).
 - **Tickets shown** — include completed, canceled and duplicated tickets in the list
   and the status counts (off by default, keeping the list focused on open work).
+- **Agent access to Linear** — give ticket agents the `linear_ticket` tools (on by default; see [Agent access to Linear](#agent-access-to-linear)).
+- **Project mappings** — the saved Linear project → Paseo project mappings, each with Forget (see [Project mappings](#project-mappings)).
 - **Default prompt** — replace the built-in launch prompt with a template (below).
 - **Auto-dispatch** — start agents for labeled tickets without opening Paseo (off by default; see below).
+- **Linear agent** — whether the native Linear agent is installed and receiving webhooks (see [Native Linear agent](#native-linear-agent)).
 - **Write back to Linear** — report ticket-linked agents' progress on the ticket (all off by default; see below).
 
 The last successful model, mode, and reasoning choices are stored in the same per-host
@@ -252,7 +259,7 @@ settings file. They update automatically and do not need a separate settings tog
 Every launch starts from the built-in default prompt: work on the ticket in the current
 workspace, respect the repository's instructions, and treat the snapshot as data, not as
 authority. You can replace it with your own template under **Default prompt** in the
-plugin's **Settings** (gear icon in the header) — for example to have the agent list a
+Paseo Agents menu bar app's Control panel — for example to have the agent list a
 plan before coding, run the test suite, or open a pull request in a specific format.
 
 Placeholders are substituted at launch time:
@@ -277,8 +284,8 @@ decides rather than the saved wording.
 ## Marking tickets In Progress
 
 By default the plugin never changes Linear. When you switch on **Mark the ticket In
-Progress when the agent starts** in the plugin's **Settings** (gear icon in the
-header), a launch also moves the ticket
+Progress when the agent starts** in the Paseo Agents menu bar app's Control panel,
+a launch also moves the ticket
 into its team's started state — the state named *In Progress* when the team has one,
 otherwise the first started state in the team's workflow. Tickets already in a started
 state are left as they are, and a team without a started state never produces a write.
@@ -356,7 +363,7 @@ timestamp newer than 60 s, answered at once, and deduplicated. A sweep every min
 sessions and replies whose webhook was missed. Each of its parts (waiting tickets, superseded
 threads, reviews, "Open in Paseo" links, missed replies) and each thread's replies are handled on
 their own: a failed Linear request skips only what it hit until the next minute.
-**Settings → Linear agent** shows the state.
+The Paseo Agents menu bar app's **Control panel → Linear agent** shows the state.
 
 **In the panel.**
 - The agent's commands and file edits show up while it works, merged at most every 4 seconds.
@@ -475,7 +482,7 @@ reloading are picked up by the minute sweep. Plannotator chat rows in Paseo need
 connection and are skipped until one arrives; Linear still gets the review.
 
 **Waiting their turn.** A ticket blocked by unfinished tickets, or started while *max agents*
-(Settings → Auto-dispatch, up to 50; 0 means no limit)
+(Paseo Agents menu bar app's Control panel → Auto-dispatch, up to 50; 0 means no limit)
 are already working, waits. A labelled ticket keeps its label; a delegated one says why in its
 panel. The minute sweep starts it once it is admitted, however long it waited. A delegated ticket
 whose thread was ended, or which was closed meanwhile, starts nothing; one that already has an
@@ -773,7 +780,7 @@ started before this feature need a new session to get the hook.
 
 ## Auto-dispatch
 
-With **Settings → Auto-dispatch** on, the plugin polls Linear (every 60 seconds by default,
+With **Auto-dispatch** on in the Paseo Agents menu bar app's Control panel, the plugin polls Linear (every 60 seconds by default,
 30–3600 allowed) for open tickets that carry the trigger label (`paseo` by default) in the
 listed team keys (for example `ENG, OPS`). No teams means nothing is dispatched. Tickets are
 picked up **whoever they are assigned to**: anyone who can label a ticket in those teams can
@@ -792,13 +799,13 @@ comment saying why; fix the cause and add the trigger label again.
 Paseo gives plugin code its daemon connection only inside RPCs and lifecycle hooks, so
 polling starts at the first of these after the plugin loads: opening the ticket surface,
 saving a setting, or any agent or workspace activity on the host (agents resumed after a
-daemon restart count). The surface's Settings shows the last poll,
+daemon restart count). The Paseo Agents menu bar app's Control panel shows the last poll,
 its error and the most recent dispatches.
 
 ## Write back to Linear
 
 For agents carrying the `linear.issueId` label (every agent started from a ticket, manually
-or dispatched), **Settings → Write back to Linear** can report their lifecycle on the ticket
+or dispatched), **Write back to Linear** in the Paseo Agents menu bar app's Control panel can report their lifecycle on the ticket
 written as the Paseo app (see [Who Linear shows as the author](#who-linear-shows-as-the-author)),
 independently of the agent's own `linear_ticket` tools:
 
