@@ -473,9 +473,9 @@ test("a ready, green, reviewed pull request outside the queue is told to merge; 
   h.github.view = READY;
   assert.deepEqual(await h.poll(), [], "a person's thread is open");
   h.github.threads = [];
-  h.github.view = { ...READY, labels: ["complex-review"], reviews: [{ author: "greptile-apps", state: "COMMENTED", submittedAt: "2026-09-29T08:00:00Z", body: "", commit: "0ld" }] };
-  assert.equal(promptOf(await h.poll()), undefined, "complex-review: Greptile has not reviewed this head");
-  h.github.view = { ...h.github.view, reviews: [{ author: "greptile-apps", state: "COMMENTED", submittedAt: "2026-09-29T09:00:00Z", body: "", commit: HEAD }], mergeActivity: activity(QUEUED) };
+  h.github.view = { ...READY, labels: ["complex-review"] };
+  assert.equal(promptOf(await h.poll()), undefined, "complex-review: Greptile has not reviewed the pull request at all");
+  h.github.view = { ...h.github.view, reviews: [{ author: "greptile-apps", state: "COMMENTED", submittedAt: "2026-09-29T08:00:00Z", body: "", commit: "0ld" }], mergeActivity: activity(QUEUED) };
   assert.equal(promptOf(await h.poll()), undefined, "added to the queue");
   h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(460)) };
   assert.deepEqual(await h.poll(), [], "the queue's CI runs");
@@ -491,17 +491,18 @@ test("a ready, green, reviewed pull request outside the queue is told to merge; 
   assert.equal(promptOf(await h.poll()), `[The pull request](${PR}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.\nNext step: \`gt checkout mtuchel/tuc-1-fix && gt merge\`, then \`node tools/ci/wait-queue.mjs 419\`. The rest of the stack follows once it is reviewed.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
 });
 
-test("with complex-review, Greptile's summary comment naming the head as its last reviewed commit counts as its review when it left no findings", async (t) => {
+test("with complex-review, one Greptile review of any head counts, also as a summary comment naming its last reviewed commit when it left no findings", async (t) => {
   const SHA = "93d151619aeebbfcc6d60e587641821a952df3d9";
   const summary = (sha: string) => `<h3>Greptile Summary</h3>\n\nAdds the upload retry.\n\n<sub>Last reviewed commit: ["Fix TUC-1 [plugin] Retry the upload"](https://github.com/tuchel-sohn/tuchel-platform/commit/${sha}) · [Prompt To Fix All With AI](https://app.greptile.com)</sub>`;
   const reviewed = { ...READY, headSha: SHA, labels: ["complex-review"] };
   for (const [comments, ready, why] of [
     [[{ author: "greptile-apps", body: summary(SHA) }], true, "the summary names the head"],
     [[{ author: "greptile-apps[bot]", body: summary(SHA) }], true, "the REST login names it too"],
-    [[{ author: "greptile-apps", body: summary("1111111111111111111111111111111111111111") }], false, "the summary names an older commit"],
-    [[{ author: "greptile-apps", body: summary(`${SHA}1`) }], false, "a longer sha is another commit"],
+    [[{ author: "greptile-apps", body: summary("1111111111111111111111111111111111111111") }], true, "a summary naming an older commit: one review of any head is enough"],
+    [[{ author: "greptile-apps", body: "<h3>Greptile Summary</h3>\n\nAdds the upload retry." }], false, "a summary without the last reviewed commit line is no finished review"],
     [[{ author: "Mtuchel", body: summary(SHA) }], false, "a person quoting the summary is not Greptile"],
     [[{ author: "greptile-apps", body: `Reviewed https://github.com/tuchel-sohn/tuchel-platform/commit/${SHA}` }], false, "a Greptile comment without the last reviewed commit line"],
+    [[], false, "no Greptile review or summary at all"],
   ] as const) {
     const h = harness(t);
     h.github.view = { ...reviewed, comments: [...comments] };
