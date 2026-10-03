@@ -1,15 +1,11 @@
-import { createHash } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { planHash } from "../shared/plan-risk";
 
 // `remoteUrl`: the tailnet link shown in the Linear panel, removed again when the review ends.
 export type PendingReview = { localUrl: string; remoteUrl?: string; openedAt?: string; planHash?: string };
 export type ReviewOutcome = "open" | { approved: boolean; feedback?: string; planContent: string } | null;
-
-export function planHash(plan: string): string {
-  return createHash("sha256").update(plan.trim()).digest("hex");
-}
 
 // What became of a review the plugin is waiting on. Decisions taken on Plannotator's own page
 // reach nobody when omp's plan mode runs the review, but Plannotator saves every decided plan as

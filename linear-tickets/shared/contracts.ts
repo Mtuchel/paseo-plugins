@@ -195,6 +195,12 @@ const writebackSettingsSchema = z.object({
   mentions: z.boolean(),
   autoResume: z.boolean(),
 });
+// Plan auto-approval (shared/plan-risk.ts): impact levels 0–4.
+const autoApproveSettingsSchema = z.object({
+  enabled: z.boolean(),
+  maxImpact: z.number().int().min(0).max(4),
+  maxImpactWithFlag: z.number().int().min(0).max(4),
+});
 export type DispatchSettingsValue = z.infer<typeof dispatchSettingsSchema>;
 export type WritebackSettingsValue = z.infer<typeof writebackSettingsSchema>;
 const settingsOutputSchema = z.object({
@@ -208,6 +214,7 @@ const settingsOutputSchema = z.object({
   agentLinearAccess: z.boolean(),
   dispatch: dispatchSettingsSchema,
   writeback: writebackSettingsSchema,
+  autoApprove: autoApproveSettingsSchema,
 });
 export const getSettingsRpc = defineRpc({
   name: "linear.get-settings",
@@ -226,6 +233,7 @@ export const setSettingsRpc = defineRpc({
     launchPreference: launchPreferenceSchema.extend({ provider: z.string().min(1).max(500) }).optional(),
     dispatch: dispatchSettingsSchema.partial().optional(),
     writeback: writebackSettingsSchema.partial().optional(),
+    autoApprove: autoApproveSettingsSchema.partial().optional(),
   }),
   output: settingsOutputSchema,
 });

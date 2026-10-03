@@ -10,7 +10,8 @@ import type { AgentApi, SelectOption, SessionPlanStep } from "./agent-app";
 import { agentAppDirectory } from "./agent-app";
 import type { AgentSessionWebhook } from "./agent-webhook";
 import { groupProgress, groupStatus, isGroup } from "./groups";
-import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
+import { planHash } from "../shared/plan-risk";
+import type { PendingReview, ReviewOutcome } from "./review-outcome";
 import { dispatchLabels } from "./dispatch";
 import type { IssueGroup, LinearService } from "./linear";
 import { CODING_STATE } from "./plannotator";
@@ -899,13 +900,14 @@ export class SessionRouter {
 // The review's server is gone or no longer takes decisions.
 export class ReviewClosedError extends Error {}
 
+// `feedback` on an approval reaches the agent as Plannotator's approval notes.
 export async function decidePlannotatorReview(localUrl: string, approve: boolean, feedback: string): Promise<void> {
   const origin = new URL(localUrl).origin;
   if (!/^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) throw new Error("Only local Plannotator reviews can be decided.");
   const response = await fetch(`${origin}/api/${approve ? "approve" : "deny"}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(approve ? {} : { feedback }),
+    body: JSON.stringify(approve && !feedback ? {} : { feedback }),
     signal: AbortSignal.timeout(10_000),
   }).catch((error: unknown) => {
     throw new ReviewClosedError(`Plannotator is not reachable at ${origin}: ${error instanceof Error ? error.message : error}`);
