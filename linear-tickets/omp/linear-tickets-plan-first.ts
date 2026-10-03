@@ -21,6 +21,10 @@
 //   record is therefore checked in its own handler, so a record listed before the submit in the
 //   same message counts, and a plan write or edit queued in that message holds both back. Subagents
 //   (`task` children, which share the environment but cannot create an advisor) are not gated.
+//   The record also needs the plan's `## Risk and impact` section (shared/plan-risk.ts) and drops an
+//   `advised` event with the verdict and the plan text's hash, from which the plugin's Plannotator
+//   bridge decides whether the plan is approved without the owner (README, "Plan risk and
+//   auto-approval").
 // - LINEAR_TICKETS_ISSUE=<ticket>: Linear writes (README, "Agent access to Linear"). The user-level
 //   Linear MCP server acts as the owner, so ticket agents and their subagents may call only its read
 //   tools, named below; every other tool of that server is blocked, whether called directly
@@ -34,6 +38,7 @@ import { homedir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
 import { ADVISOR_MODEL, ADVISOR_SECTION, ADVISOR_THINKING, advisorSteps, RECORD_ADVICE_TOOL } from "../shared/plan-advisor";
+import { parsePlanRisk, planHash } from "../shared/plan-risk";
 
 type Phase = "idle" | "planning" | "executing";
 type Entry = { type: string; customType?: string; data?: { reason?: string; path?: string; hash?: string }; message?: { role?: string } };
@@ -74,6 +79,19 @@ const OWNER_ASKED = "The owner added the `plan` label to this ticket, so you are
 
 function text(message: string, details: Record<string, unknown> = {}): ToolResult {
   return { content: [{ type: "text", text: message }], details };
+}
+
+// Hands an event to the plugin's Plannotator bridge; best-effort, the bridge treats a missing one
+// as "ask the owner".
+function dropEvent(event: Record<string, unknown>): void {
+  try {
+    mkdirSync(EVENTS, { recursive: true, mode: 0o700 });
+    const name = `${Date.now()}-${randomUUID()}.json`;
+    writeFileSync(join(EVENTS, `.${name}.tmp`), JSON.stringify({ ...event, agentId: AGENT_ID, at: new Date().toISOString() }), { mode: 0o600 });
+    renameSync(join(EVENTS, `.${name}.tmp`), join(EVENTS, name));
+  } catch {
+    // See above.
+  }
 }
 
 // The plan file a submission names, as given: a path relative to the working directory, or omp's
@@ -184,6 +202,8 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       return text(`${file} has no "## ${ADVISOR_SECTION}" section. Add it (the advisor's model, the rounds, what changed because of it, and every open point with both positions), then record again.`);
     }
     const verdict = params.verdict;
+    const rated = parsePlanRisk(content);
+    if ("problem" in rated) return text(`${file}: ${rated.problem}\n\nFix the section, then record again.`);
     if (verdict === "unavailable") {
       const reason = params.reason?.trim();
       if (!reason) return text("Give the reason the advisor could not be created.");
@@ -191,6 +211,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
         return text(`The plan's "## ${ADVISOR_SECTION}" section must tell the owner that the advisor was unavailable and why, with the reason you pass here word for word. Say so there, then record again.`);
       }
     } else if (verdict === "agreed" || verdict === "disagreements") {
+      if (!rated.risk.advisor) return text(`The plan's "Advisor rating" says unavailable, but the verdict is ${verdict}. Put the advisor's own impact and reversibility there, then record again.`);
       const advisorId = params.advisorAgentId?.trim();
       if (!advisorId) return text("Pass the advisor's Paseo agent id (from `create_agent`).");
       let agent: Record<string, unknown>;
@@ -207,6 +228,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const hash = createHash("sha256").update(content).digest("hex");
     advised.set(key, hash);
     pi.appendEntry(ADVICE_MARKER, { path: key, hash, verdict, advisorAgentId: params.advisorAgentId ?? null, reason: params.reason ?? null, at: new Date().toISOString() });
+    dropEvent({ type: "advised", verdict, hash: planHash(content) });
     return text(`Advisor review recorded for ${file} (${verdict}). Submit the plan now, without editing it again.`, { verdict });
   };
   // Plannotator's plan-mode control (plannotator:request). null: Plannotator did not answer.
@@ -369,14 +391,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       if (phase !== "planning") return text(`Not in plan mode (${phase ?? "Plannotator did not answer"}); there is nothing to skip.`);
       if (await planMode("exit") !== "idle") return text("Plan mode could not be left. Write the plan and submit it for review instead.");
       pi.appendEntry(MARKER, { reason: "skipped", at: new Date().toISOString() });
-      try {
-        mkdirSync(EVENTS, { recursive: true, mode: 0o700 });
-        const name = `${Date.now()}-${randomUUID()}.json`;
-        writeFileSync(join(EVENTS, `.${name}.tmp`), JSON.stringify({ type: "skipped", agentId: AGENT_ID, reason, at: new Date().toISOString() }), { mode: 0o600 });
-        renameSync(join(EVENTS, `.${name}.tmp`), join(EVENTS, name));
-      } catch {
-        // The ticket note is a convenience; leaving plan mode already happened.
-      }
+      dropEvent({ type: "skipped", reason });
       return text("Plan skipped; your reason is posted on the ticket. Implement the ticket now.", { skipped: true });
     },
   });

@@ -3,7 +3,8 @@ import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { planHash, reviewOutcome } from "./review-outcome";
+import { planHash } from "../shared/plan-risk";
+import { reviewOutcome } from "./review-outcome";
 
 const closed = async () => false;
 const plan = "# TUC-1 Fix\n\n## Steps\n1. a\n2. b\n";

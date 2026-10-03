@@ -429,6 +429,47 @@ provider error) is recorded as `unavailable` only when the plan's advisor sectio
 the same reason. Claude and Codex planners get the steps as instructions when they launch in a
 planning policy, without the gate.
 
+**Plan risk and auto-approval.** Every ticket plan ends with a `## Risk and impact` section, before
+`## Advisor review`, in a fixed format ([`shared/plan-risk.ts`](shared/plan-risk.ts)): affected
+Area labels and business processes, an **impact** level, **reversibility**, feature flag yes/no,
+migration yes/no, auth yes/no, the failure mode, the advisor's own rating, and a recommendation
+(`auto` or `owner`).
+
+| Impact | Meaning |
+|---|---|
+| 0 | No business process: agent tooling, CI, docs, refactor without behavior change |
+| 1 | Read-only: reports, views, dashboards, logs |
+| 2 | Changes how people do a step: screens, validation, defaults, internal notifications |
+| 3 | Changes business records: orders, stock, batches, QM decisions, specifications, master data |
+| 4 | External, financial or legal effect: Business Central postings, payroll, EDI or mail to customers and suppliers, certificates, food-safety alerts |
+
+Reversibility is `revert` (reverting the pull request restores everything), `data-fix` (records
+written in the meantime need fixing) or `irreversible`. The advisor rates the plan itself from the
+ticket and the code; a plan rated lower than the advisor is a must-change point, and the policy
+takes the higher of both ratings. For omp planners, `record_plan_advice` refuses a plan without a
+readable section (or with `agreed`/`disagreements` but no advisor rating) and tells the plugin
+which verdict was recorded for which plan text.
+
+When the review opens, the plugin approves it on your behalf only if all of these hold:
+
+- impact at or below `maxImpact` (default 1), or `maxImpactWithFlag` (default 2) behind a feature flag;
+- reversibility `revert`, no migration, no auth change, and the planner recommends `auto`;
+- the advisor `agreed`, recorded for exactly the text Plannotator shows (an edited plan, an
+  unavailable advisor, open disagreements or a plugin reload in between send it to you);
+- the ticket is yours (not someone else's, not `feedback`) and not marked attended.
+
+A project planner's work order is judged the same way (the planner rates the order itself, which
+only changes Linear, normally impact 0), so a project's tickets are not left waiting on you.
+
+An auto-approved plan goes through the same approval as yours (state, `plan-ready`, the plan
+document, the agent's usual mode); the agent gets "Auto-approved by the risk policy" with the
+rating as its approval notes, and the panel, chat row and ticket say so. Every other plan reaches
+you as before, with the rating and the reasons it needs you. The threshold lives in
+`$PASEO_HOME/linear-tickets/settings.json` and the `linear.set-settings` RPC as
+`"autoApprove": { "enabled": true, "maxImpact": 1, "maxImpactWithFlag": 2 }`; `enabled: false`
+sends every plan to you. Claude and Codex planners write the section too, but without the
+extension's record their plans always reach you.
+
 **The omp extension.** The planning phase, `skip_plan` and the plan advisor gate come from
 [`omp/linear-tickets-plan-first.ts`](omp/linear-tickets-plan-first.ts), which omp loads from its
 extensions directory. Install it once with a symlink, so plugin updates reach it:
@@ -512,7 +553,8 @@ the sidebar skip the line.
 others start as usual. A ticket may need you when it carries `paseo-attended` (the project
 planner marks these, and you can add or remove the label yourself) or when its plan needs your
 approval: someone else wrote it, or it carries `plan` (an approved plan, `plan-ready`, no longer
-counts). A project's planner ticket never waits: its plan is reviewed whenever you are back.
+counts). A project's planner ticket never waits: its work order is auto-approved within your
+threshold, or reviewed whenever you are back.
 Waiting tickets keep their place and start within a few minutes of you being present again; agents
 already working continue. A ticket that asks you something anyway stops in Needs input and frees
 its slot.
@@ -577,8 +619,9 @@ every 2 minutes.
   (Urgent, labels `paseo-planner` and `plan`) and assigns it to Paseo. Its agent reads the open
   tickets, listed in its description with the new ones marked, and the code, and plans which
   tickets block which (because one builds on another, or both touch the same files), which
-  must wait for you, and which may need you while they run. You review that plan like any other.
-  Its last section is a block like:
+  must wait for you, and which may need you while they run. Its plan is approved like any other,
+  automatically when its rating is within your threshold (see **Plan risk and auto-approval**).
+  Its `## Work order` section holds a block like:
 
   ````
   ```project-order
@@ -589,7 +632,7 @@ every 2 minutes.
   ```
   ````
 
-  On approval Paseo adds the blocking relations, puts `paseo-hold` on held tickets (removes it
+  On approval, yours or automatic, Paseo adds the blocking relations, puts `paseo-hold` on held tickets (removes it
   from released ones) and `paseo-attended` on attended ones (`unattended X` removes it), comments
   what it applied and skipped, closes the planner ticket and archives its agent. Nothing else of
   an approval (In Progress, `plan-ready`) applies to it. The planner is told to mark a ticket
@@ -743,9 +786,11 @@ agent.
 
 Plannotator shows its review URL only in omp's own status line, which Paseo does not display.
 The plugin sets `PLANNOTATOR_BROWSER` for every agent session to a small hook
-(`$PASEO_HOME/linear-tickets/plannotator/open`). When a review starts, the hook still opens it
-on the host. It also publishes the review port inside your tailnet with `tailscale serve`
-(HTTPS, reachable only from your devices). The agent's Paseo chat then gets a “Handed off to
+(`$PASEO_HOME/linear-tickets/plannotator/open`). When a review starts, the hook publishes the
+review port inside your tailnet with `tailscale serve` (HTTPS, reachable only from your devices)
+and hands the review to the plugin, which opens it on the host within a few seconds, after the
+risk policy has looked at it: an auto-approved plan opens no tab. When the plugin cannot take the
+review (no events directory), the hook opens it itself. The agent's Paseo chat then gets a “Handed off to
 Plannotator” row with the link. Agents linked to a ticket also get it in the Linear comment (or
 the panel's “Plan review” link), so reviews open on your phone.
 

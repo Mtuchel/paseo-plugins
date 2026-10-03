@@ -9,6 +9,7 @@ import { HealthMonitor } from "./health";
 import { reviewChange, type PullRequestView } from "./pr-watch";
 import { decidePlannotatorReview, describeTool, questionPrompt, SessionRouter, SessionStore } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { approveForLater, splitIntoSubIssues } from "./split";
 import { AWAY_REASON } from "./scheduler";
 import { advisorNote, isUntrusted, planDecisionNote, PLAN_REQUIRED_NOTE, TicketStarter, QUESTIONS_NOTE, UNTRUSTED_NOTE } from "./starter";
@@ -19,7 +20,7 @@ const APP = "paseo-app";
 const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: "omp", launchPreferences: { omp: { model: "omp/opus", modeId: "full" } },
   projectMappings: { "team:t1": { projectId: "p1", label: "Team", baseBranch: "refs/heads/main" } }, agentLinearAccess: false,
-  dispatch: { ...DEFAULT_DISPATCH, maxRunning: 2 }, writeback: DEFAULT_WRITEBACK,
+  dispatch: { ...DEFAULT_DISPATCH, maxRunning: 2 }, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE,
 };
 
 const twoPart: AgentPermissionRequest = {

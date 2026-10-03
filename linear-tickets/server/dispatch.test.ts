@@ -7,6 +7,7 @@ import { Dispatcher } from "./dispatch";
 import { advisorNote, planDecisionNote, QUESTIONS_NOTE, TicketStarter } from "./starter";
 import type { LabeledIssue } from "./linear";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 
 const baseSettings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false,
@@ -14,7 +15,7 @@ const baseSettings: PluginSettings = {
   projectMappings: { "project:lp-1": { projectId: "p1", label: "App", baseBranch: "refs/heads/dev" } },
   agentLinearAccess: true,
   dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["ENG"] },
-  writeback: DEFAULT_WRITEBACK,
+  writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE,
 };
 
 // A Linear workspace in memory: tickets with label names, and every write recorded.

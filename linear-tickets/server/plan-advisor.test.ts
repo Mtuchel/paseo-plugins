@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { planHash } from "../shared/plan-risk";
 
 // The omp extension reads its environment when it loads, so it is imported after this setup.
 const root = mkdtempSync(join(tmpdir(), "paseo-plan-advisor-"));
@@ -75,7 +76,9 @@ function load() {
   };
 }
 
-const PLAN = "# Plan\n\nDo the thing.\n\n## Advisor review\n\nGPT-6 Astra, 2 rounds, agreed.\n";
+const RISK = "## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: 1 — read-only\n- Reversibility: revert — nothing written\n- Feature flag: no\n- Migration: no\n- Auth: no\n- Failure mode: a wrong column in the report\n- Advisor rating: impact 1, reversibility revert\n- Recommendation: auto — routine\n\n";
+const UNADVISED_RISK = RISK.replace("impact 1, reversibility revert", "unavailable");
+const PLAN = `# Plan\n\nDo the thing.\n\n${RISK}## Advisor review\n\nGPT-6 Astra, 2 rounds, agreed.\n`;
 
 test("a ticket plan cannot reach the owner until a finished GPT-6 Astra advisor review is recorded for that exact text", async () => {
   const h = load();
@@ -124,11 +127,31 @@ test("an unavailable advisor is recorded only with a reason the plan itself tell
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable" }), /Give the reason/);
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "quota exhausted" }), /must tell the owner that the advisor was unavailable/);
   assert.equal((await h.submit("PLAN.md"))?.block, true);
-  writeFileSync(join(h.cwd, "PLAN.md"), "# Plan\n\nDo the thing.\n\n## Advisor review\n\nThe advisor was unavailable.\n");
+  writeFileSync(join(h.cwd, "PLAN.md"), `# Plan\n\nDo the thing.\n\n${UNADVISED_RISK}## Advisor review\n\nThe advisor was unavailable.\n`);
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "quota exhausted" }), /with the reason you pass here/, "the owner must see why, not only that");
-  writeFileSync(join(h.cwd, "PLAN.md"), "# Plan\n\nDo the thing.\n\n## Advisor review\n\nThe GPT-6 Astra advisor was unavailable: quota exhausted.\n\n## Out of scope\n\nNothing.\n");
+  writeFileSync(join(h.cwd, "PLAN.md"), `# Plan\n\nDo the thing.\n\n${UNADVISED_RISK}## Advisor review\n\nThe GPT-6 Astra advisor was unavailable: quota exhausted.\n\n## Out of scope\n\nNothing.\n`);
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "quota exhausted" }), /recorded/);
   assert.equal(await h.submit("PLAN.md"), undefined, "an explained unavailable advisor lets the owner decide");
+});
+
+test("the record needs a readable risk rating with the advisor's own, and tells the plugin which verdict belongs to which plan text", async () => {
+  const h = load();
+  writeFileSync(join(h.cwd, "PLAN.md"), "# Plan\n\nDo the thing.\n\n## Advisor review\n\nGPT-6 Astra, 1 round, agreed.\n");
+  assert.match(await h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" }), /no "## Risk and impact" section/);
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("- Migration: no\n", ""));
+  assert.match(await h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" }), /unreadable value for: Migration/);
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace(RISK, UNADVISED_RISK));
+  assert.match(await h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" }), /"Advisor rating" says unavailable, but the verdict is agreed/);
+  assert.equal((await h.submit("PLAN.md"))?.block, true);
+
+  const events = join(root, "linear-tickets", "plannotator", "events");
+  const before = new Set(existsSync(events) ? readdirSync(events) : []);
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN);
+  assert.match(await h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" }), /recorded/);
+  const added = readdirSync(events).filter((name) => !before.has(name));
+  assert.equal(added.length, 1);
+  const event = JSON.parse(readFileSync(join(events, added[0]), "utf8"));
+  assert.deepEqual({ ...event, at: "t" }, { type: "advised", verdict: "agreed", hash: planHash(PLAN), agentId: "planner-1", at: "t" });
 });
 
 test("omp's local plan proposals are checked against the text the bridge would submit, and fail closed when unreadable", async () => {

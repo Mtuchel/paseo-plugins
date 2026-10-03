@@ -261,7 +261,7 @@ export function plannerBrief(projectName: string, work: ProjectIssue[], unplanne
   });
   return [
     `Paseo hands the open tickets of **${projectName}** to agents on its own, up to the agent limit at once. Before it hands out the tickets marked NEW, decide their work order. Do not change code: this ticket only produces the order.`,
-    `Read the tickets below and the code they touch, then write a plan whose last section is a fenced block in exactly this format:`,
+    `Read the tickets below and the code they touch, then write a plan with a \`## Work order\` section holding a fenced block in exactly this format:`,
     "```project-order\nTUC-12 blocks TUC-15\nhold TUC-20: too big, split it first\nrelease TUC-21\nattended TUC-23: which customer groups get the discount is not decided\n```",
     [
       "- `A blocks B`: B must not start before A is finished. Add one where B builds on A, or where both change the same files and would conflict as parallel pull requests.",
@@ -271,7 +271,8 @@ export function plannerBrief(projectName: string, work: ProjectIssue[], unplanne
       "- `unattended X`: X no longer needs the owner present (removes an earlier `attended`).",
       "- Tickets not mentioned are handed out as soon as they are unblocked; independent tickets run in parallel.",
     ].join("\n"),
-    "Once the owner approves the plan, Paseo writes the order into Linear and closes this ticket. Nothing is left to implement then: stop.",
+    "Rate the work order itself in the plan's `## Risk and impact` section, not the tickets: it only changes Linear (blocking relations and labels), and every ticket is still planned and approved on its own. That is impact 0 with reversibility `revert`, unless the order itself affects a business process, for example by holding back a ticket a deadline depends on. Put tickets that need the owner under `hold` or `attended` rather than recommending `owner`; recommend `owner` only when the order needs a decision you cannot make from the tickets, for example two tickets that contradict each other.",
+    "Once the plan is approved (by the owner, or automatically when its rating is within the owner's threshold), Paseo writes the order into Linear and closes this ticket. Nothing is left to implement then: stop.",
     `## Open tickets (${work.length})\n\n${lines.join("\n")}`,
   ].join("\n\n");
 }
