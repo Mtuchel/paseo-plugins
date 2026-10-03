@@ -108,8 +108,48 @@ test("unknown agents and malformed ids are 404; other methods are refused", asyn
     await links.opened("agent-1", opened(50_001));
     assert.equal((await get("/review/nobody")).status, 404);
     assert.equal((await get("/review/a.b")).status, 404);
-    assert.equal((await get("/")).status, 404);
+    assert.equal((await get("/nothing")).status, 404);
     assert.equal((await get("/review/agent-1", "POST")).status, 405);
+    assert.equal((await get("/", "POST")).status, 405);
+  });
+});
+
+test("the inbox lists only reviews the owner can open now, oldest first, and the latest decisions", async () => {
+  await withLinks(async (links, get, live) => {
+    live.add(50_001).add(50_002).add(50_003).add(50_005);
+    await links.opened("agent-1", opened(50_001), "TUC-1");
+    await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, "<TUC-2>");
+    // Superseded by the same agent's newer review: only the newer one is listed.
+    await links.opened("agent-3", { ...opened(50_003), agentId: "agent-3" }, "TUC-3-old");
+    await links.opened("agent-3", { ...opened(50_005), agentId: "agent-3" }, "TUC-3");
+    // Not answering any more (not yet swept), and local-only: neither can be opened from a phone.
+    await links.opened("agent-4", { ...opened(50_004), agentId: "agent-4" }, "TUC-4");
+    await links.opened("agent-5", { ...opened(50_006), agentId: "agent-5", remoteUrl: null }, "TUC-5");
+    live.add(50_006);
+    // Decided and closed: listed under recent decisions instead.
+    await links.opened("agent-6", { ...opened(50_007), agentId: "agent-6" }, "TUC-6");
+    await links.decided("agent-6", true);
+    await links.sweep();
+    await links.sweep();
+
+    const response = await get("/");
+    assert.equal(response.status, 200);
+    const page = await response.text();
+    const [waiting, recent] = page.split("Recently decided");
+    const listed = [...waiting.matchAll(/href="\/review\/([^"]+)"/g)].map((match) => match[1]);
+    assert.deepEqual(listed, ["agent-1", "agent-2", "agent-3"]);
+    assert.match(waiting, /&#60;TUC-2&#62;/);
+    assert.doesNotMatch(page, /TUC-3-old/);
+    assert.match(recent, /TUC-6/);
+    assert.match(recent, /approved/);
+    assert.match(recent, /TUC-4/, "the dead review was closed by the sweep");
+    assert.doesNotMatch(page, /TUC-5/);
+  });
+});
+
+test("the inbox says so when nothing is waiting", async () => {
+  await withLinks(async (_links, get) => {
+    assert.match(await (await get("/")).text(), /Nothing to review/);
   });
 });
 
