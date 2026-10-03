@@ -682,13 +682,20 @@ an open pull request when Graphite's last Merge activity bullet ends the attempt
 "merge when ready" turned off, a failed check), or when the draft its latest "CI is running"
 bullet names was closed without its head reaching the base branch and no newer queue draft for
 the pull request is open. Without Merge activity, drafts alone never count. Each drop is one of
-two kinds, as the repo's `tools/ci/wait-queue.mjs` decides for the agent's own wait
+three kinds, as the repo's `tools/ci/wait-queue.mjs` decides for the agent's own wait
 (`docs/automation/merge-queue.md`). It is **conflict-only** when Graphite names a merge conflict
 and nothing on the queue's draft failed, was cancelled or was still running (every check run on
 its head is read, all pages), or no draft existed; a draft no longer listed counts as unread, so
-the drop is plain. Every other drop is **plain**: Graphite also says "merge conflicts" for real
+the drop is plain. It is **main-broken** when `main` was already red on the same jobs: every
+check on the draft that failed or timed out (gates such as `Platform gate` left out) is, without
+its `Code validation / ` prefix, a failed job of `main`'s deciding ci.yml run at that check's
+own completion, as the repo's `tools/ci/main-health.mjs` judges it (push or dispatch runs on
+`main`; of a run, the newest attempt that completed, was not cancelled and had finished by then).
+When `main`'s state at that moment is unknown, or one job does not match, the drop is plain;
+when `main`'s CI cannot be read, nothing is claimed and the next poll decides again. Every other
+drop is **plain**: Graphite also says "merge conflicts" for real
 failures. The ticket's agent gets the reason, the checks that did not pass on the draft and the
-runbook for the kind. Both re-enqueue the dropped queue range from its top branch, the one
+runbook for the kind. All re-enqueue the dropped queue range from its top branch, the one
 enqueued before the drop: the highest of the ticket's open pull requests the queue's draft
 listed, or the dropped pull request itself when no draft lists it; never the stack's top branch,
 which would enqueue pull requests above the range that are not ready. Every enqueue goes through
@@ -704,17 +711,21 @@ merging them, the focused checks, the same `gt submit`, then right away `git swi
 && node tools/ci/enqueue.mjs` and `node tools/ci/wait-queue.mjs <its PR>`, without waiting for
 the pull request's checks: the queue's draft runs the full suite (only when `gt merge` refuses
 because checks still run: `node tools/ci/wait-checks.mjs <its PR>`, then `enqueue.mjs` once
-more). The
+more). A main-broken drop names the jobs `main` already failed, needs no restack or fix of its
+own, and asks for `git switch <range top> && node tools/ci/enqueue.mjs --wait-main` (it waits
+until `main` is green, then checks and enqueues) and `node tools/ci/wait-queue.mjs <its PR>`. The
 message goes out once the agent is idle; Paseo resumes it if it has stopped. While the agent is
 in a turn or waiting for an answer, or Paseo is not connected,
 the message waits for a later poll. When the agent is gone or archived, the same text becomes a
 ticket comment mentioning you, and the ticket moves back to In Progress (when status write-back
 is on). Each drop is claimed in `$PASEO_HOME/linear-tickets/pr-watch.json` (by its draft, or by
 the bullet when there is none) before anything is sent, so it is delivered at most once, also
-across restarts. The kinds are counted separately per pull request: one fix request after a
-plain drop and up to five restacks after conflict-only drops. The second plain drop or the sixth
+across restarts. The plain and conflict-only kinds are counted separately per pull request: one
+fix request after a plain drop and up to five restacks after conflict-only drops. Main-broken
+drops count toward neither limit and never escalate; their message carries all three counts. The
+second plain drop or the sixth
 conflict-only drop, whichever comes first, only mentions you ("the merge queue dropped this
-stack again", with both counts), and after that drops of either kind are only logged. Drops
+stack again", with both counts), and after that drops of any kind are only logged. Drops
 claimed before the kinds existed count as plain, and three of them as escalated. An
 archived agent's open pull request stays watched until that escalation or 14 days without
 activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
