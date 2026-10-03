@@ -372,35 +372,25 @@ The Paseo Agents menu bar app's **Control panel → Linear agent** shows the sta
 - **Stop** interrupts the turn and keeps the agent stopped (a turn the provider starts by itself within 5 minutes is stopped again) until you reply.
 - When a session exists, the plan review, its decision and pull-request review changes update the progress comment instead of adding comments. The panel's own messages are copied into the ticket thread by Linear.
 
-**Plan-first.** Every launch (sidebar, auto-dispatch, delegation, mention) picks one of three
-plan policies, first match wins:
+**Plan-first.** Every ticket plans first, whatever launched it (sidebar, auto-dispatch,
+delegation, mention) and however small it is. The only exception is a ticket carrying
+`plan-ready`: its approved plan is implemented (below). There is no way to skip a plan: the old
+`no-plan` label and the sidebar's Plan-first toggle are gone, and so is omp's `skip_plan`. The
+prompt asks to keep the plan as short as the ticket allows.
 
-| Ticket | Policy |
-|---|---|
-| Carries `plan-ready` | No plan: the approved plan is implemented (below). |
-| Written by someone else, or labelled `feedback` | **Plan required**; `no-plan` does not apply, so the ticket's own text cannot skip its review. |
-| Labelled `plan`, or started with **Plan first** in the sidebar | **Plan required**. |
-| Labelled `no-plan` | No plan. |
-| Anything else | **The agent decides**. |
-
-*Plan required*: Claude starts in `plan` mode and Codex in `auto`; omp keeps your usual mode
-(its `write` mode asks before every shell command, reads included) and starts in Plannotator's
-planning phase instead. The prompt asks only for a plan and, for someone else's ticket, marks
+Claude starts in `plan` mode and Codex in `auto`; omp keeps your usual mode (its `write` mode asks
+before every shell command, reads included) and starts in Plannotator's planning phase instead.
+The prompt asks only for a plan and, for a ticket someone else wrote or labelled `feedback`, marks
 its text as untrusted input. With status write-back on, the ticket starts in **Planning** instead
-of In Progress. Approving the plan switches the agent to your usual mode.
+of In Progress. Approving the plan switches the agent to your usual mode. A plan you sent back is
+planned again by the next agent, which gets the previous plan and your feedback from the ticket's
+plan document.
 
-*The agent decides*: the prompt says to plan for a schema or migration change, auth or
-permissions, more than one app or service, a public or cross-service API change, unclear or
-conflicting acceptance criteria, or more than about three files, and to plan when unsure. omp
-agents start in the planning phase and leave it only through `skip_plan` with a one-sentence
-reason, which the ticket gets as a "No plan" note (the panel and progress comment with a Linear
-agent session). Other providers get the same rules as instructions.
-
-**Plan on a running agent.** Add `plan` to the ticket while its agent works: within a minute the
-plugin asks the agent for a plan. An omp agent enters the planning phase at its next tool call
-(that call is stopped and the reason follows as a message) or prompt, from implementing an approved plan too, and cannot
-`skip_plan` afterwards. Other providers only get the message. A label that was there when the
-agent started does nothing; remove and add it again to ask once more.
+**Plan on a running agent.** Add `plan` to the ticket while its agent implements an approved plan:
+within a minute the plugin asks the agent for a new plan. An omp agent enters the planning phase at
+its next tool call (that call is stopped and the reason follows as a message) or prompt. Other
+providers only get the message. A label that was there when the agent started does nothing;
+remove and add it again to ask once more.
 
 **Plan advisor.** Every plan a ticket agent writes gets a second opinion before it reaches you.
 The planner (the model you launch tickets with; the model guard keeps it there) creates a GPT-6
@@ -458,19 +448,38 @@ When the review opens, the plugin approves it on your behalf only if all of thes
   unavailable advisor, open disagreements or a plugin reload in between send it to you);
 - the ticket is yours (not someone else's, not `feedback`) and not marked attended.
 
-A project planner's work order is judged the same way (the planner rates the order itself, which
-only changes Linear, normally impact 0), so a project's tickets are not left waiting on you.
+A project planner's work order is always approved without you: it only orders the project's
+tickets (blocking relations and labels), and every ticket still plans and is judged on its own.
 
 An auto-approved plan goes through the same approval as yours (state, `plan-ready`, the plan
 document, the agent's usual mode); the agent gets "Auto-approved by the risk policy" with the
 rating as its approval notes, and the panel, chat row and ticket say so. Every other plan reaches
-you as before, with the rating and the reasons it needs you. The threshold lives in
-`$PASEO_HOME/linear-tickets/settings.json` and the `linear.set-settings` RPC as
+you with the rating and the reasons it needs you, parked (below) when it can be. The threshold
+lives in `$PASEO_HOME/linear-tickets/settings.json` and the `linear.set-settings` RPC as
 `"autoApprove": { "enabled": true, "maxImpact": 1, "maxImpactWithFlag": 2 }`; `enabled: false`
 sends every plan to you. Claude and Codex planners write the section too, but without the
 extension's record their plans always reach you.
 
-**The omp extension.** The planning phase, `skip_plan` and the plan advisor gate come from
+**Parked plans.** A plan that needs you does not keep its agent (an agent slot and its memory)
+waiting. The plugin saves it to `$PASEO_HOME/linear-tickets/plannotator/parked/<issue>.json`,
+closes the agent's own review, archives the agent, and moves the ticket to **Planning** without
+`plan-ready`. A central Plannotator host the plugin runs (`plannotator/host.mjs`, started with Bun
+on plugin start, restarted when it exits, stopped with the plugin) serves every parked plan with
+Plannotator's own review page, published in the tailnet like any review, so the review inbox, the
+agent's stable link, the panel and the Linear comment work as before; the review tab opens once.
+Your decision there, or **Approve plan** / **Send back** in the panel:
+
+- approve: the plan document, `plan-ready`, the ticket back to Todo, and a fresh agent that
+  implements the plan as soon as a slot is free (with a Linear agent session; otherwise assign
+  Paseo again);
+- send back: the plan document with your feedback, and a fresh agent that plans again from it.
+
+Plans stay parked across plugin and host restarts. The host needs Bun (`~/.bun/bin/bun`,
+Homebrew or `LINEAR_TICKETS_BUN`) and the Plannotator omp plugin
+(`~/.omp/plugins/node_modules/@plannotator/pi-extension`, or `LINEAR_TICKETS_PLANNOTATOR_PACKAGE`);
+without them plans are not parked and their agents wait for you as before.
+
+**The omp extension.** The planning phase and the plan advisor gate come from
 [`omp/linear-tickets-plan-first.ts`](omp/linear-tickets-plan-first.ts), which omp loads from its
 extensions directory. Install it once with a symlink, so plugin updates reach it:
 
@@ -549,15 +558,15 @@ line. While slots under *max agents* are short, a free slot goes to:
 An admitted ticket keeps its slot for 3 minutes while its agent starts. Tickets you start from
 the sidebar skip the line.
 
-**Present and away.** While you are away, tickets that may need you during the run wait; all
-others start as usual. A ticket may need you when it carries `paseo-attended` (the project
-planner marks these, and you can add or remove the label yourself) or when its plan needs your
-approval: someone else wrote it, or it carries `plan` (an approved plan, `plan-ready`, no longer
-counts). A project's planner ticket never waits: its work order is auto-approved within your
-threshold, or reviewed whenever you are back.
-Waiting tickets keep their place and start within a few minutes of you being present again; agents
-already working continue. A ticket that asks you something anyway stops in Needs input and frees
-its slot.
+**Present and away.** Planning never waits: every ticket plans at any time, also at night. A plan
+that needs you is parked (see **Parked plans**) and takes no slot, so the plans are ready for your
+review when you are back. While you are away, only the implementation of a ticket that may need
+you during the run waits: one that carries `paseo-attended` (the project planner marks these, and
+you can add or remove the label yourself) and has an approved plan (`plan-ready`). Its plan always
+goes to you (the risk policy never approves an attended ticket), so an attended ticket you approve
+while away starts once you are present again. Waiting tickets keep their place and start within a
+few minutes of you being present again; agents already working continue. A ticket that asks you
+something anyway stops in Needs input and frees its slot.
 
 You switch with the Present/Away toggle of the Paseo Agents menu bar app, or with a schedule
 (off by default; host-local times such as away 22:00–07:00). A toggle holds until the
@@ -610,18 +619,17 @@ as before.
 the whole project without you assigning each ticket. Auto-dispatch must be on; projects are read
 every 2 minutes.
 
-- **Planning on request.** Nothing is planned until you ask; planning never starts on its own.
-  The plugin offers two RPCs for that, used by the Paseo Agents menu bar app:
-  `linear.projects-status` lists each labelled project with how many new tickets wait for a
-  plan and the planner waiting for your approval (with a link to it); `linear.plan-project`
-  plans one project's new tickets.
+- **Planning on its own.** Whenever a labelled project has new tickets and no open planner, the
+  plugin files one. The Paseo Agents menu bar app uses two RPCs: `linear.projects-status` lists
+  each labelled project with how many new tickets wait for a plan and the open planner (with a
+  link to it); `linear.plan-project` files the planner right away instead of at the next read.
 - **Planner.** Planning files a ticket *Plan the work order of <project>* in the project
-  (Urgent, labels `paseo-planner` and `plan`) and assigns it to Paseo. Its agent reads the open
-  tickets, listed in its description with the new ones marked, and the code, and plans which
-  tickets block which (because one builds on another, or both touch the same files), which
-  must wait for you, and which may need you while they run. Its plan is approved like any other,
-  automatically when its rating is within your threshold (see **Plan risk and auto-approval**).
-  Its `## Work order` section holds a block like:
+  (Urgent, label `paseo-planner`) and assigns it to Paseo. Its agent reads the open tickets,
+  listed in its description with the new ones marked, and the code, and plans which tickets
+  block which (because one builds on another, or both touch the same files), which must wait for
+  you, and which may need you while they run. Its plan is always approved automatically: it only
+  changes Linear, and every ticket still plans on its own. Its `## Work order` section holds a
+  block like:
 
   ````
   ```project-order
@@ -632,7 +640,7 @@ every 2 minutes.
   ```
   ````
 
-  On approval, yours or automatic, Paseo adds the blocking relations, puts `paseo-hold` on held tickets (removes it
+  On approval, Paseo adds the blocking relations, puts `paseo-hold` on held tickets (removes it
   from released ones) and `paseo-attended` on attended ones (`unattended X` removes it), comments
   what it applied and skipped, closes the planner ticket and archives its agent. Nothing else of
   an approval (In Progress, `plan-ready`) applies to it. The planner is told to mark a ticket
@@ -645,12 +653,13 @@ every 2 minutes.
   Triage or already started, someone else's, and sub-issues (their parent's group hands them
   out) are left alone. A ticket with open sub-issues in the project is assigned as a group and
   takes no slot itself. Removing `paseo-hold` releases a ticket.
-- **New tickets.** Tickets filed after the last plan are not handed out until you plan them;
-  `linear.projects-status` counts them. Only tickets the project could hand out count: new sub-issues, tickets
-  already with Paseo or someone else, and started ones do not. There is at most one planner per
-  project at a time: tickets filed while one waits for approval are counted for the next.
-- **Skipping a plan.** Closing or canceling the planner ticket yourself counts its tickets as
-  planned: they are handed out without a work order.
+- **New tickets.** Tickets filed after the last work order are not handed out until the next
+  planner has ordered them; `linear.projects-status` counts them. Only tickets the project could
+  hand out count: new sub-issues, tickets already with Paseo or someone else, and started ones do
+  not. There is at most one planner per project at a time: tickets filed while one works are
+  listed by the next.
+- **Skipping a work order.** Closing or canceling the planner ticket yourself counts its tickets
+  as planned: they are handed out without a work order.
 - Removing the label from the project stops new hand-outs; agents already working continue.
   Without a usable Paseo app (no threads) projects are not worked on.
 

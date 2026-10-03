@@ -30,7 +30,7 @@ const MIN_RATE_LIMIT_DELAY_MS = 5_000;
 const PULL_REQUEST_URL = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/g;
 
 type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
-// `planFirst`: launched plan-first (a ticket you did not write, before its plan is approved).
+// `planFirst`: launched to plan (every ticket until its plan is approved, `plan-ready`).
 type Link = { issueId: string; identifier: string; planFirst: boolean };
 // Steps that must not repeat when a failed write-back is retried (comments, session activities):
 // a retry of the same event skips the steps that already succeeded and gets their earlier result.

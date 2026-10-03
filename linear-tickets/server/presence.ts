@@ -3,12 +3,13 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { PresenceSchedule, PresenceState } from "../shared/contracts";
 import { dispatchLabels } from "./dispatch";
-import { planPolicy } from "./plan-policy";
+import { PLAN_READY_LABEL } from "./plan-policy";
 import { paseoHome } from "./ticket-mcp";
 
-// Present and away (README, "Present and away"). While the owner is away, tickets that may need
-// them during the run wait; everything else starts as usual. Away comes from the owner's toggle,
-// which holds until the schedule's next switch, or from the schedule (host-local times).
+// Present and away (README, "Present and away"). While the owner is away, approved plans of
+// tickets that may need them during the run wait; planning and everything else starts as usual.
+// Away comes from the owner's toggle, which holds until the schedule's next switch, or from the
+// schedule (host-local times).
 
 // `override`: the owner's toggle; `until` null holds until the owner toggles again (no schedule).
 type PresenceFile = { schedule: PresenceSchedule; override: { away: boolean; until: string | null } | null };
@@ -110,14 +111,11 @@ export class Presence {
   }
 }
 
-// Whether a ticket may need the owner while its agent works, so it waits while they are away:
-// the planner marked it (`<trigger>-attended`), or its plan needs the owner's approval (someone
-// else wrote it, or it carries `plan`). A project's planner ticket never waits: the owner asked
-// for it, and its plan is reviewed whenever they are back.
-export function needsOwner(labels: string[], untrusted: boolean, trigger: string): boolean {
+// Whether a ticket waits while the owner is away: the planner marked it (`<trigger>-attended`)
+// because its agent will very likely have to ask them during the work, and its plan is approved
+// (plan-ready), so the next agent implements. Planning never waits: it needs nobody, and a plan
+// that is not approved automatically waits for the owner on its own (README, "Parked plans").
+export function needsOwner(labels: string[], trigger: string): boolean {
   const names = new Set(labels.map((name) => name.trim().toLowerCase()));
-  const own = dispatchLabels(trigger);
-  if (names.has(own.planner.toLowerCase())) return false;
-  if (names.has(own.attended.toLowerCase())) return true;
-  return planPolicy({ untrusted, labels: labels.map((name) => ({ name })) }) === "required";
+  return names.has(dispatchLabels(trigger).attended.toLowerCase()) && names.has(PLAN_READY_LABEL);
 }

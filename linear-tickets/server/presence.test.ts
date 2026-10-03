@@ -49,11 +49,9 @@ test("the toggle holds until the schedule's next switch, or until toggled again 
   await assert.rejects(p.instance.update({ schedule: { enabled: true, awayFrom: "08:00", awayUntil: "08:00" } }), /different start and end/);
 });
 
-test("a ticket needs the owner when marked attended or when its plan needs approval; a planner or an approved plan never", () => {
-  assert.equal(needsOwner([], false, "paseo"), false);
-  assert.equal(needsOwner(["Paseo-Attended"], false, "paseo"), true);
-  assert.equal(needsOwner([], true, "paseo"), true, "written by someone else");
-  assert.equal(needsOwner(["plan"], false, "paseo"), true);
-  assert.equal(needsOwner(["plan", "plan-ready"], false, "paseo"), false, "its plan is approved");
-  assert.equal(needsOwner(["paseo-planner", "plan"], false, "paseo"), false, "the owner asked for the planner");
+test("a ticket waits for the owner only when it is marked attended and its plan is approved", () => {
+  assert.equal(needsOwner([], "paseo"), false);
+  assert.equal(needsOwner(["Paseo-Attended"], "paseo"), false, "it still plans first");
+  assert.equal(needsOwner(["plan-ready"], "paseo"), false);
+  assert.equal(needsOwner(["Paseo-Attended", "Plan-Ready"], "paseo"), true);
 });

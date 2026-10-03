@@ -41,7 +41,8 @@ export type SessionLink = {
   // What a plain reply in the panel means right now, besides a pending permission.
   review: PendingReview | null;
   // "split" / "later": the plugin retired the planner on purpose, so no Resume is offered.
-  offer: "resume" | "split" | "later" | null;
+  // "parked": its plan waits for the owner in the central Plannotator host (parked.ts).
+  offer: "resume" | "split" | "later" | "parked" | null;
   // Waiting for blockers or a free agent slot; the sweep starts it when admitted.
   queued?: boolean;
   // A question with several parts, asked one part at a time.
@@ -360,8 +361,8 @@ export class SessionRouter {
       if (link.agentId && link.agentId !== started.agentId) await this.paseo!.agents.ref(link.agentId).archive().catch(() => {});
       const warnings = started.warnings.length ? `\n\nWarnings:\n${started.warnings.map((warning) => `- ${warning}`).join("\n")}` : "";
       const plan = started.plan === "required"
-        ? started.untrusted ? " This ticket is not yours, so the agent only plans until you approve." : " The agent plans first and starts coding once you approve."
-        : started.plan === "agent" ? " The agent decides whether the ticket needs a plan; a skipped plan is noted here with its reason." : "";
+        ? started.untrusted ? " This ticket is not yours, so its plan waits for your approval." : " The agent plans first; a plan within your risk threshold is approved automatically, any other waits for you."
+        : "";
       await this.say(link.sessionId, "thought", `${started.resumed ? "Resumed the previous agent's work" : "Started"} with ${started.provider} in ${started.target} (Paseo agent ${started.agentId.slice(0, 8)}).${plan}${warnings}`);
       await this.linkToPaseo(link.sessionId, started.agentId);
     } catch (error) {
@@ -435,7 +436,7 @@ export class SessionRouter {
       try {
         await this.deps.decideReview(link.review.localUrl, approve, approve ? "" : feedback, link.agentId);
         await this.clearReview(sessionId);
-        await this.say(sessionId, "thought", approve ? "Plan approved — the agent continues." : "Plan sent back with your feedback.");
+        await this.say(sessionId, "thought", approve ? "Plan approved." : "Plan sent back with your feedback.");
         return;
       } catch (error) {
         if (!(error instanceof ReviewClosedError)) throw error;
@@ -836,7 +837,8 @@ export class SessionRouter {
     const { reviewOutcome, recordOutcome } = this.deps;
     if (!reviewOutcome || !recordOutcome) return;
     for (const link of await this.deps.store.all()) {
-      if (!link.review || link.closed || !link.agentId) continue;
+      // A parked plan's review moves to the central host, which may restart: it stays bound.
+      if (!link.review || link.closed || !link.agentId || link.offer === "parked") continue;
       const outcome = await reviewOutcome(link.review).catch(() => "open" as const);
       if (outcome === "open") continue;
       await this.clearReview(link.sessionId);
@@ -860,9 +862,29 @@ export class SessionRouter {
 
   async offerResume(sessionId: string): Promise<void> {
     const offer = (await this.deps.store.get(sessionId))?.offer;
-    if (offer === "split" || offer === "later") return;
+    if (offer === "split" || offer === "later" || offer === "parked") return;
     await this.deps.store.patch(sessionId, { offer: "resume" });
     await this.ask(sessionId, "The agent stopped. Continue with a new agent on the same branch?", [{ label: "Resume with a new agent", value: RESUME }, { label: "Leave it", value: LEAVE }]);
+  }
+
+  // The plan waits for the owner in the central Plannotator host and its agent is retired: no
+  // Resume is offered, and the review is bound again once the host serves the plan.
+  async parked(agentId: string): Promise<void> {
+    const link = await this.sessionFor(agentId);
+    if (!link) return;
+    await this.deps.store.patch(link.sessionId, { offer: "parked" });
+    await this.clearReview(link.sessionId);
+  }
+
+  // The owner decided a parked plan: the thread waits for a slot like a queued one, and the queue
+  // sweep starts a fresh agent that implements the approved plan or plans again. False: no thread.
+  async requeue(agentId: string, note: string): Promise<boolean> {
+    const link = await this.sessionFor(agentId);
+    if (!link) return false;
+    await this.clearReview(link.sessionId);
+    await this.deps.store.patch(link.sessionId, { agentId: null, queued: true, offer: null });
+    await this.say(link.sessionId, "thought", note);
+    return true;
   }
 
   async linkToPaseo(sessionId: string, agentId: string): Promise<void> {
