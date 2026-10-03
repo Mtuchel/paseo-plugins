@@ -12,7 +12,8 @@ import { activeModel } from "./model";
 import { APPROVE_LATER, APPROVE_PLAN, decidePlannotatorReview, MAX_SPLIT, planSteps, SEND_BACK, setAgentMode, SPLIT_PLAN, type SessionRouter } from "./sessions";
 import { hasLabel, PLAN_POLICY_LABEL, PLAN_READY_LABEL } from "./plan-policy";
 import type { ReviewLinks } from "./review-links";
-import { autoApproval, parsePlanRisk, planHash, ratingText } from "../shared/plan-risk";
+import { autoApproval, parsePlanRisk, ratingText } from "../shared/plan-risk";
+import { planHash } from "./review-outcome";
 import { isUntrusted } from "./starter";
 import { dispatchLabels } from "./dispatch";
 

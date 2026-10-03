@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { planHash } from "../shared/plan-risk";
+// The bridge's hash: the extension's `advised` event must carry the same one.
+import { planHash } from "./review-outcome";
 
 // The omp extension reads its environment when it loads, so it is imported after this setup.
 const root = mkdtempSync(join(tmpdir(), "paseo-plan-advisor-"));

@@ -38,7 +38,7 @@ import { homedir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
 import { ADVISOR_MODEL, ADVISOR_SECTION, ADVISOR_THINKING, advisorSteps, RECORD_ADVICE_TOOL } from "../shared/plan-advisor";
-import { parsePlanRisk, planHash } from "../shared/plan-risk";
+import { parsePlanRisk } from "../shared/plan-risk";
 
 type Phase = "idle" | "planning" | "executing";
 type Entry = { type: string; customType?: string; data?: { reason?: string; path?: string; hash?: string }; message?: { role?: string } };
@@ -228,7 +228,8 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const hash = createHash("sha256").update(content).digest("hex");
     advised.set(key, hash);
     pi.appendEntry(ADVICE_MARKER, { path: key, hash, verdict, advisorAgentId: params.advisorAgentId ?? null, reason: params.reason ?? null, at: new Date().toISOString() });
-    dropEvent({ type: "advised", verdict, hash: planHash(content) });
+    // The Plannotator bridge compares it with server/review-outcome.ts `planHash` of the text it shows.
+    dropEvent({ type: "advised", verdict, hash: createHash("sha256").update(content.trim()).digest("hex") });
     return text(`Advisor review recorded for ${file} (${verdict}). Submit the plan now, without editing it again.`, { verdict });
   };
   // Plannotator's plan-mode control (plannotator:request). null: Plannotator did not answer.
