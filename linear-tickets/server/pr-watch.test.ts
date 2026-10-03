@@ -163,7 +163,7 @@ test("a queue drop prompts the live agent once with the reason, the failed check
   assert.match(prompt, /`gt submit --stack --ignore-out-of-sync-trunk`, then `git switch mtuchel\/tuc-1-fix && node tools\/ci\/enqueue\.mjs` \(the top branch of the dropped queue range, not the stack's top branch; never a bare `gt merge`[^\n]*\) and `node tools\/ci\/wait-queue\.mjs 419`/);
   assert.doesNotMatch(prompt, /run `gt sync/);
   assert.match(prompt, /If your stack sits on a PR that has already landed, or your PR was auto-closed, follow docs\/automation\/merge-queue\.md instead\.\n2\. Fix the cause\./);
-  assert.match(prompt, /one plain `node tools\/ci\/enqueue\.mjs` retry/);
+  assert.match(prompt, /one plain `git switch mtuchel\/tuc-1-fix && node tools\/ci\/enqueue\.mjs` retry/);
   assert.match(said, /^say thought The merge queue dropped the pull request/);
   assert.deepEqual(await h.poll(), [], "not prompted again on the next poll");
   // Graphite's bullet for the same attempt arrives later; it is the same drop.
