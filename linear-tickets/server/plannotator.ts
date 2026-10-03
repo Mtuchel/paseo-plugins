@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -21,6 +22,15 @@ export async function readReviewPlan(localUrl: string): Promise<string> {
   if (!response.ok) return "";
   const body: unknown = await response.json();
   return body && typeof body === "object" && "plan" in body && typeof body.plan === "string" ? body.plan : "";
+}
+
+// Opens a review on this machine, as Plannotator would without the hook. LINEAR_TICKETS_OPENER
+// replaces the system opener (tests).
+export function openInBrowser(url: string): void {
+  const opener = process.env.LINEAR_TICKETS_OPENER || (process.platform === "darwin" ? "open" : "xdg-open");
+  try { spawn(opener, [url], { detached: true, stdio: "ignore" }).unref(); } catch (error) {
+    console.error(`[linear-tickets] opening ${url} failed: ${error instanceof Error ? error.message : error}`);
+  }
 }
 
 export const PLANNOTATOR_KIND = "plannotator";
@@ -140,6 +150,8 @@ export class PlannotatorBridge {
   // Per agent, the advisor verdict the omp extension recorded last and the hash of that plan text.
   // In memory: after a plugin reload the next review simply goes to the owner.
   private readonly advised = new Map<string, { verdict: string; hash: string }>();
+  // Reviews already opened on this machine, so a retried event does not open a second tab.
+  private readonly shown = new Set<string>();
 
   constructor(
     private readonly linear: Linear,
@@ -151,7 +163,16 @@ export class PlannotatorBridge {
     private readonly setMode: (agentId: string, modeId: string) => Promise<void> = setAgentMode,
     private readonly reviews?: Pick<ReviewLinks, "opened" | "decided">,
     private readonly decide: (localUrl: string, approve: boolean, feedback: string) => Promise<void> = decidePlannotatorReview,
+    private readonly open: (url: string) => void = openInBrowser,
   ) {}
+
+  // The browser hook leaves opening the review to the bridge, so an auto-approved plan never opens
+  // a tab: every other review opens once, after the risk policy has had its say.
+  private show(localUrl: string): void {
+    if (this.shown.has(localUrl)) return;
+    this.shown.add(localUrl);
+    this.open(localUrl);
+  }
 
   // The ticket's Linear agent panel: review link, plan checklist and Approve / Send back.
   // Returns whether the agent has a session: then the progress comment carries the plan state
@@ -254,15 +275,21 @@ export class PlannotatorBridge {
     const path = join(this.events, name);
     const paseo = this.paseo;
     if (!paseo) return;
+    let event: PlannotatorEvent | null = null;
     try {
-      const event = parseEvent(await readFile(path, "utf8"));
+      event = parseEvent(await readFile(path, "utf8"));
       if (event?.agentId) await this.deliver(event, event.agentId, paseo);
+      else if (event?.type === "opened") this.show(event.localUrl);
       await rm(path, { force: true });
       this.attempts.delete(name);
     } catch (error) {
       const tries = (this.attempts.get(name) ?? 0) + 1;
       console.error(`[linear-tickets] Plannotator event ${name} failed (attempt ${tries}): ${error instanceof Error ? error.message : error}`);
-      if (tries >= MAX_ATTEMPTS) { await rm(path, { force: true }); this.attempts.delete(name); } else this.attempts.set(name, tries);
+      if (tries < MAX_ATTEMPTS) { this.attempts.set(name, tries); return; }
+      // Given up: the review still opens, so it is not lost.
+      if (event?.type === "opened") this.show(event.localUrl);
+      await rm(path, { force: true });
+      this.attempts.delete(name);
     }
   }
 
@@ -287,6 +314,7 @@ export class PlannotatorBridge {
     const settings = await this.settings.read();
     const planText = event.type === "opened" ? await this.fetchPlan(event.localUrl).catch(() => "") : "";
     const judgement = event.type === "opened" && issueId ? await this.judge(event.localUrl, agentId, issueId, planText, settings) : null;
+    if (event.type === "opened" && !judgement?.approved) this.show(event.localUrl);
     const row: PlannotatorRow = event.type === "opened"
       ? { title: judgement?.approved ? "Plan auto-approved by the risk policy" : "Handed off to Plannotator for review", url, detail: `${event.remoteUrl ? "Opens on any device in your tailnet." : "Local link only: Tailscale was unavailable."}${model ? ` Planned with ${model}.` : ""}${judgement ? ` ${judgement.line}` : ""}` }
       : { title: event.approved ? "Plan approved in Plannotator" : "Plan sent back from Plannotator", ...(event.feedback ? { detail: event.feedback.slice(0, 4_000) } : {}) };

@@ -11,6 +11,8 @@ import { parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, writeOpe
 import { DEFAULT_AUTO_APPROVE, planHash } from "../shared/plan-risk";
 
 const exec = promisify(execFile);
+// Bridges built without an opener use the default one: never open a real browser from the tests.
+process.env.LINEAR_TICKETS_OPENER = "true";
 
 test("the browser hook publishes the port in the tailnet and records the link for the agent", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-plannotator-hook-"));
@@ -31,6 +33,7 @@ test("the browser hook publishes the port in the tailnet and records the link fo
     const event = parseEvent(await readFile(join(paths.events, name), "utf8"));
     assert.deepEqual({ ...event, at: "t" }, { type: "opened", agentId: "agent-7", localUrl: "http://localhost:41234/?review=1", remoteUrl: "https://host.tail1.ts.net:41234/?review=1", at: "t" });
     assert.match(await readFile(log, "utf8"), /tailscale serve --bg --https=41234 http:\/\/127\.0\.0\.1:41234/);
+    assert.doesNotMatch(await readFile(log, "utf8"), /opener/, "the bridge opens the review once the risk policy has had its say");
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
@@ -189,22 +192,24 @@ const RISKY = (impact: number) => `# Plan\n\n1. Add the column to the report.\n\
 async function review(options: { advisedPlan: string; shownPlan?: string; verdict?: string; ticket?: { creatorId: string; labels: string[] } }) {
   const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" }, options.ticket);
   const decisions: string[] = [];
+  const tabs: string[] = [];
   await withEvents([
     { type: "advised", agentId: "agent-1", verdict: options.verdict ?? "agreed", hash: planHash(options.advisedPlan), at: "2026-01-01T09:59:00Z" },
     { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
   ], async (directory) => {
     const decide = async (url: string, approve: boolean, feedback: string) => { decisions.push(`${url} ${approve} ${feedback}`); };
-    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => options.shownPlan ?? options.advisedPlan, undefined, undefined, undefined, decide);
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => options.shownPlan ?? options.advisedPlan, undefined, undefined, undefined, decide, (url) => tabs.push(url));
     bridge.attach(paseo);
     await bridge.drain();
     bridge.stop();
   });
-  return { calls, decisions, comment: calls.find((call) => call.startsWith("comment issue-1")) ?? "" };
+  return { calls, decisions, tabs, comment: calls.find((call) => call.startsWith("comment issue-1")) ?? "" };
 }
 
 test("a plan rated within the threshold, agreed by the advisor for exactly that text, is approved without the owner", async () => {
-  const { calls, decisions, comment } = await review({ advisedPlan: RISKY(1) });
+  const { calls, decisions, tabs, comment } = await review({ advisedPlan: RISKY(1) });
   assert.deepEqual(decisions, ["http://localhost:4000/ true Auto-approved by the risk policy. Risk: impact 1/4, revert."]);
+  assert.deepEqual(tabs, [], "an auto-approved plan opens no review tab");
   assert.ok(calls.includes("row agent-1: Plan auto-approved by the risk policy https://host.ts.net:4000/"));
   assert.match(comment, /^comment issue-1: 🤖 \*\*Plan auto-approved\*\* by the risk policy: https:\/\/host\.ts\.net:4000\/\n\nAuto-approved within your threshold\. Risk: impact 1\/4, revert\.$/);
 });
@@ -218,8 +223,9 @@ test("a plan goes to the owner, with the rating and why, when anything the polic
     ["attended ticket", { advisedPlan: RISKY(1), ticket: { creatorId: "owner", labels: ["paseo-attended"] } }, /the ticket is marked attended/],
   ];
   for (const [name, options, reason] of cases) {
-    const { decisions, comment } = await review(options);
+    const { decisions, tabs, comment } = await review(options);
     assert.deepEqual(decisions, [], name);
+    assert.deepEqual(tabs, ["http://localhost:4000/"], name);
     assert.ok(comment.startsWith("comment issue-1: 📋 **Plan ready for review in Plannotator**"), name);
     assert.match(comment, /Risk: impact \d\/4, revert\. Needs your approval: /, name);
     assert.match(comment, reason, name);

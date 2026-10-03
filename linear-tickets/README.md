@@ -786,9 +786,11 @@ agent.
 
 Plannotator shows its review URL only in omp's own status line, which Paseo does not display.
 The plugin sets `PLANNOTATOR_BROWSER` for every agent session to a small hook
-(`$PASEO_HOME/linear-tickets/plannotator/open`). When a review starts, the hook still opens it
-on the host. It also publishes the review port inside your tailnet with `tailscale serve`
-(HTTPS, reachable only from your devices). The agent's Paseo chat then gets a “Handed off to
+(`$PASEO_HOME/linear-tickets/plannotator/open`). When a review starts, the hook publishes the
+review port inside your tailnet with `tailscale serve` (HTTPS, reachable only from your devices)
+and hands the review to the plugin, which opens it on the host within a few seconds, after the
+risk policy has looked at it: an auto-approved plan opens no tab. When the plugin cannot take the
+review (no events directory), the hook opens it itself. The agent's Paseo chat then gets a “Handed off to
 Plannotator” row with the link. Agents linked to a ticket also get it in the Linear comment (or
 the panel's “Plan review” link), so reviews open on your phone.
 
