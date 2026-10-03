@@ -582,7 +582,7 @@ export class PullRequestWatch {
     const top = range.filter((pull) => !range.some((other) => other.baseBranch === pull.headBranch)).sort((a, b) => b.number - a.number)[0];
     const branch = top?.headBranch ?? view.headBranch;
     const pr = top?.number ?? drop.number;
-    const enqueue = `\`git switch ${branch} && gt merge\` (the top branch of the dropped queue range, not the stack's top branch)`;
+    const enqueue = `\`git switch ${branch} && node tools/ci/enqueue.mjs\` (the top branch of the dropped queue range, not the stack's top branch; never a bare \`gt merge\`: it refuses while the range conflicts with \`main\` or the queue tip and names the fix)`;
     const worktree = `In your stack's worktree${record.worktreePath ? ` (\`${record.worktreePath}\`)` : ""}, on the top branch of the stack`;
     const rebase = "`git fetch origin main && git rebase --update-refs --onto origin/main \"$(git merge-base HEAD origin/main)\"`. It moves only your own branches; never `gt sync` or `gt restack`, which move the shared `main` and other agents' branches.";
     const fix = kind === "conflict" ? [
@@ -591,7 +591,7 @@ export class PullRequestWatch {
       "Conflict only: Graphite names a merge conflict and nothing failed, was cancelled or was still running on the queue's draft. Restack and re-enqueue right away, without asking (docs/automation/merge-queue.md#conflict-only-drops), unless a pull request of the stack carries `do-not-merge`:",
       `1. ${worktree}, and only when every branch below it is your own, run ${rebase}`,
       "2. Keep `main`'s version of generated files and regenerate them; never merge them by hand. Run the focused checks for the files the restack touched.",
-      `3. Run \`gt submit --stack --ignore-out-of-sync-trunk\`, then right away ${enqueue} and \`node tools/ci/wait-queue.mjs ${pr}\`. Do not wait for the pull request's checks first: the queue's draft runs the full suite. Only when \`gt merge\` refuses because checks are still running, wait with \`node tools/ci/wait-checks.mjs ${pr}\` and run \`gt merge\` once more.`,
+      `3. Run \`gt submit --stack --ignore-out-of-sync-trunk\`, then right away ${enqueue} and \`node tools/ci/wait-queue.mjs ${pr}\`. Do not wait for the pull request's checks first: the queue's draft runs the full suite. Only when \`enqueue.mjs\` reports that \`gt merge\` refused because checks are still running, wait with \`node tools/ci/wait-checks.mjs ${pr}\` and run \`node tools/ci/enqueue.mjs\` once more.`,
       "",
       `This is automatic restack ${count} of ${DROP_PROMPTS.conflict} for this pull request; after that the owner takes over.`,
     ] : [
@@ -602,7 +602,7 @@ export class PullRequestWatch {
       "2. Fix the cause.",
       `3. Run \`gt submit --stack --ignore-out-of-sync-trunk\`, then ${enqueue} and \`node tools/ci/wait-queue.mjs ${pr}\`.`,
       "",
-      `An obviously flaky failure (unrelated to the change) gets one plain \`gt merge\` retry on \`${branch}\` instead.`,
+      `An obviously flaky failure (unrelated to the change) gets one plain \`git switch ${branch} && node tools/ci/enqueue.mjs\` retry instead.`,
       `This is automatic fix request ${count} of ${DROP_PROMPTS.plain} for this pull request; the next plain drop goes to the owner.`,
     ];
     return { kind, pending: { key: drop.key, reason: drop.reason, facts, fix: fix.join("\n") } };

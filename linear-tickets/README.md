@@ -688,20 +688,23 @@ and nothing on the queue's draft failed, was cancelled or was still running (eve
 its head is read, all pages), or no draft existed; a draft no longer listed counts as unread, so
 the drop is plain. Every other drop is **plain**: Graphite also says "merge conflicts" for real
 failures. The ticket's agent gets the reason, the checks that did not pass on the draft and the
-runbook for the kind. Both re-enqueue the dropped queue range from its top branch, the one `gt
-merge` ran on before the drop: the highest of the ticket's open pull requests the queue's draft
+runbook for the kind. Both re-enqueue the dropped queue range from its top branch, the one
+enqueued before the drop: the highest of the ticket's open pull requests the queue's draft
 listed, or the dropped pull request itself when no draft lists it; never the stack's top branch,
-which would enqueue pull requests above the range that are not ready. A plain drop: on the
+which would enqueue pull requests above the range that are not ready. Every enqueue goes through
+the repo's `node tools/ci/enqueue.mjs`, never a bare `gt merge`: it refuses a range that
+conflicts with `main` or the queue tip and names the fix. A plain drop: on the
 stack's top branch `git fetch origin main && git rebase --update-refs --onto origin/main
 "$(git merge-base HEAD origin/main)"`, which moves only its own branches, never `gt
 sync`/`gt restack`; fix, `gt submit --stack --ignore-out-of-sync-trunk`, then `git switch
-<range top> && gt merge` and `node tools/ci/wait-queue.mjs <its PR>`; one plain `gt merge` retry
-on that branch for an obviously flaky failure. A conflict-only drop: the same rebase (only when
-every branch below is the agent's own), regenerate generated files instead of merging them, the
-focused checks, the same `gt submit`, then right away `git switch <range top> && gt merge` and
-`node tools/ci/wait-queue.mjs <its PR>`, without waiting for the pull request's checks: the
-queue's draft runs the full suite (only when `gt merge` refuses because checks still run: `node
-tools/ci/wait-checks.mjs <its PR>`, then `gt merge` once more). The
+<range top> && node tools/ci/enqueue.mjs` and `node tools/ci/wait-queue.mjs <its PR>`; one plain
+`enqueue.mjs` retry on that branch for an obviously flaky failure. A conflict-only drop: the same
+rebase (only when every branch below is the agent's own), regenerate generated files instead of
+merging them, the focused checks, the same `gt submit`, then right away `git switch <range top>
+&& node tools/ci/enqueue.mjs` and `node tools/ci/wait-queue.mjs <its PR>`, without waiting for
+the pull request's checks: the queue's draft runs the full suite (only when `gt merge` refuses
+because checks still run: `node tools/ci/wait-checks.mjs <its PR>`, then `enqueue.mjs` once
+more). The
 message goes out once the agent is idle; Paseo resumes it if it has stopped. While the agent is
 in a turn or waiting for an answer, or Paseo is not connected,
 the message waits for a later poll. When the agent is gone or archived, the same text becomes a
@@ -750,7 +753,7 @@ new message, the first that applies:
 | Failed checks | a ready pull request whose latest run of a check failed (pending runs and `Graphite / mergeability_check` do not count) | the failed checks with links; fix, then `gt submit --stack` |
 | Changes requested | a reviewer's latest approving, change-requesting or dismissed review asks for changes (on any commit), or GitHub's review decision is "changes requested" | each such review and the unresolved review threads; address them, then `gt submit --stack` (for a review on an earlier commit: reply on its threads and re-request the review) |
 | Findings | unresolved review threads a bot started (Greptile, any bot reviewer) | the findings; run the AGENTS.md review loop |
-| Merge | `PR code` and `PR metadata` ran on the head and succeeded or were skipped (so did `Label queued PRs for Linear` when it ran), every other check is green (except Graphite's mergeability check), no change request is open, no review thread is unresolved, and Greptile has reviewed the current head when the pull request has `complex-review` (a Greptile review on the head, or, for a review without findings, which files no review, Greptile's summary comment naming the head as its `Last reviewed commit`) | for the ticket's highest such pull request whose pull requests below it are all such too: `gt checkout <its branch> && gt merge` (which enqueues the ones below it), then `node tools/ci/wait-queue.mjs <its number>`; the rest of the stack follows once it is reviewed |
+| Merge | `PR code` and `PR metadata` ran on the head and succeeded or were skipped (so did `Label queued PRs for Linear` when it ran), every other check is green (except Graphite's mergeability check), no change request is open, no review thread is unresolved, and Greptile has reviewed the current head when the pull request has `complex-review` (a Greptile review on the head, or, for a review without findings, which files no review, Greptile's summary comment naming the head as its `Last reviewed commit`) | for the ticket's highest such pull request whose pull requests below it are all such too: `gt checkout <its branch> && node tools/ci/enqueue.mjs` (which enqueues the ones below it; never a bare `gt merge`), then `node tools/ci/wait-queue.mjs <its number>`; the rest of the stack follows once it is reviewed |
 
 The first four stages look at the ticket's recorded pull request. The merge stage covers every
 open pull request of the ticket: the recorded one and each whose title names the ticket as a

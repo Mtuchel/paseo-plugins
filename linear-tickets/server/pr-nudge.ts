@@ -149,6 +149,6 @@ export function mergeText(url: string, view: PullRequestView, below: { number: n
   return [
     `[The pull request](${url}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.`,
     ...(below.length ? [`So are the pull requests below it: ${below.map((pull) => `[#${pull.number}](${pull.url})`).join(", ")}.`] : []),
-    `Next step: \`gt checkout ${view.headBranch} && gt merge\`${below.length ? " (it enqueues the pull requests below it too)" : ""}, then \`node tools/ci/wait-queue.mjs ${number}\`. The rest of the stack follows once it is reviewed.`,
+    `Next step: \`gt checkout ${view.headBranch} && node tools/ci/enqueue.mjs\`${below.length ? " (it enqueues the pull requests below it too)" : ""}, then \`node tools/ci/wait-queue.mjs ${number}\`. Never a bare \`gt merge\`: \`enqueue.mjs\` refuses a range that conflicts with \`main\` or the queue tip and names the fix. The rest of the stack follows once it is reviewed.`,
   ].join("\n");
 }

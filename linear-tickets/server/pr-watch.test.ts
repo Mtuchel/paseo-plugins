@@ -160,10 +160,10 @@ test("a queue drop prompts the live agent once with the reason, the failed check
   assert.match(prompt, /Reason: The merge queue closed its draft pull request #437 without landing it\./);
   assert.match(prompt, /- \[Code validation \/ Core \(core-web\)\]\(https:\/\/github\.com\/tuchel-sohn\/tuchel-platform\/actions\/runs\/1\/job\/2\) — failure/);
   assert.match(prompt, /worktree \(`\/wt\/tuc-1`\), on the top branch of the stack, run `git fetch origin main && git rebase --update-refs --onto origin\/main "\$\(git merge-base HEAD origin\/main\)"`/);
-  assert.match(prompt, /`gt submit --stack --ignore-out-of-sync-trunk`, then `git switch mtuchel\/tuc-1-fix && gt merge` \(the top branch of the dropped queue range, not the stack's top branch\) and `node tools\/ci\/wait-queue\.mjs 419`/);
+  assert.match(prompt, /`gt submit --stack --ignore-out-of-sync-trunk`, then `git switch mtuchel\/tuc-1-fix && node tools\/ci\/enqueue\.mjs` \(the top branch of the dropped queue range, not the stack's top branch; never a bare `gt merge`[^\n]*\) and `node tools\/ci\/wait-queue\.mjs 419`/);
   assert.doesNotMatch(prompt, /run `gt sync/);
   assert.match(prompt, /If your stack sits on a PR that has already landed, or your PR was auto-closed, follow docs\/automation\/merge-queue\.md instead\.\n2\. Fix the cause\./);
-  assert.match(prompt, /one plain `gt merge` retry/);
+  assert.match(prompt, /one plain `node tools\/ci\/enqueue\.mjs` retry/);
   assert.match(said, /^say thought The merge queue dropped the pull request/);
   assert.deepEqual(await h.poll(), [], "not prompted again on the next poll");
   // Graphite's bullet for the same attempt arrives later; it is the same drop.
@@ -488,7 +488,7 @@ test("a ready, green, reviewed pull request outside the queue is told to merge; 
   h.github.view = { ...h.github.view, reviewDecision: "CHANGES_REQUESTED" };
   assert.match(promptOf(await h.poll()) ?? "", /^GitHub reports changes requested/, "no merge while GitHub reports changes requested");
   h.github.view = { ...h.github.view, reviewDecision: "", checks: [...h.github.view.checks, { ...RUNNING_CI, name: "Graphite / mergeability_check" }] };
-  assert.equal(promptOf(await h.poll()), `[The pull request](${PR}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.\nNext step: \`gt checkout mtuchel/tuc-1-fix && gt merge\`, then \`node tools/ci/wait-queue.mjs 419\`. The rest of the stack follows once it is reviewed.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+  assert.equal(promptOf(await h.poll()), `[The pull request](${PR}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.\nNext step: \`gt checkout mtuchel/tuc-1-fix && node tools/ci/enqueue.mjs\`, then \`node tools/ci/wait-queue.mjs 419\`. Never a bare \`gt merge\`: \`enqueue.mjs\` refuses a range that conflicts with \`main\` or the queue tip and names the fix. The rest of the stack follows once it is reviewed.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
 });
 
 test("with complex-review, Greptile's summary comment naming the head as its last reviewed commit counts as its review when it left no findings", async (t) => {
@@ -613,7 +613,7 @@ test("the merge nudge names the ticket's highest ready pull request with everyth
   assert.equal(promptOf(calls), [
     `[The pull request](${pull(1501)}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.`,
     `So are the pull requests below it: [#419](${PR}).`,
-    "Next step: `gt checkout mtuchel/tuc-1-b && gt merge` (it enqueues the pull requests below it too), then `node tools/ci/wait-queue.mjs 1501`. The rest of the stack follows once it is reviewed.",
+    "Next step: `gt checkout mtuchel/tuc-1-b && node tools/ci/enqueue.mjs` (it enqueues the pull requests below it too), then `node tools/ci/wait-queue.mjs 1501`. Never a bare `gt merge`: `enqueue.mjs` refuses a range that conflicts with `main` or the queue tip and names the fix. The rest of the stack follows once it is reviewed.",
     "",
     "This is nudge 1 of 2 for this step; after that the owner takes over.",
   ].join("\n"), "1502's CI still runs, so 1503 above it waits too; TUC-10's pull request is not the ticket's");
@@ -629,7 +629,7 @@ test("a merge conflict before any queue draft, or with nothing failed or running
   assert.match(prompt, /Conflict only: .*\(docs\/automation\/merge-queue\.md#conflict-only-drops\)/);
   assert.match(prompt, /`git fetch origin main && git rebase --update-refs --onto origin\/main "\$\(git merge-base HEAD origin\/main\)"`/);
   assert.match(prompt, /regenerate them; never merge them by hand\. Run the focused checks/);
-  assert.match(prompt, /then right away `git switch mtuchel\/tuc-1-fix && gt merge` \(the top branch of the dropped queue range, not the stack's top branch\) and `node tools\/ci\/wait-queue\.mjs 419`\. Do not wait for the pull request's checks[^\n]*wait with `node tools\/ci\/wait-checks\.mjs 419` and run `gt merge` once more\./);
+  assert.match(prompt, /then right away `git switch mtuchel\/tuc-1-fix && node tools\/ci\/enqueue\.mjs` \(the top branch of the dropped queue range, not the stack's top branch; never a bare `gt merge`[^\n]*\) and `node tools\/ci\/wait-queue\.mjs 419`\. Do not wait for the pull request's checks[^\n]*wait with `node tools\/ci\/wait-checks\.mjs 419` and run `node tools\/ci\/enqueue\.mjs` once more\./);
   assert.doesNotMatch(prompt, /Fix the cause/);
   assert.match(prompt, /This is automatic restack 1 of 5 for this pull request/);
 
@@ -656,7 +656,7 @@ test("a drop re-enqueues the dropped queue range from its top branch, never from
     h.github.open = stack;
     const prompt = promptOf(await h.poll()) ?? "";
     assert.match(prompt, outcome === CONFLICT ? /Conflict only/ : /Fix the cause/);
-    assert.match(prompt, /`git switch mtuchel\/tuc-1-b && gt merge` \(the top branch of the dropped queue range, not the stack's top branch\) and `node tools\/ci\/wait-queue\.mjs 1501`/, outcome);
+    assert.match(prompt, /`git switch mtuchel\/tuc-1-b && node tools\/ci\/enqueue\.mjs` \(the top branch of the dropped queue range, not the stack's top branch;[^\n]*\) and `node tools\/ci\/wait-queue\.mjs 1501`/, outcome);
     assert.doesNotMatch(prompt, /tuc-1-c|1502|tuc-10-x|wait-queue\.mjs 1600/, outcome);
 
     // Without a draft listing the range, the dropped pull request is its top.
@@ -664,7 +664,7 @@ test("a drop re-enqueues the dropped queue range from its top branch, never from
     bare.github.view = { ...OPEN_PR, mergeActivity: activity(QUEUED, outcome) };
     bare.github.open = stack;
     const own = promptOf(await bare.poll()) ?? "";
-    assert.match(own, /`git switch mtuchel\/tuc-1-fix && gt merge` [^\n]* and `node tools\/ci\/wait-queue\.mjs 419`/, outcome);
+    assert.match(own, /`git switch mtuchel\/tuc-1-fix && node tools\/ci\/enqueue\.mjs` [^\n]* and `node tools\/ci\/wait-queue\.mjs 419`/, outcome);
     assert.doesNotMatch(own, /tuc-1-c|1502/, outcome);
   }
 });
