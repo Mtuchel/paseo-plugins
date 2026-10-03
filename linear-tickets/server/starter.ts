@@ -3,6 +3,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { TicketDetail } from "../shared/contracts";
 import { advisorSteps } from "../shared/plan-advisor";
 import { mappedBaseBranch, mappingLabel, type ProjectMapping } from "../shared/mapping";
+import { Capacity } from "./capacity";
 import type { Handover } from "./handover";
 import type { Launcher } from "./launch";
 import type { LinearService } from "./linear";
@@ -19,6 +20,7 @@ type Deps = {
   handover?: Pick<Handover, "resumeTarget">;
   branches?: typeof readBranches;
   scheduler?: Scheduler;
+  capacity?: Capacity;
   presence?: Pick<Presence, "away">;
 };
 
@@ -115,11 +117,14 @@ export async function runningTicketAgents(paseo: PaseoApi): Promise<string[]> {
 // handover on this ticket, the same branch and worktree so the new agent continues its work.
 export class TicketStarter {
   private readonly branches: typeof readBranches;
-  // Shared by every start path, so all of them wait in one line (README, "Who starts next").
+  // Shared by every start path, so all of them wait in one line (README, "Who starts next")
+  // under one cap (README, "Memory lease").
   readonly scheduler: Scheduler;
+  readonly capacity: Capacity;
 
   constructor(private readonly deps: Deps) {
     this.branches = deps.branches ?? readBranches;
+    this.capacity = deps.capacity ?? new Capacity();
     this.scheduler = deps.scheduler ?? new Scheduler({
       running: runningTicketAgents,
       projectOf: async (issueId) => (await deps.linear.issueState(issueId)).projectId,
@@ -134,7 +139,7 @@ export class TicketStarter {
     if (state.blockedBy.length) return { ok: false, reason: `Waiting for ${state.blockedBy.join(", ")} to finish.` };
     const untrusted = isUntrusted(state, await this.deps.linear.viewerId(), await this.deps.linear.appUserId());
     const attended = needsOwner(state.labels.map((item) => item.name), untrusted, settings.dispatch.label);
-    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended }, paseo, settings.dispatch.maxRunning);
+    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended }, paseo, this.capacity.limit(settings.dispatch.maxRunning));
   }
 
   async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean }): Promise<Started> {

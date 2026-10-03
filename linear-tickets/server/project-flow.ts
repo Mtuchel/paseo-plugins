@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { ProjectStatus } from "../shared/contracts";
+import type { Capacity } from "./capacity";
 import { dispatchLabels } from "./dispatch";
 import type { LinearService, ProjectIssue } from "./linear";
 import { PLAN_LABEL } from "./plan-policy";
@@ -72,6 +73,8 @@ export function parseOrder(plan: string): OrderStep[] {
 type Deps = {
   linear: Pick<LinearService, "labeledProjects" | "projectIssues" | "issueDescriptions" | "createIssue" | "addLabel" | "removeLabel" | "delegate" | "addBlocker" | "complete" | "comment" | "appUserId" | "viewerId">;
   scheduler: Pick<Scheduler, "note" | "admit" | "release">;
+  // The cap the starter's start paths admit under (max agents, or a memory lease).
+  capacity: Pick<Capacity, "limit">;
   store?: ProjectStore;
   // Stops the planner's turn and archives it once its plan is applied.
   retire: (agentId: string, paseo: PaseoApi) => Promise<void>;
@@ -190,7 +193,7 @@ export class ProjectFlow {
     }));
     this.deps.scheduler.note(candidates);
     for (const candidate of candidates) {
-      const admission = await this.deps.scheduler.admit(candidate, paseo, settings.dispatch.maxRunning);
+      const admission = await this.deps.scheduler.admit(candidate, paseo, this.deps.capacity.limit(settings.dispatch.maxRunning));
       if (!admission.ok) continue;
       try {
         await this.deps.linear.delegate(candidate.issueId, appId);

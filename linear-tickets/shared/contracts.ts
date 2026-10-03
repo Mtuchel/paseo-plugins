@@ -296,6 +296,33 @@ export const setPresenceRpc = defineRpc({
   output: presenceSchema,
 });
 
+// RAM lease (README, "Memory lease"): the Paseo Agents menu bar app caps new ticket-agent starts
+// by free memory for a short while. `limit` is the cap in effect now (null: no limit); `source`
+// is "ram" while the lease is what applies. Server-side validation (capacity.ts) owns the exact
+// ranges; these bound the wire shape.
+export const capacityLeaseSchema = z.object({ limit: z.number().int(), reason: z.string(), until: z.string() });
+export type CapacityLease = z.infer<typeof capacityLeaseSchema>;
+export const capacityStateSchema = z.object({
+  maxRunning: z.number().int(),
+  limit: z.number().int().nullable(),
+  source: z.enum(["settings", "ram"]),
+  lease: capacityLeaseSchema.nullable(),
+  running: z.number().int(),
+  reserved: z.number().int(),
+  waiting: z.number().int(),
+});
+export type CapacityState = z.infer<typeof capacityStateSchema>;
+export const capacityRpc = defineRpc({
+  name: "linear.capacity",
+  input: z.object({}),
+  output: capacityStateSchema,
+});
+export const setCapacityRpc = defineRpc({
+  name: "linear.set-capacity",
+  input: z.object({ lease: z.object({ limit: z.number().int(), ttlSeconds: z.number().int(), reason: z.string().max(200) }).nullable() }),
+  output: capacityStateSchema,
+});
+
 // The native Linear agent's health for the settings screen.
 export const agentStatusRpc = defineRpc({
   name: "linear.agent-status",

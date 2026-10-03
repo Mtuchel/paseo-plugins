@@ -1,4 +1,5 @@
 import type { PaseoApi } from "@getpaseo/client";
+import type { EffectiveLimit } from "./capacity";
 
 // Who gets the next free agent slot (README, "Who starts next"). Every path that wants to start a
 // ticket asks here: threads waiting their turn, labelled tickets and project tickets. Each ask
@@ -76,8 +77,8 @@ export class Scheduler {
     this.reserved.delete(issueId);
   }
 
-  // `limit` 0: no limit. Asking registers the ticket as waiting.
-  async admit(candidate: Candidate, paseo: PaseoApi, limit: number): Promise<Admission> {
+  // `cap.limit` null: no limit; 0 admits nothing (a memory lease). Asking registers the ticket as waiting.
+  async admit(candidate: Candidate, paseo: PaseoApi, cap: EffectiveLimit): Promise<Admission> {
     if (this.reserved.has(candidate.issueId)) return { ok: true };
     const away = (await this.deps.away?.()) ?? false;
     if (away && candidate.attended) {
@@ -86,13 +87,15 @@ export class Scheduler {
     }
     this.note([candidate]);
     const now = (this.deps.now ?? Date.now)();
-    if (limit <= 0) return this.reserve(candidate, now);
-    if (!this.runningCache || now - this.runningCache.at > RUNNING_CACHE_MS) this.runningCache = { at: now, ids: await this.deps.running(paseo) };
-    const running = this.runningCache.ids;
-    for (const [issueId, reservation] of this.reserved) if (reservation.until < now || running.includes(issueId)) this.reserved.delete(issueId);
-    for (const [issueId, waiting] of this.waiting) if (now - waiting.seenAt > WAITING_MS || running.includes(issueId)) this.waiting.delete(issueId);
+    const limit = cap.limit;
+    if (limit === null) return this.reserve(candidate, now);
+    const running = await this.refresh(paseo, now);
     const used = running.length + this.reserved.size;
-    if (used >= limit) return { ok: false, reason: `Queued: ${used} of ${limit} ticket agents are working. It starts when one finishes.` };
+    if (used >= limit) {
+      return { ok: false, reason: cap.source === "ram" && cap.lease
+        ? `Queued: RAM-limited, ${used} of ${limit} slots used (${cap.lease.reason}). It starts when memory frees up.`
+        : `Queued: ${used} of ${limit} ticket agents are working. It starts when one finishes.` };
+    }
     const load = new Map<string | null, number>();
     for (const issueId of running) {
       if (!this.projects.has(issueId)) this.projects.set(issueId, await this.deps.projectOf(issueId).catch(() => null));
@@ -105,6 +108,21 @@ export class Scheduler {
     if (picked.some((item) => item.issueId === candidate.issueId)) return this.reserve(candidate, now);
     const ahead = rankWaiting(line, load, line.length).findIndex((item) => item.issueId === candidate.issueId);
     return { ok: false, reason: `Queued: ${limit - used} free agent slot${limit - used === 1 ? "" : "s"}, ${ahead} ticket${ahead === 1 ? "" : "s"} ahead. It starts when its turn comes.` };
+  }
+
+  // Ticket agents working, admitted ones whose agent is not visible yet, and tickets waiting for a slot.
+  async counts(paseo: PaseoApi): Promise<{ running: number; reserved: number; waiting: number }> {
+    const running = await this.refresh(paseo, (this.deps.now ?? Date.now)());
+    return { running: running.length, reserved: this.reserved.size, waiting: this.waiting.size };
+  }
+
+  // The working agents (read once per burst), with stale reservations and waiting tickets dropped.
+  private async refresh(paseo: PaseoApi, now: number): Promise<string[]> {
+    if (!this.runningCache || now - this.runningCache.at > RUNNING_CACHE_MS) this.runningCache = { at: now, ids: await this.deps.running(paseo) };
+    const running = this.runningCache.ids;
+    for (const [issueId, reservation] of this.reserved) if (reservation.until < now || running.includes(issueId)) this.reserved.delete(issueId);
+    for (const [issueId, waiting] of this.waiting) if (now - waiting.seenAt > WAITING_MS || running.includes(issueId)) this.waiting.delete(issueId);
+    return running;
   }
 
   private reserve(candidate: Candidate, now: number): Admission {

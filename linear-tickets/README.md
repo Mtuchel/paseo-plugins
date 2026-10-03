@@ -516,6 +516,16 @@ schedule's next switch, or, without a schedule, until you toggle again. Changing
 drops an earlier toggle. Both are kept in `~/.paseo/linear-tickets/presence.json` and are read
 and changed through the `linear.presence` and `linear.set-presence` RPCs.
 
+**Memory lease.** The Paseo Agents menu bar app can cap new ticket-agent starts by free memory.
+It sends a lease (a slot count, a reason, and a lifetime of 30–600 seconds) through
+`linear.set-capacity` and renews it while it runs; `linear.capacity` reads the cap in effect and
+how many ticket agents are working, reserved and waiting. With *max agents* set, the lower of the
+two applies; with no limit there, the lease alone does. A lease of 0 starts nothing new. Tickets
+held back by the lease wait in the same line, with a reason like `Queued: RAM-limited, 12 of 12
+slots used (…)`. The lease lives in the plugin's memory only: when it runs out, the app sends
+`lease: null`, or the daemon restarts, *max agents* applies again. It only gates new starts and
+never stops or touches agents already working.
+
 **Split into sub-issues.** A plan with 2–12 steps also offers **Approve & split into N
 sub-issues**. The plan becomes the parent's plan document and the planning agent is closed.
 Each step becomes a sub-issue in Todo, assigned to Paseo, blocked by the step before, and the
