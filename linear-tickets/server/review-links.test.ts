@@ -141,8 +141,8 @@ test("the inbox lists only reviews the owner can open now, oldest first, and the
     assert.equal(response.status, 200);
     const page = await response.text();
     const [waiting, recent] = page.split("Recently decided");
-    const listed = [...waiting.matchAll(/href="\/review\/([^"]+)"/g)].map((match) => match[1]);
-    assert.deepEqual(listed, ["agent-1", "agent-2", "agent-3"]);
+    const listed = [...waiting.matchAll(/href="\/review\/([^"]+)" target="_blank"/g)].map((match) => match[1]);
+    assert.deepEqual(listed, ["agent-1", "agent-2", "agent-3"], "rows open the review in a browser tab, not inside the home-screen app");
     assert.match(waiting, /&#60;TUC-2&#62;/);
     assert.doesNotMatch(page, /TUC-3-old/);
     assert.match(recent, /TUC-6/);

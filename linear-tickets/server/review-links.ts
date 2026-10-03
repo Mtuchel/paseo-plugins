@@ -167,8 +167,10 @@ const MANIFEST = JSON.stringify({ name: "Plan reviews", short_name: "Reviews", s
 // Rows link to the agent's stable /review/<agentId> link, which shows the closed page if the review
 // ends before it is tapped.
 function inboxPage({ open, decided }: { open: ReviewEntry[]; decided: ReviewEntry[] }, now: Date): string {
+  // A new browser tab: the stable link redirects to the review's own port, another origin, which a
+  // home-screen app (iOS standalone mode) can fail to open inside itself; Safari follows it.
   const waiting = open.length
-    ? `<ul>${open.map((entry) => `<li><a href="/review/${encodeURIComponent(entry.agentId)}"><div class="head"><span class="id">${reviewName(entry)}</span><span class="meta">${ago(entry.openedAt, now)}</span></div>${detailRows(entry.details, true)}</a></li>`).join("")}</ul>`
+    ? `<ul>${open.map((entry) => `<li><a href="/review/${encodeURIComponent(entry.agentId)}" target="_blank" rel="noopener"><div class="head"><span class="id">${reviewName(entry)}</span><span class="meta">${ago(entry.openedAt, now)}</span></div>${detailRows(entry.details, true)}</a></li>`).join("")}</ul>`
     : `<p class="empty">Nothing to review.</p>`;
   const recent = decided.length
     ? `<h2>Recently decided</h2><ul>${decided.map((entry) => `<li><div><div class="head"><span class="id">${reviewName(entry)}</span><span class="meta">${escapeHtml(outcomeText(entry))} · ${ago(entry.closedAt ?? entry.openedAt, now, true)}</span></div>${detailRows(entry.details, false)}</div></li>`).join("")}</ul>`

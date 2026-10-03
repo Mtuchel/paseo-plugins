@@ -820,7 +820,8 @@ risk rating (see *Plan risk and auto-approval*) as a coloured badge (green impac
 3–4; planner and advisor combined, as the policy reads it) and why the risk policy left it to
 you. Decided rows keep the title and badge, and say `auto-approved` when the policy approved
 it. The details are read once when the review opens (plans that predate the rating have no
-badge). The page refreshes every 30 s. On a phone, use “Add to Home Screen” to keep it as an app.
+badge). The page refreshes every 30 s. On a phone, use “Add to Home Screen” to keep it as an app;
+a tapped review opens in a browser tab, since each review runs on its own port (another origin).
 
 With status write-back on, a ticket moves to its team's started state named **Planning**
 when a plan is handed off (and stays there when it is sent back), and to **In Progress** once
