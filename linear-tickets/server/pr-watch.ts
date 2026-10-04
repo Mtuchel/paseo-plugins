@@ -8,7 +8,12 @@ import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
 import { CODING_STATE } from "./plannotator";
-import { mergeable, mergeText, STAGE_STEP, stalledStage, type ReviewThread, type Stage } from "./pr-nudge";
+import { STAGE_STEP, stalledStage, type ReviewThread, type Stage } from "./pr-nudge";
+import {
+  activityBoundary, BACKSTOP_ENQUEUE, BackstopCheckout, CLASS_TEXT, commentOnce, dropWhy, ENQUEUE_READY, enqueueArgs, enqueuedComment, HELD_KINDS, parseEnqueue, parseExpect, parseJudgment, parseReady,
+  READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, runNodeScript, WAIT_QUEUE, waitQueueArgs,
+  type ActionRecord, type DropClass, type DropJudgment, type Problem, type Refusal, type ScriptRunner,
+} from "./queue-backstop";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
 import type { Settings } from "./settings";
@@ -16,6 +21,11 @@ import { paseoHome } from "./ticket-mcp";
 
 const exec = promisify(execFile);
 const INTERVAL_MS = 2 * 60 * 1000;
+// The queue backstop (see queueBackstop) runs this often, and right after a poll claimed a drop
+// it re-enqueues.
+const BACKSTOP_INTERVAL_MS = 10 * 60 * 1000;
+// Finished actions and refusals are kept this long, so a round is never acted on twice.
+const BACKSTOP_MEMORY_MS = 14 * 24 * 60 * 60 * 1000;
 const REVIEW_STATE = "In Review";
 // Approved and waiting for the merge click; teams without this state stay in In Review.
 const READY_STATE = "Ready to merge";
@@ -26,8 +36,11 @@ const QUEUE_DRAFT_TITLE = "[Graphite MQ] Draft PR";
 // Automatic prompts per pull request and drop kind (docs/automation/merge-queue.md in the repo):
 // one fix request after a plain drop, up to five restacks after conflict-only drops. The next drop
 // of a kind goes to the owner instead, and after that escalation no drop prompts the agent again.
-// Main-broken drops have no budget: they count toward neither limit.
+// Main-broken drops have no budget: they count toward neither limit. An automatic re-enqueue after
+// a flaky or infra drop counts as a plain drop.
 const DROP_PROMPTS: Record<Exclude<DropKind, "main">, number> = { plain: 1, conflict: 5 };
+// How the repo's drop class counts (see claimDrop).
+const DROP_KIND: Record<DropClass, DropKind> = { conflictOnly: "conflict", mainBroken: "main", infra: "plain", flaky: "plain", genuine: "plain" };
 // Nudges per pull request and lifecycle stage; the next time that stage stalls goes to the owner.
 const STAGE_NUDGES = 2;
 // The owner's veto: such a pull request is never nudged.
@@ -63,55 +76,73 @@ export type PullRequestView = {
 };
 // `held`: approved, but kept out of Ready to merge while manual tasks due before merge are open.
 // `closed`: closed without merging. Merge queue drops already claimed, by draft (`#123`) or, for
-// drops before any draft, by the Merge activity bullet: `drops` the plain ones (and every drop
-// claimed before drops had kinds), `conflicts` the conflict-only ones, `mainBroken` the main-broken
-// ones (counted toward neither limit). `escalated`: a drop went to the owner; before drops had
-// kinds that was the third drop. `pending`: the claimed drop still to
-// be delivered. `replay`: closed without merging, `due` until the closure was looked at once,
+// drops before any draft, by the Merge activity bullet, on every pull request of the dropped range:
+// `drops` the plain ones (and every drop claimed before drops had kinds), `conflicts` the
+// conflict-only ones, `mainBroken` the main-broken ones (counted toward neither limit).
+// `escalated`: a drop went to the owner (every pull request of the range is marked); before drops
+// had kinds that was the third drop. `pending`: the claimed drop (or refused enqueue) still to be
+// delivered. `replay`: closed without merging, `due` until the closure was looked at once,
 // `asked` once the agent was told to open a replacement pull request (see replace). `nudges`: per
 // stage, one key per nudge (or the escalation after them): the head, or for requested changes the
 // reviews it covered, space-separated (see stalledStage). `activeAt`: the last change, drop or
 // nudge seen. `missing`: GitHub has no pull request at the link (a made-up or mistyped URL); it is
 // never read again, so a later pull request that takes the number is not mistaken for the ticket's.
 // `advance`: landed, `due` until the ticket's next open pull request was looked for (see advance).
-type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; conflicts?: string[]; mainBroken?: string[]; escalated?: boolean; pending?: PendingDrop | null; replay?: "due" | "asked"; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean; advance?: "due" };
-// A claimed drop, saved before anything is sent. `fix` goes to the agent (or, when it is gone, to
-// the ticket); without it, `facts` escalate to the owner. `sending`: a message went out and its
-// result was not recorded (a restart or a failed save), so it is not sent again.
-type PendingDrop = { key: string; reason: string; facts: string; fix: string | null; sending?: boolean };
+// The queue backstop's state (see queueBackstop): `blockedAt`, the head a genuine drop (or a drop
+// whose code could not be compared) left, which no automatic enqueue touches until a new head;
+// `actions`, its enqueues of ranges whose top this is; `refusals`, their refused enqueues.
+type Seen = {
+  reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; conflicts?: string[]; mainBroken?: string[]; escalated?: boolean; pending?: PendingDrop | null; replay?: "due" | "asked"; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean; advance?: "due";
+  blockedAt?: string; actions?: ActionRecord[]; refusals?: Refusal[];
+};
+// A claimed drop or refused enqueue, saved before anything is sent. `fix` goes to the agent (or,
+// when it is gone, to the ticket); without it, `facts` escalate to the owner. `sending`: a message
+// went out and its result was not recorded (a restart or a failed save), so it is not sent again.
+// `subject` names it in the agent panel ("The merge queue dropped the pull request" by default).
+// `orphan`: the pull request has no handover record, so it goes to its tickets, or without one as
+// a pull request comment (see deliverOrphan).
+type PendingDrop = { key: string; reason: string; facts: string; fix: string | null; sending?: boolean; subject?: string; orphan?: { tickets: string[] } };
 type Change = { thought: string; review: string; state?: string };
 
 // A draft pull request the merge queue tests a stack on; `base` is the branch it lands on.
 export type QueueDraft = { number: number; title: string; body: string; state: string; headSha: string; base: string };
-// A check run on a queue draft that did not pass; `completedAt` is null while it still runs.
-export type FailedCheck = { name: string; url: string; conclusion: string; completedAt: string | null };
 // An open pull request of the repo, from one listing per repo and poll; `trunk` is the repo's
 // default branch.
 export type OpenPull = { number: number; url: string; title: string; headBranch: string; headSha: string; baseBranch: string; trunk: string; draft: boolean; labels: string[] };
-// The GitHub reads beyond the pull request itself; `repo` is `owner/name`.
+// The GitHub reads beyond the pull request itself, and the queue backstop's pull request comments;
+// `repo` is `owner/name`.
 export type GitHubReader = {
   // Graphite's recent draft pull requests in the repo.
   drafts(repo: string): Promise<QueueDraft[]>;
   // Whether the draft's head reached its base branch.
   landed(repo: string, draft: QueueDraft): Promise<boolean>;
-  // Every check run on the commit that did not pass, still running ones included.
-  failedChecks(repo: string, sha: string): Promise<FailedCheck[]>;
-  // The failed jobs of `main`'s deciding ci.yml run attempt at `at` (epoch ms), or null when no run
-  // had decided by then (see mainFailedJobsAt).
-  mainFailedJobs(repo: string, at: number): Promise<string[] | null>;
   reviewThreads(repo: string, number: number): Promise<ReviewThread[]>;
   // Every open pull request of the repo (REST, every page).
   openPullRequests(repo: string): Promise<OpenPull[]>;
   branchExists(repo: string, branch: string): Promise<boolean>;
+  // The bodies of the pull request's conversation comments (REST, every page), and a new one.
+  pullComments(repo: string, number: number): Promise<string[]>;
+  commentOnPull(repo: string, number: number, body: string): Promise<void>;
 };
-// The pull request a ticket's merge nudge names, with the ready ones below it (bottom first).
-type MergeTarget = { pull: OpenPull; view: PullRequestView; below: OpenPull[] };
+// The queue backstop's runners (see queueBackstop): the repo's scripts, the checkout they run in,
+// and the clock its hourly retries use.
+export type BackstopDeps = { run?: ScriptRunner; checkout?: Pick<BackstopCheckout, "prepare" | "commentFile">; now?: () => number };
 // `repo` is the pull request's `owner/name` and `number` its number; `draft.headSha` is null when
 // the draft is no longer listed, and `draft.pulls` are the pull requests its body lists (none then).
 type Drop = { key: string; reason: string; repo: string; number: number; draft: { number: number; url: string; headSha: string | null; pulls: number[] } | null };
-// `conflict`: Graphite names a merge conflict and nothing else went wrong (see isConflictOnly).
-// `main`: every failed job on the queue's draft was already red on `main` (see isMainBroken).
+// `conflict`: the repo's class is conflictOnly; `main`: mainBroken; `plain`: any other class.
 type DropKind = "plain" | "conflict" | "main";
+// What one poll or backstop run reads at most once per repo.
+type RunContext = { records: HandoverRecord[]; pulls(repo: string): Promise<OpenPull[]>; checkout(repo: string): Promise<string | null>; now: number };
+
+const pullUrl = (repo: string, number: number) => `https://github.com/${repo}/pull/${number}`;
+const PULL_URL = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/;
+
+// The pull request's entry, created when it has none.
+function entry(seenByUrl: Record<string, Seen>, url: string): Seen {
+  seenByUrl[url] ??= { reviewedAt: null, decision: null, merged: false };
+  return seenByUrl[url];
+}
 
 // A pull request title that names the ticket as a whole word (`Add TUC-34 [area] …`, never TUC-343).
 function namesTicket(identifier: string): RegExp {
@@ -234,18 +265,6 @@ export const githubReader: GitHubReader = {
     const { status } = await ghJson<{ status?: string }>(["api", `repos/${repo}/compare/${draft.headSha}...${encodeURIComponent(draft.base)}`, "--jq", "{status}"]);
     return status === "identical" || status === "ahead";
   },
-  // Every page (a draft runs about 90 check runs): a failed or still running run left out must
-  // never let a drop pass as conflict-only.
-  async failedChecks(repo, sha) {
-    const runs = await ghJson(["api", "--paginate", `repos/${repo}/commits/${sha}/check-runs?per_page=100`, "--jq", "[.check_runs[] | {name, html_url, status, conclusion, completed_at}]"],
-      pages<{ name?: string; html_url?: string; status?: string; conclusion?: string | null; completed_at?: string | null }>);
-    return runs.filter((run) => !PASSING_CONCLUSIONS.includes(run.conclusion ?? ""))
-      .map((run) => ({ name: run.name ?? "check", url: run.html_url ?? "", conclusion: run.conclusion ?? run.status ?? "unknown", completedAt: run.completed_at ?? null }));
-  },
-  // One page per read: a listed run carries both repositories (about 24 KB).
-  mainFailedJobs(repo, at) {
-    return mainFailedJobsAt(repo, at, (path) => ghJson<MainReply>(["api", path]));
-  },
   async openPullRequests(repo) {
     const open = await ghJson(["api", "--paginate", `repos/${repo}/pulls?state=open&per_page=100`, "--jq", "[.[] | {number, url: .html_url, title, headBranch: .head.ref, headSha: .head.sha, baseBranch: .base.ref, trunk: .base.repo.default_branch, draft, labels: [.labels[].name]}]"], pages<OpenPull>);
     return open.sort((a, b) => b.number - a.number);
@@ -259,6 +278,13 @@ export const githubReader: GitHubReader = {
       if (error && typeof error === "object" && "stderr" in error && /HTTP 404/.test(String(error.stderr))) return false;
       throw error;
     }
+  },
+  // Every page: a marker on any page means the comment is already there.
+  async pullComments(repo, number) {
+    return ghJson(["api", "--paginate", `repos/${repo}/issues/${number}/comments?per_page=100`, "--jq", "[.[] | .body]"], pages<string>);
+  },
+  async commentOnPull(repo, number, body) {
+    await ghJson(["api", "-X", "POST", `repos/${repo}/issues/${number}/comments`, "-f", `body=${body}`, "--jq", "{id}"]);
   },
   // Every page: a thread left out could hide a finding or hold a merge.
   async reviewThreads(repo, number) {
@@ -314,111 +340,79 @@ export function activityBullets(body: string | null): Bullet[] {
   });
 }
 
-// A drop whose only cause is a merge conflict (TUC-540; the repo's tools/ci/wait-queue.mjs
-// `isConflictOnly` decides the same for the agent's own wait): Graphite names a merge conflict, and
-// nothing on the queue's draft failed, was cancelled or was still running, or no draft existed.
-// Graphite also says "merge conflicts" for real failures (#429), so a draft whose checks could not
-// be read (no longer listed) makes it a plain drop.
-function isConflictOnly(drop: Drop, checks: FailedCheck[]): boolean {
-  return /merge conflict/i.test(drop.reason) && (drop.draft === null || (drop.draft.headSha !== null && checks.length === 0));
-}
-
-// The repo's tools/ci/main-health.mjs rule for `main`'s state at a past moment (TUC-612): ci.yml
-// runs on `main` from a push or main-ci-dispatch.mjs's `workflow_dispatch`; of a run, the newest
-// attempt that completed, was not cancelled and finished by then decides.
-const MAIN_RUN_EVENTS = ["push", "workflow_dispatch"];
-// Runs listed at most per walk; past it `main`'s state is unknown.
-const MAIN_RUN_CAP = 300;
-// A listed run carries both repositories (about 24 KB), so run pages stay small; job pages hold
-// the API's maximum.
-const MAIN_RUN_PAGE = 10;
-const JOB_PAGE = 100;
-// Job and check conclusions that fail a run.
-const FAILED_CONCLUSIONS = ["failure", "timed_out"];
-// The caller job queue and pull request rows carry ci.yml's jobs behind.
-const CALLER_PREFIX = "Code validation / ";
-// A ci.yml run on `main` as the REST API lists it; also one attempt's metadata.
-type MainRun = { id?: number; event?: string; created_at?: string; run_attempt?: number; status?: string; conclusion?: string | null };
-// A job row of one run attempt.
-type MainJob = { name?: string; status?: string; conclusion?: string | null; completed_at?: string | null };
-// One `gh api` answer of the walk: a page of runs, an attempt's metadata or a page of its jobs.
-export type MainReply = MainRun & { workflow_runs?: MainRun[]; jobs?: MainJob[]; total_count?: number };
-
-// Aggregating checks fail because a job they wait for failed, so the job, not the gate, is the
-// cause; also a gate row recorded under the unexpanded expression a job-level skip leaves.
-export function isGateCheck(name: string): boolean {
-  return /(?:^|\/ )(?:PR code|Platform gate|Post-merge gate)$/.test(name) || /'Post-merge gate'$/.test(name);
-}
-
-// A job's name as ci.yml spells it on a `main` run: queue and pull request rows carry it behind
-// the caller job (`Code validation / Migration replay`).
-export function bareJobName(name: string): string {
-  return name.startsWith(CALLER_PREFIX) ? name.slice(CALLER_PREFIX.length) : name;
-}
-
-// The failed jobs (gates left out) of `main`'s deciding ci.yml run attempt at `at` (epoch ms), or
-// null when none had decided by then (unknown). `get` answers one `gh api` path. Runs are listed
-// newest first up to `at`; a run seen on an earlier page (a new push shifts the pages) is not
-// judged twice, and a page without a new run ends the walk. Of a run, attempts are tried from the
-// newest: one still running or cancelled, with a job still running, or finished after `at` (a
-// later rerun never rewrites history) leaves the decision to the previous one. A read error throws.
-export async function mainFailedJobsAt(repo: string, at: number, get: (path: string) => Promise<MainReply>): Promise<string[] | null> {
-  const created = encodeURIComponent(`<=${new Date(at).toISOString().replace(/\.\d{3}Z$/, "Z")}`);
-  const listed = new Set<number>();
-  for (let page = 1; ; page++) {
-    const runs = (await get(`repos/${repo}/actions/workflows/ci.yml/runs?branch=main&exclude_pull_requests=true&per_page=${MAIN_RUN_PAGE}&page=${page}&created=${created}`)).workflow_runs ?? [];
-    let fresh = 0;
-    for (const run of runs) {
-      if (run.id === undefined || listed.has(run.id)) continue;
-      if (listed.size >= MAIN_RUN_CAP) return null;
-      listed.add(run.id);
-      fresh++;
-      if (!MAIN_RUN_EVENTS.includes(run.event ?? "") || Date.parse(run.created_at ?? "") > at) continue;
-      const latest = run.run_attempt ?? 1;
-      for (let attempt = latest; attempt >= 1; attempt--) {
-        const meta = attempt === latest ? run : await get(`repos/${repo}/actions/runs/${run.id}/attempts/${attempt}`);
-        if (meta.status !== "completed" || meta.conclusion === "cancelled") continue;
-        const jobs: MainJob[] = [];
-        for (let jobPage = 1; ; jobPage++) {
-          const body = await get(`repos/${repo}/actions/runs/${run.id}/attempts/${attempt}/jobs?per_page=${JOB_PAGE}&page=${jobPage}`);
-          const rows = body.jobs ?? [];
-          jobs.push(...rows);
-          if (rows.length < JOB_PAGE || jobs.length >= (body.total_count ?? jobs.length)) break;
-        }
-        const finished = Math.max(0, ...jobs.map((job) => Date.parse(job.completed_at ?? "") || 0));
-        if (jobs.length === 0 || jobs.some((job) => job.status !== "completed") || finished > at) continue;
-        return jobs.filter((job) => job.status === "completed" && FAILED_CONCLUSIONS.includes(job.conclusion ?? "") && !isGateCheck(job.name ?? "")).map((job) => job.name ?? "");
-      }
-    }
-    if (runs.length < MAIN_RUN_PAGE || fresh === 0) return null;
-  }
-}
-
-// A drop whose failed jobs were all red on `main` already (TUC-612; the repo's
-// tools/ci/wait-queue.mjs `mainBroken` decides the same for the agent's own wait): the draft's
-// failed or timed-out checks, gates left out, are not empty, and the bare name of each is a failed
-// job of `main`'s state at that check's own completion (`main`, read once per distinct time).
-// Returns those job names; null for nothing failed, a check without a completion time, an unknown
-// state of `main` or one job `main` did not fail. A read error throws.
-export async function mainBrokenJobs(checks: FailedCheck[], main: (at: number) => Promise<string[] | null>): Promise<string[] | null> {
-  const byTime = new Map<number, string[]>();
-  for (const check of checks) {
-    if (!FAILED_CONCLUSIONS.includes(check.conclusion) || isGateCheck(check.name)) continue;
-    const at = Date.parse(check.completedAt ?? "");
-    if (Number.isNaN(at)) return null;
-    byTime.set(at, [...(byTime.get(at) ?? []), bareJobName(check.name)]);
-  }
-  if (byTime.size === 0) return null;
-  for (const [at, names] of byTime) {
-    const red = await main(at);
-    if (!red || names.some((name) => !red.includes(name))) return null;
-  }
-  return [...new Set([...byTime.values()].flat())];
-}
-
 // A drop went to the owner. Before drops had kinds, the third drop did.
 function escalated(seen: Seen | undefined): boolean {
   return Boolean(seen?.escalated) || (seen?.drops?.length ?? 0) > 2;
+}
+
+// Every drop key claimed on the pull request, of any kind.
+function handledDrops(seen: Seen | undefined): string[] {
+  return [...(seen?.drops ?? []), ...(seen?.conflicts ?? []), ...(seen?.mainBroken ?? [])];
+}
+
+// The dropped queue range, lowest first, with its top pull request and that one's branch, the one
+// `gt merge` ran on: the range `wait-queue.mjs` compared, else the dropped pull request's own
+// chain among the open pull requests the queue's draft listed (a draft can test other stacks too).
+function dropRange(drop: Drop, judgment: DropJudgment, open: OpenPull[]): { prs: number[]; top: number; branch: string } {
+  const branchOf = (top: number) => judgment.revision.branch ?? open.find((pull) => pull.number === top)?.headBranch ?? "";
+  const compared = parseExpect(judgment.revision.expect ?? "")?.map((member) => member.pr);
+  if (compared?.length) return { prs: [...new Set([...compared, drop.number])].sort((a, b) => a - b), top: compared[compared.length - 1], branch: branchOf(compared[compared.length - 1]) };
+  const listed = open.filter((pull) => drop.draft?.pulls.includes(pull.number) || pull.number === drop.number);
+  const dropped = listed.find((pull) => pull.number === drop.number);
+  const chain = [drop.number];
+  for (let below = dropped; below;) {
+    const current: OpenPull = below;
+    below = listed.find((pull) => pull.headBranch === current.baseBranch && !chain.includes(pull.number));
+    if (below) chain.push(below.number);
+  }
+  let top = drop.number;
+  for (let above = dropped; above;) {
+    const current: OpenPull = above;
+    above = listed.filter((pull) => pull.baseBranch === current.headBranch && !chain.includes(pull.number)).sort((a, b) => b.number - a.number)[0];
+    if (above) {
+      chain.push(above.number);
+      top = above.number;
+    }
+  }
+  return { prs: chain.sort((a, b) => a - b), top, branch: branchOf(top) };
+}
+
+// The round right after the backstop's own enqueue of the very heads that are open now: that
+// enqueue proves the code is the code that dropped, whatever the comparison says. Each enqueued
+// action is followed by one round only: the drop marks every action of its pull request.
+function ownRound(drop: Drop, seenByUrl: Record<string, Seen>, open: OpenPull[]): { expect: string; branch: string } | null {
+  let found: { expect: string; branch: string } | null = null;
+  for (const [url, seen] of Object.entries(seenByUrl)) {
+    if (PULL_URL.exec(url)?.[1] !== drop.repo) continue;
+    for (const action of seen.actions ?? []) {
+      if (action.steps.enqueue !== "enqueued" || !action.prs.includes(drop.number) || (action.followedBy ?? drop.key) !== drop.key) continue;
+      action.followedBy = drop.key;
+      const heads = parseExpect(action.expect) ?? [];
+      if (heads.length && heads.every((member) => open.some((pull) => pull.number === member.pr && pull.headSha === member.sha))) found = { expect: action.expect, branch: action.branch };
+    }
+  }
+  return found;
+}
+
+const TICKET_ID = /(?<![A-Za-z0-9-])([A-Z][A-Z0-9]*-\d+)(?![A-Za-z0-9])/g;
+
+// The tickets of a repo's pull requests: the record's, those whose records link one of them, and
+// those their open pull requests' titles name (an identifier Linear does not know is dropped later).
+function ticketsOf(repo: string, prs: number[], open: OpenPull[], records: HandoverRecord[], record: HandoverRecord | null): string[] {
+  const pulls = open.filter((pull) => prs.includes(pull.number));
+  const urls = prs.map((pr) => pullUrl(repo, pr));
+  const found = new Set(record ? [record.identifier] : []);
+  for (const item of records) {
+    if (urls.includes(item.links["Pull request"] ?? "") || pulls.some((pull) => namesTicket(item.identifier).test(pull.title))) found.add(item.identifier);
+  }
+  for (const pull of pulls) for (const match of pull.title.matchAll(TICKET_ID)) found.add(match[1]);
+  return [...found].sort();
+}
+
+// The handover record of one of the tickets: a running agent's first, else the latest one.
+function recordFor(tickets: string[], records: HandoverRecord[]): HandoverRecord | null {
+  const own = records.filter((record) => tickets.includes(record.identifier)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return own.find((record) => record.status !== "archived") ?? own[0] ?? null;
 }
 
 // What changed since the last look, as one panel thought, a progress line and an optional state.
@@ -449,34 +443,51 @@ export function reviewChange(view: PullRequestView, seen: Seen): { change: Chang
 }
 
 // Mirrors each ticket's pull request review into Linear every 2 minutes, sends pull requests the
-// Graphite merge queue dropped back to be fixed, nudges stalled ones to their next step, and
-// follows a pull request closed after part of its stack landed to its replacement.
+// Graphite merge queue dropped back to be fixed (or re-enqueues them when the drop was not their
+// fault), enqueues ready stacks nobody enqueued (see queueBackstop), nudges stalled ones to their
+// next step, and follows a pull request closed after part of its stack landed to its replacement.
 export class PullRequestWatch {
   private timer: NodeJS.Timeout | null = null;
+  private backstopTimer: NodeJS.Timeout | null = null;
   private pausedPool: RateLimitedError["pool"] | null = null;
+  // A poll created an enqueue action: the backstop runs right after it instead of within 10 minutes.
+  private kicked = false;
 
   constructor(
     private readonly deps: {
       handover: Pick<Handover, "all" | "update">;
       sessions: Pick<SessionRouter, "sessionFor" | "say" | "prompt" | "link">;
-      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "viewerId" | "userUrl" | "linkUrl">;
-      manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge">;
+      // `issueState` finds a ticket that has no handover record by its identifier.
+      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "viewerId" | "userUrl" | "linkUrl"> & Partial<Pick<LinearService, "issueState">>;
+      // `tasks` finds the before-merge tasks of tickets that have no handover record.
+      manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge"> & Partial<Pick<ManualTasks, "tasks">>;
       settings: Pick<Settings, "read">;
       view?: (url: string) => Promise<PullRequestView>;
       github?: GitHubReader;
+      backstop?: BackstopDeps;
     },
     private readonly path = join(paseoHome(), "linear-tickets", "pr-watch.json"),
   ) {}
 
   start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => { void this.poll(); }, INTERVAL_MS);
+    this.timer = setInterval(() => {
+      void this.poll().then(() => {
+        if (!this.kicked) return;
+        this.kicked = false;
+        void this.backstop();
+      });
+    }, INTERVAL_MS);
     this.timer.unref?.();
+    this.backstopTimer = setInterval(() => { void this.backstop(); }, BACKSTOP_INTERVAL_MS);
+    this.backstopTimer.unref?.();
   }
 
   stop(): void {
     if (this.timer) clearInterval(this.timer);
+    clearInterval(this.backstopTimer ?? undefined);
     this.timer = null;
+    this.backstopTimer = null;
   }
 
   private async load(): Promise<Record<string, Seen>> {
@@ -493,21 +504,68 @@ export class PullRequestWatch {
   }
 
   private running: Promise<void> | null = null;
+  private backstopping: Promise<void> | null = null;
   private githubThrottled = false;
+  // The poll and the backstop share pr-watch.json, so they take turns.
+  private turn: Promise<unknown> = Promise.resolve();
+
+  private exclusive(work: () => Promise<void>): Promise<void> {
+    const next = this.turn.then(work, work);
+    this.turn = next.catch(() => {});
+    return next;
+  }
 
   // Background priority: requests stop at their pool's reserve. A pause ends the poll (logged once
   // per pool); unsaved records are retried on the next poll. One poll at a time: a tick while the
   // last one still runs joins it.
   poll(): Promise<void> {
-    this.running ??= withPriority("background", () => this.watch()).finally(() => { this.running = null; });
+    this.running ??= this.exclusive(() => withPriority("background", () => this.watch())).finally(() => { this.running = null; });
     return this.running;
+  }
+
+  // One queue backstop run at a time (see queueBackstop); a tick while one runs joins it.
+  backstop(): Promise<void> {
+    this.backstopping ??= this.exclusive(() => withPriority("background", () => this.queueBackstop())).finally(() => { this.backstopping = null; });
+    return this.backstopping;
+  }
+
+  private github(): GitHubReader {
+    return this.deps.github ?? githubReader;
+  }
+
+  private view(url: string): Promise<PullRequestView> {
+    return (this.deps.view ?? viewPullRequest)(url);
+  }
+
+  // The poll's and the backstop's reads, once per repo: the open pull requests and the backstop
+  // checkout (made from the worktree of any record of the repo).
+  private context(records: HandoverRecord[]): RunContext {
+    const pulls = new Map<string, Promise<OpenPull[]>>();
+    const checkouts = new Map<string, Promise<string | null>>();
+    const checkout = this.deps.backstop?.checkout ?? new BackstopCheckout();
+    return {
+      records,
+      now: this.deps.backstop?.now?.() ?? Date.now(),
+      pulls: (repo) => {
+        const listing = pulls.get(repo) ?? this.github().openPullRequests(repo);
+        pulls.set(repo, listing);
+        return listing;
+      },
+      checkout: (repo) => {
+        const sources = records.filter((record) => PULL_URL.exec(record.links["Pull request"] ?? "")?.[1] === repo && record.worktreePath).map((record) => record.worktreePath ?? "");
+        const path = checkouts.get(repo) ?? checkout.prepare(repo, sources);
+        checkouts.set(repo, path);
+        return path;
+      },
+    };
   }
 
   private async watch(): Promise<void> {
     const seenByUrl = await this.load();
     const manual = this.deps.manualTasks;
+    const all = await this.deps.handover.all();
     const records: HandoverRecord[] = [];
-    for (const record of await this.deps.handover.all()) {
+    for (const record of all) {
       const url = record.links["Pull request"];
       if (!url) continue;
       const seen = seenByUrl[url];
@@ -524,15 +582,12 @@ export class PullRequestWatch {
     // Graphite's drafts and the open pull requests are listed once per repo and poll.
     const drafts = new Map<string, Promise<QueueDraft[]>>();
     const listDrafts = (repo: string) => {
-      if (!drafts.has(repo)) drafts.set(repo, (this.deps.github ?? githubReader).drafts(repo));
-      return drafts.get(repo)!;
-    };
-    const pulls = new Map<string, Promise<OpenPull[]>>();
-    const listPulls = (repo: string) => {
-      const listing = pulls.get(repo) ?? (this.deps.github ?? githubReader).openPullRequests(repo);
-      pulls.set(repo, listing);
+      const listing = drafts.get(repo) ?? this.github().drafts(repo);
+      drafts.set(repo, listing);
       return listing;
     };
+    const context = this.context(all);
+    const listPulls = context.pulls;
     const save = () => this.save(seenByUrl);
     // Agents that got a message this poll: one instruction per agent and poll, so the pull
     // requests of one stack do not each send it one.
@@ -580,17 +635,13 @@ export class PullRequestWatch {
         }
         let dropped = Boolean(seenByUrl[url].pending);
         if (!dropped) {
-          const current = seenByUrl[url];
-          const drop = await this.queueDrop(url, view, [...(current.drops ?? []), ...(current.conflicts ?? []), ...(current.mainBroken ?? [])], listDrafts);
-          if (drop) {
+          const drop = await this.queueDrop(url, view, handledDrops(seenByUrl[url]), listDrafts);
+          // Claimed and saved before anything is sent: a later failure, a restart or another
+          // poll never sends it twice. A failed read in claimDrop saves nothing: the next poll
+          // claims it, and so does a round the repo's wait-queue.mjs does not call dropped yet.
+          if (drop && await this.claimDrop(drop, record, seenByUrl, context)) {
             dropped = true;
-            // Claimed and saved before anything is sent: a later failure, a restart or another
-            // poll never sends it twice. A failed read in claim saves nothing: the next poll claims it.
-            const { kind, pending } = await this.claim(record, url, view, drop, current, listPulls);
-            const counted = kind === "conflict" ? { conflicts: [...(current.conflicts ?? []), drop.key] }
-              : kind === "main" ? { mainBroken: [...(current.mainBroken ?? []), drop.key] }
-              : { drops: [...(current.drops ?? []), drop.key] };
-            seenByUrl[url] = { ...current, ...counted, ...(pending?.fix === null ? { escalated: true } : {}), pending, activeAt: now };
+            seenByUrl[url] = { ...seenByUrl[url], activeAt: now };
             await save();
           }
         }
@@ -606,7 +657,7 @@ export class PullRequestWatch {
       if (!going) break;
     }
     for (const { record, url, view } of stopped.paused || stopped.throttled ? [] : nudges) {
-      const next = view.state === "OPEN" ? () => this.nudge(record, url, view, seenByUrl, save, listDrafts, listPulls, reserved)
+      const next = view.state === "OPEN" ? () => this.nudge(record, url, view, seenByUrl, save, listDrafts, reserved)
         : seenByUrl[url].merged ? () => this.advance(record, url, seenByUrl, listPulls)
         : () => this.replace(record, url, view, seenByUrl, save, listPulls, reserved);
       if (!await step(record, url, next)) break;
@@ -657,62 +708,132 @@ export class PullRequestWatch {
     return { key, reason, repo, number: Number(number), draft: { number: draftNumber, url: draftUrl, headSha: draft?.headSha || null, pulls } };
   }
 
-  // What a drop sends, by kind (see isConflictOnly and mainBrokenJobs): a fix request for a plain
-  // drop, a restack request for a conflict-only one, up to DROP_PROMPTS of that kind per pull
-  // request, and a re-enqueue request once `main` is green for a main-broken one, which counts
-  // toward neither limit and never escalates. The next drop of a counted kind past its limit
-  // escalates to the owner; after the escalation drops of any kind only reach the log. All
-  // re-enqueue the dropped queue range from its top branch, the one `gt merge` ran on
-  // before the drop: the highest of the ticket's open pull requests the queue's draft listed, or
-  // the dropped one. `gt merge` on the stack's top branch would enqueue pull requests above the
-  // range that are not ready to land.
-  private async claim(record: HandoverRecord, url: string, view: PullRequestView, drop: Drop, seen: Seen, pulls: (repo: string) => Promise<OpenPull[]>): Promise<{ kind: DropKind; pending: PendingDrop | null }> {
+  // A drop as the repo's `wait-queue.mjs` judges it (class, requeue, revision; see
+  // queue-backstop.ts), claimed on every pull request of the dropped range and counted by class:
+  // conflict-only toward the restack limit, main-broken toward none, every other class toward the
+  // plain limit. The next drop of a counted kind past its limit escalates to the owner (every pull
+  // request of the range is marked); after the escalation drops of any kind only reach the log.
+  // Otherwise:
+  // - not the stack's fault, the code provably the code that dropped (`same`, or the backstop's
+  //   own enqueue of the current heads came right before the round) and no manual task due before
+  //   the merge open: the backstop re-enqueues the range (an action, see advanceAction);
+  // - genuine: the fix request; the backstop leaves the range alone until a new head (`blockedAt`);
+  // - not genuine, but the code changed since the drop: nothing is sent, the new code goes through
+  //   the ready rule;
+  // - not genuine, but the code could not be compared: the kind's request goes to the agent with
+  //   why Paseo did not re-enqueue, and the range is blocked like a genuine drop;
+  // - a manual task is open: the kind's request goes to the agent, to re-enqueue once it is done.
+  // Requests re-enqueue the dropped range from its top branch, never the stack's top branch above
+  // it, which would enqueue pull requests that are not ready. False when nothing was claimed: the
+  // repo's script does not call the round dropped (yet). A failed read throws and claims nothing.
+  private async claimDrop(drop: Drop, record: HandoverRecord | null, seenByUrl: Record<string, Seen>, context: RunContext): Promise<boolean> {
+    const url = pullUrl(drop.repo, drop.number);
+    const seen = entry(seenByUrl, url);
     if (escalated(seen)) {
-      console.error(`[linear-tickets] ${record.identifier}: the merge queue dropped ${url} again; already escalated to the owner`);
+      console.error(`[linear-tickets] ${record?.identifier ?? drop.repo}: the merge queue dropped ${url} again; already escalated to the owner`);
       // The kind no longer matters: the key only keeps the drop from being claimed again.
-      return { kind: "plain", pending: null };
+      seen.drops = [...(seen.drops ?? []), drop.key];
+      return true;
     }
-    const github = this.deps.github ?? githubReader;
-    const checks = drop.draft?.headSha ? await github.failedChecks(drop.repo, drop.draft.headSha) : [];
-    const conflictOnly = isConflictOnly(drop, checks);
-    const redOnMain = conflictOnly ? null : await mainBrokenJobs(checks, (at) => github.mainFailedJobs(drop.repo, at));
-    const kind: DropKind = conflictOnly ? "conflict" : redOnMain ? "main" : "plain";
-    const plain = (seen.drops?.length ?? 0) + (kind === "plain" ? 1 : 0);
-    const conflicts = (seen.conflicts?.length ?? 0) + (kind === "conflict" ? 1 : 0);
-    const main = (seen.mainBroken?.length ?? 0) + (kind === "main" ? 1 : 0);
+    const judgment = await this.judge(drop.repo, drop.number, drop.draft?.number ?? null, context);
+    if (!judgment) return false;
+    const open = await context.pulls(drop.repo);
+    const range = dropRange(drop, judgment, open);
+    const kind = DROP_KIND[judgment.class];
+    const list = kind === "conflict" ? "conflicts" : kind === "main" ? "mainBroken" : "drops";
+    for (const pr of range.prs) {
+      const member = entry(seenByUrl, pullUrl(drop.repo, pr));
+      if (!handledDrops(member).includes(drop.key)) member[list] = [...(member[list] ?? []), drop.key];
+    }
+    const plain = seen.drops?.length ?? 0;
+    const conflicts = seen.conflicts?.length ?? 0;
+    const main = seen.mainBroken?.length ?? 0;
+    const reason = drop.reason || judgment.reason;
+    const draft = judgment.queueDraft;
     const facts = [
       `The Graphite merge queue dropped [the pull request](${url}) without merging it.`,
-      `Reason: ${drop.reason}`,
-      ...(!drop.draft?.headSha ? [] : checks.length
-        ? [`Checks that did not pass on the queue's draft [#${drop.draft.number}](${drop.draft.url}):`, ...checks.map((check) => `- [${check.name}](${check.url}) — ${check.conclusion}`)]
-        : [`No check failed on the queue's draft [#${drop.draft.number}](${drop.draft.url}).`]),
+      `Reason: ${reason}`,
+      ...(draft === null ? [] : judgment.failures.length
+        ? [`Checks that did not pass on the queue's draft [#${draft}](${pullUrl(drop.repo, draft)}):`, ...judgment.failures.map((check) => `- [${check.check}](${check.url}) — ${check.conclusion}`)]
+        : [`No check failed on the queue's draft [#${draft}](${pullUrl(drop.repo, draft)}).`]),
+      ...(draft === null ? [] : [`Kind (tools/ci/wait-queue.mjs): ${CLASS_TEXT[judgment.class]}.`, ...judgment.evidence.map((line) => `- ${line}`)]),
     ].join("\n");
+    const tickets = ticketsOf(drop.repo, range.prs, open, context.records, record);
+    const target = { record, url, tickets };
     const count = kind === "plain" ? plain : conflicts;
-    if (kind !== "main" && count > DROP_PROMPTS[kind]) return { kind, pending: { key: drop.key, reason: drop.reason, facts: `${facts}\nDrops of this pull request so far: ${plain} plain, ${conflicts} conflict-only.`, fix: null } };
-    const identifier = namesTicket(record.identifier);
-    const range = drop.draft?.pulls.length ? (await pulls(drop.repo)).filter((pull) => drop.draft?.pulls.includes(pull.number) && (pull.url === url || identifier.test(pull.title))) : [];
-    const top = range.filter((pull) => !range.some((other) => other.baseBranch === pull.headBranch)).sort((a, b) => b.number - a.number)[0];
-    const branch = top?.headBranch ?? view.headBranch;
-    const pr = top?.number ?? drop.number;
+    if (kind !== "main" && count > DROP_PROMPTS[kind]) {
+      for (const pr of range.prs) entry(seenByUrl, pullUrl(drop.repo, pr)).escalated = true;
+      this.route(seenByUrl, target, { key: drop.key, reason, facts: `${facts}\nDrops of this pull request so far: ${plain} plain, ${conflicts} conflict-only.`, fix: null });
+      return true;
+    }
+    const own = ownRound(drop, seenByUrl, open);
+    const same = judgment.revision.state === "same" && judgment.revision.expect ? { expect: judgment.revision.expect, branch: judgment.revision.branch } : null;
+    const proof = same ?? own;
+    const unchanged = same ? judgment.revision.reason || "checked against the queue's draft" : "Paseo's queue backstop enqueued these very heads right before this round";
+    const gated = (await this.gatedTickets(context.records, tickets)).size > 0;
+    const counted = kind === "main" ? "Main-broken drops count toward no limit; the enqueue waits until `main` is green."
+      : kind === "conflict" ? `This is conflict-only drop ${conflicts} of ${DROP_PROMPTS.conflict} before the owner takes over.`
+      : `It counts as plain drop ${plain} of ${DROP_PROMPTS.plain}; the next plain drop goes to the owner.`;
+    if (judgment.requeue && proof && !gated) {
+      const members = parseExpect(proof.expect) ?? [];
+      const top = members.at(-1)?.pr ?? range.top;
+      const action: ActionRecord = {
+        id: `drop:${drop.key}`, repo: drop.repo, branch: proof.branch ?? range.branch, expect: proof.expect, prs: members.map((member) => member.pr), top, tickets,
+        why: dropWhy(drop.repo, judgment, unchanged, counted), at: new Date(context.now).toISOString(), activityBoundary: null,
+        steps: { enqueue: "due", prComment: "none", linearComment: "none", note: "none" },
+      };
+      const holder = entry(seenByUrl, pullUrl(drop.repo, top));
+      holder.actions = [...(holder.actions ?? []).filter((item) => item.id !== action.id), action];
+      this.kicked = true;
+      return true;
+    }
+    // The range stays out of every automatic enqueue until one of its heads changes.
+    const block = () => {
+      for (const pr of range.prs) {
+        const head = open.find((pull) => pull.number === pr)?.headSha;
+        if (head) entry(seenByUrl, pullUrl(drop.repo, pr)).blockedAt = head;
+      }
+    };
+    if (judgment.class !== "genuine" && judgment.revision.state === "changed") {
+      console.error(`[linear-tickets] ${record?.identifier ?? drop.repo}: the merge queue dropped ${url} (${judgment.class}), and the range has changed since; the new code goes through the ready rule`);
+      return true;
+    }
+    if (judgment.class === "genuine" ? judgment.revision.state !== "changed" : !proof) block();
+    const branch = range.branch;
+    const pr = range.top;
     const enqueue = `\`git switch ${branch} && node tools/ci/enqueue.mjs\` (the top branch of the dropped queue range, not the stack's top branch; never a bare \`gt merge\`: it refuses while the range conflicts with \`main\` or the queue tip and names the fix)`;
-    const worktree = `In your stack's worktree${record.worktreePath ? ` (\`${record.worktreePath}\`)` : ""}, on the top branch of the stack`;
+    const worktree = `In your stack's worktree${record?.worktreePath ? ` (\`${record.worktreePath}\`)` : ""}, on the top branch of the stack`;
     const rebase = "`git fetch origin main && git rebase --update-refs --onto origin/main \"$(git merge-base HEAD origin/main)\"`. It moves only your own branches; never `gt sync` or `gt restack`, which move the shared `main` and other agents' branches.";
-    const fix = redOnMain ? [
+    const notRequeued = !judgment.requeue ? "`tools/ci/wait-queue.mjs` does not clear this drop for an automatic re-enqueue. Follow the steps below."
+      : !proof ? `it could not prove that the range is still the code that dropped (${judgment.revision.reason || "no comparison"}), and it leaves the range alone until one of its heads changes. Check that nothing changed, then follow the steps below.`
+      : "a manual task due before the merge is open. Re-enqueue once it is done.";
+    const held = judgment.class === "genuine" ? [] : [`Paseo did not re-enqueue it: ${notRequeued}`, ""];
+    const fix = judgment.class === "mainBroken" ? [
       facts,
       "",
-      `Main broken: the merge queue dropped the range because \`main\` was already red on the same job${redOnMain.length === 1 ? "" : "s"} at that time (${redOnMain.map((job) => `\`${job}\``).join(", ")}; tools/ci/main-health.mjs). This drop does not count toward the stack's limits, and no restack or fix of your own is needed unless \`enqueue.mjs\` refuses the range.`,
+      ...held,
+      "Main broken: the merge queue dropped the range because `main` was already red on the same jobs at that time (tools/ci/wait-queue.mjs). This drop does not count toward the stack's limits, and no restack or fix of your own is needed unless `enqueue.mjs` refuses the range.",
       `Re-enqueue the dropped queue range from its top branch once \`main\` is green: \`git switch ${branch} && node tools/ci/enqueue.mjs --wait-main\` (it waits until \`main\` is green, then checks and enqueues), then \`node tools/ci/wait-queue.mjs ${pr}\`.`,
       "",
       `Drops of this pull request so far: ${plain} plain, ${conflicts} conflict-only, ${main} main-broken (not counted).`,
-    ] : kind === "conflict" ? [
+    ] : judgment.class === "conflictOnly" ? [
       facts,
       "",
+      ...held,
       "Conflict only: Graphite names a merge conflict and nothing failed, was cancelled or was still running on the queue's draft. Restack and re-enqueue right away, without asking (docs/automation/merge-queue.md#conflict-only-drops), unless a pull request of the stack carries `do-not-merge`:",
       `1. ${worktree}, and only when every branch below it is your own, run ${rebase}`,
       "2. Keep `main`'s version of generated files and regenerate them; never merge them by hand. Run the focused checks for the files the restack touched.",
       `3. Run \`gt submit --stack --ignore-out-of-sync-trunk\`, then right away ${enqueue} and \`node tools/ci/wait-queue.mjs ${pr}\`. Do not wait for the pull request's checks first: the queue's draft runs the full suite. Only when \`enqueue.mjs\` reports that \`gt merge\` refused because checks are still running, wait with \`node tools/ci/wait-checks.mjs ${pr}\` and run \`node tools/ci/enqueue.mjs\` once more.`,
       "",
       `This is automatic restack ${count} of ${DROP_PROMPTS.conflict} for this pull request; after that the owner takes over.`,
+    ] : judgment.class !== "genuine" ? [
+      facts,
+      "",
+      ...held,
+      `Not the stack's fault (${CLASS_TEXT[judgment.class]}): no fix of your own is needed unless \`enqueue.mjs\` refuses the range.`,
+      `Re-enqueue the dropped queue range from its top branch: ${enqueue}, then \`node tools/ci/wait-queue.mjs ${pr}\`.`,
+      "",
+      `This drop counts as plain drop ${count} of ${DROP_PROMPTS.plain} for this pull request; the next plain drop goes to the owner.`,
     ] : [
       facts,
       "",
@@ -724,7 +845,353 @@ export class PullRequestWatch {
       `An obviously flaky failure (unrelated to the change) gets one plain \`git switch ${branch} && node tools/ci/enqueue.mjs\` retry instead.`,
       `This is automatic fix request ${count} of ${DROP_PROMPTS.plain} for this pull request; the next plain drop goes to the owner.`,
     ];
-    return { kind, pending: { key: drop.key, reason: drop.reason, facts, fix: fix.join("\n") } };
+    this.route(seenByUrl, target, { key: drop.key, reason, facts, fix: fix.join("\n") });
+    return true;
+  }
+
+  // The round as the repo's `wait-queue.mjs` (from the backstop checkout) judges it; null while it
+  // does not call it dropped. A repo without a backstop has no classes: its drops are genuine.
+  private async judge(repo: string, number: number, draft: number | null, context: RunContext): Promise<DropJudgment | null> {
+    const checkout = await context.checkout(repo);
+    if (!checkout) return { result: "dropped", reason: "", class: "genuine", requeue: false, evidence: [], revision: { state: "unknown", draft, branch: null, expect: null, reason: "the repo has no queue backstop" }, queueDraft: null, failures: [] };
+    const judged = parseJudgment(await this.run(checkout, WAIT_QUEUE, waitQueueArgs(number, draft), repo));
+    return judged.result === "dropped" ? judged : null;
+  }
+
+  private run(checkout: string, script: string, args: string[], repo: string) {
+    return (this.deps.backstop?.run ?? runNodeScript)(checkout, script, args, { GITHUB_REPOSITORY: repo });
+  }
+
+  // A message for the ticket's agent goes to its record's pull request, delivered by the poll (see
+  // deliver); without a record, to the pull request's own entry, delivered by the backstop (see
+  // deliverOrphan). False while that entry still holds an earlier message.
+  private route(seenByUrl: Record<string, Seen>, target: { record: HandoverRecord | null; url: string; tickets: string[] }, pending: PendingDrop): boolean {
+    const seen = entry(seenByUrl, target.record?.links["Pull request"] ?? target.url);
+    if (seen.pending) return false;
+    seen.pending = target.record ? pending : { ...pending, orphan: { tickets: target.tickets } };
+    return true;
+  }
+
+  // The tickets, of `among`, whose before-merge manual tasks are open; a gate that cannot be read
+  // counts as open. Tickets are found by their records and by the tasks themselves.
+  private async gatedTickets(records: HandoverRecord[], among?: string[]): Promise<Set<string>> {
+    const manual = this.deps.manualTasks;
+    const gated = new Set<string>();
+    if (!manual) return gated;
+    const parents = new Map<string, string>();
+    for (const record of records) parents.set(record.issueId, record.identifier);
+    for (const task of (await manual.tasks?.()) ?? []) if (task.when === "before_merge") parents.set(task.parentId, task.parentIdentifier);
+    for (const [issueId, identifier] of parents) {
+      if (gated.has(identifier) || (among && !among.includes(identifier))) continue;
+      try {
+        if ((await manual.openBlockers(issueId)).length) gated.add(identifier);
+      } catch {
+        gated.add(identifier);
+      }
+    }
+    return gated;
+  }
+
+  // The Linear issue ids of tickets: from their records, their manual tasks, or Linear itself.
+  private async issueIds(tickets: string[], records: HandoverRecord[]): Promise<{ identifier: string; issueId: string }[]> {
+    const tasks = (await this.deps.manualTasks?.tasks?.()) ?? [];
+    const found: { identifier: string; issueId: string }[] = [];
+    for (const identifier of tickets) {
+      let issueId = records.find((record) => record.identifier === identifier)?.issueId ?? tasks.find((task) => task.parentIdentifier === identifier)?.parentId;
+      if (!issueId && this.deps.linear.issueState) issueId = await this.deps.linear.issueState(identifier).then((state) => state.id, () => undefined);
+      if (issueId) found.push({ identifier, issueId });
+    }
+    return found;
+  }
+
+  // The queue backstop (TUC-615): every 10 minutes, and right after a poll claimed a drop to
+  // re-enqueue, for each repo with a backstop checkout (see BackstopCheckout): earlier enqueues
+  // move on (see advanceAction), the repo's `enqueue-ready.mjs` names the ready stacks and the
+  // drops it saw, drops no record watches are claimed like the poll's, refused enqueues and
+  // messages for pull requests without a record go out, and each ready stack is enqueued as an
+  // action. It shares pr-watch.json with the poll and runs in turn with it.
+  private async queueBackstop(): Promise<void> {
+    const seenByUrl = await this.load();
+    const records = await this.deps.handover.all();
+    const context = this.context(records);
+    const save = () => this.save(seenByUrl);
+    const repos = new Set([...records.map((record) => record.links["Pull request"] ?? ""), ...Object.keys(seenByUrl)].map((url) => PULL_URL.exec(url)?.[1] ?? "").filter(Boolean));
+    for (const repo of repos) {
+      try {
+        await this.backstopRepo(repo, seenByUrl, context, save);
+      } catch (error) {
+        console.error(`[linear-tickets] queue backstop for ${repo} stopped: ${error instanceof Error ? error.message : error}`);
+        if (error instanceof RateLimitedError || error instanceof GitHubRateLimitedError) break;
+      }
+    }
+    await save();
+  }
+
+  private async backstopRepo(repo: string, seenByUrl: Record<string, Seen>, context: RunContext, save: () => Promise<void>): Promise<void> {
+    const checkout = await context.checkout(repo);
+    if (!checkout) return;
+    const inRepo = () => Object.entries(seenByUrl).filter(([url]) => PULL_URL.exec(url)?.[1] === repo);
+    for (const [, seen] of inRepo()) {
+      seen.actions = seen.actions?.filter((action) => context.now - Date.parse(action.at) < BACKSTOP_MEMORY_MS || ["due", "started", "held"].includes(action.steps.enqueue));
+      seen.refusals = seen.refusals?.filter((refusal) => context.now - Date.parse(refusal.at) < BACKSTOP_MEMORY_MS);
+    }
+    // Each action moves at most once per run: a held one is retried on the next run, not twice.
+    const advanced = new Set<string>();
+    const advance = async () => {
+      for (const [, seen] of inRepo()) {
+        for (const action of seen.actions ?? []) {
+          if (advanced.has(action.id)) continue;
+          advanced.add(action.id);
+          await this.advanceAction(action, seenByUrl, context, checkout, save);
+        }
+      }
+    };
+    await advance();
+    const open = await context.pulls(repo);
+    const gated = await this.gatedTickets(context.records);
+    const excluded = this.excluded(repo, seenByUrl, open, gated, context.records);
+    const skips = await this.skips(repo, seenByUrl, open, context.now);
+    // A refused drop re-enqueue whose refusals are all released runs again: `enqueue-ready.mjs`
+    // never lists a dropped range as ready, so nothing else would retry it.
+    for (const [, seen] of inRepo()) {
+      for (const action of seen.actions ?? []) {
+        if (!action.id.startsWith("drop:") || action.steps.enqueue !== "refused" || skips.includes(action.id)) continue;
+        if (action.prs.some((pr) => excluded.has(pr)) || action.tickets.some((ticket) => gated.has(ticket))) continue;
+        action.steps.enqueue = "due";
+        advanced.delete(action.id);
+      }
+    }
+    const ready = parseReady(await this.run(checkout, ENQUEUE_READY, readyArgs([...excluded].sort((a, b) => a - b), skips), repo));
+    const watched = new Set(context.records.map((record) => record.links["Pull request"]));
+    for (const found of ready.drops) {
+      const url = pullUrl(repo, found.pr);
+      if (watched.has(url) || handledDrops(seenByUrl[url]).includes(found.key)) continue;
+      const drop: Drop = { key: found.key, reason: "", repo, number: found.pr, draft: found.draft === null ? null : { number: found.draft, url: pullUrl(repo, found.draft), headSha: null, pulls: [] } };
+      if (await this.claimDrop(drop, recordFor(ticketsOf(repo, [found.pr], open, context.records, null), context.records), seenByUrl, context)) await save();
+    }
+    // The drops claimed above may have started re-enqueues of their own.
+    const busy = this.excluded(repo, seenByUrl, open, gated, context.records);
+    for (const stack of ready.stacks) {
+      if (stack.result !== "candidate" || stack.prs.some((pr) => busy.has(pr)) || stack.tickets.some((ticket) => gated.has(ticket)) || skips.includes(stack.action)) continue;
+      const holder = entry(seenByUrl, pullUrl(repo, stack.top));
+      const existing = holder.actions?.find((action) => action.id === stack.action);
+      // A stack already enqueued under this action is followed by the drop path from now on.
+      if (existing && existing.steps.enqueue !== "refused") continue;
+      if (existing) {
+        existing.steps.enqueue = "due";
+        advanced.delete(existing.id);
+      } else holder.actions = [...(holder.actions ?? []), {
+        id: stack.action, repo, branch: stack.branch, expect: stack.expect, prs: stack.prs, top: stack.top, tickets: stack.tickets, why: READY_WHY,
+        at: new Date(context.now).toISOString(), activityBoundary: null, steps: { enqueue: "due", prComment: "none", linearComment: "none", note: "none" },
+      }];
+      await save();
+    }
+    // The ready stacks, and the drops claimed above, are enqueued right away.
+    await advance();
+    await this.routeRefusals(repo, seenByUrl, context, save);
+    for (const [url, seen] of inRepo()) if (seen.pending?.orphan) await this.deliverOrphan(url, seen, context, save);
+  }
+
+  // The pull requests no automatic enqueue may touch: escalated ones, ones blocked at their head
+  // (a new head releases them), ones with a message or a drop re-enqueue still pending, and the
+  // pull requests of tickets whose before-merge manual tasks are open.
+  private excluded(repo: string, seenByUrl: Record<string, Seen>, open: OpenPull[], gated: Set<string>, records: HandoverRecord[]): Set<number> {
+    const excluded = new Set<number>();
+    for (const [url, seen] of Object.entries(seenByUrl)) {
+      const source = PULL_URL.exec(url);
+      if (source?.[1] !== repo) continue;
+      const number = Number(source[2]);
+      const head = open.find((pull) => pull.number === number)?.headSha;
+      if (seen.blockedAt && head && head !== seen.blockedAt) delete seen.blockedAt;
+      if (escalated(seen) || seen.blockedAt || seen.pending) excluded.add(number);
+      for (const action of seen.actions ?? []) if (["due", "started", "held"].includes(action.steps.enqueue)) for (const pr of action.prs) excluded.add(pr);
+    }
+    for (const pull of open) if ([...gated].some((identifier) => namesTicket(identifier).test(pull.title))) excluded.add(pull.number);
+    for (const record of records) {
+      const source = PULL_URL.exec(record.links["Pull request"] ?? "");
+      if (source?.[1] === repo && gated.has(record.identifier)) excluded.add(Number(source[2]));
+    }
+    return excluded;
+  }
+
+  // The actions whose refusals are not released yet (see released): `enqueue-ready.mjs` skips them.
+  private async skips(repo: string, seenByUrl: Record<string, Seen>, open: OpenPull[], now: number): Promise<string[]> {
+    const skips = new Set<string>();
+    let drafts: Set<number> | null = null;
+    for (const [url, seen] of Object.entries(seenByUrl)) {
+      if (PULL_URL.exec(url)?.[1] !== repo) continue;
+      for (const refusal of seen.refusals ?? []) {
+        if (refusal.kind === "conflict-tip") drafts ??= new Set((await this.github().drafts(repo)).filter((draft) => draft.state === "OPEN").map((draft) => draft.number));
+        const prs = seen.actions?.find((action) => action.id === refusal.action)?.prs ?? [];
+        const vetoed = open.some((pull) => prs.includes(pull.number) && pull.labels.includes(DO_NOT_MERGE_LABEL));
+        if (!released(refusal, now, drafts ?? new Set(), vetoed)) skips.add(refusal.action);
+      }
+    }
+    return [...skips];
+  }
+
+  // One action's next steps, each saved before it runs (see ActionRecord):
+  // - `due`/`held`: the top pull request's Merge activity is read as the boundary right before
+  //   `backstop-enqueue.mjs` runs; enqueued, held (retried on the next run), refused (each new
+  //   refusal key is routed once, see routeRefusals) or closed (`range-changed` before any enqueue);
+  //   an error or an answer that cannot be read leaves it `started`;
+  // - `started` (a restart, or that error): reconciled from the bullets appended after the
+  //   boundary: an enqueue bullet means enqueued; none means not enqueued, retried while the pull
+  //   request is open; a boundary that no longer matches can tell neither, so it is not retried
+  //   but routed to the agent;
+  // - enqueued: the pull request comment (by marker, also after the pull request closed or
+  //   landed), the ticket comment and a note to a living agent that nothing is needed from it.
+  private async advanceAction(action: ActionRecord, seenByUrl: Record<string, Seen>, context: RunContext, checkout: string, save: () => Promise<void>): Promise<void> {
+    const { steps } = action;
+    const topUrl = pullUrl(action.repo, action.top);
+    const enqueued = () => {
+      steps.enqueue = "enqueued";
+      steps.prComment = steps.prComment === "done" ? "done" : "due";
+      steps.linearComment = action.tickets.length ? "due" : "none";
+      steps.note = "due";
+    };
+    if (steps.enqueue === "started") {
+      const view = await this.view(topUrl);
+      const verdict = reconcile(action.activityBoundary, activityBullets(view.mergeActivity));
+      if (verdict === "enqueued") enqueued();
+      else if (verdict === "mismatch") {
+        steps.enqueue = "unclear";
+        for (const member of parseExpect(action.expect) ?? []) entry(seenByUrl, pullUrl(action.repo, member.pr)).blockedAt = member.sha;
+        const holder = entry(seenByUrl, topUrl);
+        holder.refusals = [...(holder.refusals ?? []), { key: `${action.id} unclear`, action: action.id, kind: "unclear", draft: null, at: new Date(context.now).toISOString(), routedAt: null, retryAfter: null }];
+      } else steps.enqueue = view.state === "OPEN" ? "due" : "closed";
+      await save();
+    }
+    if (steps.enqueue === "due" || steps.enqueue === "held") {
+      const view = await this.view(topUrl);
+      if (view.state !== "OPEN") {
+        steps.enqueue = "closed";
+        await save();
+        return;
+      }
+      action.activityBoundary = activityBoundary(activityBullets(view.mergeActivity));
+      steps.enqueue = "started";
+      await save();
+      const file = await (this.deps.backstop?.checkout ?? new BackstopCheckout()).commentFile(action.id, enqueuedComment(action));
+      const outcome = parseEnqueue(await this.run(checkout, BACKSTOP_ENQUEUE, enqueueArgs(action.branch, action.expect, action.id, file), action.repo));
+      if (outcome.result === "enqueued") {
+        if (outcome.comment !== "none") steps.prComment = "done";
+        enqueued();
+      } else if (outcome.result === "held") steps.enqueue = "held";
+      else if (outcome.result === "refused") this.refused(action, outcome.problems, seenByUrl, context.now);
+      else console.error(`[linear-tickets] queue backstop: ${action.id} did not answer clearly (${outcome.error}); its Merge activity decides on the next run`);
+      await save();
+    }
+    if (steps.enqueue !== "enqueued") return;
+    if (steps.prComment === "due") {
+      await commentOnce(this.github(), action.repo, action.top, action.id, enqueuedComment(action));
+      steps.prComment = "done";
+      await save();
+    }
+    if (steps.linearComment === "due" || steps.linearComment === "started") {
+      for (const { identifier, issueId } of await this.issueIds(action.tickets, context.records)) {
+        const done = action.linearDone ?? [];
+        if (done.includes(identifier)) continue;
+        // Recorded before it goes out: a comment whose result was lost (a restart) is not posted
+        // again; one that failed outright is retried on the next run.
+        action.linearDone = [...done, identifier];
+        steps.linearComment = "started";
+        await save();
+        try {
+          await this.deps.linear.comment(issueId, enqueuedComment(action));
+        } catch (error) {
+          action.linearDone = done;
+          throw error;
+        }
+      }
+      steps.linearComment = "done";
+      await save();
+    }
+    if (steps.note === "due" || steps.note === "started") {
+      const living = recordFor(action.tickets, context.records);
+      if (steps.note === "due" && living && living.status !== "archived") {
+        const outcome = await this.deps.sessions.prompt(living.agentId, `${enqueuedComment(action)}\n\nDo not enqueue it again yourself.`, async () => {
+          steps.note = "started";
+          await save();
+        });
+        if (outcome === "busy" || outcome === "unavailable") return;
+      }
+      steps.note = "done";
+      await save();
+    }
+  }
+
+  // A refused enqueue: closed when only its range changed before the enqueue (the next ready run
+  // decides again), otherwise one refusal per key. A key seen before is not routed again; a
+  // repairable one is retried an hour after its last refusal.
+  private refused(action: ActionRecord, problems: Problem[], seenByUrl: Record<string, Seen>, now: number): void {
+    const refused = problems.filter((problem) => !HELD_KINDS.includes(problem.kind));
+    if (!refused.length || refused.every((problem) => problem.kind === "range-changed")) {
+      action.steps.enqueue = refused.length ? "closed" : "held";
+      return;
+    }
+    action.steps.enqueue = "refused";
+    const holder = entry(seenByUrl, pullUrl(action.repo, action.top));
+    const refusals = holder.refusals ?? [];
+    for (const problem of refused) {
+      const key = refusalKey(action.id, problem);
+      const retryAfter = REPAIRABLE_KINDS.includes(problem.kind) ? new Date(now + REPAIR_RETRY_MS).toISOString() : null;
+      const known = refusals.find((refusal) => refusal.key === key);
+      if (known) known.retryAfter = retryAfter;
+      else refusals.push({ key, action: action.id, kind: problem.kind, draft: problem.draft, at: new Date(now).toISOString(), routedAt: null, retryAfter, text: problem.text });
+    }
+    holder.refusals = refusals;
+  }
+
+  // Each refusal goes once to the agent of its tickets (the ticket when the agent is gone, the
+  // pull request when there is no ticket); a refusal waits while that slot holds another message.
+  private async routeRefusals(repo: string, seenByUrl: Record<string, Seen>, context: RunContext, save: () => Promise<void>): Promise<void> {
+    for (const [url, seen] of Object.entries(seenByUrl)) {
+      if (PULL_URL.exec(url)?.[1] !== repo) continue;
+      for (const action of seen.actions ?? []) {
+        const unrouted = (seen.refusals ?? []).filter((refusal) => refusal.action === action.id && !refusal.routedAt);
+        if (!unrouted.length) continue;
+        const kinds = unrouted.map((refusal) => refusal.kind).join(", ");
+        const fix = unrouted.every((refusal) => refusal.kind === "unclear")
+          ? `Paseo's queue backstop ran the enqueue of the range up to [#${action.top}](${url}) from \`${action.branch}\`, but stopped before it learned the outcome, and the pull request's Merge activity changed since, so it cannot tell whether the range was enqueued. Paseo does not retry it. Check with \`node tools/ci/wait-queue.mjs ${action.top} --last\`; when the range is not in the queue, enqueue it: \`git switch ${action.branch} && node tools/ci/enqueue.mjs\`, then \`node tools/ci/wait-queue.mjs ${action.top}\`.`
+          : refusalText(action, unrouted.map((refusal) => ({ kind: refusal.kind, text: refusal.text ?? "", draft: refusal.draft })), unrouted.some((refusal) => refusal.kind.startsWith("conflict-"))
+            ? "Restack only your own stack: on its top branch `git fetch origin main && git rebase --update-refs --onto origin/main \"$(git merge-base HEAD origin/main)\"` (never `gt sync` or `gt restack`), keep `main`'s version of generated files and regenerate them, then `gt submit --stack --ignore-out-of-sync-trunk`."
+            : null);
+        const routed = this.route(seenByUrl, { record: recordFor(action.tickets, context.records), url, tickets: action.tickets }, {
+          key: `refused:${unrouted.map((refusal) => refusal.key).join(",")}`, reason: `the enqueue was refused (${kinds})`, facts: fix, fix,
+          subject: `Paseo's automatic enqueue of the pull request was refused (${kinds})`,
+        });
+        if (!routed) continue;
+        for (const refusal of unrouted) refusal.routedAt = new Date(context.now).toISOString();
+        await save();
+      }
+    }
+  }
+
+  // A message for a pull request without a handover record: a comment mentioning the owner on
+  // each of its tickets, or without a ticket one comment on the pull request itself (with a
+  // marker, so a retry never doubles it). A ticket comment is saved as `sending` right before it
+  // goes out, so one whose result was lost (a restart) is not posted again.
+  private async deliverOrphan(url: string, seen: Seen, context: RunContext, save: () => Promise<void>): Promise<void> {
+    const pending = seen.pending;
+    const source = PULL_URL.exec(url);
+    if (!pending?.orphan || !source) return;
+    const text = pending.fix ?? `The merge queue dropped this stack again after Paseo's automatic requests (one fix request after a plain drop, ${DROP_PROMPTS.conflict} restacks after conflict-only drops), so Paseo stops asking. Please take over.\n\n${pending.facts}`;
+    const issues = await this.issueIds(pending.orphan.tickets, context.records);
+    if (!issues.length) await commentOnce(this.github(), source[1], Number(source[2]), `route:${pending.key}`, text);
+    else if (pending.sending) console.error(`[linear-tickets] queue backstop: the message about ${url} may already have gone out; it is not sent again`);
+    else {
+      pending.sending = true;
+      await save();
+      try {
+        for (const { issueId } of issues) await this.mention(issueId, text);
+      } catch (error) {
+        pending.sending = false;
+        throw error;
+      }
+    }
+    seen.pending = null;
+    await save();
   }
 
   // Delivers a claimed drop: the fix request to the agent while it exists, otherwise to the ticket,
@@ -761,13 +1228,13 @@ export class PullRequestWatch {
         const outcome = await this.deps.sessions.prompt(record.agentId, fix, toAgent);
         if (outcome === "sent") {
           await delivered();
-          await this.tell(record, "thought", `The merge queue dropped the pull request (${pending.reason}). The agent was asked to fix it.`);
+          await this.tell(record, "thought", `${pending.subject ?? `The merge queue dropped the pull request (${pending.reason})`}. The agent was asked to fix it.`);
         }
         if (outcome !== "gone") return;
       }
       await this.handBack(record, fix, toAgent);
       await delivered();
-      await this.tell(record, "response", `The merge queue dropped the pull request and the agent is no longer running; the ticket is back in ${CODING_STATE}.\n\n${pending.facts}`);
+      await this.tell(record, "response", `${pending.subject ?? "The merge queue dropped the pull request"} and the agent is no longer running; the ticket is back in ${CODING_STATE}.\n\n${pending.facts}`);
     } finally {
       // A send that failed outright is retried on the next poll (saved with the rest of the state).
       pending.sending = false;
@@ -777,46 +1244,26 @@ export class PullRequestWatch {
   // The next lifecycle step of a stalled ticket (see pr-nudge.ts), for its idle agent. Nothing
   // while manual tasks due before the merge are open or the agent already got a message this poll.
   // The recorded pull request gets the steps before the merge (draft, failed checks, requested
-  // changes, findings) unless it may not be nudged (see nudgeable). The merge step covers every
-  // open pull request of the ticket: one nudge per ticket and poll, for the highest one that is
-  // ready to land with everything below it (see mergeTarget). Pull requests the recorded one's
-  // steps leave out are settled before review threads are read. A step is claimed per head of its
-  // pull request right before its message goes out: at most STAGE_NUDGES per stage and pull
-  // request, then one escalation to the owner, then only the log. A busy agent or a disconnected
-  // Paseo claims nothing; the next poll decides again.
-  private async nudge(record: HandoverRecord, url: string, view: PullRequestView, seenByUrl: Record<string, Seen>, save: () => Promise<void>, drafts: (repo: string) => Promise<QueueDraft[]>, pulls: (repo: string) => Promise<OpenPull[]>, reserved: Set<string>): Promise<void> {
+  // changes, findings) unless it may not be nudged (see nudgeable); a ready stack is the queue
+  // backstop's (see queueBackstop). A step is claimed per head right before its message goes out:
+  // at most STAGE_NUDGES per stage and pull request, then one escalation to the owner, then only
+  // the log. A busy agent or a disconnected Paseo claims nothing; the next poll decides again.
+  private async nudge(record: HandoverRecord, url: string, view: PullRequestView, seenByUrl: Record<string, Seen>, save: () => Promise<void>, drafts: (repo: string) => Promise<QueueDraft[]>, reserved: Set<string>): Promise<void> {
     const source = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
     if (!source || reserved.has(record.agentId)) return;
     const [, repo, number] = source;
     if ((await this.deps.manualTasks?.openBlockers(record.issueId))?.length) return;
-    const claimedOn = (target: string, stage: Stage) => seenByUrl[target]?.nudges?.[stage] ?? [];
-    const github = this.deps.github ?? githubReader;
-    // Each pull request's review threads are read at most once per nudge.
-    const threadReads = new Map<number, Promise<ReviewThread[]>>();
-    const threads = (pull: number) => {
-      const read = threadReads.get(pull) ?? github.reviewThreads(repo, pull);
-      threadReads.set(pull, read);
-      return read;
-    };
-    let target = url;
-    let found: { stage: Stage; key: string; text: string } | null = null;
-    if (await this.nudgeable(repo, Number(number), view, drafts)) {
-      const step = await stalledStage(view, url, Date.now(), (stage, key) => claimedOn(url, stage).some((entry) => entry.split(" ").includes(key)), () => threads(Number(number)));
-      if (step && step.stage !== "merge" && !claimedOn(url, step.stage).includes(step.key)) found = step;
-    }
-    if (!found) {
-      const ready = await this.mergeTarget(record, repo, url, view, drafts, pulls, threads);
-      if (!ready || claimedOn(ready.pull.url, "merge").includes(ready.view.headSha)) return;
-      target = ready.pull.url;
-      found = { stage: "merge", key: ready.view.headSha, text: mergeText(ready.pull.url, ready.view, ready.below) };
-    }
+    const claimedOn = (stage: Stage) => seenByUrl[url]?.nudges?.[stage] ?? [];
+    if (!await this.nudgeable(repo, Number(number), view, drafts)) return;
+    const found = await stalledStage(view, url, Date.now(), (stage, key) => claimedOn(stage).some((entry) => entry.split(" ").includes(key)), () => this.github().reviewThreads(repo, Number(number)));
+    if (!found || claimedOn(found.stage).includes(found.key)) return;
     const { stage, text, key } = found;
-    const before = seenByUrl[target]?.nudges ?? {};
+    const before = seenByUrl[url]?.nudges ?? {};
     const heads = before[stage] ?? [];
     const sent = heads.length;
     let claimed = false;
     const claim = async () => {
-      seenByUrl[target] = { ...(seenByUrl[target] ?? { reviewedAt: null, decision: null, merged: false }), nudges: { ...before, [stage]: [...heads, key] }, activeAt: new Date().toISOString() };
+      seenByUrl[url] = { ...entry(seenByUrl, url), nudges: { ...before, [stage]: [...heads, key] }, activeAt: new Date().toISOString() };
       claimed = true;
       await save();
     };
@@ -826,13 +1273,13 @@ export class PullRequestWatch {
     };
     try {
       if (sent > STAGE_NUDGES) {
-        console.error(`[linear-tickets] ${record.identifier}: ${target} is waiting for the agent to ${STAGE_STEP[stage]} again; already escalated to the owner`);
+        console.error(`[linear-tickets] ${record.identifier}: ${url} is waiting for the agent to ${STAGE_STEP[stage]} again; already escalated to the owner`);
         await claim();
         return;
       }
       if (sent === STAGE_NUDGES) {
         await claim();
-        await this.mention(record.issueId, `Paseo asked the agent ${STAGE_NUDGES} times to ${STAGE_STEP[stage]} on [the pull request](${target}), and it is stuck there again, so Paseo stops asking. Please take over.\n\n${text}`);
+        await this.mention(record.issueId, `Paseo asked the agent ${STAGE_NUDGES} times to ${STAGE_STEP[stage]} on [the pull request](${url}), and it is stuck there again, so Paseo stops asking. Please take over.\n\n${text}`);
         await this.tell(record, "response", `The pull request is stuck again waiting for the agent to ${STAGE_STEP[stage]}; the owner was asked to take over.`);
         return;
       }
@@ -846,7 +1293,7 @@ export class PullRequestWatch {
       await this.tell(record, "response", `The pull request is waiting for the agent to ${STAGE_STEP[stage]}, and the agent is no longer running; the ticket is back in ${CODING_STATE}.`);
     } catch (error) {
       // A message that failed outright was not sent: the next poll sends it again.
-      if (claimed) seenByUrl[target] = { ...seenByUrl[target], nudges: before };
+      if (claimed) seenByUrl[url] = { ...seenByUrl[url], nudges: before };
       throw error;
     }
   }
@@ -861,45 +1308,11 @@ export class PullRequestWatch {
     return !(await drafts(repo)).some((draft) => draft.state === "OPEN" && draft.title.startsWith(QUEUE_DRAFT_TITLE) && draft.body.includes(listed));
   }
 
-  // The pull request a ticket's merge nudge names. The ticket's open pull requests are the
-  // recorded one and every open pull request whose title names the ticket (see namesTicket). A
-  // stack lands bottom first, so it is the highest one that is ready (mergeable, nudgeable, no
-  // open review thread) with every pull request below it ready too, climbing from the repo's
-  // default branch through the ticket's own pull requests;
-  // `below` lists those, bottom first. Drafts and vetoed pull requests are left out from the
-  // listing; the others are read bottom up, and only while everything below them is ready.
-  private async mergeTarget(record: HandoverRecord, repo: string, url: string, view: PullRequestView, drafts: (repo: string) => Promise<QueueDraft[]>, pulls: (repo: string) => Promise<OpenPull[]>, threads: (pull: number) => Promise<ReviewThread[]>): Promise<MergeTarget | null> {
-    const identifier = namesTicket(record.identifier);
-    const own = (await pulls(repo)).filter((pull) => pull.url === url || identifier.test(pull.title)).sort((a, b) => a.number - b.number);
-    const ready = async (pull: OpenPull): Promise<PullRequestView | null> => {
-      if (pull.draft || pull.labels.includes(DO_NOT_MERGE_LABEL)) return null;
-      const pullView = pull.url === url ? view : await (this.deps.view ?? viewPullRequest)(pull.url);
-      if (!mergeable(pullView) || !await this.nudgeable(repo, pull.number, pullView, drafts)) return null;
-      return (await threads(pull.number)).some((thread) => !thread.resolved && thread.comments.length) ? null : pullView;
-    };
-    const climb = async (pull: OpenPull, below: OpenPull[]): Promise<MergeTarget | null> => {
-      const pullView = await ready(pull);
-      if (!pullView) return null;
-      let top: MergeTarget = { pull, view: pullView, below };
-      for (const child of own.filter((item) => item.baseBranch === pull.headBranch)) {
-        const higher = await climb(child, [...below, pull]);
-        if (higher && higher.below.length > top.below.length) top = higher;
-      }
-      return top;
-    };
-    let best: MergeTarget | null = null;
-    for (const root of own.filter((pull) => pull.baseBranch === pull.trunk)) {
-      const top = await climb(root, []);
-      if (top && (!best || top.below.length > best.below.length)) best = top;
-    }
-    return best;
-  }
-
   // The recorded pull request landed, but part of the ticket may not have: the rest of its stack
   // stays open (the queue landed only the range below it), or the agent replayed it onto main as
   // new pull requests. While the ticket has an open pull request, the record's link moves to the
   // lowest one (the one no other open pull request of the ticket sits below; ties go to the lower
-  // number), as for a replacement, and the watch, its nudges and the ticket's merge nudge follow
+  // number), as for a replacement, and the watch and its nudges follow
   // it from the next poll. `advance: due` is cleared only once the lookup and the move succeeded,
   // so a failure, or a poll that ended before it, is retried on the next poll.
   private async advance(record: HandoverRecord, url: string, seenByUrl: Record<string, Seen>, pulls: (repo: string) => Promise<OpenPull[]>): Promise<void> {

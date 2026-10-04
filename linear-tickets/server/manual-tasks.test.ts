@@ -129,7 +129,7 @@ test("an approval waits for before-merge tasks, then moves to Ready to merge; ar
       merged: async (issueId) => { calls.push(`merged ${issueId}`); awaiting = false; },
     },
     view: async () => view,
-    github: { drafts: async () => [], landed: async () => false, failedChecks: async () => [], mainFailedJobs: async () => null, reviewThreads: async () => [], openPullRequests: async () => [], branchExists: async () => true },
+    github: { drafts: async () => [], landed: async () => false, reviewThreads: async () => [], openPullRequests: async () => [], branchExists: async () => true, pullComments: async () => [], commentOnPull: async () => {} },
   }, join(home, "pr-watch.json"));
   try {
     await watch.poll();
