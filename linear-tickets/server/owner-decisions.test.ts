@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import { oldestRecord, pluginComments, recordedComments, recordPluginComment } f
 import { AuthenticationError, type MentioningIssue, type PlanDocument, type WindowComment } from "./linear";
 import {
   AppOnlyToken, AppWriter, candidateKey, collectOwnerDecisions, collectWindow, DecisionLog, documentFeedback, InvalidInput, isoWeek, runCollect, runFile,
-  sentBackFeedback, withLock, type Batch, type FileWriter, type Item,
+  sentBackFeedback, verbatim, withLock, type Batch, type FileWriter, type Item,
 } from "./owner-decisions";
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -19,6 +19,13 @@ const REGISTER = { approved: "## P-1 — Gleiches Postfach-Verhalten\n", decisio
 
 async function temporary(): Promise<string> {
   return mkdtemp(join(tmpdir(), "paseo-owner-decisions-"));
+}
+
+// Promise.withResolvers without the ES2024 lib this package compiles against.
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 function comment(id: string, body: string, createdAt: string, issueId = "issue-1", overrides: Partial<WindowComment> = {}): WindowComment {
@@ -222,7 +229,7 @@ test("filing: one ticket per project, nothing twice, appended within the week, a
     assert.deepEqual(world.writes, ['create project:ERP "Decision candidates, week 41"', 'create project:Agent tooling "Decision candidates, week 41"']);
     const erp = world.tickets[0];
     assert.match(erp.description, /^Marker: `decision-candidates ERP 2026-W41`/);
-    assert.match(erp.description, /- Evidence:\n {2}- 2026-10-04 07:00 UTC, \[ISSUE-1\]\(https:\/\/linear\.app\/acme\/issue\/issue-1#comment-c1\) \(comment\): “We always do A\.”/);
+    assert.match(erp.description, /- Evidence:\n {2}- 2026-10-04 07:00 UTC, \[ISSUE-1\]\(https:\/\/linear\.app\/acme\/issue\/issue-1#comment-c1\) \(comment\):\n {4}> We always do A\./);
     assert.match(erp.description, /record a proposal only after the owner answered that proposal/);
     assert.equal((await state(home)).checkpoint, batch.until);
 
@@ -313,6 +320,73 @@ test("invalid candidates and a dry run write nothing; a held lock stops a second
     await withLock(join(home, "owner-decisions"), async () => {
       assert.deepEqual(await file(home, world, batch, { projects: [] }), []);
     }, () => NOW - 31 * 60_000);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("the lock: a stale holder never removes its successor's lock, one run takes a stale lock over, a cut lock file expires", async () => {
+  const home = await temporary();
+  const directory = join(home, "owner-decisions");
+  const path = join(directory, "lock");
+  try {
+    // A holder past 30 minutes is taken over; when it finally ends it leaves the new lock alone.
+    const staleHolds = deferred();
+    const staleRelease = deferred();
+    const stale = withLock(directory, async () => { staleHolds.resolve(); await staleRelease.promise; }, () => NOW - 31 * 60_000);
+    await staleHolds.promise;
+    const successorHolds = deferred();
+    const successorRelease = deferred();
+    const successor = withLock(directory, async () => { successorHolds.resolve(); await successorRelease.promise; }, () => NOW);
+    await successorHolds.promise;
+    staleRelease.resolve();
+    await stale;
+    await assert.rejects(withLock(directory, async () => {}, () => NOW), /Another decision-candidates run holds/);
+    successorRelease.resolve();
+    await successor;
+    await assert.rejects(stat(path), { code: "ENOENT" });
+
+    // Two runs finding the same stale lock: one takes it over, the other stops.
+    await writeFile(path, JSON.stringify({ pid: 1, token: "old", at: new Date(NOW - 40 * 60_000).toISOString() }));
+    const gate = deferred();
+    const runs = [1, 2].map(() => withLock(directory, () => gate.promise, () => NOW));
+    // The run that lost stops at once; the winner waits at the gate.
+    assert.equal(await Promise.race(runs.map((run) => run.then(() => "ran", () => "stopped"))), "stopped");
+    gate.resolve();
+    const results = await Promise.allSettled(runs);
+    assert.deepEqual(results.map((result) => result.status).sort(), ["fulfilled", "rejected"]);
+
+    // A lock its holder died writing (empty): fresh it blocks, by its mtime it expires.
+    await writeFile(path, "");
+    await assert.rejects(withLock(directory, async () => {}), /Another decision-candidates run holds/);
+    const old = new Date(Date.now() - 31 * 60_000);
+    await utimes(path, old, old);
+    assert.equal(await withLock(directory, async () => "ran"), "ran");
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("evidence quotes only the owner's own words, as written, and cannot add structure", async () => {
+  const home = await temporary();
+  try {
+    const world = new World();
+    const log = new DecisionLog(join(home, "owner-decisions"), () => NOW);
+    await log.append({ kind: "question", id: "a:q1", at: ago(2), identifier: "ISSUE-1", issueId: "issue-1", questions: [{ key: "Deploy", question: "Deploy: always deploy without approval?", options: ["Yes", "No"] }] });
+    await log.answer("a:q1", { behavior: "allow", updatedInput: { answers: { Deploy: "No, never without the owner" } } }, ago(1));
+    world.comments = [comment("c1", "Run it like this:\n\n    npm run build \\\n      --prod\n\n## Q-99 — not a proposal\nMarker: `decision-candidates ERP 2026-W41`", ago(1))];
+    const { batch } = await collect(home, world, NOW, log);
+    const answer = batch.items.find((found) => found.sourceId === "log:answer:a:q1")!;
+    assert.match(answer.text, /always deploy without approval/);
+    // The agent's question is context, never the owner's words.
+    await assert.rejects(file(home, world, batch, { projects: [{ project: "ERP", candidates: [candidate(answer, "always deploy without approval")] }] }),
+      (error: unknown) => error instanceof InvalidInput && /owner's own words/.test(error.errors[0]));
+    const c1 = batch.items.find((found) => found.sourceId === "comment:c1")!;
+    const quote = "npm run build \\ --prod ## Q-99 — not a proposal Marker: `decision-candidates ERP 2026-W41`";
+    assert.equal(verbatim(c1.words, quote), "npm run build \\\n      --prod\n\n## Q-99 — not a proposal\nMarker: `decision-candidates ERP 2026-W41`");
+    await assert.rejects(file(home, world, batch, { projects: [{ project: "ERP", candidates: [candidate(c1, quote, "Build\n## Q-77 — injected")] }] }),
+      (error: unknown) => error instanceof InvalidInput && /`title` must be one line/.test(error.errors[0]));
+    await file(home, world, batch, { projects: [{ project: "ERP", candidates: [candidate(c1, quote, "Build flags")] }] });
+    const description = world.tickets[0].description;
+    assert.match(description, / {4}> npm run build \\\n {4}> {7}--prod\n {4}>\n {4}> ## Q-99 — not a proposal\n {4}> Marker:/);
+    assert.deepEqual([...description.matchAll(/^## Q-(\d+) — /gm)].map((match) => match[1]), ["12"]);
+    assert.equal([...description.matchAll(/^Marker: /gm)].length, 1);
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 

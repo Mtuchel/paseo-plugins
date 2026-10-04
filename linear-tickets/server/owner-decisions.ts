@@ -169,8 +169,10 @@ export async function logQuietly(work: () => Promise<void>, what: string): Promi
 
 export type ItemKind = "plan-feedback" | "answer" | "comment";
 // `sourceId`: stable per event (a Linear comment id, a log entry, a plan document's id plus its
-// update time), so a candidate citing it keeps its identity however it is worded.
-export type Item = { kind: ItemKind; sourceId: string; at: string; identifier: string; ticketUrl: string; project: string; sourceUrl: string; text: string };
+// update time), so a candidate citing it keeps its identity however it is worded. `text`: what the
+// sorting agent reads (for an answer also the agent's question and options); `words`: only what
+// the owner wrote, the one place evidence may quote from.
+export type Item = { kind: ItemKind; sourceId: string; at: string; identifier: string; ticketUrl: string; project: string; sourceUrl: string; text: string; words: string };
 export type CollectReader = Pick<LinearService, "viewerId" | "ownerCommentsSince" | "planSentBackSince" | "planDocumentsSince" | "issueLinks">;
 // `recorded`: comment ids agents and the plugin wrote (agent-records.ts); `agentTickets`: tickets
 // that had an agent (handover and needs-you records); `excluded`: the candidate tickets.
@@ -209,6 +211,11 @@ function answerText(question: Extract<LogEntry, { kind: "question" }>, answer: E
   ].filter(Boolean).join("\n")).join("\n\n");
 }
 
+function answerWords(question: Extract<LogEntry, { kind: "question" }>, answer: Extract<LogEntry, { kind: "answer" }>): string {
+  if (answer.denyMessage !== undefined) return answer.denyMessage;
+  return question.questions.map((item) => answer.answers?.[item.key] ?? "").filter(Boolean).join("\n\n");
+}
+
 // `commentsFrom`: owner comments before it are left out, since a comment written with the key then
 // has no record and cannot be told from the owner's own (see collectWindow).
 export async function collectOwnerDecisions(sources: CollectSources, window: { since: string; until: string; commentsFrom?: string }): Promise<Item[]> {
@@ -228,21 +235,21 @@ export async function collectOwnerDecisions(sources: CollectSources, window: { s
   });
   const links = await linear.issueLinks([...feedback.map((entry) => entry.issueId), ...answers.map(({ question }) => question.issueId)]);
   const allowed = (issueId: string) => !sources.excluded.has(issueId);
-  const item = (kind: ItemKind, sourceId: string, at: string, link: IssueLink, sourceUrl: string, body: string): Item =>
-    ({ kind, sourceId, at, identifier: link.identifier, ticketUrl: link.url, project: link.project, sourceUrl, text: body });
+  const item = (kind: ItemKind, sourceId: string, at: string, link: IssueLink, sourceUrl: string, body: string, words: string): Item =>
+    ({ kind, sourceId, at, identifier: link.identifier, ticketUrl: link.url, project: link.project, sourceUrl, text: body, words });
 
   const planItems: Item[] = [];
   for (const entry of feedback) {
     const link = links.get(entry.issueId);
-    if (link && allowed(entry.issueId)) planItems.push(item("plan-feedback", `log:plan-feedback:${entry.id}`, entry.at, link, link.url, `${entry.approved ? "Approved with feedback" : "Sent back"}:\n${entry.text}`));
+    if (link && allowed(entry.issueId)) planItems.push(item("plan-feedback", `log:plan-feedback:${entry.id}`, entry.at, link, link.url, `${entry.approved ? "Approved with feedback" : "Sent back"}:\n${entry.text}`, entry.text));
   }
   for (const document of await linear.planDocumentsSince(window.since)) {
     const found = document.issue && inWindow(document.updatedAt) ? documentFeedback(document.content) : null;
-    if (found && document.issue && allowed(document.issue.id)) planItems.push(item("plan-feedback", `doc:${document.id}:${document.updatedAt}`, document.updatedAt, document.issue, document.url, `${found.approved ? "Approved with feedback" : "Sent back"}:\n${found.text}`));
+    if (found && document.issue && allowed(document.issue.id)) planItems.push(item("plan-feedback", `doc:${document.id}:${document.updatedAt}`, document.updatedAt, document.issue, document.url, `${found.approved ? "Approved with feedback" : "Sent back"}:\n${found.text}`, found.text));
   }
   for (const comment of await linear.planSentBackSince(window.since)) {
     const found = comment.issue && inWindow(comment.createdAt) ? sentBackFeedback(comment.body) : null;
-    if (found && comment.issue && allowed(comment.issue.id)) planItems.push(item("plan-feedback", `comment:${comment.id}`, comment.createdAt, comment.issue, comment.url, `Sent back:\n${found}`));
+    if (found && comment.issue && allowed(comment.issue.id)) planItems.push(item("plan-feedback", `comment:${comment.id}`, comment.createdAt, comment.issue, comment.url, `Sent back:\n${found}`, found));
   }
   // The same feedback reaches the log, the plan document and a comment (cut at 4,000 characters):
   // kept once, from the fullest source first.
@@ -255,7 +262,7 @@ export async function collectOwnerDecisions(sources: CollectSources, window: { s
 
   const answerItems = answers.flatMap(({ answer, question }) => {
     const link = links.get(question.issueId);
-    return link && allowed(question.issueId) ? [item("answer", `log:answer:${answer.id}`, answer.at, link, link.url, answerText(question, answer))] : [];
+    return link && allowed(question.issueId) ? [item("answer", `log:answer:${answer.id}`, answer.at, link, link.url, answerText(question, answer), answerWords(question, answer))] : [];
   });
 
   const owner = await linear.viewerId();
@@ -265,7 +272,7 @@ export async function collectOwnerDecisions(sources: CollectSources, window: { s
     if (!issue || comment.userId !== owner || !inWindow(comment.createdAt) || Date.parse(comment.createdAt) < commentsFrom || sources.recorded.has(comment.id) || !allowed(issue.id)) return [];
     if (!sources.agentTickets.has(issue.id) && !(issue.parentId && sources.agentTickets.has(issue.parentId))) return [];
     const answered = issue.title.startsWith("Needs you:") || Boolean(comment.parentBody?.includes("is waiting for"));
-    return [item(answered ? "answer" : "comment", `comment:${comment.id}`, comment.createdAt, issue, comment.url, comment.body.trim())];
+    return [item(answered ? "answer" : "comment", `comment:${comment.id}`, comment.createdAt, issue, comment.url, comment.body.trim(), comment.body.trim())];
   }).filter((found) => found.text);
 
   return [...kept, ...answerItems, ...commentItems].sort((a, b) => a.at.localeCompare(b.at) || a.sourceId.localeCompare(b.sourceId));
@@ -321,29 +328,64 @@ export function collectWindow(state: State, now: number, recordsFrom: string | n
   return { since: new Date(Math.min(start, now)).toISOString(), until: new Date(now).toISOString(), coverageFrom, commentsFrom };
 }
 
+// Who holds the lock and since when (the time its holder wrote, else the file's mtime: a holder
+// that died while writing leaves it empty or cut); null once it is gone.
+async function lockHolder(path: string): Promise<{ token: string | null; since: number } | null> {
+  const content = await readFile(path, "utf8").catch(() => null);
+  if (content === null) return null;
+  let value: Record<string, unknown> = {};
+  try { value = record(JSON.parse(content)); } catch { /* empty or cut: judged by mtime */ }
+  const at = text(value.at) ? Date.parse(value.at) : Number.NaN;
+  const since = Number.isNaN(at) ? (await stat(path).catch(() => null))?.mtimeMs ?? 0 : at;
+  return { token: text(value.token) ? value.token : null, since };
+}
+
+// One `collect` or `file` at a time. Each acquisition writes its own token, so a run removes only
+// its own lock; a stale lock (30 minutes) is taken over by one run only, through `lock.takeover`.
 export async function withLock<T>(directory: string, work: () => Promise<T>, now = () => Date.now()): Promise<T> {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const path = join(directory, "lock");
+  const token = randomUUID();
+  const busy = (since: number) => new Error(`Another decision-candidates run holds ${path} (since ${new Date(since).toISOString()}).`);
   const take = async () => {
     const handle = await open(path, "wx", 0o600);
-    await handle.writeFile(JSON.stringify({ pid: process.pid, at: new Date(now()).toISOString() }));
+    try {
+      await handle.writeFile(JSON.stringify({ pid: process.pid, token, at: new Date(now()).toISOString() }));
+    } catch (error) {
+      await handle.close();
+      await rm(path, { force: true });
+      throw error;
+    }
     await handle.close();
   };
   try {
     await take();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    // Stale by the time its holder wrote into it (the same clock as `now`), else by its mtime.
-    const held = await readFile(path, "utf8").then((content) => Date.parse(String(record(JSON.parse(content)).at)), () => Number.NaN);
-    const since = Number.isNaN(held) ? (await stat(path).catch(() => null))?.mtimeMs : held;
-    if (since !== undefined && now() - since < LOCK_STALE_MS) throw new Error(`Another decision-candidates run holds ${path} (since ${new Date(since).toISOString()}).`);
-    await rm(path, { force: true });
-    await take();
+    const stale = await lockHolder(path);
+    if (stale && now() - stale.since < LOCK_STALE_MS) throw busy(stale.since);
+    const takeover = `${path}.takeover`;
+    // A takeover left by a run that died within it.
+    const left = await stat(takeover).catch(() => null);
+    if (left && now() - left.mtimeMs >= LOCK_STALE_MS) await rm(takeover, { force: true });
+    const guard = await open(takeover, "wx", 0o600).catch((failure: unknown) => {
+      throw (failure as NodeJS.ErrnoException).code === "EEXIST" ? busy(stale?.since ?? now()) : failure;
+    });
+    await guard.close();
+    try {
+      // Still the same stale lock: another run may have taken it over in between.
+      const again = await lockHolder(path);
+      if (again && (again.token !== (stale?.token ?? null) || now() - again.since < LOCK_STALE_MS)) throw busy(again.since);
+      await rm(path, { force: true });
+      await take();
+    } finally {
+      await rm(takeover, { force: true });
+    }
   }
   try {
     return await work();
   } finally {
-    await rm(path, { force: true });
+    if ((await lockHolder(path))?.token === token) await rm(path, { force: true });
   }
 }
 
@@ -460,7 +502,7 @@ export function validateInput(raw: unknown, batch: Batch): { input: FileInput; e
         if (!source) { errors.push(`${where}, evidence ${at + 1}: \`sourceId\` ${JSON.stringify(entry.sourceId)} is not in batch ${batch.until}.`); return; }
         if (!text(entry.url) || !/^https:\/\/\S+$/.test(entry.url)) errors.push(`${where}, evidence ${at + 1}: \`url\` must be an https link.`);
         if (!text(entry.quote) || !normalize(entry.quote)) errors.push(`${where}, evidence ${at + 1}: \`quote\` is required.`);
-        else if (!normalize(source.text).includes(normalize(entry.quote))) errors.push(`${where}, evidence ${at + 1}: \`quote\` must be the owner's words verbatim from ${entry.sourceId}.`);
+        else if (!normalize(source.words ?? "").includes(normalize(entry.quote))) errors.push(`${where}, evidence ${at + 1}: \`quote\` must be the owner's own words verbatim from ${entry.sourceId} (not the question or options an agent asked).`);
         cited.push({ sourceId: String(entry.sourceId), url: String(entry.url ?? ""), quote: String(entry.quote ?? "") });
       });
       candidates.push({
@@ -473,11 +515,20 @@ export function validateInput(raw: unknown, batch: Batch): { input: FileInput; e
   return { input: { projects }, errors };
 }
 
+// The quoted passage as the owner wrote it (line breaks, indentation), found in their words with
+// any whitespace between its words; validateInput made sure it is there.
+export function verbatim(words: string, quote: string): string {
+  const pattern = normalize(quote).split(" ").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s+");
+  return words.match(new RegExp(pattern))?.[0] ?? normalize(quote);
+}
+
 function renderCandidate(number: number, key: string, candidate: Candidate, batch: Batch): string {
   const items = new Map(batch.items.map((found) => [found.sourceId, found]));
-  const evidence = candidate.evidence.map((entry) => {
+  // Each quoted line is prefixed, so none of the owner's lines can read as a heading or marker.
+  const evidence = candidate.evidence.flatMap((entry) => {
     const source = items.get(entry.sourceId)!;
-    return `  - ${source.at.slice(0, 16).replace("T", " ")} UTC, [${source.identifier}](${entry.url}) (${source.kind}): “${normalize(entry.quote)}”`;
+    const quoted = verbatim(source.words, entry.quote).split("\n").map((line) => line.trimEnd() ? `    > ${line.trimEnd()}` : "    >");
+    return [`  - ${source.at.slice(0, 16).replace("T", " ")} UTC, [${source.identifier}](${entry.url}) (${source.kind}):`, ...quoted];
   });
   const oneLine = (value: string) => normalize(value);
   return [
