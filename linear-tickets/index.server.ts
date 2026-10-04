@@ -285,7 +285,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(agentStatusRpc, async (_input, { paseo }) => {
     attach(paseo);
     const installed = await startAgent();
-    return { installed, funnel: funnel?.active ?? false, funnelNote: funnel?.note ?? null, lastWebhookAt: webhook.lastEventAt };
+    return { installed, funnel: funnel?.active ?? false, funnelNote: funnel?.note ?? null, lastWebhookAt: webhook.lastEventAt, webhooks: webhook.events, ...sessions.readStats() };
   });
   // No hook within a few seconds of loading (typically a reload): use the plugin's own connection.
   let own: PaseoClient | null = null;
