@@ -1383,6 +1383,93 @@ A saved Linear view of label `<label>-manual`, assignee *me*, status not complet
 lists everything waiting on you. Keep the team setting that closes a parent when all its
 sub-issues are done **off**, or finishing the tasks closes the ticket.
 
+## Decision candidates
+
+Once a week the owner's decisions made outside plans become proposals for the rules that bind
+later work. Nothing becomes a rule until the owner answers each proposal.
+
+**What is collected.** For a window of normally 7 days: feedback on plan reviews (sent back and
+approved, from the plan documents, the `Plan sent back` comments and the local log), the owner's
+answers to agents' questions (the local log, `Needs you` sub-issues, replies after a "waiting for
+an answer" comment) and the owner's own comments on tickets an agent worked on. Comments the
+plugin or a ticket agent wrote with the key are left out by their records under
+`agent-comments/` (kept 35 days), and so is everything on candidate tickets themselves.
+
+**Local log.** Answers given in the Paseo app and earlier review rounds leave no lasting trace in
+Linear (the plan document is replaced every round), so the plugin appends them to
+`$PASEO_HOME/linear-tickets/owner-decisions/log.jsonl` (directory `0700`, file `0600`): every plan
+review decision with feedback (`plan-feedback`), every question request (`question`) and its
+resolution (`answer`), also with write-back off. Entries older than 60 days are dropped. A failed
+write is logged and never stops the review or the question.
+
+**Window.** `collect` covers from the checkpoint of the last successful `file` (at most 28 days
+back) to now, otherwise the last 7 days, and never before `coverageFrom` in
+`owner-decisions/state.json` (the first run minus 7 days, since older key-written comments have
+no record left).
+
+**Runbook for the weekly agent.** The schedule `decision-candidates` (Mondays 07:00
+Europe/Berlin) starts an agent in a scratch folder with these steps:
+
+1. From the plugin folder (`~/dev/paseo-plugins/linear-tickets`) run
+   `node --import tsx scripts/decision-candidates.ts collect`. It prints the window's items, each
+   with its `sourceId`, link and the owner's words; every earlier candidate ticket with its
+   comments; the full register (`approved.md`, `decisions.md`, `decision-queue.md` from
+   tuchel-platform's `origin/main`); open tickets that mention `docs/principles`; and the files
+   holding the agents' rules (this README, the launch template in `settings.json`). The first
+   line names the batch (`--batch <until>`).
+2. Sort each item: **general** is a rule for future tickets or for other places than this one;
+   **one-off** settles only that ticket. Drop one-offs. Comments the owner's own assistant
+   sessions wrote through his Linear account show him as author and cannot be told apart (no
+   record, no bot marker): take such a report (a status, findings, a summary) as a decision only
+   where it states the owner's decision, and quote that part.
+3. Drop general items already covered: by `approved.md`, by `decisions.md` (approved **or
+   rejected**; judge statement, scope and rationale, not words), by `decision-queue.md`, by an
+   earlier candidate ticket, by an open register ticket, or (Agent tooling) by this README or the
+   launch template. A rejected decision is never raised again.
+4. Merge duplicates and route each to a project: `ERP` (rules of the platform) or
+   `Agent tooling` (how agents work).
+5. Write the input file and run
+   `node --import tsx scripts/decision-candidates.ts file --batch <until> --input <file.json>`
+   (first with `--dry-run`):
+
+   ```json
+   { "projects": [{ "project": "ERP", "candidates": [{
+     "title": "Lists sort newest first", "type": "principle",
+     "wording": "Every list in the ERP sorts newest first unless the page says otherwise.",
+     "scope": "All list pages", "question": "Make this a principle?",
+     "options": "Approve / reject / change the wording", "recommendation": "Approve",
+     "evidence": [{ "sourceId": "comment:…", "url": "https://linear.app/…", "quote": "the owner's words, verbatim" }]
+   }] }] }
+   ```
+
+   `type` is `principle`, `conflict` or `exception`. Every candidate needs at least one evidence
+   entry with a collected `sourceId`, an https link and the owner's words quoted verbatim. An
+   empty `projects` list files nothing and still closes the window.
+6. Never edit a repository and never write Linear except through `file`.
+
+**Filing.** `file` writes only as the Paseo app (`agent-app/token.json`); a missing, expiring or
+rejected token stops it before or at the first write, never a write with the key. Per project it
+files at most one ticket per run: *Decision candidates, week <n>*, marked
+``Marker: `decision-candidates <project> <year>-W<week>` `` in its description. A candidate whose
+key (derived from its evidence: source ids and quotes) is in any earlier candidate ticket of that
+project is skipped; new ones go into that week's open ticket or, if there is none (or it was
+closed), into a new one (`run 2`, ...). Proposals are numbered `Q-<n>` after the highest number in
+the register and in earlier candidate tickets. Created tickets go through the project's normal
+pickup. The checkpoint moves only once every project was filed; a rerun of the same batch files
+nothing twice. One lock (`owner-decisions/lock`, taken over by one run after 30 minutes) keeps
+two runs apart. A run that dies inside the milliseconds it checks or replaces the lock leaves
+`owner-decisions/lock.guard`; it is never removed automatically, and runs fail naming it until a
+person removes it with no run active.
+
+**Answers.** The ticket tells its agent to ask the owner each proposal, post
+`**Q-<n> answered** — approved | rejected | changed | deferred: <the owner's words>` per answer,
+and record them: for ERP one tuchel-platform pull request following `docs/principles/README.md`
+(`D-N` each, `P-N` for approved principles, `Q-N` in the queue for deferred ones); for Agent
+tooling a change to this README or the launch template. The ops digest shows
+`Decision candidates waiting: N`: proposals of open candidate tickets without such a comment.
+
+**Undo.** Pause or delete the schedule; tickets already filed are closed by hand.
+
 ## Connection storage
 
 The API-key form stores the key on the daemon host in
@@ -1423,5 +1510,7 @@ and validation, repository orientation (guide matching, ranking and the cap), cr
 settings persistence, ticket retrieval, state-transition
 resolution and failure handling, agent creation/retries with mocked Linear and Paseo
 calls, and the pull request view (CI summaries, merge queue parsing, polling cadence, the GitHub
-budget's reserve, labelling) against a fake GitHub.
+budget's reserve, labelling) against a fake GitHub, and the decision candidates (the log, the
+collector's sources and exclusions, window limits, candidate identity, one ticket per project,
+app-only filing) against a fake Linear.
 Live account authentication and agent execution require your configured host and key.

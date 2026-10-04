@@ -16,8 +16,9 @@ export type FiledIssue = { id: string; identifier: string; createdAt: string };
 export type PostedComment = { id: string; issueId: string; identifier: string | null; createdAt: string };
 
 const PLUGIN = "plugin";
-// Long enough for any relay pause; the relay reads past them within a poll otherwise.
-const PLUGIN_RECORD_MS = 7 * 24 * 60 * 60 * 1000;
+// Long enough for any relay pause, and for the weekly decision candidates (owner-decisions.ts),
+// which look back up to 28 days and must not take one of these for the owner's own comment.
+export const PLUGIN_RECORD_MS = 35 * 24 * 60 * 60 * 1000;
 
 async function records(directory: string): Promise<{ name: string; value: Record<string, unknown> }[]> {
   const names = await readdir(directory).catch(() => [] as string[]);
@@ -41,7 +42,7 @@ export async function postedComments(directory: string, ticket: string): Promise
     .map((value) => ({ id: value.id as string, issueId: value.issueId as string, identifier: text(value.identifier) ? value.identifier : null, createdAt: value.createdAt as string }));
 }
 
-// The ids of the plugin's key-written comments; records older than a week are removed.
+// The ids of the plugin's key-written comments; records older than PLUGIN_RECORD_MS are removed.
 export async function pluginComments(directory: string, now = Date.now()): Promise<string[]> {
   const folder = join(directory, "agent-comments", PLUGIN);
   const ids: string[] = [];
@@ -51,6 +52,28 @@ export async function pluginComments(directory: string, now = Date.now()): Promi
     else ids.push(value.id);
   }
   return ids;
+}
+
+// Every comment id recorded here: the ticket agents' (every ticket) and the plugin's.
+export async function recordedComments(directory: string, now = Date.now()): Promise<Set<string>> {
+  const ids = new Set<string>(await pluginComments(directory, now));
+  for (const ticket of await readdir(join(directory, "agent-comments")).catch(() => [] as string[])) {
+    for (const comment of await postedComments(directory, ticket)) ids.add(comment.id);
+  }
+  return ids;
+}
+
+// When the oldest comment record still kept was written (ticket agents' and the plugin's), or null
+// without one: the weekly decision candidates count the owner's comments only from there.
+export async function oldestRecord(directory: string): Promise<string | null> {
+  let oldest: number | null = null;
+  for (const folder of await readdir(join(directory, "agent-comments")).catch(() => [] as string[])) {
+    for (const { value } of await records(join(directory, "agent-comments", folder))) {
+      const at = text(value.createdAt) ? Date.parse(value.createdAt) : Number.NaN;
+      if (!Number.isNaN(at) && (oldest === null || at < oldest)) oldest = at;
+    }
+  }
+  return oldest === null ? null : new Date(oldest).toISOString();
 }
 
 export async function recordPluginComment(directory: string, id: string, issueId: string, now = new Date()): Promise<void> {

@@ -14,6 +14,7 @@ import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./sett
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { NeedsYouIssues } from "./needs-you";
 import { MAX_SUMMARY_LENGTH, ownerRequest, turnPullRequests, turnReply, Writeback } from "./writeback";
+import { DecisionLog } from "./owner-decisions";
 
 // Writebacks built without an outbox path keep theirs here, never in the real Paseo home.
 process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-writeback-home-"));
@@ -499,4 +500,41 @@ test("other Linear outages are retried twice, after 30 s and 2 min, then dropped
   await settle();
   assert.equal(attempts, 3);
   assert.deepEqual(errors.mock.calls.map((call) => String(call.arguments[0]).match(/retrying in \d+ s/)?.[0]).filter(Boolean), ["retrying in 30 s", "retrying in 120 s"]);
+});
+
+test("questions and the owner's answers are logged for the decision candidates, across a reload and with write-back off", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-decision-log-"));
+  const linear = new FakeLinear();
+  const off = { ...allOn, writeback: DEFAULT_WRITEBACK };
+  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1", "linear.identifier": "ENG-1" }, pendingPermissions: [] } }) }) } } as unknown as PaseoApi;
+  const before = new Writeback(linear, { read: async () => off }, undefined, 0);
+  before.recordDecisions(new DecisionLog(directory));
+  const ask = (id: string) => before.permissionRequested({ agent: root, request: { id, provider: "omp", name: "ask", kind: "question", input: { questions: [{ header: "Merge", question: "May I merge?", options: [{ label: "Yes" }, { label: "No" }] }] } } }, paseo);
+  await ask("q1");
+  await ask("q2");
+  await before.permissionRequested({ agent: root, request: { id: "t1", provider: "omp", name: "Bash", kind: "tool" } }, paseo);
+  // The plugin reloads before the owner answers in the Paseo app.
+  const after = new Writeback(linear, { read: async () => off }, undefined, 0);
+  after.recordDecisions(new DecisionLog(directory));
+  const answer = (requestId: string, choice: string) => after.permissionResolved({ agent: root, requestId, resolution: { behavior: "allow", updatedInput: { answers: { Merge: choice } } } }, paseo);
+  await answer("q1", "Yes");
+  await answer("q1", "Yes");
+  await answer("q2", "No");
+  await after.permissionResolved({ agent: root, requestId: "t1", resolution: { behavior: "allow" } }, paseo);
+  const entries = await new DecisionLog(directory).entries();
+  assert.deepEqual(entries.map((entry) => `${entry.kind} ${entry.id}`), ["question agent-1:q1", "question agent-1:q2", "answer agent-1:q1", "answer agent-1:q2"]);
+  assert.deepEqual(entries[0], { kind: "question", id: "agent-1:q1", at: entries[0].at, identifier: "ENG-1", issueId: "issue-1", questions: [{ key: "Merge", question: "Merge: May I merge?", options: ["Yes", "No"] }] });
+  assert.deepEqual(linear.writes, []);
+});
+
+test("a failing decision log never stops the waiting write-back", async () => {
+  const linear = new FakeLinear();
+  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" }, pendingPermissions: [{ id: "q1" }] } }) }) } } as unknown as PaseoApi;
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
+  writeback.recordDecisions({ append: async () => { throw new Error("disk full"); }, answer: async () => { throw new Error("disk full"); } });
+  const errors = test.mock.method(console, "error", () => {});
+  await writeback.permissionRequested({ agent: root, request: { id: "q1", provider: "omp", name: "ask", kind: "question", title: "Which?" } }, paseo);
+  errors.mock.restore();
+  assert.ok(linear.writes.includes("move issue-1 Needs input"));
+  assert.match(String(errors.mock.calls[0]?.arguments[0]), /decision log: question on issue-1 failed: disk full/);
 });

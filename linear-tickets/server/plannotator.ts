@@ -19,6 +19,7 @@ import { isUntrusted } from "./starter";
 import { dispatchLabels } from "./dispatch";
 import { orderProblems, type ProjectFlow } from "./project-flow";
 import type { PlanFollowUps } from "./plan-follow-ups";
+import { feedbackEntry, logQuietly, type DecisionLog } from "./owner-decisions";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -163,6 +164,8 @@ export class PlannotatorBridge {
   private readonly advised = new Map<string, { verdict: string; hash: string }>();
   // Reviews already opened on this machine, so a retried event does not open a second tab.
   private readonly shown = new Set<string>();
+  // Where the owner's review feedback is kept for the weekly decision candidates (owner-decisions.ts).
+  private decisions: Pick<DecisionLog, "append"> | null = null;
 
   constructor(
     private readonly linear: Linear,
@@ -249,6 +252,17 @@ export class PlannotatorBridge {
     this.followUps = followUps;
   }
 
+  recordDecisions(log: Pick<DecisionLog, "append">): void {
+    this.decisions = log;
+  }
+
+  // The plan document is replaced every round, so the log is where each round's feedback stays.
+  private async logFeedback(agentId: string, event: DecidedEvent, issue: { id: string; identifier: string }): Promise<void> {
+    const entry = feedbackEntry(agentId, event, issue);
+    const log = this.decisions;
+    if (entry && log) await logQuietly(() => log.append(entry), `plan feedback on ${issue.identifier}`);
+  }
+
   // The risk policy (README, "Plan risk and auto-approval"): approves the plan on the owner's
   // behalf when its `## Risk and impact` rating is within the threshold, the advisor review the
   // extension recorded is for exactly this text, and nothing about the ticket needs the owner.
@@ -326,6 +340,7 @@ export class PlannotatorBridge {
     const issueId = labels["paseo.parent-agent-id"] ? undefined : labels["linear.issueId"];
     const identifier = labels["linear.identifier"] || "this ticket";
     if (issueId && this.projectPlans && await this.projectPlans.isPlanner(issueId)) return this.deliverWorkOrder(event, agentId, issueId, identifier, paseo);
+    if (event.type === "decided" && issueId) await this.logFeedback(agentId, event, { id: issueId, identifier });
     // The agent's stable link when ReviewLinks is up; otherwise this review's own tailnet or local URL.
     const url = event.type === "opened" ? (await this.reviews?.opened(agentId, event, labels["linear.identifier"] || undefined)) ?? event.remoteUrl ?? event.localUrl : undefined;
     if (event.type === "decided") await this.reviews?.decided(agentId, event.approved);
@@ -474,6 +489,7 @@ export class PlannotatorBridge {
     this.lastDecision.set(parked.agentId, at);
     // The plugin closed the review itself (approve later, split), which already moved the ticket on.
     if (previous !== undefined && Math.abs(at - previous) < 120_000) return;
+    await this.logFeedback(parked.agentId, event, { id: parked.issueId, identifier: parked.identifier });
     const documentUrl = await this.linear.upsertIssueDocument(parked.issueId, `Plan: ${parked.identifier}`, planDocument({ ...event, planContent: event.planContent ?? parked.plan }, parked.identifier, parked.model));
     if (event.approved) {
       await this.followUps?.file({ issueId: parked.issueId, identifier: parked.identifier, plan: event.planContent ?? parked.plan, documentUrl: documentUrl || null });

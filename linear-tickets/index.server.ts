@@ -17,6 +17,7 @@ import { PlannotatorBridge, readReviewPlan, recordDecision, writeOpenScript } fr
 import { ParkedPlans, PlannotatorHost } from "./server/parked";
 import { reviewOutcome } from "./server/review-outcome";
 import { Writeback } from "./server/writeback";
+import { DecisionLog } from "./server/owner-decisions";
 import { AgentApi, AppAuth } from "./server/agent-app";
 import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
 import { ensureFunnel, type FunnelStatus } from "./server/funnel";
@@ -96,6 +97,9 @@ export default function contribute(server: PluginServerContext) {
   }, restart: (issueId, identifier) => sessions.restartFor(issueId, identifier), accountedFor: async (issueId) => launcher.underWay(issueId) || await sessions.threadHolds(issueId) });
   const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
+  // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
+  const decisions = new DecisionLog();
+  writeback.recordDecisions(decisions);
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   const reviewLinks = new ReviewLinks();
   // Plans that need the owner are parked and served by one central Plannotator host, so their
@@ -113,6 +117,7 @@ export default function contribute(server: PluginServerContext) {
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks, undefined, undefined, parking);
   plannotator.onProjectPlan(projects);
   plannotator.useFollowUps(followUps);
+  plannotator.recordDecisions(decisions);
   const manualTasks = new ManualTasks({ linear, settings });
   const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });
