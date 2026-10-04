@@ -1454,7 +1454,8 @@ files at most one ticket per run: *Decision candidates, week <n>*, marked
 key (derived from its evidence: source ids and quotes) is in any earlier candidate ticket of that
 project is skipped; new ones go into that week's open ticket or, if there is none (or it was
 closed), into a new one (`run 2`, ...). Proposals are numbered `Q-<n>` after the highest number in
-the register and in earlier candidate tickets. Created tickets go through the project's normal
+the register and in earlier candidate tickets. Created tickets go into the team's Todo (Triage is
+never handed out) and through the project's normal
 pickup. The checkpoint moves only once every project was filed; a rerun of the same batch files
 nothing twice. One lock (`owner-decisions/lock`, taken over by one run after 30 minutes) keeps
 two runs apart. A run that dies inside the milliseconds it checks or replaces the lock leaves

@@ -41,6 +41,7 @@ class World {
   writes: string[] = [];
   failOn: string | null = null;
   async teamIdByKey() { return "team"; }
+  async todoStateId() { return "state:todo"; }
   async projectIdByName(name: string) { return `project:${name}`; }
   async viewerId() { return "owner"; }
   async issuesMentioning(_team: string, text: string, openOnly = false) {
@@ -55,7 +56,7 @@ class World {
       if (this.failOn && input.projectId.endsWith(this.failOn)) throw new Error("Linear is down");
       const number = this.tickets.length + 100;
       this.writes.push(`create ${input.projectId} "${input.title}"`);
-      const ticket = { id: `t${number}`, identifier: `TUC-${number}`, url: `https://linear.app/acme/issue/TUC-${number}`, project: input.projectId.replace("project:", ""), title: input.title, status: "Backlog", statusType: "backlog", description: input.description, comments: [] };
+      const ticket = { id: `t${number}`, identifier: `TUC-${number}`, url: `https://linear.app/acme/issue/TUC-${number}`, project: input.projectId.replace("project:", ""), title: input.title, status: input.stateId === "state:todo" ? "Todo" : "Triage", statusType: input.stateId === "state:todo" ? "unstarted" : "triage", description: input.description, comments: [] };
       this.tickets.push(ticket);
       return { id: ticket.id, identifier: ticket.identifier, url: ticket.url };
     },
@@ -227,6 +228,8 @@ test("filing: one ticket per project, nothing twice, appended within the week, a
       ["Agent tooling", "created", ["Q-14 — Fetch main first"]],
     ]);
     assert.deepEqual(world.writes, ['create project:ERP "Decision candidates, week 41"', 'create project:Agent tooling "Decision candidates, week 41"']);
+    // Todo, not Triage: the project hand-out never takes a ticket out of Triage.
+    assert.deepEqual(world.tickets.map((ticket) => ticket.status), ["Todo", "Todo"]);
     const erp = world.tickets[0];
     assert.match(erp.description, /^Marker: `decision-candidates ERP 2026-W41`/);
     assert.match(erp.description, /- Evidence:\n {2}- 2026-10-04 07:00 UTC, \[ISSUE-1\]\(https:\/\/linear\.app\/acme\/issue\/issue-1#comment-c1\) \(comment\):\n {4}> We always do A\./);
