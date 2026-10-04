@@ -825,7 +825,7 @@ new message, the first that applies:
 
 | Stage | When | Next step sent |
 |---|---|---|
-| Draft | a draft with no new commit and no pull request activity for 30 minutes | run the background Sol review if not done, then publish only the reviewed part of the stack, bottom first: `gt submit --publish --no-stack --branch <branch>` once the branch and every branch below it are reviewed |
+| Draft | a draft with no new commit and no pull request activity for 30 minutes | run the background Sol review if not done, then publish only the reviewed part of the stack, bottom first: `git switch <branch> && node tools/ci/publish.mjs` once the branch and every branch below it are reviewed and each passed `verify:pre-pr --body-file` (never a bare `gt submit --publish` or `gh pr ready`; `publish.mjs` refuses until PR metadata is green and prints any owner question) |
 | Failed checks | a ready pull request whose latest run of a check failed (pending runs and `Graphite / mergeability_check` do not count) | the failed checks with links; fix, then `gt submit --stack` |
 | Changes requested | a reviewer's latest approving, change-requesting or dismissed review asks for changes (on any commit), or GitHub's review decision is "changes requested" | each such review and the unresolved review threads; address them, then `gt submit --stack` (for a review on an earlier commit: reply on its threads and re-request the review) |
 | Findings | unresolved review threads a bot started (Greptile, any bot reviewer) | the findings; run the AGENTS.md review loop |
