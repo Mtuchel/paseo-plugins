@@ -1739,6 +1739,22 @@ test("a crashed agent without an open pull request is restarted while its ticket
   }
 });
 
+test("an owner comment that failed after the restarts without an open pull request is posted on the next poll", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = harness(t, { crash: true });
+  h.records[0] = { ...h.records[0], links: {} };
+  for (let restart = 0; restart < 2; restart++) {
+    h.daemon.agent = CRASHED;
+    assert.ok((await h.poll()).includes("reload a1"));
+  }
+  h.daemon.agent = CRASHED;
+  h.linear.arrive = async () => { throw new Error("Linear is unavailable"); };
+  assert.deepEqual(await h.poll(), [], "the comment failed");
+  h.linear.arrive = async () => {};
+  assert.ok((await h.poll()).some((call) => call.startsWith(`comment ${OWNER} The agent crashed again`)), "retried");
+  assert.deepEqual(await h.poll(), [], "then nothing");
+});
+
 test("without an open pull request, a healthy agent or a ticket that is not started is left alone", async (t) => {
   for (const [agent, statusType] of [[RESTARTED, "started"], [CRASHED, "completed"]] as const) {
     const h = harness(t, { crash: true });

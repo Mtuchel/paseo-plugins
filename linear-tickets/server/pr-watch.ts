@@ -1606,8 +1606,15 @@ export class PullRequestWatch {
         if (state.statusType !== "started") continue;
         const restarts = entry.restarts ?? 0;
         if (restarts >= STAGE_NUDGES) {
+          // Claimed before the comment; a comment that failed is retried on the next poll, as for
+          // a stage's escalation.
           await this.saveCrash(record.agentId, { escalated: true, resume: null });
-          await this.mention(record.issueId, `The agent crashed again after Paseo restarted it ${STAGE_NUDGES} times while no pull request was open, so Paseo stops restarting it. Please take over.\n\n\`${error}\``);
+          try {
+            await this.mention(record.issueId, `The agent crashed again after Paseo restarted it ${STAGE_NUDGES} times while no pull request was open, so Paseo stops restarting it. Please take over.\n\n\`${error}\``);
+          } catch (failure) {
+            await this.saveCrash(record.agentId, { escalated: false });
+            throw failure;
+          }
           await this.tell(record, "response", "The agent crashed again; the owner was asked to take over.");
           continue;
         }
