@@ -4,6 +4,7 @@ import { createServer, type Server } from "node:http";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { parsePlanRisk, combinedRating, ratingText } from "../shared/plan-risk";
+import { planFollowUps } from "../shared/plan-sections";
 import { FUNNEL_PORT } from "./funnel";
 import { plannotatorPaths, readReviewPlan, type OpenedEvent } from "./plannotator";
 import { createReviewProxy } from "./review-proxy";
@@ -32,6 +33,9 @@ export type PlanDetails = {
   // Why the risk policy left it to the owner; absent when the policy did not judge the review.
   reasons?: string[];
   autoApproved?: boolean;
+  // The plan's `follow-up` items (filed as tickets on approval) and whether it sets a new rule.
+  followUps?: number;
+  newRule?: boolean;
 };
 export type ReviewEntry = {
   agentId: string;
@@ -97,7 +101,7 @@ function escapeHtml(text: string): string {
 const PAGE_STYLE = `body{font:17px/1.5 -apple-system,system-ui,sans-serif;margin:0;padding:48px 24px;color:#1c1c1e;background:#f2f2f7}main{max-width:32rem;margin:auto}h1{font-size:1.4rem;margin:0 0 .5rem}h2{font-size:.8rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:#8e8e93;margin:2rem 0 .5rem}
 ul{list-style:none;margin:0;padding:0;border-radius:12px;overflow:hidden;background:#fff}li+li{border-top:1px solid #e5e5ea}li>a,li>div{display:block;padding:14px 16px;color:inherit;text-decoration:none}li>a:active{background:#e5e5ea}
 .head{display:flex;justify-content:space-between;gap:12px}.id{font-weight:600}.meta{color:#8e8e93;white-space:nowrap}.empty{color:#8e8e93}.title{margin-top:2px}.summary{margin-top:4px;font-size:15px;color:#3c3c43;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.chip{display:inline-block;margin-top:8px;font-size:13px;padding:2px 10px;border-radius:999px;background:#e5e5ea}.low{background:#d6f5df;color:#1b6e35}.mid{background:#fdecc8;color:#7a4f00}.high{background:#fde1df;color:#a3221b}.why{margin-top:6px;font-size:13px;color:#8e8e93}
+.chip{display:inline-block;margin-top:8px;margin-right:6px;font-size:13px;padding:2px 10px;border-radius:999px;background:#e5e5ea}.low{background:#d6f5df;color:#1b6e35}.mid{background:#fdecc8;color:#7a4f00}.high{background:#fde1df;color:#a3221b}.why{margin-top:6px;font-size:13px;color:#8e8e93}
 @media(prefers-color-scheme:dark){body{color:#f2f2f7;background:#000}ul{background:#1c1c1e}li+li{border-color:#38383a}li>a:active{background:#2c2c2e}.summary{color:#c7c7cc}.chip{background:#2c2c2e}.low{background:#123d22;color:#8fe0a8}.mid{background:#4a3500;color:#ffd27a}.high{background:#4d1512;color:#ff9f97}}`;
 
 function page(title: string, body: string, head = ""): string {
@@ -157,7 +161,8 @@ export function planDetails(plan: string, identifier?: string): PlanDetails {
   }
   const rated = parsePlanRisk(plan);
   const risk = "risk" in rated ? { impact: combinedRating(rated.risk).impact, text: ratingText(rated.risk) } : null;
-  return { title, summary: summary || null, risk };
+  const followUps = planFollowUps(plan).length;
+  return { title, summary: summary || null, risk, ...(followUps ? { followUps } : {}), ...("risk" in rated && rated.risk.newRule ? { newRule: true } : {}) };
 }
 
 function riskChip(risk: PlanDetails["risk"]): string {
@@ -169,7 +174,9 @@ function riskChip(risk: PlanDetails["risk"]): string {
 function detailRows(details: PlanDetails | undefined, withSummary: boolean): string {
   if (!details) return "";
   const reasons = details.reasons?.length ? `<div class="why">Needs you: ${escapeHtml(details.reasons.join("; "))}</div>` : "";
-  return `${details.title ? `<div class="title">${escapeHtml(details.title)}</div>` : ""}${withSummary && details.summary ? `<div class="summary">${escapeHtml(details.summary)}</div>` : ""}${riskChip(details.risk)}${withSummary ? reasons : ""}`;
+  const followUps = details.followUps ? `<span class="chip">${details.followUps} follow-up${details.followUps === 1 ? "" : "s"}</span>` : "";
+  const newRule = details.newRule ? `<span class="chip mid">new rule</span>` : "";
+  return `${details.title ? `<div class="title">${escapeHtml(details.title)}</div>` : ""}${withSummary && details.summary ? `<div class="summary">${escapeHtml(details.summary)}</div>` : ""}${riskChip(details.risk)}${followUps}${newRule}${withSummary ? reasons : ""}`;
 }
 
 function outcomeText(entry: ReviewEntry): string {

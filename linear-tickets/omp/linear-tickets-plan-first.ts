@@ -18,9 +18,11 @@
 //   record is therefore checked in its own handler, so a record listed before the submit in the
 //   same message counts, and a plan write or edit queued in that message holds both back. Subagents
 //   (`task` children, which share the environment but cannot create an advisor) are not gated.
-//   The record also needs the plan's `## Risk and impact` section (shared/plan-risk.ts) and drops an
-//   `advised` event with the verdict and the plan text's hash, from which the plugin's Plannotator
-//   bridge decides whether the plan is approved without the owner (README, "Plan risk and
+//   The record also needs the plan's `## Risk and impact` section (shared/plan-risk.ts) and its
+//   `## Reach` and `## Principles and rules` sections (shared/plan-sections.ts; one line each
+//   suffices at impact 0–1, by the higher of planner and advisor rating), and drops an `advised`
+//   event with the verdict and the plan text's hash, from which the plugin's Plannotator bridge
+//   decides whether the plan is approved without the owner (README, "Plan risk and
 //   auto-approval").
 // - LINEAR_TICKETS_ISSUE=<ticket>: Linear writes (README, "Agent access to Linear"). The user-level
 //   Linear MCP server acts as the owner, so ticket agents and their subagents may call only its read
@@ -40,7 +42,8 @@ import { homedir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
 import { ADVISOR_MODEL, ADVISOR_SECTION, ADVISOR_THINKING, advisorSteps, RECORD_ADVICE_TOOL } from "../shared/plan-advisor";
-import { parsePlanRisk } from "../shared/plan-risk";
+import { combinedRating, parsePlanRisk } from "../shared/plan-risk";
+import { parsePlanSections, ruleMismatch, sectionSteps } from "../shared/plan-sections";
 
 type Phase = "idle" | "planning" | "executing";
 type Entry = { type: string; customType?: string; data?: { reason?: string; path?: string; hash?: string }; message?: { role?: string } };
@@ -286,6 +289,9 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const verdict = params.verdict;
     const rated = parsePlanRisk(content);
     if ("problem" in rated) return text(`${file}: ${rated.problem}\n\nFix the section, then record again.`);
+    const sections = parsePlanSections(content, combinedRating(rated.risk).impact);
+    const sectionProblem = "problem" in sections ? sections.problem : ruleMismatch(rated.risk.newRule, sections.sections);
+    if (sectionProblem) return text(`${file}: ${sectionProblem}\n\n${sectionSteps()}\n\nFix the section, then record again.`);
     if (verdict === "unavailable") {
       const reason = params.reason?.trim();
       if (!reason) return text("Give the reason the advisor could not be created.");

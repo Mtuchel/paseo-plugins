@@ -416,6 +416,45 @@ are linked with `add_relation related` while the agent plans; a ticket another o
 gets a plan that proposes closing it as that ticket's duplicate. A project's planner gets its own
 overlap instructions (see **Projects** below).
 
+**Reach and principles.** A decision made in one ticket should apply everywhere it belongs and not
+come back in the next one, so every plan carries two more sections before `## Risk and impact`, in
+a fixed format ([`shared/plan-sections.ts`](shared/plan-sections.ts)):
+
+```markdown
+## Reach
+
+- Changes: <the concept the ticket changes, not the page it names>
+- <place>: include — AC-N
+- <place>: follow-up — <title of the follow-up ticket>
+- <place>: n/a — <reason>
+
+## Principles and rules
+
+- Applies: <IDs of the approved principles and ADRs | none apply — reason>
+- Exceptions: <none | ID — why>
+- New rule: <none — reason | the rule in one sentence — AC-N>
+- Replaces: / Lives in: / Enforced by: / Existing violations:   (for a new rule only)
+```
+
+`## Reach` goes through every place the changed thing is used: workspaces, pages and roles, shared
+components, existing records (data fix or backfill), exports, PDFs and labels, EDI, Business
+Central, mail and notifications, help pages and German labels, permissions, seed and test data,
+other repositories, and work outside the software. Each place gets one decision. When the right
+behaviour per role is a business choice no approved principle covers, the planner asks you instead
+of guessing. `## Principles and rules` names the rules the plan follows and whether it sets a new
+one: where it lives, what it replaces, how it is enforced and what already violates it (`fixed
+now` or `follow-up — <title>` lines). In tuchel-platform a new rule is a `Q-N` proposal in
+`docs/principles/decision-queue.md`, never an approved principle. A plan rated impact 0–1 (the
+higher of planner and advisor) may answer each section in one line ("Only the menu bar app,
+because …"). Every `include` and every new rule name their own acceptance criterion (`AC-N`,
+defined in the plan's verification), so the implementer cannot skip a place unnoticed: the omp gate
+checks that each named criterion exists outside these two sections and that no two share one,
+not that it really proves the place (that is the advisor's question and yours). Every
+`follow-up` is filed as a ticket when the plan is approved (**Plan follow-ups** below). Every
+ticket agent, the one that plans and then implements as well as one that implements an approved
+plan later, is told to file a place the plan missed as a follow-up ticket (`create_issue`, related
+to the ticket) instead of quietly doing more.
+
 Claude starts in `plan` mode and Codex in `auto`; omp keeps your usual mode (its `write` mode asks
 before every shell command, reads included) and starts in Plannotator's planning phase instead.
 The prompt asks only for a plan and, for a ticket someone else wrote or labelled `feedback`, marks
@@ -448,7 +487,9 @@ and for those agents the extension blocks `plannotator_submit_plan`, its `xd://`
 submitted; a plan the gate cannot read is blocked too. The tool checks with `paseo inspect` that
 the advisor runs GPT-6 Astra at medium, was created by this agent and has finished its latest
 turn; any later edit to the plan needs a new record, and the record follows the session branch
-(resume, `/tree` and branch switches rebuild it). It cannot check what the advisor said: the
+(resume, `/tree` and branch switches rebuild it). The record also needs readable `## Reach` and
+`## Principles and rules` sections; a refusal names the missing section or line and shows the
+format. It cannot check what the advisor said: the
 plan's advisor section is your record of that. Recording and submitting in one step works when the
 record comes first: the record is checked before any tool of that step runs, and a plan edit queued
 in the same step holds both back. Subagents of a ticket agent (`task` children) are not gated; the
@@ -460,7 +501,8 @@ planning policy, without the gate.
 **Plan risk and auto-approval.** Every ticket plan ends with a `## Risk and impact` section, before
 `## Advisor review`, in a fixed format ([`shared/plan-risk.ts`](shared/plan-risk.ts)): affected
 Area labels and business processes, an **impact** level, **reversibility**, feature flag yes/no,
-migration yes/no, auth yes/no, the failure mode, the advisor's own rating, and a recommendation
+migration yes/no, auth yes/no, **new rule** yes/no (the plan sets a rule for future work, stated in
+`## Principles and rules`), the failure mode, the advisor's own rating, and a recommendation
 (`auto` or `owner`).
 
 | Impact | Meaning |
@@ -475,13 +517,15 @@ Reversibility is `revert` (reverting the pull request restores everything), `dat
 written in the meantime need fixing) or `irreversible`. The advisor rates the plan itself from the
 ticket and the code; a plan rated lower than the advisor is a must-change point, and the policy
 takes the higher of both ratings. For omp planners, `record_plan_advice` refuses a plan without a
-readable section (or with `agreed`/`disagreements` but no advisor rating) and tells the plugin
-which verdict was recorded for which plan text.
+readable section (or with `agreed`/`disagreements` but no advisor rating, or a `New rule` that
+disagrees with `## Principles and rules`) and tells the plugin which verdict was recorded for which
+plan text.
 
 When the review opens, the plugin approves it on your behalf only if all of these hold:
 
 - impact at or below `maxImpact` (default 1), or `maxImpactWithFlag` (default 2) behind a feature flag;
-- reversibility `revert`, no migration, no auth change, and the planner recommends `auto`;
+- reversibility `revert`, no migration, no auth change, no new rule (a plan with `New rule: yes`
+  always reaches you, whatever its impact: "it sets a new rule"), and the planner recommends `auto`;
 - the advisor `agreed`, recorded for exactly the text Plannotator shows (an edited plan, an
   unavailable advisor, open disagreements or a plugin reload in between send it to you);
 - the ticket is yours (not someone else's, not `feedback`) and not marked attended.
@@ -517,6 +561,22 @@ Plans stay parked across plugin and host restarts. The host needs Bun (`~/.bun/b
 Homebrew or `LINEAR_TICKETS_BUN`) and the Plannotator omp plugin
 (`~/.omp/plugins/node_modules/@plannotator/pi-extension`, or `LINEAR_TICKETS_PLANNOTATOR_PACKAGE`);
 without them plans are not parked and their agents wait for you as before.
+
+**Plan follow-ups.** When a ticket plan is approved, by you on Plannotator's page, by **Approve
+plan**, **Approve, implement later** or **Approve & split** in the panel, as a parked plan or by
+the risk policy, every `follow-up — <title>` line of its `## Reach` and `## Principles and rules`
+sections becomes a ticket: in Todo, without assignee or labels, in the original ticket's team and
+project, related to it, with a description pointing at the plan. One comment on the original
+ticket lists them ("Follow-ups filed from the approved plan: …"). They are written only by the
+Paseo app, never under your name: when the app cannot write at that moment, nothing is filed and
+the comment says so ("file them by hand or approve again later"). For a ticket someone else wrote,
+or one labelled `feedback`, nothing is filed; the comment lists the titles for you instead. Paseo
+keeps what it filed per ticket in `$PASEO_HOME/linear-tickets/plan-follow-ups/<issue>.json`, so a
+repeated approval files nothing twice, and a ticket filed but not yet linked is only linked on the
+next try. Linear failures are retried every 10 minutes, at most five times (the trust check is
+repeated before each pending creation), then listed for you in the comment. A duplicate is still
+possible in one case: Linear created the ticket but its answer was lost on the way back. Project
+planners' work orders file nothing.
 
 **The omp extension.** The planning phase and the plan advisor gate come from
 [`omp/linear-tickets-plan-first.ts`](omp/linear-tickets-plan-first.ts), which omp loads from its
@@ -1030,9 +1090,11 @@ still answers; each row opens the agent's stable link. Each waiting row shows th
 (its `# ` heading without the ticket number), its opening paragraph, the
 risk rating (see *Plan risk and auto-approval*) as a coloured badge (green impact 0–1, amber 2, red
 3–4; planner and advisor combined, as the policy reads it) and why the risk policy left it to
-you. Decided rows keep the title and badge, and say `auto-approved` when the policy approved
-it. The details are read once when the review opens (plans that predate the rating have no
-badge). The page refreshes every 30 s. On a phone, use “Add to Home Screen” to keep it as an app.
+you. Next to the badge, `2 follow-ups` counts the plan's `follow-up` items (filed as tickets on
+approval) and `new rule` marks a plan that sets one. Decided rows keep the title and the chips, and
+say `auto-approved` when the policy approved it. The details are read once when the review opens
+(plans that predate the rating have no badge). The page refreshes every 30 s. On a phone, use “Add
+to Home Screen” to keep it as an app.
 
 With status write-back on, a ticket moves to its team's started state named **Planning**
 when a plan is handed off (and stays there when it is sent back), and to **In Progress** once

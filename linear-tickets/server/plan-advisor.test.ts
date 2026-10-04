@@ -80,9 +80,11 @@ function load() {
   };
 }
 
-const RISK = "## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: 1 — read-only\n- Reversibility: revert — nothing written\n- Feature flag: no\n- Migration: no\n- Auth: no\n- Failure mode: a wrong column in the report\n- Advisor rating: impact 1, reversibility revert\n- Recommendation: auto — routine\n\n";
+const RISK = "## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: 1 — read-only\n- Reversibility: revert — nothing written\n- Feature flag: no\n- Migration: no\n- Auth: no\n- New rule: no — a one-off report column\n- Failure mode: a wrong column in the report\n- Advisor rating: impact 1, reversibility revert\n- Recommendation: auto — routine\n\n";
 const UNADVISED_RISK = RISK.replace("impact 1, reversibility revert", "unavailable");
-const PLAN = `# Plan\n\nDo the thing.\n\n${RISK}## Advisor review\n\nGPT-6 Astra, 2 rounds, agreed.\n`;
+// One line each: enough at impact 0–1.
+const SECTIONS = "## Reach\n\nOnly the order report, because nothing else reads it.\n\n## Principles and rules\n\nNone apply; no new rule.\n\n";
+const PLAN = `# Plan\n\nDo the thing.\n\n${SECTIONS}${RISK}## Advisor review\n\nGPT-6 Astra, 2 rounds, agreed.\n`;
 
 test("a ticket plan cannot reach the owner until a finished GPT-6 Astra advisor review is recorded for that exact text", async () => {
   const h = load();
@@ -131,9 +133,9 @@ test("an unavailable advisor is recorded only with a reason the plan itself tell
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable" }), /Give the reason/);
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "quota exhausted" }), /must tell the owner that the advisor was unavailable/);
   assert.equal((await h.submit("PLAN.md"))?.block, true);
-  writeFileSync(join(h.cwd, "PLAN.md"), `# Plan\n\nDo the thing.\n\n${UNADVISED_RISK}## Advisor review\n\nThe advisor was unavailable.\n`);
+  writeFileSync(join(h.cwd, "PLAN.md"), `# Plan\n\nDo the thing.\n\n${SECTIONS}${UNADVISED_RISK}## Advisor review\n\nThe advisor was unavailable.\n`);
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "quota exhausted" }), /with the reason you pass here/, "the owner must see why, not only that");
-  writeFileSync(join(h.cwd, "PLAN.md"), `# Plan\n\nDo the thing.\n\n${UNADVISED_RISK}## Advisor review\n\nThe GPT-6 Astra advisor was unavailable: quota exhausted.\n\n## Out of scope\n\nNothing.\n`);
+  writeFileSync(join(h.cwd, "PLAN.md"), `# Plan\n\nDo the thing.\n\n${SECTIONS}${UNADVISED_RISK}## Advisor review\n\nThe GPT-6 Astra advisor was unavailable: quota exhausted.\n\n## Out of scope\n\nNothing.\n`);
   assert.match(await h.record({ filePath: "PLAN.md", verdict: "unavailable", reason: "quota exhausted" }), /recorded/);
   assert.equal(await h.submit("PLAN.md"), undefined, "an explained unavailable advisor lets the owner decide");
 });
@@ -156,6 +158,38 @@ test("the record needs a readable risk rating with the advisor's own, and tells 
   assert.equal(added.length, 1);
   const event = JSON.parse(readFileSync(join(events, added[0]), "utf8"));
   assert.deepEqual({ ...event, at: "t" }, { type: "advised", verdict: "agreed", hash: planHash(PLAN), agentId: "planner-1", at: "t" });
+});
+
+test("the record needs readable Reach and Principles sections: one line each at impact 0–1, the full format once planner or advisor rates higher", async () => {
+  const h = load();
+  const record = () => h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" });
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("## Reach\n\nOnly the order report, because nothing else reads it.\n\n", ""));
+  const refused = await record();
+  assert.match(refused, /no "## Reach" section/);
+  assert.match(refused, /- <place>: include — AC-N/, "the refusal shows the format");
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace(SECTIONS, ""));
+  assert.match(await record(), /no "## Reach" and no "## Principles and rules" section/);
+  // The planner says impact 1, the advisor 3: the higher rating takes the one-line allowance away.
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("impact 1, reversibility revert", "impact 3, reversibility revert"));
+  assert.match(await record(), /"## Reach" has no "- Changes:/);
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("- New rule: no — a one-off report column", "- New rule: yes — every report gets an export"));
+  assert.match(await record(), /says "New rule: yes", but "## Principles and rules" states no rule/);
+  assert.equal((await h.submit("PLAN.md"))?.block, true, "no refused record opens the gate");
+
+  const rated3 = RISK.replace("- Impact: 1 — read-only", "- Impact: 3 — writes orders").replace("impact 1, reversibility revert", "impact 3, reversibility revert");
+  const full = [
+    "# Plan\n\nDo the thing.\n\n## Verification\n\n- AC-1: the order page shows the column\n- AC-2: the CSV export carries it\n",
+    "## Reach\n\n- Changes: the order's delivery date column\n- Order page (sales, warehouse): include — AC-1\n- CSV export: include — AC-2\n- Help page: follow-up — Document the delivery date column\n- Seed data: n/a — no new data\n",
+    "## Principles and rules\n\n- Applies: none apply — no principle covers report columns\n- Exceptions: none\n- New rule: none — a one-off column\n",
+    `${rated3}## Advisor review\n\nGPT-6 Astra, 1 round, agreed.\n`,
+  ].join("\n");
+  writeFileSync(join(h.cwd, "PLAN.md"), full);
+  assert.match(await record(), /recorded/);
+
+  // A project planner's work order: one line each, no new rule.
+  const order = `# Work order\n\n## Work order\n\n\`\`\`project-order\nTUC-1 blocks TUC-2\n\`\`\`\n\n## Reach\n\nOnly this project's tickets in Linear; each ticket's own plan answers where else it applies.\n\n## Principles and rules\n\nNone apply; no new rule.\n\n${RISK.replace("- Impact: 1 — read-only", "- Impact: 0 — Linear only").replace("impact 1, reversibility revert", "impact 0, reversibility revert")}## Advisor review\n\nGPT-6 Astra, 1 round, agreed.\n`;
+  writeFileSync(join(h.cwd, "PLAN.md"), order);
+  assert.match(await record(), /recorded/);
 });
 
 test("omp's local plan proposals are checked against the text the bridge would submit, and fail closed when unreadable", async () => {

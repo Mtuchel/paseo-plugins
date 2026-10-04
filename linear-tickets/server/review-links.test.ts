@@ -16,7 +16,7 @@ function opened(port: number): OpenedEvent {
   return { type: "opened", agentId: "agent-1", localUrl: `http://localhost:${port}/?r=1`, remoteUrl: `https://host.tail1.ts.net:${port}/?r=1`, at: "t" };
 }
 
-const RISK = (impact: number, reversibility = "revert") => `## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: ${impact} — why\n- Reversibility: ${reversibility} — why\n- Feature flag: no\n- Migration: no\n- Auth: no\n- Failure mode: a wrong column\n- Advisor rating: impact ${impact}, reversibility ${reversibility}\n- Recommendation: auto — routine\n`;
+const RISK = (impact: number, reversibility = "revert", newRule = "no — none") => `## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: ${impact} — why\n- Reversibility: ${reversibility} — why\n- Feature flag: no\n- Migration: no\n- Auth: no\n- New rule: ${newRule}\n- Failure mode: a wrong column\n- Advisor rating: impact ${impact}, reversibility ${reversibility}\n- Recommendation: auto — routine\n`;
 
 // `live` holds the local ports whose Plannotator server answers; `unserved` the routes turned off;
 // `plans` the plan text each port's server returns; `routed` the routes pointed at the proxy.
@@ -220,13 +220,14 @@ test("inbox rows show the plan's title, opening paragraph, risk rating and why i
   await withLinks(async (links, get, live, _unserved, plans) => {
     live.add(50_001).add(50_002).add(50_003);
     await links.opened("agent-1", opened(50_001), "TUC-1");
-    await links.described("http://localhost:50001/?r=1", `# TUC-1 — Warn when a <delay> breaks a date\n\n## Summary\n\nWhen a **container** is late, the [sales](https://x) team gets a notice.\n\n${RISK(3, "data-fix")}`, { approved: false, reasons: ["impact 3 is above the threshold 1", "reversibility is data-fix"] });
+    const reach = "## Reach\n\n- Changes: date warnings\n- Delivery notes: include — AC-1\n- Help page: follow-up — Document the delay warning\n- Mobile app: follow-up — Warn on mobile too\n\n";
+    await links.described("http://localhost:50001/?r=1", `# TUC-1 — Warn when a <delay> breaks a date\n\n## Summary\n\nWhen a **container** is late, the [sales](https://x) team gets a notice.\n\n${reach}${RISK(3, "data-fix", "yes — every late date warns")}`, { approved: false, reasons: ["impact 3 is above the threshold 1", "reversibility is data-fix", "it sets a new rule"] });
     // Opened before the plugin recorded details: read from its running server when the inbox loads.
     await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, "TUC-2");
     plans.set(50_002, `# TUC-2 · Report column\n\n| a | b |\n|---|---|\n\nAdds a column to the order report.\n\n${RISK(1)}`);
     // Decided while its server still answers: not waiting any more.
     await links.opened("agent-3", { ...opened(50_003), agentId: "agent-3" }, "TUC-3");
-    await links.described("http://localhost:50003/?r=1", `# TUC-3 Tooling\n\nCI only.\n\n${RISK(0)}`, { approved: true, reasons: [] });
+    await links.described("http://localhost:50003/?r=1", `# TUC-3 Tooling\n\nCI only.\n\n## Reach\n\n- Changes: CI\n- Deploy script: follow-up — Use the new check in deploys\n\n${RISK(0, "revert", "yes — every job runs the check")}`, { approved: true, reasons: [] });
     await links.decided("agent-3", true);
 
     const page = await (await get("/")).text();
@@ -234,11 +235,11 @@ test("inbox rows show the plan's title, opening paragraph, risk rating and why i
     assert.deepEqual([...waiting.matchAll(/href="\/review\/([^"]+)"/g)].map((match) => match[1]), ["agent-1", "agent-2"]);
     assert.match(waiting, /<div class="title">Warn when a &#60;delay&#62; breaks a date<\/div>/);
     assert.match(waiting, /<div class="summary">When a container is late, the sales team gets a notice\.<\/div>/);
-    assert.match(waiting, /<span class="chip high">Risk: impact 3\/4 · data-fix<\/span>/);
-    assert.match(waiting, /Needs you: impact 3 is above the threshold 1; reversibility is data-fix/);
-    assert.match(waiting, /<div class="title">Report column<\/div><div class="summary">Adds a column to the order report\.<\/div><span class="chip low">Risk: impact 1\/4 · revert<\/span>/);
+    assert.match(waiting, /<span class="chip high">Risk: impact 3\/4 · data-fix<\/span><span class="chip">2 follow-ups<\/span><span class="chip mid">new rule<\/span>/);
+    assert.match(waiting, /Needs you: impact 3 is above the threshold 1; reversibility is data-fix; it sets a new rule/);
+    assert.match(waiting, /<div class="title">Report column<\/div><div class="summary">Adds a column to the order report\.<\/div><span class="chip low">Risk: impact 1\/4 · revert<\/span><\/a>/, "a plan without follow-ups or a rule shows neither chip");
     assert.match(recent, /TUC-3<\/span><span class="meta">auto-approved/);
-    assert.match(recent, /<div class="title">Tooling<\/div><span class="chip low">/);
+    assert.match(recent, /<div class="title">Tooling<\/div><span class="chip low">Risk: impact 0\/4 · revert<\/span><span class="chip">1 follow-up<\/span><span class="chip mid">new rule<\/span>/);
     assert.doesNotMatch(recent, /CI only/, "decided rows stay one-glance");
   });
 });

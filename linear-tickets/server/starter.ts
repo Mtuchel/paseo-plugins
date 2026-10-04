@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { PaseoApi } from "@getpaseo/client";
 import type { TicketDetail } from "../shared/contracts";
 import { advisorSteps } from "../shared/plan-advisor";
+import { sectionSteps } from "../shared/plan-sections";
 import { mappedBaseBranch, mappingLabel, type ProjectMapping } from "../shared/mapping";
 import { Capacity } from "./capacity";
 import { dispatchLabels } from "./dispatch";
@@ -46,6 +47,12 @@ export const OVERLAP_NOTE = "Before you plan, look for overlapping work. Search 
 export function advisorNote(providerKey: string): string {
   return advisorSteps({ omp: providerKey === "omp" });
 }
+// Every ticket plan says where else the change applies and which rules it follows or sets
+// (README, "Plan-first"); the omp extension's record gate reads the same format.
+export const PLAN_SECTIONS_NOTE = sectionSteps();
+// Every ticket agent, whether it planned and continues or implements a plan approved earlier: a
+// place the plan missed is filed, not quietly added to the ticket (README, "Plan-first").
+export const MISSED_REACH_NOTE = "A place the plan missed that you find while implementing (another page, role, record, export or repository that uses what this ticket changes) becomes a follow-up ticket (the linear_ticket tool `create_issue`, related to this ticket; without it, list it for the owner in your final comment), not extra scope in this ticket.";
 const MAX_PLAN_NOTE_CHARS = 20_000;
 // A question request moves the ticket to "Needs input" and notifies the owner, so one ask beats
 // five, and an ask only written into the final reply is easy to miss.
@@ -98,8 +105,10 @@ export async function planSetup(linear: Pick<LinearService, "issueState" | "view
       policy ? (untrusted ? UNTRUSTED_NOTE : PLAN_REQUIRED_NOTE) : untrusted ? UNTRUSTED_TEXT : "",
       // A project's planner gets its own overlap instructions in its description.
       policy && !hasLabel(state.labels, plannerLabel.toLowerCase()) ? OVERLAP_NOTE : "",
+      policy ? PLAN_SECTIONS_NOTE : "",
       policy ? advisorNote(providerKey) : approvedPlanNote(state.identifier, plan),
       policy ? sentBackPlanNote(state.identifier, plan) : "",
+      MISSED_REACH_NOTE,
     ].filter(Boolean),
     labels: policy ? { [PLAN_POLICY_LABEL]: policy } : {},
     env: policy ? { [PLAN_POLICY_ENV]: policy } : {},

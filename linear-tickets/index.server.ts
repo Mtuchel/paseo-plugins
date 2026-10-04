@@ -34,6 +34,7 @@ import { approveForLater, splitIntoSubIssues } from "./server/split";
 import { planSetup, TicketStarter } from "./server/starter";
 import { isPlanPolicy, PLAN_POLICY_ENV, PLAN_POLICY_LABEL } from "./server/plan-policy";
 import { PlanRequests } from "./server/plan-requests";
+import { PlanFollowUps } from "./server/plan-follow-ups";
 import { labelDaemon, StateLabels } from "./server/state-labels";
 import { LabelSync, PullRequestFiles } from "./server/label-sync";
 import { ProjectFlow } from "./server/project-flow";
@@ -64,6 +65,8 @@ export default function contribute(server: PluginServerContext) {
     await stopAgentTurn(agentId).catch(() => {});
     await api.agents.ref(agentId).archive().catch(() => {});
   };
+  // Every approval path files the approved plan's follow-ups (README, "Plan follow-ups").
+  const followUps = new PlanFollowUps(linear);
   // Waits on tickets already closed live in "Needs you" sub-issues; replies there (a relayed
   // comment or an @mention of the app) go to the agent that asked.
   const needsYou = new NeedsYouIssues();
@@ -75,8 +78,8 @@ export default function contribute(server: PluginServerContext) {
     },
     reviewOutcome: (review) => reviewOutcome(review),
     recordOutcome: (agentId, outcome) => recordDecision({ type: "decided", agentId, ...outcome, at: new Date().toISOString() }),
-    splitPlan: (link, localUrl, paseo) => splitIntoSubIssues({ linear, appUserId: async () => (await agentApi.viewer()).id, readPlan: readReviewPlan, retirePlanner }, link, localUrl, paseo),
-    approveLater: (link, localUrl, paseo) => approveForLater({ linear, readPlan: readReviewPlan, retirePlanner }, link, localUrl, paseo),
+    splitPlan: (link, localUrl, paseo) => splitIntoSubIssues({ linear, appUserId: async () => (await agentApi.viewer()).id, readPlan: readReviewPlan, retirePlanner, followUps }, link, localUrl, paseo),
+    approveLater: (link, localUrl, paseo) => approveForLater({ linear, readPlan: readReviewPlan, retirePlanner, followUps }, link, localUrl, paseo),
     // `paseo agent reload` for crashed agents (README, "Crashed agents"); the plugin SDK has no reload.
     reloader: async () => {
       const client = await internalDaemon();
@@ -109,6 +112,7 @@ export default function contribute(server: PluginServerContext) {
   };
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks, undefined, undefined, parking);
   plannotator.onProjectPlan(projects);
+  plannotator.useFollowUps(followUps);
   const manualTasks = new ManualTasks({ linear, settings });
   const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });

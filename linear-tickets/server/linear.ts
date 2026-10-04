@@ -528,6 +528,14 @@ function succeeded(data: Record<string, unknown>, field: string, what: string): 
   if (result.success !== true) throw new LinearRefusedError(`Linear did not ${what}.`);
 }
 
+type CreateIssueInput = { teamId: string; title: string; description: string; parentId?: string; projectId?: string | null; assigneeId?: string; priority?: number; ready?: boolean; startedState?: string };
+
+function createdIssue(data: Record<string, unknown>): { id: string; identifier: string; url: string } {
+  succeeded(data, "issueCreate", "create the ticket");
+  const issue = record(record(data.issueCreate).issue ?? {});
+  return { id: label(issue.id), identifier: label(issue.identifier), url: label(issue.url) };
+}
+
 export const COMMENT_QUERY = `query issueComments($id: String!, $first: Int!, $after: String) {
   issue(id: $id) {
     comments(first: $first, after: $after) {
@@ -950,7 +958,20 @@ export class LinearService {
 
   // `ready` puts the ticket into the team's first unstarted state (Todo) instead of Triage, for
   // tickets the plugin creates as planned work; `startedState` into the started state of that name.
-  async createIssue(input: { teamId: string; title: string; description: string; parentId?: string; projectId?: string | null; assigneeId?: string; priority?: number; ready?: boolean; startedState?: string }): Promise<{ id: string; identifier: string; url: string }> {
+  async createIssue(input: CreateIssueInput): Promise<{ id: string; identifier: string; url: string }> {
+    return createdIssue(record(await this.write(CREATE_ISSUE_QUERY, { input: await this.issuePayload(input) })));
+  }
+
+  // Only ever as the Paseo app (follow-ups filed from an approved plan must not appear as the
+  // owner's): null when the app cannot be used here, and then nothing is written. Reading the
+  // team's states may use either credential.
+  async createIssueAsApp(input: CreateIssueInput): Promise<{ id: string; identifier: string; url: string } | null> {
+    const payload = await this.issuePayload(input);
+    const data = this.app ? await this.app.mutate(CREATE_ISSUE_QUERY, { input: payload }) : null;
+    return data ? createdIssue(record(data)) : null;
+  }
+
+  private async issuePayload(input: CreateIssueInput): Promise<Record<string, unknown>> {
     const payload: Record<string, unknown> = { teamId: input.teamId, title: input.title, description: input.description };
     if (input.ready || input.startedState) {
       const states = await this.teamStates(input.teamId);
@@ -963,10 +984,7 @@ export class LinearService {
     if (input.parentId) payload.parentId = input.parentId;
     if (input.projectId) payload.projectId = input.projectId;
     if (input.assigneeId) payload.assigneeId = input.assigneeId;
-    const data = record(await this.write(CREATE_ISSUE_QUERY, { input: payload }));
-    succeeded(data, "issueCreate", "create the ticket");
-    const issue = record(record(data.issueCreate).issue ?? {});
-    return { id: label(issue.id), identifier: label(issue.identifier), url: label(issue.url) };
+    return payload;
   }
 
   // Stays on the key: delegating is the owner's instruction that opens the ticket's Linear agent
@@ -984,6 +1002,14 @@ export class LinearService {
   // `relatedId`; Linear then moves it to its Duplicate status.
   async relate(issueId: string, relatedId: string, type: "related" | "duplicate"): Promise<void> {
     succeeded(record(await this.write(RELATION_QUERY, { input: { issueId, relatedIssueId: relatedId, type } })), "issueRelationCreate", "link the tickets");
+  }
+
+  // relate, only ever as the Paseo app (see createIssueAsApp): null when the app cannot be used here.
+  async relateAsApp(issueId: string, relatedId: string, type: "related" | "duplicate"): Promise<true | null> {
+    const data = this.app ? await this.app.mutate(RELATION_QUERY, { input: { issueId, relatedIssueId: relatedId, type } }) : null;
+    if (!data) return null;
+    succeeded(record(data), "issueRelationCreate", "link the tickets");
+    return true;
   }
 
   async ping(): Promise<void> {
