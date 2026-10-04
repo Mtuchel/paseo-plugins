@@ -602,13 +602,14 @@ function ticketDescription(project: Project, marker: Marker, blocks: string[]): 
   ].join("\n").trimEnd();
 }
 
-export type FileWriter = { createIssue(input: { teamId: string; projectId: string; title: string; description: string }): Promise<{ id: string; identifier: string; url: string }>; updateDescription(issueId: string, description: string): Promise<void> };
+export type FileWriter = { createIssue(input: { teamId: string; projectId: string; stateId: string; title: string; description: string }): Promise<{ id: string; identifier: string; url: string }>; updateDescription(issueId: string, description: string): Promise<void> };
 export type ProjectReport = { project: Project; action: "none" | "created" | "appended"; ticket: string | null; proposals: string[]; skipped: string[] };
 
 // One ticket per project per run at most: candidates whose key any candidate ticket of the project
 // already holds (open or closed, any week) are dropped; the rest go into the week's open ticket,
 // or a new one when there is none (with a run number when that week's ticket was closed).
-export async function fileCandidates(deps: { batch: Batch; tickets: MentioningIssue[]; teamId: string; projectIds: Record<Project, string>; writer: FileWriter; dryRun: boolean }, input: FileInput): Promise<ProjectReport[]> {
+// A new ticket goes into the team's Todo (`stateId`), so the project's planner and hand-out take it.
+export async function fileCandidates(deps: { batch: Batch; tickets: MentioningIssue[]; teamId: string; stateId: string; projectIds: Record<Project, string>; writer: FileWriter; dryRun: boolean }, input: FileInput): Promise<ProjectReport[]> {
   const { batch } = deps;
   const tickets = candidateTickets(deps.tickets);
   let next = Math.max(batch.registerMaxQ, ...tickets.flatMap((ticket) => proposalNumbers(ticket.description)), 0) + 1;
@@ -639,7 +640,7 @@ export async function fileCandidates(deps: { batch: Batch; tickets: MentioningIs
     }
     const runNumber = sameWeek.length ? Math.max(...sameWeek.map((ticket) => ticket.marker.run)) + 1 : 1;
     const description = ticketDescription(project, { project, year, week, run: runNumber }, blocks);
-    const created = deps.dryRun ? null : await deps.writer.createIssue({ teamId: deps.teamId, projectId: deps.projectIds[project], title: `Decision candidates, week ${week}`, description });
+    const created = deps.dryRun ? null : await deps.writer.createIssue({ teamId: deps.teamId, projectId: deps.projectIds[project], stateId: deps.stateId, title: `Decision candidates, week ${week}`, description });
     reports.push({ project, action: "created", ticket: created?.url ?? null, proposals, skipped });
   }
   return reports;
@@ -674,7 +675,7 @@ export class AppWriter implements FileWriter {
     return result;
   }
 
-  async createIssue(input: { teamId: string; projectId: string; title: string; description: string }): Promise<{ id: string; identifier: string; url: string }> {
+  async createIssue(input: { teamId: string; projectId: string; stateId: string; title: string; description: string }): Promise<{ id: string; identifier: string; url: string }> {
     const issue = record((await this.mutate(CREATE_ISSUE_QUERY, { input }, "issueCreate")).issue ?? {});
     return { id: String(issue.id ?? ""), identifier: String(issue.identifier ?? ""), url: String(issue.url ?? "") };
   }
@@ -760,7 +761,7 @@ export type FileRun = {
   directory: string;
   batch: string;
   input: unknown;
-  linear: Pick<LinearService, "teamIdByKey" | "projectIdByName" | "issuesMentioning">;
+  linear: Pick<LinearService, "teamIdByKey" | "todoStateId" | "projectIdByName" | "issuesMentioning">;
   writer: FileWriter;
   teamKey: string;
   dryRun: boolean;
@@ -780,6 +781,8 @@ export async function runFile(deps: FileRun): Promise<ProjectReport[]> {
     if (errors.length) throw new InvalidInput(errors);
     const teamId = await deps.linear.teamIdByKey(deps.teamKey);
     if (!teamId) throw new Error(`Linear has no team ${deps.teamKey}.`);
+    const stateId = await deps.linear.todoStateId(teamId);
+    if (!stateId) throw new Error(`Team ${deps.teamKey} has no unstarted (Todo) state.`);
     const projectIds = {} as Record<Project, string>;
     for (const project of PROJECTS) {
       if (!input.projects.some((entry) => entry.project === project && entry.candidates.length)) continue;
@@ -788,7 +791,7 @@ export async function runFile(deps: FileRun): Promise<ProjectReport[]> {
       projectIds[project] = id;
     }
     const tickets = await deps.linear.issuesMentioning(teamId, `${MARKER} `);
-    const reports = await fileCandidates({ batch, tickets, teamId, projectIds, writer: deps.writer, dryRun: deps.dryRun }, input);
+    const reports = await fileCandidates({ batch, tickets, teamId, stateId, projectIds, writer: deps.writer, dryRun: deps.dryRun }, input);
     if (!deps.dryRun) {
       // Only after every project went through, and never backwards (an older batch filed late).
       const state = await readState(deps.directory);

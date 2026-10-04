@@ -815,6 +815,12 @@ export class LinearService {
     return states;
   }
 
+  // The team's first unstarted state (Todo): where the plugin files planned work, since the
+  // project hand-out never takes a ticket out of Triage. Null when the team has none.
+  async todoStateId(teamId: string): Promise<string | null> {
+    return (await this.teamStates(teamId)).filter((state) => state.type === "unstarted").sort((a, b) => a.position - b.position)[0]?.id ?? null;
+  }
+
   // Best-effort by design: callers surface `note` as a warning,
   // and a failure here must never turn into a launch failure.
   async markInProgress(issue: Pick<Issue, "id" | "status" | "statusType">, teamId: string | null): Promise<{ changed: boolean; note?: string }> {
