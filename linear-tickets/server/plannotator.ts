@@ -17,7 +17,7 @@ import { autoApproval, parsePlanRisk, ratingText } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
 import { isUntrusted } from "./starter";
 import { dispatchLabels } from "./dispatch";
-import type { ProjectFlow } from "./project-flow";
+import { orderProblems, type ProjectFlow } from "./project-flow";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -396,24 +396,41 @@ export class PlannotatorBridge {
   // tickets, each of which plans on its own. It is approved as soon as it is submitted, with no
   // risk check or Linear read that could fail and send it to the owner, and the project flow writes
   // it into Linear, retrying on later polls. Nothing of a ticket approval (state, plan-ready, a new
-  // agent) applies to it. A plan that cannot be read is retried and, after that, opens for the
-  // owner like any review; their approval then arrives as a `decided` event.
+  // agent) applies to it. One whose order cannot be read line by line is sent back to the planner
+  // instead, so a broken block never closes as an empty order. A plan that cannot be read is
+  // retried and, after that, opens for the owner like any review; their approval then arrives as
+  // a `decided` event.
   private async deliverWorkOrder(event: OpenedEvent | DecidedEvent, agentId: string, issueId: string, identifier: string, paseo: PaseoApi): Promise<void> {
     const settings = await this.settings.read();
     if (event.type === "decided") {
       // A send-back reaches the agent through Plannotator itself; it submits again.
       if (!event.approved) return;
       if (!event.planContent?.trim()) { console.error(`[linear-tickets] ${identifier}: the approved work order arrived without its text, so it was not written`); return; }
-      await this.projectPlans!.applyPlan(issueId, agentId, event.planContent, paseo, settings);
+      await this.applyWorkOrder(issueId, agentId, identifier, event.planContent, paseo, settings);
       return;
     }
     const plan = await this.fetchPlan(event.localUrl);
     if (!plan.trim()) throw new Error(`the work order of ${identifier} could not be read from Plannotator`);
+    const problems = orderProblems(plan);
+    if (problems.length) {
+      await this.decide(event.localUrl, false, [
+        "Paseo cannot apply this work order as written:",
+        problems.map((problem) => `- ${problem}`).join("\n"),
+        "The `## Work order` section needs one fenced ```project-order block with one change per line: `TUC-1 blocks TUC-2`, `hold TUC-3: reason`, `release TUC-4`, `attended TUC-5: reason` or `unattended TUC-6`. A reason goes after a colon. An empty block means no changes. Fix the block and submit the plan again.",
+      ].join("\n\n"));
+      console.log(`[linear-tickets] ${identifier}: work order sent back to the planner: ${problems.join("; ")}`);
+      return;
+    }
     // The plugin approves it: the extension's report of that approval is not a second decision.
     this.settled(agentId);
     await this.decide(event.localUrl, true, "Work order approved automatically: it only orders the project's tickets, each of which plans on its own. Paseo writes it into Linear; stop now.")
       .catch((error: unknown) => console.error(`[linear-tickets] ${identifier}: closing the work order's review failed: ${error instanceof Error ? error.message : error}`));
-    await this.projectPlans!.applyPlan(issueId, agentId, plan, paseo, settings);
+    await this.applyWorkOrder(issueId, agentId, identifier, plan, paseo, settings);
+  }
+
+  private async applyWorkOrder(issueId: string, agentId: string, identifier: string, plan: string, paseo: PaseoApi, settings: PluginSettings): Promise<void> {
+    if (await this.projectPlans!.applyPlan(issueId, agentId, plan, paseo, settings)) return;
+    console.error(`[linear-tickets] ${identifier}: the work order was not written: the ticket is no longer its project's open planner`);
   }
 
   // A parked plan's events, all from the central host: `opened` binds the stable link, inbox and

@@ -24,6 +24,16 @@ export class LinearApiError extends Error {
 }
 // Linear did not accept the credential (HTTP 401 or AUTHENTICATION_ERROR), so it ran nothing.
 export class AuthenticationError extends LinearApiError {}
+// Linear answered a mutation with `success: false`: it ran, and refused the change.
+export class LinearRefusedError extends Error {}
+
+// Whether Linear itself refused the request, so sending it again changes nothing: a mutation it
+// answered with `success: false` or an error answer below HTTP 500 (rate limits, a rejected key,
+// server errors and an unreachable API pass and are worth retrying).
+export function refusedByLinear(error: unknown): boolean {
+  if (error instanceof LinearRefusedError) return true;
+  return error instanceof LinearApiError && !(error instanceof AuthenticationError) && error.status !== 429 && error.status < 500;
+}
 
 function errorDetails(payload: unknown): { codes: string[]; reasons: string[] } {
   const codes: string[] = [];
@@ -488,7 +498,7 @@ function labelNodes(value: unknown): { id: string; name: string }[] {
 
 function succeeded(data: Record<string, unknown>, field: string, what: string): void {
   const result = data[field] && typeof data[field] === "object" ? record(data[field]) : {};
-  if (result.success !== true) throw new Error(`Linear did not ${what}.`);
+  if (result.success !== true) throw new LinearRefusedError(`Linear did not ${what}.`);
 }
 
 export const COMMENT_QUERY = `query issueComments($id: String!, $first: Int!, $after: String) {

@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
+import { setImmediate } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
-import type { ProjectIssue } from "./linear";
+import { LinearApiError, LinearRefusedError, type ProjectIssue } from "./linear";
 import { Capacity } from "./capacity";
-import { parseOrder, ProjectFlow, ProjectStore } from "./project-flow";
+import { orderProblems, parseOrder, ProjectFlow, ProjectStore, type ProjectRecord } from "./project-flow";
 import { Scheduler } from "./scheduler";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
@@ -28,21 +29,39 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   let now = Date.parse("2026-01-02T00:00:00Z");
   let created = 0;
   let away = false;
-  // Plan documents by "<ticket id> <title>"; `fail`: Linear writes that fail (comments the next n
-  // times, one relation always); `comments`: every comment body posted.
+  // Plan documents by "<ticket id> <title>"; `fail`: Linear writes that fail (comments and
+  // delegations the next n times, `create` always, one relation refused or never reaching Linear,
+  // the hold label refused); `comments`: every comment body posted; `gate`: holds createIssue open.
   const documents = new Map<string, string>();
-  const fail: { comments?: number; relation?: string } = {};
+  const fail: { comments?: number; delegate?: number; create?: boolean; relation?: string; unreached?: string; hold?: boolean } = {};
   const comments: string[] = [];
+  let gate: Promise<void> | null = null;
+  let creating = false;
+  const outage = () => new LinearApiError("The Linear API request failed (HTTP 503). Try again.", 503);
   const linear = {
     labeledProjects: async () => [{ id: "erp", name: "ERP" }],
     projectIssues: async () => issues,
     issueDescriptions: async () => new Map<string, string>(),
-    createIssue: async (input: { title: string; description: string; priority?: number }) => { created++; calls.push(`create ${input.title} P${input.priority}`); return { id: `planner${created}`, identifier: `TUC-${100 + created}`, url: "" }; },
-    addLabel: async (id: string, name: string) => { calls.push(`label ${id} +${name}`); },
+    createIssue: async (input: { title: string; description: string; priority?: number }) => {
+      if (fail.create) throw outage();
+      creating = true;
+      await gate;
+      created++;
+      calls.push(`create ${input.title} P${input.priority}`);
+      return { id: `planner${created}`, identifier: `TUC-${100 + created}`, url: "" };
+    },
+    addLabel: async (id: string, name: string) => {
+      if (fail.hold && name === "paseo-hold") throw new LinearRefusedError(`Linear did not add the "${name}" label.`);
+      calls.push(`label ${id} +${name}`);
+    },
     removeLabel: async (id: string, name: string) => { calls.push(`label ${id} -${name}`); },
-    delegate: async (id: string) => { calls.push(`delegate ${id}`); },
+    delegate: async (id: string) => {
+      if (fail.delegate) { fail.delegate--; throw outage(); }
+      calls.push(`delegate ${id}`);
+    },
     addBlocker: async (blocker: string, blocked: string) => {
-      if (fail.relation === `${blocker} blocks ${blocked}`) throw new Error("Linear refused the relation");
+      if (fail.relation === `${blocker} blocks ${blocked}`) throw new LinearRefusedError("Linear refused the relation");
+      if (fail.unreached === `${blocker} blocks ${blocked}`) throw outage();
       calls.push(`${blocker} blocks ${blocked}`);
     },
     complete: async (id: string) => { calls.push(`complete ${id}`); },
@@ -55,10 +74,20 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
     appUserId: async () => APP,
     viewerId: async () => OWNER,
   };
-  const store = new ProjectStore(join(directory, "projects.json"));
+  const path = join(directory, "projects.json");
+  const store = new ProjectStore(path);
   const scheduler = new Scheduler({ running: async () => running, projectOf: async () => "erp", away: async () => away, now: () => now });
   const flow = new ProjectFlow({ linear, scheduler, capacity: new Capacity(() => now), store, retire: async (agentId) => { calls.push(`retire ${agentId}`); }, now: () => now });
-  return { flow, calls, store, issues, documents, fail, comments, advance: (ms: number) => { now += ms; }, setAway: (value: boolean) => { away = value; } };
+  return {
+    flow, calls, store, issues, documents, fail, comments,
+    advance: (ms: number) => { now += ms; },
+    setAway: (value: boolean) => { away = value; },
+    // The project's record as an earlier poll left it.
+    seed: (record: ProjectRecord) => writeFile(path, JSON.stringify({ erp: record })),
+    // Holds createIssue until `open` runs; `creating` is true once a call waits there.
+    // Executor form: the plugin's lib is ES2023, without Promise.withResolvers.
+    hold: () => { let open!: () => void; gate = new Promise((resolve) => { open = resolve; }); return { open, creating: () => creating }; },
+  };
 }
 
 test("a labelled project files a planner for its new tickets on its own, and hands them out only once the order is applied", async (t) => {
@@ -209,13 +238,16 @@ test("a change Linear keeps refusing is retried for three polls, then the order 
   r.calls.length = 0;
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);
-  assert.deepEqual(r.calls.slice(0, 4), [
+  assert.deepEqual(r.calls, [
     "i2 blocks i3",
     "comment planner1 **Work order applied** (1 change). The project's tickets are now handed to Paseo in order as agent slots free up.",
     "complete planner1",
     "retire agent-p",
-  ]);
+    "delegate i1",
+    "delegate i3",
+  ], "TUC-2's blocker was refused, so it is not handed out unordered");
   assert.match(r.comments.at(-1)!, /Skipped:\n- TUC-1 blocks TUC-2 \(Linear refused the relation\)/);
+  assert.match(r.comments.at(-1)!, /Not handed out, because Linear refused their hold or blocker: TUC-2\./);
 });
 
 test("a planner approved some other way (plan-ready and its plan document) is written from that document at the next poll", async (t) => {
@@ -237,6 +269,96 @@ test("a planner approved some other way (plan-ready and its plan document) is wr
   ]);
   assert.ok(!r.calls.some((call) => call.startsWith("retire")), "no agent of its own to retire");
   assert.equal(await r.flow.isPlanner("planner1"), true, "a late report of its review is still its own");
+});
+
+test("a change that never reached Linear is retried every poll, without the three-poll limit", async (t) => {
+  const r = await room(t, [issue(1), issue(2)]);
+  await r.flow.planNow("erp", settings);
+  r.issues.push(issue(100, { id: "planner1", labels: ["paseo-planner"], delegateId: APP }));
+  r.fail.unreached = "i1 blocks i2";
+  await r.flow.applyPlan("planner1", "agent-p", "```project-order\nTUC-1 blocks TUC-2\n```", paseo, settings);
+  for (let poll = 0; poll < 4; poll++) { r.advance(HOUR); await r.flow.tick(paseo, settings); }
+  assert.ok(!r.calls.includes("complete planner1"), "an outage never closes the order with the change skipped");
+  assert.equal((await r.store.all()).erp.planner?.approved?.agentId, "agent-p");
+  r.fail.unreached = undefined;
+  r.calls.length = 0;
+  r.advance(HOUR);
+  await r.flow.tick(paseo, settings);
+  assert.deepEqual(r.calls.slice(0, 2), ["i1 blocks i2", "comment planner1 **Work order applied** (1 change). The project's tickets are now handed to Paseo in order as agent slots free up."]);
+});
+
+test("a planner whose label or assignment failed is started by the next poll, not filed again", async (t) => {
+  const r = await room(t, [issue(1)]);
+  r.fail.delegate = 1;
+  await r.flow.planNow("erp", settings);
+  assert.deepEqual(r.calls, ["create Plan the work order of ERP P1", "label planner1 +paseo-planner"]);
+  r.issues.push(issue(100, { id: "planner1", labels: ["paseo-planner"] }));
+  r.calls.length = 0;
+  r.advance(HOUR);
+  await r.flow.tick(paseo, settings);
+  assert.deepEqual(r.calls, ["delegate planner1"], "only the missing assignment is repeated");
+  r.calls.length = 0;
+  r.advance(HOUR);
+  await r.flow.tick(paseo, settings);
+  assert.deepEqual(r.calls, [], "started: nothing is repeated");
+});
+
+test("a planner that cannot be filed never stops the hand-out of tickets already planned", async (t) => {
+  const r = await room(t, [issue(1), issue(2, { createdAt: "2026-01-02T00:00:00Z" })]);
+  await r.seed({ plannedThrough: "2026-01-01T12:00:00Z", planner: null });
+  r.fail.create = true;
+  await r.flow.tick(paseo, settings);
+  assert.deepEqual(r.calls, ["delegate i1"]);
+  assert.deepEqual({ toPlan: r.flow.status()[0].toPlan, planner: r.flow.status()[0].planner }, { toPlan: 1, planner: null });
+  r.fail.create = false;
+  r.advance(HOUR);
+  await r.flow.tick(paseo, settings);
+  assert.ok(r.calls.includes("create Plan the work order of ERP P1"), "the next poll files it");
+});
+
+test("an approved order whose planner ticket was closed meanwhile is still written, without completing the ticket", async (t) => {
+  const r = await room(t, [issue(1), issue(2)]);
+  await r.flow.planNow("erp", settings);
+  r.issues.push(issue(100, { id: "planner1", labels: ["paseo-planner"], delegateId: APP }));
+  r.fail.comments = 1;
+  await r.flow.applyPlan("planner1", "agent-p", "```project-order\nTUC-1 blocks TUC-2\n```", paseo, settings);
+  // The owner closes the planner; Linear has the relation from the first write.
+  r.issues.splice(0, r.issues.length, issue(1), issue(2, { blockers: [{ id: "i1", identifier: "TUC-1", status: "Todo", statusType: "unstarted", delegateId: null, finished: false }] }));
+  r.calls.length = 0;
+  r.advance(HOUR);
+  await r.flow.tick(paseo, settings);
+  assert.deepEqual(r.calls, [
+    "comment planner1 **Work order applied** (1 change). The project's tickets are now handed to Paseo in order as agent slots free up.",
+    "retire agent-p",
+    "delegate i1",
+  ]);
+});
+
+test("Plan during a poll that is filing the project's planner files no second one", async (t) => {
+  const r = await room(t, [issue(1)]);
+  const gate = r.hold();
+  const poll = r.flow.tick(paseo, settings);
+  while (!gate.creating()) await setImmediate();
+  await assert.rejects(r.flow.planNow("erp", settings), /being filed right now/);
+  gate.open();
+  await poll;
+  assert.deepEqual(r.calls.filter((call) => call.startsWith("create")), ["create Plan the work order of ERP P1"]);
+});
+
+test("changes to the project store made at the same time all land", async (t) => {
+  const r = await room(t, []);
+  const empty = { plannedThrough: null, planner: null };
+  await Promise.all([
+    r.store.update("erp", (current) => ({ ...(current ?? empty), plannedThrough: "2026-01-01T00:00:00Z" })),
+    r.store.update("erp", (current) => ({ ...(current ?? empty), closedPlanner: "planner1" })),
+  ]);
+  assert.deepEqual((await r.store.all()).erp, { plannedThrough: "2026-01-01T00:00:00Z", planner: null, closedPlanner: "planner1" });
+});
+
+test("a work order is readable only when every line in its block is one change", () => {
+  assert.deepEqual(orderProblems("```project-order\nTUC-1 blocks TUC-2: shares the form.\nhold TUC-3 - owner decides\n\n```"), []);
+  assert.deepEqual(orderProblems("no block"), ["The plan has no ```project-order block."]);
+  assert.deepEqual(orderProblems("```project-order\nTUC-1 blocks TUC-2, TUC-3\nhold TUC-4\n```"), ['Not one work-order change: "TUC-1 blocks TUC-2, TUC-3"']);
 });
 
 test("the work-order block accepts list markers and case, and ignores other lines", () => {

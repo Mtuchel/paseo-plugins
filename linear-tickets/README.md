@@ -656,7 +656,9 @@ every 2 minutes.
   each labelled project with how many new tickets wait for a plan and the open planner (with a
   link to it); `linear.plan-project` files the planner right away instead of at the next read.
 - **Planner.** Planning files a ticket *Plan the work order of <project>* in the project
-  (Urgent, label `paseo-planner`) and assigns it to Paseo. Its agent reads the open tickets,
+  (Urgent, label `paseo-planner`) and assigns it to Paseo. The ticket is recorded the moment it
+  exists; when its label or assignment fails, every project read repeats what is missing, so a
+  failed step never files a second planner or leaves one without an agent. Its agent reads the open tickets,
   listed in its description with the new ones marked, and the code, and plans which tickets
   block which (because one builds on another, or both touch the same files), which must wait for
   you, and which may need you while they run. Its plan is always approved automatically: it only
@@ -673,19 +675,25 @@ every 2 minutes.
   ````
 
   The plan is approved the moment the agent submits it: no risk check, no inbox, no parking, and
-  no Linear read that could fail and send it to you. Paseo then adds the blocking relations,
+  no Linear read that could fail and send it to you. A plan whose block is missing, or has a line
+  that is not exactly one change (`TUC-1 blocks TUC-2, TUC-3`), is sent back to the planner with
+  the unreadable lines instead of closing as an empty order. Paseo then adds the blocking relations,
   puts `paseo-hold` on held tickets (removes it from released ones) and `paseo-attended` on
   attended ones (`unattended X` removes it), comments what it applied and skipped, closes the
   planner ticket and archives its agent. Nothing else of an approval (In Progress, `plan-ready`,
   a new agent) applies to it. The approved order is kept in `projects.json` before it is
   written, and every project read writes one that is not in Linear yet, so Linear being down or
-  rate-limited only delays it; a change Linear refuses three reads in a row is listed as skipped
-  and the order closes anyway. A planner ticket that carries `plan-ready` was approved like a
+  rate-limited only delays it, for as long as it lasts. A change Linear itself refuses three reads
+  in a row is listed as skipped and the order closes anyway; a ticket whose `hold` or blocker was
+  skipped is not handed out by the project (the comment names it), so assign it yourself when it
+  may start. An approved order is still written when you close the planner ticket before that
+  (the ticket stays closed). A planner ticket that carries `plan-ready` was approved like a
   ticket plan (by a plugin version that parked work orders for you) and is written from its
   "Plan:" document the same way. The planner is told to mark a ticket
   attended only for an open business decision, acceptance criteria too vague to check,
   user-facing wording or layout you choose, changes to production data, external accounts or
-  spend, or a step only a person can do; never for size or risk alone.
+  spend, or a step only a person can do; never for size or risk alone. A planner that cannot be
+  filed or written never holds back the hand-out of tickets that are already planned.
 - **Hand-out.** Planned tickets in Backlog or Todo that are unassigned or yours, not handed to
   Paseo yet, without `paseo-hold` (or other `paseo-` state labels) and with every blocker
   finished are assigned to Paseo in the *Who starts next* order, one per free slot. Tickets in
@@ -695,10 +703,10 @@ every 2 minutes.
 - **New tickets.** Tickets filed after the last work order are not handed out until the next
   planner has ordered them; `linear.projects-status` counts them. Only tickets the project could
   hand out count: new sub-issues, tickets already with Paseo or someone else, and started ones do
-  not. There is at most one planner per project at a time: tickets filed while one works are
-  listed by the next.
-- **Skipping a work order.** Closing or canceling the planner ticket yourself counts its tickets
-  as planned: they are handed out without a work order.
+  not. There is at most one planner per project at a time, also when Plan is pressed during a
+  read: tickets filed while one works are listed by the next.
+- **Skipping a work order.** Closing or canceling the planner ticket yourself before its order is
+  approved counts its tickets as planned: they are handed out without a work order.
 - Removing the label from the project stops new hand-outs; agents already working continue.
   Without a usable Paseo app (no threads) projects are not worked on.
 
