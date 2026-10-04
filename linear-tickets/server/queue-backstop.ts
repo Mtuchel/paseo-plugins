@@ -72,10 +72,18 @@ export const runGit: GitRunner = async (args) => {
   }
 };
 
+// `<owner>/<repo>` (lower case) of a GitHub remote URL, `https://github.com/o/r(.git)` or
+// `git@github.com:o/r(.git)`; null for anything else.
+export function originRepo(url: string): string | null {
+  const match = /github\.com[/:]([^/\s]+\/[^/\s]+?)(?:\.git)?\/?$/i.exec(url.trim());
+  return match ? match[1].toLowerCase() : null;
+}
+
 // One detached worktree per repo at `$PASEO_HOME/linear-tickets/queue-backstop/<owner>-<repo>`,
 // created from the git common dir of a worktree of that repo and reset to `origin/main` (fetched
-// first) before each run, so the scripts that run are always `main`'s. Null when no worktree of the
-// repo is known yet or `main` has no tools/ci/enqueue-ready.mjs: the backstop does not run there.
+// first) before each run, so the scripts that run are always `main`'s. Null when no recorded folder
+// is a clone of the repo (`origin` on GitHub's `<owner>/<repo>`) or `main` has no
+// tools/ci/enqueue-ready.mjs: the backstop does not run there.
 export class BackstopCheckout {
   constructor(private readonly git: GitRunner = runGit, private readonly root = join(paseoHome(), "linear-tickets", "queue-backstop")) {}
 
@@ -86,9 +94,8 @@ export class BackstopCheckout {
   async prepare(repo: string, sources: string[]): Promise<string | null> {
     const path = this.path(repo);
     if (!existsSync(join(path, ".git"))) {
-      const source = sources.find((candidate) => existsSync(candidate));
-      if (!source) return null;
-      const common = await this.git(["-C", source, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+      const common = await this.commonDir(repo, sources);
+      if (!common) return null;
       await mkdir(this.root, { recursive: true, mode: 0o700 });
       // A worktree whose folder was removed by hand is still registered; prune lets it be added again.
       await this.git(["--git-dir", common, "worktree", "prune"]);
@@ -98,6 +105,23 @@ export class BackstopCheckout {
     await this.git(["-C", path, "fetch", "--quiet", "origin", "main"]);
     await this.git(["-C", path, "reset", "--hard", "--quiet", "origin/main"]);
     return existsSync(join(path, ENQUEUE_READY)) ? path : null;
+  }
+
+  // The git common dir of the first recorded folder that is a clone of `repo`. A folder that is
+  // gone, not a git repository (a ticket record can name `/tmp`) or another repository's clone
+  // is skipped, so it never stops the backstop.
+  private async commonDir(repo: string, sources: string[]): Promise<string | null> {
+    for (const source of sources) {
+      if (!existsSync(source)) continue;
+      try {
+        const common = await this.git(["-C", source, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+        const origin = await this.git(["--git-dir", common, "remote", "get-url", "origin"]);
+        if (originRepo(origin) === repo.toLowerCase()) return common;
+      } catch {
+        // Not a git repository, or one without `origin`: try the next folder.
+      }
+    }
+    return null;
   }
 
   // Comment files for `backstop-enqueue.mjs --comment-file`, outside the checkout it resets.
