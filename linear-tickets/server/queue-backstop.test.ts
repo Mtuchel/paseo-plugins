@@ -206,9 +206,23 @@ test("the backstop checkout skips a recorded folder that is not a git repository
   assert.ok(calls.includes("--git-dir ~/repo.git worktree add --detach ~/queue-backstop/tuchel-sohn-tuchel-platform origin/main"), "the clone of the repo is used");
 });
 
-test("originRepo reads owner/repo from GitHub https and ssh remotes only", () => {
+test("originRepo reads owner/repo only from github.com itself, never a lookalike host or a path naming github.com", () => {
   assert.equal(originRepo("https://github.com/Tuchel-Sohn/tuchel-platform.git\n"), "tuchel-sohn/tuchel-platform");
   assert.equal(originRepo("git@github.com:Mtuchel/paseo-plugins"), "mtuchel/paseo-plugins");
-  assert.equal(originRepo("https://gitlab.com/o/r.git"), null);
-  assert.equal(originRepo(""), null);
+  assert.equal(originRepo("ssh://git@github.com/Mtuchel/paseo-plugins.git"), "mtuchel/paseo-plugins");
+  assert.equal(originRepo("https://github.com/o/r/"), "o/r");
+  for (const remote of [
+    "https://notgithub.com/tuchel-sohn/tuchel-platform.git",
+    "https://github.com.evil/github.com/tuchel-sohn/tuchel-platform.git",
+    "https://evil.example/github.com/tuchel-sohn/tuchel-platform",
+    "git@notgithub.com:tuchel-sohn/tuchel-platform.git",
+    "git@evil.example:github.com:tuchel-sohn/tuchel-platform",
+    "https://github.com:8443/tuchel-sohn/tuchel-platform",
+    "http://github.com/tuchel-sohn/tuchel-platform",
+    "https://github.com/tuchel-sohn/tuchel-platform/extra",
+    "https://gitlab.com/o/r.git",
+    "/srv/git/tuchel-platform.git",
+    "",
+  ])
+    assert.equal(originRepo(remote), null, remote);
 });

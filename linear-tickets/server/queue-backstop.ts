@@ -72,11 +72,27 @@ export const runGit: GitRunner = async (args) => {
   }
 };
 
-// `<owner>/<repo>` (lower case) of a GitHub remote URL, `https://github.com/o/r(.git)` or
-// `git@github.com:o/r(.git)`; null for anything else.
-export function originRepo(url: string): string | null {
-  const match = /github\.com[/:]([^/\s]+\/[^/\s]+?)(?:\.git)?\/?$/i.exec(url.trim());
-  return match ? match[1].toLowerCase() : null;
+// `<owner>/<repo>` (lower case) of a GitHub remote: `https://github.com/o/r(.git)`,
+// `ssh://git@github.com/o/r(.git)` or `git@github.com:o/r(.git)`. The host must be exactly
+// github.com and the path exactly two segments; anything else (a lookalike host, a path that
+// only names github.com) is null.
+export function originRepo(remote: string): string | null {
+  const text = remote.trim();
+  const scp = /^git@github\.com:([^/\s]+\/[^/\s]+)$/i.exec(text);
+  let path: string;
+  if (scp) path = scp[1];
+  else {
+    let url: URL;
+    try {
+      url = new URL(text);
+    } catch {
+      return null;
+    }
+    if (!["https:", "ssh:"].includes(url.protocol) || url.hostname.toLowerCase() !== "github.com" || url.port !== "") return null;
+    path = url.pathname.replace(/^\//, "");
+  }
+  const segments = path.replace(/\/$/, "").replace(/\.git$/i, "").split("/");
+  return segments.length === 2 && segments.every((segment) => segment !== "") ? segments.join("/").toLowerCase() : null;
 }
 
 // One detached worktree per repo at `$PASEO_HOME/linear-tickets/queue-backstop/<owner>-<repo>`,
