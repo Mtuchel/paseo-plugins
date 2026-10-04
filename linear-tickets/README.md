@@ -221,8 +221,8 @@ credential is put into them.
 
 Everything the plugin and the `linear_ticket` tools write (comments, status moves, labels, links,
 new sub-issues, reactions, plan documents) is sent with the [Paseo Linear app](#native-linear-agent)'s
-token, so Linear's history shows **Paseo**, not you. Your own comments stay yours, so `@paseo`
-replies still steer agents. The `linear_ticket` server reads the app's token from
+token, so Linear's history shows **Paseo**, not you. Your own comments stay yours, so they
+still steer agents ([Replies from Linear](#write-back-to-linear)). The `linear_ticket` server reads the app's token from
 `agent-app/token.json` on every call; only the daemon refreshes it (ten minutes before it expires,
 checked every five minutes), so a running agent always picks up the current one. Manual tasks are
 still assigned to you: the server reads your user ID with the API key, whoever writes.
@@ -967,7 +967,7 @@ independently of the agent's own `linear_ticket` tools:
   without it), assigned to you, with the `<label>-needs-you` label and the mention comment.
   Further questions in the same wait edit that comment, and while the sub-issue is open the
   agent's later waits on the ticket reuse it. It is closed for you when the question or
-  approval is answered (in Paseo or in Linear), or when you reply on it with `@paseo …`, which
+  approval is answered (in Paseo or in Linear), or when you comment on it, which
   goes to the agent that asked. A wait that ended otherwise (for example the agent's next turn
   started) may be a manual step, so that sub-issue stays open until you close it. Archiving the
   agent leaves its open sub-issues for you; replies there no longer reach anyone.
@@ -976,22 +976,33 @@ independently of the agent's own `linear_ticket` tools:
   started state named like *In Review*. Completion is left to Linear's GitHub integration and to
   the agent itself ([Agent access to Linear](#agent-access-to-linear)).
 
-- **Replies from Linear** — your own comments that start with `@paseo`, and your replies in a
-  thread started by a Paseo app comment (status, question, summary), reach the ticket's agent
-  (the newest active one) within one poll interval; a reply needs no `@paseo`. If the agent is
-  waiting on a question, the comment is the answer (an option name picks that option). If it is
-  waiting on an approval, `approve` / `deny <reason>` decides it. Otherwise the text is
-  sent as a message. Its reply comes back as a turn summary, so the conversation stays in
-  Linear. Delivered comments get a 👀 reaction; undeliverable ones get ❌ and a reply saying
-  why. All linked tickets are read in one request per poll, each from a cursor kept in
-  `$PASEO_HOME/linear-tickets/relay-cursors.json`, so neither a restart nor a long pause
-  delivers a comment twice or skips one. Comments by other people, and your comments that
-  neither start with the mention nor reply to Paseo, are ignored. Without a usable Paseo app,
-  Paseo's comments are written as you, so only `@paseo` comments count. Blocked alerts end with
-  how to reply. With the Paseo app installed, Linear turns a typed `@paseo` into a mention of
-  the app: that comment, and any reply in that agent session's thread, reaches the agent
-  through its agent session right away, with the same question and approval rules, and the
-  relay leaves it alone.
+- **Replies from Linear** — your comments reach the agent within one poll interval, no
+  `@paseo` needed, on every issue it watches:
+  - its ticket (the newest active agent on it) and its "Needs you" sub-issues;
+  - the issues it filed with `create_issue`, until one gets an agent of its own;
+  - the threads it started with `add_comment` on other issues: your replies there reach it,
+    other comments on that issue do not.
+
+  A comment on another issue than its ticket arrives prefixed with that issue's identifier
+  ("Comment on TUC-9, the issue you filed: …", "Reply to your comment on TUC-7: …"). If the
+  agent is waiting on a question, the comment is the answer (an option name picks that
+  option). If it is waiting on an approval, `approve` / `deny <reason>` decides it. Otherwise
+  the text is sent as a message. Its reply comes back as a turn summary (or its own comment),
+  so the conversation stays in Linear. Delivered comments get a 👀 reaction; undeliverable ones
+  get ❌ and a reply saying why. All watched issues are read in one request per poll, each from
+  a cursor kept in `$PASEO_HOME/linear-tickets/relay-cursors.json`, so neither a restart nor a
+  long pause delivers a comment twice or skips one. Comments by other people are ignored, and
+  so are the comments the agents and the plugin wrote themselves, even when they show you as
+  the author: the `linear_ticket` server records each comment it posts (and each issue it files)
+  under `$PASEO_HOME/linear-tickets/agent-comments/` (`agent-issues/`), and the plugin records
+  the comments it had to write with your key because the Paseo app could not be used. Any
+  other comment written as you counts as yours, including one another agent posts through a
+  Linear connection signed in as you. Without a usable Paseo app, Paseo's comments are written
+  as you, so only comments that start with `@paseo`, replies to a Paseo app comment and replies
+  in an agent's thread count. Blocked alerts end with how to reply. With the Paseo app
+  installed, Linear turns a typed `@paseo` into a mention of the app: that comment, and any
+  reply in that agent session's thread, reaches the agent through its agent session right
+  away, with the same question and approval rules, and the relay leaves it alone.
 
 Archiving a linked agent always removes `<label>-running`. Subagents never report. Paseo
 delivers lifecycle events live and best-effort: events while the plugin is stopped are not

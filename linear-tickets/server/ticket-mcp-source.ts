@@ -168,6 +168,27 @@ async function createdIssues() {
   return records.filter((record) => record && typeof record.id === "string" && typeof record.title === "string");
 }
 
+// Comments this agent posted (add_comment, set_status reasons), one private file each like the
+// issues above (format: agent-records.ts). The plugin's comment relay never takes them for the
+// owner's (the key writes them as the owner when the app cannot be used), and the owner's replies
+// to one on another issue reach this agent.
+const COMMENTS_DIRECTORY = join(paseoHome, "linear-tickets", "agent-comments", issueId || "none");
+
+// Posts and records the comment; null when Linear did not create it. "recorded" false: posted, but
+// the record failed.
+async function postComment(target, body) {
+  const data = await linear("mutation comment($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id url createdAt } } }", { input: { issueId: target.id, body } });
+  const result = data.commentCreate || {};
+  if (!result.success || !result.comment || typeof result.comment.id !== "string") return null;
+  const comment = result.comment;
+  try {
+    await writePrivate(COMMENTS_DIRECTORY, comment.id + ".json", { id: comment.id, issueId: target.id, identifier: target.identifier || null, createdAt: comment.createdAt || new Date().toISOString() });
+    return { url: comment.url || null, recorded: true };
+  } catch {
+    return { url: comment.url || null, recorded: false };
+  }
+}
+
 // "own": the ticket the agent was launched from; "created": an issue it filed; "other": anything else.
 async function scopeOf(issue) {
   if (issue.id === issueId || issue.identifier === issueId) return "own";
@@ -263,10 +284,9 @@ const tools = [
     async run(input) {
       const body = text(input.body, "body", 20000);
       const target = input.issue === undefined ? { id: issueId, identifier: null } : await loadIssue(input.issue);
-      const data = await linear("mutation comment($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { url } } }", { input: { issueId: target.id, body } });
-      const result = data.commentCreate || {};
-      if (!result.success) throw new Error("Linear did not create the comment.");
-      return { posted: true, issue: target.identifier || undefined, url: result.comment ? result.comment.url : null };
+      const posted = await postComment(target, body);
+      if (!posted) throw new Error("Linear did not create the comment.");
+      return { posted: true, issue: target.identifier || undefined, url: posted.url, ...(posted.recorded ? {} : { warning: "Posted, but Paseo could not record it: the owner's replies to it will not reach you." }) };
     },
   },
   {
@@ -283,8 +303,8 @@ const tools = [
       if (REASON_TYPES.includes(target.type)) {
         if (input.reason === undefined) throw new Error("Moving the issue to " + target.name + " closes it without its work: give the reason.");
         const reason = text(input.reason, "reason", 2000);
-        const posted = await linear("mutation comment($input: CommentCreateInput!) { commentCreate(input: $input) { success } }", { input: { issueId: issue.id, body: "Moved to " + target.name + " by its agent: " + reason } });
-        if (!posted.commentCreate || !posted.commentCreate.success) throw new Error("Linear did not post the reason; the status is unchanged.");
+        const posted = await postComment(issue, "Moved to " + target.name + " by its agent: " + reason);
+        if (!posted) throw new Error("Linear did not post the reason; the status is unchanged.");
       }
       const data = await linear("mutation status($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { state { name } } } }", { id: issue.id, stateId: target.id });
       if (!data.issueUpdate || !data.issueUpdate.success) throw new Error("Linear did not apply the status change.");

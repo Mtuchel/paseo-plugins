@@ -456,16 +456,18 @@ export const DELETE_ATTACHMENT_QUERY = `mutation deleteAttachment($id: String!) 
 export const LINK_URL_QUERY = `mutation link($issueId: String!, $url: String!, $title: String) {
   attachmentLinkURL(issueId: $issueId, url: $url, title: $title) { success }
 }`;
-// The relay's read: the owner's "@paseo" comments and thread replies on up to RELAY_BATCH tickets in one request, each
-// ticket from its own cursor (`$sN`, inclusive) and page (`$aN`). `issues(filter: id eq)` rather
-// than `issue(id:)`: a ticket the token cannot see comes back empty instead of failing the query.
+// The relay's read: the owner's comments on up to RELAY_BATCH issues in one request, each issue
+// from its own cursor (`$sN`, inclusive) and page (`$aN`). `plain`: all of them; otherwise only
+// "@paseo" comments and thread replies. `issues(filter: id eq)` rather than `issue(id:)`: an issue
+// the token cannot see comes back empty instead of failing the query.
 export const RELAY_BATCH = 50;
-export function relayCommentsQuery(count: number): string {
+export function relayCommentsQuery(count: number, plain = false): string {
   const indexes = Array.from({ length: count }, (_, index) => index);
   const declarations = indexes.map((index) => `$i${index}: ID!, $s${index}: DateTimeOrDuration!, $a${index}: String`).join(", ");
+  const addressed = plain ? "" : `, or: [{ body: { containsIgnoreCase: "@paseo" } }, { parent: { null: false } }]`;
   const fields = indexes.map((index) => `t${index}: issues(first: 1, filter: { id: { eq: $i${index} } }) {
-    nodes { id comments(first: 50, after: $a${index}, filter: { createdAt: { gte: $s${index} }, user: { id: { eq: $u } }, or: [{ body: { containsIgnoreCase: "@paseo" } }, { parent: { null: false } }] }) {
-      nodes { id body createdAt user { id } reactions { emoji user { id } } agentSession { id } parent { user { id } agentSession { id } } }
+    nodes { id comments(first: 50, after: $a${index}, filter: { createdAt: { gte: $s${index} }, user: { id: { eq: $u } }${addressed} }) {
+      nodes { id body createdAt user { id } reactions { emoji user { id } } agentSession { id } parent { id user { id } agentSession { id } } }
       pageInfo { hasNextPage endCursor }
     } }
   }`).join("\n  ");
@@ -480,7 +482,7 @@ export const REACTION_QUERY = `mutation react($commentId: String!, $emoji: Strin
 // `sessionId`: the Paseo agent session the comment opened or replied in (an @mention of the app);
 // those reach the agent through the session webhook, not the relay. `parent`: the thread's first
 // comment when this one is a reply (its `sessionId` set when the thread is an agent session's).
-export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[]; sessionId: string | null; parent: { userId: string; sessionId: string | null } | null };
+export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[]; sessionId: string | null; parent: { id: string; userId: string; sessionId: string | null } | null };
 
 export const ISSUE_DOCUMENTS_QUERY = `query issueDocuments($id: String!) {
   issue(id: $id) { id documents(first: 50) { nodes { id title url content } } }
@@ -580,6 +582,10 @@ export class LinearService {
   }
 
   private warnedKeyWrites = false;
+  // Told about every comment the key creates although the Paseo app is set up (it could not be
+  // used at that moment): the comment shows the owner as its author, so the relay must not take it
+  // for one of the owner's messages.
+  onOwnerComment?: (commentId: string, issueId: string) => Promise<void>;
 
   // Every automated write is authored by the Paseo app. The key writes only when the app cannot be
   // used here (`app.mutate` returns null: Linear authenticated nothing, so nothing ran); every other
@@ -591,7 +597,13 @@ export class LinearService {
       this.warnedKeyWrites = true;
       console.error("[linear-tickets] the Paseo app is not usable on this host; Linear writes appear as the key's owner");
     }
-    return this.withKey((key) => this.post(key, query, variables));
+    const result = await this.withKey((key) => this.post(key, query, variables));
+    const commentId = label(record(record(record(result).commentCreate ?? {}).comment ?? {}).id);
+    const issueId = label(record(variables.input ?? {}).issueId);
+    if (this.app && this.onOwnerComment && commentId && issueId) {
+      await this.onOwnerComment(commentId, issueId).catch((error: unknown) => console.error(`[linear-tickets] recording comment ${commentId} failed: ${error instanceof Error ? error.message : error}`));
+    }
+    return result;
   }
 
   private appUser: string | null = null;
@@ -1132,7 +1144,7 @@ export class LinearService {
   // The owner's "@paseo" comments and thread replies since each ticket's cursor (inclusive), oldest first, in one
   // request per RELAY_BATCH tickets on the app's pool; tickets the app cannot see are read with
   // the key. `unseen`: tickets neither credential returned (deleted, no access, not a Linear id).
-  async relayComments(userId: string, cursors: { issueId: string; since: string }[]): Promise<{ comments: Map<string, RelayComment[]>; unseen: string[] }> {
+  async relayComments(userId: string, cursors: { issueId: string; since: string }[], plain = false): Promise<{ comments: Map<string, RelayComment[]>; unseen: string[] }> {
     const comments = new Map<string, RelayComment[]>();
     const unseen = cursors.filter((cursor) => !UUID.test(cursor.issueId)).map((cursor) => cursor.issueId);
     const valid = cursors.filter((cursor) => UUID.test(cursor.issueId));
@@ -1140,7 +1152,7 @@ export class LinearService {
     const reader = this.app;
     for (let start = 0; start < valid.length; start += RELAY_BATCH) {
       const batch = valid.slice(start, start + RELAY_BATCH);
-      const fromApp = reader ? await this.relayPages(userId, batch, comments, async (query, variables) => {
+      const fromApp = reader ? await this.relayPages(userId, batch, comments, plain, async (query, variables) => {
         const data = await reader.query(query, variables);
         if (!data) throw APP_UNUSABLE;
         return data;
@@ -1149,7 +1161,7 @@ export class LinearService {
         throw error;
       }) : null;
       const retry = fromApp === null ? batch : batch.filter((cursor) => fromApp.includes(cursor.issueId));
-      if (retry.length) unseen.push(...await this.relayPages(userId, retry, comments, viaKey));
+      if (retry.length) unseen.push(...await this.relayPages(userId, retry, comments, plain, viaKey));
     }
     for (const list of comments.values()) list.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     return { comments, unseen };
@@ -1157,13 +1169,13 @@ export class LinearService {
 
   // Pages through the batch, one request per round for every ticket that still has a next page
   // (at most 10 rounds; the rest comes on the next poll). Returns the tickets that came back empty.
-  private async relayPages(userId: string, batch: { issueId: string; since: string }[], into: Map<string, RelayComment[]>, send: (query: string, variables: Record<string, unknown>) => Promise<Record<string, unknown>>): Promise<string[]> {
+  private async relayPages(userId: string, batch: { issueId: string; since: string }[], into: Map<string, RelayComment[]>, plain: boolean, send: (query: string, variables: Record<string, unknown>) => Promise<Record<string, unknown>>): Promise<string[]> {
     const empty: string[] = [];
     let round = batch.map((cursor) => ({ ...cursor, after: null as string | null }));
     for (let page = 0; page < 10 && round.length; page++) {
       const variables: Record<string, unknown> = { u: userId };
       round.forEach((item, index) => Object.assign(variables, { [`i${index}`]: item.issueId, [`s${index}`]: item.since, [`a${index}`]: item.after }));
-      const data = record(await send(relayCommentsQuery(round.length), variables));
+      const data = record(await send(relayCommentsQuery(round.length, plain), variables));
       const next: typeof round = [];
       round.forEach((item, index) => {
         const issue = connection(data[`t${index}`] ?? { nodes: [] }).nodes[0];
@@ -1184,7 +1196,7 @@ export class LinearService {
             userId: label(record(node.user ?? {}).id),
             reactions: (Array.isArray(node.reactions) ? node.reactions : []).map((entry) => record(entry)).map((reaction) => ({ emoji: label(reaction.emoji), userId: label(record(reaction.user ?? {}).id) })),
             sessionId: label(record(node.agentSession ?? {}).id) || null,
-            parent: node.parent ? { userId: label(record(record(node.parent).user ?? {}).id), sessionId: label(record(record(node.parent).agentSession ?? {}).id) || null } : null,
+            parent: node.parent ? { id: label(record(node.parent).id), userId: label(record(record(node.parent).user ?? {}).id), sessionId: label(record(record(node.parent).agentSession ?? {}).id) || null } : null,
           });
         }
         if (found.hasNextPage && found.endCursor) next.push({ ...item, after: found.endCursor });

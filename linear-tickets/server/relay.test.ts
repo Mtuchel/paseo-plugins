@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import type { RelayComment } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 import { NeedsYouIssues } from "./needs-you";
+import { recordPluginComment } from "./agent-records";
 import { approvalDecision, CommentRelay, mentionMessage, questionAnswer } from "./relay";
 
 const ME = "user-me";
@@ -90,48 +91,98 @@ function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>,
 
 const comment = (id: string, body: string, extra: Partial<RelayComment> = {}): RelayComment => ({ id, body, createdAt: `2026-02-01T00:00:0${id.length}Z`, userId: ME, reactions: [], sessionId: null, parent: null, ...extra });
 
-test("my @paseo comments reach the newest agent on the ticket and are marked delivered; everything else is ignored", async () => {
-  const { relay, paseo, events, since } = setup([
+test("my comments on the ticket reach the newest agent and are marked delivered; anyone else's, handled ones and the plugin's own do not", async () => {
+  const { relay, paseo, events, since, path } = setup([
     { id: "old", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" },
     { id: "new", issueId: "i1", createdAt: "2026-01-02T00:00:00Z", updatedAt: "2026-01-03T00:00:00Z" },
     { id: "child", issueId: "i1", createdAt: "2026-01-04T00:00:00Z", updatedAt: "2026-01-05T00:00:00Z", parent: "new" },
   ], {
     i1: [
       comment("c1", "@paseo please also handle returns"),
-      comment("c2", "just a note for the team"),
+      comment("c2", "  also check the export  "),
       comment("c3", "@paseo from someone else", { userId: "user-other" }),
       comment("c4", "@paseo already delivered", { reactions: [{ emoji: "eyes", userId: ME }] }),
-      comment("c5", "**TUC-1** (Paseo) finished a turn: @paseo mentioned in a summary"),
+      // Written by the plugin with the key while the app was not usable: it shows me as its author.
+      comment("c5", "**TUC-1** (Paseo) finished a turn"),
       // A real @mention of the Paseo app: its agent session delivers it, not the relay.
       comment("c6", "@paseo via the app mention", { sessionId: "session-1" }),
     ],
   });
+  await recordPluginComment(dirname(path), "c5", "i1");
   await relay.poll(paseo);
   assert.deepEqual(since, ["i1@2026-01-02T00:00:00Z"]);
-  assert.deepEqual(events, ["send new: please also handle returns", "react c1 eyes"]);
+  assert.deepEqual(events, ["send new: please also handle returns", "send new: also check the export", "react c1 eyes", "react c2 eyes"]);
 });
 
-test("my replies to a Paseo app comment reach the agent without @paseo; replies elsewhere and in agent session threads do not", async () => {
+test("my replies reach the agent except in agent session threads; without a usable app only @paseo and replies to Paseo count", async () => {
   const agent = { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
   const comments = {
     i1: [
-      comment("c1", "  go with option 2 ", { parent: { userId: APP, sessionId: null } }),
-      comment("c22", "@paseo also mentioned", { parent: { userId: APP, sessionId: null } }),
-      comment("c333", "reply to a teammate", { parent: { userId: "user-other", sessionId: null } }),
+      comment("c1", "  go with option 2 ", { parent: { id: "p-app", userId: APP, sessionId: null } }),
+      comment("c22", "@paseo also mentioned", { parent: { id: "p-app", userId: APP, sessionId: null } }),
+      comment("c333", "reply to my own note", { parent: { id: "p-me", userId: ME, sessionId: null } }),
       // The session webhook delivers replies in an agent session's thread.
-      comment("c4444", "in the session thread", { parent: { userId: ME, sessionId: "session-1" } }),
-      comment("c55555", "@paseo in the session thread", { parent: { userId: ME, sessionId: "session-1" } }),
+      comment("c4444", "in the session thread", { parent: { id: "p-s", userId: ME, sessionId: "session-1" } }),
+      comment("c55555", "@paseo in the session thread", { parent: { id: "p-s", userId: ME, sessionId: "session-1" } }),
     ],
   };
   const { relay, paseo, events } = setup([agent], comments);
   await relay.poll(paseo);
-  assert.deepEqual(events, ["send a: go with option 2", "send a: also mentioned", "react c1 eyes", "react c22 eyes"]);
+  assert.deepEqual(events, ["send a: go with option 2", "send a: also mentioned", "send a: reply to my own note", "react c1 eyes", "react c22 eyes", "react c333 eyes"]);
 
-  // Without a usable app, Paseo's comments cannot be told apart from mine: only @paseo counts.
-  const keyOnly = setup([agent], { i1: [comment("c1", "go with option 2", { parent: { userId: APP, sessionId: null } })] });
+  // Without a usable app, Paseo's comments cannot be told apart from mine.
+  const keyOnly = setup([agent], { i1: [comment("c1", "go with option 2", { parent: { id: "p-app", userId: APP, sessionId: null } }), comment("c22", "a plain note"), comment("c333", "@paseo go")] });
   keyOnly.fake.appId = null;
   await keyOnly.relay.poll(keyOnly.paseo);
-  assert.deepEqual(keyOnly.events, []);
+  assert.deepEqual(keyOnly.events, ["send a: go", "react c333 eyes"]);
+});
+
+test("my comments on an issue the agent filed and replies to its comments elsewhere reach it, naming the issue", async () => {
+  const T = "00000000-0000-4000-8000-000000000001";
+  const FILED = "00000000-0000-4000-8000-000000000002";
+  const TAKEN = "00000000-0000-4000-8000-000000000003";
+  const OTHER = "00000000-0000-4000-8000-000000000004";
+  const path = join(mkdtempSync(join(tmpdir(), "relay-")), "cursors.json");
+  const record = (folder: string, name: string, value: object) => {
+    mkdirSync(join(dirname(path), folder), { recursive: true });
+    writeFileSync(join(dirname(path), folder, `${name}.json`), JSON.stringify(value));
+  };
+  record(`agent-issues/${T}`, FILED, { id: FILED, identifier: "TUC-9", title: "Follow-up", createdAt: "2026-01-02T00:00:00Z" });
+  // A filed issue with an agent of its own belongs to that agent.
+  record(`agent-issues/${T}`, TAKEN, { id: TAKEN, identifier: "TUC-10", title: "Taken", createdAt: "2026-01-02T00:00:00Z" });
+  record(`agent-comments/${T}`, "p1", { id: "p1", issueId: OTHER, identifier: "TUC-7", createdAt: "2026-01-03T00:00:00Z" });
+  // The agent's own comment on its ticket, written with the key: it shows me as its author.
+  record(`agent-comments/${T}`, "own", { id: "own", issueId: T, identifier: null, createdAt: "2026-01-03T00:00:00Z" });
+  const { relay, paseo, events, since } = setup([
+    { id: "a", issueId: T, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" },
+    { id: "b", issueId: TAKEN, createdAt: "2026-01-04T00:00:00Z", updatedAt: "2026-01-04T00:00:00Z" },
+  ], {
+    [T]: [comment("own", "Started.")],
+    [FILED]: [comment("f1", "use the staging bucket")],
+    [TAKEN]: [comment("t1", "on it?")],
+    [OTHER]: [
+      comment("o1", "sounds right", { parent: { id: "p1", userId: ME, sessionId: null } }),
+      comment("o22", "unrelated note"),
+      comment("o333", "reply in another thread", { parent: { id: "p9", userId: ME, sessionId: null } }),
+    ],
+  }, path);
+  await relay.poll(paseo);
+  assert.deepEqual(since.sort(), [`${FILED}@2026-01-02T00:00:00Z`, `${OTHER}@2026-01-03T00:00:00Z`, `${TAKEN}@2026-01-04T00:00:00Z`, `${T}@2026-01-01T00:00:00Z`].sort());
+  assert.deepEqual(events.filter((event) => event.startsWith("send")).sort(), [
+    "send a: Comment on TUC-9, the issue you filed: use the staging bucket",
+    "send a: Reply to your comment on TUC-7: sounds right",
+    "send b: on it?",
+  ]);
+});
+
+test("cursors saved before plain comments counted skip the plain comments written before the upgrade", async () => {
+  const path = join(mkdtempSync(join(tmpdir(), "relay-")), "cursors.json");
+  writeFileSync(path, JSON.stringify({ cursors: { i1: { agentId: "a", since: "2026-01-01T00:00:00Z", boundaryIds: [] } }, acks: [] }));
+  const { relay, paseo, events } = setup([{ id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }], {
+    i1: [comment("c1", "an old note"), comment("c22", "a new note", { createdAt: "2999-01-01T00:00:00Z" })],
+  }, path);
+  await relay.poll(paseo);
+  assert.deepEqual(events, ["send a: a new note", "react c22 eyes"]);
 });
 
 test("a comment the Paseo app already marked is not relayed again, even when the ack record was lost; without a usable app, someone else's reaction does not count", async () => {

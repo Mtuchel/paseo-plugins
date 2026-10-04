@@ -10,6 +10,9 @@ import { cacheScope, TicketCache } from "./server/cache";
 import { Credentials } from "./server/credentials";
 import { Dispatcher } from "./server/dispatch";
 import { CommentRelay } from "./server/relay";
+import { recordPluginComment } from "./server/agent-records";
+import { paseoHome } from "./server/ticket-mcp";
+import { join } from "node:path";
 import { PlannotatorBridge, readReviewPlan, recordDecision, writeOpenScript } from "./server/plannotator";
 import { ParkedPlans, PlannotatorHost } from "./server/parked";
 import { reviewOutcome } from "./server/review-outcome";
@@ -45,6 +48,7 @@ export default function contribute(server: PluginServerContext) {
   const auth = new AppAuth();
   const agentApi = new AgentApi(auth);
   const linear = new LinearService(credentials, undefined, agentApi);
+  linear.onOwnerComment = (commentId, issueId) => recordPluginComment(join(paseoHome(), "linear-tickets"), commentId, issueId);
   const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url));
   const settings = new Settings();
   const cache = new TicketCache();
