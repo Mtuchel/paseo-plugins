@@ -557,6 +557,45 @@ export const FINISHED_BLOCKERS_QUERY = `query finishedBlockers($ids: [ID!]!) {
   } }
 }`;
 
+// Decision candidates (owner-decisions.ts): the comments, plan documents and tickets of a time
+// window, read with the key, page by page.
+export const WINDOW_COMMENTS_QUERY = `query windowComments($filter: CommentFilter!, $after: String) {
+  comments(first: 100, after: $after, filter: $filter) {
+    nodes { id body createdAt url user { id } issue { id identifier title url project { name } parent { id } } parent { body } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export const PLAN_DOCUMENTS_QUERY = `query planDocuments($since: DateTimeOrDuration!, $after: String) {
+  documents(first: 50, after: $after, filter: { title: { startsWith: "Plan: " }, updatedAt: { gte: $since } }) {
+    nodes { id title url content updatedAt issue { id identifier url project { name } } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export const MENTIONING_ISSUES_QUERY = `query mentioningIssues($filter: IssueFilter!, $after: String) {
+  issues(first: 50, after: $after, includeArchived: true, filter: $filter) {
+    nodes { id identifier title url state { name type } description project { name } comments(first: 100) { nodes { body createdAt url user { name } } } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export const ISSUE_LINKS_QUERY = `query issueLinks($ids: [ID!]!) {
+  issues(first: 50, includeArchived: true, filter: { id: { in: $ids } }) { nodes { id identifier url project { name } } }
+}`;
+export const PROJECT_BY_NAME_QUERY = `query projectByName($name: String!) {
+  projects(first: 1, filter: { name: { eqIgnoreCase: $name } }) { nodes { id } }
+}`;
+const WINDOW_PAGES = 50;
+export type IssueLink = { id: string; identifier: string; url: string; project: string };
+// `issue.parentId`: the ticket's parent (a "Needs you" sub-issue's ticket); `parentBody`: the
+// comment this one replies to.
+export type WindowComment = { id: string; body: string; createdAt: string; url: string; userId: string; issue: (IssueLink & { title: string; parentId: string | null }) | null; parentBody: string | null };
+export type PlanDocument = { id: string; title: string; url: string; content: string; updatedAt: string; issue: IssueLink | null };
+export type MentioningIssue = IssueLink & { title: string; status: string; statusType: string; description: string; comments: { body: string; createdAt: string; url: string; author: string }[] };
+
+function issueLink(value: unknown): IssueLink | null {
+  const node = record(value ?? {});
+  return label(node.id) ? { id: label(node.id), identifier: label(node.identifier), url: label(node.url), project: label(record(node.project ?? {}).name) } : null;
+}
+
 export class LinearService {
   private stateWritten: ((issueId: string, state: WrittenState) => void) | null = null;
 
@@ -1303,6 +1342,85 @@ export class LinearService {
       round = next;
     }
     return empty;
+  }
+
+  // Every page of a connection read with the key (at most WINDOW_PAGES), for the windowed reads below.
+  private async allPages(query: string, variables: Record<string, unknown>, field: string): Promise<Record<string, unknown>[]> {
+    const nodes: Record<string, unknown>[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < WINDOW_PAGES; page++) {
+      const data = record(await this.withKey((key) => this.post(key, query, { ...variables, after })));
+      const found = connection(record(data[field] ?? {}));
+      nodes.push(...found.nodes.map((node) => record(node)));
+      if (!found.hasNextPage || !found.endCursor) return nodes;
+      after = found.endCursor;
+    }
+    throw new Error(`Linear returned more than ${WINDOW_PAGES} pages of ${field}; narrow the window.`);
+  }
+
+  private async windowComments(filter: Record<string, unknown>): Promise<WindowComment[]> {
+    return (await this.allPages(WINDOW_COMMENTS_QUERY, { filter }, "comments")).map((node) => {
+      const issue = issueLink(node.issue);
+      const raw = record(node.issue ?? {});
+      return {
+        id: label(node.id), body: label(node.body), createdAt: label(node.createdAt), url: label(node.url), userId: label(record(node.user ?? {}).id),
+        issue: issue ? { ...issue, title: label(raw.title), parentId: label(record(raw.parent ?? {}).id) || null } : null,
+        parentBody: node.parent ? label(record(node.parent).body) : null,
+      };
+    }).filter((comment) => comment.id);
+  }
+
+  // The user's comments created since then, on every issue the key can see.
+  async ownerCommentsSince(userId: string, since: string): Promise<WindowComment[]> {
+    return this.windowComments({ user: { id: { eq: userId } }, createdAt: { gte: since } });
+  }
+
+  // The "↩️ Plan sent back" comments (PlannotatorBridge) created since then.
+  async planSentBackSince(since: string): Promise<WindowComment[]> {
+    return this.windowComments({ body: { contains: "Plan sent back" }, createdAt: { gte: since } });
+  }
+
+  // "Plan: <ID>" documents updated since then, with their ticket.
+  async planDocumentsSince(since: string): Promise<PlanDocument[]> {
+    return (await this.allPages(PLAN_DOCUMENTS_QUERY, { since }, "documents")).map((node) => ({
+      id: label(node.id), title: label(node.title), url: label(node.url), content: typeof node.content === "string" ? node.content : "", updatedAt: label(node.updatedAt), issue: issueLink(node.issue),
+    })).filter((document) => document.id);
+  }
+
+  // The team's tickets whose description contains `text` (archived ones too), with their comments;
+  // `openOnly` leaves out completed, canceled and duplicate ones.
+  async issuesMentioning(teamId: string, text: string, openOnly = false): Promise<MentioningIssue[]> {
+    const filter = { team: { id: { eq: teamId } }, description: { contains: text }, ...(openOnly ? { state: { type: { nin: ["completed", "canceled", "duplicate"] } } } : {}) };
+    return (await this.allPages(MENTIONING_ISSUES_QUERY, { filter }, "issues")).flatMap((node) => {
+      const link = issueLink(node);
+      if (!link) return [];
+      const state = record(node.state ?? {});
+      return [{
+        ...link, title: label(node.title), status: label(state.name), statusType: label(state.type), description: label(node.description),
+        comments: connection(node.comments ?? { nodes: [] }).nodes.map((item) => record(item))
+          .map((item) => ({ body: label(item.body), createdAt: label(item.createdAt), url: label(item.url), author: label(record(item.user ?? {}).name) }))
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+      }];
+    });
+  }
+
+  // Identifier, URL and project of tickets by id; tickets the key cannot see are missing.
+  async issueLinks(ids: string[]): Promise<Map<string, IssueLink>> {
+    const links = new Map<string, IssueLink>();
+    const valid = [...new Set(ids)].filter((id) => UUID.test(id));
+    for (let start = 0; start < valid.length; start += 50) {
+      const data = record(await this.withKey((key) => this.post(key, ISSUE_LINKS_QUERY, { ids: valid.slice(start, start + 50) })));
+      for (const node of connection(record(data.issues ?? {})).nodes) {
+        const link = issueLink(node);
+        if (link) links.set(link.id, link);
+      }
+    }
+    return links;
+  }
+
+  async projectIdByName(name: string): Promise<string | null> {
+    const data = record(await this.withKey((key) => this.post(key, PROJECT_BY_NAME_QUERY, { name })));
+    return connection(record(data.projects ?? {})).nodes.map((node) => label(record(node).id))[0] || null;
   }
 
   async react(commentId: string, emoji: string): Promise<void> {

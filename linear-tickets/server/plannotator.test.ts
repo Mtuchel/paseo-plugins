@@ -11,6 +11,7 @@ import { parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, writeOpe
 import type { ParkedPlan } from "./parked";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
+import { DecisionLog } from "./owner-decisions";
 
 const exec = promisify(execFile);
 // Bridges built without an opener use the default one: never open a real browser from the tests.
@@ -368,4 +369,48 @@ test("without the central host a plan that needs the owner keeps its agent and o
   assert.equal(plans.size, 0);
   assert.ok(!calls.some((call) => call.startsWith("retire")));
   assert.ok(calls.some((call) => call.startsWith("comment issue-1: 📋 **Plan ready for review in Plannotator**")));
+});
+
+test("the owner's review feedback is logged for the decision candidates; the risk policy's note and the retired agent's report are not", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-plannotator-decisions-"));
+  try {
+    const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+    const log = new DecisionLog(home);
+    const { plans, parking } = parkingFake(calls);
+    // Recent times: the log drops entries older than 60 days.
+    const base = Date.now() - 600 * 60_000;
+    const at = (minutes: number) => new Date(base + minutes * 60_000).toISOString();
+    plans.set("issue-2", { issueId: "issue-2", identifier: "TUC-26", agentId: "agent-9", plan: "# Plan", line: "", reasons: [], model: null, parkedAt: at(0), announced: true });
+    await withEvents([
+      { type: "decided", agentId: "agent-1", approved: false, feedback: "Use option B", at: at(60) },
+      { type: "decided", agentId: "agent-2", approved: true, feedback: "Auto-approved by the risk policy. Risk: impact 0/4, revert.", at: at(70) },
+      { type: "decided", agentId: "agent-3", approved: true, at: at(80) },
+      { type: "decided", agentId: "agent-9", approved: false, feedback: "The owner has to decide this plan.", at: at(90) },
+      { type: "decided", agentId: "agent-9", approved: true, parked: true, feedback: "Fine, but keep the old export", at: at(180) },
+    ], async (directory) => {
+      const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
+      bridge.recordDecisions(log);
+      bridge.attach(paseo);
+      await bridge.drain();
+      bridge.stop();
+    });
+    assert.deepEqual((await log.entries()).map((entry) => entry.kind === "plan-feedback" ? [entry.id, entry.identifier, entry.approved, entry.text] : entry.kind), [
+      [`agent-1:${at(60)}`, "TUC-25", false, "Use option B"],
+      [`agent-9:${at(180)}`, "TUC-26", true, "Fine, but keep the old export"],
+    ]);
+
+    // A log that cannot be written never stops the hand-off.
+    calls.length = 0;
+    const errors = test.mock.method(console, "error", () => {});
+    await withEvents([{ type: "decided", agentId: "agent-4", approved: false, feedback: "Split it", at: at(240) }], async (directory) => {
+      const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+      bridge.recordDecisions({ append: async () => { throw new Error("disk full"); } });
+      bridge.attach(paseo);
+      await bridge.drain();
+      bridge.stop();
+    });
+    errors.mock.restore();
+    assert.ok(calls.includes("document issue-1 Plan: TUC-25"));
+    assert.match(String(errors.mock.calls[0]?.arguments[0]), /decision log: plan feedback on TUC-25 failed: disk full/);
+  } finally { await rm(home, { recursive: true, force: true }); }
 });

@@ -11,6 +11,7 @@ import type { IssueState, LinearService } from "./linear";
 import type { NeedsYouIssues } from "./needs-you";
 import { PLANNING_STATE } from "./plannotator";
 import { PLAN_POLICY_LABEL } from "./plan-policy";
+import { logQuietly, questionEntry, type DecisionLog } from "./owner-decisions";
 import { RateLimitedError } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
@@ -168,10 +169,16 @@ export class Writeback {
   private outboxQueue: Promise<unknown> = Promise.resolve();
   private drainQueue: Promise<unknown> = Promise.resolve();
   private recovered = false;
+  // Where the owner's answers to questions are kept for the weekly decision candidates.
+  private decisions: Pick<DecisionLog, "append" | "answer"> | null = null;
 
   // `needsYou`: where waits on closed tickets keep their sub-issues; without it such a wait only
   // labels and comments on the closed ticket.
   constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly agentBridge?: AgentBridge, private readonly settleMs = 2_000, private readonly outboxPath = join(paseoHome(), "linear-tickets", "writeback-outbox.json"), private readonly needsYou?: NeedsYouIssues) {}
+
+  recordDecisions(log: Pick<DecisionLog, "append" | "answer">): void {
+    this.decisions = log;
+  }
 
   // The running model, and the agent with its title: hook events can carry none.
   private async snapshot(agent: PluginHookAgent, paseo: PaseoApi): Promise<{ model: string | null; named: PluginHookAgent }> {
@@ -555,6 +562,11 @@ export class Writeback {
 
   permissionRequested({ agent, request }: PluginLifecycleEvents["agent.permission_requested"], paseo: PaseoApi): Promise<void> {
     return this.run("permission_requested", agent, paseo, async ({ issueId, identifier }, settings, context) => {
+      // Logged first and whatever the write-back settings: an answer given in the Paseo app leaves
+      // no other trace, and the answer is joined to this entry by id, even after a plugin reload.
+      const question = questionEntry(agent.id, request, { id: issueId, identifier });
+      const log = this.decisions;
+      if (question && log) await logQuietly(() => log.append(question), `question on ${identifier}`);
       // Providers sometimes resolve a request themselves within moments (for example after a
       // plan approval switches the mode); only requests still pending after a short wait are shown.
       await new Promise((resolve) => setTimeout(resolve, this.settleMs));
@@ -588,8 +600,10 @@ export class Writeback {
 
   // A follow-up question usually arrives within moments (question 2/5 after 1/5): the waiting
   // period only ends once nothing is pending after the settle wait.
-  permissionResolved({ agent }: PluginLifecycleEvents["agent.permission_resolved"], paseo: PaseoApi): Promise<void> {
+  permissionResolved({ agent, requestId, resolution }: PluginLifecycleEvents["agent.permission_resolved"], paseo: PaseoApi): Promise<void> {
     return this.run("permission_resolved", agent, paseo, async ({ issueId, identifier }, settings) => {
+      const log = this.decisions;
+      if (log) await logQuietly(() => log.answer(`${agent.id}:${requestId}`, resolution), `answer on ${identifier}`);
       if (!settings.writeback.blocked) return;
       await new Promise((resolve) => setTimeout(resolve, this.settleMs));
       const refreshed = await paseo.agents.ref(agent.id).refresh().catch(() => null);
