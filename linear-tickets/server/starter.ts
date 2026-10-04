@@ -4,6 +4,7 @@ import type { TicketDetail } from "../shared/contracts";
 import { advisorSteps } from "../shared/plan-advisor";
 import { mappedBaseBranch, mappingLabel, type ProjectMapping } from "../shared/mapping";
 import { Capacity } from "./capacity";
+import { dispatchLabels } from "./dispatch";
 import type { Handover } from "./handover";
 import type { Launcher } from "./launch";
 import type { LinearService } from "./linear";
@@ -136,12 +137,15 @@ export class TicketStarter {
   }
 
   // Whether the ticket may start now: its blockers are finished, and the scheduler gives it a slot
-  // (none while the owner is away for an approved plan that may need them).
+  // (none while the owner is away for an approved plan that may need them). A project's planner
+  // skips max agents: it only orders tickets, and while it waits none of its project's new tickets
+  // can be handed out (README, "Who starts next"). A memory lease still caps it.
   async admission(issueId: string, paseo: PaseoApi, settings: PluginSettings): Promise<Admission> {
     const state = await this.deps.linear.issueState(issueId);
     if (state.blockedBy.length) return { ok: false, reason: `Waiting for ${state.blockedBy.join(", ")} to finish.` };
     const attended = needsOwner(state.labels.map((item) => item.name), settings.dispatch.label);
-    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended }, paseo, this.capacity.limit(settings.dispatch.maxRunning));
+    const planner = hasLabel(state.labels, dispatchLabels(settings.dispatch.label).planner.toLowerCase());
+    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended }, paseo, this.capacity.limit(planner ? 0 : settings.dispatch.maxRunning));
   }
 
   async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean }): Promise<Started> {

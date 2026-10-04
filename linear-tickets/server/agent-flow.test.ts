@@ -319,6 +319,15 @@ test("admission waits for unfinished blockers and for a free agent slot", async 
   assert.deepEqual(await room.starter.admission("i1", room.paseo, { ...settings, dispatch: { ...settings.dispatch, maxRunning: 0 } }), { ok: true });
 });
 
+test("a project planner starts even when every agent slot is taken; a memory lease still holds it", async () => {
+  const planner = { creatorId: APP, labels: [{ id: "p", name: "paseo-planner" }], blockedBy: [] };
+  const full = starterHarness(planner, 2);
+  assert.deepEqual(await full.starter.admission("i1", full.paseo, settings), { ok: true }, "2 of 2 slots used");
+  const leased = starterHarness(planner, 2);
+  leased.starter.capacity.set({ limit: 2, ttlSeconds: 60, reason: "low memory" });
+  assert.match((await leased.starter.admission("i1", leased.paseo, settings) as { reason: string }).reason, /RAM-limited, 2 of 2/);
+});
+
 test("while the owner is away, only the implementation of an attended ticket waits; planning never does, even with no agent limit", async () => {
   const unlimited = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 0 } };
   const approved = starterHarness({ creatorId: OWNER, labels: [{ id: "l1", name: "paseo-attended" }, { id: "r", name: "plan-ready" }], blockedBy: [] }, 0, APP, true);
