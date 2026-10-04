@@ -557,7 +557,10 @@ line. While slots under *max agents* are short, a free slot goes to:
 5. then the oldest ticket.
 
 An admitted ticket keeps its slot for 3 minutes while its agent starts. Tickets you start from
-the sidebar skip the line.
+the sidebar skip the line. So does a project's planner ticket (see **Projects**): it only orders
+tickets, and while it waits none of its project's new tickets can be handed out, so it starts
+even when every slot under *max agents* is taken. It still counts as a working agent, and a
+memory lease still holds it back.
 
 **Present and away.** Planning never waits: every ticket plans at any time, also at night. A plan
 that needs you is parked (see **Parked plans**) and takes no slot, so the plans are ready for your
