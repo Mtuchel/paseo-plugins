@@ -52,6 +52,8 @@ export async function writePlanContext(requestId: string, prompt: string, direct
 export class Launcher {
   private readonly requests = new Map<string, { fingerprint: string; result: Promise<Result> }>();
   private readonly active = new Map<string, Promise<Result>>();
+  // Launches under way per ticket, from any start path (sidebar, label, thread, project).
+  private readonly launching = new Map<string, number>();
 
   constructor(
     private readonly linear: Pick<LinearService, "detail" | "markInProgress" | "finishedBlockers">,
@@ -80,8 +82,15 @@ export class Launcher {
     const result = this.launch(input, paseo, options, () => { creationStarted = true; });
     this.requests.set(input.requestId, { fingerprint, result });
     this.active.set(fingerprint, result);
-    void result.then(() => this.active.delete(fingerprint), () => {
+    this.launching.set(input.id, (this.launching.get(input.id) ?? 0) + 1);
+    const settled = () => {
       this.active.delete(fingerprint);
+      const left = (this.launching.get(input.id) ?? 1) - 1;
+      if (left) this.launching.set(input.id, left);
+      else this.launching.delete(input.id);
+    };
+    void result.then(settled, () => {
+      settled();
       // A creation request may have succeeded before its response was lost.
       // Keep that result so retrying this request cannot create a second agent.
       if (!creationStarted) {
@@ -91,6 +100,10 @@ export class Launcher {
       }
     });
     return result;
+  }
+
+  underWay(issueId: string): boolean {
+    return this.launching.has(issueId);
   }
 
   private async launch(input: Start, paseo: PaseoApi, options: Options, onCreate: () => void): Promise<Result> {

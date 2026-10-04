@@ -83,6 +83,8 @@ export type SessionLink = {
   // A question with several parts, asked one part at a time.
   questions?: { requestId: string; index: number; answers: Record<string, string> } | null;
   // Replaced by a newer thread on the same ticket (every @mention opens one); told so and completed.
+  // Also a thread that ended without an agent on purpose: refused (not the owner's), or completed
+  // in Linear while it waited.
   closed?: boolean;
   // The agent the thread's "Open in Paseo" link points at.
   paseoLinked?: string;
@@ -337,12 +339,14 @@ export class SessionRouter {
     if (!issueId) throw new Error("The session has no ticket.");
     const known = await this.deps.store.get(session.id);
     if (known?.agentId || known?.group) return;
-    // One-person workspace: other integrations acting in Linear must not start agents here.
+    const link: SessionLink = { sessionId: session.id, agentId: null, issueId, identifier, createdAt: new Date().toISOString(), handled: [], review: null, offer: null };
+    // One-person workspace: other integrations acting in Linear must not start agents here. Kept
+    // as closed, so the ticket left assigned to Paseo is not taken for a failed start either.
     if (String(session.creatorId ?? "") !== await this.owner()) {
+      await this.deps.store.put({ ...link, closed: true });
       await this.say(session.id, "error", "Only the workspace owner can start Paseo agents.");
       return;
     }
-    const link: SessionLink = { sessionId: session.id, agentId: null, issueId, identifier, createdAt: new Date().toISOString(), handled: [], review: null, offer: null };
     const asked = (await this.deps.needsYou?.all())?.find((entry) => entry.id === issueId);
     const existing = asked
       ? { id: asked.agentId, title: (await this.paseo!.agents.ref(asked.agentId).refresh().catch(() => null))?.agent.title ?? null }
@@ -524,6 +528,17 @@ export class SessionRouter {
     await handle.send(body);
   }
 
+  // Whether a start or crash recovery under way (the ticket's turn, see exclusive) or the ticket's
+  // newest thread accounts for it, so a missing agent is no failed start: the thread waits for
+  // blockers or a free slot (`startQueued` starts it), its agent came up once (a plan approved for
+  // later, a resume offered, a parked plan, a group), or it was closed on purpose. False when the
+  // ticket has no thread or its newest one never got an agent.
+  async threadHolds(issueId: string): Promise<boolean> {
+    if (this.turns.has(issueId)) return true;
+    const newest = (await this.deps.store.all()).filter((link) => link.issueId === issueId).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+    return Boolean(newest && (newest.queued || newest.agentId || newest.offer || newest.group || newest.closed));
+  }
+
   // Threads waiting for blockers or an agent slot. Read from the store, not from `openSessions`:
   // that is Linear's 50 most recently updated sessions in the whole workspace, and a waiting
   // thread posts nothing, so it drops out of that list hours before a slow blocker finishes.
@@ -538,7 +553,8 @@ export class SessionRouter {
         // The owner may have ended the thread or closed the ticket while it waited.
         const status = await this.deps.api.sessionStatus(link.sessionId);
         if (!status || status === "complete" || status === "error") {
-          await this.deps.store.patch(link.sessionId, { queued: false });
+          // Completed by the owner: left alone. An errored or vanished thread is no decision.
+          await this.deps.store.patch(link.sessionId, { queued: false, ...(status === "complete" ? { closed: true } : {}) });
           console.log(`[linear-tickets] ${link.identifier}: queued thread ended in Linear (${status ?? "gone"}); no agent started`);
           continue;
         }
@@ -982,7 +998,12 @@ export class SessionRouter {
   // launch failed is in error in Linear, and Linear opens no new thread when the ticket is assigned
   // to Paseo again. Its stopped agents are archived once the new one runs, so a later reply or
   // mention never reaches them, and its earlier threads are closed as superseded.
-  async restartFor(issueId: string, identifier: string): Promise<void> {
+  // Runs in the ticket's turn, like any successor start.
+  restartFor(issueId: string, identifier: string): Promise<void> {
+    return this.exclusive(issueId, () => this.restartNow(issueId, identifier));
+  }
+
+  private async restartNow(issueId: string, identifier: string): Promise<void> {
     if (!this.paseo) throw new Error("Paseo is not connected yet.");
     const settings = await this.deps.settings.read();
     const admission = await this.deps.starter.admission(issueId, this.paseo, settings);

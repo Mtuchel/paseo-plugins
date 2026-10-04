@@ -85,11 +85,12 @@ export default function contribute(server: PluginServerContext) {
   });
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
   // Labelled projects: a planner ticket sets the work order, then tickets are handed out as slots free up.
-  // A planner without a live agent is started again with a new agent and thread (README, "Projects").
+  // A planner without a live agent, and a ticket assigned to Paseo whose start failed, is started
+  // again with a new agent and thread (README, "Projects").
   const projects = new ProjectFlow({ linear, scheduler: starter.scheduler, capacity: starter.capacity, retire: async (agentId, api) => {
     await stopAgentTurn(agentId).catch(() => {});
     await api.agents.ref(agentId).archive().catch(() => {});
-  }, restart: (issueId, identifier) => sessions.restartFor(issueId, identifier) });
+  }, restart: (issueId, identifier) => sessions.restartFor(issueId, identifier), accountedFor: async (issueId) => launcher.underWay(issueId) || await sessions.threadHolds(issueId) });
   const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
