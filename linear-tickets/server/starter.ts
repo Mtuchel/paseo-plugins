@@ -38,6 +38,9 @@ export const UNTRUSTED_NOTE = [
 // Every ticket plans first (README, "Plan-first"); the risk policy approves plans within the
 // owner's threshold, the owner the rest.
 export const PLAN_REQUIRED_NOTE = "Every ticket gets a plan first. Investigate and write a plan; do not change code until it is approved, by the owner or automatically when its risk rating is within the owner's threshold. Keep the plan as short as the ticket allows: a one-line fix needs a few lines of plan, not a document.";
+// Every ticket plan starts with a search for overlapping work (README, "Plan-first"): new tickets,
+// by people or agents, are filed without one.
+export const OVERLAP_NOTE = "Before you plan, look for overlapping work. Search Linear's open tickets (with the linear_ticket tool search_issues, or another Linear read tool such as list_issues with a query; every team and project, including tickets In Progress or In Review whose pull requests are not merged yet) for tickets that change the same feature, files or data as this one, or already ask for what it does, and read the full description of each candidate. Your plan gets an `## Overlapping tickets` section: each overlapping ticket, how it overlaps and what this plan does about it (waits for it, builds on it, leaves a part to it), or \"None found\" with the search terms you used. When you have the linear_ticket tool add_relation, link every real overlap with it as related while you plan. When another ticket already covers all of this one, the plan says so and proposes closing this ticket as its duplicate instead of doing the work.";
 // Every plan a ticket agent writes gets a second opinion before the owner sees it (README, "Plan
 // advisor"). omp planners have the extension's record tool and submission gate.
 export function advisorNote(providerKey: string): string {
@@ -80,7 +83,7 @@ export type PlanSetup = { untrusted: boolean; policy: PlanPolicy | null; modeId:
 
 // What a ticket's launch looks like under its plan policy: mode, instructions, and the agent
 // label and environment the omp extension and write-back read. Shared by every launch path.
-export async function planSetup(linear: Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "issueDocument">, issueId: string, provider: string, usualModeId: string | undefined): Promise<PlanSetup> {
+export async function planSetup(linear: Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "issueDocument">, issueId: string, provider: string, usualModeId: string | undefined, plannerLabel: string): Promise<PlanSetup> {
   const state = await linear.issueState(issueId);
   const untrusted = isUntrusted(state, await linear.viewerId(), await linear.appUserId());
   const policy = planPolicy(state.labels);
@@ -93,6 +96,8 @@ export async function planSetup(linear: Pick<LinearService, "issueState" | "view
     modeId: policy ? SAFE_MODES[providerKey] ?? usualModeId : usualModeId,
     notes: [
       policy ? (untrusted ? UNTRUSTED_NOTE : PLAN_REQUIRED_NOTE) : untrusted ? UNTRUSTED_TEXT : "",
+      // A project's planner gets its own overlap instructions in its description.
+      policy && !hasLabel(state.labels, plannerLabel.toLowerCase()) ? OVERLAP_NOTE : "",
       policy ? advisorNote(providerKey) : approvedPlanNote(state.identifier, plan),
       policy ? sentBackPlanNote(state.identifier, plan) : "",
     ].filter(Boolean),
@@ -166,7 +171,7 @@ export class TicketStarter {
     const project = await findProject(paseo, mapping.projectId);
     const target = project.projectCustomName || project.projectDisplayName || mapping.label;
     const resume = options.fresh ? null : await this.deps.handover?.resumeTarget(issueId);
-    const setup = await planSetup(this.deps.linear, issueId, preference.model, preference.modeId);
+    const setup = await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, dispatchLabels(settings.dispatch.label).planner);
     const base = {
       id: issueId,
       projectId: mapping.projectId,

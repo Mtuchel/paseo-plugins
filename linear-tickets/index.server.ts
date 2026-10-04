@@ -8,7 +8,7 @@ import { Settings } from "./server/settings";
 import { DEFAULT_PROMPT_TEMPLATE } from "./shared/contracts";
 import { cacheScope, TicketCache } from "./server/cache";
 import { Credentials } from "./server/credentials";
-import { Dispatcher } from "./server/dispatch";
+import { Dispatcher, dispatchLabels } from "./server/dispatch";
 import { CommentRelay } from "./server/relay";
 import { recordPluginComment } from "./server/agent-records";
 import { paseoHome } from "./server/ticket-mcp";
@@ -247,8 +247,8 @@ export default function contribute(server: PluginServerContext) {
     return { ...saved, builtin: DEFAULT_PROMPT_TEMPLATE };
   });
   server.handle(launchAgentRpc, async (input, { paseo }) => {
-    const { template, agentLinearAccess } = await settings.read();
-    const setup = await planSetup(linear, input.id, input.provider, input.modeId);
+    const { template, agentLinearAccess, dispatch } = await settings.read();
+    const setup = await planSetup(linear, input.id, input.provider, input.modeId, dispatchLabels(dispatch.label).planner);
     const launch = { ...input, modeId: setup.modeId, instructions: [...setup.notes, input.instructions.trim()].filter(Boolean).join("\n\n") };
     const markInProgress = input.markInProgress && setup.policy !== "required";
     const result = await launcher.start(launch, paseo, { promptTemplate: template ?? undefined, markInProgress, linearAccess: agentLinearAccess, labels: setup.labels, env: setup.env });
