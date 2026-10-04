@@ -176,7 +176,7 @@ test("with review links, the agent's stable link is posted instead of the review
   });
 });
 
-const RISKY = (impact: number) => `# Plan\n\n1. Add the column to the report.\n\n## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: ${impact} — read-only report\n- Reversibility: revert — no data written\n- Feature flag: no\n- Migration: no\n- Auth: no\n- Failure mode: the report shows a wrong column; sales notices on the next export\n- Advisor rating: impact ${impact}, reversibility revert\n- Recommendation: auto — nothing for the owner to decide\n\n## Advisor review\n\nGPT-6 Astra, 1 round, agreed.\n`;
+const RISKY = (impact: number, newRule = "no — a one-off column") => `# Plan\n\n1. Add the column to the report.\n\n## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: ${impact} — read-only report\n- Reversibility: revert — no data written\n- Feature flag: no\n- Migration: no\n- Auth: no\n- New rule: ${newRule}\n- Failure mode: the report shows a wrong column; sales notices on the next export\n- Advisor rating: impact ${impact}, reversibility revert\n- Recommendation: auto — nothing for the owner to decide\n\n## Advisor review\n\nGPT-6 Astra, 1 round, agreed.\n`;
 
 // Runs one review: the extension's advised event for `advisedPlan`, then the hand-off of `shownPlan`.
 async function review(options: { advisedPlan: string; shownPlan?: string; verdict?: string; ticket?: { creatorId: string; labels: string[] } }) {
@@ -220,6 +220,31 @@ test("a plan goes to the owner, with the rating and why, when anything the polic
     assert.match(comment, /Risk: impact \d\/4, revert\. Needs your approval: /, name);
     assert.match(comment, reason, name);
   }
+});
+
+test("a plan that sets a new rule goes to the owner although everything else would approve it", async () => {
+  const rule = await review({ advisedPlan: RISKY(0, "yes — every report gets a CSV export") });
+  assert.deepEqual(rule.decisions, []);
+  assert.match(rule.comment, /Needs your approval: it sets a new rule\.$/);
+  assert.equal((await review({ advisedPlan: RISKY(0) })).decisions.length, 1, "the same plan without the rule is approved");
+});
+
+test("approving a plan files its follow-ups, on the Plannotator page or as a parked plan; a send-back files none", async () => {
+  const { linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake([]);
+  const filed: string[] = [];
+  const run = (events: object[]) => withEvents(events, async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.useFollowUps({ file: async (origin) => { filed.push(`${origin.issueId} ${origin.identifier} ${origin.documentUrl} ${origin.plan}`); }, retryPending: async () => {} });
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  await run([{ type: "decided", agentId: "agent-1", approved: false, feedback: "Narrow it", planContent: "# Plan A", at: "2026-01-01T09:00:00Z" }]);
+  await run([{ type: "decided", agentId: "agent-1", approved: true, planContent: "# Plan A", at: "2026-01-01T10:00:00Z" }]);
+  plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-2", plan: "# Parked plan", line: "", reasons: [], model: null, parkedAt: "2026-01-01T11:00:00Z", announced: true });
+  await run([{ type: "decided", agentId: "agent-2", approved: true, parked: true, at: "2026-01-01T12:00:00Z" }]);
+  assert.deepEqual(filed, ["issue-1 TUC-25 https://linear.app/doc/1 # Plan A", "issue-1 TUC-25 https://linear.app/doc/1 # Parked plan"]);
 });
 
 test("a project planner's work order is approved on submission and handed to the project flow, without a Linear read that could fail", async () => {

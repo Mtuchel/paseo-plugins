@@ -5,7 +5,7 @@ import { autoApproval, DEFAULT_AUTO_APPROVE, parsePlanRisk, type PlanRisk, type 
 const section = (fields: Record<string, string>) => {
   const values = {
     Areas: "Warehouse", Processes: "stock transfer", Impact: "1 — read-only", Reversibility: "revert — nothing written", "Feature flag": "no",
-    Migration: "no", Auth: "no", "Failure mode": "wrong totals in the view", "Advisor rating": "impact 1, reversibility revert", Recommendation: "auto — routine",
+    Migration: "no", Auth: "no", "New rule": "no — nothing general", "Failure mode": "wrong totals in the view", "Advisor rating": "impact 1, reversibility revert", Recommendation: "auto — routine",
     ...fields,
   };
   return `# Plan\n\n## Risk and impact\n\n${Object.entries(values).map(([name, value]) => `- ${name}: ${value}`).join("\n")}\n\n## Advisor review\n\nAgreed.\n`;
@@ -21,7 +21,7 @@ const trusted: ReviewFacts = { verdict: "agreed", untrusted: false, attended: fa
 
 test("the rating section is read from its fixed lines, bold labels included, and a missing or unreadable field is named", () => {
   assert.deepEqual(risk({ Impact: "3 — writes orders", Reversibility: "data-fix", "Feature flag": "yes — sales.newFlow", "Advisor rating": "impact 4, reversibility irreversible" }), {
-    impact: 3, reversibility: "data-fix", featureFlag: true, migration: false, auth: false, advisor: { impact: 4, reversibility: "irreversible" }, recommendation: "auto",
+    impact: 3, reversibility: "data-fix", featureFlag: true, migration: false, auth: false, newRule: false, advisor: { impact: 4, reversibility: "irreversible" }, recommendation: "auto",
   });
   assert.equal(risk({ "Advisor rating": "unavailable" }).advisor, null);
   const bold = parsePlanRisk(section({}).replace("- Impact:", "- **Impact:**"));
@@ -52,4 +52,12 @@ test("hard stops hold whatever the impact: owner request, migration, auth, no re
   assert.deepEqual(reasons({ "Advisor rating": "unavailable" }, { ...trusted, verdict: "unavailable" }), ["the advisor was unavailable"]);
   assert.deepEqual(reasons({}, { ...trusted, verdict: "disagreements" }), ["the advisor review left open disagreements"]);
   assert.deepEqual(reasons({}, trusted, { ...DEFAULT_AUTO_APPROVE, enabled: false }), ["auto-approval is off"]);
+});
+
+test("a plan that sets a new rule always goes to the owner, whatever its impact or the threshold, and must say whether it does", () => {
+  const rule = { Impact: "0 — tooling", "Advisor rating": "impact 0, reversibility revert", "New rule": "yes — every plan carries a Reach section" };
+  assert.deepEqual(autoApproval(risk(rule), DEFAULT_AUTO_APPROVE, trusted).reasons, ["it sets a new rule"]);
+  assert.deepEqual(autoApproval(risk(rule), { enabled: true, maxImpact: 4, maxImpactWithFlag: 4 }, trusted).reasons, ["it sets a new rule"]);
+  const unstated = parsePlanRisk(section({}).replace("- New rule: no — nothing general\n", ""));
+  assert.ok("problem" in unstated && /unreadable value for: New rule/.test(unstated.problem), "an old-format plan is not rated, so it is never auto-approved");
 });

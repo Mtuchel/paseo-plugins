@@ -31,6 +31,8 @@ export type PlanRisk = Rating & {
   featureFlag: boolean;
   migration: boolean;
   auth: boolean;
+  // The plan sets a rule for future work (shared/plan-sections.ts, `## Principles and rules`).
+  newRule: boolean;
   // The advisor's own rating; null when the advisor was unavailable.
   advisor: Rating | null;
   recommendation: "auto" | "owner";
@@ -47,6 +49,7 @@ export function riskSteps(): string {
     "- Feature flag: <yes | no> — <which flag keeps the change off until it is switched on>",
     "- Migration: <yes | no>",
     "- Auth: <yes | no> (authentication, authorization or permissions)",
+    "- New rule: <yes | no> — <the rule this plan sets for future work (as in `## Principles and rules`), or why it sets none>",
     "- Failure mode: <what breaks for whom if the change is wrong, and how we would notice>",
     "- Advisor rating: <impact 0-4, reversibility revert | data-fix | irreversible> (the advisor's own rating, or `unavailable`)",
     "- Recommendation: <auto | owner> — <owner when the plan needs a business decision, wording or layout the owner chooses, production data changes, external accounts or spend>",
@@ -58,7 +61,13 @@ export function riskSteps(): string {
   ].join("\n");
 }
 
-function field(body: string, name: string): string | null {
+// A section's body: from its heading (any level) to the next heading of level 1 or 2. null: no such heading.
+export function sectionBody(plan: string, name: string): string | null {
+  return new RegExp(`^#{1,6}\\s+${name}\\b[^\\n]*\\n([\\s\\S]*?)(?=^#{1,2}\\s|(?![\\s\\S]))`, "im").exec(plan)?.[1] ?? null;
+}
+
+// One `- Name: value` line of a section (bold labels allowed).
+export function field(body: string, name: string): string | null {
   const match = new RegExp(`^\\s*[-*]\\s*(?:\\*\\*)?${name}(?:\\*\\*)?\\s*:(?:\\*\\*)?\\s*(.+)$`, "im").exec(body);
   return match ? match[1].trim() : null;
 }
@@ -75,8 +84,7 @@ function yesNo(value: string): boolean | null {
 
 // The plan's rating, or the problem the planner must fix (the record tool returns it).
 export function parsePlanRisk(plan: string): { risk: PlanRisk } | { problem: string } {
-  // The section's body up to the next heading of level 1 or 2.
-  const body = new RegExp(`^#{1,6}\\s+${RISK_SECTION}\\b[^\\n]*\\n([\\s\\S]*?)(?=^#{1,2}\\s|(?![\\s\\S]))`, "im").exec(plan)?.[1] ?? null;
+  const body = sectionBody(plan, RISK_SECTION);
   if (body === null) return { problem: `The plan has no "## ${RISK_SECTION}" section.\n\n${riskSteps()}` };
   const missing: string[] = [];
   const read = <T>(name: string, parse: (value: string) => T | null): T | null => {
@@ -93,6 +101,7 @@ export function parsePlanRisk(plan: string): { risk: PlanRisk } | { problem: str
   const featureFlag = read("Feature flag", yesNo);
   const migration = read("Migration", yesNo);
   const auth = read("Auth", yesNo);
+  const newRule = read("New rule", yesNo);
   const recommendation = read("Recommendation", (value) => /^\W*(auto|owner)\b/i.exec(value)?.[1].toLowerCase() as "auto" | "owner" | undefined ?? null);
   const advisor = read("Advisor rating", (value): { rating: Rating | null } | null => {
     if (/^\W*unavailable\b/i.test(value)) return { rating: null };
@@ -101,10 +110,10 @@ export function parsePlanRisk(plan: string): { risk: PlanRisk } | { problem: str
     return level && undo ? { rating: { impact: Number(level[1]) as Impact, reversibility: undo } } : null;
   });
   for (const name of ["Areas", "Processes", "Failure mode"]) if (!field(body, name)) missing.push(name);
-  if (missing.length || impact === null || reversibility === null || featureFlag === null || migration === null || auth === null || recommendation === null || advisor === null) {
+  if (missing.length || impact === null || reversibility === null || featureFlag === null || migration === null || auth === null || newRule === null || recommendation === null || advisor === null) {
     return { problem: `The "## ${RISK_SECTION}" section is missing or has an unreadable value for: ${missing.join(", ")}.\n\n${riskSteps()}` };
   }
-  return { risk: { impact, reversibility, featureFlag, migration, auth, advisor: advisor.rating, recommendation } };
+  return { risk: { impact, reversibility, featureFlag, migration, auth, newRule, advisor: advisor.rating, recommendation } };
 }
 
 // The planner's and the advisor's rating combined: the higher impact, the worse reversibility.
@@ -147,6 +156,7 @@ export function autoApproval(risk: PlanRisk, policy: AutoApprovePolicy, facts: R
     reversibility !== "revert" ? `reversibility is ${reversibility}` : "",
     risk.migration ? "it includes a migration" : "",
     risk.auth ? "it changes auth or permissions" : "",
+    risk.newRule ? "it sets a new rule" : "",
   ].filter(Boolean);
   return { approve: reasons.length === 0, reasons };
 }

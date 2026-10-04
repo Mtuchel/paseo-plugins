@@ -18,6 +18,7 @@ import { planHash } from "./review-outcome";
 import { isUntrusted } from "./starter";
 import { dispatchLabels } from "./dispatch";
 import { orderProblems, type ProjectFlow } from "./project-flow";
+import type { PlanFollowUps } from "./plan-follow-ups";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -155,6 +156,8 @@ export class PlannotatorBridge {
   private readonly lastDecision = new Map<string, number>();
   // A project's planner tickets and their work orders (project-flow.ts).
   private projectPlans: ProjectPlans | null = null;
+  // Files an approved plan's follow-ups (plan-follow-ups.ts); its retries run on this bridge's sweep.
+  private followUps: Pick<PlanFollowUps, "file" | "retryPending"> | null = null;
   // Per agent, the advisor verdict the omp extension recorded last and the hash of that plan text.
   // In memory: after a plugin reload the next review simply goes to the owner.
   private readonly advised = new Map<string, { verdict: string; hash: string }>();
@@ -222,7 +225,7 @@ export class PlannotatorBridge {
     this.paseo = paseo;
     if (!first) return;
     // A cheap directory sweep; fs.watch proved unreliable for files renamed into place.
-    this.timer = setInterval(() => { void this.drain(); }, SWEEP_MS);
+    this.timer = setInterval(() => { void this.drain(); void this.followUps?.retryPending(); }, SWEEP_MS);
     this.timer.unref?.();
     void this.drain();
   }
@@ -240,6 +243,10 @@ export class PlannotatorBridge {
 
   onProjectPlan(plans: ProjectPlans): void {
     this.projectPlans = plans;
+  }
+
+  useFollowUps(followUps: Pick<PlanFollowUps, "file" | "retryPending">): void {
+    this.followUps = followUps;
   }
 
   // The risk policy (README, "Plan risk and auto-approval"): approves the plan on the owner's
@@ -369,6 +376,7 @@ export class PlannotatorBridge {
       return;
     }
     const documentUrl = await this.linear.upsertIssueDocument(issueId, `Plan: ${identifier}`, planDocument(event, identifier, model));
+    if (event.approved) await this.followUps?.file({ issueId, identifier, plan: event.planContent ?? "", documentUrl: documentUrl || null });
     if (progress) {
       await progress({ plan: event.approved ? "approved" : `sent back${event.feedback ? ` — ${event.feedback.slice(0, 300)}` : ""}`, ...(documentUrl ? { link: ["Plan", documentUrl] as [string, string] } : {}) });
       return;
@@ -468,6 +476,7 @@ export class PlannotatorBridge {
     if (previous !== undefined && Math.abs(at - previous) < 120_000) return;
     const documentUrl = await this.linear.upsertIssueDocument(parked.issueId, `Plan: ${parked.identifier}`, planDocument({ ...event, planContent: event.planContent ?? parked.plan }, parked.identifier, parked.model));
     if (event.approved) {
+      await this.followUps?.file({ issueId: parked.issueId, identifier: parked.identifier, plan: event.planContent ?? parked.plan, documentUrl: documentUrl || null });
       await this.linear.addLabel(parked.issueId, PLAN_READY_LABEL);
       const moved = await this.linear.moveToReady(parked.issueId).catch((error: unknown) => ({ changed: false, note: error instanceof Error ? error.message : String(error) }));
       if (moved.note) console.error(`[linear-tickets] ${parked.identifier}: ${moved.note}`);
