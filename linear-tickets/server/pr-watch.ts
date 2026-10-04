@@ -4,17 +4,22 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
+import { z } from "zod";
 import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
 import { CODING_STATE } from "./plannotator";
 import { STAGE_STEP, stalledStage, type ReviewThread, type Stage } from "./pr-nudge";
+// `ghGet` and the REST types live with the menu bar's pull request view (see "Pull request view" in
+// the README); both readers share them. The import cycle (pull-requests reads `ghJson` and
+// `activityBullets` back from here) is resolved at call time, never at module load.
+import { ghGet, type RestGet, type RestResponse } from "./pull-requests";
 import {
   activityBoundary, BACKSTOP_ENQUEUE, BackstopCheckout, CLASS_TEXT, commentOnce, dropWhy, ENQUEUE_READY, enqueueArgs, enqueuedComment, HELD_KINDS, parseEnqueue, parseExpect, parseJudgment, parseReady,
   READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, runNodeScript, ticketMarker, WAIT_QUEUE, waitQueueArgs,
   type ActionRecord, type DropClass, type DropJudgment, type Problem, type Refusal, type ScriptRunner,
 } from "./queue-backstop";
-import { RateLimitedError, withPriority } from "./rate-budget";
+import { githubBudget, GitHubPausedError, RateLimitedError, withPriority, type GitHubBudget } from "./rate-budget";
 import type { PromptOutcome, Recovery, SessionRouter } from "./sessions";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
@@ -247,6 +252,180 @@ export async function viewPullRequest(url: string): Promise<PullRequestView> {
   };
 }
 
+// How long a cached view is served while nothing the cheap probe can see changed, as a bounded
+// safety net for a change no ETag moves (a draft marked ready without touching the resource, say).
+// While the merge queue is testing the pull request its Merge activity comment is edited whenever
+// the attempt ends, so the view is read anew every poll then.
+const STALE_VIEW_MS = 10 * 60 * 1000;
+// Cached views kept at most; the watched set is far smaller, this only bounds a long-lived daemon.
+const MAX_VIEWS = 256;
+
+// What one conditional REST request leaves behind: the ETag to ask with next time, and a
+// fingerprint of the fields the change key compares, for a server that ignores `If-None-Match`.
+type Probe = { etag: string | null; fingerprint: string | null };
+// The head's checks, keyed by the head they were read on.
+type ChecksProbe = { sha: string; runs: Probe; status: Probe };
+// The pull request's own reads beyond the resource: its conversation comments (Graphite edits its
+// Merge activity comment in place) and its reviews.
+type RestProbe = { comments: Probe; reviews: Probe; checks: ChecksProbe | null };
+// A view served from memory and the probe state that decides when it is read again.
+type CachedView = { view: PullRequestView; issue: Probe; rest: RestProbe | null; readAt: number };
+
+// GitHub's REST payloads are read through these narrow schemas, as the menu bar's pull request view
+// reads its own. A field the API renames or drops makes the parse fail, which the probe treats as a
+// change (it reads the pull request in full) rather than silently serving a stale view.
+const issueJson = z.object({
+  state: z.string().nullish(),
+  updated_at: z.string().nullish(),
+  labels: z.array(z.object({ name: z.string().nullish() })).nullish(),
+  pull_request: z.object({ merged_at: z.string().nullish() }).nullish(),
+});
+// The conversation comments as last edited; an edit moves `updated_at`, which a new comment and
+// Graphite's appended Merge activity bullet both do.
+const commentsJson = z.array(z.object({ id: z.number().nullish(), updated_at: z.string().nullish() }));
+const reviewsJson = z.array(z.object({ id: z.number().nullish(), state: z.string().nullish(), submitted_at: z.string().nullish() }));
+// A check run (or combined status entry) changing does not move the pull request resource, so the
+// head's checks carry their own key; `total_count` catches one added beyond the first page.
+const checkRunsJson = z.object({
+  total_count: z.number().nullish(),
+  check_runs: z.array(z.object({ name: z.string().nullish(), status: z.string().nullish(), conclusion: z.string().nullish(), started_at: z.string().nullish(), completed_at: z.string().nullish() })).nullish(),
+});
+const statusJson = z.object({
+  total_count: z.number().nullish(),
+  statuses: z.array(z.object({ context: z.string().nullish(), state: z.string().nullish(), updated_at: z.string().nullish() })).nullish(),
+});
+
+// The change key of the pull request read as an issue: state, labels and the last change of any
+// kind, with `pull_request.merged_at` telling a merged pull request from a merely closed one. The
+// single-pull-request endpoint (`repos/{repo}/pulls/{n}`) is not used: its ETag moves on every
+// request, so it never answers 304, while the issue resource's is stable.
+function issueFingerprint(body: unknown): string {
+  const issue = issueJson.parse(body);
+  return [issue.state ?? "", issue.updated_at ?? "", issue.pull_request?.merged_at ?? "", (issue.labels ?? []).map((label) => label.name ?? "").sort().join(",")].join("\n");
+}
+
+function commentsFingerprint(body: unknown): string {
+  return commentsJson.parse(body).map((comment) => `${comment.id ?? ""}:${comment.updated_at ?? ""}`).join("\n");
+}
+
+function reviewsFingerprint(body: unknown): string {
+  return reviewsJson.parse(body).map((review) => `${review.id ?? ""}:${review.state ?? ""}:${review.submitted_at ?? ""}`).join("\n");
+}
+
+function checkRunsFingerprint(body: unknown): string {
+  const page = checkRunsJson.parse(body);
+  return [String(page.total_count ?? 0), ...(page.check_runs ?? []).map((run) => `${run.name ?? ""}:${run.status ?? ""}:${run.conclusion ?? ""}:${run.started_at ?? ""}:${run.completed_at ?? ""}`)].join("\n");
+}
+
+function statusFingerprint(body: unknown): string {
+  const page = statusJson.parse(body);
+  return [String(page.total_count ?? 0), ...(page.statuses ?? []).map((status) => `${status.context ?? ""}:${status.state ?? ""}:${status.updated_at ?? ""}`)].join("\n");
+}
+
+// One watched pull request's cheap first look. `viewPullRequest` is one GraphQL query per pull
+// request per poll; this class asks REST first, so a quiet pull request costs the shared GraphQL
+// budget nothing: the pull request read as an issue, then its comments, reviews and the head's
+// checks, are read conditionally (their stable ETags make an unchanged resource answer 304, which
+// GitHub does not meter), and the detail read runs only when one of them changed, when the merge
+// queue is mid-attempt, or when the cached view is older than STALE_VIEW_MS. Every REST request
+// passes the shared GitHub budget first, at the caller's priority, so the reserve that keeps the
+// agents' own `gh` calls working also holds here.
+export class ConditionalPullView {
+  private readonly views = new Map<string, CachedView>();
+
+  constructor(private readonly deps: { get: RestGet; budget: GitHubBudget; read: (url: string) => Promise<PullRequestView>; now?: () => number }) {}
+
+  async view(url: string): Promise<PullRequestView> {
+    const source = PULL_URL.exec(url);
+    if (!source) return this.deps.read(url);
+    const [, repo, number] = source;
+    const cached = this.views.get(url);
+    try {
+      const issue = await this.conditional(`repos/${repo}/issues/${number}`, cached?.issue ?? null, issueFingerprint);
+      if (!cached || issue.changed || this.stale(cached)) return await this.read(url, repo, number, issue.probe);
+      // The rest is only watched while the pull request is open; a closed or merged one is decided
+      // by the resource itself, whose state transition already forced the read above.
+      const rest = cached.view.state === "OPEN" ? await this.probeRest(repo, number, cached.view, cached.rest) : null;
+      if (rest?.changed) return await this.read(url, repo, number, issue.probe);
+      // Nothing changed: the last view is served as is, only its probe state moves forward.
+      this.views.set(url, { ...cached, issue: issue.probe, rest: rest?.probe ?? cached.rest });
+      return cached.view;
+    } catch (error) {
+      // A failed look is not cached: the next poll reads it again.
+      this.views.delete(url);
+      throw error;
+    }
+  }
+
+  // The detail read, with the rest of the pull request seeded right after, so the poll that follows
+  // compares them instead of reading the pull request again.
+  private async read(url: string, repo: string, number: string, issue: Probe): Promise<PullRequestView> {
+    const view = await this.deps.read(url);
+    const rest = view.state === "OPEN" ? (await this.probeRest(repo, number, view, null)).probe : null;
+    this.views.set(url, { view, issue, rest, readAt: this.deps.now?.() ?? Date.now() });
+    if (this.views.size > MAX_VIEWS) {
+      const oldest = [...this.views].sort((a, b) => a[1].readAt - b[1].readAt)[0];
+      if (oldest) this.views.delete(oldest[0]);
+    }
+    return view;
+  }
+
+  // The cached view is read in full again when it is this old: every poll while the merge queue is
+  // mid-attempt (unfinished bullets are edited in place, invisible to the resource's ETag), the
+  // safety-net age otherwise.
+  private stale(cached: CachedView): boolean {
+    if (cached.view.state !== "OPEN") return false;
+    const last = activityBullets(cached.view.mergeActivity).at(-1);
+    return (this.deps.now?.() ?? Date.now()) - cached.readAt >= (last?.kind === "queued" || last?.kind === "running" ? INTERVAL_MS : STALE_VIEW_MS);
+  }
+
+  private async probeRest(repo: string, number: string, view: PullRequestView, stored: RestProbe | null): Promise<{ changed: boolean; probe: RestProbe }> {
+    const [comments, reviews] = await Promise.all([
+      this.conditional(`repos/${repo}/issues/${number}/comments?per_page=100`, stored?.comments ?? null, commentsFingerprint),
+      this.conditional(`repos/${repo}/pulls/${number}/reviews?per_page=100`, stored?.reviews ?? null, reviewsFingerprint),
+    ]);
+    const checks = view.headSha ? await this.probeChecks(repo, view, stored?.checks ?? null) : null;
+    return { changed: comments.changed || reviews.changed || Boolean(checks?.changed), probe: { comments: comments.probe, reviews: reviews.probe, checks: checks?.probe ?? null } };
+  }
+
+  private async probeChecks(repo: string, view: PullRequestView, stored: ChecksProbe | null): Promise<{ changed: boolean; probe: ChecksProbe }> {
+    const sha = view.headSha;
+    const same = stored && stored.sha === sha ? stored : null;
+    const [runs, status] = await Promise.all([
+      this.conditional(`repos/${repo}/commits/${sha}/check-runs?per_page=100`, same?.runs ?? null, checkRunsFingerprint),
+      this.conditional(`repos/${repo}/commits/${sha}/status`, same?.status ?? null, statusFingerprint),
+    ]);
+    return { changed: runs.changed || status.changed, probe: { sha, runs: runs.probe, status: status.probe } };
+  }
+
+  // One conditional REST GET. GitHub answers 304 while the resource is the one the stored ETag
+  // names (no body, no budget); otherwise the response carries the new ETag and this read's
+  // fingerprint, which says whether the fields the detail read needs actually moved.
+  private async conditional(path: string, stored: Probe | null, fingerprint: (body: unknown) => string): Promise<{ changed: boolean; probe: Probe }> {
+    this.deps.budget.admit();
+    let response: RestResponse;
+    try {
+      response = await this.deps.get(path, stored?.etag ?? null);
+    } catch (error) {
+      if (error instanceof GitHubRateLimitedError) throw this.deps.budget.throttled();
+      throw error;
+    }
+    this.deps.budget.record(response.headers);
+    const etag = response.headers.get("etag") ?? null;
+    if (response.status === 304) return { changed: false, probe: stored ?? { etag, fingerprint: null } };
+    if (response.status !== 200) throw new Error(`GitHub answered HTTP ${response.status} for ${path}`);
+    let mark: string | null;
+    try {
+      mark = fingerprint(JSON.parse(response.body));
+    } catch {
+      // A body that is neither JSON nor the schema: read the pull request in full rather than guess.
+      mark = null;
+    }
+    // A first look (nothing to compare against) or an unreadable body counts as a change.
+    return { changed: typeof stored?.fingerprint !== "string" || stored.fingerprint !== mark, probe: { etag, fingerprint: mark } };
+  }
+}
+
 const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(first: 100, after: $cursor) {
     pageInfo { hasNextPage endCursor }
@@ -472,6 +651,10 @@ async function writeState(path: string, value: unknown): Promise<void> {
 // longer applies; `error`: the crash of the last restart.
 type Crash = { restarts?: number; escalated?: boolean; resume?: { text: string; issueId: string } | null; error?: string };
 
+// The cheap first look at a pull request; `ConditionalPullView` is the real one, and the tests
+// inject a fake (see the deps of PullRequestWatch).
+export type PullViewSource = { view(url: string): Promise<PullRequestView> };
+
 // Mirrors each ticket's pull request review into Linear every 2 minutes, sends pull requests the
 // Graphite merge queue dropped back to be fixed (or re-enqueues them when the drop was not their
 // fault), enqueues ready stacks nobody enqueued (see queueBackstop), nudges stalled ones to their
@@ -494,6 +677,10 @@ export class PullRequestWatch {
       manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge"> & Partial<Pick<ManualTasks, "tasks">>;
       settings: Pick<Settings, "read">;
       view?: (url: string) => Promise<PullRequestView>;
+      // The cheap first look that decides whether `view` (the detail read) is needed at all. The
+      // daemon leaves both out and gets the real one (ConditionalPullView); an injected `view`
+      // without a `probe` reads in full every poll, as before.
+      probe?: PullViewSource;
       github?: GitHubReader;
       backstop?: BackstopDeps;
     },
@@ -580,6 +767,8 @@ export class PullRequestWatch {
   private running: Promise<void> | null = null;
   private backstopping: Promise<void> | null = null;
   private githubThrottled = false;
+  // The shared REST budget tripped its reserve: logged once per pause, like the throttle above.
+  private githubPaused = false;
   // The poll and the backstop share pr-watch.json, so they take turns.
   private turn: Promise<unknown> = Promise.resolve();
 
@@ -607,8 +796,14 @@ export class PullRequestWatch {
     return this.deps.github ?? githubReader;
   }
 
+  // The detail read, behind the cheap first look unless the caller injected its own `view`.
+  private changer: ConditionalPullView | null = null;
+
   private view(url: string): Promise<PullRequestView> {
-    return (this.deps.view ?? viewPullRequest)(url);
+    if (this.deps.probe) return this.deps.probe.view(url);
+    if (this.deps.view) return this.deps.view(url);
+    this.changer ??= new ConditionalPullView({ get: ghGet, budget: githubBudget, read: viewPullRequest });
+    return this.changer.view(url);
   }
 
   // The poll's and the backstop's reads, once per repo: the open pull requests, Graphite's drafts
@@ -668,17 +863,18 @@ export class PullRequestWatch {
     // Agents that got a message this poll: one instruction per agent and poll, so the pull
     // requests of one stack do not each send it one.
     const reserved = new Set<string>();
-    const stopped: { paused: RateLimitedError | null; throttled: GitHubRateLimitedError | null } = { paused: null, throttled: null };
+    const stopped: { paused: RateLimitedError | null; budget: GitHubPausedError | null; throttled: GitHubRateLimitedError | null } = { paused: null, budget: null, throttled: null };
     // A failure for one pull request is logged and the rest go on; a rate limit ends the poll.
     const step = async (record: HandoverRecord, url: string, work: () => Promise<void>): Promise<boolean> => {
       try {
         await work();
       } catch (error) {
         if (error instanceof RateLimitedError) stopped.paused = error;
+        else if (error instanceof GitHubPausedError) stopped.budget = error;
         else if (error instanceof GitHubRateLimitedError) stopped.throttled = error;
         else console.error(`[linear-tickets] ${record.identifier}: reading ${url} failed: ${error instanceof Error ? error.message : error}`);
       }
-      return !stopped.paused && !stopped.throttled;
+      return !stopped.paused && !stopped.budget && !stopped.throttled;
     };
     // A rate limit in the crash passes ends the poll too; other failures are logged per agent.
     const pass = async (work: () => Promise<void>) => {
@@ -694,12 +890,12 @@ export class PullRequestWatch {
     // Stalled pull requests are nudged, and closed ones followed to their replacement, after every
     // drop was handled: a drop's fix request comes first when both are for the same agent.
     const nudges: { record: HandoverRecord; url: string; view: PullRequestView }[] = [];
-    for (const record of stopped.paused ? [] : records) {
+    for (const record of stopped.paused || stopped.budget ? [] : records) {
       const url = record.links["Pull request"];
       const going = await step(record, url, async () => {
         let view: PullRequestView;
         try {
-          view = await (this.deps.view ?? viewPullRequest)(url);
+          view = await this.view(url);
         } catch (error) {
           if (!(error instanceof PullRequestNotFoundError)) throw error;
           console.error(`[linear-tickets] ${record.identifier}: ${url} does not exist (${error.message}); it is no longer watched`);
@@ -743,17 +939,19 @@ export class PullRequestWatch {
       });
       if (!going) break;
     }
-    for (const { record, url, view } of stopped.paused || stopped.throttled ? [] : nudges) {
+    for (const { record, url, view } of stopped.paused || stopped.budget || stopped.throttled ? [] : nudges) {
       const next = view.state === "OPEN" ? () => this.nudge(record, url, view, seenByUrl, save, listDrafts, reserved)
         : seenByUrl[url].merged ? () => this.advance(record, url, seenByUrl, listPulls)
         : () => this.replace(record, url, view, seenByUrl, save, listPulls, reserved);
       if (!await step(record, url, next)) break;
     }
     // Tickets without an open pull request, once the pull requests relinked theirs.
-    if (!stopped.paused) await pass(() => this.crashedWithoutPull(seenByUrl, reserved));
-    const { paused, throttled } = stopped;
+    if (!stopped.paused && !stopped.budget) await pass(() => this.crashedWithoutPull(seenByUrl, reserved));
+    const { paused, budget, throttled } = stopped;
     if (paused && paused.pool !== this.pausedPool) console.error(`[linear-tickets] pull request watch paused: ${paused.message}`);
     this.pausedPool = paused?.pool ?? null;
+    if (budget && !this.githubPaused) console.error(`[linear-tickets] pull request watch paused: ${budget.message}`);
+    this.githubPaused = budget !== null;
     if (throttled && !this.githubThrottled) console.error(`[linear-tickets] pull request watch paused until the next poll: ${throttled.message}`);
     this.githubThrottled = throttled !== null;
     await save();
