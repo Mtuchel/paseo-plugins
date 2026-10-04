@@ -28,7 +28,12 @@
 //   (`mcp__linear_<tool>`) or through its xd:// device. The plugin's own `linear_ticket` tools,
 //   which write as the Paseo app, stay open. A guard against mistakes, not isolation: the agent
 //   runs as the owner's user.
-import { execFile } from "node:child_process";
+// - LINEAR_TICKETS_MCP=<server command as JSON> (set by the plugin when Agent access to Linear is
+//   on): omp cannot load MCP servers, so this extension mounts the plugin's `linear_ticket` server
+//   tools as `linear_ticket_<tool>` and runs each call through one server process. The read tools
+//   are direct ("essential") tools, so they also work in Plannotator's planning phase, which
+//   refuses every xd:// write.
+import { execFileSync, execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -42,10 +47,12 @@ type Entry = { type: string; customType?: string; data?: { reason?: string; path
 type Context = { cwd?: string; agent?: { kind?: string }; sessionManager: { getBranch(): Entry[]; getArtifactsDir?(): string } };
 type ToolResult = { content: { type: "text"; text: string }[]; details?: Record<string, unknown> };
 type Params = Record<string, string | undefined>;
+type Field = { describe(text: string): Field; optional(): unknown };
 type Schema = {
   object(shape: Record<string, unknown>): unknown;
-  string(): { optional(): unknown };
-  enum(values: [string, ...string[]]): unknown;
+  string(): Field;
+  number(): Field;
+  enum(values: [string, ...string[]]): Field;
 };
 type ExtensionApi = {
   on(event: "session_start" | "session_switch" | "session_branch" | "session_tree" | "before_agent_start" | "turn_start", handler: (event: unknown, ctx: Context) => Promise<void> | void): void;
@@ -53,7 +60,7 @@ type ExtensionApi = {
   events: { emit(channel: string, data: unknown): void };
   appendEntry(customType: string, data: unknown): void;
   sendMessage(message: { customType: string; content: string; display: boolean }, options: { deliverAs: "aside" }): void;
-  registerTool(tool: { name: string; label: string; description: string; parameters: unknown; loadMode?: "essential" | "discoverable"; execute(id: string, params: Params, signal?: unknown, onUpdate?: unknown, ctx?: Context): Promise<ToolResult> }): void;
+  registerTool(tool: { name: string; label: string; description: string; parameters: unknown; loadMode?: "essential" | "discoverable"; execute(id: string, params: Params, signal?: AbortSignal, onUpdate?: unknown, ctx?: Context): Promise<ToolResult> }): void;
   zod: Schema;
 };
 
@@ -157,6 +164,85 @@ export function linearWrite(toolName: string, input: Record<string, unknown> | u
   // The plugin's own server is named `linear_ticket` (TICKET_MCP_NAME), so its tools share the prefix.
   if (!tool.startsWith(LINEAR_MCP) || tool.startsWith("mcp__linear_ticket_")) return null;
   return LINEAR_READ_TOOLS.has(tool) ? null : tool;
+}
+
+type TicketServer = { command: string; args: string[]; env: Record<string, string> };
+type JsonSchema = { type?: string; enum?: string[]; description?: string; properties?: Record<string, JsonSchema>; required?: string[] };
+type TicketTool = { name: string; description: string; inputSchema: JsonSchema; annotations?: { readOnlyHint?: boolean } };
+const TICKET_TOOL_PREFIX = "linear_ticket_";
+const TICKET_LIST_TIMEOUT_MS = 10_000;
+const TICKET_CALL_TIMEOUT_MS = 90_000;
+
+// The plugin's ticket server from LINEAR_TICKETS_MCP (server/ticket-mcp.ts TicketMcpServer), or
+// null when this agent has no Linear access.
+export function ticketServer(raw: string | undefined): TicketServer | null {
+  if (!raw) return null;
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { return null; }
+  if (!value || typeof value !== "object" || !("command" in value) || !("args" in value)) return null;
+  const { command, args } = value;
+  if (typeof command !== "string" || !Array.isArray(args) || !args.every((arg): arg is string => typeof arg === "string")) return null;
+  const env: Record<string, string> = {};
+  if ("env" in value && value.env && typeof value.env === "object") {
+    for (const [name, setting] of Object.entries(value.env)) if (typeof setting === "string") env[name] = setting;
+  }
+  return { command, args, env };
+}
+
+// The result of the response to request 1 in the server's output, or the error it reports.
+function rpcResult(output: string): unknown {
+  for (const line of output.split("\n")) {
+    if (!line.trim()) continue;
+    const message: unknown = JSON.parse(line);
+    if (!message || typeof message !== "object" || !("id" in message) || message.id !== 1) continue;
+    if ("error" in message && message.error && typeof message.error === "object" && "message" in message.error) throw new Error(String(message.error.message));
+    return "result" in message ? message.result : null;
+  }
+  throw new Error("The linear_ticket server gave no answer.");
+}
+
+// The server's tools, read once when the extension loads (the server answers tools/list at once).
+export function listTicketTools(server: TicketServer): TicketTool[] {
+  const output = execFileSync(server.command, server.args, { input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) + "\n", env: { ...process.env, ...server.env }, encoding: "utf8", timeout: TICKET_LIST_TIMEOUT_MS, stdio: ["pipe", "pipe", "ignore"] });
+  const result = rpcResult(output);
+  const tools = result && typeof result === "object" && "tools" in result && Array.isArray(result.tools) ? result.tools : [];
+  return tools.filter((tool): tool is TicketTool => Boolean(tool) && typeof tool.name === "string" && typeof tool.description === "string" && Boolean(tool.inputSchema) && typeof tool.inputSchema === "object");
+}
+
+// One process per call: the server answers the request, then exits once its input is closed.
+export function callTicketTool(server: TicketServer, name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+  // Executor form for the same reason as planMode below.
+  return new Promise((resolve, reject) => {
+    const child = spawn(server.command, server.args, { env: { ...process.env, ...server.env }, stdio: ["pipe", "pipe", "ignore"], signal, timeout: TICKET_CALL_TIMEOUT_MS });
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { output += chunk; });
+    child.on("error", reject);
+    child.on("close", () => {
+      try {
+        const result = rpcResult(output);
+        const content = result && typeof result === "object" && "content" in result && Array.isArray(result.content) ? result.content : [];
+        const message = content.map((part: unknown) => (part && typeof part === "object" && "text" in part && typeof part.text === "string" ? part.text : "")).join("\n");
+        if (result && typeof result === "object" && "isError" in result && result.isError === true) reject(new Error(message || "The Linear request failed."));
+        else resolve(message);
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    child.stdin.end(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) + "\n");
+  });
+}
+
+// The tool's JSON Schema (strings, numbers and string enums at the top level) as omp's schema.
+function toolParameters(z: Schema, schema: JsonSchema): unknown {
+  const shape: Record<string, unknown> = {};
+  for (const [name, property] of Object.entries(schema.properties ?? {})) {
+    const [first, ...rest] = property.enum ?? [];
+    let field = first !== undefined ? z.enum([first, ...rest]) : property.type === "integer" || property.type === "number" ? z.number() : z.string();
+    if (property.description) field = field.describe(property.description);
+    shape[name] = schema.required?.includes(name) ? field : field.optional();
+  }
+  return z.object(shape);
 }
 
 export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
@@ -305,7 +391,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const input = event.input;
     const linearTool = linearWrite(event.toolName, input);
     if (linearTool) {
-      return { block: true, reason: `Stopped by the linear-tickets plugin: ticket agents change Linear only through the linear_ticket tools, which write as Paseo; ${linearTool} would act as the owner. Reading with the Linear tools is fine. For anything else in Linear, ask the owner (or add a manual task).` };
+      return { block: true, reason: `Stopped by the linear-tickets plugin: ${linearTool} would act as the owner. Ticket agents change Linear only through the ${TICKET_TOOL_PREFIX}* tools, which write as Paseo: comments and relations on any issue, status and links on your ticket and the issues you created, create_issue for follow-ups. Reading with the Linear tools is fine. For anything else in Linear, ask the owner (or add a manual task).` };
     }
     if (event.toolName === "write" || event.toolName === "edit") {
       // omp gives an edit's targets as `paths` (hashline patches) or `path`; an apply_patch edit
@@ -367,4 +453,25 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       return checked ?? recordAdvice(params, ctx);
     },
   });
+
+  const server = TICKET ? ticketServer(process.env.LINEAR_TICKETS_MCP) : null;
+  if (!server) return;
+  let listed: TicketTool[] = [];
+  try {
+    listed = listTicketTools(server);
+  } catch (error) {
+    console.error(`[linear-tickets] could not list the linear_ticket tools: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
+  }
+  for (const tool of listed) {
+    pi.registerTool({
+      name: TICKET_TOOL_PREFIX + tool.name,
+      label: `Linear: ${tool.name.replace(/_/g, " ")}`,
+      description: tool.description,
+      parameters: toolParameters(pi.zod, tool.inputSchema),
+      ...(tool.annotations?.readOnlyHint ? { loadMode: "essential" as const } : {}),
+      async execute(_id, params, signal) {
+        return text(await callTicketTool(server, tool.name, params, signal));
+      },
+    });
+  }
 }

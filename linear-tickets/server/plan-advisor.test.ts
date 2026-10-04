@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -8,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 // The bridge's hash: the extension's `advised` event must carry the same one.
 import { planHash } from "./review-outcome";
+import { ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
 
 // The omp extension reads its environment when it loads, so it is imported after this setup.
 const root = mkdtempSync(join(tmpdir(), "paseo-plan-advisor-"));
@@ -286,12 +289,45 @@ test("ticket agents and their subagents change Linear only through the linear_ti
   const names = ["mcp__linear_save_comment", "mcp__linear_save_issue", "mcp__linear_new_tool", "mcp__linear_save_comment"];
   for (const [index, result] of (await Promise.all(blocked)).entries()) {
     assert.equal(result?.block, true, names[index]);
-    assert.match(result.reason, /^Stopped by the linear-tickets plugin: ticket agents change Linear only through the linear_ticket tools/);
     assert.ok(result.reason.includes(names[index]));
   }
   assert.equal(await h.call("mcp__linear_get_issue", { id: "ENG-1" }), undefined);
   assert.equal(await h.call("write", { path: "xd://mcp__linear_list_issues", content: "{}" }), undefined);
   assert.equal(await h.call("mcp__linear_ticket_add_comment", { body: "x" }), undefined);
+});
+
+test("omp ticket agents get the linear_ticket tools, run through the plugin's server", async () => {
+  const calls: { query: string; variables: Record<string, unknown> }[] = [];
+  const node = (id: string, identifier: string) => ({ id, identifier, title: identifier, url: `https://linear.app/x/issue/${identifier}`, state: { name: "Todo", type: "unstarted" }, team: { id: "t", name: "Eng", states: { nodes: [{ id: "s-todo", name: "Todo", type: "unstarted", position: 1 }] } } });
+  const linear = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    const call = JSON.parse(body) as { query: string; variables: Record<string, unknown> };
+    calls.push(call);
+    const data = call.query.includes("query ticket") ? { issue: call.variables.id === "ENG-7" ? node("other-1", "ENG-7") : node("ticket-1", "ENG-1") }
+      : call.query.includes("commentCreate") ? { commentCreate: { success: true, comment: { url: "https://linear.app/c/1" } } } : {};
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ data }));
+  });
+  await new Promise<void>((resolve) => linear.listen(0, "127.0.0.1", resolve));
+  const server = ticketMcpServer(await writeTicketMcpScript(root), "ticket-1", root);
+  process.env.LINEAR_TICKETS_MCP = JSON.stringify({ ...server, env: { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: `http://127.0.0.1:${(linear.address() as AddressInfo).port}/graphql` } });
+  const tools: (Tool & { loadMode?: string })[] = [];
+  const field = (): object => ({ describe: field, optional: () => ({}) });
+  try {
+    extension({ on: () => {}, events: { emit: () => {} }, appendEntry: () => {}, sendMessage: () => {}, registerTool: (tool: Tool) => { tools.push(tool); }, zod: { object: () => ({}), string: field, number: field, enum: field } } as never);
+    const mounted = Object.fromEntries(tools.filter((tool) => tool.name.startsWith("linear_ticket_")).map((tool) => [tool.name, tool]));
+    assert.deepEqual(Object.keys(mounted).sort(), ["add_comment", "add_manual_task", "add_relation", "create_issue", "get_issue", "get_ticket", "link_url", "search_issues", "set_status", "update_issue"].map((name) => `linear_ticket_${name}`));
+    // Read tools are direct, so Plannotator's planning phase (which refuses xd:// calls) lets them through.
+    assert.deepEqual(Object.values(mounted).filter((tool) => tool.loadMode === "essential").map((tool) => tool.name).sort(), ["linear_ticket_get_issue", "linear_ticket_get_ticket", "linear_ticket_search_issues"]);
+    const posted = JSON.parse((await mounted.linear_ticket_add_comment.execute("c1", { issue: "ENG-7", body: "FYI" })).content[0].text);
+    assert.equal(posted.posted, true);
+    assert.deepEqual(calls.at(-1)?.variables, { input: { issueId: "other-1", body: "FYI" } });
+    await assert.rejects(mounted.linear_ticket_set_status.execute("c2", { issue: "ENG-7", status: "Todo" }), /ENG-7 is neither this agent's ticket nor an issue it created/);
+  } finally {
+    delete process.env.LINEAR_TICKETS_MCP;
+    await new Promise<void>((resolve) => linear.close(() => resolve()));
+  }
 });
 
 test("outside ticket agents the Linear tools are not blocked", async () => {
