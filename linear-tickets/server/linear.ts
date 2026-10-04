@@ -433,8 +433,9 @@ export const UPDATE_COMMENT_QUERY = `mutation commentUpdate($id: String!, $input
   commentUpdate(id: $id, input: $input) { success }
 }`;
 // Whether a ticket has a comment containing a text (a marker a retried comment is looked up by).
+// Linear's filter only narrows the search; each body is checked for the exact text (see hasComment).
 export const MARKED_COMMENT_QUERY = `query markedComment($id: String!, $text: String!) {
-  issue(id: $id) { comments(first: 1, filter: { body: { contains: $text } }) { nodes { id } } }
+  issue(id: $id) { comments(first: 50, filter: { body: { contains: $text } }) { nodes { id body } } }
 }`;
 // One attachment per ticket links to the Paseo agent working on it; Linear updates an
 // attachment in place when the issue and URL match.
@@ -1050,12 +1051,13 @@ export class LinearService {
     succeeded(record(await this.write(CREATE_COMMENT_QUERY, { input: { issueId, body } })), "commentCreate", "create the comment");
   }
 
-  // Whether one of the ticket's comments contains `text`. Throws when Linear does not return the
-  // ticket: a caller that would post the comment otherwise must not post it blind.
+  // Whether one of the ticket's comments contains `text`, checked on the bodies Linear returns
+  // rather than trusted to its filter. Throws when Linear does not return the ticket: a caller that
+  // would post the comment otherwise must not post it blind.
   async hasComment(issueId: string, text: string): Promise<boolean> {
     const data = await this.read(MARKED_COMMENT_QUERY, { id: issueId, text }, (result) => Boolean(result.issue));
     if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return the ticket whose comments were looked up.");
-    return connection(record(data.issue).comments).nodes.length > 0;
+    return connection(record(data.issue).comments).nodes.some((node) => label(record(node).body).includes(text));
   }
 
   // Edits the tracked comment (the progress or waiting comment), or posts a new one when there is

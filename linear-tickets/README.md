@@ -749,12 +749,13 @@ whose `main` has no `tools/ci/enqueue-ready.mjs` gets no backstop. One run at a 
 with the poll:
 
 1. Re-enqueues claimed above, and earlier enqueues that are still due or held, move on. Right
-   before each enqueue the range is checked again as it is now: a round on its top pull request
-   that ended and nobody claimed yet is claimed first, like the poll's. The enqueue is dropped for
-   good when a newer round superseded it, a pull request of the range closed or has a new head,
-   the range escalated, or a pull request of it is blocked at its head; it waits for the next run
-   while that round is not judged yet, a message about the range is still pending, or a
-   before-merge manual task of its tickets is open (or cannot be read).
+   before each enqueue the range is checked again as it is now: a round on any pull request of
+   the range (someone may have enqueued only part of it) that ended and nobody claimed yet is
+   claimed first, like the poll's. The enqueue is dropped for good when a newer round superseded
+   it, a pull request of the range closed or has a new head, the range escalated, or a pull
+   request of it is blocked at its head; it waits for the next run while such a round is not
+   judged yet, a message about the range is still pending, or a before-merge manual task of its
+   tickets is open (or cannot be read).
 2. `node tools/ci/enqueue-ready.mjs --ready-minutes 10 --exclude <pr>… --skip <action>…` lists
    the stacks that have been green, reviewed and without open threads for 10 minutes and nobody
    enqueued, and the drops it saw. Excluded are escalated pull requests, ones blocked at their
@@ -773,10 +774,12 @@ text of the top pull request's Merge activity bullets right before the enqueue, 
 the pull request comment, the ticket comment and the note to the agent. Enqueued: the script
 comments on the top pull request (marked `<!-- queue-backstop:<action> -->`, never twice), the
 plugin comments on each ticket (ending in `` `queue-backstop:<action>` ``; the ticket's comments
-are searched for it before posting, and a ticket counts as done only once Linear confirmed it, so
-a lost answer never doubles it and a crash never skips it) and tells a running agent that
-nothing is needed from it. Held (`main` red or unknown, or already queued): retried on the next
-run. Refused: routed once per refusal (action and kind, plus the draft for a queue-tip conflict)
+are searched for this whole mark, backticks included, and only a comment whose body carries it
+counts, so another action's mark that starts with the same text never does; a ticket counts as
+done only once Linear confirmed it, so a lost answer never doubles it and a crash never skips it)
+and tells a running agent that nothing is needed from it. Held (`main` red or unknown, or already
+queued): retried on the next run. Refused: routed once per refusal (action and kind, plus the
+draft for a queue-tip conflict)
 to the agent, the ticket when the agent is gone, or as one marked comment on the pull request
 when there is no ticket. A refusal is retried only after the change that can fix it: a new head
 (a new action), the end of the queue draft for a queue-tip conflict (read by its number; a state

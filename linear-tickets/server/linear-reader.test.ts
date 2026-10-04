@@ -63,16 +63,20 @@ test("tickets the app cannot see are read with the key", async () => {
   assert.deepEqual(partial.keyCalls, [ISSUE_STATUSES_QUERY]);
 });
 
-test("hasComment looks a marker up among the ticket's comments, and fails rather than answer for a ticket Linear does not return", async () => {
+test("hasComment looks a marker up among the ticket's comments, counts only a body that carries it whole, and fails rather than answer for a ticket Linear does not return", async () => {
   const asked: Record<string, unknown>[] = [];
-  const marked = (found: boolean) => service({ query: (query, variables) => {
+  const mark = "`queue-backstop:drop:#437:419`";
+  const marked = (bodies: string[]) => service({ query: (query, variables) => {
     assert.equal(query, MARKED_COMMENT_QUERY);
     asked.push(variables);
-    return Promise.resolve({ issue: { comments: { nodes: found ? [{ id: "c1" }] : [] } } });
+    return Promise.resolve({ issue: { comments: { nodes: bodies.map((body, index) => ({ id: `c${index}`, body })) } } });
   } }, () => { throw new Error("the key must not be used"); });
-  assert.equal(await marked(true).linear.hasComment("i1", "queue-backstop:drop:#437:419"), true);
-  assert.equal(await marked(false).linear.hasComment("i1", "queue-backstop:drop:#437:419"), false);
-  assert.deepEqual(asked, [{ id: "i1", text: "queue-backstop:drop:#437:419" }, { id: "i1", text: "queue-backstop:drop:#437:419" }]);
+  assert.equal(await marked([`Enqueued.\n\n${mark}`]).linear.hasComment("i1", mark), true);
+  assert.equal(await marked([]).linear.hasComment("i1", mark), false);
+  // Linear's filter matched a comment that does not carry the whole mark: another action's.
+  assert.equal(await marked(["Enqueued.\n\n`queue-backstop:drop:#437:4190`"]).linear.hasComment("i1", mark), false, "only the exact mark counts");
+  assert.equal(await marked(["Enqueued.\n\n`queue-backstop:drop:#437:4190`", `Enqueued.\n\n${mark}`]).linear.hasComment("i1", mark), true, "among other matches");
+  assert.deepEqual(asked, Array.from({ length: 4 }, () => ({ id: "i1", text: mark })));
   const missing = service({ query: () => Promise.resolve({ issue: null }) }, () => ({ issue: null }));
   await assert.rejects(missing.linear.hasComment("i1", "queue-backstop:x"), /did not return the ticket/);
   assert.deepEqual(missing.keyCalls, [MARKED_COMMENT_QUERY], "a ticket the app cannot see is read with the key first");

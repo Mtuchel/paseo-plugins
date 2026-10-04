@@ -1407,6 +1407,34 @@ test("a held enqueue is not retried after the round someone else queued dropped 
   }
 });
 
+test("a held enqueue of a stack waits while the round someone queued for its lower pull request alone is not judged, and is not retried after it dropped genuinely", async (t) => {
+  for (const judged of ["at once", "a run later"] as const) {
+    const h = harness(t);
+    h.github.view = READY;
+    // Someone enqueued #419 alone; #1501 above it shows no activity of its own.
+    const bullets = bulletsOf(h, {}, QUEUED);
+    const step2 = { ...READY, headSha: "5e5e5e5", headBranch: "mtuchel/tuc-1-b", baseBranch: "mtuchel/tuc-1-fix" };
+    h.github.open = [listed(prUrl(1501), step2, "Add TUC-1 [plugin] Step two")];
+    h.github.views[prUrl(1501)] = step2;
+    h.scripts.ready = { stacks: [{ action: `ready:1501@${HEAD},5e5e5e5`, top: 1501, branch: "mtuchel/tuc-1-b", prs: [419, 1501], expect: `419@${HEAD},1501@5e5e5e5`, tickets: ["TUC-1"], result: "candidate" }], drops: [] };
+    h.scripts.enqueue = [QUEUED_ALREADY, { code: 0, answer: { result: "enqueued", comment: "posted" } }];
+    assert.equal(count(await h.backstop(), "enqueue "), 1, judged);
+    // #419's round drops before any poll saw it.
+    bullets.add(running(437), REMOVED);
+    h.github.drafts = [draft(437, [419])];
+    if (judged === "a run later") {
+      h.scripts.judgment = null;
+      assert.equal(count(await h.backstop(), "enqueue "), 0, "the round is not judged yet: the action waits");
+      assert.deepEqual(h.scripts.runs.filter((run) => !run.startsWith(WAIT_QUEUE)), [`${READY_RUN} --exclude 419 --exclude 1501`], "and keeps its range out of the ready run");
+      h.scripts.judgment = GENUINE;
+    }
+    assert.equal(count(await h.backstop(), "enqueue "), 0, `${judged}: the range whose lower pull request failed is not enqueued again`);
+    assert.deepEqual(h.scripts.runs.filter((run) => !run.startsWith(WAIT_QUEUE)), [`${READY_RUN} --exclude 419`], `${judged}: #419 is blocked at its head`);
+    assert.match(promptOf(await h.poll()) ?? "", /2\. Fix the cause\./, `${judged}: the backstop's claim goes to the agent`);
+    assert.equal(count(await h.backstop(), "enqueue "), 0, `${judged}: nor later`);
+  }
+});
+
 test("a held enqueue waits while a manual task due before the merge opened meanwhile, or cannot be read, and is enqueued once it is done", async (t) => {
   for (const gate of ["open", "unreadable"] as const) {
     const h = harness(t);
@@ -1485,6 +1513,21 @@ test("a range counts as its most-dropped pull request: a plain drop or an escala
   }
 });
 
+test("a range member's two plain drops from before drops had kinds, without the escalation flag, route the range's next plain drop to the owner", async (t) => {
+  const h = harness(t);
+  const step2 = { ...READY, headSha: "5e5e5e5", headBranch: "mtuchel/tuc-1-b", baseBranch: "mtuchel/tuc-1-fix", mergeActivity: activity(QUEUED, running(437), REMOVED) };
+  h.github.open = [listed(prUrl(1501), step2, "Add TUC-1 [plugin] Step two")];
+  h.github.views[prUrl(1501)] = step2;
+  await h.state({ [prUrl(1501)]: { reviewedAt: null, decision: null, merged: false, drops: ["#435", "#436"] } });
+  h.github.view = { ...READY, mergeActivity: activity(QUEUED, running(437), REMOVED) };
+  h.github.drafts = [draft(437, [419, 1501])];
+  const calls = await h.poll();
+  assert.equal(promptOf(calls), undefined);
+  assert.match(calls[0] ?? "", /dropped this stack again[^]*so far: 3 plain, 0 conflict-only\./, "the owner is asked to take over");
+  assert.equal(count(await h.backstop(), "enqueue "), 0);
+  assert.deepEqual(h.scripts.runs, [`${READY_RUN} --exclude 419 --exclude 1501`], "the whole range escalated");
+});
+
 test("the ticket comment of an enqueue is looked up by its mark before it goes out: a lost answer never doubles it, and one that never went out is posted after a restart", async (t) => {
   t.mock.method(console, "error", () => {});
   for (const failure of ["lost answer", "crash before it went out"] as const) {
@@ -1508,6 +1551,21 @@ test("the ticket comment of an enqueue is looked up by its mark before it goes o
     assert.equal(h.linear.comments.i1?.length, 1, failure);
     assert.match(h.linear.comments.i1?.[0] ?? "", /^Paseo's queue backstop enqueued [^]*\n\n`queue-backstop:ready:419@a1b2c3d4e5f6`$/, failure);
   }
+});
+
+test("the ticket comment of an enqueue is found only by its whole mark: another action's mark that starts with it does not count", async (t) => {
+  const h = harness(t);
+  const bullets = bulletsOf(h, {}, QUEUED, running(5000), REMOVED);
+  h.github.drafts = [draft(5000, [419])];
+  h.scripts.judgment = { ...FLAKY, revision: { ...SAME, draft: 5000 } };
+  h.scripts.onEnqueue = async () => bullets.add(QUEUED);
+  const other = "Paseo's queue backstop enqueued [#4190](https://github.com/tuchel-sohn/tuchel-platform/pull/4190) through `tools/ci/enqueue.mjs`.\n\n`queue-backstop:drop:#5000:4190`";
+  h.linear.comments.i1 = [other];
+  assert.deepEqual(await h.poll(), []);
+  assert.equal(count(await h.backstop(), `comment ${ENQUEUED}`), 1);
+  assert.equal(h.linear.comments.i1.length, 2);
+  assert.match(h.linear.comments.i1[1], /^Paseo's queue backstop enqueued \[#419\][^]*\n\n`queue-backstop:drop:#5000:419`$/);
+  assert.deepEqual(await h.backstop(), [], "once");
 });
 
 test("a queue-tip conflict's draft is read by its number: still open but out of Graphite's listing, or unreadable, it holds the refusal", async (t) => {

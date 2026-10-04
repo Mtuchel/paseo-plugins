@@ -336,10 +336,11 @@ export function marker(id: string): string {
   return `<!-- queue-backstop:${id} -->`;
 }
 
-// The ticket comment's mark: Linear does not keep HTML comments, so it is a visible code span,
-// and a retry finds it by this text (see LinearService.hasComment).
+// The ticket comment's mark: Linear does not keep HTML comments, so it is a visible code span. The
+// backticks belong to the mark: a retry finds it by this whole text (see LinearService.hasComment),
+// and the closing one keeps `drop:#5000:419` from matching `drop:#5000:4190`.
 export function ticketMarker(id: string): string {
-  return `queue-backstop:${id}`;
+  return `\`queue-backstop:${id}\``;
 }
 
 // Posts a pull request comment with the marker once: nothing when a comment carries it already.

@@ -760,9 +760,12 @@ export class PullRequestWatch {
     const kind = DROP_KIND[judgment.class];
     const list = kind === "conflict" ? "conflicts" : kind === "main" ? "mainBroken" : "drops";
     const members = range.prs.map((pr) => entry(seenByUrl, pullUrl(drop.repo, pr)));
+    // Decided before this drop is added: a member's legacy plain drops reaching the old limit with
+    // this one is a new escalation, routed below, not an earlier one.
+    const already = members.some((member) => escalated(member));
     for (const member of members) if (!handledDrops(member).includes(drop.key)) member[list] = [...(member[list] ?? []), drop.key];
     if (judgment.revision.state !== "changed") this.supersede(drop.repo, range.prs, drop.key, seenByUrl);
-    if (members.some((member) => escalated(member))) {
+    if (already) {
       for (const member of members) member.escalated = true;
       console.error(`[linear-tickets] ${record?.identifier ?? drop.repo}: the merge queue dropped ${url}, whose range already escalated to the owner`);
       return true;
@@ -1163,7 +1166,7 @@ export class PullRequestWatch {
         // Looked up before it goes out, and recorded only once Linear confirmed it: a comment whose
         // answer was lost (a restart, a request that failed after it reached Linear) is found by
         // its mark and not posted again; one that never went out is posted on the next run.
-        if (!await this.deps.linear.hasComment(issueId, mark)) await this.deps.linear.comment(issueId, `${enqueuedComment(action)}\n\n\`${mark}\``);
+        if (!await this.deps.linear.hasComment(issueId, mark)) await this.deps.linear.comment(issueId, `${enqueuedComment(action)}\n\n${mark}`);
         action.linearDone = [...(action.linearDone ?? []), identifier];
         await save();
       }
@@ -1186,21 +1189,24 @@ export class PullRequestWatch {
 
   // Right before an action enqueues, its range is checked again as it is now: the ready run and the
   // drop claim decided on an older view, and a held action waits through other rounds. A round on
-  // the top pull request that ended and nobody claimed yet is claimed first, like the poll's (it
-  // may supersede this action). Then the action closes when a newer round superseded it, a pull
-  // request of its range closed or has a new head (the next ready run decides again), the range
-  // escalated, or one of its pull requests is blocked at its head. It waits for the next run while
-  // that round is not judged dropped yet, a message about one of its pull requests is still
-  // pending, or a before-merge manual task of its tickets is open (or cannot be read). Null: it
-  // may enqueue.
+  // any pull request of its range that ended and nobody claimed yet is claimed first, like the
+  // poll's (it may supersede this action or block the range): someone may have enqueued only part
+  // of the range. Then the action closes when a newer round superseded it, a pull request of its
+  // range closed or has a new head (the next ready run decides again), the range escalated, or one
+  // of its pull requests is blocked at its head. It waits for the next run while such a round is
+  // not judged dropped yet, a message about one of its pull requests is still pending, or a
+  // before-merge manual task of its tickets is open (or cannot be read). Null: it may enqueue.
   private async stale(action: ActionRecord, view: PullRequestView, seenByUrl: Record<string, Seen>, context: RunContext): Promise<{ close: boolean; why: string } | null> {
     const { repo } = action;
-    const topUrl = pullUrl(repo, action.top);
     const open = await context.pulls(repo);
-    const drop = await this.queueDrop(topUrl, view, handledDrops(seenByUrl[topUrl]), context.drafts);
-    if (drop) {
-      const record = context.records.find((item) => item.links["Pull request"] === topUrl) ?? recordFor(ticketsOf(repo, [action.top], open, context.records, null), context.records);
-      if (!await this.claimDrop(drop, record, seenByUrl, context)) return { close: false, why: `queue round ${drop.key} ended, and tools/ci/wait-queue.mjs does not call it dropped yet` };
+    for (const pr of action.prs) {
+      const url = pullUrl(repo, pr);
+      // A member that is no longer open closes the action below; its rounds are not read.
+      if (pr !== action.top && !open.some((pull) => pull.number === pr)) continue;
+      const drop = await this.queueDrop(url, pr === action.top ? view : await this.view(url), handledDrops(seenByUrl[url]), context.drafts);
+      if (!drop) continue;
+      const record = context.records.find((item) => item.links["Pull request"] === url) ?? recordFor(ticketsOf(repo, [pr], open, context.records, null), context.records);
+      if (!await this.claimDrop(drop, record, seenByUrl, context)) return { close: false, why: `queue round ${drop.key} of #${pr} ended, and tools/ci/wait-queue.mjs does not call it dropped yet` };
     }
     if (action.supersededBy) return { close: true, why: `queue round ${action.supersededBy} came after it` };
     for (const { pr, sha } of parseExpect(action.expect) ?? []) {
