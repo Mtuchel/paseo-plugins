@@ -24,6 +24,8 @@ import { paseoHome } from "./ticket-mcp";
 //    one that is not in Linear yet (README, "Projects"), so a failed write never stops the project.
 // 4. A started planner without a live agent is started again after a grace period, a few times,
 //    then left to the owner (README, "Projects"), so a failed launch never stalls the project.
+// 5. So is a ticket assigned to Paseo whose start failed or never came (README, "Projects"): it
+//    stays assigned to Paseo, so the hand-out would never take it again.
 
 // How often a project's tickets are read: a project is a few paginated queries.
 const POLL_MS = 2 * 60_000;
@@ -72,7 +74,10 @@ export type PlannerRecord = {
   id: string; identifier: string; url: string; listedAt: string; listed?: string[]; tickets: number; started?: boolean;
   startedAt?: string; restarts?: number; ownerAsked?: boolean; approved?: { agentId: string | null; plan: string; done?: string[] };
 };
-export type ProjectRecord = { planned?: string[]; plannedThrough?: string | null; planner: PlannerRecord | null; closedPlanner?: string; withheld?: string[] };
+// A ticket assigned to Paseo whose start failed: `since` it was first seen so or last started
+// again, `restarts` so far, `ownerAsked` past RESTART_CAP.
+export type StalledRecord = { since: string; restarts: number; ownerAsked?: boolean };
+export type ProjectRecord = { planned?: string[]; plannedThrough?: string | null; planner: PlannerRecord | null; closedPlanner?: string; withheld?: string[]; stalled?: Record<string, StalledRecord> };
 
 type Read = { work: ProjectIssue[]; record: ProjectRecord; plannerIssue: ProjectIssue | null; owner: string; readAt: string; planned: (issue: ProjectIssue) => boolean; unplanned: ProjectIssue[]; status: ProjectStatus };
 
@@ -190,6 +195,10 @@ type Deps = {
   // Assigning the ticket to Paseo again is no restart: Linear opens no new thread for it, and a
   // thread whose launch failed is in error.
   restart: (issueId: string, identifier: string) => Promise<void>;
+  // Whether something still accounts for a missing agent: a start under way, or the ticket's newest
+  // Linear thread waits for blockers or a slot, had an agent once or was closed on purpose
+  // (Launcher.underWay, SessionRouter.threadHolds).
+  accountedFor: (issueId: string) => Promise<boolean>;
   now?: () => number;
 };
 
@@ -250,6 +259,8 @@ export class ProjectFlow {
           : read.status;
         statuses.push(status);
         await this.handOut(project.id, read, appId, paseo, settings);
+        await this.reviveStalled(project.id, read, appId, paseo, settings)
+          .catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: restarting stalled tickets failed, the next poll retries: ${message(error)}`));
       } catch (error) {
         console.error(`[linear-tickets] project ${project.name}: ${message(error)}`);
       }
@@ -406,6 +417,65 @@ export class ProjectFlow {
         this.deps.scheduler.release(candidate.issueId);
         console.error(`[linear-tickets] project hand-out ${candidate.identifier} failed: ${message(error)}`);
       }
+    }
+  }
+
+  // Tickets assigned to Paseo that never got an agent: the launch failed (TUC-53: "Daemon client
+  // closed", TUC-534: OMP did not come up) or Linear's webhook never arrived (TUC-290). The ticket
+  // stays assigned to Paseo, so the hand-out never takes it again, and assigning Paseo once more
+  // opens no new thread. Such a ticket still waits in Backlog or Todo (a started agent moves it
+  // on), is not a group (a parent waits there while its sub-issues work), has no live agent, no
+  // start under way, and its newest thread neither waits for a slot, ever had an agent nor was
+  // closed on purpose (a plan approved for later is back in Todo on purpose, a delegation by
+  // someone else was refused). RESTART_GRACE_MS after it is first seen so it is started again with
+  // a new thread, admitted like any start, at most RESTART_CAP times; then the owner is asked once.
+  // One restart per poll: a start takes a minute or two, and the dispatcher's poll waits for it.
+  private async reviveStalled(projectId: string, read: Read, appId: string, paseo: PaseoApi, settings: PluginSettings): Promise<void> {
+    const labels = dispatchLabels(settings.dispatch.label);
+    // Labelled tickets belong to the label dispatch, held ones and the owner's tasks to the owner.
+    const skip = new Set([labels.hold, labels.manual, labels.needsYou, labels.running, labels.failed, settings.dispatch.label].map((name) => name.toLowerCase()));
+    const parents = new Set(read.work.map((issue) => issue.parentId).filter(Boolean));
+    const suspects = read.work.filter((issue) => issue.delegateId === appId && HAND_OUT_TYPES.has(issue.statusType) && !parents.has(issue.id)
+      && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished));
+    const stalled: ProjectIssue[] = [];
+    for (const issue of suspects) {
+      const page = await paseo.agents.list({ filter: { labels: { "linear.issueId": issue.id }, includeArchived: false }, page: { limit: 20 } });
+      if (page.entries.some(({ agent }) => !agent.labels?.["paseo.parent-agent-id"] && LIVE_AGENT[agent.status])) continue;
+      if (await this.deps.accountedFor(issue.id)) continue;
+      stalled.push(issue);
+    }
+    const now = new Date(this.now()).toISOString();
+    const records = await this.store.update(projectId, (current) => {
+      const base = current ?? read.record;
+      const previous = base.stalled ?? {};
+      const next = Object.fromEntries(stalled.map((issue) => [issue.id, previous[issue.id] ?? { since: now, restarts: 0 }]));
+      return JSON.stringify(next) === JSON.stringify(previous) ? null : { ...base, stalled: next };
+    }).then((record) => record?.stalled ?? read.record.stalled ?? {});
+    for (const issue of stalled) {
+      const entry = records[issue.id];
+      if (!entry || entry.ownerAsked || this.now() - Date.parse(entry.since) < RESTART_GRACE_MS) continue;
+      if (entry.restarts >= RESTART_CAP) {
+        await this.deps.linear.comment(issue.id, `**Paseo could not start an agent for this ticket.** It is assigned to Paseo, but Paseo restarted it ${entry.restarts} times and no agent is working on it now (the start failed, or the agent never came up), so it stops trying. Start an agent for it from the Linear tickets sidebar, or add the \`${settings.dispatch.label}\` label to try again.`);
+        await this.store.update(projectId, (current) => current?.stalled?.[issue.id] ? { ...current, stalled: { ...current.stalled, [issue.id]: { ...entry, ownerAsked: true } } } : null);
+        console.error(`[linear-tickets] ${issue.identifier}: no live agent after ${entry.restarts} restarts; left to the owner`);
+        continue;
+      }
+      // Admitted like a hand-out, so a restart never takes more than the free slots; one that
+      // waits for its turn is not counted.
+      const admission = await this.deps.scheduler.admit({
+        issueId: issue.id, identifier: issue.identifier, projectId, priority: issue.priority, unblocks: issue.blocks.length, createdAt: issue.createdAt,
+        attended: needsOwner(issue.labels, settings.dispatch.label),
+      }, paseo, this.deps.capacity.limit(settings.dispatch.maxRunning));
+      if (!admission.ok) continue;
+      // Counted before the start, so a start that keeps failing still reaches the cap, and the
+      // grace runs from now: a start still under way at the next poll is not doubled.
+      await this.store.update(projectId, (current) => current?.stalled?.[issue.id] ? { ...current, stalled: { ...current.stalled, [issue.id]: { since: now, restarts: entry.restarts + 1 } } } : null);
+      console.log(`[linear-tickets] ${issue.identifier}: assigned to Paseo without an agent since ${entry.since}; restart ${entry.restarts + 1} of ${RESTART_CAP}`);
+      await this.deps.restart(issue.id, issue.identifier).catch((error: unknown) => {
+        this.deps.scheduler.release(issue.id);
+        console.error(`[linear-tickets] ${issue.identifier}: restart failed, the first poll after ${RESTART_GRACE_MS / 60_000} minutes retries: ${message(error)}`);
+      });
+      return;
     }
   }
 

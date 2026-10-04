@@ -738,6 +738,20 @@ every 2 minutes.
   Triage or already started, someone else's, and sub-issues (their parent's group hands them
   out) are left alone. A ticket with open sub-issues in the project is assigned as a group and
   takes no slot itself. Removing `paseo-hold` releases a ticket.
+- **Restarting a failed start.** A ticket stays assigned to Paseo when its start fails (the
+  launch timed out, the daemon connection dropped) or Linear's webhook never arrives, so the
+  hand-out never takes it again. So every project read also checks each ticket assigned to Paseo
+  that is still in Backlog or Todo (a started agent moves it on), is not a group, carries none of
+  the `paseo`, `paseo-running`, `paseo-failed`, `paseo-hold`, `paseo-manual` or `paseo-needs-you`
+  labels and has every blocker finished. When it has no live agent and no start under way, and its
+  newest thread neither waits for its turn, ever had an agent nor was closed on purpose (a plan
+  approved for later is back in Todo on purpose; a ticket someone else handed to Paseo was
+  refused; a waiting thread you completed is left alone), it is started again ten minutes after
+  it was first seen so, admitted like any start (a full agent limit is waited out without
+  counting), with a new agent and thread, as for the planner, one ticket per poll. After three
+  restarts without a live agent Paseo comments on the ticket and stops: start an agent from the
+  sidebar, or add the `paseo` label. Kept under `stalled` in `projects.json`; a ticket drops out
+  once an agent works on it.
 - **New tickets.** A ticket is planned once a planner listed it (by ticket, not by creation
   time), so a ticket filed while the planner is being filed, or moved into the project from
   another one, is new too. Tickets that leave the project's open tickets (closed, moved out) drop

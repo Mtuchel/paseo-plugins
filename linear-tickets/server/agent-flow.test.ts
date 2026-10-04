@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setImmediate } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { HealthMonitor } from "./health";
@@ -72,6 +73,41 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
 }
 
 const link = { sessionId: "s1", agentId: "a1", issueId: "i1", identifier: "TUC-1", createdAt: "2026-01-01T00:00:00Z", handled: [], review: null, offer: null };
+
+test("a ticket's newest thread accounts for a missing agent only while it waits, once its agent came up, or once it was refused", async () => {
+  const h = routerHarness([]);
+  assert.equal(await h.router.threadHolds("i1"), false, "no thread: the webhook never arrived");
+  // TUC-534: the launch failed; an older thread whose agent ran does not count.
+  await h.store.put({ ...link, offer: "later" });
+  await h.store.put({ ...link, sessionId: "s2", agentId: null, createdAt: "2026-01-02T00:00:00Z" });
+  assert.equal(await h.router.threadHolds("i1"), false);
+  await h.store.patch("s2", { queued: true });
+  assert.equal(await h.router.threadHolds("i1"), true, "it waits for blockers or a slot");
+  // A plan approved for later: back in Todo on purpose, its planner retired.
+  await h.store.put({ ...link, sessionId: "s3", offer: "later", createdAt: "2026-01-03T00:00:00Z" });
+  assert.equal(await h.router.threadHolds("i1"), true);
+  // Handed to Paseo by someone else: refused, and not taken for a failed start either.
+  await h.store.put({ ...link, sessionId: "s4", agentId: null, createdAt: "2026-01-04T00:00:00Z" });
+  assert.equal(await h.router.threadHolds("i1"), false);
+  await h.router.created({ id: "s5", issueId: "i1", issue: { identifier: "TUC-1" }, creatorId: "teammate" });
+  assert.equal(await h.router.threadHolds("i1"), true);
+  await h.cleanup();
+});
+
+test("a start under way accounts for the ticket until it ends", async () => {
+  const gate: { fail?: (error: Error) => void } = {};
+  const h = routerHarness([], {
+    // Executor form: the plugin's lib is ES2023, without Promise.withResolvers.
+    starter: { admission: async () => ({ ok: true as const }), start: () => new Promise((_resolve, reject) => { gate.fail = reject; }) },
+  });
+  const restart = h.router.restartFor("i9", "TUC-9");
+  while (!gate.fail) await setImmediate();
+  assert.equal(await h.router.threadHolds("i9"), true, "the agent takes a minute or two to show up");
+  gate.fail(new Error("Timed out waiting for OMP to become ready"));
+  await assert.rejects(restart, /Timed out/);
+  assert.equal(await h.router.threadHolds("i9"), false);
+  await h.cleanup();
+});
 
 test("a multi-part question collects every answer before answering the agent once", async () => {
   const h = routerHarness([twoPart]);

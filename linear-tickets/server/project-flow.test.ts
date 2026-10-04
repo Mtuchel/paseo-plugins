@@ -16,8 +16,12 @@ const APP = "paseo-app";
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 type Agent = { id: string; status: string; labels: Record<string, string> };
-// Paseo with these agents for every ticket asked about.
-const paseoWith = (agents: () => Agent[]) => ({ agents: { list: async () => ({ entries: agents().map((agent) => ({ agent })), pageInfo: { hasMore: false } }) } }) as unknown as PaseoApi;
+// Paseo with these agents: one labelled with a ticket only for that ticket, any other for every
+// ticket asked about.
+const paseoWith = (agents: () => Agent[]) => ({ agents: { list: async ({ filter }: { filter: { labels: Record<string, string> } }) => ({
+  entries: agents().filter((agent) => !agent.labels["linear.issueId"] || agent.labels["linear.issueId"] === filter.labels["linear.issueId"]).map((agent) => ({ agent })),
+  pageInfo: { hasMore: false },
+}) } }) as unknown as PaseoApi;
 // Every planner has a working agent, except in the restart test.
 const paseo = paseoWith(() => [{ id: "agent-p", status: "running", labels: {} }]);
 const settings = { dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["TUC"], maxRunning: 2 }, writeback: DEFAULT_WRITEBACK } as PluginSettings;
@@ -92,13 +96,16 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   const path = join(directory, "projects.json");
   const store = new ProjectStore(path);
   const scheduler = new Scheduler({ running: async () => running, projectOf: async () => "erp", away: async () => away, now: () => now });
+  // Tickets a start under way, or their newest thread, accounts for.
+  const held = new Set<string>();
   const flow = new ProjectFlow({ linear, scheduler, capacity: new Capacity(() => now), store, retire: async (agentId) => { calls.push(`retire ${agentId}`); }, now: () => now,
     restart: async (id) => {
       calls.push(`restart ${id}`);
       if (fail.restart) throw new Error("Agent creation could not be confirmed (Timed out waiting for OMP to become ready).");
-    } });
+    },
+    accountedFor: async (id) => held.has(id) });
   return {
-    flow, calls, store, issues, documents, fail, comments, descriptions, team, elsewhere, briefs,
+    flow, calls, store, issues, documents, fail, comments, descriptions, team, elsewhere, briefs, held,
     advance: (ms: number) => { now += ms; },
     setAway: (value: boolean) => { away = value; },
     // The project's record as an earlier poll left it.
@@ -364,7 +371,8 @@ test("Plan during a poll that is filing the project's planner files no second on
 });
 
 test("a planner without a live agent (TUC-678: its launch timed out) is started again after ten minutes, at most three times, then left to the owner", async (t) => {
-  const r = await room(t, [issue(1, { delegateId: APP }), issue(100, { id: "planner1", labels: ["paseo-planner"], delegateId: APP })]);
+  // TUC-1 is worked on (In Progress), so only the planner lacks an agent.
+  const r = await room(t, [issue(1, { delegateId: APP, statusType: "started", status: "In Progress" }), issue(100, { id: "planner1", labels: ["paseo-planner"], delegateId: APP })]);
   // As TUC-678 stood: filed and assigned to Paseo an hour ago by a version without restarts; no agent.
   await r.seed({ plannedThrough: "2026-01-01T12:00:00Z", planner: { id: "planner1", identifier: "TUC-101", url: "", listedAt: "2026-01-01T23:00:00Z", tickets: 1, started: true } });
   const agents: Agent[] = [];
@@ -388,6 +396,80 @@ test("a planner without a live agent (TUC-678: its launch timed out) is started 
   assert.deepEqual(await poll(60), [], "asked once, then left to the owner");
   const planner = (await r.store.all()).erp.planner!;
   assert.deepEqual({ restarts: planner.restarts, ownerAsked: planner.ownerAsked }, { restarts: 3, ownerAsked: true });
+});
+
+// A ticket assigned to Paseo by an earlier poll, and how its blockers stand.
+const blocker = (finished: boolean) => ({ id: "b1", identifier: "TUC-90", status: finished ? "Done" : "In Progress", statusType: finished ? "completed" : "started", delegateId: null, finished });
+
+test("a ticket assigned to Paseo whose start failed (TUC-53) is started again after ten minutes, at most three times, then left to the owner", async (t) => {
+  const r = await room(t, [
+    issue(1, { delegateId: APP }),
+    // Not stalled: a thread waits for a slot, the label dispatch owns it, it is worked on, it is a
+    // group whose sub-issue works, or it waits for its blocker.
+    issue(2, { delegateId: APP }),
+    issue(3, { delegateId: APP, labels: ["paseo-failed"] }),
+    issue(4, { delegateId: APP, statusType: "started", status: "In Progress" }),
+    issue(5, { delegateId: APP }), issue(6, { parentId: "i5", statusType: "started", status: "In Progress" }),
+    issue(7, { delegateId: APP, blockers: [blocker(false)] }),
+  ]);
+  r.held.add("i2");
+  r.fail.restart = true;
+  const none = paseoWith(() => []);
+  const poll = async (minutes: number) => {
+    r.calls.length = 0;
+    r.advance(minutes * MINUTE);
+    await r.flow.tick(none, settings);
+    return r.calls.filter((call) => call.startsWith("restart") || call.startsWith("comment"));
+  };
+  assert.deepEqual(await poll(0), [], "first seen without an agent: its start may still be under way");
+  assert.deepEqual(await poll(9), []);
+  assert.deepEqual(await poll(2), ["restart i1"]);
+  assert.deepEqual(await poll(9), [], "the grace runs again from the restart");
+  assert.deepEqual(await poll(2), ["restart i1"]);
+  assert.deepEqual(await poll(11), ["restart i1"]);
+  assert.deepEqual(await poll(11), ["comment i1 **Paseo could not start an agent for this ticket.** It is assigned to Paseo, but Paseo restarted it 3 times and no agent is working on it now (the start failed, or the agent never came up), so it stops trying. Start an agent for it from the Linear tickets sidebar, or add the `paseo` label to try again."]);
+  assert.deepEqual(await poll(60), [], "asked once, then left to the owner");
+  assert.deepEqual((await r.store.all()).erp.stalled, { i1: { since: "2026-01-02T00:33:00.000Z", restarts: 3, ownerAsked: true } });
+});
+
+test("stalled tickets restart one per poll, and a failed restart frees its slot for the next one", async (t) => {
+  const r = await room(t, [issue(1, { delegateId: APP }), issue(2, { delegateId: APP })]);
+  r.fail.restart = true;
+  const one = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 1 } };
+  const none = paseoWith(() => []);
+  const poll = async (minutes: number) => {
+    r.calls.length = 0;
+    r.advance(minutes * MINUTE);
+    await r.flow.tick(none, one);
+    return r.calls.filter((call) => call.startsWith("restart"));
+  };
+  assert.deepEqual(await poll(0), []);
+  assert.deepEqual(await poll(11), ["restart i1"]);
+  assert.deepEqual(await poll(2), ["restart i2"], "the only agent slot is free again");
+});
+
+test("a stalled ticket waits for a free slot without using up a restart, and is forgotten once its agent works", async (t) => {
+  const running = ["x1", "x2"];
+  const r = await room(t, [issue(1, { delegateId: APP }), issue(7, { delegateId: APP, blockers: [blocker(false)] })], running);
+  const agents: Agent[] = [];
+  const local = paseoWith(() => agents);
+  const poll = async (minutes: number) => {
+    r.calls.length = 0;
+    r.advance(minutes * MINUTE);
+    await r.flow.tick(local, settings);
+    return r.calls.filter((call) => call.startsWith("restart"));
+  };
+  assert.deepEqual(await poll(0), []);
+  assert.deepEqual(await poll(30), [], "both agent slots are taken");
+  assert.deepEqual((await r.store.all()).erp.stalled?.i1.restarts, 0);
+  running.length = 0;
+  r.issues[1] = issue(7, { delegateId: APP, blockers: [blocker(true)] });
+  assert.deepEqual(await poll(2), ["restart i1"], "a slot is free");
+  assert.deepEqual((await r.store.all()).erp.stalled?.i7, { since: "2026-01-02T00:32:00.000Z", restarts: 0 }, "TUC-7's blocker finished only now, so its grace starts now");
+  agents.push({ id: "agent-1", status: "running", labels: { "linear.issueId": "i1" } });
+  assert.deepEqual(await poll(8), []);
+  assert.deepEqual(await poll(2), ["restart i7"]);
+  assert.deepEqual((await r.store.all()).erp.stalled, { i7: { since: "2026-01-02T00:42:00.000Z", restarts: 1 } }, "TUC-1 is forgotten once its agent works");
 });
 
 test("a ticket is planned only once a planner listed it: one created while the planner is filed, or moved in from another project, is new", async (t) => {
