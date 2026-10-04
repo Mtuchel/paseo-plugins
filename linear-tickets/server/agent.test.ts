@@ -235,6 +235,20 @@ test("a delegation from someone else is refused; the owner's starts an agent lin
   await mine.cleanup();
 });
 
+test("a project planner is started again with a new agent and thread: its errored thread is closed and its stopped agent archived", async () => {
+  const h = harness();
+  // TUC-678: the thread whose launch timed out (in error in Linear, no agent), and an older thread
+  // whose agent was closed without a plan.
+  await h.store.put(link({ sessionId: "s0", agentId: "agent-old", createdAt: "2025-12-31T00:00:00Z" }));
+  await h.store.put(link({ agentId: null }));
+  await h.router.restartFor("i1", "TUC-1");
+  assert.deepEqual(h.calls, ["+paseo-running", "start undefined", "delegate i1 to paseo-app", "archive agent-old"]);
+  assert.equal((await h.store.get("s-new"))?.agentId, "agent-new", "a new thread, not the errored one");
+  assert.equal((await h.store.get("s1"))?.closed, true);
+  assert.equal((await h.store.get("s0"))?.closed, true);
+  await h.cleanup();
+});
+
 const child = (identifier: string, change: Partial<GroupChild> = {}): GroupChild => ({ id: identifier.toLowerCase(), identifier, status: "Todo", statusType: "unstarted", delegateId: null, finished: false, assigneeId: null, labels: [], blockers: [], ...change });
 const parent = (children: GroupChild[], change: Partial<IssueGroup> = {}): IssueGroup => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusType: "unstarted", delegateId: "paseo-app", finished: false, children, ...change });
 const blocker = (identifier: string, change: Partial<GroupChild> = {}) => ({ id: identifier.toLowerCase(), identifier, status: "Todo", statusType: "unstarted", delegateId: null, finished: false, ...change });

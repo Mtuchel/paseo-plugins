@@ -860,6 +860,31 @@ export class SessionRouter {
     return true;
   }
 
+  // A project planner without a live agent (README, "Projects"): a new agent and a new thread, as
+  // for a label launch, admitted like any start. Its earlier thread cannot be reused: one whose
+  // launch failed is in error in Linear, and Linear opens no new thread when the ticket is assigned
+  // to Paseo again. Its stopped agents are archived once the new one runs, so a later reply or
+  // mention never reaches them, and its earlier threads are closed as superseded.
+  async restartFor(issueId: string, identifier: string): Promise<void> {
+    if (!this.paseo) throw new Error("Paseo is not connected yet.");
+    const settings = await this.deps.settings.read();
+    const admission = await this.deps.starter.admission(issueId, this.paseo, settings);
+    if (!admission.ok) throw new Error(admission.reason);
+    const stopped = new Set((await this.deps.store.all()).filter((link) => link.issueId === issueId && link.agentId).map((link) => link.agentId!));
+    const running = dispatchLabels(settings.dispatch.label).running;
+    await this.deps.linear.addLabel(issueId, running).catch(() => {});
+    let agentId: string;
+    try {
+      agentId = (await this.deps.starter.start(issueId, this.paseo, settings, { retryHint: "the project's next read starts it again" })).agentId;
+    } catch (error) {
+      await this.deps.linear.removeLabel(issueId, running).catch(() => {});
+      throw error;
+    }
+    await this.openFor(issueId, identifier, agentId);
+    for (const old of stopped) if (old !== agentId) await this.paseo.agents.ref(old).archive().catch(() => {});
+    await this.closeSuperseded();
+  }
+
   async offerResume(sessionId: string): Promise<void> {
     const offer = (await this.deps.store.get(sessionId))?.offer;
     if (offer === "split" || offer === "later" || offer === "parked") return;

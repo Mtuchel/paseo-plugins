@@ -683,7 +683,10 @@ every 2 minutes.
   planner ticket and archives its agent. Nothing else of an approval (In Progress, `plan-ready`,
   a new agent) applies to it. The approved order is kept in `projects.json` before it is
   written, and every project read writes one that is not in Linear yet, so Linear being down or
-  rate-limited only delays it, for as long as it lasts. A change Linear itself refuses three reads
+  rate-limited only delays it, for as long as it lasts. The changes that went through are kept
+  with it, so a later read repeats only the rest: a `paseo-hold` you removed meanwhile is not
+  added again. Until the order is written, the tickets it blocks, holds or marks attended are not
+  handed out, even when they were planned before. A change Linear itself refuses three reads
   in a row is listed as skipped and the order closes anyway; a ticket whose `hold` or blocker was
   skipped is not handed out by the project (the comment names it), so assign it yourself when it
   may start. An approved order is still written when you close the planner ticket before that
@@ -694,17 +697,32 @@ every 2 minutes.
   user-facing wording or layout you choose, changes to production data, external accounts or
   spend, or a step only a person can do; never for size or risk alone. A planner that cannot be
   filed or written never holds back the hand-out of tickets that are already planned.
+- **Restarting the planner.** A planner whose agent never came up (its launch failed) or stopped
+  without submitting a plan (closed after idling, or archived) would hold the project: no new
+  planner is filed while it is open. So every project read checks the open, started planner
+  without an approved order for a live agent (one labelled with its ticket that is initializing,
+  idle or running). Ten minutes after its last start without one (a launch takes a couple of
+  minutes, so one still under way is never doubled), it is started again with a new agent and a
+  new thread on the ticket, like a label launch; its earlier threads are closed and its stopped
+  agents archived. Assigning the ticket to Paseo again is no restart: Linear opens no new thread
+  for it, and a thread whose launch failed is in error. After three restarts without a live agent
+  Paseo comments on the planner ticket and stops: start an agent for it from the sidebar, or close
+  the ticket to skip the order. Each restart is logged and counted in `projects.json`.
 - **Hand-out.** Planned tickets in Backlog or Todo that are unassigned or yours, not handed to
   Paseo yet, without `paseo-hold` (or other `paseo-` state labels) and with every blocker
   finished are assigned to Paseo in the *Who starts next* order, one per free slot. Tickets in
   Triage or already started, someone else's, and sub-issues (their parent's group hands them
   out) are left alone. A ticket with open sub-issues in the project is assigned as a group and
   takes no slot itself. Removing `paseo-hold` releases a ticket.
-- **New tickets.** Tickets filed after the last work order are not handed out until the next
-  planner has ordered them; `linear.projects-status` counts them. Only tickets the project could
-  hand out count: new sub-issues, tickets already with Paseo or someone else, and started ones do
-  not. There is at most one planner per project at a time, also when Plan is pressed during a
-  read: tickets filed while one works are listed by the next.
+- **New tickets.** A ticket is planned once a planner listed it (by ticket, not by creation
+  time), so a ticket filed while the planner is being filed, or moved into the project from
+  another one, is new too. Tickets that leave the project's open tickets (closed, moved out) drop
+  out of the planned ones when a planner closes, so they are new again if they come back. New
+  tickets are not handed out until the next planner has ordered them; `linear.projects-status`
+  counts them. Only tickets the project could hand out count: new sub-issues, tickets already with
+  Paseo or someone else, and started ones do not. There is at most one planner per project at a
+  time, also when Plan is pressed during a read: tickets filed while one works are listed by the
+  next. Records of older versions, which planned by creation time, keep what they had planned.
 - **Skipping a work order.** Closing or canceling the planner ticket yourself before its order is
   approved counts its tickets as planned: they are handed out without a work order.
 - Removing the label from the project stops new hand-outs; agents already working continue.
