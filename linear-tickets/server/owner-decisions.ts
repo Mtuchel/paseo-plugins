@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { agentAppDirectory, type AgentApi } from "./agent-app";
@@ -32,8 +33,13 @@ export const MAX_LOOKBACK_MS = 28 * DAY_MS;
 // raised it: anything older may have lost its record, so it cannot be told from the owner's.
 const RECORDS_BEFORE_ROLLOUT_MS = 7 * DAY_MS;
 const LOCK_STALE_MS = 30 * 60 * 1000;
+// A release waits up to 2 s for another run's takeover or release (each takes milliseconds).
+const GUARD_RETRY_MS = 50;
+const GUARD_RETRIES = 40;
 const TOKEN_MARGIN_MS = 5 * 60 * 1000;
 const CLOSED_TYPES = ["completed", "canceled", "duplicate"];
+// Every line terminator Markdown or a multiline `^` (Q_HEADING, MARKER_LINE) would break a line at.
+const LINE_BREAK = /\r\n|[\n\r\u2028\u2029]/;
 export const PROJECTS = ["ERP", "Agent tooling"] as const;
 export type Project = (typeof PROJECTS)[number];
 export const MARKER = "decision-candidates";
@@ -340,8 +346,40 @@ async function lockHolder(path: string): Promise<{ token: string | null; since: 
   return { token: text(value.token) ? value.token : null, since };
 }
 
-// One `collect` or `file` at a time. Each acquisition writes its own token, so a run removes only
-// its own lock; a stale lock (30 minutes) is taken over by one run only, through `lock.takeover`.
+// The few milliseconds in which an existing lock is checked and then replaced (takeover) or
+// removed (release): `lock.guard`, created exclusively, so no run checks a lock while another
+// replaces or removes it. `retries`: how often to try again while another run is in it; false when
+// it stayed busy. A guard left by a run that died within it is removed after 30 minutes, only if it
+// is still that same file. Filesystem times are compared with the real clock, never with `now`.
+async function guarded(path: string, work: () => Promise<void>, retries: number): Promise<boolean> {
+  const guard = `${path}.guard`;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await (await open(guard, "wx", 0o600)).close();
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const left = await stat(guard).catch(() => null);
+      if (left && Date.now() - left.mtimeMs >= LOCK_STALE_MS) {
+        const still = await stat(guard).catch(() => null);
+        if (still && still.ino === left.ino && still.mtimeMs === left.mtimeMs) await rm(guard, { force: true });
+        continue;
+      }
+      if (attempt >= retries) return false;
+      await sleep(GUARD_RETRY_MS);
+    }
+  }
+  try {
+    await work();
+    return true;
+  } finally {
+    await rm(guard, { force: true });
+  }
+}
+
+// One `collect` or `file` at a time. Each acquisition writes its own token, and every check of an
+// existing lock that ends in replacing or removing it runs inside `guarded`: a run removes only its
+// own lock, and a stale lock (30 minutes) is taken over by one run only.
 export async function withLock<T>(directory: string, work: () => Promise<T>, now = () => Date.now()): Promise<T> {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const path = join(directory, "lock");
@@ -364,28 +402,25 @@ export async function withLock<T>(directory: string, work: () => Promise<T>, now
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     const stale = await lockHolder(path);
     if (stale && now() - stale.since < LOCK_STALE_MS) throw busy(stale.since);
-    const takeover = `${path}.takeover`;
-    // A takeover left by a run that died within it.
-    const left = await stat(takeover).catch(() => null);
-    if (left && now() - left.mtimeMs >= LOCK_STALE_MS) await rm(takeover, { force: true });
-    const guard = await open(takeover, "wx", 0o600).catch((failure: unknown) => {
-      throw (failure as NodeJS.ErrnoException).code === "EEXIST" ? busy(stale?.since ?? now()) : failure;
-    });
-    await guard.close();
-    try {
+    let took = false;
+    await guarded(path, async () => {
       // Still the same stale lock: another run may have taken it over in between.
       const again = await lockHolder(path);
-      if (again && (again.token !== (stale?.token ?? null) || now() - again.since < LOCK_STALE_MS)) throw busy(again.since);
+      if (again && (again.token !== (stale?.token ?? null) || now() - again.since < LOCK_STALE_MS)) return;
       await rm(path, { force: true });
-      await take();
-    } finally {
-      await rm(takeover, { force: true });
-    }
+      // A run that found no lock at all may have taken it in this gap.
+      try { await take(); } catch (failure) { if ((failure as NodeJS.ErrnoException).code === "EEXIST") return; throw failure; }
+      took = true;
+    }, 0);
+    if (!took) throw busy(stale?.since ?? now());
   }
   try {
     return await work();
   } finally {
-    if ((await lockHolder(path))?.token === token) await rm(path, { force: true });
+    const released = await guarded(path, async () => {
+      if ((await lockHolder(path))?.token === token) await rm(path, { force: true });
+    }, GUARD_RETRIES);
+    if (!released) console.error(`[linear-tickets] decision candidates: ${path} could not be released; it expires after 30 minutes.`);
   }
 }
 
@@ -491,7 +526,7 @@ export function validateInput(raw: unknown, batch: Batch): { input: FileInput; e
       const candidate = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
       const fields = ["title", "wording", "scope", "question", "options", "recommendation"] as const;
       for (const field of fields) if (!text(candidate[field]) || !String(candidate[field]).trim()) errors.push(`${where}: \`${field}\` is required.`);
-      if (text(candidate.title) && (candidate.title.includes("\n") || candidate.title.length > 120)) errors.push(`${where}: \`title\` must be one line of at most 120 characters.`);
+      if (text(candidate.title) && (LINE_BREAK.test(candidate.title) || candidate.title.length > 120)) errors.push(`${where}: \`title\` must be one line of at most 120 characters.`);
       if (!TYPES.includes(candidate.type as Candidate["type"])) errors.push(`${where}: \`type\` must be ${TYPES.join(", ")}.`);
       const evidence = Array.isArray(candidate.evidence) ? candidate.evidence : [];
       if (!evidence.length) errors.push(`${where}: at least one \`evidence\` entry is required.`);
@@ -527,7 +562,7 @@ function renderCandidate(number: number, key: string, candidate: Candidate, batc
   // Each quoted line is prefixed, so none of the owner's lines can read as a heading or marker.
   const evidence = candidate.evidence.flatMap((entry) => {
     const source = items.get(entry.sourceId)!;
-    const quoted = verbatim(source.words, entry.quote).split("\n").map((line) => line.trimEnd() ? `    > ${line.trimEnd()}` : "    >");
+    const quoted = verbatim(source.words, entry.quote).split(LINE_BREAK).map((line) => line.trimEnd() ? `    > ${line.trimEnd()}` : "    >");
     return [`  - ${source.at.slice(0, 16).replace("T", " ")} UTC, [${source.identifier}](${entry.url}) (${source.kind}):`, ...quoted];
   });
   const oneLine = (value: string) => normalize(value);

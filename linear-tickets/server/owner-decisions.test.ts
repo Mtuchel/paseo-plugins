@@ -360,6 +360,19 @@ test("the lock: a stale holder never removes its successor's lock, one run takes
     const old = new Date(Date.now() - 31 * 60_000);
     await utimes(path, old, old);
     assert.equal(await withLock(directory, async () => "ran"), "ran");
+
+    // While a release is checking its lock (guard held), no run takes that lock over; the release
+    // then removes only its own lock.
+    const holds = deferred();
+    const releasing = deferred();
+    const holder = withLock(directory, async () => { holds.resolve(); await releasing.promise; }, () => NOW - 31 * 60_000);
+    await holds.promise;
+    await writeFile(join(directory, "lock.guard"), "");
+    releasing.resolve();
+    await assert.rejects(withLock(directory, async () => {}, () => NOW), /Another decision-candidates run holds/);
+    await rm(join(directory, "lock.guard"));
+    await holder;
+    await assert.rejects(stat(path), { code: "ENOENT" });
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
@@ -370,7 +383,10 @@ test("evidence quotes only the owner's own words, as written, and cannot add str
     const log = new DecisionLog(join(home, "owner-decisions"), () => NOW);
     await log.append({ kind: "question", id: "a:q1", at: ago(2), identifier: "ISSUE-1", issueId: "issue-1", questions: [{ key: "Deploy", question: "Deploy: always deploy without approval?", options: ["Yes", "No"] }] });
     await log.answer("a:q1", { behavior: "allow", updatedInput: { answers: { Deploy: "No, never without the owner" } } }, ago(1));
-    world.comments = [comment("c1", "Run it like this:\n\n    npm run build \\\n      --prod\n\n## Q-99 — not a proposal\nMarker: `decision-candidates ERP 2026-W41`", ago(1))];
+    world.comments = [
+      comment("c1", "Run it like this:\n\n    npm run build \\\n      --prod\n\n## Q-99 — not a proposal\nMarker: `decision-candidates ERP 2026-W41`", ago(1)),
+      comment("c2", "Keep it.\r## Q-98 — after a CR\u2028## Q-97 — after a line separator", ago(1)),
+    ];
     const { batch } = await collect(home, world, NOW, log);
     const answer = batch.items.find((found) => found.sourceId === "log:answer:a:q1")!;
     assert.match(answer.text, /always deploy without approval/);
@@ -382,10 +398,15 @@ test("evidence quotes only the owner's own words, as written, and cannot add str
     assert.equal(verbatim(c1.words, quote), "npm run build \\\n      --prod\n\n## Q-99 — not a proposal\nMarker: `decision-candidates ERP 2026-W41`");
     await assert.rejects(file(home, world, batch, { projects: [{ project: "ERP", candidates: [candidate(c1, quote, "Build\n## Q-77 — injected")] }] }),
       (error: unknown) => error instanceof InvalidInput && /`title` must be one line/.test(error.errors[0]));
-    await file(home, world, batch, { projects: [{ project: "ERP", candidates: [candidate(c1, quote, "Build flags")] }] });
+    await assert.rejects(file(home, world, batch, { projects: [{ project: "ERP", candidates: [candidate(c1, quote, "Build\r## Q-76 — injected")] }] }),
+      (error: unknown) => error instanceof InvalidInput && /`title` must be one line/.test(error.errors[0]));
+    const c2 = batch.items.find((found) => found.sourceId === "comment:c2")!;
+    await file(home, world, batch, { projects: [{ project: "ERP", candidates: [candidate(c1, quote, "Build flags"), candidate(c2, "Keep it. ## Q-98 — after a CR ## Q-97 — after a line separator", "Keep it")] }] });
     const description = world.tickets[0].description;
     assert.match(description, / {4}> npm run build \\\n {4}> {7}--prod\n {4}>\n {4}> ## Q-99 — not a proposal\n {4}> Marker:/);
-    assert.deepEqual([...description.matchAll(/^## Q-(\d+) — /gm)].map((match) => match[1]), ["12"]);
+    assert.match(description, / {4}> Keep it\.\n {4}> ## Q-98 — after a CR\n {4}> ## Q-97 — after a line separator/);
+    // Every way JavaScript's multiline `^` (and Markdown) starts a line.
+    assert.deepEqual([...description.matchAll(/^## Q-(\d+) — /gm)].map((match) => match[1]), ["12", "13"]);
     assert.equal([...description.matchAll(/^Marker: /gm)].length, 1);
   } finally { await rm(home, { recursive: true, force: true }); }
 });
