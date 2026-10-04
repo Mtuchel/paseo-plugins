@@ -355,6 +355,21 @@ test("admission waits for unfinished blockers and for a free agent slot", async 
   assert.deepEqual(await room.starter.admission("i1", room.paseo, { ...settings, dispatch: { ...settings.dispatch, maxRunning: 0 } }), { ok: true });
 });
 
+test("an agent waiting for the owner's answer or approval frees its slot; one at work keeps it", async () => {
+  const h = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
+  // One running ticket agent per entry, with that entry's pending permission requests.
+  const paseoWith = (pending: { id: string; kind: string }[][]) => ({ ...h.paseo, agents: { list: async () => ({
+    entries: pending.map((pendingPermissions, index) => ({ agent: { id: `r${index}`, status: "running", labels: { "linear.issueId": `x${index}` }, pendingPermissions } })),
+    pageInfo: { hasMore: false },
+  }) } }) as unknown as PaseoApi;
+  const waiting = paseoWith([[{ id: "q", kind: "question" }], [{ id: "p", kind: "tool" }]]);
+  assert.deepEqual(await h.starter.admission("i1", waiting, settings), { ok: true }, "both agents wait for the owner: 0 of 2 slots used");
+  assert.equal((await h.starter.scheduler.counts(waiting)).running, 0);
+  const working = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
+  const busy = paseoWith([[], []]);
+  assert.match((await working.starter.admission("i1", busy, settings) as { reason: string }).reason, /Queued: 2 of 2/);
+});
+
 test("a project planner starts even when every agent slot is taken, also under a memory lease of 0", async () => {
   const planner = { creatorId: APP, labels: [{ id: "p", name: "paseo-planner" }], blockedBy: [] };
   const full = starterHarness(planner, 2);

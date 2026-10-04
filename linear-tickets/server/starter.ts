@@ -106,7 +106,9 @@ export async function planSetup(linear: Pick<LinearService, "issueState" | "view
   };
 }
 
-// Issue ids of the ticket agents working right now (not idle, not archived, not subagents).
+// Issue ids of the ticket agents working right now (not idle, not archived, not subagents). An
+// agent waiting for the owner's answer or approval stays "running" in Paseo but works on nothing,
+// so it frees its slot (README, "Present and away") until the answer starts it again.
 export async function runningTicketAgents(paseo: PaseoApi): Promise<string[]> {
   const running: string[] = [];
   let cursor: string | undefined;
@@ -114,7 +116,7 @@ export async function runningTicketAgents(paseo: PaseoApi): Promise<string[]> {
     const page = await paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
     for (const { agent } of page.entries) {
       const issueId = agent.labels?.["linear.issueId"];
-      if (issueId && !agent.labels["paseo.parent-agent-id"] && (agent.status === "running" || agent.status === "initializing")) running.push(issueId);
+      if (issueId && !agent.labels["paseo.parent-agent-id"] && (agent.status === "running" || agent.status === "initializing") && !agent.pendingPermissions?.length) running.push(issueId);
     }
     cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
   } while (cursor);
