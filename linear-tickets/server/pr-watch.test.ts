@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -7,6 +7,7 @@ import type { HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
 import { activityBullets, GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type QueueDraft } from "./pr-watch";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, marker, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
+import { SessionRouter } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
 const settings = { dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true } } as unknown as PluginSettings;
@@ -37,6 +38,24 @@ function draft(number: number, prs: number[], state = "CLOSED"): QueueDraft {
 
 type Outcome = "sent" | "busy" | "gone" | "unavailable";
 
+// A crashed agent as Paseo shows it; a reload keeps `lastError`, so a restarted agent still has it.
+const CRASH = "OMP RPC process is closed";
+const CRASHED = { status: "error", lastError: CRASH, pendingPermissions: [] };
+const RESTARTED = { status: "idle", lastError: CRASH, pendingPermissions: [] };
+
+// A real SessionRouter on a fake Paseo daemon with one agent: its snapshot is `agent`, a reload
+// (`reload <id>` in the calls) sets it to `reloaded`, and a send is recorded like the fake
+// router's prompts (`send` runs first and may throw).
+function crashDaemon(calls: string[]) {
+  const daemon = { agent: CRASHED as Record<string, unknown>, reloaded: RESTARTED as Record<string, unknown>, send: async () => {}, router: null as unknown as SessionRouter };
+  daemon.router = new SessionRouter({ reloader: async () => async (agentId: string) => { calls.push(`reload ${agentId}`); daemon.agent = daemon.reloaded; } } as never);
+  Object.assign(daemon.router, { paseo: { agents: {
+    ref: (id: string) => ({ refresh: async () => ({ agent: daemon.agent }), send: async (text: string) => { await daemon.send(); calls.push(`prompt ${id}\n${text}`); } }),
+    list: async () => ({ entries: [] }),
+  } } });
+  return daemon;
+}
+
 const HEAD = "a1b2c3d4e5f6";
 const RUNNING_CI: CheckRun = { name: "Code validation / Core (core-web)", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/1/job/1", state: "pending", conclusion: "pending" };
 // An open, ready pull request whose CI still runs: no lifecycle stage applies to it.
@@ -58,7 +77,8 @@ const MAIN_BROKEN: Judgment = {
   failures: [{ check: "Code validation / Migration replay", conclusion: "failure", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/9/job/1" }],
 };
 
-function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string } = {}) {
+// `crash`: the agent runs on crashDaemon (`daemon`) instead of the fake router (`paseo`).
+function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean } = {}) {
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open; `views`: other pull requests by URL, and
   // `open` the listing's other entries; `deleted`: branches gone; `throttle`: pull requests whose
@@ -93,8 +113,8 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // `failure`: what linking a URL on the ticket throws; `arrive`: runs before a ticket comment
   // reaches Linear (a hanging one is a crash before it went out), `stall` after it did (a crash
   // right after); `lost`: the request fails although the comment reached Linear. `comments`:
-  // each ticket's comments.
-  const linear = { failure: null as Error | null, arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]> };
+  // each ticket's comments; `state`: the ticket's workflow state.
+  const linear = { failure: null as Error | null, arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" } };
   // Open before-merge manual tasks of the ticket; `unreadable`: reading them fails.
   const blockers: string[] = [];
   const gate = { unreadable: false };
@@ -106,6 +126,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     session: async () => ({ sessionId: "s" }),
   };
   const calls: string[] = [];
+  const daemon = agent.crash ? crashDaemon(calls) : null;
   const directory = mkdtemp(join(tmpdir(), "paseo-pr-watch-"));
   t.after(async () => rm(await directory, { recursive: true, force: true }));
   const create = () => directory.then((home) => new PullRequestWatch({
@@ -119,7 +140,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       sessionFor: () => paseo.session() as never,
       say: async (_id, kind, text) => { calls.push(`say ${kind} ${text.split("\n")[0]}`); },
       link: async (_id, label, url) => { calls.push(`session link ${label} ${url}`); },
-      prompt: async (agentId, text, onDispatch) => {
+      prompt: daemon ? (agentId, text, onDispatch, recovery) => daemon.router.prompt(agentId, text, onDispatch, recovery) : async (agentId, text, onDispatch) => {
         const outcome = await paseo.answer();
         if (outcome !== "sent") return outcome;
         await onDispatch?.();
@@ -127,6 +148,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         calls.push(`prompt ${agentId}\n${text}`);
         return outcome;
       },
+      crashed: async (agentId) => daemon ? daemon.router.crashed(agentId) : null,
     },
     linear: {
       moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; },
@@ -144,6 +166,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         if (linear.failure) throw linear.failure;
         calls.push(`link ${title} ${url}`);
       },
+      issueState: async () => ({ ...linear.state }) as never,
     },
     manualTasks: {
       openBlockers: async () => {
@@ -239,7 +262,14 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   const restart = () => { watch = create(); return watch; };
   // The state an earlier plugin version left.
   const state = async (value: unknown) => writeFile(join(await directory, "pr-watch.json"), JSON.stringify(value));
-  return { github, linear, paseo, records, blockers, gate, calls, scripts, poll, backstop, restart, state, watch: () => watch };
+  // The crash recovery state file, read or written as is.
+  const crashFile = async (value?: string) => {
+    const path = join(await directory, "crash-recovery.json");
+    if (value === undefined) return readFile(path, "utf8");
+    await writeFile(path, value);
+    return value;
+  };
+  return { github, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, watch: () => watch };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -1598,4 +1628,139 @@ test("a drop claimed while its pull request still holds an earlier message is qu
   assert.deepEqual(firstLines(await h.backstop()), ["pr comment #1700 Earlier message.", `pr comment #1700 The Graphite merge queue dropped [the pull request](${prUrl(1700)}) without merging it.`]);
   assert.match(h.github.comments[1700][1], /2\. Fix the cause\.[^]*<!-- queue-backstop:route:#450 -->$/);
   assert.deepEqual(await h.backstop(), [], "each once");
+});
+
+test("a crashed agent is restarted and resumed with its nudge, also on an unchanged head; repeated crashes still reach the owner after two attempts, then nothing", async (t) => {
+  const h = harness(t, { crash: true });
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.daemon.agent = RESTARTED;
+  const first = await h.poll();
+  assert.match(promptOf(first) ?? "", /nudge 1 of 2/);
+  assert.ok(!first.includes("reload a1"), "a healthy agent is nudged as before");
+  assert.deepEqual(await h.poll(), [], "a healthy agent is not nudged twice on one head");
+  h.daemon.agent = CRASHED;
+  const restarted = await h.poll();
+  assert.deepEqual(restarted.filter((call) => !call.startsWith("prompt")), ["reload a1", `say thought The agent had crashed (${CRASH}); Paseo restarted it and asked it to resume and fix the failing checks.`]);
+  const resume = promptOf(restarted) ?? "";
+  assert.match(resume, /^Your previous run crashed \(`OMP RPC process is closed`\), and Paseo restarted you\./);
+  assert.match(resume, /run `git status`/);
+  assert.match(resume, /nudge 2 of 2 for this step/);
+  h.daemon.agent = CRASHED;
+  const escalated = await h.poll();
+  assert.ok(!escalated.includes("reload a1"), "the escalation restarts nothing");
+  assert.match(escalated[0], /^comment https:\/\/linear\.app\/ws\/profiles\/me Paseo asked the agent 2 times to fix the failing checks/);
+  assert.deepEqual(await h.poll(), [], "after the escalation, nothing");
+  // Reloaded by hand: no automatic resume reaches it.
+  h.daemon.agent = RESTARTED;
+  await h.restart();
+  assert.deepEqual(await h.poll(), []);
+});
+
+test("a crashed agent whose restart fails is sent nothing, and the attempt counts", async (t) => {
+  const h = harness(t, { crash: true });
+  t.mock.method(console, "error", () => {});
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.daemon.reloaded = CRASHED;
+  assert.deepEqual(await h.poll(), ["reload a1", `say thought The agent had crashed (${CRASH}), and Paseo's restart failed.`]);
+  h.daemon.reloaded = RESTARTED;
+  const second = await h.poll();
+  assert.equal(second[0], "reload a1");
+  assert.match(promptOf(second) ?? "", /nudge 2 of 2/);
+});
+
+test("a resume that did not go out after the restart is sent on a later poll, also after a plugin restart, and cleared only once sent", async (t) => {
+  const h = harness(t, { crash: true });
+  t.mock.method(console, "error", () => {});
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.daemon.reloaded = { ...RESTARTED, status: "running" };
+  assert.deepEqual(await h.poll(), ["reload a1", `say thought The agent had crashed (${CRASH}); Paseo restarted it, and asks it to resume once it takes a message.`]);
+  await h.restart();
+  h.daemon.agent = RESTARTED;
+  h.daemon.send = async () => { throw new Error("connection lost"); };
+  assert.deepEqual(await h.poll(), [], "the send failed: kept");
+  h.daemon.send = async () => {};
+  const saved = await h.crashFile();
+  const sent = await h.poll();
+  assert.match(promptOf(sent) ?? "", /^Your previous run crashed[\s\S]*nudge 1 of 2/);
+  assert.equal(sent.at(-1), "say thought Paseo sent the restarted agent its resume.");
+  assert.deepEqual(await h.poll(), [], "sent once");
+  // The plugin stopped after the send, before the resume was cleared: it goes out once more.
+  await h.crashFile(saved);
+  await h.restart();
+  assert.match(promptOf(await h.poll()) ?? "", /^Your previous run crashed/);
+});
+
+test("a drop's fix request for an agent whose restart fails goes to the ticket, and its resume is never sent later", async (t) => {
+  const h = harness(t, { crash: true });
+  t.mock.method(console, "error", () => {});
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  h.daemon.reloaded = CRASHED;
+  const calls = await h.poll();
+  assert.equal(calls[0], "reload a1");
+  assert.ok(calls.includes("move In Progress"));
+  assert.ok(calls.some((call) => call.startsWith(`comment ${OWNER} The agent that worked on this ticket is no longer running`)));
+  // Reloaded by hand.
+  h.daemon.agent = RESTARTED;
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("prompt")));
+});
+
+test("a pending resume is dropped unsent once its ticket is no longer started or another agent took the ticket over", async (t) => {
+  t.mock.method(console, "error", () => {});
+  for (const change of ["completed", "successor"] as const) {
+    const h = harness(t, { crash: true });
+    h.github.view = { ...READY, checks: [failing("PR code")] };
+    h.daemon.reloaded = { ...RESTARTED, status: "running" };
+    await h.poll();
+    if (change === "completed") h.linear.state = { status: "Done", statusType: "completed" };
+    else h.records[0] = { ...h.records[0], agentId: "a2" };
+    h.daemon.agent = RESTARTED;
+    assert.ok(!(await h.poll()).some((call) => call.includes("Your previous run crashed")), change);
+    assert.equal(JSON.parse(await h.crashFile()).a1.resume, null, change);
+  }
+});
+
+test("a crashed agent without an open pull request is restarted while its ticket is started: twice, then the owner once, then nothing", async (t) => {
+  t.mock.method(console, "error", () => {});
+  for (const pull of ["never linked", "closed"] as const) {
+    const h = harness(t, { crash: true });
+    if (pull === "never linked") h.records[0] = { ...h.records[0], links: {} };
+    else h.github.view = { ...OPEN_PR, state: "CLOSED" };
+    const first = await h.poll();
+    assert.ok(first.includes("reload a1"), pull);
+    assert.match(promptOf(first) ?? "", /\n\nYour ticket TUC-1 is in In Progress\. Continue the lifecycle step you were on\.$/, pull);
+    h.daemon.agent = CRASHED;
+    assert.ok((await h.poll()).includes("reload a1"), `${pull}: the second restart`);
+    h.daemon.agent = CRASHED;
+    const third = await h.poll();
+    assert.ok(!third.includes("reload a1"), pull);
+    assert.ok(third.some((call) => call.startsWith(`comment ${OWNER} The agent crashed again after Paseo restarted it 2 times while no pull request was open`)), pull);
+    await h.restart();
+    assert.deepEqual(await h.poll(), [], `${pull}: then nothing`);
+  }
+});
+
+test("an owner comment that failed after the restarts without an open pull request is posted on the next poll", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = harness(t, { crash: true });
+  h.records[0] = { ...h.records[0], links: {} };
+  for (let restart = 0; restart < 2; restart++) {
+    h.daemon.agent = CRASHED;
+    assert.ok((await h.poll()).includes("reload a1"));
+  }
+  h.daemon.agent = CRASHED;
+  h.linear.arrive = async () => { throw new Error("Linear is unavailable"); };
+  assert.deepEqual(await h.poll(), [], "the comment failed");
+  h.linear.arrive = async () => {};
+  assert.ok((await h.poll()).some((call) => call.startsWith(`comment ${OWNER} The agent crashed again`)), "retried");
+  assert.deepEqual(await h.poll(), [], "then nothing");
+});
+
+test("without an open pull request, a healthy agent or a ticket that is not started is left alone", async (t) => {
+  for (const [agent, statusType] of [[RESTARTED, "started"], [CRASHED, "completed"]] as const) {
+    const h = harness(t, { crash: true });
+    h.records[0] = { ...h.records[0], links: {} };
+    h.daemon.agent = agent;
+    h.linear.state = { status: statusType === "started" ? "In Progress" : "Done", statusType };
+    assert.deepEqual(await h.poll(), [], statusType);
+  }
 });

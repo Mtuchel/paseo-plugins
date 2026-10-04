@@ -5,6 +5,7 @@ import type { LinearService } from "./linear";
 import { PLAN_LABEL } from "./plan-policy";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
+import type { PromptOutcome } from "./sessions";
 
 const POLL_MS = 60_000;
 const STATE_FILE = "state.json";
@@ -15,10 +16,10 @@ export function planRequestsDirectory(home = paseoHome()): string {
   return join(home, "linear-tickets", "plan-requests");
 }
 
-type Prompt = (agentId: string, text: string) => Promise<"sent" | "busy" | "gone" | "unavailable">;
+type Prompt = (agentId: string, text: string) => Promise<PromptOutcome>;
 type Deps = { linear: Pick<LinearService, "issueLabels">; prompt: Prompt; directory?: string };
 // Per agent: whether its ticket carried the `plan` label at the last poll, and whether the agent
-// still has to be told (it was busy, or Paseo was unavailable).
+// still has to be told (it was busy, crashed, or Paseo was unavailable).
 type Entry = { plan: boolean; pending: boolean };
 type TicketAgent = { id: string; issueId: string; identifier: string };
 
@@ -95,13 +96,14 @@ export class PlanRequests {
   }
 
   // Whether the agent still has to be told. The omp extension removes the request file once the
-  // agent is planning, which also covers a busy agent: nothing left to say.
+  // agent is planning, which also covers a busy agent: nothing left to say. A crashed agent is not
+  // reloaded here; it is told once the pull request watch restarted it.
   private async tell(agent: TicketAgent): Promise<boolean> {
     const waiting = await stat(join(this.directory, agent.id)).then(() => true, () => false);
     if (!waiting) return false;
     const outcome = await this.deps.prompt(agent.id, planRequestText(agent.identifier));
     if (outcome === "sent") console.log(`[linear-tickets] ${agent.identifier}: plan requested from agent ${agent.id.slice(0, 8)}`);
-    return outcome === "busy" || outcome === "unavailable";
+    return outcome === "busy" || outcome === "unavailable" || outcome === "crashed";
   }
 
   private async writeRequest(agent: TicketAgent): Promise<void> {
