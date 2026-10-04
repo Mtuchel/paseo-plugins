@@ -64,10 +64,12 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // `open` the listing's other entries; `deleted`: branches gone; `throttle`: pull requests whose
   // read GitHub throttles; `listFailure`: what listing the open pull requests throws; `comments`:
   // each pull request's conversation comments; `stall`: runs after a pull request comment went
-  // out (a hanging one is a crash right after).
-  const github = { view: OPEN_PR, views: {} as Record<string, PullRequestView>, drafts: [] as QueueDraft[], landed: [] as number[], threads: [] as ReviewThread[], open: [] as OpenPull[], deleted: [] as string[], reads: [] as string[], threadReads: 0, throttled: false, throttle: [] as string[], missing: false, listFailure: null as Error | null, comments: {} as Record<number, string[]>, stall: async () => {} };
+  // out (a hanging one is a crash right after); `states`: pull request states as REST reads them
+  // one by one (a draft's own state by default; `unreadable` ones fail).
+  const github = { view: OPEN_PR, views: {} as Record<string, PullRequestView>, drafts: [] as QueueDraft[], landed: [] as number[], threads: [] as ReviewThread[], open: [] as OpenPull[], deleted: [] as string[], reads: [] as string[], threadReads: 0, throttled: false, throttle: [] as string[], missing: false, listFailure: null as Error | null, comments: {} as Record<number, string[]>, stall: async () => {}, states: {} as Record<number, string>, unreadable: [] as number[], stateReads: [] as number[] };
   // The repo's scripts the backstop runs from its checkout (`checkout` null: the repo has none).
-  // `judgment`: what `wait-queue.mjs` answers for a dropped round (null: still running), or
+  // `judgment`: what `wait-queue.mjs` answers for a dropped round (null: still running; `judgments`
+  // per pull request override it), or
   // `queueFailure` its stderr when it fails; `ready`: `enqueue-ready.mjs`'s answer; `enqueue`:
   // `backstop-enqueue.mjs`'s answers in turn (the last one repeats; enqueued and commented by
   // default). `onEnqueue`: what an enqueue changes (Graphite's bullets); `answered` runs before
@@ -77,6 +79,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   const scripts = {
     checkout: "/backstop" as string | null,
     judgment: GENUINE as Judgment | null,
+    judgments: {} as Record<number, Judgment>,
     queueFailure: null as string | null,
     ready: { stacks: [] as unknown[], drops: [] as unknown[] },
     enqueue: [] as { code: number; answer: Record<string, unknown> }[],
@@ -87,9 +90,11 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     runs: [] as string[],
     now: Date.now(),
   };
-  // `failure`: what linking a URL on the ticket throws; `stall`: runs after a ticket comment went
-  // out (a hanging one is a crash right after).
-  const linear = { failure: null as Error | null, stall: async () => {} };
+  // `failure`: what linking a URL on the ticket throws; `arrive`: runs before a ticket comment
+  // reaches Linear (a hanging one is a crash before it went out), `stall` after it did (a crash
+  // right after); `lost`: the request fails although the comment reached Linear. `comments`:
+  // each ticket's comments.
+  const linear = { failure: null as Error | null, arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]> };
   // Open before-merge manual tasks of the ticket; `unreadable`: reading them fails.
   const blockers: string[] = [];
   const gate = { unreadable: false };
@@ -125,10 +130,14 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     },
     linear: {
       moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; },
-      comment: async (_id, body) => {
+      comment: async (id, body) => {
+        await linear.arrive();
+        linear.comments[id] = [...(linear.comments[id] ?? []), body];
         calls.push(`comment ${body}`);
         await linear.stall();
+        if (linear.lost) throw new Error("socket hang up");
       },
+      hasComment: async (id, text) => (linear.comments[id] ?? []).some((body) => body.includes(text)),
       viewerId: async () => "me",
       userUrl: async () => OWNER,
       linkUrl: async (_id, url, title) => {
@@ -153,6 +162,11 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     },
     github: {
       drafts: async () => github.drafts,
+      pullState: async (_repo, number) => {
+        github.stateReads.push(number);
+        if (github.unreadable.includes(number)) throw new Error("HTTP 502");
+        return github.states[number] ?? github.drafts.find((item) => item.number === number)?.state.toLowerCase() ?? "closed";
+      },
       landed: async (_repo, item) => github.landed.includes(item.number),
       reviewThreads: async () => { github.threadReads++; return github.threads; },
       openPullRequests: async () => {
@@ -182,9 +196,9 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         const answer = (code: number, value: unknown) => ({ code, stdout: `${JSON.stringify(value)}\n`, stderr: "" });
         if (script === WAIT_QUEUE) {
           if (scripts.queueFailure) return { code: 1, stdout: "", stderr: scripts.queueFailure };
-          if (!scripts.judgment) return answer(3, { pr: Number(args[0]), result: "none" });
+          if (!scripts.judgment && !scripts.judgments[Number(args[0])]) return answer(3, { pr: Number(args[0]), result: "none" });
           const draft = args[1] === "--draft" ? Number(args[2]) : null;
-          return answer(2, { result: "dropped", reason: "", ...scripts.judgment, queueDraft: draft });
+          return answer(2, { result: "dropped", reason: "", ...(scripts.judgments[Number(args[0])] ?? scripts.judgment), queueDraft: draft });
         }
         if (script === ENQUEUE_READY) return answer(0, scripts.ready);
         assert.equal(script, BACKSTOP_ENQUEUE);
@@ -1069,8 +1083,8 @@ test("a flaky drop of unchanged code is re-enqueued by the backstop without the 
   h.scripts.onEnqueue = async () => bullets.add(QUEUED);
   assert.deepEqual(await h.poll(), [], "nothing for the agent");
   const calls = await h.backstop();
-  assert.deepEqual(h.scripts.runs, [enqueueRun("drop:#437"), READY_RUN]);
-  assert.deepEqual(firstLines(calls), [`enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#437`, `pr comment #419 ${ENQUEUED}`, `comment ${ENQUEUED}`, "prompt a1"]);
+  assert.deepEqual(h.scripts.runs, [enqueueRun("drop:#437:419"), READY_RUN]);
+  assert.deepEqual(firstLines(calls), [`enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#437:419`, `pr comment #419 ${ENQUEUED}`, `comment ${ENQUEUED}`, "prompt a1"]);
   assert.match(h.github.comments[419][0], /\[queue run #437\]\([^)]+\)\), and it was not the stack's fault: flaky[^]*- `server\/upload\.test\.ts > retries`[^]*The code is unchanged since the drop \(the queue's draft tested these heads\)\. It counts as plain drop 1 of 1; the next plain drop goes to the owner\./);
   assert.deepEqual(await h.backstop(), [], "once");
   bullets.add(running(438), REMOVED);
@@ -1090,7 +1104,7 @@ test("a main-broken drop of unchanged code is re-enqueued once main is green: he
   const held = { code: 3, answer: { result: "held", problems: [{ kind: "main-red", text: "main is red" }] } };
   h.scripts.enqueue = [held, { code: 0, answer: { result: "enqueued", comment: "posted" } }];
   assert.deepEqual(await h.poll(), []);
-  assert.deepEqual(firstLines(await h.backstop()), [`enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#437`], "held: no comment yet");
+  assert.deepEqual(firstLines(await h.backstop()), [`enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#437:419`], "held: no comment yet");
   const enqueued = await h.backstop();
   assert.equal(count(enqueued, "enqueue "), 1);
   assert.match(h.github.comments[419][0], /main-broken[^]*Main-broken drops count toward no limit; the enqueue waits until `main` is green\./);
@@ -1109,7 +1123,7 @@ test("the same heads dropped in two rounds are two re-enqueues, and each drop is
     await h.restart();
     enqueues.push(...(await h.backstop()).filter((call) => call.startsWith("enqueue ")));
   }
-  assert.deepEqual(enqueues, [`enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#437`, `enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#438`]);
+  assert.deepEqual(enqueues, [`enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#437:419`, `enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#438:419`]);
   assert.deepEqual(await h.poll(), []);
   bullets.add(running(439), REMOVED);
   h.github.drafts = [draft(439, [419])];
@@ -1370,4 +1384,160 @@ test("after a restart that came after the landing, the enqueue's comments still 
   assert.equal(count(calls, "enqueue "), 0);
   assert.equal(count(calls, `pr comment #419 ${ENQUEUED}`), 1);
   assert.equal(count(calls, `comment ${ENQUEUED}`), 1);
+});
+
+// The agent enqueued the range first: the backstop's enqueue is held while it is queued.
+const QUEUED_ALREADY = { code: 3, answer: { result: "held", problems: [{ kind: "queued", text: "the range is in the merge queue" }] } };
+
+test("a held enqueue is not retried after the round someone else queued dropped genuinely, whether the poll or the backstop claims that drop first", async (t) => {
+  for (const claimer of ["poll", "backstop"] as const) {
+    const h = harness(t);
+    h.github.view = READY;
+    const bullets = bulletsOf(h, {}, QUEUED);
+    h.scripts.ready = { stacks: [STACK], drops: [] };
+    h.scripts.enqueue = [QUEUED_ALREADY, { code: 0, answer: { result: "enqueued", comment: "posted" } }];
+    assert.equal(count(await h.backstop(), "enqueue "), 1, claimer);
+    bullets.add(running(437), REMOVED);
+    h.github.drafts = [draft(437, [419])];
+    if (claimer === "poll") assert.match(promptOf(await h.poll()) ?? "", /2\. Fix the cause\./, claimer);
+    assert.equal(count(await h.backstop(), "enqueue "), 0, `${claimer}: the range that failed is not enqueued again`);
+    assert.deepEqual(h.scripts.runs.filter((run) => !run.startsWith(WAIT_QUEUE)), [`${READY_RUN} --exclude 419`], `${claimer}: blocked at its head`);
+    if (claimer === "backstop") assert.match(promptOf(await h.poll()) ?? "", /2\. Fix the cause\./, "the backstop's claim goes to the agent");
+    assert.equal(count(await h.backstop(), "enqueue "), 0, `${claimer}: nor later`);
+  }
+});
+
+test("a held enqueue waits while a manual task due before the merge opened meanwhile, or cannot be read, and is enqueued once it is done", async (t) => {
+  for (const gate of ["open", "unreadable"] as const) {
+    const h = harness(t);
+    h.github.view = READY;
+    h.scripts.ready = { stacks: [STACK], drops: [] };
+    h.scripts.enqueue = [{ code: 3, answer: { result: "held", problems: [{ kind: "main-red", text: "main is red" }] } }, { code: 0, answer: { result: "enqueued", comment: "posted" } }];
+    assert.equal(count(await h.backstop(), "enqueue "), 1, gate);
+    if (gate === "open") h.blockers.push("TUC-9");
+    else h.gate.unreadable = true;
+    for (let run = 0; run < 2; run++) {
+      assert.deepEqual(await h.backstop(), [], `${gate}: run ${run}`);
+      assert.deepEqual(h.scripts.runs, [`${READY_RUN} --exclude 419`], `${gate}: run ${run}`);
+    }
+    h.blockers.length = 0;
+    h.gate.unreadable = false;
+    const done = await h.backstop();
+    assert.equal(count(done, "enqueue "), 1, gate);
+    assert.equal(count(done, `pr comment #419 ${ENQUEUED}`), 1, gate);
+  }
+});
+
+test("a held enqueue a newer round superseded is retired: only the drop's own re-enqueue runs", async (t) => {
+  const h = harness(t);
+  h.github.view = READY;
+  const bullets = bulletsOf(h, {}, QUEUED);
+  h.scripts.ready = { stacks: [STACK], drops: [] };
+  h.scripts.enqueue = [QUEUED_ALREADY, { code: 0, answer: { result: "enqueued", comment: "posted" } }];
+  h.scripts.onEnqueue = async () => bullets.add(QUEUED);
+  await h.backstop();
+  bullets.add(running(437), REMOVED);
+  h.github.drafts = [draft(437, [419])];
+  h.scripts.judgment = FLAKY;
+  assert.deepEqual(await h.poll(), []);
+  assert.deepEqual((await h.backstop()).filter((call) => call.startsWith("enqueue ")), [`enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#437:419`]);
+  assert.equal(count(await h.backstop(), "enqueue "), 0);
+});
+
+test("one queue draft that tested two independent stacks gives each its own re-enqueue", async (t) => {
+  const h = harness(t);
+  const dropped = activity(QUEUED, running(450), REMOVED);
+  const other = { ...READY, headSha: "6a6a6a6", headBranch: "mtuchel/other", mergeActivity: dropped };
+  h.github.view = { ...READY, mergeActivity: dropped };
+  h.github.views[prUrl(1600)] = other;
+  h.github.open = [listed(prUrl(1600), other, "Bump the upload library")];
+  h.github.drafts = [draft(450, [419, 1600])];
+  h.scripts.judgments = {
+    419: { ...FLAKY, revision: { ...SAME, draft: 450 } },
+    1600: { ...FLAKY, revision: { ...SAME, draft: 450, branch: "mtuchel/other", expect: "1600@6a6a6a6" } },
+  };
+  h.scripts.ready = { stacks: [], drops: [{ pr: 1600, draft: 450, key: "#450", revision: null }] };
+  assert.deepEqual(await h.poll(), []);
+  const enqueues = [...await h.backstop(), ...await h.backstop()].filter((call) => call.startsWith("enqueue "));
+  assert.deepEqual(enqueues, [`enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#450:419`, "enqueue mtuchel/other --expect 1600@6a6a6a6 --action drop:#450:1600"]);
+  assert.match(h.github.comments[1600][0], /<!-- queue-backstop:drop:#450:1600 -->$/);
+});
+
+test("a range counts as its most-dropped pull request: a plain drop or an escalation of another member keeps the re-enqueue away", async (t) => {
+  const log = t.mock.method(console, "error", () => {});
+  for (const before of [{ drops: ["#436"] }, { escalated: true }]) {
+    const h = harness(t);
+    const step2 = { ...READY, headSha: "5e5e5e5", headBranch: "mtuchel/tuc-1-b", baseBranch: "mtuchel/tuc-1-fix", mergeActivity: activity(QUEUED, running(437), REMOVED) };
+    h.github.open = [listed(prUrl(1501), step2, "Add TUC-1 [plugin] Step two")];
+    h.github.views[prUrl(1501)] = step2;
+    await h.state({ [prUrl(1501)]: { reviewedAt: null, decision: null, merged: false, ...before } });
+    h.github.view = { ...READY, mergeActivity: activity(QUEUED, running(437), REMOVED) };
+    h.github.drafts = [draft(437, [419, 1501])];
+    h.scripts.judgment = { ...FLAKY, revision: { ...SAME, branch: "mtuchel/tuc-1-b", expect: `419@${HEAD},1501@5e5e5e5` } };
+    const calls = await h.poll();
+    if ("drops" in before) assert.match(calls[0], /dropped this stack again[^]*so far: 2 plain, 0 conflict-only\./, "the second plain drop of the range goes to the owner");
+    else {
+      assert.deepEqual(calls, []);
+      assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /whose range already escalated to the owner/);
+    }
+    assert.equal(count(await h.backstop(), "enqueue "), 0, JSON.stringify(before));
+    assert.deepEqual(h.scripts.runs, [`${READY_RUN} --exclude 419 --exclude 1501`], `${JSON.stringify(before)}: the whole range escalated`);
+  }
+});
+
+test("the ticket comment of an enqueue is looked up by its mark before it goes out: a lost answer never doubles it, and one that never went out is posted after a restart", async (t) => {
+  t.mock.method(console, "error", () => {});
+  for (const failure of ["lost answer", "crash before it went out"] as const) {
+    const h = harness(t);
+    h.github.view = READY;
+    h.scripts.ready = { stacks: [STACK], drops: [] };
+    if (failure === "lost answer") {
+      h.linear.lost = true;
+      await h.backstop();
+      h.linear.lost = false;
+    } else {
+      const stop = hang();
+      h.linear.arrive = stop.point;
+      void h.backstop();
+      await stop.reached;
+      h.linear.arrive = async () => {};
+    }
+    await h.restart();
+    await h.backstop();
+    await h.backstop();
+    assert.equal(h.linear.comments.i1?.length, 1, failure);
+    assert.match(h.linear.comments.i1?.[0] ?? "", /^Paseo's queue backstop enqueued [^]*\n\n`queue-backstop:ready:419@a1b2c3d4e5f6`$/, failure);
+  }
+});
+
+test("a queue-tip conflict's draft is read by its number: still open but out of Graphite's listing, or unreadable, it holds the refusal", async (t) => {
+  const h = harness(t);
+  t.mock.method(console, "error", () => {});
+  h.github.view = READY;
+  h.scripts.ready = { stacks: [STACK], drops: [] };
+  h.scripts.enqueue = [{ code: 2, answer: { result: "refused", problems: [{ kind: "conflict-tip", draft: 900, text: "conflicts with the queue tip" }] } }, { code: 0, answer: { result: "enqueued", comment: "posted" } }];
+  await h.backstop();
+  await h.poll();
+  // Thirty newer drafts pushed #900 out of Graphite's listing.
+  h.github.drafts = [];
+  h.github.states[900] = "open";
+  assert.deepEqual(await h.backstop(), [], "still open");
+  assert.deepEqual(h.scripts.runs, [`${READY_RUN} --skip ${STACK.action}`], "still open");
+  h.github.unreadable = [900];
+  assert.deepEqual(await h.backstop(), [], "unreadable");
+  assert.deepEqual(h.scripts.runs, [`${READY_RUN} --skip ${STACK.action}`], "unreadable");
+  h.github.unreadable = [];
+  h.github.states[900] = "closed";
+  assert.equal(count(await h.backstop(), "enqueue "), 1, "closed: retried");
+});
+
+test("a drop claimed while its pull request still holds an earlier message is queued behind it, and both go out once", async (t) => {
+  const h = harness(t);
+  h.github.open = [listed(prUrl(1700), { ...OPEN_PR, headSha: "7a7a7a7", headBranch: "mtuchel/bump" }, "Bump the upload library")];
+  h.github.drafts = [draft(450, [1700])];
+  await h.state({ [prUrl(1700)]: { reviewedAt: null, decision: null, merged: false, pending: { key: "refused:earlier", reason: "an earlier refusal", facts: "Earlier message.", fix: "Earlier message.", orphan: { tickets: [] } } } });
+  h.scripts.ready = { stacks: [], drops: [{ pr: 1700, draft: 450, key: "#450", revision: null }] };
+  assert.deepEqual(firstLines(await h.backstop()), ["pr comment #1700 Earlier message.", `pr comment #1700 The Graphite merge queue dropped [the pull request](${prUrl(1700)}) without merging it.`]);
+  assert.match(h.github.comments[1700][1], /2\. Fix the cause\.[^]*<!-- queue-backstop:route:#450 -->$/);
+  assert.deepEqual(await h.backstop(), [], "each once");
 });

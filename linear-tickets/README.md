@@ -686,13 +686,16 @@ what kind of drop it is: the plugin runs `tools/ci/wait-queue.mjs <pr> --draft <
 without a draft) from the [queue backstop's checkout](#queue-backstop) and reads its `class`,
 `requeue`, `evidence`, `revision` and failed checks (`docs/automation/merge-queue.md`). A repo
 without that checkout has no classes: its drops are genuine. A run that fails or prints no JSON
-claims nothing, and the next poll decides again. The class counts per pull request, on every
-pull request of the dropped range: `conflictOnly` toward up to five restacks, `mainBroken`
-toward nothing (it never escalates), every other class (`infra`, `flaky`, `genuine`) toward one
-fix request. The next drop past a limit only mentions you ("the merge queue dropped this stack
-again", with both counts), every pull request of the range is marked escalated, and after that
-drops of any kind are only logged. Drops claimed before the kinds existed count as plain, and
-three of them as escalated. Then, by class and revision:
+claims nothing, and the next poll decides again. The class counts on every pull request of the
+dropped range: `conflictOnly` toward up to five restacks, `mainBroken` toward nothing (it never
+escalates), every other class (`infra`, `flaky`, `genuine`) toward one fix request. A range
+counts as its most-dropped pull request: the next drop past a limit on any of them only mentions
+you ("the merge queue dropped this stack again", with both counts), every pull request of the
+range is marked escalated, and after that drops of any kind are only logged; a drop of a range
+one of whose pull requests escalated already escalates the whole range, too. Drops claimed
+before the kinds existed count as plain, and three of them as escalated. A newer round of a range
+retires the backstop's enqueues of it that had not gone through yet (unless the range changed
+since the drop). Then, by class and revision:
 
 - not the stack's fault (`requeue`), the code provably the code that dropped (`revision` is
   `same`, or the backstop's own enqueue of these very heads came right before this round) and no
@@ -732,9 +735,10 @@ waiting for an answer, or Paseo is not connected, the message waits for a later 
 agent is gone or archived, the same text becomes a ticket comment mentioning you, and the ticket
 moves back to In Progress (when status write-back is on). Each drop is claimed in
 `$PASEO_HOME/linear-tickets/pr-watch.json` (by its draft, or by the bullet when there is none)
-before anything is sent, so it is delivered at most once, also across restarts. An archived
-agent's open pull request stays watched until that escalation or 14 days without activity. When
-GitHub throttles `gh`, the rest of the poll waits for the next one.
+before anything is sent, so it is delivered at most once, also across restarts. A message for a
+pull request that still holds an undelivered one waits behind it and goes out after it. An
+archived agent's open pull request stays watched until that escalation or 14 days without
+activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
 
 **Queue backstop.** Every 10 minutes, and right after a poll claimed a drop to re-enqueue, the
 plugin enqueues on its own what nobody else did. It runs the repo's scripts, never its own
@@ -744,7 +748,13 @@ recorded worktree of the repo and reset to `origin/main` (fetched first) before 
 whose `main` has no `tools/ci/enqueue-ready.mjs` gets no backstop. One run at a time, taking turns
 with the poll:
 
-1. Re-enqueues claimed above, and earlier enqueues that are still due or held, move on.
+1. Re-enqueues claimed above, and earlier enqueues that are still due or held, move on. Right
+   before each enqueue the range is checked again as it is now: a round on its top pull request
+   that ended and nobody claimed yet is claimed first, like the poll's. The enqueue is dropped for
+   good when a newer round superseded it, a pull request of the range closed or has a new head,
+   the range escalated, or a pull request of it is blocked at its head; it waits for the next run
+   while that round is not judged yet, a message about the range is still pending, or a
+   before-merge manual task of its tickets is open (or cannot be read).
 2. `node tools/ci/enqueue-ready.mjs --ready-minutes 10 --exclude <pr>… --skip <action>…` lists
    the stacks that have been green, reviewed and without open threads for 10 minutes and nobody
    enqueued, and the drops it saw. Excluded are escalated pull requests, ones blocked at their
@@ -757,17 +767,21 @@ with the poll:
    <pr>@<sha>,… --action <id> --comment-file <file>`, which re-checks every head and runs the
    checkout's `tools/ci/enqueue.mjs`.
 
-Every enqueue is an action (`drop:<drop key>` or `ready:<top>@<heads>`) saved in `pr-watch.json`
-before each step: the number and last text of the top pull request's Merge activity bullets right
-before the enqueue, then the enqueue, the pull request comment, the ticket comment and the note
-to the agent. Enqueued: the script comments on the top pull request (marked `<!-- queue-backstop:
-<action> -->`, never twice), the plugin comments on each ticket and tells a running agent that
+Every enqueue is an action (`drop:<drop key>:<top>`, since one queue draft can test several
+stacks, or `ready:<top>@<heads>`) saved in `pr-watch.json` before each step: the number and last
+text of the top pull request's Merge activity bullets right before the enqueue, then the enqueue,
+the pull request comment, the ticket comment and the note to the agent. Enqueued: the script
+comments on the top pull request (marked `<!-- queue-backstop:<action> -->`, never twice), the
+plugin comments on each ticket (ending in `` `queue-backstop:<action>` ``; the ticket's comments
+are searched for it before posting, and a ticket counts as done only once Linear confirmed it, so
+a lost answer never doubles it and a crash never skips it) and tells a running agent that
 nothing is needed from it. Held (`main` red or unknown, or already queued): retried on the next
 run. Refused: routed once per refusal (action and kind, plus the draft for a queue-tip conflict)
 to the agent, the ticket when the agent is gone, or as one marked comment on the pull request
 when there is no ticket. A refusal is retried only after the change that can fix it: a new head
-(a new action), the queue draft's end for a queue-tip conflict, at most hourly for a local branch
-that differs from GitHub, the `do-not-merge` label's removal for a veto. An answer that is not the
+(a new action), the end of the queue draft for a queue-tip conflict (read by its number; a state
+that cannot be read keeps the refusal), at most hourly for a local branch that differs from
+GitHub, the `do-not-merge` label's removal for a veto. An answer that is not the
 script's JSON, or an exit it does not document, never counts as an enqueue. After a restart an
 enqueue whose outcome was not recorded is decided by the Merge activity: an enqueue bullet after
 the saved bullets means it went through, none means it is retried while the pull request is open,

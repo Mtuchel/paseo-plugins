@@ -271,9 +271,12 @@ export type MessageStep = "none" | "due" | "started" | "done";
 // The number of Graphite's Merge activity bullets on the top pull request and the last one's text,
 // read right before the enqueue: bullets appended after it belong to this enqueue.
 export type ActivityBoundary = { count: number; last: string | null };
-// One automatic enqueue of a range, saved before each step. `id` is round-specific:
-// `drop:<drop key>` or `ready:<top>@<shas>`. `why` opens its comments. `followedBy`: the drop key
-// of the queue round that followed it once it was enqueued.
+// One automatic enqueue of a range, saved before each step. `id` is round- and range-specific:
+// `drop:<drop key>:<top>` (a queue draft can test several stacks, each its own range) or
+// `ready:<top>@<shas>`; it names the action in its refusals and comment markers. `why` opens its
+// comments. `linearDone`: the tickets whose comment is confirmed. `followedBy`: the drop key of
+// the queue round that followed it once it was enqueued. `supersededBy`: the drop key of a newer
+// round claimed on its range before its own enqueue was confirmed; it is never enqueued after it.
 export type ActionRecord = {
   id: string;
   repo: string;
@@ -288,6 +291,7 @@ export type ActionRecord = {
   steps: { enqueue: EnqueueStep; prComment: MessageStep; linearComment: MessageStep; note: MessageStep };
   linearDone?: string[];
   followedBy?: string;
+  supersededBy?: string;
 };
 // A refused enqueue, routed once per key (action + problem kind, + draft for a queue-tip
 // conflict) and released by the change that can fix it (see released). `text`: the script's words.
@@ -330,6 +334,12 @@ export function reconcile(boundary: ActivityBoundary | null, bullets: { text: st
 
 export function marker(id: string): string {
   return `<!-- queue-backstop:${id} -->`;
+}
+
+// The ticket comment's mark: Linear does not keep HTML comments, so it is a visible code span,
+// and a retry finds it by this text (see LinearService.hasComment).
+export function ticketMarker(id: string): string {
+  return `queue-backstop:${id}`;
 }
 
 // Posts a pull request comment with the marker once: nothing when a comment carries it already.

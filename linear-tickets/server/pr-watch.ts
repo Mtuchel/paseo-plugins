@@ -11,7 +11,7 @@ import { CODING_STATE } from "./plannotator";
 import { STAGE_STEP, stalledStage, type ReviewThread, type Stage } from "./pr-nudge";
 import {
   activityBoundary, BACKSTOP_ENQUEUE, BackstopCheckout, CLASS_TEXT, commentOnce, dropWhy, ENQUEUE_READY, enqueueArgs, enqueuedComment, HELD_KINDS, parseEnqueue, parseExpect, parseJudgment, parseReady,
-  READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, runNodeScript, WAIT_QUEUE, waitQueueArgs,
+  READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, runNodeScript, ticketMarker, WAIT_QUEUE, waitQueueArgs,
   type ActionRecord, type DropClass, type DropJudgment, type Problem, type Refusal, type ScriptRunner,
 } from "./queue-backstop";
 import { RateLimitedError, withPriority } from "./rate-budget";
@@ -81,7 +81,8 @@ export type PullRequestView = {
 // conflict-only ones, `mainBroken` the main-broken ones (counted toward neither limit).
 // `escalated`: a drop went to the owner (every pull request of the range is marked); before drops
 // had kinds that was the third drop. `pending`: the claimed drop (or refused enqueue) still to be
-// delivered. `replay`: closed without merging, `due` until the closure was looked at once,
+// delivered, `queued` the messages routed to the same pull request while it was, delivered in turn
+// after it (see route). `replay`: closed without merging, `due` until the closure was looked at once,
 // `asked` once the agent was told to open a replacement pull request (see replace). `nudges`: per
 // stage, one key per nudge (or the escalation after them): the head, or for requested changes the
 // reviews it covered, space-separated (see stalledStage). `activeAt`: the last change, drop or
@@ -92,7 +93,7 @@ export type PullRequestView = {
 // whose code could not be compared) left, which no automatic enqueue touches until a new head;
 // `actions`, its enqueues of ranges whose top this is; `refusals`, their refused enqueues.
 type Seen = {
-  reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; conflicts?: string[]; mainBroken?: string[]; escalated?: boolean; pending?: PendingDrop | null; replay?: "due" | "asked"; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean; advance?: "due";
+  reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; conflicts?: string[]; mainBroken?: string[]; escalated?: boolean; pending?: PendingDrop | null; queued?: PendingDrop[]; replay?: "due" | "asked"; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean; advance?: "due";
   blockedAt?: string; actions?: ActionRecord[]; refusals?: Refusal[];
 };
 // A claimed drop or refused enqueue, saved before anything is sent. `fix` goes to the agent (or,
@@ -112,8 +113,10 @@ export type OpenPull = { number: number; url: string; title: string; headBranch:
 // The GitHub reads beyond the pull request itself, and the queue backstop's pull request comments;
 // `repo` is `owner/name`.
 export type GitHubReader = {
-  // Graphite's recent draft pull requests in the repo.
+  // Graphite's recent draft pull requests in the repo (the latest 30).
   drafts(repo: string): Promise<QueueDraft[]>;
+  // One pull request's state as REST names it (`open` or `closed`), however old it is.
+  pullState(repo: string, number: number): Promise<string>;
   // Whether the draft's head reached its base branch.
   landed(repo: string, draft: QueueDraft): Promise<boolean>;
   reviewThreads(repo: string, number: number): Promise<ReviewThread[]>;
@@ -133,7 +136,7 @@ type Drop = { key: string; reason: string; repo: string; number: number; draft: 
 // `conflict`: the repo's class is conflictOnly; `main`: mainBroken; `plain`: any other class.
 type DropKind = "plain" | "conflict" | "main";
 // What one poll or backstop run reads at most once per repo.
-type RunContext = { records: HandoverRecord[]; pulls(repo: string): Promise<OpenPull[]>; checkout(repo: string): Promise<string | null>; now: number };
+type RunContext = { records: HandoverRecord[]; pulls(repo: string): Promise<OpenPull[]>; drafts(repo: string): Promise<QueueDraft[]>; checkout(repo: string): Promise<string | null>; now: number };
 
 const pullUrl = (repo: string, number: number) => `https://github.com/${repo}/pull/${number}`;
 const PULL_URL = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/;
@@ -260,6 +263,9 @@ export const githubReader: GitHubReader = {
       ["pr", "list", "-R", repo, "--state", "all", "--author", "app/graphite-app", "--limit", "30", "--json", "number,title,body,state,headRefOid,baseRefName"]);
     return drafts.map((draft) => ({ number: draft.number, title: draft.title ?? "", body: draft.body ?? "", state: draft.state ?? "", headSha: draft.headRefOid ?? "", base: draft.baseRefName ?? "main" }));
   },
+  async pullState(repo, number) {
+    return ghJson(["api", `repos/${repo}/pulls/${number}`, "--jq", ".state"], (stdout) => stdout.trim());
+  },
   async landed(repo, draft) {
     // Compared from the draft's head: the base branch is `identical` or `ahead` once it contains it.
     const { status } = await ghJson<{ status?: string }>(["api", `repos/${repo}/compare/${draft.headSha}...${encodeURIComponent(draft.base)}`, "--jq", "{status}"]);
@@ -348,6 +354,13 @@ function escalated(seen: Seen | undefined): boolean {
 // Every drop key claimed on the pull request, of any kind.
 function handledDrops(seen: Seen | undefined): string[] {
   return [...(seen?.drops ?? []), ...(seen?.conflicts ?? []), ...(seen?.mainBroken ?? [])];
+}
+
+// The pull request's message slot once its pending message went out: the next message routed to
+// it while that one waited, if any (see route).
+function nextMessage(seen: Seen): Pick<Seen, "pending" | "queued"> {
+  const [next = null, ...rest] = seen.queued ?? [];
+  return { pending: next, queued: rest.length ? rest : undefined };
 }
 
 // The dropped queue range, lowest first, with its top pull request and that one's branch, the one
@@ -458,7 +471,7 @@ export class PullRequestWatch {
       handover: Pick<Handover, "all" | "update">;
       sessions: Pick<SessionRouter, "sessionFor" | "say" | "prompt" | "link">;
       // `issueState` finds a ticket that has no handover record by its identifier.
-      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "viewerId" | "userUrl" | "linkUrl"> & Partial<Pick<LinearService, "issueState">>;
+      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "hasComment" | "viewerId" | "userUrl" | "linkUrl"> & Partial<Pick<LinearService, "issueState">>;
       // `tasks` finds the before-merge tasks of tickets that have no handover record.
       manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge"> & Partial<Pick<ManualTasks, "tasks">>;
       settings: Pick<Settings, "read">;
@@ -537,10 +550,11 @@ export class PullRequestWatch {
     return (this.deps.view ?? viewPullRequest)(url);
   }
 
-  // The poll's and the backstop's reads, once per repo: the open pull requests and the backstop
-  // checkout (made from the worktree of any record of the repo).
+  // The poll's and the backstop's reads, once per repo: the open pull requests, Graphite's drafts
+  // and the backstop checkout (made from the worktree of any record of the repo).
   private context(records: HandoverRecord[]): RunContext {
     const pulls = new Map<string, Promise<OpenPull[]>>();
+    const drafts = new Map<string, Promise<QueueDraft[]>>();
     const checkouts = new Map<string, Promise<string | null>>();
     const checkout = this.deps.backstop?.checkout ?? new BackstopCheckout();
     return {
@@ -549,6 +563,11 @@ export class PullRequestWatch {
       pulls: (repo) => {
         const listing = pulls.get(repo) ?? this.github().openPullRequests(repo);
         pulls.set(repo, listing);
+        return listing;
+      },
+      drafts: (repo) => {
+        const listing = drafts.get(repo) ?? this.github().drafts(repo);
+        drafts.set(repo, listing);
         return listing;
       },
       checkout: (repo) => {
@@ -580,13 +599,8 @@ export class PullRequestWatch {
       if (record.status !== "archived" || seen?.pending || seen?.replay === "due" || seen?.advance === "due" || watched || await manual?.awaitingMerge(record.issueId)) records.push(record);
     }
     // Graphite's drafts and the open pull requests are listed once per repo and poll.
-    const drafts = new Map<string, Promise<QueueDraft[]>>();
-    const listDrafts = (repo: string) => {
-      const listing = drafts.get(repo) ?? this.github().drafts(repo);
-      drafts.set(repo, listing);
-      return listing;
-    };
     const context = this.context(all);
+    const listDrafts = context.drafts;
     const listPulls = context.pulls;
     const save = () => this.save(seenByUrl);
     // Agents that got a message this poll: one instruction per agent and poll, so the pull
@@ -616,7 +630,7 @@ export class PullRequestWatch {
         } catch (error) {
           if (!(error instanceof PullRequestNotFoundError)) throw error;
           console.error(`[linear-tickets] ${record.identifier}: ${url} does not exist (${error.message}); it is no longer watched`);
-          seenByUrl[url] = { ...(seenByUrl[url] ?? { reviewedAt: null, decision: null, merged: false }), missing: true, pending: null };
+          seenByUrl[url] = { ...(seenByUrl[url] ?? { reviewedAt: null, decision: null, merged: false }), missing: true, pending: null, queued: undefined };
           return;
         }
         const result = reviewChange(view, seenByUrl[url] ?? { reviewedAt: null, decision: null, merged: false });
@@ -629,7 +643,7 @@ export class PullRequestWatch {
         seenByUrl[url] = { ...seen, closed, ...(closed && !seen.closed ? { replay: "due" as const } : {}), ...(change?.review === "merged" ? { advance: "due" as const } : {}), ...(change ? { activeAt: now } : {}) };
         if (view.state !== "OPEN") {
           if (seenByUrl[url].pending) console.error(`[linear-tickets] ${record.identifier}: ${url} is no longer open; the merge queue drop is not reported`);
-          seenByUrl[url] = { ...seenByUrl[url], pending: null };
+          seenByUrl[url] = { ...seenByUrl[url], pending: null, queued: undefined };
           if (closed || seen.merged) nudges.push({ record, url, view });
           return;
         }
@@ -648,7 +662,7 @@ export class PullRequestWatch {
         const pending = seenByUrl[url].pending;
         // Recorded as delivered as soon as the message went out, before any session line.
         if (pending) await this.deliver(record, url, pending, save, reserved, async () => {
-          seenByUrl[url] = { ...seenByUrl[url], pending: null };
+          seenByUrl[url] = { ...seenByUrl[url], ...nextMessage(seenByUrl[url]) };
           await save();
         });
         // A stalled pull request gets its next step, but never in a poll that handles a drop.
@@ -711,9 +725,12 @@ export class PullRequestWatch {
   // A drop as the repo's `wait-queue.mjs` judges it (class, requeue, revision; see
   // queue-backstop.ts), claimed on every pull request of the dropped range and counted by class:
   // conflict-only toward the restack limit, main-broken toward none, every other class toward the
-  // plain limit. The next drop of a counted kind past its limit escalates to the owner (every pull
-  // request of the range is marked); after the escalation drops of any kind only reach the log.
-  // Otherwise:
+  // plain limit. The range counts as its most-dropped pull request: the next drop of a counted kind
+  // past its limit on any of them escalates to the owner, and so does a drop of a range one of
+  // whose pull requests escalated already (every pull request of the range is marked); after the
+  // escalation drops of any kind only reach the log. A newer round retires the range's automatic
+  // enqueues that had not gone through yet (see supersede), unless the range changed since the
+  // drop. Otherwise:
   // - not the stack's fault, the code provably the code that dropped (`same`, or the backstop's
   //   own enqueue of the current heads came right before the round) and no manual task due before
   //   the merge open: the backstop re-enqueues the range (an action, see advanceAction);
@@ -733,6 +750,7 @@ export class PullRequestWatch {
       console.error(`[linear-tickets] ${record?.identifier ?? drop.repo}: the merge queue dropped ${url} again; already escalated to the owner`);
       // The kind no longer matters: the key only keeps the drop from being claimed again.
       seen.drops = [...(seen.drops ?? []), drop.key];
+      this.supersede(drop.repo, [drop.number], drop.key, seenByUrl);
       return true;
     }
     const judgment = await this.judge(drop.repo, drop.number, drop.draft?.number ?? null, context);
@@ -741,13 +759,18 @@ export class PullRequestWatch {
     const range = dropRange(drop, judgment, open);
     const kind = DROP_KIND[judgment.class];
     const list = kind === "conflict" ? "conflicts" : kind === "main" ? "mainBroken" : "drops";
-    for (const pr of range.prs) {
-      const member = entry(seenByUrl, pullUrl(drop.repo, pr));
-      if (!handledDrops(member).includes(drop.key)) member[list] = [...(member[list] ?? []), drop.key];
+    const members = range.prs.map((pr) => entry(seenByUrl, pullUrl(drop.repo, pr)));
+    for (const member of members) if (!handledDrops(member).includes(drop.key)) member[list] = [...(member[list] ?? []), drop.key];
+    if (judgment.revision.state !== "changed") this.supersede(drop.repo, range.prs, drop.key, seenByUrl);
+    if (members.some((member) => escalated(member))) {
+      for (const member of members) member.escalated = true;
+      console.error(`[linear-tickets] ${record?.identifier ?? drop.repo}: the merge queue dropped ${url}, whose range already escalated to the owner`);
+      return true;
     }
-    const plain = seen.drops?.length ?? 0;
-    const conflicts = seen.conflicts?.length ?? 0;
-    const main = seen.mainBroken?.length ?? 0;
+    const most = (field: "drops" | "conflicts" | "mainBroken") => Math.max(...members.map((member) => member[field]?.length ?? 0));
+    const plain = most("drops");
+    const conflicts = most("conflicts");
+    const main = most("mainBroken");
     const reason = drop.reason || judgment.reason;
     const draft = judgment.queueDraft;
     const facts = [
@@ -762,7 +785,7 @@ export class PullRequestWatch {
     const target = { record, url, tickets };
     const count = kind === "plain" ? plain : conflicts;
     if (kind !== "main" && count > DROP_PROMPTS[kind]) {
-      for (const pr of range.prs) entry(seenByUrl, pullUrl(drop.repo, pr)).escalated = true;
+      for (const member of members) member.escalated = true;
       this.route(seenByUrl, target, { key: drop.key, reason, facts: `${facts}\nDrops of this pull request so far: ${plain} plain, ${conflicts} conflict-only.`, fix: null });
       return true;
     }
@@ -775,10 +798,10 @@ export class PullRequestWatch {
       : kind === "conflict" ? `This is conflict-only drop ${conflicts} of ${DROP_PROMPTS.conflict} before the owner takes over.`
       : `It counts as plain drop ${plain} of ${DROP_PROMPTS.plain}; the next plain drop goes to the owner.`;
     if (judgment.requeue && proof && !gated) {
-      const members = parseExpect(proof.expect) ?? [];
-      const top = members.at(-1)?.pr ?? range.top;
+      const heads = parseExpect(proof.expect) ?? [];
+      const top = heads.at(-1)?.pr ?? range.top;
       const action: ActionRecord = {
-        id: `drop:${drop.key}`, repo: drop.repo, branch: proof.branch ?? range.branch, expect: proof.expect, prs: members.map((member) => member.pr), top, tickets,
+        id: `drop:${drop.key}:${top}`, repo: drop.repo, branch: proof.branch ?? range.branch, expect: proof.expect, prs: heads.map((head) => head.pr), top, tickets,
         why: dropWhy(drop.repo, judgment, unchanged, counted), at: new Date(context.now).toISOString(), activityBoundary: null,
         steps: { enqueue: "due", prComment: "none", linearComment: "none", note: "none" },
       };
@@ -864,12 +887,30 @@ export class PullRequestWatch {
 
   // A message for the ticket's agent goes to its record's pull request, delivered by the poll (see
   // deliver); without a record, to the pull request's own entry, delivered by the backstop (see
-  // deliverOrphan). False while that entry still holds an earlier message.
-  private route(seenByUrl: Record<string, Seen>, target: { record: HandoverRecord | null; url: string; tickets: string[] }, pending: PendingDrop): boolean {
+  // deliverOrphan). While that entry still holds an earlier message, it is queued behind it and
+  // delivered once the earlier one went out (see nextMessage), so a claimed drop is never lost; a
+  // message with the same key already waiting there is not added twice.
+  private route(seenByUrl: Record<string, Seen>, target: { record: HandoverRecord | null; url: string; tickets: string[] }, pending: PendingDrop): void {
     const seen = entry(seenByUrl, target.record?.links["Pull request"] ?? target.url);
-    if (seen.pending) return false;
-    seen.pending = target.record ? pending : { ...pending, orphan: { tickets: target.tickets } };
-    return true;
+    const message = target.record ? pending : { ...pending, orphan: { tickets: target.tickets } };
+    if (!seen.pending) seen.pending = message;
+    else if (![seen.pending, ...(seen.queued ?? [])].some((waiting) => waiting.key === pending.key)) seen.queued = [...(seen.queued ?? []), message];
+  }
+
+  // A newer queue round of the range retires its automatic enqueues that had not gone through yet:
+  // due, held or refused ones close; one whose outcome is not recorded yet (`started`) closes once
+  // its Merge activity shows it did not go through (see advanceAction). That round's own outcome
+  // is the drop path's.
+  private supersede(repo: string, prs: number[], key: string, seenByUrl: Record<string, Seen>): void {
+    for (const [url, seen] of Object.entries(seenByUrl)) {
+      if (PULL_URL.exec(url)?.[1] !== repo) continue;
+      for (const action of seen.actions ?? []) {
+        const { enqueue } = action.steps;
+        if (!action.prs.some((pr) => prs.includes(pr)) || !["due", "held", "refused", "started"].includes(enqueue)) continue;
+        action.supersededBy = key;
+        if (enqueue !== "started") action.steps.enqueue = "closed";
+      }
+    }
   }
 
   // The tickets, of `among`, whose before-merge manual tasks are open; a gate that cannot be read
@@ -989,7 +1030,8 @@ export class PullRequestWatch {
     // The ready stacks, and the drops claimed above, are enqueued right away.
     await advance();
     await this.routeRefusals(repo, seenByUrl, context, save);
-    for (const [url, seen] of inRepo()) if (seen.pending?.orphan) await this.deliverOrphan(url, seen, context, save);
+    // Every message waiting for a pull request without a record goes out in turn.
+    for (const [url, seen] of inRepo()) while (seen.pending?.orphan) await this.deliverOrphan(url, seen, context, save);
   }
 
   // The pull requests no automatic enqueue may touch: escalated ones, ones blocked at their head
@@ -1015,32 +1057,48 @@ export class PullRequestWatch {
   }
 
   // The actions whose refusals are not released yet (see released): `enqueue-ready.mjs` skips them.
+  // A queue-tip conflict's draft is read by its number (Graphite's listing names only its latest
+  // drafts); one whose state cannot be read counts as open, so its refusal holds.
   private async skips(repo: string, seenByUrl: Record<string, Seen>, open: OpenPull[], now: number): Promise<string[]> {
     const skips = new Set<string>();
-    let drafts: Set<number> | null = null;
+    const openDrafts = new Set<number>();
+    const read = new Set<number>();
     for (const [url, seen] of Object.entries(seenByUrl)) {
       if (PULL_URL.exec(url)?.[1] !== repo) continue;
       for (const refusal of seen.refusals ?? []) {
-        if (refusal.kind === "conflict-tip") drafts ??= new Set((await this.github().drafts(repo)).filter((draft) => draft.state === "OPEN").map((draft) => draft.number));
-        const prs = seen.actions?.find((action) => action.id === refusal.action)?.prs ?? [];
+        const action = seen.actions?.find((item) => item.id === refusal.action);
+        // Only a refusal still holding its action back is worth a read.
+        if (refusal.kind === "conflict-tip" && refusal.draft !== null && action?.steps.enqueue === "refused" && !read.has(refusal.draft)) {
+          read.add(refusal.draft);
+          try {
+            if (await this.github().pullState(repo, refusal.draft) !== "closed") openDrafts.add(refusal.draft);
+          } catch (error) {
+            if (error instanceof GitHubRateLimitedError) throw error;
+            console.error(`[linear-tickets] queue backstop: the state of queue draft #${refusal.draft} could not be read (${error instanceof Error ? error.message : error}); its refusal holds`);
+            openDrafts.add(refusal.draft);
+          }
+        }
+        const prs = action?.prs ?? [];
         const vetoed = open.some((pull) => prs.includes(pull.number) && pull.labels.includes(DO_NOT_MERGE_LABEL));
-        if (!released(refusal, now, drafts ?? new Set(), vetoed)) skips.add(refusal.action);
+        if (!released(refusal, now, openDrafts, vetoed)) skips.add(refusal.action);
       }
     }
     return [...skips];
   }
 
   // One action's next steps, each saved before it runs (see ActionRecord):
-  // - `due`/`held`: the top pull request's Merge activity is read as the boundary right before
-  //   `backstop-enqueue.mjs` runs; enqueued, held (retried on the next run), refused (each new
-  //   refusal key is routed once, see routeRefusals) or closed (`range-changed` before any enqueue);
-  //   an error or an answer that cannot be read leaves it `started`;
+  // - `due`/`held`: the range is checked again as it is now (see stale), which may close the action
+  //   or keep it for the next run; then the top pull request's Merge activity is read as the
+  //   boundary right before `backstop-enqueue.mjs` runs; enqueued, held (retried on the next run),
+  //   refused (each new refusal key is routed once, see routeRefusals) or closed (`range-changed`
+  //   before any enqueue); an error or an answer that cannot be read leaves it `started`;
   // - `started` (a restart, or that error): reconciled from the bullets appended after the
   //   boundary: an enqueue bullet means enqueued; none means not enqueued, retried while the pull
-  //   request is open; a boundary that no longer matches can tell neither, so it is not retried
-  //   but routed to the agent;
+  //   request is open and no newer round superseded it; a boundary that no longer matches can tell
+  //   neither, so it is not retried but routed to the agent;
   // - enqueued: the pull request comment (by marker, also after the pull request closed or
-  //   landed), the ticket comment and a note to a living agent that nothing is needed from it.
+  //   landed), the ticket comment (by its mark, see ticketMarker) and a note to a living agent
+  //   that nothing is needed from it.
   private async advanceAction(action: ActionRecord, seenByUrl: Record<string, Seen>, context: RunContext, checkout: string, save: () => Promise<void>): Promise<void> {
     const { steps } = action;
     const topUrl = pullUrl(action.repo, action.top);
@@ -1059,13 +1117,22 @@ export class PullRequestWatch {
         for (const member of parseExpect(action.expect) ?? []) entry(seenByUrl, pullUrl(action.repo, member.pr)).blockedAt = member.sha;
         const holder = entry(seenByUrl, topUrl);
         holder.refusals = [...(holder.refusals ?? []), { key: `${action.id} unclear`, action: action.id, kind: "unclear", draft: null, at: new Date(context.now).toISOString(), routedAt: null, retryAfter: null }];
-      } else steps.enqueue = view.state === "OPEN" ? "due" : "closed";
+      } else steps.enqueue = view.state === "OPEN" && !action.supersededBy ? "due" : "closed";
       await save();
     }
     if (steps.enqueue === "due" || steps.enqueue === "held") {
       const view = await this.view(topUrl);
       if (view.state !== "OPEN") {
         steps.enqueue = "closed";
+        await save();
+        return;
+      }
+      const stale = await this.stale(action, view, seenByUrl, context);
+      if (stale) {
+        if (stale.close) {
+          steps.enqueue = "closed";
+          console.error(`[linear-tickets] queue backstop: ${action.id} is not enqueued: ${stale.why}`);
+        }
         await save();
         return;
       }
@@ -1089,20 +1156,16 @@ export class PullRequestWatch {
       await save();
     }
     if (steps.linearComment === "due" || steps.linearComment === "started") {
+      const mark = ticketMarker(action.id);
+      steps.linearComment = "started";
       for (const { identifier, issueId } of await this.issueIds(action.tickets, context.records)) {
-        const done = action.linearDone ?? [];
-        if (done.includes(identifier)) continue;
-        // Recorded before it goes out: a comment whose result was lost (a restart) is not posted
-        // again; one that failed outright is retried on the next run.
-        action.linearDone = [...done, identifier];
-        steps.linearComment = "started";
+        if ((action.linearDone ?? []).includes(identifier)) continue;
+        // Looked up before it goes out, and recorded only once Linear confirmed it: a comment whose
+        // answer was lost (a restart, a request that failed after it reached Linear) is found by
+        // its mark and not posted again; one that never went out is posted on the next run.
+        if (!await this.deps.linear.hasComment(issueId, mark)) await this.deps.linear.comment(issueId, `${enqueuedComment(action)}\n\n\`${mark}\``);
+        action.linearDone = [...(action.linearDone ?? []), identifier];
         await save();
-        try {
-          await this.deps.linear.comment(issueId, enqueuedComment(action));
-        } catch (error) {
-          action.linearDone = done;
-          throw error;
-        }
       }
       steps.linearComment = "done";
       await save();
@@ -1119,6 +1182,38 @@ export class PullRequestWatch {
       steps.note = "done";
       await save();
     }
+  }
+
+  // Right before an action enqueues, its range is checked again as it is now: the ready run and the
+  // drop claim decided on an older view, and a held action waits through other rounds. A round on
+  // the top pull request that ended and nobody claimed yet is claimed first, like the poll's (it
+  // may supersede this action). Then the action closes when a newer round superseded it, a pull
+  // request of its range closed or has a new head (the next ready run decides again), the range
+  // escalated, or one of its pull requests is blocked at its head. It waits for the next run while
+  // that round is not judged dropped yet, a message about one of its pull requests is still
+  // pending, or a before-merge manual task of its tickets is open (or cannot be read). Null: it
+  // may enqueue.
+  private async stale(action: ActionRecord, view: PullRequestView, seenByUrl: Record<string, Seen>, context: RunContext): Promise<{ close: boolean; why: string } | null> {
+    const { repo } = action;
+    const topUrl = pullUrl(repo, action.top);
+    const open = await context.pulls(repo);
+    const drop = await this.queueDrop(topUrl, view, handledDrops(seenByUrl[topUrl]), context.drafts);
+    if (drop) {
+      const record = context.records.find((item) => item.links["Pull request"] === topUrl) ?? recordFor(ticketsOf(repo, [action.top], open, context.records, null), context.records);
+      if (!await this.claimDrop(drop, record, seenByUrl, context)) return { close: false, why: `queue round ${drop.key} ended, and tools/ci/wait-queue.mjs does not call it dropped yet` };
+    }
+    if (action.supersededBy) return { close: true, why: `queue round ${action.supersededBy} came after it` };
+    for (const { pr, sha } of parseExpect(action.expect) ?? []) {
+      const pull = open.find((item) => item.number === pr);
+      if (!pull || pull.headSha !== sha) return { close: true, why: `#${pr} ${pull ? "has a new head" : "is no longer open"}` };
+      const seen = seenByUrl[pullUrl(repo, pr)];
+      if (escalated(seen)) return { close: true, why: `#${pr} escalated to the owner` };
+      if (seen?.blockedAt === sha) return { close: true, why: `#${pr} is blocked at its head` };
+    }
+    if (action.prs.some((pr) => seenByUrl[pullUrl(repo, pr)]?.pending)) return { close: false, why: "a message about its range is still pending" };
+    const tickets = [...new Set([...action.tickets, ...ticketsOf(repo, action.prs, open, context.records, null)])];
+    if ((await this.gatedTickets(context.records, tickets)).size) return { close: false, why: "a manual task due before the merge is open, or cannot be read" };
+    return null;
   }
 
   // A refused enqueue: closed when only its range changed before the enqueue (the next ready run
@@ -1144,7 +1239,7 @@ export class PullRequestWatch {
   }
 
   // Each refusal goes once to the agent of its tickets (the ticket when the agent is gone, the
-  // pull request when there is no ticket); a refusal waits while that slot holds another message.
+  // pull request when there is no ticket), behind any message that slot still holds (see route).
   private async routeRefusals(repo: string, seenByUrl: Record<string, Seen>, context: RunContext, save: () => Promise<void>): Promise<void> {
     for (const [url, seen] of Object.entries(seenByUrl)) {
       if (PULL_URL.exec(url)?.[1] !== repo) continue;
@@ -1157,11 +1252,10 @@ export class PullRequestWatch {
           : refusalText(action, unrouted.map((refusal) => ({ kind: refusal.kind, text: refusal.text ?? "", draft: refusal.draft })), unrouted.some((refusal) => refusal.kind.startsWith("conflict-"))
             ? "Restack only your own stack: on its top branch `git fetch origin main && git rebase --update-refs --onto origin/main \"$(git merge-base HEAD origin/main)\"` (never `gt sync` or `gt restack`), keep `main`'s version of generated files and regenerate them, then `gt submit --stack --ignore-out-of-sync-trunk`."
             : null);
-        const routed = this.route(seenByUrl, { record: recordFor(action.tickets, context.records), url, tickets: action.tickets }, {
+        this.route(seenByUrl, { record: recordFor(action.tickets, context.records), url, tickets: action.tickets }, {
           key: `refused:${unrouted.map((refusal) => refusal.key).join(",")}`, reason: `the enqueue was refused (${kinds})`, facts: fix, fix,
           subject: `Paseo's automatic enqueue of the pull request was refused (${kinds})`,
         });
-        if (!routed) continue;
         for (const refusal of unrouted) refusal.routedAt = new Date(context.now).toISOString();
         await save();
       }
@@ -1190,7 +1284,7 @@ export class PullRequestWatch {
         throw error;
       }
     }
-    seen.pending = null;
+    Object.assign(seen, nextMessage(seen));
     await save();
   }
 
