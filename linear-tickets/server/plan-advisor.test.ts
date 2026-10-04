@@ -305,7 +305,7 @@ test("omp ticket agents get the linear_ticket tools, run through the plugin's se
     const call = JSON.parse(body) as { query: string; variables: Record<string, unknown> };
     calls.push(call);
     const data = call.query.includes("query ticket") ? { issue: call.variables.id === "ENG-7" ? node("other-1", "ENG-7") : node("ticket-1", "ENG-1") }
-      : call.query.includes("commentCreate") ? { commentCreate: { success: true, comment: { url: "https://linear.app/c/1" } } } : {};
+      : call.query.includes("commentCreate") ? { commentCreate: { success: true, comment: { id: "c-1", url: "https://linear.app/c/1" } } } : {};
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify({ data }));
   });

@@ -14,6 +14,7 @@ import { buildPrompt, normalizeIssue } from "./context";
 import { Launcher } from "./launch";
 import { Settings } from "./settings";
 import { ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
+import { postedComments } from "./agent-records";
 
 // Launches save the ticket prompt for the plan advisor under PASEO_HOME; keep it out of the real one.
 process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-ticket-mcp-home-"));
@@ -231,7 +232,7 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
   const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-e2e-"));
   const linear = await fakeLinear((call) => {
     if (call.query.includes("query ticket")) return { issue };
-    if (call.query.includes("commentCreate")) return { commentCreate: { success: true, comment: { url: "https://linear.app/c/1" } } };
+    if (call.query.includes("commentCreate")) return { commentCreate: { success: true, comment: { id: "c-1", url: "https://linear.app/c/1", createdAt: "2026-02-01T00:00:00.000Z" } } };
     if (call.query.includes("issueUpdate")) return { issueUpdate: { success: true, issue: { state: { name: "In Review" } } } };
     if (call.query.includes("attachmentLinkURL")) return { attachmentLinkURL: { success: true } };
     return {};
@@ -341,7 +342,11 @@ test("writes follow the issue's scope: own ticket, issues the agent created, any
       return { issueCreate: { success: true, issue: { id: node.id, identifier: node.identifier, url: node.url } } };
     }
     if (call.query.includes("issueRelationCreate")) return { issueRelationCreate: { success: true } };
-    if (call.query.includes("commentCreate")) return { commentCreate: { success: true, comment: { url: "https://linear.app/c/2" } } };
+    if (call.query.includes("commentCreate")) {
+      const input = call.variables.input;
+      const target = input && typeof input === "object" && "issueId" in input ? String(input.issueId) : "unknown";
+      return { commentCreate: { success: true, comment: { id: `c-${target}`, url: "https://linear.app/c/2", createdAt: "2026-02-01T00:00:00.000Z" } } };
+    }
     if (call.query.includes("issueUpdate")) return { issueUpdate: { success: true, issue: { state: { name: "In Progress" } } } };
     return {};
   });
@@ -368,6 +373,8 @@ test("writes follow the issue's scope: own ticket, issues the agent created, any
     assert.equal(writes("issueUpdate").length, 0);
     assert.equal((await mcp.call("add_comment", { issue: "ENG-7", body: "FYI" })).isError, false);
     assert.deepEqual(writes("commentCreate").at(-1), { input: { issueId: "other-1", body: "FYI" } });
+    // Recorded under this ticket, so the relay routes the owner's replies on ENG-7 back to this agent.
+    assert.deepEqual(await postedComments(join(home, "linear-tickets"), ISSUE_ID), [{ id: "c-other-1", issueId: "other-1", identifier: "ENG-7", createdAt: "2026-02-01T00:00:00.000Z" }]);
     assert.equal((await mcp.call("add_relation", { issue: "ENG-7", type: "blocked_by" })).isError, false);
     assert.deepEqual(writes("issueRelationCreate").at(-1), { input: { issueId: "other-1", relatedIssueId: ISSUE_ID, type: "blocks" } });
     assert.equal(JSON.parse((await mcp.call("get_issue", { issue: "ENG-7" })).text).scope, "other");
@@ -493,7 +500,7 @@ test("a rate-limited Linear answer tells the agent to try again later instead of
 
 test("the MCP server validates envelopes, never runs tools for notifications, and bounds input", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-envelope-"));
-  const linear = await fakeLinear(() => ({ commentCreate: { success: true, comment: { url: "u" } }, attachmentLinkURL: { success: true } }));
+  const linear = await fakeLinear(() => ({ commentCreate: { success: true, comment: { id: "c-1", url: "u" } }, attachmentLinkURL: { success: true } }));
   const script = await writeTicketMcpScript(home);
   const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: linear.url });
   try {
@@ -514,7 +521,7 @@ test("the MCP server validates envelopes, never runs tools for notifications, an
 
 test("the MCP server caps concurrent Linear calls and ignores a non-127.0.0.1 endpoint override", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-limits-"));
-  const slow = await fakeLinear(() => ({ commentCreate: { success: true, comment: { url: "u" } } }), { delayMs: 300 });
+  const slow = await fakeLinear(() => ({ commentCreate: { success: true, comment: { id: "c-1", url: "u" } } }), { delayMs: 300 });
   const script = await writeTicketMcpScript(home);
   const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: slow.url });
   const localhost = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "not-a-real-key", LINEAR_TICKET_MCP_ENDPOINT: slow.url.replace("127.0.0.1", "localhost") });
@@ -548,7 +555,7 @@ function startOn(home: string, script: string, url: string) {
 
 function answers(call: Call) {
   if (call.query.includes("query ticket")) return { issue };
-  if (call.query.includes("commentCreate")) return { commentCreate: { success: true, comment: { url: "https://linear.app/c/1" } } };
+  if (call.query.includes("commentCreate")) return { commentCreate: { success: true, comment: { id: "c-1", url: "https://linear.app/c/1" } } };
   if (call.query.includes("issueUpdate")) return { issueUpdate: { success: true, issue: { state: { name: "In Review" } } } };
   if (call.query.includes("attachmentLinkURL")) return { attachmentLinkURL: { success: true } };
   return {};
