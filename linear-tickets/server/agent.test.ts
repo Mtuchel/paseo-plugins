@@ -172,7 +172,9 @@ test("plan checklists come from checkboxes, or numbered steps under a Steps head
 });
 
 type Call = string;
-function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]> } = {}) {
+// `reload`: the daemon's agent reload (null: the plugin has no daemon connection); `send`: runs
+// before each send is recorded.
+function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void> } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -187,7 +189,7 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
       list: async () => ({ entries: options.activeAgent ? [{ agent: { ...options.activeAgent, labels: {} } }] : [] }),
       ref: (id: string) => ({
         refresh: options.snapshot ?? (async () => ({ agent: { pendingPermissions: options.pending ?? [] } })),
-        send: async (text: string) => { calls.push(`send ${id}: ${text}`); },
+        send: async (text: string) => { await options.send?.(); calls.push(`send ${id}: ${text}`); },
         respondToPermission: async ({ requestId, response }: { requestId: string; response: unknown }) => { calls.push(`respond ${requestId} ${JSON.stringify(response)}`); },
         archive: async () => { calls.push(`archive ${id}`); return { archivedAt: "now" }; },
       }),
@@ -212,6 +214,7 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
     needsYou: options.needsYou,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     decideReview: async (url, approve, feedback) => { calls.push(`review ${url} ${approve ? "approve" : `deny:${feedback}`}`); },
+    ...("reload" in options ? { reloader: async () => options.reload ? async (agentId: string) => { calls.push(`reload ${agentId}`); await options.reload!(agentId); } : null } : {}),
   });
   // Group tests drive the sweep themselves: the startup sweep would advance the group alongside them.
   if (options.groups) Object.assign(router, { paseo });
@@ -506,6 +509,104 @@ test("an automatic prompt reaches only an idle agent; busy, gone and disconnecte
     const h = harness(options);
     assert.equal(await h.router.prompt("agent-1", "fix it", async () => { h.calls.push("dispatch"); }), expected, why);
     assert.deepEqual(h.calls, expected === "sent" ? ["dispatch", "send agent-1: fix it"] : [], why);
+    await h.cleanup();
+  }
+});
+
+// A crashed agent as Paseo shows it; a reload keeps `lastError`, so a restarted agent still has it.
+const CRASHED = { status: "error", lastError: "OMP RPC process is closed", pendingPermissions: [] };
+const RESTARTED = { status: "idle", lastError: "OMP RPC process is closed", pendingPermissions: [] };
+
+// The agent's snapshot is `state.agent`; the daemon's reload moves it to `after`, or throws it. The
+// reload finishes after every pending read: a recovery waiting for the ticket read the crash first.
+function crashed(after: unknown, options: Parameters<typeof harness>[0] = {}) {
+  const state: { agent: unknown } = { agent: CRASHED };
+  const reload = async () => {
+    await setImmediatePromise();
+    if (after instanceof Error) throw after;
+    state.agent = after;
+  };
+  const h = harness({ reload, ...options, snapshot: options.snapshot ?? (async () => ({ agent: state.agent })) });
+  const recovery = { issueId: "i1", before: async (_resume: string, error: string) => { h.calls.push(`before ${error}`); } };
+  return { ...h, state, recovery };
+}
+
+test("a crashed agent is reloaded, then sent the resume: the crash, git status, an interrupted rebase, then the original message", async () => {
+  const h = crashed(RESTARTED);
+  assert.equal(await h.router.prompt("agent-1", "fix it", async () => { h.calls.push("dispatch"); }, h.recovery), "restarted");
+  assert.deepEqual(h.calls.slice(0, 2), ["before OMP RPC process is closed", "reload agent-1"]);
+  assert.equal(h.calls.length, 3, "no dispatch: before claims the attempt");
+  const resume = h.calls[2];
+  assert.match(resume, /^send agent-1: Your previous run crashed \(`OMP RPC process is closed`\), and Paseo restarted you\./);
+  assert.match(resume, /run `git status`/);
+  assert.match(resume, /`git rebase --continue`/);
+  assert.match(resume, /`git rebase --abort`/);
+  assert.ok(resume.endsWith("\n\nfix it"));
+  await h.cleanup();
+});
+
+test("a crashed agent whose reload fails, or that is still in error after it, is sent nothing", async (t) => {
+  t.mock.method(console, "error", () => {});
+  for (const [after, why] of [[CRASHED, "still crashed"], [{ ...RESTARTED, status: "error", lastError: "provider quota" }, "in error for another reason"], [new Error("rpc_error"), "the reload threw"]] as const) {
+    const h = crashed(after);
+    assert.equal(await h.router.prompt("agent-1", "fix it", undefined, h.recovery), "crashed", why);
+    assert.deepEqual(h.calls, ["before OMP RPC process is closed", "reload agent-1"], why);
+    await h.cleanup();
+  }
+});
+
+test("a restarted agent that is busy right after, or whose resume fails to send, keeps the resume for later", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const cases: [unknown, Parameters<typeof harness>[0], string][] = [
+    [{ ...RESTARTED, status: "running" }, {}, "running"],
+    [{ ...RESTARTED, pendingPermissions: [{ id: "q" }] }, {}, "a pending question"],
+    [RESTARTED, { send: async () => { throw new Error("connection lost"); } }, "the send failed"],
+  ];
+  for (const [after, options, why] of cases) {
+    const h = crashed(after, options);
+    assert.equal(await h.router.prompt("agent-1", "fix it", undefined, h.recovery), "reloaded", why);
+    assert.deepEqual(h.calls, ["before OMP RPC process is closed", "reload agent-1"], why);
+    await h.cleanup();
+  }
+});
+
+test("a crashed agent is not reloaded while busy, while another live agent has its ticket, without a daemon connection, or without a recovery", async () => {
+  const cases: [Parameters<typeof harness>[0], boolean, string, string][] = [
+    [{ snapshot: async () => ({ agent: { ...CRASHED, pendingPermissions: [{ id: "q" }] } }) }, true, "busy", "a pending question"],
+    [{ snapshot: async () => ({ agent: { ...CRASHED, activeTurn: { id: "t" } } }) }, true, "busy", "in a turn"],
+    [{ activeAgent: { id: "agent-2", title: "Successor" } }, true, "busy", "a successor took over"],
+    [{ reload: null }, true, "unavailable", "no daemon connection"],
+    [{}, false, "crashed", "no recovery asked for"],
+  ];
+  for (const [options, recover, expected, why] of cases) {
+    const h = crashed(RESTARTED, options);
+    assert.equal(await h.router.prompt("agent-1", "fix it", async () => { h.calls.push("dispatch"); }, recover ? h.recovery : undefined), expected, why);
+    assert.deepEqual(h.calls, [], why);
+    await h.cleanup();
+  }
+});
+
+test("an agent in error whose process still runs is sent the message as usual", async () => {
+  const h = harness({ snapshot: async () => ({ agent: { status: "error", lastError: "provider quota exceeded", pendingPermissions: [] } }), reload: async () => {} });
+  assert.equal(await h.router.prompt("agent-1", "fix it", async () => { h.calls.push("dispatch"); }, { issueId: "i1", before: async () => { h.calls.push("before"); } }), "sent");
+  assert.deepEqual(h.calls, ["dispatch", "send agent-1: fix it"]);
+  await h.cleanup();
+});
+
+test("two recoveries of one ticket take turns: the second judges the agent again and never reloads it twice", async () => {
+  for (const [after, expected, calls] of [
+    [{ ...RESTARTED, status: "running" }, "busy", []],
+    [RESTARTED, "sent", ["send agent-1: again"]],
+  ] as const) {
+    const h = crashed(after);
+    // The second recovery read the crash before the first one's reload finished.
+    const [first, second] = await Promise.all([
+      h.router.prompt("agent-1", "fix it", undefined, h.recovery),
+      h.router.prompt("agent-1", "again", undefined, h.recovery),
+    ]);
+    assert.equal(first, after.status === "running" ? "reloaded" : "restarted");
+    assert.equal(second, expected);
+    assert.deepEqual(h.calls.filter((call) => !call.startsWith("send agent-1: Your previous run")), ["before OMP RPC process is closed", "reload agent-1", ...calls]);
     await h.cleanup();
   }
 });

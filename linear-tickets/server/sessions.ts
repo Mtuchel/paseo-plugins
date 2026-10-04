@@ -4,7 +4,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoAgentHandle, PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { AgentApi, SelectOption, SessionPlanStep } from "./agent-app";
 import { agentAppDirectory } from "./agent-app";
@@ -30,6 +30,41 @@ export const SPLIT_PLAN = "split-plan";
 export const MAX_SPLIT = 12;
 export const RESUME = "resume";
 export const LEAVE = "leave";
+
+// A crashed agent: Paseo shows it in error and its provider process exited or is closed (OMP:
+// "OMP RPC process exited with code 1 …", "OMP RPC process is closed"). A message reaches nobody
+// until the agent is reloaded. An agent in error for another reason (a failed API call) still has
+// its process and takes messages.
+const CLOSED_PROCESS = /\bprocess (exited|is closed)\b/i;
+
+export function crashedProcess(agent: { status?: string; lastError?: string | null }): string | null {
+  return agent.status === "error" && agent.lastError && CLOSED_PROCESS.test(agent.lastError) ? agent.lastError : null;
+}
+
+// What a restarted agent is sent: the crash, the git state to check first, then the message it
+// would have got. It can arrive twice (see PullRequestWatch's pending resumes).
+export function crashResume(error: string, next: string): string {
+  return [
+    `Your previous run crashed (\`${error}\`), and Paseo restarted you. Before anything else, run \`git status\` in your worktree: if a rebase is in progress, finish it (\`git rebase --continue\` once its conflicts are resolved) or abort it (\`git rebase --abort\`) and redo that step; the same for an interrupted merge or cherry-pick. Check the current state of your pull requests and lifecycle step before acting (this message can arrive twice). Then continue with the step below.`,
+    "",
+    next,
+  ].join("\n");
+}
+
+// `restarted`: the agent had crashed, was reloaded and got the resume. `reloaded`: it was reloaded,
+// but the resume did not go out (busy right after, or the send failed). `crashed`: it is crashed and
+// was not (or could not be) reloaded; nothing was sent.
+export type PromptOutcome = "sent" | "restarted" | "reloaded" | "crashed" | "busy" | "gone" | "unavailable";
+// How a crashed agent is recovered: `before` runs with the resume text and the crash right before
+// the reload, so the caller can claim the attempt and keep the resume until it went out.
+export type Recovery = { issueId: string; before: (resume: string, error: string) => Promise<void> };
+type Snapshot = { status?: string; lastError?: string | null; activeTurn?: unknown; pendingPermissions?: unknown[] | null; archivedAt?: string | null; labels?: Record<string, string> | null; id?: string };
+
+// Running, starting, in a turn or waiting for an answer: a message would interrupt the turn or drop
+// the question.
+function busy(agent: Snapshot): boolean {
+  return Boolean(agent.activeTurn || agent.status === "running" || agent.status === "initializing" || agent.pendingPermissions?.length);
+}
 
 export type SessionLink = {
   sessionId: string;
@@ -228,6 +263,9 @@ type Deps = {
   recordOutcome?: (agentId: string, outcome: Exclude<ReviewOutcome, "open" | null>) => Promise<void>;
   // Open "Needs you" sub-issues: an @mention there goes to the agent that asked, not a new one.
   needsYou?: NeedsYouIssues;
+  // The daemon's agent reload (`paseo agent reload`), resolved per use: null while the plugin has
+  // no daemon connection of its own.
+  reloader?: () => Promise<((agentId: string) => Promise<void>) | null>;
 };
 
 // Linear agent sessions ↔ Paseo agents. Inbound: `created` starts or links an agent, and
@@ -349,7 +387,13 @@ export class SessionRouter {
     }
   }
 
-  private async startFor(link: SessionLink, fresh: boolean): Promise<void> {
+  // A new agent for the thread's ticket. It runs in the ticket's turn (see exclusive), so a crash
+  // recovery of the predecessor waits until the successor started and the predecessor is archived.
+  private startFor(link: SessionLink, fresh: boolean): Promise<void> {
+    return this.exclusive(link.issueId, () => this.startNow(link, fresh));
+  }
+
+  private async startNow(link: SessionLink, fresh: boolean): Promise<void> {
     const settings = await this.deps.settings.read();
     const running = dispatchLabels(settings.dispatch.label).running;
     await this.deps.linear.addLabel(link.issueId, running).catch(() => {});
@@ -716,19 +760,92 @@ export class SessionRouter {
   // an answer (Paseo would interrupt the turn or drop the question): `busy`. `gone`: the agent no
   // longer exists or is archived; `unavailable`: Paseo is not connected, try again later.
   // `onDispatch` runs once the agent is known to take it, right before the message is sent.
-  async prompt(agentId: string, text: string, onDispatch?: () => Promise<void>): Promise<"sent" | "busy" | "gone" | "unavailable"> {
+  // A crashed agent (see crashedProcess) takes no message: `crashed`, unless `recovery` asks to
+  // reload it and send it the resume (see recover).
+  async prompt(agentId: string, text: string, onDispatch?: () => Promise<void>, recovery?: Recovery): Promise<PromptOutcome> {
     if (!this.paseo) return "unavailable";
-    const handle = this.paseo.agents.ref(agentId);
+    const found = await this.agent(agentId);
+    if (!found) return "gone";
+    if (busy(found.agent)) return "busy";
+    if (!crashedProcess(found.agent)) {
+      await onDispatch?.();
+      await found.handle.send(text);
+      return "sent";
+    }
+    if (!recovery) return "crashed";
+    return this.exclusive(recovery.issueId, () => this.recover(agentId, text, onDispatch, recovery));
+  }
+
+  // The crashed process of an existing, unarchived agent (its last error), else null.
+  async crashed(agentId: string): Promise<string | null> {
+    if (!this.paseo) return null;
+    const found = await this.agent(agentId);
+    return found ? crashedProcess(found.agent) : null;
+  }
+
+  // Reloads a crashed agent (as `paseo agent reload` does) and sends it the resume, in its ticket's
+  // turn: an earlier recovery or a successor start for the ticket has finished, so the agent is read
+  // and judged again first. A live, uncrashed agent of the same ticket is taking over (`busy`).
+  // `before` claims the attempt right before the reload; nothing after it throws: the reload
+  // throwing or leaving the agent in error is `crashed`, a resume that does not go out `reloaded`.
+  private async recover(agentId: string, text: string, onDispatch: (() => Promise<void>) | undefined, recovery: Recovery): Promise<PromptOutcome> {
+    const found = await this.agent(agentId);
+    if (!found) return "gone";
+    if (busy(found.agent)) return "busy";
+    const error = crashedProcess(found.agent);
+    if (!error) {
+      await onDispatch?.();
+      await found.handle.send(text);
+      return "sent";
+    }
+    const page = await this.paseo!.agents.list({ filter: { labels: { "linear.issueId": recovery.issueId }, includeArchived: false }, page: { limit: 20 } });
+    if (page.entries.some(({ agent }) => agent.id !== agentId && !agent.archivedAt && !agent.labels?.["paseo.parent-agent-id"] && !crashedProcess(agent))) return "busy";
+    const reload = await this.deps.reloader?.();
+    if (!reload) return "unavailable";
+    const resume = crashResume(error, text);
+    await recovery.before(resume, error);
+    try {
+      await reload(agentId);
+    } catch (failure) {
+      console.error(`[linear-tickets] reloading crashed agent ${agentId} failed: ${failure instanceof Error ? failure.message : failure}`);
+      return "crashed";
+    }
+    const reloaded = await this.agent(agentId).catch((failure: unknown) => {
+      console.error(`[linear-tickets] reading restarted agent ${agentId} failed: ${failure instanceof Error ? failure.message : failure}`);
+      return undefined;
+    });
+    if (reloaded === undefined) return "reloaded";
+    if (!reloaded) return "gone";
+    if (reloaded.agent.status === "error") return "crashed";
+    if (busy(reloaded.agent)) return "reloaded";
+    try {
+      await reloaded.handle.send(resume);
+    } catch (failure) {
+      console.error(`[linear-tickets] the resume for restarted agent ${agentId} failed: ${failure instanceof Error ? failure.message : failure}`);
+      return "reloaded";
+    }
+    return "restarted";
+  }
+
+  // The agent's current snapshot; null when it no longer exists or is archived.
+  private async agent(agentId: string): Promise<{ handle: PaseoAgentHandle; agent: Snapshot } | null> {
+    const handle = this.paseo!.agents.ref(agentId);
     const refreshed = await handle.refresh().catch((error: unknown) => {
       if (error instanceof Error && /not found/i.test(error.message)) return null;
       throw error;
     });
-    if (!refreshed || refreshed.agent.archivedAt) return "gone";
-    const { activeTurn, status, pendingPermissions } = refreshed.agent;
-    if (activeTurn || status === "running" || status === "initializing" || pendingPermissions?.length) return "busy";
-    await onDispatch?.();
-    await handle.send(text);
-    return "sent";
+    return refreshed && !refreshed.agent.archivedAt ? { handle, agent: refreshed.agent } : null;
+  }
+
+  // One recovery or successor start per ticket at a time, in call order.
+  private readonly turns = new Map<string, Promise<unknown>>();
+
+  private exclusive<T>(issueId: string, work: () => Promise<T>): Promise<T> {
+    const run = (this.turns.get(issueId) ?? Promise.resolve()).then(work);
+    const settled = run.catch(() => {});
+    this.turns.set(issueId, settled);
+    void settled.then(() => { if (this.turns.get(issueId) === settled) this.turns.delete(issueId); });
+    return run;
   }
 
   async say(sessionId: string, type: "thought" | "response" | "error", body: string, ephemeral = false): Promise<void> {

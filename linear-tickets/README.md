@@ -934,6 +934,26 @@ that only the log. A busy or disconnected agent is asked on a later poll; a gone
 agent's nudge goes to the ticket like a drop's fix request (it counts toward the same two).
 Review threads are read (GraphQL, every page) only when a stage needs them.
 
+**Crashed agents.** An agent whose provider process exited or closed (Paseo shows it in error,
+for example "OMP RPC process is closed") receives no message. Before a nudge, a merge queue fix
+request or a replacement request goes out, the watch reads the agent: a crashed one is restarted
+the way `paseo agent reload` does it, keeping its conversation and worktree, and then gets one
+message that names the crash, tells it to run `git status` and finish or abort an interrupted
+rebase, and repeats the step it was about to be asked for. The agent panel shows "The agent had
+crashed (…); Paseo restarted it …". A restart counts as a nudge for its stage even on an
+unchanged head, so an agent that crashes on every turn still reaches the owner after two. When
+the restart fails, the attempt still counts; a fix or replacement request then goes to the ticket
+as for a gone agent. A busy agent, an agent waiting for an answer, and an agent whose ticket has
+another live agent (for example a successor the automatic resume just started) are never
+restarted. If the message does not go out after the restart (the agent is busy right away, the
+send fails, or the plugin stops), it is sent on a later poll, at least once: a duplicate is
+possible, so the message asks the agent to check its state first. It is dropped unsent once the
+ticket is no longer started, another agent took it over, or the step went to the owner.
+An agent whose ticket has no open pull request (none yet, or the last one merged or closed) is
+restarted the same way while its ticket is in a started state: up to two restarts, then one
+comment to the owner, then nothing. The state lives in `$PASEO_HOME/linear-tickets/crash-recovery.json`.
+A plan request (see `plan` label) waits until the watch restarted the agent.
+
 **Health.** Every 5 minutes the plugin checks the Linear key, the Paseo app, Tailscale Funnel
 and the local receiver. A problem confirmed twice opens one urgent ticket, "⚠️ Paseo needs
 attention", assigned to you (in the first auto-dispatch team), so Linear notifies you. The ticket

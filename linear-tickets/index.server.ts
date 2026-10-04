@@ -77,6 +77,11 @@ export default function contribute(server: PluginServerContext) {
     recordOutcome: (agentId, outcome) => recordDecision({ type: "decided", agentId, ...outcome, at: new Date().toISOString() }),
     splitPlan: (link, localUrl, paseo) => splitIntoSubIssues({ linear, appUserId: async () => (await agentApi.viewer()).id, readPlan: readReviewPlan, retirePlanner }, link, localUrl, paseo),
     approveLater: (link, localUrl, paseo) => approveForLater({ linear, readPlan: readReviewPlan, retirePlanner }, link, localUrl, paseo),
+    // `paseo agent reload` for crashed agents (README, "Crashed agents"); the plugin SDK has no reload.
+    reloader: async () => {
+      const client = await internalDaemon();
+      return client ? async (agentId) => { await client.refreshAgent(agentId); } : null;
+    },
   });
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
   // Labelled projects: a planner ticket sets the work order, then tickets are handed out as slots free up.

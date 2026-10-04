@@ -5,8 +5,9 @@ import { join } from "node:path";
 import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import { PlanRequests, planRequestText } from "./plan-requests";
+import type { PromptOutcome } from "./sessions";
 
-type Outcome = "sent" | "busy" | "gone" | "unavailable";
+type Outcome = PromptOutcome;
 
 async function harness(run: (h: { requests: PlanRequests; labels: Map<string, string[]>; prompts: string[]; outcome: { next: Outcome }; files: () => Promise<string[]>; directory: string }) => Promise<void>) {
   const directory = await mkdtemp(join(tmpdir(), "paseo-plan-requests-"));
@@ -57,18 +58,21 @@ test("a label present when the agent is first seen was the launch's reason and r
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("a busy agent is told on a later poll unless its omp extension already took the request", async () => {
-  await harness(async ({ requests, labels, prompts, outcome, directory }) => {
-    labels.set("issue-1", ["plan"]);
-    outcome.next = "busy";
-    await requests.poll();
-    await requests.poll();
-    assert.equal(prompts.length, 2);
-    // The extension removes the file once the agent is planning: nothing left to say.
-    await rm(join(directory, "agent-1"));
-    await requests.poll();
-    assert.equal(prompts.length, 2);
-  });
+test("a busy or crashed agent is told on a later poll unless its omp extension already took the request", async () => {
+  // A crashed agent is not restarted here: the pull request watch restarts it.
+  for (const waiting of ["busy", "crashed"] as const) {
+    await harness(async ({ requests, labels, prompts, outcome, directory }) => {
+      labels.set("issue-1", ["plan"]);
+      outcome.next = waiting;
+      await requests.poll();
+      await requests.poll();
+      assert.equal(prompts.length, 2, waiting);
+      // The extension removes the file once the agent is planning: nothing left to say.
+      await rm(join(directory, "agent-1"));
+      await requests.poll();
+      assert.equal(prompts.length, 2, waiting);
+    });
+  }
 });
 
 test("removing the label before delivery withdraws the request, and adding it again requests again", async () => {
