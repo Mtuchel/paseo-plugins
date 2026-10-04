@@ -121,7 +121,7 @@ test("an approval waits for before-merge tasks, then moves to Ready to merge; ar
   const watch = new PullRequestWatch({
     handover: { all: async () => [record], update: async (_issue, _agent, patch) => { calls.push(`review ${patch.review}`); return null as never; } },
     sessions: { sessionFor: async () => ({ sessionId: "s" }) as never, say: async (_id, _kind, text) => { calls.push(`say ${text}`); }, prompt: async () => "gone" as const, link: async () => {} },
-    linear: { moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; }, comment: async () => {}, viewerId: async () => "u", userUrl: async () => "u", linkUrl: async () => {} },
+    linear: { moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; }, comment: async () => {}, hasComment: async () => false, viewerId: async () => "u", userUrl: async () => "u", linkUrl: async () => {} },
     settings: { read: async () => settings },
     manualTasks: {
       openBlockers: async () => open.map((identifier) => ({ identifier }) as ManualTask),
@@ -129,7 +129,7 @@ test("an approval waits for before-merge tasks, then moves to Ready to merge; ar
       merged: async (issueId) => { calls.push(`merged ${issueId}`); awaiting = false; },
     },
     view: async () => view,
-    github: { drafts: async () => [], landed: async () => false, failedChecks: async () => [], mainFailedJobs: async () => null, reviewThreads: async () => [], openPullRequests: async () => [], branchExists: async () => true },
+    github: { drafts: async () => [], pullState: async () => "closed", landed: async () => false, reviewThreads: async () => [], openPullRequests: async () => [], branchExists: async () => true, pullComments: async () => [], commentOnPull: async () => {} },
   }, join(home, "pr-watch.json"));
   try {
     await watch.poll();

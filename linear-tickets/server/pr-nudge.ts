@@ -2,7 +2,7 @@ import type { PullRequestView } from "./pr-watch";
 
 // The next lifecycle step a stalled pull request is waiting on its agent for. The watch sends it
 // to an idle agent (see PullRequestWatch.nudge); this module only decides the step and its text.
-export type Stage = "draft" | "red" | "changes" | "findings" | "merge";
+export type Stage = "draft" | "red" | "changes" | "findings";
 export type ReviewThread = {
   resolved: boolean;
   path: string | null;
@@ -15,14 +15,6 @@ export const DRAFT_IDLE_MS = 30 * 60 * 1000;
 // Graphite's own check: it stays in progress until the pull request is queued, and the queue
 // reports on it; the agent cannot fix it by pushing.
 const QUEUE_CHECK = "Graphite / mergeability_check";
-// Pull requests with this label need one Greptile review, of any head, before they merge (owner
-// decision 2026-10-03, TUC-646: Greptile often skips re-published heads; Sol re-checks fix diffs).
-const GREPTILE_LABEL = "complex-review";
-const GREPTILE = /^greptile-apps(\[bot\])?$/;
-// The repo's required checks: a merge nudge needs each on the head (the optional one only when it
-// ran), finished as a success or skipped. Other checks only have to be green when they are there.
-const REQUIRED_CHECKS = ["PR code", "PR metadata"];
-const REQUIRED_WHEN_PRESENT = ["Label queued PRs for Linear"];
 const DECISIVE = ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"];
 
 // The step, for a panel line and the owner's escalation: "… the agent to <step>".
@@ -31,7 +23,6 @@ export const STAGE_STEP: Record<Stage, string> = {
   red: "fix the failing checks",
   changes: "address the requested changes",
   findings: "resolve the review findings",
-  merge: "merge it through the merge queue",
 };
 
 // Review comments quoted in a prompt: Greptile's badges become their alt text, other markup goes.
@@ -55,7 +46,7 @@ function threadLines(threads: ReviewThread[]): string[] {
 // keyed by the reviews themselves (`<reviewer>@<submitted at>`, or `review-decision` when only
 // GitHub's decision says so), so pushing does not repeat a request that was already sent.
 // `claimed(stage, key)`: already sent; review threads are only read when a stage that needs them
-// can still be sent.
+// can still be sent. A ready pull request gets no nudge: the queue backstop enqueues it (TUC-615).
 export async function stalledStage(view: PullRequestView, url: string, now: number, claimed: (stage: Stage, key: string) => boolean, readThreads: () => Promise<ReviewThread[]>): Promise<{ stage: Stage; key: string; text: string } | null> {
   const head = view.headSha.slice(0, 7);
   const key = view.headSha;
@@ -94,8 +85,7 @@ export async function stalledStage(view: PullRequestView, url: string, now: numb
       ...(earlier.length ? [`Where the new commits already address a review, reply on its threads and re-request a review from ${earlier.join(", ")}.`] : []),
     ].join("\n") };
   }
-  const ready = mergeable(view);
-  if (claimed("findings", key) && (claimed("merge", key) || !ready)) return null;
+  if (claimed("findings", key)) return null;
   const open = (await readThreads()).filter((thread) => !thread.resolved && thread.comments.length);
   const findings = open.filter((thread) => thread.comments[0].bot);
   if (findings.length) {
@@ -106,8 +96,7 @@ export async function stalledStage(view: PullRequestView, url: string, now: numb
       "Next step: run the AGENTS.md review loop on them.",
     ].join("\n") };
   }
-  if (!ready || open.length) return null;
-  return { stage: "merge", key, text: mergeText(url, view, []) };
+  return null;
 }
 
 function failedChecks(view: PullRequestView): PullRequestView["checks"] {
@@ -122,32 +111,4 @@ function changeRequests(view: PullRequestView): PullRequestView["reviews"] {
     if (DECISIVE.includes(review.state)) latestByAuthor.set(review.author, review);
   }
   return [...latestByAuthor.values()].filter((review) => review.state === "CHANGES_REQUESTED");
-}
-
-// Ready to merge as far as the pull request itself shows; its review threads must be resolved
-// too. Not a draft, no failed check and no change request; green: the required checks ran on the
-// head and passed, and every other check but the queue's own finished and passed (an empty or
-// incomplete rollup is not green); and with `complex-review`, Greptile reviewed the pull request
-// once, on any head: a review, or, for a review without findings (Greptile then files no review),
-// its summary comment's `Last reviewed commit: [subject](https://github.com/<repo>/commit/<sha>)`.
-export function mergeable(view: PullRequestView): boolean {
-  if (view.isDraft || failedChecks(view).length || changeRequests(view).length || view.reviewDecision === "CHANGES_REQUESTED") return false;
-  const named = (name: string) => view.checks.filter((check) => check.name === name);
-  const green = view.checks.every((check) => check.state === "passed" || check.name === QUEUE_CHECK)
-    && REQUIRED_CHECKS.every((name) => named(name).length > 0)
-    && [...REQUIRED_CHECKS, ...REQUIRED_WHEN_PRESENT].every((name) => named(name).every((check) => check.conclusion === "success" || check.conclusion === "skipped"));
-  if (!green || !view.labels.includes(GREPTILE_LABEL)) return green;
-  if (view.reviews.some((review) => GREPTILE.test(review.author))) return true;
-  return view.comments.some((comment) => GREPTILE.test(comment.author) && /Last reviewed commit:[^\n]*\/commit\/[0-9a-f]{7,40}\b/i.test(comment.body));
-}
-
-// The merge step for the highest ready pull request of a stack; `below`: the ready ones under it,
-// bottom first, which `gt merge` enqueues with it.
-export function mergeText(url: string, view: PullRequestView, below: { number: number; url: string }[]): string {
-  const number = /\/pull\/(\d+)/.exec(url)?.[1] ?? "";
-  return [
-    `[The pull request](${url}) is ready: its checks are green, no review thread is open, the reviewers are done, and it is not in the merge queue.`,
-    ...(below.length ? [`So are the pull requests below it: ${below.map((pull) => `[#${pull.number}](${pull.url})`).join(", ")}.`] : []),
-    `Next step: \`gt checkout ${view.headBranch} && node tools/ci/enqueue.mjs\`${below.length ? " (it enqueues the pull requests below it too)" : ""}, then \`node tools/ci/wait-queue.mjs ${number}\`. Never a bare \`gt merge\`: \`enqueue.mjs\` refuses a range that conflicts with \`main\` or the queue tip and names the fix. The rest of the stack follows once it is reviewed.`,
-  ].join("\n");
 }

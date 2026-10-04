@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
-import { AuthenticationError, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, type App, type Post } from "./linear";
+import { AuthenticationError, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, type App, type Post } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 
 const issue = { id: "i1", identifier: "TUC-1", state: { id: "s1", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] } };
@@ -61,6 +61,25 @@ test("tickets the app cannot see are read with the key", async () => {
   const statuses = await partial.linear.issueStatuses([ID_A, ID_B]);
   assert.equal(statuses.get(ID_B)?.statusType, "started");
   assert.deepEqual(partial.keyCalls, [ISSUE_STATUSES_QUERY]);
+});
+
+test("hasComment looks a marker up among the ticket's comments, counts only a body that carries it whole, and fails rather than answer for a ticket Linear does not return", async () => {
+  const asked: Record<string, unknown>[] = [];
+  const mark = "`queue-backstop:drop:#437:419`";
+  const marked = (bodies: string[]) => service({ query: (query, variables) => {
+    assert.equal(query, MARKED_COMMENT_QUERY);
+    asked.push(variables);
+    return Promise.resolve({ issue: { comments: { nodes: bodies.map((body, index) => ({ id: `c${index}`, body })) } } });
+  } }, () => { throw new Error("the key must not be used"); });
+  assert.equal(await marked([`Enqueued.\n\n${mark}`]).linear.hasComment("i1", mark), true);
+  assert.equal(await marked([]).linear.hasComment("i1", mark), false);
+  // Linear's filter matched a comment that does not carry the whole mark: another action's.
+  assert.equal(await marked(["Enqueued.\n\n`queue-backstop:drop:#437:4190`"]).linear.hasComment("i1", mark), false, "only the exact mark counts");
+  assert.equal(await marked(["Enqueued.\n\n`queue-backstop:drop:#437:4190`", `Enqueued.\n\n${mark}`]).linear.hasComment("i1", mark), true, "among other matches");
+  assert.deepEqual(asked, Array.from({ length: 4 }, () => ({ id: "i1", text: mark })));
+  const missing = service({ query: () => Promise.resolve({ issue: null }) }, () => ({ issue: null }));
+  await assert.rejects(missing.linear.hasComment("i1", "queue-backstop:x"), /did not return the ticket/);
+  assert.deepEqual(missing.keyCalls, [MARKED_COMMENT_QUERY], "a ticket the app cannot see is read with the key first");
 });
 
 test("an app rate limit pauses the read instead of spending the key", async () => {

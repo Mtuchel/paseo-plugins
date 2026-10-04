@@ -746,54 +746,117 @@ as merged, including its after-merge [manual tasks](#manual-tasks). A queue drop
 an open pull request when Graphite's last Merge activity bullet ends the attempt (a conflict,
 "merge when ready" turned off, a failed check), or when the draft its latest "CI is running"
 bullet names was closed without its head reaching the base branch and no newer queue draft for
-the pull request is open. Without Merge activity, drafts alone never count. Each drop is one of
-three kinds, as the repo's `tools/ci/wait-queue.mjs` decides for the agent's own wait
-(`docs/automation/merge-queue.md`). It is **conflict-only** when Graphite names a merge conflict
-and nothing on the queue's draft failed, was cancelled or was still running (every check run on
-its head is read, all pages), or no draft existed; a draft no longer listed counts as unread, so
-the drop is plain. It is **main-broken** when `main` was already red on the same jobs: every
-check on the draft that failed or timed out (gates such as `Platform gate` left out) is, without
-its `Code validation / ` prefix, a failed job of `main`'s deciding ci.yml run at that check's
-own completion, as the repo's `tools/ci/main-health.mjs` judges it (push or dispatch runs on
-`main`; of a run, the newest attempt that completed, was not cancelled and had finished by then).
-When `main`'s state at that moment is unknown, or one job does not match, the drop is plain;
-when `main`'s CI cannot be read, nothing is claimed and the next poll decides again. Every other
-drop is **plain**: Graphite also says "merge conflicts" for real
-failures. The ticket's agent gets the reason, the checks that did not pass on the draft and the
-runbook for the kind. All re-enqueue the dropped queue range from its top branch, the one
-enqueued before the drop: the highest of the ticket's open pull requests the queue's draft
-listed, or the dropped pull request itself when no draft lists it; never the stack's top branch,
-which would enqueue pull requests above the range that are not ready. Every enqueue goes through
-the repo's `node tools/ci/enqueue.mjs`, never a bare `gt merge`: it refuses a range that
-conflicts with `main` or the queue tip and names the fix. A plain drop: on the
-stack's top branch `git fetch origin main && git rebase --update-refs --onto origin/main
-"$(git merge-base HEAD origin/main)"`, which moves only its own branches, never `gt
-sync`/`gt restack`; fix, `gt submit --stack --ignore-out-of-sync-trunk`, then `git switch
-<range top> && node tools/ci/enqueue.mjs` and `node tools/ci/wait-queue.mjs <its PR>`; one plain
-`enqueue.mjs` retry on that branch for an obviously flaky failure. A conflict-only drop: the same
-rebase (only when every branch below is the agent's own), regenerate generated files instead of
-merging them, the focused checks, the same `gt submit`, then right away `git switch <range top>
-&& node tools/ci/enqueue.mjs` and `node tools/ci/wait-queue.mjs <its PR>`, without waiting for
-the pull request's checks: the queue's draft runs the full suite (only when `gt merge` refuses
-because checks still run: `node tools/ci/wait-checks.mjs <its PR>`, then `enqueue.mjs` once
-more). A main-broken drop names the jobs `main` already failed, needs no restack or fix of its
-own, and asks for `git switch <range top> && node tools/ci/enqueue.mjs --wait-main` (it waits
-until `main` is green, then checks and enqueues) and `node tools/ci/wait-queue.mjs <its PR>`. The
-message goes out once the agent is idle; Paseo resumes it if it has stopped. While the agent is
-in a turn or waiting for an answer, or Paseo is not connected,
-the message waits for a later poll. When the agent is gone or archived, the same text becomes a
-ticket comment mentioning you, and the ticket moves back to In Progress (when status write-back
-is on). Each drop is claimed in `$PASEO_HOME/linear-tickets/pr-watch.json` (by its draft, or by
-the bullet when there is none) before anything is sent, so it is delivered at most once, also
-across restarts. The plain and conflict-only kinds are counted separately per pull request: one
-fix request after a plain drop and up to five restacks after conflict-only drops. Main-broken
-drops count toward neither limit and never escalate; their message carries all three counts. The
-second plain drop or the sixth
-conflict-only drop, whichever comes first, only mentions you ("the merge queue dropped this
-stack again", with both counts), and after that drops of any kind are only logged. Drops
-claimed before the kinds existed count as plain, and three of them as escalated. An
+the pull request is open. Without Merge activity, drafts alone never count. The repo decides
+what kind of drop it is: the plugin runs `tools/ci/wait-queue.mjs <pr> --draft <n>` (`--last`
+without a draft) from the [queue backstop's checkout](#queue-backstop) and reads its `class`,
+`requeue`, `evidence`, `revision` and failed checks (`docs/automation/merge-queue.md`). A repo
+without that checkout has no classes: its drops are genuine. A run that fails or prints no JSON
+claims nothing, and the next poll decides again. The class counts on every pull request of the
+dropped range: `conflictOnly` toward up to five restacks, `mainBroken` toward nothing (it never
+escalates), every other class (`infra`, `flaky`, `genuine`) toward one fix request. A range
+counts as its most-dropped pull request: the next drop past a limit on any of them only mentions
+you ("the merge queue dropped this stack again", with both counts), every pull request of the
+range is marked escalated, and after that drops of any kind are only logged; a drop of a range
+one of whose pull requests escalated already escalates the whole range, too. Drops claimed
+before the kinds existed count as plain, and three of them as escalated. A newer round of a range
+retires the backstop's enqueues of it that had not gone through yet (unless the range changed
+since the drop). Then, by class and revision:
+
+- not the stack's fault (`requeue`), the code provably the code that dropped (`revision` is
+  `same`, or the backstop's own enqueue of these very heads came right before this round) and no
+  [manual task](#manual-tasks) due before the merge open (one that cannot be read counts as
+  open): the [queue backstop](#queue-backstop) re-enqueues the range, nothing goes to the agent.
+  A main-broken range waits there until `main` is green;
+- not genuine, but the range changed since the drop (`changed`): nothing is sent; the new heads
+  go through the ready rule;
+- not genuine, but the code could not be compared (`unknown`), or a manual task is open: the
+  kind's request goes to the agent, saying why Paseo did not re-enqueue it. An `unknown` range is
+  blocked like a genuine one;
+- genuine: today's fix request. The range is blocked at its heads: the backstop leaves it alone
+  until one of them changes.
+
+The ticket's agent gets the reason, the checks that did not pass on the draft, the kind with its
+evidence and the runbook for it. All re-enqueue the dropped queue range from its top branch, the
+one enqueued before the drop: the range `wait-queue.mjs` compared, else the dropped pull
+request's own chain among the open pull requests the queue's draft listed (a draft can test
+other stacks too); never the stack's top branch, which would enqueue pull requests above the
+range that are not ready. Every enqueue goes through the repo's `node tools/ci/enqueue.mjs`,
+never a bare `gt merge`: it refuses a range that conflicts with `main` or the queue tip and names
+the fix. A genuine drop: on the stack's top branch `git fetch origin main && git rebase
+--update-refs --onto origin/main "$(git merge-base HEAD origin/main)"`, which moves only its own
+branches, never `gt sync`/`gt restack`; fix, `gt submit --stack --ignore-out-of-sync-trunk`, then
+`git switch <range top> && node tools/ci/enqueue.mjs` and `node tools/ci/wait-queue.mjs <its
+PR>`. A conflict-only drop: the same rebase (only when every branch below is the agent's own),
+regenerate generated files instead of merging them, the focused checks, the same `gt submit`,
+then right away `git switch <range top> && node tools/ci/enqueue.mjs` and `node
+tools/ci/wait-queue.mjs <its PR>`, without waiting for the pull request's checks: the queue's
+draft runs the full suite (only when `gt merge` refuses because checks still run: `node
+tools/ci/wait-checks.mjs <its PR>`, then `enqueue.mjs` once more). A main-broken drop needs no
+restack or fix of its own, and asks for `git switch <range top> && node tools/ci/enqueue.mjs
+--wait-main` (it waits until `main` is green, then checks and enqueues) and `node
+tools/ci/wait-queue.mjs <its PR>`; its message carries all three counts. The message goes out
+once the agent is idle; Paseo resumes it if it has stopped. While the agent is in a turn or
+waiting for an answer, or Paseo is not connected, the message waits for a later poll. When the
+agent is gone or archived, the same text becomes a ticket comment mentioning you, and the ticket
+moves back to In Progress (when status write-back is on). Each drop is claimed in
+`$PASEO_HOME/linear-tickets/pr-watch.json` (by its draft, or by the bullet when there is none)
+before anything is sent, so it is delivered at most once, also across restarts. A message for a
+pull request that still holds an undelivered one waits behind it and goes out after it. An
 archived agent's open pull request stays watched until that escalation or 14 days without
 activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
+
+**Queue backstop.** Every 10 minutes, and right after a poll claimed a drop to re-enqueue, the
+plugin enqueues on its own what nobody else did. It runs the repo's scripts, never its own
+judgment, from a detached worktree per repo at
+`$PASEO_HOME/linear-tickets/queue-backstop/<owner>-<repo>`, made from the git common dir of any
+recorded worktree of the repo and reset to `origin/main` (fetched first) before every run; a repo
+whose `main` has no `tools/ci/enqueue-ready.mjs` gets no backstop. One run at a time, taking turns
+with the poll:
+
+1. Re-enqueues claimed above, and earlier enqueues that are still due or held, move on. Right
+   before each enqueue the range is checked again as it is now: a round on any pull request of
+   the range (someone may have enqueued only part of it) that ended and nobody claimed yet is
+   claimed first, like the poll's. The enqueue is dropped for good when a newer round superseded
+   it, a pull request of the range closed or has a new head, the range escalated, or a pull
+   request of it is blocked at its head; it waits for the next run while such a round is not
+   judged yet, a message about the range is still pending, or a before-merge manual task of its
+   tickets is open (or cannot be read).
+2. `node tools/ci/enqueue-ready.mjs --ready-minutes 10 --exclude <pr>… --skip <action>…` lists
+   the stacks that have been green, reviewed and without open threads for 10 minutes and nobody
+   enqueued, and the drops it saw. Excluded are escalated pull requests, ones blocked at their
+   head, ones with a drop message or re-enqueue still pending, and the pull requests of tickets
+   whose before-merge manual tasks are open (or cannot be read); skipped are refused enqueues not
+   released yet. The script's scope is the shared login's own pull requests only: never
+   Dependabot, another author, or a range with `do-not-merge`.
+3. Drops of pull requests no ticket's agent watches are claimed like the poll's.
+4. Each ready stack is enqueued with `node tools/ci/backstop-enqueue.mjs <top branch> --expect
+   <pr>@<sha>,… --action <id> --comment-file <file>`, which re-checks every head and runs the
+   checkout's `tools/ci/enqueue.mjs`.
+
+Every enqueue is an action (`drop:<drop key>:<top>`, since one queue draft can test several
+stacks, or `ready:<top>@<heads>`) saved in `pr-watch.json` before each step: the number and last
+text of the top pull request's Merge activity bullets right before the enqueue, then the enqueue,
+the pull request comment, the ticket comment and the note to the agent. Enqueued: the script
+comments on the top pull request (marked `<!-- queue-backstop:<action> -->`, never twice), the
+plugin comments on each ticket (ending in `` `queue-backstop:<action>` ``; the ticket's comments
+are searched for this whole mark, backticks included, and only a comment whose body carries it
+counts, so another action's mark that starts with the same text never does; a ticket counts as
+done only once Linear confirmed it, so a lost answer never doubles it and a crash never skips it)
+and tells a running agent that nothing is needed from it. Held (`main` red or unknown, or already
+queued): retried on the next run. Refused: routed once per refusal (action and kind, plus the
+draft for a queue-tip conflict)
+to the agent, the ticket when the agent is gone, or as one marked comment on the pull request
+when there is no ticket. A refusal is retried only after the change that can fix it: a new head
+(a new action), the end of the queue draft for a queue-tip conflict (read by its number; a state
+that cannot be read keeps the refusal), at most hourly for a local branch that differs from
+GitHub, the `do-not-merge` label's removal for a veto. An answer that is not the
+script's JSON, or an exit it does not document, never counts as an enqueue. After a restart an
+enqueue whose outcome was not recorded is decided by the Merge activity: an enqueue bullet after
+the saved bullets means it went through, none means it is retried while the pull request is open,
+and a comment that no longer starts with the saved bullets means nothing can be told: it is not
+retried, the range is blocked and the agent is asked to check. Comments owed for an enqueue still
+go out once after the pull request closed or landed. To switch the backstop off, revert the
+plugin change and `paseo plugin reload linear-tickets`; ranges already in the queue stay there.
 
 **Partial landings.** When the ticket's recorded pull request lands (merged, or closed by the
 queue as above) while other pull requests of the ticket are still open (the rest of its stack,
@@ -801,9 +864,9 @@ or pull requests the agent replayed onto main), the ticket links the lowest of t
 other open pull request of the ticket sits on; ties go to the lower number), the agent panel
 and the handover record point at it, and the plugin watches and nudges it from the next poll,
 also for an archived agent. This repeats with each landing until none of the ticket's pull
-requests is open. The ticket's pull requests are the ones whose title names it as a whole word,
-as for the merge nudge. A lookup or link move that fails, or a poll that ends before it (a rate
-limit), is retried on the next poll, also across restarts.
+requests is open. The ticket's pull requests are the ones whose title names it as a whole word
+(`Add TUC-34 [area] …` is TUC-34's, never TUC-343's). A lookup or link move that fails, or a poll
+that ends before it (a rate limit), is retried on the next poll, also across restarts.
 
 **Replacement pull requests.** When the queue lands part of a stack, Graphite deletes the
 landed branch, and GitHub closes the pull request based on it for good (it cannot be reopened
@@ -829,15 +892,9 @@ new message, the first that applies:
 | Failed checks | a ready pull request whose latest run of a check failed (pending runs and `Graphite / mergeability_check` do not count) | the failed checks with links; fix, then `gt submit --stack` |
 | Changes requested | a reviewer's latest approving, change-requesting or dismissed review asks for changes (on any commit), or GitHub's review decision is "changes requested" | each such review and the unresolved review threads; address them, then `gt submit --stack` (for a review on an earlier commit: reply on its threads and re-request the review) |
 | Findings | unresolved review threads a bot started (Greptile, any bot reviewer) | the findings; run the AGENTS.md review loop |
-| Merge | `PR code` and `PR metadata` ran on the head and succeeded or were skipped (so did `Label queued PRs for Linear` when it ran), every other check is green (except Graphite's mergeability check), no change request is open, no review thread is unresolved, and Greptile has reviewed the pull request once, on any head, when it has `complex-review` (a Greptile review, or, for a review without findings, which files no review, Greptile's summary comment naming its `Last reviewed commit`); a re-published head is not waited on | for the ticket's highest such pull request whose pull requests below it are all such too: `gt checkout <its branch> && node tools/ci/enqueue.mjs` (which enqueues the ones below it; never a bare `gt merge`), then `node tools/ci/wait-queue.mjs <its number>`; the rest of the stack follows once it is reviewed |
 
-The first four stages look at the ticket's recorded pull request. The merge stage covers every
-open pull request of the ticket: the recorded one and each whose title names the ticket as a
-whole word (`Add TUC-34 [area] …` is TUC-34's, never TUC-343's). The repo's open pull requests
-are listed once per repo and poll (REST, every page). A stack lands bottom first, so the plugin
-climbs from the default branch through the ticket's pull requests and stops at the first one
-that is not ready; one merge nudge per ticket and poll names the highest ready one. A pull
-request stacked on another ticket's open branch is left to that ticket.
+The stages look at the ticket's recorded pull request. A ready pull request gets no nudge: the
+[queue backstop](#queue-backstop) enqueues it.
 
 Nothing is sent for a pull request labelled `do-not-merge`, while [manual tasks](#manual-tasks)
 due before the merge are open, while the merge queue has it (its last Merge activity bullet
