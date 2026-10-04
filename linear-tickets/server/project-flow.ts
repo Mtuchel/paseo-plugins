@@ -22,6 +22,8 @@ import { paseoHome } from "./ticket-mcp";
 //    Paseo in the scheduler's order, one per free agent slot. Each ticket plans on its own.
 // 3. An approved work order is kept with the record before it is written, and every poll writes
 //    one that is not in Linear yet (README, "Projects"), so a failed write never stops the project.
+// 4. A started planner without a live agent is started again after a grace period, a few times,
+//    then left to the owner (README, "Projects"), so a failed launch never stalls the project.
 
 // How often a project's tickets are read: a project is a few paginated queries.
 const POLL_MS = 2 * 60_000;
@@ -32,18 +34,57 @@ const HAND_OUT_TYPES = new Set(["backlog", "unstarted"]);
 // Polls a work order is retried while Linear refuses some of its changes, before it is closed with
 // them skipped. Changes that did not reach Linear (rate limit, outage) are retried without limit.
 const APPLY_TRIES = 3;
+// A started planner without a live agent this long after its (re)start is started again. A start
+// takes a couple of minutes (TUC-678: filed 08:26:04, its workspace stood at 08:26:46, the daemon
+// gave up waiting for the agent at 08:27:46), so ten minutes never starts a second agent beside one
+// still launching, and a project stalls by a failed start for at most that plus one poll.
+const RESTART_GRACE_MS = 10 * 60_000;
+// Restarts per planner before it is left to the owner: a start that fails this often (no project
+// mapping, a provider that does not come up) needs them, not another try.
+const RESTART_CAP = 3;
+// Agent states that still work on the plan. A closed agent (idle too long) or one in error never
+// submits it on its own.
+const LIVE_AGENT: Record<string, true> = { initializing: true, idle: true, running: true };
 
-// `plannedThrough`: tickets created up to this time are in an approved (or closed) plan.
-// `planner`: the open planner ticket, the time its ticket list was taken and how many new tickets it
-// plans; `started`: false until it carries its label and is assigned to Paseo (records of older
-// versions have none: started); `approved`: its approved work order, until it is written into Linear.
+// `planned`: the tickets in an approved (or closed) plan: those its planner listed. Kept by id, not
+// by creation time, so a ticket created while the planner was filed, or moved into the project from
+// elsewhere, is new until a planner lists it. Tickets no longer open in the project drop out when a
+// planner closes. `plannedThrough`: what older versions kept instead (tickets created up to then
+// were planned); `migrated` turns it into `planned` with the project's tickets of that time.
+// `planner`: the open planner ticket, the time its ticket list was taken, the tickets it `listed`
+// and how many new tickets it plans; `started`: false until it carries its label and is assigned to
+// Paseo (records of older versions have none: started); `startedAt`: when it was last (re)started
+// (absent: `listedAt`); `restarts`: how often it was started again without a live agent;
+// `ownerAsked`: past RESTART_CAP, the owner was asked to start it; `approved`: its approved work
+// order, until it is written into Linear, with the changes of it already `done` in Linear.
 // `closedPlanner`: the planner ticket closed last, so a late report of its review is still its own.
 // `withheld`: tickets whose `hold` or blocker Linear refused: planned, but never handed out by the
 // project; you hand them out yourself.
-export type PlannerRecord = { id: string; identifier: string; url: string; listedAt: string; tickets: number; started?: boolean; approved?: { agentId: string | null; plan: string } };
-export type ProjectRecord = { plannedThrough: string | null; planner: PlannerRecord | null; closedPlanner?: string; withheld?: string[] };
+export type PlannerRecord = {
+  id: string; identifier: string; url: string; listedAt: string; listed?: string[]; tickets: number; started?: boolean;
+  startedAt?: string; restarts?: number; ownerAsked?: boolean; approved?: { agentId: string | null; plan: string; done?: string[] };
+};
+export type ProjectRecord = { planned?: string[]; plannedThrough?: string | null; planner: PlannerRecord | null; closedPlanner?: string; withheld?: string[] };
 
-type Read = { work: ProjectIssue[]; record: ProjectRecord; plannerIssue: ProjectIssue | null; owner: string; planned: (issue: ProjectIssue) => boolean; unplanned: ProjectIssue[]; status: ProjectStatus };
+type Read = { work: ProjectIssue[]; record: ProjectRecord; plannerIssue: ProjectIssue | null; owner: string; readAt: string; planned: (issue: ProjectIssue) => boolean; unplanned: ProjectIssue[]; status: ProjectStatus };
+
+// A record of an older version, which planned by creation time, with the tickets those times cover
+// now as its planned and listed tickets, so what was planned stays planned. The same record when
+// there is nothing to migrate.
+function migrated(record: ProjectRecord, issues: ProjectIssue[]): ProjectRecord {
+  const covered = (through: string | null | undefined) => through ? issues.filter((issue) => issue.createdAt <= through).map((issue) => issue.id) : [];
+  const planner = record.planner && !record.planner.listed ? { ...record.planner, listed: covered(record.planner.listedAt) } : record.planner;
+  if (record.planned && planner === record.planner) return record;
+  const { plannedThrough, ...rest } = record;
+  return { ...rest, planned: rest.planned ?? covered(plannedThrough), planner };
+}
+
+// The planned tickets once `planner` closes: what it listed joins them, and tickets no longer open
+// in the project drop out (one moved out and back in, or reopened, is new again).
+function plannedAfter(record: ProjectRecord, planner: PlannerRecord, issues: ProjectIssue[]): string[] {
+  const open = new Set(issues.map((issue) => issue.id));
+  return [...new Set([...(record.planned ?? []), ...(planner.listed ?? [])])].filter((id) => open.has(id));
+}
 
 export class ProjectStore {
   private queue: Promise<unknown> = Promise.resolve();
@@ -124,6 +165,10 @@ type Deps = {
   store?: ProjectStore;
   // Stops the planner's turn and archives it once its plan is applied.
   retire: (agentId: string, paseo: PaseoApi) => Promise<void>;
+  // Starts a new agent with a new Linear thread for a planner ticket (SessionRouter.restartFor).
+  // Assigning the ticket to Paseo again is no restart: Linear opens no new thread for it, and a
+  // thread whose launch failed is in error.
+  restart: (issueId: string, identifier: string) => Promise<void>;
   now?: () => number;
 };
 
@@ -174,6 +219,9 @@ export class ProjectFlow {
         if (open?.started === false && read.plannerIssue) {
           await this.startPlanner(project.id, open, read.plannerIssue, appId, settings)
             .catch((error: unknown) => console.error(`[linear-tickets] ${open.identifier}: starting the planner failed, the next poll retries: ${message(error)}`));
+        } else if (open && read.plannerIssue && !open.approved && !read.plannerIssue.labels.some((name) => name.toLowerCase() === PLAN_READY_LABEL)) {
+          await this.revive(project.id, open, paseo)
+            .catch((error: unknown) => console.error(`[linear-tickets] ${open.identifier}: restarting the planner failed, the first poll after ${RESTART_GRACE_MS / 60_000} minutes retries: ${message(error)}`));
         }
         // Always on: new tickets get a planner as soon as none is open.
         const status = !open && read.unplanned.length
@@ -193,29 +241,36 @@ export class ProjectFlow {
   // started work never count.
   private async read(project: { id: string; name: string }, settings: PluginSettings): Promise<Read> {
     const labels = dispatchLabels(settings.dispatch.label);
+    // Taken before the tickets are read: a planner filed from this read lists no ticket newer.
+    const readAt = new Date(this.now()).toISOString();
     const issues = await this.deps.linear.projectIssues(project.id);
-    let record: ProjectRecord = (await this.store.all())[project.id] ?? { plannedThrough: null, planner: null };
+    const stored = (await this.store.all())[project.id];
+    let record: ProjectRecord = stored ? migrated(stored, issues) : { planned: [], planner: null };
+    if (stored && record !== stored) await this.store.update(project.id, (current) => current ? migrated(current, issues) : null);
     // A planner closed without an approved plan (the owner canceled or finished it): its tickets
     // count as planned, so they are not offered for planning again. One with an approved order
     // stays until the order is written (`write` then leaves the ticket as it is).
     const gone = record.planner && !record.planner.approved && !issues.some((issue) => issue.id === record.planner!.id) ? record.planner.id : null;
     if (gone) {
-      await this.store.update(project.id, (current) => current?.planner?.id === gone && !current.planner.approved
-        ? { ...current, plannedThrough: current.planner.listedAt, planner: null, closedPlanner: gone } : null);
+      await this.store.update(project.id, (current) => {
+        const next = current && migrated(current, issues);
+        return next?.planner?.id === gone && !next.planner.approved ? { ...next, planned: plannedAfter(next, next.planner, issues), planner: null, closedPlanner: gone } : null;
+      });
       record = (await this.store.all())[project.id] ?? record;
     }
     const plannerId = record.planner?.id;
     const plannerIssue = plannerId ? issues.find((issue) => issue.id === plannerId) ?? null : null;
     const work = issues.filter((issue) => issue.id !== plannerId && !issue.labels.some((name) => name.toLowerCase() === labels.planner.toLowerCase()));
     const owner = await this.deps.linear.viewerId();
-    const planned = (issue: ProjectIssue) => record.plannedThrough !== null && issue.createdAt <= record.plannedThrough;
+    const plannedIds = new Set(record.planned ?? []);
+    const planned = (issue: ProjectIssue) => plannedIds.has(issue.id);
     const unplanned = work.filter((issue) => !planned(issue) && (HAND_OUT_TYPES.has(issue.statusType) || issue.statusType === "triage")
       && !issue.delegateId && !issue.parentId && (!issue.assigneeId || issue.assigneeId === owner));
     // Tickets the open planner already lists are in review, not waiting for a plan.
-    const listedAt = record.planner?.listedAt;
-    const toPlan = unplanned.filter((issue) => !listedAt || issue.createdAt > listedAt).length;
+    const listed = new Set(record.planner?.listed ?? []);
+    const toPlan = unplanned.filter((issue) => !listed.has(issue.id)).length;
     const planner = record.planner ? plannerSummary(record.planner) : null;
-    return { work, record, plannerIssue, owner, planned, unplanned, status: { id: project.id, name: project.name, toPlan, planner, readAt: new Date(this.now()).toISOString() } };
+    return { work, record, plannerIssue, owner, readAt, planned, unplanned, status: { id: project.id, name: project.name, toPlan, planner, readAt } };
   }
 
   // `linear.plan-project`: files a planner ticket for the project's unplanned tickets right away
@@ -245,13 +300,12 @@ export class ProjectFlow {
       const current = (await this.store.all())[project.id]?.planner;
       if (current) return { ...read.status, toPlan: 0, planner: plannerSummary(current) };
       const labels = dispatchLabels(settings.dispatch.label);
-      const listedAt = new Date(this.now()).toISOString();
       const teams = new Map<string, number>();
       for (const issue of read.work) teams.set(issue.teamId, (teams.get(issue.teamId) ?? 0) + 1);
       const teamId = [...teams.entries()].sort((a, b) => b[1] - a[1])[0][0];
       const descriptions = await this.deps.linear.issueDescriptions(read.work.map((issue) => issue.id));
       const created = await this.deps.linear.createIssue({ teamId, projectId: project.id, ready: true, priority: 1, title: `Plan the work order of ${project.name}`, description: plannerBrief(project.name, read.work, read.unplanned, descriptions, labels) });
-      const planner: PlannerRecord = { id: created.id, identifier: created.identifier, url: created.url, listedAt, tickets: read.unplanned.length, started: false };
+      const planner: PlannerRecord = { id: created.id, identifier: created.identifier, url: created.url, listedAt: read.readAt, listed: read.work.map((issue) => issue.id), tickets: read.unplanned.length, started: false };
       await this.store.update(project.id, (record) => ({ ...(record ?? read.record), planner }));
       console.log(`[linear-tickets] project ${project.name}: planner ${created.identifier} for ${read.unplanned.length} new ticket${read.unplanned.length === 1 ? "" : "s"}`);
       await this.startPlanner(project.id, planner, null, appId, settings)
@@ -268,18 +322,45 @@ export class ProjectFlow {
     const label = dispatchLabels(settings.dispatch.label).planner;
     if (!issue?.labels.some((name) => name.toLowerCase() === label.toLowerCase())) await this.deps.linear.addLabel(planner.id, label);
     if (issue?.delegateId !== appId) await this.deps.linear.delegate(planner.id, appId);
-    await this.store.update(projectId, (current) => current?.planner?.id === planner.id ? { ...current, planner: { ...current.planner, started: true } } : null);
+    await this.store.update(projectId, (current) => current?.planner?.id === planner.id ? { ...current, planner: { ...current.planner, started: true, startedAt: new Date(this.now()).toISOString() } } : null);
+  }
+
+  // A started planner whose agent never came up (TUC-678: its launch timed out) or stopped without
+  // a plan (closed after idling, archived) would hold its project for good: no new planner is filed
+  // while it is open. RESTART_GRACE_MS after its (re)start without a live agent it is started again
+  // with a new thread, at most RESTART_CAP times; then the owner is asked once on the ticket.
+  private async revive(projectId: string, planner: PlannerRecord, paseo: PaseoApi): Promise<void> {
+    const since = planner.startedAt ?? planner.listedAt;
+    if (planner.ownerAsked || this.now() - Date.parse(since) < RESTART_GRACE_MS) return;
+    const page = await paseo.agents.list({ filter: { labels: { "linear.issueId": planner.id }, includeArchived: false }, page: { limit: 20 } });
+    if (page.entries.some(({ agent }) => !agent.labels?.["paseo.parent-agent-id"] && LIVE_AGENT[agent.status])) return;
+    const restarts = planner.restarts ?? 0;
+    if (restarts >= RESTART_CAP) {
+      await this.deps.linear.comment(planner.id, `**No agent is planning this work order.** Paseo started this planner ${restarts + 1} times, and none of its agents is working on it now (the start failed, or the agent stopped without submitting a plan), so it stops trying. Start an agent for it from the Linear tickets sidebar, or close this ticket to skip the work order: its tickets then count as planned and are handed out without one.`);
+      await this.store.update(projectId, (current) => current?.planner?.id === planner.id ? { ...current, planner: { ...current.planner, ownerAsked: true } } : null);
+      console.error(`[linear-tickets] ${planner.identifier}: no live planner agent after ${restarts} restarts; left to the owner`);
+      return;
+    }
+    // Counted before the start, so a start that keeps failing still reaches the cap, and the grace
+    // runs from now: a start still under way when the next poll comes is not doubled.
+    await this.store.update(projectId, (current) => current?.planner?.id === planner.id ? { ...current, planner: { ...current.planner, restarts: restarts + 1, startedAt: new Date(this.now()).toISOString() } } : null);
+    console.log(`[linear-tickets] ${planner.identifier}: no live planner agent since its start at ${since}; restart ${restarts + 1} of ${RESTART_CAP}`);
+    await this.deps.restart(planner.id, planner.identifier);
   }
 
   // Ranked by the scheduler; each admitted ticket is assigned to Paseo, whose session then starts
   // it in its reserved slot. A ticket with open sub-issues in the project is a group: assigning it
-  // takes no slot, its sub-issues are handed out by the group. Withheld tickets are left to you.
+  // takes no slot, its sub-issues are handed out by the group. Withheld tickets are left to you, and
+  // so are, until it is written, those an approved order not yet in Linear blocks, holds or marks
+  // attended: Linear does not show that order yet, so they would start against it.
   private async handOut(projectId: string, read: Read, appId: string, paseo: PaseoApi, settings: PluginSettings): Promise<void> {
     const labels = dispatchLabels(settings.dispatch.label);
     const skip = new Set([labels.hold, labels.manual, labels.needsYou, labels.running, labels.failed, settings.dispatch.label].map((name) => name.toLowerCase()));
     const withheld = new Set(read.record.withheld ?? []);
+    const pending = (await this.store.all())[projectId]?.planner?.approved;
+    const ordered = new Set(pending ? parseOrder(pending.plan).flatMap((step) => step.kind === "blocks" ? [step.blocked] : step.kind === "hold" || step.kind === "attended" ? [step.ticket] : []) : []);
     const parents = new Set(read.work.map((issue) => issue.parentId).filter(Boolean));
-    const ready = read.work.filter((issue) => read.planned(issue) && !withheld.has(issue.id) && HAND_OUT_TYPES.has(issue.statusType) && !issue.delegateId && (!issue.assigneeId || issue.assigneeId === read.owner)
+    const ready = read.work.filter((issue) => read.planned(issue) && !withheld.has(issue.id) && !ordered.has(issue.identifier) && HAND_OUT_TYPES.has(issue.statusType) && !issue.delegateId && (!issue.assigneeId || issue.assigneeId === read.owner)
       && !issue.parentId && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished));
     for (const group of ready.filter((issue) => parents.has(issue.id))) {
       await this.deps.linear.delegate(group.id, appId);
@@ -337,10 +418,12 @@ export class ProjectFlow {
   }
 
   // Writes the order into Linear, marks its tickets planned, closes the planner ticket and retires
-  // its agent. Every change is safe to repeat, so a failed write is simply written again. Changes
-  // that did not reach Linear are retried every poll; changes Linear refuses for APPLY_TRIES polls
-  // (at once when the planner ticket is no longer open: closing it ends the wait) are skipped, and
-  // a ticket whose `hold` or blocker was skipped is withheld instead of handed out unordered.
+  // its agent. The changes that went through are kept with the approval, so a write retried by a
+  // later poll repeats only the others and never redoes what the owner changed since (a removed
+  // `paseo-hold` stays removed). Changes that did not reach Linear are retried every poll; changes
+  // Linear refuses for APPLY_TRIES polls (at once when the planner ticket is no longer open:
+  // closing it ends the wait) are skipped, and a ticket whose `hold` or blocker was skipped is
+  // withheld instead of handed out unordered.
   // `open`: the planner ticket is open in the project, so it is completed here.
   private async write(projectId: string, planner: PlannerRecord, open: boolean, paseo: PaseoApi, settings: PluginSettings): Promise<boolean> {
     if (this.applying.has(planner.id) || !planner.approved) return false;
@@ -355,9 +438,15 @@ export class ProjectFlow {
       const refused: string[] = [];
       const withhold = new Map<string, string>();
       const released = new Set<string>();
+      const already = new Set(planner.approved.done ?? []);
       for (const step of parseOrder(planner.approved.plan)) {
         const line = step.kind === "blocks" ? `${step.blocker} blocks ${step.blocked}` : `${step.kind} ${step.ticket}${step.reason ? `: ${step.reason}` : ""}`;
         const target = byIdentifier.get(step.kind === "blocks" ? step.blocked : step.ticket);
+        if (already.has(line)) {
+          done.push(line);
+          if (step.kind === "release" && target) released.add(target.id);
+          continue;
+        }
         try {
           if (step.kind === "blocks") {
             const blocker = byIdentifier.get(step.blocker);
@@ -378,6 +467,11 @@ export class ProjectFlow {
           if (target && (step.kind === "blocks" || step.kind === "hold")) withhold.set(target.id, target.identifier);
         }
       }
+      const approved = planner.approved;
+      if (done.some((line) => !already.has(line))) {
+        await this.store.update(projectId, (current) => current?.planner?.id === planner.id && (current.planner.approved?.plan ?? approved.plan) === approved.plan
+          ? { ...current, planner: { ...current.planner, approved: { ...approved, done } } } : null);
+      }
       if (refused.length) {
         const previous = this.refusedTries.get(planner.id);
         this.refusedTries.set(planner.id, { plan: planner.approved.plan, tries: previous?.plan === planner.approved.plan ? previous.tries + 1 : 1 });
@@ -392,12 +486,15 @@ export class ProjectFlow {
       ].filter(Boolean).join("\n\n"));
       if (open) await this.deps.linear.complete(planner.id);
       const openIds = new Set(issues.map((issue) => issue.id));
-      await this.store.update(projectId, (current) => current?.planner?.id === planner.id ? {
-        plannedThrough: planner.listedAt,
-        planner: null,
-        closedPlanner: planner.id,
-        withheld: [...new Set([...(current.withheld ?? []).filter((id) => openIds.has(id) && !released.has(id)), ...withhold.keys()])],
-      } : null);
+      await this.store.update(projectId, (stored) => {
+        const current = stored && migrated(stored, issues);
+        return current?.planner?.id === planner.id ? {
+          planned: plannedAfter(current, current.planner, issues),
+          planner: null,
+          closedPlanner: planner.id,
+          withheld: [...new Set([...(current.withheld ?? []).filter((id) => openIds.has(id) && !released.has(id)), ...withhold.keys()])],
+        } : null;
+      });
       this.refusedTries.delete(planner.id);
       this.statuses = this.statuses.map((status) => status.id === projectId ? { ...status, planner: null } : status);
       if (planner.approved.agentId) await this.deps.retire(planner.approved.agentId, paseo);
