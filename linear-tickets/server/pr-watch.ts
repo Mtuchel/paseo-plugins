@@ -26,7 +26,8 @@ const QUEUE_DRAFT_TITLE = "[Graphite MQ] Draft PR";
 // Automatic prompts per pull request and drop kind (docs/automation/merge-queue.md in the repo):
 // one fix request after a plain drop, up to five restacks after conflict-only drops. The next drop
 // of a kind goes to the owner instead, and after that escalation no drop prompts the agent again.
-const DROP_PROMPTS: Record<DropKind, number> = { plain: 1, conflict: 5 };
+// Main-broken drops have no budget: they count toward neither limit.
+const DROP_PROMPTS: Record<Exclude<DropKind, "main">, number> = { plain: 1, conflict: 5 };
 // Nudges per pull request and lifecycle stage; the next time that stage stalls goes to the owner.
 const STAGE_NUDGES = 2;
 // The owner's veto: such a pull request is never nudged.
@@ -63,8 +64,9 @@ export type PullRequestView = {
 // `held`: approved, but kept out of Ready to merge while manual tasks due before merge are open.
 // `closed`: closed without merging. Merge queue drops already claimed, by draft (`#123`) or, for
 // drops before any draft, by the Merge activity bullet: `drops` the plain ones (and every drop
-// claimed before drops had kinds), `conflicts` the conflict-only ones. `escalated`: a drop went to
-// the owner; before drops had kinds that was the third drop. `pending`: the claimed drop still to
+// claimed before drops had kinds), `conflicts` the conflict-only ones, `mainBroken` the main-broken
+// ones (counted toward neither limit). `escalated`: a drop went to the owner; before drops had
+// kinds that was the third drop. `pending`: the claimed drop still to
 // be delivered. `replay`: closed without merging, `due` until the closure was looked at once,
 // `asked` once the agent was told to open a replacement pull request (see replace). `nudges`: per
 // stage, one key per nudge (or the escalation after them): the head, or for requested changes the
@@ -72,7 +74,7 @@ export type PullRequestView = {
 // nudge seen. `missing`: GitHub has no pull request at the link (a made-up or mistyped URL); it is
 // never read again, so a later pull request that takes the number is not mistaken for the ticket's.
 // `advance`: landed, `due` until the ticket's next open pull request was looked for (see advance).
-type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; conflicts?: string[]; escalated?: boolean; pending?: PendingDrop | null; replay?: "due" | "asked"; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean; advance?: "due" };
+type Seen = { reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; conflicts?: string[]; mainBroken?: string[]; escalated?: boolean; pending?: PendingDrop | null; replay?: "due" | "asked"; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean; advance?: "due" };
 // A claimed drop, saved before anything is sent. `fix` goes to the agent (or, when it is gone, to
 // the ticket); without it, `facts` escalate to the owner. `sending`: a message went out and its
 // result was not recorded (a restart or a failed save), so it is not sent again.
@@ -81,7 +83,8 @@ type Change = { thought: string; review: string; state?: string };
 
 // A draft pull request the merge queue tests a stack on; `base` is the branch it lands on.
 export type QueueDraft = { number: number; title: string; body: string; state: string; headSha: string; base: string };
-export type FailedCheck = { name: string; url: string; conclusion: string };
+// A check run on a queue draft that did not pass; `completedAt` is null while it still runs.
+export type FailedCheck = { name: string; url: string; conclusion: string; completedAt: string | null };
 // An open pull request of the repo, from one listing per repo and poll; `trunk` is the repo's
 // default branch.
 export type OpenPull = { number: number; url: string; title: string; headBranch: string; headSha: string; baseBranch: string; trunk: string; draft: boolean; labels: string[] };
@@ -93,6 +96,9 @@ export type GitHubReader = {
   landed(repo: string, draft: QueueDraft): Promise<boolean>;
   // Every check run on the commit that did not pass, still running ones included.
   failedChecks(repo: string, sha: string): Promise<FailedCheck[]>;
+  // The failed jobs of `main`'s deciding ci.yml run attempt at `at` (epoch ms), or null when no run
+  // had decided by then (see mainFailedJobsAt).
+  mainFailedJobs(repo: string, at: number): Promise<string[] | null>;
   reviewThreads(repo: string, number: number): Promise<ReviewThread[]>;
   // Every open pull request of the repo (REST, every page).
   openPullRequests(repo: string): Promise<OpenPull[]>;
@@ -104,7 +110,8 @@ type MergeTarget = { pull: OpenPull; view: PullRequestView; below: OpenPull[] };
 // the draft is no longer listed, and `draft.pulls` are the pull requests its body lists (none then).
 type Drop = { key: string; reason: string; repo: string; number: number; draft: { number: number; url: string; headSha: string | null; pulls: number[] } | null };
 // `conflict`: Graphite names a merge conflict and nothing else went wrong (see isConflictOnly).
-type DropKind = "plain" | "conflict";
+// `main`: every failed job on the queue's draft was already red on `main` (see isMainBroken).
+type DropKind = "plain" | "conflict" | "main";
 
 // A pull request title that names the ticket as a whole word (`Add TUC-34 [area] …`, never TUC-343).
 function namesTicket(identifier: string): RegExp {
@@ -230,10 +237,14 @@ export const githubReader: GitHubReader = {
   // Every page (a draft runs about 90 check runs): a failed or still running run left out must
   // never let a drop pass as conflict-only.
   async failedChecks(repo, sha) {
-    const runs = await ghJson(["api", "--paginate", `repos/${repo}/commits/${sha}/check-runs?per_page=100`, "--jq", "[.check_runs[] | {name, html_url, status, conclusion}]"],
-      pages<{ name?: string; html_url?: string; status?: string; conclusion?: string | null }>);
+    const runs = await ghJson(["api", "--paginate", `repos/${repo}/commits/${sha}/check-runs?per_page=100`, "--jq", "[.check_runs[] | {name, html_url, status, conclusion, completed_at}]"],
+      pages<{ name?: string; html_url?: string; status?: string; conclusion?: string | null; completed_at?: string | null }>);
     return runs.filter((run) => !PASSING_CONCLUSIONS.includes(run.conclusion ?? ""))
-      .map((run) => ({ name: run.name ?? "check", url: run.html_url ?? "", conclusion: run.conclusion ?? run.status ?? "unknown" }));
+      .map((run) => ({ name: run.name ?? "check", url: run.html_url ?? "", conclusion: run.conclusion ?? run.status ?? "unknown", completedAt: run.completed_at ?? null }));
+  },
+  // One page per read: a listed run carries both repositories (about 24 KB).
+  mainFailedJobs(repo, at) {
+    return mainFailedJobsAt(repo, at, (path) => ghJson<MainReply>(["api", path]));
   },
   async openPullRequests(repo) {
     const open = await ghJson(["api", "--paginate", `repos/${repo}/pulls?state=open&per_page=100`, "--jq", "[.[] | {number, url: .html_url, title, headBranch: .head.ref, headSha: .head.sha, baseBranch: .base.ref, trunk: .base.repo.default_branch, draft, labels: [.labels[].name]}]"], pages<OpenPull>);
@@ -310,6 +321,99 @@ export function activityBullets(body: string | null): Bullet[] {
 // be read (no longer listed) makes it a plain drop.
 function isConflictOnly(drop: Drop, checks: FailedCheck[]): boolean {
   return /merge conflict/i.test(drop.reason) && (drop.draft === null || (drop.draft.headSha !== null && checks.length === 0));
+}
+
+// The repo's tools/ci/main-health.mjs rule for `main`'s state at a past moment (TUC-612): ci.yml
+// runs on `main` from a push or main-ci-dispatch.mjs's `workflow_dispatch`; of a run, the newest
+// attempt that completed, was not cancelled and finished by then decides.
+const MAIN_RUN_EVENTS = ["push", "workflow_dispatch"];
+// Runs listed at most per walk; past it `main`'s state is unknown.
+const MAIN_RUN_CAP = 300;
+// A listed run carries both repositories (about 24 KB), so run pages stay small; job pages hold
+// the API's maximum.
+const MAIN_RUN_PAGE = 10;
+const JOB_PAGE = 100;
+// Job and check conclusions that fail a run.
+const FAILED_CONCLUSIONS = ["failure", "timed_out"];
+// The caller job queue and pull request rows carry ci.yml's jobs behind.
+const CALLER_PREFIX = "Code validation / ";
+// A ci.yml run on `main` as the REST API lists it; also one attempt's metadata.
+type MainRun = { id?: number; event?: string; created_at?: string; run_attempt?: number; status?: string; conclusion?: string | null };
+// A job row of one run attempt.
+type MainJob = { name?: string; status?: string; conclusion?: string | null; completed_at?: string | null };
+// One `gh api` answer of the walk: a page of runs, an attempt's metadata or a page of its jobs.
+export type MainReply = MainRun & { workflow_runs?: MainRun[]; jobs?: MainJob[]; total_count?: number };
+
+// Aggregating checks fail because a job they wait for failed, so the job, not the gate, is the
+// cause; also a gate row recorded under the unexpanded expression a job-level skip leaves.
+export function isGateCheck(name: string): boolean {
+  return /(?:^|\/ )(?:PR code|Platform gate|Post-merge gate)$/.test(name) || /'Post-merge gate'$/.test(name);
+}
+
+// A job's name as ci.yml spells it on a `main` run: queue and pull request rows carry it behind
+// the caller job (`Code validation / Migration replay`).
+export function bareJobName(name: string): string {
+  return name.startsWith(CALLER_PREFIX) ? name.slice(CALLER_PREFIX.length) : name;
+}
+
+// The failed jobs (gates left out) of `main`'s deciding ci.yml run attempt at `at` (epoch ms), or
+// null when none had decided by then (unknown). `get` answers one `gh api` path. Runs are listed
+// newest first up to `at`; a run seen on an earlier page (a new push shifts the pages) is not
+// judged twice, and a page without a new run ends the walk. Of a run, attempts are tried from the
+// newest: one still running or cancelled, with a job still running, or finished after `at` (a
+// later rerun never rewrites history) leaves the decision to the previous one. A read error throws.
+export async function mainFailedJobsAt(repo: string, at: number, get: (path: string) => Promise<MainReply>): Promise<string[] | null> {
+  const created = encodeURIComponent(`<=${new Date(at).toISOString().replace(/\.\d{3}Z$/, "Z")}`);
+  const listed = new Set<number>();
+  for (let page = 1; ; page++) {
+    const runs = (await get(`repos/${repo}/actions/workflows/ci.yml/runs?branch=main&exclude_pull_requests=true&per_page=${MAIN_RUN_PAGE}&page=${page}&created=${created}`)).workflow_runs ?? [];
+    let fresh = 0;
+    for (const run of runs) {
+      if (run.id === undefined || listed.has(run.id)) continue;
+      if (listed.size >= MAIN_RUN_CAP) return null;
+      listed.add(run.id);
+      fresh++;
+      if (!MAIN_RUN_EVENTS.includes(run.event ?? "") || Date.parse(run.created_at ?? "") > at) continue;
+      const latest = run.run_attempt ?? 1;
+      for (let attempt = latest; attempt >= 1; attempt--) {
+        const meta = attempt === latest ? run : await get(`repos/${repo}/actions/runs/${run.id}/attempts/${attempt}`);
+        if (meta.status !== "completed" || meta.conclusion === "cancelled") continue;
+        const jobs: MainJob[] = [];
+        for (let jobPage = 1; ; jobPage++) {
+          const body = await get(`repos/${repo}/actions/runs/${run.id}/attempts/${attempt}/jobs?per_page=${JOB_PAGE}&page=${jobPage}`);
+          const rows = body.jobs ?? [];
+          jobs.push(...rows);
+          if (rows.length < JOB_PAGE || jobs.length >= (body.total_count ?? jobs.length)) break;
+        }
+        const finished = Math.max(0, ...jobs.map((job) => Date.parse(job.completed_at ?? "") || 0));
+        if (jobs.length === 0 || jobs.some((job) => job.status !== "completed") || finished > at) continue;
+        return jobs.filter((job) => job.status === "completed" && FAILED_CONCLUSIONS.includes(job.conclusion ?? "") && !isGateCheck(job.name ?? "")).map((job) => job.name ?? "");
+      }
+    }
+    if (runs.length < MAIN_RUN_PAGE || fresh === 0) return null;
+  }
+}
+
+// A drop whose failed jobs were all red on `main` already (TUC-612; the repo's
+// tools/ci/wait-queue.mjs `mainBroken` decides the same for the agent's own wait): the draft's
+// failed or timed-out checks, gates left out, are not empty, and the bare name of each is a failed
+// job of `main`'s state at that check's own completion (`main`, read once per distinct time).
+// Returns those job names; null for nothing failed, a check without a completion time, an unknown
+// state of `main` or one job `main` did not fail. A read error throws.
+export async function mainBrokenJobs(checks: FailedCheck[], main: (at: number) => Promise<string[] | null>): Promise<string[] | null> {
+  const byTime = new Map<number, string[]>();
+  for (const check of checks) {
+    if (!FAILED_CONCLUSIONS.includes(check.conclusion) || isGateCheck(check.name)) continue;
+    const at = Date.parse(check.completedAt ?? "");
+    if (Number.isNaN(at)) return null;
+    byTime.set(at, [...(byTime.get(at) ?? []), bareJobName(check.name)]);
+  }
+  if (byTime.size === 0) return null;
+  for (const [at, names] of byTime) {
+    const red = await main(at);
+    if (!red || names.some((name) => !red.includes(name))) return null;
+  }
+  return [...new Set([...byTime.values()].flat())];
 }
 
 // A drop went to the owner. Before drops had kinds, the third drop did.
@@ -477,13 +581,15 @@ export class PullRequestWatch {
         let dropped = Boolean(seenByUrl[url].pending);
         if (!dropped) {
           const current = seenByUrl[url];
-          const drop = await this.queueDrop(url, view, [...(current.drops ?? []), ...(current.conflicts ?? [])], listDrafts);
+          const drop = await this.queueDrop(url, view, [...(current.drops ?? []), ...(current.conflicts ?? []), ...(current.mainBroken ?? [])], listDrafts);
           if (drop) {
             dropped = true;
             // Claimed and saved before anything is sent: a later failure, a restart or another
-            // poll never sends it twice.
+            // poll never sends it twice. A failed read in claim saves nothing: the next poll claims it.
             const { kind, pending } = await this.claim(record, url, view, drop, current, listPulls);
-            const counted = kind === "conflict" ? { conflicts: [...(current.conflicts ?? []), drop.key] } : { drops: [...(current.drops ?? []), drop.key] };
+            const counted = kind === "conflict" ? { conflicts: [...(current.conflicts ?? []), drop.key] }
+              : kind === "main" ? { mainBroken: [...(current.mainBroken ?? []), drop.key] }
+              : { drops: [...(current.drops ?? []), drop.key] };
             seenByUrl[url] = { ...current, ...counted, ...(pending?.fix === null ? { escalated: true } : {}), pending, activeAt: now };
             await save();
           }
@@ -551,10 +657,12 @@ export class PullRequestWatch {
     return { key, reason, repo, number: Number(number), draft: { number: draftNumber, url: draftUrl, headSha: draft?.headSha || null, pulls } };
   }
 
-  // What a drop sends, by kind (see isConflictOnly): a fix request for a plain drop, a restack
-  // request for a conflict-only one, up to DROP_PROMPTS of that kind per pull request. The next
-  // drop of that kind escalates to the owner; after the escalation drops of either kind only reach
-  // the log. Both re-enqueue the dropped queue range from its top branch, the one `gt merge` ran on
+  // What a drop sends, by kind (see isConflictOnly and mainBrokenJobs): a fix request for a plain
+  // drop, a restack request for a conflict-only one, up to DROP_PROMPTS of that kind per pull
+  // request, and a re-enqueue request once `main` is green for a main-broken one, which counts
+  // toward neither limit and never escalates. The next drop of a counted kind past its limit
+  // escalates to the owner; after the escalation drops of any kind only reach the log. All
+  // re-enqueue the dropped queue range from its top branch, the one `gt merge` ran on
   // before the drop: the highest of the ticket's open pull requests the queue's draft listed, or
   // the dropped one. `gt merge` on the stack's top branch would enqueue pull requests above the
   // range that are not ready to land.
@@ -564,10 +672,14 @@ export class PullRequestWatch {
       // The kind no longer matters: the key only keeps the drop from being claimed again.
       return { kind: "plain", pending: null };
     }
-    const checks = drop.draft?.headSha ? await (this.deps.github ?? githubReader).failedChecks(drop.repo, drop.draft.headSha) : [];
-    const kind: DropKind = isConflictOnly(drop, checks) ? "conflict" : "plain";
+    const github = this.deps.github ?? githubReader;
+    const checks = drop.draft?.headSha ? await github.failedChecks(drop.repo, drop.draft.headSha) : [];
+    const conflictOnly = isConflictOnly(drop, checks);
+    const redOnMain = conflictOnly ? null : await mainBrokenJobs(checks, (at) => github.mainFailedJobs(drop.repo, at));
+    const kind: DropKind = conflictOnly ? "conflict" : redOnMain ? "main" : "plain";
     const plain = (seen.drops?.length ?? 0) + (kind === "plain" ? 1 : 0);
     const conflicts = (seen.conflicts?.length ?? 0) + (kind === "conflict" ? 1 : 0);
+    const main = (seen.mainBroken?.length ?? 0) + (kind === "main" ? 1 : 0);
     const facts = [
       `The Graphite merge queue dropped [the pull request](${url}) without merging it.`,
       `Reason: ${drop.reason}`,
@@ -576,7 +688,7 @@ export class PullRequestWatch {
         : [`No check failed on the queue's draft [#${drop.draft.number}](${drop.draft.url}).`]),
     ].join("\n");
     const count = kind === "plain" ? plain : conflicts;
-    if (count > DROP_PROMPTS[kind]) return { kind, pending: { key: drop.key, reason: drop.reason, facts: `${facts}\nDrops of this pull request so far: ${plain} plain, ${conflicts} conflict-only.`, fix: null } };
+    if (kind !== "main" && count > DROP_PROMPTS[kind]) return { kind, pending: { key: drop.key, reason: drop.reason, facts: `${facts}\nDrops of this pull request so far: ${plain} plain, ${conflicts} conflict-only.`, fix: null } };
     const identifier = namesTicket(record.identifier);
     const range = drop.draft?.pulls.length ? (await pulls(drop.repo)).filter((pull) => drop.draft?.pulls.includes(pull.number) && (pull.url === url || identifier.test(pull.title))) : [];
     const top = range.filter((pull) => !range.some((other) => other.baseBranch === pull.headBranch)).sort((a, b) => b.number - a.number)[0];
@@ -585,7 +697,14 @@ export class PullRequestWatch {
     const enqueue = `\`git switch ${branch} && node tools/ci/enqueue.mjs\` (the top branch of the dropped queue range, not the stack's top branch; never a bare \`gt merge\`: it refuses while the range conflicts with \`main\` or the queue tip and names the fix)`;
     const worktree = `In your stack's worktree${record.worktreePath ? ` (\`${record.worktreePath}\`)` : ""}, on the top branch of the stack`;
     const rebase = "`git fetch origin main && git rebase --update-refs --onto origin/main \"$(git merge-base HEAD origin/main)\"`. It moves only your own branches; never `gt sync` or `gt restack`, which move the shared `main` and other agents' branches.";
-    const fix = kind === "conflict" ? [
+    const fix = redOnMain ? [
+      facts,
+      "",
+      `Main broken: the merge queue dropped the range because \`main\` was already red on the same job${redOnMain.length === 1 ? "" : "s"} at that time (${redOnMain.map((job) => `\`${job}\``).join(", ")}; tools/ci/main-health.mjs). This drop does not count toward the stack's limits, and no restack or fix of your own is needed unless \`enqueue.mjs\` refuses the range.`,
+      `Re-enqueue the dropped queue range from its top branch once \`main\` is green: \`git switch ${branch} && node tools/ci/enqueue.mjs --wait-main\` (it waits until \`main\` is green, then checks and enqueues), then \`node tools/ci/wait-queue.mjs ${pr}\`.`,
+      "",
+      `Drops of this pull request so far: ${plain} plain, ${conflicts} conflict-only, ${main} main-broken (not counted).`,
+    ] : kind === "conflict" ? [
       facts,
       "",
       "Conflict only: Graphite names a merge conflict and nothing failed, was cancelled or was still running on the queue's draft. Restack and re-enqueue right away, without asking (docs/automation/merge-queue.md#conflict-only-drops), unless a pull request of the stack carries `do-not-merge`:",

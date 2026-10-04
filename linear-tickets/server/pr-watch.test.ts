@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import type { HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
-import { GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type FailedCheck, type OpenPull, type PullRequestView, type QueueDraft } from "./pr-watch";
+import { bareJobName, GitHubRateLimitedError, isGateCheck, mainBrokenJobs, mainFailedJobsAt, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type FailedCheck, type MainReply, type OpenPull, type PullRequestView, type QueueDraft } from "./pr-watch";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
 const settings = { dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true } } as unknown as PluginSettings;
@@ -49,8 +49,10 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open; `views`: other pull requests by URL, and
   // `open` the listing's other entries; `deleted`: branches gone; `throttle`: pull requests whose
-  // read GitHub throttles; `listFailure`: what listing the open pull requests throws.
-  const github = { view: OPEN_PR, views: {} as Record<string, PullRequestView>, drafts: [] as QueueDraft[], landed: [] as number[], checks: [] as FailedCheck[], threads: [] as ReviewThread[], open: [] as OpenPull[], deleted: [] as string[], reads: [] as string[], threadReads: 0, throttled: false, throttle: [] as string[], missing: false, listFailure: null as Error | null };
+  // read GitHub throttles; `listFailure`: what listing the open pull requests throws. `main`:
+  // `main`'s failed jobs at any moment (null: unknown), `mainFailure` what reading them throws,
+  // `mainReads` the moments read.
+  const github = { view: OPEN_PR, views: {} as Record<string, PullRequestView>, drafts: [] as QueueDraft[], landed: [] as number[], checks: [] as FailedCheck[], threads: [] as ReviewThread[], open: [] as OpenPull[], deleted: [] as string[], reads: [] as string[], threadReads: 0, throttled: false, throttle: [] as string[], missing: false, listFailure: null as Error | null, main: null as string[] | null, mainFailure: null as Error | null, mainReads: [] as number[] };
   // `failure`: what linking a URL on the ticket throws.
   const linear = { failure: null as Error | null };
   const blockers: string[] = [];
@@ -106,6 +108,11 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       drafts: async () => github.drafts,
       landed: async (_repo, item) => github.landed.includes(item.number),
       failedChecks: async () => github.checks,
+      mainFailedJobs: async (_repo, at) => {
+        github.mainReads.push(at);
+        if (github.mainFailure) throw github.mainFailure;
+        return github.main;
+      },
       reviewThreads: async () => { github.threadReads++; return github.threads; },
       openPullRequests: async () => {
         if (github.listFailure) throw github.listFailure;
@@ -152,7 +159,7 @@ test("a queue drop prompts the live agent once with the reason, the failed check
   const h = harness(t);
   h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(437)) };
   h.github.drafts = [draft(437, [419])];
-  h.github.checks = [{ name: "Code validation / Core (core-web)", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/1/job/2", conclusion: "failure" }];
+  h.github.checks = [{ name: "Code validation / Core (core-web)", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/1/job/2", conclusion: "failure", completedAt: null }];
   const calls = await h.poll();
   assert.equal(calls.length, 2);
   const [prompt, said] = calls;
@@ -671,7 +678,7 @@ test("a drop re-enqueues the dropped queue range from its top branch, never from
 });
 
 test("a merge conflict with a failed, cancelled or still running check on the queue's draft, or a draft no longer listed, is a plain drop", async (t) => {
-  const check = (conclusion: string): FailedCheck => ({ name: "Code validation / Core (core-web)", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/1/job/2", conclusion });
+  const check = (conclusion: string): FailedCheck => ({ name: "Code validation / Core (core-web)", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/1/job/2", conclusion, completedAt: null });
   for (const [checks, drafts] of [[[check("failure")], [draft(437, [419])]], [[check("cancelled")], [draft(437, [419])]], [[check("in_progress")], [draft(437, [419])]], [[], []]] as const) {
     const h = harness(t);
     h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(437), CONFLICT) };
@@ -715,6 +722,183 @@ test("conflict-only and plain drops count separately: five restacks, one fix req
   assert.match(second[0], /dropped this stack again[^]*so far: 2 plain, 0 conflict-only\./, "the second plain drop goes to the owner");
   plain.github.view = { ...plain.github.view, mergeActivity: activity(QUEUED, REMOVED, QUEUED, REMOVED, QUEUED, CONFLICT) };
   assert.deepEqual(await plain.poll(), [], "a conflict-only drop after the escalation is not restacked");
+});
+
+// A failed check on a queue draft, completed at `completedAt`.
+const failedCheck = (name: string, completedAt: string | null = "2026-09-29T07:30:00Z", conclusion = "failure"): FailedCheck => ({ name, url: `https://github.com/tuchel-sohn/tuchel-platform/actions/runs/9/job/${name.length}`, conclusion, completedAt });
+// `main`'s failed jobs by moment (ISO, milliseconds included); any other moment is unknown.
+const mainAt = (byTime: Record<string, string[]>, reads: string[] = []) => async (at: number) => {
+  reads.push(new Date(at).toISOString());
+  return byTime[new Date(at).toISOString()] ?? null;
+};
+
+test("main-broken: every failed draft job was red on main at its own completion, read once per distinct time", async () => {
+  const reads: string[] = [];
+  const checks = [
+    failedCheck("Code validation / Migration replay"),
+    failedCheck("Code validation / Core (core-web)"),
+    failedCheck("Code validation / Security audit", "2026-09-29T07:45:00Z", "timed_out"),
+    failedCheck("Code validation / Platform gate"),
+    failedCheck("Code validation / E2E (1/2)", null, "cancelled"),
+  ];
+  const main = mainAt({ "2026-09-29T07:30:00.000Z": ["Migration replay", "Core (core-web)", "Lint"], "2026-09-29T07:45:00.000Z": ["Security audit"] }, reads);
+  assert.deepEqual(await mainBrokenJobs(checks, main), ["Migration replay", "Core (core-web)", "Security audit"], "`Code validation / ` is stripped; gates and cancelled checks do not count");
+  assert.deepEqual(reads, ["2026-09-29T07:30:00.000Z", "2026-09-29T07:45:00.000Z"]);
+  assert.equal(bareJobName("Code validation / Migration replay"), "Migration replay");
+  assert.equal(bareJobName("Migration replay"), "Migration replay");
+  assert.equal(bareJobName("Deploy / Migration replay"), "Deploy / Migration replay");
+});
+
+test("main-broken: a failure main did not have, another shard, only gates, an unknown main or a check without a completion time is not main-broken", async () => {
+  const red = { "2026-09-29T07:30:00.000Z": ["Migration replay", "PostgreSQL integration (1/4)"] };
+  assert.equal(await mainBrokenJobs([failedCheck("Code validation / Migration replay"), failedCheck("Code validation / Core (core-web)")], mainAt(red)), null, "mixed: one failure is not red on main");
+  assert.equal(await mainBrokenJobs([failedCheck("Code validation / PostgreSQL integration (2/4)")], mainAt(red)), null, "main failed another shard");
+  const reads: string[] = [];
+  const gates = ["Code validation / Platform gate", "PR code", "Code validation / Post-merge gate", "Code validation / ${{ github.event_name == 'merge_group' && 'Platform gate' || 'Post-merge gate'"];
+  assert.ok(gates.every(isGateCheck));
+  assert.equal(isGateCheck("Code validation / PR code guard"), false);
+  assert.equal(await mainBrokenJobs(gates.map((name) => failedCheck(name)), mainAt(red, reads)), null, "only gates failed");
+  assert.equal(await mainBrokenJobs([], mainAt(red, reads)), null, "nothing failed");
+  assert.deepEqual(reads, [], "nothing to compare: main is not read");
+  assert.equal(await mainBrokenJobs([failedCheck("Code validation / Migration replay", "2026-09-29T07:31:00Z")], mainAt(red)), null, "main's state at that moment is unknown");
+  assert.equal(await mainBrokenJobs([failedCheck("Code validation / Migration replay", null)], mainAt(red)), null, "no completion time");
+});
+
+// GitHub's REST answers by path; any other read fails like gh would.
+function restApi(answers: Record<string, MainReply>) {
+  const reads: string[] = [];
+  const get = async (path: string): Promise<MainReply> => {
+    reads.push(path);
+    const answer = answers[path];
+    if (!answer) throw new Error(`unexpected read ${path}`);
+    return answer;
+  };
+  return { get, reads };
+}
+const MAIN_REPO = "tuchel-sohn/tuchel-platform";
+const AT = Date.parse("2026-09-29T08:00:00Z");
+const runsPage = (page: number) => `repos/${MAIN_REPO}/actions/workflows/ci.yml/runs?branch=main&exclude_pull_requests=true&per_page=10&page=${page}&created=%3C%3D2026-09-29T08%3A00%3A00Z`;
+const attemptPath = (run: number, attempt: number) => `repos/${MAIN_REPO}/actions/runs/${run}/attempts/${attempt}`;
+const jobsPath = (run: number, attempt: number) => `${attemptPath(run, attempt)}/jobs?per_page=100&page=1`;
+const job = (name: string, conclusion: string, completed = "2026-09-29T07:40:00Z") => ({ name, status: "completed", conclusion, completed_at: completed });
+
+test("main at a moment: a rerun finished after it is ignored and the earlier red attempt decides; other events and later runs are skipped", async () => {
+  const api = restApi({
+    [runsPage(1)]: { workflow_runs: [
+      { id: 10, event: "push", created_at: "2026-09-29T08:10:00Z", run_attempt: 1, status: "completed", conclusion: "success" },
+      { id: 9, event: "schedule", created_at: "2026-09-29T07:50:00Z", run_attempt: 1, status: "completed", conclusion: "failure" },
+      { id: 7, event: "push", created_at: "2026-09-29T07:00:00Z", run_attempt: 2, status: "completed", conclusion: "success" },
+    ] },
+    [jobsPath(7, 2)]: { total_count: 2, jobs: [job("Migration replay", "success", "2026-09-29T08:30:00Z"), job("Core (core-web)", "success", "2026-09-29T08:20:00Z")] },
+    [attemptPath(7, 1)]: { status: "completed", conclusion: "failure" },
+    [jobsPath(7, 1)]: { total_count: 3, jobs: [job("Migration replay", "failure"), job("Code validation / Platform gate", "failure", "2026-09-29T07:41:00Z"), job("Core (core-web)", "success", "2026-09-29T07:30:00Z")] },
+  });
+  assert.deepEqual(await mainFailedJobsAt(MAIN_REPO, AT, api.get), ["Migration replay"]);
+  assert.deepEqual(api.reads, [runsPage(1), jobsPath(7, 2), attemptPath(7, 1), jobsPath(7, 1)]);
+});
+
+test("main at a moment: a still running or cancelled newest attempt, or one with a job still running, leaves it to the previous attempt", async () => {
+  for (const latest of [{ status: "in_progress", conclusion: null }, { status: "completed", conclusion: "cancelled" }, { status: "completed", conclusion: "failure" }]) {
+    const api = restApi({
+      [runsPage(1)]: { workflow_runs: [{ id: 8, event: "workflow_dispatch", created_at: "2026-09-29T07:30:00Z", run_attempt: 2, ...latest }] },
+      [jobsPath(8, 2)]: { total_count: 1, jobs: [{ name: "E2E (1/2)", status: "in_progress", conclusion: null, completed_at: null }] },
+      [attemptPath(8, 1)]: { status: "completed", conclusion: "failure" },
+      [jobsPath(8, 1)]: { total_count: 2, jobs: [job("E2E (1/2)", "failure", "2026-09-29T07:50:00Z"), job("Lint", "skipped")] },
+    });
+    assert.deepEqual(await mainFailedJobsAt(MAIN_REPO, AT, api.get), ["E2E (1/2)"], JSON.stringify(latest));
+    assert.equal(api.reads.includes(jobsPath(8, 2)), latest.conclusion === "failure", "jobs are read only for a completed, not cancelled attempt");
+  }
+});
+
+test("main at a moment: unknown when no run decided, when a page brings no new run, or past 300 runs", async () => {
+  const schedule = (id: number) => ({ id, event: "schedule", created_at: "2026-09-29T07:00:00Z", run_attempt: 1, status: "completed", conclusion: "failure" });
+  const ten = (from: number) => Array.from({ length: 10 }, (_, index) => schedule(from + index));
+  const repeated = restApi({ [runsPage(1)]: { workflow_runs: ten(1) }, [runsPage(2)]: { workflow_runs: ten(1) } });
+  assert.equal(await mainFailedJobsAt(MAIN_REPO, AT, repeated.get), null);
+  assert.deepEqual(repeated.reads, [runsPage(1), runsPage(2)], "the second page had no new run");
+  const many = restApi(Object.fromEntries(Array.from({ length: 31 }, (_, index) => [runsPage(index + 1), { workflow_runs: ten(index * 10 + 1) }])));
+  assert.equal(await mainFailedJobsAt(MAIN_REPO, AT, many.get), null);
+  assert.equal(many.reads.length, 31, "the 301st run ends the walk");
+  const short = restApi({ [runsPage(1)]: { workflow_runs: [schedule(1)] } });
+  assert.equal(await mainFailedJobsAt(MAIN_REPO, AT, short.get), null, "no older run");
+});
+
+// A failure on the queue's draft that `main` also had at 07:30.
+const RED_ON_MAIN = failedCheck("Code validation / Migration replay");
+
+test("a main-broken drop counts toward neither limit and asks to re-enqueue with --wait-main once main is green", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(437)) };
+  h.github.drafts = [draft(437, [419])];
+  h.github.checks = [RED_ON_MAIN];
+  h.github.main = ["Migration replay"];
+  const prompt = promptOf(await h.poll()) ?? "";
+  assert.match(prompt, /- \[Code validation \/ Migration replay\]\(https:\/\/github\.com\/[^)]+\) — failure/);
+  assert.match(prompt, /Main broken: the merge queue dropped the range because `main` was already red on the same job at that time \(`Migration replay`; tools\/ci\/main-health\.mjs\)\. This drop does not count toward the stack's limits, and no restack or fix of your own is needed unless `enqueue\.mjs` refuses the range\./);
+  assert.match(prompt, /Re-enqueue the dropped queue range from its top branch once `main` is green: `git switch mtuchel\/tuc-1-fix && node tools\/ci\/enqueue\.mjs --wait-main` \(it waits until `main` is green, then checks and enqueues\), then `node tools\/ci\/wait-queue\.mjs 419`\./);
+  assert.match(prompt, /Drops of this pull request so far: 0 plain, 0 conflict-only, 1 main-broken \(not counted\)\.$/);
+  assert.doesNotMatch(prompt, /Fix the cause|git rebase|automatic fix request/);
+  assert.deepEqual(h.github.mainReads, [Date.parse("2026-09-29T07:30:00Z")]);
+  assert.deepEqual(await h.poll(), [], "not claimed again on the next poll");
+  await h.restart();
+  assert.deepEqual(await h.poll(), [], "nor after a restart");
+  assert.equal(h.github.mainReads.length, 1);
+
+  // With the agent gone, the same request goes to the ticket.
+  const gone = harness(t, { live: false });
+  gone.github.view = { ...gone.github.view, mergeActivity: activity(QUEUED, running(437)) };
+  gone.github.drafts = [draft(437, [419])];
+  gone.github.checks = [RED_ON_MAIN];
+  gone.github.main = ["Migration replay"];
+  const calls = await gone.poll();
+  assert.equal(calls[0], "move In Progress");
+  assert.match(calls[1], new RegExp(`^comment ${OWNER} The agent that worked on this ticket is no longer running[^]*enqueue\\.mjs --wait-main`));
+});
+
+test("three main-broken drops leave the plain budget alone: the next genuine failure gets fix request 1 of 1", async (t) => {
+  const h = harness(t);
+  const events: string[] = [];
+  const drop = (number: number) => {
+    events.push(QUEUED, running(number));
+    h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
+    h.github.drafts = [draft(number, [419])];
+    return h.poll();
+  };
+  h.github.checks = [RED_ON_MAIN];
+  h.github.main = ["Migration replay"];
+  for (const [index, number] of [440, 441, 442].entries()) assert.match(promptOf(await drop(number)) ?? "", new RegExp(`so far: 0 plain, 0 conflict-only, ${index + 1} main-broken \\(not counted\\)\\.$`));
+  h.github.checks = [failedCheck("Code validation / Core (core-web)")];
+  const genuine = promptOf(await drop(443)) ?? "";
+  assert.match(genuine, /2\. Fix the cause\./);
+  assert.match(genuine, /This is automatic fix request 1 of 1 for this pull request; the next plain drop goes to the owner\./);
+  assert.doesNotMatch(genuine, /Main broken/);
+});
+
+test("a failed main lookup claims nothing; the next poll claims the drop", async (t) => {
+  const h = harness(t);
+  const log = t.mock.method(console, "error", () => {});
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(437)) };
+  h.github.drafts = [draft(437, [419])];
+  h.github.checks = [RED_ON_MAIN];
+  h.github.main = ["Migration replay"];
+  h.github.mainFailure = new Error("gh: HTTP 502");
+  assert.deepEqual(await h.poll(), []);
+  assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /reading .*pull\/419 failed: gh: HTTP 502/);
+  h.github.mainFailure = null;
+  assert.match(promptOf(await h.poll()) ?? "", /Main broken[^]*so far: 0 plain, 0 conflict-only, 1 main-broken \(not counted\)\.$/);
+});
+
+test("an escalated pull request stays with the owner after a main-broken drop", async (t) => {
+  const h = harness(t);
+  const log = t.mock.method(console, "error", () => {});
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#437", "#438"], escalated: true, activeAt: new Date().toISOString() } });
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(439)) };
+  h.github.drafts = [draft(439, [419])];
+  h.github.checks = [RED_ON_MAIN];
+  h.github.main = ["Migration replay"];
+  assert.deepEqual(await h.poll(), []);
+  assert.deepEqual(h.github.mainReads, [], "main is not read once escalated");
+  assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /dropped .*pull\/419 again; already escalated to the owner/);
 });
 
 test("drops claimed before drops had kinds count as plain ones", async (t) => {
