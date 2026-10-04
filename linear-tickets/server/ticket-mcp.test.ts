@@ -94,6 +94,26 @@ test("a provider the daemon refuses MCP servers for starts once more without the
   assert.equal(result.warnings.filter((warning) => warning.includes("does not load MCP servers")).length, 1);
 });
 
+test("an omp launch hands the ticket tools to the plugin's omp extension instead of the daemon", async () => {
+  const calls: PaseoWorkspaceAgentCreateOptions[] = [];
+  const paseo = capturePaseo((options) => {
+    if ("mcpServers" in options.config) throw new Error("Provider 'omp' does not support MCP servers");
+    calls.push(options);
+  });
+  const launch = (installed: boolean) => new Launcher({ ...noMark, detail: async () => detail }, undefined, async () => "/s.mjs", undefined, undefined, () => installed)
+    .start({ ...input, provider: "omp", requestId: installed ? input.requestId : "7f6f1154-5838-4439-b981-b3c9d9831488" }, paseo, { linearAccess: true });
+  const result = await launch(true);
+  assert.deepEqual(result.warnings, []);
+  assert.equal(calls.length, 1, "no attempt with an MCP server");
+  assert.deepEqual(JSON.parse(calls[0].env?.LINEAR_TICKETS_MCP ?? "null")?.args?.slice(0, 3), ["/s.mjs", "--issue", ISSUE_ID]);
+  assert.ok(calls[0].prompt?.includes(LINEAR_ACCESS_NOTE));
+
+  const without = await launch(false);
+  assert.ok(without.warnings.some((warning) => warning.includes("does not load MCP servers")));
+  assert.ok(calls[1].prompt?.includes(NO_LINEAR_ACCESS_NOTE));
+  assert.equal(calls[1].env?.LINEAR_TICKETS_MCP, undefined);
+});
+
 test("any other creation failure is not retried", async () => {
   let calls = 0;
   const paseo = {
@@ -225,7 +245,7 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "add_comment", "set_status", "link_url", "add_manual_task"]);
+    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "get_issue", "search_issues", "add_comment", "set_status", "link_url", "add_relation", "create_issue", "update_issue", "add_manual_task"]);
 
     const ticket = JSON.parse((await mcp.call("get_ticket")).text);
     assert.equal(ticket.identifier, "ENG-42");
@@ -298,6 +318,77 @@ test("add_manual_task creates an assigned sub-issue, blocks the ticket only befo
     assert.deepEqual({ ...file, createdAt: undefined, cwd: undefined }, { id: "task-1", identifier: "ENG-51", url: "https://linear.app/x/issue/ENG-51", title: "Set LINEAR_API_KEY on batch-service (staging)", parentId: ISSUE_ID, parentIdentifier: "ENG-42", when: "before_merge", check: "true", createdAt: undefined, cwd: undefined, announced: false, activated: true, verifiedAt: null });
     assert.equal((await stat(join(directory, "task-1.json"))).mode & 0o777, 0o600);
     assert.equal(JSON.parse(await readFile(join(directory, "task-2.json"), "utf8")).activated, false);
+  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("writes follow the issue's scope: own ticket, issues the agent created, anything else", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-scope-"));
+  const own = { ...issue, project: { id: "lp-1", name: "Tooling" } };
+  const other = { ...issue, id: "other-1", identifier: "ENG-7", title: "Someone else's" };
+  let created = 0;
+  const filed = new Map<string, typeof issue>();
+  const linear = await fakeLinear((call) => {
+    const id = call.variables.id;
+    if (call.query.includes("query ticket")) {
+      if (id === ISSUE_ID || id === "ENG-42") return { issue: own };
+      if (id === "ENG-7") return { issue: other };
+      return { issue: [...filed.values()].find((node) => node.identifier === id || node.id === id) ?? null };
+    }
+    if (call.query.includes("issueCreate")) {
+      created++;
+      const node = { ...issue, id: `new-${created}`, identifier: `ENG-6${created}`, url: `https://linear.app/x/issue/ENG-6${created}` };
+      filed.set(node.id, node);
+      return { issueCreate: { success: true, issue: { id: node.id, identifier: node.identifier, url: node.url } } };
+    }
+    if (call.query.includes("issueRelationCreate")) return { issueRelationCreate: { success: true } };
+    if (call.query.includes("commentCreate")) return { commentCreate: { success: true, comment: { url: "https://linear.app/c/2" } } };
+    if (call.query.includes("issueUpdate")) return { issueUpdate: { success: true, issue: { state: { name: "In Progress" } } } };
+    return {};
+  });
+  const script = await writeTicketMcpScript(home);
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: linear.url });
+  const writes = (name: string) => linear.calls.filter((c) => c.query.includes(name)).map((c) => c.variables);
+  try {
+    const followUp = JSON.parse((await mcp.call("create_issue", { title: "Add retry", description: "Why and when done." })).text);
+    assert.deepEqual(followUp, { identifier: "ENG-61", url: "https://linear.app/x/issue/ENG-61", kind: "follow_up", status: "Todo", deduped: false });
+    const input = writes("issueCreate")[0].input as Record<string, unknown>;
+    assert.deepEqual({ ...input, description: undefined }, { teamId: "team-1", title: "Add retry", description: undefined, stateId: "s-todo", projectId: "lp-1" });
+    assert.match(String(input.description), /^Why and when done\.[\s\S]*ENG-42\.$/);
+    assert.deepEqual(writes("issueRelationCreate"), [{ input: { issueId: "new-1", relatedIssueId: ISSUE_ID, type: "related" } }]);
+    assert.equal(JSON.parse((await mcp.call("create_issue", { title: "add RETRY", description: "again" })).text).deduped, true);
+    assert.equal(created, 1, "a repeated title files nothing new");
+
+    // Another issue: comments and relations only.
+    const refused = await mcp.call("set_status", { issue: "ENG-7", status: "In Progress" });
+    assert.equal(refused.isError, true);
+    assert.match(refused.text, /ENG-7 is neither this agent's ticket nor an issue it created/);
+    assert.equal((await mcp.call("link_url", { issue: "ENG-7", url: "https://example.com/x" })).isError, true);
+    assert.equal((await mcp.call("update_issue", { issue: "ENG-7", title: "Mine now" })).isError, true);
+    assert.equal((await mcp.call("add_relation", { issue: "ENG-42", type: "related", from: "ENG-7" })).isError, true);
+    assert.equal(writes("issueUpdate").length, 0);
+    assert.equal((await mcp.call("add_comment", { issue: "ENG-7", body: "FYI" })).isError, false);
+    assert.deepEqual(writes("commentCreate").at(-1), { input: { issueId: "other-1", body: "FYI" } });
+    assert.equal((await mcp.call("add_relation", { issue: "ENG-7", type: "blocked_by" })).isError, false);
+    assert.deepEqual(writes("issueRelationCreate").at(-1), { input: { issueId: "other-1", relatedIssueId: ISSUE_ID, type: "blocks" } });
+    assert.equal(JSON.parse((await mcp.call("get_issue", { issue: "ENG-7" })).text).scope, "other");
+
+    // The issue it filed: text and status too. Its own ticket keeps the owner's text.
+    assert.equal((await mcp.call("update_issue", { issue: "ENG-61", title: "Add retry with backoff" })).isError, false);
+    assert.deepEqual(writes("issueUpdate").at(-1), { id: "new-1", input: { title: "Add retry with backoff" } });
+    assert.equal((await mcp.call("set_status", { issue: "ENG-61", status: "In Review" })).isError, false);
+    assert.deepEqual(writes("issueUpdate").at(-1), { id: "new-1", stateId: "s-review" });
+    assert.match((await mcp.call("update_issue", { issue: "ENG-42", title: "x" })).text, /own ticket/);
+
+    const sub = JSON.parse((await mcp.call("create_issue", { title: "Split part", description: "d", kind: "sub_issue" })).text);
+    assert.equal(sub.kind, "sub_issue");
+    assert.equal((writes("issueCreate")[1].input as Record<string, unknown>).parentId, ISSUE_ID);
+    assert.equal(writes("issueRelationCreate").length, 2, "a sub-issue gets no extra relation");
+
+    // The cap counts every recorded issue of this ticket.
+    const directory = join(home, "linear-tickets", "agent-issues", ISSUE_ID);
+    for (let i = 0; i < 8; i++) await writeFile(join(directory, `pad-${i}.json`), JSON.stringify({ id: `pad-${i}`, identifier: `ENG-9${i}`, url: "u", title: `pad ${i}` }));
+    assert.match((await mcp.call("create_issue", { title: "One too many", description: "d" })).text, /already filed 10 issues/);
+    assert.equal(created, 2);
   } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 

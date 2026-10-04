@@ -10,7 +10,7 @@ import { inReviewState, type LinearService } from "./linear";
 import { PLAN_CONTEXT_ENV, PLAN_TICKET_ENV } from "./plan-policy";
 import { findProject, readBranches } from "./projects";
 import { repoOrientation } from "./repo-orientation";
-import { paseoHome, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
+import { ompExtensionInstalled, paseoHome, TICKET_MCP_ENV, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
 
 type Start = RpcInput<typeof launchAgentRpc>;
 type Result = { agentId: string; warnings: string[] };
@@ -60,6 +60,8 @@ export class Launcher {
     // Downloads Linear uploads with the host's key; without it attachments stay links.
     private readonly download?: Download,
     private readonly planContext: (requestId: string, prompt: string) => Promise<string> = writePlanContext,
+    // Whether the plugin's omp extension is installed; it gives omp agents the ticket tools.
+    private readonly ompTools: () => boolean = ompExtensionInstalled,
   ) {}
 
   start(input: Start, paseo: PaseoApi, options: Options = {}): Promise<Result> {
@@ -183,16 +185,19 @@ export class Launcher {
       }
     }
     // The ticket marks the agent for the plan advisor gate even when its context cannot be saved.
-    const create = async (linearAccess: boolean, requestId: string) => {
+    // `attach`: hand the ticket server to the provider as an MCP server. omp cannot load one, so its
+    // agents get the server's command in TICKET_MCP_ENV and the plugin's omp extension mounts the tools.
+    const create = async (linearAccess: boolean, requestId: string, attach: boolean) => {
       const prompt = [options.resume?.handover, buildPrompt(detail, instructions, options.promptTemplate, linearAccess)].filter(Boolean).join("\n\n");
       let env: Record<string, string> = { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier };
+      if (linearAccess && mcpServers) env[TICKET_MCP_ENV] = JSON.stringify(mcpServers[TICKET_MCP_NAME]);
       try {
         env = { ...env, [PLAN_CONTEXT_ENV]: await this.planContext(input.requestId, prompt) };
       } catch (error) {
         warnings.push(`Could not save the ticket context for the plan advisor: ${error instanceof Error ? error.message : "unknown error"}`);
       }
       return workspace.agents.create({
-        config: { provider: input.provider, modeId: input.modeId, thinkingOptionId: input.thinkingOptionId, ...(linearAccess && mcpServers ? { mcpServers } : {}) },
+        config: { provider: input.provider, modeId: input.modeId, thinkingOptionId: input.thinkingOptionId, ...(linearAccess && attach && mcpServers ? { mcpServers } : {}) },
         title,
         prompt,
         requestId,
@@ -207,15 +212,17 @@ export class Launcher {
       return new Error(`Agent creation could not be confirmed${cause}. Check the workspace's agents before reopening this ticket to try again.`);
     };
     let withTools = Boolean(mcpServers);
-    const agent = await create(withTools, input.requestId).catch(async (error: unknown) => {
-      // The daemon refuses MCP servers for providers that cannot load them (omp) before it creates
+    // Attaching the server too would give an omp that learns MCP every tool twice.
+    const viaExtension = withTools && (input.provider === "omp" || input.provider.startsWith("omp/")) && this.ompTools();
+    const agent = await create(withTools, input.requestId, !viaExtension).catch(async (error: unknown) => {
+      // The daemon refuses MCP servers for providers that cannot load them before it creates
       // anything, so the same ticket starts again without the ticket tools and with the no-write note.
-      if (!withTools || !(error instanceof Error && error.message.includes("does not support MCP servers"))) throw unconfirmed(error);
+      if (!withTools || viaExtension || !(error instanceof Error && error.message.includes("does not support MCP servers"))) throw unconfirmed(error);
       withTools = false;
-      warnings.push("This provider does not load MCP servers, so the agent started without the Linear ticket tools and was told not to change Linear; choose another provider to let it update the ticket.");
-      return create(false, `${input.requestId}-no-mcp`).catch((retryError: unknown) => { throw unconfirmed(retryError); });
+      warnings.push("This provider does not load MCP servers, so the agent started without the Linear ticket tools and was told not to change Linear; choose another provider (for omp, install the plugin's omp extension) to let it update the ticket.");
+      return create(false, `${input.requestId}-no-mcp`, false).catch((retryError: unknown) => { throw unconfirmed(retryError); });
     });
-    if (withTools && agent.capabilities?.supportsMcpServers === false) {
+    if (withTools && !viaExtension && agent.capabilities?.supportsMcpServers === false) {
       warnings.push("This provider does not load MCP servers, so the agent has no Linear tools. It was still told about them; choose another provider to let it update the ticket.");
     }
     return { agentId: agent.id, warnings };

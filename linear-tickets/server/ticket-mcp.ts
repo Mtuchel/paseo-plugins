@@ -1,16 +1,25 @@
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { TICKET_MCP_SOURCE } from "./ticket-mcp-source";
 
 export const TICKET_MCP_NAME = "linear_ticket";
+// The server's command (TicketMcpServer as JSON) in an omp agent's environment: the plugin's omp
+// extension (omp/linear-tickets-plan-first.ts) mounts its tools, since omp cannot load MCP servers.
+export const TICKET_MCP_ENV = "LINEAR_TICKETS_MCP";
 export type TicketMcpServer = { type: "stdio"; command: string; args: string[]; env?: Record<string, string> };
 export type Runtime = { execPath: string; electron: boolean };
 const daemonRuntime: Runtime = { execPath: process.execPath, electron: Boolean(process.versions.electron) };
 
 export function paseoHome(): string {
   return process.env.PASEO_HOME?.replace(/^~(?=\/|$)/, homedir()) || join(homedir(), ".paseo");
+}
+
+// README "Plan-first": the extension is installed by linking it into omp's extensions directory.
+export function ompExtensionInstalled(home = homedir()): boolean {
+  return existsSync(join(home, ".omp", "agent", "extensions", "linear-tickets-plan-first.ts"));
 }
 
 // Content-addressed so agents created by an older plugin version keep a working script.

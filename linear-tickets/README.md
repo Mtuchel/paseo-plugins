@@ -162,14 +162,36 @@ forget them. Mappings are stored per host in `settings.json`.
 ## Agent access to Linear
 
 Agents started from a ticket get a `linear_ticket` MCP server (on by default, the Paseo Agents
-menu bar app's **Control panel → Agent access to Linear** turns it off). Its tools act only on the ticket the agent started from
-and its manual tasks:
+menu bar app's **Control panel → Agent access to Linear** turns it off). Agents read all of
+Linear; what they may write depends on how an issue relates to the ticket the agent started from:
+
+| Scope | Write (as Paseo) |
+| --- | --- |
+| The agent's own ticket | comment, status, links, relations, manual tasks |
+| Issues the agent created with `create_issue` | comment, status, links, relations, title and description |
+| Any other issue | comment and relations only |
+
+Deleting or archiving issues, changing another issue's status, assignee or priority, and project,
+team or label settings are not possible. The server checks every target itself, so the limits hold
+whatever the agent is told. Its tools (`issue` is an identifier such as `ENG-123`; omitted, the
+agent's own ticket):
 
 - `get_ticket` — fresh title, description, status, the team's workflow states, comments, links;
-- `add_comment` — post a Markdown comment;
-- `set_status` — move to another state of the ticket's team by name; a canceled or duplicate
-  state needs a `reason`, posted on the ticket before the move;
+- `get_issue` — any issue: text, status, project, labels, parent, sub-issues, relations,
+  comments, links, and what the agent may change on it;
+- `search_issues` — full-text search over all issues;
+- `add_comment` — post a Markdown comment, on any issue;
+- `set_status` — move the ticket (or an issue the agent created) to another state of its team by
+  name; a canceled or duplicate state needs a `reason`, posted on the issue before the move;
 - `link_url` — attach an https link, such as the pull request;
+- `add_relation` — relate the ticket (or an issue the agent created) to any issue: related,
+  blocks, blocked by or duplicate of;
+- `create_issue` — file a follow-up, related to the ticket (or blocking it, or blocked by it), or a
+  sub-issue of it. It is created in the team's Todo state and the ticket's project, so the usual
+  pickup applies: a project that carries the dispatch label plans it, otherwise it waits in Todo.
+  A repeated title returns the issue already filed, and an agent files at most 10 issues per
+  ticket. Created issues are recorded under `$PASEO_HOME/linear-tickets/agent-issues/<ticket>/`;
+- `update_issue` — change the title or description of an issue the agent created;
 - `add_manual_task` — register a step only a person can do; see [Manual tasks](#manual-tasks).
 
 The agent closes its own ticket, so finished work never waits on you: once the ticket meets its
@@ -184,11 +206,16 @@ move the ticket to review, register every manual step as a manual task and close
 and it is appended when they do not. The server is a dependency-free script written to
 `$PASEO_HOME/linear-tickets/ticket-mcp-<hash>.mjs` and run with the daemon's own Node runtime
 (the desktop app's bundled runtime included), so it does not depend on `node` being on the
-agent's PATH. A provider that cannot load MCP servers (omp: the daemon refuses its launch when
-one is attached) starts once more without the server and with the no-write note instead of
-`{{linear_access}}`, and the launch returns a warning, since that agent has no Linear tools.
-The agent configuration carries only that path and the issue ID; no credential is put into the
-agent's configuration or environment.
+agent's PATH. omp cannot load MCP servers, so an omp agent gets the server's command in
+`LINEAR_TICKETS_MCP` instead, and the plugin's omp extension (`omp/linear-tickets-plan-first.ts`,
+installed as described under **The omp extension** in [Native Linear agent](#native-linear-agent))
+mounts the same tools as `linear_ticket_<tool>`, running each call
+through the script. The read tools are direct tools, so they also work while Plannotator's
+planning phase refuses every `xd://` call. Without the extension, and for any other provider that
+cannot load MCP servers, the agent starts once more without the server and with the no-write note
+instead of `{{linear_access}}`, and the launch returns a warning, since that agent has no Linear
+tools. The agent configuration and environment carry only that path and the issue ID; no
+credential is put into them.
 
 ### Who Linear shows as the author
 
