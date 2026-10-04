@@ -376,6 +376,25 @@ test("the lock: a stale holder never removes its successor's lock, one run takes
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
+test("a guard left by a run that died inside it is reported and never removed automatically", async () => {
+  const home = await temporary();
+  const directory = join(home, "owner-decisions");
+  try {
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "lock"), JSON.stringify({ pid: 1, token: "old", at: new Date(Date.now() - 40 * 60_000).toISOString() }));
+    const guard = join(directory, "lock.guard");
+    await writeFile(guard, "");
+    const old = new Date(Date.now() - 31 * 60_000);
+    await utimes(guard, old, old);
+    // Two runs reclaiming it at once could both get in, so neither removes it.
+    const results = await Promise.allSettled([1, 2].map(() => withLock(directory, async () => "ran")));
+    for (const result of results) assert.match(String(result.status === "rejected" ? result.reason : result.value), /lock\.guard was left by a decision-candidates run that stopped inside it/);
+    assert.ok((await stat(guard)).isFile());
+    await rm(guard);
+    assert.equal(await withLock(directory, async () => "ran"), "ran");
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
 test("evidence quotes only the owner's own words, as written, and cannot add structure", async () => {
   const home = await temporary();
   try {

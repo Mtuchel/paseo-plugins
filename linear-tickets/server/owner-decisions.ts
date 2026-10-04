@@ -349,8 +349,9 @@ async function lockHolder(path: string): Promise<{ token: string | null; since: 
 // The few milliseconds in which an existing lock is checked and then replaced (takeover) or
 // removed (release): `lock.guard`, created exclusively, so no run checks a lock while another
 // replaces or removes it. `retries`: how often to try again while another run is in it; false when
-// it stayed busy. A guard left by a run that died within it is removed after 30 minutes, only if it
-// is still that same file. Filesystem times are compared with the real clock, never with `now`.
+// it stayed busy. Only the run that created the guard removes it: removing one a run left behind
+// when it died inside could race with a second run doing the same, so an old guard is reported
+// and stays until a person removes it. Filesystem times are compared with the real clock.
 async function guarded(path: string, work: () => Promise<void>, retries: number): Promise<boolean> {
   const guard = `${path}.guard`;
   for (let attempt = 0; ; attempt++) {
@@ -359,14 +360,10 @@ async function guarded(path: string, work: () => Promise<void>, retries: number)
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (attempt < retries) { await sleep(GUARD_RETRY_MS); continue; }
       const left = await stat(guard).catch(() => null);
-      if (left && Date.now() - left.mtimeMs >= LOCK_STALE_MS) {
-        const still = await stat(guard).catch(() => null);
-        if (still && still.ino === left.ino && still.mtimeMs === left.mtimeMs) await rm(guard, { force: true });
-        continue;
-      }
-      if (attempt >= retries) return false;
-      await sleep(GUARD_RETRY_MS);
+      if (left && Date.now() - left.mtimeMs >= LOCK_STALE_MS) throw new Error(`${guard} was left by a decision-candidates run that stopped inside it (${new Date(left.mtimeMs).toISOString()}); remove it once no run is active.`);
+      return false;
     }
   }
   try {
@@ -419,8 +416,11 @@ export async function withLock<T>(directory: string, work: () => Promise<T>, now
   } finally {
     const released = await guarded(path, async () => {
       if ((await lockHolder(path))?.token === token) await rm(path, { force: true });
-    }, GUARD_RETRIES);
-    if (!released) console.error(`[linear-tickets] decision candidates: ${path} could not be released; it expires after 30 minutes.`);
+    }, GUARD_RETRIES).catch((error: unknown) => {
+      console.error(`[linear-tickets] decision candidates: ${error instanceof Error ? error.message : error}`);
+      return false;
+    });
+    if (!released) console.error(`[linear-tickets] decision candidates: ${path} could not be released; another run takes it over after 30 minutes.`);
   }
 }
 

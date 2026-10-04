@@ -1456,7 +1456,10 @@ project is skipped; new ones go into that week's open ticket or, if there is non
 closed), into a new one (`run 2`, ...). Proposals are numbered `Q-<n>` after the highest number in
 the register and in earlier candidate tickets. Created tickets go through the project's normal
 pickup. The checkpoint moves only once every project was filed; a rerun of the same batch files
-nothing twice. One lock (`owner-decisions/lock`, stale after 30 minutes) keeps two runs apart.
+nothing twice. One lock (`owner-decisions/lock`, taken over by one run after 30 minutes) keeps
+two runs apart. A run that dies inside the milliseconds it checks or replaces the lock leaves
+`owner-decisions/lock.guard`; it is never removed automatically, and runs fail naming it until a
+person removes it with no run active.
 
 **Answers.** The ticket tells its agent to ask the owner each proposal, post
 `**Q-<n> answered** — approved | rejected | changed | deferred: <the owner's words>` per answer,
