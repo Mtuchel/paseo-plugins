@@ -247,6 +247,24 @@ test("a project planner's work order is approved on submission and handed to the
   assert.deepEqual(calls, ["apply planner-1 agent-1 true"], "applied once; never parked, and nothing of a ticket approval (state, plan-ready, comments) applies");
 });
 
+test("a work order Paseo cannot read line by line is sent back to the planner, never applied as an empty order", async () => {
+  for (const order of ["# Work order\n\nTUC-12 blocks TUC-15", "## Work order\n\n```project-order\nTUC-12 blocks TUC-15 and TUC-16\n```"]) {
+    const { calls, linear, paseo } = setup({ "linear.issueId": "planner-1", "linear.identifier": "TUC-90" });
+    const decisions: string[] = [];
+    await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" }], async (directory) => {
+      const decide = async (url: string, approve: boolean, feedback: string) => { decisions.push(`${approve} ${feedback.split("\n\n")[1]}`); };
+      const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => order, undefined, undefined, undefined, decide, undefined, parkingFake(calls).parking);
+      bridge.onProjectPlan({ isPlanner: async () => true, applyPlan: async () => { calls.push("apply"); return true; } });
+      bridge.attach(paseo);
+      await bridge.drain();
+      bridge.stop();
+    });
+    assert.equal(decisions.length, 1);
+    assert.match(decisions[0], order.includes("```") ? /^false - Not one work-order change: "TUC-12 blocks TUC-15 and TUC-16"/ : /^false - The plan has no ```project-order block\./);
+    assert.deepEqual(calls, [], "nothing applied, nothing parked");
+  }
+});
+
 // In-memory parked plans; `available` is the central host running.
 function parkingFake(calls: string[], available = true) {
   const plans = new Map<string, ParkedPlan>();
