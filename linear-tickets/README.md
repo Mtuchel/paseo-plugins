@@ -405,6 +405,17 @@ delegation, mention) and however small it is. The only exception is a ticket car
 `no-plan` label and the sidebar's Plan-first toggle are gone, and so is omp's `skip_plan`. The
 prompt asks to keep the plan as short as the ticket allows.
 
+**Overlap check.** Tickets are filed (by you, by agents, by intake) without a look at what else is
+open, so every plan starts with one. The prompt has the agent search Linear's open tickets
+(`search_issues`, or another Linear read tool), across every team and project and including work
+in review whose pull request is not merged yet, for tickets that change the same feature, files or
+data or already ask for the same thing, and read each candidate in full. The plan gets an
+`## Overlapping tickets` section (each overlap and what the plan does about it, or "None found"
+with the search terms). With [agent access to Linear](#agent-access-to-linear) on, real overlaps
+are linked with `add_relation related` while the agent plans; a ticket another one fully covers
+gets a plan that proposes closing it as that ticket's duplicate. A project's planner gets its own
+overlap instructions (see **Projects** below).
+
 Claude starts in `plan` mode and Codex in `auto`; omp keeps your usual mode (its `write` mode asks
 before every shell command, reads included) and starts in Plannotator's planning phase instead.
 The prompt asks only for a plan and, for a ticket someone else wrote or labelled `feedback`, marks
@@ -658,16 +669,24 @@ every 2 minutes.
 - **Planner.** Planning files a ticket *Plan the work order of <project>* in the project
   (Urgent, label `paseo-planner`) and assigns it to Paseo. The ticket is recorded the moment it
   exists; when its label or assignment fails, every project read repeats what is missing, so a
-  failed step never files a second planner or leaves one without an agent. Its agent reads the open tickets,
-  listed in its description with the new ones marked, and the code, and plans which tickets
-  block which (because one builds on another, or both touch the same files), which must wait for
-  you, and which may need you while they run. Its plan is always approved automatically: it only
-  changes Linear, and every ticket still plans on its own. Its `## Work order` section holds a
-  block like:
+  failed step never files a second planner or leaves one without an agent. Its description lists
+  every open ticket of the project (In Progress and In Review included) with its links and a
+  160-character excerpt, the new ones marked and also given in full (up to 4,000 characters each
+  and 30,000 in all; past that the agent reads them in Linear), and the 300 most recently updated
+  open tickets of the same team outside the project by title. Its agent looks for overlap first:
+  it compares every new ticket with all of those, searches Linear with its read tools for open
+  tickets the lists miss, reads the full text of any candidate, and its plan lists every overlap
+  in an `## Overlaps` section (or "None found" with the search terms). It then reads the code and
+  plans which tickets block which (because one builds on another, or both touch the same files),
+  which duplicate or relate to other tickets, which must wait for you, and which may need you
+  while they run. Its plan is always approved automatically: it only changes Linear, and every
+  ticket still plans on its own. Its `## Work order` section holds a block like:
 
   ````
   ```project-order
   TUC-12 blocks TUC-15
+  TUC-24 duplicates TUC-9: TUC-9 already adds the export, including the CSV columns
+  TUC-25 relates to TUC-31: both change the dunning e-mails
   hold TUC-20: too big, split it first
   release TUC-21
   attended TUC-23: which customer groups get the discount is not decided
@@ -677,10 +696,15 @@ every 2 minutes.
   The plan is approved the moment the agent submits it: no risk check, no inbox, no parking, and
   no Linear read that could fail and send it to you. A plan whose block is missing, or has a line
   that is not exactly one change (`TUC-1 blocks TUC-2, TUC-3`), is sent back to the planner with
-  the unreadable lines instead of closing as an empty order. Paseo then adds the blocking relations,
-  puts `paseo-hold` on held tickets (removes it from released ones) and `paseo-attended` on
-  attended ones (`unattended X` removes it), comments what it applied and skipped, closes the
-  planner ticket and archives its agent. Nothing else of an approval (In Progress, `plan-ready`,
+  the unreadable lines instead of closing as an empty order. Paseo then adds the blocking
+  relations, links related tickets, puts `paseo-hold` on held tickets (removes it from released
+  ones) and `paseo-attended` on attended ones (`unattended X` removes it), comments what it
+  applied and skipped, closes the planner ticket and archives its agent. `A duplicates B` puts
+  `paseo-hold` on A, posts the reason on it and links it as a duplicate of B, which moves A to
+  Linear's Duplicate status; B may be any ticket, in the project or not, open or done, while A
+  must be a ticket of the project that is not started and not with an agent (others are listed
+  as skipped). `A relates to B` needs A open in the project and B any ticket. Links that exist
+  count as applied. Nothing else of an approval (In Progress, `plan-ready`,
   a new agent) applies to it. The approved order is kept in `projects.json` before it is
   written, and every project read writes one that is not in Linear yet, so Linear being down or
   rate-limited only delays it, for as long as it lasts. The changes that went through are kept

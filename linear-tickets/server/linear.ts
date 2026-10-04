@@ -351,17 +351,21 @@ export type IssueState = {
 };
 
 // Projects carrying the trigger label (README, "Projects"), and their open tickets with what the
-// project flow reads: state, team, parent, who has it, labels, blockers and what they block.
+// project flow reads: state, team, parent, who has it, labels, blockers, what they block and links.
 export const LABELED_PROJECTS_QUERY = `query labeledProjects($label: String!) {
   projects(first: 50, filter: { labels: { name: { eqIgnoreCase: $label } } }) { nodes { id name } }
 }`;
+// Relation types that link two tickets without ordering them (`ProjectIssue.linked`), by how they
+// read from the ticket's side: as the relation's subject, and as its object.
+const FORWARD_LINKS: Record<string, "related" | "duplicates"> = { related: "related", duplicate: "duplicates" };
+const INVERSE_LINKS: Record<string, "related" | "duplicated by"> = { related: "related", duplicate: "duplicated by", duplicated: "duplicated by" };
 export const PROJECT_ISSUES_QUERY = `query projectIssues($id: String!, $after: String) {
   project(id: $id) { issues(first: 25, after: $after, filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } } }) {
     nodes {
       id identifier title priority createdAt state { name type } team { id key } creator { id } assignee { id } delegate { id } labels(first: 20) { nodes { name } }
       parent { id state { type } project { id } }
       inverseRelations(first: 15) { nodes { type issue { id identifier state { name type } delegate { id } attachments(first: 10) { nodes { url sourceType metadata } } } } }
-      relations(first: 15) { nodes { type relatedIssue { id state { type } } } }
+      relations(first: 15) { nodes { type relatedIssue { id identifier state { type } } } }
     }
     pageInfo { hasNextPage endCursor }
   } }
@@ -369,13 +373,29 @@ export const PROJECT_ISSUES_QUERY = `query projectIssues($id: String!, $after: S
 export const ISSUE_DESCRIPTIONS_QUERY = `query issueDescriptions($ids: [ID!]!) {
   issues(first: 50, filter: { id: { in: $ids } }) { nodes { id description } }
 }`;
+// The planner's view beyond its project (README, "Projects"): every open ticket of the teams,
+// most recently updated first.
+export const TEAM_OPEN_ISSUES_QUERY = `query teamOpenIssues($teams: [ID!]!, $after: String) {
+  issues(first: 100, after: $after, orderBy: updatedAt, filter: { team: { id: { in: $teams } }, state: { type: { nin: ["completed", "canceled", "duplicate"] } } }) {
+    nodes { id identifier title state { name } project { id name } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+// A ticket by its identifier, in any state; an empty list when no such ticket exists.
+export const ISSUE_BY_NUMBER_QUERY = `query issueByNumber($team: String!, $number: Float!) {
+  issues(first: 1, includeArchived: true, filter: { team: { key: { eqIgnoreCase: $team } }, number: { eq: $number } }) { nodes { id identifier title } }
+}`;
 export type LabeledProject = { id: string; name: string };
+export type TicketRef = { id: string; identifier: string; title: string };
+export type TeamIssue = TicketRef & { status: string; projectId: string | null; projectName: string };
 // `parentId`: the ticket's parent when it is open and in the same project (the parent's group hands it out).
-// `blocks`: ids of open tickets this one blocks.
+// `blocks`: ids of open tickets this one blocks. `linked`: tickets it is related to, a duplicate of
+// ("duplicates") or duplicated by.
+export type ProjectLink = { id: string; identifier: string; kind: "related" | "duplicates" | "duplicated by" };
 export type ProjectIssue = {
   id: string; identifier: string; title: string; priority: number; createdAt: string; status: string; statusType: string;
   teamId: string; teamKey: string; creatorId: string | null; assigneeId: string | null; delegateId: string | null; labels: string[];
-  parentId: string | null; blockers: GroupIssue[]; blocks: string[];
+  parentId: string | null; blockers: GroupIssue[]; blocks: string[]; linked: ProjectLink[];
 };
 export const CREATE_ISSUE_QUERY = `mutation issueCreate($input: IssueCreateInput!) {
   issueCreate(input: $input) { success issue { id identifier url } }
@@ -859,6 +879,14 @@ export class LinearService {
           blocks: connection(node.relations ?? { nodes: [] }).nodes.map((item) => record(item))
             .filter((relation) => label(relation.type) === "blocks").map((relation) => record(relation.relatedIssue ?? {}))
             .filter((related) => !["completed", "canceled", "duplicate"].includes(label(record(related.state ?? {}).type))).map((related) => label(related.id)).filter(Boolean),
+          linked: [
+            ...connection(node.relations ?? { nodes: [] }).nodes.map((item) => record(item))
+              .filter((relation) => Object.hasOwn(FORWARD_LINKS, label(relation.type)))
+              .map((relation) => ({ other: record(relation.relatedIssue ?? {}), kind: FORWARD_LINKS[label(relation.type)] })),
+            ...connection(node.inverseRelations ?? { nodes: [] }).nodes.map((item) => record(item))
+              .filter((relation) => Object.hasOwn(INVERSE_LINKS, label(relation.type)))
+              .map((relation) => ({ other: record(relation.issue ?? {}), kind: INVERSE_LINKS[label(relation.type)] })),
+          ].map(({ other, kind }) => ({ id: label(other.id), identifier: label(other.identifier), kind })).filter((other) => other.id),
         });
       }
       const info = record(page.pageInfo ?? {});
@@ -875,6 +903,31 @@ export class LinearService {
       for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) descriptions.set(label(node.id), label(node.description));
     }
     return descriptions;
+  }
+
+  // Open tickets of the teams, most recently updated first, up to `limit`.
+  async openTeamIssues(teamIds: string[], limit: number): Promise<TeamIssue[]> {
+    const issues: TeamIssue[] = [];
+    let after: string | null = null;
+    do {
+      const page = record(record(await this.read(TEAM_OPEN_ISSUES_QUERY, { teams: teamIds, after })).issues ?? {});
+      for (const node of connection(page).nodes.map((item) => record(item))) {
+        const project = record(node.project ?? {});
+        issues.push({ id: label(node.id), identifier: label(node.identifier), title: label(node.title), status: label(record(node.state ?? {}).name), projectId: label(project.id) || null, projectName: label(project.name) });
+      }
+      const info = record(page.pageInfo ?? {});
+      after = issues.length < limit && info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
+    } while (after);
+    return issues.slice(0, limit);
+  }
+
+  // The ticket with this identifier (for example TUC-12), in any state; null when there is none.
+  async issueRef(identifier: string): Promise<TicketRef | null> {
+    const match = /^([A-Za-z][A-Za-z0-9]*)-(\d+)$/.exec(identifier.trim());
+    if (!match) return null;
+    const data = record(await this.read(ISSUE_BY_NUMBER_QUERY, { team: match[1], number: Number(match[2]) }));
+    const node = connection(record(data.issues ?? {})).nodes.map((item) => record(item))[0];
+    return node && label(node.id) ? { id: label(node.id), identifier: label(node.identifier), title: label(node.title) } : null;
   }
 
   async issueGroup(id: string): Promise<IssueGroup> {
@@ -925,6 +978,12 @@ export class LinearService {
   // `blocker` must be finished before `blocked` can start.
   async addBlocker(blockerId: string, blockedId: string): Promise<void> {
     succeeded(record(await this.write(RELATION_QUERY, { input: { issueId: blockerId, relatedIssueId: blockedId, type: "blocks" } })), "issueRelationCreate", "link the tickets");
+  }
+
+  // `related`: both tickets touch the same work. `duplicate`: `issueId` is a duplicate of
+  // `relatedId`; Linear then moves it to its Duplicate status.
+  async relate(issueId: string, relatedId: string, type: "related" | "duplicate"): Promise<void> {
+    succeeded(record(await this.write(RELATION_QUERY, { input: { issueId, relatedIssueId: relatedId, type } })), "issueRelationCreate", "link the tickets");
   }
 
   async ping(): Promise<void> {

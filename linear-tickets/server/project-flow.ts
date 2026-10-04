@@ -5,7 +5,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { ProjectStatus } from "../shared/contracts";
 import type { Capacity } from "./capacity";
 import { dispatchLabels } from "./dispatch";
-import { refusedByLinear, type LinearService, type ProjectIssue } from "./linear";
+import { refusedByLinear, type LinearService, type ProjectIssue, type TeamIssue } from "./linear";
 import type { Scheduler } from "./scheduler";
 import { needsOwner } from "./presence";
 import { PLAN_READY_LABEL } from "./plan-policy";
@@ -30,6 +30,14 @@ const POLL_MS = 2 * 60_000;
 // Ticket list in the planner's description: each ticket's description is cut to this, which keeps
 // a 200-ticket project near 60,000 characters.
 const DESCRIPTION_CHARS = 160;
+// NEW tickets are also given in full, each up to NEW_DESCRIPTION_CHARS and all of them together up
+// to NEW_DESCRIPTIONS_BUDGET; past it the planner reads the rest in Linear. With the lists this keeps
+// a 200-ticket project's description near 120,000 characters (Linear took 73,000 without complaint).
+const NEW_DESCRIPTION_CHARS = 4_000;
+const NEW_DESCRIPTIONS_BUDGET = 30_000;
+// Open tickets of the project's teams outside the project, listed by title (about 100 characters
+// each), most recently updated first.
+const OTHER_TICKETS = 300;
 const HAND_OUT_TYPES = new Set(["backlog", "unstarted"]);
 // Polls a work order is retried while Linear refuses some of its changes, before it is closed with
 // them skipped. Changes that did not reach Linear (rate limit, outage) are retried without limit.
@@ -119,12 +127,15 @@ export class ProjectStore {
 }
 
 // One line of the planner's `project-order` block.
-export type OrderStep = { kind: "blocks"; blocker: string; blocked: string } | { kind: "hold" | "release" | "attended" | "unattended"; ticket: string; reason: string };
+export type OrderStep = { kind: "blocks"; blocker: string; blocked: string }
+  | { kind: "duplicates" | "relates"; ticket: string; other: string; reason: string }
+  | { kind: "hold" | "release" | "attended" | "unattended"; ticket: string; reason: string };
 
 const TICKET = "[A-Z][A-Z0-9]*-\\d+";
 // A reason may follow the tickets after `:`, `(`, `#` or a dash, and a line may end in a period;
 // anything else (`and TUC-3`, a list) makes the line unreadable rather than half-read.
 const BLOCKS_LINE = new RegExp(`^(${TICKET})\\s+blocks\\s+(${TICKET})\\s*(?:\\.?$|[:(#]|[—–-]\\s)`, "i");
+const LINK_LINE = new RegExp(`^(${TICKET})\\s+(duplicates|relates\\s+to)\\s+(${TICKET})\\s*(?:\\.?$|[:—–-]\\s*(.*)$)`, "i");
 const MARK_LINE = new RegExp(`^(hold|release|attended|unattended)\\s+(${TICKET})\\s*(?:\\.?$|[:—–-]\\s*(.*)$)`, "i");
 
 function orderBlock(plan: string): string | null {
@@ -138,13 +149,15 @@ function orderLines(block: string): string[] {
 function orderStep(line: string): OrderStep | null {
   const blocks = BLOCKS_LINE.exec(line);
   if (blocks) return { kind: "blocks", blocker: blocks[1].toUpperCase(), blocked: blocks[2].toUpperCase() };
+  const link = LINK_LINE.exec(line);
+  if (link) return { kind: link[2].toLowerCase() === "duplicates" ? "duplicates" : "relates", ticket: link[1].toUpperCase(), other: link[3].toUpperCase(), reason: (link[4] ?? "").trim() };
   const mark = MARK_LINE.exec(line);
   return mark ? { kind: mark[1].toLowerCase() as "hold" | "release" | "attended" | "unattended", ticket: mark[2].toUpperCase(), reason: (mark[3] ?? "").trim() } : null;
 }
 
-// The approved plan's ```project-order block: `TUC-1 blocks TUC-2`, `hold TUC-3: reason`,
-// `release TUC-4`, `attended TUC-5: reason`, `unattended TUC-6`. Unreadable lines are left out
-// (see `orderProblems`).
+// The approved plan's ```project-order block: `TUC-1 blocks TUC-2`, `TUC-3 duplicates TUC-9: reason`,
+// `TUC-4 relates to TUC-8: reason`, `hold TUC-3: reason`, `release TUC-4`, `attended TUC-5: reason`,
+// `unattended TUC-6`. Unreadable lines are left out (see `orderProblems`).
 export function parseOrder(plan: string): OrderStep[] {
   return orderLines(orderBlock(plan) ?? "").map(orderStep).filter((step): step is OrderStep => step !== null);
 }
@@ -157,8 +170,16 @@ export function orderProblems(plan: string): string[] {
   return orderLines(block).filter((line) => !orderStep(line)).map((line) => `Not one work-order change: "${line}"`);
 }
 
+function orderLine(step: OrderStep): string {
+  if (step.kind === "blocks") return `${step.blocker} blocks ${step.blocked}`;
+  const reason = step.reason ? `: ${step.reason}` : "";
+  if (step.kind === "duplicates") return `${step.ticket} duplicates ${step.other}${reason}`;
+  if (step.kind === "relates") return `${step.ticket} relates to ${step.other}${reason}`;
+  return `${step.kind} ${step.ticket}${reason}`;
+}
+
 type Deps = {
-  linear: Pick<LinearService, "labeledProjects" | "projectIssues" | "issueDescriptions" | "issueDocument" | "createIssue" | "addLabel" | "removeLabel" | "delegate" | "addBlocker" | "complete" | "comment" | "appUserId" | "viewerId">;
+  linear: Pick<LinearService, "labeledProjects" | "projectIssues" | "issueDescriptions" | "openTeamIssues" | "issueRef" | "issueDocument" | "createIssue" | "addLabel" | "removeLabel" | "delegate" | "addBlocker" | "relate" | "complete" | "comment" | "appUserId" | "viewerId">;
   scheduler: Pick<Scheduler, "note" | "admit" | "release">;
   // The cap the starter's start paths admit under (max agents, or a memory lease).
   capacity: Pick<Capacity, "limit">;
@@ -304,7 +325,10 @@ export class ProjectFlow {
       for (const issue of read.work) teams.set(issue.teamId, (teams.get(issue.teamId) ?? 0) + 1);
       const teamId = [...teams.entries()].sort((a, b) => b[1] - a[1])[0][0];
       const descriptions = await this.deps.linear.issueDescriptions(read.work.map((issue) => issue.id));
-      const created = await this.deps.linear.createIssue({ teamId, projectId: project.id, ready: true, priority: 1, title: `Plan the work order of ${project.name}`, description: plannerBrief(project.name, read.work, read.unplanned, descriptions, labels) });
+      // One more than listed, to tell the planner when the list stops short.
+      const teamIssues = await this.deps.linear.openTeamIssues([...teams.keys()], OTHER_TICKETS + read.work.length + 1);
+      const others = teamIssues.filter((issue) => issue.projectId !== project.id);
+      const created = await this.deps.linear.createIssue({ teamId, projectId: project.id, ready: true, priority: 1, title: `Plan the work order of ${project.name}`, description: plannerBrief(project.name, read.work, read.unplanned, descriptions, others.slice(0, OTHER_TICKETS), others.length > OTHER_TICKETS || teamIssues.length > OTHER_TICKETS + read.work.length, labels) });
       const planner: PlannerRecord = { id: created.id, identifier: created.identifier, url: created.url, listedAt: read.readAt, listed: read.work.map((issue) => issue.id), tickets: read.unplanned.length, started: false };
       await this.store.update(project.id, (record) => ({ ...(record ?? read.record), planner }));
       console.log(`[linear-tickets] project ${project.name}: planner ${created.identifier} for ${read.unplanned.length} new ticket${read.unplanned.length === 1 ? "" : "s"}`);
@@ -440,7 +464,7 @@ export class ProjectFlow {
       const released = new Set<string>();
       const already = new Set(planner.approved.done ?? []);
       for (const step of parseOrder(planner.approved.plan)) {
-        const line = step.kind === "blocks" ? `${step.blocker} blocks ${step.blocked}` : `${step.kind} ${step.ticket}${step.reason ? `: ${step.reason}` : ""}`;
+        const line = orderLine(step);
         const target = byIdentifier.get(step.kind === "blocks" ? step.blocked : step.ticket);
         if (already.has(line)) {
           done.push(line);
@@ -453,6 +477,24 @@ export class ProjectFlow {
             if (!blocker || !target) { skipped.push(`${line} (not an open ticket of the project)`); continue; }
             // Already there (an earlier write of this order, or the owner): counted as applied.
             if (!target.blockers.some((item) => item.id === blocker.id)) await this.deps.linear.addBlocker(blocker.id, target.id);
+          } else if (step.kind === "duplicates" || step.kind === "relates") {
+            if (!target) { skipped.push(`${line} (not an open ticket of the project)`); continue; }
+            // The other side may be any ticket, in this project or not, open or done.
+            const other = byIdentifier.get(step.other) ?? await this.deps.linear.issueRef(step.other);
+            if (!other) { skipped.push(`${line} (${step.other} does not exist)`); continue; }
+            if (other.id === target.id) { skipped.push(`${line} (a ticket cannot be linked to itself)`); continue; }
+            // Already linked (an earlier write of this order, or the owner): counted as applied. Any
+            // link counts for `relates to`; only A's own duplicate link to B for `duplicates`.
+            if (target.linked.some((item) => item.id === other.id && (step.kind === "relates" || item.kind === "duplicates"))) { done.push(line); continue; }
+            if (step.kind === "relates") await this.deps.linear.relate(target.id, other.id, "related");
+            else {
+              // A duplicate closes the ticket in Linear: never one that is started or with an agent.
+              if (!(HAND_OUT_TYPES.has(target.statusType) || target.statusType === "triage") || target.delegateId) { skipped.push(`${line} (started or with an agent; only a ticket nobody works on is closed as a duplicate)`); continue; }
+              // Held first, so it is never handed out should Linear not close it.
+              await this.deps.linear.addLabel(target.id, labels.hold);
+              await this.deps.linear.comment(target.id, `Closed as a duplicate of ${other.identifier} by the work order of ${planner.identifier}${step.reason ? `: ${step.reason}` : "."}`);
+              await this.deps.linear.relate(target.id, other.id, "duplicate");
+            }
           } else {
             if (!target) { skipped.push(`${line} (not an open ticket of the project)`); continue; }
             if (step.kind === "hold") await this.deps.linear.addLabel(target.id, labels.hold);
@@ -513,21 +555,36 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-// The planner ticket's description: what to decide, the answer format, and every open ticket.
-export function plannerBrief(projectName: string, work: ProjectIssue[], unplanned: ProjectIssue[], descriptions: Map<string, string>, labels: { hold: string; attended: string }): string {
+// The planner ticket's description: what to decide, the answer format, every open ticket of the
+// project (NEW ones also in full) and the other open tickets of its teams.
+export function plannerBrief(projectName: string, work: ProjectIssue[], unplanned: ProjectIssue[], descriptions: Map<string, string>, others: TeamIssue[], othersCut: boolean, labels: { hold: string; attended: string }): string {
   const fresh = new Set(unplanned.map((issue) => issue.id));
   const lines = work.map((issue) => {
     const blockers = issue.blockers.filter((blocker) => !blocker.finished).map((blocker) => blocker.identifier);
+    const linked = issue.linked.map((other) => `${other.kind === "related" ? "related to" : other.kind} ${other.identifier}`);
     const text = (descriptions.get(issue.id) ?? "").replace(/\s+/g, " ").trim();
-    const facts = [issue.status, issue.priority ? `P${issue.priority}` : "", issue.labels.join(", "), blockers.length ? `blocked by ${blockers.join(", ")}` : "", fresh.has(issue.id) ? "NEW" : ""].filter(Boolean).join(" · ");
+    const facts = [issue.status, issue.priority ? `P${issue.priority}` : "", issue.labels.join(", "), blockers.length ? `blocked by ${blockers.join(", ")}` : "", ...linked, fresh.has(issue.id) ? "NEW" : ""].filter(Boolean).join(" · ");
     return `- **${issue.identifier}** ${issue.title} (${facts})${text ? `\n  ${text.length > DESCRIPTION_CHARS ? `${text.slice(0, DESCRIPTION_CHARS - 1)}…` : text}` : ""}`;
   });
+  let budget = NEW_DESCRIPTIONS_BUDGET;
+  const full = work.filter((issue) => fresh.has(issue.id)).map((issue) => {
+    const text = (descriptions.get(issue.id) ?? "").trim();
+    const room = Math.min(NEW_DESCRIPTION_CHARS, budget);
+    const shown = text.length > room ? `${text.slice(0, Math.max(room - 1, 0))}…` : text;
+    budget -= shown.length;
+    const quoted = shown ? shown.split("\n").map((line) => `> ${line}`.trimEnd()).join("\n") : "> (no description)";
+    return `### ${issue.identifier} ${issue.title}\n\n${quoted}${shown.length < text.length ? "\n\n(Cut here: read the full description in Linear.)" : ""}`;
+  });
+  const otherLines = others.map((issue) => `- **${issue.identifier}** ${issue.title} (${[issue.status, issue.projectName || "no project"].join(" · ")})`);
   return [
     `Paseo hands the open tickets of **${projectName}** to agents on its own, up to the agent limit at once. Before it hands out the tickets marked NEW, decide their work order. Do not change code: this ticket only produces the order.`,
+    "Look for overlap first. Compare every NEW ticket with every other ticket below, in this project and outside it, and search Linear (the linear_ticket tool `search_issues`, or another Linear read tool such as `list_issues` with a query) for open tickets the lists do not show. Two tickets overlap when they change the same feature, files or data, or one already asks for what the other does. Before you decide on a ticket whose title or excerpt touches a NEW ticket's topic, read its full description in Linear. Your plan gets an `## Overlaps` section: every overlap found and the line of the order that handles it, or \"None found\" with the search terms you used.",
     `Read the tickets below and the code they touch, then write a plan with a \`## Work order\` section holding a fenced block in exactly this format:`,
-    "```project-order\nTUC-12 blocks TUC-15\nhold TUC-20: too big, split it first\nrelease TUC-21\nattended TUC-23: which customer groups get the discount is not decided\n```",
+    "```project-order\nTUC-12 blocks TUC-15\nTUC-24 duplicates TUC-9: TUC-9 already adds the export, including the CSV columns\nTUC-25 relates to TUC-31: both change the dunning e-mails\nhold TUC-20: too big, split it first\nrelease TUC-21\nattended TUC-23: which customer groups get the discount is not decided\n```",
     [
-      "- `A blocks B`: B must not start before A is finished. Add one where B builds on A, or where both change the same files and would conflict as parallel pull requests.",
+      "- `A blocks B`: B must not start before A is finished. Add one where B builds on A, or where both change the same files and would conflict as parallel pull requests. Both must be open tickets of this project.",
+      `- \`A duplicates B: reason\`: A asks for nothing that B does not already cover. A is a ticket of this project that is not started and not with an agent; B is any ticket, in this project or not, open or done. A gets the \`${labels.hold}\` label, the reason as a comment and the duplicate link to B, which closes A in Linear. Only for complete coverage: a partial overlap is \`relates to\`, plus \`blocks\` where one must land first.`,
+      "- `A relates to B: reason`: A (open, in this project) and B (any ticket) touch the same feature, files or data, but each keeps work of its own. The link shows each ticket's agent the other one.",
       `- \`hold X: reason\`: X must not start at all until the owner acts (too big, should be split, waits on a decision outside the code). It gets the \`${labels.hold}\` label and is not handed out until the owner removes it.`,
       "- `release X`: a ticket held earlier may now be handed out.",
       `- \`attended X: reason\`: an agent can do X, but will very likely have to stop and ask the owner during the work. X still plans at any time, but its plan always goes to the owner, and its implementation starts only while the owner is present; unmarked tickets also run at night, unattended. Mark a ticket only for one of these: a business decision the ticket leaves open, acceptance criteria too vague to check, user-facing wording or layout the owner must choose, changes to production data, external accounts or spend, or a step only a person can do. Size, difficulty, risk or code review alone are no reason: most tickets stay unmarked. It gets the \`${labels.attended}\` label.`,
@@ -535,8 +592,10 @@ export function plannerBrief(projectName: string, work: ProjectIssue[], unplanne
       "- Tickets not mentioned are handed out as soon as they are unblocked; independent tickets run in parallel.",
       "- One change per line, a reason only after a colon (`TUC-1 blocks TUC-2, TUC-3` is not read: write two lines). A block Paseo cannot read line by line is sent back to you.",
     ].join("\n"),
-    "Rate the work order itself in the plan's `## Risk and impact` section (the advisor record needs it), not the tickets: it only changes Linear (blocking relations and labels), and every ticket still plans and is approved on its own. That is impact 0 with reversibility `revert`. The work order is applied without the owner, so anything that needs them goes under `hold` or `attended`.",
+    "Rate the work order itself in the plan's `## Risk and impact` section (the advisor record needs it), not the tickets: it only changes Linear (blocking relations, related and duplicate links, and labels; a duplicate is closed, and reopening it undoes that), and every ticket still plans and is approved on its own. That is impact 0 with reversibility `revert`. The work order is applied without the owner, so anything that needs them goes under `hold` or `attended`.",
     "Once you submit the plan, Paseo approves it automatically, writes the order into Linear and closes this ticket. Nothing is left to implement then: stop.",
-    `## Open tickets (${work.length})\n\n${lines.join("\n")}`,
-  ].join("\n\n");
+    `## Open tickets of ${projectName} (${work.length})\n\n${lines.join("\n")}`,
+    full.length ? `## NEW tickets in full\n\n${full.join("\n\n")}` : "",
+    `## Open tickets outside ${projectName}, same team (${others.length}${othersCut ? "+" : ""})\n\n${otherLines.length ? otherLines.join("\n") : "None."}${othersCut ? `\n\nOnly the ${others.length} most recently updated are listed; search Linear for older ones.` : ""}`,
+  ].filter(Boolean).join("\n\n");
 }

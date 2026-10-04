@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { setImmediate } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
-import { LinearApiError, LinearRefusedError, type ProjectIssue } from "./linear";
+import { LinearApiError, LinearRefusedError, type ProjectIssue, type TeamIssue, type TicketRef } from "./linear";
 import { Capacity } from "./capacity";
 import { orderProblems, parseOrder, ProjectFlow, ProjectStore, type ProjectRecord } from "./project-flow";
 import { Scheduler } from "./scheduler";
@@ -24,7 +24,7 @@ const settings = { dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["T
 
 const issue = (n: number, change: Partial<ProjectIssue> = {}): ProjectIssue => ({
   id: `i${n}`, identifier: `TUC-${n}`, title: `Ticket ${n}`, priority: 3, createdAt: `2026-01-01T00:00:0${n}Z`, status: "Todo", statusType: "unstarted",
-  teamId: "t1", teamKey: "TUC", creatorId: OWNER, assigneeId: null, delegateId: null, labels: [], parentId: null, blockers: [], blocks: [], ...change,
+  teamId: "t1", teamKey: "TUC", creatorId: OWNER, assigneeId: null, delegateId: null, labels: [], parentId: null, blockers: [], blocks: [], linked: [], ...change,
 });
 
 async function room(t: TestContext, issues: ProjectIssue[], running: string[] = []) {
@@ -36,23 +36,33 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   let away = false;
   // Plan documents by "<ticket id> <title>"; `fail`: Linear writes that fail (comments and
   // delegations the next n times, `create` always, one relation refused or never reaching Linear,
-  // the hold label refused); `comments`: every comment body posted; `gate`: holds createIssue open.
+  // the hold label refused); `comments`: every comment body posted; `gate`: holds createIssue open;
+  // `descriptions`: ticket descriptions by id; `team`: open tickets of the team; `elsewhere`:
+  // tickets by identifier; `briefs`: every planner description filed.
   const documents = new Map<string, string>();
   const fail: { comments?: number; delegate?: number; create?: boolean; relation?: string; unreached?: string; hold?: boolean; restart?: boolean } = {};
   const comments: string[] = [];
   let gate: Promise<void> | null = null;
   let creating = false;
   const outage = () => new LinearApiError("The Linear API request failed (HTTP 503). Try again.", 503);
+  const descriptions = new Map<string, string>();
+  const team: TeamIssue[] = [];
+  const elsewhere = new Map<string, TicketRef>();
+  const briefs: string[] = [];
   const linear = {
     labeledProjects: async () => [{ id: "erp", name: "ERP" }],
     projectIssues: async () => issues,
-    issueDescriptions: async () => new Map<string, string>(),
+    issueDescriptions: async () => descriptions,
+    openTeamIssues: async (_teams: string[], limit: number) => team.slice(0, limit),
+    issueRef: async (identifier: string) => elsewhere.get(identifier) ?? null,
+    relate: async (id: string, other: string, type: string) => { calls.push(`${id} ${type} ${other}`); },
     createIssue: async (input: { title: string; description: string; priority?: number }) => {
       if (fail.create) throw outage();
       creating = true;
       await gate;
       created++;
       calls.push(`create ${input.title} P${input.priority}`);
+      briefs.push(input.description);
       return { id: `planner${created}`, identifier: `TUC-${100 + created}`, url: "" };
     },
     addLabel: async (id: string, name: string) => {
@@ -88,7 +98,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
       if (fail.restart) throw new Error("Agent creation could not be confirmed (Timed out waiting for OMP to become ready).");
     } });
   return {
-    flow, calls, store, issues, documents, fail, comments,
+    flow, calls, store, issues, documents, fail, comments, descriptions, team, elsewhere, briefs,
     advance: (ms: number) => { now += ms; },
     setAway: (value: boolean) => { away = value; },
     // The project's record as an earlier poll left it.
@@ -465,8 +475,55 @@ test("the work-order block accepts list markers and case, and ignores other line
     { kind: "hold", ticket: "TUC-3", reason: "owner decides" },
     { kind: "release", ticket: "TUC-4", reason: "" },
   ]);
-  assert.deepEqual(parseOrder("```project-order\nAttended tuc-5: wording\nunattended TUC-6\n```"), [
+  assert.deepEqual(parseOrder("```project-order\nAttended tuc-5: wording\nunattended TUC-6\ntuc-7 Duplicates OPS-2: same export\nTUC-8 relates   to TUC-9\n```"), [
     { kind: "attended", ticket: "TUC-5", reason: "wording" },
     { kind: "unattended", ticket: "TUC-6", reason: "" },
+    { kind: "duplicates", ticket: "TUC-7", other: "OPS-2", reason: "same export" },
+    { kind: "relates", ticket: "TUC-8", other: "TUC-9", reason: "" },
   ]);
+});
+
+test("the planner sees every NEW ticket in full and the team's open tickets outside the project", async (t) => {
+  const long = `Export the ledger. ${"Every column is listed here. ".repeat(20)}The CSV uses semicolons.`;
+  const r = await room(t, [issue(1, { createdAt: "2025-12-31T00:00:00Z" }), issue(2)]);
+  r.descriptions.set("i1", long);
+  r.descriptions.set("i2", long);
+  await r.seed({ plannedThrough: "2026-01-01T00:00:00Z", planner: null });
+  r.team.push(
+    { id: "i1", identifier: "TUC-1", title: "Ticket 1", status: "Todo", projectId: "erp", projectName: "ERP" },
+    { id: "o1", identifier: "TUC-50", title: "Ledger export for accounting", status: "In Review", projectId: "fin", projectName: "Finance" },
+    { id: "o2", identifier: "TUC-51", title: "Loose idea", status: "Backlog", projectId: null, projectName: "" },
+  );
+  await r.flow.planNow("erp", settings);
+  const brief = r.briefs[0];
+  assert.equal(brief.split("The CSV uses semicolons.").length - 1, 1, "only the NEW ticket's description is given in full");
+  assert.match(brief, /\*\*TUC-50\*\* Ledger export for accounting \(In Review · Finance\)/);
+  assert.match(brief, /\*\*TUC-51\*\* Loose idea \(Backlog · no project\)/);
+  assert.ok(!/outside ERP[\s\S]*\*\*TUC-1\*\*/.test(brief), "the project's own tickets are not listed again as outside it");
+});
+
+test("a work order links related tickets anywhere and closes a duplicate only when nobody works on it", async (t) => {
+  const r = await room(t, [
+    issue(1), issue(2), issue(3, { statusType: "started", status: "In Progress" }), issue(4, { linked: [{ id: "o9", identifier: "OPS-9", kind: "related" }] }),
+  ]);
+  r.elsewhere.set("OPS-9", { id: "o9", identifier: "OPS-9", title: "Shared export" });
+  await r.flow.planNow("erp", settings);
+  r.issues.push(issue(100, { id: "planner1", labels: ["paseo-planner"] }));
+  r.calls.length = 0;
+  const order = "```project-order\nTUC-1 duplicates OPS-9: OPS-9 already exports the ledger\nTUC-2 relates to OPS-9\nTUC-3 duplicates TUC-2: same\nTUC-4 relates to OPS-9\nTUC-4 duplicates OPS-9: covered\nTUC-2 relates to OPS-404\nTUC-2 relates to TUC-2\n```";
+  await r.flow.applyPlan("planner1", "agent-p", order, paseo, settings);
+  assert.deepEqual(r.calls.slice(0, 7), [
+    "label i1 +paseo-hold",
+    "comment i1 Closed as a duplicate of OPS-9 by the work order of TUC-101: OPS-9 already exports the ledger",
+    "i1 duplicate o9",
+    "i2 related o9",
+    "label i4 +paseo-hold",
+    "comment i4 Closed as a duplicate of OPS-9 by the work order of TUC-101: covered",
+    "i4 duplicate o9",
+  ], "held before it is closed; an existing related link is not added again, but does not stand for a duplicate");
+  const summary = r.comments.at(-1)!;
+  assert.match(summary, /Applied:\n- TUC-1 duplicates OPS-9: OPS-9 already exports the ledger\n- TUC-2 relates to OPS-9\n- TUC-4 relates to OPS-9\n- TUC-4 duplicates OPS-9: covered/);
+  assert.match(summary, /- TUC-3 duplicates TUC-2: same \(started or with an agent/);
+  assert.match(summary, /- TUC-2 relates to OPS-404 \(OPS-404 does not exist\)/);
+  assert.match(summary, /- TUC-2 relates to TUC-2 \(a ticket cannot be linked to itself\)/);
 });
