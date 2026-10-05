@@ -195,7 +195,8 @@ export class PlannotatorBridge {
   ) {}
 
   // The browser hook leaves opening the review to the bridge, so an auto-approved plan never opens
-  // a tab: every other review opens once, after the risk policy has had its say.
+  // a tab. A review with a stable link is in the review inbox (and its notification) instead; only
+  // one without it opens a tab here, once, after the risk policy has had its say.
   private show(localUrl: string): void {
     if (this.shown.has(localUrl)) return;
     this.shown.add(localUrl);
@@ -418,7 +419,8 @@ export class PlannotatorBridge {
     if (issueId && this.projectPlans && await this.projectPlans.isPlanner(issueId)) return this.deliverWorkOrder(event, agentId, issueId, identifier, paseo);
     if (event.type === "decided" && issueId) await this.logFeedback(agentId, event, { id: issueId, identifier });
     // The agent's stable link when ReviewLinks is up; otherwise this review's own tailnet or local URL.
-    const url = event.type === "opened" ? (await this.reviews?.opened(agentId, event, labels["linear.identifier"] || undefined)) ?? event.remoteUrl ?? event.localUrl : undefined;
+    const stableLink = event.type === "opened" ? await this.reviews?.opened(agentId, event, { identifier: labels["linear.identifier"] || undefined, model }) ?? null : null;
+    const url = event.type === "opened" ? stableLink ?? event.remoteUrl ?? event.localUrl : undefined;
     if (event.type === "decided") await this.reviews?.decided(agentId, event.approved);
     const settings = await this.settings.read();
     const planText = event.type === "opened" ? await this.fetchPlan(event.localUrl).catch(() => "") : "";
@@ -430,7 +432,7 @@ export class PlannotatorBridge {
     // The inbox's details are a convenience: a failure must not retry (and repeat) the hand-off.
     if (event.type === "opened") await this.reviews?.described(event.localUrl, planText, judgement)
       .catch((error: unknown) => console.error(`[linear-tickets] inbox details for ${agentId} skipped: ${error instanceof Error ? error.message : error}`));
-    if (event.type === "opened" && !judgement?.approved) this.show(event.localUrl);
+    if (event.type === "opened" && !judgement?.approved && !stableLink) this.show(event.localUrl);
     const row: PlannotatorRow = event.type === "opened"
       ? { title: judgement?.approved ? "Plan auto-approved by the risk policy" : "Handed off to Plannotator for review", url, detail: `${event.remoteUrl ? "Opens on any device in your tailnet." : "Local link only: Tailscale was unavailable."}${model ? ` Planned with ${model}.` : ""}${judgement ? ` ${judgement.line}` : ""}` }
       : { title: event.approved ? "Plan approved in Plannotator" : "Plan sent back from Plannotator", ...(event.feedback ? { detail: event.feedback.slice(0, 4_000) } : {}) };
@@ -538,14 +540,15 @@ export class PlannotatorBridge {
   // the parking and queues a fresh agent. The retired agent's own report is ignored.
   private async deliverParked(event: OpenedEvent | DecidedEvent, parked: ParkedPlan): Promise<void> {
     if (event.type === "opened") {
-      const url = (await this.reviews?.opened(parked.agentId, event, parked.identifier, parked.parkedAt)) ?? event.remoteUrl ?? event.localUrl;
+      const stableLink = await this.reviews?.opened(parked.agentId, event, { identifier: parked.identifier, since: parked.parkedAt, model: parked.model }) ?? null;
+      const url = stableLink ?? event.remoteUrl ?? event.localUrl;
       await this.reviews?.described(event.localUrl, parked.plan, { approved: false, reasons: parked.reasons })
         .catch((error: unknown) => console.error(`[linear-tickets] inbox details for ${parked.identifier} skipped: ${error instanceof Error ? error.message : error}`));
       const reviewLink = event.remoteUrl ? url : null;
       const link = await this.sessions?.sessionFor(parked.agentId) ?? null;
       if (link) await this.sessions!.expectReview(link.sessionId, event.localUrl, parked.plan, reviewLink);
       if (parked.announced) return;
-      this.show(event.localUrl);
+      if (!stableLink) this.show(event.localUrl);
       const model = parked.model ? `\n\nPlanned with ${parked.model}.` : "";
       if (link) {
         const steps = planSteps(parked.plan);

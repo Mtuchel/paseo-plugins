@@ -28,7 +28,8 @@
     "tier-report": "node scripts/tier-report.mjs"
   },
   "dependencies": {
-    "simple-icons": "^16.30.0"
+    "simple-icons": "^16.30.0",
+    "web-push": "3.6.7"
   },
   "devDependencies": {
     "@getpaseo/client": "0.8.0",

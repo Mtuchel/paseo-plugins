@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -43,7 +43,7 @@ const detail = { issue: normalizeIssue(rawIssue), teamId: "team-1", projectId: "
 const input = { id: "ENG-42", projectId: "project-1", provider: "test/model", instructions: "Add a regression check.", markInProgress: false, requestId: "5f6f1154-5838-4439-b981-b3c9d9831488" };
 // Test fakes that exercise neither the state transition nor finished blockers: no-op stubs keep the contract strict.
 const noMark = { markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] };
-const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: DEFAULT_CHEAP_MODELS };
+const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: DEFAULT_CHEAP_MODELS, reviewPeers: [] };
 
 test("server entrypoint loads and registers valid Paseo RPC contracts", () => {
   const names: string[] = [];
@@ -350,6 +350,19 @@ test("settings remember the last successful launch choices per provider", async 
       projectMappings: {}, agentLinearAccess: true, ...automationDefaults,
     });
     assert.equal((await stat(path)).mode & 0o777, 0o600);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("review peers are read as inbox origins, and survive saving other settings", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-linear-settings-peers-"));
+  const path = join(directory, "settings.json");
+  try {
+    await writeFile(path, JSON.stringify({ reviewPeers: ["https://server087.tail1.ts.net:8444/", " https://server087.tail1.ts.net:8444 ", "javascript:alert(1)", "not a url", 7] }));
+    const settings = new Settings(path);
+    assert.deepEqual((await settings.read()).reviewPeers, ["https://server087.tail1.ts.net:8444"]);
+    await settings.patch({ markInProgress: true });
+    await settings.patch({ markInProgress: false });
+    assert.deepEqual((await settings.read()).reviewPeers, ["https://server087.tail1.ts.net:8444"], "a file holding only peers is kept");
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
