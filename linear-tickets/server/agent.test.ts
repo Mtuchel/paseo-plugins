@@ -71,6 +71,15 @@ test("a refused request (403) is not a reason to refresh the app token", async (
   assert.deepEqual(posted, ["Bearer t"]);
 });
 
+test("only this app's sessions are open here: another host's app never has its threads adopted", async () => {
+  const node = (id: string, app: string | null) => ({ id, status: "pending", createdAt: "2026-01-01T00:00:00Z", appUser: app ? { id: app } : null, creator: { id: OWNER }, issue: { id: `i-${id}`, identifier: `TUC-${id}` } });
+  const answer = (viewer: string | null) => async () => ({ viewer: viewer ? { id: viewer } : null, agentSessions: { nodes: [node("1", "server-app"), node("2", "mac-app"), node("3", null), node("4", "server-app")] } });
+  const mine = new AgentApi({ accessToken: async () => "t" }, answer("server-app"));
+  assert.deepEqual((await mine.openSessions()).map((session) => session.id), ["1", "4"]);
+  const unknown = new AgentApi({ accessToken: async () => "t" }, answer(null));
+  assert.deepEqual(await unknown.openSessions(), [], "without its own id the app claims no thread");
+});
+
 const NOW = 1_000_000_000_000;
 const MINUTE = 60_000;
 

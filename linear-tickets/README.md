@@ -392,6 +392,14 @@ threads, reviews, "Open in Paseo" links, missed replies) and each thread's repli
 their own: a failed Linear request skips only what it hit until the next minute.
 The Paseo Agents menu bar app's **Control panel → Linear agent** shows the state.
 
+**Several hosts.** Each host that runs the plugin installs its own app (for example "Paseo" on the
+laptop, "Paseo Server" on a server), with its own webhook URL on that host's Funnel and its own
+`app.json`/`token.json`; never copy `token.json` to a second host, because each refresh rotates
+the token the other host still holds. A ticket delegated to (or mentioning) an app runs on that
+app's host. The sweep takes only its own app's threads, since Linear lists every app's sessions
+to each of them. Keep `dispatch.enabled` on one host only: the label poll and the project flow
+cannot see agents on another host, so two dispatching hosts start the same ticket twice.
+
 **In the panel.**
 - The agent's commands and file edits show up while it works, merged at most every 4 seconds.
 - Each session links **Open in Paseo** (the web app at app.paseo.sh opens the agent when that browser is paired with this host).
