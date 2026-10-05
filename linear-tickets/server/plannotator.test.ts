@@ -192,6 +192,8 @@ async function review(options: { advisedPlan: string; shownPlan?: string; verdic
     const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => options.shownPlan ?? options.advisedPlan, undefined, undefined, undefined, decide, (url) => tabs.push(url));
     bridge.attach(paseo);
     await bridge.drain();
+    // The next sweep: an auto-approval the bridge recorded itself.
+    await bridge.drain();
     bridge.stop();
   });
   return { calls, decisions, tabs, comment: calls.find((call) => call.startsWith("comment issue-1")) ?? "" };
@@ -203,6 +205,11 @@ test("a plan rated within the threshold, agreed by the advisor for exactly that 
   assert.deepEqual(tabs, [], "an auto-approved plan opens no review tab");
   assert.ok(calls.includes("row agent-1: Plan auto-approved by the risk policy https://host.ts.net:4000/"));
   assert.match(comment, /^comment issue-1: 🤖 \*\*Plan auto-approved\*\* by the risk policy: https:\/\/host\.ts\.net:4000\/\n\nAuto-approved within your threshold\. Risk: impact 1\/4, revert\.$/);
+  // Plannotator reports no approval of its own plan mode: the bridge records it, so the approval
+  // writes the plan document and moves the ticket to coding like the owner's would.
+  assert.ok(calls.includes("row agent-1: Plan approved in Plannotator"));
+  assert.ok(calls.includes("document issue-1 Plan: TUC-25"));
+  assert.ok(calls.includes("state issue-1 In Progress"));
 });
 
 test("a plan goes to the owner, with the rating and why, when anything the policy relies on does not hold", async () => {
