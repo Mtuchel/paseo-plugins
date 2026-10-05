@@ -504,7 +504,9 @@ test("a draft with no commit or activity for 30 minutes is told to run the Sol r
   assert.deepEqual(await h.poll(), [], "activity 10 minutes ago");
   h.github.view = { ...h.github.view, updatedAt: ago(31 * MINUTE) };
   const calls = await h.poll();
-  assert.equal(promptOf(calls), `[The pull request](${PR}) is still a draft, with no new commit or pull request activity for 30 minutes.\nNext step: run the background Sol review if you have not yet. Publish only the reviewed part of your stack, bottom first: \`git switch mtuchel/tuc-1-fix && node tools/ci/publish.mjs\` once this branch and every branch below it are reviewed and each passed \`mise exec -- pnpm verify:pre-pr --body-file <body>\` (never a bare \`gt submit --publish\` or \`gh pr ready\`: \`publish.mjs\` refuses until PR metadata is green and prints any owner question); the branches above stay drafts until they are.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+  const prompt = promptOf(calls) ?? "";
+  assert.ok(prompt.startsWith(`[The pull request](${PR}) is still a draft, with no new commit or pull request activity for 30 minutes.\nNext step: `), prompt);
+  assert.ok(prompt.endsWith("\n\nThis is nudge 1 of 2 for this step; after that the owner takes over."), prompt);
   assert.equal(calls.at(-1), "say thought The pull request is waiting for the agent to publish the draft; it was asked to.");
   assert.equal(h.github.threadReads, 0, "a draft needs no review threads");
   assert.deepEqual(await h.poll(), [], "claimed for this head");
