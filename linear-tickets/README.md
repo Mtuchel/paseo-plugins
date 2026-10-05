@@ -1077,6 +1077,14 @@ the backstop still delivers the repair to that ticket's agent through the same c
 recovery path. Busy agents keep their requests pending across restarts; in-flight claims prevent
 duplicate sends. Owner fallback is reserved for escalation or a missing/unrecoverable agent record.
 
+The poll and backstop also recover a missing handover PR link before deciding the ticket's next
+step. They identify the repository from the recorded worktree's validated GitHub origin, or
+from canonical PR attachments on the ticket when that source is unavailable. Conflicting
+attachment repositories are skipped. The lowest open PR whose title names the whole ticket
+is relinked in Linear, the handover, and its agent session, then handled in the same poll.
+Archived linkless records use the same 14-day relevance window; no worker branch is changed
+by discovery.
+
 **Partial landings.** When the ticket's recorded pull request lands (merged, or closed by the
 queue as above) while other pull requests of the ticket are still open (the rest of its stack,
 or pull requests the agent replayed onto main), the ticket links the lowest of them (the one no
