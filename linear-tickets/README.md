@@ -888,8 +888,17 @@ every 2 minutes.
 
 What has been planned is kept in `~/.paseo/linear-tickets/projects.json`.
 
-**Pull request reviews.** Every 2 minutes the plugin reads each ticket's pull request with
-`gh`. Requested changes post a panel update and move the ticket back to In Progress; fixes
+**Pull request reviews.** Every 2 minutes the plugin looks at each ticket's pull request, but reads
+it in full — one `gh pr view` GraphQL query — only when something actually changed. The first look is
+REST and conditional: the pull request read as an issue (`repos/…/issues/<n>`; the single-pull
+endpoint's ETag moves on every request, the issue resource's does not), its comments (Graphite edits
+its Merge activity comment in place), its reviews, and the head's check runs and combined status. An
+unchanged resource answers `304 Not Modified`, which GitHub does not meter, so a quiet pull request
+costs the shared GraphQL budget nothing; the detail read runs only when one of them moved, while the
+merge queue is testing the pull request (its comment can end the attempt at any poll), or when the
+cached view is older than 10 minutes. Every one of those REST reads passes the shared GitHub budget
+first, so the [reserve](#pull-request-view) that keeps the agents' own `gh` calls working holds here
+too. Requested changes post a panel update and move the ticket back to In Progress; fixes
 pushed after them move it to In Review again. An approval moves it to the team's started state
 **Ready to merge** (teams without one stay in In Review), once no [manual task](#manual-tasks)
 due before merge is open; commits pushed after the approval move
@@ -1424,6 +1433,9 @@ one GitHub poller instead of two:
   login's hourly reset, it pauses until the reset and keeps the last data (`rateLimited` in the
   snapshot). After GitHub refuses a request for its rate limit, nothing is sent for 2 minutes.
   Labelling is not held back by the reserve.
+- The [pull request watch](#pull-request-reviews) reads under the same reserve: its conditional
+  first look (the issue resource, its comments and reviews, the head's checks) passes the same
+  budget, and a quiet pull request is left to its cached view rather than read in full.
 
 ## Manual tasks
 

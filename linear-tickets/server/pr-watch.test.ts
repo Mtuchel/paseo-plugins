@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import type { HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
-import { activityBullets, GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type QueueDraft } from "./pr-watch";
+import { activityBullets, ConditionalPullView, GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft } from "./pr-watch";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, marker, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
+import { GitHubBudget, GitHubPausedError, withPriority } from "./rate-budget";
 import { SessionRouter } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
@@ -78,7 +79,9 @@ const MAIN_BROKEN: Judgment = {
 };
 
 // `crash`: the agent runs on crashDaemon (`daemon`) instead of the fake router (`paseo`).
-function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean } = {}) {
+// `probe`: the cheap first look the poll goes through (see ConditionalPullView); without one the
+// injected `view` is the whole read, as for the tests that predate it.
+function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean } = {}, probe?: PullViewSource) {
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open; `views`: other pull requests by URL, and
   // `open` the listing's other entries; `deleted`: branches gone; `throttle`: pull requests whose
@@ -177,6 +180,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       merged: async (issueId) => { calls.push(`merged ${issueId}`); },
     },
     settings: { read: async () => settings },
+    ...(probe ? { probe } : {}),
     view: async (url) => {
       github.reads.push(url);
       if (github.throttled || github.throttle.includes(url)) throw new GitHubRateLimitedError("GitHub is throttling gh: HTTP 403: API rate limit exceeded");
@@ -1765,4 +1769,149 @@ test("without an open pull request, a healthy agent or a ticket that is not star
     h.linear.state = { status: statusType === "started" ? "In Progress" : "Done", statusType };
     assert.deepEqual(await h.poll(), [], statusType);
   }
+});
+
+// ---- The cheap first look (ConditionalPullView): conditional REST requests per pull request (read
+// as an issue, plus its comments, reviews and the head's checks) decide whether the one GraphQL query
+// per pull request and poll (`viewPullRequest`) is needed at all. A 304 costs no budget, so a quiet
+// pull request is free. The single-`pulls/{n}` endpoint is not used: its ETag moves every request. ---
+const REPO = "tuchel-sohn/tuchel-platform";
+const ISSUE_PATH = `repos/${REPO}/issues/419`;
+const COMMENTS_PATH = `${ISSUE_PATH}/comments?per_page=100`;
+const REVIEWS_PATH = `repos/${REPO}/pulls/419/reviews?per_page=100`;
+
+// A fake GitHub REST: each path carries an ETag that `bump` moves, and a body from `seed`. A request
+// that repeats the current ETag is answered 304, as GitHub answers an unchanged resource.
+type RestStub = {
+  calls: { path: string; etag: string | null }[];
+  get: (path: string, etag: string | null) => Promise<{ status: number; headers: Map<string, string>; body: string }>;
+  bump: (path: string) => void;
+};
+
+function restFake(seed: (path: string) => unknown): RestStub {
+  const versions = new Map<string, number>();
+  const calls: RestStub["calls"] = [];
+  const get = async (path: string, etag: string | null) => {
+    calls.push({ path, etag });
+    const etagFor = `"${path}#${versions.get(path) ?? 0}"`;
+    const headers = new Map([["etag", etagFor]]);
+    if (etag === etagFor) return { status: 304, headers, body: "" };
+    return { status: 200, headers, body: JSON.stringify(seed(path)) };
+  };
+  return { calls, get, bump: (path: string) => versions.set(path, (versions.get(path) ?? 0) + 1) };
+}
+
+const checkBody = (conclusion: string) => ({ total_count: 1, check_runs: [{ name: "Code validation / Core (core-web)", status: "completed", conclusion, started_at: "2026-10-04T21:00:00Z", completed_at: "2026-10-04T21:05:00Z" }] });
+const NO_STATUSES = { total_count: 0, statuses: [] };
+// A pull request read as an issue: state, labels, the last change of any kind, and the merge. A push
+// moves `updated_at` too, which is what tells the probe a head changed; the detail read then knows it.
+const issueBody = (updatedAt: string, state = "open") => ({ state, updated_at: updatedAt, labels: [], pull_request: { merged_at: null } });
+const checkRunsPath = (sha: string) => `repos/${REPO}/commits/${sha}/check-runs?per_page=100`;
+// What one probe test moves to make a single resource change (a real change moves its fingerprint).
+type ProbeState = { updatedAt: string; conclusion: string; commentAt: string; reviews: unknown[] };
+const probeState = (): ProbeState => ({ updatedAt: "2026-10-04T21:05:00Z", conclusion: "success", commentAt: "2026-10-04T21:00:00Z", reviews: [] });
+const restSeed = (state: ProbeState) => (path: string): unknown =>
+  path.endsWith("/check-runs?per_page=100") ? checkBody(state.conclusion)
+    : path.endsWith("/status") ? NO_STATUSES
+      : path === COMMENTS_PATH ? [{ id: 1, updated_at: state.commentAt }]
+        : path === REVIEWS_PATH ? state.reviews
+          : issueBody(state.updatedAt);
+// The `x-ratelimit-*` headers GitHub sends with every REST answer (GitHubBudget reads `remaining`).
+const limitHeaders = (remaining: number) => new Map([["x-ratelimit-resource", "core"], ["x-ratelimit-remaining", String(remaining)], ["x-ratelimit-limit", "5000"], ["x-ratelimit-reset", String(Math.floor(Date.now() / 1000) + 3600)]]);
+
+// A reader whose REST answers come from the fake, with the detail read counted.
+function probeReader(rest: RestStub, read: () => PullRequestView) {
+  const counted = { reads: 0 };
+  const reader = new ConditionalPullView({ get: rest.get, budget: new GitHubBudget(() => Date.now(), 300), read: async () => { counted.reads++; return read(); } });
+  return { reader, counted };
+}
+
+test("an unchanged pull request answers 304 and never reaches the detail read", async () => {
+  const rest = restFake(restSeed(probeState()));
+  const { reader, counted } = probeReader(rest, () => ({ ...OPEN_PR, updatedAt: "2026-10-04T21:05:00Z" }));
+  const first = await withPriority("background", () => reader.view(PR));
+  const second = await withPriority("background", () => reader.view(PR));
+  assert.equal(counted.reads, 1, "the pull request was read in detail once");
+  assert.equal(second, first, "the second poll served the cached view");
+  assert.deepEqual(rest.calls.filter((call) => call.path === ISSUE_PATH).map((call) => call.etag), [null, `"${ISSUE_PATH}#0"`], "the second look is conditional on the first ETag");
+  assert.equal(rest.calls.filter((call) => call.etag === null).length, 5, "only the first poll's five reads are unconditional");
+});
+
+test("a new head SHA reaches the detail read again", async () => {
+  const state = probeState();
+  let head = HEAD;
+  const rest = restFake(restSeed(state));
+  const { reader, counted } = probeReader(rest, () => ({ ...OPEN_PR, headSha: head, updatedAt: state.updatedAt }));
+  await withPriority("background", () => reader.view(PR));
+  // A push moves `updated_at`, which the probe sees; the detail read then returns the new head.
+  state.updatedAt = "2026-10-04T21:10:00Z";
+  head = "9f8e7d6c5b4a9f8e7d6c5b4a9f8e7d6c5b4a9f8e";
+  rest.bump(ISSUE_PATH);
+  const view = await withPriority("background", () => reader.view(PR));
+  assert.equal(counted.reads, 2);
+  assert.equal(view.headSha, head);
+});
+
+test("checks moving on an unchanged head reach the detail read again", async () => {
+  const state = probeState();
+  const rest = restFake(restSeed(state));
+  const { reader, counted } = probeReader(rest, () => ({ ...OPEN_PR, checks: [{ ...RUNNING_CI, state: state.conclusion === "success" ? "passed" : "failed", conclusion: state.conclusion }] }));
+  await withPriority("background", () => reader.view(PR));
+  state.conclusion = "failure";
+  rest.bump(checkRunsPath(HEAD));
+  const view = await withPriority("background", () => reader.view(PR));
+  assert.equal(counted.reads, 2);
+  assert.equal(view.checks[0].state, "failed");
+  assert.equal(rest.calls.filter((call) => call.path === ISSUE_PATH && call.etag !== null).length, 1, "the issue resource itself only answered 304s");
+});
+
+test("Graphite editing its merge activity comment reaches the detail read again", async () => {
+  const state = probeState();
+  const rest = restFake(restSeed(state));
+  const { reader, counted } = probeReader(rest, () => ({ ...OPEN_PR, mergeActivity: `### Merge activity\n\n* **Oct 4, 11:22 PM UTC**: ${state.commentAt}` }));
+  await withPriority("background", () => reader.view(PR));
+  state.commentAt = "2026-10-04T21:20:00Z";
+  rest.bump(COMMENTS_PATH);
+  const view = await withPriority("background", () => reader.view(PR));
+  assert.equal(counted.reads, 2);
+  assert.ok(view.mergeActivity?.includes("21:20"), "the merge activity edit reached the view");
+});
+
+test("a new review reaches the detail read again", async () => {
+  const state = probeState();
+  const rest = restFake(restSeed(state));
+  const { reader, counted } = probeReader(rest, () => ({ ...OPEN_PR, reviews: state.reviews as PullRequestView["reviews"] }));
+  await withPriority("background", () => reader.view(PR));
+  state.reviews = [{ id: 2, state: "CHANGES_REQUESTED", submitted_at: "2026-10-04T21:20:00Z" }];
+  rest.bump(REVIEWS_PATH);
+  const view = await withPriority("background", () => reader.view(PR));
+  assert.equal(counted.reads, 2);
+  assert.equal(view.reviews.length, 1);
+});
+
+test("the shared REST reserve pauses the first look before it sends anything", async () => {
+  const rest = restFake(restSeed(probeState()));
+  const budget = new GitHubBudget(() => Date.now(), 300);
+  budget.record(limitHeaders(100));
+  const reader = new ConditionalPullView({ get: rest.get, budget, read: async () => OPEN_PR });
+  await assert.rejects(() => withPriority("background", () => reader.view(PR)), (error: unknown) => error instanceof GitHubPausedError);
+  assert.deepEqual(rest.calls, [], "a background poll sends nothing below the reserve");
+  await withPriority("interactive", () => reader.view(PR));
+  assert.equal(rest.calls.length, 5, "an interactive caller still reads");
+});
+
+test("the poll reads through the injected first look, not the detail view", async (t) => {
+  let reads = 0;
+  const h = harness(t, {}, { view: async () => { reads++; return OPEN_PR; } });
+  await h.poll();
+  assert.equal(reads, 1, "the first look read the pull request");
+  assert.deepEqual(h.github.reads, [], "the injected detail read was not used");
+});
+
+test("a GitHub budget pause ends the poll and the next poll retries", async (t) => {
+  t.mock.method(console, "error", () => {});
+  let reads = 0;
+  const h = harness(t, {}, { view: async () => { reads++; if (reads === 1) throw new GitHubPausedError(Date.now() + 60_000, "budget", 10); return { ...OPEN_PR, state: "MERGED" }; } });
+  assert.deepEqual(await h.poll(), [], "the pause ended the poll before anything was sent");
+  assert.deepEqual(await h.poll(), ["review merged", "say thought The pull request was merged.", "merged i1"]);
 });
