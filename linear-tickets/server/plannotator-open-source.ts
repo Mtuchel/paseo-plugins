@@ -29,7 +29,8 @@ function localPort(url) {
 
 function openLocally(url) {
   const opener = process.env.LINEAR_TICKETS_OPENER || (process.platform === "darwin" ? "open" : "xdg-open");
-  try { spawn(opener, [url], { detached: true, stdio: "ignore" }).unref(); } catch {}
+  // A missing opener fails asynchronously; without a listener the error would end the hook loudly.
+  try { spawn(opener, [url], { detached: true, stdio: "ignore" }).on("error", () => {}).unref(); } catch {}
 }
 
 function publish(port) {

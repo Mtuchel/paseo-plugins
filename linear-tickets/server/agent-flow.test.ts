@@ -249,6 +249,46 @@ test("a queued thread starts once its blockers finish, even after it dropped out
   await h.cleanup();
 });
 
+test("a thread Linear marked stale while this host was down starts its agent, unless the ticket was assigned again since", async () => {
+  const started: string[] = [];
+  const minutesAgo = (n: number) => new Date(Date.now() - n * 60_000).toISOString();
+  const thread = (id: string, status: string, createdAt: string, issueId: string) => ({ id, status, createdAt, creatorId: OWNER, issueId, identifier: `TUC-${issueId}` });
+  const h = routerHarness([], {
+    api: {
+      activity: async () => {},
+      activities: async () => [],
+      openSessions: async () => [
+        // Missed webhook: nobody answered, so Linear marked it stale.
+        thread("missed", "stale", minutesAgo(10), "i1"),
+        // Missed too, but the owner assigned the ticket again: the newer thread starts it.
+        thread("superseded", "stale", minutesAgo(10), "i2"),
+        thread("newer", "active", minutesAgo(1), "i2"),
+        // Past the adoption window: left alone.
+        thread("ancient", "stale", minutesAgo(3 * 60), "i3"),
+      ],
+    } as never,
+    linear: {
+      viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {},
+      issueState: async () => ({ statusType: "unstarted", status: "Todo" }),
+      issueGroup: async (id: string) => ({ id, identifier: `TUC-${id}`, status: "Todo", statusType: "unstarted", delegateId: APP, finished: false, children: [] }),
+    } as never,
+    starter: {
+      admission: async () => ({ ok: true as const }),
+      start: async (id: string) => {
+        started.push(id);
+        return { agentId: `agent-${id}`, warnings: [], provider: "omp", target: "repo", resumed: false, untrusted: false, plan: null };
+      },
+    },
+  });
+  await h.store.put({ ...link, sessionId: "newer", issueId: "i2", identifier: "TUC-i2", agentId: "agent-i2", paseoLinked: "agent-i2" });
+  await h.router.sweep();
+  assert.deepEqual(started, ["i1"]);
+  assert.equal((await h.store.get("missed"))?.agentId, "agent-i1");
+  assert.equal(await h.store.get("superseded"), null);
+  assert.equal(await h.store.get("ancient"), null);
+  await h.cleanup();
+});
+
 test("a queued thread whose ticket already has a running agent is linked to it instead of starting a second", async () => {
   const starts: string[] = [];
   const h = routerHarness([], {

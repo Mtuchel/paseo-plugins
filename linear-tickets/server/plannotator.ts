@@ -32,12 +32,13 @@ export async function readReviewPlan(localUrl: string): Promise<string> {
 }
 
 // Opens a review on this machine, as Plannotator would without the hook. LINEAR_TICKETS_OPENER
-// replaces the system opener (tests).
+// replaces the system opener (tests). A missing opener (a server without a desktop has no
+// xdg-open) fails asynchronously: logged, never thrown, since an unhandled spawn error would end
+// the plugin.
 export function openInBrowser(url: string): void {
   const opener = process.env.LINEAR_TICKETS_OPENER || (process.platform === "darwin" ? "open" : "xdg-open");
-  try { spawn(opener, [url], { detached: true, stdio: "ignore" }).unref(); } catch (error) {
-    console.error(`[linear-tickets] opening ${url} failed: ${error instanceof Error ? error.message : error}`);
-  }
+  const failed = (error: unknown) => console.error(`[linear-tickets] opening ${url} failed: ${error instanceof Error ? error.message : error}`);
+  try { spawn(opener, [url], { detached: true, stdio: "ignore" }).on("error", failed).unref(); } catch (error) { failed(error); }
 }
 
 export const PLANNOTATOR_KIND = "plannotator";
