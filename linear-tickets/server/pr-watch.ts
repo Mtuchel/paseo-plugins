@@ -1653,14 +1653,16 @@ export class PullRequestWatch {
     const source = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
     if (!source || reserved.has(record.agentId)) return;
     const [, repo, number] = source;
-    if ((await this.deps.manualTasks?.openBlockers(record.issueId))?.length) return;
+    // A stage the agent is not nudged for now (open blockers, vetoed or queued) has nothing to be
+    // reminded of: a later wait on it starts from zero.
+    if ((await this.deps.manualTasks?.openBlockers(record.issueId))?.length) return this.clearWaits(seenByUrl, url, "stage:");
     const claimedOn = (stage: Stage) => seenByUrl[url]?.nudges?.[stage] ?? [];
-    if (!await this.nudgeable(repo, Number(number), view, drafts)) return;
+    if (!await this.nudgeable(repo, Number(number), view, drafts)) return this.clearWaits(seenByUrl, url, "stage:");
     const crashed = record.status !== "archived" && Boolean(await this.deps.sessions.crashed(record.agentId));
     const again = (stage: Stage) => crashed && claimedOn(stage).length <= STAGE_NUDGES;
     const found = await stalledStage(view, url, Date.now(), (stage, key) => !again(stage) && claimedOn(stage).some((entry) => entry.split(" ").includes(key)), () => this.github().reviewThreads(repo, Number(number)));
     // A stage that no longer stalls has nothing left for the owner to be reminded of.
-    if (!found) this.clearWaits(seenByUrl, url);
+    if (!found) this.clearWaits(seenByUrl, url, "stage:");
     if (!found || (!again(found.stage) && claimedOn(found.stage).includes(found.key))) return;
     const { stage, text, key } = found;
     const before = seenByUrl[url]?.nudges ?? {};
@@ -1950,8 +1952,10 @@ export class PullRequestWatch {
     return outcome === "waiting" && since !== undefined && this.clock() - Date.parse(since) >= PERMISSION_WAIT_MS;
   }
 
-  private clearWaits(seenByUrl: Record<string, Seen>, url: string): void {
-    if (seenByUrl[url]?.waits) seenByUrl[url] = { ...seenByUrl[url], waits: undefined };
+  // Drops the permission wait of the pull request, or only one of this kind (`stage:`, `drop:`, `replay:`).
+  private clearWaits(seenByUrl: Record<string, Seen>, url: string, kind = ""): void {
+    const waits = seenByUrl[url]?.waits;
+    if (waits && Object.keys(waits).some((key) => key.startsWith(kind))) seenByUrl[url] = { ...seenByUrl[url], waits: undefined };
   }
 
   // The one reminder after a permission wait (see waitFor); the message is claimed before it.

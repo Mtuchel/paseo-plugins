@@ -118,7 +118,8 @@ export type SessionLink = {
 
 // Every @mention or assignment opens a new Linear thread, so a ticket collects threads while one
 // agent works. Only the newest thread with an agent stays open; older ones on that ticket
-// (and their stale review links or resume offers) are superseded.
+// (and their stale review links or resume offers) are superseded. A queued thread whose comment
+// was not delivered yet is not: the queue sweep passes it on first (see startQueued).
 export function supersededSessions(links: SessionLink[]): { link: SessionLink; current: SessionLink }[] {
   const result: { link: SessionLink; current: SessionLink }[] = [];
   const byIssue = new Map<string, SessionLink[]>();
@@ -126,7 +127,7 @@ export function supersededSessions(links: SessionLink[]): { link: SessionLink; c
   for (const group of byIssue.values()) {
     const current = group.filter((link) => link.agentId).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
     if (!current) continue;
-    for (const link of group) if (link !== current && !link.closed && link.createdAt < current.createdAt) result.push({ link, current });
+    for (const link of group) if (link !== current && !link.closed && !(link.queued && link.pendingText) && link.createdAt < current.createdAt) result.push({ link, current });
   }
   return result;
 }
@@ -1259,7 +1260,10 @@ export class SessionRouter {
       await later("opening the successor's thread", () => this.openFor(issue.id, issue.identifier, agentId));
       await later("archiving the gone agent", async () => { if (await this.agent(predecessorId)) await paseo.agents.ref(predecessorId).archive(); });
       await later("closing superseded threads", () => this.closeSuperseded());
-      await later("handing the record to the successor", () => this.deps.handover.handOff(issue, predecessorId, agent));
+      // Without the successor's worktree the record would lose its branch: the hand-off waits for
+      // the next poll, which finds the successor live (see above), or for its first write-back.
+      if (snapshot) await later("handing the record to the successor", () => this.deps.handover.handOff(issue, predecessorId, agent));
+      else console.error(`[linear-tickets] ${issue.identifier}: the successor ${agentId.slice(0, 8)} could not be read; its record hand-off waits`);
       return { kind: "started", agent };
     } finally {
       gate.release();

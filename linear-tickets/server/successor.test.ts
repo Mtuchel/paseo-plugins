@@ -180,6 +180,8 @@ function routerHarness(options: {
   handOff?: () => Promise<boolean> | never;
   admission?: { ok: true } | { ok: false; reason: string };
   failStart?: boolean;
+  // Called inside the start, before the agent exists; the start goes on once it settles.
+  pauseStart?: () => Promise<void>;
   openFails?: boolean;
   statusType?: string;
   gates?: Launcher;
@@ -196,7 +198,7 @@ function routerHarness(options: {
   linear.addLabel = async (_id: string, name: string) => { calls.push(`+${name}`); };
   linear.removeLabel = async (_id: string, name: string) => { calls.push(`-${name}`); };
   const handover = {
-    resumeTarget: async (): Promise<ResumeTarget | null> => ("resumeTarget" in options ? options.resumeTarget! : { branch: BRANCH, worktreePath: null, handover: "Continue the work." }),
+    resumeTarget: async (): Promise<ResumeTarget | null> => ("resumeTarget" in options ? options.resumeTarget ?? null : { branch: BRANCH, worktreePath: null, handover: "Continue the work." }),
     handOff: async (_issue: { id: string; identifier: string }, predecessor: string, successor: { id: string }) => {
       calls.push(`handOff ${predecessor} -> ${successor.id}`);
       return options.handOff ? options.handOff() : true;
@@ -206,6 +208,7 @@ function routerHarness(options: {
     start: async (issueId: string, _paseo: PaseoApi, _settings: PluginSettings, startOptions: StartOptions): Promise<Started> => {
       calls.push("start");
       starts.push({ issueId, options: startOptions });
+      if (options.pauseStart) await options.pauseStart();
       if (options.failStart) throw new Error("Paseo is not connected yet.");
       daemon.add(ticketAgent("agent-new", "2026-02-01T00:00:09Z"));
       return { agentId: "agent-new", warnings: [], provider: "claude/opus", target: "repo", resumed: true, untrusted: false, plan: null };
@@ -489,7 +492,7 @@ test("a held gate keeps a labelled ticket's trigger label and reports no failure
   assert.ok(gate);
   await dispatcher.tick();
   assert.equal(daemon.created.length, 0, "nothing starts while another path holds the gate");
-  assert.deepEqual([...linear.labels.get("eng-1")!], ["paseo"], "the trigger label stays for the next poll");
+  assert.deepEqual([...(linear.labels.get("eng-1") ?? [])], ["paseo"], "the trigger label stays for the next poll");
   assert.ok(!linear.writes.some((write) => write.includes("paseo-failed")), "no failed label");
   assert.ok(!linear.writes.some((write) => write.includes("could not start an agent")), "no failure comment");
   assert.deepEqual(dispatcher.snapshot().recent, []);
@@ -497,7 +500,7 @@ test("a held gate keeps a labelled ticket's trigger label and reports no failure
   gate.release();
   await dispatcher.tick();
   assert.equal(daemon.created.length, 0);
-  assert.deepEqual([...linear.labels.get("eng-1")!], ["paseo-running"]);
+  assert.deepEqual([...(linear.labels.get("eng-1") ?? [])], ["paseo-running"]);
   assert.equal(dispatcher.snapshot().recent[0].outcome, "linked");
   assert.ok(linear.writes.some((write) => write.includes("Paseo already has an active agent for this ticket")));
   dispatcher.stop();
@@ -620,6 +623,52 @@ test("a thread that arrives during a launch waits with its comment and is linked
   assert.deepEqual({ queued: linked?.queued, pendingText: linked?.pendingText, agentId: linked?.agentId }, { queued: false, pendingText: null, agentId: "agent-new" });
   assert.deepEqual(h.daemon.sent, ["agent-new: rebase it please"], "the successor got the comment");
   assertGateFree(h.gates);
+  await h.cleanup();
+});
+
+test("a thread opened while a successor starts keeps its comment through the successor's new thread and passes it on once", async (t) => {
+  t.mock.method(console, "log", () => {});
+  // Executor form: the plugin's TypeScript lib predates Promise.withResolvers.
+  let reachedStart = () => {};
+  const reached = new Promise<void>((resolve) => { reachedStart = resolve; });
+  let resume = () => {};
+  const paused = new Promise<void>((resolve) => { resume = resolve; });
+  const h = routerHarness({
+    agents: [ticketAgent("agent-gone", "2026-01-01T00:00:00Z", { status: "closed" })],
+    pauseStart: () => { reachedStart(); return paused; },
+  });
+  const starting = succeed(h);
+  await reached;
+
+  await h.router.created({ id: "s-owner", creatorId: OWNER, issueId: ISSUE.id, issue: { identifier: ISSUE.identifier }, comment: { body: "@paseo rebase it please" } });
+  // The owner's thread is older than the one the successor start opens next.
+  await h.store.patch("s-owner", { createdAt: "2026-01-01T00:00:00Z" });
+  resume();
+  assert.equal((await starting).kind, "started");
+  const waiting = await h.store.get("s-owner");
+  assert.deepEqual({ queued: waiting?.queued, closed: Boolean(waiting?.closed), pendingText: waiting?.pendingText }, { queued: true, closed: false, pendingText: "rebase it please" }, "the successor's thread does not supersede an undelivered comment");
+
+  await h.router.startQueued();
+  await h.router.startQueued();
+  assert.deepEqual(h.daemon.sent, ["agent-new: rebase it please"], "the successor got the comment, once");
+  assert.equal((await h.store.get("s-owner"))?.agentId, "agent-new");
+  assertGateFree(h.gates);
+  await h.cleanup();
+});
+
+test("a successor that cannot be read after its start keeps the predecessor's record for a later hand-off", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = routerHarness({ agents: [ticketAgent("agent-gone", "2026-01-01T00:00:00Z", { status: "closed" })] });
+  const agents = h.daemon.paseo.agents;
+  const ref = agents.ref.bind(agents);
+  agents.ref = ((id: string) => (id === "agent-new" ? { ...ref(id), refresh: async () => { throw new Error("daemon went away"); } } : ref(id))) as typeof agents.ref;
+
+  assert.deepEqual(await succeed(h), { kind: "started", agent: { id: "agent-new", title: null, cwd: "" } });
+  assert.ok(!h.calls.some((call) => call.startsWith("handOff")), "no hand-off with an unknown worktree");
+  // The next succession finds the successor live and hands the record over with its worktree.
+  agents.ref = ref;
+  assert.equal((await succeed(h)).kind, "live");
+  assert.deepEqual(h.calls.filter((call) => call.startsWith("handOff")), ["handOff agent-gone -> agent-new"]);
   await h.cleanup();
 });
 

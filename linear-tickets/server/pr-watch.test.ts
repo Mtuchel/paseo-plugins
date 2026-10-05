@@ -2163,6 +2163,25 @@ test("a message that went out, a new head or another stage starts the permission
   assert.deepEqual(await h.poll(), [WAITED("resolve the review findings")]);
 });
 
+test("a stage the owner vetoed meanwhile waits from zero once the veto is lifted", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t);
+  const start = h.scripts.now;
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.paseo.answer = async () => "waiting";
+  assert.deepEqual(await h.poll(), []);
+  h.scripts.now = start + 50 * MINUTE;
+  h.github.view = { ...READY, checks: [failing("PR code")], labels: ["do-not-merge"] };
+  assert.deepEqual(await h.poll(), [], "vetoed: no nudge and no reminder");
+  h.scripts.now = start + 90 * MINUTE;
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  assert.deepEqual(await h.poll(), [], "the same stage waits again, from now");
+  h.scripts.now = start + 90 * MINUTE + 59 * MINUTE;
+  assert.deepEqual(await h.poll(), []);
+  h.scripts.now = start + 150 * MINUTE;
+  assert.deepEqual(await h.poll(), [WAITED("fix the failing checks")]);
+});
+
 test("a drop's fix request or a replay request waiting 60 minutes for the owner's answer escalates once", async (t) => {
   t.mock.method(console, "log", () => {});
   const drop = harness(t);
