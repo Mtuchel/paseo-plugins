@@ -8,6 +8,10 @@ import { type AutoApprovePolicy, DEFAULT_AUTO_APPROVE, MAX_IMPACT } from "../sha
 export const MAX_TEMPLATE_LENGTH = 8_000;
 
 export type LaunchPreference = { model: string; modeId?: string; thinkingOptionId?: string };
+// The cheap model tier's model per provider (README, "Model tiers"); a provider without one
+// implements every plan on its launch model.
+export type CheapModel = { model: string; thinkingOptionId?: string };
+export const DEFAULT_CHEAP_MODELS: Record<string, CheapModel> = { omp: { model: "omp/deepseek/deepseek-flash", thinkingOptionId: "max" } };
 // Auto-dispatch starts an agent for every open ticket carrying `label` in one of `teamKeys`,
 // whoever it is assigned to. No teams means nothing is dispatched, even when enabled.
 // `maxRunning`: at most this many ticket agents work at once (0 = no limit); others wait their turn.
@@ -33,6 +37,8 @@ export type PluginSettings = {
   writeback: WritebackSettings;
   // Plans rated at or below the threshold are approved without the owner (README, "Plan risk and auto-approval").
   autoApprove: AutoApprovePolicy;
+  // The cheap tier's model per provider; `{}` turns the cheap tier off.
+  cheapModels: Record<string, CheapModel>;
 };
 
 type SettingsFile = {
@@ -46,6 +52,7 @@ type SettingsFile = {
   dispatch?: Partial<DispatchSettings>;
   writeback?: Partial<WritebackSettings>;
   autoApprove?: Partial<AutoApprovePolicy>;
+  cheapModels?: Record<string, CheapModel>;
 };
 
 function savedString(value: unknown): string | undefined {
@@ -63,6 +70,12 @@ function normalizeLaunchPreferences(value: unknown): Record<string, LaunchPrefer
     const thinkingOptionId = savedString(candidate.thinkingOptionId);
     return [[provider, { model, ...(modeId ? { modeId } : {}), ...(thinkingOptionId ? { thinkingOptionId } : {}) }]];
   }));
+}
+
+// A missing setting means the defaults; a saved one (even `{}`) replaces them.
+function normalizeCheapModels(value: unknown): Record<string, CheapModel> {
+  if (value === undefined) return DEFAULT_CHEAP_MODELS;
+  return Object.fromEntries(Object.entries(normalizeLaunchPreferences(value)).map(([provider, { model, thinkingOptionId }]) => [provider, { model, ...(thinkingOptionId ? { thinkingOptionId } : {}) }]));
 }
 
 const MAPPING_KEY = /^(project|team):[A-Za-z0-9_-]{1,100}$/;
@@ -200,6 +213,7 @@ export class Settings {
       dispatch: normalizeDispatch(value.dispatch),
       writeback: normalizeWriteback(value.writeback),
       autoApprove: normalizeAutoApprove(value.autoApprove),
+      cheapModels: normalizeCheapModels(value.cheapModels),
     };
   }
 
@@ -254,7 +268,8 @@ export class Settings {
     const customDispatch = JSON.stringify(value.dispatch) !== JSON.stringify(DEFAULT_DISPATCH);
     const customWriteback = JSON.stringify(value.writeback) !== JSON.stringify(DEFAULT_WRITEBACK);
     const customAutoApprove = JSON.stringify(value.autoApprove) !== JSON.stringify(DEFAULT_AUTO_APPROVE);
-    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customAutoApprove) {
+    const customCheapModels = JSON.stringify(value.cheapModels) !== JSON.stringify(DEFAULT_CHEAP_MODELS);
+    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customAutoApprove && !customCheapModels) {
       await rm(this.path, { force: true });
       return value;
     }
@@ -272,6 +287,7 @@ export class Settings {
     if (customDispatch) fileValue.dispatch = value.dispatch;
     if (customWriteback) fileValue.writeback = value.writeback;
     if (customAutoApprove) fileValue.autoApprove = value.autoApprove;
+    if (customCheapModels) fileValue.cheapModels = value.cheapModels;
     const temporary = `${this.path}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, JSON.stringify(fileValue), { mode: 0o600, flag: "wx" });

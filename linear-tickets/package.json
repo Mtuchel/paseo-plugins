@@ -24,7 +24,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "generate:icons": "node scripts/generate-provider-icons.mjs",
-    "test": "node --import tsx --test server/*.test.ts client/*.test.ts"
+    "test": "node --import tsx --test server/*.test.ts client/*.test.ts",
+    "tier-report": "node scripts/tier-report.mjs"
   },
   "dependencies": {
     "simple-icons": "^16.30.0"

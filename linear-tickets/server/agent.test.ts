@@ -20,7 +20,7 @@ import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 const OWNER = "owner-1";
 const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: false,
-  dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE,
+  dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {},
 };
 
 test("only fresh, correctly signed webhooks are accepted", () => {

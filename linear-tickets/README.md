@@ -279,7 +279,9 @@ list and the launch flow.
 - **Write back to Linear** — report ticket-linked agents' progress on the ticket (all off by default; see below).
 
 The last successful model, mode, and reasoning choices are stored in the same per-host
-settings file. They update automatically and do not need a separate settings toggle.
+settings file. They update automatically and do not need a separate settings toggle. The cheap
+model tier's model per provider (`cheapModels`, see [Model tiers](#model-tiers)) has no toggle
+either: edit `$PASEO_HOME/linear-tickets/settings.json`.
 
 ## Customizing the launch prompt
 
@@ -455,6 +457,46 @@ ticket agent, the one that plans and then implements as well as one that impleme
 plan later, is told to file a place the plan missed as a follow-up ticket (`create_issue`, related
 to the ticket) instead of quietly doing more.
 
+### Model tiers
+
+Planning always runs on the launch model (the strong tier, e.g. Opus). The plan then picks the
+tier its implementation runs on, in a fixed `## Model` section ([`shared/plan-model.ts`](shared/plan-model.ts)):
+
+```markdown
+## Model
+
+- Tier: <cheap | strong> — <why>
+- Strong steps: <none | step numbers> — <why>
+```
+
+`cheap` is the default for well-specified work that follows existing patterns; `strong` needs a
+reason: work spanning four or more layers, interface design, several call sites that must agree on
+one computation, a gap between a check and the write it guards, or more than 15–20 files. The omp
+gate refuses to record the advisor review without a readable section, and refuses `cheap` for a
+plan rated (planner or advisor, the higher) above impact 2 or not reversible by a revert. The
+GPT-6 Astra advisor checks the choice like the rest of the plan. A project planner's work order
+carries no tier: each ticket's own plan picks one.
+
+When the approved plan is implemented, the agent starts on the strongest of: the ticket's
+`model:cheap` / `model:strong` label (set by the plugin on approval; change it to override), the
+ticket's latest recorded tier (an escalation stays), and the plan's tier. A plan without a
+`## Model` section, from before tiers, implements on the strong tier. The cheap tier runs the
+provider's model in `cheapModels` (default for omp: `deepseek/deepseek-flash`, thinking `max`); a
+provider without one implements on the launch model. After **Approve & split**, each sub-issue
+plans again and picks its own tier; a sub-issue of a strong plan, or of a step the plan lists under
+`Strong steps`, gets `model:strong` first, so its own plan cannot lower it.
+
+On the cheap tier, the agent hands the plan's strong steps to subagents on the strong model (omp:
+`model: "@slow"`), and calls `escalate_model` with a reason when the same check still fails after
+two honest fix attempts, the work needs judgment the plan did not settle, or a review finds a design
+problem. The plugin then switches the agent to the strong model within seconds, records the reason
+and posts it in the ticket's panel. Subagents cannot call it.
+
+Every decision (plan, start, escalation) is kept per ticket in
+`$PASEO_HOME/linear-tickets/model-tiers/`. `npm run tier-report [-- --since 2026-10-01]` compares
+the tiers each ticket started implementing on, from those records and the handover records:
+tickets per tier, escalations, failures, and how many reached a pull request.
+
 Claude starts in `plan` mode and Codex in `auto`; omp keeps your usual mode (its `write` mode asks
 before every shell command, reads included) and starts in Plannotator's planning phase instead.
 The prompt asks only for a plan and, for a ticket someone else wrote or labelled `feedback`, marks
@@ -609,11 +651,13 @@ with this host). Its subtitle shows the phase and model; a new agent on the tick
 Every Linear thread linked to an agent has "Open in Paseo" under Links, and the Plan review link
 is there only while the review is open.
 
-**Ticket agents keep the launch model.** Every ticket agent runs the model and thinking level
-chosen for launches in the plugin. Plannotator's plan mode switches back to the model it saved when
-planning began once a plan is approved; the plugin notices within seconds (at most 20 s), restores
-the launch model and says so in the ticket's panel. To use another model for ticket work, change the
-launch model in the plugin; changing it on one agent in Paseo is undone.
+**Ticket agents keep their tier's model.** A ticket agent plans on the model and thinking level
+chosen for launches in the plugin and implements on its [model tier](#model-tiers)'s model.
+Plannotator's plan mode switches back to the model it saved when planning began once a plan is
+approved; the plugin notices within seconds (at most 20 s), switches the agent to its tier's model
+and says so in the ticket's panel. To use another model for ticket work, change the launch model
+or `cheapModels` in the plugin, or the ticket's `model:` label; changing it on one agent in Paseo
+is undone.
 
 **Which model is working.** The progress comment, the final report, the plan review question and
 the plan document ("Planned with") show the model the agent runs, with its thinking level. When

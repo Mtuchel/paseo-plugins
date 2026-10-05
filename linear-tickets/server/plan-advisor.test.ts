@@ -82,8 +82,9 @@ function load() {
 
 const RISK = "## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: 1 — read-only\n- Reversibility: revert — nothing written\n- Feature flag: no\n- Migration: no\n- Auth: no\n- New rule: no — a one-off report column\n- Failure mode: a wrong column in the report\n- Advisor rating: impact 1, reversibility revert\n- Recommendation: auto — routine\n\n";
 const UNADVISED_RISK = RISK.replace("impact 1, reversibility revert", "unavailable");
-// One line each: enough at impact 0–1.
-const SECTIONS = "## Reach\n\nOnly the order report, because nothing else reads it.\n\n## Principles and rules\n\nNone apply; no new rule.\n\n";
+// One line each: enough at impact 0–1. The model tier rides along: every ticket plan needs it.
+const MODEL = "## Model\n\n- Tier: cheap — one report column\n- Strong steps: none — nothing needs judgment\n\n";
+const SECTIONS = `## Reach\n\nOnly the order report, because nothing else reads it.\n\n## Principles and rules\n\nNone apply; no new rule.\n\n${MODEL}`;
 const PLAN = `# Plan\n\nDo the thing.\n\n${SECTIONS}${RISK}## Advisor review\n\nGPT-6 Astra, 2 rounds, agreed.\n`;
 
 test("a ticket plan cannot reach the owner until a finished GPT-6 Astra advisor review is recorded for that exact text", async () => {
@@ -181,6 +182,7 @@ test("the record needs readable Reach and Principles sections: one line each at 
     "# Plan\n\nDo the thing.\n\n## Verification\n\n- AC-1: the order page shows the column\n- AC-2: the CSV export carries it\n",
     "## Reach\n\n- Changes: the order's delivery date column\n- Order page (sales, warehouse): include — AC-1\n- CSV export: include — AC-2\n- Help page: follow-up — Document the delivery date column\n- Seed data: n/a — no new data\n",
     "## Principles and rules\n\n- Applies: none apply — no principle covers report columns\n- Exceptions: none\n- New rule: none — a one-off column\n",
+    "## Model\n\n- Tier: strong — order records need judgment\n- Strong steps: none — the whole ticket is strong\n",
     `${rated3}## Advisor review\n\nGPT-6 Astra, 1 round, agreed.\n`,
   ].join("\n");
   writeFileSync(join(h.cwd, "PLAN.md"), full);
@@ -190,6 +192,24 @@ test("the record needs readable Reach and Principles sections: one line each at 
   const order = `# Work order\n\n## Work order\n\n\`\`\`project-order\nTUC-1 blocks TUC-2\n\`\`\`\n\n## Reach\n\nOnly this project's tickets in Linear; each ticket's own plan answers where else it applies.\n\n## Principles and rules\n\nNone apply; no new rule.\n\n${RISK.replace("- Impact: 1 — read-only", "- Impact: 0 — Linear only").replace("impact 1, reversibility revert", "impact 0, reversibility revert")}## Advisor review\n\nGPT-6 Astra, 1 round, agreed.\n`;
   writeFileSync(join(h.cwd, "PLAN.md"), order);
   assert.match(await record(), /recorded/);
+});
+
+test("the record needs a readable model tier, and a plan rated above impact 2 or not reversible by a revert cannot pick the cheap one", async () => {
+  const h = load();
+  const record = () => h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" });
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace(MODEL, ""));
+  const refused = await record();
+  assert.match(refused, /no "## Model" section/);
+  assert.match(refused, /- Tier: <cheap \| strong> — <why>/, "the refusal shows the format");
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("- Tier: cheap — one report column", "- Tier: cheap"));
+  assert.match(await record(), /gives no reason after the dash/);
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("- Strong steps: none — nothing needs judgment\n", ""));
+  assert.match(await record(), /no "- Strong steps:/);
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("- Reversibility: revert — nothing written", "- Reversibility: data-fix — rows are written"));
+  assert.match(await record(), /"- Tier: cheap" is not allowed for this plan \(data-fix/);
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("- Reversibility: revert — nothing written", "- Reversibility: data-fix — rows are written").replace("- Tier: cheap — one report column", "- Tier: strong — rows need a data fix if wrong"));
+  assert.match(await record(), /recorded/);
+  assert.equal(await h.submit("PLAN.md"), undefined);
 });
 
 test("omp's local plan proposals are checked against the text the bridge would submit, and fail closed when unreadable", async () => {

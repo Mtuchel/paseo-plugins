@@ -24,6 +24,7 @@ import { ensureFunnel, type FunnelStatus } from "./server/funnel";
 import { ReviewLinks } from "./server/review-links";
 import { closeInternalDaemon, internalDaemon, modelSetter, ownConnection } from "./server/connection";
 import { ModelGuard } from "./server/model-guard";
+import { recordStart, TIER_AGENT_LABEL, tierModel, TierStore } from "./server/model-tiers";
 import { HealthMonitor } from "./server/health";
 import { PullRequestWatch } from "./server/pr-watch";
 import { PullRequestBoard } from "./server/pull-requests";
@@ -57,7 +58,9 @@ export default function contribute(server: PluginServerContext) {
   const handover = new Handover(linear, undefined, undefined, undefined, async (agentId) => { const serverId = await daemonServerId(); return serverId ? paseoAgentUrl(serverId, agentId) : null; });
   // Present or away (README, "Present and away"): every start path asks the starter's scheduler.
   const presence = new Presence();
-  const starter = new TicketStarter({ linear, launcher, handover, presence });
+  // Model tiers (README, "Model tiers"): the tier each ticket implements on.
+  const tiers = new TierStore();
+  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers });
   // The plugin itself closes the review (split, implement later): the extension's report of that
   // closing is not the owner's decision, so the bridge skips it.
   const retirePlanner = async (reviewUrl: string, agentId: string, api: PaseoApi, reason: string) => {
@@ -177,11 +180,17 @@ export default function contribute(server: PluginServerContext) {
     return null;
   });
   let attached = false;
-  // Ticket agents keep the launch model (Plannotator restores its pre-planning model on approval).
+  // Ticket agents run their tier's model: the launch model while planning and on the strong tier
+  // (Plannotator restores its pre-planning model on approval), the cheap model on the cheap tier.
   const modelGuard = new ModelGuard(settings, modelSetter, async (change) => {
     const link = await sessions.sessionFor(change.agentId);
-    if (link) await sessions.say(link.sessionId, "thought", `Model restored to ${change.to} (it had switched to ${change.from}).`);
+    if (link) await sessions.say(link.sessionId, "thought", change.tier === "cheap" ? `Switched to the cheap model tier: ${change.to} (was ${change.from}).` : `Model restored to ${change.to} (it had switched to ${change.from}).`);
+  }, async (agent) => {
+    const issueId = agent.labels["linear.issueId"];
+    const label = agent.labels[TIER_AGENT_LABEL];
+    return (issueId ? await tiers.forAgent(issueId, agent.id) : null) ?? (label === "cheap" || label === "strong" ? label : null);
   });
+  plannotator.useTiers({ store: tiers, apply: (agentId) => modelGuard.apply(agentId) });
   // The central Plannotator host starts once, after the hook it runs for each parked review exists.
   const startHost = async () => { if (await plannotatorHook() && !stopped) await plannotatorHost.start(); };
   const attach = (paseo: PaseoApi) => { const first = !attached; attached = true; if (!stopped) { void reviewLinks.start(); if (first) void startHost(); } dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); void startAgent(); };
@@ -262,11 +271,14 @@ export default function contribute(server: PluginServerContext) {
     return { ...saved, builtin: DEFAULT_PROMPT_TEMPLATE };
   });
   server.handle(launchAgentRpc, async (input, { paseo }) => {
-    const { template, agentLinearAccess, dispatch } = await settings.read();
-    const setup = await planSetup(linear, input.id, input.provider, input.modeId, dispatchLabels(dispatch.label).planner);
-    const launch = { ...input, modeId: setup.modeId, instructions: [...setup.notes, input.instructions.trim()].filter(Boolean).join("\n\n") };
+    const current = await settings.read();
+    const { template, agentLinearAccess, dispatch } = current;
+    const setup = await planSetup(linear, input.id, input.provider, input.modeId, dispatchLabels(dispatch.label).planner, tiers);
+    const model = tierModel(current, input.provider.split("/")[0], setup.tier?.tier ?? null, { provider: input.provider, ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}) });
+    const launch = { ...input, ...model, modeId: setup.modeId, instructions: [...setup.notes, input.instructions.trim()].filter(Boolean).join("\n\n") };
     const markInProgress = input.markInProgress && setup.policy !== "required";
     const result = await launcher.start(launch, paseo, { promptTemplate: template ?? undefined, markInProgress, linearAccess: agentLinearAccess, labels: setup.labels, env: setup.env });
+    await recordStart(tiers, { id: input.id, identifier: setup.identifier }, setup.tier, result.agentId, model.provider);
     await openSession(input.id, input.id, result.agentId);
     return result;
   });

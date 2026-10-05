@@ -20,6 +20,8 @@ import { dispatchLabels } from "./dispatch";
 import { orderProblems, type ProjectFlow } from "./project-flow";
 import type { PlanFollowUps } from "./plan-follow-ups";
 import { feedbackEntry, logQuietly, type DecisionLog } from "./owner-decisions";
+import { planTier, strongerTier, type Tier } from "../shared/plan-model";
+import { labelTier, TIER_LABELS, tierModel, type TierStore } from "./model-tiers";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -50,7 +52,12 @@ export type OpenedEvent = { type: "opened"; agentId: string | null; localUrl: st
 export type DecidedEvent = { type: "decided"; agentId: string | null; approved: boolean; feedback?: string; planUri?: string; planContent?: string; parked?: true; at: string };
 // The omp extension recorded the plan advisor's review (verdict) for the plan text with this hash.
 export type AdvisedEvent = { type: "advised"; agentId: string | null; verdict: string; hash: string; at: string };
-type PlannotatorEvent = OpenedEvent | DecidedEvent | AdvisedEvent;
+// The ticket agent asked for the strong model tier (the omp extension's escalate_model tool).
+export type EscalatedEvent = { type: "escalated"; agentId: string | null; reason: string; at: string };
+type PlannotatorEvent = OpenedEvent | DecidedEvent | AdvisedEvent | EscalatedEvent;
+// Model tiers (README, "Model tiers"): where tier decisions are recorded, and the model guard's
+// immediate switch of one agent.
+export type Tiers = { store: Pick<TierStore, "record">; apply: (agentId: string) => Promise<unknown> };
 type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "moveToStateNamed" | "moveToReady" | "addLabel" | "removeLabel" | "issueState" | "viewerId" | "appUserId">;
 // What the risk policy made of an opened review: `line` tells the owner, in the panel and on Linear;
 // `reasons` why it needs the owner (empty when approved).
@@ -126,6 +133,9 @@ export function parseEvent(raw: string): PlannotatorEvent | null {
   if (event.type === "advised" && typeof event.verdict === "string" && typeof event.hash === "string") {
     return { type: "advised", agentId, verdict: event.verdict, hash: event.hash, at };
   }
+  if (event.type === "escalated" && typeof event.reason === "string" && event.reason.trim()) {
+    return { type: "escalated", agentId, reason: event.reason.trim().slice(0, 1_000), at };
+  }
   return null;
 }
 
@@ -166,6 +176,8 @@ export class PlannotatorBridge {
   private readonly shown = new Set<string>();
   // Where the owner's review feedback is kept for the weekly decision candidates (owner-decisions.ts).
   private decisions: Pick<DecisionLog, "append"> | null = null;
+  // Model tiers (README, "Model tiers"): approved plans and escalations set the agent's tier.
+  private tiers: Tiers | null = null;
 
   constructor(
     private readonly linear: Linear,
@@ -256,6 +268,62 @@ export class PlannotatorBridge {
     this.decisions = log;
   }
 
+  useTiers(tiers: Tiers): void {
+    this.tiers = tiers;
+  }
+
+  // The ticket's `model:` label follows its tier, so Linear shows (and filters) which tier a ticket
+  // runs on; the owner raises it by setting `model:strong`.
+  private async labelTier(issueId: string, tier: Tier, current: { id: string; name: string }[]): Promise<void> {
+    await this.linear.addLabel(issueId, TIER_LABELS[tier]);
+    await this.linear.removeLabel(issueId, TIER_LABELS[tier === "cheap" ? "strong" : "cheap"], current);
+  }
+
+  // An approved plan's tier (README, "Model tiers"): the stronger of the plan's `## Model` section
+  // and the ticket's label, recorded for this agent and applied by the model guard right away. A
+  // failure leaves the agent on the launch model, the safe side.
+  private async applyPlanTier(agentId: string, provider: string, issue: { id: string; identifier: string }, plan: string, settings: PluginSettings): Promise<void> {
+    const tiers = this.tiers;
+    if (!tiers) return;
+    try {
+      const state = await this.linear.issueState(issue.id);
+      const planned = planTier(plan);
+      const tier = strongerTier(labelTier(state.labels), planned?.tier) ?? "strong";
+      const reason = !planned ? "the plan names no tier" : tier === planned.tier ? planned.reason || "the approved plan" : "raised by the ticket's model:strong label";
+      const launch = settings.launchPreferences[provider];
+      const model = launch ? tierModel(settings, provider, tier, { provider: launch.model }).provider : null;
+      await tiers.store.record(issue, { tier, source: "plan", reason, agentId, model });
+      if (settings.writeback.status) await this.labelTier(issue.id, tier, state.labels);
+      await tiers.apply(agentId);
+      const link = await this.sessions?.sessionFor(agentId);
+      if (link) await this.sessions!.say(link.sessionId, "thought", `Implementing on the ${tier} model tier${model ? ` (${model})` : ""}: ${reason}.`);
+      console.log(`[linear-tickets] ${issue.identifier}: implementing on the ${tier} tier (${reason})`);
+    } catch (error) {
+      console.error(`[linear-tickets] ${issue.identifier}: applying the plan's model tier failed, the agent stays on the launch model: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+
+  // The ticket agent asked for the strong tier (escalate_model). The record comes first: it is what
+  // the model guard enforces; the label, switch and note are best-effort so a retry never records twice.
+  private async escalate(event: EscalatedEvent, agentId: string, paseo: PaseoApi): Promise<void> {
+    const tiers = this.tiers;
+    if (!tiers) return;
+    const agent = (await paseo.agents.ref(agentId).refresh())?.agent;
+    const issueId = agent?.labels["paseo.parent-agent-id"] ? undefined : agent?.labels["linear.issueId"];
+    if (!agent || !issueId) return;
+    const issue = { id: issueId, identifier: agent.labels["linear.identifier"] || issueId };
+    const settings = await this.settings.read();
+    const from = activeModel(agent);
+    await tiers.store.record(issue, { tier: "strong", source: "escalated", reason: event.reason, agentId, model: settings.launchPreferences[agent.provider]?.model ?? null });
+    const quietly = (what: string) => (error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: ${what} after the escalation failed: ${error instanceof Error ? error.message : error}`);
+    if (settings.writeback.status) await this.linear.issueState(issueId).then((state) => this.labelTier(issueId, "strong", state.labels)).catch(quietly("updating the model label"));
+    await tiers.apply(agentId).catch(quietly("switching the model"));
+    const note = `Escalated to the strong model tier${from ? ` from ${from}` : ""}: ${event.reason}`;
+    const link = await this.sessions?.sessionFor(agentId).catch(() => null);
+    await (link ? this.sessions!.say(link.sessionId, "thought", note) : this.linear.comment(issueId, `⬆️ **${note}**`)).catch(quietly("telling the owner"));
+    console.log(`[linear-tickets] ${issue.identifier}: ${note}`);
+  }
+
   // The plan document is replaced every round, so the log is where each round's feedback stays.
   private async logFeedback(agentId: string, event: DecidedEvent, issue: { id: string; identifier: string }): Promise<void> {
     const entry = feedbackEntry(agentId, event, issue);
@@ -325,6 +393,7 @@ export class PlannotatorBridge {
 
   private async deliver(event: PlannotatorEvent, agentId: string, paseo: PaseoApi): Promise<void> {
     if (event.type === "advised") { this.advised.set(agentId, { verdict: event.verdict, hash: event.hash }); return; }
+    if (event.type === "escalated") return this.escalate(event, agentId, paseo);
     const parked = this.parking ? await this.parking.plans.forAgent(agentId) : null;
     if (parked) return this.deliverParked(event, parked);
     if (event.type === "decided") {
@@ -370,6 +439,7 @@ export class PlannotatorBridge {
       const preference = settings.lastProvider ? settings.launchPreferences[settings.lastProvider] : undefined;
       if (preference?.modeId) await this.setMode(agentId, preference.modeId).catch((error: unknown) => console.error(`[linear-tickets] ${identifier}: restoring the agent mode failed: ${error instanceof Error ? error.message : error}`));
     }
+    if (event.type === "decided" && event.approved && refreshed?.agent) await this.applyPlanTier(agentId, refreshed.agent.provider, { id: issueId, identifier }, event.planContent ?? "", settings);
     // Planning while a plan is out for review (and after it is sent back); coding once approved.
     if (settings.writeback.status) {
       const approved = event.type === "decided" && event.approved;

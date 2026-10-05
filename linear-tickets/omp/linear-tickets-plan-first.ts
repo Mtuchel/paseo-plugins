@@ -23,7 +23,11 @@
 //   suffices at impact 0–1, by the higher of planner and advisor rating), and drops an `advised`
 //   event with the verdict and the plan text's hash, from which the plugin's Plannotator bridge
 //   decides whether the plan is approved without the owner (README, "Plan risk and
-//   auto-approval").
+//   auto-approval"). The record also needs the plan's `## Model` section (shared/plan-model.ts):
+//   the tier its implementation runs on.
+// - LINEAR_TICKETS_ISSUE=<ticket>: `escalate_model` (README, "Model tiers") lets a ticket agent on
+//   the cheap tier ask for the strong model; it drops an `escalated` event and the plugin switches
+//   the agent's model. Subagents cannot call it.
 // - LINEAR_TICKETS_ISSUE=<ticket>: Linear writes (README, "Agent access to Linear"). The user-level
 //   Linear MCP server acts as the owner, so ticket agents and their subagents may call only its read
 //   tools, named below; every other tool of that server is blocked, whether called directly
@@ -42,8 +46,9 @@ import { homedir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
 import { ADVISOR_MODEL, ADVISOR_SECTION, ADVISOR_THINKING, advisorSteps, RECORD_ADVICE_TOOL } from "../shared/plan-advisor";
-import { combinedRating, parsePlanRisk } from "../shared/plan-risk";
+import { combinedRating, parsePlanRisk, sectionBody } from "../shared/plan-risk";
 import { parsePlanSections, ruleMismatch, sectionSteps } from "../shared/plan-sections";
+import { ESCALATE_TOOL, parsePlanModel } from "../shared/plan-model";
 
 type Phase = "idle" | "planning" | "executing";
 type Entry = { type: string; customType?: string; data?: { reason?: string; path?: string; hash?: string }; message?: { role?: string } };
@@ -292,6 +297,9 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const sections = parsePlanSections(content, combinedRating(rated.risk).impact);
     const sectionProblem = "problem" in sections ? sections.problem : ruleMismatch(rated.risk.newRule, sections.sections);
     if (sectionProblem) return text(`${file}: ${sectionProblem}\n\n${sectionSteps()}\n\nFix the section, then record again.`);
+    // A project planner's work order only orders tickets; each ticket's own plan picks its tier.
+    const model = sectionBody(content, "Work order") === null ? parsePlanModel(content, rated.risk) : null;
+    if (model && "problem" in model) return text(`${file}: ${model.problem}\n\nFix the section, then record again.`);
     if (verdict === "unavailable") {
       const reason = params.reason?.trim();
       if (!reason) return text("Give the reason the advisor could not be created.");
@@ -457,6 +465,21 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       const checked = recordOutcomes.get(id);
       recordOutcomes.delete(id);
       return checked ?? recordAdvice(params, ctx);
+    },
+  });
+
+  if (TICKET) pi.registerTool({
+    name: ESCALATE_TOOL,
+    label: "Escalate Model",
+    description: "Ask the plugin to move this ticket to the strong model tier when you run on the cheap tier and the work needs more: the same check still fails after two honest fix attempts, the change turns out to need judgment the plan did not settle (several layers, an interface others build on, call sites that must agree, a check-then-write gap, many files), or a review found a design problem. The plugin switches your model within seconds and records the reason on the ticket; carry on with the work afterwards. Not for routine failures you can fix.",
+    parameters: pi.zod.object({ reason: pi.zod.string() }),
+    loadMode: "essential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (ctx?.agent?.kind === "sub") return text("Only the ticket agent itself can escalate; report back to it instead.");
+      const reason = params.reason?.trim();
+      if (!reason) return text("Give the reason the cheap model is not enough.");
+      dropEvent({ type: "escalated", reason: reason.slice(0, 1_000) });
+      return text("Escalation requested: the plugin switches you to the strong model within seconds and records the reason on the ticket. Carry on with the work.");
     },
   });
 
