@@ -9,6 +9,7 @@ import {
   commentOnce,
   ENQUEUE_READY,
   enqueueArgs,
+  originRepo,
   parseEnqueue,
   parseJudgment,
   parseReady,
@@ -130,9 +131,11 @@ test("the backstop checkout: one detached worktree per repo from a recorded work
   const root = join(home, "queue-backstop");
   const calls: string[] = [];
   let tools = true;
+  let origin = "https://github.com/tuchel-sohn/tuchel-platform.git\n";
   const git = async (args: string[]) => {
     calls.push(args.join(" ").replaceAll(home, "~"));
     if (args.includes("rev-parse")) return join(home, "repo.git");
+    if (args.includes("get-url")) return origin;
     const add = args.indexOf("add");
     if (add !== -1) {
       const path = args[add + 2];
@@ -149,6 +152,7 @@ test("the backstop checkout: one detached worktree per repo from a recorded work
   assert.equal(path, join(root, "tuchel-sohn-tuchel-platform"));
   assert.deepEqual(calls, [
     "-C ~/agent-worktree rev-parse --path-format=absolute --git-common-dir",
+    "--git-dir ~/repo.git remote get-url origin",
     "--git-dir ~/repo.git worktree prune",
     "--git-dir ~/repo.git fetch --quiet origin main",
     "--git-dir ~/repo.git worktree add --detach ~/queue-backstop/tuchel-sohn-tuchel-platform origin/main",
@@ -160,7 +164,65 @@ test("the backstop checkout: one detached worktree per repo from a recorded work
   assert.deepEqual(calls, ["-C ~/queue-backstop/tuchel-sohn-tuchel-platform fetch --quiet origin main", "-C ~/queue-backstop/tuchel-sohn-tuchel-platform reset --hard --quiet origin/main"], "an existing checkout is only reset");
 
   tools = false;
+  origin = "https://github.com/other/repo.git\n";
   assert.equal(await checkout.prepare("other/repo", [source]), null, "main has no tools/ci/enqueue-ready.mjs");
   const file = await checkout.commentFile("ready:419@a1b2c3d,b2c3d4e", "Enqueued.");
   assert.equal(file, join(root, "comments", "ready_419_a1b2c3d_b2c3d4e.md"));
+});
+
+test("the backstop checkout skips a recorded folder that is not a git repository or is another repository's clone, and runs nothing when none is a clone", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "queue-backstop-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const plain = join(home, "tmp");
+  const other = join(home, "other-clone");
+  const clone = join(home, "agent-worktree");
+  for (const folder of [plain, other, clone]) await mkdir(folder);
+  const root = join(home, "queue-backstop");
+  const calls: string[] = [];
+  const git = async (args: string[]) => {
+    calls.push(args.join(" ").replaceAll(home, "~"));
+    if (args.includes("rev-parse")) {
+      if (args[1] === plain) throw new Error("fatal: not a git repository (or any of the parent directories): .git");
+      return join(home, args[1] === other ? "other.git" : "repo.git");
+    }
+    if (args.includes("get-url")) return args[1].endsWith("other.git") ? "git@github.com:Mtuchel/zeiterfassung.git" : "git@github.com:Tuchel-Sohn/tuchel-platform.git";
+    const add = args.indexOf("add");
+    if (add !== -1) {
+      const path = args[add + 2];
+      await mkdir(join(path, "tools", "ci"), { recursive: true });
+      await writeFile(join(path, ".git"), "gitdir: …");
+      await writeFile(join(path, ENQUEUE_READY), "");
+    }
+    return "";
+  };
+  const checkout = new BackstopCheckout(git, root);
+
+  assert.equal(await checkout.prepare("tuchel-sohn/tuchel-platform", [plain, other]), null, "neither folder is a clone of the repo");
+  assert.ok(!calls.some((call) => call.includes("worktree add")), "nothing is added from a folder of another repository");
+
+  calls.length = 0;
+  const path = await checkout.prepare("tuchel-sohn/tuchel-platform", [plain, other, clone]);
+  assert.equal(path, join(root, "tuchel-sohn-tuchel-platform"));
+  assert.ok(calls.includes("--git-dir ~/repo.git worktree add --detach ~/queue-backstop/tuchel-sohn-tuchel-platform origin/main"), "the clone of the repo is used");
+});
+
+test("originRepo reads owner/repo only from github.com itself, never a lookalike host or a path naming github.com", () => {
+  assert.equal(originRepo("https://github.com/Tuchel-Sohn/tuchel-platform.git\n"), "tuchel-sohn/tuchel-platform");
+  assert.equal(originRepo("git@github.com:Mtuchel/paseo-plugins"), "mtuchel/paseo-plugins");
+  assert.equal(originRepo("ssh://git@github.com/Mtuchel/paseo-plugins.git"), "mtuchel/paseo-plugins");
+  assert.equal(originRepo("https://github.com/o/r/"), "o/r");
+  for (const remote of [
+    "https://notgithub.com/tuchel-sohn/tuchel-platform.git",
+    "https://github.com.evil/github.com/tuchel-sohn/tuchel-platform.git",
+    "https://evil.example/github.com/tuchel-sohn/tuchel-platform",
+    "git@notgithub.com:tuchel-sohn/tuchel-platform.git",
+    "git@evil.example:github.com:tuchel-sohn/tuchel-platform",
+    "https://github.com:8443/tuchel-sohn/tuchel-platform",
+    "http://github.com/tuchel-sohn/tuchel-platform",
+    "https://github.com/tuchel-sohn/tuchel-platform/extra",
+    "https://gitlab.com/o/r.git",
+    "/srv/git/tuchel-platform.git",
+    "",
+  ])
+    assert.equal(originRepo(remote), null, remote);
 });
