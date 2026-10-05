@@ -16,6 +16,7 @@ import { ticketPullRequest, type PullRequestCheck } from "./pull-request-check";
 import { RateLimitedError } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
+import { issueAgents } from "./starter";
 import { paseoHome } from "./ticket-mcp";
 
 export const MAX_SUMMARY_LENGTH = 4_000;
@@ -48,7 +49,7 @@ type OutboxEntry = { agentId: string; agentTitle: string | null; cwd: string; is
 // write-back keeps working without the Paseo Linear app installed.
 export type AgentBridge = {
   sessions: Pick<SessionRouter, "sessionFor" | "say" | "action" | "ask" | "askQuestion" | "link" | "offerResume" | "resumeNow" | "holdIfStopped" | "follow" | "unfollow">;
-  handover: Pick<Handover, "read" | "update" | "finish" | "waiting" | "setWaiting">;
+  handover: Pick<Handover, "read" | "update" | "finish" | "handOff" | "waiting" | "setWaiting">;
 };
 type Linear = Pick<LinearService, "issueState" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "upsertComment" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "isPerson" | "userUrl" | "createIssue" | "complete">;
 
@@ -648,12 +649,17 @@ export class Writeback {
       if (this.needsYou) for (const entry of (await this.needsYou.all()).filter((known) => known.agentId === agent.id)) await this.needsYou.remove(entry.id);
       const labels = dispatchLabels(settings.dispatch.label);
       const state = await this.linear.issueState(issueId);
-      // A successor already working on the ticket (a resume) keeps the running marker and the session.
-      const others = await paseo.agents.list({ filter: { labels: { "linear.issueId": issueId }, includeArchived: false }, page: { limit: 5 } });
-      const succeeded = others.entries.some(({ agent: other }) => other.id !== agent.id);
+      // A successor already working on the ticket (a resume) keeps the running marker and the session,
+      // and the record: the newest other ticket agent (subagents are not one) takes it over unless it
+      // or a third agent already owns it (Handover.handOff), whichever event comes first.
+      const others = (await issueAgents(paseo, issueId)).filter((other) => other.id !== agent.id);
+      const successor = others.filter((other) => !other.labels?.["paseo.parent-agent-id"]).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
       const handover = this.agentBridge?.handover;
-      if (succeeded) {
-        if (handover) await once("finish", () => handover.finish({ id: issueId, identifier }, agent, "archived", "handed over to a new agent"));
+      if (others.length) {
+        if (handover) await once("finish", async () => {
+          if (successor) await handover.handOff({ id: issueId, identifier }, agent.id, { id: successor.id, title: successor.title ?? null, cwd: successor.cwd }, { title: agent.title ?? null });
+          else await handover.finish({ id: issueId, identifier }, agent, "archived", "handed over to a new agent");
+        });
         return;
       }
       // The running marker belongs to the dispatcher and is always cleared; the blocked and

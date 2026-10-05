@@ -52,9 +52,9 @@ const RESTART_GRACE_MS = 10 * 60_000;
 // Restarts per planner before it is left to the owner: a start that fails this often (no project
 // mapping, a provider that does not come up) needs them, not another try.
 const RESTART_CAP = 3;
-// Agent states that still work on the plan. A closed agent (idle too long) or one in error never
-// submits it on its own.
-const LIVE_AGENT: Record<string, true> = { initializing: true, idle: true, running: true };
+// Agent states that still work on the ticket. A closed agent (idle too long) or one in error never
+// submits a plan, or takes the next step, on its own. Also SessionRouter.liveSuccessorFor's test.
+export const LIVE_AGENT: Record<string, true> = { initializing: true, idle: true, running: true };
 
 // `planned`: the tickets in an approved (or closed) plan: those its planner listed. Kept by id, not
 // by creation time, so a ticket created while the planner was filed, or moved into the project from

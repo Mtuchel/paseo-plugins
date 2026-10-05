@@ -49,7 +49,7 @@ const starter = {
 
 function dispatcher(t: TestContext, linear: LinearService, budget: RateBudget) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const result = new Dispatcher({ linear, starter, settings: { read: async () => settings }, budget });
+  const result = new Dispatcher({ linear, starter, launcher: { gate: () => ({ release: () => {} }) }, settings: { read: async () => settings }, budget });
   result.attach({} as PaseoApi);
   return result;
 }

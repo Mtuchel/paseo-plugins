@@ -4,6 +4,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { RpcInput } from "@getpaseo/plugin";
 import type { launchAgentRpc, TicketDetail } from "../shared/contracts";
 import { Dispatcher } from "./dispatch";
+import { Launcher } from "./launch";
 import { advisorNote, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, QUESTIONS_NOTE, TicketStarter } from "./starter";
 import type { LabeledIssue } from "./linear";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
@@ -74,7 +75,7 @@ function fakePaseo(activeAgents: { id: string; title: string }[] = []): PaseoApi
   } as unknown as PaseoApi;
 }
 
-function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = baseSettings, paseo = fakePaseo(), handOff?: (issueId: string) => Promise<boolean>) {
+function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = baseSettings, paseo = fakePaseo(), handOff?: (issueId: string) => Promise<boolean>, gates = new Launcher(linear as never)) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const launches: RpcInput<typeof launchAgentRpc>[] = [];
   const starter = new TicketStarter({
@@ -82,7 +83,7 @@ function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = ba
     launcher: { start: async (input) => { launches.push(input); return { agentId: "agent-1", warnings: [] }; } },
     branches: async () => ({ branches: [{ id: "refs/heads/dev", label: "dev" }, { id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }),
   });
-  const dispatcher = new Dispatcher({ linear, starter, settings: { read: async () => settings }, handOff });
+  const dispatcher = new Dispatcher({ linear, starter, launcher: gates, settings: { read: async () => settings }, handOff });
   dispatcher.attach(paseo);
   return { dispatcher, launches };
 }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -8,7 +8,7 @@ import type { ReviewThread } from "./pr-nudge";
 import { activityBullets, ConditionalPullView, GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft } from "./pr-watch";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, marker, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
 import { GitHubBudget, GitHubPausedError, withPriority } from "./rate-budget";
-import { SessionRouter } from "./sessions";
+import { SessionRouter, type Succession } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
 const settings = { dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true } } as unknown as PluginSettings;
@@ -37,7 +37,7 @@ function draft(number: number, prs: number[], state = "CLOSED"): QueueDraft {
   };
 }
 
-type Outcome = "sent" | "busy" | "gone" | "unavailable";
+type Outcome = "sent" | "busy" | "waiting" | "gone" | "unavailable";
 
 // A crashed agent as Paseo shows it; a reload keeps `lastError`, so a restarted agent still has it.
 const CRASH = "OMP RPC process is closed";
@@ -79,9 +79,11 @@ const MAIN_BROKEN: Judgment = {
 };
 
 // `crash`: the agent runs on crashDaemon (`daemon`) instead of the fake router (`paseo`).
+// `autoResume`: *Start a new agent automatically when one fails* is on, so a gone agent's message
+// starts a successor (`paseo.succeed`).
 // `probe`: the cheap first look the poll goes through (see ConditionalPullView); without one the
 // injected `view` is the whole read, as for the tests that predate it.
-function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean } = {}, probe?: PullViewSource) {
+function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean } = {}, probe?: PullViewSource) {
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open; `views`: other pull requests by URL, and
   // `open` the listing's other entries; `deleted`: branches gone; `throttle`: pull requests whose
@@ -122,11 +124,16 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   const blockers: string[] = [];
   const gate = { unreadable: false };
   // `answer`: what Paseo finds before sending (only "sent" dispatches); `send`: the send itself,
-  // after the dispatch was recorded; `session`: the agent's session lookup.
-  const paseo: { answer: () => Promise<Outcome>; send: () => Promise<void>; session: () => Promise<unknown> } = {
+  // after the dispatch was recorded; `session`: the agent's session lookup. `succeed`: what a
+  // successor start for a gone agent comes to (impossible by default: the message goes to the
+  // ticket as before); `claim` is the watch's claim, which a start runs right before it creates
+  // the agent (see `started`). A start or a live agent moves the record to it, as
+  // SessionRouter.succeed does.
+  const paseo: { answer: () => Promise<Outcome>; send: () => Promise<void>; session: () => Promise<unknown>; succeed: (claim: () => Promise<void>) => Promise<Succession> } = {
     answer: async () => (agent.live ?? true) ? "sent" : "gone",
     send: async () => {},
     session: async () => ({ sessionId: "s" }),
+    succeed: async () => ({ kind: "impossible", reason: "no branch is recorded for the ticket" }),
   };
   const calls: string[] = [];
   const daemon = agent.crash ? crashDaemon(calls) : null;
@@ -152,6 +159,12 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         return outcome;
       },
       crashed: async (agentId) => daemon ? daemon.router.crashed(agentId) : null,
+      succeed: async (_issueId, _identifier, predecessor, lead, onDispatch) => {
+        const next = await paseo.succeed(onDispatch);
+        if (next.kind === "started") calls.push(`succeed ${predecessor}\n${lead}`);
+        if (next.kind === "started" || next.kind === "live") records[0] = { ...records[0], agentId: next.agent.id, agentTitle: next.agent.title ?? "", status: "working" };
+        return next;
+      },
     },
     linear: {
       moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; },
@@ -179,7 +192,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       awaitingMerge: async () => false,
       merged: async (issueId) => { calls.push(`merged ${issueId}`); },
     },
-    settings: { read: async () => settings },
+    settings: { read: async () => agent.autoResume ? { ...settings, writeback: { ...settings.writeback, autoResume: true } } : settings },
     ...(probe ? { probe } : {}),
     view: async (url) => {
       github.reads.push(url);
@@ -273,7 +286,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     await writeFile(path, value);
     return value;
   };
-  return { github, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, watch: () => watch };
+  return { github, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, home: () => directory, watch: () => watch };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -1914,4 +1927,291 @@ test("a GitHub budget pause ends the poll and the next poll retries", async (t) 
   const h = harness(t, {}, { view: async () => { reads++; if (reads === 1) throw new GitHubPausedError(Date.now() + 60_000, "budget", 10); return { ...OPEN_PR, state: "MERGED" }; } });
   assert.deepEqual(await h.poll(), [], "the pause ended the poll before anything was sent");
   assert.deepEqual(await h.poll(), ["review merged", "say thought The pull request was merged.", "merged i1"]);
+});
+
+// A successor SessionRouter.succeed started for the gone agent `a1`: it claims, then creates.
+const SUCCESSOR = { id: "s2a2b3c4d5", title: "TUC-1: successor", cwd: "/wt/tuc-1" };
+const startSuccessor = async (claim: () => Promise<void>): Promise<Succession> => {
+  await claim();
+  return { kind: "started", agent: SUCCESSOR };
+};
+const STARTED_LINE = (step: string) => `say thought The agent was gone; Paseo started a successor (agent s2a2b3c4) on mtuchel/tuc-1-fix and asked it to ${step}.`;
+const HANDED_BACK = new RegExp(`^comment ${OWNER} The agent that worked on this ticket is no longer running, so the ticket is back in In Progress`);
+
+test("a gone agent's stalled stage starts one successor with the nudge as its lead; without a free slot it waits, unclaimed", async (t) => {
+  t.mock.method(console, "log", () => {});
+  for (const agent of [{ status: "archived" as const }, { live: false }]) {
+    const h = harness(t, { ...agent, autoResume: true });
+    h.records[0] = { ...h.records[0], branch: "mtuchel/tuc-1-fix" };
+    h.github.view = { ...READY, checks: [failing("PR code")] };
+    h.paseo.succeed = async () => ({ kind: "wait", reason: "the agent limit (2) is reached" });
+    assert.deepEqual(await h.poll(), [], "no slot: nothing claimed, nothing to the ticket");
+    assert.deepEqual(await h.poll(), [], "judged again on the next poll");
+    h.paseo.succeed = startSuccessor;
+    const calls = await h.poll();
+    assert.match(calls[0], /^succeed a1\nChecks failed on the head[^]*This is nudge 1 of 2 for this step; after that the owner takes over\.$/);
+    assert.equal(calls[1], STARTED_LINE("fix the failing checks"));
+    assert.equal(calls.length, 2, JSON.stringify(agent));
+    assert.equal(h.records[0].agentId, SUCCESSOR.id, "the record names the successor");
+    h.paseo.answer = async () => "sent";
+    h.paseo.succeed = async () => { throw new Error("no second successor"); };
+    assert.deepEqual(await h.poll(), [], "the claimed head is not sent again, to the successor either");
+  }
+});
+
+test("a successor start counts as a nudge: a gone agent's stage still reaches the owner after two", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { status: "archived", autoResume: true });
+  h.paseo.succeed = async (claim) => {
+    await claim();
+    h.records[0] = { ...h.records[0], status: "archived" };
+    return { kind: "started", agent: { ...SUCCESSOR, id: h.records[0].agentId } };
+  };
+  for (const head of ["h1", "h2"]) {
+    h.github.view = { ...READY, headSha: head, checks: [failing("PR code")] };
+    assert.match((await h.poll())[0], /^succeed a1\n/, head);
+    h.records[0] = { ...h.records[0], status: "archived" };
+  }
+  h.github.view = { ...READY, headSha: "h3", checks: [failing("PR code")] };
+  const calls = await h.poll();
+  assert.match(calls[0], new RegExp(`^comment ${OWNER} Paseo asked the agent 2 times to fix the failing checks`));
+  assert.ok(!calls.some((call) => call.startsWith("succeed")));
+});
+
+test("a gone agent's message goes to the ticket when no successor can start, the switch is off, or the pull request is vetoed", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const none = harness(t, { status: "archived", autoResume: true });
+  none.github.view = { ...READY, checks: [failing("PR code")] };
+  const calls = await none.poll();
+  assert.equal(calls[0], "move In Progress");
+  assert.match(calls[1], HANDED_BACK);
+  assert.deepEqual(await none.poll(), [], "claimed once");
+
+  const off = harness(t, { status: "archived" });
+  off.github.view = { ...off.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  off.paseo.succeed = async () => { throw new Error("the switch is off"); };
+  assert.match((await off.poll())[1], HANDED_BACK);
+
+  const vetoed = harness(t, { status: "archived", autoResume: true });
+  vetoed.github.view = { ...vetoed.github.view, labels: ["do-not-merge"], mergeActivity: activity(QUEUED, CONFLICT) };
+  vetoed.paseo.succeed = async () => { throw new Error("do-not-merge"); };
+  assert.match((await vetoed.poll())[1], HANDED_BACK);
+});
+
+test("a gone agent's queue drop stays pending while no successor can start yet, then starts one with the fix request, delivered once", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { status: "archived", autoResume: true });
+  h.records[0] = { ...h.records[0], branch: "mtuchel/tuc-1-fix" };
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  let starts = 0;
+  h.paseo.succeed = async () => ({ kind: "wait", reason: "a launch for this ticket is under way" });
+  assert.deepEqual(await h.poll(), []);
+  assert.deepEqual(await h.poll(), [], "still pending");
+  h.paseo.succeed = async (claim) => { starts++; return startSuccessor(claim); };
+  const calls = await h.poll();
+  assert.match(calls[0], /^succeed a1\n[^]*Reason: Sep 29, 7:01 AM UTC: The Graphite merge queue couldn't merge this PR because it had merge conflicts\./);
+  assert.equal(calls[1], STARTED_LINE("fix the merge queue drop"));
+  assert.equal(calls.length, 2);
+  assert.deepEqual(await h.poll(), [], "delivered");
+  await h.restart();
+  assert.deepEqual(await h.poll(), [], "also after a restart");
+  assert.equal(starts, 1);
+});
+
+test("a gone agent's replay request starts a successor and the closed pull request then waits for the replacement", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { status: "archived", autoResume: true });
+  h.records[0] = { ...h.records[0], branch: "mtuchel/tuc-1-fix" };
+  h.github.view = { ...OPEN_PR, state: "CLOSED", baseBranch: PARENT };
+  h.github.deleted = [PARENT];
+  h.paseo.succeed = startSuccessor;
+  const calls = await h.poll();
+  assert.match(calls[0], new RegExp(`^succeed a1\\n\\[The pull request\\]\\(${PR}\\) was closed without merging[^]*gt track mtuchel/tuc-1-fix --parent main`));
+  assert.equal(calls[1], STARTED_LINE("open the replacement pull request"));
+  h.paseo.succeed = async () => { throw new Error("no second successor"); };
+  assert.deepEqual(await h.poll(), [], "asked once");
+  h.github.open = [listed(NEXT, OPEN_PR)];
+  assert.match((await h.poll())[0], new RegExp(`^link Pull request ${NEXT}`), "the successor's replacement is followed");
+});
+
+test("a refused enqueue for a gone agent starts a successor with the refusal, after waiting for a slot", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { live: false, autoResume: true });
+  h.github.view = READY;
+  h.scripts.ready = { stacks: [STACK], drops: [] };
+  h.scripts.enqueue = [{ code: 2, answer: { result: "refused", problems: [{ kind: "conflict-main", text: "conflicts with main" }] } }];
+  await h.backstop();
+  h.paseo.succeed = async () => ({ kind: "wait", reason: "blocked by TUC-0" });
+  assert.deepEqual(await h.poll(), []);
+  h.paseo.succeed = startSuccessor;
+  const calls = await h.poll();
+  assert.match(calls[0], /^succeed a1\n[^]*`conflict-main`/);
+  assert.deepEqual(await h.poll(), [], "delivered once");
+});
+
+test("once a successor started, a failing panel line, state save or plugin restart never starts a second one", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  // The panel line fails after the start: the claim stands.
+  const panel = harness(t, { status: "archived", autoResume: true });
+  panel.github.view = { ...READY, checks: [failing("PR code")] };
+  panel.paseo.session = async () => { throw new Error("Linear is unavailable"); };
+  let starts = 0;
+  panel.paseo.succeed = async (claim) => { starts++; return startSuccessor(claim); };
+  assert.match((await panel.poll())[0], /^succeed a1\n/);
+  assert.deepEqual(await panel.poll(), []);
+  await panel.restart();
+  assert.deepEqual(await panel.poll(), []);
+  assert.equal(starts, 1);
+
+  // The state cannot be saved after the start (the drop's delivery included): the saved claim holds.
+  const save = harness(t, { status: "archived", autoResume: true });
+  save.github.view = { ...save.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  const home = await save.home();
+  let dropStarts = 0;
+  save.paseo.succeed = async (claim) => {
+    dropStarts++;
+    const started = await startSuccessor(claim);
+    await chmod(home, 0o500);
+    return started;
+  };
+  try {
+    await assert.rejects(save.poll());
+  } finally {
+    await chmod(home, 0o700);
+  }
+  await save.restart();
+  assert.deepEqual(await save.poll(), [], "the message may have gone out: not again");
+  assert.equal(dropStarts, 1);
+
+  // The plugin stops between the claim and the start: no start, no second claim (the accepted gap).
+  const gap = harness(t, { status: "archived", autoResume: true });
+  gap.github.view = { ...READY, checks: [failing("PR code")] };
+  const stop = hang();
+  let claims = 0;
+  gap.paseo.succeed = async (claim) => { claims++; await claim(); return stop.point().then(() => startSuccessor(claim)); };
+  void gap.poll();
+  await stop.reached;
+  await gap.restart();
+  gap.paseo.succeed = async () => { throw new Error("no start after the claim"); };
+  assert.deepEqual(await gap.poll(), []);
+  assert.equal(claims, 1);
+});
+
+test("a live agent of the ticket takes the gone agent's record and gets the message on the next poll", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { status: "archived", autoResume: true });
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.paseo.succeed = async () => ({ kind: "live", agent: { id: "a2", title: "TUC-1: resumed", cwd: "/wt/tuc-1" } });
+  assert.deepEqual(await h.poll(), [], "nothing claimed yet");
+  h.paseo.succeed = async () => { throw new Error("the live agent takes it"); };
+  const calls = await h.poll();
+  assert.match(calls[0], /^prompt a2\nChecks failed on the head[^]*nudge 1 of 2/);
+  assert.deepEqual(await h.poll(), []);
+});
+
+const HOUR = 60 * MINUTE;
+const WAITED = (step: string) => `comment ${OWNER} The agent has waited over 60 minutes for your answer while [the pull request](${PR}) waits for it to ${step}. Answer it in the ticket's thread, or take over.`;
+
+test("a stage waiting 60 minutes for the owner's answer reminds the owner once; restarts and busy polls keep the timer", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t);
+  const start = h.scripts.now;
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.paseo.answer = async () => "waiting";
+  assert.deepEqual(await h.poll(), []);
+  h.scripts.now = start + 30 * MINUTE;
+  h.paseo.answer = async () => "busy";
+  assert.deepEqual(await h.poll(), [], "busy keeps the wait");
+  await h.restart();
+  h.paseo.answer = async () => "unavailable";
+  assert.deepEqual(await h.poll(), [], "so does a disconnected Paseo, after a restart");
+  h.paseo.answer = async () => "waiting";
+  h.scripts.now = start + 59 * MINUTE;
+  assert.deepEqual(await h.poll(), []);
+  h.scripts.now = start + HOUR;
+  assert.deepEqual(await h.poll(), [WAITED("fix the failing checks")]);
+  h.scripts.now = start + 3 * HOUR;
+  assert.deepEqual(await h.poll(), [], "once");
+  h.paseo.answer = async () => "sent";
+  h.github.view = { ...READY, headSha: "h2", checks: [failing("PR code")] };
+  assert.deepEqual(await h.poll(), [], "the stage is exhausted: a new head of it only reaches the log");
+});
+
+test("a message that went out, a new head or another stage starts the permission wait again from zero", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t);
+  const start = h.scripts.now;
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.paseo.answer = async () => "waiting";
+  await h.poll();
+  h.scripts.now = start + 50 * MINUTE;
+  h.paseo.answer = async () => "sent";
+  assert.match(promptOf(await h.poll()) ?? "", /nudge 1 of 2/, "answered before the hour: sent");
+  h.github.view = { ...READY, headSha: "h2", checks: [failing("PR code")] };
+  h.paseo.answer = async () => "waiting";
+  assert.deepEqual(await h.poll(), [], "a new head waits from now");
+  h.scripts.now = start + 50 * MINUTE + 59 * MINUTE;
+  assert.deepEqual(await h.poll(), []);
+  // The checks pass on the same head, and a bot's finding holds it instead: another stage.
+  h.github.view = { ...READY, headSha: "h2" };
+  h.github.threads = [FINDING];
+  assert.deepEqual(await h.poll(), [], "another stage waits from now");
+  h.scripts.now += 59 * MINUTE;
+  assert.deepEqual(await h.poll(), []);
+  h.scripts.now += MINUTE;
+  assert.deepEqual(await h.poll(), [WAITED("resolve the review findings")]);
+});
+
+test("a stage the owner vetoed meanwhile waits from zero once the veto is lifted", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t);
+  const start = h.scripts.now;
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.paseo.answer = async () => "waiting";
+  assert.deepEqual(await h.poll(), []);
+  h.scripts.now = start + 50 * MINUTE;
+  h.github.view = { ...READY, checks: [failing("PR code")], labels: ["do-not-merge"] };
+  assert.deepEqual(await h.poll(), [], "vetoed: no nudge and no reminder");
+  h.scripts.now = start + 90 * MINUTE;
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  assert.deepEqual(await h.poll(), [], "the same stage waits again, from now");
+  h.scripts.now = start + 90 * MINUTE + 59 * MINUTE;
+  assert.deepEqual(await h.poll(), []);
+  h.scripts.now = start + 150 * MINUTE;
+  assert.deepEqual(await h.poll(), [WAITED("fix the failing checks")]);
+});
+
+test("a drop's fix request or a replay request waiting 60 minutes for the owner's answer escalates once", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const drop = harness(t);
+  drop.github.view = { ...drop.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  drop.paseo.answer = async () => "waiting";
+  assert.deepEqual(await drop.poll(), []);
+  drop.scripts.now += HOUR;
+  assert.deepEqual(await drop.poll(), [WAITED("fix the merge queue drop")]);
+  drop.paseo.answer = async () => "sent";
+  assert.deepEqual(await drop.poll(), [], "escalated: the fix request is not sent after all");
+
+  const replay = harness(t);
+  replay.github.view = { ...OPEN_PR, state: "CLOSED", baseBranch: PARENT };
+  replay.github.deleted = [PARENT];
+  replay.paseo.answer = async () => "waiting";
+  assert.deepEqual(await replay.poll(), []);
+  replay.scripts.now += HOUR;
+  assert.deepEqual(await replay.poll(), [WAITED("open the replacement pull request")]);
+  replay.paseo.answer = async () => "sent";
+  assert.deepEqual(await replay.poll(), [], "asked");
+});
+
+test("the backstop's enqueued note waits while the agent waits for the owner, and goes out once it takes messages", async (t) => {
+  const h = harness(t);
+  h.github.view = READY;
+  h.scripts.ready = { stacks: [STACK], drops: [] };
+  h.paseo.answer = async () => "waiting";
+  const calls = await h.backstop();
+  assert.ok(!calls.some((call) => call.startsWith("prompt")), "not sent to an agent waiting for the owner");
+  h.paseo.answer = async () => "sent";
+  assert.match(promptOf(await h.backstop()) ?? "", /Do not enqueue it again yourself\.$/);
+  assert.ok(!(await h.backstop()).some((call) => call.startsWith("prompt")), "once");
 });

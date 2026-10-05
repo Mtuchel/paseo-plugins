@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import type { TicketDetail } from "../shared/contracts";
 import { advisorSteps } from "../shared/plan-advisor";
 import { sectionSteps } from "../shared/plan-sections";
@@ -147,6 +147,27 @@ export async function runningTicketAgents(paseo: PaseoApi): Promise<string[]> {
   return running;
 }
 
+// Every agent of the ticket that is not archived, subagents included, on every page.
+export async function issueAgents(paseo: PaseoApi, issueId: string): Promise<PaseoAgent[]> {
+  const agents: PaseoAgent[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await paseo.agents.list({ filter: { labels: { "linear.issueId": issueId }, includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
+    agents.push(...page.entries.map((entry) => entry.agent));
+    cursor = page.pageInfo?.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
+  } while (cursor);
+  return agents;
+}
+
+// A successor the pull request watch asked for cannot continue the ticket's recorded work: no
+// branch is recorded, the project has no Git, or reopening the branch failed. Never a fresh start.
+export class ResumeUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ResumeUnavailableError";
+  }
+}
+
 // Starts the agent for one ticket, whatever asked for it (label, delegation, mention, resume):
 // saved project mapping, remembered provider, base branch — and, when an earlier agent left a
 // handover on this ticket, the same branch and worktree so the new agent continues its work.
@@ -180,7 +201,9 @@ export class TicketStarter {
     return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended }, paseo, cap);
   }
 
-  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean }): Promise<Started> {
+  // `resumeOnly`: continue the recorded branch and worktree or throw ResumeUnavailableError, never
+  // start fresh. `lead`: the last part of the first prompt (see Launcher).
+  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string }): Promise<Started> {
     const detail: TicketDetail = await this.deps.linear.detail(issueId);
     const source = { projectId: detail.projectId, projectName: detail.issue.project, teamId: detail.teamId, teamName: detail.issue.team };
     // Only saved mappings launch. The sidebar's name-match preselection is a UI hint;
@@ -197,6 +220,8 @@ export class TicketStarter {
     const project = await findProject(paseo, mapping.projectId);
     const target = project.projectCustomName || project.projectDisplayName || mapping.label;
     const resume = options.fresh ? null : await this.deps.handover?.resumeTarget(issueId);
+    if (options.resumeOnly && !resume) throw new ResumeUnavailableError(`${detail.issue.identifier} has no recorded branch to continue on.`);
+    if (options.resumeOnly && project.projectKind !== "git") throw new ResumeUnavailableError(`${target} is not a Git project, so ${detail.issue.identifier}'s branch cannot be continued.`);
     const setup = await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, dispatchLabels(settings.dispatch.label).planner, this.deps.tiers);
     const model = tierModel(settings, preference.model.split("/")[0], setup.tier?.tier ?? null, { provider: preference.model, ...(preference.thinkingOptionId ? { thinkingOptionId: preference.thinkingOptionId } : {}) });
     const base = {
@@ -209,7 +234,7 @@ export class TicketStarter {
       // A required plan goes to Planning on the agent's first turn (write-back), not In Progress.
       markInProgress: settings.markInProgress && setup.policy !== "required",
     };
-    const launchOptions = { promptTemplate: settings.template ?? undefined, markInProgress: base.markInProgress, linearAccess: settings.agentLinearAccess, labels: { ...options.labels, ...setup.labels }, env: setup.env };
+    const launchOptions = { promptTemplate: settings.template ?? undefined, markInProgress: base.markInProgress, linearAccess: settings.agentLinearAccess, labels: { ...options.labels, ...setup.labels }, env: setup.env, ...(options.lead ? { lead: options.lead } : {}) };
     const plan = { untrusted: setup.untrusted, plan: setup.policy };
     const started = (result: { agentId: string }) => recordStart(this.deps.tiers, { id: issueId, identifier: detail.issue.identifier }, setup.tier, result.agentId, model.provider);
     if (resume && project.projectKind === "git") {
@@ -218,8 +243,10 @@ export class TicketStarter {
         await started(result);
         return { ...result, provider: model.provider, target, resumed: true, ...plan };
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (options.resumeOnly) throw new ResumeUnavailableError(`Could not continue ${detail.issue.identifier} on ${resume.branch}: ${message}`);
         // A deleted or merged branch cannot be continued; a fresh start is the useful fallback.
-        console.error(`[linear-tickets] ${detail.issue.identifier}: resume failed, starting fresh: ${error instanceof Error ? error.message : error}`);
+        console.error(`[linear-tickets] ${detail.issue.identifier}: resume failed, starting fresh: ${message}`);
       }
     }
     let baseBranch: string | undefined;

@@ -87,6 +87,12 @@ export function finalBody(record: HandoverRecord, reason: string): string {
   ].join("\n\n");
 }
 
+// The report of an agent that was closed after another agent had already taken the ticket's record:
+// nothing of the record is its own any more, so only who took over.
+export function handedOverBody(title: string, successorTitle: string): string {
+  return [`🏁 **Paseo final report** — ${title}`, `**Outcome:** ${PHASE.archived} — handed over to ${successorTitle}`].join("\n\n");
+}
+
 // What the next agent reads before the ticket prompt.
 export function handoverPrompt(record: HandoverRecord): string {
   return [
@@ -128,43 +134,69 @@ export class Handover {
   // Updates the record for this agent (a new agent on the ticket starts a new progress comment)
   // and edits the progress comment. Returns the record.
   update(issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, change: { status?: HandoverStatus; summary?: string; link?: [string, string]; plan?: string; review?: string; model?: string | null }): Promise<HandoverRecord> {
+    return this.serialize(async () => this.write(await this.read(issue.id), issue, agent, change));
+  }
+
+  private async write(previous: HandoverRecord | null, issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, change: { status?: HandoverStatus; summary?: string; link?: [string, string]; plan?: string; review?: string; model?: string | null }): Promise<HandoverRecord> {
+    const sameAgent = previous?.agentId === agent.id;
+    const git = await this.git(agent.cwd).catch(() => ({ branch: null, lastCommit: null }));
+    const paseoUrl = await this.agentUrl?.(agent.id).catch(() => null) ?? null;
+    const record: HandoverRecord = {
+      issueId: issue.id,
+      identifier: issue.identifier,
+      agentId: agent.id,
+      // Hook events can carry no title; the one seen earlier for this agent stays.
+      agentTitle: agent.title ?? (sameAgent ? previous.agentTitle : null) ?? `Paseo agent on ${issue.identifier}`,
+      branch: git.branch ?? (sameAgent ? previous.branch : null),
+      worktreePath: agent.cwd,
+      lastCommit: git.lastCommit ?? (sameAgent ? previous.lastCommit : null),
+      summaries: [...(sameAgent ? previous.summaries : previous?.summaries ?? []), ...(change.summary ? [clip(change.summary, MAX_SUMMARY)] : [])].slice(-KEPT_SUMMARIES),
+      // The ticket's links (its pull request above all, which the pull request watch follows)
+      // stay when another agent takes over; only the agent's own Paseo link is its own.
+      links: { ...(paseoUrl ? { "Open in Paseo": paseoUrl } : {}), ...Object.fromEntries(Object.entries(previous?.links ?? {}).filter(([name]) => sameAgent || name !== "Open in Paseo")), ...(change.link ? { [change.link[0]]: change.link[1] } : {}) },
+      plan: change.plan ?? (sameAgent ? previous.plan ?? null : null),
+      review: change.review ?? (sameAgent ? previous.review ?? null : null),
+      model: change.model ?? (sameAgent ? previous.model ?? null : null),
+      waiting: previous?.waiting ?? null,
+      status: change.status ?? (sameAgent ? previous.status : "working"),
+      progressCommentId: sameAgent ? previous.progressCommentId : null,
+      resumedFrom: sameAgent ? previous.resumedFrom : previous?.agentId ?? null,
+      updatedAt: this.now(),
+    };
+    const body = progressBody(record);
+    record.progressCommentId = await this.linear.upsertComment(issue.id, body, record.progressCommentId);
+    // The ticket's link to the agent (next to its pull requests), kept current and moved to a
+    // new agent when one takes over. Best-effort: the comment above is the record.
+    if (paseoUrl) {
+      await this.linear.upsertAttachment(issue.id, paseoUrl, record.agentTitle.startsWith("Paseo agent") ? record.agentTitle : `Paseo agent · ${record.agentTitle}`, [PHASE[record.status], record.model].filter(Boolean).join(" · ")).catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: Paseo agent link failed: ${error instanceof Error ? error.message : error}`));
+      if (!sameAgent) await this.linear.removeAttachments(issue.id, PASEO_WEB, paseoUrl).catch(() => {});
+    }
+    await this.save(record);
+    return record;
+  }
+
+  // A takeover: the only way the record changes owner when one agent follows another (README,
+  // "Durable record and resume"). A record that names the predecessor, or no record, becomes the
+  // successor's (working, carried over as for any new agent); one that names the successor already
+  // keeps its state (a waiting or finished successor stays so), and one that names a third agent is
+  // not touched, so whichever event comes last never hands the ticket back. `report` (the
+  // predecessor was closed): its final report, from the record as it was before the takeover when
+  // that record was its own, else only who took over. Returns whether the record was rewritten.
+  handOff(issue: { id: string; identifier: string }, predecessorId: string, successor: { id: string; title: string | null; cwd: string }, report?: { title: string | null }): Promise<boolean> {
     return this.serialize(async () => {
       const previous = await this.read(issue.id);
-      const sameAgent = previous?.agentId === agent.id;
-      const git = await this.git(agent.cwd).catch(() => ({ branch: null, lastCommit: null }));
-      const paseoUrl = await this.agentUrl?.(agent.id).catch(() => null) ?? null;
-      const record: HandoverRecord = {
-        issueId: issue.id,
-        identifier: issue.identifier,
-        agentId: agent.id,
-        // Hook events can carry no title; the one seen earlier for this agent stays.
-        agentTitle: agent.title ?? (sameAgent ? previous.agentTitle : null) ?? `Paseo agent on ${issue.identifier}`,
-        branch: git.branch ?? (sameAgent ? previous.branch : null),
-        worktreePath: agent.cwd,
-        lastCommit: git.lastCommit ?? (sameAgent ? previous.lastCommit : null),
-        summaries: [...(sameAgent ? previous.summaries : previous?.summaries ?? []), ...(change.summary ? [clip(change.summary, MAX_SUMMARY)] : [])].slice(-KEPT_SUMMARIES),
-        // The ticket's links (its pull request above all, which the pull request watch follows)
-        // stay when another agent takes over; only the agent's own Paseo link is its own.
-        links: { ...(paseoUrl ? { "Open in Paseo": paseoUrl } : {}), ...Object.fromEntries(Object.entries(previous?.links ?? {}).filter(([name]) => sameAgent || name !== "Open in Paseo")), ...(change.link ? { [change.link[0]]: change.link[1] } : {}) },
-        plan: change.plan ?? (sameAgent ? previous.plan ?? null : null),
-        review: change.review ?? (sameAgent ? previous.review ?? null : null),
-        model: change.model ?? (sameAgent ? previous.model ?? null : null),
-        waiting: previous?.waiting ?? null,
-        status: change.status ?? (sameAgent ? previous.status : "working"),
-        progressCommentId: sameAgent ? previous.progressCommentId : null,
-        resumedFrom: sameAgent ? previous.resumedFrom : previous?.agentId ?? null,
-        updatedAt: this.now(),
-      };
-      const body = progressBody(record);
-      record.progressCommentId = await this.linear.upsertComment(issue.id, body, record.progressCommentId);
-      // The ticket's link to the agent (next to its pull requests), kept current and moved to a
-      // new agent when one takes over. Best-effort: the comment above is the record.
-      if (paseoUrl) {
-        await this.linear.upsertAttachment(issue.id, paseoUrl, record.agentTitle.startsWith("Paseo agent") ? record.agentTitle : `Paseo agent · ${record.agentTitle}`, [PHASE[record.status], record.model].filter(Boolean).join(" · ")).catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: Paseo agent link failed: ${error instanceof Error ? error.message : error}`));
-        if (!sameAgent) await this.linear.removeAttachments(issue.id, PASEO_WEB, paseoUrl).catch(() => {});
+      const own = !previous || previous.agentId === predecessorId;
+      if (own) await this.write(previous, issue, successor, { status: "working" });
+      if (!report) return own;
+      const successorTitle = successor.title ?? `a new agent (${successor.id.slice(0, 8)})`;
+      if (previous && own) {
+        const closed: HandoverRecord = { ...previous, status: "archived", updatedAt: this.now() };
+        if (previous.progressCommentId) await this.linear.upsertComment(issue.id, progressBody(closed), previous.progressCommentId);
+        await this.linear.comment(issue.id, finalBody(closed, `handed over to ${successorTitle}`));
+      } else {
+        await this.linear.comment(issue.id, handedOverBody(report.title ?? `Paseo agent on ${issue.identifier}`, successorTitle));
       }
-      await this.save(record);
-      return record;
+      return own;
     });
   }
 

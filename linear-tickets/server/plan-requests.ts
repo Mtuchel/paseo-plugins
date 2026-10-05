@@ -103,7 +103,7 @@ export class PlanRequests {
     if (!waiting) return false;
     const outcome = await this.deps.prompt(agent.id, planRequestText(agent.identifier));
     if (outcome === "sent") console.log(`[linear-tickets] ${agent.identifier}: plan requested from agent ${agent.id.slice(0, 8)}`);
-    return outcome === "busy" || outcome === "unavailable" || outcome === "crashed";
+    return outcome === "busy" || outcome === "waiting" || outcome === "unavailable" || outcome === "crashed";
   }
 
   private async writeRequest(agent: TicketAgent): Promise<void> {

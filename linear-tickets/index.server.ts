@@ -80,7 +80,7 @@ export default function contribute(server: PluginServerContext) {
     await decidePlannotatorReview(localUrl, approve, feedback);
     await recordDecision({ type: "decided", agentId, approved: approve, ...(feedback ? { feedback } : {}), planContent, at: new Date().toISOString() });
   };
-  const sessions = new SessionRouter({ api: agentApi, linear, starter, settings, store: new SessionStore(), needsYou,
+  const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: new SessionStore(), needsYou,
     decideReview,
     reviewOutcome: (review) => reviewOutcome(review),
     recordOutcome: (agentId, outcome) => recordDecision({ type: "decided", agentId, ...outcome, at: new Date().toISOString() }),
@@ -100,7 +100,7 @@ export default function contribute(server: PluginServerContext) {
     await stopAgentTurn(agentId).catch(() => {});
     await api.agents.ref(agentId).archive().catch(() => {});
   }, restart: (issueId, identifier) => sessions.restartFor(issueId, identifier), accountedFor: async (issueId) => launcher.underWay(issueId) || await sessions.threadHolds(issueId) });
-  const dispatcher = new Dispatcher({ linear, starter, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects });
+  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
   const decisions = new DecisionLog();
