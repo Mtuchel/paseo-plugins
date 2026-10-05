@@ -1209,8 +1209,7 @@ test("a refused enqueue goes to the agent once per refusal, and is skipped until
   h.scripts.enqueue = [{ code: 2, answer: { result: "refused", problems: [{ kind: "conflict-main", text: "server/upload.ts conflicts with main" }] } }];
   assert.deepEqual(firstLines(await h.backstop()), [`enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action ${STACK.action}`]);
   const routed = await h.poll();
-  assert.match(promptOf(routed) ?? "", /^Paseo's queue backstop tried to enqueue \[#419\][^]*refused:\n- `conflict-main`: server\/upload\.ts conflicts with main[^]*Restack only your own stack/);
-  assert.ok(routed.includes("say thought Paseo's automatic enqueue of the pull request was refused (conflict-main). The agent was asked to fix it."));
+  assert.equal(count(routed, "prompt "), 1, "the repair is dispatched to the agent");
   for (let run = 0; run < 2; run++) {
     assert.deepEqual(await h.backstop(), [], `run ${run}`);
     assert.deepEqual(h.scripts.runs, [`${READY_RUN} --skip ${STACK.action}`], `run ${run}`);
@@ -1239,7 +1238,7 @@ test("a refusal of a pull request whose agent is gone goes to the ticket, and wi
   assert.deepEqual(await orphan.backstop(), [], "once");
 });
 
-test("a refusal still reaches its ticket when the handover has no pull request link", async (t) => {
+test("a refusal reaches its existing agent even when the handover has no pull request link", async (t) => {
   const h = harness(t);
   h.records[0].links = {};
   h.github.view = { ...READY, state: "CLOSED" };
@@ -1249,12 +1248,12 @@ test("a refusal still reaches its ticket when the handover has no pull request l
   h.scripts.ready = { stacks: [STACK], drops: [] };
   h.scripts.enqueue = [{ code: 2, answer: { result: "refused", problems: [{ kind: "conflict-main", text: "conflicts with main" }] } }];
   const calls = await h.backstop();
-  assert.ok(calls.some((call) => call.startsWith(`comment ${OWNER}`) && call.includes("conflict-main")));
-  assert.equal(promptOf(calls), undefined);
+  assert.equal(count(calls, "prompt "), 1);
+  assert.equal(count(calls, "comment "), 0, "the owner is not asked to run a repair");
   assert.deepEqual(await h.backstop(), [], "delivered once");
 });
 
-test("a persisted refusal follows ticket fallback when its handover link moves before delivery", async (t) => {
+test("a persisted refusal still reaches its agent when the handover link moves before delivery", async (t) => {
   const h = harness(t);
   h.github.view = READY;
   h.scripts.ready = { stacks: [STACK], drops: [] };
@@ -1264,8 +1263,8 @@ test("a persisted refusal follows ticket fallback when its handover link moves b
   h.github.open = [listed(PR, READY)];
   await h.restart();
   const calls = await h.backstop();
-  assert.ok(calls.some((call) => call.startsWith(`comment ${OWNER}`) && call.includes("conflict-main")));
-  assert.equal(promptOf(calls), undefined);
+  assert.equal(count(calls, "prompt "), 1);
+  assert.equal(count(calls, "comment "), 0);
   assert.deepEqual(await h.backstop(), [], "persisted delivery is not repeated");
 });
 
@@ -1287,14 +1286,14 @@ test("a queue-tip conflict is routed once and retried once its queue draft is cl
   assert.deepEqual(await h.backstop(), [], "enqueued: not retried again");
 });
 
-test("a local branch that differs from GitHub, repaired at the same remote SHA, is retried within the hour and not routed again", async (t) => {
+test("other repairable conditions retry only after the hourly boundary, without repeating the repair request", async (t) => {
   const h = harness(t);
   h.github.view = READY;
   h.scripts.ready = { stacks: [STACK], drops: [] };
-  const differs = { code: 2, answer: { result: "refused", problems: [{ kind: "local-differs", text: "the local branch is not at the remote head" }] } };
+  const differs = { code: 2, answer: { result: "refused", problems: [{ kind: "remote-differs", text: "a fresh remote read is needed" }] } };
   h.scripts.enqueue = [differs, differs, { code: 0, answer: { result: "enqueued", comment: "posted" } }];
   await h.backstop();
-  assert.match(promptOf(await h.poll()) ?? "", /- `local-differs`: the local branch is not at the remote head/);
+  assert.equal(count(await h.poll(), "prompt "), 1);
   h.scripts.now += 30 * MINUTE;
   assert.deepEqual(await h.backstop(), []);
   assert.deepEqual(h.scripts.runs, [`${READY_RUN} --skip ${STACK.action}`], "not within half an hour");
@@ -1305,6 +1304,51 @@ test("a local branch that differs from GitHub, repaired at the same remote SHA, 
   const repaired = await h.backstop();
   assert.equal(count(repaired, `pr comment #419 ${ENQUEUED}`), 1, "repaired: enqueued");
   assert.deepEqual(await h.poll(), []);
+});
+
+test("old local-differs refusals retry on the next backstop tick with unchanged reviewed heads", async (t) => {
+  const h = harness(t);
+  h.github.view = READY;
+  h.scripts.ready = { stacks: [STACK], drops: [] };
+  h.scripts.enqueue = [{ code: 2, answer: { result: "refused", problems: [{ kind: "local-differs" }] } }, { code: 0, answer: { result: "enqueued", comment: "posted" } }];
+  await h.backstop();
+  await h.poll();
+  assert.equal(count(await h.backstop(), "enqueue "), 1, "no hourly wait for shared refs");
+  assert.deepEqual(await h.backstop(), [], "no second enqueue after success");
+});
+
+test("an unlinked repair waits for its busy agent, survives restart, and dispatches once when it is idle", async (t) => {
+  const h = harness(t);
+  h.records[0].links = {};
+  h.github.view = { ...READY, state: "CLOSED" };
+  h.github.open = [listed(PR, READY)];
+  h.github.views[PR] = READY;
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false } });
+  h.scripts.ready = { stacks: [STACK], drops: [] };
+  h.scripts.enqueue = [{ code: 2, answer: { result: "refused", problems: [{ kind: "conflict-main" }] } }];
+  h.paseo.answer = async () => "busy";
+  assert.equal(count(await h.backstop(), "prompt "), 0);
+  await h.restart();
+  assert.deepEqual(await h.backstop(), [], "a busy agent keeps the persisted repair pending");
+  h.paseo.answer = async () => "sent";
+  assert.equal(count(await h.backstop(), "prompt "), 1);
+  assert.deepEqual(await h.backstop(), [], "the repair is not repeated");
+});
+
+test("an unlinked repair restarts a crashed agent rather than assigning its shell commands to the owner", async (t) => {
+  const h = harness(t, { crash: true });
+  h.records[0].links = {};
+  h.github.view = { ...READY, state: "CLOSED" };
+  h.github.open = [listed(PR, READY)];
+  h.github.views[PR] = READY;
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false } });
+  h.scripts.ready = { stacks: [STACK], drops: [] };
+  h.scripts.enqueue = [{ code: 2, answer: { result: "refused", problems: [{ kind: "conflict-main" }] } }];
+  const calls = await h.backstop();
+  assert.equal(count(calls, "reload a1"), 1);
+  assert.equal(count(calls, "prompt "), 1);
+  assert.equal(count(calls, "comment "), 0);
+  assert.deepEqual(await h.backstop(), [], "restart dispatch is not repeated");
 });
 
 test("an open manual task due before the merge, or one that cannot be read, keeps the range out of both enqueue paths", async (t) => {

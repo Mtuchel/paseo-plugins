@@ -1035,6 +1035,15 @@ with the poll:
    <pr>@<sha>,… --action <id> --comment-file <file>`, which re-checks every head and runs the
    checkout's `tools/ci/enqueue.mjs`.
 
+   Each invocation uses a fresh private clone with its own branch refs and Graphite metadata,
+   borrowing objects from the trusted checkout without copying the worker's refs or metadata.
+   The clone's `origin` is the actual GitHub remote, its trunk starts at the trusted checkout's
+   fetched head, and Graphite reconstructs the range from the expected PRs. Only the trusted
+   checkout's script executes. The invocation removes its private clone on completion or failure.
+   A worker's stale branch, unpublished commits, dirty files or changed Graphite parents cannot
+   block this enqueue and are never overwritten. The expected-head, author, veto, main-health,
+   queue-conflict and gate checks still apply.
+
 Every enqueue is an action (`drop:<drop key>:<top>`, since one queue draft can test several
 stacks, or `ready:<top>@<heads>`) saved in `pr-watch.json` before each step: the number and last
 text of the top pull request's Merge activity bullets right before the enqueue, then the enqueue,
@@ -1047,11 +1056,14 @@ done only once Linear confirmed it, so a lost answer never doubles it and a cras
 and tells a running agent that nothing is needed from it. Held (`main` red or unknown, or already
 queued): retried on the next run. Refused: routed once per refusal (action and kind, plus the
 draft for a queue-tip conflict)
-to the agent, the ticket when the agent is gone, or as one marked comment on the pull request
-when there is no ticket. A refusal is retried only after the change that can fix it: a new head
-(a new action), the end of the queue draft for a queue-tip conflict (read by its number; a state
-that cannot be read keeps the refusal), at most hourly for a local branch that differs from
-GitHub, the `do-not-merge` label's removal for a veto. An answer that is not the
+to the agent (including crash restart or automatic successor recovery), the ticket when no agent
+can recover, or as one marked comment on the pull request when there is no ticket. Repair text
+identifies the ticket's agent as the worker; it is not an instruction for the owner to run commands.
+A refusal is retried only after the change that can fix it: a new head (a new action), the end of
+the queue draft for a queue-tip conflict (read by its number; a state that cannot be read keeps the
+refusal), at most hourly for other repairable conditions, or the `do-not-merge` label's removal for
+a veto. Previously persisted `local-differs` and `stack-differs` refusals are released on the next
+backstop run because private refs remove their shared-checkout cause. An answer that is not the
 script's JSON, or an exit it does not document, never counts as an enqueue. After a restart an
 enqueue whose outcome was not recorded is decided by the Merge activity: an enqueue bullet after
 the saved bullets means it went through, none means it is retried while the pull request is open,
@@ -1060,10 +1072,10 @@ retried, the range is blocked and the agent is asked to check. Comments owed for
 go out once after the pull request closed or landed. To switch the backstop off, revert the
 plugin change and `paseo plugin reload linear-tickets`; ranges already in the queue stay there.
 
-If a handover record has no pull-request link, its message takes the ticket
-fallback too. The backstop also recovers pending messages for open pull requests
-whose handover link moved or disappeared after routing, including across a restart;
-existing delivery claims still prevent duplicate sends.
+If a handover record has no pull-request link, or its link moved or disappeared after routing,
+the backstop still delivers the repair to that ticket's agent through the same crash/successor
+recovery path. Busy agents keep their requests pending across restarts; in-flight claims prevent
+duplicate sends. Owner fallback is reserved for escalation or a missing/unrecoverable agent record.
 
 **Partial landings.** When the ticket's recorded pull request lands (merged, or closed by the
 queue as above) while other pull requests of the ticket are still open (the rest of its stack,

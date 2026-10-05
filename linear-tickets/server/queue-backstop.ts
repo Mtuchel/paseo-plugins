@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { paseoHome } from "./ticket-mcp";
 
@@ -71,6 +72,32 @@ export const runGit: GitRunner = async (args) => {
     throw new Error(`git ${args.join(" ")} failed: ${failedRun(error).stderr.trim()}`);
   }
 };
+
+// Each enqueue owns its refs and Graphite metadata. Reuse the trusted checkout's objects, never
+// its worker branches: local-only commits, dirty indexes and another clone's restack stay intact.
+// The script still fetches and checks every expected GitHub head before it calls gt merge.
+export async function inEnqueueClone(checkout: string, run: (clone: string) => Promise<ScriptOutput>): Promise<ScriptOutput> {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-queue-enqueue-"));
+  const clone = join(directory, "repo");
+  try {
+    const origin = await runGit(["-C", checkout, "remote", "get-url", "origin"]);
+    const head = await runGit(["-C", checkout, "rev-parse", "HEAD"]);
+    await runGit(["clone", "--quiet", "--shared", "--no-checkout", "--", checkout, clone]);
+    await runGit(["-C", clone, "remote", "set-url", "origin", origin]);
+    await runGit(["-C", clone, "update-ref", "refs/heads/main", head]);
+    await runGit(["-C", clone, "symbolic-ref", "HEAD", "refs/heads/main"]);
+    return await run(clone);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+export async function runIsolatedEnqueue(checkout: string, args: string[], env: Record<string, string>): Promise<ScriptOutput> {
+  return inEnqueueClone(checkout, async (clone) => {
+    await exec("gt", ["init", "--trunk", "main", "--no-interactive"], { cwd: clone, timeout: 60_000, env: { ...process.env, PATH: TOOL_PATH } });
+    return runNodeScript(clone, resolve(checkout, BACKSTOP_ENQUEUE), args, env);
+  });
+}
 
 // `<owner>/<repo>` (lower case) of a GitHub remote: `https://github.com/o/r(.git)`,
 // `ssh://git@github.com/o/r(.git)` or `git@github.com:o/r(.git)`. The host must be exactly
@@ -352,6 +379,8 @@ export function refusalKey(action: string, problem: Problem): string {
 // new action.
 export function released(refusal: Refusal, now: number, openDrafts: Set<number>, vetoed: boolean): boolean {
   if (refusal.kind === "conflict-tip") return refusal.draft !== null && !openDrafts.has(refusal.draft);
+  // Old shared-ref refusals can be retried immediately: the next enqueue has private refs.
+  if (refusal.kind === "local-differs" || refusal.kind === "stack-differs") return true;
   if (REPAIRABLE_KINDS.includes(refusal.kind)) return refusal.retryAfter !== null && now >= Date.parse(refusal.retryAfter);
   if (refusal.kind === "veto") return !vetoed;
   return false;
@@ -432,6 +461,6 @@ export function refusalText(action: Pick<ActionRecord, "repo" | "prs" | "branch"
     ...refused.map((problem) => `- \`${problem.kind}\`${problem.draft !== null ? ` (queue draft #${problem.draft})` : ""}${problem.text ? `: ${problem.text}` : ""}`),
     "",
     ...(extra ? [extra, ""] : []),
-    `Fix it, then \`git switch ${action.branch} && node tools/ci/enqueue.mjs\` and \`node tools/ci/wait-queue.mjs ${action.top}\`. Paseo does not retry this refusal until the change that fixes it: a new head for a conflict with \`main\`, the queue draft's end for a conflict with the queue tip, and at most hourly for local branches that differ from GitHub.`,
+    `This is a repair request for the ticket's agent, not a command for the owner to run. Resolve the refusal without discarding local work, then \`git switch ${action.branch} && node tools/ci/enqueue.mjs\` and \`node tools/ci/wait-queue.mjs ${action.top}\`. The backstop uses private Git refs, so it never overwrites a worker's local branches. It retries after a new head for a conflict with \`main\`, the queue draft's end for a conflict with the queue tip, and at most hourly for other repairable conditions.`,
   ].join("\n");
 }

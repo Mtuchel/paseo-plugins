@@ -16,7 +16,7 @@ import { STAGE_STEP, stalledStage, type ReviewThread, type Stage } from "./pr-nu
 import { ghGet, type RestGet, type RestResponse } from "./pull-requests";
 import {
   activityBoundary, BACKSTOP_ENQUEUE, BackstopCheckout, CLASS_TEXT, commentOnce, dropWhy, ENQUEUE_READY, enqueueArgs, enqueuedComment, HELD_KINDS, parseEnqueue, parseExpect, parseJudgment, parseReady,
-  READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, runNodeScript, ticketMarker, WAIT_QUEUE, waitQueueArgs,
+  READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, runIsolatedEnqueue, runNodeScript, ticketMarker, WAIT_QUEUE, waitQueueArgs,
   type ActionRecord, type DropClass, type DropJudgment, type Problem, type Refusal, type ScriptRunner,
 } from "./queue-backstop";
 import { githubBudget, GitHubPausedError, RateLimitedError, withPriority, type GitHubBudget } from "./rate-budget";
@@ -1164,7 +1164,9 @@ export class PullRequestWatch {
   }
 
   private run(checkout: string, script: string, args: string[], repo: string) {
-    return (this.deps.backstop?.run ?? runNodeScript)(checkout, script, args, { GITHUB_REPOSITORY: repo });
+    const env = { GITHUB_REPOSITORY: repo };
+    if (!this.deps.backstop?.run && script === BACKSTOP_ENQUEUE) return runIsolatedEnqueue(checkout, args, env);
+    return (this.deps.backstop?.run ?? runNodeScript)(checkout, script, args, env);
   }
 
   // A message goes to the ticket record's linked pull request, delivered by the
@@ -1323,8 +1325,11 @@ export class PullRequestWatch {
     // The ready stacks, and the drops claimed above, are enqueued right away.
     await advance();
     await this.routeRefusals(repo, seenByUrl, context, save);
-    // Every message waiting for a pull request without a record goes out in turn.
-    for (const [url, seen] of inRepo()) while (seen.pending?.orphan) await this.deliverOrphan(url, seen, context, save);
+    // Unlinked messages still belong to the ticket's agent. A busy agent keeps its message pending.
+    const reserved = new Set<string>();
+    for (const [url, seen] of inRepo()) {
+      while (seen.pending?.orphan) if (!await this.deliverOrphan(url, seen, seenByUrl, context, save, reserved)) break;
+    }
   }
 
   // The pull requests no automatic enqueue may touch: escalated ones, ones blocked at their head
@@ -1558,14 +1563,25 @@ export class PullRequestWatch {
     }
   }
 
-  // A message for a pull request without a handover record: a comment mentioning the owner on
-  // each of its tickets, or without a ticket one comment on the pull request itself (with a
-  // marker, so a retry never doubles it). A ticket comment is saved as `sending` right before it
-  // goes out, so one whose result was lost (a restart) is not posted again.
-  private async deliverOrphan(url: string, seen: Seen, context: RunContext, save: () => Promise<void>): Promise<void> {
+  // A missing/moved PR link does not make the owner the repair worker. Reuse normal agent delivery
+  // and crash/successor recovery whenever a ticket record exists; only genuine escalations or a
+  // ticket with no recoverable agent record use the ticket/PR fallback.
+  private async deliverOrphan(url: string, seen: Seen, seenByUrl: Record<string, Seen>, context: RunContext, save: () => Promise<void>, reserved: Set<string>): Promise<boolean> {
     const pending = seen.pending;
     const source = PULL_URL.exec(url);
-    if (!pending?.orphan || !source) return;
+    if (!pending?.orphan || !source) return false;
+    const record = recordFor(pending.orphan.tickets, context.records);
+    if (record && pending.fix !== null) {
+      const pull = (await context.pulls(source[1])).find((pull) => pull.url === url);
+      if (!pull) return false;
+      await this.deliver(record, url, pull.labels, pending, seenByUrl, save, reserved, async () => {
+        const current = seenByUrl[url];
+        Object.assign(current, nextMessage(current));
+        Object.assign(seen, current);
+        await save();
+      });
+      return seen.pending !== pending;
+    }
     const text = pending.fix ?? `The merge queue dropped this stack again after Paseo's automatic requests (one fix request after a plain drop, ${DROP_PROMPTS.conflict} restacks after conflict-only drops), so Paseo stops asking. Please take over.\n\n${pending.facts}`;
     const issues = await this.issueIds(pending.orphan.tickets, context.records);
     if (!issues.length) await commentOnce(this.github(), source[1], Number(source[2]), `route:${pending.key}`, text);
@@ -1582,6 +1598,7 @@ export class PullRequestWatch {
     }
     Object.assign(seen, nextMessage(seen));
     await save();
+    return true;
   }
 
   // Delivers a claimed drop: the fix request to the agent while it exists; for a gone agent, to a
