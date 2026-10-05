@@ -17,6 +17,7 @@ import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { NeedsYouIssues } from "./needs-you";
 import { MAX_SUMMARY_LENGTH, ownerRequest, turnPullRequests, turnReply, Writeback } from "./writeback";
 import { DecisionLog } from "./owner-decisions";
+import { Handover } from "./handover";
 
 // Writebacks built without an outbox path keep theirs here, never in the real Paseo home.
 process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-writeback-home-"));
@@ -341,6 +342,49 @@ test("archiving clears the running marker and reports only when no pull request 
   withPr.state = { ...withPr.state, attachmentUrls: ["https://github.com/o/r/pull/9"] };
   await new Writeback(withPr, { read: async () => allOn }, undefined, 0).archived({ agent: root, archivedAt: "now" }, linked);
   assert.ok(!withPr.writes.some((write) => write.startsWith("comment")));
+});
+
+// The ticket's non-archived agents on pages of two: five subagents first, the successor last.
+function paseoWithAgents(agents: { id: string; createdAt: string; parent?: string }[]): PaseoApi {
+  const entries = agents.map(({ id, createdAt, parent }) => ({ agent: { id, createdAt, title: `ENG-1 (${id})`, cwd: "/repo", status: "idle", labels: { "linear.issueId": "issue-1", ...(parent ? { "paseo.parent-agent-id": parent } : {}) } } }));
+  return {
+    agents: {
+      ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" } } }) }),
+      list: async (input: { page?: { cursor?: string } }) => {
+        const start = Number(input.page?.cursor ?? 0);
+        const hasMore = start + 2 < entries.length;
+        return { entries: entries.slice(start, start + 2), pageInfo: { hasMore, nextCursor: hasMore ? String(start + 2) : null } };
+      },
+    },
+  } as unknown as PaseoApi;
+}
+
+test("an archived predecessor hands the record to its successor beyond the first page of subagents, and never takes it back", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-writeback-takeover-"));
+  const linear = new FakeLinear();
+  const handover = new Handover(linear as never, directory, async () => ({ branch: "mtuchel/eng-1-fix", lastCommit: "abc123 the fix" }), () => "2026-01-01T10:00:00.000Z");
+  await handover.update({ id: "issue-1", identifier: "ENG-1" }, root, { summary: "Pushed the fix." });
+  const subagents = Array.from({ length: 5 }, (_, index) => ({ id: `sub-${index}`, createdAt: `2026-01-03T00:00:0${index}Z`, parent: "agent-2" }));
+  const paseo = paseoWithAgents([...subagents, { id: "agent-2", createdAt: "2026-01-02T00:00:00Z" }]);
+  const writeback = new Writeback(linear, { read: async () => allOn }, { sessions: {} as never, handover }, 0, outboxPath());
+
+  await writeback.archived({ agent: root, archivedAt: "now" }, paseo);
+  const record = await handover.read("issue-1");
+  assert.deepEqual({ agentId: record?.agentId, status: record?.status, branch: record?.branch }, { agentId: "agent-2", status: "working", branch: "mtuchel/eng-1-fix" });
+  assert.ok(linear.writes.some((write) => /^comment: 🏁 \*\*Paseo final report\*\* — ENG-1: Fix sign-in\n[\s\S]*handed over to ENG-1 \(agent-2\)[\s\S]*Pushed the fix\./.test(write)), "the predecessor reports its own work");
+  assert.ok(!linear.writes.includes("-paseo-running"), "the successor keeps the running marker");
+
+  // A repeated archive event (or a later one of the predecessor) leaves the successor's record.
+  await handover.update({ id: "issue-1", identifier: "ENG-1" }, { ...root, id: "agent-2", title: "ENG-1 (agent-2)" }, { status: "waiting" });
+  await new Writeback(linear, { read: async () => allOn }, { sessions: {} as never, handover }, 0, outboxPath()).archived({ agent: root, archivedAt: "now" }, paseo);
+  assert.deepEqual({ agentId: (await handover.read("issue-1"))?.agentId, status: (await handover.read("issue-1"))?.status }, { agentId: "agent-2", status: "waiting" });
+
+  // Only subagents left: the record is the predecessor's to close.
+  const alone = mkdtempSync(join(tmpdir(), "paseo-writeback-takeover-"));
+  const own = new Handover(linear as never, alone, async () => ({ branch: "mtuchel/eng-1-fix", lastCommit: "abc123 the fix" }), () => "2026-01-01T10:00:00.000Z");
+  await own.update({ id: "issue-1", identifier: "ENG-1" }, root, { summary: "Pushed the fix." });
+  await new Writeback(linear, { read: async () => allOn }, { sessions: {} as never, handover: own }, 0, outboxPath()).archived({ agent: root, archivedAt: "now" }, paseoWithAgents(subagents));
+  assert.deepEqual({ agentId: (await own.read("issue-1"))?.agentId, status: (await own.read("issue-1"))?.status }, { agentId: "agent-1", status: "archived" });
 });
 
 test("a Linear failure is logged and never thrown back into the daemon hook", async (t) => {

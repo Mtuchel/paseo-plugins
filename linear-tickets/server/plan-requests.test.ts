@@ -58,9 +58,10 @@ test("a label present when the agent is first seen was the launch's reason and r
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("a busy or crashed agent is told on a later poll unless its omp extension already took the request", async () => {
-  // A crashed agent is not restarted here: the pull request watch restarts it.
-  for (const waiting of ["busy", "crashed"] as const) {
+test("a busy, waiting or crashed agent is told on a later poll unless its omp extension already took the request", async () => {
+  // A crashed agent is not restarted here: the pull request watch restarts it. A waiting one has a
+  // question open for the owner; the request waits until it takes messages again.
+  for (const waiting of ["busy", "waiting", "crashed"] as const) {
     await harness(async ({ requests, labels, prompts, outcome, directory }) => {
       labels.set("issue-1", ["plan"]);
       outcome.next = waiting;
