@@ -56,7 +56,7 @@ test("the plan document states the decision and feedback above the plan", () => 
 
 const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true,
-  dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true }, autoApprove: DEFAULT_AUTO_APPROVE,
+  dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true }, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {},
 };
 
 // `ticket`: who wrote the ticket and its labels, for the risk policy's checks.
@@ -413,4 +413,33 @@ test("the owner's review feedback is logged for the decision candidates; the ris
     assert.ok(calls.includes("document issue-1 Plan: TUC-25"));
     assert.match(String(errors.mock.calls[0]?.arguments[0]), /decision log: plan feedback on TUC-25 failed: disk full/);
   } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("an approved plan sets the ticket's tier; an escalation records the strong tier first, then relabels, switches and tells the owner", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" }, { creatorId: "owner", labels: ["model:cheap"] });
+  const recorded: string[] = [];
+  const tiers = {
+    store: { record: async (issue: { identifier: string }, event: { tier: string; source: string; reason: string; agentId: string | null }) => { recorded.push(`${issue.identifier} ${event.source} ${event.tier} ${event.agentId}: ${event.reason}`); return null as never; } },
+    apply: async (agentId: string) => { calls.push(`apply ${agentId}`); },
+  };
+  const plan = "# Plan\n1. Add the column\n\n## Model\n\n- Tier: cheap — one column\n- Strong steps: none — routine\n";
+  await withEvents([
+    { type: "decided", agentId: "agent-1", approved: true, planContent: plan, at: "2026-01-01T10:05:00Z" },
+    { type: "escalated", agentId: "agent-1", reason: "the migration test still fails after two fixes", at: "2026-01-01T11:00:00Z" },
+  ], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+    bridge.useTiers(tiers);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.deepEqual(recorded, [
+    "TUC-25 plan cheap agent-1: one column",
+    "TUC-25 escalated strong agent-1: the migration test still fails after two fixes",
+  ]);
+  assert.deepEqual(calls, [
+    "row agent-1: Plan approved in Plannotator", "+model:cheap issue-1", "-model:strong issue-1", "apply agent-1",
+    "state issue-1 In Progress", "+plan-ready issue-1", "document issue-1 Plan: TUC-25", "comment issue-1: ✅ **Plan approved** in Plannotator — [plan](https://linear.app/doc/1)",
+    "+model:strong issue-1", "-model:cheap issue-1", "apply agent-1", "comment issue-1: ⬆️ **Escalated to the strong model tier: the migration test still fails after two fixes**",
+  ]);
 });

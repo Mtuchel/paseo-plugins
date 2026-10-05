@@ -3,6 +3,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { TicketDetail } from "../shared/contracts";
 import { advisorSteps } from "../shared/plan-advisor";
 import { sectionSteps } from "../shared/plan-sections";
+import { modelSteps, planTier, type Tier } from "../shared/plan-model";
 import { mappedBaseBranch, mappingLabel, type ProjectMapping } from "../shared/mapping";
 import { Capacity } from "./capacity";
 import { dispatchLabels } from "./dispatch";
@@ -14,6 +15,7 @@ import { hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, planPol
 import { needsOwner, type Presence } from "./presence";
 import { Scheduler, type Admission } from "./scheduler";
 import type { PluginSettings } from "./settings";
+import { launchTier, recordStart, TIER_AGENT_LABEL, tierModel, tierNote, type TierStore } from "./model-tiers";
 
 export type Started = { agentId: string; warnings: string[]; provider: string; target: string; resumed: boolean; untrusted: boolean; plan: PlanPolicy | null };
 type Deps = {
@@ -24,6 +26,7 @@ type Deps = {
   scheduler?: Scheduler;
   capacity?: Capacity;
   presence?: Pick<Presence, "away">;
+  tiers?: Pick<TierStore, "get" | "record">;
 };
 
 // Plan-first modes where the provider's plan mode lets the planner read without asking. omp has
@@ -50,6 +53,8 @@ export function advisorNote(providerKey: string): string {
 // Every ticket plan says where else the change applies and which rules it follows or sets
 // (README, "Plan-first"); the omp extension's record gate reads the same format.
 export const PLAN_SECTIONS_NOTE = sectionSteps();
+// Every ticket plan picks the model tier its implementation runs on (README, "Model tiers").
+export const MODEL_NOTE = modelSteps();
 // Every ticket agent, whether it planned and continues or implements a plan approved earlier: a
 // place the plan missed is filed, not quietly added to the ticket (README, "Plan-first").
 export const MISSED_REACH_NOTE = "A place the plan missed that you find while implementing (another page, role, record, export or repository that uses what this ticket changes) becomes a follow-up ticket (the linear_ticket tool `create_issue`, related to this ticket; without it, list it for the owner in your final comment), not extra scope in this ticket.";
@@ -86,17 +91,23 @@ export function isUntrusted(state: { creatorId: string | null; labels: { name: s
   return !state.creatorId || (state.creatorId !== ownerId && state.creatorId !== appId) || hasLabel(state.labels, "feedback");
 }
 
-export type PlanSetup = { untrusted: boolean; policy: PlanPolicy | null; modeId: string | undefined; notes: string[]; labels: Record<string, string>; env: Record<string, string> };
+// `tier`: the model tier an implementing launch runs on (null while the ticket plans), and why.
+export type PlanSetup = { identifier: string; untrusted: boolean; policy: PlanPolicy | null; modeId: string | undefined; notes: string[]; labels: Record<string, string>; env: Record<string, string>; tier: { tier: Tier; reason: string } | null };
 
-// What a ticket's launch looks like under its plan policy: mode, instructions, and the agent
-// label and environment the omp extension and write-back read. Shared by every launch path.
-export async function planSetup(linear: Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "issueDocument">, issueId: string, provider: string, usualModeId: string | undefined, plannerLabel: string): Promise<PlanSetup> {
+// What a ticket's launch looks like under its plan policy: mode, instructions, model tier, and the
+// agent label and environment the omp extension and write-back read. Shared by every launch path.
+export async function planSetup(linear: Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "issueDocument">, issueId: string, provider: string, usualModeId: string | undefined, plannerLabel: string, tiers?: Pick<TierStore, "get">): Promise<PlanSetup> {
   const state = await linear.issueState(issueId);
   const untrusted = isUntrusted(state, await linear.viewerId(), await linear.appUserId());
   const policy = planPolicy(state.labels);
   const plan = await linear.issueDocument(issueId, `Plan: ${state.identifier}`).catch(() => null);
   const providerKey = provider.split("/")[0];
+  // Implementing an approved plan: the strongest of the ticket's label, its recorded tier and the plan's.
+  const planned = policy ? null : planTier(plan?.content ?? "");
+  const tier = policy ? null : launchTier(state.labels, await tiers?.get(issueId) ?? null, planned?.tier ?? null);
+  const planner = hasLabel(state.labels, plannerLabel.toLowerCase());
   return {
+    identifier: state.identifier,
     untrusted,
     policy,
     // A required plan starts in the provider's safe mode, if it has one; approving the plan restores the usual mode.
@@ -104,14 +115,18 @@ export async function planSetup(linear: Pick<LinearService, "issueState" | "view
     notes: [
       policy ? (untrusted ? UNTRUSTED_NOTE : PLAN_REQUIRED_NOTE) : untrusted ? UNTRUSTED_TEXT : "",
       // A project's planner gets its own overlap instructions in its description.
-      policy && !hasLabel(state.labels, plannerLabel.toLowerCase()) ? OVERLAP_NOTE : "",
+      policy && !planner ? OVERLAP_NOTE : "",
       policy ? PLAN_SECTIONS_NOTE : "",
+      // A project planner's work order only orders tickets; each ticket's own plan picks its tier.
+      policy && !planner ? MODEL_NOTE : "",
       policy ? advisorNote(providerKey) : approvedPlanNote(state.identifier, plan),
       policy ? sentBackPlanNote(state.identifier, plan) : "",
+      tier ? tierNote(tier, tier === planned?.tier ? planned.strongSteps : null) : "",
       MISSED_REACH_NOTE,
     ].filter(Boolean),
-    labels: policy ? { [PLAN_POLICY_LABEL]: policy } : {},
+    labels: { ...(policy ? { [PLAN_POLICY_LABEL]: policy } : {}), ...(tier ? { [TIER_AGENT_LABEL]: tier } : {}) },
     env: policy ? { [PLAN_POLICY_ENV]: policy } : {},
+    tier: tier ? { tier, reason: !planned ? "the approved plan names no tier" : tier === planned.tier ? planned.reason || "the approved plan" : "raised by the ticket's model label or an earlier escalation" } : null,
   };
 }
 
@@ -182,23 +197,26 @@ export class TicketStarter {
     const project = await findProject(paseo, mapping.projectId);
     const target = project.projectCustomName || project.projectDisplayName || mapping.label;
     const resume = options.fresh ? null : await this.deps.handover?.resumeTarget(issueId);
-    const setup = await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, dispatchLabels(settings.dispatch.label).planner);
+    const setup = await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, dispatchLabels(settings.dispatch.label).planner, this.deps.tiers);
+    const model = tierModel(settings, preference.model.split("/")[0], setup.tier?.tier ?? null, { provider: preference.model, ...(preference.thinkingOptionId ? { thinkingOptionId: preference.thinkingOptionId } : {}) });
     const base = {
       id: issueId,
       projectId: mapping.projectId,
-      provider: preference.model,
+      provider: model.provider,
       modeId: setup.modeId,
-      thinkingOptionId: preference.thinkingOptionId,
+      thinkingOptionId: model.thinkingOptionId,
       instructions: [...setup.notes, QUESTIONS_NOTE].join("\n\n"),
       // A required plan goes to Planning on the agent's first turn (write-back), not In Progress.
       markInProgress: settings.markInProgress && setup.policy !== "required",
     };
     const launchOptions = { promptTemplate: settings.template ?? undefined, markInProgress: base.markInProgress, linearAccess: settings.agentLinearAccess, labels: { ...options.labels, ...setup.labels }, env: setup.env };
     const plan = { untrusted: setup.untrusted, plan: setup.policy };
+    const started = (result: { agentId: string }) => recordStart(this.deps.tiers, { id: issueId, identifier: detail.issue.identifier }, setup.tier, result.agentId, model.provider);
     if (resume && project.projectKind === "git") {
       try {
         const result = await this.deps.launcher.start({ ...base, requestId: randomUUID() }, paseo, { ...launchOptions, resume });
-        return { ...result, provider: preference.model, target, resumed: true, ...plan };
+        await started(result);
+        return { ...result, provider: model.provider, target, resumed: true, ...plan };
       } catch (error) {
         // A deleted or merged branch cannot be continued; a fresh start is the useful fallback.
         console.error(`[linear-tickets] ${detail.issue.identifier}: resume failed, starting fresh: ${error instanceof Error ? error.message : error}`);
@@ -211,6 +229,7 @@ export class TicketStarter {
       if (!baseBranch) throw new Error(`Could not pick a base branch in ${mapping.label}. Save a base branch for its project mapping.`);
     }
     const result = await this.deps.launcher.start({ ...base, baseBranch, requestId: randomUUID() }, paseo, launchOptions);
-    return { ...result, provider: preference.model, target, resumed: false, ...plan };
+    await started(result);
+    return { ...result, provider: model.provider, target, resumed: false, ...plan };
   }
 }

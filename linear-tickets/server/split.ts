@@ -5,6 +5,8 @@ import { PLAN_READY_LABEL } from "./plan-policy";
 import { MAX_SPLIT, planSteps } from "./sessions";
 import { agentModel } from "./model";
 import type { PlanFollowUps } from "./plan-follow-ups";
+import { planTier, strongStepNumbers } from "../shared/plan-model";
+import { TIER_LABELS } from "./model-tiers";
 
 type Deps = {
   linear: Pick<LinearService, "issueState" | "createIssue" | "addBlocker" | "delegate" | "upsertIssueDocument" | "moveToStateNamed" | "addLabel">;
@@ -45,6 +47,8 @@ export function subIssueTitle(step: string): string {
 // "Approve & split": the approved plan becomes the parent's plan document and each step a
 // sub-issue assigned to Paseo. Each step is blocked by the one before, so the agents run one
 // after another: a step starts when its predecessor is done (normally when its PR is merged).
+// Each sub-issue plans again and picks its own model tier; a strong plan, or a step its `## Model`
+// section names as strong, gets the `model:strong` label, which that plan cannot lower.
 export async function splitIntoSubIssues(deps: Deps, link: { issueId: string; identifier: string; agentId: string | null }, localUrl: string, paseo: PaseoApi): Promise<string> {
   const planText = await deps.readPlan(localUrl);
   const steps = planSteps(planText);
@@ -56,6 +60,8 @@ export async function splitIntoSubIssues(deps: Deps, link: { issueId: string; id
   const documentUrl = await deps.linear.upsertIssueDocument(link.issueId, `Plan: ${link.identifier}`, planDocument({ type: "decided", agentId: link.agentId, approved: true, planContent: planText, at: new Date().toISOString() }, link.identifier, model));
   await deps.followUps?.file({ issueId: link.issueId, identifier: link.identifier, plan: planText, documentUrl: documentUrl || null });
   if (link.agentId) await deps.retirePlanner(localUrl, link.agentId, paseo, "The owner split this plan into Linear sub-issues, each handled by its own agent. Stop now and do not implement anything.");
+  const planned = planTier(planText);
+  const strongSteps = strongStepNumbers(planned?.strongSteps ?? null);
   const created: { id: string; identifier: string }[] = [];
   for (const [index, step] of steps.entries()) {
     const issue = await deps.linear.createIssue({
@@ -68,6 +74,7 @@ export async function splitIntoSubIssues(deps: Deps, link: { issueId: string; id
     });
     const previous = created.at(-1);
     if (previous) await deps.linear.addBlocker(previous.id, issue.id);
+    if (planned?.tier === "strong" || strongSteps.has(index + 1)) await deps.linear.addLabel(issue.id, TIER_LABELS.strong);
     created.push(issue);
   }
   const appUserId = await deps.appUserId();
