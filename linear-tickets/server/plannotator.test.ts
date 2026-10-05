@@ -470,6 +470,47 @@ test("a parked plan is judged again once its advisor review is recorded for exac
   ]);
 });
 
+test("a parked decision whose hand-off fails on a Linear error is delivered in full by the retry, not dropped", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(calls);
+  plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T10:00:00Z", announced: true });
+  const upsert = linear.upsertIssueDocument;
+  let outage = true;
+  linear.upsertIssueDocument = async (issueId: string, title: string) => {
+    if (outage) { outage = false; throw new Error("The Linear API request failed (HTTP 503). Try again."); }
+    return upsert(issueId, title);
+  };
+  const errors = test.mock.method(console, "error", () => {});
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: false, parked: true, feedback: "Cover every table", at: "2026-01-01T12:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  errors.mock.restore();
+  assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "comment issue-1: ↩️ **Plan sent back** in Plannotator ([plan](https://linear.app/doc/1))\n\nCover every table\n\nAssign Paseo again to plan it again."]);
+  assert.equal(plans.size, 0);
+});
+
+test("a parked decision is never given up while Linear stays unavailable", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(calls);
+  plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T10:00:00Z", announced: true });
+  linear.upsertIssueDocument = async () => { throw new Error("Linear's hourly request limit is reached for the Paseo Linear app"); };
+  const errors = test.mock.method(console, "error", () => {});
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: RISKY(2), at: "2026-01-01T12:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.attach(paseo);
+    for (let attempt = 0; attempt < 25; attempt++) await bridge.drain();
+    bridge.stop();
+    assert.deepEqual(await readdir(directory), ["0.json"], "the decision waits for the next retry");
+  });
+  const failures = errors.mock.callCount();
+  errors.mock.restore();
+  assert.equal(failures, 20, "past the quick attempts it waits instead of retrying every sweep");
+  assert.equal(plans.size, 1);
+});
+
 test("without the central host a plan that needs the owner keeps its agent and opens as before", async () => {
   const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
   const { plans, parking } = parkingFake(calls, false);

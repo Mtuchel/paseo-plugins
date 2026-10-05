@@ -45,6 +45,10 @@ export function openInBrowser(url: string): void {
 export const PLANNOTATOR_KIND = "plannotator";
 // About a minute of retries at the sweep interval, enough to ride out a Linear hiccup.
 const MAX_ATTEMPTS = 20;
+// The owner's decision on a parked plan exists nowhere else (its agent is retired), so it is never
+// given up: past the quick attempts it is retried at this pace until Linear takes it (the
+// hourly request limit lasts up to an hour).
+const PARKED_DECISION_RETRY_MS = 60_000;
 const SWEEP_MS = 3_000;
 const MAX_PLAN_CHARS = 180_000;
 
@@ -166,6 +170,8 @@ export class PlannotatorBridge {
   private draining: Promise<void> | null = null;
   private again = false;
   private readonly attempts = new Map<string, number>();
+  // A parked decision past its quick attempts: when it is tried next.
+  private readonly retryAt = new Map<string, number>();
   // A decision taken in Linear is also reported by the omp plan extension; the second report
   // within this window is the same decision and is skipped.
   private readonly lastDecision = new Map<string, number>();
@@ -458,6 +464,7 @@ export class PlannotatorBridge {
     const path = join(this.events, name);
     const paseo = this.paseo;
     if (!paseo) return;
+    if ((this.retryAt.get(name) ?? 0) > Date.now()) return;
     let event: PlannotatorEvent | null = null;
     try {
       event = parseEvent(await readFile(path, "utf8"));
@@ -471,6 +478,7 @@ export class PlannotatorBridge {
       else if (event?.type === "opened") this.show(event.localUrl);
       await rm(path, { force: true });
       this.attempts.delete(name);
+      this.retryAt.delete(name);
     } catch (error) {
       const tries = (this.attempts.get(name) ?? 0) + 1;
       console.error(`[linear-tickets] Plannotator event ${name} failed (attempt ${tries}): ${error instanceof Error ? error.message : error}`);
@@ -479,7 +487,9 @@ export class PlannotatorBridge {
           console.error("[linear-tickets] could not record the plan delivery failure");
         });
       }
-      if (tries < MAX_ATTEMPTS) { this.attempts.set(name, tries); return; }
+      this.attempts.set(name, tries);
+      if (tries < MAX_ATTEMPTS) return;
+      if (event?.type === "decided" && event.parked) { this.retryAt.set(name, Date.now() + PARKED_DECISION_RETRY_MS); return; }
       // Given up: the review still opens, so it is not lost.
       if (event?.type === "opened") this.show(event.localUrl);
       await rm(path, { force: true });
@@ -646,6 +656,8 @@ export class PlannotatorBridge {
   // A parked plan's events, all from the central host: `opened` binds the stable link, inbox and
   // panel to the host's review (and tells the owner the first time); the owner's `decided` ends
   // the parking and queues a fresh agent. The retired agent's own report is ignored.
+  // The parking ends only after the hand-off: a failed attempt (a Linear outage) leaves the plan
+  // parked and the decision unrecorded, so the event's retry repeats the whole hand-off.
   private async deliverParked(event: OpenedEvent | DecidedEvent, parked: ParkedPlan): Promise<void> {
     if (event.type === "opened") {
       const stableLink = await this.reviews?.opened(parked.agentId, event, { identifier: parked.identifier, issueId: parked.issueId, since: parked.parkedAt, model: parked.model }) ?? null;
@@ -670,13 +682,18 @@ export class PlannotatorBridge {
       return;
     }
     if (!event.parked) return;
-    await this.parking!.plans.remove(parked.issueId);
-    await this.reviews?.decided(parked.agentId, event.approved);
     const at = Date.parse(event.at) || Date.now();
     const previous = this.lastDecision.get(parked.agentId);
-    this.lastDecision.set(parked.agentId, at);
     // The plugin closed the review itself (approve later, split), which already moved the ticket on.
-    if (previous !== undefined && Math.abs(at - previous) < 120_000) return;
+    if (previous === undefined || Math.abs(at - previous) >= 120_000) await this.handOffParked(event, parked);
+    await this.parking!.plans.remove(parked.issueId);
+    await this.reviews?.decided(parked.agentId, event.approved);
+    this.lastDecision.set(parked.agentId, at);
+  }
+
+  // Every step is safe to repeat: the log skips a known entry, the document is upserted, labels
+  // and states are set, and follow-ups are filed by title.
+  private async handOffParked(event: DecidedEvent, parked: ParkedPlan): Promise<void> {
     await this.logFeedback(parked.agentId, event, { id: parked.issueId, identifier: parked.identifier });
     const documentUrl = await this.linear.upsertIssueDocument(parked.issueId, `Plan: ${parked.identifier}`, planDocument({ ...event, planContent: event.planContent ?? parked.plan }, parked.identifier, parked.model));
     if (event.approved) {

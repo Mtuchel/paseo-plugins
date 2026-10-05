@@ -781,8 +781,10 @@ Your decision there, or **Approve plan** / **Send back** in the panel:
   Paseo again);
 - send back: the plan document with your feedback, and a fresh agent that plans again from it.
 
-Plans stay parked across plugin and host restarts. The host needs Bun (`~/.bun/bin/bun`,
-Homebrew or `LINEAR_TICKETS_BUN`) and the Plannotator omp plugin
+Plans stay parked across plugin and host restarts, and until your decision has been handed on:
+when Linear fails (an outage, the hourly request limit), the decision is retried every few seconds
+for about a minute, then once a minute until it goes through; it is never dropped. The host needs
+Bun (`~/.bun/bin/bun`, Homebrew or `LINEAR_TICKETS_BUN`) and the Plannotator omp plugin
 (`~/.omp/plugins/node_modules/@plannotator/pi-extension`, or `LINEAR_TICKETS_PLANNOTATOR_PACKAGE`);
 without them plans are not parked and their agents wait for you as before.
 
