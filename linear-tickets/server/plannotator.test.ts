@@ -311,8 +311,14 @@ test("a plan that needs the owner is parked and its agent retired; the central h
   const { plans, parking } = parkingFake(calls);
   const tabs: string[] = [];
   const decisions: string[] = [];
+  const inbox: string[] = [];
+  const reviews = {
+    async opened(agentId: string, event: { localUrl: string }, _identifier?: string, since?: string) { inbox.push(`${agentId} ${event.localUrl} since ${since}`); return null; },
+    async decided() {},
+    async described() {},
+  };
   const run = async (events: object[]) => withEvents(events, async (directory) => {
-    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, undefined,
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, reviews,
       async (url, approve) => { decisions.push(`${url} ${approve}`); }, (url) => tabs.push(url), parking);
     bridge.attach(paseo);
     await bridge.drain();
@@ -331,6 +337,8 @@ test("a plan that needs the owner is parked and its agent retired; the central h
   assert.deepEqual(tabs, ["http://localhost:5000/"]);
   assert.equal(calls.filter((call) => call.startsWith("comment issue-1: 📋 **Plan waiting for your review in Plannotator**: https://host.ts.net:5000/")).length, 1);
   assert.equal(plans.get("issue-1")?.announced, true);
+  const parkedAt = plans.get("issue-1")?.parkedAt;
+  assert.deepEqual(inbox.slice(1), [`agent-1 http://localhost:5000/ since ${parkedAt}`, `agent-1 http://localhost:5001/ since ${parkedAt}`], "the inbox keeps the time the plan was parked across host restarts");
 
   calls.length = 0;
   await run([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: RISKY(2), at: "2026-01-01T12:00:00Z" }]);

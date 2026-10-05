@@ -19,8 +19,9 @@ function opened(port: number): OpenedEvent {
 const RISK = (impact: number, reversibility = "revert", newRule = "no — none") => `## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: ${impact} — why\n- Reversibility: ${reversibility} — why\n- Feature flag: no\n- Migration: no\n- Auth: no\n- New rule: ${newRule}\n- Failure mode: a wrong column\n- Advisor rating: impact ${impact}, reversibility ${reversibility}\n- Recommendation: auto — routine\n`;
 
 // `live` holds the local ports whose Plannotator server answers; `unserved` the routes turned off;
-// `plans` the plan text each port's server returns; `routed` the routes pointed at the proxy.
-async function withLinks(run: (links: ReviewLinks, get: (path: string, method?: string) => Promise<Response>, live: Set<number>, unserved: number[], plans: Map<number, string>, routed: number[]) => Promise<void>, unserveError?: (port: number) => Error | null) {
+// `plans` the plan text each port's server returns; `routed` the routes pointed at the proxy;
+// `setNow` moves the clock (each reading advances it by a second). Times show in Berlin time.
+async function withLinks(run: (links: ReviewLinks, get: (path: string, method?: string) => Promise<Response>, live: Set<number>, unserved: number[], plans: Map<number, string>, routed: number[], setNow: (iso: string) => void) => Promise<void>, unserveError?: (port: number) => Error | null) {
   const directory = await mkdtemp(join(tmpdir(), "paseo-review-links-"));
   const live = new Set<number>();
   const unserved: number[] = [];
@@ -28,7 +29,7 @@ async function withLinks(run: (links: ReviewLinks, get: (path: string, method?: 
   const routed: number[] = [];
   let clock = Date.parse("2026-01-01T10:00:00Z");
   const links = new ReviewLinks({
-    port: 0, proxyPort: 0, file: join(directory, "reviews.json"), sweepMs: 3_600_000,
+    port: 0, proxyPort: 0, file: join(directory, "reviews.json"), sweepMs: 3_600_000, timeZone: "Europe/Berlin",
     now: () => new Date(clock += 1_000),
     alive: async (localUrl) => live.has(Number(new URL(localUrl).port)),
     serve: async () => ORIGIN,
@@ -43,7 +44,7 @@ async function withLinks(run: (links: ReviewLinks, get: (path: string, method?: 
   try {
     await links.start();
     const get = (path: string, method = "GET") => fetch(`http://127.0.0.1:${links.listeningPort}${path}`, { method, redirect: "manual" });
-    await run(links, get, live, unserved, plans, routed);
+    await run(links, get, live, unserved, plans, routed, (iso) => { clock = Date.parse(iso); });
   } finally {
     links.stop();
     await rm(directory, { recursive: true, force: true });
@@ -177,7 +178,7 @@ test("unknown agents and malformed ids are 404; other methods are refused", asyn
   });
 });
 
-test("the inbox lists only reviews the owner can open now, oldest first, and the latest decisions", async () => {
+test("the inbox lists only reviews the owner can open now, newest first, and the latest decisions", async () => {
   await withLinks(async (links, get, live) => {
     live.add(50_001).add(50_002).add(50_003).add(50_005);
     await links.opened("agent-1", opened(50_001), "TUC-1");
@@ -200,13 +201,38 @@ test("the inbox lists only reviews the owner can open now, oldest first, and the
     const page = await response.text();
     const [waiting, recent] = page.split("Recently decided");
     const listed = [...waiting.matchAll(/href="\/review\/([^"]+)"/g)].map((match) => match[1]);
-    assert.deepEqual(listed, ["agent-1", "agent-2", "agent-3"]);
+    assert.deepEqual(listed, ["agent-3", "agent-2", "agent-1"]);
     assert.match(waiting, /&#60;TUC-2&#62;/);
     assert.doesNotMatch(page, /TUC-3-old/);
     assert.match(recent, /TUC-6/);
     assert.match(recent, /approved/);
     assert.match(recent, /TUC-4/, "the dead review was closed by the sweep");
     assert.doesNotMatch(page, /TUC-5/);
+  });
+});
+
+test("waiting reviews show when the owner got them, grouped by the owner's calendar day, with the oldest age in the header", async () => {
+  await withLinks(async (links, get, live, _unserved, _plans, _routed, setNow) => {
+    live.add(50_001).add(50_002).add(50_004);
+    // 23:30 UTC on 1 Jan is already 2 Jan in Berlin; 22:30 UTC is still 1 Jan there.
+    setNow("2026-01-01T23:30:00Z");
+    await links.opened("agent-1", opened(50_001), "TUC-1");
+    setNow("2026-01-01T22:30:00Z");
+    await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, "TUC-2");
+    setNow("2025-12-29T09:00:00Z");
+    await links.opened("agent-3", { ...opened(50_003), agentId: "agent-3" }, "TUC-3");
+    // Served again after a restart: it keeps the time the owner got it, and the new server.
+    setNow("2026-01-02T08:00:00Z");
+    await links.opened("agent-3", { ...opened(50_004), agentId: "agent-3" }, "TUC-3", "2025-12-29T09:00:00.000Z");
+    setNow("2026-01-02T09:00:00Z");
+
+    const page = await (await get("/")).text();
+    const order = [...page.matchAll(/<h3>([^<]+)<\/h3>|href="\/review\/([^"]+)"/g)].map((match) => match[1] ?? match[2]);
+    assert.deepEqual(order, ["Today", "agent-1", "Yesterday", "agent-2", "Mon, 29 Dec 2025", "agent-3"]);
+    assert.match(page, /<span class="when">[^]*?>00:30<\/time> · 9 h<\/span>/, "opened 00:30 Berlin time, waiting 9 h");
+    assert.match(page, /<span class="when stale">[^]*?>10:00<\/time> · 4 d<\/span>/, "a review waiting over 12 h is highlighted");
+    assert.match(page, /3 waiting · oldest 4 d · updated 10:00/);
+    assert.equal((await get("/review/agent-3")).headers.get("location"), "https://host.tail1.ts.net:50004/?r=1");
   });
 });
 
@@ -232,14 +258,16 @@ test("inbox rows show the plan's title, opening paragraph, risk rating and why i
 
     const page = await (await get("/")).text();
     const [waiting, recent] = page.split("Recently decided");
-    assert.deepEqual([...waiting.matchAll(/href="\/review\/([^"]+)"/g)].map((match) => match[1]), ["agent-1", "agent-2"]);
-    assert.match(waiting, /<div class="title">Warn when a &#60;delay&#62; breaks a date<\/div>/);
-    assert.match(waiting, /<div class="summary">When a container is late, the sales team gets a notice\.<\/div>/);
-    assert.match(waiting, /<span class="chip high">Risk: impact 3\/4 · data-fix<\/span><span class="chip">2 follow-ups<\/span><span class="chip mid">new rule<\/span>/);
-    assert.match(waiting, /Needs you: impact 3 is above the threshold 1; reversibility is data-fix; it sets a new rule/);
-    assert.match(waiting, /<div class="title">Report column<\/div><div class="summary">Adds a column to the order report\.<\/div><span class="chip low">Risk: impact 1\/4 · revert<\/span><\/a>/, "a plan without follow-ups or a rule shows neither chip");
-    assert.match(recent, /TUC-3<\/span><span class="meta">auto-approved/);
-    assert.match(recent, /<div class="title">Tooling<\/div><span class="chip low">Risk: impact 0\/4 · revert<\/span><span class="chip">1 follow-up<\/span><span class="chip mid">new rule<\/span>/);
+    assert.deepEqual([...waiting.matchAll(/href="\/review\/([^"]+)"/g)].map((match) => match[1]), ["agent-2", "agent-1"]);
+    const [second, first] = waiting.split('href="/review/').slice(1);
+    assert.match(first, /<div class="title">Warn when a &#60;delay&#62; breaks a date<\/div>/);
+    assert.match(first, /<div class="summary">When a container is late, the sales team gets a notice\.<\/div>/);
+    assert.match(first, /<span class="chip high">Risk: impact 3\/4 · data-fix<\/span><span class="chip">2 follow-ups<\/span><span class="chip mid">new rule<\/span>/);
+    assert.match(first, /Needs you:<\/b> impact 3 is above the threshold 1; reversibility is data-fix; it sets a new rule/);
+    assert.match(second, /<div class="title">Report column<\/div><div class="summary">Adds a column to the order report\.<\/div>/);
+    assert.match(second, /<div class="chips"><span class="chip low">Risk: impact 1\/4 · revert<\/span><\/div>/, "a plan without follow-ups or a rule shows neither chip");
+    assert.match(recent, /TUC-3<\/span><span class="outcome">auto-approved/);
+    assert.match(recent, /<div class="title">Tooling<\/div><div class="chips"><span class="chip low">Risk: impact 0\/4 · revert<\/span><span class="chip">1 follow-up<\/span><span class="chip mid">new rule<\/span><\/div>/);
     assert.doesNotMatch(recent, /CI only/, "decided rows stay one-glance");
   });
 });

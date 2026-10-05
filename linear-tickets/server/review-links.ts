@@ -22,6 +22,8 @@ const AGENT_ID = /^[A-Za-z0-9_-]+$/;
 const RECENT_DECISIONS = 10;
 const INBOX_REFRESH_S = 30;
 const SUMMARY_CHARS = 280;
+// A review waiting this long gets its age highlighted.
+const STALE_HOURS = 12;
 
 export type ReviewOutcome = "approved" | "sent back";
 // What the inbox shows about a review's plan, read once from the plan text.
@@ -43,6 +45,8 @@ export type ReviewEntry = {
   remoteUrl: string | null;
   identifier?: string;
   openedAt: string;
+  // When the owner first got this plan, for a review served again (see `opened`).
+  since?: string;
   outcome?: ReviewOutcome;
   closedAt?: string;
   details?: PlanDetails;
@@ -65,6 +69,8 @@ export type ReviewLinksOptions = {
   proxyPort?: number;
   // The plan text of a running review (Plannotator's /api/plan); "" when it cannot be read.
   fetchPlan?: (localUrl: string) => Promise<string>;
+  // The time zone the inbox shows clock times and days in; the host's when absent.
+  timeZone?: string;
 };
 
 async function backendAlive(localUrl: string): Promise<boolean> {
@@ -98,21 +104,34 @@ function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
 }
 
-const PAGE_STYLE = `body{font:17px/1.5 -apple-system,system-ui,sans-serif;margin:0;padding:48px 24px;color:#1c1c1e;background:#f2f2f7}main{max-width:32rem;margin:auto}h1{font-size:1.4rem;margin:0 0 .5rem}h2{font-size:.8rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:#8e8e93;margin:2rem 0 .5rem}
-ul{list-style:none;margin:0;padding:0;border-radius:12px;overflow:hidden;background:#fff}li+li{border-top:1px solid #e5e5ea}li>a,li>div{display:block;padding:14px 16px;color:inherit;text-decoration:none}li>a:active{background:#e5e5ea}
-.head{display:flex;justify-content:space-between;gap:12px}.id{font-weight:600}.meta{color:#8e8e93;white-space:nowrap}.empty{color:#8e8e93}.title{margin-top:2px}.summary{margin-top:4px;font-size:15px;color:#3c3c43;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.chip{display:inline-block;margin-top:8px;margin-right:6px;font-size:13px;padding:2px 10px;border-radius:999px;background:#e5e5ea}.low{background:#d6f5df;color:#1b6e35}.mid{background:#fdecc8;color:#7a4f00}.high{background:#fde1df;color:#a3221b}.why{margin-top:6px;font-size:13px;color:#8e8e93}
-@media(prefers-color-scheme:dark){body{color:#f2f2f7;background:#000}ul{background:#1c1c1e}li+li{border-color:#38383a}li>a:active{background:#2c2c2e}.summary{color:#c7c7cc}.chip{background:#2c2c2e}.low{background:#123d22;color:#8fe0a8}.mid{background:#4a3500;color:#ffd27a}.high{background:#4d1512;color:#ff9f97}}`;
+const PAGE_STYLE = `:root{color-scheme:light dark;--bg:#f2f2f7;--card:#fff;--fg:#1c1c1e;--sub:#3c3c43;--muted:#6e6e73;--line:#d8d8dd;--press:#ebebf0;--tint:#0a64d6;--chip:#ececf1;--ok:#1b7a3d;--ok-bg:#dcf5e3;--warn:#8a5a00;--warn-bg:#fdefd0;--bad:#b3261e;--bad-bg:#fde4e1}
+@media(prefers-color-scheme:dark){:root{--bg:#000;--card:#1c1c1e;--fg:#f2f2f7;--sub:#d1d1d6;--muted:#98989f;--line:#38383a;--press:#2c2c2e;--tint:#5aa9ff;--chip:#2c2c2e;--ok:#8fe0a8;--ok-bg:#123d22;--warn:#ffd27a;--warn-bg:#4a3500;--bad:#ff9f97;--bad-bg:#4d1512}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}body{margin:0;font:17px/1.45 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;color:var(--fg);background:var(--bg);font-variant-numeric:tabular-nums}::selection{background:color-mix(in srgb,var(--tint) 30%,transparent)}a{color:var(--tint)}
+.bar{position:sticky;top:0;z-index:2;padding:calc(env(safe-area-inset-top) + 14px) max(20px,env(safe-area-inset-right)) 10px max(20px,env(safe-area-inset-left));background:color-mix(in srgb,var(--bg) 80%,transparent);-webkit-backdrop-filter:saturate(1.8) blur(20px);backdrop-filter:saturate(1.8) blur(20px);border-bottom:.5px solid var(--line)}
+.bar>div,main{max-width:36rem;margin:0 auto}h1{margin:0;font-size:1.75rem;line-height:1.15;font-weight:700;letter-spacing:-.02em}.sub{margin:2px 0 0;font-size:.875rem;color:var(--muted)}.sub.offline::after{content:" · offline, retrying";color:var(--warn)}
+main{padding:4px max(16px,env(safe-area-inset-right)) calc(48px + env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}
+h2{display:flex;align-items:baseline;gap:8px;margin:28px 4px 4px;font-size:1.25rem;font-weight:700;letter-spacing:-.01em}h2 .n{font-size:1rem;font-weight:600;color:var(--muted)}h2 .hint{margin-left:auto;font-size:.8125rem;font-weight:500;color:var(--muted)}
+h3{margin:18px 4px 6px;font-size:.8125rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+.list{list-style:none;margin:0;padding:0;background:var(--card);border-radius:14px;overflow:hidden}.list>li{position:relative}.list>li+li::before{content:"";position:absolute;top:0;left:16px;right:0;border-top:.5px solid var(--line)}
+.row{position:relative;display:block;padding:12px 16px 13px;color:inherit;text-decoration:none}a.row{padding-right:36px;-webkit-tap-highlight-color:transparent;transition:background-color .25s ease-out}a.row:active{background:var(--press);transition:none}@media(hover:hover){a.row:hover{background:var(--press)}}a.row:focus-visible{outline:2px solid var(--tint);outline-offset:-2px}
+.go{position:absolute;right:16px;top:50%;width:8px;height:14px;margin-top:-7px;color:var(--muted);opacity:.55}
+.top{display:flex;align-items:baseline;gap:8px}.id{font-size:.8125rem;font-weight:600;color:var(--muted)}.when{margin-left:auto;font-size:.8125rem;color:var(--muted);white-space:nowrap}.when.stale{color:var(--warn);font-weight:600}
+.title{margin-top:2px;font-weight:600;line-height:1.3;text-wrap:pretty}.summary{margin-top:4px;font-size:.9375rem;color:var(--sub);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.chip{font-size:.75rem;line-height:1.5;padding:2px 8px;border-radius:7px;background:var(--chip);color:var(--sub)}.low{background:var(--ok-bg);color:var(--ok)}.mid{background:var(--warn-bg);color:var(--warn)}.high{background:var(--bad-bg);color:var(--bad)}
+.why{margin-top:6px;font-size:.8125rem;color:var(--muted)}.why b{font-weight:600;color:var(--sub)}
+.outcome{font-size:.75rem;font-weight:600;line-height:1.6;padding:0 8px;border-radius:999px;background:var(--chip);color:var(--sub)}.outcome.approved{background:var(--ok-bg);color:var(--ok)}.outcome.back{background:var(--warn-bg);color:var(--warn)}
+.empty{margin:0;padding:28px 16px;text-align:center;color:var(--muted);background:var(--card);border-radius:14px}.empty b{display:block;color:var(--fg);font-size:1.0625rem}
+.closed{padding:calc(env(safe-area-inset-top) + 48px) 24px 48px}.closed h1{font-size:1.4rem;margin-bottom:.5rem}`;
 
 function page(title: string, body: string, head = ""): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)}</title>${head}<style>${PAGE_STYLE}</style></head>
-<body><main>${body}</main></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>${escapeHtml(title)}</title>${head}<style>${PAGE_STYLE}</style></head>
+<body>${body}</body></html>`;
 }
 
 function closedPage(entry: ReviewEntry): string {
   const outcome = entry.outcome ?? "ended";
   const subject = entry.identifier ? `The plan review for ${escapeHtml(entry.identifier)}` : "This plan review";
-  return page("Review closed", `<h1>Review closed — ${escapeHtml(outcome)}</h1><p>${subject} is no longer running. This link opens the agent's next review once it plans again.</p>`);
+  return page("Review closed", `<main class="closed"><h1>Review closed — ${escapeHtml(outcome)}</h1><p>${subject} is no longer running. This link opens the agent's next review once it plans again.</p><p><a href="/">All plan reviews</a></p></main>`);
 }
 
 // "12 min" for a waiting review; with `suffix`, "12 min ago" for a decision.
@@ -122,6 +141,41 @@ function ago(from: string, now: Date, suffix = false): string {
   const hours = Math.floor(minutes / 60);
   const span = minutes < 60 ? `${minutes} min` : hours < 48 ? `${hours} h` : `${Math.floor(hours / 24)} d`;
   return suffix ? `${span} ago` : span;
+}
+
+// Clock times and calendar days as the owner reads them, in one time zone.
+class Dates {
+  readonly clock: Intl.DateTimeFormat;
+  readonly full: Intl.DateTimeFormat;
+  private readonly key: Intl.DateTimeFormat;
+  private readonly day: Intl.DateTimeFormat;
+  private readonly dayWithYear: Intl.DateTimeFormat;
+  private readonly today: number;
+  private readonly year: string;
+
+  constructor(now: Date, timeZone: string | undefined) {
+    this.clock = new Intl.DateTimeFormat("en-GB", { timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+    this.full = new Intl.DateTimeFormat("en-GB", { timeZone, dateStyle: "full", timeStyle: "short" });
+    this.key = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" });
+    this.day = new Intl.DateTimeFormat("en-GB", { timeZone, weekday: "short", day: "numeric", month: "short" });
+    this.dayWithYear = new Intl.DateTimeFormat("en-GB", { timeZone, weekday: "short", day: "numeric", month: "short", year: "numeric" });
+    this.today = this.dayNumber(now);
+    this.year = this.key.format(now).slice(0, 4);
+  }
+
+  // Days since the epoch of the calendar date in the time zone, so "yesterday" holds across DST.
+  private dayNumber(at: Date): number {
+    const [year, month, day] = this.key.format(at).split("-").map(Number);
+    return Date.UTC(year, month - 1, day) / 86_400_000;
+  }
+
+  // "Today", "Yesterday", "Mon 29 Dec", or with the year when it is not this one.
+  dayLabel(at: Date): string {
+    const days = this.today - this.dayNumber(at);
+    if (days === 0) return "Today";
+    if (days === 1) return "Yesterday";
+    return (this.key.format(at).startsWith(this.year) ? this.day : this.dayWithYear).format(at);
+  }
 }
 
 function reviewName(entry: ReviewEntry): string {
@@ -173,10 +227,11 @@ function riskChip(risk: PlanDetails["risk"]): string {
 
 function detailRows(details: PlanDetails | undefined, withSummary: boolean): string {
   if (!details) return "";
-  const reasons = details.reasons?.length ? `<div class="why">Needs you: ${escapeHtml(details.reasons.join("; "))}</div>` : "";
+  const reasons = details.reasons?.length ? `<div class="why"><b>Needs you:</b> ${escapeHtml(details.reasons.join("; "))}</div>` : "";
   const followUps = details.followUps ? `<span class="chip">${details.followUps} follow-up${details.followUps === 1 ? "" : "s"}</span>` : "";
   const newRule = details.newRule ? `<span class="chip mid">new rule</span>` : "";
-  return `${details.title ? `<div class="title">${escapeHtml(details.title)}</div>` : ""}${withSummary && details.summary ? `<div class="summary">${escapeHtml(details.summary)}</div>` : ""}${riskChip(details.risk)}${followUps}${newRule}${withSummary ? reasons : ""}`;
+  const chips = `${riskChip(details.risk)}${followUps}${newRule}`;
+  return `${details.title ? `<div class="title">${escapeHtml(details.title)}</div>` : ""}${withSummary && details.summary ? `<div class="summary">${escapeHtml(details.summary)}</div>` : ""}${chips ? `<div class="chips">${chips}</div>` : ""}${withSummary ? reasons : ""}`;
 }
 
 function outcomeText(entry: ReviewEntry): string {
@@ -186,18 +241,58 @@ function outcomeText(entry: ReviewEntry): string {
 
 const MANIFEST = JSON.stringify({ name: "Plan reviews", short_name: "Reviews", start_url: "/", display: "standalone", background_color: "#f2f2f7", theme_color: "#f2f2f7" });
 
-// The root of :8444: every review waiting for the owner, oldest first, plus the latest decisions.
-// Rows link to the agent's stable /review/<agentId> link, which shows the closed page if the review
-// ends before it is tapped.
-function inboxPage({ open, decided }: { open: ReviewEntry[]; decided: ReviewEntry[] }, now: Date): string {
+const CHEVRON = `<svg class="go" viewBox="0 0 8 14" aria-hidden="true"><path d="M1 1l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+// Swaps in the fresh page every 30 s and whenever the page comes back into view, keeping the
+// scroll position (a meta refresh reloads and jumps to the top); without script, the meta refresh.
+const REFRESH_SCRIPT = `<script>(()=>{let busy=false;async function refresh(){if(busy||document.hidden)return;busy=true;try{const response=await fetch(location.pathname,{cache:"no-store"});if(!response.ok)throw new Error(String(response.status));const next=new DOMParser().parseFromString(await response.text(),"text/html");document.title=next.title;document.body.replaceChildren(...next.body.childNodes)}catch{document.querySelector(".sub")?.classList.add("offline")}finally{busy=false}}setInterval(refresh,${INBOX_REFRESH_S * 1000});document.addEventListener("visibilitychange",refresh);addEventListener("pageshow",(event)=>{if(event.persisted)refresh()})})()</script>`;
+
+// When the owner got the plan: what the inbox shows, sorts and groups waiting reviews by.
+function waitingSince(entry: ReviewEntry): string {
+  return entry.since ?? entry.openedAt;
+}
+
+function waitingRow(entry: ReviewEntry, now: Date, dates: Dates): string {
+  const iso = waitingSince(entry);
+  const opened = new Date(iso);
+  const stale = now.getTime() - opened.getTime() >= STALE_HOURS * 3_600_000;
+  const when = `<span class="when${stale ? " stale" : ""}"><time datetime="${escapeHtml(iso)}" title="Opened ${dates.full.format(opened)}">${dates.clock.format(opened)}</time> · ${ago(iso, now)}</span>`;
+  return `<li><a class="row" href="/review/${encodeURIComponent(entry.agentId)}"><div class="top"><span class="id">${reviewName(entry)}</span>${when}</div>${detailRows(entry.details, true)}${CHEVRON}</a></li>`;
+}
+
+function decidedRow(entry: ReviewEntry, now: Date, dates: Dates): string {
+  const iso = entry.closedAt ?? entry.openedAt;
+  const at = new Date(iso);
+  const day = dates.dayLabel(at);
+  const outcome = outcomeText(entry);
+  const tone = outcome === "approved" ? " approved" : outcome === "sent back" ? " back" : "";
+  const when = `<span class="when"><time datetime="${escapeHtml(iso)}" title="Decided ${dates.full.format(at)}">${day === "Today" ? "" : `${day} `}${dates.clock.format(at)}</time> · ${ago(iso, now, true)}</span>`;
+  return `<li><div class="row"><div class="top"><span class="id">${reviewName(entry)}</span><span class="outcome${tone}">${escapeHtml(outcome)}</span>${when}</div>${detailRows(entry.details, false)}</div></li>`;
+}
+
+// The root of :8444: every review waiting for the owner, newest first and grouped by the day it
+// opened, plus the latest decisions. Rows link to the agent's stable /review/<agentId> link, which
+// shows the closed page if the review ends before it is tapped.
+function inboxPage({ open, decided }: { open: ReviewEntry[]; decided: ReviewEntry[] }, now: Date, timeZone: string | undefined): string {
+  const dates = new Dates(now, timeZone);
+  const days: { label: string; rows: string[] }[] = [];
+  for (const entry of open) {
+    const label = dates.dayLabel(new Date(waitingSince(entry)));
+    const last = days.at(-1);
+    if (last?.label === label) last.rows.push(waitingRow(entry, now, dates));
+    else days.push({ label, rows: [waitingRow(entry, now, dates)] });
+  }
   const waiting = open.length
-    ? `<ul>${open.map((entry) => `<li><a href="/review/${encodeURIComponent(entry.agentId)}"><div class="head"><span class="id">${reviewName(entry)}</span><span class="meta">${ago(entry.openedAt, now)}</span></div>${detailRows(entry.details, true)}</a></li>`).join("")}</ul>`
-    : `<p class="empty">Nothing to review.</p>`;
+    ? `<section><h2>Waiting <span class="n">${open.length}</span><span class="hint">newest first</span></h2>${days.map((day) => `<h3>${escapeHtml(day.label)}</h3><ul class="list">${day.rows.join("")}</ul>`).join("")}</section>`
+    : `<section><h2>Waiting</h2><p class="empty"><b>Nothing to review.</b>New plan reviews show up here on their own.</p></section>`;
   const recent = decided.length
-    ? `<h2>Recently decided</h2><ul>${decided.map((entry) => `<li><div><div class="head"><span class="id">${reviewName(entry)}</span><span class="meta">${escapeHtml(outcomeText(entry))} · ${ago(entry.closedAt ?? entry.openedAt, now, true)}</span></div>${detailRows(entry.details, false)}</div></li>`).join("")}</ul>`
+    ? `<section><h2>Recently decided</h2><ul class="list">${decided.map((entry) => decidedRow(entry, now, dates)).join("")}</ul></section>`
     : "";
-  const head = `<meta http-equiv="refresh" content="${INBOX_REFRESH_S}"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Reviews"><link rel="manifest" href="/manifest.webmanifest">`;
-  return page(open.length ? `Plan reviews (${open.length})` : "Plan reviews", `<h1>Plan reviews</h1>${waiting}${recent}`, head);
+  const oldest = open.at(-1);
+  const status = [open.length ? `${open.length} waiting` : "Nothing waiting", ...(oldest ? [`oldest ${ago(waitingSince(oldest), now)}`] : []), `updated ${dates.clock.format(now)}`].join(" · ");
+  const header = `<header class="bar"><div><h1>Plan reviews</h1><p class="sub">${status}</p></div></header>`;
+  const head = `<noscript><meta http-equiv="refresh" content="${INBOX_REFRESH_S}"></noscript><meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)"><meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Reviews"><link rel="manifest" href="/manifest.webmanifest">${REFRESH_SCRIPT}`;
+  return page(open.length ? `Plan reviews (${open.length})` : "Plan reviews", `${header}<main>${waiting}${recent}</main>`, head);
 }
 
 // One stable tailnet link per agent — https://<host>:8444/review/<agentId> — that redirects to
@@ -225,6 +320,7 @@ export class ReviewLinks {
   private readonly route: (port: number, proxyPort: number) => Promise<void>;
   private readonly proxyPort: number;
   private readonly fetchPlan: (localUrl: string) => Promise<string>;
+  private readonly timeZone: string | undefined;
 
   constructor(options: ReviewLinksOptions = {}) {
     this.port = options.port ?? REVIEW_PORT;
@@ -237,6 +333,7 @@ export class ReviewLinks {
     this.route = options.route ?? routeReview;
     this.proxyPort = options.proxyPort ?? REVIEW_PROXY_PORT;
     this.fetchPlan = options.fetchPlan ?? readReviewPlan;
+    this.timeZone = options.timeZone;
   }
 
   // The port actually listened on (differs from the configured one when that is 0).
@@ -329,11 +426,13 @@ export class ReviewLinks {
   }
 
   // Records a new review and returns the agent's stable link, or null when there is none to give
-  // (the server is not published, or the review itself is not reachable in the tailnet).
-  async opened(agentId: string, event: OpenedEvent, identifier?: string): Promise<string | null> {
+  // (the server is not published, or the review itself is not reachable in the tailnet). `since`
+  // is when the owner first got the plan, for a review served again (a parked plan after a restart
+  // of the central host); without it the review opened now.
+  async opened(agentId: string, event: OpenedEvent, identifier?: string, since?: string): Promise<string | null> {
     await this.starting;
     await this.change((registry) => {
-      registry[event.localUrl] = { agentId, localUrl: event.localUrl, remoteUrl: event.remoteUrl, ...(identifier ? { identifier } : {}), openedAt: this.now().toISOString() };
+      registry[event.localUrl] = { agentId, localUrl: event.localUrl, remoteUrl: event.remoteUrl, ...(identifier ? { identifier } : {}), openedAt: this.now().toISOString(), ...(since ? { since } : {}) };
     });
     this.misses.delete(event.localUrl);
     // Before the link is handed out, so the first tap already gets the compressed page.
@@ -400,7 +499,7 @@ export class ReviewLinks {
     if (path === "/" || path === "/manifest.webmanifest") {
       if (method !== "GET") return { status: 405, headers: { allow: "GET" } };
       if (path === "/manifest.webmanifest") return { status: 200, headers: { "content-type": "application/manifest+json" }, body: MANIFEST };
-      return { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: inboxPage(await this.inbox(), this.now()) };
+      return { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: inboxPage(await this.inbox(), this.now(), this.timeZone) };
     }
     const match = /^\/review\/([^/]+)\/?$/.exec(path);
     const agentId = match ? decodeURIComponent(match[1]) : null;
@@ -420,7 +519,7 @@ export class ReviewLinks {
     const current = Object.values(registry).filter((entry) => AGENT_ID.test(entry.agentId) && latest(registry, entry.agentId) === entry);
     const candidates = current.filter((entry) => !entry.closedAt && !entry.outcome && entry.remoteUrl);
     const alive = await Promise.all(candidates.map((entry) => this.alive(entry.localUrl)));
-    const open = candidates.filter((_, index) => alive[index]).sort((a, b) => a.openedAt.localeCompare(b.openedAt));
+    const open = candidates.filter((_, index) => alive[index]).sort((a, b) => waitingSince(b).localeCompare(waitingSince(a)));
     const missing = open.filter((entry) => !entry.details);
     const plans = await Promise.all(missing.map((entry) => this.fetchPlan(entry.localUrl).catch(() => "")));
     if (plans.some((plan) => plan.trim())) {

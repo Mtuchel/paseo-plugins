@@ -1136,7 +1136,11 @@ are. The route is switched when the review opens, before its link is posted, and
 for reviews still open. If the proxy cannot listen, reviews keep their direct, uncompressed route.
 
 **Review inbox.** `https://<machine>.<tailnet>.ts.net:8444/` lists every review still waiting
-for you, oldest first, with how long it has waited, and the last ten decisions below. A review
+for you, newest first and grouped by day (Today, Yesterday, then the date, in the host's time
+zone), each with the clock time you got it and how long it has waited (amber after 12 hours), and
+the last ten decisions below with their outcome and when they were decided. The header counts the
+waiting reviews and how long the oldest has waited. A parked plan the central host serves again
+after a restart keeps the time it was parked. A review
 is listed while it is the agent's latest, undecided, was published in the tailnet and its server
 still answers; each row opens the agent's stable link. Each waiting row shows the plan's title
 (its `# ` heading without the ticket number), its opening paragraph, the
@@ -1145,8 +1149,9 @@ risk rating (see *Plan risk and auto-approval*) as a coloured badge (green impac
 you. Next to the badge, `2 follow-ups` counts the plan's `follow-up` items (filed as tickets on
 approval) and `new rule` marks a plan that sets one. Decided rows keep the title and the chips, and
 say `auto-approved` when the policy approved it. The details are read once when the review opens
-(plans that predate the rating have no badge). The page refreshes every 30 s. On a phone, use “Add
-to Home Screen” to keep it as an app.
+(plans that predate the rating have no badge). The page refreshes in place every 30 s and when you
+return to it, keeping your scroll position; when the host cannot be reached it says so and keeps
+retrying. On a phone, use “Add to Home Screen” to keep it as an app.
 
 With status write-back on, a ticket moves to its team's started state named **Planning**
 when a plan is handed off (and stays there when it is sent back), and to **In Progress** once

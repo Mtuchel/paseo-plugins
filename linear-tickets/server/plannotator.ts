@@ -531,7 +531,7 @@ export class PlannotatorBridge {
   // the parking and queues a fresh agent. The retired agent's own report is ignored.
   private async deliverParked(event: OpenedEvent | DecidedEvent, parked: ParkedPlan): Promise<void> {
     if (event.type === "opened") {
-      const url = (await this.reviews?.opened(parked.agentId, event, parked.identifier)) ?? event.remoteUrl ?? event.localUrl;
+      const url = (await this.reviews?.opened(parked.agentId, event, parked.identifier, parked.parkedAt)) ?? event.remoteUrl ?? event.localUrl;
       await this.reviews?.described(event.localUrl, parked.plan, { approved: false, reasons: parked.reasons })
         .catch((error: unknown) => console.error(`[linear-tickets] inbox details for ${parked.identifier} skipped: ${error instanceof Error ? error.message : error}`));
       const reviewLink = event.remoteUrl ? url : null;
