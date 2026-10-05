@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -10,6 +10,7 @@ import {
   ENQUEUE_READY,
   enqueueArgs,
   originRepo,
+  inEnqueueClone,
   parseEnqueue,
   parseJudgment,
   parseReady,
@@ -17,6 +18,7 @@ import {
   reconcile,
   refusalKey,
   released,
+  runGit,
   waitQueueArgs,
   type Refusal,
   type ScriptOutput,
@@ -96,8 +98,9 @@ test("refusals: keyed by action and kind, a queue-tip conflict also by its draft
   const refusal = (kind: string, more: Partial<Refusal> = {}): Refusal => ({ key: `${action} ${kind}`, action, kind, draft: null, at: "2026-10-04T09:00:00Z", routedAt: "2026-10-04T09:00:00Z", retryAfter: null, ...more });
   assert.equal(released(refusal("conflict-tip", { draft: 900 }), now, new Set([900]), false), false, "its draft is still open");
   assert.equal(released(refusal("conflict-tip", { draft: 900 }), now, new Set([901]), false), true, "its draft closed");
-  assert.equal(released(refusal("local-differs", { retryAfter: "2026-10-04T10:00:01Z" }), now, new Set(), false), false, "within the hour");
-  assert.equal(released(refusal("local-differs", { retryAfter: "2026-10-04T10:00:00Z" }), now, new Set(), false), true, "an hour later");
+  for (const kind of ["local-differs", "stack-differs"]) assert.equal(released(refusal(kind, { retryAfter: "2026-10-04T11:00:00Z" }), now, new Set(), false), true, "private refs release old shared-ref refusals immediately");
+  assert.equal(released(refusal("unread", { retryAfter: "2026-10-04T10:00:01Z" }), now, new Set(), false), false, "within the hour");
+  assert.equal(released(refusal("unread", { retryAfter: "2026-10-04T10:00:00Z" }), now, new Set(), false), true, "an hour later");
   assert.equal(released(refusal("veto"), now, new Set(), true), false, "still vetoed");
   assert.equal(released(refusal("veto"), now, new Set(), false), true, "the label is gone");
   for (const kind of ["conflict-main", "range-changed", "unclear", "author"]) assert.equal(released(refusal(kind), now, new Set(), false), false, `${kind}: only a new head, a new action`);
@@ -225,4 +228,46 @@ test("originRepo reads owner/repo only from github.com itself, never a lookalike
     "",
   ])
     assert.equal(originRepo(remote), null, remote);
+});
+
+test("private enqueue refs follow the trusted head, leaving divergent worker commits, dirty files and Graphite metadata untouched", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "queue-ref-isolation-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const source = join(home, "source");
+  await runGit(["init", "--quiet", "--initial-branch=main", source]);
+  await runGit(["-C", source, "remote", "add", "origin", "https://github.com/o/r.git"]);
+  await writeFile(join(source, "file"), "trusted\n");
+  await runGit(["-C", source, "add", "file"]);
+  await runGit(["-C", source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "--quiet", "-m", "trusted"]);
+  const trusted = await runGit(["-C", source, "rev-parse", "HEAD"]);
+  await runGit(["-C", source, "switch", "--quiet", "-c", "worker"]);
+  await writeFile(join(source, "file"), "unpushed worker commit\n");
+  await runGit(["-C", source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "--quiet", "-am", "worker"]);
+  const worker = await runGit(["-C", source, "rev-parse", "HEAD"]);
+  await writeFile(join(source, "file"), "dirty worker file\n");
+  await writeFile(join(source, ".git", ".graphite_metadata.db"), "worker parent metadata");
+  const before = await runGit(["-C", source, "status", "--porcelain"]);
+  const checkout = join(home, "trusted");
+  await runGit(["-C", source, "worktree", "add", "--quiet", "--detach", checkout, trusted]);
+  let used = "";
+  const result = await inEnqueueClone(checkout, async (clone) => {
+    used = clone;
+    assert.equal(await runGit(["-C", clone, "rev-parse", "main"]), trusted);
+    assert.equal(await runGit(["-C", clone, "remote", "get-url", "origin"]), "https://github.com/o/r.git");
+    await assert.rejects(runGit(["-C", clone, "show-ref", "--verify", "refs/heads/worker"]));
+    await runGit(["-C", clone, "branch", "worker", trusted]);
+    await writeFile(join(clone, ".git", ".graphite_metadata.db"), "enqueue parent metadata");
+    return out(2, { result: "refused", problems: [{ kind: "conflict-main" }] });
+  });
+  assert.equal(parseEnqueue(result).result, "refused", "a real refusal is not disguised as recovery");
+  await assert.rejects(access(used), "the invocation's clone is removed");
+  assert.equal(await runGit(["-C", source, "rev-parse", "worker"]), worker);
+  assert.equal(await runGit(["-C", source, "status", "--porcelain"]), before);
+  assert.equal(await readFile(join(source, "file"), "utf8"), "dirty worker file\n");
+  assert.equal(await readFile(join(source, ".git", ".graphite_metadata.db"), "utf8"), "worker parent metadata");
+  await assert.rejects(inEnqueueClone(checkout, async (clone) => {
+    used = clone;
+    throw new Error("interrupted enqueue");
+  }), /interrupted enqueue/);
+  await assert.rejects(access(used), "a failed invocation is cleaned up too");
 });
