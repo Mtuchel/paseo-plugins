@@ -524,6 +524,9 @@ test("a draft with no commit or activity for 30 minutes is told to run the Sol r
   const prompt = promptOf(calls) ?? "";
   assert.ok(prompt.startsWith(`[The pull request](${PR}) is still a draft, with no new commit or pull request activity for 30 minutes.\nNext step: `), prompt);
   assert.ok(prompt.endsWith("\n\nThis is nudge 1 of 2 for this step; after that the owner takes over."), prompt);
+  const order = ["- CI is the proof: <killed | timed out | failed twice on unrelated tests> — <evidence>", "none of the ticket's questions to the owner is still unanswered", "node tools/ci/publish.mjs --ci-proof"].map((part) => prompt.indexOf(part));
+  assert.ok(order.every((at, i) => at !== -1 && (i === 0 || at > order[i - 1])), `evidence line, then the owner-question check, then --ci-proof: ${order}`);
+  assert.ok(!prompt.includes("gt submit --publish") && !prompt.includes("gh pr ready"), "publish.mjs is the only publish route");
   assert.equal(calls.at(-1), "say thought The pull request is waiting for the agent to publish the draft; it was asked to.");
   assert.equal(h.github.threadReads, 0, "a draft needs no review threads");
   assert.deepEqual(await h.poll(), [], "claimed for this head");
