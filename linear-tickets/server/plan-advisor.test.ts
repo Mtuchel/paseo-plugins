@@ -197,19 +197,21 @@ test("the record needs readable Reach and Principles sections: one line each at 
   assert.match(await record(), /recorded/);
 });
 
-test("the record needs a readable model tier, and a plan rated above impact 2 or not reversible by a revert cannot pick the cheap one", async () => {
+test("the record needs a readable model tier, and a plan rated above impact 2 or not reversible by a revert cannot pick the cheap or standard one", async () => {
   const h = load();
   const record = () => h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" });
   writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace(MODEL, ""));
   const refused = await record();
   assert.match(refused, /no "## Model" section/);
-  assert.match(refused, /- Tier: <cheap \| strong> — <why>/, "the refusal shows the format");
+  assert.match(refused, /- Tier: <cheap \| standard \| strong> — <why>/, "the refusal shows the format");
   writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("- Tier: cheap — one report column", "- Tier: cheap"));
   assert.match(await record(), /gives no reason after the dash/);
   writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("- Strong steps: none — nothing needs judgment\n", ""));
   assert.match(await record(), /no "- Strong steps:/);
   writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("- Reversibility: revert — nothing written", "- Reversibility: data-fix — rows are written"));
   assert.match(await record(), /"- Tier: cheap" is not allowed for this plan \(data-fix/);
+  writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("- Reversibility: revert — nothing written", "- Reversibility: data-fix — rows are written").replace("- Tier: cheap — one report column", "- Tier: standard — a careful column"));
+  assert.match(await record(), /"- Tier: standard" is not allowed for this plan \(data-fix/);
   writeFileSync(join(h.cwd, "PLAN.md"), PLAN.replace("- Reversibility: revert — nothing written", "- Reversibility: data-fix — rows are written").replace("- Tier: cheap — one report column", "- Tier: strong — rows need a data fix if wrong"));
   assert.match(await record(), /recorded/);
   assert.equal(await h.submit("PLAN.md"), undefined);

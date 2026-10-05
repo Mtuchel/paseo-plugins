@@ -25,7 +25,7 @@ const settings: PluginSettings = {
   projectMappings: { "project:lp-1": { projectId: "p1", label: "App", baseBranch: "refs/heads/dev" } },
   agentLinearAccess: false,
   dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["ENG"], maxRunning: 2 },
-  writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, reviewPeers: [],
+  writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [],
 };
 
 // --- The daemon ---------------------------------------------------------------------------------

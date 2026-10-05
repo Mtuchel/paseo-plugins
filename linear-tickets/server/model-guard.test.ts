@@ -3,8 +3,10 @@ import test from "node:test";
 import { setImmediate } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
 import { drift, ModelGuard } from "./model-guard";
+import { launchTier, type TierRecord, type TierSource } from "./model-tiers";
+import type { Tier } from "../shared/plan-model";
 
-const settings = { launchPreferences: { omp: { model: "omp/anthropic/claude-opus-5-5", modeId: "full", thinkingOptionId: "medium" } }, cheapModels: {} };
+const settings = { launchPreferences: { omp: { model: "omp/anthropic/claude-opus-5-5", modeId: "full", thinkingOptionId: "medium" } }, cheapModels: {}, standardModels: {} };
 const ticketAgent = (runtime: string, thinking = "medium", labels: Record<string, string> = { "linear.issueId": "i1" }) =>
   ({ id: "a1", provider: "omp", model: "anthropic/claude-opus-5-5", thinkingOptionId: "medium", runtimeInfo: { provider: "omp", sessionId: "s", model: runtime, thinkingOptionId: thinking }, labels, archivedAt: null }) as never;
 
@@ -14,7 +16,7 @@ test("a ticket agent drifting from the launch model is detected; others are left
   assert.equal(drift(ticketAgent("anthropic/claude-opus-5-5", "high"), settings)?.thinking, "medium");
   assert.equal(drift(ticketAgent("deepseek/deepseek-v4-flash", "medium", {}), settings), null, "not a ticket agent");
   assert.equal(drift(ticketAgent("deepseek/deepseek-v4-flash", "medium", { "linear.issueId": "i1", "paseo.parent-agent-id": "p" }), settings), null, "subagents follow their parent");
-  assert.equal(drift(ticketAgent("deepseek/deepseek-v4-flash"), { launchPreferences: {}, cheapModels: {} }), null, "no launch model chosen");
+  assert.equal(drift(ticketAgent("deepseek/deepseek-v4-flash"), { launchPreferences: {}, cheapModels: {}, standardModels: {} }), null, "no launch model chosen");
 });
 
 test("the guard restores the model once and announces it in the ticket's panel", async () => {
@@ -37,13 +39,26 @@ test("the guard restores the model once and announces it in the ticket's panel",
   ]);
 });
 
-const tiered = { ...settings, cheapModels: { omp: { model: "omp/deepseek/deepseek-flash", thinkingOptionId: "max" } } };
+const tiered = { ...settings, cheapModels: { omp: { model: "omp/deepseek/deepseek-flash", thinkingOptionId: "max" } }, standardModels: { omp: { model: "omp/openai-codex/gpt-6.1-sol", thinkingOptionId: "high" } } };
 
-test("an agent on the cheap tier runs the provider's cheap model; without one, or on the strong tier, the launch model", () => {
+test("an agent on the cheap or standard tier runs the provider's model for it; without one, or on the strong tier, the launch model", () => {
   assert.deepEqual(drift(ticketAgent("anthropic/claude-opus-5-5"), tiered, "cheap"), { agentId: "a1", from: "anthropic/claude-opus-5-5 · thinking medium", to: "deepseek/deepseek-flash · thinking max", model: "deepseek/deepseek-flash", thinking: "max", tier: "cheap" });
+  assert.deepEqual(drift(ticketAgent("anthropic/claude-opus-5-5"), tiered, "standard"), { agentId: "a1", from: "anthropic/claude-opus-5-5 · thinking medium", to: "openai-codex/gpt-6.1-sol · thinking high", model: "openai-codex/gpt-6.1-sol", thinking: "high", tier: "standard" });
   assert.equal(drift(ticketAgent("deepseek/deepseek-flash", "max"), tiered, "cheap"), null);
   assert.equal(drift(ticketAgent("anthropic/claude-opus-5-5"), settings, "cheap"), null, "no cheap model for this provider");
+  assert.equal(drift(ticketAgent("anthropic/claude-opus-5-5"), settings, "standard"), null, "no standard model for this provider");
   assert.equal(drift(ticketAgent("deepseek/deepseek-flash", "max"), tiered, "strong")?.model, "anthropic/claude-opus-5-5", "an escalated agent goes back to the launch model");
+  assert.equal(drift(ticketAgent("openai-codex/gpt-6.1-sol", "high"), tiered, "strong")?.model, "anthropic/claude-opus-5-5", "an agent escalated from standard goes to the launch model");
+});
+
+test("a launch's tier is the strongest of label, decided record and plan; a recorded start alone decides nothing", () => {
+  const record = (...events: [TierSource, Tier][]): TierRecord => ({ issueId: "i1", identifier: "TUC-1", tier: events.at(-1)![1], agentId: "a1", updatedAt: "", history: events.map(([source, tier]) => ({ source, tier, reason: "", agentId: "a1", model: null, at: "" })) });
+  assert.equal(launchTier([], null, "standard"), "standard");
+  assert.equal(launchTier([{ name: "model:cheap" }], null, "standard"), "standard", "the plan raises a lower label");
+  assert.equal(launchTier([{ name: "Model:Strong" }], null, "cheap"), "strong");
+  assert.equal(launchTier([], record(["plan", "standard"], ["escalated", "strong"], ["start", "strong"]), "standard"), "strong", "an escalation stays");
+  assert.equal(launchTier([], record(["start", "strong"]), null), null, "a start from before plans named a tier is no decision");
+  assert.equal(launchTier([], null, null), null);
 });
 
 test("a tier decided right after a restore is applied at once, not after the quiet window", async () => {

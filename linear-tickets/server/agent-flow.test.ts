@@ -13,7 +13,7 @@ import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./sett
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { approveForLater, splitIntoSubIssues } from "./split";
 import { AWAY_REASON } from "./scheduler";
-import { advisorNote, isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, TicketStarter, QUESTIONS_NOTE, UNTRUSTED_NOTE } from "./starter";
+import { advisorNote, isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, TicketStarter, QUESTIONS_NOTE, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
 import { planPolicy } from "./plan-policy";
 
 const OWNER = "owner-1";
@@ -21,7 +21,7 @@ const APP = "paseo-app";
 const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: "omp", launchPreferences: { omp: { model: "omp/opus", modeId: "full" } },
   projectMappings: { "team:t1": { projectId: "p1", label: "Team", baseBranch: "refs/heads/main" } }, agentLinearAccess: false,
-  dispatch: { ...DEFAULT_DISPATCH, maxRunning: 2 }, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, reviewPeers: [],
+  dispatch: { ...DEFAULT_DISPATCH, maxRunning: 2 }, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [],
 };
 
 const twoPart: AgentPermissionRequest = {
@@ -602,12 +602,12 @@ test("a plan-first ticket is not marked in progress; once its plan is approved (
   const first = starterHarness({ creatorId: "customer", labels: [{ id: "f", name: "feedback" }], blockedBy: [] }, 0);
   await first.starter.start("i1", first.paseo, syncing, { retryHint: "retry" });
   assert.equal(first.launches[0].markInProgress, false);
-  const later = starterHarness({ creatorId: "customer", labels: [{ id: "f", name: "feedback" }, { id: "r", name: "plan-ready" }], blockedBy: [] }, 0);
+  const later = starterHarness({ creatorId: "customer", labels: [{ id: "f", name: "feedback" }, { id: "r", name: "plan-ready" }], blockedBy: [] }, 0, APP, false, "# Plan\n1. Add the table\n\n## Model\n\n- Tier: strong — four layers\n- Strong steps: none — all of it\n");
   const started = await later.starter.start("i1", later.paseo, syncing, { retryHint: "retry" });
   assert.equal(started.plan, null);
   assert.equal(later.launches[0].modeId, "full");
   assert.equal(later.launches[0].markInProgress, true);
-  assert.deepEqual(later.launches[0].labels, { "linear.tier": "strong" }, "a plan without a tier implements on the strong model");
+  assert.deepEqual(later.launches[0].labels, { "linear.tier": "strong" });
   assert.match(later.launches[0].instructions, /untrusted input/);
   assert.doesNotMatch(later.launches[0].instructions, /write a plan only/);
   assert.match(later.launches[0].instructions, /already approved a plan.*https:\/\/linear\.app\/doc\/plan/);
@@ -629,6 +629,31 @@ test("an approved plan on the cheap tier launches on the provider's cheap model;
   const labelled = starterHarness({ creatorId: OWNER, labels: [ready, { id: "s", name: "model:strong" }], blockedBy: [] }, 0, APP, false, cheapPlan);
   await labelled.starter.start("i1", labelled.paseo, tiered, { retryHint: "retry" });
   assert.deepEqual({ provider: labelled.launches[0].provider, labels: labelled.launches[0].labels }, { provider: "omp/opus", labels: { "linear.tier": "strong" } });
+});
+
+const READY = { id: "r", name: "plan-ready" };
+const RISK = (impact: number) => `## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: ${impact} — orders\n- Reversibility: revert — none\n- Feature flag: no\n- Migration: no\n- Auth: no\n- New rule: no — none\n- Failure mode: a wrong column\n- Advisor rating: impact ${impact}, reversibility revert\n- Recommendation: auto — none\n`;
+
+test("an approved standard plan launches on the provider's standard model; a risk rating that requires strong launches on the launch model", async () => {
+  const standardPlan = (impact: number) => `# Plan\n1. Add the column\n\n## Model\n\n- Tier: standard — a column with a filter\n- Strong steps: none — routine\n\n${RISK(impact)}`;
+  const tiered = { ...settings, standardModels: { omp: { model: "omp/openai-codex/gpt-6.1-sol", thinkingOptionId: "high" } } };
+  const standard = starterHarness({ creatorId: OWNER, labels: [READY], blockedBy: [] }, 0, APP, false, standardPlan(2));
+  await standard.starter.start("i1", standard.paseo, tiered, { retryHint: "retry" });
+  assert.deepEqual({ provider: standard.launches[0].provider, thinking: standard.launches[0].thinkingOptionId, labels: standard.launches[0].labels }, { provider: "omp/openai-codex/gpt-6.1-sol", thinking: "high", labels: { "linear.tier": "standard" } });
+  assert.match(standard.launches[0].instructions, /standard model tier.*escalate_model/s);
+  const risky = starterHarness({ creatorId: OWNER, labels: [READY], blockedBy: [] }, 0, APP, false, standardPlan(3));
+  await risky.starter.start("i1", risky.paseo, tiered, { retryHint: "retry" });
+  assert.deepEqual({ provider: risky.launches[0].provider, labels: risky.launches[0].labels }, { provider: "omp/opus", labels: { "linear.tier": "strong" } }, "impact 3 always implements on the strong tier");
+});
+
+test("an approved plan that names no tier goes back to planning for its model section instead of implementing on a default tier", async () => {
+  const h = starterHarness({ creatorId: OWNER, labels: [READY], blockedBy: [] }, 0);
+  const started = await h.starter.start("i1", h.paseo, { ...settings, markInProgress: true }, { retryHint: "retry" });
+  assert.equal(started.plan, "required");
+  assert.deepEqual({ provider: h.launches[0].provider, labels: h.launches[0].labels, env: h.launches[0].env, markInProgress: h.launches[0].markInProgress }, { provider: "omp/opus", labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
+  assert.ok(h.launches[0].instructions.startsWith(tierMissingNote("TUC-1", { url: "https://linear.app/doc/plan", content: "# Plan\n1. Add the table" })));
+  assert.ok(h.launches[0].instructions.includes(MODEL_NOTE));
+  assert.ok(!h.launches[0].instructions.includes(OVERLAP_NOTE), "the approved plan already looked for overlaps");
 });
 
 test("approve, implement later: plan recorded, planner retired, ticket back in Todo with plan-ready", async () => {

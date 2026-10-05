@@ -8,10 +8,12 @@ import { type AutoApprovePolicy, DEFAULT_AUTO_APPROVE, MAX_IMPACT } from "../sha
 export const MAX_TEMPLATE_LENGTH = 8_000;
 
 export type LaunchPreference = { model: string; modeId?: string; thinkingOptionId?: string };
-// The cheap model tier's model per provider (README, "Model tiers"); a provider without one
-// implements every plan on its launch model.
-export type CheapModel = { model: string; thinkingOptionId?: string };
-export const DEFAULT_CHEAP_MODELS: Record<string, CheapModel> = { omp: { model: "omp/deepseek/deepseek-flash", thinkingOptionId: "max" } };
+// A lower model tier's model per provider (README, "Model tiers"); a provider without one
+// implements plans of that tier on its launch model.
+export type TierModel = { model: string; thinkingOptionId?: string };
+export const DEFAULT_CHEAP_MODELS: Record<string, TierModel> = { omp: { model: "omp/deepseek/deepseek-flash", thinkingOptionId: "max" } };
+// GPT-6.1 Sol runs on the OpenAI account, apart from the launch model's Claude account.
+export const DEFAULT_STANDARD_MODELS: Record<string, TierModel> = { omp: { model: "omp/openai-codex/gpt-6.1-sol", thinkingOptionId: "high" } };
 // Auto-dispatch starts an agent for every open ticket carrying `label` in one of `teamKeys`,
 // whoever it is assigned to. No teams means nothing is dispatched, even when enabled.
 // `maxRunning`: at most this many ticket agents work at once (0 = no limit); others wait their turn.
@@ -37,8 +39,9 @@ export type PluginSettings = {
   writeback: WritebackSettings;
   // Plans rated at or below the threshold are approved without the owner (README, "Plan risk and auto-approval").
   autoApprove: AutoApprovePolicy;
-  // The cheap tier's model per provider; `{}` turns the cheap tier off.
-  cheapModels: Record<string, CheapModel>;
+  // The cheap and standard tiers' models per provider; `{}` turns that tier's own model off.
+  cheapModels: Record<string, TierModel>;
+  standardModels: Record<string, TierModel>;
   // Other hosts' review inboxes (https://<host>.<tailnet>.ts.net:8444) this host's inbox also lists.
   reviewPeers: string[];
 };
@@ -54,7 +57,8 @@ type SettingsFile = {
   dispatch?: Partial<DispatchSettings>;
   writeback?: Partial<WritebackSettings>;
   autoApprove?: Partial<AutoApprovePolicy>;
-  cheapModels?: Record<string, CheapModel>;
+  cheapModels?: Record<string, TierModel>;
+  standardModels?: Record<string, TierModel>;
   reviewPeers?: string[];
 };
 
@@ -76,8 +80,8 @@ function normalizeLaunchPreferences(value: unknown): Record<string, LaunchPrefer
 }
 
 // A missing setting means the defaults; a saved one (even `{}`) replaces them.
-function normalizeCheapModels(value: unknown): Record<string, CheapModel> {
-  if (value === undefined) return DEFAULT_CHEAP_MODELS;
+function normalizeTierModels(value: unknown, defaults: Record<string, TierModel>): Record<string, TierModel> {
+  if (value === undefined) return defaults;
   return Object.fromEntries(Object.entries(normalizeLaunchPreferences(value)).map(([provider, { model, thinkingOptionId }]) => [provider, { model, ...(thinkingOptionId ? { thinkingOptionId } : {}) }]));
 }
 
@@ -177,6 +181,9 @@ export type SettingsPatch = {
   dispatch?: Partial<DispatchSettings>;
   writeback?: Partial<WritebackSettings>;
   autoApprove?: Partial<AutoApprovePolicy>;
+  // Sets one provider's model for the cheap or standard tier; `model: null` removes it (that
+  // tier then implements on the provider's launch model).
+  tierModel?: { tier: "cheap" | "standard"; provider: string; model: string | null; thinkingOptionId?: string };
 };
 
 // Returns null for an empty template (meaning: use the built-in default).
@@ -230,7 +237,8 @@ export class Settings {
       dispatch: normalizeDispatch(value.dispatch),
       writeback: normalizeWriteback(value.writeback),
       autoApprove: normalizeAutoApprove(value.autoApprove),
-      cheapModels: normalizeCheapModels(value.cheapModels),
+      cheapModels: normalizeTierModels(value.cheapModels, DEFAULT_CHEAP_MODELS),
+      standardModels: normalizeTierModels(value.standardModels, DEFAULT_STANDARD_MODELS),
       reviewPeers: normalizeReviewPeers(value.reviewPeers),
     };
   }
@@ -266,6 +274,14 @@ export class Settings {
       next.lastProvider = provider;
       next.launchPreferences = { ...current.launchPreferences, [provider]: { model, ...(modeId ? { modeId } : {}), ...(thinkingOptionId ? { thinkingOptionId } : {}) } };
     }
+    if (patch.tierModel) {
+      const { tier, provider, model, thinkingOptionId } = patch.tierModel;
+      const key = tier === "cheap" ? "cheapModels" : "standardModels";
+      const models = { ...current[key] };
+      if (model) models[provider] = { model, ...(thinkingOptionId ? { thinkingOptionId } : {}) };
+      else delete models[provider];
+      next[key] = normalizeTierModels(models, {});
+    }
     if (patch.projectMapping || patch.forgetProjectMapping) {
       const mappings = { ...current.projectMappings };
       if (patch.forgetProjectMapping) delete mappings[patch.forgetProjectMapping];
@@ -287,7 +303,8 @@ export class Settings {
     const customWriteback = JSON.stringify(value.writeback) !== JSON.stringify(DEFAULT_WRITEBACK);
     const customAutoApprove = JSON.stringify(value.autoApprove) !== JSON.stringify(DEFAULT_AUTO_APPROVE);
     const customCheapModels = JSON.stringify(value.cheapModels) !== JSON.stringify(DEFAULT_CHEAP_MODELS);
-    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customAutoApprove && !customCheapModels && !value.reviewPeers.length) {
+    const customStandardModels = JSON.stringify(value.standardModels) !== JSON.stringify(DEFAULT_STANDARD_MODELS);
+    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length) {
       await rm(this.path, { force: true });
       return value;
     }
@@ -306,6 +323,7 @@ export class Settings {
     if (customWriteback) fileValue.writeback = value.writeback;
     if (customAutoApprove) fileValue.autoApprove = value.autoApprove;
     if (customCheapModels) fileValue.cheapModels = value.cheapModels;
+    if (customStandardModels) fileValue.standardModels = value.standardModels;
     if (value.reviewPeers.length) fileValue.reviewPeers = value.reviewPeers;
     const temporary = `${this.path}.${randomUUID()}.tmp`;
     try {

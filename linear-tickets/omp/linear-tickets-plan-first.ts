@@ -6,8 +6,9 @@
 // - LINEAR_TICKETS_PLAN=required (set by the plugin for every ticket agent without an approved
 //   plan): a fresh session starts in Plannotator's planning phase. There is no way to skip it.
 // - <PASEO_HOME>/linear-tickets/plan-requests/<agent id> (written by the plugin when the owner adds
-//   the `plan` label while the agent works): the agent enters planning at its next tool call, which
-//   is blocked and followed by a message with the reason, or at its next prompt.
+//   the `plan` label while the agent works, or when an approved plan names no model tier): the
+//   agent enters planning at its next tool call, which is blocked and followed by a message with
+//   the reason (the file's `message`, else the owner's request), or at its next prompt.
 // - LINEAR_TICKETS_ISSUE=<ticket> (set by the plugin for every ticket agent): plan advisor
 //   (README, "Plan advisor"). Submitting a plan (`plannotator_submit_plan`, its xd:// device, or
 //   omp's `xd://propose`) is blocked until `record_plan_advice` recorded a GPT-6 Astra review for
@@ -26,8 +27,8 @@
 //   auto-approval"). The record also needs the plan's `## Model` section (shared/plan-model.ts):
 //   the tier its implementation runs on.
 // - LINEAR_TICKETS_ISSUE=<ticket>: `escalate_model` (README, "Model tiers") lets a ticket agent on
-//   the cheap tier ask for the strong model; it drops an `escalated` event and the plugin switches
-//   the agent's model. Subagents cannot call it.
+//   the cheap or standard tier ask for the strong model; it drops an `escalated` event and the
+//   plugin switches the agent's model. Subagents cannot call it.
 // - LINEAR_TICKETS_ISSUE=<ticket>: Linear writes (README, "Agent access to Linear"). The user-level
 //   Linear MCP server acts as the owner, so ticket agents and their subagents may call only its read
 //   tools, named below; every other tool of that server is blocked, whether called directly
@@ -345,22 +346,28 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     });
   }
 
-  // The owner's request: planning from wherever the agent is (an approved plan being executed
-  // included). The request file goes only once the agent is planning, so a failure retries.
-  async function takeOwnerRequest(): Promise<"entered" | "planning" | null> {
+  // The owner's (or the plugin's) request: planning from wherever the agent is (an approved plan
+  // being executed included). The request file goes only once the agent is planning, so a failure
+  // retries. `message`: why, from the file; the owner's request when it has none.
+  async function takeOwnerRequest(): Promise<{ entered: boolean; message: string } | null> {
     if (unanswered || !existsSync(request)) return null;
+    let message = OWNER_ASKED;
+    try {
+      const saved: unknown = JSON.parse(readFileSync(request, "utf8"));
+      if (saved && typeof saved === "object" && "message" in saved && typeof saved.message === "string" && saved.message.trim()) message = saved.message;
+    } catch { /* an unreadable request is still the owner's */ }
     let phase = await planMode("status");
     if (phase === null) { unanswered = true; return null; }
     if (phase === "planning") {
       rmSync(request, { force: true });
-      return "planning";
+      return { entered: false, message };
     }
     if (phase === "executing") phase = await planMode("exit");
     if (phase === "idle") phase = await planMode("enter");
     if (phase !== "planning") return null;
     rmSync(request, { force: true });
-    pi.appendEntry(MARKER, { reason: "owner", at: new Date().toISOString() });
-    return "entered";
+    pi.appendEntry(MARKER, { reason: message === OWNER_ASKED ? "owner" : "plugin", at: new Date().toISOString() });
+    return { entered: true, message };
   }
 
   // Advice is rebuilt from the active branch only: another branch's or session's must not carry over.
@@ -397,9 +404,10 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
   // A tool result reads like data, so the owner's request arrives as a harness message at the next
   // step; the blocked call only points to it.
   pi.on("tool_call", async (event, ctx) => {
-    if (await takeOwnerRequest() === "entered") {
-      pi.sendMessage({ customType: MARKER, content: OWNER_ASKED, display: true }, { deliverAs: "aside" });
-      return { block: true, reason: "Stopped by the linear-tickets plugin: the owner asked for a plan before further changes (see its message)." };
+    const asked = await takeOwnerRequest();
+    if (asked?.entered) {
+      pi.sendMessage({ customType: MARKER, content: asked.message, display: true }, { deliverAs: "aside" });
+      return { block: true, reason: `Stopped by the linear-tickets plugin: ${asked.message === OWNER_ASKED ? "the owner asked for a plan before further changes" : "back to planning"} (see its message).` };
     }
     if (!TICKET) return undefined;
     const input = event.input;
@@ -471,13 +479,13 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
   if (TICKET) pi.registerTool({
     name: ESCALATE_TOOL,
     label: "Escalate Model",
-    description: "Ask the plugin to move this ticket to the strong model tier when you run on the cheap tier and the work needs more: the same check still fails after two honest fix attempts, the change turns out to need judgment the plan did not settle (several layers, an interface others build on, call sites that must agree, a check-then-write gap, many files), or a review found a design problem. The plugin switches your model within seconds and records the reason on the ticket; carry on with the work afterwards. Not for routine failures you can fix.",
+    description: "Ask the plugin to move this ticket to the strong model tier when you run on the cheap or standard tier and the work needs more: the same check still fails after two honest fix attempts, the change turns out to need judgment the plan did not settle (several layers, an interface others build on, call sites that must agree, a check-then-write gap, many files), or a review found a design problem. The plugin switches your model within seconds and records the reason on the ticket; carry on with the work afterwards. Not for routine failures you can fix.",
     parameters: pi.zod.object({ reason: pi.zod.string() }),
     loadMode: "essential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
       if (ctx?.agent?.kind === "sub") return text("Only the ticket agent itself can escalate; report back to it instead.");
       const reason = params.reason?.trim();
-      if (!reason) return text("Give the reason the cheap model is not enough.");
+      if (!reason) return text("Give the reason your model is not enough.");
       dropEvent({ type: "escalated", reason: reason.slice(0, 1_000) });
       return text("Escalation requested: the plugin switches you to the strong model within seconds and records the reason on the ticket. Carry on with the work.");
     },
