@@ -13,6 +13,7 @@ import { SessionRouter, SessionStore, type SessionLink, type Succession } from "
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { ResumeUnavailableError, TicketStarter, type Started } from "./starter";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
+import { ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 
 const OWNER = "owner-1";
 const APP = "paseo-app";
@@ -40,7 +41,7 @@ type FakeAgent = {
   pendingPermissions?: { id: string; kind: string }[];
   lastError?: string | null;
   archivedAt?: string | null;
-};
+} & Pick<ProcessAgent, "provider" | "runtimeInfo" | "persistence">;
 
 type StartOptions = { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string };
 
@@ -187,6 +188,7 @@ function routerHarness(options: {
   statusType?: string;
   gates?: Launcher;
   daemon?: Daemon;
+  processInspector?: ProcessInspector;
 } = {}) {
   const calls: string[] = [];
   const daemon = options.daemon ?? fakeDaemon(options.agents ?? [], { pageSize: options.pageSize });
@@ -232,6 +234,7 @@ function routerHarness(options: {
     settings: { read: async () => settings },
     store,
     stop: async (agentId: string) => { calls.push(`stop ${agentId}`); },
+    ...(options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector) } : {}),
   });
   // Connected without attach(): the startup sweep would run alongside the test.
   Object.assign(router, { paseo: daemon.paseo });
@@ -738,4 +741,126 @@ test("every gated start path gives the ticket's gate back", async (t) => {
   assertGateFree(failing.gates);
   await failing.cleanup();
   await h.cleanup();
+});
+
+// Closed/archive is a daemon lifecycle state, not proof that the writable owner exited.
+const NATIVE_HANDLE = "/home/mirko/.omp/agent/sessions/worktree/2026-10-05T11-05-57-212Z_01a10bbd-e6dc-7761-93d1-081ca47d9501.jsonl";
+const ompRoot = (id: string, change: Partial<FakeAgent> = {}) => ticketAgent(id, "2026-01-01T00:00:00Z", {
+  provider: "omp", status: "closed",
+  runtimeInfo: { provider: "omp", sessionId: "01a10bbd-e6dc-7761-93d1-081ca47d9501" },
+  persistence: { provider: "omp", sessionId: "01a10bbd-e6dc-7761-93d1-081ca47d9501", nativeHandle: NATIVE_HANDLE },
+  ...change,
+});
+
+function processInspection(output: string, cwd = "/repo/wt"): ProcessInspector {
+  return { processes: async () => output, cwd: async () => cwd, canonicalPath: async (path) => path };
+}
+
+test("a closed or archived root with an exact live process prevents successor dispatch, send and launch", async () => {
+  for (const change of [{}, { archivedAt: "now" }]) {
+    const h = routerHarness({ agents: [ompRoot("agent-gone", change)], processInspector: processInspection(`2100185 omp --mode rpc-ui --session ${NATIVE_HANDLE}\n`) });
+    try {
+      assert.equal((await succeed(h)).kind, "wait");
+      assert.deepEqual(h.calls, [], "the dispatch claim stays pending");
+      assert.deepEqual(h.starts, []);
+      assert.deepEqual(h.daemon.sent, []);
+      assert.deepEqual(h.daemon.archived, []);
+      assertGateFree(h.gates);
+    } finally { await h.cleanup(); }
+  }
+});
+
+test("an archived older root blocks a hand-off to a live successor, including across pages", async () => {
+  const h = routerHarness({
+    agents: [ticketAgent("agent-live", "2026-01-02T00:00:00Z"), ompRoot("older-root", { archivedAt: "now" })],
+    pageSize: 1, processInspector: processInspection(`2100185 omp --mode rpc-ui --session ${NATIVE_HANDLE}\n`),
+  });
+  try {
+    assert.equal((await succeed(h)).kind, "wait");
+    assert.deepEqual(h.calls, [], "no hand-off can authorize another writable owner");
+    assert.deepEqual(h.daemon.sent, []);
+    assertGateFree(h.gates);
+  } finally { await h.cleanup(); }
+});
+
+test("confirmed absence permits ordinary successor recovery with claim-before-start ordering", async () => {
+  for (const output of ["", `2100185 omp --mode rpc-ui --session ${NATIVE_HANDLE}.different\n`]) {
+    const h = routerHarness({ agents: [ompRoot("agent-gone")], processInspector: processInspection(output) });
+    try {
+      assert.equal((await succeed(h)).kind, "started");
+      assert.deepEqual(h.calls.slice(0, 3), ["claim", "+paseo-running", "start"]);
+      assert.equal(h.starts[0].options.resumeOnly, true);
+      assertGateFree(h.gates);
+    } finally { await h.cleanup(); }
+  }
+});
+
+test("process inspection failure leaves successor dispatch pending", async () => {
+  const inspect = processInspection("");
+  inspect.processes = async () => { throw new Error("ps failed"); };
+  const h = routerHarness({ agents: [ompRoot("agent-gone")], processInspector: inspect });
+  try {
+    assert.equal((await succeed(h)).kind, "wait");
+    assert.deepEqual(h.calls, []);
+    assert.deepEqual(h.starts, []);
+    assertGateFree(h.gates);
+  } finally { await h.cleanup(); }
+});
+
+test("native auto-resume and planner restart wait for terminal processes without consuming a retry", async () => {
+  let output = "2100185 omp --mode rpc-ui\n";
+  const inspect = processInspection("");
+  inspect.processes = async () => output;
+  const h = routerHarness({ agents: [ompRoot("agent-old", { archivedAt: "now" })], processInspector: inspect });
+  try {
+    await h.store.put(thread({ agentId: "agent-old" }));
+    assert.equal(await h.router.resumeNow("s1"), false);
+    await assert.rejects(h.router.restartFor(ISSUE.id, ISSUE.identifier), /OMP worker.*still alive/);
+    assert.deepEqual(h.starts, []);
+    assert.deepEqual(h.calls, []);
+    assert.deepEqual(h.daemon.archived, []);
+    assertGateFree(h.gates);
+    output = "";
+    assert.equal(await h.router.resumeNow("s1"), true, "a process wait did not use the hourly resume");
+    assert.equal(h.starts.length, 1);
+    assertGateFree(h.gates);
+  } finally { await h.cleanup(); }
+});
+
+test("a queued comment cannot lazily resurrect a closed live-process owner", async () => {
+  let output = `2100185 omp --mode rpc-ui --session ${NATIVE_HANDLE}\n`;
+  const inspect = processInspection("");
+  inspect.processes = async () => output;
+  const h = routerHarness({ agents: [ompRoot("agent-old")], processInspector: inspect });
+  try {
+    await h.store.put(thread({ queued: true, pendingText: "rebase it please" }));
+    await h.router.startQueued();
+    assert.deepEqual(h.daemon.sent, []);
+    assert.deepEqual(h.starts, []);
+    assert.equal((await h.store.get("s1"))?.pendingText, "rebase it please");
+    assert.equal((await h.store.get("s1"))?.queued, true);
+    assertGateFree(h.gates);
+    output = "";
+    await h.router.startQueued();
+    assert.deepEqual(h.daemon.sent, ["agent-old: rebase it please"]);
+  } finally { await h.cleanup(); }
+});
+
+test("the process inspection and dispatch claim both execute under the ticket start gate", async () => {
+  const inspect = processInspection("");
+  const h = routerHarness({ agents: [ompRoot("agent-gone")], processInspector: inspect });
+  inspect.processes = async () => {
+    assert.equal(h.gates.gate(ISSUE.id), null, "inspection cannot race another automatic start");
+    h.calls.push("inspect");
+    return "";
+  };
+  try {
+    const outcome = await h.router.succeed(ISSUE.id, ISSUE.identifier, "agent-gone", "fix it", async () => {
+      assert.equal(h.gates.gate(ISSUE.id), null);
+      h.calls.push("claim");
+    });
+    assert.equal(outcome.kind, "started");
+    assert.deepEqual(h.calls.slice(0, 4), ["inspect", "claim", "+paseo-running", "start"]);
+    assertGateFree(h.gates);
+  } finally { await h.cleanup(); }
 });

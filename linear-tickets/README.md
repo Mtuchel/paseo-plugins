@@ -1158,6 +1158,15 @@ comment mentioning you. The same happens for a pull request labelled `do-not-mer
 start (the plugin stops in that second) loses the message: the log names the claim, and it is not
 repeated.
 
+**Native process ownership.** `CLOSED`, archive and a closed-process error do not prove an OMP
+worker exited. Native thread starts, automatic resumes, planner restarts, successor dispatch
+and recovery prompts check all same-ticket root snapshots, including archived ones, while
+holding the start gate. Exact native session identities are compared with the local process
+listing; sessionless or ambiguous RPC workers also require an exact worktree-cwd check
+(`/proc` on Linux, `lsof` on macOS). A live or unobservable terminal worker leaves recovery
+pending, before any dispatch claim, send, reload or launch. The check never kills a process,
+removes a worktree or changes a branch.
+
 **Waiting for your answer.** An agent waiting for your answer or approval takes no message, so
 the pull request waits with it. When a nudge, fix request or replacement request has waited 60
 minutes for such an agent, you get one comment, "The agent has waited over 60 minutes for your
@@ -1172,7 +1181,8 @@ and checks for a live agent first, so two of them never start two agents for one
 finds the gate taken waits: the label stays for the next poll, a thread is queued with its comment
 and joins the agent once it runs, a project restart is retried on the next read, the automatic
 resume leaves you the "Resume with a new agent" offer, a successor waits for the next poll.
-Starting an agent from the sidebar or by answering "Resume" takes no gate.
+Sidebar starts retain their existing user-controlled launch behavior. Answering "Resume" now
+also takes the ticket gate and checks native process ownership before starting another agent.
 
 *Rollback.* Reverting the change stops new successors; agents already started keep running until
 archived (`paseo ls`, label `linear.issueId`), and the messages they got count as sent. Switching

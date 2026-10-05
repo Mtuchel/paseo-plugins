@@ -16,6 +16,7 @@ import { NeedsYouIssues } from "./needs-you";
 import { planSteps, SessionRouter, SessionStore, type SessionLink } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
+import { ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 
 const OWNER = "owner-1";
 const settings: PluginSettings = {
@@ -183,7 +184,7 @@ test("plan checklists come from checkboxes, or numbered steps under a Steps head
 type Call = string;
 // `reload`: the daemon's agent reload (null: the plugin has no daemon connection); `send`: runs
 // before each send is recorded.
-function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void> } = {}) {
+function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -195,7 +196,12 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
   };
   const paseo = {
     agents: {
-      list: async () => ({ entries: options.activeAgent ? [{ agent: { ...options.activeAgent, labels: {} } }] : [] }),
+      list: async (input?: { filter?: { includeArchived?: boolean } }) => ({
+        entries: options.agents
+          ? options.agents.filter((agent) => input?.filter?.includeArchived || !agent.archivedAt).map((agent) => ({ agent }))
+          : options.activeAgent ? [{ agent: { ...options.activeAgent, labels: {} } }] : [],
+        pageInfo: { hasMore: false, nextCursor: null },
+      }),
       ref: (id: string) => ({
         refresh: options.snapshot ?? (async () => ({ agent: { pendingPermissions: options.pending ?? [] } })),
         send: async (text: string) => { await options.send?.(); calls.push(`send ${id}: ${text}`); },
@@ -226,6 +232,7 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     decideReview: async (url, approve, feedback) => { calls.push(`review ${url} ${approve ? "approve" : `deny:${feedback}`}`); },
     ...("reload" in options ? { reloader: async () => options.reload ? async (agentId: string) => { calls.push(`reload ${agentId}`); await options.reload!(agentId); } : null } : {}),
+    ...(options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector) } : {}),
   });
   // Group tests drive the sweep themselves: the startup sweep would advance the group alongside them.
   if (options.groups) Object.assign(router, { paseo });
@@ -622,4 +629,77 @@ test("two recoveries of one ticket take turns: the second judges the agent again
     assert.deepEqual(h.calls.filter((call) => !call.startsWith("send agent-1: Your previous run")), ["before OMP RPC process is closed", "reload agent-1", ...calls]);
     await h.cleanup();
   }
+});
+
+const OMP_HANDLE = "/home/mirko/.omp/agent/sessions/worktree/2026-10-05T11-05-57-212Z_01a10bbd-e6dc-7761-93d1-081ca47d9501.jsonl";
+const OMP_CLOSED: ProcessAgent = {
+  id: "agent-1", provider: "omp", status: "closed", cwd: "/repo/wt", labels: { "linear.issueId": "i1" },
+  runtimeInfo: { provider: "omp", sessionId: "01a10bbd-e6dc-7761-93d1-081ca47d9501" },
+  persistence: { provider: "omp", sessionId: "01a10bbd-e6dc-7761-93d1-081ca47d9501", nativeHandle: OMP_HANDLE },
+};
+
+function inspectProcess(output: string): ProcessInspector {
+  return { processes: async () => output, cwd: async () => "/repo/wt", canonicalPath: async (path) => path };
+}
+
+test("an exact live OMP process behind CLOSED or archive is never automatically sent or reloaded", async () => {
+  for (const agent of [OMP_CLOSED, { ...OMP_CLOSED, archivedAt: "now" }, { ...OMP_CLOSED, ...CRASHED }]) {
+    const h = harness({
+      snapshot: async () => ({ agent }), reload: async () => {},
+      processInspector: inspectProcess(`2100185 omp --mode rpc-ui --session ${OMP_HANDLE}\n`),
+    });
+    try {
+      const outcome = await h.router.prompt("agent-1", "fix it", async () => { h.calls.push("dispatch"); }, { issueId: "i1", before: async () => { h.calls.push("before"); } });
+      assert.equal(outcome, agent.archivedAt ? "gone" : "busy");
+      assert.deepEqual(h.calls, [], "no claim, send or reload");
+    } finally { await h.cleanup(); }
+  }
+});
+
+test("a sessionless same-worktree process prevents lazy CLOSED resurrection; absence releases it", async () => {
+  let output = "2100185 omp --mode rpc-ui\n";
+  const inspect = inspectProcess("");
+  inspect.processes = async () => output;
+  const h = harness({ snapshot: async () => ({ agent: OMP_CLOSED }), processInspector: inspect });
+  try {
+    assert.equal(await h.router.prompt("agent-1", "fix it", async () => { h.calls.push("dispatch"); }), "busy");
+    assert.deepEqual(h.calls, []);
+    output = "";
+    assert.equal(await h.router.prompt("agent-1", "fix it", async () => { h.calls.push("dispatch"); }), "sent");
+    assert.deepEqual(h.calls, ["dispatch", "send agent-1: fix it"]);
+  } finally { await h.cleanup(); }
+});
+
+test("failed inspection leaves a crashed OMP recovery unclaimed; confirmed absence allows reload", async () => {
+  const inspect = inspectProcess("");
+  inspect.processes = async () => { throw new Error("ps failed"); };
+  const h = crashed(RESTARTED, { snapshot: async () => ({ agent: { ...OMP_CLOSED, ...CRASHED } }), processInspector: inspect });
+  try {
+    assert.equal(await h.router.prompt("agent-1", "fix it", undefined, h.recovery), "busy");
+    assert.deepEqual(h.calls, []);
+  } finally { await h.cleanup(); }
+
+  const absent = crashed(RESTARTED, { processInspector: inspectProcess("") });
+  absent.state.agent = { ...OMP_CLOSED, ...CRASHED };
+  try {
+    assert.equal(await absent.router.prompt("agent-1", "fix it", undefined, absent.recovery), "restarted");
+    assert.deepEqual(absent.calls.slice(0, 2), ["before OMP RPC process is closed", "reload agent-1"]);
+    assert.match(absent.calls[2], /send agent-1: Your previous run crashed/);
+  } finally { await absent.cleanup(); }
+});
+
+test("a normal idle OMP target stays usable but an archived live-process sibling blocks dispatch", async () => {
+  const agent = { ...OMP_CLOSED, status: "idle" as const };
+  const inspect = inspectProcess(`2100185 omp --mode rpc-ui --session ${OMP_HANDLE}\n`);
+  const idle = harness({ snapshot: async () => ({ agent }), agents: [agent], processInspector: inspect });
+  try {
+    assert.equal(await idle.router.prompt("agent-1", "fix it", async () => { idle.calls.push("dispatch"); }), "sent");
+    assert.deepEqual(idle.calls, ["dispatch", "send agent-1: fix it"]);
+  } finally { await idle.cleanup(); }
+
+  const sibling = harness({ snapshot: async () => ({ agent }), agents: [agent, { ...OMP_CLOSED, id: "archived-root", archivedAt: "now" }], processInspector: inspect });
+  try {
+    assert.equal(await sibling.router.prompt("agent-1", "fix it", async () => { sibling.calls.push("dispatch"); }), "busy");
+    assert.deepEqual(sibling.calls, []);
+  } finally { await sibling.cleanup(); }
 });

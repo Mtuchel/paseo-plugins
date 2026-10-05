@@ -1,0 +1,135 @@
+import { execFile } from "node:child_process";
+import { readlink, realpath } from "node:fs/promises";
+import { basename, isAbsolute } from "node:path";
+import { promisify } from "node:util";
+import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
+
+const exec = promisify(execFile);
+const MAX_PAGES = 100;
+const MAX_PROCESSES = 256;
+const CLOSED_PROCESS = /\bprocess (exited|is closed)\b/i;
+
+export type ProcessAgent = Partial<Pick<PaseoAgent, "id" | "provider" | "cwd" | "status" | "lastError" | "archivedAt" | "labels" | "runtimeInfo" | "persistence">>;
+export type ProcessLiveness = "absent" | "alive" | "unknown";
+
+// No daemon status, JSONL timestamp or missing open file can prove a provider process exited.
+// Throws mean unobservable, including a process that disappeared during inspection: retry later.
+export type ProcessInspector = {
+  processes: () => Promise<string>;
+  cwd: (pid: number) => Promise<string>;
+  canonicalPath: (path: string) => Promise<string>;
+};
+
+const inspector: ProcessInspector = {
+  processes: async () => (await exec("ps", ["-ww", "-eo", "pid=,args="], { timeout: 5_000, maxBuffer: 8 * 1024 * 1024 })).stdout,
+  cwd: async (pid) => {
+    if (process.platform === "linux") return (await readlink(`/proc/${pid}/cwd`)).replace(/ \(deleted\)$/, "");
+    if (process.platform === "darwin") {
+      const { stdout } = await exec("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], { timeout: 2_000, maxBuffer: 64 * 1024 });
+      const paths = stdout.split("\n").filter((line) => line.startsWith("n"));
+      if (paths.length === 1 && isAbsolute(paths[0].slice(1))) return paths[0].slice(1);
+    }
+    throw new Error("The OMP process cwd could not be inspected.");
+  },
+  canonicalPath: async (path) => {
+    try { return await realpath(path); }
+    catch (error) {
+      // A removed worktree is still an identity. Other failures cannot authorize recovery.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return path;
+      throw error;
+    }
+  },
+};
+
+
+function option(args: string[], name: string): string | undefined {
+  let value: string | undefined;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg !== name && !arg.startsWith(`${name}=`)) continue;
+    if (value !== undefined) throw new Error(`Ambiguous ${name} argument.`);
+    value = arg === name ? args[index + 1] : arg.slice(name.length + 1);
+    if (!value || value.startsWith("--")) throw new Error(`Incomplete ${name} argument.`);
+  }
+  return value;
+}
+
+// ps prints argv, not a shell command. Only complete whitespace-delimited identities are compared;
+// paths containing whitespace are ambiguous and deliberately never establish absence.
+function rpcProcesses(output: string): { pid: number; session?: string; ambiguous: boolean }[] {
+  const found: { pid: number; session?: string; ambiguous: boolean }[] = [];
+  for (const line of output.split("\n")) {
+    if (!line.trim()) continue;
+    const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+    if (!match) throw new Error("Incomplete process listing.");
+    const args = match[2].trim().split(/\s+/);
+    const command = basename(args[0]);
+    const interpreter = ["node", "bun", "tsx"].includes(command);
+    const omp = command === "omp" || (interpreter && args[1] && basename(args[1]) === "omp");
+    if ((!omp && !interpreter) || option(args, "--mode") !== "rpc-ui") continue;
+    if (found.length === MAX_PROCESSES) throw new Error("Too many OMP processes to inspect safely.");
+    // OMP can also run as node/bun <coding-agent cli>. Without a named omp executable, the
+    // rpc-ui process is ambiguous: its exact cwd must exclude the relevant worktree.
+    found.push({ pid: Number(match[1]), session: option(args, "--session"), ambiguous: !omp });
+  }
+  return found;
+}
+
+// Every page, archived roots included: checking only the predecessor misses an older writable
+// owner. Public snapshots carry provider runtime/persistence identities; no private disk schema.
+export async function ticketProcessLiveness(paseo: PaseoApi, issueId: string, extra: ProcessAgent[] = [], inspect: ProcessInspector = inspector): Promise<ProcessLiveness> {
+  try {
+    const agents = new Map<string, ProcessAgent>();
+    let cursor: string | undefined;
+    const cursors = new Set<string>();
+    for (let pageNumber = 0; ; pageNumber++) {
+      if (pageNumber === MAX_PAGES) return "unknown";
+      const page = await paseo.agents.list({ filter: { labels: { "linear.issueId": issueId }, includeArchived: true }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
+      for (const { agent } of page.entries) agents.set(agent.id, agent);
+      if (!page.pageInfo) return "unknown";
+      if (!page.pageInfo.hasMore) break;
+      cursor = page.pageInfo.nextCursor ?? undefined;
+      if (!cursor || cursors.has(cursor)) return "unknown";
+      cursors.add(cursor);
+    }
+    // The caller refreshed before this listing. Include a missing target, but never let that
+    // earlier snapshot erase a newly closed/archived identity returned by the listing.
+    for (const agent of extra) if (agent.id && !agents.has(agent.id)) agents.set(agent.id, agent);
+    const candidates = [...agents.values()].filter((agent) => agent.provider === "omp" && !agent.labels?.["paseo.parent-agent-id"]
+      && Boolean(agent.archivedAt || agent.status === "closed"
+        || (agent.status === "error" && agent.lastError && CLOSED_PROCESS.test(agent.lastError))));
+    if (!candidates.length) return "absent";
+    const processes = rpcProcesses(await inspect.processes());
+    if (!processes.length) return "absent";
+    const sessions = new Set<string>();
+    const handles = new Set<string>();
+    const worktrees = new Set<string>();
+    let incomplete = false;
+    for (const agent of candidates) {
+      const native = agent.persistence?.nativeHandle;
+      if (typeof native === "string" && isAbsolute(native) && !/\s/.test(native)) handles.add(native);
+      else incomplete = true;
+      for (const session of [agent.runtimeInfo?.sessionId, agent.persistence?.sessionId]) {
+        if (session && !/\s/.test(session)) sessions.add(session);
+      }
+      if (!agent.cwd || !isAbsolute(agent.cwd)) return "unknown";
+      worktrees.add(await inspect.canonicalPath(agent.cwd));
+    }
+    let unknown = false;
+    for (const process of processes) {
+      if (process.session) {
+        if (handles.has(process.session) || sessions.has(process.session)) return "alive";
+        // Without the full native handle, a UUID alone cannot exclude an absolute JSONL argument.
+        if (incomplete) unknown = true;
+        if (!process.ambiguous) continue;
+      }
+      try {
+        // Newly created workers have no --session: exact cwd is the conservative ownership seam.
+        if (worktrees.has(await inspect.canonicalPath(await inspect.cwd(process.pid)))) return "alive";
+      } catch { unknown = true; }
+    }
+    return unknown ? "unknown" : "absent";
+  } catch {
+    return "unknown";
+  }
+}

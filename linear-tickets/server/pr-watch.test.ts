@@ -49,10 +49,19 @@ const RESTARTED = { status: "idle", lastError: CRASH, pendingPermissions: [] };
 // router's prompts (`send` runs first and may throw).
 function crashDaemon(calls: string[]) {
   const daemon = { agent: CRASHED as Record<string, unknown>, reloaded: RESTARTED as Record<string, unknown>, send: async () => {}, router: null as unknown as SessionRouter };
-  daemon.router = new SessionRouter({ reloader: async () => async (agentId: string) => { calls.push(`reload ${agentId}`); daemon.agent = daemon.reloaded; } } as never);
+  let held = false;
+  daemon.router = new SessionRouter({
+    launcher: { gate: () => {
+      if (held) return null;
+      held = true;
+      return { release: () => { held = false; } };
+    } },
+    store: { forAgent: async () => null },
+    reloader: async () => async (agentId: string) => { calls.push(`reload ${agentId}`); daemon.agent = daemon.reloaded; },
+  } as never);
   Object.assign(daemon.router, { paseo: { agents: {
     ref: (id: string) => ({ refresh: async () => ({ agent: daemon.agent }), send: async (text: string) => { await daemon.send(); calls.push(`prompt ${id}\n${text}`); } }),
-    list: async () => ({ entries: [] }),
+    list: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }),
   } } });
   return daemon;
 }
