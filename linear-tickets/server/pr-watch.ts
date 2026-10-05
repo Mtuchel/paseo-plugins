@@ -153,7 +153,7 @@ function entry(seenByUrl: Record<string, Seen>, url: string): Seen {
 }
 
 // A pull request title that names the ticket as a whole word (`Add TUC-34 [area] …`, never TUC-343).
-function namesTicket(identifier: string): RegExp {
+export function namesTicket(identifier: string): RegExp {
   return new RegExp(`(?<![A-Za-z0-9-])${identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9])`, "i");
 }
 

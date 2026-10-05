@@ -1274,9 +1274,18 @@ independently of the agent's own `linear_ticket` tools:
   started) may be a manual step, so that sub-issue stays open until you close it. Archiving the
   agent leaves its open sub-issues for you; replies there no longer reach anyone.
 - **Pull requests** — GitHub pull request URLs printed by the agent's completed shell
-  commands during a turn (for example `gh pr create`) are attached to the ticket, which then moves to its team's
-  started state named like *In Review*. Completion is left to Linear's GitHub integration and to
-  the agent itself ([Agent access to Linear](#agent-access-to-linear)).
+  commands during a turn (for example `gh pr create`) are attached to the ticket, the agent
+  panel and the handover record, and the ticket then moves to its team's started state named
+  like *In Review*, but only for a pull request of that ticket: `gh pr view` on this host
+  finds it, and its title, description or head branch names the ticket identifier as a whole
+  word (`Part of TUC-123`; `TUC-12` does not name `TUC-123`). Test fixtures, which
+  `gh` cannot resolve ("no such pull request", or a repository that does not exist or this
+  host's `gh` cannot see), and real pull requests of other tickets are skipped, each with a
+  plugin log line `[linear-tickets] not linking <url> to <identifier>: <reason>`, and a turn
+  that printed only skipped URLs leaves the ticket where it is. A skipped URL is checked again
+  in any later turn that prints it. An agent links any other pull request itself with
+  `link_url`. Completion is left to Linear's GitHub integration and to the agent itself
+  ([Agent access to Linear](#agent-access-to-linear)).
 
 - **Replies from Linear** — your comments reach the agent within one poll interval, no
   `@paseo` needed, on every issue it watches:
@@ -1428,7 +1437,14 @@ header of the last answer plus the refill since then.
   for up to 6 hours. A retry that a newer event for the same agent overtook only links its
   pull requests: those are kept in `$PASEO_HOME/linear-tickets/writeback-outbox.json` until
   they are linked on the ticket, in the agent panel and in the handover record, even across
-  restarts. Retries never repeat a comment or panel activity that already went out.
+  restarts. Retries never repeat a comment or panel activity that already went out. A pull
+  request is checked ([Pull requests](#write-back-to-linear)) before it is linked anywhere: when
+  GitHub cannot be reached (network, auth, throttling, a timeout) the write-back is retried
+  after 30 s and 2 min, and the entry stays in the outbox for the agent's next turn with a pull
+  request or the next plugin start; a URL `gh` cannot resolve, or one that does not name the
+  ticket, is dropped from the outbox with its log line. An entry already attached on Linear
+  before this check existed and now rejected gets `; already attached on Linear; remove it by
+  hand` in that line.
 
 ## Pull request view
 
