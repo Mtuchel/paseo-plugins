@@ -29,6 +29,9 @@ case "$2" in
 esac
 `);
 chmodSync(cli, 0o755);
+// A ticket agent running these tests carries its own LINEAR_TICKETS_* (its policy, and the host's
+// real linear_ticket server in LINEAR_TICKETS_MCP); none of it belongs in the extension under test.
+for (const name of Object.keys(process.env)) if (name.startsWith("LINEAR_TICKETS_")) delete process.env[name];
 Object.assign(process.env, { PASEO_AGENT_ID: "planner-1", PASEO_HOME: root, PASEO_CLI: cli, LINEAR_TICKETS_ISSUE: "ENG-1", LINEAR_TICKETS_CONTEXT: join(root, "ticket.md") });
 const { default: extension, submittedPlan } = await import("../omp/linear-tickets-plan-first");
 
