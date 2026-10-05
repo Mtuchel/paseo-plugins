@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,8 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type { IssueState } from "./linear";
+import { GitHubRateLimitedError } from "./pr-watch";
+import { ticketPullRequest, type PullRequestText } from "./pull-request-check";
 import { RateLimitedError } from "./rate-budget";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
@@ -30,6 +32,8 @@ const allOn: PluginSettings = {
 const root: PluginHookAgent = { id: "agent-1", workspaceId: "w1", parentAgentId: null, provider: "claude", cwd: "/repo", title: "ENG-1: Fix sign-in" };
 
 const toolCall = (output: string): Timeline[number] => ({ type: "tool_call", callId: "c1", name: "bash", status: "completed", detail: { type: "shell", command: "gh pr create", output }, error: null });
+// The pull request check for tests whose pull requests are the ticket's; it never runs gh.
+const accept = async () => ({ link: true as const });
 
 class FakeLinear {
   readonly writes: string[] = [];
@@ -124,7 +128,7 @@ test("agents without a Linear link and subagents never touch Linear", async () =
 
 test("a completed turn posts its reply, truncated, and links a new pull request then moves to review", async () => {
   const linear = new FakeLinear();
-  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), undefined, accept);
   const long = "x".repeat(MAX_SUMMARY_LENGTH + 50);
   await writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "completed" }, timeline: [toolCall("https://github.com/o/r/pull/9"), { type: "assistant_message", text: long }] }, linked);
   const comment = linear.writes.find((write) => write.startsWith("comment: "))!;
@@ -376,7 +380,7 @@ function fakeBridge() {
       finish: async (_issue: unknown, _agent: unknown, status: string) => { calls.push(`finish ${status}`); return {}; },
     },
   };
-  return { calls, bridge: bridge as never };
+  return { calls, bridge: bridge as never, sessions: bridge.sessions };
 }
 
 test("a rate-limited turn end is retried whenever Linear's pool refills, however often, until it lands", async (t) => {
@@ -386,7 +390,7 @@ test("a rate-limited turn end is retried whenever Linear's pool refills, however
   const issueState = linear.issueState.bind(linear);
   let attempts = 0;
   linear.issueState = async () => { if (++attempts <= 4) throw new RateLimitedError("key", Date.now() + 10 * MINUTE); return issueState(); };
-  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), undefined, accept);
   await writeback.turnEnded(completedWithPr, linked);
   for (let retry = 1; retry <= 4; retry++) {
     t.mock.timers.tick(10 * MINUTE - 1);
@@ -407,7 +411,7 @@ test("a turn end that stays rate-limited gives up after 6 h", async (t) => {
   const linear = new FakeLinear();
   let attempts = 0;
   linear.issueState = async () => { attempts++; throw new RateLimitedError("key", Date.now() + 60 * MINUTE); };
-  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), undefined, accept);
   await writeback.turnEnded(completedWithPr, linked);
   for (let hour = 1; hour <= 6; hour++) {
     t.mock.timers.tick(60 * MINUTE);
@@ -429,7 +433,7 @@ test("a delayed retry overtaken by a newer event links its pull request but leav
   let limited = true;
   linear.issueState = async () => { if (limited) { limited = false; throw new RateLimitedError("key", Date.now() + 10 * MINUTE); } return issueState(); };
   const { calls, bridge } = fakeBridge();
-  const writeback = new Writeback(linear, { read: async () => allOn }, bridge, 0, outboxPath());
+  const writeback = new Writeback(linear, { read: async () => allOn }, bridge, 0, outboxPath(), undefined, accept);
   await writeback.turnEnded(completedWithPr, linked);
   await writeback.turnStarted({ agent: root, turnId: "next" }, linked);
   linear.writes.length = 0;
@@ -451,7 +455,7 @@ test("a retry after partial success repeats no comment, report or session activi
     if (name === "paseo-blocked" && limited) { limited = false; throw new RateLimitedError("key", Date.now() + MINUTE); }
     return removeLabel(id, name);
   };
-  await new Writeback(plain, { read: async () => allOn }, undefined, 0, outboxPath()).turnEnded(completedWithPr, linked);
+  await new Writeback(plain, { read: async () => allOn }, undefined, 0, outboxPath(), undefined, accept).turnEnded(completedWithPr, linked);
   t.mock.timers.tick(MINUTE);
   await until(() => plain.writes.includes("review"));
   assert.equal(plain.writes.filter((write) => write.startsWith("comment: ")).length, 1);
@@ -474,11 +478,11 @@ test("a pull request left in the outbox is linked by the next plugin instance on
   const path = outboxPath();
   const before = new FakeLinear();
   before.linkUrl = async () => { throw new Error("Linear did not link the URL."); };
-  await new Writeback(before, { read: async () => allOn }, undefined, 0, path).turnEnded(completedWithPr, linked);
+  await new Writeback(before, { read: async () => allOn }, undefined, 0, path, undefined, accept).turnEnded(completedWithPr, linked);
   assert.deepEqual(JSON.parse(await readFile(path, "utf8")).map((entry: { url: string; done: object }) => [entry.url, entry.done]), [[PR, { linear: false, session: false, handover: false }]]);
 
   const after = new FakeLinear();
-  await new Writeback(after, { read: async () => allOn }, undefined, 0, path).turnStarted({ agent: { ...root, id: "agent-2" }, turnId: "t" }, linked);
+  await new Writeback(after, { read: async () => allOn }, undefined, 0, path, undefined, accept).turnStarted({ agent: { ...root, id: "agent-2" }, turnId: "t" }, linked);
   assert.deepEqual(after.writes, [`link ${PR}`, "state", "in-progress issue-1"]);
   assert.deepEqual(JSON.parse(await readFile(path, "utf8")), []);
 });
@@ -489,7 +493,7 @@ test("other Linear outages are retried twice, after 30 s and 2 min, then dropped
   const linear = new FakeLinear();
   let attempts = 0;
   linear.issueState = async () => { attempts++; throw new Error("The Linear API request failed (HTTP 503). Try again."); };
-  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), undefined, accept);
   await writeback.turnEnded(completedWithPr, linked);
   t.mock.timers.tick(30_000);
   await until(() => attempts === 2);
@@ -500,6 +504,145 @@ test("other Linear outages are retried twice, after 30 s and 2 min, then dropped
   await settle();
   assert.equal(attempts, 3);
   assert.deepEqual(errors.mock.calls.map((call) => String(call.arguments[0]).match(/retrying in \d+ s/)?.[0]).filter(Boolean), ["retrying in 30 s", "retrying in 120 s"]);
+});
+
+// The URL printed on TUC-810's agent turn: a fixture of these tests, not a pull request.
+const FIXTURE = "https://github.com/o/r/pull/1";
+const NO_REPOSITORY = "no such repository, or this host's gh cannot see it";
+const ticketLinked = paseoWithLabels({ "linear.issueId": "issue-1", "linear.identifier": "ENG-1" });
+const linksIn = (writes: string[]) => writes.filter((write) => write.startsWith("link ") || write === "review");
+const bridgeLinks = (calls: string[]) => calls.filter((call) => call.startsWith("session link ") || call.startsWith('handover {"link"'));
+const outbox = async (path: string) => JSON.parse(await readFile(path, "utf8")) as { url: string; checked?: true; done: object }[];
+
+// The pull request check, faked: URLs in `rejected` fail with that reason, any other is the
+// ticket's. Every call is recorded.
+function fakeCheck(rejected: Record<string, string> = {}) {
+  const checked: string[] = [];
+  const check = async (url: string) => {
+    checked.push(url);
+    return url in rejected ? { link: false as const, reason: rejected[url] } : { link: true as const };
+  };
+  return { checked, check };
+}
+
+test("a turn printing a test fixture's pull request URL links nothing on the ticket, the session or the handover, and leaves the ticket out of review", async (t) => {
+  const errors = t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  const { calls, bridge } = fakeBridge();
+  const path = outboxPath();
+  const { checked, check } = fakeCheck({ [FIXTURE]: NO_REPOSITORY });
+  await new Writeback(linear, { read: async () => allOn }, bridge, 0, path, undefined, check).turnEnded({ ...completedWithPr, timeline: [toolCall(`not ok 3 - links\n  expected: '${FIXTURE}'`), { type: "assistant_message", text: "done" }] }, ticketLinked);
+  assert.deepEqual(checked, [FIXTURE]);
+  assert.deepEqual(linksIn(linear.writes), []);
+  assert.deepEqual(bridgeLinks(calls), []);
+  assert.deepEqual(await outbox(path), []);
+  assert.ok(errors.mock.calls.some((call) => String(call.arguments[0]) === `[linear-tickets] not linking ${FIXTURE} to ENG-1: ${NO_REPOSITORY}`));
+});
+
+test("of a turn's pull requests only the one naming the ticket is linked in all three places, and the ticket moves to review once", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  const { calls, bridge } = fakeBridge();
+  const other = "https://github.com/o/r/pull/3";
+  const own = "https://github.com/o/r/pull/4";
+  const shown: Record<string, PullRequestText> = { [other]: { title: "ENG-2: another ticket", body: "Part of ENG-2", headRefName: "eng-2" }, [own]: { title: "Fix sign-in", body: "Part of ENG-1", headRefName: "fix-sign-in" } };
+  const check = (url: string, identifier: string) => ticketPullRequest(url, identifier, async (viewed) => shown[viewed]);
+  await new Writeback(linear, { read: async () => allOn }, bridge, 0, outboxPath(), undefined, check).turnEnded({ ...completedWithPr, timeline: [toolCall(`${other}\nCreated ${own}`), { type: "assistant_message", text: "done" }] }, ticketLinked);
+  assert.deepEqual(linksIn(linear.writes), [`link ${own}`, "review"]);
+  assert.deepEqual(bridgeLinks(calls), [`session link ${own}`, `handover {"link":["Pull request","${own}"]}`]);
+});
+
+test("a pull request whose check cannot reach GitHub stays in the outbox unlinked, and a later drain links it", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const errors = t.mock.method(console, "error", () => {});
+  const path = outboxPath();
+  const before = new FakeLinear();
+  const offline = (url: string) => ticketPullRequest(url, "ENG-1", async () => { throw new GitHubRateLimitedError("GitHub is throttling gh: HTTP 429"); });
+  await new Writeback(before, { read: async () => allOn }, undefined, 0, path, undefined, offline).turnEnded(completedWithPr, ticketLinked);
+  assert.deepEqual(linksIn(before.writes), []);
+  assert.deepEqual((await outbox(path)).map((entry) => [entry.url, entry.checked, entry.done]), [[PR, undefined, { linear: false, session: false, handover: false }]]);
+  assert.ok(errors.mock.calls.some((call) => String(call.arguments[0]).endsWith(`retrying in 30 s: Could not reach GitHub to check ${PR}: GitHub is throttling gh: HTTP 429`)));
+
+  const after = new FakeLinear();
+  await new Writeback(after, { read: async () => allOn }, undefined, 0, path, undefined, accept).turnStarted({ agent: { ...root, id: "agent-2" }, turnId: "t" }, ticketLinked);
+  assert.deepEqual(linksIn(after.writes), [`link ${PR}`]);
+  assert.deepEqual(await outbox(path), []);
+});
+
+test("outbox entries from before the check are checked first, even half-linked ones; entries checked earlier are not checked again", async (t) => {
+  const errors = t.mock.method(console, "error", () => {});
+  const path = outboxPath();
+  const entry = (url: string, extra: object = {}) => ({ agentId: "agent-1", agentTitle: "ENG-1: Fix sign-in", cwd: "/repo", issueId: "issue-1", identifier: "ENG-1", url, done: { linear: false, session: false, handover: false }, ...extra });
+  const own = "https://github.com/o/r/pull/5";
+  const halfLinkedFixture = "https://github.com/o/app/pull/1";
+  const checkedEarlier = "https://github.com/o/r/pull/7";
+  const halfLinked = { done: { linear: true, session: false, handover: false } };
+  await writeFile(path, JSON.stringify([entry(own), entry(FIXTURE), entry(halfLinkedFixture, halfLinked), entry(checkedEarlier, { checked: true, ...halfLinked })]));
+  const linear = new FakeLinear();
+  const { calls, bridge } = fakeBridge();
+  const { checked, check } = fakeCheck({ [FIXTURE]: NO_REPOSITORY, [halfLinkedFixture]: NO_REPOSITORY });
+  await new Writeback(linear, { read: async () => allOn }, bridge, 0, path, undefined, check).turnStarted({ agent: { ...root, id: "agent-2" }, turnId: "t" }, ticketLinked);
+  assert.deepEqual(checked, [own, FIXTURE, halfLinkedFixture]);
+  assert.deepEqual(linksIn(linear.writes), [`link ${own}`]);
+  assert.deepEqual(bridgeLinks(calls), [
+    `session link ${own}`, `handover {"link":["Pull request","${own}"]}`,
+    `session link ${checkedEarlier}`, `handover {"link":["Pull request","${checkedEarlier}"]}`,
+  ]);
+  assert.deepEqual(await outbox(path), []);
+  assert.ok(errors.mock.calls.some((call) => String(call.arguments[0]) === `[linear-tickets] not linking ${halfLinkedFixture} to ENG-1: ${NO_REPOSITORY}; already attached on Linear; remove it by hand`));
+});
+
+test("a retry after a partial link or a failed move to review checks nothing again, links each place once and still moves the ticket to review", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  t.mock.method(console, "error", () => {});
+
+  // The session panel is rate-limited once, after the ticket was linked.
+  const linear = new FakeLinear();
+  const { calls, bridge, sessions } = fakeBridge();
+  const link = sessions.link;
+  let limited = true;
+  sessions.link = async (sessionId, title, url) => {
+    if (limited) { limited = false; throw new RateLimitedError("key", Date.now() + MINUTE); }
+    return link(sessionId, title, url);
+  };
+  const { checked, check } = fakeCheck();
+  await new Writeback(linear, { read: async () => allOn }, bridge, 0, outboxPath(), undefined, check).turnEnded(completedWithPr, ticketLinked);
+  assert.deepEqual(linksIn(linear.writes), [`link ${PR}`]);
+  t.mock.timers.tick(MINUTE);
+  await until(() => linear.writes.includes("review"));
+  assert.deepEqual(checked, [PR]);
+  assert.deepEqual(linksIn(linear.writes), [`link ${PR}`, "review"]);
+  assert.deepEqual(bridgeLinks(calls), [`session link ${PR}`, `handover {"link":["Pull request","${PR}"]}`]);
+
+  // Every place is linked (the outbox is empty), then the move to review is rate-limited once.
+  const moving = new FakeLinear();
+  const moveToReview = moving.moveToReview.bind(moving);
+  let failing = true;
+  moving.moveToReview = async () => {
+    if (failing) { failing = false; throw new RateLimitedError("key", Date.now() + MINUTE); }
+    return moveToReview();
+  };
+  const second = fakeCheck();
+  await new Writeback(moving, { read: async () => allOn }, undefined, 0, outboxPath(), undefined, second.check).turnEnded(completedWithPr, ticketLinked);
+  t.mock.timers.tick(MINUTE);
+  await until(() => moving.writes.includes("review"));
+  assert.deepEqual(second.checked, [PR]);
+  assert.deepEqual(linksIn(moving.writes), [`link ${PR}`, "review"]);
+});
+
+test("a pull request rejected in one turn is checked again in a later one, and links once it names the ticket", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  const rejected: Record<string, string> = { [PR]: "the pull request does not name ENG-1 in its title, description or branch" };
+  const { checked, check } = fakeCheck(rejected);
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), undefined, check);
+  await writeback.turnEnded(completedWithPr, ticketLinked);
+  assert.deepEqual(linksIn(linear.writes), []);
+  // The agent added "Part of ENG-1" to the pull request's description.
+  delete rejected[PR];
+  await writeback.turnEnded(completedWithPr, ticketLinked);
+  assert.deepEqual(checked, [PR, PR]);
+  assert.deepEqual(linksIn(linear.writes), [`link ${PR}`, "review"]);
 });
 
 test("questions and the owner's answers are logged for the decision candidates, across a reload and with write-back off", async () => {

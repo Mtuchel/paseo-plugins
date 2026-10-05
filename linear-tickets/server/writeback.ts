@@ -12,6 +12,7 @@ import type { NeedsYouIssues } from "./needs-you";
 import { PLANNING_STATE } from "./plannotator";
 import { PLAN_POLICY_LABEL } from "./plan-policy";
 import { logQuietly, questionEntry, type DecisionLog } from "./owner-decisions";
+import { ticketPullRequest, type PullRequestCheck } from "./pull-request-check";
 import { RateLimitedError } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
@@ -38,9 +39,11 @@ type Link = { issueId: string; identifier: string; planFirst: boolean };
 export type WritebackContext = { once<T>(step: string, fn: () => Promise<T>): Promise<T | undefined> };
 type Work = (link: Link, settings: PluginSettings, context: WritebackContext) => Promise<void>;
 type Delivery = { event: string; agent: PluginHookAgent; paseo: PaseoApi; work: Work; seq: number; attempt: number; firstFailureAt: number | null; transientRetries: number };
-// A pull request found at the end of a turn, kept on disk until every place links it, so a
-// rate limit, a superseding event or a plugin restart cannot lose it.
-type OutboxEntry = { agentId: string; agentTitle: string | null; cwd: string; issueId: string; identifier: string; url: string; done: { linear: boolean; session: boolean; handover: boolean } };
+// A pull request found at the end of a turn, kept on disk until it is checked and every place
+// links it, so a rate limit, a GitHub outage, a superseding event or a plugin restart cannot lose
+// it. `checked`: the check accepted it as the ticket's pull request (entries from before the check
+// existed have none and are checked first).
+type OutboxEntry = { agentId: string; agentTitle: string | null; cwd: string; issueId: string; identifier: string; url: string; checked?: true; done: { linear: boolean; session: boolean; handover: boolean } };
 // The native Linear agent: the session panel and the durable handover record. Optional, so ticket
 // write-back keeps working without the Paseo Linear app installed.
 export type AgentBridge = {
@@ -173,8 +176,9 @@ export class Writeback {
   private decisions: Pick<DecisionLog, "append" | "answer"> | null = null;
 
   // `needsYou`: where waits on closed tickets keep their sub-issues; without it such a wait only
-  // labels and comments on the closed ticket.
-  constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly agentBridge?: AgentBridge, private readonly settleMs = 2_000, private readonly outboxPath = join(paseoHome(), "linear-tickets", "writeback-outbox.json"), private readonly needsYou?: NeedsYouIssues) {}
+  // labels and comments on the closed ticket. `checkPullRequest`: whether a pull request URL from
+  // the agent's shell output is its ticket's pull request (see ticketPullRequest).
+  constructor(private readonly linear: Linear, private readonly settings: Pick<Settings, "read">, private readonly agentBridge?: AgentBridge, private readonly settleMs = 2_000, private readonly outboxPath = join(paseoHome(), "linear-tickets", "writeback-outbox.json"), private readonly needsYou?: NeedsYouIssues, private readonly checkPullRequest: PullRequestCheck = ticketPullRequest) {}
 
   recordDecisions(log: Pick<DecisionLog, "append" | "answer">): void {
     this.decisions = log;
@@ -232,7 +236,22 @@ export class Writeback {
   }
 
   // Links one pull request everywhere it is not linked yet; each place is recorded once done.
-  private async deliver(entry: OutboxEntry): Promise<void> {
+  // First, unless an earlier delivery did, it checks that the URL is the ticket's pull request: a
+  // rejected URL leaves the outbox unlinked, a GitHub outage throws and keeps it for later.
+  // `accepted` collects the ticket's pull requests, so the turn knows to move the ticket to review.
+  private async deliver(entry: OutboxEntry, accepted?: Set<string>): Promise<void> {
+    if (!entry.checked) {
+      const verdict = await this.checkPullRequest(entry.url, entry.identifier);
+      if (!verdict.link) {
+        await this.changeOutbox((entries) => entries.filter((known) => known.agentId !== entry.agentId || known.url !== entry.url));
+        console.error(`[linear-tickets] not linking ${entry.url} to ${entry.identifier}: ${verdict.reason}${entry.done.linear ? "; already attached on Linear; remove it by hand" : ""}`);
+        return;
+      }
+      // Recorded before the first link, so a retry or restart links without checking again.
+      entry.checked = true;
+      await this.changeOutbox((entries) => entries.map((known) => known.agentId === entry.agentId && known.url === entry.url ? { ...known, checked: true } : known));
+    }
+    accepted?.add(entry.url);
     if (!entry.done.linear) {
       await this.linear.linkUrl(entry.issueId, entry.url, "Pull request");
       await this.markDelivered(entry, "linear");
@@ -253,12 +272,13 @@ export class Writeback {
   }
 
   // One agent's pending pull requests (failures propagate), or everyone's (failures are logged).
-  private drainOutbox(agentId?: string): Promise<void> {
+  // Only an agent's own drain collects `accepted`: a restart drain links but moves no ticket.
+  private drainOutbox(agentId?: string, accepted?: Set<string>): Promise<void> {
     const run = async () => {
       for (const entry of await this.readOutbox()) {
         if (agentId === undefined) {
           await this.deliver(entry).catch((error: unknown) => console.error(`[linear-tickets] linking ${entry.url} to ${entry.identifier} failed, kept for later: ${error instanceof Error ? error.message : error}`));
-        } else if (entry.agentId === agentId) await this.deliver(entry);
+        } else if (entry.agentId === agentId) await this.deliver(entry, accepted);
       }
     };
     const result = this.drainQueue.then(run, run);
@@ -507,7 +527,8 @@ export class Writeback {
       const { writeback } = settings;
       const { model, named } = await this.snapshot(agent, paseo);
       if (model) this.models.set(agent.id, model);
-      // Recorded before any Linear call, so a failure below cannot lose the turn's pull requests.
+      // Recorded before any Linear call, so a failure below cannot lose the turn's pull requests;
+      // whether each is the ticket's pull request is checked when it is delivered.
       const urls = writeback.pullRequests ? turnPullRequests(timeline) : [];
       if (urls.length) {
         const added = urls.map((url): OutboxEntry => ({ agentId: agent.id, agentTitle: named.title, cwd: agent.cwd, issueId, identifier, url, done: { linear: false, session: false, handover: false } }));
@@ -554,7 +575,12 @@ export class Writeback {
       }
       if (outcome.kind === "canceled") await this.session(agent.id, async (_sessionId, sessions) => { await sessions.unfollow(agent.id); });
       if (!urls.length) return;
-      await this.drainOutbox(agent.id);
+      // The same set on every retry of this turn end, so a retry after the links (a failed move to
+      // review) still knows the turn had the ticket's pull request.
+      const accepted = await once("accepted-pull-requests", async () => new Set<string>()) ?? new Set<string>();
+      await this.drainOutbox(agent.id, accepted);
+      // Only the ticket's own pull requests move it to review; fixtures and other tickets' do not.
+      if (!accepted.size) return;
       const moved = await this.linear.moveToReview(issueId);
       if (moved.note) console.error(`[linear-tickets] ${issueId}: ${moved.note}`);
     });
