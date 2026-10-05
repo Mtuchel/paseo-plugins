@@ -110,8 +110,11 @@ const SESSION_ON_ISSUE_MUTATION = `mutation agentSessionOnIssue($input: AgentSes
   agentSessionCreateOnIssue(input: $input) { success agentSession { id } }
 }`;
 const APP_VIEWER_QUERY = `query appViewer { viewer { id name } }`;
+// `agentSessions` lists every app's sessions in the workspace, not only this app's. Each host has
+// its own app (README, "Several hosts"), so the viewer read alongside tells this host's apart.
 const OPEN_SESSIONS_QUERY = `query openSessions($first: Int!) {
-  agentSessions(first: $first, orderBy: updatedAt) { nodes { id status createdAt creator { id } issue { id identifier } } }
+  viewer { id }
+  agentSessions(first: $first, orderBy: updatedAt) { nodes { id status createdAt appUser { id } creator { id } issue { id identifier } } }
 }`;
 const SESSION_STATUS_QUERY = `query sessionStatus($id: String!) {
   agentSession(id: $id) { status }
@@ -201,10 +204,14 @@ export class AgentApi {
     return id;
   }
 
+  // This app's sessions among the workspace's `first` most recently updated: another host's
+  // sessions are never adopted, linked or closed here.
   async openSessions(first = 50): Promise<OpenSession[]> {
-    const page = record(record(await this.call(OPEN_SESSIONS_QUERY, { first })).agentSessions ?? {});
+    const data = record(await this.call(OPEN_SESSIONS_QUERY, { first }));
+    const appId = String(record(data.viewer ?? {}).id ?? "");
+    const page = record(data.agentSessions ?? {});
     const nodes = Array.isArray(page.nodes) ? page.nodes : [];
-    return nodes.map((node) => record(node)).map((node) => ({
+    return nodes.map((node) => record(node)).filter((node) => appId && String(record(node.appUser ?? {}).id ?? "") === appId).map((node) => ({
       id: String(node.id ?? ""),
       status: String(node.status ?? ""),
       createdAt: String(node.createdAt ?? ""),
