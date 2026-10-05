@@ -276,7 +276,7 @@ list and the launch flow.
 - **Default prompt** — replace the built-in launch prompt with a template (below).
 - **Auto-dispatch** — start agents for labeled tickets without opening Paseo (off by default; see below).
 - **Linear agent** — whether the native Linear agent is installed and receiving webhooks (see [Native Linear agent](#native-linear-agent)).
-- **Write back to Linear** — report ticket-linked agents' progress on the ticket (all off by default; see below).
+- **Write back to Linear** — report ticket-linked agents' progress on the ticket, and start new agents automatically (all off by default; see below).
 
 The last successful model, mode, and reasoning choices are stored in the same per-host
 settings file. They update automatically and do not need a separate settings toggle. The cheap
@@ -1129,7 +1129,7 @@ the ticket already runs, it takes over the record and gets the message on the ne
 successor can start (the ticket is closed, no branch is recorded, the branch cannot be
 continued, the start fails), the message goes to the ticket as before: back to In Progress and a
 comment mentioning you. The same happens for a pull request labelled `do-not-merge` and while
-*Start a new agent automatically when one fails* is off. A crash right between the claim and the
+*Start a new agent automatically* (see **Write back to Linear**) is off. A crash right between the claim and the
 start (the plugin stops in that second) loses the message: the log names the claim, and it is not
 repeated.
 
@@ -1151,9 +1151,10 @@ Starting an agent from the sidebar or by answering "Resume" takes no gate.
 
 *Rollback.* Reverting the change stops new successors; agents already started keep running until
 archived (`paseo ls`, label `linear.issueId`), and the messages they got count as sent. Switching
-*Start a new agent automatically when one fails* off stops them at once. A message claimed for a successor that
-never started (the log line "is claimed; starting a successor" without a following "started a
-successor") is repaired by sending its step to the ticket's agent by hand.
+*Start a new agent automatically* off stops new successor starts at once; successors already
+running keep running. A message claimed for a successor that never started (the log line "is
+claimed; starting a successor" without a following "started a successor") is repaired by sending
+its step to the ticket's agent by hand.
 
 **Crashed agents.** An agent whose provider process exited or closed (Paseo shows it in error,
 for example "OMP RPC process is closed") receives no message. Before a nudge, a merge queue fix
@@ -1183,10 +1184,11 @@ caused by outages (HTTP 5xx, rate limits, network) are retried after 30 s and 2 
 
 **Durable record and resume.** Every ticket agent keeps one "Paseo progress" comment, edited
 in place: phase, branch, last commit, links, latest report. When the agent fails or is
-archived while the ticket is open, it also posts a final report. The panel then offers
-**Resume with a new agent**, which is automatic when *Start a new agent automatically when one
-fails* is on (at most hourly; the same setting starts successors for gone agents' pull request
-work, see **Gone agents** above).
+archived while the ticket is open, it also posts a final report. For a failed agent,
+*Start a new agent automatically* (see **Write back to Linear**) can start a replacement, at
+most once an hour per ticket; when the hourly limit or another start prevents that, the panel
+offers **Resume with a new agent**. Archiving alone never starts one: for an open ticket without
+another agent, the panel offers **Resume with a new agent**.
 Assigning Paseo again, @mentioning it or re-adding the label
 also resumes. The new agent continues on the same branch, reusing the old worktree while it
 exists so uncommitted work survives. It starts with a handover of the previous agent's reports,
@@ -1367,6 +1369,8 @@ independently of the agent's own `linear_ticket` tools:
   in any later turn that prints it. An agent links any other pull request itself with
   `link_url`. Completion is left to Linear's GitHub integration and to the agent itself
   ([Agent access to Linear](#agent-access-to-linear)).
+
+- **Start a new agent automatically** — its texts are "Start a new agent automatically when one fails, or when its pull request needs work after it is gone (failed agents at most once an hour per ticket)" (on) and "Offer Resume in Linear when an agent stops; a gone agent's pull request work goes to the ticket as a comment" (off). When on, an agent that stops with an error can be replaced by a new agent on its branch, at most once an hour per ticket; when that is not possible (the hour is not over, another start of the ticket is under way), the **Resume with a new agent** offer stays (see **Durable record and resume**). Archiving an agent never starts one by itself. A nudge, merge queue fix request or replacement request for an archived or missing agent can start a successor under the conditions in **Gone agents**. When off, a failed agent gets the offer and that pull request work goes to the ticket as a comment mentioning you.
 
 - **Replies from Linear** — your comments reach the agent within one poll interval, no
   `@paseo` needed, on every issue it watches:

@@ -79,8 +79,8 @@ const MAIN_BROKEN: Judgment = {
 };
 
 // `crash`: the agent runs on crashDaemon (`daemon`) instead of the fake router (`paseo`).
-// `autoResume`: *Start a new agent automatically when one fails* is on, so a gone agent's message
-// starts a successor (`paseo.succeed`).
+// `autoResume`: the setting *Start a new agent automatically* (`writeback.autoResume`) is on, so a
+// gone agent's message starts a successor (`paseo.succeed`).
 // `probe`: the cheap first look the poll goes through (see ConditionalPullView); without one the
 // injected `view` is the whole read, as for the tests that predate it.
 function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean } = {}, probe?: PullViewSource) {
