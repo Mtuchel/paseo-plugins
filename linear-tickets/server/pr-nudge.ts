@@ -55,7 +55,14 @@ export async function stalledStage(view: PullRequestView, url: string, now: numb
     if (!quiet) return null;
     return { stage: "draft", key, text: [
       `[The pull request](${url}) is still a draft, with no new commit or pull request activity for ${DRAFT_IDLE_MS / 60_000} minutes.`,
-      `Next step: run the background Sol review if you have not yet. Publish only the reviewed part of your stack, bottom first: \`git switch ${view.headBranch} && node tools/ci/publish.mjs\` once this branch and every branch below it are reviewed and each passed \`mise exec -- pnpm verify:pre-pr --body-file <body>\` (never a bare \`gt submit --publish\` or \`gh pr ready\`: \`publish.mjs\` refuses until PR metadata is green and prints any owner question); the branches above stay drafts until they are.`,
+      `Next step: run the background Sol review if you have not yet. Publish only the reviewed part of your stack, bottom first: \`git switch ${view.headBranch} && node tools/ci/publish.mjs\` once this branch and every branch below it are reviewed and each passed \`mise exec -- pnpm verify:pre-pr --body-file <body>\` (never a bare \`gt submit --publish\` or \`gh pr ready\` except under the exception below: \`publish.mjs\` refuses until PR metadata is green and prints any owner question); the branches above stay drafts until they are.`,
+      "",
+      "Exception (owner, Q-29, 2026-10-05): a branch whose local `verify:pre-pr` was killed from outside, timed out, or failed twice only on tests unrelated to its change may be published without a passing receipt. Everything else still holds: only the reviewed part of the stack, bottom first; the branches above stay drafts. In order:",
+      "1. Write the evidence into the PR's Verification section: the killed or timed-out run, or both failing runs and why those tests are unrelated.",
+      "2. Run `node tools/ci/publish.mjs` and continue only when its only problems are `no verify:pre-pr receipt for its tree` or `verify:pre-pr failed on this tree`, each for a branch with such evidence, and every draft branch it lists is `green`. Run it again while one is `pending`; any later change to a branch or its PR means running it again.",
+      "3. Make sure none of the ticket's questions to the owner is still unanswered.",
+      `4. Publish each such branch bottom first: those below this one first, each the same way with its own name, then this one with \`gt submit --publish --no-stack --update-only --no-edit --no-interactive --branch ${view.headBranch}\`.`,
+      "CI is the proof; continue to the merge.",
     ].join("\n") };
   }
   const failed = failedChecks(view);
