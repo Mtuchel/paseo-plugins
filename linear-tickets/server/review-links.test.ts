@@ -8,7 +8,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
 import type { OpenedEvent } from "./plannotator";
-import { planDetails, ReviewLinks } from "./review-links";
+import { ReviewLinks, type ReviewLinksOptions } from "./review-links";
+import { planDetails } from "./review-page";
 
 const ORIGIN = "https://host.tail1.ts.net:8444";
 
@@ -21,7 +22,7 @@ const RISK = (impact: number, reversibility = "revert", newRule = "no — none")
 // `live` holds the local ports whose Plannotator server answers; `unserved` the routes turned off;
 // `plans` the plan text each port's server returns; `routed` the routes pointed at the proxy;
 // `setNow` moves the clock (each reading advances it by a second). Times show in Berlin time.
-async function withLinks(run: (links: ReviewLinks, get: (path: string, method?: string) => Promise<Response>, live: Set<number>, unserved: number[], plans: Map<number, string>, routed: number[], setNow: (iso: string) => void) => Promise<void>, unserveError?: (port: number) => Error | null) {
+async function withLinks(run: (links: ReviewLinks, get: (path: string, method?: string) => Promise<Response>, live: Set<number>, unserved: number[], plans: Map<number, string>, routed: number[], setNow: (iso: string) => void) => Promise<void>, unserveError?: (port: number) => Error | null, options: ReviewLinksOptions = {}) {
   const directory = await mkdtemp(join(tmpdir(), "paseo-review-links-"));
   const live = new Set<number>();
   const unserved: number[] = [];
@@ -40,6 +41,7 @@ async function withLinks(run: (links: ReviewLinks, get: (path: string, method?: 
     },
     route: async (port) => { routed.push(port); },
     fetchPlan: async (localUrl) => plans.get(Number(new URL(localUrl).port)) ?? "",
+    ...options,
   });
   try {
     await links.start();
@@ -106,7 +108,7 @@ async function upgradeViaProxy(links: ReviewLinks, host: string): Promise<{ sock
 test("a live review redirects the agent's stable link to the review's tailnet URL", async () => {
   await withLinks(async (links, get, live) => {
     live.add(50_001);
-    assert.equal(await links.opened("agent-1", opened(50_001), "TUC-1"), `${ORIGIN}/review/agent-1`);
+    assert.equal(await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" }), `${ORIGIN}/review/agent-1`);
     const response = await get("/review/agent-1");
     assert.equal(response.status, 302);
     assert.equal(response.headers.get("location"), "https://host.tail1.ts.net:50001/?r=1");
@@ -115,7 +117,7 @@ test("a live review redirects the agent's stable link to the review's tailnet UR
 
 test("a review whose server stopped shows the closed page with its outcome", async () => {
   await withLinks(async (links, get) => {
-    await links.opened("agent-1", opened(50_001), "<TUC-1>");
+    await links.opened("agent-1", opened(50_001), { identifier: "<TUC-1>" });
     await links.decided("agent-1", false);
     const response = await get("/review/agent-1");
     assert.equal(response.status, 200);
@@ -181,17 +183,17 @@ test("unknown agents and malformed ids are 404; other methods are refused", asyn
 test("the inbox lists only reviews the owner can open now, newest first, and the latest decisions", async () => {
   await withLinks(async (links, get, live) => {
     live.add(50_001).add(50_002).add(50_003).add(50_005);
-    await links.opened("agent-1", opened(50_001), "TUC-1");
-    await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, "<TUC-2>");
+    await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" });
+    await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, { identifier: "<TUC-2>" });
     // Superseded by the same agent's newer review: only the newer one is listed.
-    await links.opened("agent-3", { ...opened(50_003), agentId: "agent-3" }, "TUC-3-old");
-    await links.opened("agent-3", { ...opened(50_005), agentId: "agent-3" }, "TUC-3");
+    await links.opened("agent-3", { ...opened(50_003), agentId: "agent-3" }, { identifier: "TUC-3-old" });
+    await links.opened("agent-3", { ...opened(50_005), agentId: "agent-3" }, { identifier: "TUC-3" });
     // Not answering any more (not yet swept), and local-only: neither can be opened from a phone.
-    await links.opened("agent-4", { ...opened(50_004), agentId: "agent-4" }, "TUC-4");
-    await links.opened("agent-5", { ...opened(50_006), agentId: "agent-5", remoteUrl: null }, "TUC-5");
+    await links.opened("agent-4", { ...opened(50_004), agentId: "agent-4" }, { identifier: "TUC-4" });
+    await links.opened("agent-5", { ...opened(50_006), agentId: "agent-5", remoteUrl: null }, { identifier: "TUC-5" });
     live.add(50_006);
     // Decided and closed: listed under recent decisions instead.
-    await links.opened("agent-6", { ...opened(50_007), agentId: "agent-6" }, "TUC-6");
+    await links.opened("agent-6", { ...opened(50_007), agentId: "agent-6" }, { identifier: "TUC-6" });
     await links.decided("agent-6", true);
     await links.sweep();
     await links.sweep();
@@ -200,7 +202,7 @@ test("the inbox lists only reviews the owner can open now, newest first, and the
     assert.equal(response.status, 200);
     const page = await response.text();
     const [waiting, recent] = page.split("Recently decided");
-    const listed = [...waiting.matchAll(/href="\/review\/([^"]+)"/g)].map((match) => match[1]);
+    const listed = [...waiting.matchAll(/data-agent="([^"]+)"/g)].map((match) => match[1]);
     assert.deepEqual(listed, ["agent-3", "agent-2", "agent-1"]);
     assert.match(waiting, /&#60;TUC-2&#62;/);
     assert.doesNotMatch(page, /TUC-3-old/);
@@ -216,18 +218,18 @@ test("waiting reviews show when the owner got them, grouped by the owner's calen
     live.add(50_001).add(50_002).add(50_004);
     // 23:30 UTC on 1 Jan is already 2 Jan in Berlin; 22:30 UTC is still 1 Jan there.
     setNow("2026-01-01T23:30:00Z");
-    await links.opened("agent-1", opened(50_001), "TUC-1");
+    await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" });
     setNow("2026-01-01T22:30:00Z");
-    await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, "TUC-2");
+    await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, { identifier: "TUC-2" });
     setNow("2025-12-29T09:00:00Z");
-    await links.opened("agent-3", { ...opened(50_003), agentId: "agent-3" }, "TUC-3");
+    await links.opened("agent-3", { ...opened(50_003), agentId: "agent-3" }, { identifier: "TUC-3" });
     // Served again after a restart: it keeps the time the owner got it, and the new server.
     setNow("2026-01-02T08:00:00Z");
-    await links.opened("agent-3", { ...opened(50_004), agentId: "agent-3" }, "TUC-3", "2025-12-29T09:00:00.000Z");
+    await links.opened("agent-3", { ...opened(50_004), agentId: "agent-3" }, { identifier: "TUC-3", since: "2025-12-29T09:00:00.000Z" });
     setNow("2026-01-02T09:00:00Z");
 
     const page = await (await get("/")).text();
-    const order = [...page.matchAll(/<h3>([^<]+)<\/h3>|href="\/review\/([^"]+)"/g)].map((match) => match[1] ?? match[2]);
+    const order = [...page.matchAll(/<h3>([^<]+)<\/h3>|data-agent="([^"]+)"/g)].map((match) => match[1] ?? match[2]);
     assert.deepEqual(order, ["Today", "agent-1", "Yesterday", "agent-2", "Mon, 29 Dec 2025", "agent-3"]);
     assert.match(page, /<span class="when">[^]*?>00:30<\/time> · 9 h<\/span>/, "opened 00:30 Berlin time, waiting 9 h");
     assert.match(page, /<span class="when stale">[^]*?>10:00<\/time> · 4 d<\/span>/, "a review waiting over 12 h is highlighted");
@@ -245,21 +247,21 @@ test("the inbox says so when nothing is waiting", async () => {
 test("inbox rows show the plan's title, opening paragraph, risk rating and why it needs the owner", async () => {
   await withLinks(async (links, get, live, _unserved, plans) => {
     live.add(50_001).add(50_002).add(50_003);
-    await links.opened("agent-1", opened(50_001), "TUC-1");
+    await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" });
     const reach = "## Reach\n\n- Changes: date warnings\n- Delivery notes: include — AC-1\n- Help page: follow-up — Document the delay warning\n- Mobile app: follow-up — Warn on mobile too\n\n";
     await links.described("http://localhost:50001/?r=1", `# TUC-1 — Warn when a <delay> breaks a date\n\n## Summary\n\nWhen a **container** is late, the [sales](https://x) team gets a notice.\n\n${reach}${RISK(3, "data-fix", "yes — every late date warns")}`, { approved: false, reasons: ["impact 3 is above the threshold 1", "reversibility is data-fix", "it sets a new rule"] });
     // Opened before the plugin recorded details: read from its running server when the inbox loads.
-    await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, "TUC-2");
+    await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, { identifier: "TUC-2" });
     plans.set(50_002, `# TUC-2 · Report column\n\n| a | b |\n|---|---|\n\nAdds a column to the order report.\n\n${RISK(1)}`);
     // Decided while its server still answers: not waiting any more.
-    await links.opened("agent-3", { ...opened(50_003), agentId: "agent-3" }, "TUC-3");
+    await links.opened("agent-3", { ...opened(50_003), agentId: "agent-3" }, { identifier: "TUC-3" });
     await links.described("http://localhost:50003/?r=1", `# TUC-3 Tooling\n\nCI only.\n\n## Reach\n\n- Changes: CI\n- Deploy script: follow-up — Use the new check in deploys\n\n${RISK(0, "revert", "yes — every job runs the check")}`, { approved: true, reasons: [] });
     await links.decided("agent-3", true);
 
     const page = await (await get("/")).text();
     const [waiting, recent] = page.split("Recently decided");
-    assert.deepEqual([...waiting.matchAll(/href="\/review\/([^"]+)"/g)].map((match) => match[1]), ["agent-2", "agent-1"]);
-    const [second, first] = waiting.split('href="/review/').slice(1);
+    assert.deepEqual([...waiting.matchAll(/data-agent="([^"]+)"/g)].map((match) => match[1]), ["agent-2", "agent-1"]);
+    const [second, first] = waiting.split('data-agent="').slice(1);
     assert.match(first, /<div class="title">Warn when a &#60;delay&#62; breaks a date<\/div>/);
     assert.match(first, /<div class="summary">When a container is late, the sales team gets a notice\.<\/div>/);
     assert.match(first, /<span class="chip high">Risk: impact 3\/4 · data-fix<\/span><span class="chip">2 follow-ups<\/span><span class="chip mid">new rule<\/span>/);
@@ -378,4 +380,125 @@ test("without a published origin there is no stable link to give", async () => {
     links.stop();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+// A peer host's inbox: answers /api/inbox with `inbox` and records the decisions sent to it.
+async function withPeer(inbox: unknown, run: (origin: string, decisions: string[]) => Promise<void>) {
+  const decisions: string[] = [];
+  const server = createServer((incoming, response) => {
+    const chunks: Buffer[] = [];
+    incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+    incoming.on("end", () => {
+      if (incoming.url === "/api/inbox") { response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(inbox)); return; }
+      if (incoming.method === "POST" && incoming.url?.endsWith("/decision")) {
+        decisions.push(`${incoming.url} ${incoming.headers["x-review-action"]} ${Buffer.concat(chunks).toString()}`);
+        response.writeHead(409, { "content-type": "application/json" }).end(JSON.stringify({ error: "This review is already closed." }));
+        return;
+      }
+      response.writeHead(404).end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await run(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, decisions);
+  } finally {
+    server.close();
+  }
+}
+
+function action(links: ReviewLinks, path: string, body: unknown, headers: Record<string, string> = { "x-review-action": "1" }): Promise<Response> {
+  return fetch(`http://127.0.0.1:${links.listeningPort}${path}`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+}
+
+const PEER_INBOX = {
+  host: "server087",
+  open: [
+    { agentId: "agent-9", name: "TUC-9", link: "https://server087.tail1.ts.net:8444/review/agent-9", since: "2026-01-01T10:00:30.000Z", model: "omp/opus" },
+    { agentId: "bad id", name: "TUC-8", link: "https://server087.tail1.ts.net:8444/review/bad", since: "2026-01-01T10:00:40.000Z" },
+    { agentId: "agent-7", name: "TUC-7", link: "javascript:alert(1)", since: "2026-01-01T10:00:50.000Z" },
+  ],
+  decided: [],
+};
+
+test("the inbox lists a peer host's waiting reviews among this host's, newest first, names each row's host, and says which peer did not answer", async () => {
+  await withPeer(PEER_INBOX, async (peer) => {
+    await withLinks(async (links, get, live) => {
+      live.add(50_001);
+      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1", model: "claude/opus" });
+      const page = await (await get("/")).text();
+      const [waiting] = page.split("Recently decided");
+      assert.deepEqual([...waiting.matchAll(/data-agent="([^"]+)"/g)].map((match) => match[1]), ["agent-9", "agent-1"], "rows a page could not render safely are left out");
+      assert.match(waiting, /href="https:\/\/server087\.tail1\.ts\.net:8444\/review\/agent-9"/);
+      assert.match(waiting, /<span>server087<\/span>/);
+      assert.match(waiting, /<span>mac<\/span>/);
+      assert.match(waiting, /<span>opus<\/span>/, "the model that planned it, without its provider");
+      assert.match(page, /Not reachable, so its reviews are missing: localhost/);
+      assert.doesNotMatch(page, /TUC-7|TUC-8/);
+    }, undefined, { host: "mac", peers: async () => [peer, "http://localhost:1"] });
+  });
+});
+
+test("approve and send back from the inbox decide this host's review, forward a peer's to that peer, and refuse anything a page on another site could send", async () => {
+  const decided: string[] = [];
+  await withPeer(PEER_INBOX, async (peer, forwarded) => {
+    await withLinks(async (links, get, live) => {
+      live.add(50_001).add(50_002);
+      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" });
+      await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, { identifier: "TUC-2" });
+      await get("/");
+
+      assert.equal((await action(links, "/api/reviews/agent-1/decision", { approve: true }, {})).status, 403, "without the inbox's own header");
+      assert.equal((await action(links, "/api/reviews/agent-1/decision", { approve: true }, { "x-review-action": "1", origin: "https://evil.example" })).status, 403, "from another site");
+      assert.equal((await action(links, "/api/reviews/agent-1/decision", { approve: false, feedback: "  " })).status, 400, "sending back needs a note");
+      assert.deepEqual(decided, []);
+
+      assert.equal((await action(links, "/api/reviews/agent-1/decision", { approve: true, feedback: "ignored" })).status, 200);
+      assert.equal((await action(links, "/api/reviews/agent-2/decision", { approve: false, feedback: " Split step 2 " })).status, 200);
+      assert.deepEqual(decided, ["http://localhost:50001/?r=1 true  agent-1", "http://localhost:50002/?r=1 false Split step 2 agent-2"]);
+      const again = await action(links, "/api/reviews/agent-1/decision", { approve: true });
+      assert.equal(again.status, 409, "a decided review is not decided twice");
+      const [waiting, recent] = (await (await get("/")).text()).split("Recently decided");
+      assert.doesNotMatch(waiting, /data-agent="agent-[12]"/);
+      assert.match(recent, /TUC-2<\/span><span class="outcome[^"]*">sent back/);
+
+      const remote = await action(links, "/api/reviews/agent-9/decision", { approve: true });
+      assert.deepEqual([remote.status, await remote.json()], [409, { error: "This review is already closed." }], "the peer's answer is passed on");
+      assert.deepEqual(forwarded, ['/api/reviews/agent-9/decision 1 {"approve":true,"feedback":""}']);
+      assert.equal((await action(links, "/api/reviews/agent-unknown/decision", { approve: true })).status, 404);
+    }, undefined, { peers: async () => [peer], decide: async (localUrl, approve, feedback, agentId) => { decided.push(`${localUrl} ${approve} ${feedback} ${agentId}`); } });
+  });
+});
+
+test("each review that starts waiting is pushed once to the subscribed browsers; the reviews waiting at setup and dropped subscriptions are not", async () => {
+  const sent: string[] = [];
+  let gone = false;
+  await withLinks(async (links, get, live) => {
+    const subscription = { endpoint: "https://push.example/1", keys: { p256dh: "p", auth: "a" } };
+    assert.match((await (await get("/api/push/key")).json()).publicKey, /^[A-Za-z0-9_-]{80,}$/);
+    assert.equal((await action(links, "/api/push/subscribe", { endpoint: "http://push.example/1", keys: subscription.keys })).status, 400);
+    assert.equal((await action(links, "/api/push/subscribe", subscription)).status, 200);
+    live.add(50_001).add(50_002).add(50_003);
+    await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" });
+    await links.announce();
+    assert.deepEqual(sent, [], "what already waits when notifications start is not announced");
+
+    await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, { identifier: "TUC-2" });
+    await links.announce();
+    await links.announce();
+    assert.deepEqual(sent, [`https://push.example/1 Plan review: TUC-2 ${ORIGIN}/review/agent-2 2`]);
+
+    gone = true;
+    await links.opened("agent-3", { ...opened(50_003), agentId: "agent-3" }, { identifier: "TUC-3" });
+    await links.announce();
+    gone = false;
+    await links.opened("agent-4", { ...opened(50_004), agentId: "agent-4" }, { identifier: "TUC-4" });
+    live.add(50_004);
+    await links.announce();
+    assert.equal(sent.length, 1, "the push service dropped the subscription, so it is not used again");
+  }, undefined, {
+    sendPush: async (subscription, message) => {
+      if (gone) throw Object.assign(new Error("Gone"), { statusCode: 410 });
+      sent.push(`${subscription.endpoint} ${message.title} ${message.url} ${message.count}`);
+    },
+  });
 });

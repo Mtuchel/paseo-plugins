@@ -607,7 +607,8 @@ closes the agent's own review, archives the agent, and moves the ticket to **Pla
 `plan-ready`. A central Plannotator host the plugin runs (`plannotator/host.mjs`, started with Bun
 on plugin start, restarted when it exits, stopped with the plugin) serves every parked plan with
 Plannotator's own review page, published in the tailnet like any review, so the review inbox, the
-agent's stable link, the panel and the Linear comment work as before; the review tab opens once.
+agent's stable link, the panel and the Linear comment work as before; like any review with a
+stable link, it opens no browser tab (the inbox and its notification take that place).
 Your decision there, or **Approve plan** / **Send back** in the panel:
 
 - approve: the plan document, `plan-ready`, the ticket back to Todo, and a fresh agent that
@@ -1120,8 +1121,10 @@ Plannotator shows its review URL only in omp's own status line, which Paseo does
 The plugin sets `PLANNOTATOR_BROWSER` for every agent session to a small hook
 (`$PASEO_HOME/linear-tickets/plannotator/open`). When a review starts, the hook publishes the
 review port inside your tailnet with `tailscale serve` (HTTPS, reachable only from your devices)
-and hands the review to the plugin, which opens it on the host within a few seconds, after the
-risk policy has looked at it: an auto-approved plan opens no tab. When the plugin cannot take the
+and hands the review to the plugin. A review that gets a stable link (below) opens no browser tab:
+it is listed in the review inbox, which can notify your devices. Only a review without one (`:8444`
+not published) opens on the host within a few seconds, after the risk policy has looked at it, and
+an auto-approved plan opens no tab either way. When the plugin cannot take the
 review (no events directory), the hook opens it itself. The agent's Paseo chat then gets a “Handed off to
 Plannotator” row with the link. Agents linked to a ticket also get it in the Linear comment (or
 the panel's “Plan review” link), so reviews open on your phone.
@@ -1164,11 +1167,30 @@ still answers; each row opens the agent's stable link. Each waiting row shows th
 risk rating (see *Plan risk and auto-approval*) as a coloured badge (green impact 0–1, amber 2, red
 3–4; planner and advisor combined, as the policy reads it) and why the risk policy left it to
 you. Next to the badge, `2 follow-ups` counts the plan's `follow-up` items (filed as tickets on
-approval) and `new rule` marks a plan that sets one. Decided rows keep the title and the chips, and
-say `auto-approved` when the policy approved it. The details are read once when the review opens
-(plans that predate the rating have no badge). The page refreshes in place every 30 s and when you
-return to it, keeping your scroll position; when the host cannot be reached it says so and keeps
-retrying. On a phone, use “Add to Home Screen” to keep it as an app.
+approval) and `new rule` marks a plan that sets one. Below it: **Linear ↗** (the ticket), the model
+that wrote the plan, and the host it runs on when the inbox lists several. Decided rows keep the
+title and the chips, and say `auto-approved` when the policy approved it. The details are read once
+when the review opens (plans that predate the rating have no badge). The page refreshes in place
+every 30 s and when you return to it, keeping your scroll position (not while you are writing a
+note); when the host cannot be reached it says so and keeps retrying.
+
+- **Approve / Send back** on each waiting row decide the review as on its page: approve at once,
+  or send back with the note you type there. It goes the same way as **Approve plan** / **Send
+  back** in the Linear panel, so a parked plan moves on and an agent's own review gets its answer.
+  Only the inbox's own page can send these (a custom header, no cross-site requests).
+- **All hosts in one inbox.** List the other hosts' inboxes in `reviewPeers` in
+  `$PASEO_HOME/linear-tickets/settings.json` (no toggle), e.g.
+  `"reviewPeers": ["https://server087.<tailnet>.ts.net:8444"]`, and this inbox shows their waiting
+  reviews and decisions too, each marked with its host; a decision on one of them is passed to its
+  host. A peer that does not answer is named at the top. Each host reads the others over the tailnet
+  (`/api/inbox`), so the same list is on every host that names its peers.
+- **Notifications.** **Notify me** subscribes the browser (Web Push): each review that starts
+  waiting, here or on a peer, arrives as one notification that opens it, and the app icon shows the
+  waiting count. Reviews already waiting when the first browser subscribes are not announced. On an
+  iPhone, first add the inbox to the Home Screen (Share → Add to Home Screen) and tap **Notify me**
+  there; iOS allows web notifications only for Home Screen apps. The keys and subscriptions are kept
+  in `$PASEO_HOME/linear-tickets/plannotator/push.json` (private); a subscription the push service
+  drops is removed. Subscribe on one host's inbox: each host notifies its own subscribers.
 
 With status write-back on, a ticket moves to its team's started state named **Planning**
 when a plan is handed off (and stays there when it is sent back), and to **In Progress** once

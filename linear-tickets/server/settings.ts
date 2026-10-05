@@ -39,6 +39,8 @@ export type PluginSettings = {
   autoApprove: AutoApprovePolicy;
   // The cheap tier's model per provider; `{}` turns the cheap tier off.
   cheapModels: Record<string, CheapModel>;
+  // Other hosts' review inboxes (https://<host>.<tailnet>.ts.net:8444) this host's inbox also lists.
+  reviewPeers: string[];
 };
 
 type SettingsFile = {
@@ -53,6 +55,7 @@ type SettingsFile = {
   writeback?: Partial<WritebackSettings>;
   autoApprove?: Partial<AutoApprovePolicy>;
   cheapModels?: Record<string, CheapModel>;
+  reviewPeers?: string[];
 };
 
 function savedString(value: unknown): string | undefined {
@@ -76,6 +79,20 @@ function normalizeLaunchPreferences(value: unknown): Record<string, LaunchPrefer
 function normalizeCheapModels(value: unknown): Record<string, CheapModel> {
   if (value === undefined) return DEFAULT_CHEAP_MODELS;
   return Object.fromEntries(Object.entries(normalizeLaunchPreferences(value)).map(([provider, { model, thinkingOptionId }]) => [provider, { model, ...(thinkingOptionId ? { thinkingOptionId } : {}) }]));
+}
+
+export const MAX_REVIEW_PEERS = 10;
+// Origins of other hosts' review inboxes; anything that is not an http(s) origin is dropped.
+export function normalizeReviewPeers(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const origins = value.flatMap((raw) => {
+    if (typeof raw !== "string") return [];
+    try {
+      const url = new URL(raw.trim());
+      return url.protocol === "https:" || url.protocol === "http:" ? [url.origin] : [];
+    } catch { return []; }
+  });
+  return [...new Set(origins)].slice(0, MAX_REVIEW_PEERS);
 }
 
 const MAPPING_KEY = /^(project|team):[A-Za-z0-9_-]{1,100}$/;
@@ -214,6 +231,7 @@ export class Settings {
       writeback: normalizeWriteback(value.writeback),
       autoApprove: normalizeAutoApprove(value.autoApprove),
       cheapModels: normalizeCheapModels(value.cheapModels),
+      reviewPeers: normalizeReviewPeers(value.reviewPeers),
     };
   }
 
@@ -269,7 +287,7 @@ export class Settings {
     const customWriteback = JSON.stringify(value.writeback) !== JSON.stringify(DEFAULT_WRITEBACK);
     const customAutoApprove = JSON.stringify(value.autoApprove) !== JSON.stringify(DEFAULT_AUTO_APPROVE);
     const customCheapModels = JSON.stringify(value.cheapModels) !== JSON.stringify(DEFAULT_CHEAP_MODELS);
-    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customAutoApprove && !customCheapModels) {
+    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customAutoApprove && !customCheapModels && !value.reviewPeers.length) {
       await rm(this.path, { force: true });
       return value;
     }
@@ -288,6 +306,7 @@ export class Settings {
     if (customWriteback) fileValue.writeback = value.writeback;
     if (customAutoApprove) fileValue.autoApprove = value.autoApprove;
     if (customCheapModels) fileValue.cheapModels = value.cheapModels;
+    if (value.reviewPeers.length) fileValue.reviewPeers = value.reviewPeers;
     const temporary = `${this.path}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, JSON.stringify(fileValue), { mode: 0o600, flag: "wx" });

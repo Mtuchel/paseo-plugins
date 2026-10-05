@@ -385,6 +385,10 @@ export const TEAM_OPEN_ISSUES_QUERY = `query teamOpenIssues($teams: [ID!]!, $aft
 export const ISSUE_BY_NUMBER_QUERY = `query issueByNumber($team: String!, $number: Float!) {
   issues(first: 1, includeArchived: true, filter: { team: { key: { eqIgnoreCase: $team } }, number: { eq: $number } }) { nodes { id identifier title } }
 }`;
+// The workspace's URL key, for web links to tickets (https://linear.app/<urlKey>/issue/TUC-1).
+export const ORGANIZATION_QUERY = `query organizationUrlKey {
+  organization { urlKey }
+}`;
 export type LabeledProject = { id: string; name: string };
 export type TicketRef = { id: string; identifier: string; title: string };
 export type TeamIssue = TicketRef & { status: string; projectId: string | null; projectName: string };
@@ -1263,6 +1267,16 @@ export class LinearService {
   }
 
   private viewer: string | null = null;
+  private workspace: string | null = null;
+
+  // The workspace's web address (https://linear.app/<urlKey>); cached: a key belongs to one workspace.
+  async workspaceUrl(): Promise<string> {
+    if (this.workspace) return this.workspace;
+    const urlKey = label(record(record(await this.read(ORGANIZATION_QUERY, {})).organization ?? {}).urlKey);
+    if (!urlKey) throw new Error("Linear did not return the workspace's URL key.");
+    this.workspace = `https://linear.app/${encodeURIComponent(urlKey)}`;
+    return this.workspace;
+  }
 
   // The API key's own user; cached because the key cannot change without a reconnect.
   async viewerId(): Promise<string> {

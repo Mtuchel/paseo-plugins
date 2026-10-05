@@ -70,7 +70,7 @@ test("the plan document states the decision and feedback above the plan", () => 
 
 const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true,
-  dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true }, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {},
+  dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true }, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, reviewPeers: [],
 };
 
 // `ticket`: who wrote the ticket and its labels, for the risk policy's checks.
@@ -168,10 +168,11 @@ test("agents without a ticket, and subagents, only get the chat row", async () =
   }
 });
 
-test("with review links, the agent's stable link is posted instead of the review's own port, and the inbox learns the plan and why it needs the owner", async () => {
+test("with review links, the agent's stable link is posted instead of the review's own port, no tab opens, and the inbox learns the plan and why it needs the owner", async () => {
   const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const tabs: string[] = [];
   const reviews = {
-    async opened(agentId: string, event: { remoteUrl: string | null }, identifier?: string) { calls.push(`opened ${agentId} ${event.remoteUrl} ${identifier}`); return `https://host.ts.net:8444/review/${agentId}`; },
+    async opened(agentId: string, event: { remoteUrl: string | null }, review: { identifier?: string } = {}) { calls.push(`opened ${agentId} ${event.remoteUrl} ${review.identifier}`); return `https://host.ts.net:8444/review/${agentId}`; },
     async decided(agentId: string, approved: boolean) { calls.push(`decided ${agentId} ${approved}`); },
     async described(localUrl: string, plan: string, judgement: { approved: boolean; reasons: string[] } | null) { calls.push(`described ${localUrl} ${plan === RISKY(2)} ${judgement?.approved} ${judgement?.reasons.join("; ")}`); },
   };
@@ -179,7 +180,7 @@ test("with review links, the agent's stable link is posted instead of the review
     { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
     { type: "decided", agentId: "agent-1", approved: true, planContent: "# Plan", at: "2026-01-01T10:05:00Z" },
   ], async (directory) => {
-    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, reviews, async () => {}, () => {});
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, reviews, async () => {}, (url) => tabs.push(url));
     bridge.attach(paseo);
     await bridge.drain();
     bridge.stop();
@@ -188,6 +189,7 @@ test("with review links, the agent's stable link is posted instead of the review
     assert.ok(calls.some((call) => call.startsWith("comment issue-1: 📋") && call.includes("https://host.ts.net:8444/review/agent-1") && !call.includes(":4000")));
     assert.ok(calls.includes("described http://localhost:4000/ true false no advisor review was recorded for this plan text; impact 2 is above the threshold 1"));
     assert.ok(calls.includes("decided agent-1 true"));
+    assert.deepEqual(tabs, [], "the review is in the inbox, so no browser tab opens");
   });
 });
 
@@ -334,7 +336,7 @@ test("a plan that needs the owner is parked and its agent retired; the central h
   const decisions: string[] = [];
   const inbox: string[] = [];
   const reviews = {
-    async opened(agentId: string, event: { localUrl: string }, _identifier?: string, since?: string) { inbox.push(`${agentId} ${event.localUrl} since ${since}`); return null; },
+    async opened(agentId: string, event: { localUrl: string }, review: { since?: string } = {}) { inbox.push(`${agentId} ${event.localUrl} since ${review.since}`); return null; },
     async decided() {},
     async described() {},
   };

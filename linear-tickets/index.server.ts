@@ -74,12 +74,14 @@ export default function contribute(server: PluginServerContext) {
   // Waits on tickets already closed live in "Needs you" sub-issues; replies there (a relayed
   // comment or an @mention of the app) go to the agent that asked.
   const needsYou = new NeedsYouIssues();
+  // The owner's Approve / Send back from the Linear panel or the review inbox: as on the review page.
+  const decideReview = async (localUrl: string, approve: boolean, feedback: string, agentId: string) => {
+    const planContent = await readReviewPlan(localUrl).catch(() => "");
+    await decidePlannotatorReview(localUrl, approve, feedback);
+    await recordDecision({ type: "decided", agentId, approved: approve, ...(feedback ? { feedback } : {}), planContent, at: new Date().toISOString() });
+  };
   const sessions = new SessionRouter({ api: agentApi, linear, starter, settings, store: new SessionStore(), needsYou,
-    decideReview: async (localUrl, approve, feedback, agentId) => {
-      const planContent = await readReviewPlan(localUrl).catch(() => "");
-      await decidePlannotatorReview(localUrl, approve, feedback);
-      await recordDecision({ type: "decided", agentId, approved: approve, ...(feedback ? { feedback } : {}), planContent, at: new Date().toISOString() });
-    },
+    decideReview,
     reviewOutcome: (review) => reviewOutcome(review),
     recordOutcome: (agentId, outcome) => recordDecision({ type: "decided", agentId, ...outcome, at: new Date().toISOString() }),
     splitPlan: (link, localUrl, paseo) => splitIntoSubIssues({ linear, appUserId: async () => (await agentApi.viewer()).id, readPlan: readReviewPlan, retirePlanner, followUps }, link, localUrl, paseo),
@@ -104,7 +106,12 @@ export default function contribute(server: PluginServerContext) {
   const decisions = new DecisionLog();
   writeback.recordDecisions(decisions);
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
-  const reviewLinks = new ReviewLinks();
+  // Its root is the review inbox, listing the peer hosts' reviews too (README, "Review inbox").
+  const reviewLinks = new ReviewLinks({
+    peers: async () => (await settings.read()).reviewPeers,
+    decide: decideReview,
+    linearWorkspace: () => linear.workspaceUrl(),
+  });
   // Plans that need the owner are parked and served by one central Plannotator host, so their
   // agents are retired instead of holding a slot until the owner decides (README, "Parked plans").
   const plannotatorHost = new PlannotatorHost();
