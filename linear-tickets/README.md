@@ -965,8 +965,10 @@ restack or fix of its own, and asks for `git switch <range top> && node tools/ci
 tools/ci/wait-queue.mjs <its PR>`; its message carries all three counts. The message goes out
 once the agent is idle; Paseo resumes it if it has stopped. While the agent is in a turn or
 waiting for an answer, or Paseo is not connected, the message waits for a later poll. When the
-agent is gone or archived, the same text becomes a ticket comment mentioning you, and the ticket
-moves back to In Progress (when status write-back is on). Each drop is claimed in
+agent is gone or archived, a successor starts with the same text (see **Gone agents** below);
+when none can start, it becomes a
+ticket comment mentioning you, and the ticket moves back to In Progress (when status write-back
+is on). Each drop is claimed in
 `$PASEO_HOME/linear-tickets/pr-watch.json` (by its draft, or by the bullet when there is none)
 before anything is sent, so it is delivered at most once, also across restarts. A message for a
 pull request that still holds an undelivered one waits behind it and goes out after it. An
@@ -1046,8 +1048,9 @@ branch is gone, the agent is told once to replay the rest of its stack onto
 main from the landed branch (`git fetch origin main && git rebase --update-refs --onto
 origin/main <landed branch>` on the top branch), `git push --force-with-lease` each replayed
 branch, open a new pull request onto main whose body links the old one, and `gt track <branch>
---parent main`. It is claimed and delivered like a nudge; a gone or archived agent's message goes
-to the ticket. After that request an archived agent's closed pull request stays watched for its
+--parent main`. It is claimed and delivered like a nudge; a gone or archived agent's message
+starts a successor or, when none can, goes to the ticket. After that request an archived agent's
+closed pull request stays watched for its
 replacement until 14 days pass without activity.
 
 **Stalled pull requests.** Agents often stop before their pull request reaches the merge queue.
@@ -1075,8 +1078,50 @@ claimed per review instead: a change request is sent once, however many commits 
 keeps holding the merge until the reviewer settles it), and a new request is sent again. The next time that
 stage stalls, you get one comment instead ("Paseo asked the agent 2 times to …"), and after
 that only the log. A busy or disconnected agent is asked on a later poll; a gone or archived
-agent's nudge goes to the ticket like a drop's fix request (it counts toward the same two).
+agent's nudge starts a successor or goes to the ticket like a drop's fix request (it counts toward
+the same two).
 Review threads are read (GraphQL, every page) only when a stage needs them.
+
+**Gone agents.** A nudge, merge queue fix request (the queue backstop's refused enqueues
+included) or replacement request for an agent that is archived or no longer exists starts a
+successor: a new agent on the ticket's recorded branch and worktree, which gets the handover of
+the previous agent's reports and, as the last part of its first prompt, "Paseo started you
+because the pull request needs this now:" with the message. It is claimed right before the start
+and counts like a message sent (the two nudges per stage, the drop limits), so a pull request
+that keeps stalling still reaches you. The ticket's panel shows "The agent was gone; Paseo
+started a successor (agent 1a2b3c4d) on `<branch>` and asked it to …"; it gets its own thread,
+the gone agent is archived and the handover record names the successor. When no slot is free
+(blockers, the agent limit, memory, away mode) or another start of the ticket is under way, the
+message waits and is judged again on the next poll, without a comment. When another live agent of
+the ticket already runs, it takes over the record and gets the message on the next poll. When no
+successor can start (the ticket is closed, no branch is recorded, the branch cannot be
+continued, the start fails), the message goes to the ticket as before: back to In Progress and a
+comment mentioning you. The same happens for a pull request labelled `do-not-merge` and while
+*Start a new agent automatically when one fails* is off. A crash right between the claim and the
+start (the plugin stops in that second) loses the message: the log names the claim, and it is not
+repeated.
+
+**Waiting for your answer.** An agent waiting for your answer or approval takes no message, so
+the pull request waits with it. When a nudge, fix request or replacement request has waited 60
+minutes for such an agent, you get one comment, "The agent has waited over 60 minutes for your
+answer while the pull request waits for it to …", and the message counts as escalated (the
+stage's nudges, the drop, the replacement request then only reach the log). The wait is kept in
+`pr-watch.json` across polls, restarts and a busy or disconnected agent, and starts again for a
+new head, review or stage, or once a message went out.
+
+**One start per ticket.** Every automatic start (the trigger label, a new thread on the ticket,
+the project planner's restart, the automatic resume, a successor) takes the ticket's start gate
+and checks for a live agent first, so two of them never start two agents for one ticket. One that
+finds the gate taken waits: the label stays for the next poll, a thread is queued with its comment
+and joins the agent once it runs, a project restart is retried on the next read, the automatic
+resume leaves you the "Resume with a new agent" offer, a successor waits for the next poll.
+Starting an agent from the sidebar or by answering "Resume" takes no gate.
+
+*Rollback.* Reverting the change stops new successors; agents already started keep running until
+archived (`paseo ls`, label `linear.issueId`), and the messages they got count as sent. Switching
+*Start a new agent automatically when one fails* off stops them at once. A message claimed for a successor that
+never started (the log line "is claimed; starting a successor" without a following "started a
+successor") is repaired by sending its step to the ticket's agent by hand.
 
 **Crashed agents.** An agent whose provider process exited or closed (Paseo shows it in error,
 for example "OMP RPC process is closed") receives no message. Before a nudge, a merge queue fix
@@ -1087,7 +1132,7 @@ rebase, and repeats the step it was about to be asked for. The agent panel shows
 crashed (…); Paseo restarted it …". A restart counts as a nudge for its stage even on an
 unchanged head, so an agent that crashes on every turn still reaches the owner after two. When
 the restart fails, the attempt still counts; a fix or replacement request then goes to the ticket
-as for a gone agent. A busy agent, an agent waiting for an answer, and an agent whose ticket has
+(no successor: the agent still exists). A busy agent, an agent waiting for an answer, and an agent whose ticket has
 another live agent (for example a successor the automatic resume just started) are never
 restarted. If the message does not go out after the restart (the agent is busy right away, the
 send fails, or the plugin stops), it is sent on a later poll, at least once: a duplicate is
@@ -1108,12 +1153,16 @@ caused by outages (HTTP 5xx, rate limits, network) are retried after 30 s and 2 
 in place: phase, branch, last commit, links, latest report. When the agent fails or is
 archived while the ticket is open, it also posts a final report. The panel then offers
 **Resume with a new agent**, which is automatic when *Start a new agent automatically when one
-fails* is on (at most hourly). Assigning Paseo again, @mentioning it or re-adding the label
+fails* is on (at most hourly; the same setting starts successors for gone agents' pull request
+work, see **Gone agents** above).
+Assigning Paseo again, @mentioning it or re-adding the label
 also resumes. The new agent continues on the same branch, reusing the old worktree while it
 exists so uncommitted work survives. It starts with a handover of the previous agent's reports,
 and the old agent is archived. The ticket's links, its pull request among them, stay on the
 record, so the pull request watch keeps following them; only "Open in Paseo" moves to the new
-agent.
+agent. The record changes owner at a takeover only while it still names the old agent (or none):
+once the new agent wrote to it, the old agent's archive leaves it alone, and the old agent's final
+report then only says who took over. A third agent's record is never touched.
 
 ## Plannotator reviews
 

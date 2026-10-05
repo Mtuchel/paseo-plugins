@@ -61,6 +61,8 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
     api: { activity: async (_s: string, content: { type: string; body?: string }) => { calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); }, openSessions: async () => [], activities: async () => [] } as never,
     linear: { viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, issueState: async () => { throw new Error("unused"); }, issueGroup: async () => { throw new Error("unused"); }, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {} },
     starter: { start: async () => { throw new Error("unused"); }, admission: async () => ({ ok: true as const }) },
+    handover: { resumeTarget: async () => null, handOff: async () => true },
+    launcher: { gate: () => ({ release: () => {} }) },
     settings: { read: async () => settings },
     store,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },

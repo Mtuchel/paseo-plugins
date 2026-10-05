@@ -16,9 +16,13 @@ type Start = RpcInput<typeof launchAgentRpc>;
 type Result = { agentId: string; warnings: string[] };
 // `resume` continues another agent's work: same branch (and worktree while it still exists),
 // with the handover text ahead of the ticket prompt. `labels` are added to the agent, `env` to
-// its provider process.
+// its provider process. `lead`: why Paseo started the agent now (the pull request's next step for
+// a successor the pull request watch started), the last part of its first prompt.
 export type ResumeTarget = { branch: string; worktreePath: string | null; handover: string };
-type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess?: boolean; labels?: Record<string, string>; env?: Record<string, string>; resume?: ResumeTarget };
+type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess?: boolean; labels?: Record<string, string>; env?: Record<string, string>; resume?: ResumeTarget; lead?: string };
+// A held per-ticket start gate (see Launcher.gate); `release` is idempotent.
+export type Gate = { release(): void };
+export const LEAD_INTRO = "Paseo started you because the pull request needs this now:";
 
 // Linear computes the branch name with the workspace's branch-format setting, so it is
 // the name users expect — but a stored value is not guaranteed to be a safe git ref.
@@ -54,6 +58,8 @@ export class Launcher {
   private readonly active = new Map<string, Promise<Result>>();
   // Launches under way per ticket, from any start path (sidebar, label, thread, project).
   private readonly launching = new Map<string, number>();
+  // Tickets whose automatic start path holds the start gate (see gate).
+  private readonly gates = new Set<string>();
 
   constructor(
     private readonly linear: Pick<LinearService, "detail" | "markInProgress" | "finishedBlockers">,
@@ -67,7 +73,7 @@ export class Launcher {
   ) {}
 
   start(input: Start, paseo: PaseoApi, options: Options = {}): Promise<Result> {
-    const fingerprint = JSON.stringify([input.id, input.projectId, input.baseBranch, input.provider, input.modeId, input.thinkingOptionId, input.instructions, options.promptTemplate ?? "", options.markInProgress ?? false, options.linearAccess ?? false]);
+    const fingerprint = JSON.stringify([input.id, input.projectId, input.baseBranch, input.provider, input.modeId, input.thinkingOptionId, input.instructions, options.promptTemplate ?? "", options.markInProgress ?? false, options.linearAccess ?? false, options.lead ?? ""]);
     const prior = this.requests.get(input.requestId);
     if (prior) {
       if (prior.fingerprint !== fingerprint) return Promise.reject(new Error("This launch request has already been used. Reopen the ticket to start another agent."));
@@ -103,7 +109,20 @@ export class Launcher {
   }
 
   underWay(issueId: string): boolean {
-    return this.launching.has(issueId);
+    return this.launching.has(issueId) || this.gates.has(issueId);
+  }
+
+  // One automatic start per ticket at a time (README, "Stalled pull requests"): every automatic
+  // start path (label dispatch, thread start and its queue, project restart, auto-resume, the pull
+  // request watch's successor) takes the gate before it checks for a live agent and holds it through
+  // admission and creation. Null while another path holds it or any launch of the ticket is under
+  // way (the sidebar's included); that path then takes its own "wait". Synchronous and never
+  // waiting, so holding it while awaiting the ticket's turn (SessionRouter.exclusive) cannot deadlock.
+  gate(issueId: string): Gate | null {
+    if (this.underWay(issueId)) return null;
+    this.gates.add(issueId);
+    let held = true;
+    return { release: () => { if (held) { held = false; this.gates.delete(issueId); } } };
   }
 
   private async launch(input: Start, paseo: PaseoApi, options: Options, onCreate: () => void): Promise<Result> {
@@ -201,7 +220,7 @@ export class Launcher {
     // `attach`: hand the ticket server to the provider as an MCP server. omp cannot load one, so its
     // agents get the server's command in TICKET_MCP_ENV and the plugin's omp extension mounts the tools.
     const create = async (linearAccess: boolean, requestId: string, attach: boolean) => {
-      const prompt = [options.resume?.handover, buildPrompt(detail, instructions, options.promptTemplate, linearAccess)].filter(Boolean).join("\n\n");
+      const prompt = [options.resume?.handover, buildPrompt(detail, instructions, options.promptTemplate, linearAccess), options.lead ? `${LEAD_INTRO}\n\n${options.lead}` : ""].filter(Boolean).join("\n\n");
       let env: Record<string, string> = { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier };
       if (linearAccess && mcpServers) env[TICKET_MCP_ENV] = JSON.stringify(mcpServers[TICKET_MCP_NAME]);
       try {

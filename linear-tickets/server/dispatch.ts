@@ -1,5 +1,6 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { DispatchStatus } from "../shared/contracts";
+import type { Launcher } from "./launch";
 import type { LabeledIssue, LinearService } from "./linear";
 import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
 import type { CommentRelay } from "./relay";
@@ -16,6 +17,8 @@ type Linear = Pick<LinearService, "labeledIssues" | "addLabel" | "removeLabel" |
 type Deps = {
   linear: Linear;
   starter: Pick<TicketStarter, "start" | "admission">;
+  // The per-ticket start gate every automatic start path takes (Launcher.gate).
+  launcher: Pick<Launcher, "gate">;
   settings: Pick<Settings, "read">;
   // Called after each launch, e.g. to open the ticket's Linear agent session.
   // Returns true when the launch got a Linear agent session, whose panel replaces the start comment.
@@ -182,6 +185,21 @@ export class Dispatcher {
         return;
       }
     }
+    // Another automatic start of the ticket under way (a successor, a thread): the label stays and
+    // the next poll finds its agent. Held from the check for an agent through the start.
+    const gate = this.deps.launcher.gate(issue.id);
+    if (!gate) return;
+    try {
+      await this.launch(issue, settings, paseo);
+    } finally {
+      gate.release();
+    }
+  }
+
+  private async launch(issue: LabeledIssue, settings: PluginSettings, paseo: PaseoApi): Promise<void> {
+    const { linear } = this.deps;
+    const trigger = settings.dispatch.label;
+    const labels = dispatchLabels(trigger);
     // Blocked tickets and a full agent limit wait with their label in place; the next poll retries.
     const admission = await this.deps.starter.admission(issue.id, paseo, settings);
     if (!admission.ok) return;

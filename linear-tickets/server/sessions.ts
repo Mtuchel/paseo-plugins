@@ -12,12 +12,15 @@ import type { AgentSessionWebhook } from "./agent-webhook";
 import { groupProgress, groupStatus, isGroup } from "./groups";
 import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
 import { dispatchLabels } from "./dispatch";
+import type { Handover } from "./handover";
 import type { IssueGroup, LinearService } from "./linear";
+import type { Launcher } from "./launch";
 import { CODING_STATE } from "./plannotator";
+import { LIVE_AGENT } from "./project-flow";
 import { closeAnswered, type NeedsYouIssues } from "./needs-you";
 import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, questionAnswer, questionsOf } from "./relay";
 import type { Settings } from "./settings";
-import type { TicketStarter } from "./starter";
+import { issueAgents, type TicketStarter } from "./starter";
 
 const exec = promisify(execFile);
 const HANDLED_LIMIT = 200;
@@ -59,8 +62,17 @@ export function crashResume(error: string, next: string): string {
 
 // `restarted`: the agent had crashed, was reloaded and got the resume. `reloaded`: it was reloaded,
 // but the resume did not go out (busy right after, or the send failed). `crashed`: it is crashed and
-// was not (or could not be) reloaded; nothing was sent.
-export type PromptOutcome = "sent" | "restarted" | "reloaded" | "crashed" | "busy" | "gone" | "unavailable";
+// was not (or could not be) reloaded; nothing was sent. `waiting`: it waits for the owner's answer
+// or approval, so nothing was sent; unlike `busy` it does not end by itself (README, "Stalled pull
+// requests").
+export type PromptOutcome = "sent" | "restarted" | "reloaded" | "crashed" | "busy" | "waiting" | "gone" | "unavailable";
+// What a successor start for a gone agent (SessionRouter.succeed) came to. `started`: a new agent
+// runs with the message as the last part of its first prompt. `live`: another live agent of the
+// ticket now owns its record and takes the message from the next poll. `wait`: nothing claimed, try
+// again later. `impossible`: no successor can start (the caller tells the owner).
+export type Succession =
+  | { kind: "started" | "live"; agent: { id: string; title: string | null; cwd: string } }
+  | { kind: "wait" | "impossible"; reason: string };
 // How a crashed agent is recovered: `before` runs with the resume text and the crash right before
 // the reload, so the caller can claim the attempt and keep the resume until it went out.
 export type Recovery = { issueId: string; before: (resume: string, error: string) => Promise<void> };
@@ -84,8 +96,12 @@ export type SessionLink = {
   // "split" / "later": the plugin retired the planner on purpose, so no Resume is offered.
   // "parked": its plan waits for the owner in the central Plannotator host (parked.ts).
   offer: "resume" | "split" | "later" | "parked" | null;
-  // Waiting for blockers or a free agent slot; the sweep starts it when admitted.
+  // Waiting for blockers or an agent slot, or for another start of its ticket to finish; the
+  // sweep starts it when admitted, or links it to the agent that start made.
   queued?: boolean;
+  // The comment a thread queued behind another start of its ticket came with, passed on to the
+  // agent it is linked to (see startQueued).
+  pendingText?: string | null;
   // A question with several parts, asked one part at a time.
   questions?: { requestId: string; index: number; answers: Record<string, string> } | null;
   // Replaced by a newer thread on the same ticket (every @mention opens one); told so and completed.
@@ -260,6 +276,10 @@ type Deps = {
   api: AgentApi;
   linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueGroup" | "delegate" | "moveToStateNamed">;
   starter: Pick<TicketStarter, "start" | "admission">;
+  // The ticket's handover record: a successor resumes from it and takes it over (succeed).
+  handover: Pick<Handover, "resumeTarget" | "handOff">;
+  // The per-ticket start gate every automatic start path takes (Launcher.gate).
+  launcher: Pick<Launcher, "gate">;
   settings: Pick<Settings, "read">;
   store: SessionStore;
   stop?: (agentId: string) => Promise<void>;
@@ -398,32 +418,44 @@ export class SessionRouter {
       await this.say(session.id, "error", "Only the workspace owner can start Paseo agents.");
       return;
     }
-    const asked = (await this.deps.needsYou?.all())?.find((entry) => entry.id === issueId);
-    const existing = asked
-      ? { id: asked.agentId, title: (await this.paseo!.agents.ref(asked.agentId).refresh().catch(() => null))?.agent.title ?? null }
-      : await this.activeAgentFor(issueId);
-    if (existing) {
-      await this.deps.store.put({ ...link, agentId: existing.id });
-      await this.linkToPaseo(session.id, existing.id);
-      const comment = (session.comment ?? {}) as { body?: string };
-      const text = typeof comment.body === "string" && !/^This thread is for an agent session/.test(comment.body) ? comment.body.replace(/@paseo\b/gi, "").trim() : "";
-      // Same as a relayed comment: answers a pending question or decides a pending approval.
-      if (text) await deliverToAgent(this.paseo!, existing.id, text);
-      if (text && asked) await closeAnswered(this.deps.needsYou!, this.deps.linear, issueId);
-      await this.say(session.id, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.${text ? " Your message was passed on." : ""}`);
+    const comment = (session.comment ?? {}) as { body?: string };
+    const text = typeof comment.body === "string" && !/^This thread is for an agent session/.test(comment.body) ? comment.body.replace(/@paseo\b/gi, "").trim() : "";
+    // Another automatic start of the ticket is under way: the thread waits for it, and the queue
+    // sweep links it to the agent it made (passing the comment on) or starts one.
+    const gate = this.deps.launcher.gate(issueId);
+    if (!gate) {
+      await this.deps.store.put({ ...link, queued: true, pendingText: text || null });
+      await this.say(session.id, "thought", "A launch for this ticket is under way; this thread joins its agent once it is up, or starts one.");
+      return;
+    }
+    try {
+      const asked = (await this.deps.needsYou?.all())?.find((entry) => entry.id === issueId);
+      const existing = asked
+        ? { id: asked.agentId, title: (await this.paseo!.agents.ref(asked.agentId).refresh().catch(() => null))?.agent.title ?? null }
+        : await this.activeAgentFor(issueId);
+      if (existing) {
+        await this.deps.store.put({ ...link, agentId: existing.id });
+        await this.linkToPaseo(session.id, existing.id);
+        // Same as a relayed comment: answers a pending question or decides a pending approval.
+        if (text) await deliverToAgent(this.paseo!, existing.id, text);
+        if (text && asked) await closeAnswered(this.deps.needsYou!, this.deps.linear, issueId);
+        await this.say(session.id, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.${text ? " Your message was passed on." : ""}`);
+        await this.closeSuperseded();
+        return;
+      }
+      if (await this.startGroup(link)) return;
+      await this.deps.store.put(link);
+      const admission = await this.deps.starter.admission(issueId, this.paseo!, await this.deps.settings.read());
+      if (!admission.ok) {
+        await this.deps.store.patch(session.id, { queued: true });
+        await this.say(session.id, "thought", admission.reason);
+        return;
+      }
+      await this.startFor(link, false);
       await this.closeSuperseded();
-      return;
+    } finally {
+      gate.release();
     }
-    if (await this.startGroup(link)) return;
-    await this.deps.store.put(link);
-    const admission = await this.deps.starter.admission(issueId, this.paseo!, await this.deps.settings.read());
-    if (!admission.ok) {
-      await this.deps.store.patch(session.id, { queued: true });
-      await this.say(session.id, "thought", admission.reason);
-      return;
-    }
-    await this.startFor(link, false);
-    await this.closeSuperseded();
   }
 
   // Completes older threads on a ticket once a newer one has the agent, so the ticket shows one
@@ -454,7 +486,7 @@ export class SessionRouter {
     await this.deps.linear.addLabel(link.issueId, running).catch(() => {});
     try {
       const started = await this.deps.starter.start(link.issueId, this.paseo!, settings, { labels: { "linear.sessionId": link.sessionId }, retryHint: "assign Paseo again", fresh });
-      await this.deps.store.patch(link.sessionId, { agentId: started.agentId, offer: null, queued: false });
+      await this.deps.store.patch(link.sessionId, { agentId: started.agentId, offer: null, queued: false, pendingText: null });
       // The stopped agent is closed only after the session points at its successor, so its
       // archive does not offer another resume. Its worktree stays for the new agent.
       if (link.agentId && link.agentId !== started.agentId) await this.paseo!.agents.ref(link.agentId).archive().catch(() => {});
@@ -590,53 +622,72 @@ export class SessionRouter {
     return Boolean(newest && (newest.queued || newest.agentId || newest.offer || newest.group || newest.closed));
   }
 
-  // Threads waiting for blockers or an agent slot. Read from the store, not from `openSessions`:
-  // that is Linear's 50 most recently updated sessions in the whole workspace, and a waiting
-  // thread posts nothing, so it drops out of that list hours before a slow blocker finishes.
-  // Each thread is tried on its own: a failed read leaves it queued for the next sweep, a failed
-  // start ends the wait with an error in the thread (as for a ticket that was never queued).
+  // Threads waiting for blockers, an agent slot or another start of their ticket. Read from the
+  // store, not from `openSessions`: that is Linear's 50 most recently updated sessions in the whole
+  // workspace, and a waiting thread posts nothing, so it drops out of that list hours before a slow
+  // blocker finishes. Each thread is tried on its own, under the ticket's start gate: a failed read
+  // (or a failed send of its comment) leaves it queued for the next sweep, a failed start ends the
+  // wait with an error in the thread (as for a ticket that was never queued). A ticket that has an
+  // agent meanwhile is linked to it without waiting for a slot: linking starts nothing.
   async startQueued(): Promise<void> {
     for (const link of await this.deps.store.all()) {
       if (!link.queued || link.agentId || link.closed) continue;
+      const gate = this.deps.launcher.gate(link.issueId);
+      if (!gate) continue;
       try {
-        const admission = await this.deps.starter.admission(link.issueId, this.paseo!, await this.deps.settings.read());
-        if (!admission.ok) continue;
-        // The owner may have ended the thread or closed the ticket while it waited.
-        const status = await this.deps.api.sessionStatus(link.sessionId);
-        if (!status || status === "complete" || status === "error") {
-          // Completed by the owner: left alone. An errored or vanished thread is no decision.
-          await this.deps.store.patch(link.sessionId, { queued: false, ...(status === "complete" ? { closed: true } : {}) });
-          console.log(`[linear-tickets] ${link.identifier}: queued thread ended in Linear (${status ?? "gone"}); no agent started`);
-          continue;
-        }
-        const ticket = await this.deps.linear.issueState(link.issueId);
-        if (ticket.statusType === "completed" || ticket.statusType === "canceled") {
-          await this.deps.store.patch(link.sessionId, { queued: false });
-          await this.say(link.sessionId, "response", `${link.identifier} was moved to ${ticket.status} while it waited, so no agent was started. Assign Paseo again to start one.`);
-          continue;
-        }
-        // Another path (the trigger label, a newer thread) may have started the ticket's agent meanwhile.
-        const existing = await this.activeAgentFor(link.issueId);
-        if (existing) {
-          await this.deps.store.patch(link.sessionId, { agentId: existing.id, queued: false });
-          await this.linkToPaseo(link.sessionId, existing.id);
-          await this.say(link.sessionId, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.`);
-          continue;
-        }
-      } catch (error) {
-        console.error(`[linear-tickets] ${link.identifier}: checking the queued thread failed: ${error instanceof Error ? error.message : error}`);
-        continue;
+        await this.startQueuedThread(link);
+      } finally {
+        gate.release();
       }
-      try {
-        await this.startFor(link, false);
-      } catch (error) {
-        if ((await this.deps.store.get(link.sessionId))?.agentId) {
-          console.error(`[linear-tickets] ${link.identifier}: queued agent started, reporting it failed: ${error instanceof Error ? error.message : error}`);
-          continue;
-        }
-        await this.deps.store.patch(link.sessionId, { queued: false });
-        await this.say(link.sessionId, "error", `Paseo could not start the agent: ${error instanceof Error ? error.message : error}`).catch(() => {});
+    }
+  }
+
+  private async startQueuedThread(link: SessionLink): Promise<void> {
+    try {
+      // Another path (the trigger label, a newer thread, a successor start) may have started the ticket's agent meanwhile.
+      const existing = await this.activeAgentFor(link.issueId);
+      if (!existing && !(await this.deps.starter.admission(link.issueId, this.paseo!, await this.deps.settings.read())).ok) return;
+      // The owner may have ended the thread or closed the ticket while it waited.
+      const status = await this.deps.api.sessionStatus(link.sessionId);
+      if (!status || status === "complete" || status === "error") {
+        // Completed by the owner: left alone. An errored or vanished thread is no decision.
+        await this.deps.store.patch(link.sessionId, { queued: false, pendingText: null, ...(status === "complete" ? { closed: true } : {}) });
+        console.log(`[linear-tickets] ${link.identifier}: queued thread ended in Linear (${status ?? "gone"}); no agent started`);
+        return;
       }
+      const ticket = await this.deps.linear.issueState(link.issueId);
+      if (ticket.statusType === "completed" || ticket.statusType === "canceled") {
+        await this.deps.store.patch(link.sessionId, { queued: false, pendingText: null });
+        await this.say(link.sessionId, "response", `${link.identifier} was moved to ${ticket.status} while it waited, so no agent was started. Assign Paseo again to start one.`);
+        return;
+      }
+      if (existing) {
+        // The thread's comment goes out before the thread names the agent, so a failed send is
+        // retried by the next sweep instead of being lost.
+        const text = link.pendingText;
+        const needsYou = this.deps.needsYou;
+        if (text) {
+          await deliverToAgent(this.paseo!, existing.id, text);
+          if (needsYou && (await needsYou.all()).some((entry) => entry.id === link.issueId && entry.agentId === existing.id)) await closeAnswered(needsYou, this.deps.linear, link.issueId);
+        }
+        await this.deps.store.patch(link.sessionId, { agentId: existing.id, queued: false, pendingText: null });
+        await this.linkToPaseo(link.sessionId, existing.id);
+        await this.say(link.sessionId, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.${text ? " Your message was passed on." : ""}`);
+        return;
+      }
+    } catch (error) {
+      console.error(`[linear-tickets] ${link.identifier}: checking the queued thread failed: ${error instanceof Error ? error.message : error}`);
+      return;
+    }
+    try {
+      await this.startFor(link, false);
+    } catch (error) {
+      if ((await this.deps.store.get(link.sessionId))?.agentId) {
+        console.error(`[linear-tickets] ${link.identifier}: queued agent started, reporting it failed: ${error instanceof Error ? error.message : error}`);
+        return;
+      }
+      await this.deps.store.patch(link.sessionId, { queued: false, pendingText: null });
+      await this.say(link.sessionId, "error", `Paseo could not start the agent: ${error instanceof Error ? error.message : error}`).catch(() => {});
     }
   }
 
@@ -873,9 +924,10 @@ export class SessionRouter {
   }
 
   // Sends an idle agent a new message, the same way a reply in its Linear thread does: Paseo loads
-  // a stopped agent and starts a turn. Nothing is sent while the agent is in a turn or waiting for
-  // an answer (Paseo would interrupt the turn or drop the question): `busy`. `gone`: the agent no
-  // longer exists or is archived; `unavailable`: Paseo is not connected, try again later.
+  // a stopped agent and starts a turn. Nothing is sent while the agent waits for the owner's answer
+  // or approval (`waiting`: the message would drop the question) or is in a turn (`busy`: Paseo
+  // would interrupt it). `gone`: the agent no longer exists or is archived; `unavailable`: Paseo is
+  // not connected, try again later.
   // `onDispatch` runs once the agent is known to take it, right before the message is sent.
   // A crashed agent (see crashedProcess) takes no message: `crashed`, unless `recovery` asks to
   // reload it and send it the resume (see recover).
@@ -883,6 +935,7 @@ export class SessionRouter {
     if (!this.paseo) return "unavailable";
     const found = await this.agent(agentId);
     if (!found) return "gone";
+    if (found.agent.pendingPermissions?.length) return "waiting";
     if (busy(found.agent)) return "busy";
     if (!crashedProcess(found.agent)) {
       await onDispatch?.();
@@ -908,6 +961,7 @@ export class SessionRouter {
   private async recover(agentId: string, text: string, onDispatch: (() => Promise<void>) | undefined, recovery: Recovery): Promise<PromptOutcome> {
     const found = await this.agent(agentId);
     if (!found) return "gone";
+    if (found.agent.pendingPermissions?.length) return "waiting";
     if (busy(found.agent)) return "busy";
     const error = crashedProcess(found.agent);
     if (!error) {
@@ -1081,17 +1135,30 @@ export class SessionRouter {
     }
   }
 
-  // Automatic retry after a failure, at most once an hour per ticket.
+  // Automatic retry after a failure, at most once an hour per ticket. In the ticket's turn and under
+  // its start gate: a start that ran first (a successor the pull request watch started) leaves a
+  // live agent, which needs neither a retry nor a Resume offer (true). Another start still under
+  // way may end without an agent, so the owner keeps the offer (false) and the hour is not used up.
   private readonly lastAutoResume = new Map<string, number>();
 
   async resumeNow(sessionId: string): Promise<boolean> {
-    const link = await this.deps.store.get(sessionId);
-    if (!link || !this.paseo) return false;
-    const last = this.lastAutoResume.get(link.issueId) ?? 0;
-    if (Date.now() - last < 60 * 60 * 1000) return false;
-    this.lastAutoResume.set(link.issueId, Date.now());
-    await this.startFor(link, false);
-    return true;
+    const known = await this.deps.store.get(sessionId);
+    if (!known || !this.paseo) return false;
+    return this.exclusive(known.issueId, async () => {
+      const link = await this.deps.store.get(sessionId) ?? known;
+      const last = this.lastAutoResume.get(link.issueId) ?? 0;
+      if (Date.now() - last < 60 * 60 * 1000) return false;
+      const gate = this.deps.launcher.gate(link.issueId);
+      if (!gate) return false;
+      try {
+        if (await this.liveSuccessorFor(link.issueId, link.agentId ? [link.agentId] : [])) return true;
+        this.lastAutoResume.set(link.issueId, Date.now());
+        await this.startNow(link, false);
+        return true;
+      } finally {
+        gate.release();
+      }
+    });
   }
 
   // A project planner without a live agent (README, "Projects"): a new agent and a new thread, as
@@ -1099,29 +1166,104 @@ export class SessionRouter {
   // launch failed is in error in Linear, and Linear opens no new thread when the ticket is assigned
   // to Paseo again. Its stopped agents are archived once the new one runs, so a later reply or
   // mention never reaches them, and its earlier threads are closed as superseded.
-  // Runs in the ticket's turn, like any successor start.
+  // Runs in the ticket's turn and under its start gate, like any automatic start: a live agent that
+  // came up meanwhile (a successor start before it) is no planner to restart.
   restartFor(issueId: string, identifier: string): Promise<void> {
     return this.exclusive(issueId, () => this.restartNow(issueId, identifier));
   }
 
   private async restartNow(issueId: string, identifier: string): Promise<void> {
     if (!this.paseo) throw new Error("Paseo is not connected yet.");
-    const settings = await this.deps.settings.read();
-    const admission = await this.deps.starter.admission(issueId, this.paseo, settings);
-    if (!admission.ok) throw new Error(admission.reason);
-    const stopped = new Set((await this.deps.store.all()).filter((link) => link.issueId === issueId && link.agentId).map((link) => link.agentId!));
-    const running = dispatchLabels(settings.dispatch.label).running;
-    await this.deps.linear.addLabel(issueId, running).catch(() => {});
-    let agentId: string;
+    const gate = this.deps.launcher.gate(issueId);
+    if (!gate) throw new Error("A launch for this ticket is under way.");
     try {
-      agentId = (await this.deps.starter.start(issueId, this.paseo, settings, { retryHint: "the project's next read starts it again" })).agentId;
-    } catch (error) {
-      await this.deps.linear.removeLabel(issueId, running).catch(() => {});
-      throw error;
+      if (await this.liveSuccessorFor(issueId)) return;
+      const settings = await this.deps.settings.read();
+      const admission = await this.deps.starter.admission(issueId, this.paseo, settings);
+      if (!admission.ok) throw new Error(admission.reason);
+      const stopped = new Set((await this.deps.store.all()).filter((link) => link.issueId === issueId && link.agentId).map((link) => link.agentId!));
+      const running = dispatchLabels(settings.dispatch.label).running;
+      await this.deps.linear.addLabel(issueId, running).catch(() => {});
+      let agentId: string;
+      try {
+        agentId = (await this.deps.starter.start(issueId, this.paseo, settings, { retryHint: "the project's next read starts it again" })).agentId;
+      } catch (error) {
+        await this.deps.linear.removeLabel(issueId, running).catch(() => {});
+        throw error;
+      }
+      await this.openFor(issueId, identifier, agentId);
+      for (const old of stopped) if (old !== agentId) await this.paseo.agents.ref(old).archive().catch(() => {});
+      await this.closeSuperseded();
+    } finally {
+      gate.release();
     }
-    await this.openFor(issueId, identifier, agentId);
-    for (const old of stopped) if (old !== agentId) await this.paseo.agents.ref(old).archive().catch(() => {});
-    await this.closeSuperseded();
+  }
+
+  // The newest live agent of the ticket (starting, idle or running, see LIVE_AGENT; not a subagent,
+  // not one of `exclude`), from every page of its agents. A closed, errored or crashed one is not.
+  async liveSuccessorFor(issueId: string, exclude: string[] = []): Promise<{ id: string; title: string | null; cwd: string } | null> {
+    const live = (await issueAgents(this.paseo!, issueId))
+      .filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && !exclude.includes(agent.id) && LIVE_AGENT[agent.status])
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+    return live ? { id: live.id, title: live.title ?? null, cwd: live.cwd } : null;
+  }
+
+  // A message the pull request watch has for a ticket whose agent is gone (README, "Stalled pull
+  // requests"): a successor on the recorded branch and worktree, with `lead` as the last part of
+  // its first prompt. In the ticket's turn and under its start gate, in this order: a closed ticket
+  // has none (`impossible`); another start under way is waited for (`wait`); a live agent of the
+  // ticket takes over the record and the message (`live`, before the branch is looked at); without
+  // a recorded branch nothing can continue (`impossible`); without admission (blockers, the agent
+  // limit, memory, away) it waits. Then `onDispatch` claims the message, right before the start:
+  // a failed start is `impossible`, and a claimed message never starts a second successor. What
+  // follows the start (thread, archive, record) is best effort and never undoes it.
+  succeed(issueId: string, identifier: string, predecessorId: string, lead: string, onDispatch: () => Promise<void>): Promise<Succession> {
+    return this.exclusive(issueId, () => this.succeedNow({ id: issueId, identifier }, predecessorId, lead, onDispatch));
+  }
+
+  private async succeedNow(issue: { id: string; identifier: string }, predecessorId: string, lead: string, onDispatch: () => Promise<void>): Promise<Succession> {
+    if (!this.paseo) return { kind: "wait", reason: "Paseo is not connected yet" };
+    const paseo = this.paseo;
+    const state = await this.deps.linear.issueState(issue.id);
+    if (["completed", "canceled", "duplicate"].includes(state.statusType.trim().toLowerCase())) return { kind: "impossible", reason: `${issue.identifier} is ${state.status}` };
+    const gate = this.deps.launcher.gate(issue.id);
+    if (!gate) return { kind: "wait", reason: "a launch for this ticket is under way" };
+    const later = (step: string, work: () => Promise<unknown>) => work().catch((error: unknown) => {
+      console.error(`[linear-tickets] ${issue.identifier}: ${step} failed: ${error instanceof Error ? error.message : error}`);
+    });
+    try {
+      const live = await this.liveSuccessorFor(issue.id, [predecessorId]);
+      if (live) {
+        // Nothing is claimed: a failed hand-off is tried again with the message on the next poll.
+        await later("handing the record to the live agent", () => this.deps.handover.handOff(issue, predecessorId, live));
+        return { kind: "live", agent: live };
+      }
+      if (!await this.deps.handover.resumeTarget(issue.id)) return { kind: "impossible", reason: "no branch is recorded for the ticket" };
+      const settings = await this.deps.settings.read();
+      const admission = await this.deps.starter.admission(issue.id, paseo, settings);
+      if (!admission.ok) return { kind: "wait", reason: admission.reason };
+      await onDispatch();
+      console.log(`[linear-tickets] ${issue.identifier}: the pull request's message for gone agent ${predecessorId.slice(0, 8)} is claimed; starting a successor`);
+      const running = dispatchLabels(settings.dispatch.label).running;
+      await this.deps.linear.addLabel(issue.id, running).catch(() => {});
+      let agentId: string;
+      try {
+        agentId = (await this.deps.starter.start(issue.id, paseo, settings, { retryHint: "assign Paseo again", resumeOnly: true, lead })).agentId;
+      } catch (error) {
+        await this.deps.linear.removeLabel(issue.id, running).catch(() => {});
+        return { kind: "impossible", reason: error instanceof Error ? error.message : String(error) };
+      }
+      console.log(`[linear-tickets] ${issue.identifier}: started a successor (agent ${agentId.slice(0, 8)}) for gone agent ${predecessorId.slice(0, 8)}`);
+      const snapshot = (await paseo.agents.ref(agentId).refresh().catch(() => null))?.agent;
+      const agent = { id: agentId, title: snapshot?.title ?? null, cwd: snapshot?.cwd ?? "" };
+      await later("opening the successor's thread", () => this.openFor(issue.id, issue.identifier, agentId));
+      await later("archiving the gone agent", async () => { if (await this.agent(predecessorId)) await paseo.agents.ref(predecessorId).archive(); });
+      await later("closing superseded threads", () => this.closeSuperseded());
+      await later("handing the record to the successor", () => this.deps.handover.handOff(issue, predecessorId, agent));
+      return { kind: "started", agent };
+    } finally {
+      gate.release();
+    }
   }
 
   async offerResume(sessionId: string): Promise<void> {

@@ -8,7 +8,7 @@ import type { ReviewThread } from "./pr-nudge";
 import { activityBullets, ConditionalPullView, GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft } from "./pr-watch";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, marker, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
 import { GitHubBudget, GitHubPausedError, withPriority } from "./rate-budget";
-import { SessionRouter } from "./sessions";
+import { SessionRouter, type Succession } from "./sessions";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
 const settings = { dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true } } as unknown as PluginSettings;
@@ -37,7 +37,7 @@ function draft(number: number, prs: number[], state = "CLOSED"): QueueDraft {
   };
 }
 
-type Outcome = "sent" | "busy" | "gone" | "unavailable";
+type Outcome = "sent" | "busy" | "waiting" | "gone" | "unavailable";
 
 // A crashed agent as Paseo shows it; a reload keeps `lastError`, so a restarted agent still has it.
 const CRASH = "OMP RPC process is closed";
@@ -79,9 +79,11 @@ const MAIN_BROKEN: Judgment = {
 };
 
 // `crash`: the agent runs on crashDaemon (`daemon`) instead of the fake router (`paseo`).
+// `autoResume`: *Start a new agent automatically when one fails* is on, so a gone agent's message
+// starts a successor (`paseo.succeed`).
 // `probe`: the cheap first look the poll goes through (see ConditionalPullView); without one the
 // injected `view` is the whole read, as for the tests that predate it.
-function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean } = {}, probe?: PullViewSource) {
+function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean } = {}, probe?: PullViewSource) {
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open; `views`: other pull requests by URL, and
   // `open` the listing's other entries; `deleted`: branches gone; `throttle`: pull requests whose
@@ -122,11 +124,15 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   const blockers: string[] = [];
   const gate = { unreadable: false };
   // `answer`: what Paseo finds before sending (only "sent" dispatches); `send`: the send itself,
-  // after the dispatch was recorded; `session`: the agent's session lookup.
-  const paseo: { answer: () => Promise<Outcome>; send: () => Promise<void>; session: () => Promise<unknown> } = {
+  // after the dispatch was recorded; `session`: the agent's session lookup. `succeed`: what a
+  // successor start for a gone agent comes to (impossible by default: the message goes to the
+  // ticket as before); a start runs the claim first, then moves the record to the successor, as
+  // SessionRouter.succeed does.
+  const paseo: { answer: () => Promise<Outcome>; send: () => Promise<void>; session: () => Promise<unknown>; succeed: () => Promise<Succession> } = {
     answer: async () => (agent.live ?? true) ? "sent" : "gone",
     send: async () => {},
     session: async () => ({ sessionId: "s" }),
+    succeed: async () => ({ kind: "impossible", reason: "no branch is recorded for the ticket" }),
   };
   const calls: string[] = [];
   const daemon = agent.crash ? crashDaemon(calls) : null;
@@ -152,6 +158,15 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         return outcome;
       },
       crashed: async (agentId) => daemon ? daemon.router.crashed(agentId) : null,
+      succeed: async (_issueId, _identifier, predecessor, lead, onDispatch) => {
+        const next = await paseo.succeed();
+        if (next.kind === "started") {
+          await onDispatch();
+          calls.push(`succeed ${predecessor}\n${lead}`);
+        }
+        if (next.kind === "started" || next.kind === "live") records[0] = { ...records[0], agentId: next.agent.id, agentTitle: next.agent.title ?? "", status: "working" };
+        return next;
+      },
     },
     linear: {
       moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; },
@@ -179,7 +194,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       awaitingMerge: async () => false,
       merged: async (issueId) => { calls.push(`merged ${issueId}`); },
     },
-    settings: { read: async () => settings },
+    settings: { read: async () => agent.autoResume ? { ...settings, writeback: { ...settings.writeback, autoResume: true } } : settings },
     ...(probe ? { probe } : {}),
     view: async (url) => {
       github.reads.push(url);

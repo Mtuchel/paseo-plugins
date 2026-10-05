@@ -218,6 +218,8 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
       delegate: options.delegate ?? (async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); }),
     },
     starter: { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false, untrusted: false, plan: null }; }, admission: async () => ({ ok: true as const }) },
+    handover: { resumeTarget: async () => null, handOff: async () => true },
+    launcher: { gate: () => ({ release: () => {} }) },
     settings: { read: async () => settings },
     store,
     needsYou: options.needsYou,
@@ -497,7 +499,7 @@ test("a permission shows in the agent panel only while still pending, and the ti
       sessionFor: async () => ({ sessionId: "s1" }), say: async () => {}, action: async () => {}, link: async () => {}, offerResume: async () => {}, resumeNow: async () => false,
       ask: async (_s: string, body: string, options: { value: string }[]) => { calls.push(`ask ${body.split("\n")[0]} [${options.map((o) => o.value).join("|")}]`); },
     };
-    const handover = { read: async () => null, update: async () => ({}) as never, finish: async () => ({}) as never, waiting: async () => null, setWaiting: async () => {} };
+    const handover = { read: async () => null, update: async () => ({}) as never, finish: async () => ({}) as never, handOff: async () => true, waiting: async () => null, setWaiting: async () => {} };
     const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" }, pendingPermissions: pending } }) }) } } as unknown as PaseoApi;
     const writeback = new Writeback(linear, { read: async () => ({ ...settings, writeback: { ...DEFAULT_WRITEBACK, blocked: true } }) }, { sessions: sessions as never, handover }, 0, join(tmpdir(), `paseo-writeback-outbox-${process.pid}.json`));
     await writeback.permissionRequested({ agent: { id: "a1", workspaceId: "w", parentAgentId: null, provider: "omp", cwd: "/x", title: "T" }, request }, paseo);
@@ -505,11 +507,12 @@ test("a permission shows in the agent panel only while still pending, and the ti
   }
 });
 
-test("an automatic prompt reaches only an idle agent; busy, gone and disconnected are told apart", async () => {
+test("an automatic prompt reaches only an idle agent; busy, waiting, gone and disconnected are told apart", async () => {
   const cases: [string, Parameters<typeof harness>[0], string][] = [
     ["sent", { snapshot: async () => ({ agent: { status: "closed", pendingPermissions: [] } }) }, "a stopped agent is loaded and prompted"],
     ["busy", { snapshot: async () => ({ agent: { status: "running", activeTurn: { id: "t" }, pendingPermissions: [] } }) }, "a running turn is not interrupted"],
-    ["busy", { snapshot: async () => ({ agent: { status: "idle", pendingPermissions: [{ id: "q", kind: "question" }] } }) }, "a pending question is not dropped"],
+    ["waiting", { snapshot: async () => ({ agent: { status: "idle", pendingPermissions: [{ id: "q", kind: "question" }] } }) }, "a pending question is not dropped"],
+    ["waiting", { snapshot: async () => ({ agent: { status: "running", activeTurn: { id: "t" }, pendingPermissions: [{ id: "q", kind: "question" }] } }) }, "a question asked inside a running turn waits for the owner, not for the turn"],
     ["gone", { snapshot: async () => ({ agent: { status: "idle", archivedAt: "2026-09-01T00:00:00Z", pendingPermissions: [] } }) }, "archived"],
     ["gone", { snapshot: async () => { throw new Error("Agent not found: agent-1"); } }, "deleted"],
     ["unavailable", { attach: false }, "Paseo not connected"],
@@ -581,7 +584,8 @@ test("a restarted agent that is busy right after, or whose resume fails to send,
 
 test("a crashed agent is not reloaded while busy, while another live agent has its ticket, without a daemon connection, or without a recovery", async () => {
   const cases: [Parameters<typeof harness>[0], boolean, string, string][] = [
-    [{ snapshot: async () => ({ agent: { ...CRASHED, pendingPermissions: [{ id: "q" }] } }) }, true, "busy", "a pending question"],
+    [{ snapshot: async () => ({ agent: { ...CRASHED, pendingPermissions: [{ id: "q" }] } }) }, true, "waiting", "a pending question"],
+    [{ snapshot: (() => { let reads = 0; return async () => ({ agent: reads++ ? { ...CRASHED, pendingPermissions: [{ id: "q" }] } : CRASHED }); })() }, true, "waiting", "a question that came up while the recovery waited for the ticket's turn"],
     [{ snapshot: async () => ({ agent: { ...CRASHED, activeTurn: { id: "t" } } }) }, true, "busy", "in a turn"],
     [{ activeAgent: { id: "agent-2", title: "Successor" } }, true, "busy", "a successor took over"],
     [{ reload: null }, true, "unavailable", "no daemon connection"],
