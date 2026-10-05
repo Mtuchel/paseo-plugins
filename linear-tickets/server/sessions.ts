@@ -747,13 +747,17 @@ export class SessionRouter {
         const link = await this.deps.store.get(session.id);
         // Still waiting: `startQueued` owns it.
         if (link?.queued && !link.agentId) continue;
-        if (!["pending", "active", "awaitingInput"].includes(session.status)) continue;
         if (!link) {
-          if (session.status === "pending" && Date.now() - Date.parse(session.createdAt) < ADOPT_WINDOW_MS && session.issueId) {
+          // A webhook missed while this host was down: Linear marks a thread nobody answered `stale`
+          // after about a minute, so a stale thread without a link is started like a pending one,
+          // unless the ticket has a newer thread (assigned again): that one starts the agent.
+          const stale = session.status === "stale" && !sessions.some((other) => other.id !== session.id && other.issueId === session.issueId && other.createdAt > session.createdAt);
+          if ((session.status === "pending" || stale) && Date.now() - Date.parse(session.createdAt) < ADOPT_WINDOW_MS && session.issueId) {
             await this.handle({ type: "AgentSessionEvent", action: "created", agentSession: { id: session.id, creatorId: session.creatorId, issueId: session.issueId, issue: { id: session.issueId, identifier: session.identifier } } });
           }
           continue;
         }
+        if (!["pending", "active", "awaitingInput"].includes(session.status)) continue;
         for (const activity of await this.deps.api.activities(session.id)) {
           if (activity.type !== "prompt" || activity.userId !== owner || activity.createdAt < link.createdAt || link.handled.includes(activity.id)) continue;
           await this.handle({ type: "AgentSessionEvent", action: "prompted", agentSession: { id: session.id }, agentActivity: { id: activity.id, content: { body: activity.body }, signal: activity.signal, userId: activity.userId } });

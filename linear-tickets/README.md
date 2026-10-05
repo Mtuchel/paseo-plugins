@@ -389,7 +389,9 @@ The app is also the author of everything the plugin and its agents write in Line
 The plugin receives webhooks on `127.0.0.1:47831` and publishes only `/linear/agent` on port
 8443 with `tailscale funnel` (never 443). Each webhook is checked for its HMAC signature and a
 timestamp newer than 60 s, answered at once, and deduplicated. A sweep every minute picks up
-sessions and replies whose webhook was missed. Each of its parts (waiting tickets, superseded
+sessions and replies whose webhook was missed, also a new thread Linear already marked stale
+because this host was down when it arrived (up to two hours old, unless the ticket got a newer
+thread since). Each of its parts (waiting tickets, superseded
 threads, reviews, "Open in Paseo" links, missed replies) and each thread's replies are handled on
 their own: a failed Linear request skips only what it hit until the next minute.
 The Paseo Agents menu bar app's **Control panel → Linear agent** shows the state.

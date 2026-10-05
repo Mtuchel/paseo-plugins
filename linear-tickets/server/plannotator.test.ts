@@ -7,7 +7,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import type { PaseoApi } from "@getpaseo/client";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
-import { parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, writeOpenScript, type Parking } from "./plannotator";
+import { openInBrowser, parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, writeOpenScript, type Parking } from "./plannotator";
 import type { ParkedPlan } from "./parked";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
@@ -16,6 +16,20 @@ import { DecisionLog } from "./owner-decisions";
 const exec = promisify(execFile);
 // Bridges built without an opener use the default one: never open a real browser from the tests.
 process.env.LINEAR_TICKETS_OPENER = "true";
+
+test("a host without a browser opener logs the failed open and keeps running", async (t) => {
+  // Executor form: the plugin's lib is ES2023, without Promise.withResolvers.
+  let reported: (line: string) => void = () => {};
+  const logged = new Promise<string>((resolve) => { reported = resolve; });
+  t.mock.method(console, "error", (line: string) => { reported(line); });
+  const previous = process.env.LINEAR_TICKETS_OPENER;
+  process.env.LINEAR_TICKETS_OPENER = join(tmpdir(), "no-such-opener-on-this-host");
+  try {
+    // The spawn error arrives asynchronously; unhandled, it would end this test process.
+    openInBrowser("http://localhost:41429");
+    assert.match(await logged, /^\[linear-tickets\] opening http:\/\/localhost:41429 failed: spawn .*ENOENT/);
+  } finally { process.env.LINEAR_TICKETS_OPENER = previous; }
+});
 
 test("the browser hook publishes the port in the tailnet and records the link for the agent", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-plannotator-hook-"));
