@@ -16,7 +16,7 @@ const baseSettings: PluginSettings = {
   projectMappings: { "project:lp-1": { projectId: "p1", label: "App", baseBranch: "refs/heads/dev" } },
   agentLinearAccess: true,
   dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["ENG"] },
-  writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, reviewPeers: [],
+  writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [],
 };
 
 // A Linear workspace in memory: tickets with label names, and every write recorded.

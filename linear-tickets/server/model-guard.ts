@@ -3,7 +3,7 @@ import type { Tier } from "../shared/plan-model";
 import type { PluginSettings, Settings } from "./settings";
 
 // Ticket agents run the model of their tier (README, "Model tiers"): the launch model while they
-// plan and on the strong tier, the provider's cheap model on the cheap tier. Plannotator's plan
+// plan and on the strong tier, the provider's cheap or standard model on those tiers. Plannotator's plan
 // mode restores the model it saved when planning began once a plan is approved; an agent that
 // started on another model (or was switched during planning) then silently implements on that
 // one. Seen on TUC-9: approved at 11:51 UTC, merged a pull request on DeepSeek flash instead of Opus.
@@ -21,17 +21,17 @@ const CHECK_MS = 20_000;
 const RESTORE_QUIET_MS = 30_000;
 
 // The model (without the provider prefix) and thinking level this ticket agent should run: its
-// provider's cheap model on the cheap tier, the launch model otherwise. null when no launch model
-// is chosen or the agent is not a ticket agent.
-export function intendedModel(agent: Snapshot, settings: Pick<PluginSettings, "launchPreferences" | "cheapModels">, tier: Tier | null = null): { model: string; thinking: string | null } | null {
+// provider's model for the cheap or standard tier on those tiers, the launch model otherwise. null
+// when no launch model is chosen or the agent is not a ticket agent.
+export function intendedModel(agent: Snapshot, settings: Pick<PluginSettings, "launchPreferences" | "cheapModels" | "standardModels">, tier: Tier | null = null): { model: string; thinking: string | null } | null {
   if (!agent.labels?.["linear.issueId"] || agent.labels["paseo.parent-agent-id"] || agent.archivedAt) return null;
-  const preference = (tier === "cheap" ? settings.cheapModels[agent.provider] : undefined) ?? settings.launchPreferences[agent.provider];
+  const preference = (tier === "cheap" ? settings.cheapModels[agent.provider] : tier === "standard" ? settings.standardModels[agent.provider] : undefined) ?? settings.launchPreferences[agent.provider];
   if (!preference?.model) return null;
   const prefix = `${agent.provider}/`;
   return { model: preference.model.startsWith(prefix) ? preference.model.slice(prefix.length) : preference.model, thinking: preference.thinkingOptionId ?? null };
 }
 
-export function drift(agent: Snapshot, settings: Pick<PluginSettings, "launchPreferences" | "cheapModels">, tier: Tier | null = null): Drift | null {
+export function drift(agent: Snapshot, settings: Pick<PluginSettings, "launchPreferences" | "cheapModels" | "standardModels">, tier: Tier | null = null): Drift | null {
   const intended = intendedModel(agent, settings, tier);
   const running = agent.runtimeInfo?.model || agent.model;
   if (!intended || !running) return null;

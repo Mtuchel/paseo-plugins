@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ESCALATE_TOOL, strongerTier, type Tier } from "../shared/plan-model";
+import { ADVISOR_SECTION } from "../shared/plan-advisor";
+import { ESCALATE_TOOL, MODEL_SECTION, strongerTier, TIERS, type Tier } from "../shared/plan-model";
+import { RISK_SECTION } from "../shared/plan-risk";
 import type { PluginSettings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
@@ -10,7 +12,7 @@ import { paseoHome } from "./ticket-mcp";
 // label carries the tier a launch started on; this store keeps each ticket's tier decisions, which
 // the model guard enforces and `npm run tier-report` summarises.
 
-export const TIER_LABELS: Record<Tier, string> = { cheap: "model:cheap", strong: "model:strong" };
+export const TIER_LABELS: Record<Tier, string> = { cheap: "model:cheap", standard: "model:standard", strong: "model:strong" };
 export const TIER_AGENT_LABEL = "linear.tier";
 
 // `plan`: an approved plan picked it; `start`: an agent started implementing on it; `escalated`:
@@ -23,17 +25,18 @@ export type TierRecord = { issueId: string; identifier: string; tier: Tier; agen
 
 const MAX_HISTORY = 50;
 
-// The tier a ticket's labels ask for: `model:strong` wins over `model:cheap`; null without either.
+// The tier a ticket's labels ask for: the strongest `model:` label; null without one.
 export function labelTier(labels: { name: string }[]): Tier | null {
   const names = new Set(labels.map((label) => label.name.trim().toLowerCase()));
-  return names.has(TIER_LABELS.strong) ? "strong" : names.has(TIER_LABELS.cheap) ? "cheap" : null;
+  return TIERS.filter((tier) => names.has(TIER_LABELS[tier])).reduce<Tier | null>(strongerTier, null);
 }
 
 // The model and thinking level a launch on `tier` uses. `base` is the launch choice (the strong
-// tier); the cheap tier uses the provider's cheap model, or the launch choice when it has none.
-export function tierModel(settings: Pick<PluginSettings, "cheapModels">, providerKey: string, tier: Tier | null, base: { provider: string; thinkingOptionId?: string }): { provider: string; thinkingOptionId?: string } {
-  const cheap = tier === "cheap" ? settings.cheapModels[providerKey] : undefined;
-  return cheap ? { provider: cheap.model, ...(cheap.thinkingOptionId ? { thinkingOptionId: cheap.thinkingOptionId } : {}) } : base;
+// tier); the cheap and standard tiers use the provider's model for that tier, or the launch
+// choice when it has none.
+export function tierModel(settings: Pick<PluginSettings, "cheapModels" | "standardModels">, providerKey: string, tier: Tier | null, base: { provider: string; thinkingOptionId?: string }): { provider: string; thinkingOptionId?: string } {
+  const own = tier === "cheap" ? settings.cheapModels[providerKey] : tier === "standard" ? settings.standardModels[providerKey] : undefined;
+  return own ? { provider: own.model, ...(own.thinkingOptionId ? { thinkingOptionId: own.thinkingOptionId } : {}) } : base;
 }
 
 // What the implementing agent is told about its tier (the planner learned the rules from the plan
@@ -41,16 +44,46 @@ export function tierModel(settings: Pick<PluginSettings, "cheapModels">, provide
 export function tierNote(tier: Tier, strongSteps: string | null): string {
   if (tier === "strong") return "This ticket implements on the strong model tier (its plan's `## Model` section or the ticket's `model:strong` label). Subagents still run on the cheap model by default; give one the strong model (in omp: the task tool with `model: \"@slow\"`) only for work that needs judgment.";
   return [
-    "This ticket implements on the cheap model tier (its plan's `## Model` section): you run on a fast, inexpensive model.",
+    tier === "cheap"
+      ? "This ticket implements on the cheap model tier (its plan's `## Model` section): you run on a fast, inexpensive model."
+      : "This ticket implements on the standard model tier (its plan's `## Model` section): you run on a capable mid-priced model, not the strong one.",
     strongSteps ? `Strong steps: ${strongSteps}. Hand each of them to a subagent on the strong model (in omp: the task tool with \`model: "@slow"\`).` : "",
     `Call \`${ESCALATE_TOOL}\` with the reason when the same check still fails after two honest fix attempts, the work needs judgment the plan did not settle, or a review finds a design problem; the plugin then switches you to the strong model.`,
   ].filter(Boolean).join(" ");
 }
 
-// The tier an implementing launch runs on: the strongest of the ticket's label, its latest recorded
-// tier (an escalation stays) and its approved plan; the strong tier when none says.
-export function launchTier(labels: { name: string }[], record: TierRecord | null, plan: Tier | null): Tier {
-  return strongerTier(strongerTier(labelTier(labels), record?.tier), plan) ?? "strong";
+// The tier a ticket's record decided: its latest approved plan or escalation. A `start` only
+// repeats the decision its launch made, so it decides nothing on its own.
+export function decidedTier(record: TierRecord | null): Tier | null {
+  return record?.history.findLast((event) => event.source !== "start")?.tier ?? null;
+}
+
+// The tier an implementing launch runs on: the strongest of the ticket's label, its recorded
+// decision (an escalation stays) and its approved plan. null when none of them names one: the
+// approved plan then goes back to planning to add its `## Model` section (starter.ts).
+export function launchTier(labels: { name: string }[], record: TierRecord | null, plan: Tier | null): Tier | null {
+  return strongerTier(strongerTier(labelTier(labels), decidedTier(record)), plan);
+}
+
+// Sections a plan sent back only for its missing tier may add or change without a new review:
+// the tier itself, the risk rating it is checked against, and the advisor review of that round.
+const TIER_ONLY_SECTIONS = [MODEL_SECTION, RISK_SECTION, ADVISOR_SECTION];
+
+// The plan's words, without the sections above: what the owner approved.
+function approvedWords(plan: string): string {
+  const body = TIER_ONLY_SECTIONS.reduce((text, name) => text.replace(new RegExp(`^#{1,6}\\s+${name}\\b[^\\n]*\\n[\\s\\S]*?(?=^#{1,2}\\s|(?![\\s\\S]))`, "gim"), ""), plan);
+  return (body.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).join(" ");
+}
+
+// Whether `plan` is the plan in the ticket's approved plan document (server/plannotator.ts
+// planDocument) with only its tier added: then the owner's approval still holds. Compares words,
+// so Linear's markdown formatting does not matter; any changed word does.
+export function onlyTierAdded(approvedDocument: string, plan: string): boolean {
+  if (!/^>\s*\*\*Approved\*\*/.test(approvedDocument.trim())) return false;
+  const rule = /^\s*(?:-{3,}|\*{3,}|_{3,}|(?:\*\s*){3,})\s*$/m.exec(approvedDocument);
+  if (!rule) return false;
+  const approved = approvedWords(approvedDocument.slice(rule.index + rule[0].length));
+  return approved.length > 0 && approved === approvedWords(plan);
 }
 
 // Records that an agent started implementing on its tier (the launch label carries it until then).

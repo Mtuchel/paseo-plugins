@@ -63,13 +63,28 @@ const MAX_PLAN_NOTE_CHARS = 20_000;
 // five, and an ask only written into the final reply is easy to miss.
 export const QUESTIONS_NOTE = "Anything you need from the owner (an answer, a decision, an approval such as to push or to add a label, a secret or setting, or a manual step only they can do) goes into a question request, never only into your final message: the question request is what moves the ticket to Needs input and notifies the owner. When you have the linear_ticket tool add_manual_task, register manual steps (secrets, settings, actions in other systems) with it instead. Collect all of it and ask together in one question request instead of one at a time. Plan approval goes through the plan review, not a question.";
 
+// The approved plan's text for the agent's instructions, or where to read it.
+function approvedPlanText(plan: { url: string; content: string } | null): string {
+  const text = plan?.content.trim() ?? "";
+  return text ? `Approved plan:\n\n${text.length > MAX_PLAN_NOTE_CHARS ? `${text.slice(0, MAX_PLAN_NOTE_CHARS)}\n\n… (truncated; read the full document)` : text}` : "The plan document could not be read; read it on the ticket before starting.";
+}
+
 // A ticket with the plan-ready label already has an approved plan ("Approve, implement later"
 // or an earlier planner): the new agent implements it instead of planning again.
 export function approvedPlanNote(identifier: string, plan: { url: string; content: string } | null): string {
-  const text = plan?.content.trim() ?? "";
   return [
     `The owner already approved a plan for this ticket${plan?.url ? ` (Linear document "Plan: ${identifier}": ${plan.url})` : ""}. Implement that plan; do not write or submit a new plan unless the approved one turns out to be wrong, and then say why.`,
-    text ? `Approved plan:\n\n${text.length > MAX_PLAN_NOTE_CHARS ? `${text.slice(0, MAX_PLAN_NOTE_CHARS)}\n\n… (truncated; read the full document)` : text}` : "The plan document could not be read; read it on the ticket before starting.",
+    approvedPlanText(plan),
+  ].join("\n\n");
+}
+
+// An approved plan that names no model tier (README, "Model tiers"): it goes back to planning for
+// its `## Model` section only. The plugin approves the result without the owner when nothing
+// else changed (plannotator.ts).
+export function tierMissingNote(identifier: string, plan: { url: string; content: string } | null): string {
+  return [
+    `The owner approved a plan for this ticket${plan?.url ? ` (Linear document "Plan: ${identifier}": ${plan.url})` : ""}, but it has no \`## Model\` section, so it does not say which model implements it. It comes back to you for that section only: do not change code yet. Submit the approved plan unchanged with the \`## Model\` section added (and a \`## Risk and impact\` rating and advisor review, which every submission needs). When nothing else changed, the plugin approves it without the owner and you implement it on the tier you picked; any other change goes through the usual review.`,
+    approvedPlanText(plan),
   ].join("\n\n");
 }
 
@@ -99,13 +114,18 @@ export type PlanSetup = { identifier: string; untrusted: boolean; policy: PlanPo
 export async function planSetup(linear: Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "issueDocument">, issueId: string, provider: string, usualModeId: string | undefined, plannerLabel: string, tiers?: Pick<TierStore, "get">): Promise<PlanSetup> {
   const state = await linear.issueState(issueId);
   const untrusted = isUntrusted(state, await linear.viewerId(), await linear.appUserId());
-  const policy = planPolicy(state.labels);
   const plan = await linear.issueDocument(issueId, `Plan: ${state.identifier}`).catch(() => null);
   const providerKey = provider.split("/")[0];
-  // Implementing an approved plan: the strongest of the ticket's label, its recorded tier and the plan's.
-  const planned = policy ? null : planTier(plan?.content ?? "");
-  const tier = policy ? null : launchTier(state.labels, await tiers?.get(issueId) ?? null, planned?.tier ?? null);
   const planner = hasLabel(state.labels, plannerLabel.toLowerCase());
+  // Implementing an approved plan: the strongest of the ticket's label, its recorded tier and the plan's.
+  const approved = planPolicy(state.labels) === null;
+  const planned = approved ? planTier(plan?.content ?? "") : null;
+  const decided = approved ? launchTier(state.labels, await tiers?.get(issueId) ?? null, planned?.tier ?? null) : null;
+  // None of them names a tier: the plan goes back to planning for it, never to a default tier. A
+  // project planner's work order picks no tier.
+  const tierMissing = approved && !decided && !planner;
+  const policy: PlanPolicy | null = approved && !tierMissing ? null : "required";
+  const tier = tierMissing ? null : decided;
   return {
     identifier: state.identifier,
     untrusted,
@@ -113,20 +133,21 @@ export async function planSetup(linear: Pick<LinearService, "issueState" | "view
     // A required plan starts in the provider's safe mode, if it has one; approving the plan restores the usual mode.
     modeId: policy ? SAFE_MODES[providerKey] ?? usualModeId : usualModeId,
     notes: [
-      policy ? (untrusted ? UNTRUSTED_NOTE : PLAN_REQUIRED_NOTE) : untrusted ? UNTRUSTED_TEXT : "",
+      tierMissing ? (untrusted ? UNTRUSTED_TEXT : "") : policy ? (untrusted ? UNTRUSTED_NOTE : PLAN_REQUIRED_NOTE) : untrusted ? UNTRUSTED_TEXT : "",
+      tierMissing ? tierMissingNote(state.identifier, plan) : "",
       // A project's planner gets its own overlap instructions in its description.
-      policy && !planner ? OVERLAP_NOTE : "",
+      policy && !planner && !tierMissing ? OVERLAP_NOTE : "",
       policy ? PLAN_SECTIONS_NOTE : "",
       // A project planner's work order only orders tickets; each ticket's own plan picks its tier.
       policy && !planner ? MODEL_NOTE : "",
       policy ? advisorNote(providerKey) : approvedPlanNote(state.identifier, plan),
-      policy ? sentBackPlanNote(state.identifier, plan) : "",
+      policy && !tierMissing ? sentBackPlanNote(state.identifier, plan) : "",
       tier ? tierNote(tier, tier === planned?.tier ? planned.strongSteps : null) : "",
       MISSED_REACH_NOTE,
     ].filter(Boolean),
     labels: { ...(policy ? { [PLAN_POLICY_LABEL]: policy } : {}), ...(tier ? { [TIER_AGENT_LABEL]: tier } : {}) },
     env: policy ? { [PLAN_POLICY_ENV]: policy } : {},
-    tier: tier ? { tier, reason: !planned ? "the approved plan names no tier" : tier === planned.tier ? planned.reason || "the approved plan" : "raised by the ticket's model label or an earlier escalation" } : null,
+    tier: tier ? { tier, reason: tier === planned?.tier ? planned.reason || "the approved plan" : "raised by the ticket's model label or an earlier escalation" } : null,
   };
 }
 

@@ -200,6 +200,8 @@ const autoApproveSettingsSchema = z.object({
   maxImpact: z.number().int().min(0).max(4),
   maxImpactWithFlag: z.number().int().min(0).max(4),
 });
+// A model tier's model per provider (server/settings.ts TierModel).
+const tierModelsSchema = z.record(z.string(), z.object({ model: z.string().min(1).max(500), thinkingOptionId: z.string().min(1).max(500).optional() }));
 export type DispatchSettingsValue = z.infer<typeof dispatchSettingsSchema>;
 export type WritebackSettingsValue = z.infer<typeof writebackSettingsSchema>;
 const settingsOutputSchema = z.object({
@@ -214,6 +216,9 @@ const settingsOutputSchema = z.object({
   dispatch: dispatchSettingsSchema,
   writeback: writebackSettingsSchema,
   autoApprove: autoApproveSettingsSchema,
+  // README, "Model tiers": the cheap and standard tiers' models per provider.
+  cheapModels: tierModelsSchema,
+  standardModels: tierModelsSchema,
 });
 export const getSettingsRpc = defineRpc({
   name: "linear.get-settings",
@@ -233,6 +238,13 @@ export const setSettingsRpc = defineRpc({
     dispatch: dispatchSettingsSchema.partial().optional(),
     writeback: writebackSettingsSchema.partial().optional(),
     autoApprove: autoApproveSettingsSchema.partial().optional(),
+    // One provider's model for the cheap or standard tier; `model: null` removes it.
+    tierModel: z.object({
+      tier: z.enum(["cheap", "standard"]),
+      provider: z.string().min(1).max(500),
+      model: z.string().min(1).max(500).nullable(),
+      thinkingOptionId: z.string().min(1).max(500).optional(),
+    }).optional(),
   }),
   output: settingsOutputSchema,
 });

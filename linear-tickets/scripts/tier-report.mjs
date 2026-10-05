@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Model tier report (README, "Model tiers"): how tickets on the cheap tier fare against the strong
-// tier. Reads the plugin's tier records ($PASEO_HOME/linear-tickets/model-tiers) and handover
-// records (…/handover) on this host; read-only.
+// Model tier report (README, "Model tiers"): how tickets on the cheap and standard tiers fare
+// against the strong tier. Reads the plugin's tier records ($PASEO_HOME/linear-tickets/model-tiers)
+// and handover records (…/handover) on this host; read-only.
 //   npm run tier-report [-- --since 2026-10-01]
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -47,12 +47,13 @@ if (!rows.length) {
 const percent = (part, whole) => (whole ? `${Math.round((part / whole) * 100)}%` : "–");
 console.log(`Model tiers: ${rows.length} tickets since ${rows[0].startedAt.slice(0, 10)}\n`);
 console.log(["tier", "tickets", "escalated", "failed", "pull request"].map((cell) => cell.padEnd(14)).join(""));
-for (const tier of ["cheap", "strong"]) {
+const TIERS = ["cheap", "standard", "strong"];
+for (const tier of TIERS) {
   const group = rows.filter((row) => row.tier === tier);
   const escalated = group.filter((row) => row.escalations.length).length;
   const failed = group.filter((row) => row.outcome === "failed").length;
   const withPr = group.filter((row) => row.pullRequest).length;
-  console.log([tier, String(group.length), tier === "cheap" ? `${escalated} (${percent(escalated, group.length)})` : "–", `${failed} (${percent(failed, group.length)})`, `${withPr} (${percent(withPr, group.length)})`].map((cell) => cell.padEnd(14)).join(""));
+  console.log([tier, String(group.length), tier === "strong" ? "–" : `${escalated} (${percent(escalated, group.length)})`, `${failed} (${percent(failed, group.length)})`, `${withPr} (${percent(withPr, group.length)})`].map((cell) => cell.padEnd(14)).join(""));
 }
 
 const escalated = rows.filter((row) => row.escalations.length);
@@ -61,7 +62,7 @@ if (escalated.length) {
   for (const row of escalated) for (const event of row.escalations) console.log(`  ${row.identifier.padEnd(10)} ${event.at.slice(0, 16).replace("T", " ")}  ${event.reason}`);
 }
 
-console.log("\nCheap-tier tickets (spot-check their pull requests and review rounds):");
-for (const row of rows.filter((item) => item.tier === "cheap")) {
-  console.log(`  ${row.identifier.padEnd(10)} ${row.startedAt.slice(0, 10)}  ${(row.escalations.length ? "escalated" : row.outcome).padEnd(13)} ${row.pullRequest ?? ""}`);
+console.log("\nCheap- and standard-tier tickets (spot-check their pull requests and review rounds):");
+for (const row of rows.filter((item) => item.tier !== "strong")) {
+  console.log(`  ${row.identifier.padEnd(10)} ${row.tier.padEnd(9)} ${row.startedAt.slice(0, 10)}  ${(row.escalations.length ? "escalated" : row.outcome).padEnd(13)} ${row.pullRequest ?? ""}`);
 }

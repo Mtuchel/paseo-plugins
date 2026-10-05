@@ -20,8 +20,8 @@ import { dispatchLabels } from "./dispatch";
 import { orderProblems, type ProjectFlow } from "./project-flow";
 import type { PlanFollowUps } from "./plan-follow-ups";
 import { feedbackEntry, logQuietly, type DecisionLog } from "./owner-decisions";
-import { planTier, strongerTier, type Tier } from "../shared/plan-model";
-import { labelTier, TIER_LABELS, tierModel, type TierStore } from "./model-tiers";
+import { modelProblem, modelSteps, planTier, strongerTier, TIERS, type Tier } from "../shared/plan-model";
+import { labelTier, onlyTierAdded, TIER_LABELS, tierModel, type TierStore } from "./model-tiers";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -56,10 +56,10 @@ export type AdvisedEvent = { type: "advised"; agentId: string | null; verdict: s
 // The ticket agent asked for the strong model tier (the omp extension's escalate_model tool).
 export type EscalatedEvent = { type: "escalated"; agentId: string | null; reason: string; at: string };
 type PlannotatorEvent = OpenedEvent | DecidedEvent | AdvisedEvent | EscalatedEvent;
-// Model tiers (README, "Model tiers"): where tier decisions are recorded, and the model guard's
-// immediate switch of one agent.
-export type Tiers = { store: Pick<TierStore, "record">; apply: (agentId: string) => Promise<unknown> };
-type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "moveToStateNamed" | "moveToReady" | "addLabel" | "removeLabel" | "issueState" | "viewerId" | "appUserId">;
+// Model tiers (README, "Model tiers"): where tier decisions are recorded, the model guard's
+// immediate switch of one agent, and sending a working agent back to planning (plan-requests.ts).
+export type Tiers = { store: Pick<TierStore, "record">; apply: (agentId: string) => Promise<unknown>; replan: (agent: { id: string; issueId: string; identifier: string }, message: string) => Promise<void> };
+type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "issueDocument" | "moveToStateNamed" | "moveToReady" | "addLabel" | "removeLabel" | "issueState" | "viewerId" | "appUserId">;
 // What the risk policy made of an opened review: `line` tells the owner, in the panel and on Linear;
 // `reasons` why it needs the owner (empty when approved).
 type Judgement = { approved: boolean; line: string; reasons: string[] };
@@ -179,6 +179,9 @@ export class PlannotatorBridge {
   private decisions: Pick<DecisionLog, "append"> | null = null;
   // Model tiers (README, "Model tiers"): approved plans and escalations set the agent's tier.
   private tiers: Tiers | null = null;
+  // Agents whose plan the plugin sent back for its `## Model` section: the omp extension's report
+  // of that send-back is not the owner's decision. Cleared by the agent's next review.
+  private readonly tierSendBacks = new Set<string>();
 
   constructor(
     private readonly linear: Linear,
@@ -275,29 +278,36 @@ export class PlannotatorBridge {
   }
 
   // The ticket's `model:` label follows its tier, so Linear shows (and filters) which tier a ticket
-  // runs on; the owner raises it by setting `model:strong`.
+  // runs on; the owner raises it by setting a stronger `model:` label.
   private async labelTier(issueId: string, tier: Tier, current: { id: string; name: string }[]): Promise<void> {
     await this.linear.addLabel(issueId, TIER_LABELS[tier]);
-    await this.linear.removeLabel(issueId, TIER_LABELS[tier === "cheap" ? "strong" : "cheap"], current);
+    for (const other of TIERS) if (other !== tier) await this.linear.removeLabel(issueId, TIER_LABELS[other], current);
   }
 
   // An approved plan's tier (README, "Model tiers"): the stronger of the plan's `## Model` section
   // and the ticket's label, recorded for this agent and applied by the model guard right away. A
-  // failure leaves the agent on the launch model, the safe side.
+  // failure leaves the agent on the launch model, the safe side. A plan that names no tier (its
+  // review text could not be checked) sends the agent back to planning for it.
   private async applyPlanTier(agentId: string, provider: string, issue: { id: string; identifier: string }, plan: string, settings: PluginSettings): Promise<void> {
     const tiers = this.tiers;
     if (!tiers) return;
     try {
       const state = await this.linear.issueState(issue.id);
       const planned = planTier(plan);
-      const tier = strongerTier(labelTier(state.labels), planned?.tier) ?? "strong";
-      const reason = !planned ? "the plan names no tier" : tier === planned.tier ? planned.reason || "the approved plan" : "raised by the ticket's model:strong label";
+      const tier = strongerTier(labelTier(state.labels), planned?.tier);
+      const link = await this.sessions?.sessionFor(agentId);
+      if (!tier) {
+        await tiers.replan({ id: agentId, issueId: issue.id, identifier: issue.identifier }, `The approved plan for ${issue.identifier} has no \`## Model\` section, so it does not say which model implements it. You are back in planning for that section only: do not change code yet. Submit the approved plan unchanged with the \`## Model\` section added; when nothing else changed, the plugin approves it without the owner.\n\n${modelSteps()}`);
+        if (link) await this.sessions!.say(link.sessionId, "thought", "The approved plan names no model tier: back to planning to add its `## Model` section.");
+        console.log(`[linear-tickets] ${issue.identifier}: the approved plan names no model tier, its agent plans again for it`);
+        return;
+      }
+      const reason = tier === planned?.tier ? planned.reason || "the approved plan" : "raised by the ticket's model label";
       const launch = settings.launchPreferences[provider];
       const model = launch ? tierModel(settings, provider, tier, { provider: launch.model }).provider : null;
       await tiers.store.record(issue, { tier, source: "plan", reason, agentId, model });
       if (settings.writeback.status) await this.labelTier(issue.id, tier, state.labels);
       await tiers.apply(agentId);
-      const link = await this.sessions?.sessionFor(agentId);
       if (link) await this.sessions!.say(link.sessionId, "thought", `Implementing on the ${tier} model tier${model ? ` (${model})` : ""}: ${reason}.`);
       console.log(`[linear-tickets] ${issue.identifier}: implementing on the ${tier} tier (${reason})`);
     } catch (error) {
@@ -336,29 +346,33 @@ export class PlannotatorBridge {
   // The risk policy (README, "Plan risk and auto-approval"): approves the plan on the owner's
   // behalf when its `## Risk and impact` rating is within the threshold, the advisor review the
   // extension recorded is for exactly this text, and nothing about the ticket needs the owner.
-  // A project planner's work order never comes here (deliverWorkOrder).
+  // A plan that came back only for its `## Model` section (README, "Model tiers") keeps the
+  // approval it had when nothing else changed. A project planner's work order never comes here
+  // (deliverWorkOrder).
   // null: the plan has no readable rating.
   private async judge(localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
     const rated = parsePlanRisk(planText);
     const rating = "problem" in rated ? "" : `Risk: ${ratingText(rated.risk)}.`;
     try {
       const state = await this.linear.issueState(issueId);
-      if ("problem" in rated) return null;
+      const approvedBefore = await this.linear.issueDocument(issueId, `Plan: ${state.identifier}`).catch(() => null);
+      const tierOnly = approvedBefore ? onlyTierAdded(approvedBefore.content, planText) : false;
+      if (!tierOnly && "problem" in rated) return null;
       const advice = this.advised.get(agentId);
-      const outcome = autoApproval(rated.risk, settings.autoApprove, {
+      const outcome = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, {
         verdict: advice && advice.hash === planHash(planText) ? advice.verdict : null,
         untrusted: isUntrusted(state, await this.linear.viewerId(), await this.linear.appUserId()),
         attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()),
       });
       if (!outcome.approve) return { approved: false, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.`, reasons: outcome.reasons };
-      const feedback = `Auto-approved by the risk policy. ${rating}`;
+      const feedback = tierOnly ? "Approved again: the owner approved this plan before; only its model tier was added." : `Auto-approved by the risk policy. ${rating}`;
       await this.decide(localUrl, true, feedback);
       // Plannotator reports no approval of its own plan mode, so the bridge records it like the
       // panel's: the plan document, the coding state and the model tier follow from that event.
       // When the omp plan extension reports it too, the second report is skipped as a duplicate.
       await recordDecision({ type: "decided", agentId, approved: true, feedback, planContent: planText, at: new Date().toISOString() }, this.events)
         .catch((error: unknown) => console.error(`[linear-tickets] recording the auto-approval of ${agentId} failed: ${error instanceof Error ? error.message : error}`));
-      return { approved: true, line: `Auto-approved within your threshold. ${rating}`, reasons: [] };
+      return { approved: true, line: tierOnly ? `Approved without you: the plan you approved, with its model tier added. ${rating}`.trim() : `Auto-approved within your threshold. ${rating}`, reasons: [] };
     } catch (error) {
       console.error(`[linear-tickets] auto-approval check for ${agentId} failed: ${error instanceof Error ? error.message : error}`);
       return { approved: false, line: [rating, "The auto-approval check failed, so it needs your approval."].filter(Boolean).join(" "), reasons: ["the auto-approval check failed"] };
@@ -405,6 +419,7 @@ export class PlannotatorBridge {
     const parked = this.parking ? await this.parking.plans.forAgent(agentId) : null;
     if (parked) return this.deliverParked(event, parked);
     if (event.type === "decided") {
+      if (!event.approved && this.tierSendBacks.delete(agentId)) return;
       const previous = this.lastDecision.get(agentId);
       const at = Date.parse(event.at) || Date.now();
       if (previous !== undefined && Math.abs(at - previous) < 120_000) return;
@@ -418,12 +433,24 @@ export class PlannotatorBridge {
     const identifier = labels["linear.identifier"] || "this ticket";
     if (issueId && this.projectPlans && await this.projectPlans.isPlanner(issueId)) return this.deliverWorkOrder(event, agentId, issueId, identifier, paseo);
     if (event.type === "decided" && issueId) await this.logFeedback(agentId, event, { id: issueId, identifier });
+    const planText = event.type === "opened" ? await this.fetchPlan(event.localUrl).catch(() => "") : "";
+    // A ticket plan without a complete `## Model` section (README, "Model tiers") goes back to its
+    // planner before anyone reviews it; it never reaches the owner or a default tier.
+    if (event.type === "opened" && issueId) {
+      this.tierSendBacks.delete(agentId);
+      const problem = planText.trim() ? modelProblem(planText) : null;
+      if (problem) {
+        this.tierSendBacks.add(agentId);
+        await this.decide(event.localUrl, false, `Paseo sent this plan back before review. ${problem}\n\nAdd or fix the section and submit the plan again.`);
+        console.log(`[linear-tickets] ${identifier}: plan sent back to the planner: its model tier is missing or not allowed`);
+        return;
+      }
+    }
     // The agent's stable link when ReviewLinks is up; otherwise this review's own tailnet or local URL.
     const stableLink = event.type === "opened" ? await this.reviews?.opened(agentId, event, { identifier: labels["linear.identifier"] || undefined, model }) ?? null : null;
     const url = event.type === "opened" ? stableLink ?? event.remoteUrl ?? event.localUrl : undefined;
     if (event.type === "decided") await this.reviews?.decided(agentId, event.approved);
     const settings = await this.settings.read();
-    const planText = event.type === "opened" ? await this.fetchPlan(event.localUrl).catch(() => "") : "";
     const judgement = event.type === "opened" && issueId ? await this.judge(event.localUrl, agentId, issueId, planText, settings) : null;
     if (event.type === "opened" && issueId && !judgement?.approved && planText.trim() && this.parking?.available()) {
       await this.park(event, { issueId, identifier, agentId, plan: planText, line: judgement?.line ?? "The plan has no readable risk rating, so it needs your approval.", reasons: judgement?.reasons ?? ["no readable risk rating"], model, parkedAt: new Date().toISOString(), announced: false }, paseo);

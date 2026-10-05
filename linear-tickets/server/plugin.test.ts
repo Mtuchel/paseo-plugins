@@ -10,7 +10,7 @@ import type { PaseoApi, PaseoWorkspaceAgentCreateOptions, PaseoWorkspaceCreateOp
 import { buildContext, buildPrompt, issuePage, normalizeIssue, connection, relationships, stateHistorySpans, ticketRelations } from "./context";
 import { Credentials } from "./credentials";
 import { Launcher, safeBranchName } from "./launch";
-import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_CHEAP_MODELS, DEFAULT_DISPATCH, DEFAULT_WRITEBACK } from "./settings";
+import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_CHEAP_MODELS, DEFAULT_STANDARD_MODELS, DEFAULT_DISPATCH, DEFAULT_WRITEBACK } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { LinearService, postGraphQL, ADD_LABEL_QUERY, CREATE_LABEL_QUERY, LABEL_BY_NAME_QUERY, resolveReviewState, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
 import { RateBudget, RateLimitedError } from "./rate-budget";
@@ -43,7 +43,7 @@ const detail = { issue: normalizeIssue(rawIssue), teamId: "team-1", projectId: "
 const input = { id: "ENG-42", projectId: "project-1", provider: "test/model", instructions: "Add a regression check.", markInProgress: false, requestId: "5f6f1154-5838-4439-b981-b3c9d9831488" };
 // Test fakes that exercise neither the state transition nor finished blockers: no-op stubs keep the contract strict.
 const noMark = { markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] };
-const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: DEFAULT_CHEAP_MODELS, reviewPeers: [] };
+const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: DEFAULT_CHEAP_MODELS, standardModels: DEFAULT_STANDARD_MODELS, reviewPeers: [] };
 
 test("server entrypoint loads and registers valid Paseo RPC contracts", () => {
   const names: string[] = [];
@@ -331,6 +331,22 @@ test("the mark-in-progress setting round-trips without disturbing the saved temp
     await settings.patch({ markInProgress: false, showClosed: false });
     assert.deepEqual(await settings.read(), { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true, ...automationDefaults });
     await assert.rejects(readFile(path), { code: "ENOENT" });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a tier's model per provider is set and removed through settings; removing the default is remembered", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-linear-settings-tiers-"));
+  const path = join(directory, "settings.json");
+  try {
+    const settings = new Settings(path);
+    assert.deepEqual((await settings.read()).standardModels, { omp: { model: "omp/openai-codex/gpt-6.1-sol", thinkingOptionId: "high" } });
+    await settings.patch({ tierModel: { tier: "standard", provider: "claude", model: "claude/sonnet", thinkingOptionId: "high" } });
+    assert.deepEqual((await settings.read()).standardModels, { omp: { model: "omp/openai-codex/gpt-6.1-sol", thinkingOptionId: "high" }, claude: { model: "claude/sonnet", thinkingOptionId: "high" } });
+    assert.deepEqual((await settings.read()).cheapModels, DEFAULT_CHEAP_MODELS, "the other tier is untouched");
+    await settings.patch({ tierModel: { tier: "standard", provider: "omp", model: null } });
+    assert.deepEqual((await new Settings(path).read()).standardModels, { claude: { model: "claude/sonnet", thinkingOptionId: "high" } });
+    await settings.patch({ tierModel: { tier: "standard", provider: "claude", model: null } });
+    assert.deepEqual((await new Settings(path).read()).standardModels, {}, "an emptied tier stays empty instead of falling back to the defaults");
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 

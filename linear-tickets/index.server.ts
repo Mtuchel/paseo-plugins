@@ -25,6 +25,7 @@ import { ReviewLinks } from "./server/review-links";
 import { closeInternalDaemon, internalDaemon, modelSetter, ownConnection } from "./server/connection";
 import { ModelGuard } from "./server/model-guard";
 import { recordStart, TIER_AGENT_LABEL, tierModel, TierStore } from "./server/model-tiers";
+import { isTier } from "./shared/plan-model";
 import { HealthMonitor } from "./server/health";
 import { PullRequestWatch } from "./server/pr-watch";
 import { PullRequestBoard } from "./server/pull-requests";
@@ -188,16 +189,16 @@ export default function contribute(server: PluginServerContext) {
   });
   let attached = false;
   // Ticket agents run their tier's model: the launch model while planning and on the strong tier
-  // (Plannotator restores its pre-planning model on approval), the cheap model on the cheap tier.
+  // (Plannotator restores its pre-planning model on approval), the cheap or standard model on those tiers.
   const modelGuard = new ModelGuard(settings, modelSetter, async (change) => {
     const link = await sessions.sessionFor(change.agentId);
-    if (link) await sessions.say(link.sessionId, "thought", change.tier === "cheap" ? `Switched to the cheap model tier: ${change.to} (was ${change.from}).` : `Model restored to ${change.to} (it had switched to ${change.from}).`);
+    if (link) await sessions.say(link.sessionId, "thought", change.tier === "cheap" || change.tier === "standard" ? `Switched to the ${change.tier} model tier: ${change.to} (was ${change.from}).` : `Model restored to ${change.to} (it had switched to ${change.from}).`);
   }, async (agent) => {
     const issueId = agent.labels["linear.issueId"];
     const label = agent.labels[TIER_AGENT_LABEL];
-    return (issueId ? await tiers.forAgent(issueId, agent.id) : null) ?? (label === "cheap" || label === "strong" ? label : null);
+    return (issueId ? await tiers.forAgent(issueId, agent.id) : null) ?? (isTier(label) ? label : null);
   });
-  plannotator.useTiers({ store: tiers, apply: (agentId) => modelGuard.apply(agentId) });
+  plannotator.useTiers({ store: tiers, apply: (agentId) => modelGuard.apply(agentId), replan: (agent, message) => planRequests.send(agent, message) });
   // The central Plannotator host starts once, after the hook it runs for each parked review exists.
   const startHost = async () => { if (await plannotatorHook() && !stopped) await plannotatorHost.start(); };
   const attach = (paseo: PaseoApi) => { const first = !attached; attached = true; if (!stopped) { void reviewLinks.start(); if (first) void startHost(); } dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); void startAgent(); };

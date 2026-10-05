@@ -95,6 +95,15 @@ export class PlanRequests {
     this.lastError = null;
   }
 
+  // The plugin itself sends a working agent back to planning (README, "Model tiers"): the same
+  // request file, carrying the message the omp extension shows instead of the owner's. The prompt
+  // is all other providers get; a busy agent gets it from the file at its next tool call.
+  async send(agent: TicketAgent, message: string): Promise<void> {
+    await this.writeRequest(agent, message);
+    const outcome = await this.deps.prompt(agent.id, message).catch(() => "unavailable" as const);
+    console.log(`[linear-tickets] ${agent.identifier}: agent ${agent.id.slice(0, 8)} sent back to planning (${outcome})`);
+  }
+
   // Whether the agent still has to be told. The omp extension removes the request file once the
   // agent is planning, which also covers a busy agent: nothing left to say. A crashed agent is not
   // reloaded here; it is told once the pull request watch restarted it.
@@ -106,11 +115,11 @@ export class PlanRequests {
     return outcome === "busy" || outcome === "waiting" || outcome === "unavailable" || outcome === "crashed";
   }
 
-  private async writeRequest(agent: TicketAgent): Promise<void> {
+  private async writeRequest(agent: TicketAgent, message?: string): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     const path = join(this.directory, agent.id);
     const temporary = `${path}.${process.pid}.tmp`;
-    await writeFile(temporary, JSON.stringify({ identifier: agent.identifier, at: new Date().toISOString() }), { mode: 0o600 });
+    await writeFile(temporary, JSON.stringify({ identifier: agent.identifier, at: new Date().toISOString(), ...(message ? { message } : {}) }), { mode: 0o600 });
     await rename(temporary, path);
   }
 
