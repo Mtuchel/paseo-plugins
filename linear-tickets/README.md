@@ -388,12 +388,16 @@ The app is also the author of everything the plugin and its agents write in Line
 
 The plugin receives webhooks on `127.0.0.1:47831` and publishes only `/linear/agent` on port
 8443 with `tailscale funnel` (never 443). Each webhook is checked for its HMAC signature and a
-timestamp newer than 60 s, answered at once, and deduplicated. A sweep every minute picks up
-sessions and replies whose webhook was missed, also a new thread Linear already marked stale
-because this host was down when it arrived (up to two hours old, unless the ticket got a newer
-thread since). Each of its parts (waiting tickets, superseded
-threads, reviews, "Open in Paseo" links, missed replies) and each thread's replies are handled on
-their own: a failed Linear request skips only what it hit until the next minute.
+timestamp newer than 60 s, answered at once, and deduplicated. The minute sweep is the fallback
+for what a webhook did not deliver: a session Linear has webhooked for is re-read on a 5-minute
+cadence instead of every minute, and a webhook whose read is due pulls that read forward to the
+webhook. A session it never webhooked for, or without one for over 5 minutes, is read every minute
+as before, so a missed webhook costs what the sweep always cost and no reply is missed (see
+[Rate limits](#rate-limits) for what that saves and how it is measured); the sweep also picks up a
+new thread Linear already marked stale because this host was down when it arrived (up to two hours
+old, unless the ticket got a newer thread since). Each of the sweep's parts (waiting tickets,
+superseded threads, reviews, "Open in Paseo" links, missed replies) and each thread's replies are
+handled on their own: a failed Linear request skips only what it hit until the next minute.
 The Paseo Agents menu bar app's **Control panel → Linear agent** shows the state.
 
 **Several hosts.** Each host that runs the plugin installs its own app (for example "Paseo" on the
@@ -1365,11 +1369,22 @@ header of the last answer plus the refill since then.
 
 - **Reads that pollers repeat use the app's pool** when the Paseo app is installed: the relay's
   comment read, the auto-dispatch label query, ticket state, manual-task status, the sidebar
-  state labels and the label rules' sweeps. The key reads them only when the app is not installed, its token cannot be
+  state labels, the agent session sweep and the label rules' sweeps. The key reads them only when the app is not installed, its token cannot be
   refreshed, or it cannot see a ticket. An app rate limit never falls back to the key. Writes use
   the app's pool too; the key writes only in the cases listed under [Who Linear shows as the
   author](#who-linear-shows-as-the-author). The agents' `linear_ticket` servers send their own
   requests, which the daemon's estimate does not count.
+- **The session sweep's per-session reads follow the webhooks.** It still lists Linear's open
+  agent sessions every minute (one request, shared by the parts of a sweep that need it), because
+  that is how a session whose `created` webhook was missed is found, but it reads a session's
+  activities only when they are due: at most every 5 minutes while Linear webhooks for that
+  session, at once when such a webhook arrives with the read due, and every minute once no webhook
+  has arrived for 5 minutes (a session that was never webhooked for keeps the minute sweep). With
+  22–35 live sessions this is `1 + N/5` requests a minute instead of `1 + N`: about 320–480/h
+  instead of 1,380–2,160/h while every session is covered. `linear.agent-status` reports
+  `webhooks` (delivered since the plugin loaded), `sweepReads`, `sweepSkips` and `webhookReads`;
+  `sweepSkips` against `sweepReads + sweepSkips` is how much of the saving the webhooks actually
+  cover.
 - **Background work stops at a 15% reserve** of the pool it needs: auto-dispatch, the relay,
   manual tasks, the pull request watch, the state labels, the label rules and the health check. It resumes on its
   own as the pool refills. Session prompts, write-backs, agents' `linear_ticket` tools and the
@@ -1571,7 +1586,9 @@ GraphQL response parsing, pagination, context preservation, prompt template rend
 and validation, repository orientation (guide matching, ranking and the cap), credential and
 settings persistence, ticket retrieval, state-transition
 resolution and failure handling, agent creation/retries with mocked Linear and Paseo
-calls, and the pull request view (CI summaries, merge queue parsing, polling cadence, the GitHub
+calls, the session sweep's webhook-driven activity reads (skipped while a webhook is fresh, the
+5-minute fallback, the minute sweep without webhooks), and the pull request view (CI summaries,
+merge queue parsing, polling cadence, the GitHub
 budget's reserve, labelling) against a fake GitHub, and the decision candidates (the log, the
 collector's sources and exclusions, window limits, candidate identity, one ticket per project,
 app-only filing) against a fake Linear.

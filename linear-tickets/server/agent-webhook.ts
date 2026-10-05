@@ -39,6 +39,10 @@ export class AgentWebhookServer {
   private server: Server | null = null;
   private readonly seen = new Set<string>();
   lastEventAt: string | null = null;
+  // Agent session events accepted since the plugin loaded (deduplicated deliveries). The sweep
+  // skips sessions this receiver covers, so this is the delivery rate that saving rests on
+  // (README, "Rate limits").
+  events = 0;
 
   constructor(
     private readonly secret: () => Promise<string | null>,
@@ -71,6 +75,7 @@ export class AgentWebhookServer {
             if (this.seen.size > SEEN_LIMIT) this.seen.delete(this.seen.values().next().value as string);
           }
           this.lastEventAt = new Date().toISOString();
+          this.events += 1;
           this.onEvent(payload as AgentSessionWebhook);
         })().catch((error: unknown) => {
           console.error(`[linear-tickets] agent webhook failed: ${error instanceof Error ? error.message : error}`);

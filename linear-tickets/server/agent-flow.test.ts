@@ -209,6 +209,112 @@ test("one failed Linear read skips only its part of the sweep: a reply in anothe
   await h.cleanup();
 });
 
+test("a session Linear webhooks for is read at once and then skipped by the minute sweep", async () => {
+  let clock = Date.parse("2026-01-01T00:00:00Z");
+  const reads: string[] = [];
+  const h = routerHarness([], {
+    now: () => clock,
+    api: {
+      activity: async () => {},
+      openSessions: async () => [{ id: "s1", status: "active" }],
+      activities: async (id: string) => { reads.push(id); return []; },
+    } as never,
+  });
+  await h.store.put({ ...link, sessionId: "s1" });
+  h.router.receive({ type: "AgentSessionEvent", action: "prompted", agentSession: { id: "s1" }, agentActivity: { id: "p1", content: { body: "carry on" }, userId: OWNER } });
+  await h.router.settled();
+  assert.deepEqual(reads, ["s1"], "the webhook read the session at once");
+  clock += 60_000;
+  await h.router.sweep();
+  assert.deepEqual(reads, ["s1"], "a minute later the sweep skips it: the webhook delivered the prompt");
+  assert.deepEqual(h.router.readStats(), { sweepReads: 0, sweepSkips: 1, webhookReads: 1 });
+  await h.cleanup();
+});
+
+test("a session Linear webhooks for is re-read on the 5-minute fallback, and every minute again once its webhooks stop", async () => {
+  const start = Date.parse("2026-01-01T00:00:00Z");
+  let clock = start;
+  const reads: number[] = [];
+  const h = routerHarness([], {
+    now: () => clock,
+    api: {
+      activity: async () => {},
+      openSessions: async () => [{ id: "s1", status: "active" }],
+      activities: async (id: string) => { reads.push(Math.floor((clock - start) / 60_000)); return []; },
+    } as never,
+  });
+  await h.store.put({ ...link, sessionId: "s1" });
+  const webhook = (n: number) => h.router.receive({ type: "AgentSessionEvent", action: "prompted", agentSession: { id: "s1" }, agentActivity: { id: `p${n}`, content: { body: "go on" }, userId: OWNER } });
+  webhook(1);
+  await h.router.settled();
+  for (let minute = 1; minute <= 4; minute++) {
+    clock = start + minute * 60_000;
+    webhook(minute + 1);
+    await h.router.settled();
+    await h.router.sweep();
+  }
+  assert.deepEqual(reads, [0], "the webhooks cover it, so the sweep skips it every minute");
+  // The last webhook was 90 s ago (still fresh), but nothing has read the session for 5 minutes.
+  clock = start + 5 * 60_000 + 30_000;
+  await h.router.sweep();
+  assert.deepEqual(reads, [0, 5], "the fallback read is due again");
+  // The webhooks stop: once the freshness window is over it is back on the minute sweep.
+  clock = start + 10 * 60_000;
+  await h.router.sweep();
+  await h.router.sweep();
+  assert.deepEqual(reads, [0, 5, 10, 10], "no webhook for 5 minutes: today's reads every sweep");
+  await h.cleanup();
+});
+
+test("a webhook pulls a due fallback read forward, and one that is not due does not read", async () => {
+  const start = Date.parse("2026-01-01T00:00:00Z");
+  let clock = start;
+  const reads: string[] = [];
+  const h = routerHarness([], {
+    now: () => clock,
+    api: {
+      activity: async () => {},
+      openSessions: async () => [{ id: "s1", status: "active" }],
+      activities: async (id: string) => { reads.push(id); return []; },
+    } as never,
+  });
+  await h.store.put({ ...link, sessionId: "s1" });
+  const webhook = (n: number) => h.router.receive({ type: "AgentSessionEvent", action: "prompted", agentSession: { id: "s1" }, agentActivity: { id: `p${n}`, content: { body: "go on" }, userId: OWNER } });
+  webhook(1);
+  await h.router.settled();
+  clock += 10_000;
+  webhook(2);
+  await h.router.settled();
+  assert.deepEqual(reads, ["s1"], "a prompt ten seconds later does not read again");
+  clock = start + 5 * 60_000 + 6_000;
+  webhook(3);
+  await h.router.settled();
+  assert.deepEqual(reads, ["s1", "s1"], "the due read happens at the webhook, not at the next sweep");
+  assert.deepEqual(h.router.readStats(), { sweepReads: 0, sweepSkips: 0, webhookReads: 2 });
+  await h.cleanup();
+});
+
+test("a session with no webhook keeps the minute sweep", async () => {
+  let clock = Date.parse("2026-01-01T00:00:00Z");
+  const reads: string[] = [];
+  const h = routerHarness([], {
+    now: () => clock,
+    api: {
+      activity: async () => {},
+      openSessions: async () => [{ id: "s1", status: "active" }],
+      activities: async (id: string) => { reads.push(id); return []; },
+    } as never,
+  });
+  await h.store.put({ ...link, sessionId: "s1" });
+  for (let minute = 0; minute < 3; minute++) {
+    await h.router.sweep();
+    clock += 60_000;
+  }
+  assert.deepEqual(reads, ["s1", "s1", "s1"]);
+  assert.deepEqual(h.router.readStats(), { sweepReads: 3, sweepSkips: 0, webhookReads: 0 });
+  await h.cleanup();
+});
+
 test("a queued thread starts once its blockers finish, even after it dropped out of Linear's recent sessions", async () => {
   const events: string[] = [];
   const blocked = new Set(["i1", "i2", "i3", "i4", "i5"]);

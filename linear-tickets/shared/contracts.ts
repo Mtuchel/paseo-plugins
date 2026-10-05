@@ -334,7 +334,19 @@ export const setCapacityRpc = defineRpc({
 export const agentStatusRpc = defineRpc({
   name: "linear.agent-status",
   input: z.object({}),
-  output: z.object({ installed: z.boolean(), funnel: z.boolean(), funnelNote: z.string().nullable(), lastWebhookAt: z.string().nullable() }),
+  output: z.object({
+    installed: z.boolean(),
+    funnel: z.boolean(),
+    funnelNote: z.string().nullable(),
+    lastWebhookAt: z.string().nullable(),
+    // Rate-limit observability (README, "Rate limits"): webhooks Linear delivered since the plugin
+    // loaded, session activity reads the sweep did, and sessions it skipped because a webhook
+    // covered them. `sweepSkips` against `sweepReads + sweepSkips` is the saving.
+    webhooks: z.number().int().nonnegative(),
+    sweepReads: z.number().int().nonnegative(),
+    sweepSkips: z.number().int().nonnegative(),
+    webhookReads: z.number().int().nonnegative(),
+  }),
 });
 
 // The Paseo Agents menu bar's pull request view (README, "Pull request view"): one GitHub poller
