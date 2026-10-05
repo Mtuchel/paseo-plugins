@@ -21,6 +21,7 @@ import { closeAnswered, type NeedsYouIssues } from "./needs-you";
 import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, questionAnswer, questionsOf } from "./relay";
 import type { Settings } from "./settings";
 import { issueAgents, type TicketStarter } from "./starter";
+import { ticketProcessLiveness, type ProcessAgent } from "./process-liveness";
 
 const exec = promisify(execFile);
 const HANDLED_LIMIT = 200;
@@ -76,7 +77,7 @@ export type Succession =
 // How a crashed agent is recovered: `before` runs with the resume text and the crash right before
 // the reload, so the caller can claim the attempt and keep the resume until it went out.
 export type Recovery = { issueId: string; before: (resume: string, error: string) => Promise<void> };
-type Snapshot = { status?: string; lastError?: string | null; activeTurn?: unknown; pendingPermissions?: unknown[] | null; archivedAt?: string | null; labels?: Record<string, string> | null; id?: string };
+type Snapshot = ProcessAgent & { activeTurn?: unknown; pendingPermissions?: unknown[] | null };
 
 // Running, starting, in a turn or waiting for an answer: a message would interrupt the turn or drop
 // the question.
@@ -295,6 +296,8 @@ type Deps = {
   // The daemon's agent reload (`paseo agent reload`), resolved per use: null while the plugin has
   // no daemon connection of its own.
   reloader?: () => Promise<((agentId: string) => Promise<void>) | null>;
+  // Exact provider-process inspection, injectable without changing daemon or filesystem state.
+  processLiveness?: typeof ticketProcessLiveness;
   // The clock the webhook fallback windows are measured against.
   now?: () => number;
 };
@@ -359,7 +362,7 @@ export class SessionRouter {
     if (event.action !== "created" && due) this.track(this.readSession(sessionId, "webhook"));
     if (event.action === "created") void this.say(event.agentSession.id, "thought", "Paseo received this — preparing an agent…").catch(() => {});
     if (!this.paseo) { this.waiting.push(event); return; }
-    void this.handle(event);
+    this.track(this.handle(event));
   }
 
   // What the event-driven reads did, for `linear.agent-status` (README, "Rate limits").
@@ -367,7 +370,7 @@ export class SessionRouter {
     return { sweepReads: this.reads.sweep, sweepSkips: this.reads.skipped, webhookReads: this.reads.webhook };
   }
 
-  // Waits for the reads webhooks started, the way `sweep()` waits for its parts.
+  // Waits for the reads and deliveries webhooks started, the way `sweep()` waits for its parts.
   async settled(): Promise<void> {
     while (this.inflightReads.size) await Promise.all([...this.inflightReads]);
   }
@@ -430,6 +433,12 @@ export class SessionRouter {
       return;
     }
     try {
+      const wait = await this.processWait(issueId);
+      if (wait) {
+        await this.deps.store.put({ ...link, queued: true, pendingText: text || null });
+        await this.say(session.id, "thought", `Queued: ${wait}; this thread waits for confirmed process exit.`);
+        return;
+      }
       const asked = (await this.deps.needsYou?.all())?.find((entry) => entry.id === issueId);
       const existing = asked
         ? { id: asked.agentId, title: (await this.paseo!.agents.ref(asked.agentId).refresh().catch(() => null))?.agent.title ?? null }
@@ -452,7 +461,7 @@ export class SessionRouter {
         await this.say(session.id, "thought", admission.reason);
         return;
       }
-      await this.startFor(link, false);
+      await this.startFor(link, false, true);
       await this.closeSuperseded();
     } finally {
       gate.release();
@@ -477,8 +486,21 @@ export class SessionRouter {
 
   // A new agent for the thread's ticket. It runs in the ticket's turn (see exclusive), so a crash
   // recovery of the predecessor waits until the successor started and the predecessor is archived.
-  private startFor(link: SessionLink, fresh: boolean): Promise<void> {
-    return this.exclusive(link.issueId, () => this.startNow(link, fresh));
+  private startFor(link: SessionLink, fresh: boolean, gateHeld = false): Promise<void> {
+    return this.exclusive(link.issueId, async () => {
+      const gate = gateHeld ? null : this.deps.launcher.gate(link.issueId);
+      try {
+        const wait = !gateHeld && !gate ? "a launch for this ticket is under way" : await this.processWait(link.issueId);
+        if (wait) {
+          if (!link.agentId) await this.deps.store.patch(link.sessionId, { queued: true });
+          await this.say(link.sessionId, "thought", `Queued: ${wait}; this thread waits before starting another agent.`);
+          return;
+        }
+        await this.startNow(link, fresh);
+      } finally {
+        gate?.release();
+      }
+    });
   }
 
   private async startNow(link: SessionLink, fresh: boolean): Promise<void> {
@@ -645,6 +667,7 @@ export class SessionRouter {
 
   private async startQueuedThread(link: SessionLink): Promise<void> {
     try {
+      if (await this.processWait(link.issueId)) return;
       // Another path (the trigger label, a newer thread, a successor start) may have started the ticket's agent meanwhile.
       const existing = await this.activeAgentFor(link.issueId);
       if (!existing && !(await this.deps.starter.admission(link.issueId, this.paseo!, await this.deps.settings.read())).ok) return;
@@ -681,7 +704,7 @@ export class SessionRouter {
       return;
     }
     try {
-      await this.startFor(link, false);
+      await this.startFor(link, false, true);
     } catch (error) {
       if ((await this.deps.store.get(link.sessionId))?.agentId) {
         console.error(`[linear-tickets] ${link.identifier}: queued agent started, reporting it failed: ${error instanceof Error ? error.message : error}`);
@@ -924,11 +947,11 @@ export class SessionRouter {
     return this.deps.store.forAgent(agentId);
   }
 
-  // Sends an idle agent a new message, the same way a reply in its Linear thread does: Paseo loads
-  // a stopped agent and starts a turn. Nothing is sent while the agent waits for the owner's answer
-  // or approval (`waiting`: the message would drop the question) or is in a turn (`busy`: Paseo
-  // would interrupt it). `gone`: the agent no longer exists or is archived; `unavailable`: Paseo is
-  // not connected, try again later.
+  // Sends an idle agent a new message; a stopped one is loaded only after its ticket's terminal
+  // OMP roots are confirmed absent. A live or unobservable orphan, or a held start gate, is `busy`.
+  // Nothing is sent while the agent waits for the owner's answer or approval (`waiting`: the
+  // message would drop the question) or is in a turn (`busy`: Paseo would interrupt it). `gone`:
+  // the agent no longer exists or is archived; `unavailable`: Paseo is not connected, retry later.
   // `onDispatch` runs once the agent is known to take it, right before the message is sent.
   // A crashed agent (see crashedProcess) takes no message: `crashed`, unless `recovery` asks to
   // reload it and send it the resume (see recover).
@@ -938,13 +961,32 @@ export class SessionRouter {
     if (!found) return "gone";
     if (found.agent.pendingPermissions?.length) return "waiting";
     if (busy(found.agent)) return "busy";
-    if (!crashedProcess(found.agent)) {
-      await onDispatch?.();
-      await found.handle.send(text);
-      return "sent";
+    const issueId = recovery?.issueId ?? found.agent.labels?.["linear.issueId"] ?? (await this.deps.store.forAgent(agentId))?.issueId;
+    if (issueId) {
+      return this.exclusive(issueId, async () => {
+        const gate = this.deps.launcher.gate(issueId);
+        if (!gate) return "busy";
+        try {
+          const current = await this.agent(agentId);
+          if (!current) return "gone";
+          if (current.agent.pendingPermissions?.length) return "waiting";
+          if (busy(current.agent)) return "busy";
+          if (await this.processWait(issueId, [{ ...current.agent, id: agentId }])) return "busy";
+          if (crashedProcess(current.agent)) return recovery ? await this.recover(agentId, text, onDispatch, recovery) : "crashed";
+          await onDispatch?.();
+          await current.handle.send(text);
+          return "sent";
+        } finally {
+          gate.release();
+        }
+      });
     }
-    if (!recovery) return "crashed";
-    return this.exclusive(recovery.issueId, () => this.recover(agentId, text, onDispatch, recovery));
+    // Without a ticket identity a terminal OMP worker cannot safely be lazily resurrected.
+    if (found.agent.provider === "omp" && (found.agent.status === "closed" || crashedProcess(found.agent))) return "busy";
+    if (crashedProcess(found.agent)) return "crashed";
+    await onDispatch?.();
+    await found.handle.send(text);
+    return "sent";
   }
 
   // The crashed process of an existing, unarchived agent (its last error), else null.
@@ -970,8 +1012,8 @@ export class SessionRouter {
       await found.handle.send(text);
       return "sent";
     }
-    const page = await this.paseo!.agents.list({ filter: { labels: { "linear.issueId": recovery.issueId }, includeArchived: false }, page: { limit: 20 } });
-    if (page.entries.some(({ agent }) => agent.id !== agentId && !agent.archivedAt && !agent.labels?.["paseo.parent-agent-id"] && !crashedProcess(agent))) return "busy";
+    const agents = await issueAgents(this.paseo!, recovery.issueId);
+    if (agents.some((agent) => agent.id !== agentId && !agent.archivedAt && !agent.labels?.["paseo.parent-agent-id"] && agent.status !== "closed" && !crashedProcess(agent))) return "busy";
     const reload = await this.deps.reloader?.();
     if (!reload) return "unavailable";
     const resume = crashResume(error, text);
@@ -1018,6 +1060,18 @@ export class SessionRouter {
     this.turns.set(issueId, settled);
     void settled.then(() => { if (this.turns.get(issueId) === settled) this.turns.delete(issueId); });
     return run;
+  }
+
+  // Called only with the Launcher gate held; successor/recovery paths also hold the ticket's turn.
+  // Unobservable is a pending wait, not exit; no dispatch claim, send, reload or launch precedes it.
+  private async processWait(issueId: string, extra: ProcessAgent[] = []): Promise<string | null> {
+    try {
+      const state = await (this.deps.processLiveness ?? ticketProcessLiveness)(this.paseo!, issueId, extra);
+      if (state === "absent") return null;
+      return state === "alive" ? "an OMP worker for this ticket is still alive" : "the OMP workers for this ticket could not be inspected";
+    } catch {
+      return "the OMP workers for this ticket could not be inspected";
+    }
   }
 
   async say(sessionId: string, type: "thought" | "response" | "error", body: string, ephemeral = false): Promise<void> {
@@ -1152,6 +1206,7 @@ export class SessionRouter {
       const gate = this.deps.launcher.gate(link.issueId);
       if (!gate) return false;
       try {
+        if (await this.processWait(link.issueId)) return false;
         if (await this.liveSuccessorFor(link.issueId, link.agentId ? [link.agentId] : [])) return true;
         this.lastAutoResume.set(link.issueId, Date.now());
         await this.startNow(link, false);
@@ -1178,6 +1233,8 @@ export class SessionRouter {
     const gate = this.deps.launcher.gate(issueId);
     if (!gate) throw new Error("A launch for this ticket is under way.");
     try {
+      const wait = await this.processWait(issueId);
+      if (wait) throw new Error(wait);
       if (await this.liveSuccessorFor(issueId)) return;
       const settings = await this.deps.settings.read();
       const admission = await this.deps.starter.admission(issueId, this.paseo, settings);
@@ -1233,6 +1290,8 @@ export class SessionRouter {
       console.error(`[linear-tickets] ${issue.identifier}: ${step} failed: ${error instanceof Error ? error.message : error}`);
     });
     try {
+      const wait = await this.processWait(issue.id);
+      if (wait) return { kind: "wait", reason: wait };
       const live = await this.liveSuccessorFor(issue.id, [predecessorId]);
       if (live) {
         // Nothing is claimed: a failed hand-off is tried again with the message on the next poll.

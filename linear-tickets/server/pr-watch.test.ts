@@ -49,10 +49,19 @@ const RESTARTED = { status: "idle", lastError: CRASH, pendingPermissions: [] };
 // router's prompts (`send` runs first and may throw).
 function crashDaemon(calls: string[]) {
   const daemon = { agent: CRASHED as Record<string, unknown>, reloaded: RESTARTED as Record<string, unknown>, send: async () => {}, router: null as unknown as SessionRouter };
-  daemon.router = new SessionRouter({ reloader: async () => async (agentId: string) => { calls.push(`reload ${agentId}`); daemon.agent = daemon.reloaded; } } as never);
+  let held = false;
+  daemon.router = new SessionRouter({
+    launcher: { gate: () => {
+      if (held) return null;
+      held = true;
+      return { release: () => { held = false; } };
+    } },
+    store: { forAgent: async () => null },
+    reloader: async () => async (agentId: string) => { calls.push(`reload ${agentId}`); daemon.agent = daemon.reloaded; },
+  } as never);
   Object.assign(daemon.router, { paseo: { agents: {
     ref: (id: string) => ({ refresh: async () => ({ agent: daemon.agent }), send: async (text: string) => { await daemon.send(); calls.push(`prompt ${id}\n${text}`); } }),
-    list: async () => ({ entries: [] }),
+    list: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }),
   } } });
   return daemon;
 }
@@ -91,7 +100,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // each pull request's conversation comments; `stall`: runs after a pull request comment went
   // out (a hanging one is a crash right after); `states`: pull request states as REST reads them
   // one by one (a draft's own state by default; `unreadable` ones fail).
-  const github = { view: OPEN_PR, views: {} as Record<string, PullRequestView>, drafts: [] as QueueDraft[], landed: [] as number[], threads: [] as ReviewThread[], open: [] as OpenPull[], deleted: [] as string[], reads: [] as string[], threadReads: 0, throttled: false, throttle: [] as string[], missing: false, listFailure: null as Error | null, comments: {} as Record<number, string[]>, stall: async () => {}, states: {} as Record<number, string>, unreadable: [] as number[], stateReads: [] as number[] };
+  const github = { view: OPEN_PR, views: {} as Record<string, PullRequestView>, drafts: [] as QueueDraft[], landed: [] as number[], threads: [] as ReviewThread[], open: [] as OpenPull[], deleted: [] as string[], reads: [] as string[], listings: [] as string[], threadReads: 0, throttled: false, throttle: [] as string[], missing: false, listFailure: null as Error | null, comments: {} as Record<number, string[]>, stall: async () => {}, states: {} as Record<number, string>, unreadable: [] as number[], stateReads: [] as number[] };
   // The repo's scripts the backstop runs from its checkout (`checkout` null: the repo has none).
   // `judgment`: what `wait-queue.mjs` answers for a dropped round (null: still running; `judgments`
   // per pull request override it), or
@@ -114,12 +123,15 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     files: {} as Record<string, string>,
     runs: [] as string[],
     now: Date.now(),
+    checkouts: [] as { repo: string; sources: string[] }[],
   };
   // `failure`: what linking a URL on the ticket throws; `arrive`: runs before a ticket comment
   // reaches Linear (a hanging one is a crash before it went out), `stall` after it did (a crash
   // right after); `lost`: the request fails although the comment reached Linear. `comments`:
   // each ticket's comments; `state`: the ticket's workflow state.
-  const linear = { failure: null as Error | null, arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" } };
+  const linear = { failure: null as Error | null, issueFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" } };
+  // No test worktree exists unless its git source is explicitly provided.
+  const git = { origin: null as string | null, root: null as string | null, reads: [] as string[][] };
   // Open before-merge manual tasks of the ticket; `unreadable`: reading them fails.
   const blockers: string[] = [];
   const gate = { unreadable: false };
@@ -140,11 +152,12 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   const directory = mkdtemp(join(tmpdir(), "paseo-pr-watch-"));
   t.after(async () => rm(await directory, { recursive: true, force: true }));
   const create = () => directory.then((home) => new PullRequestWatch({
-    handover: { all: async () => records, update: async (_issue, _agent, patch) => {
+    handover: { all: async () => records, update: async (issue, _agent, patch) => {
       if (!patch.link) { calls.push(`review ${patch.review}`); return null as never; }
       calls.push(`handover link ${patch.link[1]}`);
-      records[0] = { ...records[0], links: { ...records[0].links, [patch.link[0]]: patch.link[1] } };
-      return records[0];
+      const index = records.findIndex((record) => record.issueId === issue.id);
+      records[index] = { ...records[index], links: { ...records[index].links, [patch.link[0]]: patch.link[1] } };
+      return records[index];
     } },
     sessions: {
       sessionFor: () => paseo.session() as never,
@@ -182,7 +195,11 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         if (linear.failure) throw linear.failure;
         calls.push(`link ${title} ${url}`);
       },
-      issueState: async () => ({ ...linear.state }) as never,
+      issueState: async (id) => {
+        linear.issueReads.push(id);
+        if (linear.issueFailure) throw linear.issueFailure;
+        return { ...linear.state, attachmentUrls: linear.attachments } as never;
+      },
     },
     manualTasks: {
       openBlockers: async () => {
@@ -209,9 +226,12 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       },
       landed: async (_repo, item) => github.landed.includes(item.number),
       reviewThreads: async () => { github.threadReads++; return github.threads; },
-      openPullRequests: async () => {
+      openPullRequests: async (repo) => {
+        github.listings.push(repo);
         if (github.listFailure) throw github.listFailure;
-        return [...(github.view.state === "OPEN" ? [listed(records[0].links["Pull request"], github.view)] : []), ...github.open];
+        const linked = records[0].links["Pull request"];
+        return [...(github.view.state === "OPEN" && linked ? [listed(linked, github.view)] : []), ...github.open]
+          .filter((pull) => pull.url.startsWith(`https://github.com/${repo}/pull/`));
       },
       branchExists: async (_repo, branch) => !github.deleted.includes(branch),
       pullComments: async (_repo, number) => github.comments[number] ?? [],
@@ -221,10 +241,19 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         await github.stall();
       },
     },
+    git: async (args) => {
+      git.reads.push(args);
+      if (!git.origin) throw new Error("not a git repository");
+      if (args.includes("--show-toplevel")) return git.root ?? args[1];
+      return git.origin;
+    },
     backstop: {
       now: () => scripts.now,
       checkout: {
-        prepare: async () => scripts.checkout,
+        prepare: async (repo, sources) => {
+          scripts.checkouts.push({ repo, sources });
+          return scripts.checkout;
+        },
         commentFile: async (action, body) => {
           await scripts.beforeEnqueue();
           scripts.files[`/comments/${action}.md`] = body;
@@ -265,6 +294,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     calls.length = 0;
     github.reads.length = 0;
     github.threadReads = 0;
+    github.listings.length = 0;
     await (await watch).poll();
     return [...calls];
   };
@@ -272,6 +302,8 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   const backstop = async () => {
     calls.length = 0;
     scripts.runs.length = 0;
+    github.listings.length = 0;
+    scripts.checkouts.length = 0;
     await (await watch).backstop();
     return [...calls];
   };
@@ -286,7 +318,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     await writeFile(path, value);
     return value;
   };
-  return { github, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, home: () => directory, watch: () => watch };
+  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, home: () => directory, watch: () => watch };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -1049,6 +1081,170 @@ test("an archived agent's landing is followed to the ticket's next pull request 
     assert.equal(h.github.reads[0], pull(1501), failure);
     assert.ok(nudged.some((call) => call.includes(`Checks failed on the head of [the pull request](${pull(1501)})`)), `${failure}: the remaining pull request is nudged`);
   }
+});
+
+test("missing PR links recover the lowest open ticket remainder after #2000 landed and repair it in the same poll", async (t) => {
+  const h = harness(t);
+  h.records[0] = { ...h.records[0], identifier: "TUC-654", branch: "mtuchel/tuc-654-landed", links: {} };
+  h.git.origin = "git@github.com:tuchel-sohn/tuchel-platform.git";
+  const bottom = { ...OPEN_PR, headBranch: "mtuchel/tuc-654-b", checks: [failing("PR code")] };
+  const middle = { ...OPEN_PR, headBranch: "mtuchel/tuc-654-c", baseBranch: bottom.headBranch };
+  const top = { ...OPEN_PR, headBranch: "mtuchel/tuc-654-d", baseBranch: middle.headBranch };
+  h.github.view = { ...OPEN_PR, state: "CLOSED", labels: ["externally-merged"] };
+  h.github.views[prUrl(2001)] = bottom;
+  h.github.open = [
+    listed(prUrl(1999), OPEN_PR, "Fix TUC-6540 [queue] Not this ticket"),
+    listed(prUrl(2003), top, "Fix TUC-654 [queue] Top"),
+    listed(prUrl(2010), { ...OPEN_PR, headBranch: "mtuchel/tuc-654-independent" }, "Fix TUC-654 [queue] Independent"),
+    listed(prUrl(2002), middle, "Fix TUC-654 [queue] Middle"),
+    listed(prUrl(2001), bottom, "Fix TUC-654 [queue] Bottom remainder"),
+  ];
+  const landed = { reviewedAt: null, decision: null, merged: true, advance: "due" };
+  await h.state({ [prUrl(2000)]: landed });
+  const calls = await h.poll();
+  assert.equal(h.records[0].links["Pull request"], prUrl(2001));
+  assert.deepEqual(h.github.reads, [prUrl(2001)]);
+  assert.match(promptOf(calls) ?? "", /Checks failed on the head of \[the pull request\]\(https:\/\/github\.com\/tuchel-sohn\/tuchel-platform\/pull\/2001\)/);
+  assert.deepEqual(h.linear.issueReads, [], "a validated source origin wins without ticket reads");
+  assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"))[prUrl(2000)], landed, "discovery leaves earlier lifecycle claims intact");
+  assert.deepEqual(await h.poll(), [], "link and repair are not repeated");
+  await h.restart();
+  assert.deepEqual(await h.poll(), [], "persisted link and nudge survive restart");
+});
+
+test("a removed worktree recovers its open remainder from the ticket's canonical landed-PR attachment", async (t) => {
+  for (const worktreePath of ["/removed/tuc-654", null]) {
+    const h = harness(t);
+    h.records[0] = { ...h.records[0], identifier: "TUC-654", branch: "mtuchel/tuc-654-landed", worktreePath, links: {} };
+    h.linear.attachments = [prUrl(2000), prUrl(2000), "https://linear.app/ws/issue/TUC-654"];
+    const bottom = { ...OPEN_PR, headBranch: "mtuchel/tuc-654-b" };
+    h.github.open = [
+      listed(prUrl(2002), { ...OPEN_PR, headBranch: "mtuchel/tuc-654-c", baseBranch: bottom.headBranch }, "Fix TUC-654 [queue] Upper"),
+      listed(prUrl(2001), bottom, "Fix TUC-654 [queue] Remainder"),
+    ];
+    h.github.views[prUrl(2001)] = bottom;
+    h.github.view = { ...OPEN_PR, state: "CLOSED" };
+    assert.ok((await h.poll()).includes(`handover link ${prUrl(2001)}`), String(worktreePath));
+    assert.equal(h.records[0].links["Pull request"], prUrl(2001));
+    assert.deepEqual(h.github.reads, [prUrl(2001)], "the recovered PR is read immediately");
+    assert.deepEqual(h.github.listings, ["tuchel-sohn/tuchel-platform"]);
+    await h.restart();
+    assert.deepEqual(await h.poll(), [], "attachment fallback is not relinked on restart");
+  }
+});
+
+test("linkless records share one repository listing and retain same-poll recovered records", async (t) => {
+  const h = harness(t);
+  h.records[0] = { ...h.records[0], identifier: "TUC-654", branch: "mtuchel/tuc-654", links: {} };
+  h.records.push({ ...h.records[0], issueId: "i2", agentId: "a2", identifier: "TUC-566", branch: "mtuchel/tuc-566" });
+  h.git.origin = "https://github.com/tuchel-sohn/tuchel-platform.git";
+  h.github.open = [listed(prUrl(2001), OPEN_PR, "Fix TUC-654 [queue] Recover"), listed(prUrl(2050), OPEN_PR, "Fix TUC-566 [queue] Recover")];
+  await h.poll();
+  assert.deepEqual(h.records.map((record) => record.links["Pull request"]), [prUrl(2001), prUrl(2050)]);
+  assert.deepEqual(h.github.reads, [prUrl(2001), prUrl(2050)]);
+  assert.deepEqual(h.github.listings, ["tuchel-sohn/tuchel-platform"]);
+});
+
+test("direct backstop recovery uses an existing trusted checkout and reuses the attachment repository listing", async (t) => {
+  const h = harness(t);
+  h.records[0] = { ...h.records[0], identifier: "TUC-654", branch: "mtuchel/tuc-654-landed", worktreePath: null, links: {} };
+  h.linear.attachments = [prUrl(2000)];
+  h.github.view = { ...OPEN_PR, state: "CLOSED" };
+  h.github.open = [listed(prUrl(2001), OPEN_PR, "Fix TUC-654 [queue] Remainder")];
+  const calls = await h.backstop();
+  assert.ok(calls.includes(`handover link ${prUrl(2001)}`));
+  assert.deepEqual(h.scripts.checkouts, [{ repo: "tuchel-sohn/tuchel-platform", sources: [] }], "the trusted checkout can exist without worker folders");
+  assert.ok(h.scripts.runs.includes(READY_RUN), "the newly discovered repo participates in the backstop");
+  assert.deepEqual(h.github.listings, ["tuchel-sohn/tuchel-platform"], "discovery and the backstop share the listing");
+  assert.deepEqual(await h.backstop(), [], "no repeated link");
+  await h.restart();
+  assert.deepEqual(await h.backstop(), [], "no repeated link after restart");
+});
+
+test("missing-link discovery respects in-flight delivery and keeps queued repairs through restart", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = harness(t);
+  h.records[0] = { ...h.records[0], branch: OPEN_PR.headBranch, links: {} };
+  h.git.origin = "ssh://git@github.com/tuchel-sohn/tuchel-platform.git";
+  h.github.open = [listed(PR, OPEN_PR)];
+  const pending = { key: "#437", reason: "Already claimed.", facts: "Repair.", fix: "Fix the checks.", sending: true };
+  const queued = [{ key: "#438", reason: "Next claim.", facts: "Repair next.", fix: "Fix the next checks." }];
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#437", "#438"], blockedAt: HEAD, pending, queued } });
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("prompt ")), "an in-flight send is never duplicated");
+  await h.restart();
+  h.paseo.answer = async () => "busy";
+  assert.deepEqual(await h.poll(), []);
+  h.paseo.answer = async () => "sent";
+  assert.match(promptOf(await h.poll()) ?? "", /Fix the next checks\./);
+  await h.restart();
+  assert.deepEqual(await h.poll(), [], "the queued repair is delivered only once");
+});
+
+test("missing-link recovery skips wrong origins, invalid folders, noncanonical attachments and tickets with no exact open candidate", async (t) => {
+  const cases = [
+    { name: "valid other origin takes precedence over ticket attachments", origin: "https://github.com/another/repo.git", attachments: [prUrl(2000)], expectedRepo: "another/repo" },
+    { name: "lookalike origin is not GitHub", origin: "https://github.com.evil.test/tuchel-sohn/tuchel-platform.git", attachments: [], expectedRepo: null },
+    { name: "non-worktree /tmp is ignored", origin: "https://github.com/tuchel-sohn/tuchel-platform.git", root: "/different/checkout", attachments: [], expectedRepo: null },
+    { name: "no source and no attachments", origin: null, attachments: [], expectedRepo: null },
+    { name: "noncanonical attachments", origin: null, attachments: ["https://github.com.evil.test/tuchel-sohn/tuchel-platform/pull/2000", "http://github.com/tuchel-sohn/tuchel-platform/pull/2000", "https://github.com/tuchel-sohn/tuchel-platform/issues/2000", `${prUrl(2000)}/extra`], expectedRepo: null },
+    { name: "ambiguous attachment repositories", origin: null, attachments: [prUrl(2000), "https://github.com/another/repo/pull/1"], expectedRepo: null },
+    { name: "only the longer ticket identifier is open", origin: "git@github.com:tuchel-sohn/tuchel-platform.git", attachments: [], expectedRepo: "tuchel-sohn/tuchel-platform" },
+  ];
+  for (const item of cases) {
+    const h = harness(t);
+    h.records[0] = { ...h.records[0], identifier: "TUC-654", branch: "mtuchel/tuc-654", worktreePath: "root" in item ? "/tmp" : h.records[0].worktreePath, links: {} };
+    h.git.origin = item.origin;
+    h.git.root = "root" in item ? item.root! : null;
+    h.linear.attachments = item.attachments;
+    h.github.open = [listed(prUrl(2001), OPEN_PR, "Fix TUC-6540 [queue] Different ticket")];
+    assert.deepEqual(await h.poll(), [], item.name);
+    assert.deepEqual(h.records[0].links, {}, item.name);
+    assert.deepEqual(h.github.reads, [], item.name);
+    assert.deepEqual(h.github.listings, item.expectedRepo ? [item.expectedRepo] : [], item.name);
+  }
+});
+
+test("an unreadable attachment source leaves discovery and its existing claims pending", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = harness(t);
+  h.records[0] = { ...h.records[0], branch: OPEN_PR.headBranch, links: {} };
+  h.linear.attachments = [PR];
+  h.linear.issueFailure = new Error("Linear is unavailable");
+  const pending = { key: "#437", reason: "Claimed.", facts: "Repair.", fix: "Fix the checks." };
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, pending } });
+  assert.deepEqual(await h.poll(), []);
+  assert.deepEqual(h.github.listings, []);
+  assert.deepEqual(h.records[0].links, {});
+  assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"))[PR].pending, pending);
+});
+
+test("archived linkless records discover only inside the existing 14-day relevance window", async (t) => {
+  for (const days of [13, 15]) {
+    const h = harness(t, { status: "archived", updatedAt: new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString() });
+    h.records[0] = { ...h.records[0], branch: OPEN_PR.headBranch, links: {} };
+    h.git.origin = "git@github.com:tuchel-sohn/tuchel-platform.git";
+    h.github.open = [listed(PR, OPEN_PR)];
+    await h.poll();
+    assert.deepEqual(h.github.reads, days === 13 ? [PR] : [], String(days));
+    assert.equal(h.records[0].links["Pull request"], days === 13 ? PR : undefined, String(days));
+  }
+});
+
+test("a discovery listing rate limit stops later PR reads and retries discovery next poll", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = harness(t);
+  h.records[0] = { ...h.records[0], branch: OPEN_PR.headBranch, links: {} };
+  h.records.push({ ...h.records[0], issueId: "i2", agentId: "a2", identifier: "TUC-2", links: { "Pull request": prUrl(420) } });
+  h.git.origin = "git@github.com:tuchel-sohn/tuchel-platform.git";
+  h.github.listFailure = new GitHubRateLimitedError("GitHub is throttling gh");
+  assert.deepEqual(await h.poll(), []);
+  assert.deepEqual(h.github.reads, [], "the later linked PR is not read after throttling");
+  assert.deepEqual(h.records[0].links, {});
+  h.github.listFailure = null;
+  h.github.open = [listed(PR, OPEN_PR)];
+  await h.poll();
+  assert.equal(h.records[0].links["Pull request"], PR, "the failed discovery is retried");
+  assert.deepEqual(h.github.reads, [PR, prUrl(420)]);
 });
 
 // --- The queue backstop (TUC-615) ---------------------------------------------------------------

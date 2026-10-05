@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 import type { Handover, HandoverRecord } from "./handover";
@@ -16,8 +16,8 @@ import { STAGE_STEP, stalledStage, type ReviewThread, type Stage } from "./pr-nu
 import { ghGet, type RestGet, type RestResponse } from "./pull-requests";
 import {
   activityBoundary, BACKSTOP_ENQUEUE, BackstopCheckout, CLASS_TEXT, commentOnce, dropWhy, ENQUEUE_READY, enqueueArgs, enqueuedComment, HELD_KINDS, parseEnqueue, parseExpect, parseJudgment, parseReady,
-  READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, runIsolatedEnqueue, runNodeScript, ticketMarker, WAIT_QUEUE, waitQueueArgs,
-  type ActionRecord, type DropClass, type DropJudgment, type Problem, type Refusal, type ScriptRunner,
+  READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, originRepo, runGit, runIsolatedEnqueue, runNodeScript, ticketMarker, WAIT_QUEUE, waitQueueArgs,
+  type ActionRecord, type DropClass, type DropJudgment, type GitRunner, type Problem, type Refusal, type ScriptRunner,
 } from "./queue-backstop";
 import { githubBudget, GitHubPausedError, RateLimitedError, withPriority, type GitHubBudget } from "./rate-budget";
 import type { PromptOutcome, Recovery, SessionRouter, Succession } from "./sessions";
@@ -147,7 +147,7 @@ type Drop = { key: string; reason: string; repo: string; number: number; draft: 
 // `conflict`: the repo's class is conflictOnly; `main`: mainBroken; `plain`: any other class.
 type DropKind = "plain" | "conflict" | "main";
 // What one poll or backstop run reads at most once per repo.
-type RunContext = { records: HandoverRecord[]; pulls(repo: string): Promise<OpenPull[]>; drafts(repo: string): Promise<QueueDraft[]>; checkout(repo: string): Promise<string | null>; now: number };
+type RunContext = { records: HandoverRecord[]; repo(worktree: string): Promise<string | null>; pulls(repo: string): Promise<OpenPull[]>; drafts(repo: string): Promise<QueueDraft[]>; checkout(repo: string): Promise<string | null>; now: number };
 
 const pullUrl = (repo: string, number: number) => `https://github.com/${repo}/pull/${number}`;
 const PULL_URL = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/;
@@ -161,6 +161,11 @@ function entry(seenByUrl: Record<string, Seen>, url: string): Seen {
 // A pull request title that names the ticket as a whole word (`Add TUC-34 [area] …`, never TUC-343).
 export function namesTicket(identifier: string): RegExp {
   return new RegExp(`(?<![A-Za-z0-9-])${identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9])`, "i");
+}
+
+// Lowest remaining ticket PR: no other open ticket branch below it, then stable PR number.
+function lowestPull(open: OpenPull[]): OpenPull | undefined {
+  return open.filter((pull) => !open.some((other) => other.headBranch === pull.baseBranch)).sort((a, b) => a.number - b.number)[0];
 }
 
 // gh reports GitHub's throttling (HTTP 429, primary or secondary rate limit); the poll's GitHub
@@ -688,6 +693,8 @@ export class PullRequestWatch {
       // without a `probe` reads in full every poll, as before.
       probe?: PullViewSource;
       github?: GitHubReader;
+      // Read-only worktree discovery; defaults to the queue backstop's git runner.
+      git?: GitRunner;
       backstop?: BackstopDeps;
     },
     private readonly path = join(paseoHome(), "linear-tickets", "pr-watch.json"),
@@ -818,10 +825,27 @@ export class PullRequestWatch {
     const pulls = new Map<string, Promise<OpenPull[]>>();
     const drafts = new Map<string, Promise<QueueDraft[]>>();
     const checkouts = new Map<string, Promise<string | null>>();
+    const repos = new Map<string, Promise<string | null>>();
+    const git = this.deps.git ?? runGit;
+    const repo = async (worktree: string): Promise<string | null> => {
+      try {
+        // `git -C /tmp` must not discover an enclosing checkout as the ticket's worktree.
+        const root = await git(["-C", worktree, "rev-parse", "--show-toplevel"]);
+        if (resolve(root) !== resolve(worktree)) return null;
+        return originRepo(await git(["-C", worktree, "remote", "get-url", "origin"]));
+      } catch {
+        return null;
+      }
+    };
     const checkout = this.deps.backstop?.checkout ?? new BackstopCheckout();
     return {
       records,
       now: this.deps.backstop?.now?.() ?? Date.now(),
+      repo: (worktree) => {
+        const source = repos.get(worktree) ?? repo(worktree);
+        repos.set(worktree, source);
+        return source;
+      },
       pulls: (repo) => {
         const listing = pulls.get(repo) ?? this.github().openPullRequests(repo);
         pulls.set(repo, listing);
@@ -841,15 +865,51 @@ export class PullRequestWatch {
     };
   }
 
+  // A recorded branch keeps discovery tied to agent work. Archived linkless records retain
+  // the same 14-day relevance window as their linked PRs.
+  private discoverable(record: HandoverRecord, now: number): boolean {
+    return !record.links["Pull request"] && Boolean(record.branch)
+      && (record.status !== "archived" || now - (Date.parse(record.updatedAt) || 0) <= ARCHIVED_WATCH_MS);
+  }
+
+  private async discover(record: HandoverRecord, context: RunContext): Promise<void> {
+    if (!this.discoverable(record, context.now)) return;
+    let repo = record.worktreePath ? await context.repo(record.worktreePath) : null;
+    if (!repo) {
+      // Removed worker folders can still have a landed PR attached to the ticket. It supplies
+      // only the repo, never the candidate: list what remains open and match the whole ticket.
+      const state = await this.deps.linear.issueState(record.issueId);
+      const repos = new Set((state.attachmentUrls ?? []).flatMap((url) => {
+        const source = /^https:\/\/github\.com\/([A-Za-z0-9-]+\/[A-Za-z0-9_.-]+)\/pull\/[1-9]\d*\/?$/.exec(url);
+        return source ? [source[1].toLowerCase()] : [];
+      }));
+      // Conflicting attachment repos do not identify a safe source.
+      if (repos.size !== 1) return;
+      repo = [...repos][0];
+    }
+    const identifier = namesTicket(record.identifier);
+    const open = (await context.pulls(repo)).filter((pull) => pull.url.toLowerCase() === pullUrl(repo, pull.number) && identifier.test(pull.title));
+    const next = lowestPull(open);
+    if (!next) return;
+    const url = pullUrl(repo, next.number);
+    await this.relink(record, url);
+    // Handover.update can replace its stored object; the run keeps this snapshot too.
+    record.links = { ...record.links, "Pull request": url };
+  }
+
   private async watch(): Promise<void> {
     const seenByUrl = await this.load();
     this.crashes = await readFile(this.crashPath, "utf8").then((text) => JSON.parse(text) as Record<string, Crash>, () => ({}));
     const manual = this.deps.manualTasks;
     const all = await this.deps.handover.all();
+    const context = this.context(all);
     const records: HandoverRecord[] = [];
     for (const record of all) {
       const url = record.links["Pull request"];
-      if (!url) continue;
+      if (!url) {
+        if (this.discoverable(record, context.now)) records.push(record);
+        continue;
+      }
       const seen = seenByUrl[url];
       if (seen?.missing) continue;
       // An archived agent's open pull request stays watched, so a merge queue drop still reaches
@@ -862,7 +922,6 @@ export class PullRequestWatch {
       if (record.status !== "archived" || seen?.pending || seen?.replay === "due" || seen?.advance === "due" || watched || await manual?.awaitingMerge(record.issueId)) records.push(record);
     }
     // Graphite's drafts and the open pull requests are listed once per repo and poll.
-    const context = this.context(all);
     const listDrafts = context.drafts;
     const listPulls = context.pulls;
     const save = () => this.save(seenByUrl);
@@ -896,9 +955,11 @@ export class PullRequestWatch {
     // Stalled pull requests are nudged, and closed ones followed to their replacement, after every
     // drop was handled: a drop's fix request comes first when both are for the same agent.
     const nudges: { record: HandoverRecord; url: string; view: PullRequestView }[] = [];
-    for (const record of stopped.paused || stopped.budget ? [] : records) {
-      const url = record.links["Pull request"];
-      const going = await step(record, url, async () => {
+    for (const record of stopped.paused || stopped.budget || stopped.throttled ? [] : records) {
+      const going = await step(record, record.links["Pull request"] ?? "the worktree's open pull requests", async () => {
+        await this.discover(record, context);
+        const url = record.links["Pull request"];
+        if (!url || seenByUrl[url]?.missing) return;
         let view: PullRequestView;
         try {
           view = await this.view(url);
@@ -952,7 +1013,7 @@ export class PullRequestWatch {
       if (!await step(record, url, next)) break;
     }
     // Tickets without an open pull request, once the pull requests relinked theirs.
-    if (!stopped.paused && !stopped.budget) await pass(() => this.crashedWithoutPull(seenByUrl, reserved));
+    if (!stopped.paused && !stopped.budget && !stopped.throttled) await pass(() => this.crashedWithoutPull(seenByUrl, reserved));
     const { paused, budget, throttled } = stopped;
     if (paused && paused.pool !== this.pausedPool) console.error(`[linear-tickets] pull request watch paused: ${paused.message}`);
     this.pausedPool = paused?.pool ?? null;
@@ -1240,13 +1301,24 @@ export class PullRequestWatch {
     const records = await this.deps.handover.all();
     const context = this.context(records);
     const save = () => this.save(seenByUrl);
+    for (const record of records) {
+      try {
+        await this.discover(record, context);
+      } catch (error) {
+        console.error(`[linear-tickets] queue backstop discovery for ${record.identifier} stopped: ${error instanceof Error ? error.message : error}`);
+        if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) {
+          await save();
+          return;
+        }
+      }
+    }
     const repos = new Set([...records.map((record) => record.links["Pull request"] ?? ""), ...Object.keys(seenByUrl)].map((url) => PULL_URL.exec(url)?.[1] ?? "").filter(Boolean));
     for (const repo of repos) {
       try {
         await this.backstopRepo(repo, seenByUrl, context, save);
       } catch (error) {
         console.error(`[linear-tickets] queue backstop for ${repo} stopped: ${error instanceof Error ? error.message : error}`);
-        if (error instanceof RateLimitedError || error instanceof GitHubRateLimitedError) break;
+        if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) break;
       }
     }
     await save();
@@ -1771,7 +1843,7 @@ export class PullRequestWatch {
     const source = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
     const identifier = namesTicket(record.identifier);
     const open = source ? (await pulls(source[1])).filter((pull) => pull.url !== url && identifier.test(pull.title)) : [];
-    const next = open.filter((pull) => !open.some((other) => other.headBranch === pull.baseBranch)).sort((a, b) => a.number - b.number)[0];
+    const next = lowestPull(open);
     if (next) await this.relink(record, next.url);
     seenByUrl[url] = { ...seenByUrl[url], advance: undefined };
     if (next) await this.tell(record, "thought", `The pull request landed; Paseo now follows the ticket's next open pull request #${next.number}.`);
