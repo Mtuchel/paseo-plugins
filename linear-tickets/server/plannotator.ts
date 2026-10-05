@@ -213,7 +213,7 @@ export class PlannotatorBridge {
       if (event.type === "opened") {
         const steps = planSteps(planText);
         if (steps.length) await sessions.plan(link.sessionId, steps.map((content) => ({ content, status: "pending" as const })));
-        // An auto-approved plan is decided already; its approval arrives as the next event.
+        // An auto-approved plan is decided already; its approval arrives as the next event (judge).
         if (judgement?.approved) { await sessions.say(link.sessionId, "thought", judgement.line); return true; }
         await sessions.expectReview(link.sessionId, event.localUrl, planText, reviewLink);
         const split = steps.length > 1 ? [{ label: `Approve & split into ${Math.min(steps.length, MAX_SPLIT)} sub-issues`, value: SPLIT_PLAN }] : [];
@@ -349,7 +349,13 @@ export class PlannotatorBridge {
         attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()),
       });
       if (!outcome.approve) return { approved: false, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.`, reasons: outcome.reasons };
-      await this.decide(localUrl, true, `Auto-approved by the risk policy. ${rating}`);
+      const feedback = `Auto-approved by the risk policy. ${rating}`;
+      await this.decide(localUrl, true, feedback);
+      // Plannotator reports no approval of its own plan mode, so the bridge records it like the
+      // panel's: the plan document, the coding state and the model tier follow from that event.
+      // When the omp plan extension reports it too, the second report is skipped as a duplicate.
+      await recordDecision({ type: "decided", agentId, approved: true, feedback, planContent: planText, at: new Date().toISOString() }, this.events)
+        .catch((error: unknown) => console.error(`[linear-tickets] recording the auto-approval of ${agentId} failed: ${error instanceof Error ? error.message : error}`));
       return { approved: true, line: `Auto-approved within your threshold. ${rating}`, reasons: [] };
     } catch (error) {
       console.error(`[linear-tickets] auto-approval check for ${agentId} failed: ${error instanceof Error ? error.message : error}`);

@@ -585,8 +585,10 @@ tickets (blocking relations and labels), and every ticket still plans and is jud
 (see "Projects").
 
 An auto-approved plan goes through the same approval as yours (state, `plan-ready`, the plan
-document, the agent's usual mode); the agent gets "Auto-approved by the risk policy" with the
-rating as its approval notes, and the panel, chat row and ticket say so. Every other plan reaches
+document, the agent's usual mode and its [model tier](#model-tiers)): the plugin records the
+approval itself, because Plannotator reports none for its own plan mode. The agent gets
+"Auto-approved by the risk policy" with the rating as its approval notes, and the panel, chat row
+and ticket say so. Every other plan reaches
 you with the rating and the reasons it needs you, parked (below) when it can be. The threshold
 lives in `$PASEO_HOME/linear-tickets/settings.json` and the `linear.set-settings` RPC as
 `"autoApprove": { "enabled": true, "maxImpact": 1, "maxImpactWithFlag": 2 }`; `enabled: false`
