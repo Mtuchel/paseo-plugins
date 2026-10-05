@@ -1239,6 +1239,36 @@ test("a refusal of a pull request whose agent is gone goes to the ticket, and wi
   assert.deepEqual(await orphan.backstop(), [], "once");
 });
 
+test("a refusal still reaches its ticket when the handover has no pull request link", async (t) => {
+  const h = harness(t);
+  h.records[0].links = {};
+  h.github.view = { ...READY, state: "CLOSED" };
+  h.github.open = [listed(PR, READY)];
+  h.github.views[PR] = READY;
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false } });
+  h.scripts.ready = { stacks: [STACK], drops: [] };
+  h.scripts.enqueue = [{ code: 2, answer: { result: "refused", problems: [{ kind: "conflict-main", text: "conflicts with main" }] } }];
+  const calls = await h.backstop();
+  assert.ok(calls.some((call) => call.startsWith(`comment ${OWNER}`) && call.includes("conflict-main")));
+  assert.equal(promptOf(calls), undefined);
+  assert.deepEqual(await h.backstop(), [], "delivered once");
+});
+
+test("a persisted refusal follows ticket fallback when its handover link moves before delivery", async (t) => {
+  const h = harness(t);
+  h.github.view = READY;
+  h.scripts.ready = { stacks: [STACK], drops: [] };
+  h.scripts.enqueue = [{ code: 2, answer: { result: "refused", problems: [{ kind: "conflict-main", text: "conflicts with main" }] } }];
+  await h.backstop();
+  h.records[0].links["Pull request"] = prUrl(1501);
+  h.github.open = [listed(PR, READY)];
+  await h.restart();
+  const calls = await h.backstop();
+  assert.ok(calls.some((call) => call.startsWith(`comment ${OWNER}`) && call.includes("conflict-main")));
+  assert.equal(promptOf(calls), undefined);
+  assert.deepEqual(await h.backstop(), [], "persisted delivery is not repeated");
+});
+
 test("a queue-tip conflict is routed once and retried once its queue draft is closed", async (t) => {
   const h = harness(t);
   h.github.view = READY;

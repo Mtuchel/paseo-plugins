@@ -1060,6 +1060,11 @@ retried, the range is blocked and the agent is asked to check. Comments owed for
 go out once after the pull request closed or landed. To switch the backstop off, revert the
 plugin change and `paseo plugin reload linear-tickets`; ranges already in the queue stay there.
 
+If a handover record has no pull-request link, its message takes the ticket
+fallback too. The backstop also recovers pending messages for open pull requests
+whose handover link moved or disappeared after routing, including across a restart;
+existing delivery claims still prevent duplicate sends.
+
 **Partial landings.** When the ticket's recorded pull request lands (merged, or closed by the
 queue as above) while other pull requests of the ticket are still open (the rest of its stack,
 or pull requests the agent replayed onto main), the ticket links the lowest of them (the one no
