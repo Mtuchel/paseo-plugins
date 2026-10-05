@@ -35,7 +35,8 @@ import { NeedsYouIssues } from "./server/needs-you";
 import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, SessionRouter, SessionStore, stopAgentTurn } from "./server/sessions";
 import { approveForLater, splitIntoSubIssues } from "./server/split";
 import { planSetup, TicketStarter } from "./server/starter";
-import { isPlanPolicy, PLAN_POLICY_ENV, PLAN_POLICY_LABEL } from "./server/plan-policy";
+import { PLAN_TICKET_ENV } from "./server/plan-policy";
+import { AgentEnvs, sessionEnv } from "./server/agent-env";
 import { PlanRequests } from "./server/plan-requests";
 import { PlanFollowUps } from "./server/plan-follow-ups";
 import { labelDaemon, StateLabels } from "./server/state-labels";
@@ -53,7 +54,9 @@ export default function contribute(server: PluginServerContext) {
   const agentApi = new AgentApi(auth);
   const linear = new LinearService(credentials, undefined, agentApi);
   linear.onOwnerComment = (commentId, issueId) => recordPluginComment(join(paseoHome(), "linear-tickets"), commentId, issueId);
-  const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url));
+  // Each ticket agent's launch environment, given back to its resumed sessions (agent-env.ts).
+  const agentEnvs = new AgentEnvs();
+  const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url), undefined, undefined, agentEnvs);
   const settings = new Settings();
   const cache = new TicketCache();
   const handover = new Handover(linear, undefined, undefined, undefined, async (agentId) => { const serverId = await daemonServerId(); return serverId ? paseoAgentUrl(serverId, agentId) : null; });
@@ -119,8 +122,8 @@ export default function contribute(server: PluginServerContext) {
   const parking = {
     plans: new ParkedPlans(),
     available: () => plannotatorHost.available(),
-    retire: async (reviewUrl: string, agentId: string, api: PaseoApi, reason: string) => {
-      await decidePlannotatorReview(reviewUrl, false, reason).catch((error: unknown) => console.error(`[linear-tickets] closing the parked plan's own review failed: ${error instanceof Error ? error.message : error}`));
+    retire: async (reviewUrl: string | null, agentId: string, api: PaseoApi, reason: string) => {
+      if (reviewUrl) await decidePlannotatorReview(reviewUrl, false, reason).catch((error: unknown) => console.error(`[linear-tickets] closing the parked plan's own review failed: ${error instanceof Error ? error.message : error}`));
       await stopAgentTurn(agentId).catch(() => {});
       await api.agents.ref(agentId).archive().catch(() => {});
     },
@@ -219,11 +222,13 @@ export default function contribute(server: PluginServerContext) {
   server.before("agent.session_open", async ({ request }, { paseo }) => {
     attach(paseo);
     const browser = await plannotatorHook();
-    // A new ticket agent gets its plan policy with its create request; a resumed one from its label,
-    // so the omp extension keeps the same rules after a daemon restart.
-    const policy = request.env[PLAN_POLICY_ENV] ? null : await paseo.agents.ref(request.agentId).refresh()
-      .then((found) => found?.agent.labels?.[PLAN_POLICY_LABEL], () => undefined);
-    const env = { ...(browser ? { PLANNOTATOR_BROWSER: browser } : {}), ...(isPlanPolicy(policy) ? { [PLAN_POLICY_ENV]: policy } : {}) };
+    // A new ticket agent gets its plan policy and ticket environment with its create request; a
+    // resumed one (daemon restart, reload) gets them back from its labels and its saved launch
+    // environment, so the omp extension keeps the same rules and tools (agent-env.ts).
+    const labels = request.env[PLAN_TICKET_ENV] ? undefined : await paseo.agents.ref(request.agentId).refresh()
+      .then((found) => found?.agent.labels, () => undefined);
+    const saved = labels ? await agentEnvs.read(request.agentId) : {};
+    const env = { ...(browser ? { PLANNOTATOR_BROWSER: browser } : {}), ...sessionEnv(request.env, labels, saved) };
     return Object.keys(env).length ? { ...request, env: { ...request.env, ...env } } : undefined;
   });
   server.handle(statusRpc, (_input, { paseo }) => { attach(paseo); return linear.status(); });

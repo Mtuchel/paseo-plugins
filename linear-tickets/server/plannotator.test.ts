@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -101,12 +101,16 @@ function setup(labels: Record<string, string>, ticket: { creatorId: string; labe
   return { calls, documents, linear, paseo };
 }
 
+// The events directory sits in a directory of its own, like the plugin's, which keeps the advisor
+// verdicts next to it.
 async function withEvents(events: object[], run: (directory: string) => Promise<void>) {
-  const directory = await mkdtemp(join(tmpdir(), "paseo-plannotator-events-"));
+  const root = await mkdtemp(join(tmpdir(), "paseo-plannotator-"));
+  const directory = join(root, "events");
   try {
+    await mkdir(directory);
     for (const [index, event] of events.entries()) await writeFile(join(directory, `${index}.json`), JSON.stringify(event));
     await run(directory);
-  } finally { await rm(directory, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true }); }
 }
 
 test("a hand-off shows in the agent's chat and, for a ticket agent, as a Linear comment with the tailnet link", async () => {
@@ -178,6 +182,7 @@ test("with review links, the agent's stable link is posted instead of the review
     async opened(agentId: string, event: { remoteUrl: string | null }, review: { identifier?: string } = {}) { calls.push(`opened ${agentId} ${event.remoteUrl} ${review.identifier}`); return `https://host.ts.net:8444/review/${agentId}`; },
     async decided(agentId: string, approved: boolean) { calls.push(`decided ${agentId} ${approved}`); },
     async described(localUrl: string, plan: string, judgement: { approved: boolean; reasons: string[] } | null) { calls.push(`described ${localUrl} ${plan === RISKY(2)} ${judgement?.approved} ${judgement?.reasons.join("; ")}`); },
+    async describedFor() {},
   };
   await withEvents([
     { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
@@ -255,6 +260,25 @@ test("a plan that sets a new rule goes to the owner although everything else wou
   assert.deepEqual(rule.decisions, []);
   assert.match(rule.comment, /Needs your approval: it sets a new rule\.$/);
   assert.equal((await review({ advisedPlan: RISKY(0) })).decisions.length, 1, "the same plan without the rule is approved");
+});
+
+// A plugin reload (a rollout, a daemon restart) between the planner's record and its hand-off used
+// to forget the verdict, so the plan went to the owner with "no advisor review was recorded".
+test("an advisor review recorded before a plugin reload still counts for the plan handed off after it", async () => {
+  const { linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const decisions: string[] = [];
+  await withEvents([{ type: "advised", agentId: "agent-1", verdict: "agreed", hash: planHash(RISKY(1)), at: "2026-01-01T09:59:00Z" }], async (directory) => {
+    const run = async () => {
+      const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => RISKY(1), undefined, undefined, undefined, async (url, approve) => { decisions.push(`${url} ${approve}`); }, () => {});
+      bridge.attach(paseo);
+      await bridge.drain();
+      bridge.stop();
+    };
+    await run();
+    await writeFile(join(directory, "1.json"), JSON.stringify({ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" }));
+    await run();
+  });
+  assert.deepEqual(decisions, ["http://localhost:4000/ true"]);
 });
 
 test("approving a plan files its follow-ups, on the Plannotator page or as a parked plan; a send-back files none", async () => {
@@ -343,6 +367,7 @@ test("a plan that needs the owner is parked and its agent retired; the central h
     async opened(agentId: string, event: { localUrl: string }, review: { since?: string } = {}) { inbox.push(`${agentId} ${event.localUrl} since ${review.since}`); return null; },
     async decided() {},
     async described() {},
+    async describedFor() {},
   };
   const run = async (events: object[]) => withEvents(events, async (directory) => {
     const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, reviews,
@@ -388,6 +413,60 @@ test("a parked plan sent back keeps no plan-ready and asks for a new plan; the r
   });
   assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "comment issue-1: ↩️ **Plan sent back** in Plannotator ([plan](https://linear.app/doc/1))\n\nSplit step 1\n\nAssign Paseo again to plan it again."]);
   assert.equal(plans.size, 0);
+});
+
+// The plans parked on 2026-10-05 without a recorded advisor review had one from their planner; only
+// the record was missing. Recording it later, for exactly the parked text, gets the plan judged again.
+test("a parked plan is judged again once its advisor review is recorded for exactly its text", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(calls);
+  const inbox: string[] = [];
+  const reviews = {
+    async opened() { return null; },
+    async decided() {},
+    async described() {},
+    async describedFor(agentId: string, _plan: string, judgement: { reasons: string[] }) { inbox.push(`${agentId}: ${judgement.reasons.join("; ")}`); },
+  };
+  const unrecorded = "no advisor review was recorded for this plan text";
+  const park = (plan: string) => plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan, line: `Needs your approval: ${unrecorded}.`, reasons: [unrecorded], model: null, parkedAt: "2026-01-01T10:00:00Z", announced: true });
+  const advised = (plan: string, verdict = "agreed") => ({ type: "advised", agentId: "agent-1", verdict, hash: planHash(plan), at: "2026-01-01T12:00:00Z" });
+  const run = (events: object[]) => withEvents(events, async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => "", undefined, undefined, reviews, async () => {}, () => {}, parking);
+    bridge.attach(paseo);
+    await bridge.drain();
+    // The next sweep: an approval the bridge recorded itself.
+    await bridge.drain();
+    bridge.stop();
+  });
+
+  park(RISKY(1));
+  await run([advised(`${RISKY(1)}\nOne more step.\n`)]);
+  assert.deepEqual({ reasons: plans.get("issue-1")?.reasons, calls, inbox }, { reasons: [unrecorded], calls: [], inbox: [] }, "a review of another text changes nothing");
+
+  park(RISKY(2));
+  await run([advised(RISKY(2))]);
+  assert.deepEqual({ ...plans.get("issue-1"), parkedAt: "" }, { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "Risk: impact 2/4, revert. Needs your approval: impact 2 is above the threshold 1.", reasons: ["impact 2 is above the threshold 1"], model: null, parkedAt: "", announced: true });
+  assert.equal(plans.get("issue-1")?.parkedAt, "2026-01-01T10:00:00Z", "the plan keeps its place: the host does not serve it again");
+  assert.deepEqual(inbox, ["agent-1: impact 2 is above the threshold 1"]);
+  assert.deepEqual(calls, ["retire agent-1 null"], "the planner that recorded the review is retired again");
+
+  calls.length = 0;
+  inbox.length = 0;
+  park(RISKY(1));
+  await run([advised(RISKY(1), "unavailable")]);
+  assert.deepEqual(plans.get("issue-1")?.reasons, ["the advisor was unavailable"]);
+
+  calls.length = 0;
+  park(RISKY(1));
+  await run([advised(RISKY(1))]);
+  assert.equal(plans.size, 0, "approved within the threshold");
+  assert.deepEqual(calls, [
+    "retire agent-1 null",
+    "document issue-1 Plan: TUC-25",
+    "+plan-ready issue-1",
+    "ready issue-1",
+    "comment issue-1: ✅ **Plan approved** in Plannotator ([plan](https://linear.app/doc/1))\n\nAuto-approved by the risk policy. Risk: impact 1/4, revert.\n\nAssign Paseo again to implement it.",
+  ]);
 });
 
 test("without the central host a plan that needs the owner keeps its agent and opens as before", async () => {

@@ -167,6 +167,7 @@ function launcher(daemon: Daemon) {
     undefined,
     async (_requestId: string, prompt: string) => { prompts.push(prompt); return "/plan-context.md"; },
     () => false,
+    { save: async () => {} },
   );
   return { instance, prompts, daemon };
 }

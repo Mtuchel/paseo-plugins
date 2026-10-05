@@ -4,6 +4,7 @@ import { launchAgentRpc } from "../shared/contracts";
 import { existsSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { AgentEnvs } from "./agent-env";
 import { attachmentNote, saveAttachments, type Download } from "./attachments";
 import { buildPrompt, finishedBlockersNote } from "./context";
 import { inReviewState, type LinearService } from "./linear";
@@ -70,6 +71,8 @@ export class Launcher {
     private readonly planContext: (requestId: string, prompt: string) => Promise<string> = writePlanContext,
     // Whether the plugin's omp extension is installed; it gives omp agents the ticket tools.
     private readonly ompTools: () => boolean = ompExtensionInstalled,
+    // Where each agent's ticket environment is kept for its resumed sessions (agent-env.ts).
+    private readonly envs: Pick<AgentEnvs, "save"> = new AgentEnvs(),
   ) {}
 
   start(input: Start, paseo: PaseoApi, options: Options = {}): Promise<Result> {
@@ -228,7 +231,7 @@ export class Launcher {
       } catch (error) {
         warnings.push(`Could not save the ticket context for the plan advisor: ${error instanceof Error ? error.message : "unknown error"}`);
       }
-      return workspace.agents.create({
+      const agent = await workspace.agents.create({
         config: { provider: input.provider, modeId: input.modeId, thinkingOptionId: input.thinkingOptionId, ...(linearAccess && attach && mcpServers ? { mcpServers } : {}) },
         title,
         prompt,
@@ -237,6 +240,11 @@ export class Launcher {
         labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
         env,
       });
+      // Never fails the launch: a resumed session then still gets its ticket from the agent's labels.
+      await this.envs.save(agent.id, env).catch((error: unknown) => {
+        warnings.push(`Could not save the agent's ticket environment for its resumed sessions: ${error instanceof Error ? error.message : "unknown error"}`);
+      });
+      return agent;
     };
     const unconfirmed = (error: unknown) => {
       // Keep the daemon's reason (e.g. a provider failing to start with the ticket MCP server).

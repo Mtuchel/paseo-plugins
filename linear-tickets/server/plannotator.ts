@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
-import type { LinearService } from "./linear";
+import type { IssueState, LinearService } from "./linear";
 import type { PluginSettings, Settings } from "./settings";
 import { PLANNOTATOR_OPEN_SOURCE } from "./plannotator-open-source";
 import { paseoHome } from "./ticket-mcp";
@@ -13,7 +13,7 @@ import { APPROVE_LATER, APPROVE_PLAN, decidePlannotatorReview, MAX_SPLIT, planSt
 import { hasLabel, PLAN_POLICY_LABEL, PLAN_READY_LABEL } from "./plan-policy";
 import type { ParkedPlan, ParkedPlans } from "./parked";
 import type { ReviewLinks } from "./review-links";
-import { autoApproval, parsePlanRisk, ratingText } from "../shared/plan-risk";
+import { autoApproval, parsePlanRisk, ratingText, type ReviewFacts } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
 import { isUntrusted } from "./starter";
 import { dispatchLabels } from "./dispatch";
@@ -49,7 +49,8 @@ const MAX_PLAN_CHARS = 180_000;
 
 export type PlannotatorRow = { title: string; url?: string; detail?: string };
 export type OpenedEvent = { type: "opened"; agentId: string | null; localUrl: string; remoteUrl: string | null; at: string };
-// `parked`: reported by the central Plannotator host (parked.ts) for a parked plan; only it decides one.
+// `parked`: a parked plan's decision, reported by the central Plannotator host (parked.ts) or, for a
+// plan the risk policy approves once its advisor review is recorded, by the bridge (rejudgeParked).
 export type DecidedEvent = { type: "decided"; agentId: string | null; approved: boolean; feedback?: string; planUri?: string; planContent?: string; parked?: true; at: string };
 // The omp extension recorded the plan advisor's review (verdict) for the plan text with this hash.
 export type AdvisedEvent = { type: "advised"; agentId: string | null; verdict: string; hash: string; at: string };
@@ -65,12 +66,13 @@ type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "issueDocu
 type Judgement = { approved: boolean; line: string; reasons: string[] };
 type ProjectPlans = Pick<ProjectFlow, "isPlanner" | "applyPlan">;
 // Parked plans (README, "Parked plans"): `available` while the central Plannotator host runs;
-// `retire` closes the agent's own review with the reason, stops and archives the agent.
+// `retire` closes the agent's own review (when it has one) with the reason, stops and archives the agent.
 export type Parking = {
   plans: Pick<ParkedPlans, "forAgent" | "put" | "remove">;
   available: () => boolean;
-  retire: (localUrl: string, agentId: string, paseo: PaseoApi, reason: string) => Promise<void>;
+  retire: (localUrl: string | null, agentId: string, paseo: PaseoApi, reason: string) => Promise<void>;
 };
+type Advice = { verdict: string; hash: string };
 
 // Workflow states the review moves a ticket through when status write-back is on.
 export const PLANNING_STATE = "Planning";
@@ -170,9 +172,6 @@ export class PlannotatorBridge {
   private projectPlans: ProjectPlans | null = null;
   // Files an approved plan's follow-ups (plan-follow-ups.ts); its retries run on this bridge's sweep.
   private followUps: Pick<PlanFollowUps, "file" | "retryPending"> | null = null;
-  // Per agent, the advisor verdict the omp extension recorded last and the hash of that plan text.
-  // In memory: after a plugin reload the next review simply goes to the owner.
-  private readonly advised = new Map<string, { verdict: string; hash: string }>();
   // Reviews already opened on this machine, so a retried event does not open a second tab.
   private readonly shown = new Set<string>();
   // Where the owner's review feedback is kept for the weekly decision candidates (owner-decisions.ts).
@@ -191,7 +190,7 @@ export class PlannotatorBridge {
     private readonly fetchPlan: (localUrl: string) => Promise<string> = readReviewPlan,
     private readonly handover?: Pick<Handover, "update">,
     private readonly setMode: (agentId: string, modeId: string) => Promise<void> = setAgentMode,
-    private readonly reviews?: Pick<ReviewLinks, "opened" | "decided" | "described">,
+    private readonly reviews?: Pick<ReviewLinks, "opened" | "decided" | "described" | "describedFor">,
     private readonly decide: (localUrl: string, approve: boolean, feedback: string) => Promise<void> = decidePlannotatorReview,
     private readonly open: (url: string) => void = openInBrowser,
     private readonly parking?: Parking,
@@ -343,6 +342,39 @@ export class PlannotatorBridge {
     if (entry && log) await logQuietly(() => log.append(entry), `plan feedback on ${issue.identifier}`);
   }
 
+  // The advisor verdict the omp extension recorded last for the agent, with the hash of that plan
+  // text. On disk next to the events: a plugin reload between the planner's record and its
+  // hand-off must not send the plan to the owner as unreviewed.
+  private adviceFile(agentId: string): string {
+    return join(dirname(this.events), "advised", `${agentId.replace(/[^0-9A-Za-z-]/g, "")}.json`);
+  }
+
+  private async advice(agentId: string): Promise<Advice | null> {
+    const value: unknown = await readFile(this.adviceFile(agentId), "utf8").then((text) => JSON.parse(text), () => null);
+    if (!value || typeof value !== "object") return null;
+    const { verdict, hash } = value as Record<string, unknown>;
+    return typeof verdict === "string" && typeof hash === "string" ? { verdict, hash } : null;
+  }
+
+  private async remember(agentId: string, advice: Advice): Promise<void> {
+    const path = this.adviceFile(agentId);
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, JSON.stringify(advice), { mode: 0o600, flag: "wx" });
+      await rename(temporary, path);
+    } finally { await rm(temporary, { force: true }); }
+  }
+
+  // What the risk policy needs to know about the ticket besides the plan.
+  private async reviewFacts(state: IssueState, verdict: string | null, settings: PluginSettings): Promise<ReviewFacts> {
+    return {
+      verdict,
+      untrusted: isUntrusted(state, await this.linear.viewerId(), await this.linear.appUserId()),
+      attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()),
+    };
+  }
+
   // The risk policy (README, "Plan risk and auto-approval"): approves the plan on the owner's
   // behalf when its `## Risk and impact` rating is within the threshold, the advisor review the
   // extension recorded is for exactly this text, and nothing about the ticket needs the owner.
@@ -358,12 +390,8 @@ export class PlannotatorBridge {
       const approvedBefore = await this.linear.issueDocument(issueId, `Plan: ${state.identifier}`).catch(() => null);
       const tierOnly = approvedBefore ? onlyTierAdded(approvedBefore.content, planText) : false;
       if (!tierOnly && "problem" in rated) return null;
-      const advice = this.advised.get(agentId);
-      const outcome = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, {
-        verdict: advice && advice.hash === planHash(planText) ? advice.verdict : null,
-        untrusted: isUntrusted(state, await this.linear.viewerId(), await this.linear.appUserId()),
-        attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()),
-      });
+      const advice = await this.advice(agentId);
+      const outcome = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(state, advice && advice.hash === planHash(planText) ? advice.verdict : null, settings));
       if (!outcome.approve) return { approved: false, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.`, reasons: outcome.reasons };
       const feedback = tierOnly ? "Approved again: the owner approved this plan before; only its model tier was added." : `Auto-approved by the risk policy. ${rating}`;
       await this.decide(localUrl, true, feedback);
@@ -377,6 +405,28 @@ export class PlannotatorBridge {
       console.error(`[linear-tickets] auto-approval check for ${agentId} failed: ${error instanceof Error ? error.message : error}`);
       return { approved: false, line: [rating, "The auto-approval check failed, so it needs your approval."].filter(Boolean).join(" "), reasons: ["the auto-approval check failed"] };
     }
+  }
+
+  // A parked plan whose advisor review was recorded after it was parked (README, "Parked plans"):
+  // its planner, resumed for that, recorded the review for exactly the parked text. The plan is
+  // judged again: within the threshold it is approved like the owner's approval on the central
+  // host; otherwise it stays parked with the new reasons. The planner is retired again either way.
+  private async rejudgeParked(parked: ParkedPlan, verdict: string, paseo: PaseoApi): Promise<void> {
+    const rated = parsePlanRisk(parked.plan);
+    if ("problem" in rated) return;
+    const settings = await this.settings.read();
+    const outcome = autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(await this.linear.issueState(parked.issueId), verdict, settings));
+    const rating = `Risk: ${ratingText(rated.risk)}.`;
+    await this.parking!.retire(null, parked.agentId, paseo, "The plan stays parked for the owner: stop now and do not implement anything.");
+    if (outcome.approve) {
+      await recordDecision({ type: "decided", parked: true, agentId: parked.agentId, approved: true, feedback: `Auto-approved by the risk policy. ${rating}`, planContent: parked.plan, at: new Date().toISOString() }, this.events);
+      console.log(`[linear-tickets] ${parked.identifier}: parked plan auto-approved once its advisor review was recorded (${rating})`);
+      return;
+    }
+    await this.parking!.plans.put({ ...parked, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.`, reasons: outcome.reasons });
+    await this.reviews?.describedFor(parked.agentId, parked.plan, { approved: false, reasons: outcome.reasons })
+      .catch((error: unknown) => console.error(`[linear-tickets] inbox details for ${parked.identifier} skipped: ${error instanceof Error ? error.message : error}`));
+    console.log(`[linear-tickets] ${parked.identifier}: parked plan judged again with its advisor review, still for the owner (${outcome.reasons.join("; ")})`);
   }
 
   async drain(): Promise<void> {
@@ -414,7 +464,14 @@ export class PlannotatorBridge {
   }
 
   private async deliver(event: PlannotatorEvent, agentId: string, paseo: PaseoApi): Promise<void> {
-    if (event.type === "advised") { this.advised.set(agentId, { verdict: event.verdict, hash: event.hash }); return; }
+    if (event.type === "advised") {
+      await this.remember(agentId, { verdict: event.verdict, hash: event.hash });
+      const parked = await this.parking?.plans.forAgent(agentId);
+      if (parked && planHash(parked.plan) === event.hash) await this.rejudgeParked(parked, event.verdict, paseo);
+      return;
+    }
+    // A decided review's verdict is spent: the next round records its own.
+    if (event.type === "decided") await rm(this.adviceFile(agentId), { force: true });
     if (event.type === "escalated") return this.escalate(event, agentId, paseo);
     const parked = this.parking ? await this.parking.plans.forAgent(agentId) : null;
     if (parked) return this.deliverParked(event, parked);
