@@ -6,7 +6,8 @@
 //      id, exactly as for an agent's review: it publishes the port in the tailnet and records an
 //      `opened` event, so stable links, the inbox and the Linear panel work unchanged;
 //   2. the owner's decision is recorded as a `decided` event marked `parked`, which only this host
-//      writes; the server stops a few seconds later (Plannotator's page reads the result first).
+//      and the plugin's risk policy (a parked plan approved once its advisor review is recorded)
+//      write; the server stops a few seconds later (Plannotator's page reads the result first).
 // A record the plugin removed stops its server. A record changed to a new `parkedAt` (the plan was
 // parked again) gets a new server. Restarted hosts serve every record again, on new ports.
 export const PLANNOTATOR_HOST_SOURCE = String.raw`import { spawn } from "node:child_process";

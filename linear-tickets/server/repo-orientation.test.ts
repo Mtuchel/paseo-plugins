@@ -164,7 +164,7 @@ test("a launch into a git worktree puts the guide list into the agent's prompt a
       projects: { list: async () => ({ projects: [{ projectId: "p1", projectKind: "git", projectRootPath: directory }] }) },
       workspaces: { create: async () => ({ directory, agents: { create: async (options: PaseoWorkspaceAgentCreateOptions) => { prompt = options.prompt; return { id: "agent-1" }; } } }) },
     } as unknown as PaseoApi;
-    const launcher = new Launcher({ detail: async () => detail, markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] }, async () => ({ branches: [{ id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }), undefined, undefined, async (_id, text) => { saved = text; return "/ctx.md"; });
+    const launcher = new Launcher({ detail: async () => detail, markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] }, async () => ({ branches: [{ id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }), undefined, undefined, async (_id, text) => { saved = text; return "/ctx.md"; }, undefined, { save: async () => {} });
     const result = await launcher.start({ id: "TUC-1", projectId: "p1", baseBranch: "refs/heads/main", provider: "omp/opus", instructions: "Plan first.", markInProgress: false, requestId: "5f6f1154-5838-4439-b981-b3c9d9831499" }, paseo, { promptTemplate: "Work on {{ticket}}.\n\n{{instructions}}\n\n{{context}}" });
     assert.deepEqual(result.warnings, []);
     assert.ok(prompt?.includes(`- possible match: \`${DOMAINS}/sales/AGENTS.md\``));

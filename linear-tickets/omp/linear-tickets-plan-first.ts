@@ -9,7 +9,8 @@
 //   the `plan` label while the agent works, or when an approved plan names no model tier): the
 //   agent enters planning at its next tool call, which is blocked and followed by a message with
 //   the reason (the file's `message`, else the owner's request), or at its next prompt.
-// - LINEAR_TICKETS_ISSUE=<ticket> (set by the plugin for every ticket agent): plan advisor
+// - LINEAR_TICKETS_ISSUE=<ticket> (set by the plugin for every ticket agent, also when Paseo
+//   resumes its session: server/agent-env.ts): plan advisor
 //   (README, "Plan advisor"). Submitting a plan (`plannotator_submit_plan`, its xd:// device, or
 //   omp's `xd://propose`) is blocked until `record_plan_advice` recorded a GPT-6 Astra review for
 //   exactly that plan text. The block reason carries the steps, pointing the advisor at the saved

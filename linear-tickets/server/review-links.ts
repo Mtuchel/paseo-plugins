@@ -350,6 +350,16 @@ export class ReviewLinks {
     });
   }
 
+  // The same for the agent's latest review: a parked plan judged again (its review is the central host's).
+  async describedFor(agentId: string, plan: string, judgement: { approved: boolean; reasons: string[] }): Promise<void> {
+    if (!plan.trim()) return;
+    await this.change((registry) => {
+      const entry = latest(registry, agentId);
+      if (!entry) return;
+      entry.details = { ...planDetails(plan, entry.identifier), reasons: judgement.reasons, autoApproved: judgement.approved };
+    });
+  }
+
   async sweep(): Promise<void> {
     const open = Object.values(await this.load()).filter((entry) => !entry.closedAt);
     const dead: ReviewEntry[] = [];

@@ -555,6 +555,7 @@ planner adopts or answers each point and sends changes back to the same advisor 
 disputed with both positions, for you to decide in Plannotator.
 
 omp planners cannot skip this. Every ticket agent carries its ticket in `LINEAR_TICKETS_ISSUE`,
+also in a session Paseo resumes after a daemon restart or reload (see "The omp extension" below),
 and for those agents the extension blocks `plannotator_submit_plan`, its `xd://` device and omp's
 `xd://propose` until `record_plan_advice` has recorded the review for exactly the plan text being
 submitted; a plan the gate cannot read is blocked too. The tool checks with `paseo inspect` that
@@ -600,7 +601,9 @@ When the review opens, the plugin approves it on your behalf only if all of thes
 - reversibility `revert`, no migration, no auth change, no new rule (a plan with `New rule: yes`
   always reaches you, whatever its impact: "it sets a new rule"), and the planner recommends `auto`;
 - the advisor `agreed`, recorded for exactly the text Plannotator shows (an edited plan, an
-  unavailable advisor, open disagreements or a plugin reload in between send it to you);
+  unavailable advisor or open disagreements send it to you; the recorded verdict is kept in
+  `$PASEO_HOME/linear-tickets/plannotator/advised/<agent>.json` until the review is decided, so a
+  plugin reload in between does not);
 - the ticket is yours (not someone else's, not `feedback`) and not marked attended.
 
 A project planner's work order never goes through this policy: it only orders the project's
@@ -638,6 +641,11 @@ Homebrew or `LINEAR_TICKETS_BUN`) and the Plannotator omp plugin
 (`~/.omp/plugins/node_modules/@plannotator/pi-extension`, or `LINEAR_TICKETS_PLANNOTATOR_PACKAGE`);
 without them plans are not parked and their agents wait for you as before.
 
+A parked plan is judged again when its planner records the advisor review for exactly the parked
+text after the plan was parked (a planner resumed for that, e.g. one whose session had lost
+`record_plan_advice`): within your threshold it is approved like your approval above, otherwise it
+stays parked with the new reasons in the inbox. The planner is retired again either way.
+
 **Plan follow-ups.** When a ticket plan is approved, by you on Plannotator's page, by **Approve
 plan**, **Approve, implement later** or **Approve & split** in the panel, as a parked plan or by
 the risk policy, every `follow-up — <title>` line of its `## Reach` and `## Principles and rules`
@@ -663,9 +671,16 @@ ln -s "$PWD/omp/linear-tickets-plan-first.ts" ~/.omp/agent/extensions/
 ```
 
 It needs the Plannotator omp plugin (`@plannotator/pi-extension`). The plugin gives ticket agents
-the policy in `LINEAR_TICKETS_PLAN` (also after a daemon restart) and writes mid-run requests to
+the policy in `LINEAR_TICKETS_PLAN` and writes mid-run requests to
 `$PASEO_HOME/linear-tickets/plan-requests/<agent id>`. Only fresh sessions start in planning; a
-resumed agent keeps its phase.
+resumed agent keeps its phase. Paseo hands a session it resumes (daemon restart, reload) only the
+daemon's environment, not the one the agent was created with, so the plugin gives it back when the
+session opens: the policy from the agent's `linear.plan` label, and `LINEAR_TICKETS_ISSUE`,
+`LINEAR_TICKETS_CONTEXT` and `LINEAR_TICKETS_MCP` from what the launch saved in
+`$PASEO_HOME/linear-tickets/agent-env/<agent>.json` (the ticket from the agent's labels when
+nothing was saved, as for agents started before). Without them a resumed planner had no
+`record_plan_advice`, no submission gate and no Linear write guard, and its plan reached the risk
+policy with "no advisor review was recorded for this plan text".
 
 **`plan-ready`.** Every approved plan adds the `plan-ready` label: always for a split or
 “Approve, implement later”, and with status write-back on for Plannotator and panel approvals,
