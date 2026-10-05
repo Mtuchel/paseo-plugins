@@ -1167,14 +1167,14 @@ export class PullRequestWatch {
     return (this.deps.backstop?.run ?? runNodeScript)(checkout, script, args, { GITHUB_REPOSITORY: repo });
   }
 
-  // A message for the ticket's agent goes to its record's pull request, delivered by the poll (see
-  // deliver); without a record, to the pull request's own entry, delivered by the backstop (see
-  // deliverOrphan). While that entry still holds an earlier message, it is queued behind it and
+  // A message goes to the ticket record's linked pull request, delivered by the
+  // poll (see deliver); without a linked record, it uses the ticket/PR fallback
+  // delivered by the backstop (see deliverOrphan). While an earlier message waits, it is queued and
   // delivered once the earlier one went out (see nextMessage), so a claimed drop is never lost; a
   // message with the same key already waiting there is not added twice.
   private route(seenByUrl: Record<string, Seen>, target: { record: HandoverRecord | null; url: string; tickets: string[] }, pending: PendingDrop): void {
     const seen = entry(seenByUrl, target.record?.links["Pull request"] ?? target.url);
-    const message = target.record ? pending : { ...pending, orphan: { tickets: target.tickets } };
+    const message = target.record?.links["Pull request"] ? pending : { ...pending, orphan: { tickets: target.tickets } };
     if (!seen.pending) seen.pending = message;
     else if (![seen.pending, ...(seen.queued ?? [])].some((waiting) => waiting.key === pending.key)) seen.queued = [...(seen.queued ?? []), message];
   }
@@ -1271,6 +1271,18 @@ export class PullRequestWatch {
     };
     await advance();
     const open = await context.pulls(repo);
+    const watched = new Set(context.records.map((record) => record.links["Pull request"]));
+    // Recover messages whose record lost or moved its link after routing.
+    // Only open PRs need a repair request; preserve any in-flight delivery claim.
+    for (const pull of open) {
+      if (watched.has(pull.url)) continue;
+      const seen = seenByUrl[pull.url];
+      if (!seen?.pending) continue;
+      const tickets = ticketsOf(repo, [pull.number], open, context.records, null);
+      for (const pending of [seen.pending, ...(seen.queued ?? [])]) {
+        pending.orphan ??= { tickets };
+      }
+    }
     const gated = await this.gatedTickets(context.records);
     const excluded = this.excluded(repo, seenByUrl, open, gated, context.records);
     const skips = await this.skips(repo, seenByUrl, open, context.now);
@@ -1285,7 +1297,6 @@ export class PullRequestWatch {
       }
     }
     const ready = parseReady(await this.run(checkout, ENQUEUE_READY, readyArgs([...excluded].sort((a, b) => a - b), skips), repo));
-    const watched = new Set(context.records.map((record) => record.links["Pull request"]));
     for (const found of ready.drops) {
       const url = pullUrl(repo, found.pr);
       if (watched.has(url) || handledDrops(seenByUrl[url]).includes(found.key)) continue;
