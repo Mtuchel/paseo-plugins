@@ -1,5 +1,7 @@
-import { open } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { open, opendir } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
+import type { HandoverRecord } from "./handover";
+import type { PipelineOwnerEvidence } from "./plan-pipeline";
 
 // Only provider-native OMP session files named by the PUBLIC persistence handle are read.
 // Shapes below are emitted by OMP and the installed Plannotator extension, not daemon disk fields.
@@ -15,10 +17,79 @@ export type NativeRevision = {
 export type NativeState = {
   phase?: string; phaseAt?: string; progress: string | null; planningAt?: string;
   hash?: string; advisor?: string; adviceAt?: string;
-  revisions: NativeRevision[]; head?: string; unknown?: boolean; stoppedAt?: string; error?: string; errorAt?: string;
+  revisions: NativeRevision[]; head?: string; unknown?: boolean; crashAt?: string; disposedAt?: string; error?: string; errorAt?: string;
 };
 export type NativeCursor = { path: string; inode: string; offset: number; anchor: string; state: NativeState };
 export type NativeEvidence = { state: NativeState; cursor: NativeCursor; complete: boolean; problem?: string };
+
+async function sourceJson(path: string, limit: number): Promise<ObjectValue | null> {
+  const file = await open(path, "r").catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return null; throw error; });
+  if (!file) return null;
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile() || stat.size > limit) throw new Error("Owner evidence exceeds safe bound");
+    const buffer = Buffer.alloc(stat.size + 1);
+    let bytes = 0;
+    while (bytes < buffer.length) {
+      const chunk = await file.read(buffer, bytes, buffer.length - bytes, bytes);
+      if (!chunk.bytesRead) break;
+      bytes += chunk.bytesRead;
+    }
+    if (bytes !== stat.size) throw new Error("Owner evidence changed during read");
+    return object(JSON.parse(buffer.subarray(0, bytes).toString("utf8")));
+  } finally { await file.close(); }
+}
+
+/** Bounded local ownership sample; no Linear reads and no work on the inbox HTTP path. */
+export async function pipelineOwnerEvidence(home: string, issueIds: readonly string[], readOwner?: (issueId: string) => Promise<HandoverRecord | null>): Promise<PipelineOwnerEvidence[]> {
+  if (issueIds.length > 512) throw new Error("Owner evidence exceeds safe bound");
+  if (!issueIds.length) return [];
+  const unresolvedWaits = new Set<string>();
+  const owners = new Map<string, PipelineOwnerEvidence>();
+  let index = 0;
+  await Promise.all(Array.from({ length: Math.min(4, issueIds.length) }, async () => {
+    while (index < issueIds.length) {
+      const issueId = issueIds[index++];
+      // The general handover reader intentionally swallows errors. Monitoring must distinguish
+      // an absent record from unreadable evidence; only ENOENT means there is no owner record.
+      const value = readOwner ? await readOwner(issueId) : await sourceJson(join(home, "linear-tickets", "handover", `${issueId.replace(/[^A-Za-z0-9-]/g, "_")}.json`), 64 * 1024);
+      if (value === null) continue;
+      const record = object(value), waiting = record.waiting == null ? null : object(record.waiting);
+      if (record.issueId !== issueId || typeof record.agentId !== "string" || !timestamp(record.updatedAt)) throw new Error("Owner evidence malformed");
+      if (waiting && ((waiting.previousStateId !== null && typeof waiting.previousStateId !== "string")
+        || (waiting.commentId !== null && typeof waiting.commentId !== "string"))) throw new Error("Owner wait evidence malformed");
+      if (typeof waiting?.subIssueId === "string") unresolvedWaits.add(waiting.subIssueId);
+      owners.set(`${issueId}:${record.agentId}`, {
+        issueId, agentId: record.agentId, waiting: Boolean(waiting && !waiting.subIssueId),
+        at: timestamp(record.updatedAt)!,
+        ...(record.status === "failed" ? { failedAt: timestamp(record.updatedAt)! } : {}),
+        ...(typeof record.resumedFrom === "string" ? { resumedFrom: record.resumedFrom } : {}),
+      });
+    }
+  }));
+  const directory = join(home, "linear-tickets", "needs-you");
+  const dir = await opendir(directory).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return null; throw error; });
+  if (!dir) {
+    if (unresolvedWaits.size) throw new Error("Needs-you wait evidence unavailable");
+    return [...owners.values()];
+  }
+  const requested = new Set(issueIds);
+  let files = 0;
+  for await (const entry of dir) {
+    if (++files > 1000) throw new Error("Needs-you evidence exceeds safe bound");
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const value = await sourceJson(join(directory, entry.name), 16 * 1024);
+    if (!value) throw new Error("Needs-you evidence changed during read");
+    if (typeof value.id !== "string" || typeof value.parentId !== "string" || typeof value.agentId !== "string") throw new Error("Needs-you evidence malformed");
+    if (!requested.has(value.parentId)) continue;
+    unresolvedWaits.delete(value.id);
+    const key = `${value.parentId}:${value.agentId}`, before = owners.get(key);
+    owners.set(key, { ...before, issueId: value.parentId, agentId: value.agentId, waiting: true });
+    if (owners.size > 1000) throw new Error("Owner evidence exceeds safe bound");
+  }
+  if (unresolvedWaits.size) throw new Error("Needs-you wait evidence unavailable");
+  return [...owners.values()];
+}
 
 function object(value: unknown): ObjectValue { return value && typeof value === "object" && !Array.isArray(value) ? value as ObjectValue : {}; }
 export function timestamp(value: unknown): string | null {
@@ -40,7 +111,8 @@ function progress(state: NativeState, at: string): void {
   state.progress = later(state.progress, at);
   const revision = state.revisions.at(-1);
   if (revision && !["auto-approved", "completed", "cancelled"].includes(revision.stage)) revision.progress = later(revision.progress, at);
-  if (state.stoppedAt && at > state.stoppedAt) delete state.stoppedAt;
+  if (state.crashAt && at > state.crashAt) delete state.crashAt;
+  if (state.disposedAt && at > state.disposedAt) delete state.disposedAt;
   if (state.errorAt && at > state.errorAt) { delete state.error; delete state.errorAt; }
 }
 function submission(name: unknown, input: ObjectValue): boolean {
@@ -52,9 +124,10 @@ function submit(state: NativeState, id: unknown, at: string): void {
   if (typeof id !== "string" || !id) { state.unknown = true; return; }
   const before = state.revisions.at(-1);
   if (before?.attempt === id) return; // assistant call followed by tool_execution_start
-  const key = state.hash ? `hash:${state.hash}` : `submit:${id}`;
+  // Content is not an attempt identity: an unchanged-content resubmission is still a new review.
+  const key = `submit:${id.slice(0, 200)}`;
   let revision = before;
-  if (!revision || (revision.attempt && revision.key !== key) || ["auto-approved", "completed", "cancelled"].includes(revision.stage)) {
+  if (!revision || revision.attempt || ["auto-approved", "completed", "cancelled"].includes(revision.stage)) {
     revision = { key, at, progress: at, stage: "publishing" };
     state.revisions.push(revision);
   }
@@ -73,6 +146,12 @@ export function diagnostic(error: unknown): string {
   const raw = error instanceof Error ? error.message : typeof error === "string" ? error : "";
   const code = object(error).code;
   if (/import|Cannot find (module|package)|module.*not found|ERR_MODULE_NOT_FOUND/i.test(raw)) return "Plan tool dependency/import failed";
+  if (/\b429\b|rate.?limit|quota.*exceed/i.test(raw)) {
+    const retry = /\b(retryAfter|retry-after-ms|retry-after)["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?)/i.exec(raw);
+    const seconds = retry ? Number(retry[2]) / (retry[1].toLowerCase() === "retry-after-ms" ? 1000 : 1) : NaN;
+    return `Provider rate limit (429); ${Number.isFinite(seconds) && seconds > 0 && seconds <= 365 * 86400 ? `retry after ${Math.ceil(seconds)} seconds; ` : ""}wait for provider quota before retrying`;
+  }
+  if (/\bprocess (exited|is closed)\b/i.test(raw)) return "Provider process exited or is closed; reload is required before resuming";
   if (/ECONNREFUSED|connection refused/i.test(raw)) return "Review delivery connection refused";
   if (/ETIMEDOUT|timed? ?out|timeout/i.test(raw)) return "Review delivery timed out";
   if (/EACCES|EPERM|permission denied/i.test(raw)) return "Evidence or delivery access denied";
@@ -101,7 +180,10 @@ function apply(state: NativeState, entry: ObjectValue): void {
   const data = object(entry.data);
   const at = timestamp(entry.timestamp) ?? timestamp(data.at);
   if (!at) return;
-  if (state.stoppedAt && at > state.stoppedAt && entry.type !== "title") delete state.stoppedAt;
+  if (entry.type !== "title") {
+    if (state.crashAt && at > state.crashAt) delete state.crashAt;
+    if (state.disposedAt && at > state.disposedAt) delete state.disposedAt;
+  }
   const kind = entry.customType;
   if (entry.type === "custom" && kind === "linear-tickets.plan-first") {
     if (!state.planningAt || (state.phase !== "planning" && at > state.planningAt)) {
@@ -137,7 +219,10 @@ function apply(state: NativeState, entry: ObjectValue): void {
     const revision = state.revisions.at(-1);
     if (revision) { revision.stage = "completed"; revision.resolvedAt = at; }
   } else if (entry.type === "custom" && kind === "session_exit") {
-    state.stoppedAt = timestamp(data.recordedAt) ?? at;
+    const exitAt = timestamp(data.recordedAt) ?? at;
+    if (data.kind === "normal" && data.reason === "dispose") state.disposedAt = exitAt;
+    else if (["crash", "error", "signal"].includes(String(data.kind)) || typeof data.code === "number" && data.code !== 0) state.crashAt = exitAt;
+    else state.unknown = true;
   } else if (entry.type === "custom" && kind === "tool_execution_start") {
     progress(state, at);
     if (submission(data.toolName, object(data.args))) submit(state, data.toolCallId, at);

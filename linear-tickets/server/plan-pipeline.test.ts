@@ -7,9 +7,10 @@ import test from "node:test";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import type { SessionLink } from "./sessions";
 import type { ParkedPlan } from "./parked";
+import type { HandoverRecord } from "./handover";
 import { ADVISOR_MODEL } from "../shared/plan-advisor";
 import { PlanPipeline, type PipelineReview } from "./plan-pipeline";
-import { NativeReader } from "./plan-pipeline-source";
+import { NativeReader, pipelineOwnerEvidence } from "./plan-pipeline-source";
 import type { PipelineHost } from "../shared/plan-pipeline";
 
 const START = "2026-10-06T12:00:00.000Z";
@@ -46,11 +47,20 @@ function link(extra: Partial<SessionLink> = {}): SessionLink {
 function parked(): ParkedPlan {
   return { issueId: "issue", identifier: "TUC-99", agentId: "root", plan: "# Private plan not exposed", line: "Owner review", reasons: [], model: null, parkedAt: ARRIVED, announced: true };
 }
+function owner(extra: Partial<HandoverRecord> = {}): HandoverRecord {
+  return {
+    issueId: "issue", identifier: "TUC-99", agentId: "root", agentTitle: "Planner",
+    branch: null, worktreePath: null, lastCommit: null, summaries: [], links: {},
+    status: "working", waiting: null, progressCommentId: null, resumedFrom: null, updatedAt: ARRIVED,
+    ...extra,
+  };
+}
 
 type Harness = {
   pipeline: PlanPipeline; home: string; file: string; native: string; agents: PaseoAgent[];
   sessions: SessionLink[]; parked: ParkedPlan[]; clock: Date; failList: boolean; absent: boolean;
   timelines: Record<string, { timestamp: string; item: Record<string, unknown> }[]>;
+  owners: Map<string, HandoverRecord>; ownerFiles: boolean;
   append(entries: FixtureEntry[]): Promise<void>;
   snapshot(open?: PipelineReview[], decided?: PipelineReview[]): Promise<PipelineHost>;
   restart(): Promise<void>; refresh(): Promise<void>;
@@ -66,12 +76,14 @@ async function harness(run: (h: Harness) => Promise<void>, entries = planning())
   await writeFile(native, JSON.stringify({ type: "session", version: 3, id: "native-session", timestamp: START, cwd: home }) + "\n");
   await append(entries);
   const agents = [{ id: "root", provider: "omp", cwd: home, model: "openai-codex/gpt-6.1-sol", createdAt: START, updatedAt: START, status: "running", labels: { "linear.issueId": "issue", "linear.identifier": "TUC-99", "linear.plan": "required" }, pendingPermissions: [], runtimeInfo: { provider: "omp", sessionId: "native-session" }, persistence: { provider: "omp", sessionId: "native-session", nativeHandle: native } }] as unknown as PaseoAgent[];
-  const make = (): PlanPipeline => new PlanPipeline({ host: "test-host", home, file, now: () => h.clock, sessions: async () => h.sessions, parked: async () => h.parked, processInspector: {
+  const make = (): PlanPipeline => new PlanPipeline({ host: "test-host", home, file, now: () => h.clock, sessions: async () => h.sessions, parked: async () => h.parked,
+    owners: (issueIds) => pipelineOwnerEvidence(home, issueIds, h.ownerFiles ? undefined : async (issueId) => h.owners.get(issueId) ?? null),
+    processInspector: {
     processes: async () => h.absent ? "" : `123 omp --mode rpc-ui --session ${native}\n`,
     cwd: async () => home, canonicalPath: async (path) => path,
   } });
   const h: Harness = {
-    home, native, file, agents, sessions: [], parked: [], clock: new Date(ARRIVED), failList: false, absent: false, timelines: {}, append,
+    home, native, file, agents, sessions: [], parked: [], owners: new Map(), ownerFiles: false, clock: new Date(ARRIVED), failList: false, absent: false, timelines: {}, append,
     pipeline: make(),
     refresh: async () => { await h.pipeline.refresh(); },
     snapshot: (open = [], decided = []) => h.pipeline.snapshot(open, decided),
@@ -437,5 +449,367 @@ test("delivered content supersedes older mismatched native content without claim
     await h.append(submit(HASH_B, "submit-b", next));
     await h.refresh();
     assert.equal((await h.snapshot([delivered])).rows.some((row) => row.stage === "publishing" && row.since === next), true);
+  });
+});
+
+for (const [outcome, stage] of [["approved", "completed"], ["sent back", "superseded"], ["cancelled", "cancelled"]] as const) {
+  test(`legacy ${outcome} settles attempts before actual decision, not later identical submissions`, async () => {
+    await harness(async (h) => {
+      await h.append(submit()); await h.refresh();
+      const original = (await h.snapshot()).rows[0].id;
+      const decision = review({ since: START, outcome, decidedAt: ARRIVED });
+      const resolved = await h.snapshot([], [decision]);
+      assert.equal(resolved.rows.find((row) => row.id === original)?.stage, stage);
+      assert.equal(resolved.rows.some((row) => ["preparing", "publishing"].includes(row.stage)), false);
+      await h.refresh(); await h.restart();
+      assert.equal((await h.snapshot([], [decision])).rows.find((row) => row.id === original)?.stage, stage);
+      const next = "2026-10-06T12:04:00.000Z";
+      await h.append(submit(HASH_A, "same-content-new-call", next)); await h.refresh();
+      const newer = await h.snapshot([], [decision]);
+      const active = newer.rows.find((row) => row.stage === "publishing");
+      assert.ok(active); assert.notEqual(active.id, original); assert.equal(active.since, next);
+      await h.refresh(); await h.restart();
+      assert.equal((await h.snapshot([], [decision])).rows.find((row) => row.id === active.id)?.stage, "publishing");
+      const latest = await h.snapshot([review({ revision: HASH_A, publishedAt: "2026-10-06T12:04:05.000Z" })], [decision]);
+      assert.equal(latest.rows.find((row) => row.id === active.id)?.stage, "ready");
+      assert.equal(latest.rows.find((row) => row.id === original)?.stage, stage);
+    });
+  });
+}
+
+test("a hashed earlier review cannot resolve a same-content resubmission made after publication", async () => {
+  await harness(async (h) => {
+    await h.append(submit()); await h.refresh();
+    const delivered = review({ revision: HASH_A });
+    const original = (await h.snapshot([delivered])).rows[0].id;
+    const next = "2026-10-06T12:04:00.000Z";
+    await h.append(submit(HASH_A, "submit-again", next)); await h.refresh();
+    const decided = { ...delivered, outcome: "approved", decidedAt: "2026-10-06T12:05:00.000Z" };
+    const rows = (await h.snapshot([], [decided])).rows;
+    assert.equal(rows.find((row) => row.id === original)?.stage, "completed");
+    const pending = rows.find((row) => row.stage === "publishing");
+    assert.ok(pending); assert.equal(pending.since, next);
+    await h.refresh(); await h.restart();
+    assert.equal((await h.snapshot([], [decided])).rows.find((row) => row.id === pending.id)?.stage, "publishing");
+  });
+});
+
+test("a newer preparing cycle is not retired by a legacy earlier decision", async () => {
+  await harness(async (h) => {
+    await h.append(submit()); await h.refresh();
+    const next = "2026-10-06T12:04:00.000Z";
+    await h.append([
+      { type: "custom", timestamp: next, customType: "plannotator", data: { phase: "executing" } },
+      { type: "custom", timestamp: next, customType: "plannotator", data: { phase: "planning" } },
+    ]);
+    await h.refresh();
+    const decision = review({ since: START, outcome: "approved", decidedAt: ARRIVED });
+    const row = (await h.snapshot([], [decision])).rows.find((entry) => entry.stage === "preparing");
+    assert.ok(row); assert.equal(row.since, next);
+    await h.restart();
+    assert.equal((await h.snapshot([], [decision])).rows.find((entry) => entry.id === row.id)?.stage, "preparing");
+  });
+});
+
+test("handover owner waits survive normal disposal and reload without inventing inbox readiness", async () => {
+  await harness(async (h) => {
+    h.clock = new Date("2026-10-06T14:00:00.000Z"); h.absent = true;
+    h.owners.set("issue", owner({ status: "waiting", waiting: { previousStateId: "planning", commentId: "question" } }));
+    await h.append([{ type: "custom", timestamp: ARRIVED, customType: "session_exit", data: { kind: "normal", reason: "dispose", recordedAt: ARRIVED } }]);
+    h.agents[0].status = "closed"; h.agents[0].archivedAt = ARRIVED;
+    await h.refresh(); await h.restart();
+    const row = (await h.snapshot()).rows[0];
+    assert.equal(row.stage, "waiting"); assert.equal(row.status, "normal");
+    assert.equal(row.reviewUrl, undefined); assert.equal((await h.snapshot()).lastArrivalAt, null);
+  });
+});
+
+test("needs-you waits remain with their historical owner, not a successor carrying the old handover hold", async () => {
+  await harness(async (h) => {
+    h.clock = new Date("2026-10-06T14:00:00.000Z"); h.absent = true;
+    h.agents[0].status = "closed"; h.agents[0].archivedAt = ARRIVED;
+    h.agents.push({ ...h.agents[0], id: "successor", status: "running", archivedAt: null });
+    h.owners.set("issue", owner({ agentId: "successor", waiting: { previousStateId: null, commentId: "question", subIssueId: "need" } }));
+    const directory = join(h.home, "linear-tickets", "needs-you"); await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "need.json"), JSON.stringify({ id: "need", identifier: "TUC-100", parentId: "issue", agentId: "root" }));
+    await h.refresh(); await h.restart();
+    const rows = (await h.snapshot()).rows;
+    assert.equal(rows.find((row) => row.agentId === "root")?.stage, "waiting");
+    assert.equal(rows.find((row) => row.agentId === "root")?.status, "normal");
+    assert.equal(rows.find((row) => row.agentId === "successor")?.status, "failed");
+    assert.notEqual(rows.find((row) => row.agentId === "successor")?.stage, "waiting");
+  });
+});
+
+test("normal disposal is an unfinished-planning warning, abnormal exit is failure, and progress clears both", async () => {
+  await harness(async (h) => {
+    h.absent = true; h.clock = new Date("2026-10-06T14:00:00.000Z");
+    await h.append([{ type: "custom", timestamp: SUBMIT, customType: "session_exit", data: { kind: "normal", reason: "dispose", recordedAt: SUBMIT } }]);
+    await h.refresh(); await h.restart();
+    assert.equal((await h.snapshot()).rows[0].status, "attention");
+    assert.equal((await h.snapshot()).rows[0].stage, "preparing");
+    await h.append([{ type: "custom", timestamp: ARRIVED, customType: "session_exit", data: { kind: "error", code: 1, recordedAt: ARRIVED } }]);
+    await h.refresh(); assert.equal((await h.snapshot()).rows[0].status, "failed");
+    h.absent = false; h.clock = new Date("2026-10-06T12:02:00.000Z");
+    await h.append([{ type: "message", timestamp: h.clock.toISOString(), message: { role: "assistant", content: [{ type: "text", text: "New planning turn" }] } }]);
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows[0].status, "normal");
+  });
+});
+
+test("provider 429 keeps sanitized retry timing visible even with a live process and owner wait", async () => {
+  await harness(async (h) => {
+    h.owners.set("issue", owner({ waiting: { previousStateId: null, commentId: "question" } }));
+    const error = '429 {"request_id":"private-provider-id","message":"private request"} retry-after-ms=274228000 (model=private-model)';
+    await h.append([{ type: "message", timestamp: ARRIVED, message: { role: "assistant", stopReason: "error", errorMessage: error, content: [] } }]);
+    await h.refresh(); await h.restart();
+    const row = (await h.snapshot()).rows[0];
+    assert.equal(row.status, "failed"); assert.match(row.detail, /429/);
+    assert.match(row.detail, /274228 seconds/);
+    assert.doesNotMatch(await readFile(h.file, "utf8"), /private-provider-id|private request|private-model/);
+  });
+});
+
+test("a stopped initial prompt becomes current planning on same-agent recovery, not a retained stale failure", async () => {
+  await harness(async (h) => {
+    h.clock = new Date("2026-10-06T14:00:00.000Z"); h.agents[0].status = "closed"; h.absent = true;
+    h.owners.set("issue", owner({ status: "failed", updatedAt: SUBMIT }));
+    await h.refresh();
+    const stopped = (await h.snapshot()).rows[0];
+    assert.equal(stopped.status, "failed");
+    h.absent = false; h.agents[0].status = "running";
+    h.clock = new Date("2026-10-06T14:01:00.000Z");
+    h.agents[0].activeTurn = { turnId: "recovery", startedAt: h.clock.toISOString() };
+    await h.append([{ type: "message", timestamp: h.clock.toISOString(), message: { role: "assistant", content: [{ type: "text", text: "Recovered initial prompt" }] } }]);
+    await h.refresh(); await h.restart();
+    const rows = (await h.snapshot()).rows;
+    assert.equal(rows.find((row) => row.id === stopped.id)?.status, "normal");
+    assert.equal(rows.filter((row) => row.agentId === "root").length, 1);
+  }, [{ type: "custom", timestamp: START, customType: "plannotator", data: { phase: "idle" } }]);
+});
+
+test("explicit executing phase resolves previously observed missing-plan work after native compaction", async () => {
+  await harness(async (h) => {
+    const original = (await h.snapshot()).rows[0].id;
+    h.absent = true; h.clock = new Date("2026-10-06T14:00:00.000Z");
+    await h.refresh(); assert.equal((await h.snapshot()).rows[0].status, "failed");
+    const replacement = join(h.home, "executing.jsonl");
+    await writeFile(replacement, JSON.stringify({ type: "custom", id: "execute", parentId: null, timestamp: ARRIVED, customType: "plannotator", data: { phase: "executing" } }) + "\n");
+    await rename(replacement, h.native);
+    await h.refresh(); await h.restart();
+    const row = (await h.snapshot()).rows.find((entry) => entry.id === original);
+    assert.equal(row?.stage, "completed"); assert.equal(row?.status, "normal");
+  });
+});
+
+test("authoritative owner transfer retires only the named predecessor; missing owner evidence is not success", async () => {
+  await harness(async (h) => {
+    await h.append(submit()); await h.refresh();
+    const original = (await h.snapshot()).rows[0].id;
+    h.agents.push({ ...h.agents[0], id: "unrelated" });
+    h.owners.set("issue", owner({ agentId: "successor", resumedFrom: "root", updatedAt: ARRIVED }));
+    await h.refresh(); await h.restart();
+    const rows = (await h.snapshot()).rows;
+    assert.equal(rows.find((row) => row.id === original)?.stage, "superseded");
+    assert.equal(rows.find((row) => row.agentId === "unrelated")?.stage, "publishing");
+    h.owners.clear(); h.agents = []; await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((row) => row.agentId === "unrelated")?.stage, "publishing");
+  });
+});
+
+test("archived exact-session history settles journal queues before session sweep and cannot settle another thread", async () => {
+  await harness(async (h) => {
+    h.sessions = [link({ agentId: null, queued: true })]; await h.refresh();
+    const queue = (await h.snapshot()).rows.find((row) => row.agentId === "");
+    assert.ok(queue); assert.equal(queue.stage, "queued");
+    h.agents[0].labels["linear.sessionId"] = "thread";
+    h.agents[0].archivedAt = ARRIVED; h.agents[0].status = "closed";
+    h.sessions.push(link({ agentId: null, queued: true, sessionId: "different-thread" }));
+    await h.refresh(); await h.restart();
+    const rows = (await h.snapshot()).rows;
+    assert.equal(rows.find((row) => row.id === queue.id)?.stage, "completed");
+    assert.equal(rows.find((row) => row.agentId === "" && row.id !== queue.id)?.stage, "queued");
+    h.sessions = []; await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((row) => row.id === queue.id)?.stage, "completed");
+  });
+});
+
+test("already-run exact-session agents never produce fresh phantom queue rows; blockers retain actual queue reason", async () => {
+  await harness(async (h) => {
+    h.agents[0].labels["linear.sessionId"] = "thread";
+    h.sessions = [link({ agentId: null, queued: true })];
+    const blocked = { ...link({ agentId: null, queued: true, sessionId: "blocked" }), queueReason: "Blocked by predecessor dependency" };
+    h.sessions.push(blocked); await h.refresh();
+    const rows = (await h.snapshot()).rows.filter((row) => row.agentId === "");
+    assert.equal(rows.length, 1); assert.equal(rows[0].stage, "queued");
+    assert.equal(rows[0].detail, blocked.queueReason);
+    h.failList = true; await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((row) => row.id === rows[0].id)?.status, "unknown");
+  });
+});
+
+test("unreadable owner evidence and partial execution stay unknown; an invalid inbox link is never ready", async () => {
+  await harness(async (h) => {
+    const directory = join(h.home, "linear-tickets", "needs-you"); await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "broken.json"), "{");
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows[0].status, "unknown");
+    await rm(join(directory, "broken.json"));
+    await h.append([{ type: "custom", timestamp: ARRIVED, customType: "plannotator", data: { phase: "executing" } }]);
+    await appendFile(h.native, '{"type":"message"');
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows[0].status, "unknown");
+    const invalid = await h.snapshot([review({ link: "http://owner:secret@host.test/review" })]);
+    assert.equal(invalid.rows.some((row) => row.stage === "ready"), false);
+    assert.equal(invalid.lastArrivalAt, null);
+    const delivered = await h.snapshot([review()]);
+    assert.equal(delivered.rows[0].stage, "ready"); assert.equal(delivered.rows[0].status, "normal");
+  });
+});
+
+test("legacy crash summaries are replayed on reload without changing historical row identities", async () => {
+  await harness(async (h) => {
+    await h.append([...submit(), { type: "custom", timestamp: ARRIVED, customType: "session_exit", data: { kind: "normal", reason: "dispose", recordedAt: ARRIVED } }]);
+    await h.refresh();
+    const original = (await h.snapshot()).rows[0].id;
+    h.pipeline.stop(); await h.pipeline.refresh();
+    const journal = JSON.parse(await readFile(h.file, "utf8"));
+    journal.records[0].key = `hash:${HASH_A}`;
+    journal.cursors.root.state.stoppedAt = ARRIVED;
+    delete journal.cursors.root.state.disposedAt;
+    await writeFile(h.file, JSON.stringify(journal));
+    await h.restart();
+    const row = (await h.snapshot()).rows.find((entry) => entry.id === original);
+    assert.equal(row?.stage, "publishing"); assert.equal(row?.status, "attention");
+  });
+});
+
+test("exact-session history resolves a journal queue even after its registry link is no longer present", async () => {
+  await harness(async (h) => {
+    h.sessions = [link({ agentId: null, queued: true })]; await h.refresh();
+    const queued = (await h.snapshot()).rows.find((row) => row.agentId === "");
+    assert.ok(queued);
+    h.sessions = []; const agent = h.agents[0]; h.agents = [];
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((row) => row.id === queued.id)?.stage, "queued");
+    agent.labels["linear.sessionId"] = "thread"; agent.status = "closed"; agent.archivedAt = ARRIVED; h.agents = [agent];
+    await h.restart();
+    assert.equal((await h.snapshot()).rows.find((row) => row.id === queued.id)?.stage, "completed");
+  });
+});
+
+test("explicit parked-plan requeues create a new durable admission cycle and never settle from retired history", async () => {
+  await harness(async (h) => {
+    h.sessions = [link({ agentId: null, queued: true })]; await h.refresh();
+    const prior = (await h.snapshot()).rows.find((row) => row.agentId === "");
+    assert.ok(prior);
+    h.agents[0].labels["linear.sessionId"] = "thread"; h.agents[0].status = "closed"; h.agents[0].archivedAt = ARRIVED;
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((row) => row.id === prior.id)?.stage, "completed");
+    const requeued = { ...link({ agentId: null, queued: true }), restartRequested: true, queueReason: "Owner-decided plan waits for admission" };
+    h.sessions = [requeued];
+    await h.refresh(); await h.restart();
+    const next = (await h.snapshot()).rows.find((row) => row.agentId === "" && row.stage === "queued");
+    assert.ok(next); assert.notEqual(next.id, prior.id);
+    assert.equal((await h.snapshot()).rows.find((row) => row.id === prior.id)?.stage, "completed");
+    h.sessions = []; await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((row) => row.id === next.id)?.stage, "queued");
+    h.sessions = [link({ queued: false, agentId: "new-root" })]; await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((row) => row.id === next.id)?.stage, "completed");
+  });
+});
+
+test("a retired exact-session owner cannot erase an undelivered queued message", async () => {
+  await harness(async (h) => {
+    h.agents[0].labels["linear.sessionId"] = "thread"; h.agents[0].status = "closed"; h.agents[0].archivedAt = ARRIVED;
+    const waiting = { ...link({ agentId: null, queued: true, pendingText: "Private unanswered owner instruction" }), queueReason: "Queued owner message waits for a live owner" };
+    h.sessions = [waiting];
+    await h.refresh(); await h.restart();
+    const queued = (await h.snapshot()).rows.find((row) => row.agentId === "");
+    assert.ok(queued); assert.equal(queued.stage, "queued"); assert.equal(queued.status, "normal");
+    assert.equal(queued.detail, "Queued owner message waits for a live owner");
+    assert.doesNotMatch(await readFile(h.file, "utf8"), /Private unanswered owner instruction/);
+    h.sessions = []; await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((row) => row.id === queued.id)?.stage, "queued");
+  });
+});
+
+test("missing needs-you evidence cannot convert a recorded owner wait into a process failure", async () => {
+  await harness(async (h) => {
+    h.absent = true; h.clock = new Date("2026-10-06T14:00:00.000Z");
+    h.owners.set("issue", owner({ waiting: { previousStateId: null, commentId: "question", subIssueId: "missing" } }));
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows[0].status, "unknown");
+    assert.equal((await h.snapshot()).rows[0].stage, "preparing");
+  });
+});
+
+test("untracked archived roots stay out of planning counts until actual parked evidence makes them monitored", async () => {
+  await harness(async (h) => {
+    h.agents.push({
+      ...h.agents[0], id: "never-tracked", status: "closed", archivedAt: ARRIVED,
+      labels: { "linear.issueId": "historical", "linear.identifier": "TUC-101", "linear.plan": "required" },
+    });
+    await h.refresh(); await h.restart();
+    assert.equal((await h.snapshot()).rows.some((row) => row.agentId === "never-tracked"), false);
+    h.parked.push({ ...parked(), issueId: "historical", identifier: "TUC-101", agentId: "never-tracked" });
+    await h.refresh();
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "never-tracked");
+    assert.equal(row?.stage, "publishing"); assert.equal(row?.status, "normal");
+  });
+});
+
+test("strict owner sampling distinguishes absent records from malformed, oversized and unreadable owner files", async () => {
+  await harness(async (h) => {
+    h.ownerFiles = true; h.absent = true; h.clock = new Date("2026-10-06T14:00:00.000Z");
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows[0].status, "failed", "a genuinely absent owner record supplies no hold");
+    const directory = join(h.home, "linear-tickets", "handover"), path = join(directory, "issue.json");
+    await mkdir(directory, { recursive: true });
+    await writeFile(path, JSON.stringify(owner({ waiting: { previousStateId: "planning", commentId: "question" } })));
+    await h.refresh(); assert.equal((await h.snapshot()).rows[0].stage, "waiting");
+    const checkedAt = (await h.snapshot()).checkedAt;
+    await writeFile(path, "{"); await h.refresh();
+    assert.equal((await h.snapshot()).rows[0].status, "unknown");
+    assert.equal((await h.snapshot()).checkedAt, checkedAt);
+    await writeFile(path, JSON.stringify({ ...owner(), summaries: ["x".repeat(64 * 1024)] })); await h.refresh();
+    assert.equal((await h.snapshot()).rows[0].status, "unknown");
+    await rm(path); await mkdir(path); await h.refresh();
+    assert.equal((await h.snapshot()).rows[0].status, "unknown");
+    assert.ok((await h.snapshot()).error);
+  });
+});
+
+test("unreadable owner evidence retains a confirmed initial-prompt failure across reload, but not after real recovery progress", async () => {
+  await harness(async (h) => {
+    h.ownerFiles = true; h.agents[0].status = "closed";
+    const directory = join(h.home, "linear-tickets", "handover"), path = join(directory, "issue.json");
+    await mkdir(directory, { recursive: true });
+    await writeFile(path, JSON.stringify(owner({ status: "failed", updatedAt: SUBMIT })));
+    await h.refresh(); assert.equal((await h.snapshot()).rows[0].status, "failed");
+    await writeFile(path, "{"); await h.refresh(); await h.restart();
+    const stale = await h.snapshot();
+    assert.equal(stale.rows[0].status, "failed"); assert.ok(stale.error);
+    h.agents[0].status = "running";
+    const recovered = "2026-10-06T12:03:00.000Z";
+    h.clock = new Date(recovered); h.agents[0].activeTurn = { turnId: "recovered", startedAt: recovered };
+    await h.append([{ type: "message", timestamp: recovered, message: { role: "assistant", content: [{ type: "text", text: "Current recovery output" }] } }]);
+    await h.refresh(); assert.equal((await h.snapshot()).rows[0].status, "unknown");
+    await writeFile(path, JSON.stringify(owner({ status: "working", updatedAt: recovered })));
+    await h.refresh(); assert.equal((await h.snapshot()).rows[0].status, "normal");
+  }, [{ type: "custom", timestamp: START, customType: "plannotator", data: { phase: "idle" } }]);
+});
+
+test("a known provider error stays visible when both native and owner evidence become unreadable", async () => {
+  await harness(async (h) => {
+    h.ownerFiles = true;
+    await h.append([{ type: "message", timestamp: ARRIVED, message: { role: "assistant", stopReason: "error", errorMessage: "429 retry-after-ms=274228000 private-request-token", content: [] } }]);
+    await h.refresh();
+    const directory = join(h.home, "linear-tickets", "handover");
+    await mkdir(directory, { recursive: true }); await writeFile(join(directory, "issue.json"), "{");
+    await rm(h.native); await h.refresh(); await h.restart();
+    const row = (await h.snapshot()).rows[0];
+    assert.equal(row.status, "failed"); assert.match(row.detail, /429/); assert.match(row.detail, /274228 seconds/);
+    assert.ok((await h.snapshot()).error); assert.doesNotMatch(await readFile(h.file, "utf8"), /private-request-token/);
   });
 });

@@ -52,6 +52,7 @@ import { resumeGuard } from "./server/activation-guard";
 import { ReviewDeletions } from "./server/review-deletions";
 import { ReviewIssueInfos } from "./server/review-issue-info";
 import { PlanPipeline } from "./server/plan-pipeline";
+import { pipelineOwnerEvidence } from "./server/plan-pipeline-source";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -125,7 +126,10 @@ export default function contribute(server: PluginServerContext) {
     },
   });
   const hostName = hostname().replace(/\.local$/, "");
-  const pipeline = new PlanPipeline({ host: hostName, sessions: () => sessionStore.all(), parked: () => parking.plans.all() });
+  const pipeline = new PlanPipeline({
+    host: hostName, sessions: () => sessionStore.all(), parked: () => parking.plans.all(),
+    owners: (issueIds) => pipelineOwnerEvidence(paseoHome(), issueIds),
+  });
   let pipelineServerId: string | null = null;
   void daemonServerId().then((id) => { pipelineServerId = id; });
   const drain = new DrainRouter({ settings, paseo: () => attachedPaseo, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName,

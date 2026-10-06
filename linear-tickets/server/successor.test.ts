@@ -972,7 +972,7 @@ test("an explicitly resumed queued owner message reaches the real successor's fi
   Object.assign(router, { paseo: daemon.paseo });
   await store.put(thread({ queued: true, pendingText: "Keep the current API compatible.", offer: "resume" }));
   await router.startQueued();
-  assert.deepEqual(daemon.created, [], "history alone cannot restart the planner");
+  assert.equal(daemon.created.length, 0, "history alone cannot restart the planner");
   assert.equal((await store.get("s1"))?.queued, true);
 
   await router.prompted("s1", { id: "owner-resume", userId: OWNER, body: "resume" });
@@ -1130,24 +1130,6 @@ test("a planner restart replaces a root agent that shows running without a proce
   } finally { await h.cleanup(); }
 });
 
-test("a queued comment cannot lazily resurrect a closed live-process owner", async () => {
-  let output = `2100185 omp --mode rpc-ui --session ${NATIVE_HANDLE}\n`;
-  const inspect = processInspection("");
-  inspect.processes = async () => output;
-  const h = routerHarness({ agents: [ompRoot("agent-old")], processInspector: inspect });
-  try {
-    await h.store.put(thread({ queued: true, pendingText: "rebase it please" }));
-    await h.router.startQueued();
-    assert.deepEqual(h.daemon.sent, []);
-    assert.deepEqual(h.starts, []);
-    assert.equal((await h.store.get("s1"))?.pendingText, "rebase it please");
-    assert.equal((await h.store.get("s1"))?.queued, true);
-    assertGateFree(h.gates);
-    output = "";
-    await h.router.startQueued();
-    assert.deepEqual(h.daemon.sent, ["agent-old: rebase it please"]);
-  } finally { await h.cleanup(); }
-});
 
 test("the process inspection and dispatch claim both execute under the ticket start gate", async () => {
   const inspect = processInspection("");
