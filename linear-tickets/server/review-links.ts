@@ -5,6 +5,7 @@ import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
+import { isActivationPath, MAX_ACTIVATION_BODY_BYTES, type ActivationRoute } from "./activation";
 import { FUNNEL_PORT } from "./funnel";
 import { plannotatorPaths, readReviewPlan, type OpenedEvent } from "./plannotator";
 import { ReviewBundles } from "./review-bundle";
@@ -76,6 +77,8 @@ export type ReviewLinksOptions = {
   // Web Push: where its keys and subscriptions are kept, and how a message is sent (tests).
   pushFile?: string;
   sendPush?: PushSend;
+  // Draining a host: the /activation* routes this server also answers (activation-endpoints.ts).
+  routes?: ActivationRoute;
 };
 
 class DecisionError extends Error {
@@ -201,6 +204,7 @@ export class ReviewLinks {
   private readonly linearWorkspace: (() => Promise<string>) | null;
   private readonly push: ReviewPush;
   private readonly bundles = new ReviewBundles();
+  private readonly routes: ActivationRoute | null;
 
   constructor(options: ReviewLinksOptions = {}) {
     this.port = options.port ?? REVIEW_PORT;
@@ -219,6 +223,7 @@ export class ReviewLinks {
     this.decide = options.decide ?? null;
     this.linearWorkspace = options.linearWorkspace ?? null;
     this.push = new ReviewPush(options.pushFile ?? join(dirname(this.file), "push.json"), options.sendPush);
+    this.routes = options.routes ?? null;
   }
 
   // The port actually listened on (differs from the configured one when that is 0).
@@ -237,9 +242,12 @@ export class ReviewLinks {
       const server = createServer((request, response) => {
         const chunks: Buffer[] = [];
         let size = 0;
+        // The activation protocol carries a whole prompt and a handover note, so its routes have
+        // their own (larger) limit; every other route keeps the small one.
+        const limit = isActivationPath(request.url ?? "") ? MAX_ACTIVATION_BODY_BYTES : MAX_BODY_BYTES;
         request.on("data", (chunk: Buffer) => {
           size += chunk.length;
-          if (size > MAX_BODY_BYTES) { response.writeHead(413).end(); request.destroy(); return; }
+          if (size > limit) { response.writeHead(413).end(); request.destroy(); return; }
           chunks.push(chunk);
         });
         request.on("end", () => {
@@ -416,6 +424,12 @@ export class ReviewLinks {
 
   private async respond(method: string, url: string, headers: IncomingHttpHeaders, body: string): Promise<{ status: number; headers?: Record<string, string>; body?: string | Buffer }> {
     const path = new URL(url, "http://localhost").pathname;
+    // Draining a host: /activation* goes to the authenticated activation protocol, which answers
+    // 401 for a request without the shared secret (and null for every other path).
+    if (this.routes) {
+      const custom = await this.routes({ method, path, headers, body });
+      if (custom) return custom;
+    }
     const decision = /^\/api\/reviews\/([^/]+)\/decision$/.exec(path);
     if (decision || path === "/api/push/subscribe") {
       if (method !== "POST") return { status: 405, headers: { allow: "POST" } };

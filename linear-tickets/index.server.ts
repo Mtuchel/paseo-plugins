@@ -4,7 +4,7 @@ import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
-import { Settings } from "./server/settings";
+import { Settings, type PluginSettings } from "./server/settings";
 import { DEFAULT_PROMPT_TEMPLATE } from "./shared/contracts";
 import { cacheScope, TicketCache } from "./server/cache";
 import { Credentials } from "./server/credentials";
@@ -43,6 +43,12 @@ import { labelDaemon, StateLabels } from "./server/state-labels";
 import { LabelSync, PullRequestFiles } from "./server/label-sync";
 import { ProjectFlow } from "./server/project-flow";
 import { Presence } from "./server/presence";
+import { hostname } from "node:os";
+import { readActivationSecret, type ActivationSink } from "./server/activation";
+import { activationEndpoints } from "./server/activation-endpoints";
+import { ActivationIntake } from "./server/activation-intake";
+import { DrainRouter } from "./server/drain";
+import { resumeGuard } from "./server/activation-guard";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -56,7 +62,12 @@ export default function contribute(server: PluginServerContext) {
   linear.onOwnerComment = (commentId, issueId) => recordPluginComment(join(paseoHome(), "linear-tickets"), commentId, issueId);
   // Each ticket agent's launch environment, given back to its resumed sessions (agent-env.ts).
   const agentEnvs = new AgentEnvs();
-  const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url), undefined, undefined, agentEnvs);
+  // Every start path passes this before it creates a root (README, "Draining a host"): the
+  // automatic paths forward or defer first (sessions.ts, dispatch.ts); this keeps a path that did
+  // not -- the sidebar included -- from falling back to a local start while this host drains or
+  // while the peer still owns the ticket. Assigned once the routers exist.
+  let activationGuard: (issueId: string) => Promise<string | null> = async () => null;
+  const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url), undefined, undefined, agentEnvs, (issueId) => activationGuard(issueId));
   const settings = new Settings();
   const cache = new TicketCache();
   const handover = new Handover(linear, undefined, undefined, undefined, async (agentId) => { const serverId = await daemonServerId(); return serverId ? paseoAgentUrl(serverId, agentId) : null; });
@@ -84,7 +95,14 @@ export default function contribute(server: PluginServerContext) {
     await decidePlannotatorReview(localUrl, approve, feedback);
     await recordDecision({ type: "decided", agentId, approved: approve, ...(feedback ? { feedback } : {}), planContent, at: new Date().toISOString() });
   };
-  const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: new SessionStore(), needsYou,
+  // Activation routing (README, "Draining a host"): every automatic start path calls `take`
+  // before it starts. Remote mode forwards to the peer through the drain router; local mode
+  // answers the peer's activations and defers the tickets it still claims. The two routers are
+  // built below, once the session router exists; `take` only runs after this function returns.
+  let attachedPaseo: PaseoApi | null = null;
+  const route: ActivationSink = { take: async (request) => ((await settings.read()).activation.mode === "remote" ? drain.take(request) : intake.take(request)) };
+  const sessionStore = new SessionStore();
+  const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, needsYou, route,
     decideReview,
     reviewOutcome: (review) => reviewOutcome(review),
     recordOutcome: (agentId, outcome) => recordDecision({ type: "decided", agentId, ...outcome, at: new Date().toISOString() }),
@@ -96,6 +114,29 @@ export default function contribute(server: PluginServerContext) {
       return client ? async (agentId) => { await client.refreshAgent(agentId); } : null;
     },
   });
+  const hostName = hostname().replace(/\.local$/, "");
+  const drain = new DrainRouter({ settings, paseo: () => attachedPaseo, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName,
+    ticketState: async (issueId) => { const state = await linear.issueState(issueId).catch(() => null); return state ? { statusType: state.statusType } : null; } });
+  const intake = new ActivationIntake({ settings, paseo: () => attachedPaseo, linear: () => linear, starter: () => starter, launcher: () => launcher, sessions: () => sessions, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName });
+  activationGuard = async (issueId) => {
+    const { mode, peer } = (await settings.read()).activation;
+    // A guard that cannot read its own state refuses: it starts nothing on a guess, and the
+    // sidebar says why.
+    if (mode === "remote") {
+      try {
+        if (await drain.ownerFor(issueId)) return null;
+      } catch {
+        return "This host could not confirm whether the ticket still runs here (its state is unreadable), so it started nothing. Try again in a minute.";
+      }
+      return `This host forwards new Linear work to ${peer ?? "the peer host"}; assign Paseo or add the trigger label and it starts there.`;
+    }
+    try {
+      const claim = await intake.claimFor(issueId);
+      return claim ? `This ticket is still running on ${claim.host}; new work for it goes there.` : null;
+    } catch {
+      return "This host could not read which tickets still run elsewhere, so it started nothing. Try again in a minute.";
+    }
+  };
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
   // Labelled projects: a planner ticket sets the work order, then tickets are handed out as slots free up.
   // A planner without a live agent, and a ticket assigned to Paseo whose start failed, is started
@@ -104,7 +145,7 @@ export default function contribute(server: PluginServerContext) {
     await stopAgentTurn(agentId).catch(() => {});
     await api.agents.ref(agentId).archive().catch(() => {});
   }, restart: (issueId, identifier) => sessions.restartFor(issueId, identifier), accountedFor: async (issueId) => launcher.underWay(issueId) || await sessions.threadHolds(issueId) });
-  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, relay: new CommentRelay(linear, undefined, needsYou), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects });
+  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay: new CommentRelay(linear, undefined, needsYou, route), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
   const decisions = new DecisionLog();
@@ -115,6 +156,9 @@ export default function contribute(server: PluginServerContext) {
     peers: async () => (await settings.read()).reviewPeers,
     decide: decideReview,
     linearWorkspace: () => linear.workspaceUrl(),
+    // Draining a host: /activation, /activation/claims, /activation/deliver and
+    // /activation/health ride this tailnet service (activation-endpoints.ts).
+    routes: activationEndpoints({ settings, intake, drain }),
   });
   // Plans that need the owner are parked and served by one central Plannotator host, so their
   // agents are retired instead of holding a slot until the owner decides (README, "Parked plans").
@@ -204,7 +248,7 @@ export default function contribute(server: PluginServerContext) {
   plannotator.useTiers({ store: tiers, apply: (agentId) => modelGuard.apply(agentId), replan: (agent, message) => planRequests.send(agent, message) });
   // The central Plannotator host starts once, after the hook it runs for each parked review exists.
   const startHost = async () => { if (await plannotatorHook() && !stopped) await plannotatorHost.start(); };
-  const attach = (paseo: PaseoApi) => { const first = !attached; attached = true; if (!stopped) { void reviewLinks.start(); if (first) void startHost(); } dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); void startAgent(); };
+  const attach = (paseo: PaseoApi) => { const first = !attached; attached = true; attachedPaseo = paseo; if (!stopped) { void reviewLinks.start(); drain.start(); intake.start(); if (first) void startHost(); } dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); void startAgent(); };
   const cacheIdentity = async () => {
     const connection = await credentials.read();
     return connection.key ? cacheScope(connection.key) : null;
@@ -212,6 +256,11 @@ export default function contribute(server: PluginServerContext) {
   // The daemon connection is only handed to handlers and hooks; the first one starts the
   // dispatcher and the Plannotator bridge: opening the ticket surface, or any agent or workspace activity on this host
   // (resumed agents open their sessions right after a daemon restart).
+  //
+  // The resume guard goes first: a heartbeat, a schedule or an internal actor may not wake a
+  // ticket root that this host no longer owns, and the env hook below then only ever runs for the
+  // opens this one lets through.
+  server.before("agent.session_open", resumeGuard({ settings, drain, attach, ready: () => drain.readyNow(), known: (agentId) => sessionStore.agentTicket(agentId) }));
   server.on("agent.turn_started", (event, { paseo }) => { attach(paseo); return writeback.turnStarted(event, paseo); });
   server.on("agent.turn_ended", (event, { paseo }) => { attach(paseo); return writeback.turnEnded(event, paseo); });
   server.on("agent.permission_requested", (event, { paseo }) => { attach(paseo); return writeback.permissionRequested(event, paseo); });
@@ -276,15 +325,25 @@ export default function contribute(server: PluginServerContext) {
   server.handle(branchesRpc, ({ projectId }, { paseo }) => projectBranches(paseo, projectId));
   server.handle(getDefaultPromptRpc, async () => ({ template: (await settings.read()).template, builtin: DEFAULT_PROMPT_TEMPLATE }));
   server.handle(setDefaultPromptRpc, ({ template }) => settings.save(template).then((saved) => ({ ...saved, builtin: DEFAULT_PROMPT_TEMPLATE })));
-  server.handle(getSettingsRpc, async () => ({ ...(await settings.read()), builtin: DEFAULT_PROMPT_TEMPLATE }));
+  // The settings screen sees the routing mode and whether a secret is stored; the secret itself
+  // never leaves the host (README, "Draining a host").
+  const settingsView = async (saved: PluginSettings) => ({
+    ...saved,
+    activation: { ...saved.activation, secretConfigured: Boolean(await readActivationSecret()) },
+    builtin: DEFAULT_PROMPT_TEMPLATE,
+  });
+  server.handle(getSettingsRpc, async () => settingsView(await settings.read()));
   server.handle(setSettingsRpc, async (input, { paseo }) => {
     const saved = await settings.patch(input);
     attach(paseo);
     if (input.dispatch) dispatcher.wake();
-    return { ...saved, builtin: DEFAULT_PROMPT_TEMPLATE };
+    return settingsView(saved);
   });
   server.handle(launchAgentRpc, async (input, { paseo }) => {
     const current = await settings.read();
+    // The sidebar starts an agent here and now; a draining host starts none, so it refuses
+    // instead of forwarding a launch whose workspace the owner picked on this host.
+    if (current.activation.mode === "remote") throw new Error(`This host forwards new Linear work to ${current.activation.peer ?? "the peer host"}; the agent starts there. Assign Paseo or add the trigger label on the ticket.`);
     const { template, agentLinearAccess, dispatch } = current;
     const setup = await planSetup(linear, input.id, input.provider, input.modeId, dispatchLabels(dispatch.label).planner, tiers);
     const model = tierModel(current, input.provider.split("/")[0], setup.tier?.tier ?? null, { provider: input.provider, ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}) });
@@ -313,5 +372,5 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); void closeInternalDaemon(); };
+  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); void closeInternalDaemon(); };
 }

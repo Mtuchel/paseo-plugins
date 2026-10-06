@@ -73,6 +73,10 @@ export class Launcher {
     private readonly ompTools: () => boolean = ompExtensionInstalled,
     // Where each agent's ticket environment is kept for its resumed sessions (agent-env.ts).
     private readonly envs: Pick<AgentEnvs, "save"> = new AgentEnvs(),
+    // When set, returns why this ticket must not start here (README, "Draining a host"): the
+    // backstop for every start path that did not route the activation first (the sidebar
+    // included). Never consulted for a ticket an allowed local agent still owns.
+    private readonly blocked?: (issueId: string) => Promise<string | null>,
   ) {}
 
   start(input: Start, paseo: PaseoApi, options: Options = {}): Promise<Result> {
@@ -129,6 +133,8 @@ export class Launcher {
   }
 
   private async launch(input: Start, paseo: PaseoApi, options: Options, onCreate: () => void): Promise<Result> {
+    const blocked = await this.blocked?.(input.id);
+    if (blocked) throw new Error(blocked);
     const project = await findProject(paseo, input.projectId);
     if (project.projectKind === "git" && !options.resume) {
       const available = await this.branches(project.projectRootPath);

@@ -10,7 +10,7 @@ import { Capacity } from "./capacity";
 import { orderProblems, parseOrder, ProjectFlow, ProjectStore, type ProjectRecord } from "./project-flow";
 import type { ProcessInspector } from "./process-liveness";
 import { Scheduler } from "./scheduler";
-import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
 const OWNER = "owner-1";
 const APP = "paseo-app";

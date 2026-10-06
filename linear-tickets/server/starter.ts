@@ -7,8 +7,11 @@ import { modelSteps, planTier, type Tier } from "../shared/plan-model";
 import { mappedBaseBranch, mappingLabel, type ProjectMapping } from "../shared/mapping";
 import { Capacity } from "./capacity";
 import { dispatchLabels } from "./dispatch";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { Handover } from "./handover";
-import type { Launcher } from "./launch";
+import type { ActivationResume } from "./activation";
+import type { Launcher, ResumeTarget } from "./launch";
 import type { LinearService } from "./linear";
 import { findProject, readBranches } from "./projects";
 import { hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, planPolicy, type PlanPolicy } from "./plan-policy";
@@ -224,7 +227,7 @@ export class TicketStarter {
 
   // `resumeOnly`: continue the recorded branch and worktree or throw ResumeUnavailableError, never
   // start fresh. `lead`: the last part of the first prompt (see Launcher).
-  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string }): Promise<Started> {
+  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string; resume?: ActivationResume }): Promise<Started> {
     const detail: TicketDetail = await this.deps.linear.detail(issueId);
     const source = { projectId: detail.projectId, projectName: detail.issue.project, teamId: detail.teamId, teamName: detail.issue.team };
     // Only saved mappings launch. The sidebar's name-match preselection is a UI hint;
@@ -240,7 +243,12 @@ export class TicketStarter {
     }
     const project = await findProject(paseo, mapping.projectId);
     const target = project.projectCustomName || project.projectDisplayName || mapping.label;
-    const resume = options.fresh ? null : await this.deps.handover?.resumeTarget(issueId);
+    // An activation that carried a resume target continues exactly that branch here or blocks:
+    // the recorded branch of this host's own handover is not consulted (it belongs to older work
+    // on this host, not to the work the other host handed over).
+    const resume = options.fresh ? null
+      : options.resume ? await this.importedResume(project, detail.issue.identifier, options.resume)
+      : await this.deps.handover?.resumeTarget(issueId);
     if (options.resumeOnly && !resume) throw new ResumeUnavailableError(`${detail.issue.identifier} has no recorded branch to continue on.`);
     if (options.resumeOnly && project.projectKind !== "git") throw new ResumeUnavailableError(`${target} is not a Git project, so ${detail.issue.identifier}'s branch cannot be continued.`);
     const setup = await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, dispatchLabels(settings.dispatch.label).planner, this.deps.tiers);
@@ -265,7 +273,7 @@ export class TicketStarter {
         return { ...result, provider: model.provider, target, resumed: true, ...plan };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (options.resumeOnly) throw new ResumeUnavailableError(`Could not continue ${detail.issue.identifier} on ${resume.branch}: ${message}`);
+        if (options.resumeOnly || options.resume?.branch) throw new ResumeUnavailableError(`Could not continue ${detail.issue.identifier} on ${resume.branch}: ${message}`);
         // A deleted or merged branch cannot be continued; a fresh start is the useful fallback.
         console.error(`[linear-tickets] ${detail.issue.identifier}: resume failed, starting fresh: ${message}`);
       }
@@ -279,5 +287,30 @@ export class TicketStarter {
     const result = await this.deps.launcher.start({ ...base, baseBranch, requestId: randomUUID() }, paseo, launchOptions);
     await started(result);
     return { ...result, provider: model.provider, target, resumed: false, ...plan };
+  }
+
+  // A resume target that came with an activation from the draining host. Only the branch name,
+  // the commit it was expected at and whether that host had uncommitted changes travel; this host
+  // never walks into another host's worktree. The branch must be here at that commit, so work
+  // that only exists on the other host is never pretended to be copied -- the activation stays
+  // queued and the ticket says what must happen (push or fetch the branch here).
+  private async importedResume(project: { projectKind: string; projectRootPath: string }, identifier: string, target: ActivationResume | undefined): Promise<ResumeTarget | null> {
+    if (!target?.branch) return null;
+    if (project.projectKind !== "git") throw new ResumeUnavailableError(`${identifier} should continue on ${target.branch}, but its mapped project is not a Git project here.`);
+    if (target.dirty) throw new ResumeUnavailableError(`The agent on the other host still had uncommitted changes on ${target.branch}; they cannot move between hosts automatically.`);
+    const available = await this.branches(project.projectRootPath);
+    if (!available.branches.some((branch) => branch.label === target.branch || branch.id === `refs/heads/${target.branch}`)) {
+      throw new ResumeUnavailableError(`The branch ${target.branch} is not on this host; push or fetch it here and the queued request continues on it.`);
+    }
+    if (target.commit) {
+      const tip = await this.gitTip(project.projectRootPath, target.branch);
+      if (tip && tip !== target.commit) throw new ResumeUnavailableError(`The branch ${target.branch} is at ${tip.slice(0, 8)} here, not at ${target.commit.slice(0, 8)} the other host recorded; the work was not transferred.`);
+    }
+    return { branch: target.branch, worktreePath: null, handover: target.handover?.trim() || `Continuing the work recorded on ${target.branch} on the other host.` };
+  }
+
+  private async gitTip(cwd: string, branch: string): Promise<string> {
+    const { stdout } = await promisify(execFile)("git", ["-C", cwd, "rev-parse", "--verify", `refs/heads/${branch}`], { maxBuffer: 1_000_000 }).catch(() => ({ stdout: "" }));
+    return String(stdout).trim();
   }
 }

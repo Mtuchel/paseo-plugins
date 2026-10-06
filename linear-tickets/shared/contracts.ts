@@ -202,6 +202,13 @@ const autoApproveSettingsSchema = z.object({
 });
 // A model tier's model per provider (server/settings.ts TierModel).
 const tierModelsSchema = z.record(z.string(), z.object({ model: z.string().min(1).max(500), thinkingOptionId: z.string().min(1).max(500).optional() }));
+// Draining a host (server/settings.ts ActivationSettings): `secretConfigured` is read-only; the
+// shared secret itself is a host-local file and is never sent.
+const activationSettingsSchema = z.object({
+  mode: z.enum(["local", "remote"]),
+  peer: z.string().nullable(),
+  secretConfigured: z.boolean(),
+});
 export type DispatchSettingsValue = z.infer<typeof dispatchSettingsSchema>;
 export type WritebackSettingsValue = z.infer<typeof writebackSettingsSchema>;
 const settingsOutputSchema = z.object({
@@ -219,6 +226,8 @@ const settingsOutputSchema = z.object({
   // README, "Model tiers": the cheap and standard tiers' models per provider.
   cheapModels: tierModelsSchema,
   standardModels: tierModelsSchema,
+  // README, "Draining a host".
+  activation: activationSettingsSchema,
 });
 export const getSettingsRpc = defineRpc({
   name: "linear.get-settings",
@@ -244,6 +253,12 @@ export const setSettingsRpc = defineRpc({
       provider: z.string().min(1).max(500),
       model: z.string().min(1).max(500).nullable(),
       thinkingOptionId: z.string().min(1).max(500).optional(),
+    }).optional(),
+    // README, "Draining a host"; `secret` is write-only and `null`/"" removes the stored secret.
+    activation: z.object({
+      mode: z.enum(["local", "remote"]).optional(),
+      peer: z.string().max(500).nullable().optional(),
+      secret: z.string().max(500).nullable().optional(),
     }).optional(),
   }),
   output: settingsOutputSchema,

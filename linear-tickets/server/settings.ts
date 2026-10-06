@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { MAX_PROJECT_MAPPINGS, type ProjectMapping } from "../shared/mapping";
 import { type AutoApprovePolicy, DEFAULT_AUTO_APPROVE, MAX_IMPACT } from "../shared/plan-risk";
+import { writeActivationSecret } from "./activation";
 
 export const MAX_TEMPLATE_LENGTH = 8_000;
 
@@ -24,6 +25,14 @@ export type WritebackSettings = { status: boolean; summaries: boolean; blocked: 
 export const DEFAULT_DISPATCH: DispatchSettings = { enabled: false, label: "paseo", teamKeys: [], intervalSeconds: 60, maxRunning: 0 };
 export const MAX_RUNNING_LIMIT = 50;
 export const DEFAULT_WRITEBACK: WritebackSettings = { status: false, summaries: false, blocked: false, pullRequests: false, mentions: false, autoResume: false };
+// Draining a host (README, "Draining a host"): which host starts the agents Linear asks for.
+// `local` (the default) starts them here. `remote` starts none here: every new automatic
+// activation for a ticket without an allowed local owner is forwarded to `peer`, the other host's
+// tailnet origin (https://<host>.<tailnet>.ts.net:8444). A host that is not draining still needs
+// `peer` to hand a ticket's messages to the agent that the draining host registered as its owner.
+// The shared secret is not part of this: it lives in the host-local `activation-secret` file.
+export type ActivationSettings = { mode: "local" | "remote"; peer: string | null };
+export const DEFAULT_ACTIVATION: ActivationSettings = { mode: "local", peer: null };
 export const MIN_DISPATCH_INTERVAL_SECONDS = 30;
 export const MAX_DISPATCH_INTERVAL_SECONDS = 3_600;
 export const MAX_DISPATCH_TEAMS = 20;
@@ -44,6 +53,8 @@ export type PluginSettings = {
   standardModels: Record<string, TierModel>;
   // Other hosts' review inboxes (https://<host>.<tailnet>.ts.net:8444) this host's inbox also lists.
   reviewPeers: string[];
+  // Activation routing (README, "Draining a host"); the secret is a separate host-local file.
+  activation: ActivationSettings;
 };
 
 type SettingsFile = {
@@ -60,6 +71,7 @@ type SettingsFile = {
   cheapModels?: Record<string, TierModel>;
   standardModels?: Record<string, TierModel>;
   reviewPeers?: string[];
+  activation?: { mode?: unknown; peer?: unknown };
 };
 
 function savedString(value: unknown): string | undefined {
@@ -161,6 +173,28 @@ export function normalizeWriteback(value: unknown): WritebackSettings {
   };
 }
 
+// Anything that is not a usable http(s) origin is dropped, so a half-typed address cannot make
+// the host forward nowhere instead of nowhere-yet.
+export function normalizeActivation(value: unknown): ActivationSettings {
+  const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  return { mode: candidate.mode === "remote" ? "remote" : "local", peer: normalizeOrigin(candidate.peer) };
+}
+
+function normalizeOrigin(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === "https:" || url.protocol === "http:" ? url.origin : null;
+  } catch { return null; }
+}
+
+// A user edit is rejected rather than silently repaired, so the settings form can say why.
+function validActivation(value: ActivationSettings): ActivationSettings {
+  if (value.peer !== null && !normalizeOrigin(value.peer)) throw new Error("The peer host must be an http(s) origin, for example https://server087.tail5efd6b.ts.net:8444.");
+  if (value.mode === "remote" && !normalizeOrigin(value.peer)) throw new Error("Routing new activations to the peer needs the peer host's origin, for example https://server087.tail5efd6b.ts.net:8444.");
+  return normalizeActivation(value);
+}
+
 export function normalizeAutoApprove(value: unknown): AutoApprovePolicy {
   const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const [maxImpact, maxImpactWithFlag] = (["maxImpact", "maxImpactWithFlag"] as const).map((key) => {
@@ -184,6 +218,8 @@ export type SettingsPatch = {
   // Sets one provider's model for the cheap or standard tier; `model: null` removes it (that
   // tier then implements on the provider's launch model).
   tierModel?: { tier: "cheap" | "standard"; provider: string; model: string | null; thinkingOptionId?: string };
+  // Activation routing; `secret` is write-only (the host-local file) and `null`/`""` removes it.
+  activation?: { mode?: "local" | "remote"; peer?: string | null; secret?: string | null };
 };
 
 // Returns null for an empty template (meaning: use the built-in default).
@@ -240,6 +276,7 @@ export class Settings {
       cheapModels: normalizeTierModels(value.cheapModels, DEFAULT_CHEAP_MODELS),
       standardModels: normalizeTierModels(value.standardModels, DEFAULT_STANDARD_MODELS),
       reviewPeers: normalizeReviewPeers(value.reviewPeers),
+      activation: normalizeActivation(value.activation),
     };
   }
 
@@ -282,6 +319,11 @@ export class Settings {
       else delete models[provider];
       next[key] = normalizeTierModels(models, {});
     }
+    if (patch.activation) {
+      const { secret, ...change } = patch.activation;
+      if (secret !== undefined) await writeActivationSecret(secret);
+      next.activation = validActivation({ ...current.activation, ...change });
+    }
     if (patch.projectMapping || patch.forgetProjectMapping) {
       const mappings = { ...current.projectMappings };
       if (patch.forgetProjectMapping) delete mappings[patch.forgetProjectMapping];
@@ -304,7 +346,8 @@ export class Settings {
     const customAutoApprove = JSON.stringify(value.autoApprove) !== JSON.stringify(DEFAULT_AUTO_APPROVE);
     const customCheapModels = JSON.stringify(value.cheapModels) !== JSON.stringify(DEFAULT_CHEAP_MODELS);
     const customStandardModels = JSON.stringify(value.standardModels) !== JSON.stringify(DEFAULT_STANDARD_MODELS);
-    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length) {
+    const customActivation = JSON.stringify(value.activation) !== JSON.stringify(DEFAULT_ACTIVATION);
+    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length && !customActivation) {
       await rm(this.path, { force: true });
       return value;
     }
@@ -325,6 +368,7 @@ export class Settings {
     if (customCheapModels) fileValue.cheapModels = value.cheapModels;
     if (customStandardModels) fileValue.standardModels = value.standardModels;
     if (value.reviewPeers.length) fileValue.reviewPeers = value.reviewPeers;
+    if (customActivation) fileValue.activation = value.activation;
     const temporary = `${this.path}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, JSON.stringify(fileValue), { mode: 0o600, flag: "wx" });

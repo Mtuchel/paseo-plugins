@@ -405,10 +405,76 @@ The Paseo Agents menu bar app's **Control panel → Linear agent** shows the sta
 **Several hosts.** Each host that runs the plugin installs its own app (for example "Paseo" on the
 laptop, "Paseo Server" on a server), with its own webhook URL on that host's Funnel and its own
 `app.json`/`token.json`; never copy `token.json` to a second host, because each refresh rotates
-the token the other host still holds. A ticket delegated to (or mentioning) an app runs on that
-app's host. The sweep takes only its own app's threads, since Linear lists every app's sessions
-to each of them. Keep `dispatch.enabled` on one host only: the label poll and the project flow
-cannot see agents on another host, so two dispatching hosts start the same ticket twice.
+the token the other host still holds. By default, a ticket delegated to (or mentioning) an app
+runs on that app's host. The sweep takes only its own app's threads, since Linear lists every
+app's sessions to each of them. Keep `dispatch.enabled` on one host only. Without activation
+routing, the label poll and project flow cannot see another host's agents.
+
+**Drain one host into another.** Activation routing lets the old host keep its Linear app and
+threads while sending new work to the destination. In the old host's
+`$PASEO_HOME/linear-tickets/settings.json`, set:
+
+```json
+{
+  "activation": {
+    "mode": "remote",
+    "peer": "https://server087.example.ts.net:8444"
+  }
+}
+```
+
+The destination uses `"mode": "local"` and a `peer` pointing back to the old host's tailnet
+review inbox. Put the same secret in both hosts'
+`$PASEO_HOME/linear-tickets/activation-secret` files, mode `0600`; it is never returned by the
+settings RPC. These requests use the tailnet-only review service, not the public Linear webhook.
+Before enabling drain mode, write `$PASEO_HOME/linear-tickets/activation-allowlist-seed.json`
+on the old host: `{"agents":[{"agentId":"<existing root>","issueId":"<issue UUID>","identifier":"TUC-123"}]}`.
+Only those roots are grandfathered; the list is seeded once and never grows on reload. An empty
+list keeps none. A malformed list holds new work without starting or forwarding it. Without the
+file, the initializer discovers existing non-archived ticket roots once; use an explicit list
+when the daemon has stale roots.
+
+Deploy and reload the destination first, with its secret and local mode plus the old host's
+peer URL. Until it receives its first claims snapshot it queues automatic starts. Then deploy
+the old host, enable remote mode and reload. Authenticate `/activation/health` on both hosts
+with `x-paseo-activation`; require a non-null `drain.seededAt`, an acknowledged claims revision,
+and the matching `intake.claims` count before restoring destination dispatch. A local host with
+no peer configured does not require this handshake.
+
+The old host retains ownership of its grandfathered working or owner-waiting ticket agents.
+Replies, questions and approvals for those agents stay local while their existing work finishes;
+they are not stopped or moved. Ownership is registered durably on the destination, which does
+not start a second agent for a claimed ticket. An offline old host blocks only its claimed
+tickets, not unrelated new server work. Once an owner retires, later work goes to the destination.
+
+A root keeps ownership across normal turn endings, idle waits and an open ticket thread whose
+process was closed. It retires when archived, failed, confirmed as a processless ghost, its
+thread closes, or its ticket completes or is canceled. Existing agents on the destination keep
+their own replies and approvals even if the old host also claims that ticket; existing overlap
+is not resolved by stopping workers. Resuming a retired ticket root on the old host is refused,
+including a heartbeat or a manual resume; unrelated chats are unaffected.
+
+New native threads, replies without a retained local owner, project work, parked-plan
+implementations and automatic replacements go to the destination's normal start gate,
+scheduler and plan policy. Old thread replies still reach the destination. New ticket starts
+from the old host's sidebar are refused; select the destination host instead. Unrelated manual
+Paseo chats are unchanged.
+
+Routing governs Linear ticket activations, not unrelated Paseo schedules. Move fresh-agent
+schedules separately and pause their old copies. Existing worker heartbeats can remain while
+their tasks finish; retire those heartbeats when their worker retires. Preserve host-specific
+analysis inputs when moving a scheduled job rather than substituting the destination's history.
+
+Forwarded requests are persisted and deduplicated by their source IDs. If the destination is
+unreachable or full, work stays queued; there is no local fallback. Replacement work retains
+its branch and handover context and never silently starts on an unrelated fresh branch.
+Mac-only uncommitted changes are not transferred: a replacement whose branch cannot safely
+be resumed remains a queued handoff rather than discarding that work.
+The destination acknowledges a forwarded activation after persisting it, then processes it
+asynchronously. Delivery receipts avoid repeats after a lost HTTP response. Delivery is
+at-least-once across a crash between the daemon send and the durable receipt, so that narrow
+crash window may repeat a message. Pending source activations are never evicted.
+
 
 **In the panel.**
 - The agent's commands and file edits show up while it works, merged at most every 4 seconds.
