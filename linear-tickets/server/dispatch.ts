@@ -1,5 +1,6 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { DispatchStatus } from "../shared/contracts";
+import type { ActivationSink } from "./activation";
 import type { Launcher } from "./launch";
 import type { LabeledIssue, LinearService } from "./linear";
 import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
@@ -26,6 +27,9 @@ type Deps = {
   // A ticket with open sub-issues is handed to Paseo as a group instead of starting an agent;
   // true when it was (SessionRouter.handOffGroup).
   handOff?: (issueId: string) => Promise<boolean>;
+  // Activation routing (activation.ts): a draining host forwards its label activations instead of
+  // starting them, and the receiving host defers tickets the peer still claims.
+  route?: ActivationSink;
   // Linear → agent comment delivery, run on the same cadence as dispatch.
   relay?: Pick<CommentRelay, "poll">;
   // Labelled projects (README, "Projects"), moved forward after the labelled tickets.
@@ -200,6 +204,17 @@ export class Dispatcher {
     const { linear } = this.deps;
     const trigger = settings.dispatch.label;
     const labels = dispatchLabels(trigger);
+    // New label activations belong to the peer while this host drains (or while the ticket is
+    // claimed there): forwarded durably, never started here.
+    const routed = await this.deps.route?.take({ kind: "ticket", issueId: issue.id, identifier: issue.identifier, label: trigger });
+    if (routed && "held" in routed) {
+      this.record(issue.identifier, "failed", `not forwarded yet: ${routed.held}; the label stays and the next poll retries`);
+      return;
+    }
+    if (routed) {
+      this.record(issue.identifier, "launched", `handed to ${routed.peer}: this host forwards new work there`);
+      return;
+    }
     // Blocked tickets and a full agent limit wait with their label in place; the next poll retries.
     const admission = await this.deps.starter.admission(issue.id, paseo, settings);
     if (!admission.ok) return;

@@ -7,7 +7,7 @@ import type { HandoverRecord } from "./handover";
 import type { IssueStatus } from "./linear";
 import { ManualTasks, runCheck, type CheckResult, type ManualTask } from "./manual-tasks";
 import { PullRequestWatch, type PullRequestView } from "./pr-watch";
-import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
 const settings = { dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true } } as unknown as PluginSettings;
 const OWNER = "https://linear.app/ws/profiles/me";

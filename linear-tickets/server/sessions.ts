@@ -8,6 +8,7 @@ import type { PaseoAgentHandle, PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { AgentApi, OpenSession, SelectOption, SessionPlanStep } from "./agent-app";
 import { agentAppDirectory } from "./agent-app";
+import { recoverActivationId, type ActivationSink } from "./activation";
 import type { AgentSessionWebhook } from "./agent-webhook";
 import { groupProgress, groupStatus, isGroup } from "./groups";
 import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
@@ -111,6 +112,9 @@ export type SessionLink = {
   closed?: boolean;
   // The agent the thread's "Open in Paseo" link points at.
   paseoLinked?: string;
+  // The peer host that took this thread's work over (DrainRouter/ActivationIntake): its replies
+  // are forwarded, and no local agent id is ever stored for it.
+  remote?: string;
   // Handed to Paseo as a group (groups.ts): no agent of its own; its sub-issues are handed out and
   // it closes when they are finished. `delegated`: the ticket was assigned to Paseo when the group
   // started, so unassigning it stops the group. `status`: the last status posted in the panel.
@@ -172,6 +176,15 @@ export class SessionStore {
 
   async all(): Promise<SessionLink[]> {
     return Object.values(await this.load());
+  }
+
+  // The ticket of a known agent: the newest thread that names it. The resume guard
+  // (activation-guard.ts) reads this so a heartbeat for an old root of this host is still
+  // recognized as ticket work after its thread was closed.
+  async agentTicket(agentId: string): Promise<{ issueId: string; identifier: string } | null> {
+    const links = Object.values(await this.load()).filter((link) => link.agentId === agentId);
+    const newest = links.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+    return newest ? { issueId: newest.issueId, identifier: newest.identifier } : null;
   }
 
   async put(link: SessionLink): Promise<void> {
@@ -282,6 +295,9 @@ type Deps = {
   handover: Pick<Handover, "resumeTarget" | "handOff">;
   // The per-ticket start gate every automatic start path takes (Launcher.gate).
   launcher: Pick<Launcher, "gate">;
+  // Activation routing (activation.ts): the draining host forwards, the receiving host defers
+  // claimed tickets. Absent: today's local-only behavior.
+  route?: ActivationSink;
   settings: Pick<Settings, "read">;
   store: SessionStore;
   stop?: (agentId: string) => Promise<void>;
@@ -455,6 +471,22 @@ export class SessionRouter {
         await this.closeSuperseded();
         return;
       }
+      // Everything this host must not start (it drains, the peer still owns the ticket, or the
+      // hosts have not shaken hands yet) is taken over before anything local plans it -- the
+      // group keeper included, so no sub-issue is handed out here for a ticket that is not this
+      // host's to start.
+      const routed = await this.deps.route?.take({ kind: "session", issueId, identifier, sessionId: session.id, ...(text ? { text } : {}) });
+      if (routed && "held" in routed) {
+        await this.deps.store.patch(session.id, { queued: true, pendingText: text || null });
+        await this.say(session.id, "thought", `Not started yet: ${routed.held}. This thread stays queued here.`);
+        return;
+      }
+      if (routed) {
+        await this.deps.store.patch(session.id, { remote: routed.peer });
+        await this.say(session.id, "thought", `${identifier} is handled on ${routed.peer}${text ? "; your message was passed on" : ""}.`);
+        await this.closeSuperseded();
+        return;
+      }
       if (await this.startGroup(link)) return;
       await this.deps.store.put(link);
       const admission = await this.deps.starter.admission(issueId, this.paseo!, await this.deps.settings.read());
@@ -507,6 +539,21 @@ export class SessionRouter {
 
   private async startNow(link: SessionLink, fresh: boolean): Promise<void> {
     const settings = await this.deps.settings.read();
+    // This thread's next agent belongs to the peer (the host drains, or the ticket is claimed
+    // there): the pending comment goes with it, and nothing starts here.
+    const routed = await this.deps.route?.take({ kind: "session", issueId: link.issueId, identifier: link.identifier, sessionId: link.sessionId, ...(link.pendingText ? { text: link.pendingText } : {}) });
+    if (routed && "held" in routed) {
+      // Nothing was started and nothing was forwarded: the thread keeps its message and the
+      // sweep tries again.
+      await this.deps.store.patch(link.sessionId, { queued: true });
+      await this.say(link.sessionId, "thought", `Not started yet: ${routed.held}. This thread stays queued here.`);
+      return;
+    }
+    if (routed) {
+      await this.deps.store.patch(link.sessionId, { queued: false, pendingText: null, offer: null, remote: routed.peer });
+      await this.say(link.sessionId, "thought", `Handed to ${routed.peer}: this host does not start new work for ${link.identifier}.`);
+      return;
+    }
     const running = dispatchLabels(settings.dispatch.label).running;
     await this.deps.linear.addLabel(link.issueId, running).catch(() => {});
     try {
@@ -560,6 +607,21 @@ export class SessionRouter {
       // Any reply asks for the current status, posted even when it has not changed.
       await this.advanceGroup({ ...link, group: { ...link.group, status: undefined } });
       return;
+    }
+    if (body && this.deps.route) {
+      const routed = await this.deps.route.take({ kind: "reply", issueId: link.issueId, identifier: link.identifier, sessionId, ...(activityId ? { activityId } : {}), text: body });
+      if (routed && "held" in routed) {
+        // Nothing was started or sent anywhere; the answer stays with the thread and the sweep
+        // tries again (the owner sees why here).
+        await this.deps.store.patch(sessionId, { queued: true, pendingText: body });
+        await this.say(sessionId, "thought", `Not passed on yet: ${routed.held}. Your message stays queued here.`);
+        return;
+      }
+      if (routed) {
+        await this.deps.store.patch(sessionId, { remote: routed.peer });
+        await this.say(sessionId, "response", `Passed to the agent working on ${link.identifier} on ${routed.peer}.`);
+        return;
+      }
     }
     if (!link.agentId) { await this.say(sessionId, "error", "The agent for this session has not started yet."); return; }
     const handle = this.paseo!.agents.ref(link.agentId);
@@ -672,7 +734,18 @@ export class SessionRouter {
       if (await this.processWait(link.issueId)) return;
       // Another path (the trigger label, a newer thread, a successor start) may have started the ticket's agent meanwhile.
       const existing = await this.activeAgentFor(link.issueId);
-      if (!existing && !(await this.deps.starter.admission(link.issueId, this.paseo!, await this.deps.settings.read())).ok) return;
+      // A ticket this host no longer starts goes to its owner before this host waits for a slot
+      // (a full host must not hold a forwarded ticket in its queue for hours).
+      if (!existing) {
+        const routed = await this.deps.route?.take({ kind: "session", issueId: link.issueId, identifier: link.identifier, sessionId: link.sessionId, ...(link.pendingText ? { text: link.pendingText } : {}) });
+        if (routed && "held" in routed) return;
+        if (routed) {
+          await this.deps.store.patch(link.sessionId, { remote: routed.peer, queued: false, pendingText: null });
+          await this.say(link.sessionId, "thought", `${link.identifier} is handled on ${routed.peer}${link.pendingText ? "; your message was passed on" : ""}.`);
+          return;
+        }
+        if (!(await this.deps.starter.admission(link.issueId, this.paseo!, await this.deps.settings.read())).ok) return;
+      }
       // The owner may have ended the thread or closed the ticket while it waited.
       const status = await this.deps.api.sessionStatus(link.sessionId);
       if (!status || status === "complete" || status === "error") {
@@ -1235,6 +1308,12 @@ export class SessionRouter {
     const gate = this.deps.launcher.gate(issueId);
     if (!gate) throw new Error("A launch for this ticket is under way.");
     try {
+      const routed = await this.deps.route?.take({ kind: "session", issueId, identifier });
+      if (routed && "held" in routed) throw new Error(`Nothing was restarted: ${routed.held}. The project's next read tries again.`);
+      if (routed) {
+        console.log(`[linear-tickets] ${identifier}: the planner's restart is handed to ${routed.peer}`);
+        return;
+      }
       const wait = await this.processWait(issueId);
       if (wait) throw new Error(wait);
       if (await this.liveSuccessorFor(issueId)) return;
@@ -1301,6 +1380,23 @@ export class SessionRouter {
         // Nothing is claimed: a failed hand-off is tried again with the message on the next poll.
         await later("handing the record to the live agent", () => this.deps.handover.handOff(issue, predecessorId, live));
         return { kind: "live", agent: live };
+      }
+      // The successor belongs to the peer (the host drains, or the ticket is claimed there): the
+      // ask and its handover snapshot go with it. The message is claimed right before forwarding,
+      // and a failed forward stays in the peer's or this host's durable queue -- never a local
+      // start, and never a fresh branch when the recorded one cannot be continued there.
+      const routed = await this.deps.route?.take({
+        kind: "recover", issueId: issue.id, identifier: issue.identifier,
+        id: recoverActivationId(issue.id, predecessorId, lead),
+        text: lead, strictResume: true,
+      });
+      // Held: nothing was started here and nothing was forwarded; the message stays unclaimed so
+      // the next poll tries again.
+      if (routed && "held" in routed) return { kind: "wait", reason: `the pull request's message is not routed yet: ${routed.held}` };
+      if (routed) {
+        await onDispatch();
+        console.log(`[linear-tickets] ${issue.identifier}: the pull request's message for gone agent ${predecessorId.slice(0, 8)} is handed to ${routed.peer}`);
+        return { kind: "started", agent: { id: `peer:${routed.peer}`, title: `an agent on ${routed.peer}`, cwd: "" } };
       }
       if (!await this.deps.handover.resumeTarget(issue.id)) return { kind: "impossible", reason: "no branch is recorded for the ticket" };
       const settings = await this.deps.settings.read();

@@ -5,6 +5,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { filedIssues, pluginComments, postedComments } from "./agent-records";
 import type { LinearService, RelayComment } from "./linear";
+import type { ActivationSink, ActivationTake } from "./activation";
 import { closeAnswered, type NeedsYouIssues } from "./needs-you";
 import { RateLimitedError } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
@@ -16,7 +17,7 @@ export const ACK_EMOJI = "eyes";
 export const FAILED_EMOJI = "x";
 
 type Linear = Pick<LinearService, "viewerId" | "appUserId" | "relayComments" | "comment" | "react" | "complete">;
-type LinkedAgent = { id: string; issueId: string; createdAt: string };
+type LinkedAgent = { id: string; issueId: string; identifier: string; createdAt: string };
 type Question = { header?: string; question?: string; options?: { label?: string }[] };
 
 // The message after the mention, or null when the comment is not addressed to Paseo.
@@ -149,7 +150,9 @@ export class CommentRelay {
   private readonly directory: string;
 
   // `needsYou`: the open "Needs you" sub-issues, whose replies go to the agent that asked.
-  constructor(private readonly linear: Linear, private readonly path = join(paseoHome(), "linear-tickets", "relay-cursors.json"), private readonly needsYou?: NeedsYouIssues) {
+  // `route`: activation routing, so a comment for a ticket this host no longer owns goes to the
+  // host that owns it instead of being delivered (or reported ❌) here.
+  constructor(private readonly linear: Linear, private readonly path = join(paseoHome(), "linear-tickets", "relay-cursors.json"), private readonly needsYou?: NeedsYouIssues, private readonly route?: ActivationSink) {
     this.directory = dirname(path);
   }
 
@@ -290,7 +293,7 @@ export class CommentRelay {
         const issueId = agent.labels?.["linear.issueId"];
         if (!issueId || agent.labels?.["paseo.parent-agent-id"]) continue;
         const known = byIssue.get(issueId);
-        if (!known || agent.updatedAt > known.updatedAt) byIssue.set(issueId, { id: agent.id, issueId, createdAt: agent.createdAt, updatedAt: agent.updatedAt });
+        if (!known || agent.updatedAt > known.updatedAt) byIssue.set(issueId, { id: agent.id, issueId, identifier: agent.labels?.["linear.identifier"] ?? issueId, createdAt: agent.createdAt, updatedAt: agent.updatedAt });
       }
       cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
     } while (cursor);
@@ -299,6 +302,21 @@ export class CommentRelay {
 
   // Hands the comment to the agent; the outcome is the reaction (and, on failure, the reply) to queue.
   private async deliver(paseo: PaseoApi, agent: LinkedAgent, comment: RelayComment, message: string): Promise<{ emoji: string; reply: string | null }> {
+    if (this.route) {
+      // The comment id is the dedupe id, so a relay retried after a reload reaches the agent once.
+      // A root this host no longer owns does not take the comment here: it goes to the host that
+      // owns the ticket now (an agent of this host that still runs keeps it, see the routing).
+      let routed: ActivationTake;
+      try {
+        routed = await this.route.take({ kind: "reply", issueId: agent.issueId, identifier: agent.identifier, text: message, id: `comment:${comment.id}` });
+      } catch (error) {
+        const why = error instanceof Error ? error.message : "unknown error";
+        console.error(`[linear-tickets] routing comment ${comment.id} failed: ${why}`);
+        return { emoji: FAILED_EMOJI, reply: `Paseo could not route that comment: ${why}` };
+      }
+      if (routed && "held" in routed) return { emoji: FAILED_EMOJI, reply: `That comment is queued: ${routed.held}. It reaches the agent once the routing is ready.` };
+      if (routed) return { emoji: ACK_EMOJI, reply: `Passed to the agent working on ${agent.identifier} on ${routed.peer}.` };
+    }
     try {
       await deliverToAgent(paseo, agent.id, message);
       return { emoji: ACK_EMOJI, reply: null };

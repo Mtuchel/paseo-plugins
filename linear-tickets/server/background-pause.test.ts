@@ -10,7 +10,7 @@ import { Dispatcher } from "./dispatch";
 import { LinearService, postGraphQL } from "./linear";
 import { ManualTasks, type ManualTask } from "./manual-tasks";
 import { RateBudget } from "./rate-budget";
-import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import type { TicketStarter } from "./starter";
 
 // The real request path (LinearService → postGraphQL → budget) against a fake Linear: every
