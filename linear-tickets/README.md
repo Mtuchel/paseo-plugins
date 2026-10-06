@@ -1310,6 +1310,13 @@ note); when the host cannot be reached it says so and keeps retrying.
   or send back with the note you type there. It goes the same way as **Approve plan** / **Send
   back** in the Linear panel, so a parked plan moves on and an agent's own review gets its answer.
   Only the inbox's own page can send these (a custom header, no cross-site requests).
+- **Review pane on a wide screen.** From 1100 px wide the list sits on the left and a row opens
+  its review on the right, inside the inbox: the full Plannotator page (annotate, comment, Approve,
+  Send Feedback), as on its own tab. Each review you open keeps its page, so switching between rows
+  keeps unsent annotations; it closes once the review leaves the list (not while a peer is
+  unreachable). The address ends in `#<agentId>`, so a reload reopens it; **Open in new tab ↗**
+  above the pane and Cmd/Ctrl-click on a row open the review on its own. Narrower screens (the
+  phone) open the review as before.
 - **All hosts in one inbox.** List the other hosts' inboxes in `reviewPeers` in
   `$PASEO_HOME/linear-tickets/settings.json` (no toggle), e.g.
   `"reviewPeers": ["https://server087.<tailnet>.ts.net:8444"]`, and this inbox shows their waiting
