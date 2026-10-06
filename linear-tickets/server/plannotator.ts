@@ -22,6 +22,7 @@ import type { PlanFollowUps } from "./plan-follow-ups";
 import { feedbackEntry, logQuietly, type DecisionLog } from "./owner-decisions";
 import { modelProblem, modelSteps, planTier, strongerTier, TIERS, type Tier } from "../shared/plan-model";
 import { labelTier, onlyTierAdded, TIER_LABELS, tierModel, type TierStore } from "./model-tiers";
+import type { ReviewDeletions } from "./review-deletions";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -181,6 +182,7 @@ export class PlannotatorBridge {
   // Agents whose plan the plugin sent back for its `## Model` section: the omp extension's report
   // of that send-back is not the owner's decision. Cleared by the agent's next review.
   private readonly tierSendBacks = new Set<string>();
+  private deletions: Pick<ReviewDeletions, "get" | "forAgent"> | null = null;
 
   constructor(
     private readonly linear: Linear,
@@ -190,11 +192,15 @@ export class PlannotatorBridge {
     private readonly fetchPlan: (localUrl: string) => Promise<string> = readReviewPlan,
     private readonly handover?: Pick<Handover, "update">,
     private readonly setMode: (agentId: string, modeId: string) => Promise<void> = setAgentMode,
-    private readonly reviews?: Pick<ReviewLinks, "opened" | "decided" | "described" | "describedFor">,
+    private readonly reviews?: Pick<ReviewLinks, "opened" | "decided" | "described" | "describedFor"> & Partial<Pick<ReviewLinks, "requiresOwner">>,
     private readonly decide: (localUrl: string, approve: boolean, feedback: string) => Promise<void> = decidePlannotatorReview,
     private readonly open: (url: string) => void = openInBrowser,
     private readonly parking?: Parking,
   ) {}
+
+  useDeletions(deletions: Pick<ReviewDeletions, "get" | "forAgent">): void {
+    this.deletions = deletions;
+  }
 
   // The browser hook leaves opening the review to the bridge, so an auto-approved plan never opens
   // a tab. A review with a stable link is in the review inbox (and its notification) instead; only
@@ -383,6 +389,7 @@ export class PlannotatorBridge {
   // (deliverWorkOrder).
   // null: the plan has no readable rating.
   private async judge(localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
+    if (await this.reviews?.requiresOwner?.(issueId)) return { approved: false, line: "Rechecked plans require your review; automatic approval is disabled.", reasons: ["you requested a fresh review of this plan"] };
     const rated = parsePlanRisk(planText);
     const rating = "problem" in rated ? "" : `Risk: ${ratingText(rated.risk)}.`;
     try {
@@ -412,6 +419,7 @@ export class PlannotatorBridge {
   // judged again: within the threshold it is approved like the owner's approval on the central
   // host; otherwise it stays parked with the new reasons. The planner is retired again either way.
   private async rejudgeParked(parked: ParkedPlan, verdict: string, paseo: PaseoApi): Promise<void> {
+    if (await this.reviews?.requiresOwner?.(parked.issueId)) return;
     const rated = parsePlanRisk(parked.plan);
     if ("problem" in rated) return;
     const settings = await this.settings.read();
@@ -448,7 +456,13 @@ export class PlannotatorBridge {
     let event: PlannotatorEvent | null = null;
     try {
       event = parseEvent(await readFile(path, "utf8"));
-      if (event?.agentId) await this.deliver(event, event.agentId, paseo);
+      if (event?.agentId) {
+        const recorded = await this.deletions?.forAgent(event.agentId);
+        const issueId = recorded?.issueId ?? (await paseo.agents.ref(event.agentId).refresh())?.agent.labels?.["linear.issueId"];
+        const deletion = recorded ?? (issueId ? await this.deletions?.get(issueId) : null);
+        if (deletion?.phase === "pending") return;
+        if (!deletion) await this.deliver(event, event.agentId, paseo);
+      }
       else if (event?.type === "opened") this.show(event.localUrl);
       await rm(path, { force: true });
       this.attempts.delete(name);
@@ -504,7 +518,7 @@ export class PlannotatorBridge {
       }
     }
     // The agent's stable link when ReviewLinks is up; otherwise this review's own tailnet or local URL.
-    const stableLink = event.type === "opened" ? await this.reviews?.opened(agentId, event, { identifier: labels["linear.identifier"] || undefined, model }) ?? null : null;
+    const stableLink = event.type === "opened" ? await this.reviews?.opened(agentId, event, { identifier: labels["linear.identifier"] || undefined, ...(issueId ? { issueId } : {}), model }) ?? null : null;
     const url = event.type === "opened" ? stableLink ?? event.remoteUrl ?? event.localUrl : undefined;
     if (event.type === "decided") await this.reviews?.decided(agentId, event.approved);
     const settings = await this.settings.read();
@@ -624,7 +638,7 @@ export class PlannotatorBridge {
   // the parking and queues a fresh agent. The retired agent's own report is ignored.
   private async deliverParked(event: OpenedEvent | DecidedEvent, parked: ParkedPlan): Promise<void> {
     if (event.type === "opened") {
-      const stableLink = await this.reviews?.opened(parked.agentId, event, { identifier: parked.identifier, since: parked.parkedAt, model: parked.model }) ?? null;
+      const stableLink = await this.reviews?.opened(parked.agentId, event, { identifier: parked.identifier, issueId: parked.issueId, since: parked.parkedAt, model: parked.model }) ?? null;
       const url = stableLink ?? event.remoteUrl ?? event.localUrl;
       await this.reviews?.described(event.localUrl, parked.plan, { approved: false, reasons: parked.reasons })
         .catch((error: unknown) => console.error(`[linear-tickets] inbox details for ${parked.identifier} skipped: ${error instanceof Error ? error.message : error}`));

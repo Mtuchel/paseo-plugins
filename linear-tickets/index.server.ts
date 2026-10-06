@@ -32,7 +32,7 @@ import { PullRequestBoard } from "./server/pull-requests";
 import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
 import { NeedsYouIssues } from "./server/needs-you";
-import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, SessionRouter, SessionStore, stopAgentTurn } from "./server/sessions";
+import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, ReviewDecisionAppliedError, SessionRouter, SessionStore, stopAgentTurn } from "./server/sessions";
 import { approveForLater, splitIntoSubIssues } from "./server/split";
 import { planSetup, TicketStarter } from "./server/starter";
 import { PLAN_TICKET_ENV } from "./server/plan-policy";
@@ -49,6 +49,8 @@ import { activationEndpoints } from "./server/activation-endpoints";
 import { ActivationIntake } from "./server/activation-intake";
 import { DrainRouter } from "./server/drain";
 import { resumeGuard } from "./server/activation-guard";
+import { ReviewDeletions } from "./server/review-deletions";
+import { ReviewIssueInfos } from "./server/review-issue-info";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -59,6 +61,8 @@ export default function contribute(server: PluginServerContext) {
   const auth = new AppAuth();
   const agentApi = new AgentApi(auth);
   const linear = new LinearService(credentials, undefined, agentApi);
+  const deletions = new ReviewDeletions();
+  const issueInfos = new ReviewIssueInfos(linear);
   linear.onOwnerComment = (commentId, issueId) => recordPluginComment(join(paseoHome(), "linear-tickets"), commentId, issueId);
   // Each ticket agent's launch environment, given back to its resumed sessions (agent-env.ts).
   const agentEnvs = new AgentEnvs();
@@ -68,6 +72,7 @@ export default function contribute(server: PluginServerContext) {
   // while the peer still owns the ticket. Assigned once the routers exist.
   let activationGuard: (issueId: string) => Promise<string | null> = async () => null;
   const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url), undefined, undefined, agentEnvs, (issueId) => activationGuard(issueId));
+  launcher.useDeletions(deletions);
   const settings = new Settings();
   const cache = new TicketCache();
   const handover = new Handover(linear, undefined, undefined, undefined, async (agentId) => { const serverId = await daemonServerId(); return serverId ? paseoAgentUrl(serverId, agentId) : null; });
@@ -75,7 +80,7 @@ export default function contribute(server: PluginServerContext) {
   const presence = new Presence();
   // Model tiers (README, "Model tiers"): the tier each ticket implements on.
   const tiers = new TierStore();
-  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers });
+  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, deletions });
   // The plugin itself closes the review (split, implement later): the extension's report of that
   // closing is not the owner's decision, so the bridge skips it.
   const retirePlanner = async (reviewUrl: string, agentId: string, api: PaseoApi, reason: string) => {
@@ -93,7 +98,11 @@ export default function contribute(server: PluginServerContext) {
   const decideReview = async (localUrl: string, approve: boolean, feedback: string, agentId: string) => {
     const planContent = await readReviewPlan(localUrl).catch(() => "");
     await decidePlannotatorReview(localUrl, approve, feedback);
-    await recordDecision({ type: "decided", agentId, approved: approve, ...(feedback ? { feedback } : {}), planContent, at: new Date().toISOString() });
+    try {
+      await recordDecision({ type: "decided", agentId, approved: approve, ...(feedback ? { feedback } : {}), planContent, at: new Date().toISOString() });
+    } catch (error) {
+      throw new ReviewDecisionAppliedError(`The review decision was already delivered, but recording its lifecycle failed: ${error instanceof Error ? error.message : error}`);
+    }
   };
   // Activation routing (README, "Draining a host"): every automatic start path calls `take`
   // before it starts. Remote mode forwards to the peer through the drain router; local mode
@@ -102,7 +111,7 @@ export default function contribute(server: PluginServerContext) {
   let attachedPaseo: PaseoApi | null = null;
   const route: ActivationSink = { take: async (request) => ((await settings.read()).activation.mode === "remote" ? drain.take(request) : intake.take(request)) };
   const sessionStore = new SessionStore();
-  const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, needsYou, route,
+  const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, needsYou, route, deletions,
     decideReview,
     reviewOutcome: (review) => reviewOutcome(review),
     recordOutcome: (agentId, outcome) => recordDecision({ type: "decided", agentId, ...outcome, at: new Date().toISOString() }),
@@ -159,6 +168,30 @@ export default function contribute(server: PluginServerContext) {
     // Draining a host: /activation, /activation/claims, /activation/deliver and
     // /activation/health ride this tailnet service (activation-endpoints.ts).
     routes: activationEndpoints({ settings, intake, drain }),
+    deletions,
+    issueInfo: (identifier, options) => issueInfos.forIdentifier(identifier, options),
+    issueLink: async (agentId) => {
+      const link = await sessions.sessionFor(agentId);
+      const agent = (await attachedPaseo?.agents.ref(agentId).refresh())?.agent;
+      if (agent) {
+        const issueId = agent.labels?.["linear.issueId"];
+        const identifier = agent.labels?.["linear.identifier"];
+        if (!issueId || !identifier || agent.labels?.["paseo.parent-agent-id"]) return null;
+        if (link && (link.issueId !== issueId || link.identifier !== identifier)) return null;
+        return { issueId, identifier };
+      }
+      return link ? { issueId: link.issueId, identifier: link.identifier } : null;
+    },
+    prepareDelete: async (issueId) => {
+      await launcher.settledFor(issueId);
+      await sessions.settleTicket(issueId);
+      await plannotator.drain();
+    },
+    deleteIssue: (issueId) => linear.deleteIssue(issueId),
+    cleanupIssue: async (issueId, agentId) => {
+      await parking.plans.remove(issueId);
+      await sessions.deleteTicket(issueId, agentId);
+    },
   });
   // Plans that need the owner are parked and served by one central Plannotator host, so their
   // agents are retired instead of holding a slot until the owner decides (README, "Parked plans").
@@ -173,6 +206,7 @@ export default function contribute(server: PluginServerContext) {
     },
   };
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks, undefined, undefined, parking);
+  plannotator.useDeletions(deletions);
   plannotator.onProjectPlan(projects);
   plannotator.useFollowUps(followUps);
   plannotator.recordDecisions(decisions);

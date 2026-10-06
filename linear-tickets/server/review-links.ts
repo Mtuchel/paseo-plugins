@@ -14,6 +14,10 @@ import { closedPage, inboxPage, MANIFEST, planDetails, SERVICE_WORKER, type Inbo
 import { createReviewProxy } from "./review-proxy";
 import { pushSubscription, ReviewPush, type PushSend } from "./review-push";
 import { tailscaleBinary } from "./tailscale";
+import { AuthenticationError, refusedByLinear } from "./linear";
+import { ReviewDeletions } from "./review-deletions";
+import type { ReviewIssueInfo } from "./review-issue-info";
+import { ReviewClosedError, ReviewDecisionAppliedError } from "./sessions";
 
 const exec = promisify(execFile);
 export const REVIEW_PORT = 47_832;
@@ -29,12 +33,16 @@ const PEER_TIMEOUT_MS = 4_000;
 const MAX_BODY_BYTES = 16_384;
 const MAX_FEEDBACK_CHARS = 4_000;
 
+const RECHECK_FEEDBACK = "Recheck this plan against the current code and main branch, current open and recently merged pull requests, related Linear issues and plans, and all active reviews. Include evidence links. Resolve overlaps and conflicts; revise the plan or direction when needed and explain what changed (or why nothing changed). Obtain a fresh advisor review of the exact revised text, then resubmit it for the user's review. Do not implement anything and do not auto-approve this plan.";
+
 export type ReviewOutcome = "approved" | "sent back";
 export type ReviewEntry = {
   agentId: string;
   localUrl: string;
   remoteUrl: string | null;
   identifier?: string;
+  issueId?: string;
+  recheckRequested?: boolean;
   openedAt: string;
   // When the owner first got this plan, for a review served again (see `opened`).
   since?: string;
@@ -74,6 +82,12 @@ export type ReviewLinksOptions = {
   decide?: DecideReview;
   // The Linear workspace's web address (https://linear.app/<urlKey>), for the rows' ticket links.
   linearWorkspace?: () => Promise<string>;
+  issueInfo?: (identifier: string, options?: { fresh?: boolean }) => Promise<ReviewIssueInfo | null>;
+  issueLink?: (agentId: string) => Promise<{ issueId: string; identifier: string } | null>;
+  deleteIssue?: (issueId: string) => Promise<void>;
+  prepareDelete?: (issueId: string) => Promise<void>;
+  cleanupIssue?: (issueId: string, agentId: string) => Promise<void>;
+  deletions?: ReviewDeletions;
   // Web Push: where its keys and subscriptions are kept, and how a message is sent (tests).
   pushFile?: string;
   sendPush?: PushSend;
@@ -82,7 +96,7 @@ export type ReviewLinksOptions = {
 };
 
 class DecisionError extends Error {
-  constructor(readonly status: number, message: string) { super(message); }
+  constructor(readonly status: number, message: string, readonly outcomeUnknown = false) { super(message); }
 }
 
 async function backendAlive(localUrl: string): Promise<boolean> {
@@ -142,10 +156,14 @@ const PeerRow = z.object({
   decidedAt: text(40).optional(),
   details: PeerDetails.optional(),
   model: text(200).optional(),
+  areas: z.array(text(200)).max(50).optional(),
+  deleteable: z.boolean().optional(),
   issueUrl: text(2_000).regex(/^https:\/\/linear\.app\//).optional(),
 });
 const PeerInbox = z.object({ host: text(100), open: z.array(z.unknown()), decided: z.array(z.unknown()) });
 const DecisionRequest = z.object({ approve: z.boolean(), feedback: z.string().optional() });
+const RecheckRequest = z.object({}).strict();
+const DeleteRequest = z.object({ identifier: z.string() }).strict();
 const ErrorAnswer = z.object({ error: z.string() });
 
 // A peer's rows; a row this inbox could not render is left out, not the whole peer.
@@ -201,6 +219,13 @@ export class ReviewLinks {
   private readonly host: string;
   private readonly peers: () => Promise<string[]>;
   private readonly decide: DecideReview | null;
+  private readonly issueInfo: ReviewLinksOptions["issueInfo"];
+  private readonly issueLink: ReviewLinksOptions["issueLink"];
+  private readonly deleteIssue: ReviewLinksOptions["deleteIssue"];
+  private readonly prepareDelete: ReviewLinksOptions["prepareDelete"];
+  private readonly cleanupIssue: ReviewLinksOptions["cleanupIssue"];
+  private readonly deletions: ReviewDeletions;
+  private readonly actions = new Map<string, Promise<void>>();
   private readonly linearWorkspace: (() => Promise<string>) | null;
   private readonly push: ReviewPush;
   private readonly bundles = new ReviewBundles();
@@ -222,6 +247,12 @@ export class ReviewLinks {
     this.peers = options.peers ?? (async () => []);
     this.decide = options.decide ?? null;
     this.linearWorkspace = options.linearWorkspace ?? null;
+    this.issueInfo = options.issueInfo;
+    this.issueLink = options.issueLink;
+    this.deleteIssue = options.deleteIssue;
+    this.prepareDelete = options.prepareDelete;
+    this.cleanupIssue = options.cleanupIssue;
+    this.deletions = options.deletions ?? new ReviewDeletions(join(dirname(this.file), "deletions.json"));
     this.push = new ReviewPush(options.pushFile ?? join(dirname(this.file), "push.json"), options.sendPush);
     this.routes = options.routes ?? null;
   }
@@ -332,11 +363,13 @@ export class ReviewLinks {
   // (the server is not published, or the review itself is not reachable in the tailnet). `since`
   // is when the owner first got the plan, for a review served again (a parked plan after a restart
   // of the central host); without it the review opened now. `model` wrote the plan.
-  async opened(agentId: string, event: OpenedEvent, review: { identifier?: string; since?: string; model?: string | null } = {}): Promise<string | null> {
+  async opened(agentId: string, event: OpenedEvent, review: { identifier?: string; issueId?: string; since?: string; model?: string | null } = {}): Promise<string | null> {
     await this.starting;
-    const { identifier, since, model } = review;
+    const { identifier, issueId, since, model } = review;
+    if (issueId && await this.deletions.blocked(issueId) || await this.deletions.forAgent(agentId)) return null;
+    const recheckRequested = issueId ? await this.requiresOwner(issueId) : false;
     await this.change((registry) => {
-      registry[event.localUrl] = { agentId, localUrl: event.localUrl, remoteUrl: event.remoteUrl, ...(identifier ? { identifier } : {}), openedAt: this.now().toISOString(), ...(since ? { since } : {}), ...(model ? { model } : {}) };
+      registry[event.localUrl] = { agentId, localUrl: event.localUrl, remoteUrl: event.remoteUrl, ...(identifier ? { identifier } : {}), ...(issueId ? { issueId } : {}), ...(recheckRequested ? { recheckRequested } : {}), openedAt: this.now().toISOString(), ...(since ? { since } : {}), ...(model ? { model } : {}) };
     });
     this.misses.delete(event.localUrl);
     // Before the link is handed out, so the first tap already gets the compressed page.
@@ -349,7 +382,12 @@ export class ReviewLinks {
     await this.change((registry) => {
       const entry = latest(registry, agentId);
       if (entry) entry.outcome = approved ? "approved" : "sent back";
+      if (approved && entry?.issueId) for (const review of Object.values(registry)) if (review.issueId === entry.issueId) delete review.recheckRequested;
     });
+  }
+
+  async requiresOwner(issueId: string): Promise<boolean> {
+    return Object.values(await this.load()).some((entry) => entry.issueId === issueId && entry.recheckRequested);
   }
 
   // The plan's details for the inbox, with what the risk policy made of it (null: not judged).
@@ -430,13 +468,15 @@ export class ReviewLinks {
       const custom = await this.routes({ method, path, headers, body });
       if (custom) return custom;
     }
-    const decision = /^\/api\/reviews\/([^/]+)\/decision$/.exec(path);
-    if (decision || path === "/api/push/subscribe") {
+    const action = /^\/api\/reviews\/([^/]+)\/(decision|recheck|delete)$/.exec(path);
+    if (action || path === "/api/push/subscribe") {
       if (method !== "POST") return { status: 405, headers: { allow: "POST" } };
       // A page on another site cannot send these: the custom header needs a CORS preflight, which
       // this server never grants, and a browser's own Origin must be this inbox.
       const origin = headers.origin;
-      if (headers["x-review-action"] !== "1" || !String(headers["content-type"] ?? "").startsWith("application/json") || (origin && new URL(origin).host !== headers.host)) return json(403, { error: "Not allowed." });
+      let sameOrigin = !origin;
+      try { if (origin) sameOrigin = new URL(origin).host === headers.host; } catch { /* malformed Origin is refused */ }
+      if (headers["x-review-action"] !== "1" || !String(headers["content-type"] ?? "").startsWith("application/json") || !sameOrigin) return json(403, { error: "Not allowed." });
       let parsed: unknown;
       try { parsed = JSON.parse(body); } catch { return json(400, { error: "The request is not JSON." }); }
       if (path === "/api/push/subscribe") {
@@ -445,10 +485,42 @@ export class ReviewLinks {
         await this.push.subscribe(subscription);
         return json(200, { ok: true });
       }
-      const agentId = decodeURIComponent(decision![1]);
+      let agentId: string;
+      try { agentId = decodeURIComponent(action![1]); } catch { return json(404, { error: "No such review." }); }
       if (!AGENT_ID.test(agentId)) return json(404, { error: "No such review." });
       try {
-        await this.decideFor(agentId, parsed);
+        const operation = action![2];
+        const current = latest(await this.load(), agentId);
+        const recorded = await this.deletions.forAgent(agentId);
+        const actionKey = current?.identifier ?? recorded?.identifier ?? agentId;
+        const previous = this.actions.get(actionKey) ?? Promise.resolve();
+        const work = previous.catch(() => {}).then(async () => {
+          if (operation === "delete") return this.deleteFor(agentId, parsed);
+          if (operation === "recheck") {
+            if (!RecheckRequest.safeParse(parsed).success) throw new DecisionError(400, "Recheck takes an empty JSON object.");
+            const entry = latest(await this.load(), agentId);
+            if (!entry) return this.forward(agentId, "recheck", {});
+            await this.waiting(entry);
+            if (!this.decide) throw new DecisionError(503, "This host cannot decide reviews.");
+            const prior = entry.recheckRequested;
+            const linked = !entry.issueId && this.issueLink ? await this.issueLink(agentId).catch(() => null) : null;
+            await this.change(() => {
+              if (linked && linked.identifier === entry.identifier) entry.issueId = linked.issueId;
+              entry.recheckRequested = true;
+            });
+            try { await this.decideFor(agentId, { approve: false, feedback: RECHECK_FEEDBACK }); } catch (error) {
+              if (!(error instanceof DecisionError && error.outcomeUnknown)) await this.change(() => {
+                if (prior) entry.recheckRequested = prior;
+                else delete entry.recheckRequested;
+              });
+              throw error;
+            }
+            return;
+          }
+          return this.decideFor(agentId, parsed);
+        });
+        this.actions.set(actionKey, work);
+        try { await work; } finally { if (this.actions.get(actionKey) === work) this.actions.delete(actionKey); }
         return json(200, { ok: true });
       } catch (error) {
         if (error instanceof DecisionError) return json(error.status, { error: error.message });
@@ -489,25 +561,95 @@ export class ReviewLinks {
     if (!approve && !feedback) throw new DecisionError(400, "Say what should change.");
     const entry = latest(await this.load(), agentId);
     if (!entry) {
-      const peer = this.peerOf.get(agentId);
-      if (!peer) throw new DecisionError(404, "This review is not listed any more.");
-      const response = await fetch(`${peer}/api/reviews/${encodeURIComponent(agentId)}/decision`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-review-action": "1" },
-        body: JSON.stringify({ approve, feedback }),
-        signal: AbortSignal.timeout(15_000),
-      }).catch((error: unknown) => { throw new DecisionError(502, `${new URL(peer).hostname} did not answer: ${error instanceof Error ? error.message : error}`); });
-      if (response.ok) return;
-      const answer = ErrorAnswer.safeParse(await response.json().catch(() => null));
-      throw new DecisionError(response.status, answer.success ? answer.data.error : `${new URL(peer).hostname} answered HTTP ${response.status}.`);
+      return this.forward(agentId, "decision", { approve, feedback });
     }
-    if (entry.closedAt || entry.outcome || !await this.alive(entry.localUrl)) throw new DecisionError(409, "This review is already closed.");
+    await this.waiting(entry);
     if (!this.decide) throw new DecisionError(503, "This host cannot decide reviews.");
     try { await this.decide(entry.localUrl, approve, approve ? "" : feedback, agentId); } catch (error) {
-      throw new DecisionError(409, error instanceof Error ? error.message : String(error));
+      const uncertain = error instanceof ReviewDecisionAppliedError || error instanceof ReviewClosedError && error.outcomeUnknown;
+      throw new DecisionError(uncertain ? 502 : 409, error instanceof Error ? error.message : String(error), uncertain);
     }
     // Listed as decided at once; the decision's own event reports the same outcome again.
     await this.decided(agentId, approve);
+  }
+
+  private async waiting(entry: ReviewEntry): Promise<void> {
+    if (entry.closedAt || entry.outcome || !entry.remoteUrl || !await this.alive(entry.localUrl)) throw new DecisionError(409, "This review is already closed.");
+    if (await this.deletions.forAgent(entry.agentId) || entry.issueId && await this.deletions.blocked(entry.issueId)) throw new DecisionError(409, "Deletion is pending for this ticket; resolve or retry deletion first.");
+  }
+
+  private async forward(agentId: string, operation: string, body: unknown): Promise<void> {
+    let peer = this.peerOf.get(agentId);
+    if (!peer) { await this.view(); peer = this.peerOf.get(agentId); }
+    if (!peer) throw new DecisionError(404, "This review is not listed any more.");
+    const response = await fetch(`${peer}/api/reviews/${encodeURIComponent(agentId)}/${operation}`, {
+      method: "POST", headers: { "content-type": "application/json", "x-review-action": "1" },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(60_000),
+    }).catch((error: unknown) => { throw new DecisionError(502, `${new URL(peer).hostname} did not answer; the action's outcome is unknown: ${error instanceof Error ? error.message : error}`); });
+    if (response.ok) return;
+    const answer = ErrorAnswer.safeParse(await response.json().catch(() => null));
+    throw new DecisionError(response.status, answer.success ? answer.data.error : `${new URL(peer).hostname} answered HTTP ${response.status}.`);
+  }
+
+  private async deleteFor(agentId: string, raw: unknown): Promise<void> {
+    const request = DeleteRequest.safeParse(raw);
+    if (!request.success) throw new DecisionError(400, "Confirm the exact ticket identifier.");
+    const entry = latest(await this.load(), agentId);
+    let deletion = await this.deletions.forAgent(agentId);
+    if (!entry && !deletion) return this.forward(agentId, "delete", request.data);
+    if (!this.deleteIssue || !this.cleanupIssue || !this.issueInfo) throw new DecisionError(503, "This host cannot delete tickets.");
+    const identifier = deletion?.identifier ?? entry?.identifier;
+    if (!identifier || request.data.identifier !== identifier) throw new DecisionError(400, "The confirmation must exactly match this review's ticket identifier.");
+    if (!deletion) {
+      await this.waiting(entry!);
+      const linked = this.issueLink ? await this.issueLink(agentId).catch(() => null) : entry?.issueId ? { issueId: entry.issueId, identifier } : null;
+      const current = await this.issueInfo(identifier, { fresh: true });
+      if (!linked || linked.identifier !== identifier || !current || current.issueId !== linked.issueId || entry?.issueId && current.issueId !== entry.issueId) throw new DecisionError(409, "The review's current ticket identity could not be verified; nothing was deleted.");
+      if (latest(await this.load(), agentId) !== entry) throw new DecisionError(409, "The waiting review changed while its ticket was verified; nothing was deleted.");
+      await this.waiting(entry!);
+      deletion = { issueId: current.issueId, identifier, agentId, phase: "pending" };
+      await this.deletions.put(deletion);
+    } else if (deletion.phase === "pending") {
+      const current = await this.issueInfo(identifier, { fresh: true });
+      if (!current || current.issueId !== deletion.issueId) throw new DecisionError(409, "The previous deletion's outcome is unknown. The same ticket is not verifiably present; no duplicate deletion was sent.");
+    }
+    if (deletion.phase === "pending") {
+      try { await this.prepareDelete?.(deletion.issueId); } catch (error) {
+        await this.deletions.remove(deletion.issueId);
+        throw new DecisionError(409, `Deletion did not start; the review was preserved: ${error instanceof Error ? error.message : error}`);
+      }
+      try {
+        await this.deleteIssue(deletion.issueId);
+      } catch (error) {
+        if (refusedByLinear(error) || error instanceof AuthenticationError) {
+          await this.deletions.remove(deletion.issueId);
+          throw new DecisionError(409, `Linear refused deletion; the review was preserved: ${error instanceof Error ? error.message : error}`);
+        }
+        throw new DecisionError(502, `Deletion outcome is unknown; the ticket is paused and its review preserved. Retry only after verifying the same ticket still exists: ${error instanceof Error ? error.message : error}`);
+      }
+      deletion = { ...deletion, phase: "deleted" };
+    }
+    // Retry a failed durable phase write before cleanup; never repeat a confirmed remote delete.
+    try { await this.deletions.put(deletion); } catch (error) {
+      throw new DecisionError(500, `The underlying issue ${identifier} is already deleted, but recording local cleanup failed. Retry deletion to finish cleanup: ${error instanceof Error ? error.message : error}`);
+    }
+    try {
+      await this.cleanupIssue(deletion.issueId, agentId);
+      const entries = Object.values(await this.load()).filter((item) => item.issueId === deletion!.issueId || item.identifier === identifier || item.agentId === agentId);
+      for (const item of entries) {
+        const port = reviewPort(item.remoteUrl);
+        if (port !== null) {
+          try { await this.unserve(port); } catch (error) {
+            if (!/handler does not exist/i.test(error instanceof Error ? error.message : String(error))) throw error;
+          }
+        }
+      }
+      await this.change((registry) => {
+        for (const item of entries) { delete registry[item.localUrl]; this.misses.delete(item.localUrl); }
+      });
+    } catch (error) {
+      throw new DecisionError(500, `The underlying issue ${identifier} is already deleted, but local cleanup failed. Retry deletion to finish cleanup: ${error instanceof Error ? error.message : error}`);
+    }
   }
 
   // This host's rows plus every peer's; a peer that does not answer is named, not fatal.
@@ -528,7 +670,7 @@ export class ReviewLinks {
     this.peerOf.clear();
     for (const answer of answers) {
       if ("unreachable" in answer) { unreachable.push(answer.host); continue; }
-      for (const row of answer.open) this.peerOf.set(row.agentId, answer.peer);
+      for (const row of [...answer.open, ...answer.decided]) this.peerOf.set(row.agentId, answer.peer);
       open.push(...answer.open);
       decided.push(...answer.decided);
     }
@@ -553,9 +695,17 @@ export class ReviewLinks {
       ...(entry.model ? { model: entry.model } : {}),
       ...(workspace && entry.identifier ? { issueUrl: `${workspace}/issue/${encodeURIComponent(entry.identifier)}` } : {}),
     });
+    const enrich = async (entry: ReviewEntry): Promise<InboxRow> => {
+      const info = entry.identifier && this.issueInfo ? await this.issueInfo(entry.identifier).catch(() => null) : null;
+      const linked = entry.issueId ? { issueId: entry.issueId, identifier: entry.identifier } : this.issueLink ? await this.issueLink(entry.agentId).catch(() => null) : null;
+      const verified = info && linked && linked.identifier === entry.identifier && linked.issueId === info.issueId;
+      if (verified && !entry.issueId) await this.change(() => { entry.issueId = info.issueId; });
+      const deletion = await this.deletions.forAgent(entry.agentId);
+      return { ...row(entry), ...(info ? { areas: info.areas } : {}), deleteable: Boolean((verified || deletion) && this.deleteIssue && this.cleanupIssue) };
+    };
     return {
-      open: open.map(row),
-      decided: decided.map((entry) => ({ ...row(entry), outcome: outcomeText(entry), decidedAt: entry.closedAt ?? entry.openedAt })),
+      open: await Promise.all(open.map(enrich)),
+      decided: await Promise.all(decided.map(async (entry) => ({ ...await enrich(entry), outcome: outcomeText(entry), decidedAt: entry.closedAt ?? entry.openedAt }))),
     };
   }
 
@@ -565,17 +715,19 @@ export class ReviewLinks {
   private async inbox(): Promise<{ open: ReviewEntry[]; decided: ReviewEntry[] }> {
     const registry = await this.load();
     const current = Object.values(registry).filter((entry) => AGENT_ID.test(entry.agentId) && latest(registry, entry.agentId) === entry);
-    const candidates = current.filter((entry) => !entry.closedAt && !entry.outcome && entry.remoteUrl);
+    const deletionStates = await Promise.all(current.map((entry) => this.deletions.forAgent(entry.agentId)));
+    const retrying = current.filter((_, index) => deletionStates[index]);
+    const candidates = current.filter((entry, index) => !deletionStates[index] && !entry.closedAt && !entry.outcome && entry.remoteUrl);
     const alive = await Promise.all(candidates.map((entry) => this.alive(entry.localUrl)));
-    const open = candidates.filter((_, index) => alive[index]).sort((a, b) => waitingSince(b).localeCompare(waitingSince(a)));
-    const missing = open.filter((entry) => !entry.details);
+    const open = [...retrying, ...candidates.filter((_, index) => alive[index])].sort((a, b) => waitingSince(b).localeCompare(waitingSince(a)));
+    const missing = open.filter((entry) => !entry.details && !retrying.includes(entry));
     const plans = await Promise.all(missing.map((entry) => this.fetchPlan(entry.localUrl).catch(() => "")));
     if (plans.some((plan) => plan.trim())) {
       await this.change(() => {
         missing.forEach((entry, index) => { if (plans[index].trim()) entry.details = planDetails(plans[index], entry.identifier); });
       });
     }
-    const decided = current.filter((entry) => entry.closedAt || entry.outcome)
+    const decided = current.filter((entry) => !retrying.includes(entry) && (entry.closedAt || entry.outcome))
       .sort((a, b) => (b.closedAt ?? b.openedAt).localeCompare(a.closedAt ?? a.openedAt))
       .slice(0, RECENT_DECISIONS);
     return { open, decided };

@@ -13,6 +13,7 @@ import { findProject, readBranches } from "./projects";
 import { repoOrientation } from "./repo-orientation";
 import { ompExtensionInstalled, paseoHome, TICKET_MCP_ENV, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
 
+import type { ReviewDeletions } from "./review-deletions";
 type Start = RpcInput<typeof launchAgentRpc>;
 type Result = { agentId: string; warnings: string[] };
 // `resume` continues another agent's work: same branch (and worktree while it still exists),
@@ -61,6 +62,9 @@ export class Launcher {
   private readonly launching = new Map<string, number>();
   // Tickets whose automatic start path holds the start gate (see gate).
   private readonly gates = new Set<string>();
+  private deletions: Pick<ReviewDeletions, "blocked"> | null = null;
+  private readonly pending = new Map<string, Set<Promise<Result>>>();
+  private readonly canonicalIds = new Map<string, string>();
 
   constructor(
     private readonly linear: Pick<LinearService, "detail" | "markInProgress" | "finishedBlockers">,
@@ -79,6 +83,18 @@ export class Launcher {
     private readonly blocked?: (issueId: string) => Promise<string | null>,
   ) {}
 
+  useDeletions(deletions: Pick<ReviewDeletions, "blocked">): void {
+    this.deletions = deletions;
+  }
+
+  async settledFor(issueId: string): Promise<void> {
+    for (;;) {
+      const pending = [...this.pending].flatMap(([id, work]) => id === issueId || this.canonicalIds.get(id) === issueId ? [...work] : []);
+      if (!pending.length) return;
+      await Promise.allSettled(pending);
+    }
+  }
+
   start(input: Start, paseo: PaseoApi, options: Options = {}): Promise<Result> {
     const fingerprint = JSON.stringify([input.id, input.projectId, input.baseBranch, input.provider, input.modeId, input.thinkingOptionId, input.instructions, options.promptTemplate ?? "", options.markInProgress ?? false, options.linearAccess ?? false, options.lead ?? ""]);
     const prior = this.requests.get(input.requestId);
@@ -96,11 +112,16 @@ export class Launcher {
     this.requests.set(input.requestId, { fingerprint, result });
     this.active.set(fingerprint, result);
     this.launching.set(input.id, (this.launching.get(input.id) ?? 0) + 1);
+    const pending = this.pending.get(input.id) ?? new Set<Promise<Result>>();
+    pending.add(result);
+    this.pending.set(input.id, pending);
     const settled = () => {
       this.active.delete(fingerprint);
       const left = (this.launching.get(input.id) ?? 1) - 1;
       if (left) this.launching.set(input.id, left);
       else this.launching.delete(input.id);
+      pending.delete(result);
+      if (!pending.size) { this.pending.delete(input.id); this.canonicalIds.delete(input.id); }
     };
     void result.then(settled, () => {
       settled();
@@ -133,6 +154,7 @@ export class Launcher {
   }
 
   private async launch(input: Start, paseo: PaseoApi, options: Options, onCreate: () => void): Promise<Result> {
+    if (await this.deletions?.blocked(input.id)) throw new Error("This ticket is paused for deletion; no agent was started.");
     const blocked = await this.blocked?.(input.id);
     if (blocked) throw new Error(blocked);
     const project = await findProject(paseo, input.projectId);
@@ -145,6 +167,8 @@ export class Launcher {
       throw new Error("This project does not support Git branches.");
     }
     const detail = await this.linear.detail(input.id);
+    this.canonicalIds.set(input.id, detail.issue.id);
+    if (await this.deletions?.blocked(detail.issue.id)) throw new Error("This ticket is paused for deletion; no agent was started.");
     // Written before any creation so a failure here cannot leave a half-launched ticket.
     const mcpServers = options.linearAccess ? { [TICKET_MCP_NAME]: ticketMcpServer(await this.ticketScript(), detail.issue.id) } : undefined;
     onCreate();
@@ -237,6 +261,7 @@ export class Launcher {
       } catch (error) {
         warnings.push(`Could not save the ticket context for the plan advisor: ${error instanceof Error ? error.message : "unknown error"}`);
       }
+      if (await this.deletions?.blocked(detail.issue.id)) throw new Error("This ticket is paused for deletion; no agent was started.");
       const agent = await workspace.agents.create({
         config: { provider: input.provider, modeId: input.modeId, thinkingOptionId: input.thinkingOptionId, ...(linearAccess && attach && mcpServers ? { mcpServers } : {}) },
         title,
