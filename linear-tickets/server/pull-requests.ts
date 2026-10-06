@@ -4,9 +4,11 @@ import { activityBullets, ghJson, GitHubRateLimitedError, QUEUE_MERGED_LABEL } f
 import { githubBudget, GitHubPausedError, withPriority, type GitHubBudget } from "./rate-budget";
 
 // The Paseo Agents menu bar's pull request view (README, "Pull request view"), read from GitHub
-// REST with the owner's gh login: conditional requests (an unchanged resource answers 304 and
-// costs no budget), at most every 2 minutes per repository, and only while a client asked for it
-// in the last 10 minutes. GraphQL stays reserved for `gh pr` and `gt`.
+// REST through the routed gh CLI (github-cli.ts): the account router decides which read account
+// serves each call; without it, the owner's gh login reads as before. Conditional requests (an
+// unchanged resource answers 304 and costs no budget), at most every 2 minutes per repository,
+// and only while a client asked for it in the last 10 minutes. GraphQL stays reserved for `gh pr`
+// and `gt`.
 const REFRESH_MS = 2 * 60 * 1000;
 const ACTIVE_MS = 10 * 60 * 1000;
 const TICK_MS = 15 * 1000;
@@ -226,7 +228,7 @@ class ConditionalReader {
       this.budget.admit();
       const cached = this.cache.get(path);
       const response = await this.get(path, cached?.etag ?? null).catch((error: unknown) => {
-        throw error instanceof GitHubRateLimitedError ? this.budget.throttled() : error;
+        throw error instanceof GitHubRateLimitedError ? this.budget.refused(error) : error;
       });
       this.budget.record(response.headers);
       if (response.status === 304 && cached) {
@@ -338,7 +340,7 @@ export class PullRequestBoard {
           const relabel = (list: PullRequestEntry[]) => list.map((pull) => (pull.number === number ? pullEntry({ ...pull, labels }, pull.checks, pull.queue) : pull));
           repo.snapshot = { ...repo.snapshot, pulls: relabel(repo.snapshot.pulls), queueDrafts: relabel(repo.snapshot.queueDrafts) };
         } catch (failure) {
-          if (failure instanceof GitHubRateLimitedError) this.budget.throttled();
+          if (failure instanceof GitHubRateLimitedError) this.budget.refused(failure);
           error = `GitHub refused #${number}: ${ghMessage(failure)}`;
           break;
         }
@@ -376,7 +378,9 @@ export class PullRequestBoard {
     repo.running = withPriority("background", () => this.refresh(repository, repo)).finally(() => { repo.running = null; });
   }
 
-  // Background priority: below the budget's reserve the poll stops and the last data stays.
+  // Background priority: with the single-login budget, below its reserve the poll stops and the
+  // last data stays; with the router installed the call would not have been made below a read
+  // budget.
   private async refresh(repository: string, repo: Repo): Promise<void> {
     repo.reader.begin();
     try {

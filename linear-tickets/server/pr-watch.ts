@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
+import { githubCli } from "./github-cli";
 import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
@@ -186,21 +186,40 @@ export class PullRequestNotFoundError extends Error {
 // `at`: Graphite's time stamp as written ("Sep 29, 7:26 AM UTC"); `event`: the text after it.
 type Bullet = { text: string; event: string; at: string | null; kind: "queued" | "running" | "merged" | "dropped"; draft: number | null };
 
-function gh(): string {
-  for (const candidate of ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]) if (existsSync(candidate)) return candidate;
-  return "gh";
-}
-
+// The routed gh, explicit override, or portable gh fallback: see github-cli.ts.
 // `parse` reads gh's output; JSON by default.
 export async function ghJson<T>(args: string[], parse: (stdout: string) => T = (stdout) => JSON.parse(stdout) as T): Promise<T> {
   try {
-    const { stdout } = await exec(gh(), args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
+    const { stdout } = await exec(githubCli(), args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
     return parse(stdout);
   } catch (error) {
     const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr) : "";
-    if (/HTTP 429|rate limit/i.test(stderr)) throw new GitHubRateLimitedError(`GitHub is throttling gh: ${stderr.trim().split("\n")[0]}`);
-    if (/Could not resolve to a PullRequest/i.test(stderr)) throw new PullRequestNotFoundError(stderr.trim().split("\n")[0]);
-    throw error;
+    const stdout = error && typeof error === "object" && "stdout" in error ? String(error.stdout) : "";
+    const code = error && typeof error === "object" && "code" in error ? error.code : null;
+    const signal = error && typeof error === "object" && "signal" in error ? error.signal : null;
+    // Never log execFile's message: it includes the command and every argument, including
+    // comment bodies. Rebuild diagnostics from process metadata, not arbitrary CLI text.
+    const status = /\bHTTP(?:\/[\d.]+)?[ :]+([1-5]\d{2})\b/.exec(stderr)?.[1]
+      ?? /^HTTP\/\S+ ([1-5]\d{2})\b/.exec(stdout)?.[1];
+    const exit = typeof code === "number" || (typeof code === "string" && /^[A-Z_]+$/.test(code)) ? `exit ${code}` : "";
+    const stopped = typeof signal === "string" && /^SIG[A-Z0-9]+$/.test(signal) ? `signal ${signal}` : "";
+    const diagnostics = [exit, stopped, status ? `HTTP ${status}` : ""].filter(Boolean).join(", ");
+    const operation = args[0] === "api" ? "GitHub API request" : "GitHub CLI request";
+    const message = `${operation} failed${diagnostics ? ` (${diagnostics})` : ""}`;
+    const hasBody = args.some((arg) => /^body=|^--(?:raw-)?field=body=|^--body(?:=|$)|^-b$/.test(arg));
+    // A CLI can echo the body escaped, reformatted, or split across lines. For writes carrying
+    // a body, retain only safe diagnostics in stderr rather than trying substring redaction.
+    const metadata = { stdout, stderr: hasBody ? message : stderr, code, signal };
+    // The router's exit 75 and GitHub's throttling both stop this round. Preserve the router's
+    // retry time when no request body could have supplied it.
+    if (code === 75 || /HTTP 429|rate limit|budgets? exhausted/i.test(stderr)) {
+      const resume = !hasBody && code === 75 ? /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\b/.exec(stderr)?.[0] : null;
+      throw Object.assign(new GitHubRateLimitedError(`GitHub is throttling gh: ${message}${resume ? `; try again after ${resume}` : ""}`), metadata);
+    }
+    if (/Could not resolve to a PullRequest/i.test(stderr)) {
+      throw Object.assign(new PullRequestNotFoundError(`Pull request not found: ${message}`), metadata);
+    }
+    throw Object.assign(new Error(message), metadata);
   }
 }
 
@@ -334,13 +353,13 @@ function statusFingerprint(body: unknown): string {
 }
 
 // One watched pull request's cheap first look. `viewPullRequest` is one GraphQL query per pull
-// request per poll; this class asks REST first, so a quiet pull request costs the shared GraphQL
+// request per poll; this class asks REST first, so a quiet pull request costs the GraphQL
 // budget nothing: the pull request read as an issue, then its comments, reviews and the head's
 // checks, are read conditionally (their stable ETags make an unchanged resource answer 304, which
 // GitHub does not meter), and the detail read runs only when one of them changed, when the merge
 // queue is mid-attempt, or when the cached view is older than STALE_VIEW_MS. Every REST request
-// passes the shared GitHub budget first, at the caller's priority, so the reserve that keeps the
-// agents' own `gh` calls working also holds here.
+// passes the GitHub budget first, at the caller's priority: the single-login reserve (see
+// rate-budget.ts) where the router is not installed.
 export class ConditionalPullView {
   private readonly views = new Map<string, CachedView>();
 
@@ -418,7 +437,7 @@ export class ConditionalPullView {
     try {
       response = await this.deps.get(path, stored?.etag ?? null);
     } catch (error) {
-      if (error instanceof GitHubRateLimitedError) throw this.deps.budget.throttled();
+      if (error instanceof GitHubRateLimitedError) throw this.deps.budget.refused(error);
       throw error;
     }
     this.deps.budget.record(response.headers);

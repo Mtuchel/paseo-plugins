@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { githubRouted } from "./github-cli";
 
 // Linear meters requests per credential: the owner's API key (2,500/h, shared by every key of
 // that user) and the Paseo app token (5,000/h per app user) are separate pools. Both refill at a
@@ -158,10 +159,14 @@ export class RateBudget {
 
 export const rateBudget = new RateBudget();
 
-// GitHub's REST budget of the shared gh login, which every agent uses too. Unlike Linear's refill it
-// is a fixed window: `x-ratelimit-remaining` requests until `x-ratelimit-reset`, then full again.
-// Background readers stop while fewer than the reserve are left before the reset, so the agents
-// keep the rest; interactive requests stop only after GitHub refused one.
+// GitHub's REST budget without the account router: the one shared gh login, which every agent
+// uses too. Unlike Linear's refill it is a fixed window: `x-ratelimit-remaining` requests until
+// `x-ratelimit-reset`, then full again. Background readers stop while fewer than the reserve are
+// left before the reset, so the agents keep the rest; interactive requests stop only after
+// GitHub refused one. With the router installed (see github-cli.ts) it owns the bot and owner
+// budgets itself, and this budget records nothing: a response's headers name whichever account
+// served the call, so pausing on them would block the other account's reads and the bot's
+// writes on one account's low quota.
 export const GITHUB_RESERVE = 300;
 // After GitHub refused a request (403/429 rate limit), nothing is sent for this long.
 const GITHUB_THROTTLE_MS = 2 * 60 * 1000;
@@ -181,10 +186,14 @@ export class GitHubBudget {
   private known: GitHubLimit | null = null;
   private blockedUntil = 0;
 
-  constructor(private readonly now: () => number = () => Date.now(), readonly reserve = GITHUB_RESERVE) {}
+  // `routed`: the account router (github-cli.ts) serves this host's GitHub calls and owns both
+  // accounts' quotas; see the GITHUB_RESERVE comment. Off (the default) is the single-login
+  // budget.
+  constructor(private readonly now: () => number = () => Date.now(), readonly reserve = GITHUB_RESERVE, readonly routed = false) {}
 
   // A response's headers, lower-case names. Only the `core` resource is this budget.
   record(headers: ReadonlyMap<string, string>): void {
+    if (this.routed) return;
     const resource = headers.get("x-ratelimit-resource");
     if (resource && resource !== "core") return;
     const remaining = Number(headers.get("x-ratelimit-remaining"));
@@ -200,13 +209,22 @@ export class GitHubBudget {
     return new GitHubPausedError(this.blockedUntil, "throttled", this.current()?.remaining ?? null);
   }
 
+  // The error a refused request surfaces. Routed: the router's own refusal, which names the
+  // exhausted read budgets and when they resume. Single login: the pause that keeps the next
+  // two minutes quiet.
+  refused(error: Error): Error {
+    return this.routed ? error : this.throttled();
+  }
+
   // The last known budget; null before any response and once its window reset.
   current(): GitHubLimit | null {
+    if (this.routed) return null;
     return this.known && this.known.resetAt > this.now() ? this.known : null;
   }
 
   // Admission for one request; background requests also stop at the reserve.
   admit(level: Priority = priority.getStore() ?? "interactive"): void {
+    if (this.routed) return;
     const now = this.now();
     if (this.blockedUntil > now) throw new GitHubPausedError(this.blockedUntil, "throttled", this.current()?.remaining ?? null);
     const known = this.current();
@@ -214,4 +232,4 @@ export class GitHubBudget {
   }
 }
 
-export const githubBudget = new GitHubBudget();
+export const githubBudget = new GitHubBudget(() => Date.now(), GITHUB_RESERVE, githubRouted());
