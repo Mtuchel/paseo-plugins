@@ -44,7 +44,8 @@ PRs, comments, labels, reviews, ready/merge operations and Git pushes. Read-only
 GitHub API calls share the bot and owner's independent REST/GraphQL budgets,
 choosing the account with more capacity after a reserve of 750 bot requests and
 300 owner requests. Search has its own smaller reserve. Budget probes are cached
-for one minute; admission is serialized across processes. The router never retries
+for one minute; admission is serialized across processes. Outstanding reads remain
+reserved when a concurrent write refreshes the budget. The router never retries
 a write under the owner's identity.
 
 Manual commands outside the Paseo process tree keep their existing GitHub and
@@ -84,7 +85,12 @@ Without the router, portable installations retain single-login quota admission.
 
 GitHub SSH Git URLs are rewritten to HTTPS only in automated child processes.
 Git uses the bot credential helper, without changing global Git configuration or
-commit author fields. Graphite receives the bot token through its documented
+commit author fields.
+Inherited OpenSSH host aliases are inspected before transfer; aliases targeting
+GitHub and unsupported custom SSH launchers fail closed. Inspected non-GitHub
+SSH destinations retain their existing authentication and configuration.
+
+Graphite receives the bot token through its documented
 `GRAPHITE_AUTH_TOKEN` override, checked with `gt auth`; missing or wrong credentials
 fail closed. Merges still use the repository's documented Graphite queue, never a
 `gh pr merge` bypass where the queue is required.

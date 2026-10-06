@@ -31,44 +31,48 @@ export function apiReader(deps) {
     const resource = resourceFor(path);
     const account = first ?? await deps.choose(resource);
     first = null;
-    let credential = tokens.get(account);
-    if (!credential || Date.now() - credential.at > 60_000) {
-      const auth = spawnSync(deps.realGh, ["auth", "token", "--hostname", "github.com"], { env: deps.environment(account), encoding: "utf8", timeout: 3_000 });
-      if (auth.status !== 0 || !auth.stdout.trim()) throw new Error(`GitHub router: ${account} credentials unavailable`);
-      credential = { token: auth.stdout.trim(), at: Date.now() };
-      tokens.set(account, credential);
-    }
-    const headers = new Headers(init.headers);
-    headers.set("Authorization", `Bearer ${credential.token}`);
-    headers.set("User-Agent", "paseo-github-router");
-    headers.delete("host");
-    headers.delete("connection");
-    headers.delete("content-length");
-    headers.delete("x-paseo-router");
-    const keyHeaders = [...headers].filter(([key]) => key !== "authorization");
-    const key = createHash("sha256").update(JSON.stringify([account, path, init.method ?? "GET", init.body ?? "", keyHeaders, createHash("sha256").update(credential.token).digest("hex")])).digest("hex");
-    const file = deps.home && join(deps.home, "github-router", "response-cache", key.slice(0, 2) + ".json");
-    if (file && deps.cacheMs > 0) {
-      try {
-        const cached = JSON.parse(readFileSync(file, "utf8"));
-        if (cached.key === key && Date.now() - cached.at < deps.cacheMs) return new Response(Buffer.from(cached.body, "base64"), { status: cached.status, headers: cached.headers });
-      } catch {}
-    }
-    const response = await fetch(new URL(path, "https://api.github.com/"), { ...init, headers, redirect: "manual" });
-    await deps.observe(account, resource, response.headers);
-    deps.record(account, resource);
-    if (file && deps.cacheMs > 0 && response.status === 200) {
-      const body = Buffer.from(await response.clone().arrayBuffer());
-      // Fixed slots and a per-entry bound keep the private response cache bounded.
-      if (body.length <= 256 * 1024) {
-        const directory = join(deps.home, "github-router", "response-cache");
-        mkdirSync(directory, { recursive: true, mode: 0o700 });
-        const temp = `${file}.${process.pid}`;
-        writeFileSync(temp, JSON.stringify({ key, at: Date.now(), status: response.status, headers: Object.fromEntries(response.headers), body: body.toString("base64") }), { mode: 0o600 });
-        renameSync(temp, file);
+    try {
+      let credential = tokens.get(account);
+      if (!credential || Date.now() - credential.at > 60_000) {
+        const auth = spawnSync(deps.realGh, ["auth", "token", "--hostname", "github.com"], { env: deps.environment(account), encoding: "utf8", timeout: 3_000 });
+        if (auth.status !== 0 || !auth.stdout.trim()) throw new Error(`GitHub router: ${account} credentials unavailable`);
+        credential = { token: auth.stdout.trim(), at: Date.now() };
+        tokens.set(account, credential);
       }
+      const headers = new Headers(init.headers);
+      headers.set("Authorization", `Bearer ${credential.token}`);
+      headers.set("User-Agent", "paseo-github-router");
+      headers.delete("host");
+      headers.delete("connection");
+      headers.delete("content-length");
+      headers.delete("x-paseo-router");
+      const keyHeaders = [...headers].filter(([key]) => key !== "authorization");
+      const key = createHash("sha256").update(JSON.stringify([account, path, init.method ?? "GET", init.body ?? "", keyHeaders, createHash("sha256").update(credential.token).digest("hex")])).digest("hex");
+      const file = deps.home && join(deps.home, "github-router", "response-cache", key.slice(0, 2) + ".json");
+      if (file && deps.cacheMs > 0) {
+        try {
+          const cached = JSON.parse(readFileSync(file, "utf8"));
+          if (cached.key === key && Date.now() - cached.at < deps.cacheMs) return new Response(Buffer.from(cached.body, "base64"), { status: cached.status, headers: cached.headers });
+        } catch {}
+      }
+      const response = await fetch(new URL(path, "https://api.github.com/"), { ...init, headers, redirect: "manual" });
+      await deps.observe(account, resource, response.headers);
+      deps.record(account, resource);
+      if (file && deps.cacheMs > 0 && response.status === 200) {
+        const body = Buffer.from(await response.clone().arrayBuffer());
+        // Fixed slots and a per-entry bound keep the private response cache bounded.
+        if (body.length <= 256 * 1024) {
+          const directory = join(deps.home, "github-router", "response-cache");
+          mkdirSync(directory, { recursive: true, mode: 0o700 });
+          const temp = `${file}.${process.pid}`;
+          writeFileSync(temp, JSON.stringify({ key, at: Date.now(), status: response.status, headers: Object.fromEntries(response.headers), body: body.toString("base64") }), { mode: 0o600 });
+          renameSync(temp, file);
+        }
+      }
+      return response;
+    } finally {
+      await deps.complete?.(account, resource);
     }
-    return response;
   };
 }
 
@@ -76,9 +80,10 @@ export async function runNativeApi(invocation, deps) {
   const args = [...invocation.args];
   const operation = deps.operation;
   const endpoint = operation.action;
-  const endpointIndex = args.indexOf(endpoint);
+  const endpointIndex = operation.actionIndex;
   const actual = new URL(endpoint === "graphql" ? "/graphql" : endpoint, "https://api.github.com/");
   if (actual.origin !== "https://api.github.com") throw new Error("GitHub router: routed API reads must target api.github.com");
+  const paginate = operation.paginate;
   const read = apiReader(deps);
   const nonce = randomBytes(24).toString("hex");
   let firstBody = null, refusal = null;
@@ -92,9 +97,9 @@ export async function runNativeApi(invocation, deps) {
         const parsed = body ? JSON.parse(body) : firstBody;
         if (!parsed?.query || /\bmutation\b/i.test(parsed.query)) throw new Error("GitHub router: read transport refuses GraphQL mutations");
         firstBody ??= parsed;
-        const { query, variables, ...fields } = parsed;
+        const { query, operationName, variables, ...fields } = parsed;
         const cursor = url.searchParams.get("paseoCursor");
-        body = JSON.stringify({ query, variables: { ...fields, ...variables, ...(cursor ? { endCursor: cursor } : {}) } });
+        body = JSON.stringify({ query, ...(operationName !== undefined ? { operationName } : {}), variables: { ...fields, ...variables, ...(cursor ? { endCursor: cursor } : {}) } });
       }
       if (request.method !== "GET" && !(url.pathname === "/graphql" && request.method === "POST")) throw new Error("GitHub router: read transport refuses writes");
       const remotePath = url.pathname === "/graphql" ? "/graphql" : url.pathname + url.search;
@@ -104,7 +109,7 @@ export async function runNativeApi(invocation, deps) {
       delete headers["content-length"];
       delete headers["transfer-encoding"];
       const payload = Buffer.from(await response.arrayBuffer());
-      if (headers.link) headers.link = headers.link.replaceAll("https://api.github.com", `http://127.0.0.1:${server.address().port}`);
+      if (paginate && headers.link) headers.link = headers.link.replaceAll("https://api.github.com", `http://127.0.0.1:${server.address().port}`);
       if (headers.location) headers.location = headers.location.replace("https://api.github.com", `http://127.0.0.1:${server.address().port}`);
       if (url.pathname === "/graphql" && response.ok) {
         const result = JSON.parse(payload.toString("utf8"));
@@ -113,7 +118,7 @@ export async function runNativeApi(invocation, deps) {
           outgoing.end(JSON.stringify({ message: result.errors.map((e) => e.message).join("; ") }));
           return;
         }
-        const next = cursorIn(result.data);
+        const next = paginate && cursorIn(result.data);
         if (next) headers.link = `<http://127.0.0.1:${server.address().port}/graphql?paseoCursor=${encodeURIComponent(next)}>; rel="next"`;
       }
       outgoing.writeHead(response.status, headers);
@@ -125,7 +130,9 @@ export async function runNativeApi(invocation, deps) {
     }
   });
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
-  args[endpointIndex] = `http://127.0.0.1:${server.address().port}${actual.pathname}${actual.search}`;
+  // URL normalizes braces; native gh, not the transport, expands repository placeholders.
+  const nativePath = actual.pathname.replace(/%7B(owner|repo|branch)%7D/g, "{$1}");
+  args[endpointIndex] = `http://127.0.0.1:${server.address().port}${nativePath}${actual.search}`;
   args.push("-H", `X-Paseo-Router: ${nonce}`);
   const env = { ...invocation.env, GH_TOKEN: "paseo-local-transport" };
   delete env.GITHUB_TOKEN;
@@ -167,6 +174,8 @@ export async function watchRun(args, deps) {
   repo = repo?.replace(/^https:\/\/github.com\//, "");
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? "")) throw new Error("GitHub router: gh run watch needs --repo OWNER/REPO");
   const read = apiReader(deps);
+  const interval = Number(operation.interval || 3) * 1000;
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   while (true) {
     const response = await read(`repos/${repo}/actions/runs/${id}`);
     if (!response.ok) throw new Error(`GitHub run watch failed (HTTP ${response.status})`);
@@ -176,7 +185,7 @@ export async function watchRun(args, deps) {
     if (!jobsResponse.ok) throw new Error(`GitHub run jobs failed (HTTP ${jobsResponse.status})`);
     const jobs = await jobsResponse.json();
     for (const job of jobs.jobs ?? []) console.log(`  ${job.name}: ${job.status}${job.conclusion ? ` (${job.conclusion})` : ""}`);
-    if (run.status === "completed") return args.includes("--exit-status") && run.conclusion !== "success" ? 1 : 0;
-    await new Promise((resolve) => setTimeout(resolve, Number(operation.interval) * 1000));
+    if (run.status === "completed") return operation.exitStatus && run.conclusion !== "success" ? 1 : 0;
+    await sleep(interval);
   }
 }

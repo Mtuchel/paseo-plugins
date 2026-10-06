@@ -45,6 +45,58 @@ function fixture(t) {
   return { home, repo, env, run, config, invocation, guarded, fill, ownerHelper, botHelper };
 }
 
+function openSshFixture(t) {
+  const f = fixture(t);
+  const key = join(f.home, "existing owner key");
+  const keygen = spawnSync("/usr/bin/ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", key], {
+    env: f.env, encoding: "utf8", timeout: 5_000,
+  });
+  assert.equal(keygen.error, undefined);
+  assert.equal(keygen.status, 0, keygen.stderr);
+  const marker = join(f.home, "proxy-reached");
+  const hosts = join(f.home, "included hosts");
+  const config = join(f.home, "owner ssh config");
+  writeFileSync(hosts, [
+    "Host github-personal", "  HostName github.com",
+    "Host github-alternative", "  HostName ssh.github.com", "  Port 443",
+    "Host github-dotted", "  HostName GITHUB.COM.",
+    "Host retained", "  HostName localhost", "  User retained-user", "  Port 2222",
+    "",
+  ].join("\n"));
+  // A local failing proxy makes accidental transfer attempts observable without
+  // reaching any network. OpenSSH expands the actual connection parameters.
+  const proxy = `printf '%%s\\n' '%h' '%p' '%r' > ${quote(marker)}; exit 1`;
+  writeFileSync(config, [
+    `Include "${hosts}"`, "Host *", "  User git", "  BatchMode yes",
+    `  IdentityFile "${key}"`, "  IdentitiesOnly yes",
+    `  ProxyCommand /bin/sh -c ${quote(proxy)}`, "",
+  ].join("\n"));
+  f.run(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+    "-c", "commit.gpgSign=false", "commit", "--allow-empty", "--quiet", "-m", "fixture"]);
+  f.config("push.default", "current");
+  const command = `/usr/bin/ssh -F ${quote(config)}`;
+  const inspect = (destination, options = []) => {
+    const result = spawnSync("/usr/bin/ssh", ["-G", "-F", config, ...options, destination], {
+      env: f.env, encoding: "utf8", timeout: 5_000,
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(existsSync(marker), false, "-G must not start the transfer proxy");
+    return result.stdout;
+  };
+  const push = (args = ["push", "origin"], extraEnv = {}, inherited = false) => {
+    const env = inherited ? f.invocation([], { ...extraEnv, GIT_DIR: join(f.repo, ".git") }).env : extraEnv;
+    const safe = f.invocation(["-C", f.repo, ...args], env);
+    const result = spawnSync(realGit, safe.args, {
+      cwd: f.repo, env: safe.env, encoding: "utf8", timeout: 5_000,
+    });
+    assert.equal(result.error, undefined, result.error?.message);
+    assert.equal(result.status, 128, result.stderr);
+    return result;
+  };
+  return { ...f, key, marker, command, inspect, push };
+}
+
 test("global, included, repository and URL-scoped credentials cannot win on GitHub", (t) => {
   const f = fixture(t);
   const included = join(f.home, "included");
@@ -190,6 +242,105 @@ test("remaining GitHub SSH is blocked while non-GitHub SSH reaches the existing 
   assert.equal(other.status, 128);
   assert.doesNotMatch(other.stderr, /GitHub SSH is disabled/);
   assert.match(other.stderr, /Connection closed|kex_exchange_identification/);
+});
+
+for (const [destination, hostname] of [
+  ["git@github-personal:o/r.git", "github.com"],
+  ["ssh://git@github-alternative:443/o/r.git", "ssh.github.com"],
+  ["git@github-dotted:o/r.git", "GITHUB.COM."],
+]) {
+  test(`real OpenSSH GitHub aliases are blocked before push: ${destination}`, (t) => {
+    const f = openSshFixture(t);
+    const host = destination.includes("alternative") ? "github-alternative" :
+      destination.includes("dotted") ? "github-dotted" : "github-personal";
+    const effective = f.inspect(host);
+    assert.match(effective, new RegExp(`^hostname ${hostname.replaceAll(".", "\\.")}$`, "mi"));
+    assert.match(effective, /^user git$/m);
+    assert.ok(effective.split("\n").includes(`identityfile ${f.key}`));
+    f.config("core.sshCommand", f.command);
+    f.run(["remote", "add", "origin", destination]);
+    assert.match(f.push().stderr, /GitHub SSH is disabled/);
+    assert.equal(existsSync(f.marker), false);
+  });
+}
+
+for (const kind of ["insteadOf", "pushInsteadOf"]) {
+  test(`GitHub SSH aliases reached through ${kind} are blocked before push`, (t) => {
+    const f = openSshFixture(t);
+    f.config("core.sshCommand", f.command);
+    f.config(`url.git@github-personal:.${kind}`, "gh:");
+    f.run(["remote", "add", "origin", "gh:o/r.git"]);
+    assert.equal(f.run(["remote", "get-url", "--push", "origin"]).trim(), "git@github-personal:o/r.git");
+    assert.match(f.push(["push", "origin"], {}, true).stderr, /GitHub SSH is disabled/);
+    assert.equal(existsSync(f.marker), false);
+  });
+}
+
+test("non-GitHub aliases retain inherited OpenSSH config through guarded Git children", (t) => {
+  const f = openSshFixture(t);
+  const effective = f.inspect("retained");
+  assert.match(effective, /^hostname localhost$/m);
+  assert.match(effective, /^user retained-user$/m);
+  assert.match(effective, /^port 2222$/m);
+  assert.ok(effective.split("\n").includes(`identityfile ${f.key}`));
+  f.config("core.sshCommand", f.command);
+  f.run(["remote", "add", "origin", "retained:o/r.git"]);
+  const result = f.push(["push", "origin"], {}, true);
+  assert.doesNotMatch(result.stderr, /GitHub router:/);
+  assert.match(result.stderr, /Connection closed|kex_exchange_identification/);
+  assert.equal(readFileSync(f.marker, "utf8"), "localhost\n2222\nretained-user\n");
+});
+
+test("inherited SSH command environment outranks a safe repository command", (t) => {
+  const f = openSshFixture(t);
+  f.config("core.sshCommand", "ssh -F /dev/null -o ProxyCommand=false");
+  f.run(["remote", "add", "origin", "git@github-personal:o/r.git"]);
+  assert.match(f.push(["push", "origin"], { GIT_SSH_COMMAND: f.command }).stderr, /GitHub SSH is disabled/);
+  assert.equal(existsSync(f.marker), false);
+});
+
+test("effective HostName command-line overrides cannot hide GitHub behind a retained alias", (t) => {
+  const f = openSshFixture(t);
+  assert.match(f.inspect("retained", ["-o", "HostName=github.com"]), /^hostname github.com$/m);
+  f.run(["remote", "add", "origin", "retained:o/r.git"]);
+  const result = f.push(["-c", `core.sshCommand=${f.command} -o HostName=github.com`, "push", "origin"]);
+  assert.match(result.stderr, /GitHub SSH is disabled/);
+  assert.equal(existsSync(f.marker), false);
+});
+
+test("failed effective OpenSSH inspection refuses transfer", (t) => {
+  const f = openSshFixture(t);
+  f.config("core.sshCommand", `/usr/bin/ssh -F ${quote(join(f.home, "missing config"))}`);
+  f.run(["remote", "add", "origin", "git@github-personal:o/r.git"]);
+  assert.match(f.push().stderr, /cannot inspect effective OpenSSH configuration/);
+  assert.equal(existsSync(f.marker), false);
+});
+
+test("custom SSH executables and shell launchers fail closed without executing them", (t) => {
+  const f = openSshFixture(t);
+  const custom = join(f.home, "custom ssh");
+  const marker = join(f.home, "custom-command-executed");
+  writeFileSync(custom, `#!/bin/sh\ntouch ${quote(marker)}\nexec ${f.command} "$@"\n`, { mode: 0o700 });
+  f.run(["remote", "add", "origin", "git@github-personal:o/r.git"]);
+  for (const env of [
+    { GIT_SSH: custom },
+    { GIT_SSH_COMMAND: quote(custom) },
+    { GIT_SSH_COMMAND: `${f.command}; touch ${quote(marker)}` },
+  ]) {
+    assert.match(f.push(["push", "origin"], env).stderr, /unsupported SSH (?:command|shell command)/);
+    assert.equal(existsSync(marker), false);
+    assert.equal(existsSync(f.marker), false);
+  }
+});
+
+test("non-OpenSSH variants and alternate SSH execution modes fail closed", (t) => {
+  const f = openSshFixture(t);
+  f.run(["remote", "add", "origin", "retained:o/r.git"]);
+  assert.match(f.push(["push", "origin"], { GIT_SSH_COMMAND: f.command, GIT_SSH_VARIANT: "plink" }).stderr,
+    /unsupported SSH variant/);
+  assert.match(f.push(["push", "origin"], { GIT_SSH_COMMAND: `${f.command} -W github.com:22` }).stderr,
+    /unsupported SSH option/);
+  assert.equal(existsSync(f.marker), false);
 });
 
 test("a failed guarded helper cannot fall back to inherited owner askpass", (t) => {

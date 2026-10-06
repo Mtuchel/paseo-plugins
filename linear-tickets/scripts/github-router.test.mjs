@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -35,6 +35,18 @@ test("included headers, repo flags and GraphQL variables do not turn reads into 
   ];
   for (const args of reads) assert.equal(ghOperation(args).read, true, args.join(" "));
   assert.equal(ghOperation(["api", "-i", "repos/o/r/issues/42"]).resource, "core");
+});
+
+test("help/version text used as write content cannot bypass bot routing", () => {
+  for (const args of [
+    ["pr", "comment", "42", "--body", "--help"],
+    ["pr", "edit", "42", "--title", "--version"],
+    ["api", "-X", "POST", "repos/o/r/issues/42/comments", "-f", "body=--help"],
+  ]) {
+    const operation = ghOperation(args);
+    assert.equal(operation.local, false);
+    assert.equal(operation.read, false);
+  }
 });
 
 test("read selection uses available capacity after the write reserve", () => {
@@ -80,5 +92,34 @@ test("missing bot credentials block automated writes instead of falling back", a
   const home = mkdtempSync(join(tmpdir(), "github-no-bot-"));
   try {
     await assert.rejects(route("gh", ["pr", "create"], { ...process.env, PASEO_HOME: home, PASEO_AGENT_ID: "a", GH_TOKEN: "owner-token" }), /bot credentials missing/);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("a refreshed budget cannot re-admit capacity held by an outstanding read", async () => {
+  const home = mkdtempSync(join(tmpdir(), "github-refresh-"));
+  try {
+    mkdirSync(join(home, "gh-bot"));
+    writeFileSync(join(home, "gh-bot", "hosts.yml"), "github.com:\n");
+    mkdirSync(join(home, "github-router"));
+    const now = Date.now();
+    const reset = Math.ceil((now + 600_000) / 1000);
+    const cli = join(home, "probe.cjs");
+    writeFileSync(cli, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(`HTTP/1.1 200 OK\r\nX-Ratelimit-Remaining: 751\r\nX-Ratelimit-Reset: ${reset}\r\n\r\n{"login":"bot112112121"}`)});\n`, { mode: 0o755 });
+    writeFileSync(join(home, "github-router", "config.json"), JSON.stringify({ executables: { gh: cli } }));
+    const statePath = join(home, "github-router", "budgets.json");
+    writeFileSync(statePath, JSON.stringify({
+      core: {
+        bot: { remaining: 752, resetAt: reset * 1000, at: 0 },
+        owner: { remaining: 300, resetAt: reset * 1000, at: now },
+      },
+      pendingReads: { [process.pid]: { "core:bot": 1 } },
+    }));
+    const env = { ...process.env, PASEO_HOME: home, PASEO_AGENT_ID: "refresh-agent" };
+    await assert.rejects(route("gh", ["api", "repos/o/r/issues/42"], env), /GitHub read budgets exhausted/);
+    // Completion of the outstanding request makes the unspent capacity available again.
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    delete state.pendingReads[process.pid];
+    writeFileSync(statePath, JSON.stringify(state));
+    assert.equal((await route("gh", ["api", "repos/o/r/issues/42"], env)).account, "bot");
   } finally { rmSync(home, { recursive: true, force: true }); }
 });

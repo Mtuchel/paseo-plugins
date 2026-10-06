@@ -68,10 +68,16 @@ export function caller(env = process.env, pid = process.ppid) {
   return { automated: inDaemon, agent: inDaemon ? "daemon" : null };
 }
 
+function booleanFlag(value, flag) {
+  if (["1", "t", "T", "true", "TRUE", "True"].includes(value)) return true;
+  if (["0", "f", "F", "false", "FALSE", "False"].includes(value)) return false;
+  throw new Error(`GitHub router: invalid boolean ${flag} value`);
+}
+
 export function ghOperation(args) {
   const words = [];
-  let method = "", fields = false, input = false, query = "", json = "", interval = "", cache = false;
-  const valueFlags = new Set(["-R", "--repo", "--hostname", "--jq", "-q", "--template", "-t", "--header", "-H", "--paginate-limit"]);
+  let method = "", fields = false, input = false, query = "", json = "", interval = "", cache = false, commandIndex = -1, actionIndex = -1, paginate = false, exitStatus = false;
+  const valueFlags = new Set(["-R", "--repo", "--hostname", "--jq", "-q", "--template", "-t", "--header", "-H", "--preview", "-p", "--paginate-limit"]);
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (valueFlags.has(a)) { i++; continue; }
@@ -98,10 +104,23 @@ export function ghOperation(args) {
     if (a.startsWith("--input=")) { input = true; continue; }
     if (a === "--cache") { cache = true; i++; continue; }
     if (a.startsWith("--cache=")) { cache = true; continue; }
-    if (!a.startsWith("-")) words.push(a);
+    if (words[0] === "api" && (a === "--paginate" || a.startsWith("--paginate="))) {
+      paginate = booleanFlag(a.includes("=") ? a.slice(11) : "true", "--paginate");
+      continue;
+    }
+    if (words[0] === "run" && (a === "--exit-status" || a.startsWith("--exit-status="))) {
+      exitStatus = booleanFlag(a.includes("=") ? a.slice(14) : "true", "--exit-status");
+      continue;
+    }
+    if (!a.startsWith("-")) {
+      if (!words.length) commandIndex = i;
+      if (words.length === 1) actionIndex = i;
+      words.push(a);
+    }
   }
   const [command, action] = words;
-  const local = args.includes("--help") || args.includes("--version") || command === "help";
+  // Only top-level help/version is unambiguously local; nested values may be write content.
+  const local = ["--help", "-h", "--version"].includes(args[0]) || command === "help";
   let read = false, resource = "graphql";
   if (command === "api") {
     resource = resourceFor(action ?? "/");
@@ -115,7 +134,7 @@ export function ghOperation(args) {
   else if (command === "run") { read = ["view", "list", "watch"].includes(action); resource = "core"; }
   else if (command === "search") { read = true; resource = action === "code" ? "code_search" : "search"; }
   // Authentication/token operations pin to bot, including helpers used by child commands.
-  return { command, action, read, resource, local, json, interval, cache, words };
+  return { command, action, commandIndex, actionIndex, read, resource, local, json, interval, cache, paginate, exitStatus, words };
 }
 
 export function accountEnvironment(account, home, env = process.env) {
@@ -205,11 +224,12 @@ async function verifyBot(realGh, home, env) {
   return token;
 }
 
-function pendingWriteCost(state, resource) {
+function pendingCost(entries, key) {
   let cost = 0;
-  for (const [pid, entry] of Object.entries(state.pendingWrites ?? {})) {
-    try { process.kill(Number(pid), 0); cost += entry[resource] ?? 0; }
-    catch (error) { if (error.code === "ESRCH") delete state.pendingWrites[pid]; }
+  for (const [pid, entry] of Object.entries(entries ?? {})) {
+    try { process.kill(Number(pid), 0); }
+    catch (error) { if (error.code === "ESRCH") { delete entries[pid]; continue; } }
+    cost += entry[key] ?? 0;
   }
   return cost;
 }
@@ -232,6 +252,23 @@ async function finishWrite(home) {
     const entry = state.pendingWrites?.[process.pid];
     for (const resource of Object.keys(entry ?? {})) if (state[resource]?.bot) state[resource].bot.at = 0;
     if (entry) delete state.pendingWrites[process.pid];
+    save(path, state);
+  });
+}
+
+async function finishRead(home, account, resource, invalidate = false) {
+  await withLock(home, (path) => {
+    const state = load(path);
+    const entry = state.pendingReads?.[process.pid];
+    if (entry && account && resource) {
+      const key = `${resource}:${account}`;
+      if (entry[key] > 1) entry[key]--;
+      else delete entry[key];
+      if (invalidate && state[resource]?.[account]) state[resource][account].at = 0;
+      if (!Object.keys(entry).length) delete state.pendingReads[process.pid];
+    } else if (entry) {
+      delete state.pendingReads[process.pid];
+    }
     save(path, state);
   });
 }
@@ -259,8 +296,10 @@ async function readAccount(realGh, operation, home, env, agent) {
       try { budgets[account] = probe(realGh, account, operation.resource, home, env); }
       catch { budgets[account] = { remaining: 0, resetAt: now + TTL, at: now }; }
     }
-    const debt = pendingWriteCost(state, operation.resource);
-    const effective = { ...budgets, ...(budgets.bot ? { bot: { ...budgets.bot, remaining: budgets.bot.remaining - debt } } : {}) };
+    const writeDebt = pendingCost(state.pendingWrites, operation.resource);
+    const effective = Object.fromEntries(Object.entries(budgets).map(([account, pool]) => [
+      account, { ...pool, remaining: pool.remaining - pendingCost(state.pendingReads, `${operation.resource}:${account}`) - (account === "bot" ? writeDebt : 0) },
+    ]));
     const chosen = pickRead(effective, operation.resource, now);
     state[operation.resource] = budgets;
     const allowance = state.agents ??= {};
@@ -272,7 +311,12 @@ async function readAccount(realGh, operation, home, env, agent) {
       if (chosen) allowance[agent] = { hour, count: count + 1 };
       for (const id of Object.keys(allowance)) if (allowance[id].hour < hour - 1) delete allowance[id];
     }
-    if (chosen) budgets[chosen].remaining--;
+    if (chosen) {
+      const pending = state.pendingReads ??= {};
+      const entry = pending[process.pid] ??= {};
+      const key = `${operation.resource}:${chosen}`;
+      entry[key] = (entry[key] ?? 0) + 1;
+    }
     save(path, state);
     if (!chosen) {
       const resume = Math.min(...Object.values(budgets).map((b) => b.resetAt));
@@ -315,7 +359,7 @@ export async function route(mode, args, env = process.env) {
   }
   if (mode === "gt") {
     const directory = join(home, "graphite-bot");
-    const local = args.some((a) => a === "--help" || a === "--version") || ["log", "restack", "create", "modify", "checkout", "up", "down", "branch", "init", "guide"].includes(args[0]);
+    const local = ["--help", "-h", "--version"].includes(args[0]) || ["help", "log", "restack", "create", "modify", "checkout", "up", "down", "branch", "init", "guide"].includes(args[0]);
     const next = botGitEnvironment(home, findBinary("gh", env), childEnv);
     delete next.GRAPHITE_AUTH_TOKEN;
     delete next.GRAPHITE_PROFILE;
@@ -350,8 +394,9 @@ export async function route(mode, args, env = process.env) {
   if (write) await reserveWrite(home, operation);
   let routedArgs = args;
   if (operation.read && operation.command === "api" && operation.resource === "core" && !operation.cache) {
-    const index = args.indexOf("api");
+    const index = operation.commandIndex;
     routedArgs = [...args.slice(0, index + 1), "--cache", "30s", ...args.slice(index + 1)];
+    if (operation.actionIndex >= 0) operation.actionIndex += 2;
   }
   record(home, who.agent, account, mode, `${operation.command ?? "unknown"} ${operation.action ?? ""}`.trim().replace(/\?.*$/, ""));
   return { real, args: routedArgs, env: next, account, operation, who, home, write };
@@ -379,7 +424,7 @@ async function main() {
   if (mode === "git-credential") return gitCredential(args);
   if (!["gh", "git", "gt"].includes(mode)) throw new Error("GitHub router: expected gh, git or gt");
   const invocation = await route(mode, args);
-  if (mode === "gh" && invocation.operation?.read && (invocation.operation.command === "api" || invocation.operation.command === "run" && invocation.operation.action === "watch")) {
+  if (mode === "gh" && invocation.operation?.read && (invocation.operation.command === "api" && invocation.operation.action || invocation.operation.command === "run" && invocation.operation.action === "watch")) {
     const deps = {
       realGh: invocation.real, realGit: findBinary("git"), env: invocation.env,
       firstAccount: invocation.account, operation: invocation.operation,
@@ -392,20 +437,32 @@ async function main() {
       choose: (resource) => readAccount(invocation.real, { ...invocation.operation, resource }, invocation.home, invocation.env, invocation.who.agent),
       environment: (account) => accountEnvironment(account, invocation.home, invocation.env),
       observe: (account, resource, headers) => observe(invocation.home, account, resource, headers),
+      complete: (account, resource) => finishRead(invocation.home, account, resource),
       record: (account, resource) => record(invocation.home, invocation.who.agent, account, "gh-api", resource),
     };
-    const result = invocation.operation.command === "api" ? await runNativeApi(invocation, deps) : { code: await watchRun(args, deps) };
-    process.exitCode = result.code ?? 1;
-    return;
+    try {
+      const result = invocation.operation.command === "api" ? await runNativeApi(invocation, deps) : { code: await watchRun(args, deps) };
+      process.exitCode = result.code ?? 1;
+      return;
+    } finally {
+      await finishRead(invocation.home);
+    }
   }
   const child = spawn(invocation.real, invocation.args, { env: invocation.env, stdio: "inherit" });
-  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => child.kill(signal));
-  child.on("error", (error) => { console.error(error.message); process.exitCode = 127; });
-  child.on("exit", async (code, signal) => {
-    if (invocation.write) await finishWrite(invocation.home);
+  const signals = ["SIGTERM", "SIGINT", "SIGHUP"];
+  const handlers = signals.map((signal) => { const fn = () => child.kill(signal); process.on(signal, fn); return fn; });
+  try {
+    const { code, signal } = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
     if (signal) { process.removeAllListeners(signal); process.kill(process.pid, signal); }
     else process.exitCode = code ?? 1;
-  });
+  } finally {
+    signals.forEach((signal, index) => process.removeListener(signal, handlers[index]));
+    if (invocation.write) await finishWrite(invocation.home);
+    if (invocation.operation?.read) await finishRead(invocation.home, invocation.account, invocation.operation.resource, true);
+  }
 }
 if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(SELF)) {
   main().catch((error) => {

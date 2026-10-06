@@ -53,12 +53,117 @@ function githubUrl(value) {
   throw new Error("GitHub router: unresolved GitHub transport; use a github.com HTTPS URL");
 }
 
-function sshGuard(command) {
-  // Git appends SSH options and the actual host. Do not disable SSH for other hosts.
-  const github = "[gG][iI][tT][hH][uU][bB].[cC][oO][mM]";
-  const sshGithub = `[sS][sS][hH].${github}`;
-  const body = `for arg; do case "$arg" in ${github}|*@${github}|${sshGithub}|*@${sshGithub}) echo 'GitHub router: GitHub SSH is disabled for bot operations' >&2; exit 1;; esac; done; ${command} "$@"`;
-  return `sh -c ${quote(body)} github-router-ssh`;
+// Parse only literal shell words. Expansions, pipelines and custom launchers cannot
+// be inspected safely without executing them, so SSH operations fail closed.
+function sshWords(command) {
+  const words = [];
+  let word = "", started = false, quoted = "";
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (quoted === "'") {
+      if (char === "'") quoted = "";
+      else word += char;
+    } else if (char === "\\" && command[i + 1] !== undefined) {
+      const next = command[++i];
+      if (quoted === '"' && !['$', '`', '"', "\\"].includes(next)) word += "\\";
+      if (next === "\n") throw new Error("unsupported SSH shell continuation");
+      word += next;
+    } else if (quoted === '"') {
+      if (char === '"') quoted = "";
+      else if (char === "$" || char === "`") throw new Error("unsupported SSH shell expansion");
+      else word += char;
+    } else if (char === "'" || char === '"') {
+      quoted = char;
+    } else if (/\s/.test(char)) {
+      if (started) { words.push(word); word = ""; started = false; }
+      continue;
+    } else if (/[\\$`;&|<>(){}*?!~#]/.test(char)) {
+      throw new Error("unsupported SSH shell command");
+    } else {
+      word += char;
+    }
+    started = true;
+  }
+  if (quoted) throw new Error("unterminated SSH shell quote");
+  if (started) words.push(word);
+  return words;
+}
+
+// Serialized into GIT_SSH_COMMAND so the guard runs after Git applies URL
+// rewrites and chooses the actual destination, including inherited child calls.
+function guardedSsh(selection, gitArgs) {
+  const { spawnSync } = require("node:child_process");
+  const fail = (message) => {
+    console.error(`GitHub router: ${message}`);
+    process.exit(1);
+  };
+  if (selection.error) fail(selection.error);
+  if (!["ssh", "auto"].includes(selection.variant)) fail("unsupported SSH variant; refusing uninspected transport");
+  const inherited = selection.args;
+  // These are OpenSSH connection options, not alternate execution modes such as
+  // -O (control command), -W (stdio forwarding), or an inherited -G/-V/-Q.
+  const optionEnd = (args) => {
+    let i = 0;
+    while (i < args.length && args[i].startsWith("-")) {
+      const option = args[i++];
+      if (option === "--") break;
+      for (let j = 1; j < option.length; j++) {
+        const flag = option[j];
+        if ("46AaCqTtvxXYn".includes(flag)) continue;
+        if (!"BbcDEeFIiJLlmopRSw".includes(flag)) fail("unsupported SSH option; refusing uninspected transport");
+        if (j === option.length - 1 && i++ >= args.length) fail("missing SSH option value");
+        break;
+      }
+      if (option === "-") fail("unsupported SSH destination");
+    }
+    return i;
+  };
+  if (optionEnd(inherited) !== inherited.length) fail("unsupported inherited SSH destination");
+  const args = [...inherited, ...gitArgs];
+  const destinationIndex = optionEnd(args);
+  const destination = args[destinationIndex];
+  if (!destination || destination.startsWith("-") || args.length > destinationIndex + 2) {
+    fail("cannot inspect SSH destination");
+  }
+  // -G evaluates Host/Include/Match and command-line overrides without opening a
+  // connection or running ProxyCommand. Never probe with a remote transfer.
+  const probe = spawnSync("/usr/bin/ssh", ["-G", ...args], {
+    encoding: "utf8", timeout: 5_000, maxBuffer: 1024 * 1024,
+  });
+  if (probe.error || probe.status !== 0) fail("cannot inspect effective OpenSSH configuration");
+  const hosts = probe.stdout.split(/\r?\n/).filter((line) => /^hostname\s/i.test(line));
+  if (hosts.length !== 1) fail("cannot inspect effective SSH hostname");
+  const hostname = hosts[0].replace(/^hostname\s+/i, "").trim().toLowerCase().replace(/\.$/, "");
+  if (!hostname || /\s/.test(hostname)) fail("cannot inspect effective SSH hostname");
+  if (["github.com", "ssh.github.com"].includes(hostname)) {
+    fail("GitHub SSH is disabled for bot operations");
+  }
+  const result = spawnSync("/usr/bin/ssh", args, { stdio: "inherit" });
+  if (result.error) fail("cannot launch inspected OpenSSH transport");
+  if (result.signal) process.kill(process.pid, result.signal);
+  else process.exit(result.status ?? 1);
+}
+
+function sshGuard(command, variant) {
+  const script = `(${guardedSsh.toString()})(JSON.parse(process.argv[1]), process.argv.slice(2))`;
+  let selection;
+  try {
+    const words = sshWords(command);
+    // args=[] guards are inherited by intercepted Git children. Recognize only
+    // our exact literal wrapper, not an arbitrary command claiming to be guarded.
+    if (words.length === 4 && words[0] === process.execPath && words[1] === "-e" && words[2] === script) {
+      selection = JSON.parse(words[3]);
+    } else {
+      if (!["ssh", "/usr/bin/ssh", "/bin/ssh"].includes(words[0])) {
+        throw new Error("unsupported SSH command; refusing uninspected transport");
+      }
+      selection = { args: words.slice(1), variant };
+    }
+  } catch (error) {
+    selection = { error: error.message };
+  }
+  // Pin real OpenSSH, rather than trusting a PATH shim's -G output.
+  return `${quote(process.execPath)} -e ${quote(script)} ${quote(JSON.stringify(selection))}`;
 }
 
 /**
@@ -137,8 +242,8 @@ export function botGitInvocation(realGit, _realGh, _home, args, env, credentialH
   next.GIT_CONFIG_PARAMETERS = [env.GIT_CONFIG_PARAMETERS, ...overrides.map(([key, value]) => quote(`${key}=${value}`))].filter(Boolean).join(" ");
   const last = (key) => routes.filter(([name]) => name.toLowerCase() === key).at(-1)?.[1];
   const ssh = env.GIT_SSH_COMMAND || last("core.sshcommand") || (env.GIT_SSH ? quote(env.GIT_SSH) : "ssh");
-  next.GIT_SSH_COMMAND = sshGuard(ssh);
-  next.GIT_SSH_VARIANT = env.GIT_SSH_VARIANT || last("ssh.variant") || "ssh";
+  next.GIT_SSH_COMMAND = sshGuard(ssh, env.GIT_SSH_VARIANT || last("ssh.variant") || "ssh");
+  next.GIT_SSH_VARIANT = "ssh";
   next.GIT_TERMINAL_PROMPT = "0";
   next.GIT_ASKPASS = "/usr/bin/false";
   next.SSH_ASKPASS = "/usr/bin/false";
