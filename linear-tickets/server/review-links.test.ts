@@ -310,6 +310,44 @@ test("a review page reaches the tailnet compressed, brotli or gzip as the browse
   });
 });
 
+test("a review page's inline app moves to a cached URL on the inbox, named by its content", async () => {
+  const app = `console.log(${JSON.stringify("app ".repeat(40_000))});`;
+  const style = `body{color:red}${".x{}".repeat(20_000)}`;
+  const page = `<!doctype html><html><head><script type="module" crossorigin>${app}</script><style rel="stylesheet" crossorigin>${style}</style><script type="module">tiny()</script></head><body><div id="root"></div></body></html>`;
+  const backend = createServer((_incoming, response) => { response.writeHead(200, { "content-type": "text/html" }).end(page); });
+  await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
+  const port = (backend.address() as AddressInfo).port;
+  try {
+    await withLinks(async (links, get) => {
+      await links.opened("agent-1", reviewAt(port, "agent-1"));
+      const shells = [];
+      for (const encoding of ["br", undefined]) {
+        const response = await viaProxy(links, `host.tail1.ts.net:${port}`, "/", encoding);
+        const raw = await body(response);
+        shells.push(encoding === "br" ? brotliDecompressSync(raw).toString() : raw.toString());
+      }
+      assert.equal(shells[0], shells[1]);
+      const shell = shells[0];
+      const script = /<script type="module" crossorigin src="([^"]+)"><\/script>/.exec(shell)?.[1];
+      const sheet = /<link rel="stylesheet" href="([^"]+)">/.exec(shell)?.[1];
+      assert.ok(script?.startsWith(`${ORIGIN}/plannotator/`) && sheet?.startsWith(`${ORIGIN}/plannotator/`), shell);
+      assert.ok(shell.includes("<script type=\"module\">tiny()</script>"), "a small inline script stays");
+      assert.ok(shell.length < 1_000, `shell is ${shell.length} bytes`);
+
+      const js = await get(new URL(script!).pathname);
+      assert.equal(js.status, 200);
+      assert.equal(await js.text(), app);
+      assert.match(js.headers.get("cache-control") ?? "", /immutable/);
+      assert.equal(js.headers.get("access-control-allow-origin"), "*");
+      assert.equal(await (await get(new URL(sheet!).pathname)).text(), style);
+      assert.equal((await get(`/plannotator/${"0".repeat(64)}.js`)).status, 404);
+    });
+  } finally {
+    backend.closeAllConnections();
+    backend.close();
+  }
+});
+
 test("event streams and WebSockets pass through the proxy as they happen", async () => {
   await withBackend(async (backend) => {
     await withLinks(async (links) => {

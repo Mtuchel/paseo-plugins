@@ -1,6 +1,6 @@
 import { createServer, request as httpRequest, type IncomingMessage, type Server } from "node:http";
 import { connect } from "node:net";
-import { pipeline } from "node:stream";
+import { Readable, pipeline } from "node:stream";
 import { constants, createBrotliCompress, createGzip } from "node:zlib";
 
 // Plannotator serves its review page as one ~25 MB uncompressed HTML file. A phone outside the
@@ -8,7 +8,8 @@ import { constants, createBrotliCompress, createGzip } from "node:zlib";
 // off ("network connection lost"); compressed it is ~7 MB and loads. Every review's tailnet route
 // therefore points at this proxy, which picks the review by the port the request came in on
 // (`tailscale serve` keeps it in the Host header) and compresses text responses on the fly.
-// Event streams, WebSocket upgrades and binary responses pass through untouched.
+// Event streams, WebSocket upgrades and binary responses pass through untouched. A review's HTML
+// page goes through `rewritePage` first (review-bundle.ts moves its inline app out to a cached URL).
 
 // Not text/event-stream: an event stream must reach the page as each event is written.
 const COMPRESSIBLE = /^(?:text\/(?!event-stream)|application\/(?:json|javascript|xml|manifest\+json)|image\/svg\+xml)/i;
@@ -35,7 +36,7 @@ async function backendOf(request: IncomingMessage, resolve: ResolveBackend): Pro
   return port === null ? null : resolve(port);
 }
 
-export function createReviewProxy(resolve: ResolveBackend): Server {
+export function createReviewProxy(resolve: ResolveBackend, rewritePage: (page: string) => string = (page) => page): Server {
   const server = createServer((request, response) => {
     void backendOf(request, resolve).then((backend) => {
       if (backend === null) {
@@ -45,24 +46,43 @@ export function createReviewProxy(resolve: ResolveBackend): Server {
       }
       // Identity from the review server, so the encoding is always this proxy's choice.
       const upstream = httpRequest({ host: "127.0.0.1", port: backend, method: request.method, path: request.url, headers: { ...request.headers, "accept-encoding": "identity" } }, (reply) => {
+        void forward(reply).catch(() => response.destroy());
+      });
+      const forward = async (reply: IncomingMessage) => {
         const status = reply.statusCode ?? 502;
         const bodyless = request.method === "HEAD" || status === 204 || status === 304;
-        const encoding = bodyless || reply.headers["content-encoding"] || !COMPRESSIBLE.test(String(reply.headers["content-type"] ?? ""))
+        const type = String(reply.headers["content-type"] ?? "");
+        const page = !bodyless && status === 200 && !reply.headers["content-encoding"] && /^text\/html/i.test(type);
+        const encoding = bodyless || reply.headers["content-encoding"] || !COMPRESSIBLE.test(type)
           ? null
           : encodingFor(request.headers["accept-encoding"]);
-        if (!encoding) {
+        if (!encoding && !page) {
           response.writeHead(status, reply.headers);
           pipeline(reply, response, () => {});
           return;
         }
-        const size = Number(reply.headers["content-length"]) || 0;
-        const { "content-length": _length, ...headers } = reply.headers;
+        // The body changes (compressed or rewritten), so its framing is this proxy's to set.
+        const { "content-length": length, "transfer-encoding": _framing, ...headers } = reply.headers;
+        let source: Readable = reply;
+        let size = Number(length) || 0;
+        if (page) {
+          const chunks: Buffer[] = [];
+          for await (const chunk of reply) chunks.push(chunk as Buffer);
+          const rewritten = Buffer.from(rewritePage(Buffer.concat(chunks).toString("utf8")));
+          source = Readable.from([rewritten]);
+          size = rewritten.length;
+        }
+        if (!encoding) {
+          response.writeHead(status, { ...headers, "content-length": String(size) });
+          pipeline(source, response, () => {});
+          return;
+        }
         response.writeHead(status, { ...headers, "content-encoding": encoding, vary: reply.headers.vary ? `${reply.headers.vary}, Accept-Encoding` : "Accept-Encoding" });
         const compress = encoding === "br"
           ? createBrotliCompress({ params: { [constants.BROTLI_PARAM_QUALITY]: BROTLI_QUALITY, ...(size ? { [constants.BROTLI_PARAM_SIZE_HINT]: size } : {}) } })
           : createGzip();
-        pipeline(reply, compress, response, () => {});
-      });
+        pipeline(source, compress, response, () => {});
+      };
       upstream.on("error", () => {
         if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain; charset=utf-8" }).end("The plan review is not answering.\n");
         else response.destroy();
