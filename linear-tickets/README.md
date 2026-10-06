@@ -1451,6 +1451,26 @@ host it runs on when the inbox lists several. Decided rows keep the title and th
 you return to it, keeping your scroll position and search (not while you are writing a note);
 when the host cannot be reached it says so and keeps retrying.
 
+- **Plan pipeline** shows preparing, advisor review, publishing, ready, and any queued or
+  owner-waiting plans above the review queue. Expand **Pipeline details** for **On the way**,
+  **Needs attention**, source health, last real progress, and the last inbox arrival.
+  Ready counts the reviews actually reachable in the inbox, not successful submission calls
+  or parked records alone. Published plan text is matched by its content hash; restored reviews
+  keep their original arrival time. Already-delivered reviews survive planner retirement.
+  Owner questions, permissions and capacity queues are legitimate waits. Twenty minutes without
+  observed assistant/tool progress is suspected quiet work, not proof of failure. Actual submission
+  or delivery errors and proven provider exits are failures. Missing, unsupported, incomplete,
+  stale or unreachable evidence is **Unknown**, never an all-clear; known failures remain visible.
+  Auto-approved, completed, superseded and explicitly cancelled revisions are accounted for,
+  rather than left indefinitely on the way.
+  Monitoring is read-only: it never restarts, resubmits, approves or rejects agents.
+  Each host samples public agent metadata, provider-native OMP session paths, and existing
+  request/session/parked records in the background every 30 seconds. HTTP reads use the cached
+  observation; fetching the inbox does not advance progress or the successful source-check time.
+  Bounded history backfill starts unknown. State and revision history survive plugin reloads in
+  `$PASEO_HOME/linear-tickets/plan-pipeline.json`; peer inboxes without pipeline support are unknown.
+  Refresh preserves expanded details, search/cursor position and the full Plannotator frame.
+
 - **Search reviews** filters waiting plans and recent decisions by ticket, plan title or summary,
   Area, host, model, outcome, or `rule change`. Words match together, ignoring case. Matching
   counts replace the section counts and empty day groups disappear; the app badge and header
