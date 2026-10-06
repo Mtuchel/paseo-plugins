@@ -1413,6 +1413,43 @@ test("a refused enqueue goes to the agent once per refusal, and is skipped until
   }
 });
 
+test("an enqueue.mjs that enqueued nothing is final: an enqueue someone else made meanwhile is never claimed, also after a restart", async (t) => {
+  // #2183, 2026-10-06: someone enqueued the range by hand; Graphite's comment showed that bullet
+  // only after the backstop read its boundary, and the backstop's own `gt merge` answered "The
+  // stack is already merging" (enqueue.mjs exit 1, not-enqueued).
+  const h = harness(t);
+  h.github.view = READY;
+  const bullets = bulletsOf(h, {});
+  // The hand enqueue's bullet appears while the backstop's own `gt merge` runs, after its boundary.
+  let raced = false;
+  h.scripts.answered = async () => {
+    if (!raced) bullets.add(QUEUED);
+    raced = true;
+  };
+  h.scripts.ready = { stacks: [STACK], drops: [] };
+  h.scripts.enqueue = [{
+    code: 1,
+    answer: {
+      result: "error",
+      error: "enqueue.mjs exited 1 (not-enqueued)",
+      enqueue: { result: "not-enqueued", outcome: "failed", gtOutput: "/tmp/gt-merge-419.txt", next: "node tools/ci/merge-block-evidence.mjs 419" },
+    },
+  }];
+  const first = await h.backstop();
+  assert.equal(count(first, "enqueue "), 1);
+  assert.equal(count(first, `comment ${ENQUEUED}`), 0, "no enqueue comment on the ticket");
+  await h.restart();
+  const later = await h.backstop();
+  assert.equal(count(later, "enqueue "), 0, "not retried");
+  assert.equal(count(later, `comment ${ENQUEUED}`), 0, "the other enqueue is not claimed after a restart");
+  assert.match(h.scripts.runs.at(-1) ?? "", new RegExp(` --skip ${STACK.action}$`), "the refusal is skipped");
+  const routed = await h.poll();
+  assert.equal(count(routed, "prompt "), 1, "the agent hears once that the backstop enqueued nothing");
+  assert.match(promptOf(routed) ?? "", /`not-enqueued`: `gt merge` enqueued nothing \(failed\); its output is in `\/tmp\/gt-merge-419\.txt`/);
+  assert.deepEqual(await h.backstop(), []);
+  assert.deepEqual(await h.poll(), [], "routed once");
+});
+
 test("a refusal of a pull request whose agent is gone goes to the ticket, and without a ticket to the pull request", async (t) => {
   const gone = harness(t, { live: false });
   gone.github.view = READY;

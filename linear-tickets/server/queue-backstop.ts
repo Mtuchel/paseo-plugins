@@ -276,8 +276,11 @@ function problems(value: unknown): Problem[] {
     .map((item) => ({ kind: text(item.kind) || "unknown", text: text(item.text) || text(item.reason), draft: count(item.draft) }));
 }
 
-// Exit 0 enqueued, 1 error, 2 refused, 3 held; the JSON's `result` has to say the same. Anything
-// else is an error (the caller then reconciles from the Merge activity instead of assuming).
+// Exit 0 enqueued, 1 error, 2 refused, 3 held; the JSON's `result` has to say the same. An error
+// whose `enqueue.mjs` answered `not-enqueued` (exit 1: `gt merge` ran and enqueued nothing) is
+// final: a refusal of kind `not-enqueued`, so the Merge activity never decides it, and an enqueue
+// someone else made meanwhile is never taken for the backstop's. Anything else is an error (the
+// caller then reconciles from the Merge activity instead of assuming).
 export function parseEnqueue(output: ScriptOutput): EnqueueOutcome {
   let found: Record<string, unknown>;
   try { found = answer(BACKSTOP_ENQUEUE, output); } catch (error) {
@@ -286,6 +289,13 @@ export function parseEnqueue(output: ScriptOutput): EnqueueOutcome {
   const expected = output.code === null ? undefined : ENQUEUE_EXITS[output.code];
   const result = text(found.result);
   if (!expected || expected !== result) return { result: "error", problems: problems(found.problems), comment: "none", error: `${BACKSTOP_ENQUEUE} answered ${result || "nothing"} with exit ${output.code}${text(found.error) ? `: ${text(found.error)}` : ""}` };
+  const enqueue = record(found.enqueue);
+  if (expected === "error" && enqueue && text(enqueue.result) === "not-enqueued") {
+    const outcome = text(enqueue.outcome);
+    const gtOutput = text(enqueue.gtOutput);
+    const why = `\`gt merge\` enqueued nothing${outcome ? ` (${outcome})` : ""}${gtOutput ? `; its output is in \`${gtOutput}\`` : ""}`;
+    return { result: "refused", problems: [{ kind: "not-enqueued", text: why, draft: null }], comment: "none", error: null };
+  }
   const comment = text(found.comment);
   return { result: expected, problems: problems(found.problems), comment: comment === "posted" || comment === "present" ? comment : "none", error: text(found.error) || null };
 }

@@ -1063,7 +1063,10 @@ A refusal is retried only after the change that can fix it: a new head (a new ac
 the queue draft for a queue-tip conflict (read by its number; a state that cannot be read keeps the
 refusal), at most hourly for other repairable conditions, or the `do-not-merge` label's removal for
 a veto. Previously persisted `local-differs` and `stack-differs` refusals are released on the next
-backstop run because private refs remove their shared-checkout cause. An answer that is not the
+backstop run because private refs remove their shared-checkout cause. An `enqueue.mjs` that ran
+`gt merge` and enqueued nothing (`not-enqueued`, for example "The stack is already merging") is a
+refusal of kind `not-enqueued`, routed once and released only by a new head: an enqueue someone
+else made meanwhile is never taken for the backstop's. An answer that is not the
 script's JSON, or an exit it does not document, never counts as an enqueue. After a restart an
 enqueue whose outcome was not recorded is decided by the Merge activity: an enqueue bullet after
 the saved bullets means it went through, none means it is retried while the pull request is open,
