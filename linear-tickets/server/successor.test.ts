@@ -41,7 +41,7 @@ type FakeAgent = {
   pendingPermissions?: { id: string; kind: string }[];
   lastError?: string | null;
   archivedAt?: string | null;
-} & Pick<ProcessAgent, "provider" | "runtimeInfo" | "persistence">;
+} & Pick<ProcessAgent, "provider" | "runtimeInfo" | "persistence" | "updatedAt">;
 
 type StartOptions = { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string };
 
@@ -234,7 +234,7 @@ function routerHarness(options: {
     settings: { read: async () => settings },
     store,
     stop: async (agentId: string) => { calls.push(`stop ${agentId}`); },
-    ...(options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector) } : {}),
+    ...(options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector), processInspector: options.processInspector } : {}),
   });
   // Connected without attach(): the startup sweep would run alongside the test.
   Object.assign(router, { paseo: daemon.paseo });
@@ -823,6 +823,22 @@ test("native auto-resume and planner restart wait for terminal processes without
     output = "";
     assert.equal(await h.router.resumeNow("s1"), true, "a process wait did not use the hourly resume");
     assert.equal(h.starts.length, 1);
+    assertGateFree(h.gates);
+  } finally { await h.cleanup(); }
+});
+
+test("a planner restart replaces a root agent that shows running without a process, and keeps one whose process works", async () => {
+  let output = `2100185 omp --mode rpc-ui --session ${NATIVE_HANDLE}\n`;
+  const inspect = processInspection("", "/repo/other");
+  inspect.processes = async () => output;
+  // As the TUC-949 planner stood after the 2026-10-05 daemon crash: running, last updated at the crash.
+  const h = routerHarness({ agents: [ompRoot("agent-ghost", { status: "running", updatedAt: "2026-01-01T00:09:44Z" })], processInspector: inspect });
+  try {
+    await h.router.restartFor(ISSUE.id, ISSUE.identifier);
+    assert.deepEqual(h.starts, [], "its process works: a long turn, no restart");
+    output = "";
+    await h.router.restartFor(ISSUE.id, ISSUE.identifier);
+    assert.equal(h.starts.length, 1, "the ghost is no live successor");
     assertGateFree(h.gates);
   } finally { await h.cleanup(); }
 });

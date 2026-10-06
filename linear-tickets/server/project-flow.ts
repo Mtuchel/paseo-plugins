@@ -8,6 +8,7 @@ import { dispatchLabels } from "./dispatch";
 import { refusedByLinear, type LinearService, type ProjectIssue, type TeamIssue } from "./linear";
 import type { Scheduler } from "./scheduler";
 import { needsOwner } from "./presence";
+import { ghostAgents, type ProcessInspector } from "./process-liveness";
 import { PLAN_READY_LABEL } from "./plan-policy";
 import type { PluginSettings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
@@ -53,7 +54,8 @@ const RESTART_GRACE_MS = 10 * 60_000;
 // mapping, a provider that does not come up) needs them, not another try.
 const RESTART_CAP = 3;
 // Agent states that still work on the ticket. A closed agent (idle too long) or one in error never
-// submits a plan, or takes the next step, on its own. Also SessionRouter.liveSuccessorFor's test.
+// submits a plan, or takes the next step, on its own; nor does a ghost, idle or running without a
+// process (see ghostAgents). Also SessionRouter.liveSuccessorFor's test.
 export const LIVE_AGENT: Record<string, true> = { initializing: true, idle: true, running: true };
 
 // `planned`: the tickets in an approved (or closed) plan: those its planner listed. Kept by id, not
@@ -200,6 +202,8 @@ type Deps = {
   // (Launcher.underWay, SessionRouter.threadHolds).
   accountedFor: (issueId: string) => Promise<boolean>;
   now?: () => number;
+  // Provider-process inspection for ghost agents; the tests inject a fake process table.
+  inspect?: ProcessInspector;
 };
 
 export class ProjectFlow {
@@ -219,6 +223,17 @@ export class ProjectFlow {
 
   private now(): number {
     return (this.deps.now ?? Date.now)();
+  }
+
+  // Whether a top-level agent works on the ticket: live by its status and not a ghost. A ghost is
+  // logged, so a restart it causes is explained.
+  private async working(paseo: PaseoApi, issueId: string, identifier: string): Promise<boolean> {
+    const page = await paseo.agents.list({ filter: { labels: { "linear.issueId": issueId }, includeArchived: false }, page: { limit: 20 } });
+    const live = page.entries.map(({ agent }) => agent).filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && LIVE_AGENT[agent.status]);
+    if (!live.length) return false;
+    const ghosts = await ghostAgents(live, this.now(), this.deps.inspect);
+    for (const id of ghosts) console.log(`[linear-tickets] ${identifier}: agent ${id.slice(0, 8)} shows ${live.find((agent) => agent.id === id)?.status} but its OMP process is gone; it counts as stopped`);
+    return live.some((agent) => !ghosts.has(agent.id));
   }
 
   // The labelled projects as of the last poll (`linear.projects-status`).
@@ -367,8 +382,7 @@ export class ProjectFlow {
   private async revive(projectId: string, planner: PlannerRecord, paseo: PaseoApi): Promise<void> {
     const since = planner.startedAt ?? planner.listedAt;
     if (planner.ownerAsked || this.now() - Date.parse(since) < RESTART_GRACE_MS) return;
-    const page = await paseo.agents.list({ filter: { labels: { "linear.issueId": planner.id }, includeArchived: false }, page: { limit: 20 } });
-    if (page.entries.some(({ agent }) => !agent.labels?.["paseo.parent-agent-id"] && LIVE_AGENT[agent.status])) return;
+    if (await this.working(paseo, planner.id, planner.identifier)) return;
     const restarts = planner.restarts ?? 0;
     if (restarts >= RESTART_CAP) {
       await this.deps.linear.comment(planner.id, `**No agent is planning this work order.** Paseo started this planner ${restarts + 1} times, and none of its agents is working on it now (the start failed, or the agent stopped without submitting a plan), so it stops trying. Start an agent for it from the Linear tickets sidebar, or close this ticket to skip the work order: its tickets then count as planned and are handed out without one.`);
@@ -439,8 +453,7 @@ export class ProjectFlow {
       && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished));
     const stalled: ProjectIssue[] = [];
     for (const issue of suspects) {
-      const page = await paseo.agents.list({ filter: { labels: { "linear.issueId": issue.id }, includeArchived: false }, page: { limit: 20 } });
-      if (page.entries.some(({ agent }) => !agent.labels?.["paseo.parent-agent-id"] && LIVE_AGENT[agent.status])) continue;
+      if (await this.working(paseo, issue.id, issue.identifier)) continue;
       if (await this.deps.accountedFor(issue.id)) continue;
       stalled.push(issue);
     }

@@ -21,7 +21,7 @@ import { closeAnswered, type NeedsYouIssues } from "./needs-you";
 import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, questionAnswer, questionsOf } from "./relay";
 import type { Settings } from "./settings";
 import { issueAgents, type TicketStarter } from "./starter";
-import { ticketProcessLiveness, type ProcessAgent } from "./process-liveness";
+import { ghostAgents, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 
 const exec = promisify(execFile);
 const HANDLED_LIMIT = 200;
@@ -298,6 +298,8 @@ type Deps = {
   reloader?: () => Promise<((agentId: string) => Promise<void>) | null>;
   // Exact provider-process inspection, injectable without changing daemon or filesystem state.
   processLiveness?: typeof ticketProcessLiveness;
+  // The process table ghost agents are checked against (see liveSuccessorFor); the tests inject one.
+  processInspector?: ProcessInspector;
   // The clock the webhook fallback windows are measured against.
   now?: () => number;
 };
@@ -1258,11 +1260,13 @@ export class SessionRouter {
   }
 
   // The newest live agent of the ticket (starting, idle or running, see LIVE_AGENT; not a subagent,
-  // not one of `exclude`), from every page of its agents. A closed, errored or crashed one is not.
+  // not one of `exclude`), from every page of its agents. A closed, errored or crashed one is not,
+  // nor is a ghost (idle or running without a process, see ghostAgents): a restart replaces it.
   async liveSuccessorFor(issueId: string, exclude: string[] = []): Promise<{ id: string; title: string | null; cwd: string } | null> {
-    const live = (await issueAgents(this.paseo!, issueId))
-      .filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && !exclude.includes(agent.id) && LIVE_AGENT[agent.status])
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+    const candidates = (await issueAgents(this.paseo!, issueId))
+      .filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && !exclude.includes(agent.id) && LIVE_AGENT[agent.status]);
+    const ghosts = await ghostAgents(candidates, this.clock(), this.deps.processInspector);
+    const live = candidates.filter((agent) => !ghosts.has(agent.id)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
     return live ? { id: live.id, title: live.title ?? null, cwd: live.cwd } : null;
   }
 
