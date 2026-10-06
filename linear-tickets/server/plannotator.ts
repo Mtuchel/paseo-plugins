@@ -183,6 +183,7 @@ export class PlannotatorBridge {
   // of that send-back is not the owner's decision. Cleared by the agent's next review.
   private readonly tierSendBacks = new Set<string>();
   private deletions: Pick<ReviewDeletions, "get" | "forAgent"> | null = null;
+  private deliveryFailure: ((event: OpenedEvent, error: unknown, attempts: number) => Promise<void>) | null = null;
 
   constructor(
     private readonly linear: Linear,
@@ -200,6 +201,10 @@ export class PlannotatorBridge {
 
   useDeletions(deletions: Pick<ReviewDeletions, "get" | "forAgent">): void {
     this.deletions = deletions;
+  }
+
+  observeDeliveryFailures(observer: (event: OpenedEvent, error: unknown, attempts: number) => Promise<void>): void {
+    this.deliveryFailure = observer;
   }
 
   // The browser hook leaves opening the review to the bridge, so an auto-approved plan never opens
@@ -469,6 +474,11 @@ export class PlannotatorBridge {
     } catch (error) {
       const tries = (this.attempts.get(name) ?? 0) + 1;
       console.error(`[linear-tickets] Plannotator event ${name} failed (attempt ${tries}): ${error instanceof Error ? error.message : error}`);
+      if (event?.type === "opened" && this.deliveryFailure) {
+        await this.deliveryFailure(event, error, tries).catch(() => {
+          console.error("[linear-tickets] could not record the plan delivery failure");
+        });
+      }
       if (tries < MAX_ATTEMPTS) { this.attempts.set(name, tries); return; }
       // Given up: the review still opens, so it is not lost.
       if (event?.type === "opened") this.show(event.localUrl);

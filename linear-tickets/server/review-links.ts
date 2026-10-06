@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import { hostname } from "node:os";
@@ -14,9 +15,11 @@ import { closedPage, inboxPage, MANIFEST, planDetails, SERVICE_WORKER, type Inbo
 import { createReviewProxy } from "./review-proxy";
 import { pushSubscription, ReviewPush, type PushSend } from "./review-push";
 import { tailscaleBinary } from "./tailscale";
+import { PipelineHost, type PipelineHost as HostPipeline } from "../shared/plan-pipeline";
 import { AuthenticationError, refusedByLinear } from "./linear";
 import { ReviewDeletions } from "./review-deletions";
 import type { ReviewIssueInfo } from "./review-issue-info";
+import type { PipelineReview } from "./plan-pipeline";
 import { ReviewClosedError, ReviewDecisionAppliedError } from "./sessions";
 
 const exec = promisify(execFile);
@@ -51,6 +54,7 @@ export type ReviewEntry = {
   outcome?: ReviewOutcome;
   closedAt?: string;
   details?: PlanDetails;
+  revision?: string;
 };
 type Registry = Record<string, ReviewEntry>;
 
@@ -88,6 +92,7 @@ export type ReviewLinksOptions = {
   prepareDelete?: (issueId: string) => Promise<void>;
   cleanupIssue?: (issueId: string, agentId: string) => Promise<void>;
   deletions?: ReviewDeletions;
+  pipeline?: (open: readonly PipelineReview[], decided: readonly PipelineReview[]) => Promise<HostPipeline>;
   // Web Push: where its keys and subscriptions are kept, and how a message is sent (tests).
   pushFile?: string;
   sendPush?: PushSend;
@@ -160,7 +165,7 @@ const PeerRow = z.object({
   deleteable: z.boolean().optional(),
   issueUrl: text(2_000).regex(/^https:\/\/linear\.app\//).optional(),
 });
-const PeerInbox = z.object({ host: text(100), open: z.array(z.unknown()), decided: z.array(z.unknown()) });
+const PeerInbox = z.object({ host: text(100), open: z.array(z.unknown()), decided: z.array(z.unknown()), pipeline: z.unknown().optional() });
 const DecisionRequest = z.object({ approve: z.boolean(), feedback: z.string().optional() });
 const RecheckRequest = z.object({}).strict();
 const DeleteRequest = z.object({ identifier: z.string() }).strict();
@@ -230,6 +235,7 @@ export class ReviewLinks {
   private readonly push: ReviewPush;
   private readonly bundles = new ReviewBundles();
   private readonly routes: ActivationRoute | null;
+  private readonly pipelineSource: ReviewLinksOptions["pipeline"];
 
   constructor(options: ReviewLinksOptions = {}) {
     this.port = options.port ?? REVIEW_PORT;
@@ -255,6 +261,7 @@ export class ReviewLinks {
     this.deletions = options.deletions ?? new ReviewDeletions(join(dirname(this.file), "deletions.json"));
     this.push = new ReviewPush(options.pushFile ?? join(dirname(this.file), "push.json"), options.sendPush);
     this.routes = options.routes ?? null;
+    this.pipelineSource = options.pipeline;
   }
 
   // The port actually listened on (differs from the configured one when that is 0).
@@ -397,6 +404,7 @@ export class ReviewLinks {
       const entry = registry[localUrl];
       if (!entry) return;
       entry.details = { ...planDetails(plan, entry.identifier), ...(judgement ? { reasons: judgement.reasons, autoApproved: judgement.approved } : {}) };
+      entry.revision = createHash("sha256").update(plan).digest("hex");
     });
   }
 
@@ -407,6 +415,7 @@ export class ReviewLinks {
       const entry = latest(registry, agentId);
       if (!entry) return;
       entry.details = { ...planDetails(plan, entry.identifier), reasons: judgement.reasons, autoApproved: judgement.approved };
+      entry.revision = createHash("sha256").update(plan).digest("hex");
     });
   }
 
@@ -661,14 +670,20 @@ export class ReviewLinks {
         const response = await fetch(`${peer}/api/inbox`, { signal: AbortSignal.timeout(PEER_TIMEOUT_MS) });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const answer = PeerInbox.parse(await response.json());
-        return { peer, host: answer.host, open: peerRows(answer.open, answer.host), decided: peerRows(answer.decided, answer.host) };
-      } catch { return { peer, host: peerName(peer), unreachable: true as const }; }
+        const status = PipelineHost.safeParse(answer.pipeline);
+        const pipeline: HostPipeline = status.success
+          ? { ...status.data, host: answer.host, rows: status.data.rows.map((row) => ({ ...row, host: answer.host })) }
+          : { host: answer.host, checkedAt: null, lastArrivalAt: null, rows: [], error: "Plan monitoring is unavailable on this host." };
+        return { peer, host: answer.host, open: peerRows(answer.open, answer.host), decided: peerRows(answer.decided, answer.host), pipeline };
+      } catch { return { peer, host: peerName(peer), unreachable: true as const, pipeline: { host: peerName(peer), checkedAt: null, lastArrivalAt: null, rows: [], error: "Host unreachable; plan progress is unknown." } satisfies HostPipeline }; }
     }));
     const open = [...own.open];
     const decided = [...own.decided];
     const unreachable: string[] = [];
+    const pipeline = [own.pipeline];
     this.peerOf.clear();
     for (const answer of answers) {
+      pipeline.push(answer.pipeline);
       if ("unreachable" in answer) { unreachable.push(answer.host); continue; }
       for (const row of [...answer.open, ...answer.decided]) this.peerOf.set(row.agentId, answer.peer);
       open.push(...answer.open);
@@ -677,12 +692,12 @@ export class ReviewLinks {
     open.sort((a, b) => b.since.localeCompare(a.since));
     decided.sort((a, b) => (b.decidedAt ?? b.since).localeCompare(a.decidedAt ?? a.since));
     const hosts = [this.host, ...answers.map((answer) => answer.host)];
-    return { open, decided: decided.slice(0, RECENT_DECISIONS), unreachable, hosts, push: !!this.origin };
+    return { open, decided: decided.slice(0, RECENT_DECISIONS), unreachable, hosts, push: !!this.origin, pipeline };
   }
 
   // This host's waiting and recently decided reviews as inbox rows, with absolute links when the
   // inbox is published (a peer's inbox links back here).
-  private async rows(): Promise<{ open: InboxRow[]; decided: InboxRow[] }> {
+  private async rows(): Promise<{ open: InboxRow[]; decided: InboxRow[]; pipeline: HostPipeline }> {
     const { open, decided } = await this.inbox();
     const workspace = this.linearWorkspace ? await this.linearWorkspace().catch(() => null) : null;
     const row = (entry: ReviewEntry): InboxRow => ({
@@ -703,10 +718,24 @@ export class ReviewLinks {
       const deletion = await this.deletions.forAgent(entry.agentId);
       return { ...row(entry), ...(info ? { areas: info.areas } : {}), deleteable: Boolean((verified || deletion) && this.deleteIssue && this.cleanupIssue) };
     };
-    return {
+    const result = {
       open: await Promise.all(open.map(enrich)),
       decided: await Promise.all(decided.map(async (entry) => ({ ...await enrich(entry), outcome: outcomeText(entry), decidedAt: entry.closedAt ?? entry.openedAt }))),
     };
+    let pipeline: HostPipeline = { host: this.host, checkedAt: null, lastArrivalAt: null, rows: [], error: "Plan monitoring is not connected." };
+    if (this.pipelineSource) {
+      try {
+        const observed = (rows: readonly InboxRow[], entries: readonly ReviewEntry[]): PipelineReview[] => rows.map((row) => {
+          const entry = entries.find((entry) => entry.agentId === row.agentId)!;
+          return { ...row, revision: entry.revision, autoApproved: entry.details?.autoApproved };
+        });
+        const status = PipelineHost.parse(await this.pipelineSource(observed(result.open, open), observed(result.decided, decided)));
+        pipeline = { ...status, host: this.host, rows: status.rows.map((row) => ({ ...row, host: this.host })) };
+      } catch {
+        pipeline.error = "Plan monitoring failed; progress is unknown.";
+      }
+    }
+    return { ...result, pipeline };
   }
 
   // Only each agent's latest review counts. Waiting means undecided, reachable from the tailnet
@@ -720,11 +749,15 @@ export class ReviewLinks {
     const candidates = current.filter((entry, index) => !deletionStates[index] && !entry.closedAt && !entry.outcome && entry.remoteUrl);
     const alive = await Promise.all(candidates.map((entry) => this.alive(entry.localUrl)));
     const open = [...retrying, ...candidates.filter((_, index) => alive[index])].sort((a, b) => waitingSince(b).localeCompare(waitingSince(a)));
-    const missing = open.filter((entry) => !entry.details && !retrying.includes(entry));
+    const missing = open.filter((entry) => (!entry.details || !entry.revision) && !retrying.includes(entry));
     const plans = await Promise.all(missing.map((entry) => this.fetchPlan(entry.localUrl).catch(() => "")));
     if (plans.some((plan) => plan.trim())) {
       await this.change(() => {
-        missing.forEach((entry, index) => { if (plans[index].trim()) entry.details = planDetails(plans[index], entry.identifier); });
+        missing.forEach((entry, index) => {
+          if (!plans[index].trim()) return;
+          entry.details ??= planDetails(plans[index], entry.identifier);
+          entry.revision = createHash("sha256").update(plans[index]).digest("hex");
+        });
       });
     }
     const decided = current.filter((entry) => !retrying.includes(entry) && (entry.closedAt || entry.outcome))

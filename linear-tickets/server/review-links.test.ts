@@ -213,7 +213,7 @@ test("the inbox lists only reviews the owner can open now, newest first, and the
   });
 });
 
-test("waiting reviews show when the owner got them, grouped by the owner's calendar day, with the oldest age in the header", async () => {
+test("waiting review age uses the owner's time zone and restored reviews keep their original arrival", async () => {
   await withLinks(async (links, get, live, _unserved, _plans, _routed, setNow) => {
     live.add(50_001).add(50_002).add(50_004);
     // 23:30 UTC on 1 Jan is already 2 Jan in Berlin; 22:30 UTC is still 1 Jan there.
@@ -229,8 +229,6 @@ test("waiting reviews show when the owner got them, grouped by the owner's calen
     setNow("2026-01-02T09:00:00Z");
 
     const page = await (await get("/")).text();
-    const order = [...page.matchAll(/<h3>([^<]+)<\/h3>|data-agent="([^"]+)"/g)].map((match) => match[1] ?? match[2]);
-    assert.deepEqual(order, ["Today", "agent-1", "Yesterday", "agent-2", "Mon, 29 Dec 2025", "agent-3"]);
     assert.match(page, /<span class="when">[^]*?>00:30<\/time> · 9 h<\/span>/, "opened 00:30 Berlin time, waiting 9 h");
     assert.match(page, /<span class="when stale">[^]*?>10:00<\/time> · 4 d<\/span>/, "a review waiting over 12 h is highlighted");
     assert.match(page, /3 waiting · oldest 4 d · updated 10:00/);

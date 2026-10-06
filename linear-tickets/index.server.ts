@@ -51,6 +51,7 @@ import { DrainRouter } from "./server/drain";
 import { resumeGuard } from "./server/activation-guard";
 import { ReviewDeletions } from "./server/review-deletions";
 import { ReviewIssueInfos } from "./server/review-issue-info";
+import { PlanPipeline } from "./server/plan-pipeline";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -124,6 +125,9 @@ export default function contribute(server: PluginServerContext) {
     },
   });
   const hostName = hostname().replace(/\.local$/, "");
+  const pipeline = new PlanPipeline({ host: hostName, sessions: () => sessionStore.all(), parked: () => parking.plans.all() });
+  let pipelineServerId: string | null = null;
+  void daemonServerId().then((id) => { pipelineServerId = id; });
   const drain = new DrainRouter({ settings, paseo: () => attachedPaseo, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName,
     ticketState: async (issueId) => { const state = await linear.issueState(issueId).catch(() => null); return state ? { statusType: state.statusType } : null; } });
   const intake = new ActivationIntake({ settings, paseo: () => attachedPaseo, linear: () => linear, starter: () => starter, launcher: () => launcher, sessions: () => sessions, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName });
@@ -165,6 +169,13 @@ export default function contribute(server: PluginServerContext) {
     peers: async () => (await settings.read()).reviewPeers,
     decide: decideReview,
     linearWorkspace: () => linear.workspaceUrl(),
+    pipeline: async (open, decided) => {
+      const snapshot = await pipeline.snapshot(open, decided);
+      if (pipelineServerId) for (const row of snapshot.rows) {
+        if (row.agentId) row.agentUrl = paseoAgentUrl(pipelineServerId, row.agentId);
+      }
+      return snapshot;
+    },
     // Draining a host: /activation, /activation/claims, /activation/deliver and
     // /activation/health ride this tailnet service (activation-endpoints.ts).
     routes: activationEndpoints({ settings, intake, drain }),
@@ -207,6 +218,7 @@ export default function contribute(server: PluginServerContext) {
   };
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks, undefined, undefined, parking);
   plannotator.useDeletions(deletions);
+  plannotator.observeDeliveryFailures((event, error, attempts) => pipeline.recordDeliveryError(event, error, attempts));
   plannotator.onProjectPlan(projects);
   plannotator.useFollowUps(followUps);
   plannotator.recordDecisions(decisions);
@@ -282,7 +294,7 @@ export default function contribute(server: PluginServerContext) {
   plannotator.useTiers({ store: tiers, apply: (agentId) => modelGuard.apply(agentId), replan: (agent, message) => planRequests.send(agent, message) });
   // The central Plannotator host starts once, after the hook it runs for each parked review exists.
   const startHost = async () => { if (await plannotatorHook() && !stopped) await plannotatorHost.start(); };
-  const attach = (paseo: PaseoApi) => { const first = !attached; attached = true; attachedPaseo = paseo; if (!stopped) { void reviewLinks.start(); drain.start(); intake.start(); if (first) void startHost(); } dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); void startAgent(); };
+  const attach = (paseo: PaseoApi) => { const first = !attached; attached = true; attachedPaseo = paseo; if (!stopped) { void reviewLinks.start(); drain.start(); intake.start(); if (first) void startHost(); } pipeline.attach(paseo); dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); void startAgent(); };
   const cacheIdentity = async () => {
     const connection = await credentials.read();
     return connection.key ? cacheScope(connection.key) : null;
@@ -406,5 +418,5 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); void closeInternalDaemon(); };
+  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); pipeline.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); void closeInternalDaemon(); };
 }
