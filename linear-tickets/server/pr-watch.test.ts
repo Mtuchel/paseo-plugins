@@ -1,20 +1,79 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import type { HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
-import { activityBullets, ConditionalPullView, GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft } from "./pr-watch";
+import { activityBullets, ConditionalPullView, githubReader, GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft } from "./pr-watch";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, marker, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
 import { GitHubBudget, GitHubPausedError, withPriority } from "./rate-budget";
 import { SessionRouter, type Succession } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { githubRouted } from "./github-cli";
+import { ghGet } from "./pull-requests";
 
 const settings = { dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true } } as unknown as PluginSettings;
 const OWNER = "https://linear.app/ws/profiles/me";
 const PR = "https://github.com/tuchel-sohn/tuchel-platform/pull/419";
 const graphiteLink = (number: number) => `[#${number}](https://app.graphite.com/github/pr/tuchel-sohn/tuchel-platform/${number})`;
+
+async function failingGh(t: TestContext, source: string): Promise<void> {
+  const home = await mkdtemp(join(tmpdir(), "paseo-gh-failure-"));
+  const cli = join(home, "gh");
+  const previous = process.env.LINEAR_TICKETS_GH;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.LINEAR_TICKETS_GH;
+    else process.env.LINEAR_TICKETS_GH = previous;
+    await rm(home, { recursive: true, force: true });
+  });
+  await writeFile(cli, `#!${process.execPath}\n${source}\n`);
+  await chmod(cli, 0o700);
+  process.env.LINEAR_TICKETS_GH = cli;
+}
+
+test("failed GitHub comment writes retain diagnostics without leaking the body to logs", async (t) => {
+  for (const [status, code, reason, kind] of [
+    [422, 1, "Validation failed", Error],
+    [429, 1, "rate limit exceeded", GitHubRateLimitedError],
+    [404, 1, "Could not resolve to a PullRequest", PullRequestNotFoundError],
+    [503, 75, "GitHub read budgets exhausted", GitHubRateLimitedError],
+  ] as const) {
+    await t.test(`HTTP ${status}, exit ${code}`, async (t) => {
+      await failingGh(t, `
+const body = process.argv.slice(2).find(arg => arg.startsWith("body=")).slice(5);
+process.stdout.write("response metadata");
+process.stderr.write(body + "\\n" + JSON.stringify({ body }) + "\\n${reason} (HTTP ${status})\\n");
+process.exitCode = ${code};`);
+      const sentinels = ["PRIVATE_COMMENT_FIRST_LINE", "PRIVATE_COMMENT_SECOND_LINE"];
+      await assert.rejects(() => githubReader.commentOnPull("o/r", 419, sentinels.join("\n")), (error: unknown) => {
+        assert.ok(error instanceof kind);
+        assert.match(error.message, new RegExp(`HTTP ${status}`));
+        assert.match(error.message, new RegExp(`exit ${code}`));
+        assert.ok("stderr" in error && "stdout" in error && "code" in error && "signal" in error);
+        assert.equal(error.stdout, "response metadata");
+        assert.equal(error.code, code);
+        assert.equal(error.signal, null);
+        const loggable = `${error}\n${error.stack}\n${error.stderr}`;
+        for (const sentinel of sentinels) assert.ok(!loggable.includes(sentinel), "no body line reaches a loggable diagnostic");
+        assert.ok(!loggable.includes("body="), "the raw command line is not retained");
+        return true;
+      });
+    });
+  }
+});
+
+test("a failed gh exit carrying HTTP 304 still serves conditional REST headers", async (t) => {
+  await failingGh(t, `
+process.stdout.write('HTTP/2.0 304 Not Modified\\r\\netag: "cached"\\r\\nx-ratelimit-remaining: 4900\\r\\n\\r\\n');
+process.stderr.write("gh: Not Modified (HTTP 304)\\n");
+process.exitCode = 1;`);
+  const response = await ghGet("repos/o/r/issues/419", '"cached"');
+  assert.equal(response.status, 304);
+  assert.equal(response.headers.get("etag"), '"cached"');
+  assert.equal(response.headers.get("x-ratelimit-remaining"), "4900");
+  assert.equal(response.body, "");
+});
 
 // Graphite's Merge activity comment; each bullet gets its own minute, as Graphite stamps them.
 function activity(...events: string[]): string {
@@ -2221,6 +2280,30 @@ test("the shared REST reserve pauses the first look before it sends anything", a
   assert.deepEqual(rest.calls, [], "a background poll sends nothing below the reserve");
   await withPriority("interactive", () => reader.view(PR));
   assert.equal(rest.calls.length, 5, "an interactive caller still reads");
+});
+
+test("a custom unguarded CLI preserves the single-login reserve despite installed router markers", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-gh-override-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await mkdir(join(home, ".local", "bin"), { recursive: true });
+  await mkdir(join(home, ".paseo", "bin"), { recursive: true });
+  await writeFile(join(home, ".local", "bin", "gh"), "");
+  await writeFile(join(home, ".paseo", "bin", "github-router.mjs"), "");
+  const env = { LINEAR_TICKETS_GH: "/custom/unguarded-gh" };
+  const rest = restFake(restSeed(probeState()));
+  const budget = new GitHubBudget(() => Date.now(), 300, githubRouted(env, home));
+  budget.record(limitHeaders(100));
+  const reader = new ConditionalPullView({ get: rest.get, budget, read: async () => OPEN_PR });
+  await assert.rejects(() => withPriority("background", () => reader.view(PR)), (error: unknown) => error instanceof GitHubPausedError && error.reason === "budget");
+  assert.deepEqual(rest.calls, [], "the installed but bypassed router cannot disable the reserve");
+  await withPriority("interactive", () => reader.view(PR));
+  assert.equal(rest.calls.length, 5, "interactive reads can use the reserved quota");
+
+  const optedIn = new GitHubBudget(() => Date.now(), 300, githubRouted({ ...env, LINEAR_TICKETS_GITHUB_ROUTED: "1" }, home));
+  optedIn.record(limitHeaders(100));
+  const routed = new ConditionalPullView({ get: rest.get, budget: optedIn, read: async () => OPEN_PR });
+  await withPriority("background", () => routed.view(PR));
+  assert.equal(rest.calls.length, 10, "an explicitly routed override delegates quota admission");
 });
 
 test("with the router installed one account's low quota cannot pause the next look, and the router's refusal passes through", async () => {

@@ -5,6 +5,8 @@ import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { botGitInvocation } from "./github-git.mjs";
+import { resourceFor, runNativeApi, watchRun } from "./github-api.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 const BOT = "bot112112121";
@@ -102,16 +104,16 @@ export function ghOperation(args) {
   const local = args.includes("--help") || args.includes("--version") || command === "help";
   let read = false, resource = "graphql";
   if (command === "api") {
-    resource = action === "graphql" ? "graphql" : "core";
+    resource = resourceFor(action ?? "/");
     // Unknown/file/stdin GraphQL documents are writes, never balanced across identities.
-    read = action === "graphql"
+    read = resource === "graphql"
       ? !input && !query.startsWith("@") && /^(?:\s|#[^\n]*\n)*(?:query\b|\{)/.test(query) && !/\bmutation\b/i.test(query)
       : !input && (!fields || method.toUpperCase() === "GET") && (!method || method.toUpperCase() === "GET");
   } else if (command === "pr") read = ["view", "list", "status", "checks", "diff"].includes(action);
   else if (command === "issue") { read = ["view", "list", "status"].includes(action); resource = "graphql"; }
   else if (command === "repo") read = ["view", "list"].includes(action);
   else if (command === "run") { read = ["view", "list", "watch"].includes(action); resource = "core"; }
-  else if (command === "search") { read = true; resource = "search"; }
+  else if (command === "search") { read = true; resource = action === "code" ? "code_search" : "search"; }
   // Authentication/token operations pin to bot, including helpers used by child commands.
   return { command, action, read, resource, local, json, interval, cache, words };
 }
@@ -125,8 +127,9 @@ export function accountEnvironment(account, home, env = process.env) {
   return next;
 }
 
-function probe(realGh, account, resource, home, env) {
+function probe(realGh, account, resource, home, env, token) {
   const e = accountEnvironment(account, home, env);
+  if (token) e.GH_TOKEN = token;
   let result;
   if (resource === "graphql") {
     result = spawnSync(realGh, ["api", "graphql", "-f", "query={rateLimit{limit remaining resetAt}}"], { env: e, encoding: "utf8", timeout: 3_000 });
@@ -136,7 +139,8 @@ function probe(realGh, account, resource, home, env) {
     return { remaining: budget.remaining, resetAt: Date.parse(budget.resetAt), at: Date.now() };
   }
   // /rate_limit can report a different bucket. Use actual authenticated response headers.
-  const args = resource === "search" ? ["api", "-i", "search/repositories?q=repo:cli/cli&per_page=1"] : ["api", "-i", "user"];
+  const path = resource === "search" ? "search/repositories?q=repo:cli/cli&per_page=1" : resource === "code_search" ? "search/code?q=repo:cli/cli+filename:README.md&per_page=1" : "user";
+  const args = ["api", "-i", path];
   result = spawnSync(realGh, args, { env: e, encoding: "utf8", timeout: 3_000 });
   const headers = new Map(result.stdout?.split(/\r?\n/).map((line) => {
     const colon = line.indexOf(":");
@@ -156,7 +160,7 @@ function save(path, data) {
 }
 
 export function pickRead(budgets, resource, now = Date.now()) {
-  const reserve = (account) => resource === "search" ? (account === "bot" ? 5 : 1) : account === "bot" ? BOT_RESERVE : OWNER_RESERVE;
+  const reserve = (account) => ["search", "code_search"].includes(resource) ? (account === "bot" ? 5 : 1) : account === "bot" ? BOT_RESERVE : OWNER_RESERVE;
   const candidates = ["bot", "owner"].filter((a) => budgets[a]?.resetAt > now && budgets[a].remaining > reserve(a));
   candidates.sort((a, b) => (budgets[b].remaining - reserve(b)) - (budgets[a].remaining - reserve(a)));
   return candidates[0] ?? null;
@@ -186,11 +190,61 @@ async function withLock(home, action) {
 function loadText(path) { try { return readFileSync(path, "utf8"); } catch { return ""; } }
 
 async function verifyBot(realGh, home, env) {
+  const authentication = spawnSync(realGh, ["auth", "token", "--hostname", "github.com"], { env: accountEnvironment("bot", home, env), encoding: "utf8", timeout: 3_000 });
+  if (authentication.status !== 0 || !authentication.stdout.trim()) throw new Error("GitHub router: bot credentials unavailable");
+  const token = authentication.stdout.trim();
+  const digest = createHash("sha256").update(token).digest("hex");
   await withLock(home, (path) => {
     const state = load(path);
     const core = state.core ??= {};
-    if (core.bot?.identity === BOT && Date.now() - core.bot.at < TTL) return;
-    core.bot = probe(realGh, "bot", "core", home, env);
+    if (core.bot?.identity === BOT && state.botTokenDigest === digest && Date.now() - core.bot.at < TTL) return;
+    core.bot = probe(realGh, "bot", "core", home, env, token);
+    state.botTokenDigest = digest;
+    save(path, state);
+  });
+  return token;
+}
+
+function pendingWriteCost(state, resource) {
+  let cost = 0;
+  for (const [pid, entry] of Object.entries(state.pendingWrites ?? {})) {
+    try { process.kill(Number(pid), 0); cost += entry[resource] ?? 0; }
+    catch (error) { if (error.code === "ESRCH") delete state.pendingWrites[pid]; }
+  }
+  return cost;
+}
+
+async function reserveWrite(home, operation) {
+  await withLock(home, (path) => {
+    const state = load(path);
+    const pending = state.pendingWrites ??= {};
+    const cost = operation.command === "api" ? 1 : 10;
+    const resources = operation.command === "api" ? [operation.resource] : ["core", "graphql"];
+    const entry = pending[process.pid] ??= {};
+    for (const resource of resources) entry[resource] = (entry[resource] ?? 0) + cost;
+    save(path, state);
+  });
+}
+
+async function finishWrite(home) {
+  await withLock(home, (path) => {
+    const state = load(path);
+    const entry = state.pendingWrites?.[process.pid];
+    for (const resource of Object.keys(entry ?? {})) if (state[resource]?.bot) state[resource].bot.at = 0;
+    if (entry) delete state.pendingWrites[process.pid];
+    save(path, state);
+  });
+}
+
+async function observe(home, account, resource, headers) {
+  const remaining = Number(headers.get("x-ratelimit-remaining"));
+  const resetAt = Number(headers.get("x-ratelimit-reset")) * 1000;
+  if (!headers.has("x-ratelimit-remaining") || !Number.isFinite(remaining) || !Number.isFinite(resetAt)) return;
+  await withLock(home, (path) => {
+    const state = load(path);
+    const pool = state[resource] ??= {};
+    const previous = pool[account];
+    pool[account] = { ...previous, remaining: previous?.resetAt === resetAt ? Math.min(previous.remaining, remaining) : remaining, resetAt, at: Date.now() };
     save(path, state);
   });
 }
@@ -205,7 +259,9 @@ async function readAccount(realGh, operation, home, env, agent) {
       try { budgets[account] = probe(realGh, account, operation.resource, home, env); }
       catch { budgets[account] = { remaining: 0, resetAt: now + TTL, at: now }; }
     }
-    const chosen = pickRead(budgets, operation.resource, now);
+    const debt = pendingWriteCost(state, operation.resource);
+    const effective = { ...budgets, ...(budgets.bot ? { bot: { ...budgets.bot, remaining: budgets.bot.remaining - debt } } : {}) };
+    const chosen = pickRead(effective, operation.resource, now);
     state[operation.resource] = budgets;
     const allowance = state.agents ??= {};
     if (operation.resource === "graphql" && agent && !["daemon", "plugin"].includes(agent)) {
@@ -226,28 +282,12 @@ async function readAccount(realGh, operation, home, env, agent) {
   });
 }
 
-function addGitConfig(env, entries) {
-  let count = Number(env.GIT_CONFIG_COUNT || 0);
-  for (const [key, value] of entries) {
-    env[`GIT_CONFIG_KEY_${count}`] = key;
-    env[`GIT_CONFIG_VALUE_${count++}`] = value;
-  }
-  env.GIT_CONFIG_COUNT = String(count);
+function guardedHelper() {
+  return `${JSON.stringify(process.execPath)} ${JSON.stringify(SELF)} git-credential`;
 }
 
 export function botGitEnvironment(home, realGh, env) {
-  const next = accountEnvironment("bot", home, env);
-  // Per-process configuration, not global: SSH GitHub URLs cannot use the owner's SSH key.
-  addGitConfig(next, [
-    ["url.https://github.com/.insteadOf", "git@github.com:"],
-    ["url.https://github.com/.insteadOf", "ssh://git@github.com/"],
-    ["http.https://github.com/.extraHeader", ""],
-    ["credential.https://github.com.helper", ""],
-    ["credential.https://github.com.helper", `!${JSON.stringify(realGh)} auth git-credential`],
-    ["credential.https://github.com.username", BOT],
-  ]);
-  next.GIT_TERMINAL_PROMPT = "0";
-  return next;
+  return botGitInvocation(findBinary("git", env), realGh, home, [], accountEnvironment("bot", home, env), guardedHelper()).env;
 }
 
 function record(home, agent, account, mode, operation) {
@@ -269,10 +309,9 @@ export async function route(mode, args, env = process.env) {
   if (mode === "gh" && operation.command === "auth" && ["login", "logout", "switch", "setup-git", "refresh"].includes(operation.action)) {
     throw new Error("GitHub router: automated commands cannot modify authentication configuration");
   }
-  if (mode === "gh" && !operation.read) await verifyBot(real, home, childEnv);
+  const writeToken = mode === "gh" && !operation.read ? await verifyBot(real, home, childEnv) : undefined;
   if (mode === "git") {
-    // Local Git commands do not need credentials. These overrides also cover aliases/submodules.
-    return { real, args, env: botGitEnvironment(home, findBinary("gh", env), childEnv) };
+    return { real, ...botGitInvocation(real, findBinary("gh", env), home, args, accountEnvironment("bot", home, childEnv), guardedHelper()) };
   }
   if (mode === "gt") {
     const directory = join(home, "graphite-bot");
@@ -288,7 +327,7 @@ export async function route(mode, args, env = process.env) {
       const identity = load(join(directory, "identity.json"));
       if (identity.login !== BOT || identity.digest !== digest || Date.now() - identity.at > 600_000) {
         const result = spawnSync(real, ["auth", "--no-interactive"], { env: next, encoding: "utf8", timeout: 10_000 });
-        if (result.status !== 0 || !new RegExp(`Authenticated as:\\\\s*${BOT}(?:\\\\s|$)`).test(result.stdout)) {
+        if (result.status !== 0 || !/Authenticated as:\s*bot112112121(?:\s|$)/.test(result.stdout)) {
           throw new Error("GitHub router: Graphite token is not authenticated as bot112112121; refusing owner identity");
         }
         save(join(directory, "identity.json"), { login: BOT, digest, at: Date.now() });
@@ -306,26 +345,64 @@ export async function route(mode, args, env = process.env) {
   const next = accountEnvironment(account, home, childEnv);
   // gh commands invoking Git inherit bot Git authentication even when a read used the owner.
   if (!operation.read) Object.assign(next, botGitEnvironment(home, real, childEnv));
+  if (writeToken) next.GH_TOKEN = writeToken;
+  const write = !operation.read && operation.command !== "auth";
+  if (write) await reserveWrite(home, operation);
   let routedArgs = args;
   if (operation.read && operation.command === "api" && operation.resource === "core" && !operation.cache) {
     const index = args.indexOf("api");
     routedArgs = [...args.slice(0, index + 1), "--cache", "30s", ...args.slice(index + 1)];
   }
   record(home, who.agent, account, mode, `${operation.command ?? "unknown"} ${operation.action ?? ""}`.trim().replace(/\?.*$/, ""));
-  return { real, args: routedArgs, env: next };
+  return { real, args: routedArgs, env: next, account, operation, who, home, write };
+}
+
+async function gitCredential(args) {
+  if (args[0] !== "get") return;
+  let input = "";
+  for await (const chunk of process.stdin) input += chunk;
+  const fields = Object.fromEntries(input.split("\n").filter(Boolean).map((line) => {
+    const index = line.indexOf("="); return [line.slice(0, index), line.slice(index + 1)];
+  }));
+  if (fields.protocol !== "https" || fields.host !== "github.com") throw new Error("GitHub router: guarded credential helper only supports github.com HTTPS");
+  const home = process.env.PASEO_HOME || join(homedir(), ".paseo");
+  const realGh = findBinary("gh");
+  const token = await verifyBot(realGh, home, process.env);
+  process.stdout.write(`username=${BOT}\npassword=${token}\n\n`);
 }
 
 async function main() {
   let mode = basename(process.argv[1]);
   let args = process.argv.slice(2);
   if (mode === "gh-agent-guard") mode = "gh";
-  if (mode === "github-router.mjs") { mode = args.shift(); }
+  if (mode === "github-router.mjs") mode = args.shift();
+  if (mode === "git-credential") return gitCredential(args);
   if (!["gh", "git", "gt"].includes(mode)) throw new Error("GitHub router: expected gh, git or gt");
   const invocation = await route(mode, args);
+  if (mode === "gh" && invocation.operation?.read && (invocation.operation.command === "api" || invocation.operation.command === "run" && invocation.operation.action === "watch")) {
+    const deps = {
+      realGh: invocation.real, realGit: findBinary("git"), env: invocation.env,
+      firstAccount: invocation.account, operation: invocation.operation,
+      home: invocation.home,
+      cacheMs: (() => {
+        const index = invocation.args.indexOf("--cache");
+        const value = index >= 0 ? invocation.args[index + 1] : invocation.args.find((a) => a.startsWith("--cache="))?.slice(8);
+        return [...(value ?? "").matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h)/g)].reduce((total, match) => total + Number(match[1]) * ({ ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[match[2]]), 0);
+      })(),
+      choose: (resource) => readAccount(invocation.real, { ...invocation.operation, resource }, invocation.home, invocation.env, invocation.who.agent),
+      environment: (account) => accountEnvironment(account, invocation.home, invocation.env),
+      observe: (account, resource, headers) => observe(invocation.home, account, resource, headers),
+      record: (account, resource) => record(invocation.home, invocation.who.agent, account, "gh-api", resource),
+    };
+    const result = invocation.operation.command === "api" ? await runNativeApi(invocation, deps) : { code: await watchRun(args, deps) };
+    process.exitCode = result.code ?? 1;
+    return;
+  }
   const child = spawn(invocation.real, invocation.args, { env: invocation.env, stdio: "inherit" });
   for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => child.kill(signal));
   child.on("error", (error) => { console.error(error.message); process.exitCode = 127; });
-  child.on("exit", (code, signal) => {
+  child.on("exit", async (code, signal) => {
+    if (invocation.write) await finishWrite(invocation.home);
     if (signal) { process.removeAllListeners(signal); process.kill(process.pid, signal); }
     else process.exitCode = code ?? 1;
   });

@@ -52,6 +52,13 @@ Graphite authentication. Agent attribution is recovered from ancestor processes
 when a Python kernel loses `PASEO_AGENT_ID`; the per-agent 60 GraphQL reads/hour
 limit and existing restrictions on check polling apply on either account.
 
+Native `gh api` pagination admits and records each page separately, including
+GraphQL cursor pages, without changing the CLI's `--jq`, `--slurp` or template
+formatting. Cached REST responses do not spend another request. Search and code
+search use their own quotas, not the core REST allowance. Write credentials are
+verified against the bot identity and the exact verified token is used, so a
+credential rotation cannot silently publish under the owner's account.
+
 ### Host setup
 
 Before installing, authenticate GitHub CLI as the bot in `$PASEO_HOME/gh-bot`

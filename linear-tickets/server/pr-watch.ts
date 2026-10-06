@@ -186,21 +186,40 @@ export class PullRequestNotFoundError extends Error {
 // `at`: Graphite's time stamp as written ("Sep 29, 7:26 AM UTC"); `event`: the text after it.
 type Bullet = { text: string; event: string; at: string | null; kind: "queued" | "running" | "merged" | "dropped"; draft: number | null };
 
-// The routed gh (the account router's shim, or the PATH gh on a host without it): see
-// github-cli.ts. `parse` reads gh's output; JSON by default.
+// The routed gh, explicit override, or portable gh fallback: see github-cli.ts.
+// `parse` reads gh's output; JSON by default.
 export async function ghJson<T>(args: string[], parse: (stdout: string) => T = (stdout) => JSON.parse(stdout) as T): Promise<T> {
   try {
     const { stdout } = await exec(githubCli(), args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
     return parse(stdout);
   } catch (error) {
     const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr) : "";
+    const stdout = error && typeof error === "object" && "stdout" in error ? String(error.stdout) : "";
     const code = error && typeof error === "object" && "code" in error ? error.code : null;
-    // gh reports GitHub's throttling (HTTP 429, primary or secondary rate limit); the account
-    // router reports both accounts' read budgets exhausted with exit 75 and says when they
-    // resume. Either way the caller stops its round and comes back at its own cadence.
-    if (code === 75 || /HTTP 429|rate limit|budgets? exhausted/i.test(stderr)) throw new GitHubRateLimitedError(`GitHub is throttling gh: ${stderr.trim().split("\n")[0] || `exit ${String(code)}`}`);
-    if (/Could not resolve to a PullRequest/i.test(stderr)) throw new PullRequestNotFoundError(stderr.trim().split("\n")[0]);
-    throw error;
+    const signal = error && typeof error === "object" && "signal" in error ? error.signal : null;
+    // Never log execFile's message: it includes the command and every argument, including
+    // comment bodies. Rebuild diagnostics from process metadata, not arbitrary CLI text.
+    const status = /\bHTTP(?:\/[\d.]+)?[ :]+([1-5]\d{2})\b/.exec(stderr)?.[1]
+      ?? /^HTTP\/\S+ ([1-5]\d{2})\b/.exec(stdout)?.[1];
+    const exit = typeof code === "number" || (typeof code === "string" && /^[A-Z_]+$/.test(code)) ? `exit ${code}` : "";
+    const stopped = typeof signal === "string" && /^SIG[A-Z0-9]+$/.test(signal) ? `signal ${signal}` : "";
+    const diagnostics = [exit, stopped, status ? `HTTP ${status}` : ""].filter(Boolean).join(", ");
+    const operation = args[0] === "api" ? "GitHub API request" : "GitHub CLI request";
+    const message = `${operation} failed${diagnostics ? ` (${diagnostics})` : ""}`;
+    const hasBody = args.some((arg) => /^body=|^--(?:raw-)?field=body=|^--body(?:=|$)|^-b$/.test(arg));
+    // A CLI can echo the body escaped, reformatted, or split across lines. For writes carrying
+    // a body, retain only safe diagnostics in stderr rather than trying substring redaction.
+    const metadata = { stdout, stderr: hasBody ? message : stderr, code, signal };
+    // The router's exit 75 and GitHub's throttling both stop this round. Preserve the router's
+    // retry time when no request body could have supplied it.
+    if (code === 75 || /HTTP 429|rate limit|budgets? exhausted/i.test(stderr)) {
+      const resume = !hasBody && code === 75 ? /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\b/.exec(stderr)?.[0] : null;
+      throw Object.assign(new GitHubRateLimitedError(`GitHub is throttling gh: ${message}${resume ? `; try again after ${resume}` : ""}`), metadata);
+    }
+    if (/Could not resolve to a PullRequest/i.test(stderr)) {
+      throw Object.assign(new PullRequestNotFoundError(`Pull request not found: ${message}`), metadata);
+    }
+    throw Object.assign(new Error(message), metadata);
   }
 }
 

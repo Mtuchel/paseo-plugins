@@ -42,15 +42,18 @@ function remember(path, name) {
   }
 }
 const destination = join(bin, "github-router.mjs");
-remember(destination, "github-router.mjs");
+for (const name of ["github-router.mjs", "github-api.mjs", "github-git.mjs"]) remember(join(bin, name), name);
 for (const name of ["gh", "git", "gt"]) remember(join(links, name), name);
 remember(join(bin, "gh-agent-guard"), "gh-agent-guard");
 remember(installedConfig, "config.json");
 writeFileSync(join(backup, "manifest.json"), JSON.stringify(manifest, null, 2), { mode: 0o600 });
-const source = join(dirname(fileURLToPath(import.meta.url)), "github-router.mjs");
-const temporary = `${destination}.${process.pid}`;
-copyFileSync(source, temporary);
-renameSync(temporary, destination);
+for (const name of ["github-api.mjs", "github-git.mjs", "github-router.mjs"]) {
+  const source = join(dirname(fileURLToPath(import.meta.url)), name);
+  const target = join(bin, name);
+  const temporary = `${target}.${process.pid}`;
+  copyFileSync(source, temporary);
+  renameSync(temporary, target);
+}
 writeFileSync(installedConfig, JSON.stringify({ executables }, null, 2), { mode: 0o600 });
 for (const path of [...["gh", "git", "gt"].map((name) => join(links, name)), join(bin, "gh-agent-guard")]) {
   const temp = `${path}.${process.pid}`;

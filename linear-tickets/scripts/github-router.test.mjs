@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { ghOperation, pickRead, route } from "./github-router.mjs";
 
 // Misclassification can publish activity as the human account: only explicit reads balance.
@@ -58,10 +59,10 @@ test("expired and unavailable pools cannot authorize a read", () => {
 test("read reservations are serialized across concurrent callers at the boundary", async () => {
   const home = mkdtempSync(join(tmpdir(), "github-routing-"));
   try {
-    mkdirSync(join(home, "gh-bot")); writeFileSync(join(home, "gh-bot", "hosts.yml"), "github.com:\n");
+    mkdirSync(join(home, "gh-bot")); writeFileSync(join(home, "gh-bot", "hosts.yml"), "github.com:\n  user: bot112112121\n  oauth_token: fixture\n");
     mkdirSync(join(home, "github-router"));
     const now = Date.now();
-    writeFileSync(join(home, "github-router", "budgets.json"), JSON.stringify({ core: {
+    writeFileSync(join(home, "github-router", "budgets.json"), JSON.stringify({ botTokenDigest: createHash("sha256").update("fixture").digest("hex"), core: {
       bot: { remaining: 750, resetAt: now + 600_000, at: now, identity: "bot112112121" },
       owner: { remaining: 301, resetAt: now + 600_000, at: now },
     } }));
@@ -72,7 +73,6 @@ test("read reservations are serialized across concurrent callers at the boundary
     // Writes remain admitted when both read pools are at their reserves.
     const write = await route("gh", ["api", "-X", "POST", "repos/o/r/issues/42/comments", "-f", "body=hi"], env);
     assert.equal(write.env.GH_CONFIG_DIR, join(home, "gh-bot"));
-    assert.equal(write.env.GH_TOKEN, undefined);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
