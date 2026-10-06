@@ -874,6 +874,13 @@ are already working, waits. A labelled ticket keeps its label; a delegated one s
 panel. The minute sweep starts it once it is admitted, however long it waited. A delegated ticket
 whose thread was ended, or which was closed meanwhile, starts nothing; one that already has an
 agent (from its label, say) is linked to it; a failed start is reported in the panel once.
+Queued threads also reconcile bounded public agent history by the exact Linear session ID.
+An empty thread whose agent already retired is linked back for accounting and removed from the
+admission queue; this neither restarts the agent nor declares the ticket complete. An undelivered
+owner message stays queued until a live owner can receive it or you explicitly continue it.
+Current ownership takes precedence, and explicit Resume, Later and parked-plan decisions are
+preserved. Genuine dependency, routing, capacity and process-exit waits retain their actual
+reason; terminal threads settle without waiting behind those gates.
 See *Who starts next* for the order in which waiting tickets get free slots.
 A blocker is finished when it is Done or Canceled, or when it is in review (a started state named
 like *In Review* or *Ready to merge*) and its pull requests are merged: at least one merged and

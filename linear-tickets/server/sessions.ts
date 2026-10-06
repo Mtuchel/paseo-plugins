@@ -4,7 +4,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import type { PaseoAgentHandle, PaseoApi } from "@getpaseo/client";
+import type { PaseoAgent, PaseoAgentHandle, PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { AgentApi, OpenSession, SelectOption, SessionPlanStep } from "./agent-app";
 import { agentAppDirectory } from "./agent-app";
@@ -28,6 +28,7 @@ import type { ReviewDeletions } from "./review-deletions";
 const exec = promisify(execFile);
 const HANDLED_LIMIT = 200;
 const SWEEP_MS = 60_000;
+const QUEUED_OWNER_MAX_PAGES = 100;
 // A session Linear webhooks for is re-read on this fallback cadence instead of every sweep, and a
 // webhook whose read is due pulls it forward instead of waiting for the sweep (README, "Rate
 // limits"). The webhook delivers the prompt itself, so the read only backstops a delivery Linear
@@ -102,6 +103,10 @@ export type SessionLink = {
   // Waiting for blockers or an agent slot, or for another start of its ticket to finish; the
   // sweep starts it when admitted, or links it to the agent that start made.
   queued?: boolean;
+  // The actual last process, route or admission blocker; absent after the queue is resolved.
+  queueReason?: string;
+  // An owner-decided parked plan requests a new run even though this session has retired agents.
+  restartRequested?: boolean;
   // The comment a thread queued behind another start of its ticket came with, passed on to the
   // agent it is linked to (see startQueued).
   pendingText?: string | null;
@@ -467,6 +472,33 @@ export class SessionRouter {
     return agent ? { id: agent.id, title: agent.title ?? null } : null;
   }
 
+  // Bounded public ticket history: a different Linear thread's retired root cannot settle this
+  // queue. A current root takes precedence, including one a newer thread started meanwhile.
+  private async queuedOwners(link: SessionLink): Promise<{ current: PaseoAgent | null; previous: PaseoAgent | null }> {
+    const candidates: PaseoAgent[] = [];
+    let previous: PaseoAgent | null = null;
+    let cursor: string | undefined;
+    const cursors = new Set<string>();
+    for (let pageNumber = 0; ; pageNumber++) {
+      if (pageNumber === QUEUED_OWNER_MAX_PAGES) throw new Error("The ticket's agent history could not be fully read.");
+      const page = await this.paseo!.agents.list({ filter: { labels: { "linear.issueId": link.issueId }, includeArchived: true }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
+      for (const { agent } of page.entries) {
+        if (agent.labels?.["linear.issueId"] !== link.issueId || agent.labels?.["paseo.parent-agent-id"]) continue;
+        if (agent.labels?.["linear.sessionId"] === link.sessionId && (!previous || agent.createdAt > previous.createdAt)) previous = agent;
+        if (!agent.archivedAt && agent.status !== "closed" && !crashedProcess(agent)) candidates.push(agent);
+      }
+      if (!page.pageInfo) throw new Error("The ticket's agent history could not be fully read.");
+      if (!page.pageInfo.hasMore) break;
+      cursor = page.pageInfo.nextCursor ?? undefined;
+      if (!cursor || cursors.has(cursor)) throw new Error("The ticket's agent history could not be fully read.");
+      cursors.add(cursor);
+    }
+    const ghosts = await ghostAgents(candidates, this.clock(), this.deps.processInspector);
+    let current: PaseoAgent | null = null;
+    for (const agent of candidates) if (!ghosts.has(agent.id) && (!current || agent.createdAt > current.createdAt)) current = agent;
+    return { current, previous };
+  }
+
   async created(session: Record<string, unknown> & { id: string }): Promise<void> {
     const issue = (session.issue ?? {}) as { id?: string; identifier?: string };
     const issueId = String(session.issueId ?? issue.id ?? "");
@@ -489,14 +521,14 @@ export class SessionRouter {
     // sweep links it to the agent it made (passing the comment on) or starts one.
     const gate = this.deps.launcher.gate(issueId);
     if (!gate) {
-      await this.deps.store.put({ ...link, queued: true, pendingText: text || null });
+      await this.deps.store.put({ ...link, queued: true, queueReason: "a launch for this ticket is under way", pendingText: text || null });
       await this.say(session.id, "thought", "A launch for this ticket is under way; this thread joins its agent once it is up, or starts one.");
       return;
     }
     try {
       const wait = await this.processWait(issueId);
       if (wait) {
-        await this.deps.store.put({ ...link, queued: true, pendingText: text || null });
+        await this.deps.store.put({ ...link, queued: true, queueReason: wait, pendingText: text || null });
         await this.say(session.id, "thought", `Queued: ${wait}; this thread waits for confirmed process exit.`);
         return;
       }
@@ -520,12 +552,12 @@ export class SessionRouter {
       // host's to start.
       const routed = await this.deps.route?.take({ kind: "session", issueId, identifier, sessionId: session.id, ...(text ? { text } : {}) });
       if (routed && "held" in routed) {
-        await this.deps.store.patch(session.id, { queued: true, pendingText: text || null });
+        await this.deps.store.put({ ...link, queued: true, queueReason: routed.held, pendingText: text || null });
         await this.say(session.id, "thought", `Not started yet: ${routed.held}. This thread stays queued here.`);
         return;
       }
       if (routed) {
-        await this.deps.store.patch(session.id, { remote: routed.peer });
+        await this.deps.store.put({ ...link, remote: routed.peer });
         await this.say(session.id, "thought", `${identifier} is handled on ${routed.peer}${text ? "; your message was passed on" : ""}.`);
         await this.closeSuperseded();
         return;
@@ -534,7 +566,7 @@ export class SessionRouter {
       await this.deps.store.put(link);
       const admission = await this.deps.starter.admission(issueId, this.paseo!, await this.deps.settings.read());
       if (!admission.ok) {
-        await this.deps.store.patch(session.id, { queued: true });
+        await this.deps.store.patch(session.id, { queued: true, queueReason: admission.reason, pendingText: text || null });
         await this.say(session.id, "thought", admission.reason);
         return;
       }
@@ -554,7 +586,7 @@ export class SessionRouter {
     const open = new Set((await this.listSessions()).filter((session) => session.status !== "complete").map((session) => session.id));
     for (const { link, current } of superseded) {
       await this.clearReview(link.sessionId);
-      await this.deps.store.patch(link.sessionId, { closed: true, offer: null, questions: null, queued: false });
+      await this.deps.store.patch(link.sessionId, { closed: true, offer: null, questions: null, queued: false, queueReason: undefined, restartRequested: undefined });
       if (!open.has(link.sessionId)) continue;
       const title = current.agentId ? (await this.paseo?.agents.ref(current.agentId).refresh().catch(() => null))?.agent.title : null;
       await this.say(link.sessionId, "response", `Continued in the newest Paseo thread on this ticket${title ? ` (agent “${title}”)` : ""}. Follow and reply there; this thread is closed.`).catch(() => {});
@@ -570,7 +602,7 @@ export class SessionRouter {
       try {
         const wait = !gateHeld && !gate ? "a launch for this ticket is under way" : await this.processWait(link.issueId);
         if (wait) {
-          if (!link.agentId) await this.deps.store.patch(link.sessionId, { queued: true });
+          if (!link.agentId) await this.deps.store.patch(link.sessionId, { queued: true, queueReason: wait });
           await this.say(link.sessionId, "thought", `Queued: ${wait}; this thread waits before starting another agent.`);
           return;
         }
@@ -590,20 +622,20 @@ export class SessionRouter {
     if (routed && "held" in routed) {
       // Nothing was started and nothing was forwarded: the thread keeps its message and the
       // sweep tries again.
-      await this.deps.store.patch(link.sessionId, { queued: true });
+      await this.deps.store.patch(link.sessionId, { queued: true, queueReason: routed.held });
       await this.say(link.sessionId, "thought", `Not started yet: ${routed.held}. This thread stays queued here.`);
       return;
     }
     if (routed) {
-      await this.deps.store.patch(link.sessionId, { queued: false, pendingText: null, offer: null, remote: routed.peer });
+      await this.deps.store.patch(link.sessionId, { queued: false, queueReason: undefined, restartRequested: undefined, pendingText: null, offer: null, remote: routed.peer });
       await this.say(link.sessionId, "thought", `Handed to ${routed.peer}: this host does not start new work for ${link.identifier}.`);
       return;
     }
     const running = dispatchLabels(settings.dispatch.label).running;
     await this.deps.linear.addLabel(link.issueId, running).catch(() => {});
     try {
-      const started = await this.deps.starter.start(link.issueId, this.paseo!, settings, { labels: { "linear.sessionId": link.sessionId }, retryHint: "assign Paseo again", fresh });
-      await this.deps.store.patch(link.sessionId, { agentId: started.agentId, offer: null, queued: false, pendingText: null });
+      const started = await this.deps.starter.start(link.issueId, this.paseo!, settings, { labels: { "linear.sessionId": link.sessionId }, retryHint: "assign Paseo again", fresh, ...(link.pendingText ? { lead: link.pendingText } : {}) });
+      await this.deps.store.patch(link.sessionId, { agentId: started.agentId, offer: null, queued: false, queueReason: undefined, restartRequested: undefined, pendingText: null });
       // The stopped agent is closed only after the session points at its successor, so its
       // archive does not offer another resume. Its worktree stays for the new agent.
       if (link.agentId && link.agentId !== started.agentId) await this.paseo!.agents.ref(link.agentId).archive().catch(() => {});
@@ -659,12 +691,12 @@ export class SessionRouter {
       if (routed && "held" in routed) {
         // Nothing was started or sent anywhere; the answer stays with the thread and the sweep
         // tries again (the owner sees why here).
-        await this.deps.store.patch(sessionId, { queued: true, pendingText: body });
+        await this.deps.store.patch(sessionId, { queued: true, queueReason: routed.held, pendingText: body });
         await this.say(sessionId, "thought", `Not passed on yet: ${routed.held}. Your message stays queued here.`);
         return;
       }
       if (routed) {
-        await this.deps.store.patch(sessionId, { remote: routed.peer });
+        await this.deps.store.patch(sessionId, { remote: routed.peer, queued: false, queueReason: undefined, restartRequested: undefined, pendingText: null });
         await this.say(sessionId, "response", `Passed to the agent working on ${link.identifier} on ${routed.peer}.`);
         return;
       }
@@ -767,7 +799,10 @@ export class SessionRouter {
       if (!link.queued || link.agentId || link.closed) continue;
       if (await this.deps.deletions?.blocked(link.issueId)) continue;
       const gate = this.deps.launcher.gate(link.issueId);
-      if (!gate) continue;
+      if (!gate) {
+        if (link.queueReason !== "a launch for this ticket is under way") await this.deps.store.patch(link.sessionId, { queueReason: "a launch for this ticket is under way" });
+        continue;
+      }
       try {
         await this.startQueuedThread(link);
       } finally {
@@ -778,51 +813,76 @@ export class SessionRouter {
 
   private async startQueuedThread(link: SessionLink): Promise<void> {
     try {
-      if (await this.processWait(link.issueId)) return;
-      // Another path (the trigger label, a newer thread, a successor start) may have started the ticket's agent meanwhile.
-      const existing = await this.activeAgentFor(link.issueId);
-      // A ticket this host no longer starts goes to its owner before this host waits for a slot
-      // (a full host must not hold a forwarded ticket in its queue for hours).
-      if (!existing) {
-        const routed = await this.deps.route?.take({ kind: "session", issueId: link.issueId, identifier: link.identifier, sessionId: link.sessionId, ...(link.pendingText ? { text: link.pendingText } : {}) });
-        if (routed && "held" in routed) return;
-        if (routed) {
-          await this.deps.store.patch(link.sessionId, { remote: routed.peer, queued: false, pendingText: null });
-          await this.say(link.sessionId, "thought", `${link.identifier} is handled on ${routed.peer}${link.pendingText ? "; your message was passed on" : ""}.`);
-          return;
-        }
-        if (!(await this.deps.starter.admission(link.issueId, this.paseo!, await this.deps.settings.read())).ok) return;
-      }
-      // The owner may have ended the thread or closed the ticket while it waited.
+      // Terminal Linear threads must not wait behind capacity, dependencies, routing or orphans.
+      // A failed read leaves the queue and its owner's undelivered text intact.
       const status = await this.deps.api.sessionStatus(link.sessionId);
       if (!status || status === "complete" || status === "error") {
-        // Completed by the owner: left alone. An errored or vanished thread is no decision.
-        await this.deps.store.patch(link.sessionId, { queued: false, pendingText: null, ...(status === "complete" ? { closed: true } : {}) });
+        await this.deps.store.patch(link.sessionId, { queued: false, queueReason: undefined, restartRequested: undefined, ...(status === "complete" ? { closed: true } : {}) });
         console.log(`[linear-tickets] ${link.identifier}: queued thread ended in Linear (${status ?? "gone"}); no agent started`);
+        return;
+      }
+      const { current: existing, previous } = await this.queuedOwners(link);
+      // Reconnecting an empty retired run is accounting, not a resume or a successful completion.
+      // An undelivered owner message is still a legitimate queue: keep it unlinked so the sweep
+      // can deliver it to a later live owner. Never revive the retired root or release a hold.
+      // A parked plan's explicit owner decision is a real new run, not this stale queue.
+      if ((link.offer && !(link.offer === "resume" && existing)) || (!existing && previous && !link.restartRequested)) {
+        if (link.pendingText) {
+          const reason = link.offer
+            ? `The queued owner message waits for the thread's ${link.offer} decision.`
+            : "The previous agent for this thread has stopped; the queued owner message waits for a live owner or explicit continuation.";
+          if (link.queueReason !== reason) await this.deps.store.patch(link.sessionId, { queueReason: reason });
+          return;
+        }
+        await this.deps.store.patch(link.sessionId, { ...(previous ? { agentId: previous.id } : {}), queued: false, queueReason: undefined, restartRequested: undefined });
+        return;
+      }
+      const wait = await this.processWait(link.issueId);
+      if (wait) {
+        if (link.queueReason !== wait) await this.deps.store.patch(link.sessionId, { queueReason: wait });
         return;
       }
       const ticket = await this.deps.linear.issueState(link.issueId);
       if (await this.deps.deletions?.blocked(link.issueId)) return;
       if (ticket.statusType === "completed" || ticket.statusType === "canceled") {
-        await this.deps.store.patch(link.sessionId, { queued: false, pendingText: null });
+        await this.deps.store.patch(link.sessionId, { queued: false, queueReason: undefined, restartRequested: undefined });
         await this.say(link.sessionId, "response", `${link.identifier} was moved to ${ticket.status} while it waited, so no agent was started. Assign Paseo again to start one.`);
         return;
       }
       if (existing) {
-        // The thread's comment goes out before the thread names the agent, so a failed send is
-        // retried by the next sweep instead of being lost.
+        // A failed send is retried before the thread names the agent. Refresh first: retirement
+        // between the directory read and dispatch must not lazily resurrect a dead agent.
         const text = link.pendingText;
         const needsYou = this.deps.needsYou;
         if (text) {
+          const found = await this.agent(existing.id);
+          if (!found || found.agent.status === "closed" || crashedProcess(found.agent)) return;
           await deliverToAgent(this.paseo!, existing.id, text);
           if (needsYou && (await needsYou.all()).some((entry) => entry.id === link.issueId && entry.agentId === existing.id)) await closeAnswered(needsYou, this.deps.linear, link.issueId);
         }
-        await this.deps.store.patch(link.sessionId, { agentId: existing.id, queued: false, pendingText: null });
+        await this.deps.store.patch(link.sessionId, { agentId: existing.id, queued: false, queueReason: undefined, restartRequested: undefined, pendingText: null, ...(link.offer === "resume" ? { offer: null } : {}) });
         await this.linkToPaseo(link.sessionId, existing.id);
         await this.say(link.sessionId, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.${text ? " Your message was passed on." : ""}`);
         return;
       }
+      // A draining host forwards before admission; a full host must not strand the peer's work.
+      const routed = await this.deps.route?.take({ kind: "session", issueId: link.issueId, identifier: link.identifier, sessionId: link.sessionId, ...(link.pendingText ? { text: link.pendingText } : {}) });
+      if (routed && "held" in routed) {
+        if (link.queueReason !== routed.held) await this.deps.store.patch(link.sessionId, { queueReason: routed.held });
+        return;
+      }
+      if (routed) {
+        await this.deps.store.patch(link.sessionId, { remote: routed.peer, queued: false, queueReason: undefined, restartRequested: undefined, pendingText: null });
+        await this.say(link.sessionId, "thought", `${link.identifier} is handled on ${routed.peer}${link.pendingText ? "; your message was passed on" : ""}.`);
+        return;
+      }
+      const admission = await this.deps.starter.admission(link.issueId, this.paseo!, await this.deps.settings.read());
+      if (!admission.ok) {
+        if (link.queueReason !== admission.reason) await this.deps.store.patch(link.sessionId, { queueReason: admission.reason });
+        return;
+      }
     } catch (error) {
+      if (link.queueReason !== undefined) await this.deps.store.patch(link.sessionId, { queueReason: undefined });
       console.error(`[linear-tickets] ${link.identifier}: checking the queued thread failed: ${error instanceof Error ? error.message : error}`);
       return;
     }
@@ -833,7 +893,7 @@ export class SessionRouter {
         console.error(`[linear-tickets] ${link.identifier}: queued agent started, reporting it failed: ${error instanceof Error ? error.message : error}`);
         return;
       }
-      await this.deps.store.patch(link.sessionId, { queued: false, pendingText: null });
+      await this.deps.store.patch(link.sessionId, { queued: false, queueReason: undefined, restartRequested: undefined });
       await this.say(link.sessionId, "error", `Paseo could not start the agent: ${error instanceof Error ? error.message : error}`).catch(() => {});
     }
   }
@@ -1517,7 +1577,7 @@ export class SessionRouter {
     if (!link) return false;
     if (await this.deps.deletions?.blocked(link.issueId)) return false;
     await this.clearReview(link.sessionId);
-    await this.deps.store.patch(link.sessionId, { agentId: null, queued: true, offer: null });
+    await this.deps.store.patch(link.sessionId, { agentId: null, queued: true, queueReason: undefined, restartRequested: true, offer: null });
     await this.say(link.sessionId, "thought", note);
     return true;
   }
