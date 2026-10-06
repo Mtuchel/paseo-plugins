@@ -874,6 +874,13 @@ are already working, waits. A labelled ticket keeps its label; a delegated one s
 panel. The minute sweep starts it once it is admitted, however long it waited. A delegated ticket
 whose thread was ended, or which was closed meanwhile, starts nothing; one that already has an
 agent (from its label, say) is linked to it; a failed start is reported in the panel once.
+Queued threads also reconcile bounded public agent history by the exact Linear session ID.
+An empty thread whose agent already retired is linked back for accounting and removed from the
+admission queue; this neither restarts the agent nor declares the ticket complete. An undelivered
+owner message stays queued until a live owner can receive it or you explicitly continue it.
+Current ownership takes precedence, and explicit Resume, Later and parked-plan decisions are
+preserved. Genuine dependency, routing, capacity and process-exit waits retain their actual
+reason; terminal threads settle without waiting behind those gates.
 See *Who starts next* for the order in which waiting tickets get free slots.
 A blocker is finished when it is Done or Canceled, or when it is in review (a started state named
 like *In Review* or *Ready to merge*) and its pull requests are merged: at least one merged and
@@ -1473,15 +1480,25 @@ when the host cannot be reached it says so and keeps retrying.
   Submissions without a native content hash inherit the delivered revision, preserving their
   identity across refresh and reload. Delivery supersedes older pending content rather than
   leaving a duplicate publishing row; an older review never resolves a newer submission.
-  Owner questions, permissions and capacity queues are legitimate waits. Twenty minutes without
-  observed assistant/tool progress is suspected quiet work, not proof of failure. Actual submission
-  or delivery errors and proven provider exits are failures. Missing, unsupported, incomplete,
-  stale or unreachable evidence is **Unknown**, never an all-clear; known failures remain visible.
+  A legacy decision without a content hash resolves only attempts observed before its actual
+  decision time. Submission attempts, including unchanged-content resubmissions, stay distinct.
+  Explicit native execution and recorded owner handovers retire predecessor planning; a missing
+  agent alone does not. Exact-session agent history clears historical admission rows, while
+  explicit requeues and undelivered owner messages remain pending.
+  Owner questions, permissions and admission queues are legitimate waits. Local handover and
+  Needs-you records identify owner waits even after a session retires, without transferring that
+  wait to an unrelated successor. Twenty minutes without observed assistant/tool progress is
+  suspected quiet work, not proof of failure. Normal session disposal warns about unfinished
+  planning rather than declaring a crash. Actual submission/delivery errors, abnormal exits,
+  confirmed stopped unfinished planners and provider rate limits remain failures; rate-limit
+  diagnostics show a recorded retry delay without retrying the provider.
+  Missing, unreadable, unsupported, incomplete, stale or unreachable evidence is **Unknown**,
+  never an all-clear; known failures remain visible.
   Auto-approved, completed, superseded and explicitly cancelled revisions are accounted for,
   rather than left indefinitely on the way.
   Monitoring is read-only: it never restarts, resubmits, approves or rejects agents.
-  Each host samples public agent metadata, provider-native OMP session paths, and existing
-  request/session/parked records in the background every 30 seconds. HTTP reads use the cached
+  Each host samples public agent metadata, provider-native OMP session paths, and existing local
+  request/session/parked/owner records in bounded background reads every 30 seconds. HTTP reads use the cached
   observation; fetching the inbox does not advance progress or the successful source-check time.
   Bounded history backfill starts unknown. State and revision history survive plugin reloads in
   `$PASEO_HOME/linear-tickets/plan-pipeline.json`; peer inboxes without pipeline support are unknown.

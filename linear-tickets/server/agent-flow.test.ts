@@ -47,7 +47,7 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
   const feeds: ((event: unknown) => void)[] = [];
   const paseo = {
     agents: {
-      list: async () => ({ entries: listed.map((agent) => ({ agent: { ...agent, labels: {} } })), pageInfo: { hasMore: false } }),
+      list: async () => ({ entries: listed.map((agent) => ({ agent: { ...agent, status: "idle", createdAt: "2026-01-02T00:00:00Z", labels: { "linear.issueId": "i1" } } })), pageInfo: { hasMore: false } }),
       ref: (id: string) => ({
         refresh: async () => ({ agent: { pendingPermissions: pending } }),
         send: async (text: string) => { calls.push(`send ${id}: ${text}`); },
@@ -324,7 +324,7 @@ test("a queued thread starts once its blockers finish, even after it dropped out
   const sessionStatus: Record<string, string | null> = { q1: "stale", q2: "complete", q3: "stale", q4: "stale", q5: "awaitingInput" };
   const h = routerHarness([], {
     // Linear's session list no longer contains any of the waiting threads.
-    api: { activity: async (sessionId: string, content: { type: string; body?: string }) => { if (content.type !== "thought") events.push(`${sessionId} ${content.type}: ${content.body}`); }, openSessions: async () => [], activities: async () => [], sessionStatus: async (id: string) => sessionStatus[id] } as never,
+    api: { activity: async (sessionId: string, content: { type: string; body?: string }) => { if (content.type !== "thought") events.push(`${sessionId} ${content.type}`); }, openSessions: async () => [], activities: async () => [], sessionStatus: async (id: string) => sessionStatus[id] } as never,
     linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueState: async (id: string) => ({ statusType: id === "i3" ? "canceled" : "unstarted", status: id === "i3" ? "Canceled" : "Todo" }) } as never,
     starter: {
       admission: async (id: string) => (blocked.has(id) ? { ok: false as const, reason: "Waiting for TUC-9 to finish." } : { ok: true as const }),
@@ -338,14 +338,16 @@ test("a queued thread starts once its blockers finish, even after it dropped out
   for (const n of [1, 2, 3, 4, 5]) await h.store.put({ ...link, sessionId: `q${n}`, issueId: `i${n}`, identifier: `TUC-${n}`, agentId: null, queued: true });
 
   await h.router.sweep();
-  assert.deepEqual(events, [], "nothing starts while the blockers are open");
+  assert.deepEqual(events, ["q3 response"], "closed tickets settle without waiting for blockers");
+  assert.equal((await h.store.get("q1"))?.queueReason, "Waiting for TUC-9 to finish.");
+  assert.equal((await h.store.get("q2"))?.queued, false, "completed threads settle before admission");
 
   blocked.clear();
   await h.router.sweep();
   assert.deepEqual(events, [
+    "q3 response",
     "start i1",
-    "q3 response: TUC-3 was moved to Canceled while it waited, so no agent was started. Assign Paseo again to start one.",
-    "q4 error: Paseo could not start the agent: No Paseo project is mapped",
+    "q4 error",
     "start i5",
   ]);
   assert.equal((await h.store.get("q1"))?.agentId, "agent-i1");

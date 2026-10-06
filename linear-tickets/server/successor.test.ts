@@ -180,7 +180,10 @@ function routerHarness(options: {
   pageSize?: number;
   resumeTarget?: ResumeTarget | null;
   handOff?: () => Promise<boolean> | never;
-  admission?: { ok: true } | { ok: false; reason: string };
+  admission?: { ok: true } | { ok: false; reason: string } | (() => Promise<{ ok: true } | { ok: false; reason: string }>);
+  sessionStatus?: () => Promise<string | null>;
+  route?: ConstructorParameters<typeof SessionRouter>[0]["route"];
+  processLiveness?: typeof ticketProcessLiveness;
   failStart?: boolean;
   // Called inside the start, before the agent exists; the start goes on once it settles.
   pauseStart?: () => Promise<void>;
@@ -188,12 +191,13 @@ function routerHarness(options: {
   statusType?: string;
   gates?: Launcher;
   daemon?: Daemon;
+  store?: SessionStore;
   processInspector?: ProcessInspector;
 } = {}) {
   const calls: string[] = [];
   const daemon = options.daemon ?? fakeDaemon(options.agents ?? [], { pageSize: options.pageSize });
   const directory = join(tmpdir(), `paseo-successor-${process.pid}-${Math.random().toString(36).slice(2)}`);
-  const store = new SessionStore(join(directory, "sessions.json"));
+  const store = options.store ?? new SessionStore(join(directory, "sessions.json"));
   const gates = options.gates ?? launcher(daemon).instance;
   const starts: { issueId: string; options: StartOptions }[] = [];
   const linear = new FakeLinear();
@@ -216,7 +220,7 @@ function routerHarness(options: {
       daemon.add(ticketAgent("agent-new", "2026-02-01T00:00:09Z"));
       return { agentId: "agent-new", warnings: [], provider: "claude/opus", target: "repo", resumed: true, untrusted: false, plan: null };
     },
-    admission: async () => options.admission ?? { ok: true as const },
+    admission: async () => typeof options.admission === "function" ? options.admission() : options.admission ?? { ok: true as const },
   };
   const router = new SessionRouter({
     api: {
@@ -225,7 +229,7 @@ function routerHarness(options: {
       createSessionOnIssue: async () => { if (options.openFails) throw new Error("Linear is rate-limited"); return "s-new"; },
       openSessions: async () => [],
       activities: async () => [],
-      sessionStatus: async () => "active",
+      sessionStatus: options.sessionStatus ?? (async () => "active"),
     } as never,
     linear: linear as never,
     starter: starter as never,
@@ -233,12 +237,14 @@ function routerHarness(options: {
     launcher: { gate: (issueId: string) => gates.gate(issueId) },
     settings: { read: async () => settings },
     store,
+    route: options.route,
+    processLiveness: options.processLiveness,
     stop: async (agentId: string) => { calls.push(`stop ${agentId}`); },
     ...(options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector), processInspector: options.processInspector } : {}),
   });
   // Connected without attach(): the startup sweep would run alongside the test.
   Object.assign(router, { paseo: daemon.paseo });
-  return { router, store, calls, daemon, starts, gates, linear, cleanup: () => rm(directory, { recursive: true, force: true }) };
+  return { router, store, directory, calls, daemon, starts, gates, linear, cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
 
 // A gate acquired and released proves the ticket's gate is free again (AC-19).
@@ -697,6 +703,287 @@ test("a comment that cannot be delivered keeps the thread queued and goes out on
   await h.cleanup();
 });
 
+test("a stale queue reconnects its retired exact-session owner without restarting or changing the owner's decision", async (t) => {
+  const offers: SessionLink["offer"][] = [null, "resume", "later", "parked", "split"];
+  for (const [index, offer] of offers.entries()) {
+    await t.test(offer ?? "no decision", async (t) => {
+      const retired = ticketAgent("agent-retired", "2026-01-02T00:00:00Z", {
+        labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "s1" },
+        ...(index % 2 ? { status: "closed" } : { archivedAt: "2026-01-03T00:00:00Z" }),
+      });
+      const h = routerHarness({ agents: [retired], admission: { ok: false, reason: "Waiting for TUC-9 to finish." } });
+      t.after(h.cleanup);
+      await h.store.put(thread({ queued: true, queueReason: "Waiting for TUC-9 to finish.", offer }));
+      await h.router.startQueued();
+      await h.router.startQueued();
+      const settled = await h.store.get("s1");
+      assert.equal(settled?.agentId, retired.id);
+      assert.equal(settled?.queued, false);
+      assert.equal(settled?.queueReason, undefined);
+      assert.equal(settled?.offer, offer);
+      assert.equal(Boolean(settled?.closed), false, "a stopped run is not a completed Linear thread");
+      assert.deepEqual(h.starts, []);
+      assert.deepEqual(h.daemon.sent, []);
+      assertGateFree(h.gates);
+    });
+  }
+});
+
+test("a retired exact-session owner keeps its undelivered message for an explicit resume, never for the dead agent", async (t) => {
+  const retired = ticketAgent("agent-retired", "2026-01-02T00:00:00Z", {
+    status: "error", lastError: "OMP RPC process is closed",
+    labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "s1" },
+  });
+  const h = routerHarness({ agents: [retired], processLiveness: async () => "absent" });
+  t.after(h.cleanup);
+  await h.store.put(thread({ queued: true, pendingText: "Keep the existing branch.", offer: "resume" }));
+  await h.router.startQueued();
+  assert.equal((await h.store.get("s1"))?.pendingText, "Keep the existing branch.");
+  assert.equal((await h.store.get("s1"))?.queued, true);
+  assert.equal((await h.store.get("s1"))?.agentId, null);
+  assert.equal((await h.store.get("s1"))?.offer, "resume");
+  assert.deepEqual(h.daemon.sent, []);
+  assert.deepEqual(h.starts, []);
+
+  await h.router.prompted("s1", { id: "resume-message", userId: OWNER, body: "resume" });
+  assert.equal((await h.store.get("s1"))?.agentId, "agent-new");
+  assert.equal((await h.store.get("s1"))?.pendingText, null);
+  assert.deepEqual(h.daemon.sent, [], "the saved text belongs in the successor's first prompt");
+});
+
+test("a live exact-session owner links once and receives its queued message even when admission is full", async (t) => {
+  const agent = ticketAgent("agent-owner", "2026-01-02T00:00:00Z", { labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "s1" } });
+  const h = routerHarness({ agents: [agent], admission: { ok: false, reason: "Queued: 2 of 2 slots used." } });
+  t.after(h.cleanup);
+  await h.store.put(thread({ queued: true, pendingText: "Use the smaller change.", queueReason: "Queued: 2 of 2 slots used.", offer: "resume" }));
+  await h.router.startQueued();
+  await h.router.startQueued();
+  const settled = await h.store.get("s1");
+  assert.equal(settled?.agentId, agent.id);
+  assert.equal(settled?.queued, false);
+  assert.equal(settled?.pendingText, null);
+  assert.equal(settled?.queueReason, undefined);
+  assert.equal(settled?.offer, null, "the current owner replaces a stale resume offer");
+  assert.deepEqual(h.daemon.sent, ["agent-owner: Use the smaller change."]);
+  assert.deepEqual(h.starts, []);
+});
+
+test("the current ticket owner takes precedence over retired exact-session history, across agent pages", async (t) => {
+  const h = routerHarness({
+    agents: [
+      ticketAgent("retired", "2026-01-02T00:00:00Z", { archivedAt: "now", labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "s1" } }),
+      ticketAgent("older-live", "2026-01-03T00:00:00Z"),
+      ticketAgent("current", "2026-01-04T00:00:00Z"),
+    ],
+    pageSize: 1,
+    admission: { ok: false, reason: "Waiting for TUC-9 to finish." },
+  });
+  t.after(h.cleanup);
+  await h.store.put(thread({ queued: true, pendingText: "Keep the fix minimal." }));
+  await h.router.startQueued();
+  assert.equal((await h.store.get("s1"))?.agentId, "current");
+  assert.deepEqual(h.daemon.sent, ["current: Keep the fix minimal."]);
+  assert.deepEqual(h.starts, []);
+});
+
+test("unrelated same-ticket session history and exact-session subagents cannot settle a new queued root", async (t) => {
+  const h = routerHarness({
+    agents: [
+      ticketAgent("old-root", "2025-12-01T00:00:00Z", { archivedAt: "now", labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "older-session" } }),
+      ticketAgent("advisor", "2026-01-02T00:00:00Z", { labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "s1", "paseo.parent-agent-id": "old-root" } }),
+    ],
+  });
+  t.after(h.cleanup);
+  await h.store.put(thread({ queued: true, pendingText: "Start with the failing case." }));
+  await h.router.startQueued();
+  assert.equal((await h.store.get("s1"))?.agentId, "agent-new");
+  assert.equal(h.starts.length, 1);
+  assert.deepEqual(h.daemon.sent, []);
+});
+
+test("ended, errored and vanished Linear threads settle before capacity, routing or orphan-process waits", async (t) => {
+  for (const status of ["complete", "error", null]) {
+    await t.test(status ?? "gone", async (t) => {
+      const h = routerHarness({
+        sessionStatus: async () => status,
+        admission: { ok: false, reason: "Queued: 2 of 2 slots used." },
+        processLiveness: async () => "alive",
+        route: { take: async () => ({ held: "The peer still owns this ticket." }) },
+      });
+      t.after(h.cleanup);
+      await h.store.put(thread({ queued: true, queueReason: "Queued: 2 of 2 slots used.", pendingText: "Undelivered owner instruction." }));
+      await h.router.startQueued();
+      const settled = await h.store.get("s1");
+      assert.equal(settled?.queued, false);
+      assert.equal(settled?.queueReason, undefined);
+      assert.equal(Boolean(settled?.closed), status === "complete");
+      assert.equal(settled?.pendingText, "Undelivered owner instruction.");
+      assert.deepEqual(h.starts, []);
+      assert.deepEqual(h.daemon.sent, []);
+      assertGateFree(h.gates);
+    });
+  }
+});
+
+test("a failed Linear status read keeps the queue and owner text, without inferring a historical outcome", async (t) => {
+  let readable = false;
+  const h = routerHarness({
+    agents: [ticketAgent("retired", "2026-01-02T00:00:00Z", { archivedAt: "now", labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "s1" } })],
+    sessionStatus: async () => { if (!readable) throw new Error("Linear is rate-limited."); return "active"; },
+  });
+  t.after(h.cleanup);
+  await h.store.put(thread({ queued: true, pendingText: "Keep my branch." }));
+  await h.router.startQueued();
+  assert.equal((await h.store.get("s1"))?.queued, true);
+  assert.equal((await h.store.get("s1"))?.agentId, null);
+  assert.equal((await h.store.get("s1"))?.pendingText, "Keep my branch.");
+  assert.deepEqual(h.starts, []);
+  assert.deepEqual(h.daemon.sent, []);
+  assertGateFree(h.gates);
+
+  readable = true;
+  await h.router.startQueued();
+  assert.equal((await h.store.get("s1"))?.queued, true, "the historical run cannot consume a legitimate owner message");
+  assert.equal((await h.store.get("s1"))?.agentId, null);
+  assert.equal((await h.store.get("s1"))?.pendingText, "Keep my branch.");
+});
+
+test("a real dependency wait retains its reason and message until admission permits the launch", async (t) => {
+  let blocked = true;
+  const reason = "Waiting for TUC-9 to finish.";
+  const h = routerHarness({ admission: async () => blocked ? { ok: false, reason } : { ok: true } });
+  t.after(h.cleanup);
+  await h.store.put(thread({ queued: true, pendingText: "Build on the dependency's branch." }));
+  await h.router.startQueued();
+  assert.equal((await h.store.get("s1"))?.queueReason, reason);
+  assert.equal((await h.store.get("s1"))?.pendingText, "Build on the dependency's branch.");
+  assert.deepEqual(h.starts, []);
+  assertGateFree(h.gates);
+
+  blocked = false;
+  await h.router.startQueued();
+  assert.equal((await h.store.get("s1"))?.agentId, "agent-new");
+  assert.equal((await h.store.get("s1"))?.queued, false);
+  assert.equal((await h.store.get("s1"))?.queueReason, undefined);
+  assert.equal((await h.store.get("s1"))?.pendingText, null);
+  assert.equal(h.starts.length, 1);
+});
+
+test("routing and unknown process waits retain the actual blocker without sending the owner's pending text", async (t) => {
+  for (const routing of [false, true]) {
+    await t.test(routing ? "peer ownership" : "unknown orphan process", async (t) => {
+      const h = routerHarness({
+        processLiveness: async () => routing ? "absent" : "unknown",
+        ...(routing ? { route: { take: async () => ({ held: "The peer still owns this ticket." }) } } : {}),
+      });
+      t.after(h.cleanup);
+      await h.store.put(thread({ queued: true, pendingText: "Do not lose this instruction." }));
+      await h.router.startQueued();
+      assert.equal((await h.store.get("s1"))?.queueReason, routing ? "The peer still owns this ticket." : "the OMP workers for this ticket could not be inspected");
+      assert.equal((await h.store.get("s1"))?.queued, true);
+      assert.equal((await h.store.get("s1"))?.pendingText, "Do not lose this instruction.");
+      assert.deepEqual(h.starts, []);
+      assert.deepEqual(h.daemon.sent, []);
+      assertGateFree(h.gates);
+    });
+  }
+});
+
+test("an explicitly decided parked plan still starts after reload despite its retired exact-session history", async (t) => {
+  const retired = ticketAgent("planner", "2026-01-02T00:00:00Z", {
+    archivedAt: "now", labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "s1" },
+  });
+  const h = routerHarness({ agents: [retired] });
+  t.after(h.cleanup);
+  await h.store.put(thread({ agentId: "planner", offer: "parked" }));
+  assert.equal(await h.router.requeue("planner", "The owner approved implementation."), true);
+  const restored = routerHarness({ daemon: h.daemon, store: new SessionStore(join(h.directory, "sessions.json")) });
+  t.after(restored.cleanup);
+  await restored.router.startQueued();
+  assert.equal(restored.starts.length, 1);
+  assert.equal((await restored.store.get("s1"))?.agentId, "agent-new");
+  assert.equal((await restored.store.get("s1"))?.queued, false);
+  assert.equal((await restored.store.get("s1"))?.offer, null);
+  assert.equal((await restored.store.get("s1"))?.restartRequested, undefined);
+});
+
+test("a queued owner message with only retired history remains deliverable when a current owner appears", async (t) => {
+  const h = routerHarness({ agents: [
+    ticketAgent("retired", "2026-01-02T00:00:00Z", { archivedAt: "now", labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "s1" } }),
+  ] });
+  t.after(h.cleanup);
+  await h.store.put(thread({ queued: true, pendingText: "Preserve the existing data." }));
+  await h.router.startQueued();
+  assert.equal((await h.store.get("s1"))?.queued, true);
+  assert.equal((await h.store.get("s1"))?.agentId, null);
+  assert.equal((await h.store.get("s1"))?.pendingText, "Preserve the existing data.");
+  assert.deepEqual(h.daemon.sent, []);
+  assert.deepEqual(h.starts, []);
+
+  h.daemon.add(ticketAgent("current", "2026-01-03T00:00:00Z"));
+  await h.router.startQueued();
+  await h.router.startQueued();
+  assert.equal((await h.store.get("s1"))?.agentId, "current");
+  assert.equal((await h.store.get("s1"))?.pendingText, null);
+  assert.equal((await h.store.get("s1"))?.queueReason, undefined);
+  assert.deepEqual(h.daemon.sent, ["current: Preserve the existing data."]);
+  assert.deepEqual(h.starts, []);
+});
+
+test("retirement after the agent directory read cannot send queued text to the now-closed owner", async (t) => {
+  const owner = ticketAgent("owner", "2026-01-02T00:00:00Z", { labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "s1" } });
+  const h = routerHarness({ agents: [owner] });
+  t.after(h.cleanup);
+  const issueState = h.linear.issueState.bind(h.linear);
+  h.linear.issueState = async (id) => { owner.status = "closed"; return issueState(id); };
+  await h.store.put(thread({ queued: true, pendingText: "Keep this instruction queued." }));
+  await h.router.startQueued();
+  await h.router.startQueued();
+  assert.equal((await h.store.get("s1"))?.queued, true);
+  assert.equal((await h.store.get("s1"))?.agentId, null);
+  assert.equal((await h.store.get("s1"))?.pendingText, "Keep this instruction queued.");
+  assert.deepEqual(h.daemon.sent, []);
+  assert.deepEqual(h.starts, []);
+});
+
+test("an explicitly resumed queued owner message reaches the real successor's first prompt on the recorded worktree", async (t) => {
+  const worktree = await mkdtemp(join(tmpdir(), "paseo-queued-worktree-"));
+  const directory = await mkdtemp(join(tmpdir(), "paseo-queued-handover-"));
+  t.after(async () => {
+    await rm(worktree, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true });
+  });
+  const daemon = fakeDaemon([ticketAgent("retired", "2026-01-02T00:00:00Z", {
+    status: "closed", labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "s1" },
+  })]);
+  const linear = new FakeLinear();
+  const gates = launcher(daemon).instance;
+  const handover = new Handover(linear as never, directory, async () => ({ branch: BRANCH, lastCommit: "abc123" }), () => "2026-01-02T10:00:00Z");
+  await handover.update(ISSUE, { id: "retired", title: "TUC-1", cwd: worktree }, { summary: "The branch already contains the first change." });
+  const starter = new TicketStarter({
+    linear: linear as never, launcher: gates, handover,
+    branches: async () => ({ branches: [{ id: "refs/heads/dev", label: "dev" }], defaultBranch: "refs/heads/dev" }),
+  } as never);
+  const store = new SessionStore(join(directory, "sessions.json"));
+  const router = new SessionRouter({
+    api: { activity: async () => {}, updateSession: async () => {}, sessionStatus: async () => "active" } as never,
+    linear: linear as never, starter, handover, launcher: gates, settings: { read: async () => settings }, store,
+  });
+  Object.assign(router, { paseo: daemon.paseo });
+  await store.put(thread({ queued: true, pendingText: "Keep the current API compatible.", offer: "resume" }));
+  await router.startQueued();
+  assert.equal(daemon.created.length, 0, "history alone cannot restart the planner");
+  assert.equal((await store.get("s1"))?.queued, true);
+
+  await router.prompted("s1", { id: "owner-resume", userId: OWNER, body: "resume" });
+  assert.equal(daemon.created.length, 1);
+  assert.ok(daemon.created[0].prompt?.endsWith(`${LEAD_INTRO}\n\nKeep the current API compatible.`), "the owner's retained instruction is in the real launch prompt");
+  assert.deepEqual(daemon.sources[0].source, { kind: "directory", projectId: "p1", path: worktree });
+  assert.equal((await store.get("s1"))?.agentId, "agent-created-1");
+  assert.equal((await store.get("s1"))?.pendingText, null);
+  assertGateFree(gates);
+});
+
 // --- AC-19: the live-successor predicate and the gate's hygiene ---------------------------------
 
 test("the live-successor predicate finds the newest live root agent behind subagents and beyond the first page", async () => {
@@ -843,24 +1130,6 @@ test("a planner restart replaces a root agent that shows running without a proce
   } finally { await h.cleanup(); }
 });
 
-test("a queued comment cannot lazily resurrect a closed live-process owner", async () => {
-  let output = `2100185 omp --mode rpc-ui --session ${NATIVE_HANDLE}\n`;
-  const inspect = processInspection("");
-  inspect.processes = async () => output;
-  const h = routerHarness({ agents: [ompRoot("agent-old")], processInspector: inspect });
-  try {
-    await h.store.put(thread({ queued: true, pendingText: "rebase it please" }));
-    await h.router.startQueued();
-    assert.deepEqual(h.daemon.sent, []);
-    assert.deepEqual(h.starts, []);
-    assert.equal((await h.store.get("s1"))?.pendingText, "rebase it please");
-    assert.equal((await h.store.get("s1"))?.queued, true);
-    assertGateFree(h.gates);
-    output = "";
-    await h.router.startQueued();
-    assert.deepEqual(h.daemon.sent, ["agent-old: rebase it please"]);
-  } finally { await h.cleanup(); }
-});
 
 test("the process inspection and dispatch claim both execute under the ticket start gate", async () => {
   const inspect = processInspection("");

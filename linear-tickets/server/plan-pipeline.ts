@@ -16,16 +16,26 @@ export type PipelineReview = {
   // Optional stronger matching for revisions served at the same stable URL / original since.
   revision?: string; publishedAt?: string; autoApproved?: boolean;
 };
+export type PipelineOwnerEvidence = {
+  issueId: string; agentId: string; waiting: boolean; at?: string; resumedFrom?: string; failedAt?: string;
+};
 export type PlanPipelineOptions = {
   host?: string; file?: string; now?: () => Date;
   sessions?: () => Promise<SessionLink[]>; parked?: () => Promise<ParkedPlan[]>;
+  // One bounded, local-only sample per refresh, scoped to the actual record owner.
+  owners?: (issueIds: readonly string[]) => Promise<readonly PipelineOwnerEvidence[]>;
   // Source root and read-only process inspection seam; useful for deterministic isolated tests.
   home?: string; processInspector?: ProcessInspector;
 };
 type Row = PipelineRow;
-type RecordEntry = { row: Row; key: string; revision?: string; submittedAt?: string; history: { stage: PipelineStage; status: PipelineStatus; at: string }[] };
+type RecordEntry = { row: Row; key: string; revision?: string; submittedAt?: string; observedAt?: string; ownerFailedAt?: string; queue?: { sessionId: string; restart: boolean; pending: boolean }; history: { stage: PipelineStage; status: PipelineStatus; at: string }[] };
 function revisionOf(entry: RecordEntry): string | undefined {
   return entry.revision ?? (entry.key.startsWith("hash:") ? entry.key.slice(5) : undefined);
+}
+function attemptTime(entry: RecordEntry): string { return entry.submittedAt ?? entry.observedAt ?? entry.row.since; }
+function queueDetail(link: SessionLink): string {
+  const reason = object(link).queueReason;
+  return typeof reason === "string" && reason.trim() ? label(reason, 1400) : "Waiting for admission or agent capacity";
 }
 type DeliveryError = { at: string; detail: string; attempts: number; localUrl?: string };
 type Journal = {
@@ -182,10 +192,15 @@ export class PlanPipeline {
         const history = Array.isArray(entry.history) ? entry.history.filter((event) => {
           const item = object(event); return typeof item.stage === "string" && typeof item.status === "string" && timestamp(item.at);
         }).slice(-MAX_HISTORY) : [];
-        this.records.set(parsed.data.id, { row: { ...parsed.data, host: this.host }, key: entry.key.slice(0, 300), ...(typeof entry.revision === "string" && /^[a-f0-9]{64}$/.test(entry.revision) ? { revision: entry.revision } : {}), ...(timestamp(entry.submittedAt) ? { submittedAt: timestamp(entry.submittedAt) ?? undefined } : {}), history: history as RecordEntry["history"] });
+        this.records.set(parsed.data.id, { row: { ...parsed.data, host: this.host }, key: entry.key.slice(0, 300), observedAt: timestamp(entry.observedAt) ?? timestamp(object(history[0]).at) ?? parsed.data.since, ...(typeof entry.revision === "string" && /^[a-f0-9]{64}$/.test(entry.revision) ? { revision: entry.revision } : {}), ...(timestamp(entry.submittedAt) ? { submittedAt: timestamp(entry.submittedAt) ?? undefined } : {}), history: history as RecordEntry["history"] });
+        if (timestamp(entry.ownerFailedAt)) this.records.get(parsed.data.id)!.ownerFailedAt = timestamp(entry.ownerFailedAt)!;
+        const queue = object(entry.queue);
+        if (typeof queue.sessionId === "string" && queue.sessionId.length <= 200) this.records.get(parsed.data.id)!.queue = { sessionId: queue.sessionId, restart: queue.restart === true, pending: queue.pending === true };
       }
       for (const [id, value] of Object.entries(object(saved.cursors)).slice(-MAX_ROOTS)) {
         const cursor = object(value), state = object(cursor.state);
+        // Older readers classified every dispose as a crash; replay those bounded native files.
+        if (state.stoppedAt) continue;
         if (typeof cursor.path === "string" && typeof cursor.inode === "string" && typeof cursor.offset === "number" && cursor.offset >= 0 && typeof cursor.anchor === "string" && Array.isArray(state.revisions)) this.cursors[id] = value as NativeCursor;
       }
       for (const [id, value] of Object.entries(object(saved.deliveries)).slice(-MAX_ROOTS)) {
@@ -201,14 +216,14 @@ export class PlanPipeline {
   }
 
   private latest(agentId: string): RecordEntry | undefined {
-    return [...this.records.values()].filter(({ row }) => row.agentId === agentId && row.stage !== "superseded").sort((a, b) => b.row.since.localeCompare(a.row.since))[0];
+    return [...this.records.values()].filter(({ row }) => row.agentId === agentId).sort((a, b) => attemptTime(b).localeCompare(attemptTime(a)))[0];
   }
 
   private ensure(agentId: string, identifier: string, key: string, at: string): RecordEntry {
     const id = `${this.host}:${label(agentId, 100)}:${createHash("sha256").update(key).digest("hex").slice(0, 40)}`;
     let record = this.records.get(id);
     if (!record) {
-      record = { key, row: { id, agentId: label(agentId, 100), identifier: label(identifier, 200), host: this.host, stage: "preparing", status: "unknown", since: at, lastProgressAt: null, detail: "Planning evidence not yet available" }, history: [] };
+      record = { key, observedAt: at, row: { id, agentId: label(agentId, 100), identifier: label(identifier, 200), host: this.host, stage: "preparing", status: "unknown", since: at, lastProgressAt: null, detail: "Planning evidence not yet available" }, history: [] };
       this.records.set(id, record); this.dirty = true;
     }
     record.row.identifier = label(identifier, 200);
@@ -229,53 +244,51 @@ export class PlanPipeline {
   private applyInbox(): void {
     for (const [reviews, decided] of [[this.decided, true], [this.reviews, false]] as const) for (const review of reviews) {
       const at = timestamp(review.publishedAt) ?? timestamp(review.since);
+      const decisionAt = timestamp(review.decidedAt);
       const agentId = label(review.agentId, 100);
       if (!at || !agentId) continue;
+      // Legacy registries kept the original opening time, not the latest submitted content.
+      // Only an actual decision can settle no-hash attempts between that opening and decision.
+      const cutoff = decided && !review.revision ? decisionAt ?? at : at;
       const candidates = [...this.records.values()].filter((entry) => entry.row.agentId === agentId);
-      const matches = candidates.filter((entry) => review.revision
-        ? revisionOf(entry) === review.revision : (entry.submittedAt ?? entry.row.since) <= at);
-      // Legacy/native submissions may have only a tool-call identity. Bind the latest eligible
-      // attempt to delivered content, but never let an older review resolve a newer submission.
-      const provisional = review.revision ? candidates.filter((entry) => !revisionOf(entry)
-        && !TERMINAL[entry.row.stage] && (entry.submittedAt ?? entry.row.since) <= at)
-        .sort((a, b) => (b.submittedAt ?? b.row.since).localeCompare(a.submittedAt ?? a.row.since)) : [];
-      const matched = matches.filter((entry) => entry.submittedAt && entry.submittedAt <= at)
-        .sort((a, b) => b.submittedAt!.localeCompare(a.submittedAt!))[0];
-      const pending = provisional[0];
-      let record = pending && (!matched || (pending.submittedAt ?? pending.row.since) > (matched.submittedAt ?? matched.row.since))
-        ? pending : matched ?? matches.sort((a, b) => b.row.since.localeCompare(a.row.since))[0];
-      if (!record) record = this.ensure(agentId, review.name, review.revision ? `hash:${review.revision}` : `review:${at}`, at);
+      const eligible = candidates.filter((entry) => attemptTime(entry) <= cutoff);
+      const matches = eligible.filter((entry) => !review.revision || revisionOf(entry) === review.revision);
+      const provisional = review.revision ? eligible.filter((entry) => !revisionOf(entry) && !TERMINAL[entry.row.stage]) : [];
+      const matched = matches.sort((a, b) => attemptTime(b).localeCompare(attemptTime(a)))[0];
+      const pending = provisional.sort((a, b) => attemptTime(b).localeCompare(attemptTime(a)))[0];
+      let record = pending && (!matched || attemptTime(pending) > attemptTime(matched)) ? pending : matched;
+      if (!record) record = this.ensure(agentId, review.name, review.revision ? `review:${review.revision}:${at}` : `review:${at}`, at);
       if (review.revision) {
         if (record.revision !== review.revision) { record.revision = review.revision; this.dirty = true; }
-        for (const duplicate of matches) if (duplicate !== record
-          && (!duplicate.submittedAt || duplicate.submittedAt === record.submittedAt)) {
+        // Remove only delivery placeholders for the same attempt, never real resubmissions.
+        for (const duplicate of matches) if (duplicate !== record && !duplicate.submittedAt
+          && attemptTime(duplicate) === attemptTime(record)) {
           this.records.delete(duplicate.row.id); this.dirty = true;
-        }
-        const submittedAt = record.submittedAt ?? record.row.since;
-        for (const older of provisional) if (older !== record && (older.submittedAt ?? older.row.since) < submittedAt) {
-          this.change(older, "superseded", "normal", at, "Earlier attempt replaced by the delivered review");
-        }
-        for (const older of candidates) if (older !== record && !TERMINAL[older.row.stage]
-          && older.row.stage !== "ready" && revisionOf(older) && revisionOf(older) !== review.revision
-          && (older.submittedAt ?? older.row.since) <= at) {
-          this.change(older, "superseded", "normal", at, "Earlier content replaced by the delivered review");
         }
       }
       const arrived = url(review.link);
-      if (arrived) record.row.reviewUrl = arrived;
-      if (!this.lastArrivalAt || at > this.lastArrivalAt) { this.lastArrivalAt = at; this.dirty = true; }
+      if (arrived) {
+        record.row.reviewUrl = arrived;
+        if (!this.lastArrivalAt || at > this.lastArrivalAt) { this.lastArrivalAt = at; this.dirty = true; }
+      }
       if (decided) {
         const outcome = review.outcome?.toLowerCase();
         if (!["approved", "auto-approved", "cancelled", "superseded", "sent back", "completed"].includes(outcome ?? "")) {
-          if (!TERMINAL[record.row.stage]) this.change(record, record.row.stage, "unknown", at, "Review outcome unavailable or unsupported");
+          if (!TERMINAL[record.row.stage]) this.change(record, record.row.stage, "unknown", cutoff, "Review outcome unavailable or unsupported");
           continue;
         }
         const approved = outcome === "approved" || outcome === "auto-approved";
         const stage: PipelineStage = outcome === "cancelled" ? "cancelled" : outcome === "superseded" || outcome === "sent back" ? "superseded" : approved && (review.autoApproved || outcome === "auto-approved") ? "auto-approved" : "completed";
-        this.change(record, stage, "normal", timestamp(review.decidedAt) ?? at, approved ? "Plan approved" : "Review resolved");
-      } else if (!TERMINAL[record.row.stage]) this.change(record, "ready", "normal", at, "Plan delivered to the review inbox; waiting for owner");
-      // A real open review is stronger evidence than submit errors/retirement. Never let a stale
-      // open revision undo a terminal outcome; a new submission creates a new key instead.
+        this.change(record, stage, "normal", decisionAt ?? at, approved ? "Plan approved" : "Review resolved");
+      } else if (!TERMINAL[record.row.stage]) {
+        this.change(record, arrived ? "ready" : record.row.stage, arrived ? "normal" : "unknown", at,
+          arrived ? "Plan delivered to the review inbox; waiting for owner" : "Review inbox link unavailable");
+      }
+      if (decided || arrived) for (const older of eligible) if (older !== record && !TERMINAL[older.row.stage]
+        && (attemptTime(older) < attemptTime(record) || review.revision && revisionOf(older) !== review.revision)) {
+        this.change(older, "superseded", "normal", decisionAt ?? at, "Earlier attempt replaced by the resolved or delivered review");
+      }
+      // Delivery and decisions never resolve a later attempt, even with identical content.
     }
     this.prune();
   }
@@ -354,13 +367,31 @@ export class PlanPipeline {
     }
     if (this.stopped) return;
     const now = this.now().getTime();
-    const roots = agents.filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && agent.labels?.["linear.issueId"] && (!agent.archivedAt || this.latest(agent.id) || parked.some((plan) => plan.agentId === agent.id))).slice(0, MAX_ROOTS);
+    const knownRoots = new Set([...this.records.values()].map((entry) => entry.row.agentId));
+    const parkedRoots = new Set(parked.map((plan) => plan.agentId));
+    const rootSource = agents.filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && agent.labels?.["linear.issueId"]
+      && (!agent.archivedAt || knownRoots.has(agent.id) || parkedRoots.has(agent.id)));
+    const roots = rootSource.sort((a, b) => Number(Boolean(a.archivedAt)) - Number(Boolean(b.archivedAt)) || b.createdAt.localeCompare(a.createdAt)).slice(0, MAX_ROOTS);
     const issues: string[] = [...sourceProblems, ...(this.loadProblem ? [this.loadProblem] : [])];
-    if (agents.filter((agent) => !agent.archivedAt && agent.labels?.["linear.issueId"] && !agent.labels?.["paseo.parent-agent-id"]).length > MAX_ROOTS) issues.push("Planning root limit reached");
+    if (rootSource.length > MAX_ROOTS) issues.push("Planning root limit reached");
+    let owners: readonly PipelineOwnerEvidence[] = [];
+    let ownersUnavailable = false;
+    if (this.options.owners) try {
+      owners = await this.options.owners([...new Set(roots.map((agent) => agent.labels["linear.issueId"]))]);
+      if (owners.length > MAX_ROWS) throw new Error("Owner evidence exceeds safe bound");
+    } catch (error) {
+      ownersUnavailable = true;
+      const problem = diagnostic(error); sourceProblems.push(problem); issues.push(problem);
+      owners = [];
+    }
     const ghosts = await ghostAgents(roots, now, this.options.processInspector);
     await boundedMap(roots, async (agent) => {
       const identifier = agent.labels["linear.identifier"] ?? agent.labels["linear.issueId"];
-      const link = links.filter((session) => session.agentId === agent.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+      const link = links.filter((session) => session.agentId === agent.id || !session.agentId && session.sessionId === agent.labels["linear.sessionId"])
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+      const ownerWait = owners.find((owner) => owner.issueId === agent.labels["linear.issueId"] && owner.agentId === agent.id && owner.waiting);
+      const ownerFailure = owners.find((owner) => owner.issueId === agent.labels["linear.issueId"] && owner.agentId === agent.id && timestamp(owner.failedAt));
+      const transfer = owners.find((owner) => owner.issueId === agent.labels["linear.issueId"] && owner.resumedFrom === agent.id && owner.agentId !== agent.id && timestamp(owner.at));
       const parkedPlan = parked.find((plan) => plan.agentId === agent.id);
       let requestAt: string | null = null, sourceError: string | undefined;
       try {
@@ -379,7 +410,7 @@ export class PlanPipeline {
       } else sourceError = "Native planning evidence unsupported for this provider";
       const state = native?.state;
       const previous = this.latest(agent.id);
-      const planning = state?.phase === "planning" || requestAt || parkedPlan || link?.review || this.deliveries[agent.id] || (agent.labels["linear.plan"] === "required" && state?.phase !== "executing" && !(state?.phase === "idle" && state.progress));
+      const planning = state?.phase === "planning" || requestAt || parkedPlan || link?.review || ownerWait || this.deliveries[agent.id] || (agent.labels["linear.plan"] === "required" && state?.phase !== "executing" && !(state?.phase === "idle" && state.progress));
       if (!planning && !previous && !state?.revisions.length) return; // approved implementing successor
       let timeline: { progress: string | null; submitAt?: string; failure?: string } | undefined;
       if (!native) {
@@ -392,11 +423,13 @@ export class PlanPipeline {
       let record = previous;
       for (const revision of revisions) {
         const sameAttempt = [...this.records.values()].find((entry) => entry.row.agentId === agent.id
-          && (entry.key === revision.key || revision.hash && entry.revision === revision.hash));
-        const provisional = previous && !previous.submittedAt && !TERMINAL[previous.row.stage]
-          && (previous.row.stage !== "ready" || revision.attemptAt && revision.attemptAt <= previous.row.since) ? previous : undefined;
+          && (entry.key === revision.key || revision.hash && revisionOf(entry) === revision.hash && entry.submittedAt === revision.attemptAt));
+        const provisional = record && !record.submittedAt && !TERMINAL[record.row.stage]
+          && attemptTime(record) <= (revision.attemptAt ?? revision.at)
+          && (record.row.stage !== "ready" || revision.attemptAt && revision.attemptAt <= record.row.since) ? record : undefined;
         record = sameAttempt ?? provisional ?? this.ensure(agent.id, identifier, revision.key, revision.at);
         record.key = revision.key; record.row.identifier = label(identifier, 200);
+        if (revision.hash && !record.revision) record.revision = revision.hash;
         if (revision.progress && (!record.row.lastProgressAt || revision.progress > record.row.lastProgressAt)) record.row.lastProgressAt = revision.progress;
         if (revision.attemptAt) record.submittedAt = revision.attemptAt;
         if (TERMINAL[revision.stage] && !native?.problem && (!TERMINAL[record.row.stage] || record.row.stage === "auto-approved" && revision.stage === "completed") && !(record.row.stage === "ready" && revision.stage === "cancelled")) this.change(record, revision.stage, "normal", revision.resolvedAt ?? revision.at, "Plan planning cycle resolved");
@@ -404,8 +437,22 @@ export class PlanPipeline {
       if (requestAt && (!record || requestAt > (state?.planningAt ?? record.row.since))) record = this.ensure(agent.id, identifier, `request:${requestAt}`, requestAt);
       if (!record && planning) record = this.ensure(agent.id, identifier, `planning:${cycleAt}`, cycleAt);
       if (!record) return;
+      const executingAt = state?.phase === "executing" && !native?.problem ? timestamp(state.phaseAt) : null;
+      if (executingAt) for (const entry of this.records.values()) if (entry.row.agentId === agent.id
+        && !TERMINAL[entry.row.stage] && attemptTime(entry) <= executingAt) {
+        this.change(entry, "completed", "normal", executingAt, "Native plan phase explicitly entered execution");
+      }
+      if (transfer) for (const entry of this.records.values()) if (entry.row.agentId === agent.id
+        && !TERMINAL[entry.row.stage] && entry.row.stage !== "ready" && attemptTime(entry) <= transfer.at!) {
+        this.change(entry, "superseded", "normal", transfer.at!, "Planning owner explicitly handed over to a successor");
+      }
+      if (link?.remote && (agent.archivedAt || agent.status === "closed")) for (const entry of this.records.values()) if (entry.row.agentId === agent.id
+        && !TERMINAL[entry.row.stage] && entry.row.stage !== "ready") {
+        this.change(entry, "superseded", "normal", entry.row.since, "Session explicitly transferred to a peer host");
+      }
       if (TERMINAL[record.row.stage]) return;
       if (record.row.stage === "ready") return; // real delivery survives retirement and source loss
+      if (!ownersUnavailable) record.ownerFailedAt = timestamp(ownerFailure?.failedAt) ?? undefined;
       let progressAt = state?.progress ?? record.row.lastProgressAt;
       if (record.row.lastProgressAt && (!progressAt || record.row.lastProgressAt > progressAt)) progressAt = record.row.lastProgressAt;
       if (timeline?.progress && (!progressAt || timeline.progress > progressAt)) progressAt = timeline.progress;
@@ -425,18 +472,36 @@ export class PlanPipeline {
           }
         } catch { problem = "Advisor progress source unavailable"; issues.push(problem); }
       }
-      if (link?.queued) { stage = "queued"; at = link.createdAt; detail = "Waiting for admission or agent capacity"; }
-      else if (link?.questions || agent.pendingPermissions?.length || link?.review) { stage = "waiting"; at = timestamp(link?.review?.openedAt) ?? cycleAt; detail = link?.review ? "Review exists; waiting for owner (inbox delivery not confirmed)" : "Waiting for owner's question or permission response"; }
+      if (link?.agentId === agent.id && link.queued && !link.closed && !link.remote && !agents.some((candidate) => !candidate.labels?.["paseo.parent-agent-id"] && candidate.labels?.["linear.sessionId"] === link.sessionId)) {
+        stage = "queued"; at = link.createdAt; detail = queueDetail(link);
+      } else if (ownerWait || link?.agentId === agent.id && !link.closed && (link.questions || link.review) || agent.pendingPermissions?.length) {
+        stage = "waiting"; at = timestamp(ownerWait?.at) ?? timestamp(link?.review?.openedAt) ?? cycleAt;
+        detail = link?.agentId === agent.id && !link.closed && link.review ? "Review exists; waiting for owner (inbox delivery not confirmed)" : "Waiting for owner's question or permission response";
+      }
       const legitimateWait = stage === "queued" || stage === "waiting";
       const delivery = this.deliveries[agent.id];
       const failedSubmit = revision?.failure ?? timeline?.failure ?? (!native && record.row.status === "failed" && record.row.stage === "publishing" ? record.row.detail : undefined);
-      if (!legitimateWait && (delivery && delivery.at >= (revision?.attemptAt ?? cycleAt) || failedSubmit)) {
+      const failedAt = timestamp(ownerFailure?.failedAt) ?? (ownersUnavailable ? record.ownerFailedAt : undefined);
+      const turnAt = timestamp(agent.activeTurn?.startedAt);
+      const stoppedOwner = failedAt && (!progressAt || progressAt <= failedAt) && (!turnAt || turnAt <= failedAt);
+      const cursor = this.cursors[agent.id];
+      const retainedNative = !native && cursor?.path === agent.persistence?.nativeHandle ? cursor?.state : undefined;
+      const retainedError = retainedNative?.errorAt && (!progressAt || progressAt <= retainedNative.errorAt) ? retainedNative.error : undefined;
+      const crashAt = state?.crashAt ?? (retainedNative?.crashAt && (!progressAt || progressAt <= retainedNative.crashAt) ? retainedNative.crashAt : undefined);
+      const providerError = state?.error ?? retainedError ?? (agent.status === "error" && agent.lastError ? diagnostic(agent.lastError) : undefined);
+      if (providerError && /Provider rate limit \(429\)/.test(providerError)) {
+        status = "failed"; detail = providerError;
+      } else if (!legitimateWait && (delivery && delivery.at >= (revision?.attemptAt ?? cycleAt) || failedSubmit)) {
         stage = "publishing"; status = "failed"; detail = delivery && delivery.at >= (revision?.attemptAt ?? cycleAt) ? delivery.detail : failedSubmit ?? "Plan submission failed";
         at = delivery && delivery.at >= (revision?.attemptAt ?? cycleAt) ? delivery.at : revision?.failureAt ?? at;
-      } else if (!legitimateWait && !parkedPlan && (ghosts.has(agent.id) || state?.stoppedAt || state?.error || agent.status === "error" && agent.lastError)) {
-        status = "failed"; detail = ghosts.has(agent.id) ? "Provider process proven absent" : state?.stoppedAt ? "Provider session recorded a process exit" : state?.error ?? diagnostic(agent.lastError);
+      } else if (!legitimateWait && !parkedPlan && (providerError || crashAt || ownersUnavailable && stoppedOwner)) {
+        status = "failed"; detail = providerError ?? (crashAt ? "Provider session recorded an abnormal process exit; reload before resuming" : "Owner record confirms unfinished planner stopped; current owner evidence unavailable");
       } else if (problem && !legitimateWait) {
         status = "unknown"; detail = problem;
+      } else if (!legitimateWait && !parkedPlan && (stoppedOwner || !state?.disposedAt && ghosts.has(agent.id))) {
+        status = "failed"; detail = stoppedOwner ? "Owner record confirms unfinished planner stopped; no subsequent turn progress observed" : "Provider process proven absent";
+      } else if (!legitimateWait && !parkedPlan && state?.disposedAt) {
+        status = "attention"; detail = "Planner session was disposed normally; unfinished planning is not proof of a crash";
       } else if (!legitimateWait && now - Date.parse(progressAt ?? cycleAt) >= QUIET_MS) {
         status = "attention"; detail = "No recent assistant/tool progress; quiet stage suspected, not proven failed";
       }
@@ -444,23 +509,50 @@ export class PlanPipeline {
       // A known newer submission supersedes only the preceding nonterminal revision of THIS
       // agent. Never cancel a disappearing root or conflate two planners of the same ticket.
       if (revision?.attemptAt) for (const other of this.records.values()) {
-        if (other !== record && other.row.agentId === agent.id && !TERMINAL[other.row.stage] && other.row.since < revision.attemptAt) this.change(other, "superseded", "normal", revision.attemptAt, "Replaced by a newer plan submission");
+        if (other !== record && other.row.agentId === agent.id && !TERMINAL[other.row.stage] && attemptTime(other) < revision.attemptAt) this.change(other, "superseded", "normal", revision.attemptAt, "Replaced by a newer plan submission");
       }
     });
     for (const plan of parked) {
       const record = this.latest(plan.agentId) ?? this.ensure(plan.agentId, plan.identifier, `parked:${plan.parkedAt}`, plan.parkedAt);
-      if (!TERMINAL[record.row.stage] && record.row.stage !== "ready") this.change(record, "publishing", record.row.status, timestamp(plan.parkedAt) ?? record.row.since, record.row.status === "failed" ? record.row.detail : "Parked plan recorded; inbox delivery not confirmed");
+      if (!TERMINAL[record.row.stage] && record.row.stage !== "ready" && record.row.stage !== "waiting") this.change(record, "publishing", record.row.status, timestamp(plan.parkedAt) ?? record.row.since, record.row.status === "failed" ? record.row.detail : "Parked plan recorded; inbox delivery not confirmed");
     }
-    for (const link of links) if (link.queued && !link.closed && !link.remote && !link.group) {
-      const record = link.agentId ? this.latest(link.agentId) : undefined;
-      const queued = record ?? this.ensure(link.agentId ?? "", link.identifier, `queue:${link.sessionId}`, link.createdAt);
-      if (!TERMINAL[queued.row.stage] && queued.row.stage !== "ready") this.change(queued, "queued", "normal", link.createdAt, "Waiting for admission or agent capacity");
+    const exactSessions = new Map<string, PaseoAgent>(), liveSessions = new Set<string>();
+    for (const agent of agents) {
+      const sessionId = agent.labels?.["linear.sessionId"];
+      if (!sessionId || agent.labels?.["paseo.parent-agent-id"]) continue;
+      const before = exactSessions.get(sessionId);
+      if (!before || agent.createdAt > before.createdAt) exactSessions.set(sessionId, agent);
+      if (!agent.archivedAt && agent.status !== "closed" && !ghosts.has(agent.id)
+        && !(agent.status === "error" && /\bprocess (exited|is closed)\b/i.test(agent.lastError ?? ""))) liveSessions.add(sessionId);
     }
-    for (const link of links) {
-      const queued = [...this.records.values()].find((entry) => entry.key === `queue:${link.sessionId}` && entry.row.agentId === "");
-      if (!queued || TERMINAL[queued.row.stage]) continue;
-      if (link.closed) this.change(queued, "cancelled", "normal", link.createdAt, "Queued session explicitly closed");
-      else if (link.agentId) this.change(queued, "completed", "normal", agents.find((agent) => agent.id === link.agentId)?.createdAt ?? link.createdAt, "Admission resolved; session linked to its agent");
+    for (const link of links) if (link.queued && !link.closed && !link.remote && !link.group && !link.agentId) {
+      const restart = object(link).restartRequested === true, pending = Boolean(link.pendingText);
+      const ran = exactSessions.get(link.sessionId);
+      if (!restart && !(pending && !liveSessions.has(link.sessionId)) && ran?.labels?.["linear.issueId"] === link.issueId) continue;
+      const cycles = [...this.records.values()].filter((entry) => entry.row.agentId === ""
+        && (entry.queue?.sessionId === link.sessionId || entry.key === `queue:${link.sessionId}`));
+      let queued = cycles.find((entry) => !TERMINAL[entry.row.stage]);
+      if (!queued) {
+        const previous = cycles.sort((a, b) => attemptTime(b).localeCompare(attemptTime(a)))[0];
+        const key = previous ? `queue:${link.sessionId}:cycle:${createHash("sha256").update(previous.row.id).digest("hex").slice(0, 20)}` : `queue:${link.sessionId}`;
+        queued = this.ensure("", link.identifier, key, previous ? this.now().toISOString() : link.createdAt);
+      }
+      queued.queue ??= { sessionId: link.sessionId, restart, pending };
+      queued.queue.restart = restart; queued.queue.pending = pending;
+      this.change(queued, "queued", agentSource.status === "fulfilled" ? "normal" : "unknown", queued.row.since,
+        agentSource.status === "fulfilled" ? queueDetail(link) : "Exact-session agent history unavailable; admission unconfirmed");
+    }
+    for (const queued of this.records.values()) {
+      if (!queued.key.startsWith("queue:") || queued.row.agentId !== "" || TERMINAL[queued.row.stage]) continue;
+      const sessionId = queued.queue?.sessionId ?? queued.key.slice(6), link = links.find((entry) => entry.sessionId === sessionId);
+      const ran = exactSessions.get(sessionId);
+      const restart = link ? object(link).restartRequested === true : queued.queue?.restart;
+      const pending = link ? Boolean(link.pendingText) : queued.queue?.pending;
+      if (link?.closed) this.change(queued, "cancelled", "normal", link.createdAt, "Queued session explicitly closed");
+      else if (link?.remote) this.change(queued, "superseded", "normal", link.createdAt, "Queued session explicitly transferred to a peer host");
+      else if (link?.agentId) this.change(queued, "completed", "normal", agents.find((agent) => agent.id === link.agentId)?.createdAt ?? link.createdAt, "Admission resolved; session linked to its agent");
+      else if (ran && (!link || ran.labels?.["linear.issueId"] === link.issueId) && !restart && !(pending && !liveSessions.has(sessionId))) this.change(queued, "completed", "normal", ran.createdAt, "Admission resolved; exact-session agent already ran");
+      else if (agentSource.status === "rejected" || sessionSource.status === "rejected") this.change(queued, "queued", "unknown", queued.row.since, "Queue sources unavailable; retaining unconfirmed admission");
     }
     this.applyInbox();
     this.prune();
