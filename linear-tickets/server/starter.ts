@@ -19,6 +19,7 @@ import { needsOwner, type Presence } from "./presence";
 import { Scheduler, type Admission } from "./scheduler";
 import type { PluginSettings } from "./settings";
 import { launchTier, recordStart, TIER_AGENT_LABEL, tierModel, tierNote, type TierStore } from "./model-tiers";
+import type { ReviewDeletions } from "./review-deletions";
 
 export type Started = { agentId: string; warnings: string[]; provider: string; target: string; resumed: boolean; untrusted: boolean; plan: PlanPolicy | null };
 type Deps = {
@@ -30,6 +31,7 @@ type Deps = {
   capacity?: Capacity;
   presence?: Pick<Presence, "away">;
   tiers?: Pick<TierStore, "get" | "record">;
+  deletions?: Pick<ReviewDeletions, "blocked">;
 };
 
 // Plan-first modes where the provider's plan mode lets the planner read without asking. omp has
@@ -217,6 +219,7 @@ export class TicketStarter {
   // skips max agents and the memory lease: it only orders tickets, and while it waits none of its
   // project's new tickets can be handed out (README, "Who starts next").
   async admission(issueId: string, paseo: PaseoApi, settings: PluginSettings): Promise<Admission> {
+    if (await this.deps.deletions?.blocked(issueId)) return { ok: false, reason: "This ticket is paused for deletion." };
     const state = await this.deps.linear.issueState(issueId);
     if (state.blockedBy.length) return { ok: false, reason: `Waiting for ${state.blockedBy.join(", ")} to finish.` };
     const attended = needsOwner(state.labels.map((item) => item.name), settings.dispatch.label);
@@ -228,6 +231,7 @@ export class TicketStarter {
   // `resumeOnly`: continue the recorded branch and worktree or throw ResumeUnavailableError, never
   // start fresh. `lead`: the last part of the first prompt (see Launcher).
   async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string; resume?: ActivationResume }): Promise<Started> {
+    if (await this.deps.deletions?.blocked(issueId)) throw new Error("This ticket is paused for deletion; no agent was started.");
     const detail: TicketDetail = await this.deps.linear.detail(issueId);
     const source = { projectId: detail.projectId, projectName: detail.issue.project, teamId: detail.teamId, teamName: detail.issue.team };
     // Only saved mappings launch. The sidebar's name-match preselection is a UI hint;

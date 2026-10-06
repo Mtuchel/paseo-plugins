@@ -15,6 +15,7 @@ import { approveForLater, splitIntoSubIssues } from "./split";
 import { AWAY_REASON } from "./scheduler";
 import { advisorNote, isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, TicketStarter, QUESTIONS_NOTE, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
 import { planPolicy } from "./plan-policy";
+import { ReviewDeletions } from "./review-deletions";
 
 const OWNER = "owner-1";
 const APP = "paseo-app";
@@ -768,4 +769,49 @@ test("health problems open one urgent ticket after two failed checks, update it,
     await monitor.check();
     assert.deepEqual(calls.slice(3), ["comment ✅ All checks pass again.", "complete"]);
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("deleted tickets lose parked and queued sessions, archive every affected agent, and cannot requeue or succeed after restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-deleted-session-"));
+  const issueId = "3b241101-e2bb-4255-8caf-4136c566a962";
+  const file = join(directory, "deletions.json");
+  const journal = new ReviewDeletions(file);
+  const h = routerHarness([], { deletions: journal });
+  const archived = new Set<string>();
+  let launches = 0;
+  const actions: string[] = [];
+  Object.assign(h.router, {
+    paseo: {
+      agents: {
+        list: async () => ({ entries: ["a1", "a2"].filter((id) => !archived.has(id)).map((id) => ({ agent: { id, labels: { "linear.issueId": issueId } } })), pageInfo: { hasMore: false } }),
+        ref: (id: string) => ({
+          refresh: async () => ({ agent: { id, archivedAt: archived.has(id) ? "now" : null, labels: { "linear.issueId": issueId } } }),
+          archive: async () => { archived.add(id); actions.push(`archive ${id}`); },
+        }),
+      },
+    },
+  });
+  try {
+    await h.store.put({ ...link, issueId, offer: "parked", review: { localUrl: "http://localhost:4000/" } });
+    await h.store.put({ ...link, sessionId: "queued", issueId, agentId: null, queued: true, pendingText: "Replan this" });
+    await h.store.put({ ...link, sessionId: "unrelated", issueId: "another-ticket", queued: true, pendingText: "Keep this message" });
+    await journal.put({ issueId, identifier: "TUC-1", agentId: "a1", phase: "deleted" });
+    await h.router.deleteTicket(issueId, "a1");
+    assert.deepEqual([...archived].sort(), ["a1", "a2"]);
+    assert.deepEqual(actions.sort(), ["archive a1", "archive a2"]);
+    assert.deepEqual(h.calls, ["stop a1", "stop a2"]);
+    assert.deepEqual((await h.store.all()).map((entry) => ({ id: entry.sessionId, pending: entry.pendingText })), [{ id: "unrelated", pending: "Keep this message" }]);
+    const restarted = routerHarness([], {
+      deletions: new ReviewDeletions(file),
+      starter: { admission: async () => ({ ok: true as const }), start: async () => { launches++; throw new Error("deleted issue must never start"); } },
+    });
+    try {
+      await restarted.router.created({ id: "stale", issueId, issue: { identifier: "TUC-1" }, creatorId: OWNER });
+      await restarted.router.restartFor(issueId, "TUC-1");
+      assert.equal((await restarted.router.succeed(issueId, "TUC-1", "a1", "Continue", async () => {})).kind, "impossible");
+      assert.equal(await restarted.router.requeue("a1", "Try planning again"), false);
+      assert.deepEqual(await restarted.store.all(), []);
+      assert.equal(launches, 0);
+    } finally { await restarted.cleanup(); }
+  } finally { await h.cleanup(); await rm(directory, { recursive: true, force: true }); }
 });

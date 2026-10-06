@@ -12,6 +12,7 @@ import type { ParkedPlan } from "./parked";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
 import { DecisionLog } from "./owner-decisions";
+import { ReviewDeletions } from "./review-deletions";
 
 const exec = promisify(execFile);
 // Bridges built without an opener use the default one: never open a real browser from the tests.
@@ -633,4 +634,66 @@ test("an approved plan resubmitted with only its tier added is approved without 
 
   const sentBack = planDocument({ type: "decided", agentId: "agent-0", approved: false, feedback: "Narrow it", planContent: legacy, at: "2026-01-01T09:00:00Z" }, "TUC-25");
   assert.deepEqual((await submit(tiered, sentBack)).decisions, [], "a plan that was sent back has no approval to keep");
+});
+
+test("pending deletion pauses only that ticket's events; confirmed deletion consumes stale events after restart", async () => {
+  const issueId = "3b241101-e2bb-4255-8caf-4136c566a962";
+  const { calls, linear, paseo } = setup({ "linear.issueId": issueId, "linear.identifier": "TUC-630" });
+  await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" }], async (directory) => {
+    const file = join(directory, "..", "deletions.json");
+    const journal = new ReviewDeletions(file);
+    await journal.put({ issueId, identifier: "TUC-630", agentId: "agent-1", phase: "pending" });
+    const paused = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+    paused.useDeletions(journal);
+    paused.attach(paseo);
+    try { await paused.drain(); } finally { paused.stop(); }
+    assert.deepEqual(await readdir(directory), ["0.json"]);
+    assert.deepEqual(calls, []);
+    await journal.put({ issueId, identifier: "TUC-630", agentId: "agent-1", phase: "deleted" });
+    const restarted = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+    restarted.useDeletions(new ReviewDeletions(file));
+    restarted.attach(paseo);
+    try { await restarted.drain(); } finally { restarted.stop(); }
+    assert.deepEqual(await readdir(directory), []);
+    assert.deepEqual(calls, [], "no approval, denial, new review, comment or successor event");
+    const unrelated = setup({ "linear.issueId": "other-issue", "linear.identifier": "TUC-631" });
+    await writeFile(join(directory, "1.json"), JSON.stringify({ type: "decided", agentId: "agent-2", approved: false, feedback: "Narrow the scope", at: "2026-01-01T10:05:00Z" }));
+    const other = new PlannotatorBridge(unrelated.linear, { read: async () => settings }, directory);
+    other.useDeletions(new ReviewDeletions(file));
+    other.attach(unrelated.paseo);
+    try { await other.drain(); } finally { other.stop(); }
+    assert.ok(unrelated.calls.includes("state other-issue Planning"));
+    assert.ok(unrelated.calls.includes("document other-issue Plan: TUC-631"));
+  });
+});
+
+test("rechecked plans cannot auto-approve even with matching fresh advice or an approved tier-only predecessor", async () => {
+  const { calls, documents, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  documents["Plan: TUC-25"] = planDocument({ type: "decided", agentId: "previous", approved: true, planContent: RISKY(1).replace(MODEL("strong"), ""), at: "2026-01-01T08:00:00Z" }, "TUC-25");
+  const decisions: boolean[] = [];
+  const reviews = {
+    opened: async () => "https://host.ts.net:8444/review/agent-1",
+    decided: async () => {}, described: async () => {}, describedFor: async () => {},
+    requiresOwner: async () => true,
+  };
+  await withEvents([
+    { type: "advised", agentId: "agent-1", verdict: "agreed", hash: planHash(RISKY(1)), at: "2026-01-01T09:59:00Z" },
+    { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
+  ], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => RISKY(1), undefined, undefined, reviews, async (_url, approved) => { decisions.push(approved); }, () => {});
+    bridge.attach(paseo);
+    try { await bridge.drain(); await bridge.drain(); } finally { bridge.stop(); }
+  });
+  assert.equal(decisions.includes(true), false);
+  assert.ok(calls.includes("state issue-1 Planning"));
+  assert.ok(!calls.includes("+plan-ready issue-1"));
+  const { plans, parking } = parkingFake(calls);
+  plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(1), line: "Requires owner review", reasons: ["recheck"], model: null, parkedAt: "2026-01-01T10:00:00Z", announced: true });
+  await withEvents([{ type: "advised", agentId: "agent-1", verdict: "agreed", hash: planHash(RISKY(1)), at: "2026-01-01T10:10:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => "", undefined, undefined, reviews, async (_url, approved) => { decisions.push(approved); }, () => {}, parking);
+    bridge.attach(paseo);
+    try { await bridge.drain(); await bridge.drain(); } finally { bridge.stop(); }
+  });
+  assert.equal(plans.get("issue-1")?.identifier, "TUC-25");
+  assert.deepEqual(decisions, []);
 });

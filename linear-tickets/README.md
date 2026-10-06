@@ -1375,17 +1375,38 @@ still answers; each row opens the agent's stable link. Each waiting row shows th
 risk rating (see *Plan risk and auto-approval*) as a coloured badge (green impact 0–1, amber 2, red
 3–4; planner and advisor combined, as the policy reads it) and why the risk policy left it to
 you. Next to the badge, `2 follow-ups` counts the plan's `follow-up` items (filed as tickets on
-approval) and `new rule` marks a plan that sets one. Below it: **Linear ↗** (the ticket), the model
-that wrote the plan, and the host it runs on when the inbox lists several. Decided rows keep the
-title and the chips, and say `auto-approved` when the policy approved it. The details are read once
-when the review opens (plans that predate the rating have no badge). The page refreshes in place
-every 30 s and when you return to it, keeping your scroll position (not while you are writing a
-note); when the host cannot be reached it says so and keeps retrying.
+approval) and **Rule change** marks a plan whose risk section says it introduces a new rule.
+Each ticket-backed row also shows its actual Linear **Area** labels, not an area inferred from
+the plan's wording. Below it: **Linear ↗** (the ticket), the model that wrote the plan, and the
+host it runs on when the inbox lists several. Decided rows keep the title and the chips, and say
+`auto-approved` when the policy approved it. Plan details are read once when the review opens
+(plans that predate the rating have no badge). The page refreshes in place every 30 s and when
+you return to it, keeping your scroll position and search (not while you are writing a note);
+when the host cannot be reached it says so and keeps retrying.
 
+- **Search reviews** filters waiting plans and recent decisions by ticket, plan title or summary,
+  Area, host, model, outcome, or `rule change`. Words match together, ignoring case. Matching
+  counts replace the section counts and empty day groups disappear; the app badge and header
+  still count every waiting review. Search never reloads or closes the selected Plannotator pane.
 - **Approve / Send back** on each waiting row decide the review as on its page: approve at once,
   or send back with the note you type there. It goes the same way as **Approve plan** / **Send
   back** in the Linear panel, so a parked plan moves on and an agent's own review gets its answer.
   Only the inbox's own page can send these (a custom header, no cross-site requests).
+- **Recheck landscape** sends the plan back with a fixed request to check current code and main,
+  open and recently merged PRs, related Linear issues and plans, and other active reviews. The
+  planner must cite evidence, resolve overlap or conflicts, revise the direction where necessary,
+  explain changes, get a fresh advisor review of the revised text, and resubmit. This is feedback,
+  not an automated approval or permission to implement; subsequent reviews still require you.
+- **Delete plan + issue** is available on waiting reviews with a verified Linear ticket. The
+  confirmation names that ticket and requires typing its identifier exactly. It removes the
+  waiting plan and uses Linear's normal issue deletion (moves the issue to Trash, not archive
+  or permanent purge), stops its queued work, and prevents stale reviews or cached starts from
+  reviving it. A refused deletion leaves the review actionable; a deletion that succeeded but
+  still needs local cleanup says so, and retrying completes cleanup without deleting twice.
+  Deletion state is saved in `linear-tickets/plannotator/deletions.json`, so the pause and
+  completed-deletion guard survive a restart. An inconclusive Linear response keeps work paused;
+  retry requires a fresh check of the captured ticket identity. A missing or inaccessible ticket
+  is not treated as proof that deletion succeeded.
 - **Review pane on a wide screen.** From 1100 px wide the list sits on the left and a row opens
   its review on the right, inside the inbox: the full Plannotator page (annotate, comment, Approve,
   Send Feedback), as on its own tab. Each review you open keeps its page, so switching between rows

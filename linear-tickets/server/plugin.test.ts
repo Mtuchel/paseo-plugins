@@ -916,6 +916,31 @@ test("removed or missing base branches fail before creating a workspace", async 
   await assert.rejects(launcher.start({ ...input, baseBranch: "refs/heads/deleted" }, paseo), /available base branch/);
 });
 
+test("deletion pauses block UUID and identifier launches without blocking unrelated tickets", async () => {
+  const deletedId = "3b241101-e2bb-4255-8caf-4136c566a962";
+  const unrelatedId = "0c7f5f9e-83a5-4e4b-b7f3-2f7d3c1b5a10";
+  const created: string[] = [];
+  const launcher = new Launcher({ ...noMark, detail: async (id) => ({ ...detail, issue: { ...detail.issue, id: id === "OTHER-1" ? unrelatedId : deletedId } }) }, undefined, undefined, undefined, async () => "/fixture-context.md", () => false, { save: async () => {} });
+  launcher.useDeletions({ blocked: async (id) => id === deletedId });
+  const paseo = mockPaseo(async (options) => { created.push(options.labels?.["linear.issueId"] ?? ""); return { id: "new-agent" }; });
+  await assert.rejects(launcher.start({ ...input, id: deletedId }, paseo), /paused for deletion/);
+  await assert.rejects(launcher.start({ ...input, requestId: "identifier-attempt" }, paseo), /paused for deletion/);
+  assert.deepEqual(created, []);
+  assert.equal((await launcher.start({ ...input, id: "OTHER-1", requestId: "unrelated-attempt" }, paseo)).agentId, "new-agent");
+  assert.deepEqual(created, [unrelatedId]);
+});
+
+test("a deletion pause that begins during workspace creation prevents the in-flight agent from starting", async () => {
+  let paused = false;
+  let created = false;
+  const launcher = new Launcher({ ...noMark, detail: async () => detail }, undefined, undefined, undefined, async () => "/fixture-context.md", () => false, { save: async () => {} });
+  launcher.useDeletions({ blocked: async () => paused });
+  const paseo = mockPaseo(async () => { created = true; return { id: "new-agent" }; }, undefined, () => { paused = true; });
+  await assert.rejects(launcher.start(input, paseo), /paused for deletion/);
+  assert.equal(created, false);
+  await launcher.settledFor(detail.issue.id);
+});
+
 test("uncertain workspace creation is not repeated on request retry", async () => {
   let attempts = 0;
   const launcher = new Launcher({ ...noMark, detail: async () => detail });

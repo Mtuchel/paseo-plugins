@@ -23,6 +23,7 @@ import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, que
 import type { Settings } from "./settings";
 import { issueAgents, type TicketStarter } from "./starter";
 import { ghostAgents, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
+import type { ReviewDeletions } from "./review-deletions";
 
 const exec = promisify(execFile);
 const HANDLED_LIMIT = 200;
@@ -199,6 +200,12 @@ export class SessionStore {
     await this.persist();
   }
 
+  async removeIssue(issueId: string): Promise<void> {
+    const links = await this.load();
+    for (const [id, link] of Object.entries(links)) if (link.issueId === issueId) delete links[id];
+    await this.persist();
+  }
+
   // True the first time an activity is seen; webhook and sweep both deliver prompts.
   async claim(sessionId: string, activityId: string): Promise<boolean> {
     const link = (await this.load())[sessionId];
@@ -318,6 +325,7 @@ type Deps = {
   processInspector?: ProcessInspector;
   // The clock the webhook fallback windows are measured against.
   now?: () => number;
+  deletions?: Pick<ReviewDeletions, "get" | "blocked" | "forAgent">;
 };
 
 // Linear agent sessions ↔ Paseo agents. Inbound: `created` starts or links an agent, and
@@ -364,6 +372,40 @@ export class SessionRouter {
     this.timer = null;
     for (const state of this.live.values()) { if (state.timer) clearTimeout(state.timer); state.stop(); }
     this.live.clear();
+  }
+
+  // Await any already-admitted start/recovery before deletion; the durable pause blocks new ones.
+  async settleTicket(issueId: string): Promise<void> {
+    await this.exclusive(issueId, async () => {});
+  }
+
+  async deleteTicket(issueId: string, reviewAgentId: string): Promise<void> {
+    if (!this.paseo) throw new Error("Paseo is not connected; ticket-agent cleanup cannot finish.");
+    await this.exclusive(issueId, async () => {
+      const links = (await this.deps.store.all()).filter((link) => link.issueId === issueId);
+      const agents = await issueAgents(this.paseo!, issueId);
+      const ids = new Set([reviewAgentId, ...agents.map((agent) => agent.id), ...links.flatMap((link) => link.agentId ? [link.agentId] : [])]);
+      const failures: string[] = [];
+      for (const id of ids) {
+        const state = this.live.get(id);
+        if (state) { clearTimeout(state.timer ?? undefined); state.stop(); this.live.delete(id); }
+        try {
+          const found = await this.paseo!.agents.ref(id).refresh();
+          if (!found || found.agent.archivedAt) continue;
+          try { await (this.deps.stop ?? stopAgentTurn)(id); } catch (error) { failures.push(`stop ${id}: ${error instanceof Error ? error.message : error}`); }
+          await this.paseo!.agents.ref(id).archive();
+        } catch (error) {
+          if (!/not found/i.test(error instanceof Error ? error.message : String(error))) failures.push(`archive ${id}: ${error instanceof Error ? error.message : error}`);
+        }
+      }
+      this.waiting = this.waiting.filter((event) => {
+        const issue = (event.agentSession.issue ?? {}) as { id?: string };
+        return String(event.agentSession.issueId ?? issue.id ?? "") !== issueId;
+      });
+      await this.deps.store.removeIssue(issueId);
+      this.lastAutoResume.delete(issueId);
+      if (failures.length) throw new Error(failures.join("; "));
+    });
   }
 
   // Entry point for webhooks. Acknowledges `created` right away — Linear marks sessions without
@@ -430,6 +472,7 @@ export class SessionRouter {
     const issueId = String(session.issueId ?? issue.id ?? "");
     const identifier = String(issue.identifier ?? "this ticket");
     if (!issueId) throw new Error("The session has no ticket.");
+    if (await this.deps.deletions?.blocked(issueId)) return;
     const known = await this.deps.store.get(session.id);
     if (known?.agentId || known?.group) return;
     const link: SessionLink = { sessionId: session.id, agentId: null, issueId, identifier, createdAt: new Date().toISOString(), handled: [], review: null, offer: null };
@@ -522,6 +565,7 @@ export class SessionRouter {
   // recovery of the predecessor waits until the successor started and the predecessor is archived.
   private startFor(link: SessionLink, fresh: boolean, gateHeld = false): Promise<void> {
     return this.exclusive(link.issueId, async () => {
+      if (await this.deps.deletions?.blocked(link.issueId)) return;
       const gate = gateHeld ? null : this.deps.launcher.gate(link.issueId);
       try {
         const wait = !gateHeld && !gate ? "a launch for this ticket is under way" : await this.processWait(link.issueId);
@@ -538,6 +582,7 @@ export class SessionRouter {
   }
 
   private async startNow(link: SessionLink, fresh: boolean): Promise<void> {
+    if (await this.deps.deletions?.blocked(link.issueId)) return;
     const settings = await this.deps.settings.read();
     // This thread's next agent belongs to the peer (the host drains, or the ticket is claimed
     // there): the pending comment goes with it, and nothing starts here.
@@ -586,6 +631,7 @@ export class SessionRouter {
     const signal = typeof activity.signal === "string" ? activity.signal : null;
     const link = await this.deps.store.get(sessionId);
     if (!link) { await this.say(sessionId, "error", "No Paseo agent is linked to this session. Assign Paseo to the ticket again."); return; }
+    if (await this.deps.deletions?.blocked(link.issueId)) return;
     if (activityId && !await this.deps.store.claim(sessionId, activityId)) return;
     const userId = typeof activity.userId === "string" ? activity.userId : String(((activity.user ?? {}) as { id?: string }).id ?? "");
     if (userId && userId !== await this.owner()) { await this.say(sessionId, "error", "Only the workspace owner can steer Paseo agents."); return; }
@@ -719,6 +765,7 @@ export class SessionRouter {
   async startQueued(): Promise<void> {
     for (const link of await this.deps.store.all()) {
       if (!link.queued || link.agentId || link.closed) continue;
+      if (await this.deps.deletions?.blocked(link.issueId)) continue;
       const gate = this.deps.launcher.gate(link.issueId);
       if (!gate) continue;
       try {
@@ -755,6 +802,7 @@ export class SessionRouter {
         return;
       }
       const ticket = await this.deps.linear.issueState(link.issueId);
+      if (await this.deps.deletions?.blocked(link.issueId)) return;
       if (ticket.statusType === "completed" || ticket.statusType === "canceled") {
         await this.deps.store.patch(link.sessionId, { queued: false, pendingText: null });
         await this.say(link.sessionId, "response", `${link.identifier} was moved to ${ticket.status} while it waited, so no agent was started. Assign Paseo again to start one.`);
@@ -1038,7 +1086,9 @@ export class SessionRouter {
     if (busy(found.agent)) return "busy";
     const issueId = recovery?.issueId ?? found.agent.labels?.["linear.issueId"] ?? (await this.deps.store.forAgent(agentId))?.issueId;
     if (issueId) {
+      if (await this.deps.deletions?.blocked(issueId)) return "gone";
       return this.exclusive(issueId, async () => {
+        if (await this.deps.deletions?.blocked(issueId)) return "gone";
         const gate = this.deps.launcher.gate(issueId);
         if (!gate) return "busy";
         try {
@@ -1166,6 +1216,16 @@ export class SessionRouter {
 
   // Called when a turn starts: a provider restarting on its own right after a Stop is stopped again.
   async holdIfStopped(agentId: string): Promise<boolean> {
+    if (this.deps.deletions) {
+      const deletion = await this.deps.deletions.forAgent(agentId);
+      const link = await this.deps.store.forAgent(agentId);
+      const issueId = link?.issueId ?? (await this.paseo?.agents.ref(agentId).refresh())?.agent.labels?.["linear.issueId"];
+      const issueDeletion = deletion ?? (issueId ? await this.deps.deletions.get(issueId) : null);
+      if (issueDeletion?.phase === "deleted") {
+        await (this.deps.stop ?? stopAgentTurn)(agentId);
+        return true;
+      }
+    }
     const since = this.held.get(agentId);
     if (since === undefined || Date.now() - since > HOLD_MS) { this.held.delete(agentId); return false; }
     await (this.deps.stop ?? stopAgentTurn)(agentId).catch(() => {});
@@ -1276,6 +1336,7 @@ export class SessionRouter {
     if (!known || !this.paseo) return false;
     return this.exclusive(known.issueId, async () => {
       const link = await this.deps.store.get(sessionId) ?? known;
+      if (await this.deps.deletions?.blocked(link.issueId)) return false;
       const last = this.lastAutoResume.get(link.issueId) ?? 0;
       if (Date.now() - last < 60 * 60 * 1000) return false;
       const gate = this.deps.launcher.gate(link.issueId);
@@ -1304,6 +1365,7 @@ export class SessionRouter {
   }
 
   private async restartNow(issueId: string, identifier: string): Promise<void> {
+    if (await this.deps.deletions?.blocked(issueId)) return;
     if (!this.paseo) throw new Error("Paseo is not connected yet.");
     const gate = this.deps.launcher.gate(issueId);
     if (!gate) throw new Error("A launch for this ticket is under way.");
@@ -1363,6 +1425,7 @@ export class SessionRouter {
   }
 
   private async succeedNow(issue: { id: string; identifier: string }, predecessorId: string, lead: string, onDispatch: () => Promise<void>): Promise<Succession> {
+    if (await this.deps.deletions?.blocked(issue.id)) return { kind: "impossible", reason: "the ticket was deleted or is paused for deletion" };
     if (!this.paseo) return { kind: "wait", reason: "Paseo is not connected yet" };
     const paseo = this.paseo;
     const state = await this.deps.linear.issueState(issue.id);
@@ -1430,7 +1493,9 @@ export class SessionRouter {
   }
 
   async offerResume(sessionId: string): Promise<void> {
-    const offer = (await this.deps.store.get(sessionId))?.offer;
+    const link = await this.deps.store.get(sessionId);
+    if (!link || await this.deps.deletions?.blocked(link.issueId)) return;
+    const offer = link.offer;
     if (offer === "split" || offer === "later" || offer === "parked") return;
     await this.deps.store.patch(sessionId, { offer: "resume" });
     await this.ask(sessionId, "The agent stopped. Continue with a new agent on the same branch?", [{ label: "Resume with a new agent", value: RESUME }, { label: "Leave it", value: LEAVE }]);
@@ -1450,6 +1515,7 @@ export class SessionRouter {
   async requeue(agentId: string, note: string): Promise<boolean> {
     const link = await this.sessionFor(agentId);
     if (!link) return false;
+    if (await this.deps.deletions?.blocked(link.issueId)) return false;
     await this.clearReview(link.sessionId);
     await this.deps.store.patch(link.sessionId, { agentId: null, queued: true, offer: null });
     await this.say(link.sessionId, "thought", note);
@@ -1468,6 +1534,7 @@ export class SessionRouter {
   // names Paseo. Delegated only after the session links the agent, so the delegation cannot start
   // a second one; a failed delegation keeps the session.
   async openFor(issueId: string, identifier: string, agentId: string): Promise<string | null> {
+    if (await this.deps.deletions?.blocked(issueId)) return null;
     let sessionId: string;
     try {
       sessionId = await this.deps.api.createSessionOnIssue(issueId);
@@ -1488,7 +1555,12 @@ export class SessionRouter {
 
 // Decides a waiting Plannotator review through its local server (the same endpoints its page uses).
 // The review's server is gone or no longer takes decisions.
-export class ReviewClosedError extends Error {}
+export class ReviewClosedError extends Error {
+  constructor(message: string, readonly outcomeUnknown = false) { super(message); }
+}
+
+// The review server accepted the decision, but recording its lifecycle event failed.
+export class ReviewDecisionAppliedError extends Error {}
 
 // `feedback` on an approval reaches the agent as Plannotator's approval notes.
 export async function decidePlannotatorReview(localUrl: string, approve: boolean, feedback: string): Promise<void> {
@@ -1500,7 +1572,7 @@ export async function decidePlannotatorReview(localUrl: string, approve: boolean
     body: JSON.stringify(approve && !feedback ? {} : { feedback }),
     signal: AbortSignal.timeout(10_000),
   }).catch((error: unknown) => {
-    throw new ReviewClosedError(`Plannotator is not reachable at ${origin}: ${error instanceof Error ? error.message : error}`);
+    throw new ReviewClosedError(`Plannotator is not reachable at ${origin}: ${error instanceof Error ? error.message : error}`, true);
   });
   if (!response.ok) throw new ReviewClosedError(`Plannotator answered HTTP ${response.status}; the review is already closed.`);
 }

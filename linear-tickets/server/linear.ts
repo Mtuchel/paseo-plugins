@@ -482,6 +482,10 @@ export const ISSUE_ATTACHMENTS_QUERY = `query issueAttachments($id: String!) {
 export const DELETE_ATTACHMENT_QUERY = `mutation deleteAttachment($id: String!) {
   attachmentDelete(id: $id) { success }
 }`;
+// Linear's public schema: issueDelete(id: String!) deletes (trashes), unlike issueArchive.
+export const DELETE_ISSUE_QUERY = `mutation deleteIssue($id: String!) {
+  issueDelete(id: $id) { success }
+}`;
 export const LINK_URL_QUERY = `mutation link($issueId: String!, $url: String!, $title: String) {
   attachmentLinkURL(issueId: $issueId, url: $url, title: $title) { success }
 }`;
@@ -1087,6 +1091,10 @@ export class LinearService {
     if (!canceled) return;
     await this.comment(issueId, reason);
     succeeded(await this.writeState(issueId, canceled.id), "issueUpdate", "cancel the ticket");
+  }
+
+  async deleteIssue(issueId: string): Promise<void> {
+    succeeded(record(await this.write(DELETE_ISSUE_QUERY, { id: issueId })), "issueDelete", "delete the ticket");
   }
 
   async teamIdByKey(teamKey: string): Promise<string | null> {
