@@ -654,6 +654,19 @@ fails after two honest fix attempts, the work needs judgment the plan did not se
 finds a design problem. The plugin then switches the agent to the strong model within seconds,
 records the reason and posts it in the ticket's panel. Subagents cannot call it.
 
+Worker allocation is slice-specific on **every** tier, including strong ticket owners. Keep
+Opus ownership/planning, Astra advice and independent Sol review unchanged. Use the cheap worker
+(OMP `task` without a model override; DeepSeek by default) for useful independent slices whose
+interfaces, invariants and expected behavior are settled: prescribed validators/predicates,
+established-pattern caller updates, settled behavioral fixtures, exact review fixes and specified
+smoke checks. Give each worker exact writable scope, rules and an observable verification scenario.
+A strong ticket, several files or careful execution alone does not justify `@slow`: the brief
+must name unresolved design/diagnosis, authorization/identity/financial/solver decisions,
+concurrency/recovery/external-effect boundaries or substantial rescue. New decisions and failures
+after two honest fix attempts return to the owner, who integrates and verifies; trivial or tightly
+coupled edits need no forced delegation. This is an instruction policy, not a tool-enforced model
+restriction, and does not change the existing tier maps or reviewer routing.
+
 Every decision (plan, start, escalation) is kept per ticket in
 `$PASEO_HOME/linear-tickets/model-tiers/`. `npm run tier-report [-- --since 2026-10-01]` compares
 the tiers each ticket started implementing on, from those records and the handover records:

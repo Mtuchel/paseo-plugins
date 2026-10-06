@@ -44,6 +44,11 @@ export function strongRequired(risk: PlanRisk): string | null {
   return reasons.length ? reasons.join(", ") : null;
 }
 
+// Shared by planning and every implementation tier, including strong ticket owners.
+export function workerDelegationNote(): string {
+  return "Worker allocation is slice-specific, not inherited from the ticket's tier or risk rating. Keep the ticket owner responsible for framing, integration and verification. For useful independent slices whose interfaces, invariants and expected behavior the approved plan already settles, use the cheap worker (OMP: `task` without a model override, currently DeepSeek); examples: prescribed predicate/validator replacements, established-pattern caller updates, settled behavioral fixtures, exact review fixes and specified smoke checks. Do not use `@slow` merely because the ticket is strong, touches several files or requires careful execution. Use the strong model only for unresolved design or diagnosis, authorization/identity/financial/solver decisions, concurrency/recovery/external-effect boundaries, or substantial rescue; state that slice-specific reason in the brief. Give workers exact writable scope, rules and an observable verification scenario. A worker returns new decisions or an unresolved failure after two honest fix attempts to the owner rather than improvising. Do not force delegation for a trivial or tightly coupled edit. This applies to implementation workers only: Opus planning/ownership, Astra plan advice and independent Sol review routing stay unchanged.";
+}
+
 // The section the planner writes, word for word in the prompt so the parser below can read it.
 export function modelSteps(): string {
   return [
@@ -52,7 +57,8 @@ export function modelSteps(): string {
     "- Strong steps: <none | the step numbers that need the strong model> — <why>",
     "Planning always runs on the strong model. Once the plan is approved, the implementing agent runs on the tier you pick: `cheap` is a fast, inexpensive model for well-specified, mechanical work; `standard` is a capable mid-priced model for ordinary work that needs more care than that; `strong` is the launch model. Pick `cheap` when every step is spelled out. Pick `standard` when cheap does not fit and none of the strong reasons below applies. Pick `strong` only when the implementation needs judgment the plan cannot settle up front: the change spans four or more layers (e.g. UI, API, persistence, scheduler), it designs or changes an interface others build on, several call sites must agree on one authoritative computation, there is a gap between a check and the write it guards (TOCTOU), or it touches more than about 15–20 files. Name that reason after the dash.",
     `A plan rated above impact ${MAX_IMPACT_BELOW_STRONG}, not reversible by a revert, or with a migration, an auth change or a new rule always takes \`strong\`.`,
-    `\`Strong steps\` names single steps of a cheap or standard plan that still need the strong model: the implementing agent hands each to a subagent on the strong model (in omp: the task tool with \`model: "@slow"\`). Every other subagent runs on the cheap model.`,
+    `\`Strong steps\` names single steps of a cheap or standard plan that still need the strong model: the implementing agent hands each to a subagent on the strong model (in omp: the task tool with \`model: "@slow"\`), with its slice-specific reason.`,
+    workerDelegationNote(),
     `On the cheap or standard tier, the implementing agent calls \`${ESCALATE_TOOL}\` with the reason when the same check still fails after two honest fix attempts, the work turns out to need one of the strong reasons above, or a review finds a design problem; the plugin then switches it to the strong model.`,
   ].join("\n");
 }

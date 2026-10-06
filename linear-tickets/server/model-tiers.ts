@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ADVISOR_SECTION } from "../shared/plan-advisor";
-import { ESCALATE_TOOL, MODEL_SECTION, strongerTier, TIERS, type Tier } from "../shared/plan-model";
+import { ESCALATE_TOOL, MODEL_SECTION, strongerTier, TIERS, workerDelegationNote, type Tier } from "../shared/plan-model";
 import { RISK_SECTION } from "../shared/plan-risk";
 import type { PluginSettings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
@@ -42,12 +42,13 @@ export function tierModel(settings: Pick<PluginSettings, "cheapModels" | "standa
 // What the implementing agent is told about its tier (the planner learned the rules from the plan
 // steps; this reaches a later agent that implements an approved plan).
 export function tierNote(tier: Tier, strongSteps: string | null): string {
-  if (tier === "strong") return "This ticket implements on the strong model tier (its plan's `## Model` section or the ticket's `model:strong` label). Subagents still run on the cheap model by default; give one the strong model (in omp: the task tool with `model: \"@slow\"`) only for work that needs judgment.";
+  if (tier === "strong") return `This ticket implements on the strong model tier (its plan's \`## Model\` section or the ticket's \`model:strong\` label). ${workerDelegationNote()}`;
   return [
     tier === "cheap"
       ? "This ticket implements on the cheap model tier (its plan's `## Model` section): you run on a fast, inexpensive model."
       : "This ticket implements on the standard model tier (its plan's `## Model` section): you run on a capable mid-priced model, not the strong one.",
     strongSteps ? `Strong steps: ${strongSteps}. Hand each of them to a subagent on the strong model (in omp: the task tool with \`model: "@slow"\`).` : "",
+    workerDelegationNote(),
     `Call \`${ESCALATE_TOOL}\` with the reason when the same check still fails after two honest fix attempts, the work needs judgment the plan did not settle, or a review finds a design problem; the plugin then switches you to the strong model.`,
   ].filter(Boolean).join(" ");
 }
