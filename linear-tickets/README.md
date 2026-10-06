@@ -1287,6 +1287,16 @@ gzip), about 7 MB for the page. Event streams, WebSockets and binary files pass 
 are. The route is switched when the review opens, before its link is posted, and on plugin start
 for reviews still open. If the proxy cannot listen, reviews keep their direct, uncompressed route.
 
+**One download of Plannotator per version.** Nearly all of that page is Plannotator's app (a 22 MB
+script and a 2 MB stylesheet), the same for every review, but each review has its own port, so a
+browser would fetch and compile it again for every review. The proxy therefore moves the app out
+of the page to `https://<machine>.<tailnet>.ts.net:8444/plannotator/<sha256>.js` (and `.css`),
+named by its content and served from memory with `cache-control: immutable` (brotli, compressed
+once). A review's page is then under 1 KB plus the app from the browser's cache: about 0.8 s
+instead of 1.2 s on the Mac for a review served by the Mac, and the ~7 MB transfer per review over
+the tailnet is gone. The first review after a Plannotator update loads the app once. A page without
+the inline app (another Plannotator build) passes through unchanged.
+
 **Review inbox.** `https://<machine>.<tailnet>.ts.net:8444/` lists every review still waiting
 for you, newest first and grouped by day (Today, Yesterday, then the date, in the host's time
 zone), each with the clock time you got it and how long it has waited (amber after 12 hours), and
@@ -1316,7 +1326,8 @@ note); when the host cannot be reached it says so and keeps retrying.
   keeps unsent annotations; it closes once the review leaves the list (not while a peer is
   unreachable). The address ends in `#<agentId>`, so a reload reopens it; **Open in new tab ↗**
   above the pane and Cmd/Ctrl-click on a row open the review on its own. Narrower screens (the
-  phone) open the review as before.
+  phone) open the review as before. Resting the pointer on a row for a moment starts loading its
+  review out of sight, so the click mostly finds it loaded.
 - **All hosts in one inbox.** List the other hosts' inboxes in `reviewPeers` in
   `$PASEO_HOME/linear-tickets/settings.json` (no toggle), e.g.
   `"reviewPeers": ["https://server087.<tailnet>.ts.net:8444"]`, and this inbox shows their waiting

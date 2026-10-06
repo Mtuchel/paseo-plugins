@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { z } from "zod";
 import { FUNNEL_PORT } from "./funnel";
 import { plannotatorPaths, readReviewPlan, type OpenedEvent } from "./plannotator";
+import { ReviewBundles } from "./review-bundle";
 import { REVIEW_ICON_PNG } from "./review-icon";
 import { closedPage, inboxPage, MANIFEST, planDetails, SERVICE_WORKER, type InboxRow, type InboxView, type PlanDetails } from "./review-page";
 import { createReviewProxy } from "./review-proxy";
@@ -169,7 +170,9 @@ function json(status: number, value: unknown): { status: number; headers: Record
 // once a review's server is gone, removes that port's route (the plugin owns the cleanup). Its
 // root, https://<host>:8444/, is the review inbox: every review waiting for the owner here and on
 // the peer hosts, with Approve / Send back, and Web Push for new ones. Each review's route is
-// pointed at the compressing proxy (review-proxy.ts) so its page loads over a relay.
+// pointed at the compressing proxy (review-proxy.ts) so its page loads over a relay; the proxy
+// moves the page's inline Plannotator app to /plannotator/<sha256>.js|css here (review-bundle.ts),
+// so a browser loads it once per Plannotator version instead of once per review.
 export class ReviewLinks {
   private server: Server | null = null;
   private proxy: Server | null = null;
@@ -197,6 +200,7 @@ export class ReviewLinks {
   private readonly decide: DecideReview | null;
   private readonly linearWorkspace: (() => Promise<string>) | null;
   private readonly push: ReviewPush;
+  private readonly bundles = new ReviewBundles();
 
   constructor(options: ReviewLinksOptions = {}) {
     this.port = options.port ?? REVIEW_PORT;
@@ -281,7 +285,7 @@ export class ReviewLinks {
   // Without the proxy (its port taken) reviews keep the direct route the open hook published.
   // Open reviews published before (by the hook, or by an earlier plugin version) are moved onto it.
   private async startProxy(): Promise<void> {
-    const proxy = createReviewProxy((port) => this.backendFor(port));
+    const proxy = createReviewProxy((port) => this.backendFor(port), (page) => this.origin ? this.bundles.externalize(page, this.origin) : page);
     try {
       await new Promise<void>((resolve, reject) => {
         proxy.once("error", reject);
@@ -438,6 +442,14 @@ export class ReviewLinks {
       }
     }
     if (method !== "GET") return { status: 405, headers: { allow: "GET" } };
+    const bundle = /^\/plannotator\/([0-9a-f]{64}\.(?:js|css))$/.exec(path);
+    if (bundle) {
+      const file = this.bundles.file(bundle[1]);
+      if (!file) return { status: 404 };
+      // Named by its hash, so it never changes; any review's page (another port) may load it.
+      const br = /\bbr\b/i.test(String(headers["accept-encoding"] ?? "")) ? await file.br.catch(() => null) : null;
+      return { status: 200, headers: { "content-type": file.type, "cache-control": "public, max-age=31536000, immutable", "access-control-allow-origin": "*", vary: "Accept-Encoding", ...(br ? { "content-encoding": "br" } : {}) }, body: br ?? file.raw };
+    }
     if (path === "/") return { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: inboxPage(await this.view(), this.now(), this.timeZone) };
     if (path === "/api/inbox") return json(200, { host: this.host, ...await this.rows() });
     if (path === "/api/push/key") return json(200, { publicKey: await this.push.publicKey() });
