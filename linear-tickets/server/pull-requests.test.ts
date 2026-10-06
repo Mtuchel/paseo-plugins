@@ -244,6 +244,26 @@ test("GitHub throttling the login shows as rate limited, not as an error", async
   assert.deepEqual({ error: snapshot.error, reason: snapshot.rateLimited?.reason, until: snapshot.rateLimited?.until }, { error: null, reason: "throttled", until: at(8, 32) });
 });
 
+test("with the router installed one account's low quota neither pauses the poll nor hides the router's refusal", async (t) => {
+  const github = fakeGitHub();
+  github.state.remaining = 250; // below the single-login reserve
+  const time = { now: NOW };
+  const routed = new PullRequestBoard({ get: github.get, budget: new GitHubBudget(() => time.now, 300, true), now: () => time.now });
+  t.after(() => routed.stop());
+  routed.read("o/r");
+  await routed.settled("o/r");
+  const read = routed.read("o/r");
+  assert.deepEqual({ error: read.error, rateLimited: read.rateLimited, rateLimit: read.rateLimit, pulls: read.pulls.length }, { error: null, rateLimited: null, rateLimit: null, pulls: 3 });
+  // Both accounts spent: the router's message is the round's error, not a fabricated pause.
+  const spent = new PullRequestBoard({ get: async () => { throw new GitHubRateLimitedError("GitHub is throttling gh: GitHub read budgets exhausted; try again after 2026-10-06T23:10:00Z."); }, budget: new GitHubBudget(() => time.now, 300, true), now: () => time.now });
+  t.after(() => spent.stop());
+  spent.read("o/r");
+  await spent.settled("o/r");
+  const refused = spent.read("o/r");
+  assert.equal(refused.rateLimited, null);
+  assert.match(refused.error ?? "", /read budgets exhausted; try again after 2026-10-06T23:10:00Z/);
+});
+
 test("labelling stops at the first PR GitHub refuses; the labels it answered with show at once", async (t) => {
   const tried: number[] = [];
   const post = async (_repository: string, number: number, label: string) => {

@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { githubShimDir } from "./github-cli";
 import { paseoHome } from "./ticket-mcp";
 
 const exec = promisify(execFile);
@@ -41,8 +42,11 @@ export class BackstopScriptError extends Error {
   }
 }
 
-// Tools such as node, gh and gt live in Homebrew, which a daemon's PATH often lacks.
-const TOOL_PATH = ["/opt/homebrew/bin", "/usr/local/bin", process.env.PATH ?? "/usr/bin:/bin"].join(":");
+// Tools such as node, gh and gt live in Homebrew, which a daemon's PATH often lacks. The account
+// router's shims (~/.local/bin/{gh,git,gt}, see github-cli.ts) come first, so the repo scripts
+// below and `gt` run the routed CLI, never an unguarded one (README, "GitHub automation
+// identity").
+const TOOL_PATH = [githubShimDir(), "/opt/homebrew/bin", "/usr/local/bin", process.env.PATH ?? "/usr/bin:/bin"].join(":");
 
 function nodeBinary(): string {
   if (basename(process.execPath) === "node") return process.execPath;

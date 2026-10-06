@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { GitHubRateLimitedError } from "./pr-watch";
 import { GitHubBudget, GitHubPausedError, RateBudget, RateLimitedError, withPriority } from "./rate-budget";
 
 const HOUR = 60 * 60 * 1000;
@@ -136,5 +137,18 @@ test("GitHub: after a refusal nothing is sent for two minutes, interactive reque
   assert.equal(pause.resumeAt, time.now + 120_000);
   await withPriority("interactive", async () => assert.throws(() => budget.admit(), (error: unknown) => error instanceof GitHubPausedError && error.reason === "throttled"));
   time.now += 120_000;
+  budget.admit("interactive");
+});
+
+test("GitHub: a routed budget records nothing from one account's headers and passes the router's refusal through", () => {
+  const time = { now: 1_000_000_000 };
+  const budget = new GitHubBudget(() => time.now, 300, true);
+  // However low the account that answered last is, the router picks the other one for reads.
+  budget.record(githubHeaders(1, time.now + 20 * 60_000));
+  assert.equal(budget.current(), null);
+  budget.admit("background");
+  budget.admit("interactive");
+  const refused = new GitHubRateLimitedError("GitHub is throttling gh: GitHub read budgets exhausted; try again after 2026-10-06T23:10:00Z.");
+  assert.equal(budget.refused(refused), refused, "the router's message is what the caller surfaces");
   budget.admit("interactive");
 });

@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
+import { githubCli } from "./github-cli";
 import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
@@ -186,19 +186,19 @@ export class PullRequestNotFoundError extends Error {
 // `at`: Graphite's time stamp as written ("Sep 29, 7:26 AM UTC"); `event`: the text after it.
 type Bullet = { text: string; event: string; at: string | null; kind: "queued" | "running" | "merged" | "dropped"; draft: number | null };
 
-function gh(): string {
-  for (const candidate of ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]) if (existsSync(candidate)) return candidate;
-  return "gh";
-}
-
-// `parse` reads gh's output; JSON by default.
+// The routed gh (the account router's shim, or the PATH gh on a host without it): see
+// github-cli.ts. `parse` reads gh's output; JSON by default.
 export async function ghJson<T>(args: string[], parse: (stdout: string) => T = (stdout) => JSON.parse(stdout) as T): Promise<T> {
   try {
-    const { stdout } = await exec(gh(), args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
+    const { stdout } = await exec(githubCli(), args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
     return parse(stdout);
   } catch (error) {
     const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr) : "";
-    if (/HTTP 429|rate limit/i.test(stderr)) throw new GitHubRateLimitedError(`GitHub is throttling gh: ${stderr.trim().split("\n")[0]}`);
+    const code = error && typeof error === "object" && "code" in error ? error.code : null;
+    // gh reports GitHub's throttling (HTTP 429, primary or secondary rate limit); the account
+    // router reports both accounts' read budgets exhausted with exit 75 and says when they
+    // resume. Either way the caller stops its round and comes back at its own cadence.
+    if (code === 75 || /HTTP 429|rate limit|budgets? exhausted/i.test(stderr)) throw new GitHubRateLimitedError(`GitHub is throttling gh: ${stderr.trim().split("\n")[0] || `exit ${String(code)}`}`);
     if (/Could not resolve to a PullRequest/i.test(stderr)) throw new PullRequestNotFoundError(stderr.trim().split("\n")[0]);
     throw error;
   }
@@ -334,13 +334,13 @@ function statusFingerprint(body: unknown): string {
 }
 
 // One watched pull request's cheap first look. `viewPullRequest` is one GraphQL query per pull
-// request per poll; this class asks REST first, so a quiet pull request costs the shared GraphQL
+// request per poll; this class asks REST first, so a quiet pull request costs the GraphQL
 // budget nothing: the pull request read as an issue, then its comments, reviews and the head's
 // checks, are read conditionally (their stable ETags make an unchanged resource answer 304, which
 // GitHub does not meter), and the detail read runs only when one of them changed, when the merge
 // queue is mid-attempt, or when the cached view is older than STALE_VIEW_MS. Every REST request
-// passes the shared GitHub budget first, at the caller's priority, so the reserve that keeps the
-// agents' own `gh` calls working also holds here.
+// passes the GitHub budget first, at the caller's priority: the single-login reserve (see
+// rate-budget.ts) where the router is not installed.
 export class ConditionalPullView {
   private readonly views = new Map<string, CachedView>();
 
@@ -418,7 +418,7 @@ export class ConditionalPullView {
     try {
       response = await this.deps.get(path, stored?.etag ?? null);
     } catch (error) {
-      if (error instanceof GitHubRateLimitedError) throw this.deps.budget.throttled();
+      if (error instanceof GitHubRateLimitedError) throw this.deps.budget.refused(error);
       throw error;
     }
     this.deps.budget.record(response.headers);

@@ -2223,6 +2223,18 @@ test("the shared REST reserve pauses the first look before it sends anything", a
   assert.equal(rest.calls.length, 5, "an interactive caller still reads");
 });
 
+test("with the router installed one account's low quota cannot pause the next look, and the router's refusal passes through", async () => {
+  const rest = restFake(restSeed(probeState()));
+  const budget = new GitHubBudget(() => Date.now(), 300, true);
+  budget.record(limitHeaders(100)); // the account that answered the previous call is nearly spent
+  const reader = new ConditionalPullView({ get: rest.get, budget, read: async () => OPEN_PR });
+  await withPriority("background", () => reader.view(PR));
+  assert.equal(rest.calls.length, 5, "the router, not the last response's headers, decides which account reads");
+  const refused = new GitHubRateLimitedError("GitHub is throttling gh: GitHub read budgets exhausted; try again after 2026-10-06T23:10:00Z.");
+  const spent = new ConditionalPullView({ get: async () => { throw refused; }, budget, read: async () => OPEN_PR });
+  await assert.rejects(() => withPriority("background", () => spent.view(PR)), (error: unknown) => error === refused, "the router's message reaches the caller, not a generic pause");
+});
+
 test("the poll reads through the injected first look, not the detail view", async (t) => {
   let reads = 0;
   const h = harness(t, {}, { view: async () => { reads++; return OPEN_PR; } });

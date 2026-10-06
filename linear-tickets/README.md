@@ -36,6 +36,59 @@ the sidebar or **Open Linear tickets** in the command center. After source chang
 paseo plugin reload linear-tickets
 ```
 
+## GitHub automation identity
+
+Hosts can install `scripts/github-router.mjs` as their `gh`, `git` and `gt` shims.
+Paseo agents and daemon children use `bot112112121` for GitHub-visible changes:
+PRs, comments, labels, reviews, ready/merge operations and Git pushes. Read-only
+GitHub API calls share the bot and owner's independent REST/GraphQL budgets,
+choosing the account with more capacity after a reserve of 750 bot requests and
+300 owner requests. Search has its own smaller reserve. Budget probes are cached
+for one minute; admission is serialized across processes. The router never retries
+a write under the owner's identity.
+
+Manual commands outside the Paseo process tree keep their existing GitHub and
+Graphite authentication. Agent attribution is recovered from ancestor processes
+when a Python kernel loses `PASEO_AGENT_ID`; the per-agent 60 GraphQL reads/hour
+limit and existing restrictions on check polling apply on either account.
+
+### Host setup
+
+Before installing, authenticate GitHub CLI as the bot in `$PASEO_HOME/gh-bot`
+(`PASEO_HOME` defaults to `~/.paseo`) and place the bot's **Graphite CLI token** in
+`$PASEO_HOME/graphite-bot/token` (directory mode 0700, file mode 0600). A GitHub token
+cannot replace a Graphite token. The bot must have a Graphite account and repository
+access; Team-plan queues require PR authors to have Graphite accounts. Do not
+change billing without the account owner's approval.
+
+```sh
+node scripts/install-github-router.mjs
+paseo plugin reload linear-tickets
+```
+
+The installer verifies both bot identities before changing any command path.
+It installs shims in `~/.local/bin`, saves real executable paths and backs up replaced
+commands under `$PASEO_HOME/github-router/backups/`. Put `~/.local/bin` first on
+the agent/daemon PATH. The plugin does this for its queue and manual-check children.
+Its direct `gh` calls prefer the installed shim; `LINEAR_TICKETS_GH` can name a
+custom CLI. A custom path alone does not imply two-account budgeting: set
+`LINEAR_TICKETS_GITHUB_ROUTED=1` only when that CLI implements the router contract.
+Without the router, portable installations retain single-login quota admission.
+
+GitHub SSH Git URLs are rewritten to HTTPS only in automated child processes.
+Git uses the bot credential helper, without changing global Git configuration or
+commit author fields. Graphite receives the bot token through its documented
+`GRAPHITE_AUTH_TOKEN` override, checked with `gt auth`; missing or wrong credentials
+fail closed. Merges still use the repository's documented Graphite queue, never a
+`gh pr merge` bypass where the queue is required.
+
+This is command routing, not a sandbox: explicit calls to unguarded binary paths
+or programs supplying their own credentials bypass these shims. Invoke `gh`,
+`git` and `gt` through the installed PATH. Safe attribution (no tokens or bodies)
+is recorded in `$PASEO_HOME/github-router/calls.jsonl`; quota snapshots contain no
+credentials. Roll back source changes with a revert PR and reinstall that version;
+the host backup manifest also records pre-install command paths for recovery.
+
 ## Connect and start work
 
 1. Create a personal Linear API key in Settings → Security & access, with access to the
@@ -993,11 +1046,12 @@ REST and conditional: the pull request read as an issue (`repos/…/issues/<n>`;
 endpoint's ETag moves on every request, the issue resource's does not), its comments (Graphite edits
 its Merge activity comment in place), its reviews, and the head's check runs and combined status. An
 unchanged resource answers `304 Not Modified`, which GitHub does not meter, so a quiet pull request
-costs the shared GraphQL budget nothing; the detail read runs only when one of them moved, while the
+costs the GraphQL budget nothing; the detail read runs only when one of them moved, while the
 merge queue is testing the pull request (its comment can end the attempt at any poll), or when the
-cached view is older than 10 minutes. Every one of those REST reads passes the shared GitHub budget
-first, so the [reserve](#pull-request-view) that keeps the agents' own `gh` calls working holds here
-too. Requested changes post a panel update and move the ticket back to In Progress; fixes
+cached view is older than 10 minutes. Every one of those REST reads passes the GitHub budget
+first — the router's account pick where it is installed, the [single-login
+reserve](#pull-request-view) that keeps the agents' own `gh` calls working where it is not.
+Requested changes post a panel update and move the ticket back to In Progress; fixes
 pushed after them move it to In Review again. An approval moves it to the team's started state
 **Ready to merge** (teams without one stay in In Review), once no [manual task](#manual-tasks)
 due before merge is open; commits pushed after the approval move
@@ -1688,8 +1742,9 @@ header of the last answer plus the refill since then.
 ## Pull request view
 
 The Paseo Agents menu bar app shows a repository's open pull requests, the Graphite merge queue
-and what landed on the default branch. The plugin reads them for it, so the shared `gh` login has
-one GitHub poller instead of two:
+and what landed on the default branch. The plugin reads them for it through the routed `gh`
+([GitHub automation identity](#github-automation-identity)), so the login has one GitHub poller
+instead of two:
 
 - `linear.pull-requests` (`{ repository: "owner/name" }`) answers from memory at once: open pull
   requests with their labels, a CI summary of each ready one's head (the newest run per check;
@@ -1699,20 +1754,24 @@ one GitHub poller instead of two:
   merged, dropped with Graphite's reason, removals in the last 24 hours), the open queue rounds
   (`[Graphite MQ] Draft PR`s) with their CI, and the commits of the last 24 hours. Draft pull
   requests are listed but not read in detail.
-- `linear.label-pulls` (`{ repository, label, numbers }`) adds a label to each pull request with
-  the owner's `gh` login, stopping at the first one GitHub refuses, and returns the snapshot with
+- `linear.label-pulls` (`{ repository, label, numbers }`) adds a label to each pull request as
+  the automation bot, stopping at the first one GitHub refuses, and returns the snapshot with
   the new labels.
 - A repository is polled at most every 2 minutes, and only while a client asked for it in the
   last 10 minutes: with the app closed, the plugin sends GitHub nothing. Reads are REST only
   (GraphQL stays with `gh pr` and `gt`) and conditional, so an unchanged page answers
   `304 Not Modified` and costs no budget.
-- Polling runs at background priority: while fewer than 300 REST requests are left before the
-  login's hourly reset, it pauses until the reset and keeps the last data (`rateLimited` in the
-  snapshot). After GitHub refuses a request for its rate limit, nothing is sent for 2 minutes.
-  Labelling is not held back by the reserve.
-- The [pull request watch](#pull-request-reviews) reads under the same reserve: its conditional
-  first look (the issue resource, its comments and reviews, the head's checks) passes the same
-  budget, and a quiet pull request is left to its cached view rather than read in full.
+- The account router owns both accounts' request budgets and picks the read account per call
+  ([GitHub automation identity](#github-automation-identity)); the plugin records no quota of
+  its own, and a refusal says which budgets are spent and when they resume. Without the router
+  (a host with one `gh` login) polling runs at background priority instead: while fewer than 300
+  REST requests are left before the login's hourly reset, it pauses until the reset and keeps the
+  last data (`rateLimited` in the snapshot), and after GitHub refuses a request for its rate
+  limit nothing is sent for 2 minutes. Labelling is not held back by the reserve.
+- The [pull request watch](#pull-request-reviews) reads the same way: through the router's read
+  account where it is installed, under the single-login reserve where it is not; its conditional
+  first look (the issue resource, its comments and reviews, the head's checks) keeps a quiet pull
+  request to its cached view rather than reading it in full.
 
 ## Manual tasks
 
@@ -1877,8 +1936,8 @@ settings persistence, ticket retrieval, state-transition
 resolution and failure handling, agent creation/retries with mocked Linear and Paseo
 calls, the session sweep's webhook-driven activity reads (skipped while a webhook is fresh, the
 5-minute fallback, the minute sweep without webhooks), and the pull request view (CI summaries,
-merge queue parsing, polling cadence, the GitHub
-budget's reserve, labelling) against a fake GitHub, and the decision candidates (the log, the
-collector's sources and exclusions, window limits, candidate identity, one ticket per project,
-app-only filing) against a fake Linear.
+merge queue parsing, polling cadence, the GitHub budget's reserve and its routed bypass,
+labelling) against a fake GitHub, and the decision candidates (the log, the collector's sources
+and exclusions, window limits, candidate identity, one ticket per project, app-only filing)
+against a fake Linear.
 Live account authentication and agent execution require your configured host and key.

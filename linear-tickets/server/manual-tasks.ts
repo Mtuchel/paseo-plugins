@@ -44,7 +44,7 @@ type Linear = Pick<LinearService, "addLabel" | "comment" | "moveToReady" | "reop
 // Homebrew, which a daemon's PATH often lacks.
 export function runCheck(command: string, cwd: string): Promise<CheckResult> {
   const where = existsSync(cwd) ? cwd : homedir();
-  const path = ["/opt/homebrew/bin", "/usr/local/bin", process.env.PATH ?? "/usr/bin:/bin"].join(":");
+  const path = [join(homedir(), ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin", process.env.PATH ?? "/usr/bin:/bin"].join(":");
   // Executor form: the plugin's TypeScript lib predates Promise.withResolvers.
   return new Promise((resolve) => {
     const child = spawn("/bin/sh", ["-c", command], { cwd: where, env: { ...process.env, PATH: path }, stdio: ["ignore", "pipe", "pipe"] });
