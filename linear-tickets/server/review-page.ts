@@ -68,7 +68,12 @@ h3{margin:18px 4px 6px;font-size:.8125rem;font-weight:600;text-transform:upperca
 .outcome{font-size:.75rem;font-weight:600;line-height:1.6;padding:0 8px;border-radius:999px;background:var(--chip);color:var(--sub)}.outcome.approved{background:var(--ok-bg);color:var(--ok)}.outcome.back{background:var(--warn-bg);color:var(--warn)}
 .notify{flex:none;background:var(--tint);color:#fff}
 .empty{margin:0;padding:28px 16px;text-align:center;color:var(--muted);background:var(--card);border-radius:14px}.empty b{display:block;color:var(--fg);font-size:1.0625rem}
-.closed{padding:calc(env(safe-area-inset-top) + 48px) 24px 48px}.closed h1{font-size:1.4rem;margin-bottom:.5rem}`;
+.closed{padding:calc(env(safe-area-inset-top) + 48px) 24px 48px}.closed h1{font-size:1.4rem;margin-bottom:.5rem}
+.pane{display:none}
+@media(min-width:1100px){body{display:grid;grid-template-columns:minmax(20rem,26rem) minmax(0,1fr);grid-template-rows:minmax(0,1fr);height:100vh;height:100dvh;overflow:hidden}.queue{overflow-y:auto;overscroll-behavior:contain;border-right:.5px solid var(--line)}.pane{display:flex;flex-direction:column;min-width:0;background:var(--card)}li.selected>a.row{background:color-mix(in srgb,var(--tint) 12%,transparent)}li.selected::after{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--tint)}}
+.pane-bar{display:flex;align-items:center;gap:12px;padding:8px 16px;font-size:.875rem;border-bottom:.5px solid var(--line)}.pane-bar b{font-weight:600}.pane-bar a{margin-left:auto;font-weight:600;text-decoration:none}
+.frames{position:relative;flex:1;min-height:0}.frames iframe{position:absolute;inset:0;width:100%;height:100%;border:0}.frames iframe.off{visibility:hidden}
+.pick{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;margin:0;padding:24px;text-align:center;color:var(--muted)}.pick b{color:var(--fg);font-size:1.0625rem}.pane-bar[hidden],.pick[hidden]{display:none}`;
 
 function page(title: string, body: string, head = ""): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>${escapeHtml(title)}</title>${head}<style>${PAGE_STYLE}</style></head>
@@ -77,7 +82,7 @@ function page(title: string, body: string, head = ""): string {
 
 export function closedPage(identifier: string | undefined, outcome: string): string {
   const subject = identifier ? `The plan review for ${escapeHtml(identifier)}` : "This plan review";
-  return page("Review closed", `<main class="closed"><h1>Review closed — ${escapeHtml(outcome)}</h1><p>${subject} is no longer running. This link opens the agent's next review once it plans again.</p><p><a href="/">All plan reviews</a></p></main>`);
+  return page("Review closed", `<main class="closed"><h1>Review closed — ${escapeHtml(outcome)}</h1><p>${subject} is no longer running. This link opens the agent's next review once it plans again.</p><p><a href="/" target="_top">All plan reviews</a></p></main>`);
 }
 
 // "12 min" for a waiting review; with `suffix`, "12 min ago" for a decision.
@@ -185,22 +190,31 @@ export const SERVICE_WORKER = `self.addEventListener("push",(event)=>{let data={
 self.addEventListener("notificationclick",(event)=>{event.notification.close();event.waitUntil(self.clients.openWindow(new URL(event.notification.data&&event.notification.data.url||"/",self.location.origin).href))});
 self.addEventListener("install",()=>self.skipWaiting());self.addEventListener("activate",(event)=>event.waitUntil(self.clients.claim()));`;
 
-// The page's behaviour, all optional: swaps in the fresh page every 30 s and when it comes back
-// into view (keeping the scroll position; never while a send-back note is being written), keeps
-// the app badge at the waiting count, sends Approve / Send back, and subscribes to notifications.
-const CLIENT_SCRIPT = `(()=>{let busy=false;
+// The page's behaviour, all optional: swaps in the fresh list every 30 s, when it comes back into
+// view and when focus returns from the review pane (keeping the scroll position; never while a
+// send-back note is being written), keeps the app badge at the waiting count, sends Approve /
+// Send back, and subscribes to notifications. When the pane shows (the 1100px breakpoint in
+// PAGE_STYLE), a row opens its review there instead of navigating; each opened review keeps its
+// own frame (and so its unsent annotations) until it leaves the list while every host answers,
+// and #<agentId> in the URL reopens it on reload.
+const CLIENT_SCRIPT = `(()=>{let busy=false,selected=null;
 const writing=()=>!!document.querySelector("form.back:not([hidden])");
 const badge=()=>{const n=Number(document.querySelector("[data-waiting]")?.getAttribute("data-waiting")||0);if(navigator.setAppBadge)(n?navigator.setAppBadge(n):navigator.clearAppBadge()).catch(()=>{})};
 const notifyButton=()=>{const b=document.querySelector("button[data-act=notify]");if(b)b.hidden=typeof Notification!=="undefined"&&Notification.permission==="granted"&&localStorage.getItem("reviews-notify")==="on"};
-const settle=()=>{badge();notifyButton()};
-async function refresh(force){if(busy||document.hidden||(!force&&writing()))return;busy=true;try{const response=await fetch(location.pathname,{cache:"no-store"});if(!response.ok)throw new Error(String(response.status));const next=new DOMParser().parseFromString(await response.text(),"text/html");document.title=next.title;document.body.replaceChildren(...next.body.childNodes);settle()}catch{document.querySelector(".sub")?.classList.add("offline")}finally{busy=false}}
+const items=()=>[...document.querySelectorAll(".queue li[data-agent]")];
+const frames=()=>[...document.querySelectorAll(".frames iframe")];
+function mark(){for(const li of items()){const on=li.dataset.agent===selected;li.classList.toggle("selected",on);const a=li.querySelector("a.row");if(on)a.setAttribute("aria-current","true");else a.removeAttribute("aria-current")}if(document.querySelector(".missing"))return;const waiting=new Set(items().map((li)=>li.dataset.agent));for(const f of frames())if(f.dataset.agent!==selected&&!waiting.has(f.dataset.agent))f.remove()}
+function select(item){const id=item.dataset.agent,link=item.querySelector("a.row").href;let frame=frames().find((f)=>f.dataset.agent===id);if(!frame){frame=document.createElement("iframe");frame.dataset.agent=id;frame.title="Plan review "+item.dataset.name;frame.allow="clipboard-read; clipboard-write; fullscreen";frame.src=link;document.querySelector(".frames").append(frame)}for(const f of frames())f.classList.toggle("off",f!==frame);document.querySelector(".pick").hidden=true;const bar=document.querySelector(".pane-bar");bar.hidden=false;bar.querySelector("b").textContent=item.dataset.name;bar.querySelector("a").href=link;selected=id;history.replaceState(null,"","#"+encodeURIComponent(id));mark();frame.focus()}
+const settle=()=>{badge();notifyButton();mark()};
+async function refresh(force){if(busy||document.hidden||(!force&&writing()))return;busy=true;try{const response=await fetch(location.pathname,{cache:"no-store"});if(!response.ok)throw new Error(String(response.status));const next=new DOMParser().parseFromString(await response.text(),"text/html");const fresh=next.querySelector(".queue");if(!fresh)throw new Error("no list");document.title=next.title;document.querySelector(".queue").replaceChildren(...fresh.childNodes);settle()}catch{document.querySelector(".sub")?.classList.add("offline")}finally{busy=false}}
 async function post(path,body){const response=await fetch(path,{method:"POST",headers:{"content-type":"application/json","x-review-action":"1"},body:JSON.stringify(body)});const answer=await response.json().catch(()=>({}));if(!response.ok)throw new Error(answer.error||("HTTP "+response.status));return answer}
 async function decide(item,approve,feedback){const status=item.querySelector(".status");for(const b of item.querySelectorAll("button"))b.disabled=true;status.className="status";status.textContent=approve?"Approving…":"Sending back…";try{await post("/api/reviews/"+encodeURIComponent(item.dataset.agent)+"/decision",{approve,feedback});status.textContent=approve?"Approved. The agent takes it from here.":"Sent back with your note.";item.classList.add("done");setTimeout(()=>refresh(true),2500)}catch(error){status.className="status failed";status.textContent="Not decided: "+error.message;for(const b of item.querySelectorAll("button"))b.disabled=false}}
 const urlKey=(key)=>{const padded=(key+"=".repeat((4-key.length%4)%4)).replace(/-/g,"+").replace(/_/g,"/");return Uint8Array.from(atob(padded),(c)=>c.charCodeAt(0))};
 async function subscribe(button){try{if(!("serviceWorker" in navigator)||!("PushManager" in window)||typeof Notification==="undefined")throw new Error("This browser cannot show notifications for this page. On iPhone, add it to the Home Screen first (Share → Add to Home Screen) and open it from there.");if(await Notification.requestPermission()!=="granted")throw new Error("Notifications are not allowed for this page.");const {publicKey}=await (await fetch("/api/push/key",{cache:"no-store"})).json();const registration=await navigator.serviceWorker.register("/sw.js");await navigator.serviceWorker.ready;const subscription=await registration.pushManager.getSubscription()||await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:urlKey(publicKey)});await post("/api/push/subscribe",subscription.toJSON());localStorage.setItem("reviews-notify","on");button.hidden=true}catch(error){alert(error.message)}}
+document.addEventListener("click",(event)=>{const item=event.target.closest("a.row")?.closest("li[data-agent]");if(!item||!matchMedia("(min-width: 1100px)").matches||event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;event.preventDefault();select(item)});
 document.addEventListener("click",(event)=>{const button=event.target.closest("button[data-act]");if(!button)return;const act=button.dataset.act;if(act==="notify")return void subscribe(button);const item=button.closest("[data-agent]");const form=item.querySelector("form.back");if(act==="approve"){if(confirm("Approve the plan for "+item.dataset.name+"?"))decide(item,true,"")}else if(act==="back"){form.hidden=false;form.querySelector("textarea").focus()}else if(act==="cancel")form.hidden=true});
 document.addEventListener("submit",(event)=>{const form=event.target.closest("form.back");if(!form)return;event.preventDefault();const note=form.querySelector("textarea").value.trim();if(!note)return;form.hidden=true;decide(form.closest("[data-agent]"),false,note)});
-document.addEventListener("DOMContentLoaded",settle);setInterval(()=>refresh(false),${INBOX_REFRESH_S * 1000});document.addEventListener("visibilitychange",()=>refresh(false));addEventListener("pageshow",(event)=>{if(event.persisted)refresh(false)})})()`;
+document.addEventListener("DOMContentLoaded",()=>{settle();const id=decodeURIComponent(location.hash.slice(1));const item=id&&matchMedia("(min-width: 1100px)").matches&&items().find((li)=>li.dataset.agent===id);if(item)select(item)});setInterval(()=>refresh(false),${INBOX_REFRESH_S * 1000});document.addEventListener("visibilitychange",()=>refresh(false));addEventListener("focus",()=>refresh(false));addEventListener("pageshow",(event)=>{if(event.persisted)refresh(false)})})()`;
 
 // The row's second line: where to follow up (Linear), who planned it, where it runs.
 function facts(row: InboxRow, multiHost: boolean): string[] {
@@ -232,7 +246,8 @@ function decidedRow(row: InboxRow, now: Date, dates: Dates, multiHost: boolean):
 }
 
 // The root of :8444: every review waiting for the owner on this host and its peers, newest first
-// and grouped by the day the owner got it, plus the latest decisions.
+// and grouped by the day the owner got it, plus the latest decisions. On a wide screen the pane
+// beside the list shows the selected review's Plannotator page.
 export function inboxPage(view: InboxView, now: Date, timeZone: string | undefined): string {
   const { open, decided } = view;
   const dates = new Dates(now, timeZone);
@@ -256,5 +271,6 @@ export function inboxPage(view: InboxView, now: Date, timeZone: string | undefin
   const notify = view.push ? `<button type="button" class="notify" data-act="notify">Notify me</button>` : "";
   const header = `<header class="bar" data-waiting="${open.length}"><div><div><h1>Plan reviews</h1><p class="sub">${status}</p>${missing}</div>${notify}</div></header>`;
   const head = `<noscript><meta http-equiv="refresh" content="${INBOX_REFRESH_S}"></noscript><meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)"><meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Reviews"><link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/icon.png"><link rel="icon" href="/icon.png"><script>${CLIENT_SCRIPT}</script>`;
-  return page(open.length ? `Plan reviews (${open.length})` : "Plan reviews", `${header}<main>${waiting}${recent}</main>`, head);
+  const pane = `<aside class="pane" aria-label="Plan review"><div class="pane-bar" hidden><b></b><a target="_blank" rel="noopener">Open in new tab ↗</a></div><div class="frames"><p class="pick"><b>Pick a review</b>It opens here in Plannotator: annotate, comment, approve or send back as on its own page.</p></div></aside>`;
+  return page(open.length ? `Plan reviews (${open.length})` : "Plan reviews", `<div class="queue">${header}<main>${waiting}${recent}</main></div>${pane}`, head);
 }
