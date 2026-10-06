@@ -1457,6 +1457,9 @@ when the host cannot be reached it says so and keeps retrying.
   Ready counts the reviews actually reachable in the inbox, not successful submission calls
   or parked records alone. Published plan text is matched by its content hash; restored reviews
   keep their original arrival time. Already-delivered reviews survive planner retirement.
+  Submissions without a native content hash inherit the delivered revision, preserving their
+  identity across refresh and reload. Delivery supersedes older pending content rather than
+  leaving a duplicate publishing row; an older review never resolves a newer submission.
   Owner questions, permissions and capacity queues are legitimate waits. Twenty minutes without
   observed assistant/tool progress is suspected quiet work, not proof of failure. Actual submission
   or delivery errors and proven provider exits are failures. Missing, unsupported, incomplete,

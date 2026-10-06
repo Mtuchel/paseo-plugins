@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { appendFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -385,5 +386,56 @@ test("queued admission resolves when its session links to a root; explicit queue
     h.sessions[1].closed = true;
     await h.refresh();
     assert.equal((await h.snapshot()).rows.some((entry) => entry.agentId === "" && entry.stage === "cancelled"), true);
+  });
+});
+
+test("unhashed submissions inherit delivered identity across refresh and restart without resolving a newer attempt", async () => {
+  await harness(async (h) => {
+    await h.append(submit().filter((entry) => entry.customType !== "linear-tickets.plan-advice"));
+    h.parked = [parked()];
+    await h.refresh();
+    const revision = createHash("sha256").update(h.parked[0].plan).digest("hex");
+    const delivered = review({ revision });
+    const assertDelivered = (view: PipelineHost) => {
+      assert.equal(view.rows.filter((row) => row.agentId === "root" && row.stage === "ready").length, 1);
+      assert.equal(view.rows.some((row) => row.agentId === "root" && ["preparing", "publishing", "waiting"].includes(row.stage)), false);
+    };
+    assertDelivered(await h.snapshot([delivered]));
+    await h.refresh(); assertDelivered(await h.snapshot([delivered]));
+    await h.restart(); assertDelivered(await h.snapshot([delivered]));
+    const next = "2026-10-06T12:04:00.000Z";
+    h.parked = [];
+    await h.append([
+      { type: "custom", timestamp: next, customType: "plannotator", data: { phase: "idle" } },
+      { type: "custom", timestamp: next, customType: "plannotator", data: { phase: "planning" } },
+      ...submit(HASH_B, "submit-b", next).filter((entry) => entry.customType !== "linear-tickets.plan-advice"),
+    ]);
+    await h.refresh();
+    const newer = await h.snapshot([delivered]);
+    assert.equal(newer.rows.some((row) => row.stage === "publishing" && row.since === next), true);
+    assertDelivered(await h.snapshot([review({ revision, since: "2026-10-06T12:04:05.000Z" })]));
+    await h.refresh();
+    assertDelivered(await h.snapshot([review({ revision, since: "2026-10-06T12:04:05.000Z" })]));
+  });
+});
+
+test("delivered content supersedes older mismatched native content without claiming a newer submission", async () => {
+  await harness(async (h) => {
+    await h.append(submit());
+    h.parked = [parked()];
+    await h.refresh();
+    const revision = createHash("sha256").update(h.parked[0].plan).digest("hex");
+    const delivered = review({ revision });
+    const current = await h.snapshot([delivered]);
+    assert.equal(current.rows.some((row) => row.stage === "publishing"), false);
+    assert.equal(current.rows.filter((row) => row.stage === "ready").length, 1);
+    assert.equal(current.rows.some((row) => row.stage === "superseded"), true);
+    await h.refresh();
+    assert.equal((await h.snapshot([delivered])).rows.some((row) => row.stage === "publishing"), false);
+    const next = "2026-10-06T12:04:00.000Z";
+    h.parked = [];
+    await h.append(submit(HASH_B, "submit-b", next));
+    await h.refresh();
+    assert.equal((await h.snapshot([delivered])).rows.some((row) => row.stage === "publishing" && row.since === next), true);
   });
 });
