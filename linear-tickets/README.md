@@ -878,7 +878,7 @@ every 2 minutes.
   without submitting a plan (closed after idling, or archived) would hold the project: no new
   planner is filed while it is open. So every project read checks the open, started planner
   without an approved order for a live agent (one labelled with its ticket that is initializing,
-  idle or running). Ten minutes after its last start without one (a launch takes a couple of
+  idle or running, and no ghost: see **Ghost agents**). Ten minutes after its last start without one (a launch takes a couple of
   minutes, so one still under way is never doubled), it is started again with a new agent and a
   new thread on the ticket, like a label launch; its earlier threads are closed and its stopped
   agents archived. Assigning the ticket to Paseo again is no restart: Linear opens no new thread
@@ -1193,6 +1193,17 @@ archived (`paseo ls`, label `linear.issueId`), and the messages they got count a
 running keep running. A message claimed for a successor that never started (the log line "is
 claimed; starting a successor" without a following "started a successor") is repaired by sending
 its step to the ticket's agent by hand.
+
+**Ghost agents.** After a daemon crash the daemon lists the agents it had loaded with their last
+status, idle or running, although no process works for them any more (2026-10-05: `spawn ps
+EAGAIN` crashed the daemon on server087, twenty agents stayed "running" for 16 hours, and the
+TUC-949 planner was never restarted). Such a ghost never takes the next step, so the planner
+restart, the restart of a failed start and the check for a live agent above do not count it: an
+OMP agent shown idle or running, not updated for five minutes, with no `--mode rpc-ui` process
+carrying its session and none running in its worktree, counts as stopped. The log names each
+ghost (`agent … shows running but its OMP process is gone`). Only proven absence counts: an agent
+without a recorded session file or worktree, or a process table that cannot be read completely,
+keeps the agent live until the next poll.
 
 **Crashed agents.** An agent whose provider process exited or closed (Paseo shows it in error,
 for example "OMP RPC process is closed") receives no message. Before a nudge, a merge queue fix

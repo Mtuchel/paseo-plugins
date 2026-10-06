@@ -8,6 +8,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import { LinearApiError, LinearRefusedError, type ProjectIssue, type TeamIssue, type TicketRef } from "./linear";
 import { Capacity } from "./capacity";
 import { orderProblems, parseOrder, ProjectFlow, ProjectStore, type ProjectRecord } from "./project-flow";
+import type { ProcessInspector } from "./process-liveness";
 import { Scheduler } from "./scheduler";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
@@ -31,7 +32,8 @@ const issue = (n: number, change: Partial<ProjectIssue> = {}): ProjectIssue => (
   teamId: "t1", teamKey: "TUC", creatorId: OWNER, assigneeId: null, delegateId: null, labels: [], parentId: null, blockers: [], blocks: [], linked: [], ...change,
 });
 
-async function room(t: TestContext, issues: ProjectIssue[], running: string[] = []) {
+// `inspect`: the provider process table ghost agents are checked against.
+async function room(t: TestContext, issues: ProjectIssue[], running: string[] = [], inspect?: ProcessInspector) {
   const directory = await mkdtemp(join(tmpdir(), "project-flow-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const calls: string[] = [];
@@ -98,7 +100,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   const scheduler = new Scheduler({ running: async () => running, projectOf: async () => "erp", away: async () => away, now: () => now });
   // Tickets a start under way, or their newest thread, accounts for.
   const held = new Set<string>();
-  const flow = new ProjectFlow({ linear, scheduler, capacity: new Capacity(() => now), store, retire: async (agentId) => { calls.push(`retire ${agentId}`); }, now: () => now,
+  const flow = new ProjectFlow({ linear, scheduler, capacity: new Capacity(() => now), store, retire: async (agentId) => { calls.push(`retire ${agentId}`); }, now: () => now, inspect,
     restart: async (id) => {
       calls.push(`restart ${id}`);
       if (fail.restart) throw new Error("Agent creation could not be confirmed (Timed out waiting for OMP to become ready).");
@@ -396,6 +398,27 @@ test("a planner without a live agent (TUC-678: its launch timed out) is started 
   assert.deepEqual(await poll(60), [], "asked once, then left to the owner");
   const planner = (await r.store.all()).erp.planner!;
   assert.deepEqual({ restarts: planner.restarts, ownerAsked: planner.ownerAsked }, { restarts: 3, ownerAsked: true });
+});
+
+test("a planner whose agent shows running without a process (2026-10-05: a daemon crash left TUC-949's agent so for 16 hours) is started again", async (t) => {
+  let processes = "";
+  const inspect: ProcessInspector = { processes: async () => processes, cwd: async () => "/repo/planner", canonicalPath: async (path) => path };
+  const r = await room(t, [issue(1, { delegateId: APP, statusType: "started", status: "In Progress" }), issue(100, { id: "planner1", labels: ["paseo-planner"], delegateId: APP })], [], inspect);
+  await r.seed({ plannedThrough: "2026-01-01T12:00:00Z", planner: { id: "planner1", identifier: "TUC-101", url: "", listedAt: "2026-01-01T18:00:00Z", tickets: 1, started: true, startedAt: "2026-01-01T18:00:00Z" } });
+  const handle = "/home/mirko/.omp/agent/sessions/planner/2026-01-01T18-03-07-492Z_01a10d3b.jsonl";
+  // Its last update was at the crash; the listing still shows it running.
+  const agents = [{ id: "agent-ghost", status: "running", labels: {}, provider: "omp", cwd: "/repo/planner", updatedAt: "2026-01-01T18:09:44Z", persistence: { provider: "omp", sessionId: "01a10d3b", nativeHandle: handle } }];
+  const local = paseoWith(() => agents);
+  const poll = async () => {
+    r.calls.length = 0;
+    await r.flow.tick(local, settings);
+    return r.calls.filter((call) => call.startsWith("restart"));
+  };
+  processes = `2100185 omp --mode rpc-ui --session ${handle}\n`;
+  assert.deepEqual(await poll(), [], "its process still works: a long turn, not a ghost");
+  processes = "";
+  r.advance(HOUR);
+  assert.deepEqual(await poll(), ["restart planner1"]);
 });
 
 // A ticket assigned to Paseo by an earlier poll, and how its blockers stand.

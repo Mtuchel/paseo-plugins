@@ -9,7 +9,7 @@ const MAX_PAGES = 100;
 const MAX_PROCESSES = 256;
 const CLOSED_PROCESS = /\bprocess (exited|is closed)\b/i;
 
-export type ProcessAgent = Partial<Pick<PaseoAgent, "id" | "provider" | "cwd" | "status" | "lastError" | "archivedAt" | "labels" | "runtimeInfo" | "persistence">>;
+export type ProcessAgent = Partial<Pick<PaseoAgent, "id" | "provider" | "cwd" | "status" | "lastError" | "archivedAt" | "labels" | "runtimeInfo" | "persistence" | "updatedAt">>;
 export type ProcessLiveness = "absent" | "alive" | "unknown";
 
 // No daemon status, JSONL timestamp or missing open file can prove a provider process exited.
@@ -131,5 +131,47 @@ export async function ticketProcessLiveness(paseo: PaseoApi, issueId: string, ex
     return unknown ? "unknown" : "absent";
   } catch {
     return "unknown";
+  }
+}
+
+// An agent the daemon shows idle or running although no process works for it. After a daemon
+// crash (2026-10-05 18:09, `spawn ps EAGAIN`) the daemon listed the agents it had loaded with their
+// last status; twenty stayed "running" for 16 hours without a process, and the TUC-949 planner was
+// never restarted because its agent looked live. A ghost never takes the next step on its own.
+// An agent updated within GHOST_GRACE_MS may still be starting or reloading its process.
+const GHOST_GRACE_MS = 5 * 60_000;
+
+// The ids of `agents` that are ghosts: OMP, unarchived, idle or running, quiet for GHOST_GRACE_MS,
+// and no rpc-ui process carries their session or runs in their worktree. Absence must be proven:
+// an agent without a complete native handle or cwd is never a ghost, and an inspection that fails
+// anywhere (ps, a cwd, a path) reports none, so the next poll looks again.
+export async function ghostAgents(agents: ProcessAgent[], now: number, inspect: ProcessInspector = inspector): Promise<Set<string>> {
+  const suspects = agents.filter((agent) => agent.id && agent.provider === "omp" && !agent.archivedAt
+    && (agent.status === "idle" || agent.status === "running")
+    && agent.updatedAt && now - Date.parse(agent.updatedAt) >= GHOST_GRACE_MS
+    && typeof agent.persistence?.nativeHandle === "string" && isAbsolute(agent.persistence.nativeHandle) && !/\s/.test(agent.persistence.nativeHandle)
+    && agent.cwd && isAbsolute(agent.cwd));
+  if (!suspects.length) return new Set();
+  try {
+    const processes = rpcProcesses(await inspect.processes());
+    const ghosts = new Set(suspects.map((agent) => agent.id!));
+    const byWorktree = new Map<string, string[]>();
+    for (const agent of suspects) {
+      const path = await inspect.canonicalPath(agent.cwd!);
+      byWorktree.set(path, [...byWorktree.get(path) ?? [], agent.id!]);
+    }
+    for (const process of processes) {
+      if (!ghosts.size) break;
+      if (process.session) {
+        const owner = suspects.find((agent) => [agent.persistence?.nativeHandle, agent.persistence?.sessionId, agent.runtimeInfo?.sessionId].includes(process.session));
+        if (owner) { ghosts.delete(owner.id!); continue; }
+      }
+      // A process of another session in the same worktree may still be this agent's under an
+      // identity its snapshot does not show: any rpc-ui process there keeps it alive.
+      for (const id of byWorktree.get(await inspect.canonicalPath(await inspect.cwd(process.pid))) ?? []) ghosts.delete(id);
+    }
+    return ghosts;
+  } catch {
+    return new Set();
   }
 }
