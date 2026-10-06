@@ -23,7 +23,10 @@ export type PlanPipelineOptions = {
   home?: string; processInspector?: ProcessInspector;
 };
 type Row = PipelineRow;
-type RecordEntry = { row: Row; key: string; submittedAt?: string; history: { stage: PipelineStage; status: PipelineStatus; at: string }[] };
+type RecordEntry = { row: Row; key: string; revision?: string; submittedAt?: string; history: { stage: PipelineStage; status: PipelineStatus; at: string }[] };
+function revisionOf(entry: RecordEntry): string | undefined {
+  return entry.revision ?? (entry.key.startsWith("hash:") ? entry.key.slice(5) : undefined);
+}
 type DeliveryError = { at: string; detail: string; attempts: number; localUrl?: string };
 type Journal = {
   version: 1; checkedAt: string | null; lastArrivalAt: string | null;
@@ -179,7 +182,7 @@ export class PlanPipeline {
         const history = Array.isArray(entry.history) ? entry.history.filter((event) => {
           const item = object(event); return typeof item.stage === "string" && typeof item.status === "string" && timestamp(item.at);
         }).slice(-MAX_HISTORY) : [];
-        this.records.set(parsed.data.id, { row: { ...parsed.data, host: this.host }, key: entry.key.slice(0, 300), ...(timestamp(entry.submittedAt) ? { submittedAt: timestamp(entry.submittedAt) ?? undefined } : {}), history: history as RecordEntry["history"] });
+        this.records.set(parsed.data.id, { row: { ...parsed.data, host: this.host }, key: entry.key.slice(0, 300), ...(typeof entry.revision === "string" && /^[a-f0-9]{64}$/.test(entry.revision) ? { revision: entry.revision } : {}), ...(timestamp(entry.submittedAt) ? { submittedAt: timestamp(entry.submittedAt) ?? undefined } : {}), history: history as RecordEntry["history"] });
       }
       for (const [id, value] of Object.entries(object(saved.cursors)).slice(-MAX_ROOTS)) {
         const cursor = object(value), state = object(cursor.state);
@@ -228,9 +231,36 @@ export class PlanPipeline {
       const at = timestamp(review.publishedAt) ?? timestamp(review.since);
       const agentId = label(review.agentId, 100);
       if (!at || !agentId) continue;
-      const candidates = [...this.records.values()].filter((entry) => entry.row.agentId === agentId && (review.revision ? entry.key === `hash:${review.revision}` : (entry.submittedAt ?? entry.row.since) <= at));
-      let record = candidates.sort((a, b) => b.row.since.localeCompare(a.row.since))[0];
+      const candidates = [...this.records.values()].filter((entry) => entry.row.agentId === agentId);
+      const matches = candidates.filter((entry) => review.revision
+        ? revisionOf(entry) === review.revision : (entry.submittedAt ?? entry.row.since) <= at);
+      // Legacy/native submissions may have only a tool-call identity. Bind the latest eligible
+      // attempt to delivered content, but never let an older review resolve a newer submission.
+      const provisional = review.revision ? candidates.filter((entry) => !revisionOf(entry)
+        && !TERMINAL[entry.row.stage] && (entry.submittedAt ?? entry.row.since) <= at)
+        .sort((a, b) => (b.submittedAt ?? b.row.since).localeCompare(a.submittedAt ?? a.row.since)) : [];
+      const matched = matches.filter((entry) => entry.submittedAt && entry.submittedAt <= at)
+        .sort((a, b) => b.submittedAt!.localeCompare(a.submittedAt!))[0];
+      const pending = provisional[0];
+      let record = pending && (!matched || (pending.submittedAt ?? pending.row.since) > (matched.submittedAt ?? matched.row.since))
+        ? pending : matched ?? matches.sort((a, b) => b.row.since.localeCompare(a.row.since))[0];
       if (!record) record = this.ensure(agentId, review.name, review.revision ? `hash:${review.revision}` : `review:${at}`, at);
+      if (review.revision) {
+        if (record.revision !== review.revision) { record.revision = review.revision; this.dirty = true; }
+        for (const duplicate of matches) if (duplicate !== record
+          && (!duplicate.submittedAt || duplicate.submittedAt === record.submittedAt)) {
+          this.records.delete(duplicate.row.id); this.dirty = true;
+        }
+        const submittedAt = record.submittedAt ?? record.row.since;
+        for (const older of provisional) if (older !== record && (older.submittedAt ?? older.row.since) < submittedAt) {
+          this.change(older, "superseded", "normal", at, "Earlier attempt replaced by the delivered review");
+        }
+        for (const older of candidates) if (older !== record && !TERMINAL[older.row.stage]
+          && older.row.stage !== "ready" && revisionOf(older) && revisionOf(older) !== review.revision
+          && (older.submittedAt ?? older.row.since) <= at) {
+          this.change(older, "superseded", "normal", at, "Earlier content replaced by the delivered review");
+        }
+      }
       const arrived = url(review.link);
       if (arrived) record.row.reviewUrl = arrived;
       if (!this.lastArrivalAt || at > this.lastArrivalAt) { this.lastArrivalAt = at; this.dirty = true; }
@@ -361,7 +391,8 @@ export class PlanPipeline {
       const revisions = state?.revisions ?? [];
       let record = previous;
       for (const revision of revisions) {
-        const sameAttempt = [...this.records.values()].find((entry) => entry.row.agentId === agent.id && entry.key === revision.key);
+        const sameAttempt = [...this.records.values()].find((entry) => entry.row.agentId === agent.id
+          && (entry.key === revision.key || revision.hash && entry.revision === revision.hash));
         const provisional = previous && !previous.submittedAt && !TERMINAL[previous.row.stage]
           && (previous.row.stage !== "ready" || revision.attemptAt && revision.attemptAt <= previous.row.since) ? previous : undefined;
         record = sameAttempt ?? provisional ?? this.ensure(agent.id, identifier, revision.key, revision.at);
