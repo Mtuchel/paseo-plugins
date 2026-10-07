@@ -1303,6 +1303,26 @@ test("planner source failures leave ordinary ticket classification untouched", a
   });
 });
 
+test("a rate-limited submission failure before the limit stays failed across root loss and reload", async () => {
+  await harness(async (h) => {
+    const early = "2026-10-07T09:30:00.000Z";
+    await h.append([...submit(HASH_A, "submit-429", early), result({}, true, "Error: 429 rate limit exceeded", "submit-429", early)]);
+    await stoppedPlanner(h);
+    const failed = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(failed.stage, "publishing");
+    assert.equal(failed.status, "failed");
+    assert.match(failed.detail, /Provider rate limit \(429\)/);
+    h.agents = [];
+    await h.refresh();
+    const absent = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(absent.status, "failed", "an absent root keeps the actual submission failure");
+    await h.restart();
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.stage, "publishing");
+    assert.equal(row.status, "failed");
+    assert.doesNotMatch(row.detail, /restart scheduled|waiting for agent confirmation/);
+  });
+});
 
 test("an unrelated native failure after the wait stays failed across root removal and reload", async () => {
   await harness(async (h) => {

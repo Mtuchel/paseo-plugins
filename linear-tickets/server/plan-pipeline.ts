@@ -30,7 +30,7 @@ export type PlanPipelineOptions = {
 };
 type Row = PipelineRow;
 type PlannerIdentity = { projectId: string; runId: string };
-type RecordEntry = { row: Row; key: string; revision?: string; submittedAt?: string; observedAt?: string; ownerFailedAt?: string; planner?: PlannerIdentity; queue?: { sessionId: string; restart: boolean; pending: boolean }; history: { stage: PipelineStage; status: PipelineStatus; at: string }[] };
+type RecordEntry = { row: Row; key: string; revision?: string; submittedAt?: string; observedAt?: string; ownerFailedAt?: string; submissionFailed?: true; planner?: PlannerIdentity; queue?: { sessionId: string; restart: boolean; pending: boolean }; history: { stage: PipelineStage; status: PipelineStatus; at: string }[] };
 function revisionOf(entry: RecordEntry): string | undefined {
   return entry.revision ?? (entry.key.startsWith("hash:") ? entry.key.slice(5) : undefined);
 }
@@ -196,6 +196,7 @@ export class PlanPipeline {
         }).slice(-MAX_HISTORY) : [];
         this.records.set(parsed.data.id, { row: { ...parsed.data, host: this.host }, key: entry.key.slice(0, 300), observedAt: timestamp(entry.observedAt) ?? timestamp(object(history[0]).at) ?? parsed.data.since, ...(typeof entry.revision === "string" && /^[a-f0-9]{64}$/.test(entry.revision) ? { revision: entry.revision } : {}), ...(timestamp(entry.submittedAt) ? { submittedAt: timestamp(entry.submittedAt) ?? undefined } : {}), history: history as RecordEntry["history"] });
         if (timestamp(entry.ownerFailedAt)) this.records.get(parsed.data.id)!.ownerFailedAt = timestamp(entry.ownerFailedAt)!;
+        if (entry.submissionFailed === true && parsed.data.status === "failed") this.records.get(parsed.data.id)!.submissionFailed = true;
         const queue = object(entry.queue);
         if (typeof queue.sessionId === "string" && queue.sessionId.length <= 200) this.records.get(parsed.data.id)!.queue = { sessionId: queue.sessionId, restart: queue.restart === true, pending: queue.pending === true };
         const planner = object(entry.planner);
@@ -549,10 +550,12 @@ export class PlanPipeline {
       const retainedError = retainedNative?.errorAt && (!progressAt || progressAt <= retainedNative.errorAt) ? retainedNative.error : undefined;
       const crashAt = state?.crashAt ?? (retainedNative?.crashAt && (!progressAt || progressAt <= retainedNative.crashAt) ? retainedNative.crashAt : undefined);
       const providerError = state?.error ?? retainedError ?? (agent.status === "error" && agent.lastError ? diagnostic(agent.lastError) : undefined);
+      let submissionFailure = false;
       if (providerError && /Provider rate limit \(429\)/.test(providerError)
         && !(record.planner && (legitimateWait || failedSubmit || delivery && delivery.at >= (revision?.attemptAt ?? cycleAt)))) {
         status = "failed"; detail = providerError;
       } else if (!legitimateWait && (delivery && delivery.at >= (revision?.attemptAt ?? cycleAt) || failedSubmit)) {
+        submissionFailure = true;
         stage = "publishing"; status = "failed"; detail = delivery && delivery.at >= (revision?.attemptAt ?? cycleAt) ? delivery.detail : failedSubmit ?? "Plan submission failed";
         at = delivery && delivery.at >= (revision?.attemptAt ?? cycleAt) ? delivery.at : revision?.failureAt ?? at;
       } else if (!legitimateWait && !parkedPlan && (providerError || crashAt || ownersUnavailable && stoppedOwner)) {
@@ -577,6 +580,9 @@ export class PlanPipeline {
           now, recoveryUnavailable, Boolean(protectedEvidence));
       }
       if (!recovered) this.change(record, stage, status, at, detail);
+      // Provenance, not diagnostic wording, keeps a real submission/delivery failure after root loss.
+      const submissionFailed = !recovered && submissionFailure ? true : undefined;
+      if (record.submissionFailed !== submissionFailed) { record.submissionFailed = submissionFailed; this.dirty = true; }
       // A known newer submission supersedes only the preceding nonterminal revision of THIS
       // agent. Never cancel a disappearing root or conflate two planners of the same ticket.
       if (revision?.attemptAt) for (const other of this.records.values()) {
@@ -649,7 +655,7 @@ export class PlanPipeline {
       const link = links.find((session) => session.agentId === record.row.agentId && !session.closed && !session.remote);
       const delivery = this.deliveries[record.row.agentId];
       const protectedEvidence = parked.some((plan) => plan.agentId === record.row.agentId) || agent?.pendingPermissions?.length || link?.questions || link?.review
-        || record.row.status === "failed" && !/^(Provider rate limit \(429\)|Provider process exited or is closed|Provider process proven absent)/.test(record.row.detail)
+        || record.row.status === "failed" && (record.submissionFailed || !/^(Provider rate limit \(429\)|Provider process exited or is closed|Provider process proven absent)/.test(record.row.detail))
         || delivery && delivery.at >= attemptTime(record)
         || pending && record.row.lastProgressAt && record.row.lastProgressAt > pending.failedAt;
       this.observeRecovery(record, planners.get(record.planner.projectId), agent,
