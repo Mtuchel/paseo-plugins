@@ -564,7 +564,7 @@ data or already ask for the same thing, and read each candidate in full. The pla
 `## Overlapping tickets` section (each overlap and what the plan does about it, or "None found"
 with the search terms). With [agent access to Linear](#agent-access-to-linear) on, real overlaps
 are linked with `add_relation related` while the agent plans; a ticket another one fully covers
-gets a plan that proposes closing it as that ticket's duplicate. A project's planner gets its own
+gets a plan that proposes closing it as that ticket's duplicate. A planner run gets its own
 overlap instructions (see **Projects** below).
 
 **Reach and principles.** A decision made in one ticket should apply everywhere it belongs and not
@@ -625,7 +625,7 @@ computation, a gap between a check and the write it guards, or more than 15–20
 rated (planner or advisor, the higher) above impact 2, not reversible by a revert, or with a
 migration, an auth change or a new rule always takes `strong`. The omp gate refuses to record the
 advisor review without a readable section or with a lower tier such a plan cannot take. The
-GPT-6 Astra advisor checks the choice like the rest of the plan. A project planner's work order
+GPT-6 Astra advisor checks the choice like the rest of the plan. A planner run's work order
 carries no tier: each ticket's own plan picks one.
 
 The section is never assumed. A ticket plan that reaches review without a readable section (or
@@ -752,7 +752,7 @@ When the review opens, the plugin approves it on your behalf only if all of thes
   plugin reload in between does not);
 - the ticket is yours (not someone else's, not `feedback`) and not marked attended.
 
-A project planner's work order never goes through this policy: it only orders the project's
+A planner run's work order never goes through this policy: it only orders the project's
 tickets (blocking relations and labels), and every ticket still plans and is judged on its own
 (see "Projects").
 
@@ -821,8 +821,8 @@ keeps what it filed per ticket in `$PASEO_HOME/linear-tickets/plan-follow-ups/<i
 repeated approval files nothing twice, and a ticket filed but not yet linked is only linked on the
 next try. Linear failures are retried every 10 minutes, at most five times (the trust check is
 repeated before each pending creation), then listed for you in the comment. A duplicate is still
-possible in one case: Linear created the ticket but its answer was lost on the way back. Project
-planners' work orders file nothing.
+possible in one case: Linear created the ticket but its answer was lost on the way back. A planner
+run's work order files nothing.
 
 **The omp extension.** The planning phase and the plan advisor gate come from
 [`omp/linear-tickets-plan-first.ts`](omp/linear-tickets-plan-first.ts), which omp loads from its
@@ -840,7 +840,9 @@ daemon's environment, not the one the agent was created with, so the plugin give
 session opens: the policy from the agent's `linear.plan` label, and `LINEAR_TICKETS_ISSUE`,
 `LINEAR_TICKETS_CONTEXT` and `LINEAR_TICKETS_MCP` from what the launch saved in
 `$PASEO_HOME/linear-tickets/agent-env/<agent>.json` (the ticket from the agent's labels when
-nothing was saved, as for agents started before). Without them a resumed planner had no
+nothing was saved, as for agents started before; a planner run's agent, labelled
+`linear.plannerRun`, gets its `project-planner:<run id>` and policy back the same way). Without
+them a resumed agent had no
 `record_plan_advice`, no submission gate and no Linear write guard, and its plan reached the risk
 policy with "no advisor review was recorded for this plan text".
 
@@ -917,15 +919,15 @@ line. While slots under *max agents* are short, a free slot goes to:
 5. then the oldest ticket.
 
 An admitted ticket keeps its slot for 3 minutes while its agent starts. Tickets you start from
-the sidebar skip the line. So does a project's planner ticket (see **Projects**): it only orders
-tickets, and while it waits none of its project's new tickets can be handed out, so it starts
+the sidebar skip the line. So does a project's planner run (see **Projects**): it only orders
+tickets, and while it waits none of its project's new tickets can be handed out, so its agent starts
 even when every slot under *max agents* is taken and under any memory lease. It still counts as
 a working agent.
 
 **Present and away.** Planning never waits: every ticket plans at any time, also at night. A plan
 that needs you is parked (see **Parked plans**) and takes no slot, so the plans are ready for your
 review when you are back. While you are away, only the implementation of a ticket that may need
-you during the run waits: one that carries `paseo-attended` (the project planner marks these, and
+you during the run waits: one that carries `paseo-attended` (a planner run marks these, and
 you can add or remove the label yourself) and has an approved plan (`plan-ready`). Its plan always
 goes to you (the risk policy never approves an attended ticket), so an attended ticket you approve
 while away starts once you are present again. Waiting tickets keep their place and start within a
@@ -943,7 +945,7 @@ It sends a lease (a slot count, a reason, and a lifetime of 30–600 seconds) th
 `linear.set-capacity` and renews it while it runs; `linear.capacity` reads the cap in effect and
 how many ticket agents are working, reserved and waiting. With *max agents* set, the lower of the
 two applies; with no limit there, the lease alone does. A lease of 0 starts nothing new except a
-project's planner, which no cap holds back (see *Who starts next*). Tickets
+planner run's agent, which no cap holds back (see *Who starts next*). Tickets
 held back by the lease wait in the same line, with a reason like `Queued: RAM-limited, 12 of 12
 slots used (…)`. The lease lives in the plugin's memory only: when it runs out, the app sends
 `lease: null`, or the daemon restarts, *max agents* applies again. It only gates new starts and
@@ -990,22 +992,28 @@ writes a work order; in between only its tickets changed since the last read are
 current state of the blockers its tickets wait on. A relation you add or remove in Linear without
 the ticket itself changing, or a deleted ticket, shows up with the next full read.
 
-- **Planning on its own.** Whenever a labelled project has new tickets and no open planner, the
-  plugin files one. The Paseo Agents menu bar app uses two RPCs: `linear.projects-status` lists
-  each labelled project with how many new tickets wait for a plan and the open planner (with a
-  link to it); `linear.plan-project` files the planner right away instead of at the next read.
-- **Planner.** Planning files a ticket *Plan the work order of <project>* in the project
-  (Urgent, label `paseo-planner`) and assigns it to Paseo. The ticket is recorded the moment it
-  exists; when its label or assignment fails, every project read repeats what is missing, so a
-  failed step never files a second planner or leaves one without an agent. Its description lists
-  every open ticket of the project (In Progress and In Review included) in one line with its
-  state, priority, labels, open blockers and links, the new ones marked and also given in full (up
-  to 4,000 characters each and 30,000 in all; past that the agent reads them in Linear), and the
-  300 most recently updated open tickets of the same team outside the project by title. The
-  description stays within 120,000 characters, so the planner's prompt fits Linear's 200,000 limit
-  however large the project is: every new ticket is always listed, and when the room runs out the
-  other project tickets, then those outside it, are cut, with a note to search Linear for them.
-  Its agent looks for overlap first:
+- **Planning on its own.** Whenever a labelled project has new tickets and no open planner run,
+  the plugin starts a run itself: no Linear ticket, no label, no agent session in between. A run
+  waits for the project's tickets to settle: it starts 15 minutes after the newest new ticket was
+  first seen, or an hour after the oldest one at the latest, so a steady trickle still gets its
+  order within the hour. The Paseo Agents menu bar app uses three RPCs: `linear.projects-status`
+  lists each labelled project with how many new tickets wait for a plan, when a run would start
+  (`plansAt`) and the open run (its id, agent, start time, tickets and restarts); `linear.plan-project` starts a run right away instead of at the next read, and
+  replaces one left to you; `linear.skip-plan` stops the open run, whose tickets are then handed
+  out without a work order.
+- **Planner run.** The plugin launches the run's agent itself, in the Paseo project the
+  [project mappings](#project-mappings) give the Linear project (else the busiest team of its
+  tickets), in that project's own checkout with no worktree or branch: the run changes no code. No agent slot and no memory lease holds it back: it only
+  orders tickets, and while it waits none of its project's new tickets can be handed out. Its
+  first prompt is the brief: every open ticket of the project (In Progress and In Review included)
+  in one line with its state, priority, labels, open blockers and links, the new ones marked and
+  also given in full (up to 4,000 characters each and 30,000 in all; past that the agent reads
+  them in Linear), and the 300 most recently updated open tickets of the same team outside the
+  project by title. The brief stays within 120,000 characters, so it fits any project size (the
+  ticket planners before it rode Linear's 200,000-character agent context, and ERP's 409 open
+  tickets went past it: TUC-1094 never started); every new ticket is always listed, and when the
+  room runs out the other project tickets, then those outside it, are cut, with a note to search
+  Linear for them. Its agent looks for overlap first:
   it compares every new ticket with all of those, searches Linear with its read tools for open
   tickets the lists miss, reads the full text of any candidate, and its plan lists every overlap
   in an `## Overlaps` section (or "None found" with the search terms). It then reads the code and
@@ -1030,13 +1038,14 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   that is not exactly one change (`TUC-1 blocks TUC-2, TUC-3`), is sent back to the planner with
   the unreadable lines instead of closing as an empty order. Paseo then adds the blocking
   relations, links related tickets, puts `paseo-hold` on held tickets (removes it from released
-  ones) and `paseo-attended` on attended ones (`unattended X` removes it), comments what it
-  applied and skipped, closes the planner ticket and archives its agent. `A duplicates B` puts
-  `paseo-hold` on A, posts the reason on it and links it as a duplicate of B, which moves A to
+  ones) and `paseo-attended` on attended ones (`unattended X` removes it), posts one update on the
+  *project* saying what it applied and skipped, and archives the run's agent. If that summary update
+  fails, the failure is logged; the applied order still closes. `A duplicates B` puts `paseo-hold`
+  on A, posts the reason on it and links it as a duplicate of B, which moves A to
   Linear's Duplicate status; B may be any ticket, in the project or not, open or done, while A
   must be a ticket of the project that is not started and not with an agent (others are listed
   as skipped). `A relates to B` needs A open in the project and B any ticket. Links that exist
-  count as applied. Nothing else of an approval (In Progress, `plan-ready`,
+  count as applied. Nothing else of a ticket approval (In Progress, `plan-ready`,
   a new agent) applies to it. The approved order is kept in `projects.json` before it is
   written, and every project read writes one that is not in Linear yet, so Linear being down or
   rate-limited only delays it, for as long as it lasts. The changes that went through are kept
@@ -1044,26 +1053,27 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   added again. Until the order is written, the tickets it blocks, holds or marks attended are not
   handed out, even when they were planned before. A change Linear itself refuses three reads
   in a row is listed as skipped and the order closes anyway; a ticket whose `hold` or blocker was
-  skipped is not handed out by the project (the comment names it), so assign it yourself when it
-  may start. An approved order is still written when you close the planner ticket before that
-  (the ticket stays closed). A planner ticket that carries `plan-ready` was approved like a
-  ticket plan (by a plugin version that parked work orders for you) and is written from its
-  "Plan:" document the same way. The planner is told to mark a ticket
+  skipped is not handed out by the project (the project update names it), so assign it yourself
+  when it may start. The planner is told to mark a ticket
   attended only for an open business decision, acceptance criteria too vague to check,
   user-facing wording or layout you choose, changes to production data, external accounts or
-  spend, or a step only a person can do; never for size or risk alone. A planner that cannot be
-  filed or written never holds back the hand-out of tickets that are already planned.
-- **Restarting the planner.** A planner whose agent never came up (its launch failed) or stopped
-  without submitting a plan (closed after idling, or archived) would hold the project: no new
-  planner is filed while it is open. So every project read checks the open, started planner
-  without an approved order for a live agent (one labelled with its ticket that is initializing,
-  idle or running, and no ghost: see **Ghost agents**). Ten minutes after its last start without one (a launch takes a couple of
-  minutes, so one still under way is never doubled), it is started again with a new agent and a
-  new thread on the ticket, like a label launch; its earlier threads are closed and its stopped
-  agents archived. Assigning the ticket to Paseo again is no restart: Linear opens no new thread
-  for it, and a thread whose launch failed is in error. After three restarts without a live agent
-  Paseo comments on the planner ticket and stops: start an agent for it from the sidebar, or close
-  the ticket to skip the order. Each restart is logged and counted in `projects.json`.
+  spend, or a step only a person can do; never for size or risk alone. A run that cannot be
+  started or written never holds back the hand-out of tickets that are already planned.
+- **Restarting the run.** A run whose agent never came up (its start failed) or stopped without
+  submitting a plan (closed after idling, or archived) would hold the project: no new run starts
+  while it is open. So every project read checks the open run without an approved order for a live
+  agent (one labelled with the run's `linear.plannerRun` that is initializing, idle or running,
+  and no ghost: see **Ghost agents**). Ten minutes after its last start without one (a start takes a couple of
+  minutes, so one still under way is never doubled), the plugin starts another agent for the same
+  run; its stopped agents are archived. A start that cannot succeed (no project mapped, no
+  provider chosen) leaves the run to you right away instead of retrying. After three restarts
+  without a live agent the plugin posts one update on the project, marked at risk, and stops: press Plan in the
+  menu bar app to start again, or Skip to hand the tickets out without an order. Every start and
+  restart is kept with the project's record in `projects.json`, and a late report of a run you
+  skipped or replaced is ignored rather than written.
+  Skip and order application wait for any start or write already in flight. Each later project
+  poll also archives obsolete run agents, including one whose creation response was lost and
+  became visible only after Skip.
 - **Hand-out.** Planned tickets in Backlog or Todo that are unassigned or yours, not handed to
   Paseo yet, without `paseo-hold` (or other `paseo-` state labels) and with every blocker
   finished are assigned to Paseo in the *Who starts next* order, one per free slot. Tickets in
@@ -1080,7 +1090,7 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   approved for later is back in Todo on purpose; a ticket someone else handed to Paseo was
   refused; a waiting thread you completed is left alone), it is started again ten minutes after
   it was first seen so, admitted like any start (a full agent limit is waited out without
-  counting), with a new agent and thread, as for the planner, one ticket per poll. After three
+  counting), with a new agent and thread, as for a planner run, one ticket per poll. After three
   restarts without a live agent Paseo comments on the ticket and stops: start an agent from the
   sidebar, or add the `paseo` label. Kept under `stalled` in `projects.json`; a ticket drops out
   once an agent works on it. Tickets carrying `paseo-running` or `paseo-failed` are left to
@@ -1112,7 +1122,7 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
     you are mentioned once.
   - At most one ticket is restarted per pass. Before each restart the ticket is read again: one that closed, got `paseo-hold`, moved to
     Needs input or review, or got an agent, a claim or a queued activation meanwhile is not
-    started. Tickets carrying the trigger label (the dispatch has them), planner tickets, groups
+    started. Tickets carrying the trigger label (the dispatch has them), groups
     and tickets being deleted are left alone.
   - Each incident is kept under `~repairs` in `projects.json` with its last ten steps. A restart
     and a comment are claimed there before they happen, so a reload never doubles one and never
@@ -1121,17 +1131,19 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
     hand-out and **Restarting a failed start** leave tickets with an open incident alone. Adding
     the trigger label or starting an agent from the sidebar ends the incident: a later failure
     starts with fresh retries.
-- **New tickets.** A ticket is planned once a planner listed it (by ticket, not by creation
-  time), so a ticket filed while the planner is being filed, or moved into the project from
+- **New tickets.** A ticket is planned once a run listed it (by ticket, not by creation
+  time), so a ticket filed while a run starts, or moved into the project from
   another one, is new too. Tickets that leave the project's open tickets (closed, moved out) drop
-  out of the planned ones when a planner closes, so they are new again if they come back. New
-  tickets are not handed out until the next planner has ordered them; `linear.projects-status`
-  counts them. Only tickets the project could hand out count: new sub-issues, tickets already with
-  Paseo or someone else, and started ones do not. There is at most one planner per project at a
-  time, also when Plan is pressed during a read: tickets filed while one works are listed by the
-  next. Records of older versions, which planned by creation time, keep what they had planned.
-- **Skipping a work order.** Closing or canceling the planner ticket yourself before its order is
-  approved counts its tickets as planned: they are handed out without a work order.
+  out of the planned ones when a run closes, so they are new again if they come back. New
+  tickets are not handed out until the next run has ordered them; `linear.projects-status`
+  counts them and says when a run would start. Only tickets the project could hand out count: new
+  sub-issues, tickets already with Paseo or someone else, and started ones do not. There is at
+  most one run per project at a time, also when Plan is pressed while one starts: tickets filed
+  while one works are listed by the next. Records of older versions, which planned by creation
+  time, keep what they had planned; the record of an old planner ticket is dropped (the ticket
+  itself is left alone, and the project's new tickets are planned on their own).
+- **Skipping a work order.** Skip in the menu bar app (`linear.skip-plan`) stops the open run: its
+  tickets count as planned and are handed out without a work order.
 - Removing the label from the project stops new hand-outs; agents already working continue.
   Without a usable Paseo app (no threads) projects are not worked on.
 
@@ -1453,7 +1465,7 @@ start (the plugin stops in that second) loses the message: the log names the cla
 repeated.
 
 **Native process ownership.** `CLOSED`, archive and a closed-process error do not prove an OMP
-worker exited. Native thread starts, automatic resumes, planner restarts, successor dispatch
+worker exited. Native thread starts, automatic resumes, successor dispatch
 and recovery prompts check all same-ticket root snapshots, including archived ones, while
 holding the start gate. Exact native session identities are compared with the local process
 listing; sessionless or ambiguous RPC workers also require an exact worktree-cwd check
@@ -1470,7 +1482,7 @@ stage's nudges, the drop, the replacement request then only reach the log). The 
 new head, review or stage, or once a message went out.
 
 **One start per ticket.** Every automatic start (the trigger label, a new thread on the ticket,
-the project planner's restart, the automatic resume, a successor) takes the ticket's start gate
+the automatic resume, a successor) takes the ticket's start gate
 and checks for a live agent first, so two of them never start two agents for one ticket. One that
 finds the gate taken waits: the label stays for the next poll, a thread is queued with its comment
 and joins the agent once it runs, a project restart is retried on the next read, the automatic

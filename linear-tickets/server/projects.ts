@@ -4,10 +4,12 @@ import type { PaseoApi } from "@getpaseo/client";
 
 const exec = promisify(execFile);
 
+export class ProjectUnavailableError extends Error {}
+
 export async function findProject(paseo: PaseoApi, id: string) {
   const result = await paseo.projects.list();
   const project = result.projects.find((item) => item.projectId === id);
-  if (!project?.projectRootPath) throw new Error("This project is no longer available. Refresh projects and select one again.");
+  if (!project?.projectRootPath) throw new ProjectUnavailableError("This project is no longer available. Refresh projects and select one again.");
   return project;
 }
 

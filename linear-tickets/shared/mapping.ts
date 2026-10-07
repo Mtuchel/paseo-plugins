@@ -13,6 +13,14 @@ export function mappingKey(source: MappingSource): string | null {
   return null;
 }
 
+// The saved mapping a launch uses: the Linear project's, else its team's. Only saved mappings
+// launch (the sidebar's name-match preselection is a UI hint, and guessing the repository for an
+// unattended launch is not); the callers report what to do about a missing one.
+export function savedMapping(source: { projectId: string | null; teamId: string | null }, mappings: Record<string, ProjectMapping>): ProjectMapping | undefined {
+  return (source.projectId ? mappings[`project:${source.projectId}`] : undefined)
+    ?? (source.teamId ? mappings[`team:${source.teamId}`] : undefined);
+}
+
 export function mappingLabel(source: MappingSource): string {
   return source.projectId ? source.projectName || "Linear project" : `${source.teamName || "Linear team"} (no project)`;
 }

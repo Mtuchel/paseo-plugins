@@ -1,6 +1,6 @@
 import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setPresenceRpc, setSettingsRpc, statusRpc, type CapacityState } from "./shared/contracts";
+import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setPresenceRpc, setSettingsRpc, skipPlanRpc, statusRpc, type CapacityState } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -8,7 +8,7 @@ import { Settings, type PluginSettings } from "./server/settings";
 import { DEFAULT_PROMPT_TEMPLATE } from "./shared/contracts";
 import { cacheScope, TicketCache } from "./server/cache";
 import { Credentials } from "./server/credentials";
-import { Dispatcher, dispatchLabels } from "./server/dispatch";
+import { Dispatcher } from "./server/dispatch";
 import { CommentRelay } from "./server/relay";
 import { recordPluginComment } from "./server/agent-records";
 import { paseoHome } from "./server/ticket-mcp";
@@ -170,16 +170,18 @@ export default function contribute(server: PluginServerContext) {
   };
   ticketOwner = ticketOwnership({ settings, drain, intake });
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
-  // Labelled projects: a planner ticket sets the work order, then tickets are handed out as slots free up.
-  // A planner without a live agent, and a ticket assigned to Paseo whose start failed, is started
-  // again with a new agent and thread (README, "Projects").
+  // Labelled projects: a planner run sets the work order, then tickets are handed out as slots free up.
+  // A run without a live agent, and a ticket assigned to Paseo whose start failed, is started again
+  // (README, "Projects").
   const projectStore = new ProjectStore();
   // Project tickets are read in full every 30 minutes and only as changed in between (project-issues.ts).
   const projectIssues = new ProjectIssueCache(linear);
-  const projects = new ProjectFlow({ linear, projectIssues: (projectId, full) => projectIssues.read(projectId, full), scheduler: starter.scheduler, capacity: starter.capacity, store: projectStore, retire: async (agentId, api) => {
-    await stopAgentTurn(agentId).catch(() => {});
-    await api.agents.ref(agentId).archive().catch(() => {});
-  }, restart: async (issueId, identifier) => restartOrThrow(await sessions.restartFor(issueId, identifier)), accountedFor: async (issueId) => launcher.underWay(issueId) || await sessions.threadHolds(issueId) });
+  const projects = new ProjectFlow({ linear, projectIssues: (projectId, full) => projectIssues.read(projectId, full), scheduler: starter.scheduler, capacity: starter.capacity, store: projectStore,
+    startPlanner: (input, paseo, current) => launcher.startPlanner(input, paseo, current),
+    retire: async (agentId, api) => {
+      await stopAgentTurn(agentId).catch(() => {});
+      await api.agents.ref(agentId).archive().catch(() => {});
+    }, restart: async (issueId, identifier) => restartOrThrow(await sessions.restartFor(issueId, identifier)), accountedFor: async (issueId) => launcher.underWay(issueId) || await sessions.threadHolds(issueId) });
   // Stale `-running` and `-failed` labels are reconciled, and their tickets started again (README,
   // "Repairing stale running and failed labels"); its records share projects.json with the projects.
   const labelRepair = new LabelRepair({ linear, store: projectStore, launcher, intake, deletions, restart: (issueId, identifier, options) => sessions.restartFor(issueId, identifier, options) });
@@ -367,7 +369,8 @@ export default function contribute(server: PluginServerContext) {
   server.handle(statusRpc, (_input, { paseo }) => { attach(paseo); return linear.status(); });
   server.handle(dispatchStatusRpc, (_input, { paseo }) => { attach(paseo); return dispatcher.snapshot(); });
   server.handle(projectsStatusRpc, (_input, { paseo }) => { attach(paseo); return projects.status(); });
-  server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { attach(paseo); return projects.planNow(projectId, await settings.read()); });
+  server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { attach(paseo); return projects.planNow(projectId, await settings.read(), paseo); });
+  server.handle(skipPlanRpc, async ({ projectId }, { paseo }) => { attach(paseo); return projects.skipPlan(projectId, await settings.read(), paseo); });
   server.handle(presenceRpc, () => presence.state());
   server.handle(setPresenceRpc, (change) => presence.update(change));
   // Memory lease (README, "Memory lease"): the menu bar app's RAM cap on new starts.
@@ -433,8 +436,8 @@ export default function contribute(server: PluginServerContext) {
     // The sidebar starts an agent here and now; a draining host starts none, so it refuses
     // instead of forwarding a launch whose workspace the owner picked on this host.
     if (current.activation.mode === "remote") throw new Error(`This host forwards new Linear work to ${current.activation.peer ?? "the peer host"}; the agent starts there. Assign Paseo or add the trigger label on the ticket.`);
-    const { template, agentLinearAccess, dispatch } = current;
-    const setup = await planSetup(linear, input.id, input.provider, input.modeId, dispatchLabels(dispatch.label).planner, tiers);
+    const { template, agentLinearAccess } = current;
+    const setup = await planSetup(linear, input.id, input.provider, input.modeId, tiers);
     const model = tierModel(current, input.provider.split("/")[0], setup.tier?.tier ?? null, { provider: input.provider, ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}) });
     const launch = { ...input, ...model, modeId: setup.modeId, instructions: [...setup.notes, input.instructions.trim()].filter(Boolean).join("\n\n") };
     const markInProgress = input.markInProgress && setup.policy !== "required";

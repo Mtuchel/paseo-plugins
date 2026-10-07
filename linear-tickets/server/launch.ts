@@ -1,6 +1,7 @@
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoAgentHandle, PaseoApi, PaseoWorkspaceHandle } from "@getpaseo/client";
 import type { RpcInput } from "@getpaseo/plugin";
 import { launchAgentRpc } from "../shared/contracts";
+import { savedMapping } from "../shared/mapping";
 import { existsSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -8,14 +9,20 @@ import { AgentEnvs } from "./agent-env";
 import { attachmentNote, saveAttachments, type Download } from "./attachments";
 import { buildPrompt, finishedBlockersNote } from "./context";
 import { inReviewState, type LinearService } from "./linear";
-import { PLAN_CONTEXT_ENV, PLAN_TICKET_ENV } from "./plan-policy";
-import { findProject, readBranches } from "./projects";
+import { advisorNote, PLAN_CONTEXT_ENV, PLAN_POLICY_ENV, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_TICKET_ENV, SAFE_MODES } from "./plan-policy";
+import { findProject, ProjectUnavailableError, readBranches } from "./projects";
 import { repoOrientation } from "./repo-orientation";
-import { ompExtensionInstalled, paseoHome, TICKET_MCP_ENV, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
+import type { PluginSettings } from "./settings";
+import { ompExtensionInstalled, paseoHome, TICKET_MCP_ENV, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript, type TicketMcpServer } from "./ticket-mcp";
 
 import type { ReviewDeletions } from "./review-deletions";
 type Start = RpcInput<typeof launchAgentRpc>;
 type Result = { agentId: string; warnings: string[] };
+// What a planner run (README, "Projects") launches through Launcher.startPlanner: the run, its
+// Linear project and team (the mapping fallback) and the ticket brief the planner's prompt is
+// built from. `requestId` dedupes the start: a retry of the same attempt never starts a second
+// agent (the run's own record is the retry state).
+export type PlannerStart = { runId: string; linearProjectId: string; projectName: string; teamId: string; requestId: string; brief: string };
 // `resume` continues another agent's work: same branch (and worktree while it still exists),
 // with the handover text ahead of the ticket prompt. `labels` are added to the agent, `env` to
 // its provider process. `lead`: why Paseo started the agent now (the pull request's next step for
@@ -106,39 +113,54 @@ export class Launcher {
 
   start(input: Start, paseo: PaseoApi, options: Options = {}): Promise<Result> {
     const fingerprint = JSON.stringify([input.id, input.projectId, input.baseBranch, input.provider, input.modeId, input.thinkingOptionId, input.instructions, options.promptTemplate ?? "", options.markInProgress ?? false, options.linearAccess ?? false, options.lead ?? ""]);
-    const prior = this.requests.get(input.requestId);
+    return this.tracked(input.id, input.requestId, fingerprint, "This launch request has already been used. Reopen the ticket to start another agent.", (onCreate) => this.launch(input, paseo, options, onCreate));
+  }
+
+  // Starts the agent of a planner run (README, "Projects"): no Linear ticket, no branch, no
+  // worktree — a directory workspace in the project root, like the planners before it. The run id
+  // is the agent's identity (`linear.plannerRun`); the mapping and provider come from the same
+  // saved settings every launch uses.
+  startPlanner(input: PlannerStart, paseo: PaseoApi, settings: PluginSettings): Promise<Result> {
+    const fingerprint = JSON.stringify([input.runId, input.requestId]);
+    return this.tracked(input.runId, input.requestId, fingerprint, "This planner start has already been used.", (onCreate) => this.launchPlanner(input, paseo, settings, onCreate));
+  }
+
+  // One start per ticket (or run) and request id, from any start path: a repeated request id
+  // returns what the first one did, and a launch still under way is joined instead of doubled.
+  private tracked(id: string, requestId: string, fingerprint: string, reused: string, work: (onCreate: () => void) => Promise<Result>): Promise<Result> {
+    const prior = this.requests.get(requestId);
     if (prior) {
-      if (prior.fingerprint !== fingerprint) return Promise.reject(new Error("This launch request has already been used. Reopen the ticket to start another agent."));
+      if (prior.fingerprint !== fingerprint) return Promise.reject(new Error(reused));
       return prior.result;
     }
     const active = this.active.get(fingerprint);
     if (active) {
-      this.requests.set(input.requestId, { fingerprint, result: active });
+      this.requests.set(requestId, { fingerprint, result: active });
       return active;
     }
     let creationStarted = false;
-    const result = this.launch(input, paseo, options, () => { creationStarted = true; });
-    this.requests.set(input.requestId, { fingerprint, result });
+    const result = work(() => { creationStarted = true; });
+    this.requests.set(requestId, { fingerprint, result });
     this.active.set(fingerprint, result);
-    this.launching.set(input.id, (this.launching.get(input.id) ?? 0) + 1);
-    const pending = this.pending.get(input.id) ?? new Set<Promise<Result>>();
+    this.launching.set(id, (this.launching.get(id) ?? 0) + 1);
+    const pending = this.pending.get(id) ?? new Set<Promise<Result>>();
     pending.add(result);
-    this.pending.set(input.id, pending);
+    this.pending.set(id, pending);
     const settled = () => {
       this.active.delete(fingerprint);
-      const left = (this.launching.get(input.id) ?? 1) - 1;
-      if (left) this.launching.set(input.id, left);
-      else this.launching.delete(input.id);
+      const left = (this.launching.get(id) ?? 1) - 1;
+      if (left) this.launching.set(id, left);
+      else this.launching.delete(id);
       pending.delete(result);
-      if (!pending.size) { this.pending.delete(input.id); this.canonicalIds.delete(input.id); }
+      if (!pending.size) { this.pending.delete(id); this.canonicalIds.delete(id); }
     };
     void result.then(settled, () => {
       settled();
       // A creation request may have succeeded before its response was lost.
       // Keep that result so retrying this request cannot create a second agent.
       if (!creationStarted) {
-        for (const [id, entry] of this.requests) {
-          if (entry.result === result) this.requests.delete(id);
+        for (const [key, entry] of this.requests) {
+          if (entry.result === result) this.requests.delete(key);
         }
       }
     });
@@ -259,52 +281,122 @@ export class Launcher {
       }
     }
     // The ticket marks the agent for the plan advisor gate even when its context cannot be saved.
-    // `attach`: hand the ticket server to the provider as an MCP server. omp cannot load one, so its
-    // agents get the server's command in TICKET_MCP_ENV and the plugin's omp extension mounts the tools.
+    const agent = await this.createAgent(workspace, input.requestId, {
+      title,
+      provider: input.provider,
+      modeId: input.modeId,
+      thinkingOptionId: input.thinkingOptionId,
+      // The prompt is built per attempt, so the retry without tools never promises them.
+      prompt: (linearAccess) => [options.resume?.handover, buildPrompt(detail, instructions, options.promptTemplate, linearAccess), options.lead ? `${LEAD_INTRO}\n\n${options.lead}` : ""].filter(Boolean).join("\n\n"),
+      labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
+      env: { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier },
+      mcpServers,
+      warnings,
+      retry: "Check the workspace's agents before reopening this ticket to try again.",
+      blocked: async () => (await this.deletions?.blocked(detail.issue.id)) ? "This ticket is paused for deletion; no agent was started." : null,
+    });
+    return { agentId: agent.id, warnings };
+  }
+
+  // The agent of one planner run (README, "Projects"): the brief plus the notes a planner is given
+  // under the required policy, in the saved project mapping, on the saved provider and its safe
+  // mode. No branch and no worktree — the planner writes no code and runs in the project root, as
+  // the ticket planners did. The run id is the agent's label, which routes its work order
+  // (plannotator.ts).
+  private async launchPlanner(input: PlannerStart, paseo: PaseoApi, settings: PluginSettings, onCreate: () => void): Promise<Result> {
+    const mapping = savedMapping({ projectId: input.linearProjectId, teamId: input.teamId }, settings.projectMappings);
+    if (!mapping) throw new SetupError(`No Paseo project is mapped to ${input.projectName} or its team. Start one agent from the Linear tickets sidebar (that saves the mapping), then Plan starts the run again.`);
+    const preference = settings.lastProvider ? settings.launchPreferences[settings.lastProvider] : undefined;
+    if (!preference) throw new SetupError("No provider has been chosen on this host yet. Start one agent from the Linear tickets sidebar so the plugin remembers the provider and model, then Plan starts the run again.");
+    const project = await findProject(paseo, mapping.projectId).catch((error: unknown) => {
+      if (error instanceof ProjectUnavailableError) throw new SetupError(error.message);
+      throw error;
+    });
+    const providerKey = preference.model.split("/")[0];
+    const warnings: string[] = [];
+    const title = `Plan the work order of ${input.projectName}`.slice(0, 60);
+    const prompt = [input.brief, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, advisorNote(providerKey)].join("\n\n");
+    // Written before any creation, so a lost response cannot leave the run without a record while
+    // its agent exists (the run's next attempt adopts a live agent instead of starting one).
+    onCreate();
+    const workspace = await paseo.workspaces.create({
+      title,
+      requestId: `${input.requestId}-workspace`,
+      source: { kind: "directory", projectId: project.projectId, path: project.projectRootPath },
+    });
+    const agent = await this.createAgent(workspace, input.requestId, {
+      title,
+      provider: preference.model,
+      modeId: SAFE_MODES[providerKey] ?? preference.modeId,
+      thinkingOptionId: preference.thinkingOptionId,
+      prompt: () => prompt,
+      labels: { "linear.plannerRun": input.runId, "linear.projectId": input.linearProjectId },
+      // The ticket env is a flag for the plugin's omp extension (its plan gate, record_plan_advice
+      // and ticket tools); no Linear ticket is behind it.
+      env: { [PLAN_POLICY_ENV]: "required", [PLAN_TICKET_ENV]: `project-planner:${input.runId}` },
+      mcpServers: settings.agentLinearAccess ? { [TICKET_MCP_NAME]: ticketMcpServer(await this.ticketScript(), null) } : undefined,
+      warnings,
+      retry: "Check the host's agents before the project's next read tries again.",
+    });
+    return { agentId: agent.id, warnings };
+  }
+
+  // Creates the agent in `workspace` and saves its environment for its resumed sessions
+  // (agent-env.ts). Shared by ticket launches and planner runs: the ticket server is handed to the
+  // provider as an MCP server (attach), or, for an omp that learns MCP, as TICKET_MCP_ENV for the
+  // plugin's omp extension; a provider the daemon refuses MCP servers for starts again without the
+  // tools and with the no-write prompt.
+  private async createAgent(workspace: PaseoWorkspaceHandle, contextRequestId: string, spec: {
+    title: string; provider: string; modeId: string | undefined; thinkingOptionId: string | undefined;
+    prompt: (linearAccess: boolean) => string; labels: Record<string, string>; env: Record<string, string>;
+    mcpServers: Record<string, TicketMcpServer> | undefined; warnings: string[];
+    retry: string; blocked?: () => Promise<string | null>;
+  }): Promise<PaseoAgentHandle> {
     const create = async (linearAccess: boolean, requestId: string, attach: boolean) => {
-      const prompt = [options.resume?.handover, buildPrompt(detail, instructions, options.promptTemplate, linearAccess), options.lead ? `${LEAD_INTRO}\n\n${options.lead}` : ""].filter(Boolean).join("\n\n");
-      let env: Record<string, string> = { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier };
-      if (linearAccess && mcpServers) env[TICKET_MCP_ENV] = JSON.stringify(mcpServers[TICKET_MCP_NAME]);
+      const prompt = spec.prompt(linearAccess);
+      let env: Record<string, string> = { ...spec.env };
+      if (linearAccess && spec.mcpServers) env[TICKET_MCP_ENV] = JSON.stringify(spec.mcpServers[TICKET_MCP_NAME]);
       try {
-        env = { ...env, [PLAN_CONTEXT_ENV]: await this.planContext(input.requestId, prompt) };
+        env = { ...env, [PLAN_CONTEXT_ENV]: await this.planContext(contextRequestId, prompt) };
       } catch (error) {
-        warnings.push(`Could not save the ticket context for the plan advisor: ${error instanceof Error ? error.message : "unknown error"}`);
+        spec.warnings.push(`Could not save the context for the plan advisor: ${error instanceof Error ? error.message : "unknown error"}`);
       }
-      if (await this.deletions?.blocked(detail.issue.id)) throw new Error("This ticket is paused for deletion; no agent was started.");
+      const blocked = await spec.blocked?.();
+      if (blocked) throw new Error(blocked);
       const agent = await workspace.agents.create({
-        config: { provider: input.provider, modeId: input.modeId, thinkingOptionId: input.thinkingOptionId, ...(linearAccess && attach && mcpServers ? { mcpServers } : {}) },
-        title,
+        config: { provider: spec.provider, modeId: spec.modeId, thinkingOptionId: spec.thinkingOptionId, ...(linearAccess && attach && spec.mcpServers ? { mcpServers: spec.mcpServers } : {}) },
+        title: spec.title,
         prompt,
         requestId,
         clientMessageId: requestId,
-        labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
+        labels: spec.labels,
         env,
       });
-      // Never fails the launch: a resumed session then still gets its ticket from the agent's labels.
+      // Never fails the launch: a resumed session then still gets its environment from its labels.
       await this.envs.save(agent.id, env).catch((error: unknown) => {
-        warnings.push(`Could not save the agent's ticket environment for its resumed sessions: ${error instanceof Error ? error.message : "unknown error"}`);
+        spec.warnings.push(`Could not save the agent's environment for its resumed sessions: ${error instanceof Error ? error.message : "unknown error"}`);
       });
       return agent;
     };
     const unconfirmed = (error: unknown) => {
       // Keep the daemon's reason (e.g. a provider failing to start with the ticket MCP server).
       const cause = error instanceof Error && error.message ? ` (${error.message.slice(0, 300)})` : "";
-      return new Error(`Agent creation could not be confirmed${cause}. Check the workspace's agents before reopening this ticket to try again.`);
+      return new Error(`Agent creation could not be confirmed${cause}. ${spec.retry}`);
     };
-    let withTools = Boolean(mcpServers);
+    let withTools = Boolean(spec.mcpServers);
     // Attaching the server too would give an omp that learns MCP every tool twice.
-    const viaExtension = withTools && (input.provider === "omp" || input.provider.startsWith("omp/")) && this.ompTools();
-    const agent = await create(withTools, input.requestId, !viaExtension).catch(async (error: unknown) => {
+    const viaExtension = withTools && (spec.provider === "omp" || spec.provider.startsWith("omp/")) && this.ompTools();
+    const agent = await create(withTools, contextRequestId, !viaExtension).catch(async (error: unknown) => {
       // The daemon refuses MCP servers for providers that cannot load them before it creates
-      // anything, so the same ticket starts again without the ticket tools and with the no-write note.
+      // anything, so the same agent starts again without the Linear ticket tools and with the no-write note.
       if (!withTools || viaExtension || !(error instanceof Error && error.message.includes("does not support MCP servers"))) throw unconfirmed(error);
       withTools = false;
-      warnings.push("This provider does not load MCP servers, so the agent started without the Linear ticket tools and was told not to change Linear; choose another provider (for omp, install the plugin's omp extension) to let it update the ticket.");
-      return create(false, `${input.requestId}-no-mcp`, false).catch((retryError: unknown) => { throw unconfirmed(retryError); });
+      spec.warnings.push("This provider does not load MCP servers, so the agent started without the Linear ticket tools and was told not to change Linear; choose another provider (for omp, install the plugin's omp extension) to let it update Linear.");
+      return create(false, `${contextRequestId}-no-mcp`, false).catch((retryError: unknown) => { throw unconfirmed(retryError); });
     });
     if (withTools && !viaExtension && agent.capabilities?.supportsMcpServers === false) {
-      warnings.push("This provider does not load MCP servers, so the agent has no Linear tools. It was still told about them; choose another provider to let it update the ticket.");
+      spec.warnings.push("This provider does not load MCP servers, so the agent has no Linear tools. It was still told about them; choose another provider to let it update Linear.");
     }
-    return { agentId: agent.id, warnings };
+    return agent;
   }
 }

@@ -1551,17 +1551,18 @@ export class SessionRouter {
     });
   }
 
-  // A project planner without a live agent (README, "Projects"): a new agent and a new thread, as
-  // for a label launch, admitted like any start. Its earlier thread cannot be reused: one whose
-  // launch failed is in error in Linear, and Linear opens no new thread when the ticket is assigned
-  // to Paseo again. Its stopped agents are archived once the new one runs, so a later reply or
-  // mention never reaches them, and its earlier threads are closed as superseded.
+  // A stalled ticket without a live agent (README, "Restarting a failed start") and the label
+  // repair's replacements (label-repair.ts): a new agent and a new thread, as for a label launch,
+  // admitted like any start. The earlier thread cannot be reused: one whose launch failed is in
+  // error in Linear, and Linear opens no new thread when the ticket is assigned to Paseo again.
+  // Its stopped agents are archived once the new one runs, so a later reply or mention never
+  // reaches them, and its earlier threads are closed as superseded.
   // Runs in the ticket's turn and under its start gate, like any automatic start: a live agent that
-  // came up meanwhile (a successor start before it) is no planner to restart.
-  // Also the label repair's restart (label-repair.ts): `eligible` runs last before the start, after
-  // admission (which may wait), and a reason it returns defers the start. Only a failed
-  // `starter.start` is `failed`; what follows a start (thread, archive, superseded threads) is best
-  // effort and never turns a started agent into a failure. `marked`: the running label was written.
+  // came up meanwhile (a successor start before it) is no ticket to restart.
+  // `eligible` runs last before the start, after admission (which may wait), and a reason it
+  // returns defers the start. Only a failed `starter.start` is `failed`; what follows a start
+  // (thread, archive, superseded threads) is best effort and never turns a started agent into a
+  // failure. `marked`: the running label was written.
   restartFor(issueId: string, identifier: string, options: RestartOptions = {}): Promise<RestartResult> {
     return this.exclusive(issueId, () => this.restartNow(issueId, identifier, options));
   }

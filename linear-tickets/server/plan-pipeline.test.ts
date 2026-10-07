@@ -112,6 +112,25 @@ test("existing running planner is expected before any review; an implementing id
   });
 });
 
+test("a ticketless planner run remains visible through planning and a failed submission", async () => {
+  await harness(async (h) => {
+    h.agents.splice(0, 1, { ...h.agents[0], id: "project-planner", title: "Plan the work order of ERP",
+      labels: { "linear.plannerRun": "run-erp", "linear.projectId": "erp" } });
+    await h.refresh();
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "project-planner")!;
+    assert.equal(row.identifier, "Plan the work order of ERP");
+    assert.equal(row.stage, "preparing");
+    assert.equal(row.status, "normal");
+    await h.append([...submit(), result({}, true, "Cannot find module '/private/tools/plan.mjs'")]);
+    await h.refresh();
+    const failed = (await h.snapshot()).rows.find((entry) => entry.agentId === "project-planner")!;
+    assert.equal(failed.stage, "publishing");
+    assert.equal(failed.status, "failed");
+    await h.restart();
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "project-planner")?.status, "failed");
+  });
+});
+
 test("advisor requires the explicit model AND parent; its real timeline progress prevents false stall", async () => {
   await harness(async (h) => {
     h.clock = new Date("2026-10-06T13:00:00.000Z");

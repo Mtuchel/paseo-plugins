@@ -197,8 +197,7 @@ export class LabelRepair {
   private async refusal(paseo: PaseoApi, ticket: RepairCandidate, names: Names): Promise<string | null> {
     const state = await this.deps.linear.issueState(ticket.id);
     if (CLOSED_TYPES.has(state.statusType.trim().toLowerCase())) return `${ticket.identifier} is ${state.status}`;
-    const owned = [names.trigger, names.planner].find((name) => hasLabel(state.labels, name));
-    if (owned) return `${ticket.identifier} carries ${owned} now`;
+    if (hasLabel(state.labels, names.trigger)) return `${ticket.identifier} carries ${names.trigger} now`;
     const held = heldBy(state.labels, names);
     if (held) return `${ticket.identifier} carries ${held}`;
     if (!restartable(state.status, state.statusType)) return `${ticket.identifier} is in ${state.status}`;
@@ -210,9 +209,9 @@ export class LabelRepair {
     const { linear } = this.deps;
     const running = hasLabel(ticket.labels, names.running);
     const failed = hasLabel(ticket.labels, names.failed);
-    // The trigger label belongs to the dispatch, a planner to the planner revive, a group's work to
-    // its sub-issues; a ticket being deleted to no one.
-    if (hasLabel(ticket.labels, names.trigger) || hasLabel(ticket.labels, names.planner) || ticket.openChildren) return;
+    // The trigger label belongs to the dispatch, a group's work to its sub-issues; a ticket being
+    // deleted to no one.
+    if (hasLabel(ticket.labels, names.trigger) || ticket.openChildren) return;
     if (await this.deps.deletions?.blocked(ticket.id)) return;
     const own = await this.ownership(paseo, ticket, false);
     const now = this.iso();

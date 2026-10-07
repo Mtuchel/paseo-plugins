@@ -42,11 +42,20 @@ export class AgentEnvs {
 // What a session of the agent needs added to the environment it opens with. A create request
 // carries the launch's own; a resumed ticket agent (labelled with its ticket, not a child agent
 // such as its plan advisor) gets its policy from its label and its ticket environment from the
-// saved launch environment, its ticket from its label when nothing was saved.
+// saved launch environment, its ticket from its label when nothing was saved. A resumed planner
+// run's agent has no ticket: its tools hang on the run label (README, "Projects").
 export function sessionEnv(request: Record<string, string>, labels: Record<string, string> | undefined, saved: Record<string, string>): Record<string, string> {
   const added: Record<string, string> = {};
   const policy = labels?.[PLAN_POLICY_LABEL];
   if (!request[PLAN_POLICY_ENV] && isPlanPolicy(policy)) added[PLAN_POLICY_ENV] = policy;
+  const runId = labels?.["linear.plannerRun"];
+  if (labels?.["paseo.parent-agent-id"] === undefined && runId) {
+    // The value is a flag to the plugin's omp extension; no Linear ticket is behind it.
+    if (!request[PLAN_POLICY_ENV]) added[PLAN_POLICY_ENV] = "required";
+    if (!request[PLAN_TICKET_ENV]) added[PLAN_TICKET_ENV] = `project-planner:${runId}`;
+    for (const [name, value] of Object.entries(saved)) if (!request[name]) added[name] = value;
+    return added;
+  }
   const identifier = labels?.["linear.identifier"];
   if (request[PLAN_TICKET_ENV] || !labels?.["linear.issueId"] || !identifier || labels["paseo.parent-agent-id"]) return added;
   for (const [name, value] of Object.entries({ [PLAN_TICKET_ENV]: identifier, ...saved })) if (!request[name]) added[name] = value;

@@ -514,7 +514,7 @@ test("a failed sidebar start on an exhausted label-less orphan begins a new inci
   assert.deepEqual(Object.keys(await w.store.repairs()), ["i1"]);
 });
 
-test("a failed comment never blocks the label change; trigger, planner, group and closed tickets are left alone", async (t) => {
+test("a failed comment never blocks the label change; a legacy planner label no longer shields a ticket; trigger, group and closed tickets are left alone", async (t) => {
   const w = await world(t);
   w.add(1, ["paseo-running"]);
   w.add(2, ["paseo-running", "paseo"]);
@@ -524,11 +524,16 @@ test("a failed comment never blocks the label change; trigger, planner, group an
   w.fail.comment = true;
   await w.at(0);
   await w.at(16);
-  assert.deepEqual(w.calls, ["TUC-1 -paseo-running", "TUC-1 +paseo-running"]);
+  // TUC-3 is repaired like TUC-1: the old `paseo-planner` label is no longer recognized, and only
+  // one ticket restarts per pass.
+  assert.deepEqual(w.calls, ["TUC-1 -paseo-running", "TUC-1 +paseo-running", "TUC-3 -paseo-running"]);
+  assert.deepEqual(w.restarts, ["TUC-1"]);
   w.fail.comment = false;
   await w.at(18);
+  assert.deepEqual(w.calls, ["TUC-1 -paseo-running", "TUC-1 +paseo-running", "TUC-3 -paseo-running", "TUC-3 +paseo-running"]);
+  assert.deepEqual(w.restarts, ["TUC-1", "TUC-3"], "the next pass restarts TUC-3");
   assert.deepEqual(w.comments, [], "claimed once: a lost comment is not posted twice");
-  assert.deepEqual(Object.keys(await w.store.repairs()), ["i1"]);
+  assert.deepEqual(Object.keys(await w.store.repairs()), ["i1", "i3"]);
 });
 
 test("a live agent on the second page of the ticket's agents is found", async (t) => {

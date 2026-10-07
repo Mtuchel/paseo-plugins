@@ -10,7 +10,8 @@
 //   agent enters planning at its next tool call, which is blocked and followed by a message with
 //   the reason (the file's `message`, else the owner's request), or at its next prompt.
 // - LINEAR_TICKETS_ISSUE=<ticket> (set by the plugin for every ticket agent, also when Paseo
-//   resumes its session: server/agent-env.ts): plan advisor
+//   resumes its session: server/agent-env.ts; a planner run sets `project-planner:<run id>`, a
+//   flag with no Linear ticket behind it): plan advisor
 //   (README, "Plan advisor"). Submitting a plan (`plannotator_submit_plan`, its xd:// device, or
 //   omp's `xd://propose`) is blocked until `record_plan_advice` recorded a GPT-6 Astra review for
 //   exactly that plan text. The block reason carries the steps, pointing the advisor at the saved
@@ -299,7 +300,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const sections = parsePlanSections(content, combinedRating(rated.risk).impact);
     const sectionProblem = "problem" in sections ? sections.problem : ruleMismatch(rated.risk.newRule, sections.sections);
     if (sectionProblem) return text(`${file}: ${sectionProblem}\n\n${sectionSteps()}\n\nFix the section, then record again.`);
-    // A project planner's work order only orders tickets; each ticket's own plan picks its tier.
+    // A planner run's work order only orders tickets; each ticket's own plan picks its tier.
     const model = sectionBody(content, "Work order") === null ? parsePlanModel(content, rated.risk) : null;
     if (model && "problem" in model) return text(`${file}: ${model.problem}\n\nFix the section, then record again.`);
     if (verdict === "unavailable") {

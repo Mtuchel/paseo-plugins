@@ -3,7 +3,7 @@ import { readlink, realpath } from "node:fs/promises";
 import { basename, isAbsolute } from "node:path";
 import { promisify } from "node:util";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
-import { issueAgents } from "./starter";
+import { issueAgents, runAgents } from "./starter";
 
 const exec = promisify(execFile);
 const MAX_PAGES = 100;
@@ -190,7 +190,17 @@ export const LIVE_AGENT: Record<string, true> = { initializing: true, idle: true
 export type TicketAgents = { live: PaseoAgent[]; ghosts: PaseoAgent[]; stopped: PaseoAgent[] };
 
 export async function classifyTicketAgents(paseo: PaseoApi, issueId: string, now: number, inspect?: ProcessInspector): Promise<TicketAgents> {
-  const roots = (await issueAgents(paseo, issueId)).filter((agent) => !agent.labels?.["paseo.parent-agent-id"]);
+  return classifyAgents(await issueAgents(paseo, issueId), now, inspect);
+}
+
+// The agents of one planner run (README, "Projects"), by its `linear.plannerRun` label, classified
+// like a ticket's: the run has no Linear ticket, and its stopped agents are replaced by a restart.
+export async function classifyRunAgents(paseo: PaseoApi, runId: string, now: number, inspect?: ProcessInspector): Promise<TicketAgents> {
+  return classifyAgents(await runAgents(paseo, runId), now, inspect);
+}
+
+async function classifyAgents(agents: PaseoAgent[], now: number, inspect?: ProcessInspector): Promise<TicketAgents> {
+  const roots = agents.filter((agent) => !agent.labels?.["paseo.parent-agent-id"]);
   const candidates = roots.filter((agent) => LIVE_AGENT[agent.status]);
   const ghostIds = candidates.length ? await ghostAgents(candidates, now, inspect) : new Set<string>();
   return {

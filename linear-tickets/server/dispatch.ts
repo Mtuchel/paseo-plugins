@@ -45,11 +45,11 @@ type Deps = {
 // custom trigger ("agent") gets matching companions ("agent-running", "agent-failed").
 // `blocked`: the agent stopped with an error; `needsYou`: it waits for the owner's answer or approval;
 // `manual`: a manual task an agent registered for the owner; `hold`: a project ticket the owner
-// releases before it is handed out; `planner`: a project's work-order ticket; `attended`: a ticket
+// releases before it is handed out; `attended`: a ticket
 // that may need the owner while it runs, so it waits while they are away (presence.ts).
-export type DispatchLabels = { running: string; failed: string; blocked: string; needsYou: string; manual: string; hold: string; planner: string; attended: string };
+export type DispatchLabels = { running: string; failed: string; blocked: string; needsYou: string; manual: string; hold: string; attended: string };
 export function dispatchLabels(trigger: string): DispatchLabels {
-  return { running: `${trigger}-running`, failed: `${trigger}-failed`, blocked: `${trigger}-blocked`, needsYou: `${trigger}-needs-you`, manual: `${trigger}-manual`, hold: `${trigger}-hold`, planner: `${trigger}-planner`, attended: `${trigger}-attended` };
+  return { running: `${trigger}-running`, failed: `${trigger}-failed`, blocked: `${trigger}-blocked`, needsYou: `${trigger}-needs-you`, manual: `${trigger}-manual`, hold: `${trigger}-hold`, attended: `${trigger}-attended` };
 }
 
 // Polls Linear for tickets carrying the trigger label and starts one agent per ticket

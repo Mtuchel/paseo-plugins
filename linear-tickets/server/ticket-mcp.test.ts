@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -59,6 +59,13 @@ test("the MCP server runs on the daemon's runtime, as Node even under Electron",
   assert.deepEqual(plain, { type: "stdio", command: "/usr/bin/node", args: ["/s.mjs", "--issue", ISSUE_ID, "--paseo-home", "/home"] });
   const electron = ticketMcpServer("/s.mjs", ISSUE_ID, "/home", { execPath: "/Applications/Paseo.app/Helper", electron: true });
   assert.equal(electron.command, "/Applications/Paseo.app/Helper");
+  assert.deepEqual(electron.env, { ELECTRON_RUN_AS_NODE: "1" });
+});
+
+test("a null issue id launches the MCP server read-only", () => {
+  const plain = ticketMcpServer("/s.mjs", null, "/home", { execPath: "/usr/bin/node", electron: false });
+  assert.deepEqual(plain, { type: "stdio", command: "/usr/bin/node", args: ["/s.mjs", "--read-only", "--paseo-home", "/home"] });
+  const electron = ticketMcpServer("/s.mjs", null, "/home", { execPath: "/Applications/Paseo.app/Helper", electron: true });
   assert.deepEqual(electron.env, { ELECTRON_RUN_AS_NODE: "1" });
 });
 
@@ -278,6 +285,45 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
   } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
+test("a read-only MCP server reads any issue, mounts no write tools and never touches Linear or disk", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-read-only-"));
+  const linear = await fakeLinear((call) => {
+    if (call.query.includes("query ticket")) return { issue };
+    if (call.query.includes("searchIssues")) return { searchIssues: { nodes: [{ identifier: "ENG-7", title: "Other work", url: "https://linear.app/x/issue/ENG-7", state: { name: "Todo", type: "unstarted" }, team: { key: "ENG" }, project: { name: "Tooling" } }] } };
+    return {};
+  });
+  await mkdir(join(home, "linear-tickets"), { recursive: true });
+  await writeFile(join(home, "linear-tickets", "credentials.json"), JSON.stringify({ apiKey: "saved-key" }));
+  const script = await writeTicketMcpScript(home);
+  const server = ticketMcpServer(script, null, home);
+  const mcp = runServer(server.args[0], server.args.slice(1), { LINEAR_TICKET_MCP_ENDPOINT: linear.url });
+  try {
+    const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { instructions: string };
+    assert.match(init.instructions, /Reads cover any Linear issue/);
+    assert.match(init.instructions, /writes nothing/);
+
+    const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
+    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_issue", "search_issues"]);
+
+    const read = JSON.parse((await mcp.call("get_issue", { issue: "ENG-42" })).text);
+    assert.equal(read.identifier, "ENG-42");
+    assert.equal(read.scope, "read_only");
+    assert.deepEqual(read.youMay, []);
+
+    const found = JSON.parse((await mcp.call("search_issues", { query: "sign-in" })).text);
+    assert.deepEqual(found, [{ identifier: "ENG-7", title: "Other work", url: "https://linear.app/x/issue/ENG-7", status: "Todo", team: "ENG", project: "Tooling" }]);
+
+    const before = linear.calls.length;
+    const refused = await mcp.request("tools/call", { name: "add_comment", arguments: { body: "Started." } });
+    assert.deepEqual(refused.error, { code: -32602, message: "Unknown tool" });
+    assert.equal(linear.calls.length, before, "a refused tool call reaches Linear in no way");
+    assert.ok(linear.calls.every((call) => !call.query.includes("mutation")), "no write was sent");
+
+    assert.ok(!existsSync(join(home, "linear-tickets", "agent-issues")), "read-only mode creates no created-issues directory");
+    assert.ok(!existsSync(join(home, "linear-tickets", "agent-comments")), "read-only mode creates no comments directory");
+  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+});
+
 test("add_manual_task creates an assigned sub-issue, blocks the ticket only before merge, dedups by title and records the check locally", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-manual-"));
   const withBacklog = [{ id: "s-backlog", name: "Backlog", type: "backlog", position: 0 }, ...states];
@@ -423,6 +469,25 @@ test("the MCP server refuses to start without a valid issue id", async () => {
       spawn(process.execPath, [script, "--issue", "../../etc", "--paseo-home", home], { stdio: "ignore" }).on("exit", resolve);
     });
     assert.equal(code, 2);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("the MCP script refuses to start without exactly one of --issue and --read-only", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-mode-"));
+  try {
+    const script = await writeTicketMcpScript(home);
+    const run = (args: string[]) => new Promise<{ code: number | null; stderr: string }>((resolve) => {
+      const child = spawn(process.execPath, [script, ...args], { stdio: ["ignore", "ignore", "pipe"] });
+      let stderr = "";
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.on("close", (code) => resolve({ code, stderr }));
+    });
+    const neither = await run(["--paseo-home", home]);
+    assert.equal(neither.code, 2);
+    assert.match(neither.stderr, /--issue <id> or --read-only/);
+    const both = await run(["--issue", ISSUE_ID, "--read-only", "--paseo-home", home]);
+    assert.equal(both.code, 2);
+    assert.match(both.stderr, /--issue <id> or --read-only/);
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 

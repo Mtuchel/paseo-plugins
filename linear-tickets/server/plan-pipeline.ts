@@ -369,7 +369,7 @@ export class PlanPipeline {
     const now = this.now().getTime();
     const knownRoots = new Set([...this.records.values()].map((entry) => entry.row.agentId));
     const parkedRoots = new Set(parked.map((plan) => plan.agentId));
-    const rootSource = agents.filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && agent.labels?.["linear.issueId"]
+    const rootSource = agents.filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && (agent.labels?.["linear.issueId"] || agent.labels?.["linear.plannerRun"])
       && (!agent.archivedAt || knownRoots.has(agent.id) || parkedRoots.has(agent.id)));
     const roots = rootSource.sort((a, b) => Number(Boolean(a.archivedAt)) - Number(Boolean(b.archivedAt)) || b.createdAt.localeCompare(a.createdAt)).slice(0, MAX_ROOTS);
     const issues: string[] = [...sourceProblems, ...(this.loadProblem ? [this.loadProblem] : [])];
@@ -377,7 +377,7 @@ export class PlanPipeline {
     let owners: readonly PipelineOwnerEvidence[] = [];
     let ownersUnavailable = false;
     if (this.options.owners) try {
-      owners = await this.options.owners([...new Set(roots.map((agent) => agent.labels["linear.issueId"]))]);
+      owners = await this.options.owners([...new Set(roots.flatMap((agent) => agent.labels["linear.issueId"] ? [agent.labels["linear.issueId"]] : []))]);
       if (owners.length > MAX_ROWS) throw new Error("Owner evidence exceeds safe bound");
     } catch (error) {
       ownersUnavailable = true;
@@ -386,7 +386,9 @@ export class PlanPipeline {
     }
     const ghosts = await ghostAgents(roots, now, this.options.processInspector);
     await boundedMap(roots, async (agent) => {
-      const identifier = agent.labels["linear.identifier"] ?? agent.labels["linear.issueId"];
+      const identifier = agent.labels["linear.plannerRun"]
+        ? agent.title || `Planner run ${agent.labels["linear.plannerRun"].slice(0, 8)}`
+        : agent.labels["linear.identifier"] ?? agent.labels["linear.issueId"];
       const link = links.filter((session) => session.agentId === agent.id || !session.agentId && session.sessionId === agent.labels["linear.sessionId"])
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
       const ownerWait = owners.find((owner) => owner.issueId === agent.labels["linear.issueId"] && owner.agentId === agent.id && owner.waiting);
@@ -410,7 +412,7 @@ export class PlanPipeline {
       } else sourceError = "Native planning evidence unsupported for this provider";
       const state = native?.state;
       const previous = this.latest(agent.id);
-      const planning = state?.phase === "planning" || requestAt || parkedPlan || link?.review || ownerWait || this.deliveries[agent.id] || (agent.labels["linear.plan"] === "required" && state?.phase !== "executing" && !(state?.phase === "idle" && state.progress));
+      const planning = state?.phase === "planning" || requestAt || parkedPlan || link?.review || ownerWait || this.deliveries[agent.id] || ((agent.labels["linear.plan"] === "required" || agent.labels["linear.plannerRun"]) && state?.phase !== "executing" && !(state?.phase === "idle" && state.progress));
       if (!planning && !previous && !state?.revisions.length) return; // approved implementing successor
       let timeline: { progress: string | null; submitAt?: string; failure?: string } | undefined;
       if (!native) {
