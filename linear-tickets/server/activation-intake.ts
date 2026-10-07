@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
+import { isDeepStrictEqual } from "node:util";
 import { dispatchLabels } from "./dispatch";
 import type { Launcher } from "./launch";
 import type { LinearService } from "./linear";
@@ -22,6 +23,7 @@ import {
   recoverActivationId,
   type ActivationEnvelope,
   type ActivationRequest,
+  type ActivationResume,
   type ActivationSink,
   type ActivationTake,
   type ClaimsSync,
@@ -58,6 +60,15 @@ type PendingEntry = {
   commented: boolean;
 };
 type PendingFile = { version: 1; entries: Record<string, PendingEntry> };
+
+// Strict resumes require a branch, exact commit and known dirty state before launch.
+// Incomplete evidence stays held; enrichment never replaces a supplied snapshot.
+type StrictResume = ActivationResume & { branch: string; commit: string; dirty: boolean };
+function completeStrictResume(resume: ActivationResume | undefined | null): resume is StrictResume {
+  if (!resume?.branch) return false;
+  return /^[0-9a-f]{40}$/.test(resume.commit ?? "") && typeof resume.dirty === "boolean";
+}
+
 
 export type IntakeStatus = {
   mode: "local" | "remote";
@@ -273,15 +284,23 @@ export class ActivationIntake implements ActivationSink {
   // the background and by the sweep. The duplicate check and the insert are one change to the
   // file, so two forwards of the same id that arrive together become one activation. An already
   // recorded id is never reset: the source ids are immutable (a session, an activity, a comment),
-  // and a label that is added again travels under a fresh occurrence id.
+  // and a label that is added again travels under a fresh occurrence id. An unresolved strict
+  // resume may be enriched in place (see enrich): the same action re-sent with the complete
+  // resume snapshot it could not carry when it was first forwarded.
   async accept(raw: unknown): Promise<{ status: number; body: string }> {
     const parsed = activationEnvelopeSchema.safeParse(raw);
     if (!parsed.success) return activationJson(400, { error: "That is not an activation." });
     const envelope = parsed.data;
     if ((await this.deps.settings.read()).activation.mode === "remote") return activationJson(409, { error: "This host is draining; it does not accept activations." });
     let duplicate = false;
+    let enriched = false;
     const file = await this.pendingFile.update((current) => {
-      if (current.entries[envelope.id]) { duplicate = true; return; }
+      const known = current.entries[envelope.id];
+      if (known) {
+        duplicate = true;
+        enriched = this.enrich(known, envelope);
+        return;
+      }
       current.entries[envelope.id] = {
         envelope,
         state: "pending",
@@ -295,9 +314,44 @@ export class ActivationIntake implements ActivationSink {
       this.prune(current);
     });
     const entry = file.entries[envelope.id];
-    if (duplicate) return activationJson(202, { ok: true, id: envelope.id, state: entry.state, duplicate: true });
+    if (duplicate) {
+      if (enriched) {
+        this.log(`activation routing: ${envelope.identifier} arrived again with the complete resume snapshot; the queued activation ${envelope.id} is processed again`);
+        // A run already in flight for this id loaded the record before the enrichment: it must
+        // not swallow the change (see rerun).
+        this.rerun(envelope.id);
+      }
+      return activationJson(202, { ok: true, id: envelope.id, state: entry.state, duplicate: true, ...(enriched ? { enriched: true } : {}) });
+    }
     this.kick(envelope.id);
     return activationJson(202, { ok: true, id: envelope.id, state: entry.state });
+  }
+
+  // A queued strict resume whose snapshot did not travel when it was first forwarded (an older
+  // sending host): the same action re-sent with the complete resume metadata fills the stored
+  // envelope in place, so the original identity, text and watchdog history stay and the retry
+  // continues the recorded work. Nothing else is ever changed: only complete evidence repairs a
+  // snapshot-less entry (a partial re-send changes nothing, so a later complete one can still
+  // repair it), a stored snapshot is never replaced -- a partial one from an older host keeps its
+  // entry held -- a finished activation is never reopened (a start that happened is not repeated
+  // by a late re-send), and a re-send whose kind, ticket, text or watchdog differs is not this
+  // action.
+  private enrich(entry: PendingEntry, incoming: ActivationEnvelope): boolean {
+    const stored = entry.envelope;
+    if (entry.state === "done" || stored.kind !== "recover" || !stored.strictResume || stored.resume) return false;
+    const snapshot = incoming.resume;
+    if (!completeStrictResume(snapshot)) return false;
+    const sameAction = stored.kind === incoming.kind
+      && stored.issueId === incoming.issueId
+      && stored.identifier === incoming.identifier
+      && (stored.sessionId ?? null) === (incoming.sessionId ?? null)
+      && (stored.text ?? null) === (incoming.text ?? null)
+      && (stored.label ?? null) === (incoming.label ?? null)
+      && stored.strictResume === incoming.strictResume
+      && isDeepStrictEqual(stored.watchdog ?? null, incoming.watchdog ?? null);
+    if (!sameAction) return false;
+    entry.envelope = { ...stored, resume: snapshot };
+    return true;
   }
 
   // Routing for this host's own automatic start paths. Nothing decides on a state it cannot read;
@@ -396,13 +450,22 @@ export class ActivationIntake implements ActivationSink {
 
   // --- internals ---
 
-  // One activation is processed once at a time: a forward that arrives while its predecessor is
-  // still being handled (a retried POST, the sweep, the background kick) joins the same run.
+  // One activation is processed once at a time under its id, and only from its current record: a
+  // caller can hold an entry from before a change (the sweep took its list before an earlier
+  // activation was processed or enriched), so the durable record is read again here. A finished
+  // activation is left alone: its start happened, and a late run on a stale record must neither
+  // reopen it nor start a second agent. The lock is taken before that read, so two callers for the
+  // same id always join one run.
   private process(entry: PendingEntry): Promise<PendingEntry> {
-    const running = this.inFlight.get(entry.envelope.id);
+    const id = entry.envelope.id;
+    const running = this.inFlight.get(id);
     if (running) return running;
-    const run = this.processNow(entry).finally(() => this.inFlight.delete(entry.envelope.id));
-    this.inFlight.set(entry.envelope.id, run);
+    const run = (async () => {
+      const current = (await this.pendingFile.load()).entries[id];
+      if (!current || current.state === "done") return current ?? entry;
+      return this.processNow(current);
+    })().finally(() => this.inFlight.delete(id));
+    this.inFlight.set(id, run);
     return run;
   }
 
@@ -412,6 +475,19 @@ export class ActivationIntake implements ActivationSink {
       if (entry) await this.process(entry);
     }).catch((error: unknown) => {
       this.log(`activation routing: processing ${id} failed (kept, retried every sweep): ${reason(error)}`);
+    });
+  }
+
+  // A re-run of an activation whose record was just changed (the resume enrichment): a run already
+  // in flight for the same id loaded the record before the change, so it must not swallow the
+  // change -- wait for it, then process the re-read entry (which process reads again anyway).
+  private rerun(id: string): void {
+    this.background = this.background.then(async () => {
+      await this.inFlight.get(id)?.catch(() => undefined);
+      const entry = (await this.pendingFile.load()).entries[id];
+      if (entry) await this.process(entry);
+    }).catch((error: unknown) => {
+      this.log(`activation routing: processing ${id} again failed (kept, retried every sweep): ${reason(error)}`);
     });
   }
 
@@ -545,6 +621,11 @@ export class ActivationIntake implements ActivationSink {
       const marker = parseHistory(envelope.watchdog)?.cycle?.marker;
       let started: Started;
       try {
+        // A strict resume continues what the host that sent it recorded, and only on evidence that
+        // pins that work: the recorded branch, its full commit and a known dirty state. Without
+        // them there is no such work here (this host's own record, if any, is different work), so
+        // the activation stays a queued handoff instead of resuming a guess or starting fresh.
+        if (envelope.strictResume && !completeStrictResume(envelope.resume)) throw new ResumeUnavailableError(`${envelope.identifier}'s forwarded resume did not carry the recorded branch, its exact commit and the dirty state.`);
         started = await starter.start(envelope.issueId, paseo, settings, {
           retryHint: `${envelope.host} forwarded it again, or assign Paseo on the ticket here`,
           ...(envelope.strictResume ? { resumeOnly: true } : {}),
@@ -634,11 +715,15 @@ export class ActivationIntake implements ActivationSink {
     if (entry.commented || !envelope.text) return;
     const linear = this.deps.linear?.();
     if (!linear) return;
-    const branch = envelope.resume?.branch ? `\`${envelope.resume.branch}\`` : "the recorded branch";
+    const recorded = envelope.resume?.branch ? `the branch \`${envelope.resume.branch}\` the previous agent recorded` : "the recorded branch of the previous agent";
     const links = envelope.resume?.handover?.split("\n").filter((line) => /^https?:\/\//.test(line.trim())).slice(0, 3) ?? [];
+    // Without the recorded branch's full evidence the fix is at the sending host, not a push here.
+    const remedy = envelope.strictResume && !completeStrictResume(envelope.resume)
+      ? "The sending host must forward the recorded branch's exact commit and dirty state; nothing is started until then."
+      : `Push or fetch ${envelope.resume?.branch ? `\`${envelope.resume.branch}\`` : "the recorded branch"} here, then the queued request runs on it.`;
     const note = [
-      `Paseo Server queued the work for this ticket: the branch ${branch} the previous agent recorded cannot be continued here (${reasonText}).`,
-      `Nothing was started on a fresh branch, so the previous agent's work is not lost. Push or fetch ${branch} here, then the queued request runs on it.`,
+      `Paseo Server queued the work for this ticket: ${recorded} cannot be continued here (${reasonText}).`,
+      `Nothing was started on a fresh branch, so the previous agent's work is not lost. ${remedy}`,
       ...(links.length ? [`Recorded links:\n${links.join("\n")}`] : []),
     ].join("\n\n").slice(0, HANDFOFF_NOTE_LIMIT);
     await linear.comment(envelope.issueId, note).catch((error: unknown) => {

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import type { PaseoApi, PaseoWorkspaceAgentCreateOptions, PaseoWorkspaceCreateOptions } from "@getpaseo/client";
 import type { TicketDetail } from "../shared/contracts";
+import type { ActivationResume } from "./activation";
 import { Dispatcher } from "./dispatch";
 import { Handover } from "./handover";
 import { Launcher, LEAD_INTRO, type ResumeTarget } from "./launch";
@@ -20,6 +23,8 @@ const OWNER = "owner-1";
 const APP = "paseo-app";
 const ISSUE = { id: "issue-1", identifier: "TUC-1" };
 const BRANCH = "mtuchel/tuc-1-fix";
+
+const exec = promisify(execFile);
 
 const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false,
@@ -354,9 +359,10 @@ test("a start that throws leaves the ticket unclaimed by a successor and says im
 
 // --- TicketStarter: resume-only never falls back to a fresh agent ------------------------------
 
-function starterHarness(options: { resumeTarget?: ResumeTarget | null; projectKind?: string; resumeFails?: boolean } = {}) {
+function starterHarness(options: { resumeTarget?: ResumeTarget | null; projectKind?: string; resumeFails?: boolean; projectRootPath?: string; branchName?: string } = {}) {
   const launches: { resume?: ResumeTarget }[] = [];
-  const branches = { branches: [{ id: "refs/heads/dev", label: "dev" }], defaultBranch: "refs/heads/dev" };
+  const branchName = options.branchName ?? "dev";
+  const branches = { branches: [{ id: `refs/heads/${branchName}`, label: branchName }], defaultBranch: `refs/heads/${branchName}` };
   const starter = new TicketStarter({
     linear: new FakeLinear() as never,
     handover: { resumeTarget: async () => options.resumeTarget ?? null } as never,
@@ -368,7 +374,7 @@ function starterHarness(options: { resumeTarget?: ResumeTarget | null; projectKi
     branches: async () => branches,
   });
   const paseo = {
-    projects: { list: async () => ({ projects: [{ projectId: "p1", projectKind: options.projectKind ?? "git", projectRootPath: "/repo", projectDisplayName: "repo" }] }) },
+    projects: { list: async () => ({ projects: [{ projectId: "p1", projectKind: options.projectKind ?? "git", projectRootPath: options.projectRootPath ?? "/repo", projectDisplayName: "repo" }] }) },
   } as unknown as PaseoApi;
   return { starter, paseo, launches };
 }
@@ -393,6 +399,47 @@ test("a resume-only start refuses a missing target, a non-git project and a fail
   assert.equal(started.resumed, false);
   assert.equal(fallback.launches.length, 2);
   assert.equal(fallback.launches[1].resume, undefined, "the fallback branches off instead");
+});
+
+// The resume an activation forwards is continued exactly (starter.ts importedResume): this host
+// resumes the recorded branch only while it is here at the recorded commit. Dirty work, a commit
+// the branch is not at and a branch that is not here hold the activation; none falls back to a
+// fresh start.
+test("an imported resume continues only the exact recorded commit; dirty work, a wrong SHA and a missing branch hold", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "paseo-imported-resume-"));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const git = async (...args: string[]) => (await exec("git", ["-C", repo, ...args], { maxBuffer: 1_000_000 })).stdout.trim();
+  await git("init", "--quiet");
+  await git("config", "user.email", "test@example.com");
+  await git("config", "user.name", "Test");
+  await writeFile(join(repo, "work.txt"), "the fix\n");
+  await git("add", "work.txt");
+  await git("commit", "--quiet", "-m", "fix");
+  await git("checkout", "--quiet", "-b", BRANCH);
+  const head = await git("rev-parse", "HEAD");
+  const start = { retryHint: "assign Paseo again", resumeOnly: true, lead: "Continue." };
+  const resume: ActivationResume = { branch: BRANCH, commit: head, dirty: false, handover: "Continue the recorded work." };
+
+  const h = starterHarness({ branchName: BRANCH, projectRootPath: repo });
+  const started = await h.starter.start(ISSUE.id, h.paseo, settings, { ...start, resume });
+  assert.equal(started.resumed, true);
+  assert.deepEqual(h.launches, [{ resume: { branch: BRANCH, worktreePath: null, handover: "Continue the recorded work." } }], "the recorded branch is continued, never a fresh one");
+
+  const dirty = starterHarness({ branchName: BRANCH, projectRootPath: repo });
+  await assert.rejects(dirty.starter.start(ISSUE.id, dirty.paseo, settings, { ...start, resume: { ...resume, dirty: true } }), (error: unknown) => error instanceof ResumeUnavailableError && /uncommitted changes/.test(error.message));
+  assert.deepEqual(dirty.launches, [], "dirty work is never continued as if it had been pushed");
+
+  const wrongSha = starterHarness({ branchName: BRANCH, projectRootPath: repo });
+  await assert.rejects(wrongSha.starter.start(ISSUE.id, wrongSha.paseo, settings, { ...start, resume: { ...resume, commit: "0".repeat(40) } }), (error: unknown) => error instanceof ResumeUnavailableError && /the work was not transferred/.test(error.message));
+  assert.deepEqual(wrongSha.launches, [], "a branch at another commit is not the recorded work");
+
+  const absent = starterHarness({ branchName: "dev", projectRootPath: repo });
+  await assert.rejects(absent.starter.start(ISSUE.id, absent.paseo, settings, { ...start, resume }), (error: unknown) => error instanceof ResumeUnavailableError && /is not on this host/.test(error.message));
+  assert.deepEqual(absent.launches, []);
+
+  const branchless = starterHarness({ branchName: BRANCH, projectRootPath: repo });
+  await assert.rejects(branchless.starter.start(ISSUE.id, branchless.paseo, settings, { ...start, resume: { branch: null, handover: null } }), (error: unknown) => error instanceof ResumeUnavailableError && /has no recorded branch/.test(error.message));
+  assert.deepEqual(branchless.launches, [], "a resume that points nowhere is held, never a fresh start");
 });
 
 // --- Composed: real Launcher + real TicketStarter + real SessionRouter -------------------------

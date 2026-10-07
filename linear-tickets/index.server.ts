@@ -163,7 +163,8 @@ export default function contribute(server: PluginServerContext) {
   void daemonServerId().then((id) => { pipelineServerId = id; });
   const drain = new DrainRouter({ settings, paseo: () => attachedPaseo, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName, replies,
     ticketState: async (issueId) => { const state = await linear.issueState(issueId).catch(() => null); return state ? { statusType: state.statusType } : null; },
-    watchdog: { history: (issueId, now) => watchdogStore.history(issueId, now), transferred: (issueId, identifier) => watchdogStore.transferred(issueId, identifier) } });
+    watchdog: { history: (issueId, now) => watchdogStore.history(issueId, now), transferred: (issueId, identifier) => watchdogStore.transferred(issueId, identifier) },
+    handover: { resumeSnapshot: (issueId) => handover.resumeSnapshot(issueId) } });
   const intake = new ActivationIntake({ settings, paseo: () => attachedPaseo, linear: () => linear, starter: () => starter, launcher: () => launcher, sessions: () => sessions, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName, watchdog: watchdogStore, replies });
   activationGuard = async (issueId) => {
     const { mode, peer } = (await settings.read()).activation;

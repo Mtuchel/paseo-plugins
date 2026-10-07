@@ -542,9 +542,23 @@ analysis inputs when moving a scheduled job rather than substituting the destina
 
 Forwarded requests are persisted and deduplicated by their source IDs. If the destination is
 unreachable or full, work stays queued; there is no local fallback. Replacement work retains
-its branch and handover context and never silently starts on an unrelated fresh branch.
-Mac-only uncommitted changes are not transferred: a replacement whose branch cannot safely
-be resumed remains a queued handoff rather than discarding that work.
+its branch and handover context and never silently starts on an unrelated fresh branch: a strict
+resume travels with the source's handover snapshot — the recorded branch, its exact commit,
+whether uncommitted changes are next to it and the handover text, never its worktree path. The
+destination continues that branch only while it has it at exactly the recorded commit. A strict
+resume launches only on that complete evidence: a snapshot missing the branch, the full commit
+or the dirty state stays held. A partial re-send never enriches a snapshot-less entry, so a later
+complete one still can. Dirty work, another commit, a branch that is not there, or no
+complete snapshot -- including none at all -- keep the activation a queued handoff rather than
+discarding the work, and the ticket says what to push or fetch (or that the sending host must
+forward the recorded branch's exact commit and dirty state). A queued strict resume that arrived
+without its snapshot (an older forwarding host) can be enriched in place: the same action
+re-sent with the recorded branch's complete evidence fills the stored envelope, keeps its
+identity, text and watchdog history, and runs once the branch is available; a finished activation
+is never reopened and a stored snapshot is never replaced -- an entry an older host left with a
+partial snapshot stays held. Every activation is processed from its current durable record, so a
+pass that captured an older state can neither reopen a finished activation nor start a second
+agent.
 The destination acknowledges a forwarded activation after persisting it, then processes it
 asynchronously. Delivery receipts avoid repeats after a lost HTTP response, and a message a host
 passes to its own live agent -- the destination's intake, or the draining host for a ticket one of
@@ -1638,7 +1652,9 @@ forwarded replacement's cycle) travels with every activation a draining host for
 **Drain one host into another** under [Native Linear agent](#native-linear-agent)), and the receiving host saves it before the agent starts,
 so a transfer never resets the budget. A ticket that arrives without it (an older peer) is not
 recovered for 24 hours; the forwarding host stops recovering it. A replacement for the peer is
-claimed before it is forwarded and never falls back to a local start.
+claimed before it is forwarded, carries the recorded branch, its exact commit, the dirty state
+and the handover (see **Drain one host into another** under [Native Linear agent](#native-linear-agent)),
+and never falls back to a local start.
 
 **Watchdog** has its own switch, independent of *Start a new agent automatically*, and is on by
 default. Turn it off, or change the minutes (whole numbers 1–1440), with `linear.set-settings`:

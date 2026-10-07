@@ -15,6 +15,7 @@ import {
   recoverActivationId,
   type ActivationEnvelope,
   type ActivationRequest,
+  type ActivationResume,
   type ActivationSink,
   type ActivationTake,
   type RequestLike,
@@ -152,6 +153,11 @@ export type DrainDeps = {
   // The ticket's watchdog history travels with every forwarded activation, and a forwarded ticket
   // is no longer this host's to recover (watchdog.ts).
   watchdog?: { history(issueId: string, now: number): Promise<unknown>; transferred(issueId: string, identifier: string): Promise<void> };
+  // The source's handover snapshot for a strict resume (handover.ts resumeSnapshot): the
+  // recorded branch, its exact commit, the dirty state and the handover text, never the worktree
+  // path. A missing or unreadable snapshot is left out; the receiving host then holds the
+  // activation instead of continuing on a fresh branch.
+  handover?: { resumeSnapshot(issueId: string): Promise<ActivationResume | null> };
 };
 
 function allowlistFrom(raw: unknown): Allowlist {
@@ -414,6 +420,12 @@ export class DrainRouter implements ActivationSink {
     // An unreadable history is left out: the receiving host then holds recovery for a day rather
     // than starting with a fresh budget.
     const watchdog = request.watchdog ?? await this.deps.watchdog?.history(request.issueId, this.now()).catch(() => undefined);
+    // A strict resume continues the recorded work on the peer, so the source's handover snapshot
+    // rides with it (handover.ts): the recorded branch, its exact commit and dirty state, never the
+    // worktree path. Missing or unreadable metadata is left out like the history -- the peer holds
+    // the activation (its own record, if any, is not the work that was handed over) rather than
+    // continuing on a guess.
+    const resume = request.resume ?? (request.strictResume ? await this.deps.handover?.resumeSnapshot(request.issueId).catch(() => undefined) : undefined);
     return {
       id,
       kind: request.kind,
@@ -423,7 +435,7 @@ export class DrainRouter implements ActivationSink {
       ...(text ? { text } : {}),
       ...(request.label ? { label: request.label } : {}),
       ...(request.strictResume ? { strictResume: true } : {}),
-      ...(request.resume ? { resume: request.resume } : {}),
+      ...(resume ? { resume } : {}),
       ...(watchdog ? { watchdog } : {}),
       host: this.host,
       requestedAt: new Date(this.now()).toISOString(),
