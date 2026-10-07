@@ -2253,18 +2253,20 @@ one per agent and request, kept 14 days):
    unknown counts as high.
 2. **Knowledge second.** Sources, in this order of authority: the ticket's approved `Plan:`
    document; `docs/principles/` (`approved.md`, `decisions.md`, `decision-queue.md`) at one
-   `origin/main` commit of `deputy.principlesRepository`; this README, the launch template and the
+   `origin/main` commit of `deputy.principlesRepository`; this README, the effective launch template (custom or built-in) and the
    agent repository's `AGENTS.md`; earlier owner answers the plugin itself delivered for the
    authenticated owner (`owner-answer` log entries); Hindsight recall. Only sections sharing words
    with the question are shown. Open proposals (the decision queue), rejected, superseded,
-   withdrawn or deferred decisions and memories can only block an answer, never decide one.
-   An earlier source that should exist but cannot be read (the plan, the register, recall
-   without access) makes the deputy abstain.
+   withdrawn or deferred decisions (every excerpt of such an entry, its subsections included) and
+   memories can only block an answer, never decide one. An earlier source that should exist but
+   is missing or cannot be read (the plan document of the plan-ready ticket, or one not marked
+   approved; the register; recall without access) makes the deputy abstain.
 3. **Evaluation.** One OMP call (`deputy.model`, thinking `low`, 150 s deadline) with no tools, MCP
    servers, extensions, skills, rules, memory or saved session, from an empty directory under a
    private OMP agent directory (`deputy/omp-agent/`, only the isolated configuration plus the
    owner's `auth:` block), with no Paseo, Linear or GitHub credentials in its environment. It sees
-   only the question and the excerpts and returns per part an offered option and the sources that
+   only the question, each option with what it says it does (its description), and the excerpts,
+   and returns per part an offered option and the sources that
    decide it. Every selection must be an offered option verbatim, every citation must name a
    source that can decide and quote it verbatim (at least 12 characters); a tool event, timeout,
    oversized or unreadable answer, abstention or one failed check refuses the whole request. The
@@ -2309,8 +2311,9 @@ revision and quote, the request id and "Reply to override". The linked agent ses
 same. A failed notice is retried every 5 minutes; the answer never is.
 
 **Override.** A reply in the thread of that comment, or `override D-1a2b3c4d <your answer>` in
-a ticket comment (with or without `@paseo`) or the agent session, goes to the agent that got the deputy's
-answer as a correction message naming the original question; it never answers the agent's newer
+a ticket comment (with or without `@paseo`, also one that opens a new agent session, which then
+starts nothing) or the agent session, goes to the agent that got the deputy's answer as a
+correction message naming the original question; it never answers the agent's newer
 question. Only replies whose author is the owner count; each owner activity is handled once, and
 a failed delivery is replied to as failed, never claimed. Without a reference or a notice thread,
 an owner reply is handled as before. Normal answers, messages and approvals are unchanged.

@@ -52,23 +52,29 @@ function terms(text: string): Set<string> {
   return new Set((text.toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}_-]{3,}/gu) ?? []).filter((word) => !STOP.has(word)));
 }
 
-// Markdown sections (a heading and what follows until the next heading of any level), long ones
-// cut at paragraph boundaries.
-export function sections(text: string): { heading: string; body: string }[] {
-  const found: { heading: string; body: string }[] = [];
+// Markdown sections (a heading, its level, and what follows until the next heading of any level),
+// long ones cut at paragraph boundaries; `continued` marks the cut-off rest of the one before.
+export type Section = { heading: string; level: number; body: string; continued: boolean };
+// With `headings`, a heading with no text of its own is kept (empty body): a register entry may
+// open with subsections only.
+export function sections(text: string, headings = false): Section[] {
+  const found: Section[] = [];
   let heading = "";
+  let level = 0;
   let lines: string[] = [];
   const flush = () => {
     const body = lines.join("\n").trim();
     if (body || heading) {
       let rest = body;
+      let continued = false;
       while (rest.length > SECTION_CHARS) {
         const cut = rest.lastIndexOf("\n\n", SECTION_CHARS);
         const at = cut > SECTION_CHARS / 3 ? cut : SECTION_CHARS;
-        found.push({ heading, body: rest.slice(0, at).trim() });
+        found.push({ heading, level, body: rest.slice(0, at).trim(), continued });
+        continued = true;
         rest = rest.slice(at).trim();
       }
-      if (rest || !found.length || found[found.length - 1].heading !== heading) found.push({ heading, body: rest });
+      if (rest || (headings && !continued)) found.push({ heading, level, body: rest, continued });
     }
     lines = [];
   };
@@ -77,13 +83,45 @@ export function sections(text: string): { heading: string; body: string }[] {
     if (/^\s*```/.test(line)) fenced = !fenced;
     if (!fenced && /^#{1,4}\s+\S/.test(line)) {
       flush();
+      level = /^#+/.exec(line)?.[0].length ?? 1;
       heading = line.replace(/^#+\s+/, "").trim();
       continue;
     }
     lines.push(line);
   }
   flush();
-  return found.filter((section) => section.body);
+  return headings ? found : found.filter((section) => section.body);
+}
+
+// Per section of a register file: its entry (`P-`/`D-`/`Q-`/`E-<n>`, from its heading down to the
+// next heading of the same or a higher level) and whether that whole entry binds. An outcome of
+// rejected, superseded, withdrawn or deferred anywhere in the entry makes every excerpt of it
+// (subsections and cut continuations too) non-binding. Ids are unique: the entry's first excerpt
+// carries the bare id, later ones `<id>#<section>`.
+export function registerEntries(text: string): { id: string; binding: boolean }[] {
+  const all = sections(text, true);
+  const owner: (number | null)[] = [];
+  let open: { index: number; level: number } | null = null;
+  all.forEach((section, index) => {
+    if (open && !section.continued && section.level <= open.level) open = null;
+    if (!open && !section.continued && /^[PDQE]-\d+\b/.test(section.heading)) open = { index, level: section.level };
+    owner.push(open ? open.index : null);
+  });
+  const binding = new Map<number, boolean>();
+  owner.forEach((start, index) => { if (start !== null) binding.set(start, (binding.get(start) ?? true) && !NOT_BINDING.test(all[index].body)); });
+  // Numbered like `sections(text)`, which leaves out heading-only sections.
+  const found: { id: string; binding: boolean }[] = [];
+  const named = new Set<number>();
+  all.forEach((section, index) => {
+    if (!section.body) return;
+    const start = owner[index];
+    const position = found.length;
+    if (start === null) { found.push({ id: `#${position}`, binding: !NOT_BINDING.test(section.body) }); return; }
+    const id = /^([PDQE]-\d+)\b/.exec(all[start].heading)?.[1] ?? `#${position}`;
+    found.push({ id: named.has(start) ? `${id}#${position}` : id, binding: binding.get(start) ?? true });
+    named.add(start);
+  });
+  return found;
 }
 
 // The sections sharing the most words with the question, at most `limit`, in document order.
@@ -113,11 +151,12 @@ export async function gatherSources(readers: SourceReaders, question: Question, 
     } catch (error) {
       return { sources: [], abstain: `the ticket's approved plan could not be read (${error instanceof Error ? error.message : error})` };
     }
-    if (plan && APPROVED_PLAN.test(plan.content.trim())) {
-      const revision = hash(plan.content);
-      for (const section of relevant(plan.content, words, PER_SOURCE.plan)) {
-        add({ id: `plan#${section.index}`, kind: "plan", title: `Plan: ${question.identifier} — ${section.heading || "start"}`, revision, url: plan.url, text: section.body, decisive: true });
-      }
+    // A plan-ready ticket whose plan document is missing, empty or not marked approved leaves the
+    // deputy without the plan's constraints: it abstains rather than decide from less.
+    if (!plan || !APPROVED_PLAN.test(plan.content.trim())) return { sources: [], abstain: plan ? "the ticket's plan document is not marked approved" : "the ticket has no plan document to check the answer against" };
+    const revision = hash(plan.content);
+    for (const section of relevant(plan.content, words, PER_SOURCE.plan)) {
+      add({ id: `plan#${section.index}`, kind: "plan", title: `Plan: ${question.identifier} — ${section.heading || "start"}`, revision, url: plan.url, text: section.body, decisive: true });
     }
   }
 
@@ -131,9 +170,10 @@ export async function gatherSources(readers: SourceReaders, question: Question, 
   }
   for (const [file, content] of Object.entries(principles.files)) {
     const queue = file === "decision-queue.md";
+    const entries = registerEntries(content);
     for (const section of relevant(content, words, queue ? PER_SOURCE.queue : PER_SOURCE.principles)) {
-      const id = section.heading.match(/^([PDQE]-\d+)\b/)?.[1] ?? `#${section.index}`;
-      add({ id: `principles:${file}:${id}`, kind: "principles", title: `docs/principles/${file} — ${section.heading || "start"}${queue ? " (open proposal, not binding)" : ""}`, revision: principles.commit, text: section.body, decisive: !queue && !NOT_BINDING.test(section.body) });
+      const entry = entries[section.index];
+      add({ id: `principles:${file}:${entry.id}`, kind: "principles", title: `docs/principles/${file} — ${section.heading || "start"}${queue ? " (open proposal, not binding)" : ""}`, revision: principles.commit, text: section.body, decisive: !queue && entry.binding });
     }
   }
 
@@ -276,14 +316,16 @@ export async function recall(access: RecallAccess | null, query: string): Promis
 }
 
 // The readers on this host: the ticket's "Plan:" document, the principles register, the plugin
-// README with the agent repository's AGENTS.md, the decision log and Hindsight recall.
-export function hostReaders(deps: { linear: Pick<LinearService, "issueDocument">; log: Pick<DecisionLog, "entries">; home: string; directory: string }): SourceReaders {
+// README, the effective launch template (custom or built-in) and the agent repository's
+// AGENTS.md, the decision log and Hindsight recall.
+export function hostReaders(deps: { linear: Pick<LinearService, "issueDocument">; log: Pick<DecisionLog, "entries">; home: string; directory: string; template: () => Promise<string> }): SourceReaders {
   return {
     plan: (issueId, identifier) => deps.linear.issueDocument(issueId, `Plan: ${identifier}`),
     principles: (repository) => readPrinciples(repository),
     rules: async (cwd) => {
       const instructions = await repositoryInstructions(cwd);
-      return [await pluginReadme(deps.home), ...(instructions ? [instructions] : [])];
+      const template: RuleDocument = { id: "launch-template", title: "Launch template (the prompt every ticket agent starts with)", text: await deps.template() };
+      return [await pluginReadme(deps.home), template, ...(instructions ? [instructions] : [])];
     },
     ownerAnswers: () => deps.log.entries(),
     recall: async (query) => recall(await recallAccess(deps.directory), query),

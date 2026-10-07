@@ -95,7 +95,7 @@ export function fingerprint(request: AgentPermissionRequest): string {
 // What the sources are searched with: everything the request shows, the same at prediction and
 // at dispatch, so both see the same sections.
 function questionText(request: AgentPermissionRequest): string {
-  return [request.title, request.description, ...questionsOf(request).map((item) => [item.header, item.question, ...(item.options ?? []).map((option) => option.label ?? "")].filter(Boolean).join("\n"))].filter(Boolean).join("\n");
+  return [request.title, request.description, ...questionsOf(request).map((item) => [item.header, item.question, ...(item.options ?? []).flatMap((option) => [option.label ?? "", "description" in option && typeof option.description === "string" ? option.description : ""])].filter(Boolean).join("\n"))].filter(Boolean).join("\n");
 }
 
 const refFor = (key: string) => `D-${createHash("sha256").update(key).digest("hex").slice(0, 8)}`;

@@ -184,7 +184,7 @@ export default function contribute(server: PluginServerContext) {
   const deputyDirectory = DEPUTY_DIRECTORY();
   const deputy = new Deputy({
     settings, log: decisions, linear, sessions,
-    readers: hostReaders({ linear, log: decisions, home: paseoHome(), directory: deputyDirectory }),
+    readers: hostReaders({ linear, log: decisions, home: paseoHome(), directory: deputyDirectory, template: async () => (await settings.read()).template ?? DEFAULT_PROMPT_TEMPLATE }),
     evaluate: (input, model) => evaluateWithOmp(input, model, deputyDirectory),
     directory: deputyDirectory,
   });

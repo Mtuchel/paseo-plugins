@@ -10,6 +10,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { AgentApi, AppAuth } from "./agent-app";
 import { verifyWebhook } from "./agent-webhook";
+import type { Candidate } from "./deputy";
 import { Handover, handoverPrompt, progressBody, type HandoverRecord } from "./handover";
 import { AuthenticationError, LinearApiError, type GroupChild, type IssueGroup, type IssueState } from "./linear";
 import { NeedsYouIssues } from "./needs-you";
@@ -374,11 +375,33 @@ test("a label or sidebar launch delegates its ticket to the Paseo app once the s
   await failing.cleanup();
 });
 
-test("a mention to a running agent that waits on a question answers it, like a relayed comment", async () => {
+test("a mention to a running agent that waits on a question answers it, like a relayed comment, and is recorded as the owner's answer", async () => {
   const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Format?", header: "Response", options: [{ label: "CSV" }] }] } };
   const h = harness({ activeAgent: { id: "agent-1", title: "TUC-1: Fix" }, pending: [question] });
+  const answered: string[] = [];
+  h.router.recordDeputy({ byRef: async () => null, correct: async () => ({ delivered: true, reply: "" }), ownerAnswered: async (agentId, request, _response, activity) => { answered.push(`${agentId} ${request.id} ${activity.via} ${activity.activityId} ${activity.userId}`); } });
   await h.router.created({ id: "s3", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" }, comment: { body: "@paseo csv" } });
   assert.equal(h.calls[0], `respond q ${JSON.stringify({ behavior: "allow", updatedInput: { answers: { Response: "CSV" } } })}`);
+  assert.deepEqual(answered, [`agent-1 q linear-session session:s3 ${OWNER}`]);
+  await h.cleanup();
+});
+
+test("an override that opens a session corrects the deputy's answer and neither answers the pending question nor starts an agent", async () => {
+  const question: AgentPermissionRequest = { id: "q2", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Split?", header: "Response", options: [{ label: "Keep" }, { label: "Split" }] }] } };
+  const h = harness({ activeAgent: { id: "agent-1", title: "TUC-1: Fix" }, pending: [question] });
+  const corrections: string[] = [];
+  const applied = { ref: "D-1a2b3c4d" } as Candidate;
+  h.router.recordDeputy({
+    byRef: async (ref) => ref === applied.ref ? applied : null,
+    correct: async (candidate, text, activity) => { corrections.push(`${candidate.ref} ${text} ${activity.activityId} ${activity.userId}`); return { delivered: true, reply: "Passed to the agent as your correction of D-1a2b3c4d." }; },
+    ownerAnswered: async () => { throw new Error("not an answer"); },
+  });
+  await h.router.created({ id: "s4", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" }, comment: { body: "@paseo override D-1a2b3c4d use vitest" } });
+  assert.deepEqual(corrections, [`D-1a2b3c4d use vitest session:s4 ${OWNER}`]);
+  assert.deepEqual(h.calls, ["response:Passed to the agent as your correction of D-1a2b3c4d."]);
+  await h.router.created({ id: "s5", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" }, comment: { body: "@paseo override D-0000000f keep" } });
+  assert.match(h.calls.at(-1) ?? "", /^error:D-0000000f is not an answer the deputy gave/);
+  assert.ok(!h.calls.some((call) => call.startsWith("respond ") || call.startsWith("send ") || call.startsWith("start ")));
   await h.cleanup();
 });
 

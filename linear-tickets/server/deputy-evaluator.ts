@@ -43,7 +43,7 @@ export type EvaluationInput = { identifier: string; parts: Part[]; context: stri
 export type Verdict = { ok: true; selections: Record<string, string>; citations: Citation[] } | { ok: false; reason: string; category?: string };
 
 export function evaluationPrompt(input: EvaluationInput): string {
-  const parts = input.parts.map((part) => `- key ${JSON.stringify(part.key)}: ${part.question}\n  options: ${part.options.map((option) => JSON.stringify(option)).join(", ")}`).join("\n");
+  const parts = input.parts.map((part) => `- key ${JSON.stringify(part.key)}: ${part.question}\n  options:\n${part.options.map((option) => `    ${JSON.stringify(option)}${part.effects[option] ? ` (effect: ${JSON.stringify(part.effects[option])})` : ""}`).join("\n")}`).join("\n");
   const sources = input.sources.map((source) => `[${source.id}] ${source.decisive ? "decisive" : "blocking-only"} · ${source.kind} · ${source.title} @ ${source.revision}\n<<<\n${source.text}\n>>>`).join("\n\n");
   return [`QUESTION (agent working on ${input.identifier})`, input.context ? `Context the agent gave:\n<<<\n${input.context}\n>>>` : "", `Parts:\n${parts}`, "", "SOURCES", sources || "(none)"].filter(Boolean).join("\n\n");
 }

@@ -49,7 +49,9 @@ export type RiskFacts = {
   attended: boolean;
 };
 
-export type Part = { key: string; question: string; options: string[] };
+// `effects`: what an option says it does (its description), by label; the evaluator rates those
+// too, not just the labels.
+export type Part = { key: string; question: string; options: string[]; effects: Record<string, string> };
 export type RiskVerdict = { ok: true; parts: Part[] } | { ok: false; category: RiskCategory | "not-a-question" | "untrusted" | "planning" | "attended" | "free-text" | "unsupported"; reason: string };
 
 // Every text the request shows, the effects of each offered choice included.
@@ -77,9 +79,12 @@ export function assessRisk(request: AgentPermissionRequest, facts: RiskFacts): R
     // An optional empty follow-up (omp's "Optional comment") stays empty; a required free-text
     // part leaves the whole request with the owner.
     if (!item.options?.length && flag("allowEmpty")) continue;
-    const options = (item.options ?? []).map((option) => option.label?.trim() ?? "").filter((label) => label && !FREE_TEXT_OPTION.test(label));
+    const offered = (item.options ?? []).map((option) => ({ label: option.label?.trim() ?? "", effect: "description" in option && typeof option.description === "string" ? option.description.trim() : "" }))
+      .filter((option) => option.label && !FREE_TEXT_OPTION.test(option.label));
+    const options = offered.map((option) => option.label);
     if (options.length < 2) return { ok: false, category: "free-text", reason: "a required part has no choice of options to decide between" };
-    parts.push({ key: questionKey(item, index), question: [item.header, item.question].filter(Boolean).join(": "), options });
+    const effects = Object.fromEntries(offered.filter((option) => option.effect).map((option) => [option.label, option.effect]));
+    parts.push({ key: questionKey(item, index), question: [item.header, item.question].filter(Boolean).join(": "), options, effects });
   }
   if (!parts.length) return { ok: false, category: "free-text", reason: "nothing in the request can be answered by picking an option" };
   const text = requestTexts(request).join("\n");

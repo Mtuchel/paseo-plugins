@@ -7,11 +7,11 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { Deputy, fingerprint, overrideCommand, readCandidates, type ArbitratedOutcome, type PermissionArbiter } from "./deputy";
-import { checkVerdict } from "./deputy-evaluator";
+import { checkVerdict, evaluationPrompt } from "./deputy-evaluator";
 import { LIVE_MIN_CASES, shadowEvidence } from "./deputy-evidence";
 import { renderReport, verdict, waitStats } from "./deputy-report";
 import { assessRisk, type Part } from "./deputy-risk";
-import { gatherSources, type Source, type SourceReaders } from "./deputy-sources";
+import { gatherSources, registerEntries, type Source, type SourceReaders } from "./deputy-sources";
 import type { IssueState } from "./linear";
 import { DecisionLog, type LogEntry } from "./owner-decisions";
 import { DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type DeputySettings, type PluginSettings } from "./settings";
@@ -36,7 +36,7 @@ function question(id = "r1", options = ["node:test", "vitest"], extra: Partial<A
 
 test("only a trusted, plan-approved, unattended question with options for every required part gets past the risk floor", () => {
   const verdict = assessRisk(question(), trusted);
-  assert.deepEqual(verdict, { ok: true, parts: [{ key: "Runner", question: "Runner: Which test runner should the new module's tests use?", options: ["node:test", "vitest"] }] }, "the optional empty comment stays empty");
+  assert.deepEqual(verdict, { ok: true, parts: [{ key: "Runner", question: "Runner: Which test runner should the new module's tests use?", options: ["node:test", "vitest"], effects: {} }] }, "the optional empty comment stays empty");
   assert.equal(assessRisk({ ...question(), kind: "tool" }, trusted).ok, false, "tool approvals stay with the owner");
   assert.equal(assessRisk({ ...question(), kind: "plan" }, trusted).ok, false, "plan approvals stay with the owner");
   assert.deepEqual(assessRisk(question(), { ...trusted, trusted: false }), { ok: false, category: "untrusted", reason: "the ticket was not written by the owner" });
@@ -76,7 +76,7 @@ test("every owner-kept category is refused, wherever in the request it shows, in
 
 // --- The evaluator's answer -------------------------------------------------------------------------
 
-const parts: Part[] = [{ key: "Runner", question: "Runner: Which test runner?", options: ["node:test", "vitest"] }];
+const parts: Part[] = [{ key: "Runner", question: "Runner: Which test runner?", options: ["node:test", "vitest"], effects: { vitest: "installs vitest and rewrites the test scripts" } }];
 const sources: Source[] = [
   { id: "plan#2", kind: "plan", title: "Plan: TUC-1 — Verification", revision: "aaa", text: "Tests use the node:test runner, like every other module of the plugin.", decisive: true },
   { id: "principles:decision-queue.md:Q-3", kind: "principles", title: "queue", revision: "bbb", text: "Proposal: switch every module to vitest for watch mode.", decisive: false },
@@ -101,6 +101,10 @@ test("an evaluator answer counts only with an offered option and a verbatim quot
   assert.equal(refused(JSON.stringify({ risk: "unknown", decision: "answer" })).category, "unknown", "unknown risk counts as high");
   assert.equal(refused(JSON.stringify({ risk: "production-data", decision: "answer" })).category, "production-data");
   refused("I would pick node:test.");
+});
+
+test("the evaluator sees what every option does, not only its label", () => {
+  assert.match(evaluationPrompt({ identifier: "TUC-1", parts, context: "", sources }), /"vitest" \(effect: "installs vitest and rewrites the test scripts"\)/);
 });
 
 // --- Knowledge second -------------------------------------------------------------------------------
@@ -135,6 +139,20 @@ test("an unreadable source that should exist makes the deputy abstain rather tha
   assert.match((await gatherSources(readers(), asked, null)).abstain ?? "", /no principles repository/);
   assert.match((await gatherSources(readers({ recall: async () => { throw new Error("no Hindsight access is configured on this host"); } }), asked, "/repo/platform")).abstain ?? "", /Hindsight/);
   assert.match((await gatherSources(readers({ plan: async () => { throw new Error("HTTP 500"); } }), asked, "/repo/platform")).abstain ?? "", /plan/);
+  assert.match((await gatherSources(readers({ plan: async () => null }), asked, "/repo/platform")).abstain ?? "", /no plan document/, "a plan-ready ticket without its plan");
+  assert.match((await gatherSources(readers({ plan: async () => ({ url: "https://linear.app/doc/plan", content: "# Draft\n\nTests use node:test." }) }), asked, "/repo/platform")).abstain ?? "", /not marked approved/);
+});
+
+test("a decision that is not binding stays so in every excerpt: its subsections and the cut-off rest of a long one", async () => {
+  const long = `${"Background on test runners and their history in this repository. ".repeat(60)}\n\n`;
+  const decisions = `# Decisions\n\n## D-4 - Test runner choice\n\n- Outcome: superseded by P-9\n\n${long}The vitest test runner is used for module tests.\n\n### Scope\n\nvitest test runner for every module test.\n\n## D-5 - Logging\n\nLogs go to stderr.\n`;
+  const entries = registerEntries(decisions);
+  assert.deepEqual(entries.map((entry) => entry.binding), entries.map((entry) => !entry.id.startsWith("D-4")));
+  assert.equal(new Set(entries.map((entry) => entry.id)).size, entries.length, "every excerpt has its own id");
+  const snapshot = await gatherSources(readers({ principles: async () => ({ commit: "c0ffee", files: { "decisions.md": decisions } }) }), asked, "/repo/platform");
+  const d4 = snapshot.sources.filter((source) => source.id.includes(":D-4"));
+  assert.ok(d4.length >= 2, "the continuation and the subsection are retrieved");
+  assert.ok(d4.every((source) => !source.decisive));
 });
 
 test("only answers the plugin delivered for the authenticated owner ground later questions; daemon-reported resolutions never do", async () => {
