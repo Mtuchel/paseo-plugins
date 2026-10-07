@@ -484,7 +484,7 @@ test("a successor whose recorded branch cannot be continued is queued with its h
   const answer = await intake.accept({
     id: recoverActivationId("i1", "a-gone", "Fix the failing check."),
     kind: "recover", issueId: "i1", identifier: "TUC-1", text: "Fix the failing check.", strictResume: true,
-    resume: { branch: "mtuchel/tuc-1-fix", handover: "https://github.com/o/r/pull/7" },
+    resume: { branch: "mtuchel/tuc-1-fix", commit: "1".repeat(40), dirty: false, handover: "https://github.com/o/r/pull/7" },
     host: "mac", requestedAt: "2026-01-01T00:00:00Z",
   });
   assert.equal(answer.status, 202);
@@ -957,7 +957,8 @@ test("a source-only handover resume starts on the receiving host at the exact re
   await dest.intake.idle();
   assert.equal(dest.resumes.length, 1, "without a snapshot nothing resumes, this host's own record included");
   assert.equal((await dest.intake.status()).handoffs, 2, "it waits as a queued handoff for the sending host's snapshot");
-  assert.match(dest.comments.at(-1) ?? "", /did not come with the forwarded request/);
+  assert.match(dest.comments.at(-1) ?? "", /did not carry the recorded branch, its exact commit and the dirty state/);
+  assert.match(dest.comments.at(-1) ?? "", /The sending host must forward the recorded branch's exact commit and dirty state/, "the way to fix it is named");
 });
 
 // A queued strict resume whose snapshot did not travel when it was first forwarded (the six
@@ -1013,7 +1014,7 @@ test("a queued strict resume is enriched by the same action re-sent with its sna
 });
 
 // The enrichment's safeguards: only the queued action's own snapshot is accepted, a stored
-// snapshot is never redirected, and a finished activation is never reopened.
+// snapshot is never replaced, and a finished activation is never reopened.
 test("enrichment never rewrites a stored resume, a changed action or a finished activation", async (t) => {
   const home = await withHome(t);
   const daemon = fakeDaemon([]);
@@ -1047,8 +1048,8 @@ test("enrichment never rewrites a stored resume, a changed action or a finished 
   assert.equal((await pending()).state, "handoff");
 
   // A re-send whose text or watchdog differs is a different action: it never rewrites this one.
-  assert.equal(enrichedFlag((await intake.accept({ ...base, text: "A different demand.", resume: { branch: "b", handover: null } })).body), undefined);
-  assert.equal(enrichedFlag((await intake.accept({ ...base, watchdog: { v: 1, other: true }, resume: { branch: "b", handover: null } })).body), undefined);
+  assert.equal(enrichedFlag((await intake.accept({ ...base, text: "A different demand.", resume: { branch: "b", commit: "2".repeat(40), dirty: false, handover: null } })).body), undefined);
+  assert.equal(enrichedFlag((await intake.accept({ ...base, watchdog: { v: 1, other: true }, resume: { branch: "b", commit: "2".repeat(40), dirty: false, handover: null } })).body), undefined);
   await intake.idle();
   assert.equal(attempts, 0, "a different action does not re-run the queued one");
   assert.equal((await pending()).envelope.text, base.text, "the stored action keeps its text");
@@ -1069,4 +1070,206 @@ test("enrichment never rewrites a stored resume, a changed action or a finished 
   assert.deepEqual(JSON.parse((await intake.accept({ ...base, resume: { ...snapshot, branch: "somewhere-else" } })).body), { ok: true, id: base.id, state: "done", duplicate: true });
   await intake.idle();
   assert.equal(attempts, 1, "a finished activation is never enriched or restarted");
+});
+
+// Strict resumes require complete evidence. Reject partial enrichment without losing the
+// original snapshot-less action's ability to accept a later complete resend.
+test("strict resumes hold incomplete evidence and reject partial enrichment", async (t) => {
+  const home = await withHome(t);
+  const daemon = fakeDaemon([]);
+  const attempts: { resume?: ActivationResume }[] = [];
+  const comments: string[] = [];
+  const intake = new ActivationIntake({
+    settings: { read: async () => settingsFor() }, home, host: "server087", log: () => {},
+    paseo: () => daemon.paseo,
+    linear: () => ({ comment: async (_issue: string, body: string) => { comments.push(body); }, addLabel: async () => {}, removeLabel: async () => {} }),
+    launcher: () => ({ gate: () => ({ release: () => {} }) }),
+    starter: () => ({
+      admission: async () => ({ ok: true as const }),
+      start: async (_issueId: string, _paseo: unknown, _settings: unknown, startOptions: { resume?: ActivationResume }) => {
+        attempts.push(startOptions);
+        if (startOptions.resume?.dirty) throw new ResumeUnavailableError("The agent on the other host still had uncommitted changes on mtuchel/tuc-1-fix; they cannot move between hosts automatically.");
+        return { agentId: "agent-1", warnings: [], provider: "claude/opus", target: "App", resumed: true, untrusted: false, plan: null };
+      },
+    }),
+  });
+  await intake.applyClaims({ host: "mac", seed: "seed-1", revision: 1, claims: [] });
+  const base: ActivationEnvelope = { id: "watchdog:i1:cycle-1:succeed", kind: "recover", issueId: ISSUE, identifier: "TUC-1", text: "The previous agent stopped making progress.", strictResume: true, watchdog: { v: 1 }, host: "mac", requestedAt: "2026-01-01T00:00:00Z" };
+  const entry = async (id: string) => {
+    const file = JSON.parse(await readFile(join(home, "activation-pending.json"), "utf8")) as { entries: Record<string, { state: string; envelope: ActivationEnvelope }> };
+    return file.entries[id];
+  };
+  const enrichedFlag = (body: string): unknown => JSON.parse(body).enriched;
+  const branch = "mtuchel/tuc-1-fix";
+
+  // The incident's shape: a strict resume with no snapshot at all is held.
+  await intake.accept(base);
+  await intake.idle();
+  assert.equal((await entry(base.id)).state, "handoff");
+  assert.equal(attempts.length, 0);
+
+  // A partial snapshot is preserved but cannot authorize a launch.
+  const partial = "watchdog:i1:cycle-2:succeed";
+  await intake.accept({ ...base, id: partial, text: "A partial forward.", resume: { branch, handover: "Partial." } });
+  await intake.idle();
+  assert.equal((await entry(partial)).state, "handoff");
+  assert.deepEqual((await entry(partial)).envelope.resume, { branch, handover: "Partial." });
+  assert.equal(attempts.length, 0, "a partial snapshot never launches");
+  assert.match(comments.join("\n"), /did not carry the recorded branch, its exact commit and the dirty state/);
+  assert.match(comments.join("\n"), /The sending host must forward the recorded branch's exact commit and dirty state/, "the remedy is at the sending host, not a push here");
+
+  // Partial re-sends change nothing, so the entry stays repairable by a later complete one.
+  for (const resume of [
+    { branch, handover: null },
+    { branch, commit: "abc123", dirty: false, handover: null },
+    { branch, commit: "1".repeat(40), handover: null },
+    { branch: null, commit: "1".repeat(40), dirty: false, handover: null },
+  ]) {
+    assert.equal(enrichedFlag((await intake.accept({ ...base, resume })).body), undefined);
+  }
+  await intake.idle();
+  assert.equal(attempts.length, 0, "no partial snapshot is used");
+  assert.equal((await entry(base.id)).state, "handoff");
+  assert.equal((await entry(base.id)).envelope.resume, undefined, "and none is stored");
+
+  // The recorded branch with its exact commit and known dirty state: complete evidence. Dirty work
+  // is evidence too -- the entry is repaired and the launch is attempted, where the starter keeps
+  // it queued rather than continuing uncommitted work.
+  const complete: ActivationResume = { branch, commit: "1".repeat(40), dirty: true, handover: "Continue." };
+  assert.deepEqual(JSON.parse((await intake.accept({ ...base, resume: complete })).body), { ok: true, id: base.id, state: "handoff", duplicate: true, enriched: true });
+  await intake.idle();
+  assert.equal(attempts.length, 1, "complete evidence is used, dirty or not");
+  assert.deepEqual(attempts[0].resume, complete);
+  assert.equal((await entry(base.id)).state, "handoff", "dirty work stays queued");
+  assert.deepEqual((await entry(base.id)).envelope.resume, complete, "the accepted evidence is kept");
+});
+
+// A snapshot that is already stored is never replaced, whatever a later re-send carries: the entry
+// an older host left with a partial snapshot stays held, and a later snapshot -- even for another
+// branch -- never takes it over.
+test("a stored snapshot is never replaced by a complete re-send, partial or not", async (t) => {
+  const home = await withHome(t);
+  const daemon = fakeDaemon([]);
+  let attempts = 0;
+  const base: ActivationEnvelope = { id: "watchdog:i1:cycle-1:succeed", kind: "recover", issueId: ISSUE, identifier: "TUC-1", text: "The previous agent stopped making progress.", strictResume: true, watchdog: { v: 1 }, host: "mac", requestedAt: "2026-01-01T00:00:00Z" };
+  const starter = () => ({
+    admission: async () => ({ ok: true as const }),
+    start: async () => { attempts += 1; return { agentId: "agent-1", warnings: [], provider: "claude/opus", target: "App", resumed: true, untrusted: false, plan: null }; },
+  });
+  const deps = {
+    settings: { read: async () => settingsFor() }, home, host: "server087", log: () => {},
+    paseo: () => daemon.paseo,
+    linear: () => ({ comment: async () => {}, addLabel: async () => {}, removeLabel: async () => {} }),
+    launcher: () => ({ gate: () => ({ release: () => {} }) }),
+    starter,
+  };
+  const first = new ActivationIntake(deps);
+  await first.applyClaims({ host: "mac", seed: "seed-1", revision: 1, claims: [] });
+  await first.accept(base);
+  await first.idle();
+
+  // The durable record an older host could have left: the same action, holding a partial snapshot.
+  const stored = { branch: "mtuchel/tuc-1-fix", handover: "Partial from an older host." };
+  const file = JSON.parse(await readFile(join(home, "activation-pending.json"), "utf8")) as { entries: Record<string, { envelope: ActivationEnvelope }> };
+  file.entries[base.id].envelope.resume = stored;
+  await writeFile(join(home, "activation-pending.json"), JSON.stringify(file));
+
+  const intake = new ActivationIntake(deps);
+  const enrichedFlag = (body: string): unknown => JSON.parse(body).enriched;
+  for (const resume of [
+    { branch: stored.branch, handover: null },
+    { branch: stored.branch, commit: "1".repeat(40), dirty: false, handover: null },
+    { branch: "somewhere-else", commit: "1".repeat(40), dirty: false, handover: null },
+  ]) {
+    assert.equal(enrichedFlag((await intake.accept({ ...base, resume })).body), undefined, "a stored snapshot is never replaced");
+  }
+  await intake.idle();
+  assert.equal(attempts, 0, "a partial stored snapshot never launches");
+  const record = (await intake.status()).handoffs;
+  assert.equal(record, 1, "the entry stays held");
+  const after = JSON.parse(await readFile(join(home, "activation-pending.json"), "utf8")) as { entries: Record<string, { state: string; envelope: ActivationEnvelope }> };
+  assert.equal(after.entries[base.id].state, "handoff");
+  assert.deepEqual(after.entries[base.id].envelope.resume, stored, "and keeps exactly the snapshot it had");
+  assert.equal(after.entries[base.id].envelope.text, base.text, "the original action is untouched");
+});
+
+// A sweep captures its list before it processes earlier activations, so the record it holds for a
+// later entry can be stale. This interleaving proves the id boundary reloads the durable record: an
+// activation enriched and settled while an earlier sweep run was held open stays done -- the stale
+// run neither reopens it (which would start a second agent once the first closed) nor touches its
+// record, and an independent held ticket keeps its own wait.
+test("a stale sweep record never reopens or restarts an activation enriched and settled meanwhile", async (t) => {
+  const home = await withHome(t);
+  const daemon = fakeDaemon([]);
+  const attempts: { resume?: ActivationResume }[] = [];
+  // Executor form: the plugin's TypeScript lib predates Promise.withResolvers.
+  let signalBegan!: () => void;
+  const began = new Promise<void>((resolve) => { signalBegan = () => resolve(); });
+  let releaseA!: () => void;
+  const heldOpen = new Promise<void>((resolve) => { releaseA = () => resolve(); });
+  let settledB!: () => void;
+  const bSettled = new Promise<void>((resolve) => { settledB = () => resolve(); });
+  let admission = 0;
+  const starter = () => ({
+    admission: async () => {
+      admission += 1;
+      if (admission === 1) { signalBegan(); await heldOpen; }
+      return { ok: true as const };
+    },
+    start: async (_issueId: string, _paseo: unknown, _settings: unknown, startOptions: { resume?: ActivationResume }) => {
+      attempts.push(startOptions);
+      return { agentId: `agent-${attempts.length}`, warnings: [], provider: "claude/opus", target: "App", resumed: true, untrusted: false, plan: null };
+    },
+  });
+  const deps = {
+    settings: { read: async () => settingsFor() }, home, host: "server087", log: () => {},
+    paseo: () => daemon.paseo,
+    linear: () => ({ comment: async () => {}, addLabel: async () => {}, removeLabel: async () => {} }),
+  };
+  const first = new ActivationIntake({ ...deps, launcher: () => ({ gate: () => ({ release: () => {} }) }), starter: () => ({
+    admission: async () => ({ ok: true as const }),
+    start: async () => ({ agentId: "agent-0", warnings: [], provider: "claude/opus", target: "App", resumed: true, untrusted: false, plan: null }),
+  }) });
+  await first.applyClaims({ host: "mac", seed: "seed-1", revision: 1, claims: [] });
+  const envelope = (issueId: string, identifier: string, id: string): ActivationEnvelope => ({ id, kind: "recover", issueId, identifier, text: `The previous agent for ${identifier} stopped making progress.`, strictResume: true, host: "mac", requestedAt: "2026-01-01T00:00:00Z" });
+  const heldA = envelope("i1", "TUC-1", "watchdog:i1:cycle-1:succeed");
+  const heldB = envelope("i2", "TUC-2", "watchdog:i2:cycle-1:succeed");
+  const entry = async (id: string) => {
+    const file = JSON.parse(await readFile(join(home, "activation-pending.json"), "utf8")) as { entries: Record<string, { state: string; note: string | null; attempts: number; envelope: ActivationEnvelope }> };
+    return file.entries[id];
+  };
+  await first.accept(heldA);
+  await first.idle();
+  await first.accept(heldB);
+  await first.idle();
+  assert.equal((await first.status()).handoffs, 2, "both waits are queued");
+
+  // The same records, due for a sweep pass (their waits have passed); the pass is held open inside
+  // TUC-1 after it took its list, so the record it will use for TUC-2 is the pre-enrichment one.
+  const due = JSON.parse(await readFile(join(home, "activation-pending.json"), "utf8")) as { entries: Record<string, { retryAt: string }> };
+  for (const stored of Object.values(due.entries)) stored.retryAt = "";
+  await writeFile(join(home, "activation-pending.json"), JSON.stringify(due));
+  const intake = new ActivationIntake({ ...deps, starter,
+    // The launch gate's release runs right after a run settled its record: the signal that TUC-2's
+    // enriched run is on disk, without a timer or a poll.
+    launcher: () => ({ gate: (issueId: string) => ({ release: () => { if (issueId === heldB.issueId) settledB(); } }) }),
+  });
+  const sweep = intake.retry();
+  await began;
+
+  // TUC-2's complete snapshot arrives while the sweep is still held open on TUC-1.
+  const snapshot: ActivationResume = { branch: "mtuchel/tuc-2-fix", commit: "2".repeat(40), dirty: false, handover: "Continue." };
+  assert.deepEqual(JSON.parse((await intake.accept({ ...heldB, resume: snapshot })).body), { ok: true, id: heldB.id, state: "handoff", duplicate: true, enriched: true });
+  await bSettled;
+  const settled = { state: (await entry(heldB.id)).state, attempts: (await entry(heldB.id)).attempts, note: (await entry(heldB.id)).note };
+  assert.equal(settled.state, "done", "the enriched activation settles while the sweep is still held");
+
+  // The pass then reaches TUC-2's stale record: it must leave the settled activation alone.
+  releaseA();
+  await sweep;
+  assert.deepEqual({ state: (await entry(heldB.id)).state, attempts: (await entry(heldB.id)).attempts, note: (await entry(heldB.id)).note }, settled, "a stale record never reopens, restarts or rewrites a finished activation");
+  assert.equal((await entry(heldA.id)).state, "handoff", "the independent held ticket keeps its own wait");
+  assert.equal((await intake.status()).handoffs, 1, "only the independent ticket still waits");
+  assert.equal(attempts.length, 1, "exactly one agent was started");
+  assert.deepEqual(attempts[0].resume, snapshot);
 });

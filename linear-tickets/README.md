@@ -545,14 +545,20 @@ unreachable or full, work stays queued; there is no local fallback. Replacement 
 its branch and handover context and never silently starts on an unrelated fresh branch: a strict
 resume travels with the source's handover snapshot — the recorded branch, its exact commit,
 whether uncommitted changes are next to it and the handover text, never its worktree path. The
-destination continues that branch only while it has it at exactly the recorded commit; dirty
-work, another commit, a branch that is not there, or a snapshot the source could not verify --
-including none at all -- keep the activation a queued handoff rather than discarding the work,
-and the ticket says what to push or fetch. A queued strict resume that arrived without its
-snapshot (an older forwarding host) can be enriched in place: the same action re-sent with the
-snapshot fills the stored envelope, keeps its identity, text and watchdog history, and runs once
-the branch is available; a finished activation is never reopened and a stored snapshot is never
-overwritten.
+destination continues that branch only while it has it at exactly the recorded commit. A strict
+resume launches only on that complete evidence: a snapshot missing the branch, the full commit
+or the dirty state stays held. A partial re-send never enriches a snapshot-less entry, so a later
+complete one still can. Dirty work, another commit, a branch that is not there, or no
+complete snapshot -- including none at all -- keep the activation a queued handoff rather than
+discarding the work, and the ticket says what to push or fetch (or that the sending host must
+forward the recorded branch's exact commit and dirty state). A queued strict resume that arrived
+without its snapshot (an older forwarding host) can be enriched in place: the same action
+re-sent with the recorded branch's complete evidence fills the stored envelope, keeps its
+identity, text and watchdog history, and runs once the branch is available; a finished activation
+is never reopened and a stored snapshot is never replaced -- an entry an older host left with a
+partial snapshot stays held. Every activation is processed from its current durable record, so a
+pass that captured an older state can neither reopen a finished activation nor start a second
+agent.
 The destination acknowledges a forwarded activation after persisting it, then processes it
 asynchronously. Delivery receipts avoid repeats after a lost HTTP response, and a message a host
 passes to its own live agent -- the destination's intake, or the draining host for a ticket one of
