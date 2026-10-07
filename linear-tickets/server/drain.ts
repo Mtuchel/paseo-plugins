@@ -4,6 +4,7 @@ import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { ghostAgents, type ProcessInspector } from "./process-liveness";
 import type { Settings } from "./settings";
 import { deliverToAgent } from "./relay";
+import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./permission-replies";
 import {
   activationDirectory,
   activationEnvelopeSchema,
@@ -137,7 +138,8 @@ export type DrainDeps = {
   // The ticket's Linear state, to retire a finished ticket (done or canceled). Unread or missing
   // reads keep the agent: only a finished ticket retires it.
   ticketState?: (issueId: string) => Promise<{ statusType: string } | null>;
-  deliver?: (paseo: PaseoApi, agentId: string, message: string) => Promise<void>;
+  deliver?: (paseo: PaseoApi, agentId: string, message: string, origin: DeliveryOrigin, replies: PermissionReplies) => Promise<DeliveryResult>;
+  replies?: PermissionReplies;
   request?: RequestLike;
   home?: string;
   host?: string;
@@ -227,12 +229,14 @@ export class DrainRouter implements ActivationSink {
   private readonly sweepMs: number;
   private readonly allowlist: JsonFile<Allowlist>;
   private readonly outbox: JsonFile<Outbox>;
+  private readonly replies: PermissionReplies;
   private timer: NodeJS.Timeout | null = null;
   private ready: Promise<void> | null = null;
   private sweeping = false;
 
   constructor(private readonly deps: DrainDeps) {
     this.home = deps.home ?? activationDirectory();
+    this.replies = deps.replies ?? new PermissionReplies({ directory: this.home, daemon: async () => null });
     this.host = deps.host ?? "this host";
     this.seedPath = `${this.home}/${SEED_FILE}`;
     this.now = deps.now ?? Date.now;
@@ -354,9 +358,8 @@ export class DrainRouter implements ActivationSink {
 
   // Delivers a peer's message to the allowlisted agent that still owns the ticket (the peer calls
   // this only for a ticket it has a claim for). No owner: 409, and the peer keeps its work pending.
-  // `receipt` (the activation id) is written only after the message went out: a response lost on
-  // the way is not delivered twice, while a crash in between repeats the message rather than
-  // losing it.
+  // The shared reply ledger reserves the activation before routing/sending. A failed receipt
+  // write can replay the outcome, but cannot deliver into a newer permission request.
   async deliver(issueId: string, text: string, receipt?: string): Promise<{ ok: boolean; reason?: string; duplicate?: boolean }> {
     if (receipt && (await this.allowlist.load()).receipts[receipt]) return { ok: true, duplicate: true };
     const paseo = this.deps.paseo();
@@ -365,7 +368,10 @@ export class DrainRouter implements ActivationSink {
     if (!owner) return { ok: false, reason: "No agent of this host still owns the ticket." };
     const deliver = this.deps.deliver ?? deliverToAgent;
     try {
-      await deliver(paseo, owner.id, text);
+      const ref = `activation:${receipt ?? createHash("sha256").update(`${issueId}:${text}`).digest("hex").slice(0, 16)}`;
+      const origin: DeliveryOrigin = { ref, responder: { kind: "linear-unverified", via: "activation", ref }, issueId };
+      const result = await deliver(paseo, owner.id, text, origin, this.replies);
+      if (!result.delivered) return { ok: false, reason: result.reply ?? "The message was not delivered." };
     } catch (error) {
       return { ok: false, reason: error instanceof Error ? error.message : "unknown error" };
     }

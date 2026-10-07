@@ -21,32 +21,25 @@ import { paseoHome } from "./ticket-mcp";
 // (agent, request): risk first, knowledge second, then a prediction. In shadow mode that is all:
 // the prediction is logged and the owner answers as before. In live mode the owner keeps a grace
 // period; only after it, and only if nothing changed and every gate still holds, may the deputy
-// answer — through a daemon response that lets an owner answer win and names who answered. The
-// installed daemon has no such response yet (TUC-1258), so live mode records why it is blocked
-// and answers nothing. Corrections of a deputy answer go to the agent that got it, never into a
-// newer question.
+// answer — through the plugin's checked answer connection, with plugin-local owner precedence
+// and a confirmed result. Without that connection live mode is blocked. Corrections of a deputy
+// answer go to the agent that got it, never into a newer question.
 
 export const DEPUTY_DIRECTORY = () => join(paseoHome(), "linear-tickets", "deputy");
 const KEEP_MS = 14 * 24 * 60 * 60 * 1000;
-const NOTICE_RETRY_MS = 5 * 60 * 1000;
+const SETTLEMENT_RETRY_MS = 5 * 60 * 1000;
 const MAX_PARALLEL_EVALUATIONS = 2;
-export const ARBITER_MISSING = "the Paseo daemon does not offer owner-priority permission responses with an authoritative responder yet (TUC-1258)";
+export const CHECKED_CONNECTION_MISSING = "no checked answer connection to the local Paseo daemon";
 
 export type ArbitratedOutcome = "applied" | "owner-first" | "gone";
-// The daemon response live answers need (TUC-1258): submitted only while no owner response for the
-// request is in, bound to the request's fingerprint, idempotent per intent, and resolving with
-// who actually answered. `outcome` reports an earlier intent after an interruption (null: unknown).
+// Plugin-local precedence and a checked result, idempotent per intent. The daemon cannot compare
+// request fingerprints or identify other responders; answers outside the plugin are unattributed.
+// `outcome` reports an earlier confirmed intent after an interruption (null: unknown).
 export type PermissionArbiter = {
   respond(input: { agentId: string; requestId: string; fingerprint: string; intentId: string; response: AgentPermissionResponse }): Promise<ArbitratedOutcome>;
   outcome(intentId: string): Promise<ArbitratedOutcome | null>;
 };
 
-// The host's capability check: no released Paseo daemon or SDK offers the arbitrated response,
-// so every host answers null and live mode stays blocked. Comparing answer texts or timing
-// afterwards does not prove who answered, so there is no fallback.
-export async function permissionArbiter(): Promise<PermissionArbiter | null> {
-  return null;
-}
 
 export type CandidateStatus =
   | "evaluating" | "refused" | "predicted" | "waiting" | "dispatching" | "applied"
@@ -136,7 +129,7 @@ export class Deputy {
   private storeQueue: Promise<unknown> = Promise.resolve();
   private readonly lanes = new Map<string, Promise<unknown>>();
   private readonly timers = new Map<string, NodeJS.Timeout>();
-  private noticeTimer: NodeJS.Timeout | null = null;
+  private retryTimer: NodeJS.Timeout | null = null;
   private running = 0;
   private readonly queued: (() => void)[] = [];
   // Work started in the background (evaluations, dispatches), for tests and orderly shutdown.
@@ -145,7 +138,7 @@ export class Deputy {
   constructor(private readonly deps: Deps) {
     this.directory = deps.directory ?? DEPUTY_DIRECTORY();
     this.now = deps.now ?? (() => Date.now());
-    this.arbiter = deps.arbiter ?? permissionArbiter;
+    this.arbiter = deps.arbiter ?? (async () => null);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -236,7 +229,8 @@ export class Deputy {
     this.stopped = true;
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
-    clearInterval(this.noticeTimer ?? undefined);
+    clearTimeout(this.retryTimer ?? undefined);
+    this.retryTimer = null;
   }
 
   // A question still pending after the settle window, once the owner was shown it. Returns at once:
@@ -332,7 +326,7 @@ export class Deputy {
       const evidence = shadowEvidence(await this.deps.log.entries(), policyVersion(settings.deputy.model));
       if (!evidence.ready) blockers.push(`not enough shadow evidence for ${evidence.version}: ${evidenceSummary(evidence)}`);
     }
-    if (!await this.arbiter()) blockers.push(ARBITER_MISSING);
+    if (!await this.arbiter()) blockers.push(CHECKED_CONNECTION_MISSING);
     return blockers;
   }
 
@@ -367,7 +361,7 @@ export class Deputy {
     const stale = (candidate.citations ?? []).find((citation) => typeof verifyCitation(assessed.sources, citation.sourceId, citation.quote) === "string");
     if (stale) { await this.outcome(candidate, "canceled", `the sources changed since the prediction (${stale.sourceId})`); return; }
     const arbiter = await this.arbiter();
-    if (!arbiter) { await this.outcome(candidate, "blocked", ARBITER_MISSING); return; }
+    if (!arbiter) { await this.outcome(candidate, "blocked", CHECKED_CONNECTION_MISSING); return; }
     const intentId = randomUUID();
     // Recorded before the write: a reload in between finds the intent and never submits it again.
     await this.patch(key, { status: "dispatching", intentId });
@@ -376,6 +370,7 @@ export class Deputy {
       const part = questionKey(item, index);
       answers[part] = candidate.selections?.[part] ?? "";
     });
+    if (this.stopped) { await this.outcome({ ...candidate, intentId }, "canceled", "the plugin stopped before the answer was submitted"); return; }
     let result: ArbitratedOutcome;
     try {
       result = await arbiter.respond({ agentId: candidate.agentId, requestId: candidate.requestId, fingerprint: candidate.fingerprint, intentId, response: { behavior: "allow", updatedInput: { answers } } });
@@ -387,11 +382,16 @@ export class Deputy {
   }
 
   private async settle(candidate: Candidate, result: ArbitratedOutcome): Promise<void> {
-    if (result === "owner-first") { await this.outcome(candidate, "owner-won", "the owner answered first"); return; }
-    if (result === "gone") { await this.outcome(candidate, "resolved", "the request was gone when the answer arrived"); return; }
-    await this.deps.log.append({ kind: "deputy-answer", id: candidate.key, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version: candidate.version ?? "", key: candidate.intentId ?? "", answers: candidate.selections ?? {}, citations: candidate.citations ?? [] });
-    const applied = await this.patch(candidate.key, { status: "applied", notice: { comment: false, session: false, commentId: null } });
-    if (applied) await this.notify(applied);
+    try {
+      if (result === "owner-first") { await this.outcome(candidate, "owner-won", "the owner answered first"); return; }
+      if (result === "gone") { await this.outcome(candidate, "resolved", "the request was gone when the answer arrived"); return; }
+      await this.deps.log.append({ kind: "deputy-answer", id: candidate.key, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version: candidate.version ?? "", key: candidate.intentId ?? "", answers: candidate.selections ?? {}, citations: candidate.citations ?? [] });
+      const applied = await this.patch(candidate.key, { status: "applied", notice: { comment: false, session: false, commentId: null } });
+      if (applied) await this.notify(applied);
+    } catch (error) {
+      this.retrySettlement();
+      throw error;
+    }
   }
 
   // The visible answer: a ticket comment (always, whatever the write-back settings) and the agent
@@ -416,39 +416,80 @@ export class Deputy {
       }
     } catch (error) {
       console.error(`[linear-tickets] deputy: the notice for ${candidate.identifier} ${candidate.ref} failed, retrying later: ${message(error)}`);
-      this.retryNotices();
+      this.retrySettlement();
     }
   }
 
-  private retryNotices(): void {
-    if (this.noticeTimer || this.stopped) return;
-    this.noticeTimer = setInterval(() => {
-      this.background((async () => {
-        const pending = (await this.candidates()).filter((candidate) => candidate.status === "applied" && candidate.notice && !(candidate.notice.comment && candidate.notice.session));
-        if (!pending.length && this.noticeTimer) { clearInterval(this.noticeTimer); this.noticeTimer = null; }
-        for (const candidate of pending) await this.lane(candidate.key, () => this.notify(candidate));
-      })());
-    }, NOTICE_RETRY_MS);
-    this.noticeTimer.unref?.();
+  private owesSettlement(candidate: Candidate): boolean {
+    return candidate.status === "dispatching" || Boolean(candidate.status === "applied" && candidate.notice && !(candidate.notice.comment && candidate.notice.session));
+  }
+
+  private retrySettlement(): void {
+    if (this.retryTimer || this.stopped) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.background(this.retryPending());
+    }, SETTLEMENT_RETRY_MS);
+    this.retryTimer.unref?.();
+  }
+
+  // Complete confirmed answers and their notices, never submit another permission response.
+  private async retryPending(): Promise<void> {
+    if (this.stopped) return;
+    try {
+      for (const candidate of (await this.candidates()).filter((item) => this.owesSettlement(item))) {
+        try {
+          await this.lane(candidate.key, async () => {
+            if (this.stopped) return;
+            const current = (await this.readStore())[candidate.key];
+            if (!current) return;
+            if (current.status === "dispatching") {
+              const arbiter = await this.arbiter();
+              const known = arbiter && current.intentId ? await arbiter.outcome(current.intentId) : null;
+              if (known) await this.settle(current, known);
+            } else if (this.owesSettlement(current)) await this.notify(current);
+          });
+        } catch (error) {
+          console.error(`[linear-tickets] deputy: settlement for ${candidate.identifier} ${candidate.ref} failed, retrying later: ${message(error)}`);
+        }
+      }
+      if ((await this.candidates()).some((candidate) => this.owesSettlement(candidate))) this.retrySettlement();
+    } catch (error) {
+      this.retrySettlement();
+      throw error;
+    }
   }
 
   // After a reload: candidates continue where they were, checked against the requests that are
   // actually pending. An interrupted dispatch is never submitted again.
   private async recover(): Promise<void> {
     for (const candidate of await this.candidates()) {
-      if (candidate.status === "dispatching") {
-        const arbiter = await this.arbiter();
-        const known = arbiter && candidate.intentId ? await arbiter.outcome(candidate.intentId).catch(() => null) : null;
-        await this.lane(candidate.key, () => known ? this.settle(candidate, known) : this.outcome(candidate, "unknown", "the plugin restarted while the answer was submitted; it is not submitted again"));
-        continue;
+      try {
+        await this.lane(candidate.key, async () => {
+          const current = (await this.readStore())[candidate.key];
+          if (!current) return;
+          if (current.status === "dispatching") {
+            const arbiter = await this.arbiter();
+            // Without the checked connection the outcome cannot be read now; the candidate stays
+            // owed and the settlement timer retries it instead of concluding "unknown" blindly.
+            if (!arbiter) { this.retrySettlement(); return; }
+            const known = current.intentId ? await arbiter.outcome(current.intentId) : null;
+            if (known) await this.settle(current, known);
+            else await this.outcome(current, "unknown", "the plugin restarted while the answer was submitted; it is not submitted again");
+            return;
+          }
+          if (this.owesSettlement(current)) { this.retrySettlement(); return; }
+          if (current.status !== "evaluating" && current.status !== "waiting") return;
+          const found = await this.paseo?.agents.ref(current.agentId).refresh().catch(() => null);
+          const pending = found?.agent.pendingPermissions?.some((request) => request.id === current.requestId);
+          if (!pending) { await this.outcome(current, "resolved", "the request was no longer pending after a reload"); return; }
+          if (current.status === "waiting") this.schedule(current);
+          else this.background(this.lane(current.key, () => this.slot(() => this.evaluate(current.key))));
+        });
+      } catch (error) {
+        console.error(`[linear-tickets] deputy: recovery for ${candidate.identifier} ${candidate.ref} failed: ${message(error)}`);
+        if (this.owesSettlement(candidate)) this.retrySettlement();
       }
-      if (candidate.status === "applied" && candidate.notice && !(candidate.notice.comment && candidate.notice.session)) { this.retryNotices(); continue; }
-      if (candidate.status !== "evaluating" && candidate.status !== "waiting") continue;
-      const found = await this.paseo?.agents.ref(candidate.agentId).refresh().catch(() => null);
-      const pending = found?.agent.pendingPermissions?.some((request) => request.id === candidate.requestId);
-      if (!pending) { await this.lane(candidate.key, () => this.outcome(candidate, "resolved", "the request was no longer pending after a reload")); continue; }
-      if (candidate.status === "waiting") this.schedule(candidate);
-      else this.background(this.lane(candidate.key, () => this.slot(() => this.evaluate(candidate.key))));
     }
   }
 
@@ -472,7 +513,7 @@ export class Deputy {
     const raw = response.updatedInput && typeof response.updatedInput === "object" ? Object.entries(response.updatedInput).find(([field]) => field === "answers")?.[1] : undefined;
     const answers = raw && typeof raw === "object" && !Array.isArray(raw) ? Object.fromEntries(Object.entries(raw).filter((entry): entry is [string, string] => typeof entry[1] === "string")) : {};
     const key = `${agentId}:${request.id}`;
-    await logQuietly(() => this.deps.log.append({ kind: "owner-answer", id: key, at, key: activity.activityId || `answer:${at}`, via: activity.via, userId: activity.userId, answers }), `owner answer on ${key}`);
+    await this.deps.log.append({ kind: "owner-answer", id: key, at, key: activity.activityId || `answer:${at}`, via: activity.via, userId: activity.userId, answers });
     this.unschedule(key);
     await this.lane(key, async () => {
       const candidate = (await this.readStore())[key];
@@ -488,6 +529,30 @@ export class Deputy {
 
   async byRef(ref: string): Promise<Candidate | null> {
     return (await this.candidates()).find((candidate) => candidate.ref === ref) ?? null;
+  }
+
+  // A checked deputy outcome authorises the owner's late correction even while its own log and
+  // notices are still owed. Only this in-memory copy advances; settlement keeps its durable state.
+  async correctLate(agentId: string, requestId: string, text: string, activity: CorrectionActivity): Promise<Correction> {
+    const key = `${agentId}:${requestId}`;
+    const candidate = await this.lane(key, async () => {
+      const current = (await this.readStore())[key];
+      if (!current || current.status === "applied") return current;
+      const arbiter = await this.arbiter();
+      const known = arbiter && current.intentId ? await arbiter.outcome(current.intentId) : null;
+      if (known !== "applied") return current;
+      try {
+        await this.settle(current, known);
+      } catch (error) {
+        console.error(`[linear-tickets] deputy: settlement for ${current.identifier} ${current.ref} failed; the confirmed answer can still be corrected: ${message(error)}`);
+      }
+      return { ...current, status: "applied" as const };
+    });
+    if (!candidate) return { delivered: false, reply: "Your answer was not delivered: the question was no longer waiting, or Paseo was already processing another answer to it." };
+    const result = await this.correct(candidate, text, activity);
+    return result.delivered
+      ? { delivered: true, reply: `The deputy had already answered this question (${candidate.ref}); your answer went to the agent as your correction.` }
+      : result;
   }
 
   // The owner overrides a deputy answer: the correction goes to the agent that got the answer as a

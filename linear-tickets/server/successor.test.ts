@@ -692,24 +692,26 @@ test("a successor that cannot be read after its start keeps the predecessor's re
   await h.cleanup();
 });
 
-test("a comment that cannot be delivered keeps the thread queued and goes out once on the next sweep", async () => {
+test("a comment whose delivery could not be confirmed is reported and never sent again", async (t) => {
+  t.mock.method(console, "error", () => {});
   const h = routerHarness();
   await h.store.put(thread({ queued: true, pendingText: "rebase it please" }));
   h.daemon.add(ticketAgent("agent-new", "2026-02-01T00:00:00Z"));
   h.daemon.state.failSend = true;
 
+  // The first sweep attempts the send; the sweeps after it only replay the record it left behind.
   await h.router.startQueued();
-  const failed = await h.store.get("s1");
-  assert.deepEqual({ queued: failed?.queued, pendingText: failed?.pendingText, agentId: failed?.agentId }, { queued: true, pendingText: "rebase it please", agentId: null });
-  assert.deepEqual(h.daemon.sent, []);
+  await h.router.startQueued();
+  assert.deepEqual(h.daemon.sent, [], "the failed message never went out");
+  assert.ok(h.calls.some((call) => /^error:Paseo could not confirm that your answer reached the agent:/.test(call)), "the owner is told it did not go out");
+  const waiting = await h.store.get("s1");
+  assert.deepEqual({ queued: waiting?.queued, pendingText: waiting?.pendingText, agentId: waiting?.agentId }, { queued: true, pendingText: "rebase it please", agentId: null }, "the unconfirmed text stays queued, never to be sent");
   assertGateFree(h.gates);
 
+  // The daemon taking sends again changes nothing: an interrupted submission is never sent twice.
   h.daemon.state.failSend = false;
   await h.router.startQueued();
-  assert.deepEqual(h.daemon.sent, ["agent-new: rebase it please"]);
-  assert.deepEqual({ queued: (await h.store.get("s1"))?.queued, pendingText: (await h.store.get("s1"))?.pendingText }, { queued: false, pendingText: null });
-  await h.router.startQueued();
-  assert.deepEqual(h.daemon.sent, ["agent-new: rebase it please"], "delivered exactly once");
+  assert.deepEqual(h.daemon.sent, [], "never sent again");
   await h.cleanup();
 });
 

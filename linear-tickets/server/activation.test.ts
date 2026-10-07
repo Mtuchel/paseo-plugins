@@ -9,8 +9,9 @@ import type { ActivationEnvelope, ActivationRoute, RequestLike } from "./activat
 import { ACTIVATION_HEADER, recoverActivationId } from "./activation";
 import { activationEndpoints } from "./activation-endpoints";
 import { ActivationIntake } from "./activation-intake";
-import { DrainRouter } from "./drain";
+import { DrainRouter, SEED_FILE } from "./drain";
 import { Launcher } from "./launch";
+import { PermissionReplies } from "./permission-replies";
 import { SessionStore } from "./sessions";
 import { ResumeUnavailableError } from "./starter";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, Settings, type ActivationSettings, type PluginSettings } from "./settings";
@@ -73,6 +74,7 @@ function fakeDaemon(specs: FakeAgentSpec[]) {
   const agents = specs.map(fakeAgent);
   const archived = new Set(specs.filter((spec) => spec.archived).map((spec) => spec.id));
   const sent: { agentId: string; message: string }[] = [];
+  const answers: { agentId: string; requestId: string; response: unknown }[] = [];
   const listed = (filter?: { labels?: Record<string, string>; includeArchived?: boolean }) =>
     agents.filter((agent) => (!archived.has(agent.id) || filter?.includeArchived === true) && Object.entries(filter?.labels ?? {}).every(([key, value]) => agent.labels[key] === value));
   const paseo = {
@@ -85,11 +87,11 @@ function fakeDaemon(specs: FakeAgentSpec[]) {
         refresh: async () => (agents.find((agent) => agent.id === id) ? { agent: agents.find((agent) => agent.id === id) } : null),
         send: async (message: string) => { sent.push({ agentId: id, message }); },
         archive: async () => { archived.add(id); },
-        respondToPermission: async () => {},
+        respondToPermission: async (input: { requestId: string; response: unknown }) => { answers.push({ agentId: id, ...input }); },
       }),
     },
   } as unknown as PaseoApi;
-  return { paseo, agents, sent, archived };
+  return { paseo, agents, sent, answers, archived };
 }
 
 type PeerCall = { url: string; headers: Record<string, string>; body: unknown };
@@ -524,6 +526,160 @@ test("a live root on the receiving host takes the message instead of a second st
   await intake.idle();
   assert.equal(starts, 0);
   assert.deepEqual(daemon.sent, [{ agentId: "legacy", message: "Any update?" }]);
+});
+
+// TUC-1258 AC-5: an activation's message goes through the plugin's one checked answer path like
+// every other Linear text. The sender's stable id (the forwarded envelope's id, the delivery
+// POST's receipt) is its ref there; an activation names no author, so the text keeps the owner's
+// precedence but is never recorded as the owner's answer.
+test("a forwarded message reaches the agent once through the shared ledger, unattributed", async (t) => {
+  const home = await withHome(t);
+  const daemon = fakeDaemon([{ id: "legacy", issueId: "i1", status: "running" }]);
+  const effects = { owner: 0, corrections: 0 };
+  const replies = new PermissionReplies({ directory: home, daemon: async () => null });
+  replies.recordEffects({
+    ownerAnswered: async () => { effects.owner += 1; },
+    correctLate: async () => { effects.corrections += 1; return { delivered: false, reply: "" }; },
+    needsYou: async () => {},
+  });
+  const intake = new ActivationIntake({
+    settings: { read: async () => settingsFor() }, home, host: "server087", log: () => {},
+    paseo: () => daemon.paseo,
+    linear: () => null, starter: () => null, launcher: () => null,
+    replies,
+  });
+
+  // The delivery route of a host the activation was forwarded to: the POST's receipt is the ref.
+  assert.deepEqual(await intake.deliverLocal("i1", "Any news?", "session:s2"), { ok: true });
+  // The queue of that host: the forwarded envelope's id is.
+  assert.equal((await intake.accept({ id: "reply:s1:hello", kind: "reply", issueId: "i1", identifier: "TUC-1", sessionId: "s1", text: "Any update?", host: "mac", requestedAt: "2026-01-01T00:00:00Z" })).status, 202);
+  await intake.idle();
+
+  assert.deepEqual(daemon.sent, [
+    { agentId: "legacy", message: "Any news?" },
+    { agentId: "legacy", message: "Any update?" },
+  ]);
+  assert.deepEqual([effects.owner, effects.corrections, daemon.answers], [0, 0, []], "an activation names no author: nothing here counts as the owner's answer");
+});
+
+// TUC-1258 AC-5: a forwarding host without a receipt (an older one) is still covered: the same
+// ticket and text are the same delivery, another text is a new one.
+test("without a receipt the same ticket and text reach the agent once", async (t) => {
+  const home = await withHome(t);
+  const daemon = fakeDaemon([{ id: "legacy", issueId: "i1", status: "running" }]);
+  const replies = new PermissionReplies({ directory: home, daemon: async () => null });
+  const intake = new ActivationIntake({
+    settings: { read: async () => settingsFor() }, home, host: "server087", log: () => {},
+    paseo: () => daemon.paseo,
+    linear: () => null, starter: () => null, launcher: () => null,
+    replies,
+  });
+  assert.deepEqual(await intake.deliverLocal("i1", "Any news?"), { ok: true });
+  assert.deepEqual(await intake.deliverLocal("i1", "Any news?"), { ok: true });
+  assert.deepEqual(daemon.sent, [{ agentId: "legacy", message: "Any news?" }], "the repeated text is answered from the shared record, not sent again");
+  assert.deepEqual(await intake.deliverLocal("i1", "Another thing?"), { ok: true });
+  assert.deepEqual(daemon.sent.map((entry) => entry.message), ["Any news?", "Another thing?"]);
+});
+
+// TUC-1258 AC-5/AC-19: the retry of a queued activation whose own answer was lost is answered from
+// the checked path's record. It sends nothing again, and it cannot land on the question the agent
+// asks in the meantime.
+test("a queued activation whose answer was lost is retried without a second send, and never answers a newer question", async (t) => {
+  const home = await withHome(t);
+  const daemon = fakeDaemon([{ id: "legacy", issueId: "i1", status: "running" }]);
+  const replies = new PermissionReplies({ directory: home, daemon: async () => null });
+  let now = Date.parse("2026-01-01T00:00:00Z");
+  let lost = true;
+  const intake = new ActivationIntake({
+    settings: { read: async () => settingsFor() }, home, host: "server087", log: () => {}, now: () => now,
+    paseo: () => daemon.paseo,
+    linear: () => null, starter: () => null, launcher: () => null,
+    replies,
+    deliver: async (paseo, agentId, text, origin, given) => {
+      const result = await given.deliver(paseo, agentId, text, origin);
+      // The message went out; the answer to this activation was lost (a crash between the send and
+      // the queue's record). The sweep retries the same envelope.
+      if (lost) { lost = false; throw new Error("the answer to this delivery was lost"); }
+      return result;
+    },
+  });
+  assert.equal((await intake.accept({ id: "reply:s1:hello", kind: "reply", issueId: "i1", identifier: "TUC-1", sessionId: "s1", text: "Any update?", host: "mac", requestedAt: "2026-01-01T00:00:00Z" })).status, 202);
+  await intake.idle();
+  assert.deepEqual(daemon.sent, [{ agentId: "legacy", message: "Any update?" }], "the message went out once");
+  assert.equal((await intake.status()).pending, 1, "the lost answer kept the activation queued");
+
+  // The agent can now be waiting for a newer question; the retry must not answer it.
+  daemon.agents[0].pendingPermissions = [{ id: "q2", kind: "question", title: "Which one?", description: "A or B?", options: [{ label: "A" }, { label: "B" }] }];
+  now += 60 * 60 * 1000;
+  await intake.retry();
+  assert.deepEqual(daemon.sent, [{ agentId: "legacy", message: "Any update?" }], "the retry sent nothing again");
+  assert.deepEqual(daemon.answers, [], "the retry answered no question, the newer one included");
+  const status = await intake.status();
+  assert.deepEqual({ pending: status.pending, done: status.done }, { pending: 0, done: 1 }, "the retry settled the delivered activation");
+});
+
+// TUC-1258 AC-5/AC-13: a delivery Paseo refuses is reported to the sender, is never submitted
+// again (the same receipt reports the same outcome), leaves no receipt behind, and keeps the
+// activation queued instead of reaching the agent with anything later.
+test("a refused delivery is reported, never submitted twice, and leaves the activation queued", async (t) => {
+  const home = await withHome(t);
+  const daemon = fakeDaemon([{ id: "legacy", issueId: "i1", status: "running" }]);
+  daemon.agents[0].pendingPermissions = [{ id: "q1", provider: "omp", name: "ask", kind: "question", title: "Test runner", input: { questions: [{ header: "Runner", question: "Which runner?", options: [{ label: "node:test" }, { label: "vitest" }] }] } }];
+  const submitted: string[] = [];
+  const replies = new PermissionReplies({ directory: home, daemon: async () => ({ respondToPermissionAndWait: async (_agentId: string, requestId: string) => { submitted.push(requestId); throw new Error(`No pending permission request with id '${requestId}'`); } }) });
+  const intake = new ActivationIntake({
+    settings: { read: async () => settingsFor() }, home, host: "server087", log: () => {},
+    paseo: () => daemon.paseo,
+    linear: () => null, starter: () => null, launcher: () => null,
+    replies,
+  });
+  const first = await intake.deliverLocal("i1", "Use node:test.", "session:s2");
+  assert.equal(first.ok, false, "the daemon's refusal is reported to the sender");
+  assert.deepEqual(await intake.deliverLocal("i1", "Use node:test.", "session:s2"), first, "the same receipt reports the same outcome");
+  assert.deepEqual(submitted, ["q1"], "one submission, never a retry");
+  assert.deepEqual(daemon.answers, [], "a host with a checked connection does not fall back to the untagged response");
+
+  assert.equal((await intake.accept({ id: "reply:s1:hello", kind: "reply", issueId: "i1", identifier: "TUC-1", sessionId: "s1", text: "Any update?", host: "mac", requestedAt: "2026-01-01T00:00:00Z" })).status, 202);
+  await intake.idle();
+  assert.equal(submitted.length, 2, "the queued activation tried once, and only once");
+  const pending = JSON.parse(await readFile(join(home, "activation-pending.json"), "utf8")) as { entries: Record<string, { state: string }> };
+  assert.equal(pending.entries["reply:s1:hello"].state, "pending", "a refused message keeps the activation queued");
+  const claims = JSON.parse(await readFile(join(home, "activation-claims.json"), "utf8").catch(() => "{\"receipts\":{}}")) as { receipts?: Record<string, string> };
+  assert.deepEqual(claims.receipts ?? {}, {}, "a refused delivery leaves no receipt");
+});
+
+// TUC-1258 AC-5 (owner-approved addition): the draining host delivers a peer's message for a
+// ticket its own allowlisted agent still owns through the same shared ledger, so a receipt that
+// could not be written is covered by the record: the agent gets the message once, and what the
+// host keeps (its allowlist) is not touched by a delivery.
+test("the draining host's delivery survives a lost receipt through the shared ledger, without changing what it keeps", async (t) => {
+  const home = await withHome(t);
+  await writeFile(join(home, SEED_FILE), JSON.stringify({ agents: [{ agentId: "legacy", issueId: "i1", identifier: "TUC-1" }] }));
+  const daemon = fakeDaemon([{ id: "legacy", issueId: "i1", status: "running" }]);
+  const { request } = fakeRequest();
+  const replies = new PermissionReplies({ directory: home, daemon: async () => null });
+  const drain = new DrainRouter({
+    settings: { read: async () => settingsFor({ mode: "remote", peer: PEER }) }, paseo: () => daemon.paseo, request, home, host: "mac", log: () => {},
+    ghosts: async () => new Set<string>(),
+    replies,
+  });
+  await drain.readyNow();
+  const allowlistPath = join(home, "activation-allowlist.json");
+  const before = JSON.parse(await readFile(allowlistPath, "utf8")) as { seed: string; seedSource: string; agents: Record<string, { issueId: string; identifier: string }> };
+  assert.deepEqual(before.agents, { legacy: { issueId: "i1", identifier: "TUC-1" } });
+
+  // The message goes out, the receipt cannot be written -- the crash window the peer's retry covers.
+  await rm(allowlistPath);
+  await mkdir(allowlistPath, { recursive: true });
+  await assert.rejects(drain.deliver("i1", "Any news?", "session:s2"));
+  await rm(allowlistPath, { recursive: true });
+
+  assert.deepEqual(await drain.deliver("i1", "Any news?", "session:s2"), { ok: true }, "the retry is answered from the shared record");
+  assert.deepEqual(daemon.sent, [{ agentId: "legacy", message: "Any news?" }], "the agent got the message exactly once");
+  const after = JSON.parse(await readFile(allowlistPath, "utf8")) as { seed: string; seedSource: string; agents: Record<string, { issueId: string; identifier: string }>; receipts?: Record<string, string> };
+  assert.deepEqual(after.agents, before.agents, "a delivery does not change the agents this host keeps");
+  assert.deepEqual([after.seed, after.seedSource], [before.seed, before.seedSource]);
+  assert.deepEqual(Object.keys(after.receipts ?? {}), ["session:s2"]);
 });
 
 test("the intake defers this host's own new session for a claimed ticket, and never consults the peer for the rest", async (t) => {

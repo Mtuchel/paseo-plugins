@@ -2,8 +2,8 @@ import { asCaller } from "./linear-usage";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { PaseoAgent, PaseoAgentHandle, PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
@@ -18,9 +18,10 @@ import type { Handover } from "./handover";
 import type { IssueGroup, LinearService } from "./linear";
 import type { Launcher } from "./launch";
 import { CODING_STATE } from "./plannotator";
-import { closeAnswered, type NeedsYouIssues } from "./needs-you";
+import type { NeedsYouIssues } from "./needs-you";
 import { overrideCommand, type Correction, type CorrectionActivity, type Deputy } from "./deputy";
 import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, questionAnswer, questionsOf } from "./relay";
+import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./permission-replies";
 import type { PluginSettings, Settings } from "./settings";
 import { issueAgents, type TicketStarter } from "./starter";
 import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
@@ -141,7 +142,7 @@ export type SessionLink = {
   // "Deputy for agent questions"). Null for a reply that named no author.
   pendingFrom?: { activityId: string; userId: string } | null;
   // A question with several parts, asked one part at a time.
-  questions?: { requestId: string; index: number; answers: Record<string, string> } | null;
+  questions?: { requestId: string; request?: AgentPermissionRequest; index: number; answers: Record<string, string> } | null;
   // Replaced by a newer thread on the same ticket (every @mention opens one); told so and completed.
   // Also a thread that ended without an agent on purpose: refused (not the owner's), or completed
   // in Linear while it waited.
@@ -179,7 +180,7 @@ export class SessionStore {
   private loading: Promise<Record<string, SessionLink>> | null = null;
   private queue: Promise<unknown> = Promise.resolve();
 
-  constructor(private readonly path = join(agentAppDirectory(), "sessions.json")) {}
+  constructor(readonly path = join(agentAppDirectory(), "sessions.json")) {}
 
   // One shared read: two concurrent first loads would each replace the map and drop the other's writes.
   private load(): Promise<Record<string, SessionLink>> {
@@ -342,6 +343,7 @@ type Deps = {
   route?: ActivationSink;
   settings: Pick<Settings, "read">;
   store: SessionStore;
+  replies?: PermissionReplies;
   stop?: (agentId: string) => Promise<void>;
   decideReview?: (localUrl: string, approve: boolean, feedback: string, agentId: string) => Promise<void>;
   splitPlan?: (link: SessionLink, localUrl: string, paseo: PaseoApi) => Promise<string>;
@@ -404,14 +406,23 @@ export class SessionRouter {
   // Reads webhooks started (`receive` is fire-and-forget), awaited by `settled`.
   private readonly inflightReads = new Set<Promise<unknown>>();
 
-  // The deputy for agent questions (README, "Deputy for agent questions"): overrides of its answers
-  // are routed before pending questions, and the owner's answers here are recorded for it.
-  private deputy: Pick<Deputy, "byRef" | "correct" | "ownerAnswered"> | null = null;
+  // Explicit overrides retain their existing path; confirmed answer evidence is owned by replies.
+  private deputy: Pick<Deputy, "byRef" | "correct"> | null = null;
+  private readonly replies: PermissionReplies;
 
-  constructor(private readonly deps: Deps) {}
+  constructor(private readonly deps: Deps) {
+    this.replies = deps.replies ?? new PermissionReplies({ directory: dirname(deps.store.path), daemon: async () => null });
+  }
 
-  recordDeputy(deputy: Pick<Deputy, "byRef" | "correct" | "ownerAnswered">): void {
+  recordDeputy(deputy: Pick<Deputy, "byRef" | "correct">): void {
     this.deputy = deputy;
+  }
+
+  // Restored multipart answers veto the deputy before its startup recovery or dispatch.
+  async seedHolds(): Promise<void> {
+    for (const link of await this.deps.store.all()) {
+      if (link.agentId && link.questions && !link.closed) this.replies.holdForOwner(link.agentId, link.questions.requestId);
+    }
   }
 
   attach(paseo: PaseoApi): void {
@@ -459,6 +470,7 @@ export class SessionRouter {
         return String(event.agentSession.issueId ?? issue.id ?? "") !== issueId;
       });
       await this.deps.store.removeIssue(issueId);
+      for (const link of links) this.releaseQuestions(link);
       this.lastAutoResume.delete(issueId);
       if (failures.length) throw new Error(failures.join("; "));
     });
@@ -529,14 +541,30 @@ export class SessionRouter {
       : { delivered: false, reply: `${command.ref} is not an answer the deputy gave on this host, so nothing was passed on.` };
   }
 
-  // The owner's text from a thread for a running agent: answers its pending question (recorded
-  // as the owner's answer for the deputy) or decides a pending approval, else it is a message.
-  private async passOn(agentId: string, text: string, activity: Omit<CorrectionActivity, "via">): Promise<void> {
-    const answered = await deliverToAgent(this.paseo!, agentId, text);
-    if (answered) {
-      await this.deputy?.ownerAnswered(agentId, answered.request, answered.response, { via: "linear-session", ...activity }, answered.at)
-        .catch((error: unknown) => console.error(`[linear-tickets] recording the owner's answer for agent ${agentId} failed: ${error instanceof Error ? error.message : error}`));
-    }
+  private origin(link: Pick<SessionLink, "sessionId" | "issueId">, text: string, activity?: Omit<CorrectionActivity, "via"> | null): DeliveryOrigin {
+    const ref = activity?.activityId
+      ? `session:${activity.activityId}`
+      : `queued:${link.sessionId}:${createHash("sha256").update(text).digest("hex")}`;
+    return {
+      ref,
+      issueId: link.issueId,
+      responder: activity?.userId.trim()
+        ? { kind: "owner", via: "linear-session", activityId: activity.activityId || ref, userId: activity.userId }
+        : { kind: "linear-unverified", via: "linear-session", ref },
+    };
+  }
+
+  // Routing and replay protection are shared with comments and forwarded replies.
+  private passOn(agentId: string, text: string, origin: DeliveryOrigin): Promise<DeliveryResult> {
+    return deliverToAgent(this.paseo!, agentId, text, origin, this.replies);
+  }
+
+  private async deliveryReply(sessionId: string, result: DeliveryResult): Promise<void> {
+    if (result.reply) await this.say(sessionId, result.delivered ? "response" : "error", result.reply);
+  }
+
+  private releaseQuestions(link: SessionLink): void {
+    if (link.agentId && link.questions) this.replies.releaseOwner(link.agentId, link.questions.requestId);
   }
 
   private async activeAgentFor(issueId: string): Promise<{ id: string; title: string | null } | null> {
@@ -594,7 +622,7 @@ export class SessionRouter {
     const comment = (session.comment ?? {}) as { body?: string };
     const text = typeof comment.body === "string" && !/^This thread is for an agent session/.test(comment.body) ? comment.body.replace(/@paseo\b/gi, "").trim() : "";
     // The thread's creator was checked as the owner above.
-    const from = { activityId: `session:${session.id}`, userId: owner };
+    const from = { activityId: session.id, userId: owner };
     // A correction of a deputy answer starts nothing and answers nothing: the thread only
     // reports where it went.
     const corrected = text ? await this.override(text, { via: "linear-session", ...from }) : null;
@@ -626,8 +654,7 @@ export class SessionRouter {
         await this.deps.store.put({ ...link, agentId: existing.id });
         await this.linkToPaseo(session.id, existing.id);
         // Same as a relayed comment: answers a pending question or decides a pending approval.
-        if (text) await this.passOn(existing.id, text, from);
-        if (text && asked) await closeAnswered(this.deps.needsYou!, this.deps.linear, issueId);
+        if (text) await this.deliveryReply(session.id, await this.passOn(existing.id, text, this.origin(link, text, from)));
         await this.say(session.id, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.${text ? " Your message was passed on." : ""}`);
         await this.closeSuperseded();
         return;
@@ -673,6 +700,7 @@ export class SessionRouter {
     for (const { link, current } of superseded) {
       await this.clearReview(link.sessionId);
       await this.deps.store.patch(link.sessionId, { closed: true, offer: null, questions: null, queued: false, queueReason: undefined, restartRequested: undefined });
+      this.releaseQuestions(link);
       if (!open.has(link.sessionId)) continue;
       const title = current.agentId ? (await this.paseo?.agents.ref(current.agentId).refresh().catch(() => null))?.agent.title : null;
       await this.say(link.sessionId, "response", `Continued in the newest Paseo thread on this ticket${title ? ` (agent “${title}”)` : ""}. Follow and reply there; this thread is closed.`).catch(() => {});
@@ -721,7 +749,8 @@ export class SessionRouter {
     await this.deps.linear.addLabel(link.issueId, running).catch(() => {});
     try {
       const started = await this.deps.starter.start(link.issueId, this.paseo!, settings, { labels: { "linear.sessionId": link.sessionId }, retryHint: "assign Paseo again", fresh, ...(link.pendingText ? { lead: link.pendingText } : {}) });
-      await this.deps.store.patch(link.sessionId, { agentId: started.agentId, offer: null, queued: false, queueReason: undefined, restartRequested: undefined, pendingText: null });
+      await this.deps.store.patch(link.sessionId, { agentId: started.agentId, offer: null, questions: null, queued: false, queueReason: undefined, restartRequested: undefined, pendingText: null });
+      this.releaseQuestions(link);
       // The stopped agent is closed only after the session points at its successor, so its
       // archive does not offer another resume. Its worktree stays for the new agent.
       if (link.agentId && link.agentId !== started.agentId) await this.paseo!.agents.ref(link.agentId).archive().catch(() => {});
@@ -750,9 +779,14 @@ export class SessionRouter {
     let link = await this.deps.store.get(sessionId);
     if (!link) { await this.say(sessionId, "error", "No Paseo agent is linked to this session. Assign Paseo to the ticket again."); return; }
     if (await this.deps.deletions?.blocked(link.issueId)) return;
-    if (activityId && !await this.deps.store.claim(sessionId, activityId)) return;
+    const claimed = !activityId || await this.deps.store.claim(sessionId, activityId);
     const userId = typeof activity.userId === "string" ? activity.userId : String(((activity.user ?? {}) as { id?: string }).id ?? "");
     if (userId && userId !== await this.owner()) { await this.say(sessionId, "error", "Only the workspace owner can steer Paseo agents."); return; }
+    // A durable delivery outranks the short handled window and current multipart question.
+    // Also finish effects of an already-claimed activity whose process died after the ack.
+    const recorded = activityId ? await this.replies.recorded(`session:${activityId}`) : null;
+    if (recorded) { await this.deliveryReply(sessionId, recorded); return; }
+    if (!claimed) return;
     // The ticket lock orders owner cancellation against a due start. Re-read after waiting:
     // a start that won the lock may have replaced the agent this reply originally named.
     const issueId = link.issueId;
@@ -791,12 +825,13 @@ export class SessionRouter {
       await this.say(sessionId, corrected.delivered ? "response" : "error", corrected.reply);
       return;
     }
-    if (body && this.deps.route) {
+    // Multipart progress belongs to its captured local request, not a peer's current question.
+    if (body && this.deps.route && !link.questions) {
       const routed = await this.deps.route.take({ kind: "reply", issueId: link.issueId, identifier: link.identifier, sessionId, ...(activityId ? { activityId } : {}), text: body });
       if (routed && "held" in routed) {
         // Nothing was started or sent anywhere; the answer stays with the thread and the sweep
         // tries again (the owner sees why here).
-        await this.deps.store.patch(sessionId, { queued: true, queueReason: routed.held, pendingText: body, pendingFrom: userId ? { activityId: activityId || `session:${sessionId}`, userId } : null });
+        await this.deps.store.patch(sessionId, { queued: true, queueReason: routed.held, pendingText: body, pendingFrom: userId ? { activityId, userId } : null });
         await this.say(sessionId, "thought", `Not passed on yet: ${routed.held}. Your message stays queued here.`);
         return;
       }
@@ -849,40 +884,64 @@ export class SessionRouter {
     }
     this.held.delete(link.agentId);
     const pending = (await handle.refresh())?.agent.pendingPermissions ?? [];
-    const question = pending.find((request) => request.kind === "question");
+    const progress = link.questions;
+    const question = pending.find((request) => request.kind === "question" && request.id === progress?.requestId)
+      ?? pending.find((request) => request.kind === "question");
     const approval = pending.find((request) => request.kind !== "question");
+    const origin = this.origin(link, body, { activityId, userId });
+    if (progress && progress.requestId !== question?.id) {
+      // Finish only the captured question. A newer request must never consume these old parts.
+      const request = progress.request;
+      const answers = { ...progress.answers };
+      const next = request ? answerableQuestions(request).find(({ key }) => answers[key] === undefined) : null;
+      if (next) answers[next.key] = matchOption(next.question, body);
+      const text = [...Object.entries(answers).map(([key, answer]) => `${key}: ${answer}`), ...(!next && body ? [body] : [])].join("\n");
+      const delivery = this.replies.deliver(this.paseo!, link.agentId, text, origin, {
+        requestId: progress.requestId,
+        ...(request ? { request, response: questionAnswer(request, "", answers) } : {}),
+      });
+      // deliver has synchronously admitted the owner before this multipart veto is released.
+      this.releaseQuestions(link);
+      const result = await delivery;
+      await this.deps.store.patch(sessionId, { questions: null });
+      await this.deliveryReply(sessionId, result);
+      if (question) await this.askQuestion(sessionId, question);
+      return;
+    }
     if (question) {
-      const parts = answerableQuestions(question);
-      const progress = link.questions?.requestId === question.id ? link.questions : null;
+      const request = progress?.request ?? question;
+      const parts = answerableQuestions(request);
       const answers = { ...(progress?.answers ?? {}) };
       const next = parts.find(({ key }) => answers[key] === undefined);
       if (next) answers[next.key] = matchOption(next.question, body);
       const answered = parts.filter(({ key }) => answers[key] !== undefined).length;
       if (answered < parts.length) {
-        await this.deps.store.patch(sessionId, { questions: { requestId: question.id, index: answered, answers } });
-        const prompt = questionPrompt(question, answered);
+        this.replies.holdForOwner(link.agentId, request.id);
+        await this.deps.store.patch(sessionId, { questions: { requestId: request.id, request, index: answered, answers } });
+        const prompt = questionPrompt(request, answered);
         await this.ask(sessionId, prompt.body, prompt.options);
         return;
       }
+      const response = questionAnswer(request, "", answers);
+      const text = Object.entries(answers).map(([key, answer]) => `${key}: ${answer}`).join("\n") || body;
+      const delivery = this.replies.deliver(this.paseo!, link.agentId, text, origin, { requestId: request.id, request, response });
+      this.releaseQuestions(link);
+      const result = await delivery;
       await this.deps.store.patch(sessionId, { questions: null });
-      const response = questionAnswer(question, "", answers);
-      const at = new Date().toISOString();
-      await handle.respondToPermission({ requestId: question.id, response });
-      await this.deputy?.ownerAnswered(link.agentId, question, response, { via: "linear-session", activityId, userId }, at)
-        .catch((error: unknown) => console.error(`[linear-tickets] recording the owner's answer in session ${sessionId} failed: ${error instanceof Error ? error.message : error}`));
+      await this.deliveryReply(sessionId, result);
       return;
     }
     if (approval) {
       const decision = approvalDecision(body);
       if (!decision) { await this.say(sessionId, "error", `The agent is waiting for approval of “${approval.title || approval.name}”. Choose Approve or Deny.`); return; }
-      await handle.respondToPermission({ requestId: approval.id, response: decision });
+      await this.deliveryReply(sessionId, await this.passOn(link.agentId, body, origin));
       // Parallel tool calls wait on several approvals; Linear shows only the newest question, so the next one is asked again.
       const next = pending.find((request) => request.kind !== "question" && request.id !== approval.id);
       if (next) await this.ask(sessionId, `Approve this action?\n\n${[next.title || next.name, next.description].filter(Boolean).join("\n\n")}`, [{ label: "Approve", value: "approve" }, { label: "Deny", value: "deny" }]);
       return;
     }
     if (!body) return;
-    await handle.send(body);
+    await this.deliveryReply(sessionId, await this.passOn(link.agentId, body, origin));
   }
 
   // Whether a start or crash recovery under way (the ticket's turn, see exclusive) or the ticket's
@@ -959,17 +1018,20 @@ export class SessionRouter {
         return;
       }
       if (existing) {
-        // A failed send is retried before the thread names the agent. Refresh first: retirement
-        // between the directory read and dispatch must not lazily resurrect a dead agent.
+        // A caller's failed store patch replays its activity, never the send. Refresh first:
+        // retirement between the directory read and dispatch must not resurrect a dead agent.
         const text = link.pendingText;
-        const needsYou = this.deps.needsYou;
         if (text) {
           const found = await this.agent(existing.id);
           if (!found || found.agent.status === "closed" || crashedProcess(found.agent)) return;
-          // Counted as the owner's answer only with a verified author.
-          if (link.pendingFrom) await this.passOn(existing.id, text, link.pendingFrom);
-          else await deliverToAgent(this.paseo!, existing.id, text);
-          if (needsYou && (await needsYou.all()).some((entry) => entry.id === link.issueId && entry.agentId === existing.id)) await closeAnswered(needsYou, this.deps.linear, link.issueId);
+          // Only stored, verified authors may be attributed; legacy text keeps a stable hash ref.
+          const from = link.pendingFrom?.userId.trim() ? link.pendingFrom : null;
+          try {
+            await this.deliveryReply(link.sessionId, await this.passOn(existing.id, text, this.origin(link, text, from)));
+          } catch (error) {
+            await this.say(link.sessionId, "error", error instanceof Error ? error.message : "Your message could not be delivered.");
+            throw error;
+          }
         }
         await this.deps.store.patch(link.sessionId, { agentId: existing.id, queued: false, queueReason: undefined, restartRequested: undefined, pendingText: null, ...(link.offer === "resume" ? { offer: null } : {}) });
         await this.linkToPaseo(link.sessionId, existing.id);
@@ -1422,8 +1484,9 @@ export class SessionRouter {
 
   // First part of a pending question (later parts follow each answer).
   async askQuestion(sessionId: string, request: AgentPermissionRequest): Promise<void> {
-    await this.deps.store.patch(sessionId, { questions: null });
-    const prompt = questionPrompt(request, 0);
+    const progress = (await this.deps.store.get(sessionId))?.questions;
+    if (progress && progress.requestId !== request.id) return;
+    const prompt = questionPrompt(progress?.request ?? request, progress?.index ?? 0);
     await this.ask(sessionId, prompt.body, prompt.options);
   }
 
@@ -2149,7 +2212,8 @@ export class SessionRouter {
     if (!link) return false;
     if (await this.deps.deletions?.blocked(link.issueId)) return false;
     await this.clearReview(link.sessionId);
-    await this.deps.store.patch(link.sessionId, { agentId: null, queued: true, queueReason: undefined, restartRequested: true, offer: null });
+    await this.deps.store.patch(link.sessionId, { agentId: null, questions: null, queued: true, queueReason: undefined, restartRequested: true, offer: null });
+    this.releaseQuestions(link);
     await this.say(link.sessionId, "thought", note);
     return true;
   }

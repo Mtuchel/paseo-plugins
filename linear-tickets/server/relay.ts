@@ -7,9 +7,10 @@ import { filedIssues, pluginComments, postedComments } from "./agent-records";
 import type { LinearService, RelayComment } from "./linear";
 import type { ActivationSink, ActivationTake } from "./activation";
 import { overrideCommand, type Deputy } from "./deputy";
-import { closeAnswered, type NeedsYouIssues } from "./needs-you";
+import type { NeedsYouIssues } from "./needs-you";
 import { RateLimitedError } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
+import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./permission-replies";
 
 // A comment addressed to the agent: "@paseo" first, then the message. Linear may render the
 // mention as a link, so a markdown-wrapped "[@paseo](…)" counts too.
@@ -150,17 +151,17 @@ export class CommentRelay {
   // The plugin's state directory, where the cursor file and the agents' records live.
   private readonly directory: string;
   // The deputy for agent questions (README, "Deputy for agent questions"): corrections of its
-  // answers are routed before anything else, and the owner's answers are recorded for it.
-  private deputy: Pick<Deputy, "byRef" | "noticeFor" | "correct" | "ownerAnswered"> | null = null;
+  // answers are routed before anything else. Evidence is recorded by the shared reply ledger.
+  private deputy: Pick<Deputy, "byRef" | "noticeFor" | "correct"> | null = null;
 
   // `needsYou`: the open "Needs you" sub-issues, whose replies go to the agent that asked.
   // `route`: activation routing, so a comment for a ticket this host no longer owns goes to the
   // host that owns it instead of being delivered (or reported ❌) here.
-  constructor(private readonly linear: Linear, private readonly path = join(paseoHome(), "linear-tickets", "relay-cursors.json"), private readonly needsYou?: NeedsYouIssues, private readonly route?: ActivationSink) {
+  constructor(private readonly linear: Linear, private readonly path = join(paseoHome(), "linear-tickets", "relay-cursors.json"), private readonly needsYou?: NeedsYouIssues, private readonly route?: ActivationSink, private readonly replies = new PermissionReplies({ directory: dirname(path), daemon: async () => null })) {
     this.directory = dirname(path);
   }
 
-  recordDeputy(deputy: Pick<Deputy, "byRef" | "noticeFor" | "correct" | "ownerAnswered">): void {
+  recordDeputy(deputy: Pick<Deputy, "byRef" | "noticeFor" | "correct">): void {
     this.deputy = deputy;
   }
 
@@ -200,9 +201,8 @@ export class CommentRelay {
           const route = handled || correction ? null : routeComment(watch, comment, plain, appId);
           if (correction) state.acks.push({ commentId: comment.id, issueId: watch.issueId, reacted: false, ...correction });
           if (route) {
-            const outcome = await this.deliver(paseo, route.reader.agent, comment, route.message);
+            const outcome = await this.deliver(paseo, route.reader.agent, comment, route.message, watch.issueId);
             state.acks.push({ commentId: comment.id, issueId: watch.issueId, reacted: false, ...outcome });
-            if (route.reader.kind === "needs-you" && outcome.emoji === ACK_EMOJI && this.needsYou) await closeAnswered(this.needsYou, this.linear, watch.issueId);
           }
           if (comment.createdAt === cursor.since) cursor.boundaryIds.push(comment.id);
           else Object.assign(cursor, { since: comment.createdAt, boundaryIds: [comment.id] });
@@ -329,7 +329,7 @@ export class CommentRelay {
   }
 
   // Hands the comment to the agent; the outcome is the reaction (and, on failure, the reply) to queue.
-  private async deliver(paseo: PaseoApi, agent: LinkedAgent, comment: RelayComment, message: string): Promise<{ emoji: string; reply: string | null }> {
+  private async deliver(paseo: PaseoApi, agent: LinkedAgent, comment: RelayComment, message: string, issueId: string): Promise<{ emoji: string; reply: string | null }> {
     if (this.route) {
       // The comment id is the dedupe id, so a relay retried after a reload reaches the agent once.
       // A root this host no longer owns does not take the comment here: it goes to the host that
@@ -346,10 +346,8 @@ export class CommentRelay {
       if (routed) return { emoji: ACK_EMOJI, reply: `Passed to the agent working on ${agent.identifier} on ${routed.peer}.` };
     }
     try {
-      const answered = await deliverToAgent(paseo, agent.id, message);
-      // Written with the owner's key (only those comments are delivered): the owner's own answer.
-      if (answered) await this.deputy?.ownerAnswered(agent.id, answered.request, answered.response, { via: "linear-comment", activityId: comment.id, userId: comment.userId }, answered.at).catch((error: unknown) => console.error(`[linear-tickets] recording the owner's answer from comment ${comment.id} failed: ${error instanceof Error ? error.message : error}`));
-      return { emoji: ACK_EMOJI, reply: null };
+      const result = await deliverToAgent(paseo, agent.id, message, { ref: `comment:${comment.id}`, responder: { kind: "owner", via: "linear-comment", activityId: comment.id, userId: comment.userId }, issueId }, this.replies);
+      return { emoji: ACK_EMOJI, reply: result.reply };
     } catch (error) {
       const reason = error instanceof Error ? error.message : "unknown error";
       console.error(`[linear-tickets] relaying comment ${comment.id} to agent ${agent.id} failed: ${reason}`);
@@ -358,31 +356,10 @@ export class CommentRelay {
   }
 }
 
-// A message from Linear for a running agent: the answer to its pending question, an approve/deny
-// decision for a pending approval, or otherwise a new message. Throws the reason, for the person
-// who wrote it, when the message cannot be used. Returns the question it answered, if any, with
-// the time just before the answer was submitted.
-export async function deliverToAgent(paseo: PaseoApi, agentId: string, message: string): Promise<{ request: AgentPermissionRequest; response: AgentPermissionResponse; at: string } | null> {
-  const handle = paseo.agents.ref(agentId);
-  const refreshed = await handle.refresh();
-  const pending = refreshed?.agent.pendingPermissions ?? [];
-  const question = pending.find((request) => request.kind === "question");
-  const approval = pending.find((request) => request.kind !== "question");
-  const decision = approval ? approvalDecision(message) : null;
-  if (question) {
-    if (!message) throw new Error("The agent is waiting for an answer; write it after @paseo.");
-    const response = questionAnswer(question, message);
-    const at = new Date().toISOString();
-    await handle.respondToPermission({ requestId: question.id, response });
-    return { request: question, response, at };
-  }
-  if (approval && decision) {
-    await handle.respondToPermission({ requestId: approval.id, response: decision });
-  } else if (approval) {
-    throw new Error(`The agent is waiting for approval of "${approval.title || approval.name}". Reply "@paseo approve" or "@paseo deny <reason>".`);
-  } else {
-    if (!message) throw new Error("Write the message after @paseo.");
-    await handle.send(message);
-  }
-  return null;
+// Every caller supplies a stable Linear activity and this host's shared reply ledger. Replays
+// finish only post-send effects; they never refresh or route into a newer question.
+export async function deliverToAgent(paseo: PaseoApi, agentId: string, message: string, origin: DeliveryOrigin, replies: PermissionReplies): Promise<DeliveryResult> {
+  const result = await replies.deliver(paseo, agentId, message, origin);
+  if (!result.delivered) throw new Error(result.reply ?? "The message was not delivered.");
+  return result;
 }
