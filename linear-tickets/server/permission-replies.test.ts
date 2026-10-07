@@ -81,15 +81,17 @@ test("simultaneous activity replays route Q1 once and never send into Q2, includ
   assert.equal((await stat(join(h.directory, "permission-replies.json"))).mode & 0o777, 0o600);
 });
 
-test("an owner starting during deputy's final pause vetoes the unsent deputy, durably", async (t) => {
+test("an unbound owner starting during deputy's final pause vetoes the unsent deputy, durably", async (t) => {
   const paused = barrier(), resume = barrier();
   const h = await harness(t, { beforeSubmit: async (record) => { if (record.responder.kind === "deputy") { paused.release(); await resume.promise; } } });
   const deputy = h.replies.respond(h.intent("d1"));
   await paused.promise;
-  const answer = h.replies.deliver(h.sdk, "a", "Vitest", owner("comment:owner"), { requestId: q.id, request: q, response: questionAnswer(q, "Vitest") });
+  const answer = h.replies.deliver(h.sdk, "a", "Vitest", owner("comment:owner"));
+  const duplicate = h.replies.deliver(h.sdk, "a", "Vitest", owner("comment:owner"));
   resume.release();
   assert.equal(await deputy, "owner-first");
   assert.equal((await answer).status, "applied");
+  assert.equal((await duplicate).status, "applied");
   assert.deepEqual(h.sent.map((item) => item.response), [questionAnswer(q, "Vitest")]);
   assert.equal(await h.replies.respond(h.intent("d1")), "owner-first");
   assert.equal(await h.create().outcome("d1"), "owner-first");
@@ -273,4 +275,34 @@ test("overlapping failed owners release all counters so a later deputy can send"
   assert.equal(records["comment:a"].status, "rejected");
   h.fail(null);
   assert.equal(await h.replies.respond(h.intent("later")), "applied");
+});
+
+test("admission of an old replay does not veto a deputy answering a newer request", async (t) => {
+  const paused = barrier(), resume = barrier();
+  const h = await harness(t, { beforeSubmit: async record => { if (record.responder.kind === "deputy") { paused.release(); await resume.promise; } } });
+  await h.replies.deliver(h.sdk, "a", "Node", owner("comment:old"));
+  const newer = { ...q, id: "q2" };
+  h.pending([newer]);
+  const deputy = h.replies.respond({ ...h.intent("new"), requestId: newer.id, fingerprint: fingerprint(newer) });
+  await paused.promise;
+  const replay = h.replies.deliver(h.sdk, "a", "obsolete", owner("comment:old"));
+  resume.release();
+  assert.equal((await replay).status, "applied");
+  assert.equal(await deputy, "applied");
+  assert.deepEqual(h.sent.map(entry => entry.requestId), ["q1", "q2"]);
+});
+
+test("restart recovers unfinished confirmed effects without a caller replay or new submission", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = await harness(t);
+  h.replies.recordEffects({ ...h.effects, ownerAnswered: async () => { throw new Error("evidence offline"); }, needsYou: async () => { throw new Error("Linear offline"); } });
+  await h.replies.deliver(h.sdk, "a", "Node", owner("session:claimed"));
+  const at = (await h.replies.records())["session:claimed"].at;
+  h.pending([{ ...q, id: "q2" }]);
+  const restarted = h.create();
+  await restarted.recoverEffects();
+  await restarted.recoverEffects();
+  assert.deepEqual(h.evidence, [{ request: q, response, at }]);
+  assert.deepEqual(h.needsYou, ["i1"]);
+  assert.deepEqual(h.sent.map(entry => entry.requestId), ["q1"]);
 });

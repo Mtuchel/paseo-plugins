@@ -779,9 +779,14 @@ export class SessionRouter {
     let link = await this.deps.store.get(sessionId);
     if (!link) { await this.say(sessionId, "error", "No Paseo agent is linked to this session. Assign Paseo to the ticket again."); return; }
     if (await this.deps.deletions?.blocked(link.issueId)) return;
-    if (activityId && !await this.deps.store.claim(sessionId, activityId)) return;
+    const claimed = !activityId || await this.deps.store.claim(sessionId, activityId);
     const userId = typeof activity.userId === "string" ? activity.userId : String(((activity.user ?? {}) as { id?: string }).id ?? "");
     if (userId && userId !== await this.owner()) { await this.say(sessionId, "error", "Only the workspace owner can steer Paseo agents."); return; }
+    // A durable delivery outranks the short handled window and current multipart question.
+    // Also finish effects of an already-claimed activity whose process died after the ack.
+    const recorded = activityId ? await this.replies.recorded(`session:${activityId}`) : null;
+    if (recorded) { await this.deliveryReply(sessionId, recorded); return; }
+    if (!claimed) return;
     // The ticket lock orders owner cancellation against a due start. Re-read after waiting:
     // a start that won the lock may have replaced the agent this reply originally named.
     const issueId = link.issueId;

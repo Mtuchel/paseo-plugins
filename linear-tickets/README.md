@@ -2466,6 +2466,8 @@ sent again either. The records live in `$PASEO_HOME/linear-tickets/permission-re
 (`0600` in the plugin's `0700` directory) and are kept 30 days. Approvals ("approve" / "deny
 <reason>") and plain messages are covered by the same records for this replay protection; how they
 are sent and who may send them is unchanged.
+After a restart, unfinished evidence and Needs you completion for confirmed deliveries are
+recovered from that record even when the session has already marked the activity handled.
 
 **Without a checked connection.** On a host where the plugin's own connection to the local Paseo
 daemon is missing, your answers are sent as today (fire-and-forget, recorded as unchecked) and are

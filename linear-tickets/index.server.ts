@@ -360,6 +360,7 @@ export default function contribute(server: PluginServerContext) {
       if (stopped) return;
       asCaller("deputy", () => deputy.attach(paseo));
       asCaller("session-sweep", () => sessions.attach(paseo));
+      if (first) asCaller("session-sweep", () => { void replies.recoverEffects().catch((error: unknown) => console.error(`[linear-tickets] recovering permission reply effects failed: ${error instanceof Error ? error.message : error}`)); });
     }).catch((error: unknown) => console.error(`[linear-tickets] restoring owner question holds failed: ${error instanceof Error ? error.message : error}`));
     if (!stopped) {
       asCaller("review-links", () => { void reviewLinks.start(); });

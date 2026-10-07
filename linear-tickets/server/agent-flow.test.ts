@@ -138,6 +138,47 @@ test("a multi-part question collects every answer before answering the agent onc
   await h.cleanup();
 });
 
+test("an old approval or message replay cannot become the first part of a newer multipart answer", async (t) => {
+  for (const kind of ["approval", "message"] as const) {
+    const pending: AgentPermissionRequest[] = kind === "approval" ? [{ id: "tool", provider: "omp", name: "bash", kind: "tool" }] : [];
+    const h = routerHarness(pending, {}, [], true);
+    t.after(h.cleanup);
+    await h.store.put(link);
+    await h.router.prompted("s1", { id: "old", userId: OWNER, body: kind === "approval" ? "approve" : "old text" });
+    pending.splice(0, pending.length, twoPart);
+    // More than the store's bounded handled window: only the durable activity ledger remains.
+    await h.store.patch("s1", { handled: [] });
+    await h.router.prompted("s1", { id: "old", userId: OWNER, body: "old text" });
+    assert.equal((await h.store.get("s1"))?.questions, undefined);
+    await h.router.prompted("s1", { id: "fresh1", userId: OWNER, body: "SFTP" });
+    await h.router.prompted("s1", { id: "fresh2", userId: OWNER, body: "CSV" });
+    assert.deepEqual(h.calls.filter(call => call.startsWith("checked q ")), ['checked q {"behavior":"allow","updatedInput":{"answers":{"transfer":"SFTP","format":"CSV","Comment":""}}}']);
+  }
+});
+
+test("an already-claimed session replay completes confirmed evidence without answering the next question", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const single: AgentPermissionRequest = { id: "old", provider: "omp", name: "ask", kind: "question", input: { questions: [{ header: "Runner", question: "Runner?", options: [{ label: "Node" }] }] } };
+  const pending = [single];
+  const h = routerHarness(pending, {}, [], true);
+  t.after(h.cleanup);
+  let offline = true;
+  const evidence: AgentPermissionRequest[] = [];
+  h.replies.recordEffects({
+    ownerAnswered: async (_agent, request) => { if (offline) throw new Error("offline"); evidence.push(request); },
+    correctLate: async () => ({ delivered: false, reply: "unused" }),
+    needsYou: async () => {},
+  });
+  await h.store.put(link);
+  await h.router.prompted("s1", { id: "claimed", userId: OWNER, body: "Node" });
+  pending.splice(0, pending.length, twoPart);
+  offline = false;
+  await h.router.prompted("s1", { id: "claimed", userId: OWNER, body: "Node" });
+  assert.deepEqual(evidence, [single]);
+  assert.equal((await h.store.get("s1"))?.questions, null);
+  assert.equal(h.calls.filter(call => call.startsWith("checked ")).length, 1);
+});
+
 test("the first multipart part holds the old question before its store write, and final delivery takes over before release", async (t) => {
   const h = routerHarness([twoPart], {}, [], true);
   t.after(h.cleanup);

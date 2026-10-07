@@ -72,6 +72,9 @@ export class PermissionReplies implements PermissionArbiter {
   private storeQueue: Promise<unknown> = Promise.resolve();
   private readonly flights = new Map<string, Promise<ReplyRecord>>();
   private readonly lanes = new Map<string, Promise<unknown>>();
+  // Unbound text must finish replay lookup and request selection before a deputy can pass
+  // its final fence. Waiting for admission (not vetoing on it) avoids an old replay blocking Q2.
+  private readonly admissions = new Map<string, Set<Promise<void>>>();
   private readonly owners = new Map<string, number>();
   private readonly holds = new Set<string>();
   private effects: Effects | null = null;
@@ -134,13 +137,53 @@ export class PermissionReplies implements PermissionArbiter {
     return { ref, agentId, text, responder, issueId, kind: "message", at: new Date(this.now()).toISOString(), status: "reserved", effects: { evidence: false, correction: false, needsYou: false } };
   }
 
+  private admit(agentId: string): () => void {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const admissions = this.admissions.get(agentId) ?? new Set<Promise<void>>();
+    admissions.add(pending);
+    this.admissions.set(agentId, admissions);
+    return () => {
+      admissions.delete(pending);
+      if (!admissions.size && this.admissions.get(agentId) === admissions) this.admissions.delete(agentId);
+      release();
+    };
+  }
+  private async admitted(agentId: string): Promise<void> {
+    while (this.admissions.get(agentId)?.size) await Promise.all(this.admissions.get(agentId)!);
+  }
+
+  // Replay lookup is exposed separately for session multipart collection, which must not
+  // consume a previously delivered activity as a new first part.
+  async recorded(ref: string): Promise<DeliveryResult | null> {
+    const running = this.flights.get(ref);
+    if (running) return this.result(await running);
+    const known = (await this.records())[ref];
+    if (!known) return null;
+    return this.result(await this.single(ref, async () => this.finish(await this.replay(known))));
+  }
+
+  // Claims in the session store can outlive a crash before evidence/needs-you completion.
+  // Recover those effects from the ledger independently of the caller's handled window.
+  async recoverEffects(): Promise<void> {
+    for (const record of Object.values(await this.records())) {
+      if (this.stopped) return;
+      if (record.responder.kind === "deputy") continue;
+      const delivered = record.status === "applied" || record.status === "unchecked" || record.status === "sent" || (record.status === "deputy-first" && record.correctionDelivered);
+      if ((record.status === "applied" && record.responder.kind === "owner" && !record.effects.evidence)
+        || (record.status === "deputy-first" && !record.effects.correction)
+        || (delivered && !record.effects.needsYou)) await this.recorded(record.ref);
+    }
+  }
+
   deliver(paseo: PaseoApi, agentId: string, message: string, origin: DeliveryOrigin, bound?: BoundAnswer): Promise<DeliveryResult> {
     // A bound multipart final answer takes over its hold synchronously before any disk work.
     const key = bound ? `${agentId}:${bound.requestId}` : null;
     if (key) this.owners.set(key, (this.owners.get(key) ?? 0) + 1);
+    const admitted = key || this.flights.has(origin.ref) ? () => {} : this.admit(agentId);
     const work = this.single(origin.ref, async () => {
       const known = (await this.records())[origin.ref];
-      if (known) return this.finish(await this.replay(known));
+      if (known) { admitted(); return this.finish(await this.replay(known)); }
       let record = await this.save(this.base(origin.ref, agentId, message, origin.responder, origin.issueId));
       const handle = paseo.agents.ref(agentId);
       const pending = bound ? [] : (await handle.refresh())?.agent.pendingPermissions ?? [];
@@ -151,12 +194,14 @@ export class PermissionReplies implements PermissionArbiter {
         const response = bound?.response ?? (question ? questionAnswer(question, message) : undefined);
         const selectedKey = `${agentId}:${requestId}`;
         if (!key) this.owners.set(selectedKey, (this.owners.get(selectedKey) ?? 0) + 1);
+        admitted();
         try {
           record = { ...record, kind: "answer", requestId, request: question, response, fingerprint: question ? fingerprint(question) : undefined };
           record = await this.lane(selectedKey, () => this.submit(paseo, record));
         } finally { if (!key) this.leaveOwner(selectedKey); }
       } else {
         const approval = pending.find((request) => request.kind !== "question");
+        admitted();
         const decision = approval ? approvalDecision(message) : null;
         if (approval && !decision) throw new Error(`The agent is waiting for approval of "${approval.title || approval.name}". Reply "@paseo approve" or "@paseo deny <reason>".`);
         if (!approval && !message) throw new Error("Write the message after @paseo.");
@@ -170,7 +215,7 @@ export class PermissionReplies implements PermissionArbiter {
       }
       return this.finish(record);
     });
-    return work.then((record) => this.result(record)).finally(() => { if (key) this.leaveOwner(key); });
+    return work.then((record) => this.result(record)).finally(() => { admitted(); if (key) this.leaveOwner(key); });
   }
   private leaveOwner(key: string): void {
     const remaining = (this.owners.get(key) ?? 1) - 1;
@@ -213,9 +258,17 @@ export class PermissionReplies implements PermissionArbiter {
       // fetchAgent when available, through the attached SDK supplied by setPaseo.
       const sdk = paseo ?? this.paseo;
       if (!sdk) throw new Error("no daemon connection to refresh the request");
-      const current = (await sdk.agents.ref(record.agentId).refresh())?.agent.pendingPermissions?.find((request) => request.id === requestId);
+      if (record.responder.kind === "deputy") await this.admitted(record.agentId);
+      let current = (await sdk.agents.ref(record.agentId).refresh())?.agent.pendingPermissions?.find((request) => request.id === requestId);
       if (!current || !record.fingerprint || fingerprint(current) !== record.fingerprint || !record.response) return this.save({ ...record, status: "gone" });
       await this.deps.beforeSubmit?.(record);
+      // An unbound owner may have started during refresh or the test pause. Finish its
+      // admission, then refresh again; an old replay releases admission without claiming Q2.
+      while (record.responder.kind === "deputy" && this.admissions.get(record.agentId)?.size) {
+        await this.admitted(record.agentId);
+        current = (await sdk.agents.ref(record.agentId).refresh())?.agent.pendingPermissions?.find((request) => request.id === requestId);
+        if (!current || fingerprint(current) !== record.fingerprint) return this.save({ ...record, status: "gone" });
+      }
       if (this.stopped) throw new Error("the plugin unloaded before submitting the answer");
       if (record.responder.kind === "deputy" && ((this.owners.get(key) ?? 0) > 0 || this.holds.has(key))) return this.save({ ...record, status: "owner-first" });
       // No await between the synchronous fence above and starting the external submission.
