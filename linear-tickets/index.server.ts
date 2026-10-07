@@ -51,6 +51,7 @@ import { ProjectFlow, ProjectStore } from "./server/project-flow";
 import { ProjectIssueCache } from "./server/project-issues";
 import { LabelRepair } from "./server/label-repair";
 import { Presence } from "./server/presence";
+import { rateBudget, withPriority } from "./server/rate-budget";
 import { hostname } from "node:os";
 import { readActivationSecret, type ActivationSink } from "./server/activation";
 import { activationEndpoints } from "./server/activation-endpoints";
@@ -65,6 +66,7 @@ import { Watchdog, WatchdogStore } from "./server/watchdog";
 import { asCaller, linearUsage, usageLines } from "./server/linear-usage";
 
 export default function contribute(server: PluginServerContext) {
+  void linearUsage.start();
   const credentials = new Credentials();
   // The native Linear agent ("Paseo" app): sessions, webhooks through Tailscale Funnel, and the
   // handover record every agent keeps on its ticket. Without the app installed, only the
@@ -108,7 +110,7 @@ export default function contribute(server: PluginServerContext) {
   const needsYou = new NeedsYouIssues();
   const replies = new PermissionReplies();
   // The owner's Approve / Send back from the Linear panel or the review inbox: as on the review page.
-  const decideReview = async (localUrl: string, approve: boolean, feedback: string, agentId: string) => {
+  const decideReview = (localUrl: string, approve: boolean, feedback: string, agentId: string) => withPriority("owner", "plan decision", async () => {
     const planContent = await readReviewPlan(localUrl).catch(() => "");
     await decidePlannotatorReview(localUrl, approve, feedback);
     try {
@@ -116,7 +118,7 @@ export default function contribute(server: PluginServerContext) {
     } catch (error) {
       throw new ReviewDecisionAppliedError(`The review decision was already delivered, but recording its lifecycle failed: ${error instanceof Error ? error.message : error}`);
     }
-  };
+  });
   // Activation routing (README, "Draining a host"): every automatic start path calls `take`
   // before it starts. Remote mode forwards to the peer through the drain router; local mode
   // answers the peer's activations and defers the tickets it still claims. The two routers are
@@ -136,8 +138,8 @@ export default function contribute(server: PluginServerContext) {
     decideReview,
     reviewOutcome: (review) => reviewOutcome(review),
     recordOutcome: (agentId, outcome) => recordDecision({ type: "decided", agentId, ...outcome, at: new Date().toISOString() }),
-    splitPlan: (link, localUrl, paseo) => splitIntoSubIssues({ linear, appUserId: async () => (await agentApi.viewer()).id, readPlan: readReviewPlan, retirePlanner, followUps }, link, localUrl, paseo),
-    approveLater: (link, localUrl, paseo) => approveForLater({ linear, readPlan: readReviewPlan, retirePlanner, followUps }, link, localUrl, paseo),
+    splitPlan: (link, localUrl, paseo) => withPriority("owner", "plan decision", () => splitIntoSubIssues({ linear, appUserId: async () => (await agentApi.viewer()).id, readPlan: readReviewPlan, retirePlanner, followUps }, link, localUrl, paseo)),
+    approveLater: (link, localUrl, paseo) => withPriority("owner", "plan decision", () => approveForLater({ linear, readPlan: readReviewPlan, retirePlanner, followUps }, link, localUrl, paseo)),
     // `paseo agent reload` for crashed agents (README, "Crashed agents"); the plugin SDK has no reload.
     reloader: async () => {
       const client = await internalDaemon();
@@ -493,7 +495,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(agentStatusRpc, async (_input, { paseo }) => {
     attach(paseo);
     const installed = await startAgent();
-    return { installed, funnel: funnel?.active ?? false, funnelNote: funnel?.note ?? null, lastWebhookAt: webhook.lastEventAt, webhooks: webhook.events, ...sessions.readStats(), usage: linearUsage.snapshot() };
+    return { installed, funnel: funnel?.active ?? false, funnelNote: funnel?.note ?? null, lastWebhookAt: webhook.lastEventAt, webhooks: webhook.events, ...sessions.readStats(), usage: linearUsage.snapshot(), budget: { pools: rateBudget.snapshot(), hours: linearUsage.summary() } };
   });
   // No hook within a few seconds of loading (typically a reload): use the plugin's own connection.
   let own: PaseoClient | null = null;
@@ -510,5 +512,20 @@ export default function contribute(server: PluginServerContext) {
   startSoon.unref?.();
   const usageTimer = setInterval(() => { for (const line of usageLines(linearUsage.snapshot())) console.log(line); }, 60 * 60 * 1000);
   usageTimer.unref?.();
-  return () => { stopped = true; replies.stop(); clearTimeout(startSoon); clearInterval(usageTimer); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); pipeline.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop(); void closeInternalDaemon(); };
+  return async () => {
+    stopped = true;
+    replies.stop();
+    clearTimeout(startSoon);
+    clearInterval(usageTimer);
+    stopKeepingFresh();
+    void own?.close();
+    dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop();
+    webhook.stop(); reviewLinks.stop(); pipeline.stop(); health.stop();
+    const stoppedPullRequests = pullRequests.stop();
+    pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop();
+    stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop();
+    void closeInternalDaemon();
+    await stoppedPullRequests;
+    await linearUsage.stop();
+  };
 }

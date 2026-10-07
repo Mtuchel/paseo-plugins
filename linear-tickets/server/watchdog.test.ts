@@ -92,7 +92,7 @@ async function harness(options: { settings?: PluginSettings } = {}) {
     say: async (_sessionId: string, _type: string, body: string) => { said.push(body); },
   };
   const linear = {
-    issueState: async () => ({ id: ISSUE.id, identifier: ISSUE.identifier, status: state.status.status, statusType: state.status.statusType, statusId: "s", teamId: "t", projectId: null, creatorId: null, labels: state.status.labels.map((name) => ({ id: name, name })), blockedBy: [], priority: 0, createdAt: iso(T0), unblocks: 0, attachmentUrls: [] }),
+    issueWatchState: async () => ({ status: state.status.status, statusType: state.status.statusType, labels: state.status.labels.map((name) => ({ id: name, name })) }),
     comment: async (_issueId: string, body: string) => { comments.push(body); },
     hasComment: async (_issueId: string, mark: string) => comments.some((body) => body.includes(mark)),
     viewerId: async () => "owner-1",
@@ -221,7 +221,7 @@ test("owner waits, holds, plan reviews, subagents, vetoes and unreadable evidenc
 test("a quiet ticket kept out by an exclusion is read again only every 15 minutes, and recovered once the exclusion clears", async (t) => {
   quiet(t);
   const h = await harness();
-  const reads = t.mock.method(h.deps.linear, "issueState");
+  const reads = t.mock.method(h.deps.linear, "issueWatchState");
   h.state.status = { status: "Needs input", statusType: "started", labels: [] };
   await h.poll(46);
   await h.poll(48);

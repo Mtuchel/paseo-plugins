@@ -331,7 +331,7 @@ export class PullRequestBoard {
     const repo = this.repo(repository);
     const labelled: number[] = [];
     let error: string | null = null;
-    await withPriority("interactive", async () => {
+    await withPriority("interactive", "pull request labels", async () => {
       for (const number of numbers) {
         try {
           this.budget.admit();
@@ -375,7 +375,7 @@ export class PullRequestBoard {
   private due(repository: string, repo: Repo): void {
     if (repo.running || this.now() - repo.attemptAt < REFRESH_MS) return;
     repo.attemptAt = this.now();
-    repo.running = withPriority("background", () => this.refresh(repository, repo)).finally(() => { repo.running = null; });
+    repo.running = withPriority("background", "pull request board", () => this.refresh(repository, repo)).finally(() => { repo.running = null; });
   }
 
   // Background priority: with the single-login budget, below its reserve the poll stops and the

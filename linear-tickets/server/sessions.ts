@@ -28,6 +28,7 @@ import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, type ProcessAgent, type
 import { WATCHDOG_LABEL, type TicketRoots, type WatchdogOutcome, type WatchdogRequest, type WatchdogStore } from "./watchdog";
 import type { ReviewDeletions } from "./review-deletions";
 import { availability, candidates, claims, finishPending, incidentFor, LIMIT_SPACING, limitError, limitSchedule, limitTime, normalizeModel, updateEpisode, type LimitPending, type LimitResumeStore, type UsageReader } from "./limit-resume";
+import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
 
 const exec = promisify(execFile);
 const HANDLED_LIMIT = 200;
@@ -332,7 +333,7 @@ export function planSteps(markdown: string): string[] {
 
 type Deps = {
   api: AgentApi;
-  linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
+  linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
   starter: Pick<TicketStarter, "start" | "admission">;
   // The ticket's handover record: a successor resumes from it and takes it over (succeed).
   handover: Pick<Handover, "resumeTarget" | "handOff">;
@@ -362,6 +363,7 @@ type Deps = {
   processInspector?: ProcessInspector;
   // The clock the webhook fallback windows are measured against.
   now?: () => number;
+  budget?: Pick<RateBudget, "pausedUntil" | "blockedUntil">;
   deletions?: Pick<ReviewDeletions, "get" | "blocked" | "forAgent">;
   // The watchdog's durable owner Stop and owner continuations (watchdog.ts).
   watchdog?: Pick<WatchdogStore, "hold" | "continued" | "read">;
@@ -386,6 +388,8 @@ export class SessionRouter {
   private waiting: AgentSessionWebhook[] = [];
   private timer: NodeJS.Timeout | null = null;
   private sweeping = false;
+  private pausedSweep: string | null = null;
+  private pauseDuringSweep = false;
   // Agents the user stopped from Linear: a turn the provider starts on its own is stopped again.
   private readonly held = new Map<string, number>();
   // Live action feed per agent during a turn: the subscription and actions not yet posted.
@@ -428,7 +432,7 @@ export class SessionRouter {
   attach(paseo: PaseoApi): void {
     if (this.paseo) return;
     this.paseo = paseo;
-    for (const event of this.waiting.splice(0)) void this.handle(event);
+    for (const event of this.waiting.splice(0)) this.track(this.handle(event));
     this.timer = setInterval(() => { void this.sweep(); }, SWEEP_MS);
     this.timer.unref?.();
     void this.sweep();
@@ -519,6 +523,7 @@ export class SessionRouter {
       if (event.action === "created") await this.created(event.agentSession);
       else if (event.action === "prompted" && event.agentActivity) await this.prompted(event.agentSession.id, event.agentActivity);
     } catch (error) {
+      if (error instanceof RateLimitedError) throw error;
       const message = error instanceof Error ? error.message : "unknown error";
       console.error(`[linear-tickets] agent session ${event.agentSession.id}: ${message}`);
       await this.say(event.agentSession.id, "error", `Paseo could not handle this: ${message}`).catch(() => {});
@@ -652,7 +657,7 @@ export class SessionRouter {
         : await this.activeAgentFor(issueId);
       if (existing) {
         await this.deps.store.put({ ...link, agentId: existing.id });
-        await this.linkToPaseo(session.id, existing.id);
+        await this.linkToPaseo(session.id, existing.id).catch(() => {});
         // Same as a relayed comment: answers a pending question or decides a pending approval.
         if (text) await this.deliveryReply(session.id, await this.passOn(existing.id, text, this.origin(link, text, from)));
         await this.say(session.id, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.${text ? " Your message was passed on." : ""}`);
@@ -759,7 +764,7 @@ export class SessionRouter {
         ? started.untrusted ? " This ticket is not yours, so its plan waits for your approval." : " The agent plans first; a plan within your risk threshold is approved automatically, any other waits for you."
         : "";
       await this.say(link.sessionId, "thought", `${started.resumed ? "Resumed the previous agent's work" : "Started"} with ${started.provider} in ${started.target} (Paseo agent ${started.agentId.slice(0, 8)}).${plan}${warnings}`);
-      await this.linkToPaseo(link.sessionId, started.agentId);
+      await this.linkToPaseo(link.sessionId, started.agentId).catch(() => {});
     } catch (error) {
       await this.deps.linear.removeLabel(link.issueId, running).catch(() => {});
       throw error;
@@ -767,6 +772,12 @@ export class SessionRouter {
   }
 
   async prompted(sessionId: string, activity: Record<string, unknown>): Promise<void> {
+    const link = await this.deps.store.get(sessionId);
+    if (link?.review) return withPriority("owner", "plan decision", () => this.promptedWithLink(sessionId, activity, link));
+    return this.promptedWithLink(sessionId, activity, link);
+  }
+
+  private async promptedWithLink(sessionId: string, activity: Record<string, unknown>, link: SessionLink | null): Promise<void> {
     for (const [agentId, state] of this.live) {
       if (state.sessionId !== sessionId || !state.asking) continue;
       state.asking = false;
@@ -776,7 +787,7 @@ export class SessionRouter {
     const content = (activity.content ?? {}) as { body?: string };
     let body = String(content.body ?? activity.body ?? "").trim();
     const signal = typeof activity.signal === "string" ? activity.signal : null;
-    let link = await this.deps.store.get(sessionId);
+
     if (!link) { await this.say(sessionId, "error", "No Paseo agent is linked to this session. Assign Paseo to the ticket again."); return; }
     if (await this.deps.deletions?.blocked(link.issueId)) return;
     const claimed = !activityId || await this.deps.store.claim(sessionId, activityId);
@@ -1010,7 +1021,7 @@ export class SessionRouter {
         if (link.queueReason !== wait) await this.deps.store.patch(link.sessionId, { queueReason: wait });
         return;
       }
-      const ticket = await this.deps.linear.issueState(link.issueId);
+      const ticket = await this.deps.linear.issueStatus(link.issueId);
       if (await this.deps.deletions?.blocked(link.issueId)) return;
       if (ticket.statusType === "completed" || ticket.statusType === "canceled") {
         await this.deps.store.patch(link.sessionId, { queued: false, queueReason: undefined, restartRequested: undefined });
@@ -1034,7 +1045,7 @@ export class SessionRouter {
           }
         }
         await this.deps.store.patch(link.sessionId, { agentId: existing.id, queued: false, queueReason: undefined, restartRequested: undefined, pendingText: null, ...(link.offer === "resume" ? { offer: null } : {}) });
-        await this.linkToPaseo(link.sessionId, existing.id);
+        await this.linkToPaseo(link.sessionId, existing.id).catch(() => {});
         await this.say(link.sessionId, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.${text ? " Your message was passed on." : ""}`);
         return;
       }
@@ -1055,6 +1066,7 @@ export class SessionRouter {
         return;
       }
     } catch (error) {
+      if (error instanceof RateLimitedError) throw error;
       if (link.queueReason !== undefined) await this.deps.store.patch(link.sessionId, { queueReason: undefined });
       console.error(`[linear-tickets] ${link.identifier}: checking the queued thread failed: ${error instanceof Error ? error.message : error}`);
       return;
@@ -1062,6 +1074,7 @@ export class SessionRouter {
     try {
       await this.startFor(link, false, true);
     } catch (error) {
+      if (error instanceof RateLimitedError) throw error;
       if ((await this.deps.store.get(link.sessionId))?.agentId) {
         console.error(`[linear-tickets] ${link.identifier}: queued agent started, reporting it failed: ${error instanceof Error ? error.message : error}`);
         return;
@@ -1122,6 +1135,7 @@ export class SessionRouter {
       try {
         await this.advanceGroup({ ...link, group: link.group });
       } catch (error) {
+        if (error instanceof RateLimitedError) throw error;
         console.error(`[linear-tickets] ${link.identifier}: advancing the group failed: ${error instanceof Error ? error.message : error}`);
       }
     }
@@ -1168,11 +1182,15 @@ export class SessionRouter {
             await this.deps.linear.delegate(child.id, appId);
             child.delegateId = appId;
           } catch (error) {
+            if (error instanceof RateLimitedError) throw error;
             failures.push(`Could not assign ${child.identifier} to Paseo: ${error instanceof Error ? error.message : error}`);
           }
         }
         if (progress.handOut.some((child) => child.delegateId === appId)) {
-          const moved = await this.deps.linear.moveToStateNamed(link.issueId, CODING_STATE, parent).catch((error: unknown) => ({ changed: false, note: error instanceof Error ? error.message : String(error) }));
+          const moved = await this.deps.linear.moveToStateNamed(link.issueId, CODING_STATE, parent).catch((error: unknown) => {
+            if (error instanceof RateLimitedError) throw error;
+            return { changed: false, note: error instanceof Error ? error.message : String(error) };
+          });
           if (moved.note) console.error(`[linear-tickets] ${link.identifier}: ${moved.note}`);
         }
       }
@@ -1194,6 +1212,13 @@ export class SessionRouter {
   // not yet handled. Each part runs on its own, so one failed Linear request skips only the part it hit.
   async sweep(): Promise<void> {
     if (this.sweeping || !this.paseo) return;
+    const budget = this.deps.budget ?? rateBudget;
+    const until = budget.pausedUntil("app", "background");
+    if (until !== null) {
+      this.logSweepPause(new RateLimitedError("app", until, budget.blockedUntil("app") > this.clock() ? "limited" : "reserve"));
+      return;
+    }
+    this.pauseDuringSweep = false;
     this.sweeping = true;
     // One listing for this sweep's parts, and a fresh one next minute.
     this.sessionList = null;
@@ -1210,15 +1235,24 @@ export class SessionRouter {
       await this.sweepPart("missed replies", () => this.catchUp());
     } finally {
       this.sweeping = false;
+      if (!this.pauseDuringSweep) this.pausedSweep = null;
     }
   }
 
   private async sweepPart(part: string, run: () => Promise<void>): Promise<void> {
     try {
-      await asCaller(`session-sweep.${part}`, run);
+      await withPriority("background", `session-sweep.${part}`, run);
     } catch (error) {
+      if (error instanceof RateLimitedError) { this.logSweepPause(error, part); return; }
       console.error(`[linear-tickets] agent session sweep (${part}) failed: ${error instanceof Error ? error.message : error}`);
     }
+  }
+
+  private logSweepPause(error: RateLimitedError, part?: string): void {
+    const pause = `${error.pool}:${error.reason}`;
+    if (this.pausedSweep !== pause) console.error(`[linear-tickets] agent session sweep${part ? ` (${part})` : ""} paused: ${error.message}`);
+    this.pausedSweep = pause;
+    this.pauseDuringSweep = true;
   }
 
   // New sessions nobody started and prompts not yet handled. A thread whose read fails is tried
@@ -1253,6 +1287,7 @@ export class SessionRouter {
         }
         await this.readSession(session.id, "sweep");
       } catch (error) {
+        if (error instanceof RateLimitedError) throw error;
         failures.push(error instanceof Error ? error.message : String(error));
       }
     }
@@ -2222,7 +2257,7 @@ export class SessionRouter {
   async linkToPaseo(sessionId: string, agentId: string): Promise<void> {
     const serverId = await daemonServerId();
     if (!serverId) return;
-    await this.link(sessionId, "Open in Paseo", paseoAgentUrl(serverId, agentId)).catch(() => {});
+    await this.link(sessionId, "Open in Paseo", paseoAgentUrl(serverId, agentId));
     await this.deps.store.patch(sessionId, { paseoLinked: agentId });
   }
 
@@ -2236,7 +2271,7 @@ export class SessionRouter {
     try {
       sessionId = await this.deps.api.createSessionOnIssue(issueId);
       await this.deps.store.put({ sessionId, agentId, issueId, identifier, createdAt: new Date().toISOString(), handled: [], review: null, offer: null });
-      await this.linkToPaseo(sessionId, agentId);
+      await this.linkToPaseo(sessionId, agentId).catch(() => {});
     } catch (error) {
       console.error(`[linear-tickets] ${identifier}: could not open an agent session: ${error instanceof Error ? error.message : error}`);
       return null;

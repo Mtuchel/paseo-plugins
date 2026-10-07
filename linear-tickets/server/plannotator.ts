@@ -23,6 +23,7 @@ import { feedbackEntry, logQuietly, type DecisionLog } from "./owner-decisions";
 import { modelProblem, modelSteps, planTier, strongerTier, TIERS, type Tier } from "../shared/plan-model";
 import { labelTier, onlyTierAdded, TIER_LABELS, tierModel, type TierStore } from "./model-tiers";
 import type { ReviewDeletions } from "./review-deletions";
+import { RateLimitedError, withPriority } from "./rate-budget";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -170,8 +171,9 @@ export class PlannotatorBridge {
   private draining: Promise<void> | null = null;
   private again = false;
   private readonly attempts = new Map<string, number>();
-  // A parked decision past its quick attempts: when it is tried next.
+  // A paused event or a parked decision past its quick attempts: when it is tried next.
   private readonly retryAt = new Map<string, number>();
+  private readonly pausedEvents = new Map<string, string>();
   // A decision taken in Linear is also reported by the omp plan extension; the second report
   // within this window is the same decision and is skipped.
   private readonly lastDecision = new Map<string, number>();
@@ -479,7 +481,16 @@ export class PlannotatorBridge {
       await rm(path, { force: true });
       this.attempts.delete(name);
       this.retryAt.delete(name);
+      this.pausedEvents.delete(name);
     } catch (error) {
+      if (error instanceof RateLimitedError) {
+        const pause = `${error.pool}:${error.reason}:${error.resumeAt}`;
+        if (this.pausedEvents.get(name) !== pause) console.error(`[linear-tickets] Plannotator event ${name} paused: ${error.message}`);
+        this.pausedEvents.set(name, pause);
+        this.retryAt.set(name, error.resumeAt);
+        return;
+      }
+      this.pausedEvents.delete(name);
       const tries = (this.attempts.get(name) ?? 0) + 1;
       console.error(`[linear-tickets] Plannotator event ${name} failed (attempt ${tries}): ${error instanceof Error ? error.message : error}`);
       if (event?.type === "opened" && this.deliveryFailure) {
@@ -494,10 +505,16 @@ export class PlannotatorBridge {
       if (event?.type === "opened") this.show(event.localUrl);
       await rm(path, { force: true });
       this.attempts.delete(name);
+      this.retryAt.delete(name);
     }
   }
 
-  private async deliver(event: PlannotatorEvent, agentId: string, paseo: PaseoApi): Promise<void> {
+  private deliver(event: PlannotatorEvent, agentId: string, paseo: PaseoApi): Promise<void> {
+    if (event.type === "decided" || event.type === "opened") return withPriority("owner", event.type === "decided" ? "plan decision" : "plan review", () => this.deliverEvent(event, agentId, paseo));
+    return this.deliverEvent(event, agentId, paseo);
+  }
+
+  private async deliverEvent(event: PlannotatorEvent, agentId: string, paseo: PaseoApi): Promise<void> {
     if (event.type === "advised") {
       await this.remember(agentId, { verdict: event.verdict, hash: event.hash });
       const parked = await this.parking?.plans.forAgent(agentId);

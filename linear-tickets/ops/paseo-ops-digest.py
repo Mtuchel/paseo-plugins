@@ -12,7 +12,10 @@ on the Mac). Each run:
      review), ticket agents silent for more than 2 h, and tickets still labelled
      `<dispatch label>-running` without a live agent; and how many proposals in open
      "Decision candidates" tickets still wait for the owner's answer (TUC-748; a count only,
-     never an attention item or notification);
+     never an attention item or notification); and the linear-tickets plugin's own Linear API
+     usage per UTC hour (TUC-1291, `~/.paseo/linear-tickets/linear-usage.json`) for the
+     "Linear budget" section, where an hour that hit a limit in the last 24 h is a
+     non-attention item (never notified) and the section lists the last 7 days;
   3. merges both into the state in ~/.paseo/ops-digest/state.json and saves it BEFORE
      publishing, so a failed publish never loses an observed problem. The same save holds this
      run's history lines in the state's outbox (`historyOutbox`): one `run` line with every unit
@@ -49,6 +52,7 @@ state.json.bak-<date>-backfill; refuses when history-backfill.jsonl exists).
 import fcntl
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -88,6 +92,7 @@ TREND = f"{DIR}/trend.json"
 PR_WATCH = f"{HOME}/linear-tickets/pr-watch.json"
 CRASHES = f"{HOME}/linear-tickets/crash-recovery.json"
 LIMIT_RESUMES = f"{HOME}/linear-tickets/limit-resumes.json"
+LINEAR_USAGE = f"{HOME}/linear-tickets/linear-usage.json"  # the plugin's own Linear API usage per UTC hour
 PULL_URL = "https://github.com/tuchel-sohn/tuchel-platform/pull/{}"
 HISTORY = "history.jsonl"
 HISTORY_BACKFILL = "history-backfill.jsonl"
@@ -166,7 +171,7 @@ def error_category(exc):
         return "rate limit"
     if isinstance(exc, subprocess.CalledProcessError):
         return f"exit {exc.returncode}"
-    if isinstance(exc, (json.JSONDecodeError, KeyError, TypeError)):
+    if isinstance(exc, (UsageUnreadable, json.JSONDecodeError, KeyError, TypeError)):
         return "unreadable response"
     if isinstance(exc, FileNotFoundError):
         return "missing file"
@@ -345,6 +350,172 @@ def decision_candidates(issues):
     return {"waiting": sum(t["waiting"] for t in tickets), "tickets": tickets}
 
 
+# ---------------------------------------------------------------------------- linear budget (pure)
+
+# linear-usage.json (TUC-1291): what the linear-tickets plugin itself answered per UTC hour and
+# pool, the limits it saw, its callers, and an estimate of what the agents' tools and scripts of
+# this host spent outside it (`outside`), plus its RATELIMITED answers and the time a pool was
+# blocked. The digest only reads it, tolerantly: anything it cannot use counts as not read.
+HOUR_S = 3600
+BUDGET_DAYS_S = 7 * 24 * HOUR_S  # the section's "Limit reached (last 7 days)"
+BUDGET_ITEM_S = 24 * HOUR_S  # how long an hour that hit a limit stays an item
+OUTSIDE_SPENDER = "outside the plugin (agents' tools, scripts)"
+POOL_NAMES = {"app": "Paseo app", "key": "API key"}
+BUCKET_KINDS = ("points", "requests")  # what every hour measures; limits and outside hold both
+BUCKET_FIELDS = ("limits", "requests", "points", "estimatedPoints", "limited", "blockedMs", "refused",
+                 "minRemaining", "outside", "callers")
+BUCKET_COUNTS = ("requests", "points", "estimatedPoints", "limited", "blockedMs")
+SPEND_FIELDS = ("spent", "observedMs")
+CALLER_FIELDS = ("requests", "points", "refused")
+
+
+class UsageUnreadable(Exception):
+    """linear-usage.json in a shape this digest cannot read (another version, wrong values)."""
+
+
+def pool_name(pool):
+    """The pool as the owner knows it; a pool the digest does not know keeps its name."""
+    return POOL_NAMES.get(pool, pool)
+
+
+def budget_hour(ts):
+    """The UTC hour (its start) holding `ts`; Linear's limits count per UTC hour."""
+    return int(ts) // HOUR_S * HOUR_S
+
+
+def hour_text(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def clamp0(value):
+    """An outside estimate as a spend: it can be negative, shown never below zero."""
+    return max(0, value or 0)
+
+
+def outside_spend(bucket, kind):
+    """What `outside` says others spent on this kind of the hour (points or requests)."""
+    part = (bucket.get("outside") or {}).get(kind)
+    return clamp0(part.get("spent") if isinstance(part, dict) else 0)
+
+
+def _num(value, *, nullable=False):
+    """A JSON number; None only where the contract allows it. Bools are not numbers."""
+    if value is None:
+        return bool(nullable)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _keys(value, *names):
+    """An object holding every named field; the caller checks the types of the values."""
+    return isinstance(value, dict) and all(name in value for name in names)
+
+
+def bucket_ok(bucket):
+    """Whether one usage bucket has the shape the digest renders. Anything else (fields of
+    another version, strings where numbers belong) makes the whole file unreadable: the run
+    then keeps its previous items instead of failing on a file it cannot trust."""
+    if not (_keys(bucket, *BUCKET_FIELDS) and all(_num(bucket[f]) for f in BUCKET_COUNTS)):
+        return False
+    for field in ("limits", "minRemaining"):
+        if not (_keys(bucket[field], *BUCKET_KINDS)
+                and all(_num(bucket[field][k], nullable=True) for k in BUCKET_KINDS)):
+            return False
+    refused = bucket["refused"]
+    if not (_keys(refused, "background", "interactive")
+            and all(_num(refused[f]) for f in ("background", "interactive"))):
+        return False
+    outside = bucket["outside"]
+    if not (_keys(outside, *BUCKET_KINDS)
+            and all(_keys(outside[k], *SPEND_FIELDS) and all(_num(outside[k][f]) for f in SPEND_FIELDS)
+                    for k in BUCKET_KINDS)):
+        return False
+    callers = bucket["callers"]
+    return isinstance(callers, dict) and all(
+        _keys(caller, *CALLER_FIELDS) and all(_num(caller[f]) for f in CALLER_FIELDS)
+        for caller in callers.values())
+
+
+def load_linear_usage(path):
+    """linear-usage.json as the plugin wrote it (TUC-1291). Raises FileNotFoundError when it is
+    missing and UsageUnreadable when it cannot be used (bad JSON, another version, wrong types);
+    `collect` then reports the unit `linear_budget` as not read and the run goes on."""
+    try:
+        with open(path) as f:
+            usage = json.load(f)
+    except ValueError as exc:  # json.JSONDecodeError
+        raise UsageUnreadable("not JSON") from exc
+    if not isinstance(usage, dict) or usage.get("version") != 1:
+        raise UsageUnreadable("version")
+    hours = usage.get("hours")
+    if not isinstance(hours, dict):
+        raise UsageUnreadable("hours")
+    for hour, pools in hours.items():
+        if parse_iso(hour) is None or not isinstance(pools, dict):
+            raise UsageUnreadable("hour")
+        for pool, bucket in pools.items():
+            if not bucket_ok(bucket):
+                raise UsageUnreadable(f"bucket {pool} of {hour}")
+    return usage
+
+
+def budget_buckets(usage):
+    """{(hour, pool): bucket} of a usage file. load_linear_usage has already rejected unreadable
+    ones; an hour key that will not parse is dropped all the same."""
+    found = {}
+    for hour, pools in ((usage or {}).get("hours") or {}).items():
+        start = parse_iso(hour)
+        if start is None or not isinstance(pools, dict):
+            continue
+        for pool, bucket in pools.items():
+            if isinstance(bucket, dict):
+                found[(budget_hour(start), pool)] = bucket
+    return found
+
+
+def budget_limited(buckets, now, window=BUDGET_DAYS_S):
+    """(hour, pool, bucket) of every hour that hit a limit within the last `window`, newest
+    first (same hour: pools in name order)."""
+    rows = [(hour, pool, bucket) for (hour, pool), bucket in buckets.items()
+            if 0 <= now - hour <= window
+            and ((bucket.get("limited") or 0) > 0 or (bucket.get("blockedMs") or 0) > 0)]
+    rows.sort(key=lambda row: (-row[0], row[1]))
+    return rows
+
+
+def budget_spender(bucket):
+    """Who spent an hour: the caller with the most points, or the outside estimate when it is
+    larger; with no points at all the same over requests. None when neither spent anything."""
+    for kind in BUCKET_KINDS:
+        outside = outside_spend(bucket, kind)
+        best, top = None, 0
+        for name, caller in (bucket.get("callers") or {}).items():
+            spent = caller.get(kind) or 0
+            if spent > top:
+                best, top = name, spent
+        if top or outside:
+            return OUTSIDE_SPENDER if outside > top else best
+    return None
+
+
+def budget_items(usage, now):
+    """One item per (pool, hour) that hit a limit in the last 24 h (TUC-1291). Keyed by pool and
+    hour, so the same hour of two runs is one item and reaches the history once. Never an
+    attention item and thus never notified: the budget is a cost, not a problem."""
+    items = []
+    for hour, pool, bucket in budget_limited(budget_buckets(usage), now, BUDGET_ITEM_S):
+        blocked = round((bucket.get("blockedMs") or 0) / 60000)
+        items.append({"key": f"linear-limit:{pool}:{iso(hour)}", "unit": "linear_budget", "section": "linear",
+                      "attention": False, "title": f"{pool_name(pool)} {hour_text(hour)} UTC",
+                      "detail": f"limit reached ({blocked} min blocked,"
+                                f" spender: {budget_spender(bucket) or 'unknown'})"})
+    return items
+
+
 # ---------------------------------------------------------------------------- state (pure)
 
 def empty_state():
@@ -365,9 +536,10 @@ def merge_decisions(state, decisions, now):
 
 def unit_failed(unit, failed_units):
     """Whether the read behind an item failed: its own unit, a parent unit (`pulls` covers
-    `pulls/917`), or the whole repository script."""
+    `pulls/917`), or the whole repository script — which covers every item of the repository
+    part, but none of this host's own units, the plugin's `linear_budget` included."""
     unit = unit or ""
-    if "repo" in failed_units and unit.split("@")[0] not in HOST_UNITS:
+    if "repo" in failed_units and unit.split("@")[0] not in HOST_UNITS + ("linear_budget",):
         return True
     return any(unit == f or unit.startswith(f + "/") or unit.startswith(f + "@") for f in failed_units)
 
@@ -473,7 +645,80 @@ def trend_lines(trend):
     return out
 
 
-def render(state, units, now, *, new_keys=(), agent_notes=None, notify_failed=False, trend=None):
+CALLERS_SHOWN = 3  # callers listed per pool in the Linear budget section
+
+
+def budget_use(label, count, limit):
+    """`124 requests (62 % of 200)`; a limit the plugin never saw (null) leaves the raw number."""
+    return f"{count} {label}" + (f" ({round(count / limit * 100)} % of {limit})" if limit else "")
+
+
+def budget_callers(bucket):
+    """The top callers by points with their share of the hour's own points; `none` when the hour
+    spent no points at all."""
+    total = bucket.get("points") or 0
+    if not total:
+        return "none"
+    ranked = sorted(((caller.get("points") or 0, name) for name, caller in (bucket.get("callers") or {}).items()),
+                    key=lambda row: (-row[0], row[1]))
+    return ", ".join(f"{name} {points} ({round(points / total * 100)} %)"
+                     for points, name in ranked[:CALLERS_SHOWN]) or "none"
+
+
+def budget_outside(bucket):
+    """The outside estimate with an `≈`: what others spent per kind, its share of the hour, and
+    how much of the hour was observed (the estimate covers only that part)."""
+    parts = []
+    for kind in BUCKET_KINDS:
+        spent = outside_spend(bucket, kind)
+        total = (bucket.get(kind) or 0) + spent
+        parts.append(f"≈ {spent} {kind}" + (f" ({round(spent / total * 100)} % of the hour)" if spent and total else ""))
+    outside = bucket.get("outside") or {}
+    seen = {kind: round(((outside.get(kind) or {}).get("observedMs") or 0) / (HOUR_S * 1000) * 100)
+            for kind in BUCKET_KINDS}
+    observed = (f"{seen['points']} % of the hour" if seen["points"] == seen["requests"]
+                else f"{seen['points']} % of the points, {seen['requests']} % of the requests")
+    return ", ".join(parts) + f" — observed {observed}"
+
+
+def budget_limit_line(hour, pool, bucket):
+    """One hour that hit a limit: its pool, the blocked minutes and who spent it."""
+    limited = bucket.get("limited") or 0
+    return (f"- {hour_text(hour)} UTC, {pool_name(pool)}: blocked {round((bucket.get('blockedMs') or 0) / 60000)} min"
+            + (f" ({limited} rate-limited)" if limited else "")
+            + f" — spender: {budget_spender(bucket) or 'unknown'}")
+
+
+def budget_lines(usage, now):
+    """The "## Linear budget" block (TUC-1291): per pool the last full UTC hour with what it spent
+    of that hour's limits, its top callers and the outside estimate, then every hour of the last
+    7 days that hit a limit. `usage` is None when linear-usage.json was not read this run."""
+    if usage is None:
+        return ["## Linear budget", "", "- linear-usage.json not read this run (previous items kept)", ""]
+    buckets = budget_buckets(usage)
+    pools = sorted({pool for _hour, pool in buckets})
+    out = ["## Linear budget", ""]
+    last = budget_hour(now) - HOUR_S
+    if not pools:
+        out.append("- nothing recorded yet")
+    for pool in pools:
+        bucket = buckets.get((last, pool))
+        if bucket is None:
+            out.append(f"- {pool_name(pool)}: nothing recorded in the last full hour ({hour_text(last)} UTC)")
+            continue
+        limits = bucket.get("limits") or {}
+        out.append(f"- {pool_name(pool)}: {budget_use('requests', bucket.get('requests') or 0, limits.get('requests'))},"
+                   f" {budget_use('points', bucket.get('points') or 0, limits.get('points'))}"
+                   f" — last full hour {hour_text(last)} UTC")
+        out.append(f"  - Top callers by points: {budget_callers(bucket)}")
+        out.append(f"  - Outside the plugin: {budget_outside(bucket)}")
+    out += ["", "### Limit reached (last 7 days)", ""]
+    out += [budget_limit_line(hour, pool, bucket) for hour, pool, bucket in budget_limited(buckets, now)] or ["- none"]
+    out.append("")
+    return out
+
+
+def render(state, units, now, *, new_keys=(), agent_notes=None, notify_failed=False, trend=None, budget=None):
     agent_notes = agent_notes or {}
     entries = state["items"]
 
@@ -534,6 +779,7 @@ def render(state, units, now, *, new_keys=(), agent_notes=None, notify_failed=Fa
     else:
         out.append("- Decision candidates waiting: not read yet")
     out.append("")
+    out += budget_lines(budget, now)
     out += trend_lines(trend)
     if state.get("cleared"):
         out += ["## Cleared since last update", ""]
@@ -869,6 +1115,12 @@ class HostIO:
             found[name] = data if isinstance(data, dict) else None
         found["limitResumes"] = self.limit_resumes()
         return found
+
+    def linear_usage(self):
+        """The plugin's own Linear API usage per UTC hour (TUC-1291). Raises (FileNotFoundError,
+        UsageUnreadable) when the file is missing or malformed: `collect` reports the unit
+        `linear_budget` as not read and the run goes on with that unit's previous items."""
+        return load_linear_usage(LINEAR_USAGE)
 
     def snapshot(self):
         """This host's agent data for another host's digest (--agents-json), JSON-safe (the
@@ -1258,7 +1510,8 @@ def backfill_history(state_path, history_dir, lock_path, now):
 
 def collect(io, now, started):
     """All items and unit outcomes of one run. Every unit attempted is listed, read or not (the
-    history's run line counts on it)."""
+    history's run line counts on it). Also the decisions and the linear usage of this run, for
+    the sections that render from them."""
     items, units = [], []
     try:
         digest = io.repo_digest()
@@ -1325,6 +1578,13 @@ def collect(io, now, started):
         units.append({"unit": "decision_candidates", "ok": True})
     except Exception as exc:
         units.append({"unit": "decision_candidates", "ok": False, "category": error_category(exc)})
+    usage = None
+    try:
+        usage = io.linear_usage()
+        units.append({"unit": "linear_budget", "ok": True})
+    except Exception as exc:
+        units.append({"unit": "linear_budget", "ok": False, "category": error_category(exc)})
+    items += budget_items(usage, now)
     if time.monotonic() - started > RUN_BUDGET_S:
         raise TimeoutError("run budget exceeded")
     # Repository items name their ticket; the note says which agent works on it.
@@ -1337,7 +1597,7 @@ def collect(io, now, started):
         for ticket in sorted(tickets_of(agent, meta, teams or {"TUC"})):
             note = f"agent {agent['id'][:7]} {agent.get('status')}" + (f", active {age_text(now - last)} ago" if last else "")
             agent_notes.setdefault(ticket, note)
-    return items, units, agent_notes, decisions
+    return items, units, agent_notes, decisions, usage
 
 
 def dispatch_quarantine(io):
@@ -1368,12 +1628,13 @@ def run(io, *, now, mode="publish", state_path=STATE, lock_path=LOCK, started=No
         state = load_state(state_path)
         if mode == "publish":
             dispatch_quarantine(io)
-        items, units, agent_notes, decisions = collect(io, now, started)
+        items, units, agent_notes, decisions, usage = collect(io, now, started)
         failed = {u["unit"] for u in units if not u.get("ok")}
         merged, new_keys = merge_run(state, items, failed, now)
         merged = merge_decisions(merged, decisions, now)
         content = render(merged, units, now, new_keys=new_keys, agent_notes=agent_notes,
-                         notify_failed=bool(merged.get("notifyFailedAt")), trend=load_trend(trend_path))
+                         notify_failed=bool(merged.get("notifyFailedAt")), trend=load_trend(trend_path),
+                         budget=usage)
         if mode == "print":
             print(content)
             return 0

@@ -1,17 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Credentials } from "./credentials";
-import { CREATE_ISSUE_QUERY, LinearService, RELATION_QUERY, TEAM_STATES_QUERY, type App } from "./linear";
-import { MAX_ATTEMPTS, PlanFollowUps, RETRY_MS } from "./plan-follow-ups";
+import { CREATE_ISSUE_QUERY, LinearService, postGraphQL, RELATION_QUERY, TEAM_STATES_QUERY, type App } from "./linear";
+import { MAX_ATTEMPTS, PlanFollowUps, RETRY_MS, type FollowUpRecord } from "./plan-follow-ups";
+import { RateBudget, RateLimitedError, withPriority } from "./rate-budget";
+import { AgentApi } from "./agent-app";
 
 const PLAN = "# Plan\n\n## Reach\n\n- Changes: the delivery date\n- Help page: follow-up — Document the delivery date\n- Mobile app: follow-up — Show the delivery date on mobile\n\n## Principles and rules\n\nNone apply; no new rule.\n\n## Risk and impact\n\n- Impact: 0\n";
 const ORIGIN = { issueId: "origin-1", identifier: "TUC-50", plan: PLAN, documentUrl: "https://linear.app/doc/plan" };
-type Mode = "ok" | "null" | "throw";
+type Mode = "ok" | "null" | "throw" | RateLimitedError;
 type Ticket = { teamId: string; projectId: string; creatorId: string; labels: { id: string; name: string }[] };
-type Harness = { calls: string[]; mode: { create: Mode; relate: Mode; comment: Mode }; ticket: Ticket; followUps: PlanFollowUps; directory: string; later: (ms: number) => void };
+type FollowUpLinear = Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "createIssueAsApp" | "relateAsApp" | "comment">;
+type Harness = { calls: string[]; mode: { create: Mode; relate: Mode; comment: Mode }; ticket: Ticket; linear: FollowUpLinear; followUps: PlanFollowUps; directory: string; later: (ms: number) => void };
 
 // Linear as plan-follow-ups.ts sees it; `mode` decides how each write answers.
 function fakeLinear() {
@@ -20,6 +23,7 @@ function fakeLinear() {
   const ticket: Ticket = { teamId: "team-1", projectId: "project-1", creatorId: "owner", labels: [] };
   let created = 0;
   const answer = <T>(which: Mode, value: T): T | null => {
+    if (which instanceof RateLimitedError) throw which;
     if (which === "throw") throw new Error("Linear is down");
     return which === "null" ? null : value;
   };
@@ -211,5 +215,156 @@ test("a failed comment is posted by the sweep, once", async () => {
     later(RETRY_MS);
     await followUps.retryPending();
     assert.equal(comments(calls).length, 1);
+  });
+});
+
+test("rate-limited follow-up creation, relations and announcements wait without spending attempts or duplicating successful writes", async (t) => {
+  t.mock.method(console, "error", () => {});
+  for (const stage of ["create", "relate", "comment"] as const) {
+    await withFollowUps(async ({ calls, mode, followUps, directory, later }) => {
+      let now = Date.parse("2026-10-04T12:00:00Z");
+      const record = async () => JSON.parse(await readFile(join(directory, "origin-1.json"), "utf8")) as FollowUpRecord;
+      for (let failure = 0; failure < MAX_ATTEMPTS + 2; failure++) {
+        const resumeAt = now + RETRY_MS;
+        mode[stage] = new RateLimitedError("app", resumeAt);
+        if (failure === 0) await followUps.file(ORIGIN);
+        else await followUps.retryPending();
+        const pending = await record();
+        assert.equal(pending.retryAt, resumeAt, stage);
+        assert.equal(pending.attempts, 0, stage);
+        assert.ok(Object.values(pending.items).every((item) => item.stopped !== "gave-up"), stage);
+        const before = calls.length;
+        later(RETRY_MS - 1);
+        now += RETRY_MS - 1;
+        await followUps.retryPending();
+        assert.equal(calls.length, before, `${stage}: not retried before resumeAt`);
+        // The scan is minute-spaced; move to its next due scan after checking the boundary.
+        later(60_001);
+        now += 60_001;
+      }
+      mode[stage] = "ok";
+      await followUps.retryPending();
+      const finished = await record();
+      assert.equal(finished.retryAt, null, stage);
+      assert.equal(finished.attempts, 0, stage);
+      assert.ok(Object.values(finished.items).every((item) => item.id && item.related), stage);
+      assert.equal(calls.filter((call) => call.startsWith("create")).length, stage === "create" ? MAX_ATTEMPTS + 4 : 2, stage);
+      assert.equal(calls.filter((call) => call.startsWith("relate")).length, stage === "relate" ? MAX_ATTEMPTS + 4 : 2, stage);
+      const before = calls.length;
+      later(RETRY_MS);
+      await followUps.retryPending();
+      assert.equal(calls.length, before, `${stage}: completed once`);
+    });
+  }
+});
+
+test("a follow-up created before a limit is persisted and is never recreated, including after restarting the worker", async (t) => {
+  t.mock.method(console, "error", () => {});
+  await withFollowUps(async ({ calls, linear, followUps, directory, later }) => {
+    const create = linear.createIssueAsApp;
+    let writes = 0;
+    const resumeAt = Date.parse("2026-10-04T12:00:00Z") + RETRY_MS;
+    linear.createIssueAsApp = async (input) => {
+      if (++writes === 2) throw new RateLimitedError("app", resumeAt);
+      return create(input);
+    };
+    await followUps.file(ORIGIN);
+    const pending = JSON.parse(await readFile(join(directory, "origin-1.json"), "utf8")) as FollowUpRecord;
+    assert.equal(pending.items["document the delivery date"].id, "new-1");
+    assert.equal(pending.attempts, 0);
+    assert.equal(pending.retryAt, resumeAt);
+    later(RETRY_MS);
+    const restarted = new PlanFollowUps(linear, directory, () => resumeAt);
+    await restarted.retryPending();
+    assert.equal(calls.filter((call) => call.startsWith('create "Document')).length, 1);
+    assert.equal(calls.filter((call) => call.startsWith("relate new-1")).length, 1);
+    assert.equal(comments(calls).length, 1);
+  });
+});
+
+test("initial follow-up filing and retryPending admit every prerequisite and write through real admission with 3% points", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-follow-up-admission-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  let now = Date.parse("2026-10-07T12:00:00Z");
+  const budget = new RateBudget(() => now);
+  const headers = { "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": "4500", "x-ratelimit-complexity-limit": "2000000", "x-ratelimit-complexity-remaining": "60000", "x-complexity": "100" };
+  for (const pool of ["key", "app"] as const) budget.acquire(pool, "owner").done(new Headers(headers), false);
+  const sent: string[] = [];
+  let createRequests = 0;
+  const data: Record<string, object> = {
+    issueState: { issue: { id: "origin-1", identifier: "TUC-50", creator: { id: "owner" }, team: { id: "team-1" }, project: { id: "project-1" }, state: { name: "Todo", type: "unstarted" }, labels: { nodes: [] } } },
+    viewerCheck: { viewer: { id: "owner" } },
+    appViewer: { viewer: { id: "paseo-app", name: "Paseo" } },
+    teamStates: { team: { states: { nodes: [{ id: "todo", name: "Todo", type: "unstarted", position: 1 }] } } },
+    relation: { issueRelationCreate: { success: true } },
+    comment: { commentCreate: { success: true, comment: { id: "comment-1" } } },
+  };
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+    const body: { query: string } = JSON.parse(String(init?.body));
+    const operation = body.query.match(/^(?:query|mutation) (\w+)/)?.[1] ?? "?";
+    sent.push(operation);
+    if (operation === "issueCreate") {
+      createRequests++;
+      if (createRequests === 1) return new Response(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] }), { status: 400, headers });
+      return new Response(JSON.stringify({ data: { issueCreate: { success: true, issue: { id: `new-${createRequests - 1}`, identifier: `TUC-${100 + createRequests}`, url: `https://linear.app/TUC-${100 + createRequests}` } } } }), { headers });
+    }
+    assert.ok(data[operation], `unexpected Linear operation ${operation}`);
+    return new Response(JSON.stringify({ data: data[operation] }), { headers });
+  });
+  const post = (key: string, query: string, variables: Record<string, unknown>) => postGraphQL(key, query, variables, budget);
+  const linear = new LinearService(new Credentials("/unused", "owner-key"), post, new AgentApi({ accessToken: async () => "app-token" }, post));
+  const followUps = new PlanFollowUps(linear, directory, () => now);
+  await withPriority("background", "follow-up test", () => followUps.file(ORIGIN));
+  const pending = JSON.parse(await readFile(join(directory, "origin-1.json"), "utf8")) as FollowUpRecord;
+  assert.equal(pending.retryAt, now + 60_000);
+  assert.equal(pending.attempts, 0);
+  assert.ok(sent.includes("issueState"));
+  assert.ok(sent.includes("teamStates"));
+  now += 60_000;
+  assert.ok(budget.pausedUntil("app", "background"), "the app's background share has not refilled");
+  await withPriority("background", "follow-up retry test", () => followUps.retryPending());
+  const complete = JSON.parse(await readFile(join(directory, "origin-1.json"), "utf8")) as FollowUpRecord;
+  assert.equal(complete.retryAt, null);
+  assert.equal(complete.attempts, 0);
+  assert.ok(Object.values(complete.items).every((item) => item.id && item.related));
+  assert.equal(sent.filter((operation) => operation === "issueCreate").length, 3);
+  assert.equal(sent.filter((operation) => operation === "relation").length, 2);
+  assert.equal(sent.filter((operation) => operation === "comment").length, 1);
+});
+
+test("a relation saved before a limit is not repeated by a restarted follow-up worker", async (t) => {
+  t.mock.method(console, "error", () => {});
+  await withFollowUps(async ({ calls, linear, followUps, directory }) => {
+    const relate = linear.relateAsApp;
+    let relations = 0;
+    const resumeAt = Date.parse("2026-10-04T12:00:00Z") + RETRY_MS;
+    linear.relateAsApp = async (...args) => {
+      if (++relations === 2) throw new RateLimitedError("app", resumeAt);
+      return relate(...args);
+    };
+    await followUps.file(ORIGIN);
+    const pending = JSON.parse(await readFile(join(directory, "origin-1.json"), "utf8")) as FollowUpRecord;
+    assert.equal(pending.items["document the delivery date"].related, true);
+    assert.equal(pending.retryAt, resumeAt);
+    assert.equal(pending.attempts, 0);
+    await new PlanFollowUps(linear, directory, () => resumeAt).retryPending();
+    assert.equal(calls.filter((call) => call.startsWith("create ")).length, 2);
+    assert.equal(calls.filter((call) => call === "relate new-1 origin-1 related").length, 1);
+    assert.equal(calls.filter((call) => call === "relate new-2 origin-1 related").length, 1);
+    assert.equal(comments(calls).length, 1);
+  });
+});
+
+test("a limited announcement never spends the round's attempt, even when a relation failed earlier in that round", async (t) => {
+  t.mock.method(console, "error", () => {});
+  await withFollowUps(async ({ mode, followUps, directory }) => {
+    mode.relate = "throw";
+    const resumeAt = Date.parse("2026-10-04T12:00:00Z") + RETRY_MS;
+    mode.comment = new RateLimitedError("app", resumeAt);
+    await followUps.file(ORIGIN);
+    const pending = JSON.parse(await readFile(join(directory, "origin-1.json"), "utf8")) as FollowUpRecord;
+    assert.equal(pending.retryAt, resumeAt);
+    assert.equal(pending.attempts, 0);
+    assert.ok(Object.values(pending.items).every((item) => item.id && !item.stopped));
   });
 });

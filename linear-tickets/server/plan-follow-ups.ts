@@ -3,6 +3,7 @@ import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promise
 import { join } from "node:path";
 import { planFollowUps } from "../shared/plan-sections";
 import type { LinearService } from "./linear";
+import { RateLimitedError, withPriority } from "./rate-budget";
 import { isUntrusted } from "./starter";
 import { paseoHome } from "./ticket-mcp";
 
@@ -108,7 +109,23 @@ export class PlanFollowUps {
   }
 
   // One round: create what is not created, link what is not linked, then tell the owner.
-  private async process(record: FollowUpRecord): Promise<void> {
+  private process(record: FollowUpRecord): Promise<void> {
+    return withPriority("owner", "plan follow-ups", async () => {
+      const attempts = record.attempts;
+      const active = record.titles.flatMap((key) => record.items[key] && !record.items[key].stopped ? [record.items[key]] : []);
+      try {
+        await this.processRound(record);
+      } catch (error) {
+        if (!(error instanceof RateLimitedError)) throw error;
+        record.attempts = attempts;
+        for (const item of active) if (item.stopped === "gave-up") delete item.stopped;
+        record.retryAt = error.resumeAt;
+        await this.save(record);
+      }
+    });
+  }
+
+  private async processRound(record: FollowUpRecord): Promise<void> {
     const items = record.titles.flatMap((key) => record.items[key] ?? []);
     let failed = false;
     const create = items.filter((item) => !item.id && !item.stopped);
@@ -134,6 +151,7 @@ export class PlanFollowUps {
             await this.save(record);
             if (created) link.push(item);
           } catch (error) {
+            if (error instanceof RateLimitedError) throw error;
             failed = true;
             console.error(`[linear-tickets] ${record.identifier}: filing follow-up "${item.title}" failed: ${error instanceof Error ? error.message : error}`);
           }
@@ -146,11 +164,13 @@ export class PlanFollowUps {
               await this.save(record);
             } else failed = true;
           } catch (error) {
+            if (error instanceof RateLimitedError) throw error;
             failed = true;
             console.error(`[linear-tickets] ${record.identifier}: linking follow-up ${item.identifier} failed: ${error instanceof Error ? error.message : error}`);
           }
         }
       } catch (error) {
+        if (error instanceof RateLimitedError) throw error;
         failed = true;
         console.error(`[linear-tickets] ${record.identifier}: filing follow-ups failed: ${error instanceof Error ? error.message : error}`);
       }
@@ -177,6 +197,7 @@ export class PlanFollowUps {
       await this.linear.comment(record.issueId, body);
       record.notice = hash;
     } catch (error) {
+      if (error instanceof RateLimitedError) throw error;
       console.error(`[linear-tickets] ${record.identifier}: the follow-up comment failed: ${error instanceof Error ? error.message : error}`);
       if (record.retryAt === null) this.failedRound(record, []);
     }

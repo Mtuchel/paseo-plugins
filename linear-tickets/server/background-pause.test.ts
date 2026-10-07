@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,81 +8,433 @@ import type { PaseoApi } from "@getpaseo/client";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
 import { Dispatcher } from "./dispatch";
-import { LinearService, postGraphQL } from "./linear";
+import { HealthMonitor } from "./health";
+import { LabelRepair } from "./label-repair";
+import { LabelSync } from "./label-sync";
+import { LinearService, postGraphQL, type Post } from "./linear";
+import { LinearUsage } from "./linear-usage";
 import { ManualTasks, type ManualTask } from "./manual-tasks";
-import { RateBudget } from "./rate-budget";
+import { PlanRequests } from "./plan-requests";
+import { ProjectFlow, ProjectStore } from "./project-flow";
+import { PullRequestWatch } from "./pr-watch";
+import { RateBudget, RateLimitedError, withPriority, type Pool } from "./rate-budget";
+import { CommentRelay } from "./relay";
+import { SessionRouter } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
-import type { TicketStarter } from "./starter";
+import { StateLabels } from "./state-labels";
+import { Writeback } from "./writeback";
 
-// The real request path (LinearService → postGraphQL → budget) against a fake Linear: every
-// request is recorded with its credential, and answers carry the pool's remaining requests.
-type Call = { pool: "key" | "app"; operation: string };
+const APP_TOKEN = "app-token";
+const ID_A = "3b241101-e2bb-4255-8caf-4136c566a962";
+const REQUESTS_LIMIT = 5_000;
+const POINTS_LIMIT = 2_000_000;
+// The budget every background fixture runs against: 19% of the points budget is below the 20%
+// background reserve, so nothing goes out; 21% is above it, so the poller's own request is sent.
+const LOW_POINTS = Math.floor(POINTS_LIMIT * 0.19);
+const HIGH_POINTS = Math.ceil(POINTS_LIMIT * 0.21);
+const PLENTY_REQUESTS = Math.ceil(REQUESTS_LIMIT * 0.95);
 
-function fakeLinear(t: TestContext, answer: (call: Call, variables: Record<string, unknown>) => { data: Record<string, unknown>; remaining: number }) {
+type Call = { pool: Pool; operation: string };
+type Reply = Record<string, unknown> & { status?: number; errors?: { message: string }[] };
+type Refusal = [Pool, string, "background" | "interactive"];
+
+type Fixture = {
+  clock: { now: number };
+  now: () => number;
+  calls: Call[];
+  refusals: Refusal[];
+  budget: RateBudget;
+  linear: LinearService;
+  post: Post;
+  // Records a budget sample like the pool's first answered response would, without a request.
+  sample: (pool: Pool, requests: number, points: number) => void;
+};
+
+// The real request path (LinearService/AgentApi → postGraphQL → RateBudget) against a fake Linear:
+// every request is recorded with its credential and operation, the answer is canned per operation,
+// and each response carries both dimensions' budget (or the countdown the caller sets). `usage` is
+// a real LinearUsage whose `refused` is wrapped, so a local refusal is visible with its caller.
+function fixture(t: TestContext, reply: (call: Call, variables: Record<string, unknown>) => Reply = () => ({}), remaining?: (call: Call) => { requests: number; points: number }): Fixture {
+  const clock = { now: 1_000_000_000 };
+  const now = () => clock.now;
   const calls: Call[] = [];
   t.mock.method(globalThis, "fetch", (async (_url: unknown, init?: RequestInit) => {
     const auth = (init?.headers as Record<string, string>).authorization;
     const body = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
-    const call: Call = { pool: auth.startsWith("Bearer ") ? "app" : "key", operation: body.query.match(/^(?:query|mutation) (\w+)/)?.[1] ?? "?" };
+    const call: Call = { pool: /^Bearer\s/i.test(auth) ? "app" : "key", operation: /\b(?:query|mutation)\s+(\w+)/.exec(body.query)?.[1] ?? "?" };
     calls.push(call);
-    const { data, remaining } = answer(call, body.variables);
-    return new Response(JSON.stringify({ data }), {
-      status: 200,
-      headers: { "content-type": "application/json", "x-ratelimit-requests-limit": call.pool === "key" ? "2500" : "5000", "x-ratelimit-requests-remaining": String(remaining) },
+    const { status = 200, errors, ...data } = reply(call, body.variables);
+    const budget = remaining?.(call) ?? { requests: PLENTY_REQUESTS, points: HIGH_POINTS };
+    return new Response(JSON.stringify(errors ? { errors } : { data }), {
+      status,
+      headers: {
+        "content-type": "application/json",
+        "x-ratelimit-requests-limit": String(REQUESTS_LIMIT),
+        "x-ratelimit-requests-remaining": String(budget.requests),
+        "x-ratelimit-complexity-limit": String(POINTS_LIMIT),
+        "x-ratelimit-complexity-remaining": String(budget.points),
+      },
     });
   }) as typeof fetch);
-  const budget = new RateBudget();
-  const post = (key: string, query: string, variables: Record<string, unknown>) => postGraphQL(key, query, variables, budget);
-  const linear = new LinearService(new Credentials("/unused", "env-key"), post, new AgentApi({ accessToken: async () => "app-token" }, post));
-  return { calls, budget, linear };
+  const usage = new LinearUsage(now, { path: join(tmpdir(), `paseo-usage-${randomUUID()}.json`) });
+  const refusals: Refusal[] = [];
+  const accounting = usage.refused.bind(usage);
+  usage.refused = (pool, caller, level) => {
+    refusals.push([pool, caller, level]);
+    accounting(pool, caller, level);
+  };
+  const budget = new RateBudget(now, usage);
+  const post: Post = (key, query, variables) => postGraphQL(key, query, variables, budget);
+  const linear = new LinearService(new Credentials("/unused", "env-key"), post, new AgentApi({ accessToken: async () => APP_TOKEN }, post));
+  const sample = (pool: Pool, requests: number, points: number) => budget.acquire(pool, "owner").done(new Headers({
+    "x-ratelimit-requests-limit": String(REQUESTS_LIMIT),
+    "x-ratelimit-requests-remaining": String(requests),
+    "x-ratelimit-complexity-limit": String(POINTS_LIMIT),
+    "x-ratelimit-complexity-remaining": String(points),
+  }), false);
+  return { clock, now, calls, refusals, budget, linear, post, sample };
 }
 
-function prime(budget: RateBudget, pool: "key" | "app", limit: number, remaining: number) {
-  budget.acquire(pool, "interactive").done(new Headers({ "x-ratelimit-requests-limit": String(limit), "x-ratelimit-requests-remaining": String(remaining) }), false);
+const settings = {
+  dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["ENG"] },
+  writeback: DEFAULT_WRITEBACK,
+  activation: DEFAULT_ACTIVATION,
+} as unknown as PluginSettings;
+// The write-back settings that make an agent's failed turn post its one Linear error comment.
+const summaryWriteback = { ...settings, writeback: { ...DEFAULT_WRITEBACK, summaries: true } } as unknown as PluginSettings;
+
+const AGENT = { id: "agent-1", title: "Agent", cwd: "/nowhere", labels: { "linear.issueId": ID_A, "linear.identifier": "TUC-1" } };
+// The refresh every write-back path takes before its work; it carries the agent's ticket labels.
+const agentPaseo = { agents: { ref: (id: string) => ({ refresh: async () => ({ agent: { id, title: AGENT.title, labels: AGENT.labels, pendingPermissions: [] } }) }) } } as unknown as PaseoApi;
+
+const ISSUE_STATE_REPLY = { issue: { id: ID_A, identifier: "TUC-1", state: { id: "s-todo", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] }, relations: { nodes: [] } } };
+const HANDOVER_RECORD = { issueId: ID_A, identifier: "TUC-1", agentId: "agent-1", agentTitle: "Agent", branch: "tuc-1-work", worktreePath: null, lastCommit: null, summaries: [], links: {}, plan: null, review: null, model: null, waiting: null, status: "working", progressCommentId: null, resumedFrom: null, updatedAt: "2026-10-07T00:00:00Z" };
+const MANUAL_TASK = (id: string, parentId: string): ManualTask => ({ id, identifier: id.toUpperCase(), url: `https://linear.app/x/issue/${id}`, title: `Do ${id}`, parentId, parentIdentifier: parentId.toUpperCase(), when: "anytime", check: null, cwd: "/nowhere", createdAt: "2026-09-28T00:00:00Z", announced: false, activated: true, verifiedAt: null });
+// The dispatch poller's start paths must never run in these fixtures: nothing is labelled.
+const noStarter = { admission: async () => { throw new Error("no launch while the pool is paused"); }, start: async () => { throw new Error("no launch while the pool is paused"); } };
+
+function dispatcher(f: Fixture): Dispatcher {
+  const dispatch = new Dispatcher({ linear: f.linear, starter: noStarter, launcher: { gate: () => ({ release: () => {} }) }, settings: { read: async () => settings }, budget: f.budget });
+  dispatch.attach({} as PaseoApi);
+  return dispatch;
+}
+function watcher(f: Fixture, dir: string): PullRequestWatch {
+  return new PullRequestWatch({ handover: { all: async () => [HANDOVER_RECORD], update: async () => {} }, sessions: { crashed: async () => null }, linear: f.linear, settings: { read: async () => settings } } as never, join(dir, "pr-watch.json"));
+}
+async function directory(t: TestContext, prefix: string): Promise<string> {
+  const path = await mkdtemp(join(tmpdir(), prefix));
+  t.after(() => rm(path, { recursive: true, force: true }));
+  return path;
+}
+// The poller sent nothing and its local reserve refusal is counted under its own caller name.
+function assertPaused(f: Fixture, caller: string, pool: Pool = "app"): void {
+  assert.deepEqual(f.calls, [], "no request reaches Linear");
+  assert.deepEqual(f.refusals, [[pool, caller, "background"]]);
+}
+// The poller's own first request really went out.
+function assertSent(f: Fixture, pool: Pool = "app"): void {
+  assert.equal(f.calls[0]?.pool, pool, `first request is on the ${pool} pool`);
 }
 
-const settings = { dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["ENG"] }, writeback: DEFAULT_WRITEBACK } as unknown as PluginSettings;
-const labeled = { issues: { nodes: [{ id: "3b241101-e2bb-4255-8caf-4136c566a962", identifier: "ENG-1", priority: 0, team: { key: "ENG" }, labels: { nodes: [{ id: "l1", name: "paseo" }] } }] } };
-const starter = {
-  admission: async () => { throw new Error("no launch while the key is paused"); },
-  start: async () => { throw new Error("no launch while the key is paused"); },
-} as unknown as TicketStarter;
-
-function dispatcher(t: TestContext, linear: LinearService, budget: RateBudget) {
+// AC-2: the dispatch poll pauses at 19% of the points budget, and sends at 21%.
+// The mock clock keeps the timer `attach` arms from polling a second time behind the explicit tick.
+test("the dispatch poll pauses at 19% of the points budget and sends nothing; at 21% it reads", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const result = new Dispatcher({ linear, starter, launcher: { gate: () => ({ release: () => {} }) }, settings: { read: async () => settings }, budget });
-  result.attach({} as PaseoApi);
-  return result;
-}
+  const low = fixture(t);
+  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  const paused = dispatcher(low);
+  await paused.tick();
+  assertPaused(low, "dispatch");
+  assert.match(paused.snapshot().lastError ?? "", /^paused:/);
 
-test("with the key at its reserve, the dispatch poll still reads on the app and sends nothing with the key", async (t) => {
-  const { calls, budget, linear } = fakeLinear(t, () => ({ data: labeled, remaining: 4900 }));
-  prime(budget, "key", 2500, 100);
-  const dispatch = dispatcher(t, linear, budget);
-  await dispatch.tick();
-  assert.deepEqual(calls, [{ pool: "app", operation: "labeledIssues" }]);
-  assert.match(dispatch.snapshot().lastError ?? "", /^paused: Background Linear work is paused to keep the Linear API key's last requests/);
+  const high = fixture(t, () => ({ issues: { nodes: [] } }));
+  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  await dispatcher(high).tick();
+  assertSent(high);
 });
 
-test("with the app at its reserve, the dispatch poll reads nothing and does not fall back to the key", async (t) => {
-  const { calls, budget, linear } = fakeLinear(t, () => ({ data: labeled, remaining: 2400 }));
-  prime(budget, "app", 5000, 100);
-  const dispatch = dispatcher(t, linear, budget);
-  await dispatch.tick();
-  assert.deepEqual(calls, []);
-  assert.match(dispatch.snapshot().lastError ?? "", /^paused: .*the Paseo Linear app/);
+// AC-1: the ticket's fixture, the poller side: plenty of requests, 3% of the points budget.
+test("AC-1: at 3% of the points budget (4,500/5,000 requests) the dispatch poll reports paused and sends nothing", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture(t);
+  f.sample("app", 4_500, 60_000);
+  const paused = dispatcher(f);
+  await paused.tick();
+  assertPaused(f, "dispatch");
+  assert.match(paused.snapshot().lastError ?? "", /^paused: /);
 });
 
+// AC-4's no-fallback rule on the launch path: the read on one pool never spends the other's reserve.
+test("with the key at its reserve the dispatch poll still reads on the app and sends nothing with the key", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture(t, () => ({ issues: { nodes: [{ id: ID_A, identifier: "ENG-1", priority: 0, team: { key: "ENG" }, labels: { nodes: [{ id: "l1", name: "paseo" }] } }] } }));
+  f.sample("key", 100, HIGH_POINTS);
+  const dispatch = dispatcher(f);
+  await dispatch.tick();
+  assert.deepEqual(f.calls, [{ pool: "app", operation: "labeledIssues" }]);
+  assert.match(dispatch.snapshot().lastError ?? "", /^paused:/);
+});
+
+// AC-2: the comment relay owns its caller context, so a direct poll is admitted as background work.
+test("the comment relay pauses at 19% of the points budget and sends at 21%", async (t) => {
+  const dir = await directory(t, "paseo-relay-");
+  const paseo = { agents: { list: async () => ({ entries: [{ agent: { id: "agent-1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-02T00:00:00Z", labels: AGENT.labels } }], pageInfo: { hasMore: false, nextCursor: null } }) } } as unknown as PaseoApi;
+
+  // The relay's first Linear read is the viewer, which the key answers.
+  const low = fixture(t);
+  low.sample("key", PLENTY_REQUESTS, LOW_POINTS);
+  await assert.rejects(new CommentRelay(low.linear, join(dir, "low.json")).poll(paseo), RateLimitedError);
+  assertPaused(low, "comment-relay", "key");
+
+  const high = fixture(t, (call) => call.operation === "viewerCheck" ? { viewer: { id: "me" } } : call.operation === "appViewer" ? { viewer: { id: "paseo-app", name: "Paseo" } } : {});
+  high.sample("key", PLENTY_REQUESTS, HIGH_POINTS);
+  await new CommentRelay(high.linear, join(dir, "high.json")).poll(paseo);
+  assertSent(high, "key");
+});
+
+// AC-2: the project flow's own tick, not only the outer dispatch tick.
+test("the project flow pauses at 19% of the points budget and sends at 21%", async (t) => {
+  const dir = await directory(t, "paseo-projects-");
+  const flow = (f: Fixture) => new ProjectFlow({
+    linear: f.linear,
+    scheduler: { note: async () => {}, admit: async () => ({ ok: true }), release: async () => {} },
+    capacity: { limit: () => 5 },
+    store: new ProjectStore(join(dir, "projects.json")),
+    retire: async () => {},
+    restart: async () => {},
+    accountedFor: async () => false,
+    now: f.now,
+  } as never);
+
+  const low = fixture(t);
+  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  await assert.rejects(flow(low).tick({} as PaseoApi, settings), RateLimitedError);
+  assertPaused(low, "project-flow");
+
+  const high = fixture(t, (call) => call.operation === "appViewer" ? { viewer: { id: "paseo-app", name: "Paseo" } } : { projects: { nodes: [] } });
+  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  await flow(high).tick({} as PaseoApi, settings);
+  assertSent(high);
+});
+
+// AC-2: the label repair's own tick, not only the outer dispatch tick.
+test("the label repair pauses at 19% of the points budget and sends at 21%", async (t) => {
+  const dir = await directory(t, "paseo-repair-");
+  t.mock.method(console, "error", () => {});
+  const repair = (f: Fixture) => new LabelRepair({
+    linear: f.linear,
+    store: new ProjectStore(join(dir, "projects.json")),
+    launcher: { gate: () => ({ release: () => {} }), underWay: async () => false },
+    restart: async () => ({ started: false }),
+    intake: { claimsReady: async () => true, claimFor: async () => null, pendingFor: async () => [] },
+    now: f.now,
+  } as never);
+
+  const low = fixture(t);
+  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  await repair(low).tick({} as PaseoApi, settings);
+  assertPaused(low, "label-repair");
+
+  const high = fixture(t, () => ({ issues: { nodes: [], pageInfo: { hasNextPage: false } } }));
+  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  await repair(high).tick({} as PaseoApi, settings);
+  assertSent(high);
+});
+
+// AC-2: health's public check, which is where its caller context lives.
+test("the health check pauses at 19% of the points budget and sends at 21%", async (t) => {
+  const dir = await directory(t, "paseo-health-");
+  const monitor = (f: Fixture) => new HealthMonitor(f.linear, { read: async () => settings }, [{ name: "Linear", run: async () => { await f.linear.viewerId(); } }], join(dir, "health.json"), () => new Date(f.clock.now).toISOString());
+
+  const low = fixture(t);
+  low.sample("key", PLENTY_REQUESTS, LOW_POINTS);
+  assert.deepEqual(await monitor(low).check(), {}, "a limit is neither a pass nor a problem");
+  assertPaused(low, "health", "key");
+
+  const high = fixture(t, () => ({ viewer: { id: "me" } }));
+  high.sample("key", PLENTY_REQUESTS, HIGH_POINTS);
+  assert.deepEqual(await monitor(high).check(), {});
+  assertSent(high, "key");
+});
+
+// AC-2: the label rules' own sync, which reads the app's identity first.
+test("the label rules pause at 19% of the points budget and send at 21%", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const rules = { teamKeys: ["ENG"], groups: [], hash: "rules-1" };
+  const sync = (f: Fixture) => new LabelSync({ linear: f.linear, pullRequests: { filesOf: () => null, refresh: async () => {} }, rules: async () => rules, now: f.now } as never);
+
+  const low = fixture(t);
+  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  await sync(low).sync();
+  assertPaused(low, "label-sync");
+
+  const high = fixture(t, (call) => call.operation === "appViewer" ? { viewer: { id: "paseo-app", name: "Paseo" } } : call.operation === "labelCatalog" ? { issueLabels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } : { issues: { nodes: [], pageInfo: { hasNextPage: false } } });
+  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  await sync(high).sync();
+  assertSent(high);
+});
+
+// AC-2: manual tasks read their tickets through the real pool admission.
+test("the manual task poll pauses at 19% of the points budget and sends at 21%", async (t) => {
+  const dir = await directory(t, "paseo-manual-");
+  t.mock.method(console, "error", () => {});
+  await writeFile(join(dir, "a.json"), JSON.stringify(MANUAL_TASK("a", "p1")));
+
+  const low = fixture(t);
+  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  await new ManualTasks({ linear: low.linear, settings: { read: async () => settings } }, dir).poll();
+  assertPaused(low, "manual-tasks");
+
+  const high = fixture(t, (_call, variables) => ({ issues: { nodes: ((variables.ids ?? []) as string[]).map((id) => ({ id, state: { name: "Todo", type: "unstarted" }, completedAt: null })) } }));
+  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  await new ManualTasks({ linear: high.linear, settings: { read: async () => settings } }, dir).poll();
+  assertSent(high);
+});
+
+// AC-2: the plan-request poll reads the agents' tickets through the real pool admission.
+test("the plan request poll pauses at 19% of the points budget and sends at 21%", async (t) => {
+  const dir = await directory(t, "paseo-plans-");
+  t.mock.method(console, "error", () => {});
+  const paseo = { agents: { list: async () => ({ entries: [{ agent: { id: "agent-1", labels: AGENT.labels } }], pageInfo: { hasMore: false, nextCursor: null } }) } } as unknown as PaseoApi;
+  const poller = (f: Fixture) => new PlanRequests({ linear: f.linear, prompt: async () => "sent", directory: join(dir, "requests") } as never);
+
+  const low = fixture(t);
+  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  const paused = poller(low);
+  paused.attach(paseo);
+  await paused.poll();
+  paused.stop();
+  assertPaused(low, "plan-requests");
+
+  const high = fixture(t, () => ({ issues: { nodes: [{ id: ID_A, labels: { nodes: [] } }] } }));
+  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  const running = poller(high);
+  running.attach(paseo);
+  await running.poll();
+  running.stop();
+  assertSent(high);
+});
+
+// AC-2: the pull request watch's own poll.
+test("the pull request watch pauses at 19% of the points budget and sends at 21%", async (t) => {
+  const dir = await directory(t, "paseo-prwatch-");
+  t.mock.method(console, "error", () => {});
+  const low = fixture(t);
+  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  await watcher(low, dir).poll();
+  assertPaused(low, "pr-watch");
+
+  const high = fixture(t, () => ISSUE_STATE_REPLY);
+  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  await watcher(high, dir).poll();
+  assertSent(high);
+});
+
+// AC-2: the queue backstop's own run.
+test("the queue backstop pauses at 19% of the points budget and sends at 21%", async (t) => {
+  const dir = await directory(t, "paseo-backstop-");
+  t.mock.method(console, "error", () => {});
+  const low = fixture(t);
+  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  await watcher(low, dir).backstop();
+  assertPaused(low, "queue backstop");
+
+  const high = fixture(t, () => ISSUE_STATE_REPLY);
+  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  await watcher(high, dir).backstop();
+  assertSent(high);
+});
+
+// AC-2: the workspace state labels' batched ticket read.
+test("the state labels pause at 19% of the points budget and send at 21%", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const daemon = () => ({
+    workspaces: async () => [{ id: "w1", name: "TUC-1: work", labels: [] }],
+    ticketAgents: async () => [{ workspaceId: "w1", issueId: ID_A, identifier: "TUC-1", createdAt: "2026-01-01T00:00:00Z" }],
+    catalog: async () => [],
+    assign: async () => {},
+    unassign: async () => {},
+    recolor: async () => {},
+  });
+  const labels = (f: Fixture) => new StateLabels({ linear: f.linear, daemon: async () => daemon(), now: f.now } as never);
+
+  const low = fixture(t);
+  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  await labels(low).sync();
+  assertPaused(low, "state-labels");
+
+  const high = fixture(t, () => ({ issues: { nodes: [{ id: ID_A, state: { name: "Todo", type: "unstarted" }, completedAt: null }] } }));
+  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  await labels(high).sync();
+  assertSent(high);
+});
+
+// AC-4: at 4% of either dimension the interactive work is refused and the owner's share passes.
+test("AC-4: at 4% of either dimension a write-back comment, a session reply and the sidebar list are refused and the owner passes", async (t) => {
+  t.mock.method(console, "error", () => {});
+  for (const dimension of ["requests", "points"] as const) {
+    const dir = await directory(t, `paseo-interactive-${dimension}-`);
+    const f = fixture(t, (call) => call.operation === "comment" ? { commentCreate: { success: true, comment: { id: "c1" } } } : call.operation === "agentActivity" ? { agentActivityCreate: { success: true } } : { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } });
+    f.sample("app", dimension === "requests" ? 200 : PLENTY_REQUESTS, dimension === "points" ? 80_000 : HIGH_POINTS);
+    f.sample("key", dimension === "requests" ? 200 : PLENTY_REQUESTS, dimension === "points" ? 80_000 : HIGH_POINTS);
+    const writeback = new Writeback(f.linear, { read: async () => summaryWriteback }, undefined, 0, join(dir, "outbox.json"));
+    const router = new SessionRouter({ api: new AgentApi({ accessToken: async () => APP_TOKEN }, f.post) } as never);
+    const turn = { agent: AGENT, outcome: { kind: "failed", error: new Error("boom") }, timeline: [] } as never;
+
+    // Interactive work is refused on both pools, before any request goes out.
+    await writeback.turnEnded(turn, agentPaseo);
+    await assert.rejects(router.say("session-1", "thought", "hi"), (error: unknown) => error instanceof RateLimitedError && error.reason === "reserve");
+    await assert.rejects(f.linear.issues(), (error: unknown) => error instanceof RateLimitedError && error.reason === "reserve");
+    assert.deepEqual(f.calls, [], "the interactive work is not sent");
+    assert.deepEqual(f.refusals, [
+      ["app", "op:comment", "interactive"],
+      ["app", "op:agentActivity", "interactive"],
+      ["key", "op:listIssues", "interactive"],
+    ]);
+
+    // The owner's write to each of them passes at the same 4%.
+    await withPriority("owner", "plan decision", () => writeback.turnEnded(turn, agentPaseo));
+    await withPriority("owner", "plan decision", () => router.say("session-1", "thought", "hi"));
+    await withPriority("owner", "plan decision", () => f.linear.issues());
+    assert.deepEqual(f.calls, [
+      { pool: "app", operation: "comment" },
+      { pool: "app", operation: "agentActivity" },
+      { pool: "key", operation: "listIssues" },
+    ]);
+  }
+});
+
+test("AC-4: at 6% interactive work passes while the same work at background priority is refused", async (t) => {
+  t.mock.method(console, "error", () => {});
+  for (const dimension of ["requests", "points"] as const) {
+    const dir = await directory(t, `paseo-six-${dimension}-`);
+    const sample = (f: Fixture) => f.sample("app", dimension === "requests" ? 300 : PLENTY_REQUESTS, dimension === "points" ? 120_000 : HIGH_POINTS);
+    const reply = (call: Call) => call.operation === "comment" ? { commentCreate: { success: true, comment: { id: "c1" } } } : {};
+    const turn = { agent: AGENT, outcome: { kind: "failed", error: new Error("boom") }, timeline: [] } as never;
+
+    const interactive = fixture(t, reply);
+    sample(interactive);
+    await new Writeback(interactive.linear, { read: async () => summaryWriteback }, undefined, 0, join(dir, "outbox-interactive.json")).turnEnded(turn, agentPaseo);
+    assert.deepEqual(interactive.calls, [{ pool: "app", operation: "comment" }]);
+
+    const background = fixture(t, reply);
+    sample(background);
+    await withPriority("background", "dispatch poll", async () => {
+      await new Writeback(background.linear, { read: async () => summaryWriteback }, undefined, 0, join(dir, "outbox-background.json")).turnEnded(turn, agentPaseo);
+    });
+    assert.deepEqual(background.calls, [], "the same write is refused for background work");
+    assert.deepEqual(background.refusals, [["app", "dispatch poll", "background"]]);
+  }
+});
+
+// AC-4/AC-2: with the app at its reserve a poll stops on the app and never falls back to the key.
 test("the app reaching its reserve during a poll stops the remaining writes without falling back to the key; the pause is logged once", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "paseo-pause-"));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const task = (id: string, parentId: string): ManualTask => ({ id, identifier: id.toUpperCase(), url: `https://linear.app/x/issue/${id}`, title: `Do ${id}`, parentId, parentIdentifier: parentId.toUpperCase(), when: "anytime", check: null, cwd: "/nowhere", createdAt: `2026-09-28T00:00:0${id.length}Z`, announced: false, activated: true, verifiedAt: null });
-  const tasks = [task("a", "p1"), task("bb", "p2")];
-  for (const item of tasks) await writeFile(join(directory, `${item.id}.json`), JSON.stringify(item));
-  // The plugin's writes go out as the app, which starts 3 requests above its reserve (750 of 5,000)
-  // and loses one per request; the owner's reads stay on the key, which has plenty left.
-  let appRemaining = 753;
-  const { calls, linear } = fakeLinear(t, (call, variables) => {
+  const dir = await directory(t, "paseo-tasks-");
+  for (const item of [MANUAL_TASK("a", "p1"), MANUAL_TASK("bb", "p2")]) await writeFile(join(dir, `${item.id}.json`), JSON.stringify(item));
+  // The plugin's writes go out as the app, which starts one request above its 20% reserve
+  // (1,001 of 5,000) plus room and loses one per answered request; the key reads stay plentiful.
+  let appRemaining = 1_003;
+  const f = fixture(t, (call, variables) => {
     const data: Record<string, Record<string, unknown>> = {
       issueStatuses: { issues: { nodes: ((variables.ids ?? []) as string[]).map((id) => ({ id, state: { type: "unstarted" }, completedAt: null })) } },
       labelByName: { issueLabels: { nodes: [{ id: "l-manual", name: "paseo-manual" }] } },
@@ -90,25 +443,71 @@ test("the app reaching its reserve during a poll stops the remaining writes with
       userUrl: { user: { url: "https://linear.app/ws/profiles/me" } },
       comment: { commentCreate: { success: true, comment: { id: "c1" } } },
     };
-    return { data: data[call.operation], remaining: call.pool === "app" ? appRemaining-- : 2400 };
-  });
+    return data[call.operation] ?? {};
+  }, (call) => ({ requests: call.pool === "app" ? appRemaining-- : PLENTY_REQUESTS, points: HIGH_POINTS }));
+  f.sample("app", 1_003, HIGH_POINTS);
+  f.sample("key", PLENTY_REQUESTS, HIGH_POINTS);
   const errors: string[] = [];
   t.mock.method(console, "error", (...args: unknown[]) => { errors.push(args.join(" ")); });
-  const manual = new ManualTasks({ linear, settings: { read: async () => settings } }, directory);
+  const manual = new ManualTasks({ linear: f.linear, settings: { read: async () => settings } }, dir);
 
   await manual.poll();
-  assert.deepEqual(calls.map((call) => `${call.pool} ${call.operation}`), [
+  assert.deepEqual(f.calls.map((call) => `${call.pool} ${call.operation}`), [
     "app issueStatuses",
     "key labelByName", "app addLabel", "key viewerCheck", "key userUrl", "app comment",
     // The second ticket's label goes out; its mention would dip into the app's reserve and waits
     // instead of going out with the key.
     "app addLabel",
   ]);
-  assert.equal(JSON.parse(await readFile(join(directory, "a.json"), "utf8")).announced, true);
-  assert.equal(JSON.parse(await readFile(join(directory, "bb.json"), "utf8")).announced, false);
+  assert.equal(JSON.parse(await readFile(join(dir, "a.json"), "utf8")).announced, true);
+  assert.equal(JSON.parse(await readFile(join(dir, "bb.json"), "utf8")).announced, false);
 
-  calls.length = 0;
+  f.calls.length = 0;
   await manual.poll();
-  assert.deepEqual(calls, [], "the app stays paused; nothing moves to the key");
+  assert.deepEqual(f.calls, [], "the app stays paused; nothing moves to the key");
   assert.equal(errors.filter((line) => line.includes("manual tasks paused")).length, 1);
+});
+
+// AC-7: every public state mover runs at owner priority inside a background context.
+test("AC-7: moveToStateNamed reads and writes inside a background context at 3% of the points budget", async (t) => {
+  const f = fixture(t, (call) => {
+    if (call.operation === "issueState") return ISSUE_STATE_REPLY;
+    if (call.operation === "teamStates") return { team: { states: { nodes: [{ id: "s-wip", name: "In Progress", type: "started", position: 2 }, { id: "s-review", name: "In Review", type: "started", position: 3 }] } } };
+    if (call.operation === "issueUpdateState") return { issueUpdate: { success: true, issue: { id: ID_A, state: { name: "In Progress", type: "started" } } } };
+    return {};
+  });
+  f.sample("app", 4_500, 60_000);
+  f.sample("key", PLENTY_REQUESTS, 60_000);
+
+  const result = await withPriority("background", "dispatch poll", () => f.linear.moveToStateNamed(ID_A, "In Progress"));
+  assert.deepEqual(result, { changed: true });
+  assert.deepEqual(f.calls.map((call) => `${call.pool} ${call.operation}`), ["app issueState", "key teamStates", "app issueUpdateState"]);
+  assert.deepEqual(f.refusals, [], "the owner tier never touches the reserve");
+});
+
+test("AC-7: markInProgress moves the ticket inside a background context at 3% of the points budget", async (t) => {
+  const f = fixture(t, (call) => {
+    if (call.operation === "teamStates") return { team: { states: { nodes: [{ id: "s-wip", name: "In Progress", type: "started", position: 2 }] } } };
+    if (call.operation === "issueUpdateState") return { issueUpdate: { success: true, issue: { id: ID_A, state: { name: "In Progress", type: "started" } } } };
+    return {};
+  });
+  f.sample("app", 4_500, 60_000);
+  f.sample("key", PLENTY_REQUESTS, 60_000);
+
+  const moved = await withPriority("background", "dispatch poll", () => f.linear.markInProgress({ id: ID_A, status: "Todo", statusType: "unstarted" }, "t1"));
+  assert.deepEqual(moved, { changed: true });
+  assert.deepEqual(f.calls.map((call) => `${call.pool} ${call.operation}`), ["key teamStates", "app issueUpdateState"]);
+});
+
+test("AC-7: markInProgress keeps its best-effort warning note, also in a paused context", async (t) => {
+  const f = fixture(t, (call) => call.operation === "teamStates" ? { status: 500, errors: [{ message: "Internal error" }] } : {});
+  f.sample("app", 4_500, 60_000);
+  f.sample("key", PLENTY_REQUESTS, 60_000);
+
+  const failed = await withPriority("background", "dispatch poll", () => f.linear.markInProgress({ id: ID_A, status: "Todo", statusType: "unstarted" }, "t1"));
+  assert.equal(failed.changed, false);
+  assert.match(failed.note ?? "", /Could not load the ticket team's states: The Linear API request failed: Internal error/);
+
+  const teamless = await withPriority("background", "dispatch poll", () => f.linear.markInProgress({ id: ID_A, status: "Todo", statusType: "unstarted" }, null));
+  assert.deepEqual(teamless, { changed: false, note: "The ticket has no team, so it could not be marked in progress." });
 });

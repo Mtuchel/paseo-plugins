@@ -148,7 +148,7 @@ export class ManualTasks {
   // Background priority: requests stop at their pool's reserve; a pause ends the poll quietly
   // (logged once per pool) and the next poll picks up where this one stopped.
   poll(): Promise<void> {
-    this.polling ??= withPriority("background", () => this.run()).catch((error: unknown) => {
+    this.polling ??= withPriority("background", "manual-tasks", () => this.run()).catch((error: unknown) => {
       if (!(error instanceof RateLimitedError)) throw error;
       if (this.pausedPool !== error.pool) console.error(`[linear-tickets] manual tasks paused: ${error.message}`);
       this.pausedPool = error.pool;

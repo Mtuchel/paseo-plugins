@@ -78,6 +78,8 @@ class FakeIO:
         self.targets = []
         self.limit_resumes_data = {"pending": {}, "started": set()}
         self.evidence_data = {"prWatch": None, "crashes": None, "limitResumes": {"pending": {}, "started": set()}}
+        self.usage_data = {"version": 1, "hours": {}}
+        self.usage_error = None
 
     def dispatch_quarantine(self):
         self.dispatches += 1
@@ -126,6 +128,11 @@ class FakeIO:
         if self.candidates_error:
             raise self.candidates_error
         return list(self.candidates)
+
+    def linear_usage(self):
+        if self.usage_error:
+            raise self.usage_error
+        return self.usage_data
 
     def owner_url(self):
         return "https://linear.app/tuchel/profiles/mirko"
@@ -957,6 +964,184 @@ class EvidenceTest(unittest.TestCase):
                              "crashes": {}})
         found = {line["key"]: (line["owner"], line["auto"]) for line in lines[1:]}
         self.assertEqual((found["pr:917:draft"], found["pr:918:draft"]), ((False, True), (False, False)))
+
+
+def usage_bucket(*, requests=0, points=0, limits=(None, None), limited=0, blockedMs=0, callers=None, outside=None):
+    """One pool of one UTC hour of linear-usage.json, as the plugin writes it (TUC-1291)."""
+    return {"limits": {"requests": limits[0], "points": limits[1]}, "requests": requests, "points": points,
+            "estimatedPoints": 0, "limited": limited, "blockedMs": blockedMs,
+            "refused": {"background": 0, "interactive": 0},
+            "minRemaining": {"requests": None, "points": None},
+            "outside": outside or {"points": {"spent": 0, "observedMs": 0}, "requests": {"spent": 0, "observedMs": 0}},
+            "callers": callers or {}}
+
+
+def usage_file(hours):
+    return {"version": 1, "hours": hours}
+
+
+def usage_caller(requests, points, refused=0):
+    return {"requests": requests, "points": points, "refused": refused}
+
+
+def usage_outside(points=0, requests=0, observedMs=0):
+    return {"points": {"spent": points, "observedMs": observedMs},
+            "requests": {"spent": requests, "observedMs": observedMs}}
+
+
+class LinearBudgetTest(RunCase):
+    """The "## Linear budget" section and its items (TUC-1291). At 08:05 UTC the last full UTC
+    hour is 07:00; WED_10_05 is 2026-09-30T08:05Z."""
+
+    def test_section_shows_the_last_full_hour_callers_and_outside(self):  # AC-13
+        self.io.usage_data = usage_file({
+            "2026-09-30T07:00:00Z": {
+                "app": usage_bucket(requests=124, points=460, limits=(200, 1500),
+                                    callers={"ticket-agent": usage_caller(100, 300, refused=1),
+                                             "review": usage_caller(20, 100), "digest": usage_caller(12, 56),
+                                             "sidebar": usage_caller(2, 4)},
+                                    outside=usage_outside(points=40, requests=5, observedMs=1_620_000)),
+                "key": usage_bucket(requests=12, points=30)},
+            "2026-09-29T22:00:00Z": {
+                "app": usage_bucket(requests=300, points=900, limits=(200, 1500), limited=3, blockedMs=756_000,
+                                    callers={"ticket-agent": usage_caller(280, 880)}),
+                "key": usage_bucket(requests=40, points=90, limits=(60, 100), limited=1, blockedMs=300_000,
+                                    callers={"digest": usage_caller(40, 90)})}})
+        self.run_at(WED_10_05)
+        self.assertIn(
+            "## Linear budget\n\n"
+            "- Paseo app: 124 requests (62 % of 200), 460 points (31 % of 1500) — last full hour 2026-09-30 07:00 UTC\n"
+            "  - Top callers by points: ticket-agent 300 (65 %), review 100 (22 %), digest 56 (12 %)\n"
+            "  - Outside the plugin: ≈ 40 points (8 % of the hour), ≈ 5 requests (4 % of the hour)"
+            " — observed 45 % of the hour\n"
+            "- API key: 12 requests, 30 points — last full hour 2026-09-30 07:00 UTC\n"
+            "  - Top callers by points: none\n"
+            "  - Outside the plugin: ≈ 0 points, ≈ 0 requests — observed 0 % of the hour\n"
+            "\n"
+            "### Limit reached (last 7 days)\n\n"
+            "- 2026-09-29 22:00 UTC, Paseo app: blocked 13 min (3 rate-limited) — spender: ticket-agent\n"
+            "- 2026-09-29 22:00 UTC, API key: blocked 5 min (1 rate-limited) — spender: digest\n",
+            self.io.published[-1])
+        self.assertEqual([key for key in self.saved()["items"] if key.startswith("linear-limit:")],
+                         ["linear-limit:app:2026-09-29T22:00:00Z", "linear-limit:key:2026-09-29T22:00:00Z"])
+
+    def test_outside_largest_is_named_as_the_spender(self):  # AC-13
+        self.io.usage_data = usage_file({"2026-09-29T22:00:00Z": {"app": usage_bucket(
+            requests=120, points=300, limits=(200, 1500), limited=5, blockedMs=1_800_000,
+            callers={"ticket-agent": usage_caller(100, 300)},
+            outside=usage_outside(points=900, requests=200, observedMs=3_600_000))}})
+        self.run_at(WED_10_05)
+        doc = self.io.published[-1]
+        self.assertIn("- Paseo app: nothing recorded in the last full hour (2026-09-30 07:00 UTC)", doc)
+        self.assertIn("- 2026-09-29 22:00 UTC, Paseo app: blocked 30 min (5 rate-limited) — "
+                      "spender: outside the plugin (agents' tools, scripts)", doc)
+        item = self.saved()["items"]["linear-limit:app:2026-09-29T22:00:00Z"]["payload"]
+        self.assertIn("spender: outside the plugin (agents' tools, scripts)", item["detail"])
+
+    def test_no_limited_hour_renders_none(self):  # AC-13
+        self.io.usage_data = usage_file({"2026-09-30T07:00:00Z": {"app": usage_bucket(requests=5, points=5)}})
+        self.run_at(WED_10_05)
+        doc = self.io.published[-1]
+        self.assertIn("- Paseo app: 5 requests, 5 points — last full hour 2026-09-30 07:00 UTC", doc)
+        self.assertIn("### Limit reached (last 7 days)\n\n- none\n", doc)
+        self.assertEqual(self.saved()["items"], {})
+
+    def test_a_limited_hour_is_one_item_that_reaches_the_history_once(self):  # AC-14
+        self.io.usage_data = usage_file({"2026-09-30T07:00:00Z": {"app": usage_bucket(
+            requests=200, points=600, limits=(200, 1500), limited=2, blockedMs=120_000,
+            callers={"ticket-agent": usage_caller(200, 600)})}})
+        self.assertEqual(self.run_at(WED_10_05), 0)
+        self.assertEqual(self.run_at(WED_11_05), 0)
+        self.assertEqual([key for key in self.saved()["items"] if key.startswith("linear-limit:")],
+                         ["linear-limit:app:2026-09-30T07:00:00Z"])
+        item = self.saved()["items"]["linear-limit:app:2026-09-30T07:00:00Z"]["payload"]
+        self.assertEqual(digest.item_kind(item), "linear: limit reached")
+        self.assertFalse(item["attention"])
+        self.assertIn("Paseo app 2026-09-30 07:00 UTC", item["title"])
+        self.assertIn("2 min blocked", item["detail"])
+        self.assertIn("spender: ticket-agent", item["detail"])
+        self.assertEqual(self.saved()["pending"], {})
+        self.assertEqual((self.io.comments, self.io.desktops), ([], []))
+        lines = read_lines(os.path.join(self.history, "history.jsonl"))
+        self.assertEqual([(line["event"], line["key"], line["kind"]) for line in lines if line["event"] != "run"],
+                         [("opened", "linear-limit:app:2026-09-30T07:00:00Z", "linear: limit reached"),
+                          ("open", "linear-limit:app:2026-09-30T07:00:00Z", "linear: limit reached")])
+
+    def test_an_hour_older_than_a_day_is_listed_but_is_no_item(self):  # AC-14
+        self.io.usage_data = usage_file({
+            "2026-09-28T22:00:00Z": {"app": usage_bucket(limited=1, blockedMs=60_000)},   # 34 h before the run
+            "2026-09-14T22:00:00Z": {"app": usage_bucket(limited=1, blockedMs=60_000)}})  # more than 7 days
+        self.run_at(WED_10_05)
+        doc = self.io.published[-1]
+        self.assertIn("- 2026-09-28 22:00 UTC, Paseo app: blocked 1 min (1 rate-limited)", doc)
+        self.assertNotIn("2026-09-14 22:00 UTC", doc)
+        self.assertEqual(self.saved()["items"], {})
+
+    def test_an_unreadable_file_marks_the_unit_and_keeps_previous_items(self):  # AC-13
+        self.io.usage_data = usage_file({"2026-09-30T07:00:00Z": {"app": usage_bucket(
+            limited=1, blockedMs=60_000, callers={"ticket-agent": usage_caller(10, 10)})}})
+        self.assertEqual(self.run_at(WED_10_05), 0)
+        for index, (error, category) in enumerate(((FileNotFoundError("no file"), "missing file"),
+                                                 (digest.UsageUnreadable("version 2"), "unreadable response"))):
+            self.io.usage_error = error
+            self.assertEqual(self.run_at(WED_11_05 + index * digest.HOUR_S), 0)
+            doc = self.io.published[-1]
+            self.assertIn(f"- linear_budget: {category} (previous items kept)", doc)
+            self.assertIn("- linear-usage.json not read this run (previous items kept)", doc)
+            self.assertTrue(self.saved()["items"]["linear-limit:app:2026-09-30T07:00:00Z"]["stale"])
+        runs = [line for line in read_lines(os.path.join(self.history, "history.jsonl")) if line["event"] == "run"]
+        self.assertEqual([run["units"]["linear_budget"] for run in runs], [True, False, False])
+
+    def test_run_without_usage_records_nothing(self):
+        self.run_at(WED_10_05)
+        doc = self.io.published[-1]
+        self.assertIn("## Linear budget\n\n- nothing recorded yet\n", doc)
+        self.assertIn("### Limit reached (last 7 days)\n\n- none\n", doc)
+        self.assertEqual((self.saved()["items"], self.saved()["pending"]), ({}, {}))
+
+
+class LinearUsageTest(unittest.TestCase):
+    """The real reader of $PASEO_HOME/linear-tickets/linear-usage.json, without FakeIO."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "linear-usage.json")
+        self._real_path = digest.LINEAR_USAGE
+        digest.LINEAR_USAGE = self.path
+
+    def tearDown(self):
+        digest.LINEAR_USAGE = self._real_path
+        self.tmp.cleanup()
+
+    def write(self, content):
+        with open(self.path, "w") as f:
+            f.write(content if isinstance(content, str) else json.dumps(content))
+
+    def test_missing_bad_json_version_and_wrong_types_are_unreadable(self):  # AC-13
+        io = digest.HostIO()
+        with self.assertRaises(FileNotFoundError):
+            io.linear_usage()
+        good = usage_file({"2026-09-30T07:00:00Z": {"app": usage_bucket(requests=1, points=2)}})
+        bad = ["{not json", {"version": 2, "hours": {}}, {"hours": {}}, {"version": 1, "hours": []},
+               {"version": 1, "hours": {"yesterday": {"app": usage_bucket()}}},
+               {"version": 1, "hours": {"2026-09-30T07:00:00Z": {"app": {**usage_bucket(), "points": "460"}}}},
+               {"version": 1, "hours": {"2026-09-30T07:00:00Z": {"app": {**usage_bucket(), "outside": {}}}}}]
+        for content in bad:
+            self.write(content)
+            with self.assertRaises(digest.UsageUnreadable):
+                io.linear_usage()
+        self.write(good)
+        self.assertEqual(io.linear_usage(), good)
+        self.assertEqual((digest.error_category(FileNotFoundError()), digest.error_category(digest.UsageUnreadable())),
+                         ("missing file", "unreadable response"))
+
+    def test_non_finite_counts_never_abort_digest_collection(self):
+        valid = usage_file({"2026-09-30T07:00:00Z": {"app": usage_bucket(limited=1)}})
+        for value in ("1e999", "NaN", "Infinity", "9" * 400):
+            with self.subTest(value=value):
+                self.write(json.dumps(valid).replace('"blockedMs": 0', '"blockedMs": ' + value))
+                with self.assertRaises(digest.UsageUnreadable):
+                    digest.HostIO().linear_usage()
 
 
 if __name__ == "__main__":

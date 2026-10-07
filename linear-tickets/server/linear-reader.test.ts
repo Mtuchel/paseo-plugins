@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
-import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, TEAM_STATES_QUERY, type App, type Post } from "./linear";
+import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, TEAM_STATES_QUERY, type App, type Post } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 
 const issue = { id: "i1", identifier: "TUC-1", state: { id: "s1", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] } };
@@ -54,29 +54,39 @@ test("poller reads go to the app's pool and never touch the key when the app can
   const reader: Pick<App, "query"> = {
     query: (query, variables) => {
       appCalls.push(query);
-      if (query === ISSUE_STATE_QUERY) return Promise.resolve({ issue });
+      if ([ISSUE_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY].includes(query)) return Promise.resolve({ issue });
       if (query === ISSUE_STATUSES_QUERY) return Promise.resolve({ issues: { nodes: (variables.ids as string[]).map((id) => ({ id, state: { type: "started" }, completedAt: null })) } });
       return Promise.resolve({ issues: { nodes: [{ id: "i1", identifier: "TUC-1", priority: 2, team: { key: "TUC" }, labels: { nodes: [] } }] } });
     },
   };
   const { linear, keyCalls } = service(reader, () => { throw new Error("the key must not be used"); });
   assert.equal((await linear.issueState("i1")).identifier, "TUC-1");
+  assert.deepEqual(await linear.issueMetadata("i1"), { id: "i1", identifier: "TUC-1", labels: [] });
+  assert.deepEqual(await linear.issueStatus("i1"), { status: "Todo", statusType: "unstarted" });
   assert.equal((await linear.issueStatuses([ID_A, ID_B])).size, 2);
   assert.equal((await linear.labeledIssues("paseo", ["TUC"])).length, 1);
-  assert.deepEqual(appCalls, [ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY]);
+  assert.deepEqual(appCalls, [ISSUE_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY]);
   assert.deepEqual(keyCalls, []);
 });
 
 test("the key reads once when the app is not usable here", async () => {
   const { linear, keyCalls } = service({ query: () => Promise.resolve(null) }, () => ({ issue }));
   await linear.issueState("i1");
-  assert.deepEqual(keyCalls, [ISSUE_STATE_QUERY]);
+  await linear.issueMetadata("i1");
+  await linear.issueStatus("i1");
+  await linear.issueAttachments("i1");
+  await linear.issueWatchState("i1");
+  assert.deepEqual(keyCalls, [ISSUE_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_WATCH_STATE_QUERY]);
 });
 
 test("tickets the app cannot see are read with the key", async () => {
   const missingIssue = service({ query: () => Promise.resolve({ issue: null }) }, () => ({ issue }));
   assert.equal((await missingIssue.linear.issueState("i1")).identifier, "TUC-1");
-  assert.deepEqual(missingIssue.keyCalls, [ISSUE_STATE_QUERY]);
+  assert.equal((await missingIssue.linear.issueMetadata("i1")).identifier, "TUC-1");
+  assert.equal((await missingIssue.linear.issueStatus("i1")).statusType, "unstarted");
+  assert.deepEqual(await missingIssue.linear.issueAttachments("i1"), []);
+  assert.deepEqual(await missingIssue.linear.issueWatchState("i1"), { status: "Todo", statusType: "unstarted", labels: [] });
+  assert.deepEqual(missingIssue.keyCalls, [ISSUE_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_WATCH_STATE_QUERY]);
 
   const notFound = service({ query: () => Promise.reject(new Error("The Linear API request failed: Entity not found: Issue")) }, () => ({ issue }));
   await notFound.linear.issueState("i1");
@@ -90,6 +100,27 @@ test("tickets the app cannot see are read with the key", async () => {
   const statuses = await partial.linear.issueStatuses([ID_A, ID_B]);
   assert.equal(statuses.get(ID_B)?.statusType, "started");
   assert.deepEqual(partial.keyCalls, [ISSUE_STATUSES_QUERY]);
+});
+
+test("the status batch asks for exactly the rows of its chunk (AC-11): two ids send first: 2, 300 send 250 + 50", async () => {
+  const asked: Record<string, unknown>[] = [];
+  const reader: Pick<App, "query"> = {
+    query: (query, variables) => {
+      assert.equal(query, ISSUE_STATUSES_QUERY);
+      asked.push(variables);
+      return Promise.resolve({ issues: { nodes: (variables.ids as string[]).map((id) => ({ id, state: { name: "Todo", type: "unstarted" }, completedAt: null })) } });
+    },
+  };
+  const { linear, keyCalls } = service(reader, () => { throw new Error("the key must not be used"); });
+  assert.equal((await linear.issueStatuses([ID_A, ID_B])).size, 2);
+  assert.deepEqual(asked, [{ ids: [ID_A, ID_B], first: 2 }]);
+
+  asked.length = 0;
+  const ids = Array.from({ length: 300 }, (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`);
+  assert.equal((await linear.issueStatuses(ids)).size, 300);
+  assert.deepEqual(asked.map((variables) => ({ first: variables.first, count: (variables.ids as string[]).length })), [{ first: 250, count: 250 }, { first: 50, count: 50 }]);
+  assert.deepEqual((asked[0].ids as string[]).concat(asked[1].ids as string[]), ids, "the chunks cover every id in order, without overlap");
+  assert.deepEqual(keyCalls, []);
 });
 
 test("hasComment looks a marker up among the ticket's comments, counts only a body that carries it whole, and fails rather than answer for a ticket Linear does not return", async () => {
@@ -115,7 +146,12 @@ test("an app rate limit pauses the read instead of spending the key", async () =
   const limited = new RateLimitedError("app", Date.now() + 60_000);
   const { linear, keyCalls } = service({ query: () => Promise.reject(limited) }, () => ({ issue }));
   await assert.rejects(linear.issueState("i1"), (error: unknown) => error === limited);
+  await assert.rejects(linear.issueMetadata("i1"), (error: unknown) => error === limited);
+  await assert.rejects(linear.issueStatus("i1"), (error: unknown) => error === limited);
+  await assert.rejects(linear.issueAttachments("i1"), (error: unknown) => error === limited);
+  await assert.rejects(linear.issueWatchState("i1"), (error: unknown) => error === limited);
   await assert.rejects(linear.labeledIssues("paseo", ["TUC"]), RateLimitedError);
+  await assert.rejects(linear.issueStatuses([ID_A, ID_B]), RateLimitedError);
   assert.deepEqual(keyCalls, []);
 });
 

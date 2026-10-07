@@ -228,7 +228,7 @@ export class StateLabels {
     for (const [id, until] of this.missing) if (!tickets.has(id) || until <= now) this.missing.delete(id);
     const due = [...tickets].filter((id) => !this.missing.has(id) && now - (this.states.get(id)?.at ?? -Infinity) > FRESH_MS);
     if (!due.length) return;
-    const found = await withPriority("background", () => this.deps.linear.issueStatuses(due));
+    const found = await withPriority("background", "state-labels", () => this.deps.linear.issueStatuses(due));
     for (const id of due) {
       const status = found.get(id);
       if (status?.status) this.states.set(id, { state: { name: status.status, type: status.statusType }, at: now });

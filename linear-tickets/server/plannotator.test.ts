@@ -13,6 +13,10 @@ import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
 import { DecisionLog } from "./owner-decisions";
 import { ReviewDeletions } from "./review-deletions";
+import { AgentApi } from "./agent-app";
+import { Credentials } from "./credentials";
+import { LinearService, postGraphQL } from "./linear";
+import { RateBudget, RateLimitedError, withPriority } from "./rate-budget";
 
 const exec = promisify(execFile);
 // Bridges built without an opener use the default one: never open a real browser from the tests.
@@ -519,6 +523,89 @@ test("a parked decision whose hand-off fails on a Linear error is delivered in f
   errors.mock.restore();
   assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "comment issue-1: ↩️ **Plan sent back** in Plannotator ([plan](https://linear.app/doc/1))\n\nCover every table\n\nAssign Paseo again to plan it again."]);
   assert.equal(plans.size, 0);
+});
+
+test("parked rate-limited decisions keep their event and attempt count until resumeAt, however often Linear pauses", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-07T12:00:00Z") });
+  const errors = t.mock.method(console, "error", () => {});
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(calls);
+  plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-10-07T10:00:00Z", announced: true });
+  const upsert = linear.upsertIssueDocument;
+  let requests = 0;
+  let limited = true;
+  const maxAttempts = 20;
+  linear.upsertIssueDocument = async (issueId, title) => {
+    requests++;
+    if (limited) throw new RateLimitedError("app", Date.now() + 60_000);
+    return upsert(issueId, title);
+  };
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, parked: true, at: new Date().toISOString() }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
+    Object.assign(bridge, { paseo });
+    // The in-process retry map is private; inspect it to prove the pre-existing attempts stay intact.
+    const retryState = bridge as unknown as { attempts: Map<string, number> };
+    const attempts = retryState.attempts;
+    attempts.set("0.json", 2);
+    for (let pause = 0; pause < maxAttempts + 2; pause++) {
+      await bridge.drain();
+      assert.equal(requests, pause + 1);
+      assert.equal(attempts.get("0.json"), 2, "rate limits never count as a failed attempt");
+      assert.deepEqual(await readdir(directory), ["0.json"]);
+      assert.equal(plans.size, 1);
+      t.mock.timers.tick(59_999);
+      await bridge.drain();
+      await bridge.drain();
+      assert.equal(requests, pause + 1, "not retried before resumeAt");
+      assert.equal(errors.mock.callCount(), pause + 1, "one log per event and pause");
+      t.mock.timers.tick(1);
+    }
+    limited = false;
+    await bridge.drain();
+    await bridge.drain();
+    assert.deepEqual(await readdir(directory), []);
+    assert.equal(attempts.has("0.json"), false);
+    assert.equal(plans.size, 0);
+    assert.equal(calls.filter((call) => call.startsWith("document ")).length, 1);
+    assert.equal(calls.filter((call) => call.startsWith("comment ")).length, 1);
+  });
+});
+
+test("a Plannotator decision reaches its cold-cache reads and writes through real admission at 3% points", async (t) => {
+  const budget = new RateBudget(() => 0);
+  const headers = { "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": "4500", "x-ratelimit-complexity-limit": "2000000", "x-ratelimit-complexity-remaining": "60000", "x-complexity": "100" };
+  for (const pool of ["app", "key"] as const) budget.acquire(pool, "owner").done(new Headers(headers), false);
+  const sent: string[] = [];
+  const data: Record<string, object> = {
+    issueState: { issue: { id: "issue-1", identifier: "TUC-25", state: { id: "todo", name: "Todo", type: "unstarted" }, team: { id: "team-1" }, labels: { nodes: [] } } },
+    teamStates: { team: { states: { nodes: [{ id: "coding", name: "In Progress", type: "started", position: 1 }] } } },
+    issueUpdateState: { issueUpdate: { success: true, issue: { id: "issue-1", state: { id: "coding", name: "In Progress", type: "started" } } } },
+    labelByName: { issueLabels: { nodes: [{ id: "ready", name: "plan-ready" }] } },
+    addLabel: { issueAddLabel: { success: true } },
+    issueDocuments: { issue: { id: "issue-1", documents: { nodes: [] } } },
+    documentCreate: { documentCreate: { success: true, document: { id: "doc-1", url: "https://linear.app/doc/1" } } },
+    comment: { commentCreate: { success: true, comment: { id: "comment-1" } } },
+  };
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+    const body: { query: string } = JSON.parse(String(init?.body));
+    const query = body.query;
+    const operation = query.match(/^(?:query|mutation) (\w+)/)?.[1] ?? "?";
+    sent.push(operation);
+    assert.ok(data[operation], `unexpected Linear operation ${operation}`);
+    return new Response(JSON.stringify({ data: data[operation] }), { headers });
+  });
+  const post = (key: string, query: string, variables: Record<string, unknown>) => postGraphQL(key, query, variables, budget);
+  const linear = new LinearService(new Credentials("/unused", "owner-key"), post, new AgentApi({ accessToken: async () => "app-token" }, post));
+  const { paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, at: "2026-10-07T12:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+    Object.assign(bridge, { paseo });
+    await withPriority("background", "decision ingress test", () => bridge.drain());
+    assert.deepEqual(await readdir(directory), []);
+  });
+  assert.deepEqual(sent, ["issueState", "teamStates", "issueUpdateState", "labelByName", "addLabel", "issueDocuments", "documentCreate", "comment"]);
+  await assert.rejects(linear.comment("issue-1", "ordinary agent progress"), RateLimitedError);
+  assert.equal(sent.length, 8, "ordinary interactive comments cannot consume the owner's last share");
 });
 
 test("a parked decision is never given up while Linear stays unavailable", async () => {

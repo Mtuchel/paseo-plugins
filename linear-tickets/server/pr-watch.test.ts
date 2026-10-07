@@ -283,6 +283,11 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         if (linear.issueFailure) throw linear.issueFailure;
         return { ...linear.state, attachmentUrls: linear.attachments } as never;
       },
+      issueAttachments: async (id) => {
+        linear.issueReads.push(id);
+        if (linear.issueFailure) throw linear.issueFailure;
+        return linear.attachments;
+      },
     },
     manualTasks: {
       openBlockers: async () => {
@@ -2314,8 +2319,8 @@ function probeReader(rest: RestStub, read: () => PullRequestView) {
 test("an unchanged pull request answers 304 and never reaches the detail read", async () => {
   const rest = restFake(restSeed(probeState()));
   const { reader, counted } = probeReader(rest, () => ({ ...OPEN_PR, updatedAt: "2026-10-04T21:05:00Z" }));
-  const first = await withPriority("background", () => reader.view(PR));
-  const second = await withPriority("background", () => reader.view(PR));
+  const first = await withPriority("background", "pr watch", () => reader.view(PR));
+  const second = await withPriority("background", "pr watch", () => reader.view(PR));
   assert.equal(counted.reads, 1, "the pull request was read in detail once");
   assert.equal(second, first, "the second poll served the cached view");
   assert.deepEqual(rest.calls.filter((call) => call.path === ISSUE_PATH).map((call) => call.etag), [null, `"${ISSUE_PATH}#0"`], "the second look is conditional on the first ETag");
@@ -2327,12 +2332,12 @@ test("a new head SHA reaches the detail read again", async () => {
   let head = HEAD;
   const rest = restFake(restSeed(state));
   const { reader, counted } = probeReader(rest, () => ({ ...OPEN_PR, headSha: head, updatedAt: state.updatedAt }));
-  await withPriority("background", () => reader.view(PR));
+  await withPriority("background", "pr watch", () => reader.view(PR));
   // A push moves `updated_at`, which the probe sees; the detail read then returns the new head.
   state.updatedAt = "2026-10-04T21:10:00Z";
   head = "9f8e7d6c5b4a9f8e7d6c5b4a9f8e7d6c5b4a9f8e";
   rest.bump(ISSUE_PATH);
-  const view = await withPriority("background", () => reader.view(PR));
+  const view = await withPriority("background", "pr watch", () => reader.view(PR));
   assert.equal(counted.reads, 2);
   assert.equal(view.headSha, head);
 });
@@ -2341,10 +2346,10 @@ test("checks moving on an unchanged head reach the detail read again", async () 
   const state = probeState();
   const rest = restFake(restSeed(state));
   const { reader, counted } = probeReader(rest, () => ({ ...OPEN_PR, checks: [{ ...RUNNING_CI, state: state.conclusion === "success" ? "passed" : "failed", conclusion: state.conclusion }] }));
-  await withPriority("background", () => reader.view(PR));
+  await withPriority("background", "pr watch", () => reader.view(PR));
   state.conclusion = "failure";
   rest.bump(checkRunsPath(HEAD));
-  const view = await withPriority("background", () => reader.view(PR));
+  const view = await withPriority("background", "pr watch", () => reader.view(PR));
   assert.equal(counted.reads, 2);
   assert.equal(view.checks[0].state, "failed");
   assert.equal(rest.calls.filter((call) => call.path === ISSUE_PATH && call.etag !== null).length, 1, "the issue resource itself only answered 304s");
@@ -2354,10 +2359,10 @@ test("Graphite editing its merge activity comment reaches the detail read again"
   const state = probeState();
   const rest = restFake(restSeed(state));
   const { reader, counted } = probeReader(rest, () => ({ ...OPEN_PR, mergeActivity: `### Merge activity\n\n* **Oct 4, 11:22 PM UTC**: ${state.commentAt}` }));
-  await withPriority("background", () => reader.view(PR));
+  await withPriority("background", "pr watch", () => reader.view(PR));
   state.commentAt = "2026-10-04T21:20:00Z";
   rest.bump(COMMENTS_PATH);
-  const view = await withPriority("background", () => reader.view(PR));
+  const view = await withPriority("background", "pr watch", () => reader.view(PR));
   assert.equal(counted.reads, 2);
   assert.ok(view.mergeActivity?.includes("21:20"), "the merge activity edit reached the view");
 });
@@ -2366,10 +2371,10 @@ test("a new review reaches the detail read again", async () => {
   const state = probeState();
   const rest = restFake(restSeed(state));
   const { reader, counted } = probeReader(rest, () => ({ ...OPEN_PR, reviews: state.reviews as PullRequestView["reviews"] }));
-  await withPriority("background", () => reader.view(PR));
+  await withPriority("background", "pr watch", () => reader.view(PR));
   state.reviews = [{ id: 2, state: "CHANGES_REQUESTED", submitted_at: "2026-10-04T21:20:00Z" }];
   rest.bump(REVIEWS_PATH);
-  const view = await withPriority("background", () => reader.view(PR));
+  const view = await withPriority("background", "pr watch", () => reader.view(PR));
   assert.equal(counted.reads, 2);
   assert.equal(view.reviews.length, 1);
 });
@@ -2379,9 +2384,9 @@ test("the shared REST reserve pauses the first look before it sends anything", a
   const budget = new GitHubBudget(() => Date.now(), 300);
   budget.record(limitHeaders(100));
   const reader = new ConditionalPullView({ get: rest.get, budget, read: async () => OPEN_PR });
-  await assert.rejects(() => withPriority("background", () => reader.view(PR)), (error: unknown) => error instanceof GitHubPausedError);
+  await assert.rejects(() => withPriority("background", "pr watch", () => reader.view(PR)), (error: unknown) => error instanceof GitHubPausedError);
   assert.deepEqual(rest.calls, [], "a background poll sends nothing below the reserve");
-  await withPriority("interactive", () => reader.view(PR));
+  await withPriority("interactive", "pull request view", () => reader.view(PR));
   assert.equal(rest.calls.length, 5, "an interactive caller still reads");
 });
 
@@ -2397,15 +2402,15 @@ test("a custom unguarded CLI preserves the single-login reserve despite installe
   const budget = new GitHubBudget(() => Date.now(), 300, githubRouted(env, home));
   budget.record(limitHeaders(100));
   const reader = new ConditionalPullView({ get: rest.get, budget, read: async () => OPEN_PR });
-  await assert.rejects(() => withPriority("background", () => reader.view(PR)), (error: unknown) => error instanceof GitHubPausedError && error.reason === "budget");
+  await assert.rejects(() => withPriority("background", "pr watch", () => reader.view(PR)), (error: unknown) => error instanceof GitHubPausedError && error.reason === "budget");
   assert.deepEqual(rest.calls, [], "the installed but bypassed router cannot disable the reserve");
-  await withPriority("interactive", () => reader.view(PR));
+  await withPriority("interactive", "pull request view", () => reader.view(PR));
   assert.equal(rest.calls.length, 5, "interactive reads can use the reserved quota");
 
   const optedIn = new GitHubBudget(() => Date.now(), 300, githubRouted({ ...env, LINEAR_TICKETS_GITHUB_ROUTED: "1" }, home));
   optedIn.record(limitHeaders(100));
   const routed = new ConditionalPullView({ get: rest.get, budget: optedIn, read: async () => OPEN_PR });
-  await withPriority("background", () => routed.view(PR));
+  await withPriority("background", "pr watch", () => routed.view(PR));
   assert.equal(rest.calls.length, 10, "an explicitly routed override delegates quota admission");
 });
 
@@ -2414,11 +2419,11 @@ test("with the router installed one account's low quota cannot pause the next lo
   const budget = new GitHubBudget(() => Date.now(), 300, true);
   budget.record(limitHeaders(100)); // the account that answered the previous call is nearly spent
   const reader = new ConditionalPullView({ get: rest.get, budget, read: async () => OPEN_PR });
-  await withPriority("background", () => reader.view(PR));
+  await withPriority("background", "pr watch", () => reader.view(PR));
   assert.equal(rest.calls.length, 5, "the router, not the last response's headers, decides which account reads");
   const refused = new GitHubRateLimitedError("GitHub is throttling gh: GitHub read budgets exhausted; try again after 2026-10-06T23:10:00Z.");
   const spent = new ConditionalPullView({ get: async () => { throw refused; }, budget, read: async () => OPEN_PR });
-  await assert.rejects(() => withPriority("background", () => spent.view(PR)), (error: unknown) => error === refused, "the router's message reaches the caller, not a generic pause");
+  await assert.rejects(() => withPriority("background", "pr watch", () => spent.view(PR)), (error: unknown) => error === refused, "the router's message reaches the caller, not a generic pause");
 });
 
 test("the poll reads through the injected first look, not the detail view", async (t) => {

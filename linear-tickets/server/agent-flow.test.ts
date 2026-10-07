@@ -72,7 +72,7 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
   });
   const router = new SessionRouter({
     api: { activity: async (_s: string, content: { type: string; body?: string }) => { calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); }, openSessions: async () => [], activities: async () => [] } as never,
-    linear: { viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, issueState: async () => { throw new Error("unused"); }, issueGroup: async () => { throw new Error("unused"); }, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {}, comment: async () => {}, hasComment: async () => false, userUrl: async () => "https://linear.app/owner" },
+    linear: { viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, issueState: async () => { throw new Error("unused"); }, issueStatus: async () => { throw new Error("unused"); }, issueGroup: async () => { throw new Error("unused"); }, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {}, comment: async () => {}, hasComment: async () => false, userUrl: async () => "https://linear.app/owner" },
     starter: { start: async () => { throw new Error("unused"); }, admission: async () => ({ ok: true as const }) },
     handover: { resumeTarget: async () => null, handOff: async () => true },
     launcher: { gate: () => ({ release: () => {} }) },
@@ -532,7 +532,7 @@ test("a queued thread starts once its blockers finish, even after it dropped out
   const h = routerHarness([], {
     // Linear's session list no longer contains any of the waiting threads.
     api: { activity: async (sessionId: string, content: { type: string; body?: string }) => { if (content.type !== "thought") events.push(`${sessionId} ${content.type}`); }, openSessions: async () => [], activities: async () => [], sessionStatus: async (id: string) => sessionStatus[id] } as never,
-    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueState: async (id: string) => ({ statusType: id === "i3" ? "canceled" : "unstarted", status: id === "i3" ? "Canceled" : "Todo" }) } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueStatus: async (id: string) => ({ statusType: id === "i3" ? "canceled" : "unstarted", status: id === "i3" ? "Canceled" : "Todo" }) } as never,
     starter: {
       admission: async (id: string) => (blocked.has(id) ? { ok: false as const, reason: "Waiting for TUC-9 to finish." } : { ok: true as const }),
       start: async (id: string) => {
@@ -587,7 +587,7 @@ test("a thread Linear marked stale while this host was down starts its agent, un
     } as never,
     linear: {
       viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {},
-      issueState: async () => ({ statusType: "unstarted", status: "Todo" }),
+      issueStatus: async () => ({ statusType: "unstarted", status: "Todo" }),
       issueGroup: async (id: string) => ({ id, identifier: `TUC-${id}`, status: "Todo", statusType: "unstarted", delegateId: APP, finished: false, children: [] }),
     } as never,
     starter: {
@@ -611,7 +611,7 @@ test("a queued thread whose ticket already has a running agent is linked to it i
   const starts: string[] = [];
   const h = routerHarness([], {
     api: { activity: async () => {}, openSessions: async () => [], activities: async () => [], sessionStatus: async () => "stale" } as never,
-    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueState: async () => ({ statusType: "unstarted", status: "Todo" }) } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueStatus: async () => ({ statusType: "unstarted", status: "Todo" }) } as never,
     starter: { admission: async () => ({ ok: true as const }), start: async (id: string) => { starts.push(id); throw new Error("unused"); } },
   }, [{ id: "labelled", title: "Started by the paseo label" }]);
   await h.store.put({ ...link, sessionId: "q1", agentId: null, queued: true });
@@ -625,7 +625,7 @@ test("a parked plan's thread offers no resume when its agent is retired, and sta
   const starts: string[] = [];
   const h = routerHarness([], {
     api: { activity: async (_s: string, content: { type: string; body?: string }) => { h.calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); }, openSessions: async () => [], activities: async () => [], sessionStatus: async () => "stale" } as never,
-    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueState: async () => ({ statusType: "unstarted", status: "Todo" }) } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueStatus: async () => ({ statusType: "unstarted", status: "Todo" }) } as never,
     starter: {
       admission: async () => ({ ok: true as const }),
       start: async (id: string) => { starts.push(id); return { agentId: "fresh", warnings: [], provider: "omp", target: "repo", resumed: false, untrusted: false, plan: null }; },

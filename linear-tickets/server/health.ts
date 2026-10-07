@@ -52,7 +52,7 @@ export class HealthMonitor {
   }
 
   private async tick(): Promise<void> {
-    await withPriority("background", () => this.check()).catch((error: unknown) => console.error(`[linear-tickets] health check failed: ${error instanceof Error ? error.message : error}`));
+    await this.check().catch((error: unknown) => console.error(`[linear-tickets] health check failed: ${error instanceof Error ? error.message : error}`));
     this.timer = setTimeout(() => { void this.tick(); }, INTERVAL_MS);
     this.timer.unref?.();
   }
@@ -72,28 +72,32 @@ export class HealthMonitor {
 
   // Runs every check once; returns the confirmed problems. A rate limit (or background work paused
   // at the reserve) is neither a pass nor a problem: that round is skipped, so the limit neither
-  // opens an urgent ticket nor closes one for a problem that is still there.
+  // opens an urgent ticket nor closes one for a problem that is still there. Background priority is
+  // part of this entry point, not of the timer `tick` around it, so a round started some other way
+  // (a test, a call this host adds) pauses at the pool's reserve too (see rate-budget.ts).
   async check(): Promise<Record<string, string>> {
-    if (this.running) return {};
-    this.running = true;
-    try {
-      const confirmed: Record<string, string> = {};
-      for (const check of this.checks) {
-        try {
-          await check.run();
-          this.strikes.delete(check.name);
-        } catch (error) {
-          if (error instanceof RateLimitedError) return {};
-          const strikes = (this.strikes.get(check.name) ?? 0) + 1;
-          this.strikes.set(check.name, strikes);
-          if (strikes >= CONFIRMATIONS) confirmed[check.name] = error instanceof Error ? error.message.slice(0, 300) : "failed";
+    return withPriority("background", "health", async () => {
+      if (this.running) return {};
+      this.running = true;
+      try {
+        const confirmed: Record<string, string> = {};
+        for (const check of this.checks) {
+          try {
+            await check.run();
+            this.strikes.delete(check.name);
+          } catch (error) {
+            if (error instanceof RateLimitedError) return {};
+            const strikes = (this.strikes.get(check.name) ?? 0) + 1;
+            this.strikes.set(check.name, strikes);
+            if (strikes >= CONFIRMATIONS) confirmed[check.name] = error instanceof Error ? error.message.slice(0, 300) : "failed";
+          }
         }
+        await this.report(confirmed);
+        return confirmed;
+      } finally {
+        this.running = false;
       }
-      await this.report(confirmed);
-      return confirmed;
-    } finally {
-      this.running = false;
-    }
+    });
   }
 
   private async report(problems: Record<string, string>): Promise<void> {

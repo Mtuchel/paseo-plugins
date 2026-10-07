@@ -7,6 +7,7 @@ import type { LinearService, RepairCandidate } from "./linear";
 import { CODING_STATE, PLANNING_STATE } from "./plannotator";
 import { classifyTicketAgents, type ProcessInspector } from "./process-liveness";
 import type { ProjectStore } from "./project-flow";
+import { withPriority } from "./rate-budget";
 import type { ReviewDeletions } from "./review-deletions";
 import type { RestartOptions, RestartResult } from "./sessions";
 import type { PluginSettings } from "./settings";
@@ -124,30 +125,34 @@ export class LabelRepair {
 
   // Called on every dispatch poll, after the projects; runs at most every REPAIR_POLL_MS. Only the
   // host that hands out tickets repairs: a draining host never does, and this host only once it
-  // knows which tickets the peer keeps (the claims handshake).
+  // knows which tickets the peer keeps (the claims handshake). Background priority is set here, not
+  // left to the dispatch tick that usually calls it, so a direct call pauses at the pool's reserve
+  // too (see rate-budget.ts).
   async tick(paseo: PaseoApi, settings: PluginSettings): Promise<void> {
-    if (settings.activation.mode === "remote" || this.now() - this.lastPoll < REPAIR_POLL_MS) return;
-    this.lastPoll = this.now();
-    try {
-      if (!await this.deps.intake.claimsReady()) return;
-      const names = { ...dispatchLabels(settings.dispatch.label), trigger: settings.dispatch.label };
-      const records = await this.deps.store.repairs();
-      const tickets = await this.deps.linear.repairCandidates({ labels: [names.running, names.failed], teamKeys: settings.dispatch.teamKeys, ids: Object.keys(records) });
-      const open = new Map(tickets.filter((ticket) => !CLOSED_TYPES.has(ticket.statusType.trim().toLowerCase())).map((ticket) => [ticket.id, ticket]));
-      // Records whose ticket closed or is gone end with it.
-      const gone = Object.keys(records).filter((id) => !open.has(id));
-      if (gone.length) await this.deps.store.updateRepairs((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !gone.includes(id))));
-      // One restart per pass: a start takes a minute or two, and the dispatcher's poll waits for it.
-      const pass = { restarted: false };
-      for (const ticket of open.values()) {
-        await this.repair(paseo, names, ticket, records[ticket.id] ?? null, pass)
-          .catch((error: unknown) => console.error(`[linear-tickets] ${ticket.identifier}: repairing its labels failed, the next pass retries: ${message(error)}`));
+    await withPriority("background", "label-repair", async () => {
+      if (settings.activation.mode === "remote" || this.now() - this.lastPoll < REPAIR_POLL_MS) return;
+      this.lastPoll = this.now();
+      try {
+        if (!await this.deps.intake.claimsReady()) return;
+        const names = { ...dispatchLabels(settings.dispatch.label), trigger: settings.dispatch.label };
+        const records = await this.deps.store.repairs();
+        const tickets = await this.deps.linear.repairCandidates({ labels: [names.running, names.failed], teamKeys: settings.dispatch.teamKeys, ids: Object.keys(records) });
+        const open = new Map(tickets.filter((ticket) => !CLOSED_TYPES.has(ticket.statusType.trim().toLowerCase())).map((ticket) => [ticket.id, ticket]));
+        // Records whose ticket closed or is gone end with it.
+        const gone = Object.keys(records).filter((id) => !open.has(id));
+        if (gone.length) await this.deps.store.updateRepairs((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !gone.includes(id))));
+        // One restart per pass: a start takes a minute or two, and the dispatcher's poll waits for it.
+        const pass = { restarted: false };
+        for (const ticket of open.values()) {
+          await this.repair(paseo, names, ticket, records[ticket.id] ?? null, pass)
+            .catch((error: unknown) => console.error(`[linear-tickets] ${ticket.identifier}: repairing its labels failed, the next pass retries: ${message(error)}`));
+        }
+        this.lastError = null;
+      } catch (error) {
+        if (message(error) !== this.lastError) console.error(`[linear-tickets] the label repair pass failed: ${message(error)}`);
+        this.lastError = message(error);
       }
-      this.lastError = null;
-    } catch (error) {
-      if (message(error) !== this.lastError) console.error(`[linear-tickets] the label repair pass failed: ${message(error)}`);
-      this.lastError = message(error);
-    }
+    });
   }
 
   // The owner started the ticket again (the trigger label, the sidebar): any incident of it ends,

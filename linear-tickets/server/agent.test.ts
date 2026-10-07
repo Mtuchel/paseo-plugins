@@ -12,13 +12,15 @@ import { AgentApi, AppAuth } from "./agent-app";
 import { verifyWebhook } from "./agent-webhook";
 import { fingerprint, type Candidate, type CorrectionActivity } from "./deputy";
 import { Handover, handoverPrompt, progressBody, type HandoverRecord } from "./handover";
-import { AuthenticationError, LinearApiError, type GroupChild, type IssueGroup, type IssueState } from "./linear";
+import { AuthenticationError, LinearApiError, LinearService, postGraphQL, type GroupChild, type IssueGroup, type IssueState } from "./linear";
 import { closeAnswered, NeedsYouIssues } from "./needs-you";
 import { PermissionReplies } from "./permission-replies";
 import { planSteps, SessionRouter, SessionStore, type SessionLink } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
+import { Credentials } from "./credentials";
+import { RateBudget, RateLimitedError, withPriority } from "./rate-budget";
 
 const OWNER = "owner-1";
 const settings: PluginSettings = {
@@ -184,9 +186,10 @@ test("plan checklists come from checkboxes, or numbered steps under a Steps head
 });
 
 type Call = string;
+type RouterLinear = Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
 // `reload`: the daemon's agent reload (null: the plugin has no daemon connection); `send`: runs
 // before each send is recorded.
-function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean } = {}) {
+function harness(options: { now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; splitPlan?: (link: SessionLink, url: string, paseo: PaseoApi) => Promise<string>; approveLater?: (link: SessionLink, url: string, paseo: PaseoApi) => Promise<string> } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -236,13 +239,14 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
   });
   replies.attach(paseo);
   const router = new SessionRouter({
-    api: api as never,
-    linear: {
+    api: (options.api ?? api) as never,
+    linear: options.linear ?? {
       viewerId: async () => OWNER, appUserId: async () => "paseo-app",
       comment: async () => {}, hasComment: async () => false, userUrl: async () => "https://linear.app/owner",
       addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); },
       complete: async (id: string) => { calls.push(`complete ${id}`); }, cancel: async (id: string, reason: string) => { calls.push(`cancel ${id}: ${reason.split("\n")[0]}`); },
       issueState: async (id: string) => ({ id, status: "Todo", statusType: "unstarted", blockedBy: options.blockedBy?.[id] ?? [] }) as IssueState,
+      issueStatus: async () => ({ status: "Todo", statusType: "unstarted" }),
       issueGroup: async (id: string) => options.groups?.[id] ?? { id, identifier: "TUC-1", status: "Todo", statusType: "unstarted", delegateId: "paseo-app", finished: false, children: [] },
       moveToStateNamed: async (id: string, name: string) => { calls.push(`move ${id} to ${name}`); return { changed: true }; },
       delegate: options.delegate ?? (async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); }),
@@ -254,8 +258,12 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
     store,
     replies,
     needsYou: options.needsYou,
+    budget: options.budget,
+    now: options.now,
+    splitPlan: options.splitPlan,
+    approveLater: options.approveLater,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
-    decideReview: async (url, approve, feedback) => { calls.push(`review ${url} ${approve ? "approve" : `deny:${feedback}`}`); },
+    decideReview: options.decideReview ?? (async (url, approve, feedback) => { calls.push(`review ${url} ${approve ? "approve" : `deny:${feedback}`}`); }),
     ...("reload" in options ? { reloader: async () => options.reload ? async (agentId: string) => { calls.push(`reload ${agentId}`); await options.reload!(agentId); } : null } : {}),
     ...(options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector) } : {}),
   });
@@ -934,4 +942,143 @@ test("a normal idle OMP target stays usable but an archived live-process sibling
     assert.equal(await sibling.router.prompt("agent-1", "fix it", async () => { sibling.calls.push("dispatch"); }), "busy");
     assert.deepEqual(sibling.calls, []);
   } finally { await sibling.cleanup(); }
+});
+
+function routerAdmission(t: TestContext, points = 60_000, limitedOperation?: string) {
+  const budget = new RateBudget(() => 0);
+  const headers = { "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": "4500", "x-ratelimit-complexity-limit": "2000000", "x-ratelimit-complexity-remaining": String(points), "x-complexity": "100" };
+  for (const pool of ["app", "key"] as const) budget.acquire(pool, "owner").done(new Headers(headers), false);
+  const sent: { operation: string; variables: Record<string, unknown> }[] = [];
+  const data: Record<string, object> = {
+    viewerCheck: { viewer: { id: OWNER } },
+    issueState: { issue: { id: "i1", identifier: "TUC-1", state: { id: "todo", name: "Todo", type: "unstarted" }, team: { id: "team-1" }, labels: { nodes: [] } } },
+    issueStatus: { issue: { state: { name: "Todo", type: "unstarted" } } },
+    teamStates: { team: { states: { nodes: [{ id: "coding", name: "In Progress", type: "started", position: 1 }] } } },
+    issueUpdateState: { issueUpdate: { success: true, issue: { id: "i1", state: { id: "coding", name: "In Progress", type: "started" } } } },
+    comment: { commentCreate: { success: true, comment: { id: "comment-1" } } },
+    agentActivity: { agentActivityCreate: { success: true } },
+    agentSessionUpdate: { agentSessionUpdate: { success: true } },
+    openSessions: { viewer: { id: "paseo-app" }, agentSessions: { nodes: [] } },
+    sessionStatus: { agentSession: { status: "active" } },
+  };
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+    const body: { query: string; variables: Record<string, unknown> } = JSON.parse(String(init?.body));
+    const operation = body.query.match(/^(?:query|mutation) (\w+)/)?.[1] ?? "?";
+    sent.push({ operation, variables: body.variables });
+    if (operation === limitedOperation) return new Response(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] }), { status: 400, headers });
+    assert.ok(data[operation], `unexpected Linear operation ${operation}`);
+    return new Response(JSON.stringify({ data: data[operation] }), { headers });
+  });
+  const post = (key: string, query: string, variables: Record<string, unknown>) => postGraphQL(key, query, variables, budget);
+  const api = new AgentApi({ accessToken: async () => "app-token" }, post);
+  const linear = new LinearService(new Credentials("/unused", "owner-key"), post, api);
+  return { budget, headers, api, linear, sent, now: () => 0 };
+}
+
+test("Linear-panel approve, split and approve-later protect their owner check, cold-cache prerequisites and acknowledgements at 3% points", async (t) => {
+  for (const command of ["approve-plan", "split-plan", "approve-later", "send-back"]) {
+    const admission = routerAdmission(t);
+    const decisions: string[] = [];
+    const decide = async () => {
+      decisions.push(command);
+      await admission.linear.issueState("i1");
+      await admission.linear.moveToStateNamed("i1", "In Progress");
+      await admission.linear.comment("i1", `Owner decision: ${command}`);
+      return `Handled ${command}`;
+    };
+    const h = harness({ ...admission, groups: {}, decideReview: async () => { await decide(); }, splitPlan: decide, approveLater: decide });
+    try {
+      await h.store.put(link({ review: { localUrl: "http://localhost:5000/" } }));
+      await withPriority("background", "panel ingress test", () => h.router.prompted("s1", { id: `activity-${command}`, userId: OWNER, content: { body: command } }));
+      assert.deepEqual(decisions, [command]);
+      assert.equal(admission.sent[0].operation, "viewerCheck", `${command}: a cold owner-identity read is admitted`);
+      assert.ok(admission.sent.some((call) => call.operation === "issueState"), command);
+      assert.ok(admission.sent.some((call) => call.operation === "teamStates"), command);
+      assert.ok(admission.sent.some((call) => call.operation === "issueUpdateState"), command);
+      assert.ok(admission.sent.some((call) => call.operation === "comment"), command);
+      assert.equal(admission.sent.at(-1)?.operation, "agentActivity", `${command}: the acknowledgement also gets owner priority`);
+      assert.equal((await h.store.get("s1"))?.review, null);
+      if (command === "approve-later") assert.equal((await h.store.get("s1"))?.offer, "later");
+      if (command === "split-plan") assert.deepEqual((await h.store.get("s1"))?.group, { delegated: false });
+    } finally { await h.cleanup(); }
+  }
+});
+
+test("owner admission never changes the Linear-panel identity check", async (t) => {
+  const admission = routerAdmission(t);
+  const decisions: string[] = [];
+  const h = harness({ ...admission, groups: {}, decideReview: async () => { decisions.push("approved"); } });
+  try {
+    await h.store.put(link({ review: { localUrl: "http://localhost:5000/" } }));
+    await h.router.prompted("s1", { id: "not-owner", userId: "colleague", content: { body: "approve-plan" } });
+    assert.deepEqual(decisions, []);
+    assert.deepEqual(admission.sent.map((call) => call.operation), ["viewerCheck", "agentActivity"]);
+    const input = admission.sent[1].variables.input;
+    assert.ok(input && typeof input === "object" && "content" in input && input.content && typeof input.content === "object" && "body" in input.content);
+    assert.equal(input.content.body, "Only the workspace owner can steer Paseo agents.");
+    assert.ok((await h.store.get("s1"))?.review);
+  } finally { await h.cleanup(); }
+});
+
+test("two whole session sweeps send nothing and log one pause while the app has 3% points", async (t) => {
+  const errors = t.mock.method(console, "error", () => {});
+  const admission = routerAdmission(t);
+  const h = harness({ ...admission, groups: {} });
+  try {
+    await h.store.put(link({ agentId: null, queued: true, queueReason: "a slot is full" }));
+    await h.store.put(link({ sessionId: "s2", agentId: null, issueId: "i2", queued: true }));
+    await h.router.sweep();
+    await h.router.sweep();
+    assert.deepEqual(admission.sent, []);
+    assert.equal(errors.mock.callCount(), 1);
+    assert.match(String(errors.mock.calls[0].arguments[0]), /agent session sweep paused: .*Paseo Linear app/);
+    assert.equal((await h.store.get("s1"))?.queued, true);
+  } finally { await h.cleanup(); }
+});
+
+test("a queued-thread rate limit stops its loop and logs once across the remaining parts and the next sweep", async (t) => {
+  const errors = t.mock.method(console, "error", () => {});
+  const admission = routerAdmission(t, 420_000, "sessionStatus");
+  const h = harness({ ...admission, groups: {} });
+  try {
+    await h.store.put(link({ agentId: null, queued: true, queueReason: "a slot is full" }));
+    await h.store.put(link({ sessionId: "s2", agentId: null, issueId: "i2", queued: true }));
+    await h.router.sweep();
+    await h.router.sweep();
+    assert.deepEqual(admission.sent.map((call) => call.operation), ["sessionStatus"], "no other queued thread or sweep part sends after the app refuses");
+    assert.equal(errors.mock.callCount(), 1);
+    assert.match(String(errors.mock.calls[0].arguments[0]), /agent session sweep \(queued threads\) paused:/);
+    assert.equal((await h.store.get("s1"))?.queueReason, "a slot is full");
+    assert.equal((await h.store.get("s2"))?.queued, true);
+  } finally { await h.cleanup(); }
+});
+
+test("a rate-limited webhook queued before attachment is settled without an unhandled rejection", async (t) => {
+  const admission = routerAdmission(t, 1_000_000, "viewerCheck");
+  const errors = t.mock.method(console, "error", () => {});
+  const h = harness({ ...admission, attach: false });
+  try {
+    h.router.receive({ type: "AgentSessionEvent", action: "created", agentSession: { id: "s1", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" } } });
+    h.router.attach(h.paseo as unknown as PaseoApi);
+    await h.router.settled();
+    assert.equal(await h.store.get("s1"), null);
+    assert.ok(admission.sent.some((call) => call.operation === "viewerCheck"));
+    assert.ok(errors.mock.calls.some((call) => String(call.arguments[0]).includes("try again")));
+  } finally { h.router.stop(); await h.cleanup(); }
+});
+
+test("an optional session-link failure never loses the owner's initiating message or delegation", async (t) => {
+  const h = harness({ activeAgent: { id: "agent-1", title: "TUC-1: Fix" } });
+  t.mock.method(h.router, "linkToPaseo", async () => { throw new RateLimitedError("app", Date.now() + 60_000); });
+  try {
+    const event = { id: "s3", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" }, comment: { body: "@paseo Continue with the approved plan." } };
+    await h.router.created(event);
+    await h.router.created(event);
+    assert.equal(h.calls.filter((call) => call === "send agent-1: Continue with the approved plan.").length, 1);
+    assert.equal((await h.store.get("s3"))?.agentId, "agent-1");
+    assert.equal((await h.store.get("s3"))?.paseoLinked, undefined);
+    assert.equal(await h.router.openFor("i2", "TUC-2", "agent-2"), "s-new");
+    assert.ok(h.calls.includes("delegate i2 to paseo-app"));
+    assert.equal((await h.store.get("s-new"))?.paseoLinked, undefined);
+  } finally { await h.cleanup(); }
 });

@@ -141,10 +141,11 @@ test("daemon and Linear failures never throw, are logged once per cause, and end
     await h.labels.sync();
     assert.equal(errors.filter((line) => line.includes("Unknown request type")).length, 1);
     assert.equal(errors.filter((line) => line.includes("stopped this round")).length, 1);
+    const beforeLimit = errors.length;
     const offline = new StateLabels({ linear: { issueStatuses: async () => { throw new RateLimitedError("app", Date.now() + 60_000); } }, daemon: async () => h.daemon });
     await offline.sync();
     await offline.sync();
-    assert.equal(errors.filter((line) => line.includes("request limit")).length, 1);
+    assert.equal(errors.length - beforeLimit, 1, "a repeated pool pause is logged once");
     const disconnected = new StateLabels({ linear: { issueStatuses: async () => new Map() }, daemon: async () => null });
     await disconnected.sync();
     await disconnected.sync();
