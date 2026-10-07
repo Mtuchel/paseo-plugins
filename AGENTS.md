@@ -13,6 +13,9 @@ npm run typecheck
 npm test
 ```
 
+On macOS, use `TMPDIR=/private/tmp npm test`: broker fixtures need short Unix socket paths,
+and generated restore commands need a canonical temporary path without `/var` symlink aliases.
+
 There is no GitHub CI: these local checks are the merge gate.
 
 ## Pull request lifecycle
