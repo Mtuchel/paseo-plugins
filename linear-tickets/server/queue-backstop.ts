@@ -16,7 +16,9 @@ const exec = promisify(execFile);
 // - `enqueue-ready.mjs`: the stacks that are ready to enqueue, and the drops it saw;
 // - `backstop-enqueue.mjs`: the one enqueue path of the automation;
 // - `retarget-orphan.mjs`: moves an open stack stranded on an orphaned `graphite-base/<n>` branch
-//   onto `main` (TUC-1209), in the plugin's private clone.
+//   onto `main` (TUC-1209), in the plugin's private clone;
+// - `greptile-retrigger.mjs`: re-requests a missing first Greptile review of `complex-review`
+//   pull requests, capped by the repo (TUC-1208); run only on the dispatch host.
 // Every script prints one JSON line on stdout. This module is the only place that reads those
 // shapes: a stdout that is not that JSON, or an exit code the script does not document, is an
 // error, and an error never counts as an enqueue.
@@ -25,6 +27,7 @@ export const WAIT_QUEUE = "tools/ci/wait-queue.mjs";
 export const ENQUEUE_READY = "tools/ci/enqueue-ready.mjs";
 export const BACKSTOP_ENQUEUE = "tools/ci/backstop-enqueue.mjs";
 export const RETARGET_ORPHAN = "tools/ci/retarget-orphan.mjs";
+export const GREPTILE_RETRIGGER = "tools/ci/greptile-retrigger.mjs";
 // At most this many stacks are prepared or moved per repo and run: each move restarts the checks of
 // every pull request of its stack, so a backlog clears over several runs.
 export const RETARGET_PER_RUN = 3;
@@ -677,4 +680,58 @@ export function openReplayText(move: Pick<RetargetRecord, "repo" | "pr" | "base"
     replayCommands({ kind: "open", base: move.base, branches: move.range.map((item) => item.branch), pr: move.pr }),
     `It moves only your own branches; never \`gt sync\` or \`gt restack\`, and never recreate \`${move.base}\`. When the commits do not apply cleanly, resolve the conflicts during the rebase without discarding work.`,
   ].join("\n");
+}
+
+// --- greptile-retrigger.mjs -----------------------------------------------------------------
+
+// The repo decides whether a pull request is asked (30 minutes after publish or label, once per
+// head, twice per 24 hours, never after a Greptile review); the plugin only runs it with
+// `--trigger` and follows the pull requests an open outage issue lists (see greptile-outage.ts).
+export const RETRIGGER_STATES = ["waiting", "due", "triggered", "requested", "capped", "failed"] as const;
+export type RetriggerState = (typeof RETRIGGER_STATES)[number];
+export const FOLLOW_STATES = ["reviewed", "closed", "draft", "unlabelled", "waiting", "unread"] as const;
+export type FollowState = (typeof FOLLOW_STATES)[number];
+// An open, published `complex-review` pull request without a Greptile review. `triggers`: when the
+// marker comments asked Greptile (ISO, any head); `overdue`: one of them is 2 hours old.
+export type RetriggerPull = { pr: number; url: string; title: string; head: string; since: string; triggers: string[]; state: RetriggerState; overdue: boolean };
+export type RetriggerRun = { pulls: RetriggerPull[]; followed: { pr: number; state: FollowState }[]; triggered: { pr: number; head: string; at: string }[]; errors: { pr: number | null; error: string }[] };
+
+const entries = (found: Record<string, unknown>, field: string): Record<string, unknown>[] => {
+  const list = found[field];
+  if (!Array.isArray(list)) throw new BackstopScriptError(`${GREPTILE_RETRIGGER} printed no ${field}`);
+  return list.map((item) => {
+    const entry = record(item);
+    if (!entry) throw new BackstopScriptError(`${GREPTILE_RETRIGGER} printed a malformed ${field} entry`);
+    return entry;
+  });
+};
+
+// Exit 0 with all four lists; anything else (exit 1: the open pull requests could not be read) is
+// an error, and so is an entry without its number or with a state the script does not document:
+// the outage issue must never take a misread run for a recovery.
+export function parseRetrigger(output: ScriptOutput): RetriggerRun {
+  const found = answer(GREPTILE_RETRIGGER, output);
+  if (output.code !== 0) throw new BackstopScriptError(`${GREPTILE_RETRIGGER} exited ${output.code}: ${text(found.error).slice(0, 300)}`);
+  const malformed = (field: string): never => { throw new BackstopScriptError(`${GREPTILE_RETRIGGER} printed a malformed ${field} entry`); };
+  const pulls = entries(found, "pulls").map((item): RetriggerPull => {
+    const pr = count(item.pr);
+    const state = RETRIGGER_STATES.find((known) => known === item.state) ?? null;
+    if (pr === null || state === null || !text(item.url).startsWith("https://github.com/")) return malformed("pulls");
+    return { pr, url: text(item.url), title: text(item.title), head: text(item.head), since: text(item.since), triggers: texts(item.triggers), state, overdue: item.overdue === true };
+  });
+  const followed = entries(found, "followed").map((item) => {
+    const pr = count(item.pr);
+    const state = FOLLOW_STATES.find((known) => known === item.state) ?? null;
+    return pr === null || state === null ? malformed("followed") : { pr, state };
+  });
+  const triggered = entries(found, "triggered").map((item) => {
+    const pr = count(item.pr);
+    return pr === null || !text(item.at) ? malformed("triggered") : { pr, head: text(item.head), at: text(item.at) };
+  });
+  const errors = entries(found, "errors").map((item) => ({ pr: count(item.pr), error: text(item.error) || "unknown error" }));
+  return { pulls, followed, triggered, errors };
+}
+
+export function retriggerArgs(follow: number[]): string[] {
+  return ["--trigger", ...follow.flatMap((pr) => ["--follow", String(pr)])];
 }

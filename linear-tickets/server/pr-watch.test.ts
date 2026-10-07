@@ -5,10 +5,11 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
+import type { RetriggerResult } from "./greptile-outage";
 import type { HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
 import { activityBullets, ConditionalPullView, githubReader, GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft } from "./pr-watch";
-import { BACKSTOP_ENQUEUE, ENQUEUE_READY, marker, RETARGET_ORPHAN, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
+import { BACKSTOP_ENQUEUE, ENQUEUE_READY, GREPTILE_RETRIGGER, marker, RETARGET_ORPHAN, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
 import { GitHubBudget, GitHubPausedError, withPriority } from "./rate-budget";
 import { SessionRouter, type IdleRun, type Succession } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
@@ -153,7 +154,7 @@ const MAIN_BROKEN: Judgment = {
 // gone agent's message starts a successor (`paseo.succeed`).
 // `probe`: the cheap first look the poll goes through (see ConditionalPullView); without one the
 // injected `view` is the whole read, as for the tests that predate it.
-function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean } = {}, probe?: PullViewSource) {
+function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean } = {}, probe?: PullViewSource) {
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open; `views`: other pull requests by URL, and
   // `open` the listing's other entries; `deleted`: branches gone; `throttle`: pull requests whose
@@ -173,7 +174,9 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // `<script> <args>`; `now`: the backstop's clock. `retarget`: `retarget-orphan.mjs` (see
   // retargets), run only while `present`: `list` the candidates `--list` names, `prepare` and
   // `apply` its answers in turn (the last one repeats), `records` every record `--apply` read,
-  // `beforeApply` runs before its answer (a hanging one is a crash during the write).
+  // `beforeApply` runs before its answer (a hanging one is a crash during the write). `greptile`:
+  // `greptile-retrigger.mjs`, present in the checkout while `present`, answering per repo (an
+  // empty run by default); `outage` the outage issue's `follow` list and every `sync`'s results.
   const scripts = {
     checkout: "/backstop" as string | null,
     judgment: GENUINE as Judgment | null,
@@ -189,6 +192,8 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     now: Date.now(),
     checkouts: [] as { repo: string; sources: string[] }[],
     retarget: { present: false, list: [] as unknown[], prepare: [] as { code: number; answer: Record<string, unknown> }[], apply: [] as { code: number; answer: Record<string, unknown> }[], records: [] as unknown[], beforePrepare: async () => {}, beforeApply: async () => {} },
+    greptile: { present: true, answers: {} as Record<string, { code: number; answer: unknown }> },
+    outage: { follow: new Map<string, number[]>(), syncs: [] as RetriggerResult[][] },
   };
   // `failure`: what linking a URL on the ticket throws; `arrive`: runs before a ticket comment
   // reaches Linear (a hanging one is a crash before it went out), `stall` after it did (a crash
@@ -281,7 +286,8 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       awaitingMerge: async () => false,
       merged: async (issueId) => { calls.push(`merged ${issueId}`); },
     },
-    settings: { read: async () => agent.autoResume ? { ...settings, writeback: { ...settings.writeback, autoResume: true } } : settings },
+    settings: { read: async () => ({ ...settings, dispatch: { ...settings.dispatch, enabled: agent.dispatch ?? false }, writeback: { ...settings.writeback, autoResume: agent.autoResume ?? settings.writeback.autoResume } }) },
+    outage: { follow: async () => scripts.outage.follow, sync: async (results) => { scripts.outage.syncs.push(results); } },
     ...(probe ? { probe } : {}),
     view: async (url) => {
       github.reads.push(url);
@@ -321,7 +327,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     },
     backstop: {
       now: () => scripts.now,
-      has: (_checkout, script) => script !== RETARGET_ORPHAN || scripts.retarget.present,
+      has: (_checkout, script) => (script === RETARGET_ORPHAN ? scripts.retarget.present : script === GREPTILE_RETRIGGER ? scripts.greptile.present : true),
       checkout: {
         prepare: async (repo, sources) => {
           scripts.checkouts.push({ repo, sources });
@@ -333,9 +339,13 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
           return `/comments/${action}.md`;
         },
       },
-      run: async (_cwd, script, args): Promise<ScriptOutput> => {
+      run: async (_cwd, script, args, env): Promise<ScriptOutput> => {
         scripts.runs.push(`${script} ${args.join(" ")}`);
         const answer = (code: number, value: unknown) => ({ code, stdout: `${JSON.stringify(value)}\n`, stderr: "" });
+        if (script === GREPTILE_RETRIGGER) {
+          const found = scripts.greptile.answers[env.GITHUB_REPOSITORY] ?? { code: 0, answer: { pulls: [], followed: [], triggered: [], errors: [] } };
+          return answer(found.code, found.answer);
+        }
         if (script === WAIT_QUEUE) {
           if (scripts.queueFailure) return { code: 1, stdout: "", stderr: scripts.queueFailure };
           if (!scripts.judgment && !scripts.judgments[Number(args[0])]) return answer(3, { pr: Number(args[0]), result: "none" });
@@ -2972,4 +2982,63 @@ test("a second host that moved the same stack reports nothing twice, and one tha
   await h.backstop();
   assert.equal(h.github.comments[419].length, 1, "the loser posts no success comment");
   assert.equal(h.linear.comments.i1.length, 1);
+});
+
+// --- Greptile re-request (TUC-1208) ---------------------------------------------------------
+
+const PLATFORM = "tuchel-sohn/tuchel-platform";
+const GREPTILE_HEAD = "c".repeat(40);
+const greptileRuns = (runs: string[]) => runs.filter((run) => run.startsWith(GREPTILE_RETRIGGER));
+
+test("the dispatch host runs greptile-retrigger.mjs with --trigger and the outage issue's pull requests, records each request, and syncs the outage issue once with every repo (AC-4)", async (t) => {
+  const h = harness(t, { dispatch: true });
+  t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
+  h.scripts.outage.follow = new Map([[PLATFORM, [12]], ["o/other", [5]]]);
+  const run = { pulls: [{ pr: 419, url: PR, title: "Add TUC-1", head: GREPTILE_HEAD, since: "2026-10-07T10:00:00Z", triggers: ["2026-10-07T10:30:00Z"], state: "triggered", overdue: false }], followed: [{ pr: 12, state: "reviewed" }], triggered: [{ pr: 419, head: GREPTILE_HEAD, at: "2026-10-07T10:30:00Z" }], errors: [] };
+  h.scripts.greptile.answers = { [PLATFORM]: { code: 0, answer: run }, "o/other": { code: 1, answer: { error: "cannot list the open pull requests" } } };
+  await h.backstop();
+  assert.deepEqual(greptileRuns(h.scripts.runs), [`${GREPTILE_RETRIGGER} --trigger --follow 12`, `${GREPTILE_RETRIGGER} --trigger --follow 5`]);
+  assert.deepEqual(h.scripts.runs.filter((line) => line.startsWith(ENQUEUE_READY)).length, 1, "a repo only the outage issue lists gets no enqueue pass");
+  assert.equal(h.scripts.outage.syncs.length, 1);
+  assert.deepEqual(h.scripts.outage.syncs[0].map((found) => [found.repo, found.result]), [[PLATFORM, "answer"], ["o/other", "failed"]]);
+  const saved = JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"));
+  assert.deepEqual(saved[PR].greptile, [{ head: GREPTILE_HEAD, at: "2026-10-07T10:30:00Z" }]);
+});
+
+test("a host whose dispatch is off never runs greptile-retrigger.mjs or touches the outage issue, and says so once (AC-4)", async (t) => {
+  const h = harness(t);
+  const logs: string[] = [];
+  t.mock.method(console, "log", (...args: unknown[]) => { logs.push(args.join(" ")); });
+  h.scripts.outage.follow = new Map([[PLATFORM, [12]]]);
+  await h.backstop();
+  await h.backstop();
+  assert.deepEqual(greptileRuns(h.scripts.runs), []);
+  assert.deepEqual(h.scripts.outage.syncs, []);
+  assert.deepEqual(logs.filter((line) => line.includes("greptile re-request")), ["[linear-tickets] greptile re-request: skipped, dispatch is off on this host"]);
+});
+
+test("a checkout without the script counts as skipped, and a script error is the repo's failure, never a stop of the backstop (AC-4)", async (t) => {
+  const h = harness(t, { dispatch: true });
+  t.mock.method(console, "error", () => {});
+  h.scripts.greptile.present = false;
+  await h.backstop();
+  assert.deepEqual(greptileRuns(h.scripts.runs), []);
+  assert.deepEqual(h.scripts.outage.syncs.at(-1), [{ repo: PLATFORM, result: "skipped" }]);
+
+  h.scripts.greptile.present = true;
+  h.scripts.greptile.answers = { [PLATFORM]: { code: 0, answer: { pulls: [{ pr: 419, state: "asked" }], followed: [], triggered: [], errors: [] } } };
+  await h.backstop();
+  assert.equal(h.scripts.outage.syncs.at(-1)?.[0].result, "failed");
+  assert.ok(h.scripts.runs.some((line) => line.startsWith(ENQUEUE_READY)), "the enqueue pass still ran");
+});
+
+test("once GitHub's budget stops the backstop, the remaining repos count as failed for the outage issue (AC-4)", async (t) => {
+  const h = harness(t, { dispatch: true });
+  t.mock.method(console, "error", () => {});
+  h.scripts.outage.follow = new Map([["o/other", [5]]]);
+  h.github.listFailure = new GitHubRateLimitedError("GitHub is throttling gh");
+  await h.backstop();
+  assert.deepEqual(greptileRuns(h.scripts.runs), [`${GREPTILE_RETRIGGER} --trigger`], "the stopped repo's script is not run");
+  assert.deepEqual(h.scripts.outage.syncs[0].map((found) => [found.repo, found.result]), [[PLATFORM, "answer"], ["o/other", "failed"]]);
 });

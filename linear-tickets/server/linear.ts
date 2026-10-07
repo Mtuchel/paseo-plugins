@@ -608,7 +608,9 @@ function succeeded(data: Record<string, unknown>, field: string, what: string): 
   if (result.success !== true) throw new LinearRefusedError(`Linear did not ${what}.`);
 }
 
-type CreateIssueInput = { teamId: string; title: string; description: string; parentId?: string; projectId?: string | null; assigneeId?: string; priority?: number; ready?: boolean; startedState?: string };
+// `id`: a client-chosen UUID, so a create whose answer was lost can be looked up and retried
+// under the same id without filing a second ticket (see greptile-outage.ts).
+type CreateIssueInput = { id?: string; teamId: string; title: string; description: string; parentId?: string; projectId?: string | null; assigneeId?: string; priority?: number; ready?: boolean; startedState?: string };
 
 function createdIssue(data: Record<string, unknown>): { id: string; identifier: string; url: string } {
   succeeded(data, "issueCreate", "create the ticket");
@@ -1157,6 +1159,7 @@ export class LinearService {
 
   private async issuePayload(input: CreateIssueInput): Promise<Record<string, unknown>> {
     const payload: Record<string, unknown> = { teamId: input.teamId, title: input.title, description: input.description };
+    if (input.id) payload.id = input.id;
     if (input.ready || input.startedState) {
       const states = await this.teamStates(input.teamId);
       const wanted = input.startedState?.trim().toLowerCase();
