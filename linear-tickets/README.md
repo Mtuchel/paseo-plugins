@@ -2125,10 +2125,13 @@ The caller names distinguish dispatch, project flow, comment relay, label repair
 session-sweep parts, session webhooks, lifecycle write-backs, sidebar reads, health, manual
 tasks, state labels, label rules and plan handling. Each pool also includes the most recently
 observed request/complexity limits and remaining budget, with `observedAt` (not an extrapolation).
-Once an hour the plugin logs totals and its twelve most expensive caller/operation rows.
-Counters only cover this daemon's GraphQL transport: other hosts, agents' MCP processes and
-host scripts are **not** attributed. Hourly history adds a partial outside estimate only for
-isolated fresh header intervals (see below), never as exact per-caller attribution.
+Once an hour the plugin logs totals split into plugin and agent MCP sources, and its twelve most
+expensive caller/operation rows. Counters cover this daemon's GraphQL transport, including
+managed agents' `linear_ticket` requests through its broker (callers `mcp:<tool>`); other hosts
+and host scripts are **not** attributed. Hourly history adds a partial outside estimate only for
+isolated fresh header intervals (see below), never as exact per-caller attribution. Exact counts
+hold within a running broker and its graceful drain; a crash can lose the last minute of usage,
+which is never reconstructed from reservations.
 No tokens, query bodies or ticket text appear in the report.
 
 - **Reads that pollers repeat use the app's pool** when the Paseo app is installed: the relay's
@@ -2184,21 +2187,24 @@ No tokens, query bodies or ticket text appear in the report.
   Unload drains admitted Linear responses and the PR watch's in-progress runs before its final
   flush. Initial turn-start status changes run before ordinary panel progress; a refused
   prerequisite read leaves that transition eligible for retry.
-  `linear.agent-status` adds `budget.pools` with both dimensions, block/pause times, and
-  `budget.hours` with each pool's current-hour top ten callers and outside estimates.
+  `linear.agent-status` adds `sources` (plugin and agent MCP totals) to each usage pool,
+  `budget.pools` with both dimensions, block/pause times, and `budget.hours` with each pool's
+  current-hour top ten callers, plugin/agent MCP totals over every caller and outside estimates.
 - **The ops digest's “Linear budget” section** shows the last full UTC hour per pool, its top
-  three callers, and every limited or blocked hour in the last seven days with its largest
-  spender. Limited hours within 24 hours also become non-attention `linear: limit reached`
+  three callers, its plugin and agent MCP totals (`none recorded` for hours before the broker,
+  never a measured zero), and every limited or blocked hour in the last seven days with its
+  largest spender. Limited hours within 24 hours also become non-attention `linear: limit reached`
   history items, once per pool/hour, for the weekly review. Missing/unreadable usage is reported
   under `linear_budget`, keeping previous items rather than failing the digest.
-- **Outside the plugin is an estimate, not a complete meter.** Agent MCP processes, scripts
-  and the digest use the same credentials without daemon admission. Their spend appears as
-  “≈ outside the plugin” only between fresh (at most five minutes), non-overlapping own
+- **Outside shared admission is an estimate, not a complete meter.** Scripts, other hosts and
+  the digest use the same credentials without daemon admission. Their spend appears as
+  “≈ outside shared admission” only between fresh (at most five minutes), non-overlapping own
   responses carrying that dimension's headers. Observation coverage is shown separately for
   requests and points; gaps and concurrent requests are unobserved, not zero outside spend.
   Negative corrections are retained in the file but displays clamp at zero. A different host's
   app is a separate pool, not part of this estimate. These external callers can still consume
-  the owner's reserve; sharing admission with agent MCP processes is tracked in TUC-1323.
+  the owner's reserve. Hours before the broker keep their old estimate, which then also held
+  agents' tools; it is not relabelled as measured agent MCP use.
   The laptop's digest aggregation, menu-bar budget view, comment webhooks and one-week budget
   review are separate follow-ups. Status batches request only the number of IDs in each chunk.
   Review inbox metadata reads only issue id, identifier and labels; queued threads read only
