@@ -1807,9 +1807,13 @@ when the host cannot be reached it says so and keeps retrying.
   prevents transferring a wait to a ticket planner, another run or a late duplicate.
   Successful replacements supersede predecessor waits; recorded approvals or run closure
   complete them. Missing records/agents alone never prove closure. Reload revalidates the saved
-  observation against current project evidence, and unreadable recovery removes the restart
-  promise as **Unknown**. Delivered reviews, owner waits, submission/delivery failures and newer
-  actual progress keep precedence; polling does not count as progress or recompute the schedule.
+  observation against current project evidence, and unreadable recovery or malformed saved
+  ownership removes the restart promise as **Unknown**. A ghost predecessor with a genuinely live
+  duplicate stays unconfirmed until ownership is reconciled. Owner-source failures also keep
+  recovery Unknown. Submission alone never preserves an obsolete restart promise after root loss;
+  actual submission/delivery failures remain visible across reload even when that root is absent.
+  Delivered reviews, owner waits and newer actual progress keep precedence; polling does not count
+  as progress or recompute the schedule.
   Missing, unreadable, unsupported, incomplete, stale or unreachable evidence is **Unknown**,
   never an all-clear; known failures remain visible.
   Auto-approved, completed, superseded and explicitly cancelled revisions are accounted for,

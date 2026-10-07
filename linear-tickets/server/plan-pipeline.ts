@@ -199,11 +199,13 @@ export class PlanPipeline {
         const queue = object(entry.queue);
         if (typeof queue.sessionId === "string" && queue.sessionId.length <= 200) this.records.get(parsed.data.id)!.queue = { sessionId: queue.sessionId, restart: queue.restart === true, pending: queue.pending === true };
         const planner = object(entry.planner);
-        if ([planner.projectId, planner.runId].every((id) => typeof id === "string" && id.length > 0 && id.length <= 200)) {
-          this.records.get(parsed.data.id)!.planner = { projectId: planner.projectId as string, runId: planner.runId as string };
-          // A journal is historical evidence, not authority for a current restart promise.
+        if (entry.planner !== undefined) {
           const restored = this.records.get(parsed.data.id)!;
-          if (!TERMINAL[restored.row.stage] && restored.row.stage !== "ready") {
+          if ([planner.projectId, planner.runId].every((id) => typeof id === "string" && id.length > 0 && id.length <= 200)) {
+            restored.planner = { projectId: planner.projectId as string, runId: planner.runId as string };
+          }
+          // Invalidate recovery promises even when identity is malformed; retain independent failures.
+          if (!TERMINAL[restored.row.stage] && restored.row.stage !== "ready" && restored.row.status !== "failed") {
             restored.row.status = "unknown"; restored.row.detail = "Planner recovery awaiting current project evidence";
           }
         }
@@ -252,7 +254,7 @@ export class PlanPipeline {
     this.dirty = true;
   }
 
-  private observeRecovery(record: RecordEntry, project: PipelinePlannerEvidence | undefined, agent: PaseoAgent | undefined, live: boolean, now: number, unavailable: boolean): boolean {
+  private observeRecovery(record: RecordEntry, project: PipelinePlannerEvidence | undefined, agent: PaseoAgent | undefined, live: "root" | "other" | "none", now: number, unavailable: boolean, protectedEvidence = false): boolean {
     const identity = record.planner;
     if (!identity || TERMINAL[record.row.stage] || record.row.stage === "ready") return false;
     const run = project?.run;
@@ -260,13 +262,15 @@ export class PlanPipeline {
       this.change(record, "completed", "normal", this.now().toISOString(), "Project planner run closed; no automatic restart is pending");
     } else if (run && (run.runId !== identity.runId || run.agentId && run.agentId !== record.row.agentId)) {
       this.change(record, "superseded", "normal", run.listedAt, "Project planner replaced by the current run or agent");
+    } else if (protectedEvidence) {
+      return false;
     } else if (unavailable || !run || run.runId !== identity.runId) {
       this.change(record, record.row.stage, "unknown", record.row.since, "Planner recovery evidence unavailable; automatic restart unconfirmed");
     } else if (!run.pending) {
       if (!agent) this.change(record, record.row.stage, "unknown", record.row.since, "No pending planner recovery; current agent evidence unavailable");
       else return false;
-    } else if (live) {
-      if (!agent || agent.archivedAt || !LIVE_AGENT[agent.status]) this.change(record, record.row.stage, "unknown", record.row.since, "Live planner observed; waiting for recovery ownership confirmation");
+    } else if (live !== "none") {
+      if (live === "other") this.change(record, record.row.stage, "unknown", record.row.since, "Live planner observed; waiting for recovery ownership confirmation");
       else return false;
     } else if (agent && (agent.labels?.["linear.projectId"] !== identity.projectId || agent.labels?.["linear.plannerRun"] !== identity.runId || agent.labels?.["linear.issueId"] || agent.labels?.["paseo.parent-agent-id"])) {
       this.change(record, record.row.stage, "unknown", record.row.since, "Planner recovery ownership unconfirmed");
@@ -405,7 +409,6 @@ export class PlanPipeline {
     const planners = new Map((plannerSource.status === "fulfilled" ? plannerSource.value : []).map((project) => [project.projectId, project]));
     const handledRecovery = new Set<string>();
     const sourceProblems = [agentSource, sessionSource, parkedSource].flatMap((source) => source.status === "rejected" ? [diagnostic(source.reason)] : []);
-    const recoveryUnavailable = plannerSource.status === "rejected" || sourceProblems.length > 0;
     if (agentSource.status === "rejected") for (const record of this.records.values()) {
       if (!TERMINAL[record.row.stage] && record.row.stage !== "ready" && record.row.status !== "failed") this.change(record, record.row.stage, "unknown", record.row.since, "Agent source unavailable; retaining last evidence");
     }
@@ -431,9 +434,10 @@ export class PlanPipeline {
       const problem = diagnostic(error); sourceProblems.push(problem); issues.push(problem);
       owners = [];
     }
+    const recoveryUnavailable = plannerSource.status === "rejected" || sourceProblems.length > 0;
     const ghosts = await ghostAgents(roots, now, this.options.processInspector);
-    const liveRuns = new Set(agents.filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && !agent.archivedAt && LIVE_AGENT[agent.status] && !ghosts.has(agent.id))
-      .map((agent) => JSON.stringify([agent.labels?.["linear.projectId"], agent.labels?.["linear.plannerRun"]])));
+    const liveRoots = agents.filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && !agent.archivedAt && LIVE_AGENT[agent.status] && !ghosts.has(agent.id));
+    const liveRuns = new Set(liveRoots.map((agent) => JSON.stringify([agent.labels?.["linear.projectId"], agent.labels?.["linear.plannerRun"]])));
     await boundedMap(roots, async (agent) => {
       const identifier = agent.labels["linear.plannerRun"]
         ? agent.title || `Planner run ${agent.labels["linear.plannerRun"].slice(0, 8)}`
@@ -568,8 +572,9 @@ export class PlanPipeline {
           || !state?.error && !retainedError && Boolean(limitError(agent.lastError ?? ""));
         const protectedEvidence = legitimateWait || parkedPlan || failedSubmit || delivery && delivery.at >= (revision?.attemptAt ?? cycleAt)
           || !expectedFailure || plannerPending && (progressAt && progressAt > plannerPending.failedAt || turnAt && turnAt > plannerPending.failedAt);
-        if (!protectedEvidence) recovered = this.observeRecovery(record, planners.get(record.planner.projectId), agent,
-          liveRuns.has(JSON.stringify([record.planner.projectId, record.planner.runId])), now, recoveryUnavailable);
+        recovered = this.observeRecovery(record, planners.get(record.planner.projectId), agent,
+          liveRuns.has(JSON.stringify([record.planner.projectId, record.planner.runId])) ? liveRoots.some((root) => root.id === agent.id) ? "root" : "other" : "none",
+          now, recoveryUnavailable, Boolean(protectedEvidence));
       }
       if (!recovered) this.change(record, stage, status, at, detail);
       // A known newer submission supersedes only the preceding nonterminal revision of THIS
@@ -640,12 +645,15 @@ export class PlanPipeline {
     for (const record of this.records.values()) {
       if (!record.planner || handledRecovery.has(record.row.id) || TERMINAL[record.row.stage] || record.row.stage === "ready") continue;
       const agent = record.row.agentId ? agents.find((candidate) => candidate.id === record.row.agentId) : undefined;
-      if (parked.some((plan) => plan.agentId === record.row.agentId) || record.submittedAt || this.deliveries[record.row.agentId]
-        || agent?.pendingPermissions?.length) continue;
       const pending = planners.get(record.planner.projectId)?.run?.pending;
-      if (pending && record.row.lastProgressAt && record.row.lastProgressAt > pending.failedAt) continue;
+      const link = links.find((session) => session.agentId === record.row.agentId && !session.closed && !session.remote);
+      const protectedEvidence = parked.some((plan) => plan.agentId === record.row.agentId) || agent?.pendingPermissions?.length || link?.questions || link?.review
+        || record.row.status === "failed" && !/^(Provider rate limit \(429\)|Provider process exited or is closed|Provider process proven absent)/.test(record.row.detail)
+        || this.deliveries[record.row.agentId] && this.deliveries[record.row.agentId].at >= (record.submittedAt ?? record.observedAt)
+        || pending && record.row.lastProgressAt && record.row.lastProgressAt > pending.failedAt;
       this.observeRecovery(record, planners.get(record.planner.projectId), agent,
-        liveRuns.has(JSON.stringify([record.planner.projectId, record.planner.runId])), now, recoveryUnavailable);
+        liveRuns.has(JSON.stringify([record.planner.projectId, record.planner.runId])) ? liveRoots.some((root) => root.id === agent?.id) ? "root" : "other" : "none",
+        now, recoveryUnavailable, Boolean(protectedEvidence));
     }
     this.applyInbox();
     this.prune();
