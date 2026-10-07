@@ -1510,7 +1510,9 @@ waiting handover record, a "Needs you" sub-issue, the ticket in Needs input or c
 `<label>-needs-you` or `<label>-hold`), while the ticket is done or canceled, carries
 `do-not-merge` (the ticket or any open pull request of it; pull requests that cannot be read
 count as a veto), is queued, forwarded to the peer, handing out sub-issues, parked or approved
-for later, paused for deletion, or has two live root agents. Your Stop in Linear holds the ticket
+for later, paused for deletion, or has two live root agents. A quiet agent kept out this way is
+judged again 15 minutes later, not every poll (each judgement reads Linear and GitHub), so its
+recovery can start up to 15 minutes after the reason ends. Your Stop in Linear holds the ticket
 until you reply, resume or open a new thread: it is saved before the Stop goes out and survives
 reloads. Every step is re-checked inside the ticket's turn and start gate right before it, and
 claimed in `$PASEO_HOME/linear-tickets/watchdog.json` before its effect. A claim whose outcome a

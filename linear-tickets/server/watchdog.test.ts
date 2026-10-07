@@ -218,6 +218,22 @@ test("owner waits, holds, plan reviews, subagents, vetoes and unreadable evidenc
   }
 });
 
+test("a quiet ticket kept out by an exclusion is read again only every 15 minutes, and recovered once the exclusion clears", async (t) => {
+  quiet(t);
+  const h = await harness();
+  const reads = t.mock.method(h.deps.linear, "issueState");
+  h.state.status = { status: "Needs input", statusType: "started", labels: [] };
+  await h.poll(46);
+  await h.poll(48);
+  h.state.status = { status: "In Progress", statusType: "started", labels: [] };
+  await h.poll(60);
+  assert.equal(reads.mock.callCount(), 1, "one Linear read for the excluded ticket within 15 minutes");
+  assert.equal(h.acts.length, 0, "the verdict holds until it is read again");
+  await h.poll(61);
+  assert.deepEqual(h.acts.map((act) => act.action), ["steer"]);
+  await h.cleanup();
+});
+
 test("a step whose outcome a restart lost is never repeated; the next step follows after its window", async (t) => {
   quiet(t);
   const h = await harness();
