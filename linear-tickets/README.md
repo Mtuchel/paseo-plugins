@@ -1092,6 +1092,10 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   grace; a later bounded attempt has a unique durable request identity. External creation is
   not exactly once: a late duplicate may briefly exist, but the recorded live planner stays
   authoritative, redundant same-run roots are retired, and their stale orders are rejected.
+  If a replacement fails before creation for an ordinary reason, its retry returns to the
+  ordinary grace/cap; the already handled predecessor limit cannot be scheduled again.
+  A predecessor agent id is not confirmation of a new creation: an unconfirmed usage-limited
+  ordinary restart still keeps the full ten-minute grace, including after reload.
   At the limit bound, one project-update notification is attempted and the run stays owner-held
   until Plan or Skip, even after day rollover. A failed notification is logged, not repeated.
   Auto-dispatch controls automatic project recovery; the ticket-only automatic-start switch

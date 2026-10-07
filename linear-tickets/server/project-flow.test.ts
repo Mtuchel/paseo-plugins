@@ -1076,3 +1076,49 @@ test("a later provider reset postpones recovery without redrawing jitter or spen
   assert.equal(postponed.claims.length, 0);
   assert.equal(r.starts.length, 0);
 });
+
+test("ordinary replacement-start failure cannot reclassify a handled predecessor limit", async (t) => {
+  const r = await limitedRoom(t);
+  r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+  r.fail.startError = "project listing is offline";
+  r.advance(2 * MINUTE);
+  await r.flow.tick(r.paseo, settings);
+  assert.equal(r.starts.length, 1);
+  r.advance(8 * MINUTE);
+  await r.makeFlow().tick(r.paseo, settings);
+  assert.equal(r.starts.length, 1, "ordinary startup grace is ten minutes");
+  r.advance(2 * MINUTE);
+  await r.makeFlow().tick(r.paseo, settings);
+  assert.equal(r.starts.length, 2, "ordinary failure retries at ten minutes, not the limit spacing");
+  for (let poll = 0; poll < 3; poll++) {
+    r.advance(10 * MINUTE);
+    await r.makeFlow().tick(r.paseo, settings);
+  }
+  const run = (await r.store.all()).erp.planner!;
+  assert.equal(r.starts.length, 4);
+  assert.equal(run.restarts, 3);
+  assert.equal(run.recovery!.claims.length, 1);
+  assert.equal(run.ownerAsked, true);
+});
+
+test("an unconfirmed usage-limited ordinary restart retains grace despite a predecessor agent id", async (t) => {
+  const r = await room(t, [issue(1)]);
+  const paseo = paseoWith(() => [{ id: "predecessor", status: "closed", labels: { "linear.plannerRun": "run-1" } }]);
+  await r.seed({ planned: [], planner: runRecord({ agentId: "predecessor" }) });
+  r.fail.startError = "Agent creation could not be confirmed (429 usage limit model=anthropic/claude-opus-5-5).";
+  await r.flow.tick(paseo, settings);
+  assert.equal(r.starts.length, 1);
+  r.fail.startError = undefined;
+  r.usage.reports = [{ provider: "anthropic", fetchedAt: r.now(), limits: [{ amount: { usedFraction: 0 } }] }];
+  r.advance(2 * MINUTE);
+  await r.makeFlow().tick(paseo, settings);
+  assert.equal(r.starts.length, 1, "a predecessor id is not confirmation of the new failed creation");
+  r.advance(6 * MINUTE);
+  await r.makeFlow().tick(paseo, settings);
+  assert.equal(r.starts.length, 1);
+  r.advance(2 * MINUTE);
+  await r.makeFlow().tick(paseo, settings);
+  assert.equal(r.starts.length, 2);
+  assert.notEqual(r.starts[0].requestId, r.starts[1].requestId);
+  assert.equal((await r.store.all()).erp.planner!.recovery!.claims.length, 1);
+});

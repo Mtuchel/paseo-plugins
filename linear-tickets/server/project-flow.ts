@@ -71,6 +71,7 @@ const recoveryTime = z.string().refine((value) => Number.isFinite(Date.parse(val
 const plannerRecoverySchema = z.object({
   attempt: z.number().int().nonnegative(),
   claims: z.array(recoveryTime),
+  handledAgentId: z.string().optional(),
   pending: z.object({
     identity: z.string(), error: z.string(), model: z.string().nullable(), failedAt: recoveryTime,
     resumeAt: recoveryTime, fallbackAt: recoveryTime, jitterMs: z.number().min(60_000).max(300_000),
@@ -511,7 +512,7 @@ export class ProjectFlow {
     if (!live) return false;
     await this.store.update(projectId, (current) => current?.planner?.id === run.id && !current.planner.approved && !current.planner.ownerAsked
       ? { ...current, planner: { ...current.planner, started: true, agentId: live.id, startedAt: current.planner.startedAt ?? new Date(this.now()).toISOString(), error: undefined,
-        ...(run.recovery ? { recovery: { ...recoveryOf(current.planner)!, pending: undefined, claim: undefined } } : {}) } } : null);
+        ...(run.recovery ? { recovery: { ...recoveryOf(current.planner)!, pending: undefined, claim: undefined, handledAgentId: undefined } } : {}) } } : null);
     if (run.recovery) {
       for (const agent of [...agents.live, ...agents.stopped, ...agents.ghosts]) {
         if (agent.id !== live.id) await this.deps.retire(agent.id, paseo);
@@ -526,7 +527,7 @@ export class ProjectFlow {
     return { selector, recovery: reports ? availability(reports, selector ? candidates(chains, selector) : [], this.now()).recovery : null };
   }
 
-  private async scheduleLimit(projectId: string, run: PlannerRecord, identity: string, error: string, model: string | null, settings: PluginSettings): Promise<void> {
+  private async scheduleLimit(projectId: string, run: PlannerRecord, identity: string, error: string, model: string | null, settings: PluginSettings, failedAgentId?: string): Promise<void> {
     const hint = limitError(error)!;
     const old = recoveryOf(run) ?? { attempt: 0, claims: [] };
     if (old.pending?.identity === identity) return;
@@ -541,7 +542,8 @@ export class ProjectFlow {
       jitterMs, basis: timing.basis, selector: reading.selector,
     };
     await this.store.update(projectId, (current) => current?.planner?.id === run.id && !current.planner.approved && !current.planner.ownerAsked
-      ? { ...current, planner: { ...current.planner, recovery: { ...old, pending }, error } } : null);
+      ? { ...current, planner: { ...current.planner, agentId: failedAgentId ?? current.planner.agentId,
+        recovery: { ...old, handledAgentId: failedAgentId ?? old.handledAgentId, pending }, error } } : null);
   }
 
   // No new jitter or fallback deadline while waiting. Room can advance a wait, but only for the
@@ -565,7 +567,7 @@ export class ProjectFlow {
     const claims = recovery.claims.filter((claim) => Date.parse(claim) > now - LIMIT_DAY);
     if (claims.length) at = Math.max(at, Math.max(...claims.map(Date.parse)) + LIMIT_SPACING);
     // A lost launch response keeps its original grace even if another account has room.
-    if (!run.agentId || recovery.claim) at = Math.max(at, Date.parse(run.startedAt ?? run.listedAt) + RESTART_GRACE_MS);
+    if (pending.identity !== run.agentId || recovery.claim) at = Math.max(at, Date.parse(run.startedAt ?? run.listedAt) + RESTART_GRACE_MS);
     const provider = limitError(pending.error)?.provider ?? pending.model?.split("/")[0] ?? "provider";
     const updated = { ...pending, resumeAt: new Date(at).toISOString(), basis, selector: reading.selector };
     await this.store.update(projectId, (current) => current?.planner?.id === run.id && !current.planner.approved && !current.planner.ownerAsked
@@ -629,8 +631,8 @@ export class ProjectFlow {
     if (await this.adoptLive(project.id, run, agents, paseo)) return this.runStatus(project.id, read.status);
     const stopped = run.agentId ? agents.stopped.find((agent) => agent.id === run.agentId)
       : agents.stopped.slice().sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))[0];
-    if (!run.recovery?.pending && stopped?.status === "error" && limitError(stopped.lastError ?? "")) {
-      await this.scheduleLimit(project.id, run, stopped.id, stopped.lastError!, activeModel(stopped), settings);
+    if (!run.recovery?.pending && stopped?.status === "error" && stopped.id !== run.recovery?.handledAgentId && limitError(stopped.lastError ?? "")) {
+      await this.scheduleLimit(project.id, run, stopped.id, stopped.lastError!, activeModel(stopped), settings, stopped.id);
       run = (await this.store.all())[project.id].planner!;
     }
     if (run.recovery?.pending) return this.restartLimit(project, run, read, settings, paseo);
@@ -679,7 +681,7 @@ export class ProjectFlow {
       const agents = await classifyRunAgents(paseo, run.id, this.now(), this.deps.inspect);
       if (await this.adoptLive(project.id, run, agents, paseo)) return;
       const stopped = run.agentId && agents.stopped.find((agent) => agent.id === run.agentId);
-      if (!stopped || stopped.status !== "error" || !limitError(stopped.lastError ?? "")) return;
+      if (!stopped || stopped.status !== "error" || stopped.id === run.recovery?.handledAgentId || !limitError(stopped.lastError ?? "")) return;
     }
     await this.launchRun(project, run, read, settings, paseo);
   }
