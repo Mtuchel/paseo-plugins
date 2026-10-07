@@ -992,10 +992,14 @@ every 2 minutes.
   (Urgent, label `paseo-planner`) and assigns it to Paseo. The ticket is recorded the moment it
   exists; when its label or assignment fails, every project read repeats what is missing, so a
   failed step never files a second planner or leaves one without an agent. Its description lists
-  every open ticket of the project (In Progress and In Review included) with its links and a
-  160-character excerpt, the new ones marked and also given in full (up to 4,000 characters each
-  and 30,000 in all; past that the agent reads them in Linear), and the 300 most recently updated
-  open tickets of the same team outside the project by title. Its agent looks for overlap first:
+  every open ticket of the project (In Progress and In Review included) in one line with its
+  state, priority, labels, open blockers and links, the new ones marked and also given in full (up
+  to 4,000 characters each and 30,000 in all; past that the agent reads them in Linear), and the
+  300 most recently updated open tickets of the same team outside the project by title. The
+  description stays within 120,000 characters, so the planner's prompt fits Linear's 200,000 limit
+  however large the project is: every new ticket is always listed, and when the room runs out the
+  other project tickets, then those outside it, are cut, with a note to search Linear for them.
+  Its agent looks for overlap first:
   it compares every new ticket with all of those, searches Linear with its read tools for open
   tickets the lists miss, reads the full text of any candidate, and its plan lists every overlap
   in an `## Overlaps` section (or "None found" with the search terms). It then reads the code and

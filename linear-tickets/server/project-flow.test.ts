@@ -7,7 +7,7 @@ import { setImmediate } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
 import { LinearApiError, LinearRefusedError, type ProjectIssue, type TeamIssue, type TicketRef } from "./linear";
 import { Capacity } from "./capacity";
-import { orderProblems, parseOrder, ProjectFlow, ProjectStore, type ProjectRecord } from "./project-flow";
+import { orderProblems, parseOrder, plannerBrief, ProjectFlow, ProjectStore, type ProjectRecord } from "./project-flow";
 import type { ProcessInspector } from "./process-liveness";
 import { Scheduler } from "./scheduler";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
@@ -605,6 +605,21 @@ test("the planner sees every NEW ticket in full and the team's open tickets outs
   assert.match(brief, /\*\*TUC-50\*\* Ledger export for accounting \(In Review · Finance\)/);
   assert.match(brief, /\*\*TUC-51\*\* Loose idea \(Backlog · no project\)/);
   assert.ok(!/outside ERP[\s\S]*\*\*TUC-1\*\*/.test(brief), "the project's own tickets are not listed again as outside it");
+});
+
+test("a large project's planner brief stays within the prompt limit and lists every NEW ticket", () => {
+  // TUC-1094: 409 open ERP tickets with excerpts made a brief whose prompt passed 200,000 characters.
+  const title = "Rework the goods receipt booking so partial deliveries keep their batch and storage location";
+  const work = Array.from({ length: 2_000 }, (_, n) => issue(n + 1, { title: `${title} ${n + 1}`, labels: ["Platform", "Warehouse"] }));
+  const fresh = work.filter((_, n) => n % 10 === 9);
+  const descriptions = new Map(work.map((item) => [item.id, "x".repeat(5_000)]));
+  const others: TeamIssue[] = Array.from({ length: 300 }, (_, n) => ({ id: `o${n}`, identifier: `TUC-${5_000 + n}`, title, status: "Todo", projectId: "fin", projectName: "Finance" }));
+  const brief = plannerBrief("ERP", work, fresh, descriptions, others, true, { hold: "paseo-hold", attended: "paseo-attended" });
+  assert.ok(brief.length <= 120_000, `brief has ${brief.length} characters`);
+  const list = brief.split("## NEW tickets in full")[0];
+  for (const item of fresh) assert.match(list, new RegExp(`\\*\\*${item.identifier}\\*\\* .*NEW\\)`), `${item.identifier} is listed`);
+  assert.match(list, /\d+ more open tickets are not listed for length; search Linear for them\./);
+  assert.match(brief, /Only the \d+ most recently updated are listed; search Linear for older ones\./);
 });
 
 test("a work order links related tickets anywhere and closes a duplicate only when nobody works on it", async (t) => {

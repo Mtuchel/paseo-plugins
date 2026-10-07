@@ -31,16 +31,18 @@ import { paseoHome } from "./ticket-mcp";
 
 // How often a project's tickets are read: a project is a few paginated queries.
 const POLL_MS = 2 * 60_000;
-// Ticket list in the planner's description: each ticket's description is cut to this, which keeps
-// a 200-ticket project near 60,000 characters.
-const DESCRIPTION_CHARS = 160;
+// The planner ticket's description stays within this. Linear's agent prompt carries the ticket and
+// its comments as one JSON text of at most 200,000 characters (context.ts `buildContext`), and JSON
+// escaping and the planner's comments need room. ERP's 409 open tickets with a 160-character
+// excerpt each went past it (TUC-1094: its planner never started), so the project's tickets are
+// one line each, and what does not fit is left to the planner's Linear search.
+const BRIEF_CHARS = 120_000;
 // NEW tickets are also given in full, each up to NEW_DESCRIPTION_CHARS and all of them together up
-// to NEW_DESCRIPTIONS_BUDGET; past it the planner reads the rest in Linear. With the lists this keeps
-// a 200-ticket project's description near 120,000 characters (Linear took 73,000 without complaint).
+// to NEW_DESCRIPTIONS_BUDGET; past it the planner reads the rest in Linear.
 const NEW_DESCRIPTION_CHARS = 4_000;
 const NEW_DESCRIPTIONS_BUDGET = 30_000;
 // Open tickets of the project's teams outside the project, listed by title (about 100 characters
-// each), most recently updated first.
+// each), most recently updated first, as far as BRIEF_CHARS leaves room.
 const OTHER_TICKETS = 300;
 const HAND_OUT_TYPES = new Set(["backlog", "unstarted"]);
 // Polls a work order is retried while Linear refuses some of its changes, before it is closed with
@@ -669,30 +671,30 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-// The planner ticket's description: what to decide, the answer format, every open ticket of the
-// project (NEW ones also in full) and the other open tickets of its teams.
+// The planner ticket's description: what to decide, the answer format, the open tickets of the
+// project one line each (NEW ones also in full) and the other open tickets of its teams, within
+// BRIEF_CHARS. Every NEW ticket is always listed; older project tickets, then the tickets outside
+// the project, are cut when the room runs out, and the list says so.
 export function plannerBrief(projectName: string, work: ProjectIssue[], unplanned: ProjectIssue[], descriptions: Map<string, string>, others: TeamIssue[], othersCut: boolean, labels: { hold: string; attended: string }): string {
   const fresh = new Set(unplanned.map((issue) => issue.id));
-  const lines = work.map((issue) => {
+  const line = (issue: ProjectIssue) => {
     const blockers = issue.blockers.filter((blocker) => !blocker.finished).map((blocker) => blocker.identifier);
     const linked = issue.linked.map((other) => `${other.kind === "related" ? "related to" : other.kind} ${other.identifier}`);
-    const text = (descriptions.get(issue.id) ?? "").replace(/\s+/g, " ").trim();
     const facts = [issue.status, issue.priority ? `P${issue.priority}` : "", issue.labels.join(", "), blockers.length ? `blocked by ${blockers.join(", ")}` : "", ...linked, fresh.has(issue.id) ? "NEW" : ""].filter(Boolean).join(" · ");
-    return `- **${issue.identifier}** ${issue.title} (${facts})${text ? `\n  ${text.length > DESCRIPTION_CHARS ? `${text.slice(0, DESCRIPTION_CHARS - 1)}…` : text}` : ""}`;
-  });
+    return `- **${issue.identifier}** ${issue.title} (${facts})`;
+  };
   let budget = NEW_DESCRIPTIONS_BUDGET;
   const full = work.filter((issue) => fresh.has(issue.id)).map((issue) => {
     const text = (descriptions.get(issue.id) ?? "").trim();
     const room = Math.min(NEW_DESCRIPTION_CHARS, budget);
     const shown = text.length > room ? `${text.slice(0, Math.max(room - 1, 0))}…` : text;
     budget -= shown.length;
-    const quoted = shown ? shown.split("\n").map((line) => `> ${line}`.trimEnd()).join("\n") : "> (no description)";
+    const quoted = shown ? shown.split("\n").map((row) => `> ${row}`.trimEnd()).join("\n") : "> (no description)";
     return `### ${issue.identifier} ${issue.title}\n\n${quoted}${shown.length < text.length ? "\n\n(Cut here: read the full description in Linear.)" : ""}`;
   });
-  const otherLines = others.map((issue) => `- **${issue.identifier}** ${issue.title} (${[issue.status, issue.projectName || "no project"].join(" · ")})`);
-  return [
+  const head = [
     `Paseo hands the open tickets of **${projectName}** to agents on its own, up to the agent limit at once. Before it hands out the tickets marked NEW, decide their work order. Do not change code: this ticket only produces the order.`,
-    "Look for overlap first. Compare every NEW ticket with every other ticket below, in this project and outside it, and search Linear (the linear_ticket tool `search_issues`, or another Linear read tool such as `list_issues` with a query) for open tickets the lists do not show. Two tickets overlap when they change the same feature, files or data, or one already asks for what the other does. Before you decide on a ticket whose title or excerpt touches a NEW ticket's topic, read its full description in Linear. Your plan gets an `## Overlaps` section: every overlap found and the line of the order that handles it, or \"None found\" with the search terms you used.",
+    "Look for overlap first. Compare every NEW ticket with every other ticket below, in this project and outside it, and search Linear (the linear_ticket tool `search_issues`, or another Linear read tool such as `list_issues` with a query) for open tickets the lists do not show. Two tickets overlap when they change the same feature, files or data, or one already asks for what the other does. The lists give each ticket in one line: before you decide on a ticket whose title touches a NEW ticket's topic, read its full description in Linear. Your plan gets an `## Overlaps` section: every overlap found and the line of the order that handles it, or \"None found\" with the search terms you used.",
     `Read the tickets below and the code they touch, then write a plan with a \`## Work order\` section holding a fenced block in exactly this format:`,
     "```project-order\nTUC-12 blocks TUC-15\nTUC-24 duplicates TUC-9: TUC-9 already adds the export, including the CSV columns\nTUC-25 relates to TUC-31: both change the dunning e-mails\nhold TUC-20: too big, split it first\nrelease TUC-21\nattended TUC-23: which customer groups get the discount is not decided\n```",
     [
@@ -708,8 +710,33 @@ export function plannerBrief(projectName: string, work: ProjectIssue[], unplanne
     ].join("\n"),
     "Rate the work order itself in the plan's `## Risk and impact` section (the advisor record needs it), not the tickets: it only changes Linear (blocking relations, related and duplicate links, and labels; a duplicate is closed, and reopening it undoes that), and every ticket still plans and is approved on its own. That is impact 0 with reversibility `revert`, and `- New rule: no`. Answer `## Reach` and `## Principles and rules` in one line each (e.g. \"Only this project's tickets in Linear; each ticket's own plan answers where else it applies.\" and \"None apply; no new rule.\"). The work order is applied without the owner, so anything that needs them goes under `hold` or `attended`.",
     "Once you submit the plan, Paseo approves it automatically, writes the order into Linear and closes this ticket. Nothing is left to implement then: stop.",
-    `## Open tickets of ${projectName} (${work.length})\n\n${lines.join("\n")}`,
-    full.length ? `## NEW tickets in full\n\n${full.join("\n\n")}` : "",
-    `## Open tickets outside ${projectName}, same team (${others.length}${othersCut ? "+" : ""})\n\n${otherLines.length ? otherLines.join("\n") : "None."}${othersCut ? `\n\nOnly the ${others.length} most recently updated are listed; search Linear for older ones.` : ""}`,
+  ].join("\n\n");
+  const fullSection = full.length ? `## NEW tickets in full\n\n${full.join("\n\n")}` : "";
+  // Room for both lists, with some left for their headings and notes.
+  let room = BRIEF_CHARS - head.length - fullSection.length - 1_000;
+  const listed = new Set<string>();
+  for (const issue of work) if (fresh.has(issue.id)) { listed.add(issue.id); room -= line(issue).length + 1; }
+  for (const issue of work) {
+    if (listed.has(issue.id)) continue;
+    const length = line(issue).length + 1;
+    if (length > room) break;
+    listed.add(issue.id);
+    room -= length;
+  }
+  const projectLines = work.filter((issue) => listed.has(issue.id)).map(line);
+  const left = work.length - projectLines.length;
+  const otherLines: string[] = [];
+  for (const issue of others) {
+    const text = `- **${issue.identifier}** ${issue.title} (${[issue.status, issue.projectName || "no project"].join(" · ")})`;
+    if (text.length + 1 > room) break;
+    otherLines.push(text);
+    room -= text.length + 1;
+  }
+  const othersShort = othersCut || otherLines.length < others.length;
+  return [
+    head,
+    `## Open tickets of ${projectName} (${work.length})\n\n${projectLines.join("\n")}${left ? `\n\n${left} more open ticket${left === 1 ? " is" : "s are"} not listed for length; search Linear for them.` : ""}`,
+    fullSection,
+    `## Open tickets outside ${projectName}, same team (${otherLines.length}${othersShort ? "+" : ""})\n\n${otherLines.length ? otherLines.join("\n") : "None."}${othersShort ? `\n\nOnly the ${otherLines.length} most recently updated are listed; search Linear for older ones.` : ""}`,
   ].filter(Boolean).join("\n\n");
 }
