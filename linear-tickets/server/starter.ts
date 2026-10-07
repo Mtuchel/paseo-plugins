@@ -11,7 +11,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Handover } from "./handover";
 import type { ActivationResume } from "./activation";
-import type { Launcher, ResumeTarget } from "./launch";
+import { SetupError, type Launcher, type ResumeTarget } from "./launch";
 import type { LinearService } from "./linear";
 import { findProject, readBranches } from "./projects";
 import { hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, planPolicy, type PlanPolicy } from "./plan-policy";
@@ -239,11 +239,11 @@ export class TicketStarter {
     const mapping: ProjectMapping | undefined = (source.projectId ? settings.projectMappings[`project:${source.projectId}`] : undefined)
       ?? (source.teamId ? settings.projectMappings[`team:${source.teamId}`] : undefined);
     if (!mapping) {
-      throw new Error(`No Paseo project is mapped to ${mappingLabel(source)}. Start one agent for it from the Linear tickets sidebar (that saves the mapping), then ${options.retryHint}.`);
+      throw new SetupError(`No Paseo project is mapped to ${mappingLabel(source)}. Start one agent for it from the Linear tickets sidebar (that saves the mapping), then ${options.retryHint}.`);
     }
     const preference = settings.lastProvider ? settings.launchPreferences[settings.lastProvider] : undefined;
     if (!preference) {
-      throw new Error(`No provider has been chosen on this host yet. Start one agent from the Linear tickets sidebar so the plugin remembers the provider and model, then ${options.retryHint}.`);
+      throw new SetupError(`No provider has been chosen on this host yet. Start one agent from the Linear tickets sidebar so the plugin remembers the provider and model, then ${options.retryHint}.`);
     }
     const project = await findProject(paseo, mapping.projectId);
     const target = project.projectCustomName || project.projectDisplayName || mapping.label;
@@ -286,7 +286,7 @@ export class TicketStarter {
     if (project.projectKind === "git") {
       const available = await this.branches(project.projectRootPath);
       baseBranch = mappedBaseBranch(mapping.baseBranch, available.branches, available.defaultBranch) || undefined;
-      if (!baseBranch) throw new Error(`Could not pick a base branch in ${mapping.label}. Save a base branch for its project mapping.`);
+      if (!baseBranch) throw new SetupError(`Could not pick a base branch in ${mapping.label}. Save a base branch for its project mapping.`);
     }
     const result = await this.deps.launcher.start({ ...base, baseBranch, requestId: randomUUID() }, paseo, launchOptions);
     await started(result);

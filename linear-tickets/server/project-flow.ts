@@ -8,8 +8,9 @@ import { dispatchLabels } from "./dispatch";
 import { refusedByLinear, type LinearService, type ProjectIssue, type TeamIssue } from "./linear";
 import type { Scheduler } from "./scheduler";
 import { needsOwner } from "./presence";
-import { ghostAgents, type ProcessInspector } from "./process-liveness";
+import { classifyTicketAgents, type ProcessInspector } from "./process-liveness";
 import { PLAN_READY_LABEL } from "./plan-policy";
+import type { RepairRecord } from "./label-repair";
 import type { PluginSettings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
@@ -53,10 +54,6 @@ const RESTART_GRACE_MS = 10 * 60_000;
 // Restarts per planner before it is left to the owner: a start that fails this often (no project
 // mapping, a provider that does not come up) needs them, not another try.
 const RESTART_CAP = 3;
-// Agent states that still work on the ticket. A closed agent (idle too long) or one in error never
-// submits a plan, or takes the next step, on its own; nor does a ghost, idle or running without a
-// process (see ghostAgents). Also SessionRouter.liveSuccessorFor's test.
-export const LIVE_AGENT: Record<string, true> = { initializing: true, idle: true, running: true };
 
 // `planned`: the tickets in an approved (or closed) plan: those its planner listed. Kept by id, not
 // by creation time, so a ticket created while the planner was filed, or moved into the project from
@@ -101,33 +98,62 @@ function plannedAfter(record: ProjectRecord, planner: PlannerRecord, issues: Pro
   return [...new Set([...(record.planned ?? []), ...(planner.listed ?? [])])].filter((id) => open.has(id));
 }
 
+// The label repair's records (label-repair.ts) share projects.json under this key; project ids
+// never start with "~", and older versions keep the key because they write the whole file back.
+const REPAIRS_KEY = "~repairs";
+
 export class ProjectStore {
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly path = join(paseoHome(), "linear-tickets", "projects.json")) {}
 
+  private async raw(): Promise<Record<string, unknown>> {
+    return JSON.parse(await readFile(this.path, "utf8").catch(() => "{}")) as Record<string, unknown>;
+  }
+
   async all(): Promise<Record<string, ProjectRecord>> {
-    return JSON.parse(await readFile(this.path, "utf8").catch(() => "{}")) as Record<string, ProjectRecord>;
+    const { [REPAIRS_KEY]: _repairs, ...projects } = await this.raw();
+    return projects as Record<string, ProjectRecord>;
+  }
+
+  async repairs(): Promise<Record<string, RepairRecord>> {
+    return ((await this.raw())[REPAIRS_KEY] ?? {}) as Record<string, RepairRecord>;
   }
 
   // Changes run one after another, each on the file as it is then, so a poll and an approval never
   // overwrite each other's record. `change` returns the project's new record, or null to keep it.
   update(projectId: string, change: (current: ProjectRecord | undefined) => ProjectRecord | null): Promise<ProjectRecord | null> {
-    const run = this.queue.then(async () => {
-      const records = await this.all();
-      const next = change(records[projectId]);
-      if (next) await this.save({ ...records, [projectId]: next });
+    return this.queued(async () => {
+      const file = await this.raw();
+      const next = change(file[projectId] as ProjectRecord | undefined);
+      if (next) await this.save({ ...file, [projectId]: next });
       return next;
     });
+  }
+
+  // The label repair's records, changed on the same queue as the projects': `change` returns them
+  // all as they should be, or null to keep them. Resolves to the records as they are afterwards.
+  updateRepairs(change: (current: Record<string, RepairRecord>) => Record<string, RepairRecord> | null): Promise<Record<string, RepairRecord>> {
+    return this.queued(async () => {
+      const file = await this.raw();
+      const current = (file[REPAIRS_KEY] ?? {}) as Record<string, RepairRecord>;
+      const next = change(current);
+      if (next) await this.save({ ...file, [REPAIRS_KEY]: next });
+      return next ?? current;
+    });
+  }
+
+  private queued<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(work);
     this.queue = run.catch(() => {});
     return run;
   }
 
-  private async save(records: Record<string, ProjectRecord>): Promise<void> {
+  private async save(file: Record<string, unknown>): Promise<void> {
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const temporary = `${this.path}.${randomUUID()}.tmp`;
     try {
-      await writeFile(temporary, JSON.stringify(records, null, 2), { mode: 0o600, flag: "wx" });
+      await writeFile(temporary, JSON.stringify(file, null, 2), { mode: 0o600, flag: "wx" });
       await rename(temporary, this.path);
     } finally { await rm(temporary, { force: true }); }
   }
@@ -225,15 +251,18 @@ export class ProjectFlow {
     return (this.deps.now ?? Date.now)();
   }
 
-  // Whether a top-level agent works on the ticket: live by its status and not a ghost. A ghost is
-  // logged, so a restart it causes is explained.
+  // Whether a top-level agent works on the ticket: live by its status and not a ghost, on any page
+  // of its agents. A ghost is logged, so a restart it causes is explained.
   private async working(paseo: PaseoApi, issueId: string, identifier: string): Promise<boolean> {
-    const page = await paseo.agents.list({ filter: { labels: { "linear.issueId": issueId }, includeArchived: false }, page: { limit: 20 } });
-    const live = page.entries.map(({ agent }) => agent).filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && LIVE_AGENT[agent.status]);
-    if (!live.length) return false;
-    const ghosts = await ghostAgents(live, this.now(), this.deps.inspect);
-    for (const id of ghosts) console.log(`[linear-tickets] ${identifier}: agent ${id.slice(0, 8)} shows ${live.find((agent) => agent.id === id)?.status} but its OMP process is gone; it counts as stopped`);
-    return live.some((agent) => !ghosts.has(agent.id));
+    const agents = await classifyTicketAgents(paseo, issueId, this.now(), this.deps.inspect);
+    for (const ghost of agents.ghosts) console.log(`[linear-tickets] ${identifier}: agent ${ghost.id.slice(0, 8)} shows ${ghost.status} but its OMP process is gone; it counts as stopped`);
+    return agents.live.length > 0;
+  }
+
+  // Tickets the label repair (label-repair.ts) watches, restarts or left to the owner: the
+  // hand-out and the stalled-ticket restart leave them alone, so no second restart cycle starts.
+  private async repairing(): Promise<Set<string>> {
+    return new Set(Object.entries(await this.store.repairs()).filter(([, record]) => record.state !== "resolved").map(([id]) => id));
   }
 
   // The labelled projects as of the last poll (`linear.projects-status`).
@@ -406,10 +435,11 @@ export class ProjectFlow {
     const labels = dispatchLabels(settings.dispatch.label);
     const skip = new Set([labels.hold, labels.manual, labels.needsYou, labels.running, labels.failed, settings.dispatch.label].map((name) => name.toLowerCase()));
     const withheld = new Set(read.record.withheld ?? []);
+    const repairing = await this.repairing();
     const pending = (await this.store.all())[projectId]?.planner?.approved;
     const ordered = new Set(pending ? parseOrder(pending.plan).flatMap((step) => step.kind === "blocks" ? [step.blocked] : step.kind === "hold" || step.kind === "attended" ? [step.ticket] : []) : []);
     const parents = new Set(read.work.map((issue) => issue.parentId).filter(Boolean));
-    const ready = read.work.filter((issue) => read.planned(issue) && !withheld.has(issue.id) && !ordered.has(issue.identifier) && HAND_OUT_TYPES.has(issue.statusType) && !issue.delegateId && (!issue.assigneeId || issue.assigneeId === read.owner)
+    const ready = read.work.filter((issue) => read.planned(issue) && !withheld.has(issue.id) && !repairing.has(issue.id) && !ordered.has(issue.identifier) && HAND_OUT_TYPES.has(issue.statusType) && !issue.delegateId && (!issue.assigneeId || issue.assigneeId === read.owner)
       && !issue.parentId && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished));
     for (const group of ready.filter((issue) => parents.has(issue.id))) {
       await this.deps.linear.delegate(group.id, appId);
@@ -449,7 +479,8 @@ export class ProjectFlow {
     // Labelled tickets belong to the label dispatch, held ones and the owner's tasks to the owner.
     const skip = new Set([labels.hold, labels.manual, labels.needsYou, labels.running, labels.failed, settings.dispatch.label].map((name) => name.toLowerCase()));
     const parents = new Set(read.work.map((issue) => issue.parentId).filter(Boolean));
-    const suspects = read.work.filter((issue) => issue.delegateId === appId && HAND_OUT_TYPES.has(issue.statusType) && !parents.has(issue.id)
+    const repairing = await this.repairing();
+    const suspects = read.work.filter((issue) => issue.delegateId === appId && HAND_OUT_TYPES.has(issue.statusType) && !parents.has(issue.id) && !repairing.has(issue.id)
       && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished));
     const stalled: ProjectIssue[] = [];
     for (const issue of suspects) {

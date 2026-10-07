@@ -284,6 +284,27 @@ const ISSUE_LABELS_BATCH = 50;
 // `openChildren`: the ticket has at least one sub-issue that is not completed or canceled.
 export type LabeledIssue = { id: string; identifier: string; teamKey: string; priority: number; labels: { id: string; name: string }[]; openChildren: boolean };
 
+// The label repair (label-repair.ts): open tickets of the dispatch teams carrying a stale-able
+// label, and the tickets of its open records whatever their labels or state, all pages.
+export const REPAIR_CANDIDATES_QUERY = `query repairCandidates($first: Int!, $after: String, $filter: IssueFilter) {
+  issues(first: $first, after: $after, includeArchived: false, filter: $filter) {
+    nodes { id identifier state { name type } project { id } labels(first: 50) { nodes { id name } } children(first: 1, filter: { state: { type: { nin: ["completed", "canceled"] } } }) { nodes { id } } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export type RepairCandidate = { id: string; identifier: string; status: string; statusType: string; projectId: string | null; labels: { id: string; name: string }[]; openChildren: boolean };
+
+// Two reads, merged by id: Linear's `or` around this multi-field filter matched every ticket of
+// the team (1210 of TUC, 2026-10-07), so the record ids are read on their own.
+export function repairCandidateFilter(labels: string[], teamKeys: string[]): Record<string, unknown> {
+  return {
+    labels: { some: { or: labels.map((name) => ({ name: { eqIgnoreCase: name } })) } },
+    team: { key: { in: [...new Set(teamKeys)].sort() } },
+    state: { type: { nin: ["completed", "canceled"] } },
+  };
+}
+const REPAIR_IDS_BATCH = 50;
+
 // The current state, team, labels and attachment links of one ticket: enough for
 // write-back decisions without the comment pagination that `detail` performs.
 export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
@@ -872,6 +893,34 @@ export class LinearService {
     })).filter((issue) => issue.id)
       // Most urgent first; tickets without a priority last. Stable otherwise (Linear's order).
       .sort((a, b) => (a.priority || 5) - (b.priority || 5));
+  }
+
+  async repairCandidates(input: { labels: string[]; teamKeys: string[]; ids: string[] }): Promise<RepairCandidate[]> {
+    const found = new Map<string, RepairCandidate>();
+    const ids = [...new Set(input.ids)].sort();
+    const filters = [
+      ...input.teamKeys.length ? [repairCandidateFilter(input.labels, input.teamKeys)] : [],
+      ...Array.from({ length: Math.ceil(ids.length / REPAIR_IDS_BATCH) }, (_, index) => ({ id: { in: ids.slice(index * REPAIR_IDS_BATCH, (index + 1) * REPAIR_IDS_BATCH) } })),
+    ];
+    for (const filter of filters) {
+      let after: string | null = null;
+      do {
+        const data = record(await this.read(REPAIR_CANDIDATES_QUERY, { first: 100, after, filter }));
+        const page = record(data.issues ?? {});
+        for (const node of connection(page).nodes.map((item) => record(item))) {
+          const state = record(node.state ?? {});
+          const id = label(node.id);
+          if (id) found.set(id, {
+            id, identifier: label(node.identifier), status: label(state.name), statusType: label(state.type),
+            projectId: label(record(node.project ?? {}).id) || null, labels: labelNodes(node.labels),
+            openChildren: connection(node.children ?? { nodes: [] }).nodes.length > 0,
+          });
+        }
+        const info = record(page.pageInfo ?? {});
+        after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
+      } while (after);
+    }
+    return [...found.values()];
   }
 
   // Label names by ticket id, lower-cased. The Paseo app's pool first; the key when the app cannot

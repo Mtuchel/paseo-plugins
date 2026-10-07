@@ -17,12 +17,11 @@ import type { Handover } from "./handover";
 import type { IssueGroup, LinearService } from "./linear";
 import type { Launcher } from "./launch";
 import { CODING_STATE } from "./plannotator";
-import { LIVE_AGENT } from "./project-flow";
 import { closeAnswered, type NeedsYouIssues } from "./needs-you";
 import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, questionAnswer, questionsOf } from "./relay";
-import type { Settings } from "./settings";
+import type { PluginSettings, Settings } from "./settings";
 import { issueAgents, type TicketStarter } from "./starter";
-import { ghostAgents, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
+import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 import type { ReviewDeletions } from "./review-deletions";
 
 const exec = promisify(execFile);
@@ -77,6 +76,25 @@ export type PromptOutcome = "sent" | "restarted" | "reloaded" | "crashed" | "bus
 export type Succession =
   | { kind: "started" | "live"; agent: { id: string; title: string | null; cwd: string } }
   | { kind: "wait" | "impossible"; reason: string };
+// What a restart (SessionRouter.restartFor) came to. `started`: a new agent runs (`marked`: the
+// running label was written). `live`: a live agent already works on the ticket. `forwarded`: the
+// peer host owns the start. `skipped`: the ticket is deleted or paused for deletion. `deferred`:
+// nothing started and nothing failed (not connected, another start under way, held route, a process
+// still writing, no admission, `eligible` refused, or a read before the start failed). `failed`:
+// the start itself threw.
+export type RestartResult =
+  | { kind: "started"; agentId: string; marked: boolean }
+  | { kind: "live" } | { kind: "forwarded"; peer: string } | { kind: "skipped" }
+  | { kind: "deferred"; reason: string } | { kind: "failed"; error: Error };
+// `retryHint`: how the owner tries again, for a start that fails on setup. `eligible`: why the
+// ticket may not start any more (null: it may), checked last before the start.
+export type RestartOptions = { retryHint?: string; eligible?: () => Promise<string | null> };
+// The project flow's restarts: a deferred or failed restart throws, as before restartFor had a
+// result, so the caller's catch releases its scheduler reservation and logs why.
+export function restartOrThrow(result: RestartResult): void {
+  if (result.kind === "deferred") throw new Error(result.reason);
+  if (result.kind === "failed") throw result.error;
+}
 // How a crashed agent is recovered: `before` runs with the resume text and the crash right before
 // the reload, so the caller can claim the attempt and keep the resume until it went out.
 export type Recovery = { issueId: string; before: (resume: string, error: string) => Promise<void> };
@@ -1420,41 +1438,59 @@ export class SessionRouter {
   // mention never reaches them, and its earlier threads are closed as superseded.
   // Runs in the ticket's turn and under its start gate, like any automatic start: a live agent that
   // came up meanwhile (a successor start before it) is no planner to restart.
-  restartFor(issueId: string, identifier: string): Promise<void> {
-    return this.exclusive(issueId, () => this.restartNow(issueId, identifier));
+  // Also the label repair's restart (label-repair.ts): `eligible` runs last before the start, after
+  // admission (which may wait), and a reason it returns defers the start. Only a failed
+  // `starter.start` is `failed`; what follows a start (thread, archive, superseded threads) is best
+  // effort and never turns a started agent into a failure. `marked`: the running label was written.
+  restartFor(issueId: string, identifier: string, options: RestartOptions = {}): Promise<RestartResult> {
+    return this.exclusive(issueId, () => this.restartNow(issueId, identifier, options));
   }
 
-  private async restartNow(issueId: string, identifier: string): Promise<void> {
-    if (await this.deps.deletions?.blocked(issueId)) return;
-    if (!this.paseo) throw new Error("Paseo is not connected yet.");
+  private async restartNow(issueId: string, identifier: string, options: RestartOptions): Promise<RestartResult> {
+    if (await this.deps.deletions?.blocked(issueId)) return { kind: "skipped" };
+    if (!this.paseo) return { kind: "deferred", reason: "Paseo is not connected yet." };
+    const paseo = this.paseo;
     const gate = this.deps.launcher.gate(issueId);
-    if (!gate) throw new Error("A launch for this ticket is under way.");
+    if (!gate) return { kind: "deferred", reason: "A launch for this ticket is under way." };
+    const later = (step: string, work: () => Promise<unknown>) => work().catch((error: unknown) => {
+      console.error(`[linear-tickets] ${identifier}: ${step} failed: ${error instanceof Error ? error.message : error}`);
+    });
     try {
-      const routed = await this.deps.route?.take({ kind: "session", issueId, identifier });
-      if (routed && "held" in routed) throw new Error(`Nothing was restarted: ${routed.held}. The project's next read tries again.`);
-      if (routed) {
-        console.log(`[linear-tickets] ${identifier}: the planner's restart is handed to ${routed.peer}`);
-        return;
+      let settings: PluginSettings;
+      let stopped: Set<string>;
+      // Everything up to the start only reads: a failure there started nothing (deferred).
+      try {
+        const routed = await this.deps.route?.take({ kind: "session", issueId, identifier });
+        if (routed && "held" in routed) return { kind: "deferred", reason: `Nothing was restarted: ${routed.held}. The project's next read tries again.` };
+        if (routed) {
+          console.log(`[linear-tickets] ${identifier}: the restart is handed to ${routed.peer}`);
+          return { kind: "forwarded", peer: routed.peer };
+        }
+        const wait = await this.processWait(issueId);
+        if (wait) return { kind: "deferred", reason: wait };
+        if (await this.liveSuccessorFor(issueId)) return { kind: "live" };
+        settings = await this.deps.settings.read();
+        const admission = await this.deps.starter.admission(issueId, paseo, settings);
+        if (!admission.ok) return { kind: "deferred", reason: admission.reason };
+        const refused = await options.eligible?.();
+        if (refused) return { kind: "deferred", reason: refused };
+        stopped = new Set((await this.deps.store.all()).filter((link) => link.issueId === issueId && link.agentId).map((link) => link.agentId!));
+      } catch (error) {
+        return { kind: "deferred", reason: error instanceof Error ? error.message : String(error) };
       }
-      const wait = await this.processWait(issueId);
-      if (wait) throw new Error(wait);
-      if (await this.liveSuccessorFor(issueId)) return;
-      const settings = await this.deps.settings.read();
-      const admission = await this.deps.starter.admission(issueId, this.paseo, settings);
-      if (!admission.ok) throw new Error(admission.reason);
-      const stopped = new Set((await this.deps.store.all()).filter((link) => link.issueId === issueId && link.agentId).map((link) => link.agentId!));
       const running = dispatchLabels(settings.dispatch.label).running;
-      await this.deps.linear.addLabel(issueId, running).catch(() => {});
+      const marked = await this.deps.linear.addLabel(issueId, running).then(() => true, () => false);
       let agentId: string;
       try {
-        agentId = (await this.deps.starter.start(issueId, this.paseo, settings, { retryHint: "the project's next read starts it again" })).agentId;
+        agentId = (await this.deps.starter.start(issueId, paseo, settings, { retryHint: options.retryHint ?? "the project's next read starts it again" })).agentId;
       } catch (error) {
         await this.deps.linear.removeLabel(issueId, running).catch(() => {});
-        throw error;
+        return { kind: "failed", error: error instanceof Error ? error : new Error(String(error)) };
       }
-      await this.openFor(issueId, identifier, agentId);
-      for (const old of stopped) if (old !== agentId) await this.paseo.agents.ref(old).archive().catch(() => {});
-      await this.closeSuperseded();
+      await later("opening the new agent's thread", () => this.openFor(issueId, identifier, agentId));
+      for (const old of stopped) if (old !== agentId) await later(`archiving stopped agent ${old.slice(0, 8)}`, () => paseo.agents.ref(old).archive());
+      await later("closing superseded threads", () => this.closeSuperseded());
+      return { kind: "started", agentId, marked };
     } finally {
       gate.release();
     }

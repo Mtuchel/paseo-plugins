@@ -107,7 +107,9 @@ test("a start under way accounts for the ticket until it ends", async () => {
   while (!gate.fail) await setImmediate();
   assert.equal(await h.router.threadHolds("i9"), true, "the agent takes a minute or two to show up");
   gate.fail(new Error("Timed out waiting for OMP to become ready"));
-  await assert.rejects(restart, /Timed out/);
+  const result = await restart;
+  assert.equal(result.kind === "failed" && result.error.message, "Timed out waiting for OMP to become ready");
+  await setImmediate();
   assert.equal(await h.router.threadHolds("i9"), false);
   await h.cleanup();
 });

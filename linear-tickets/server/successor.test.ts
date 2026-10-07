@@ -563,13 +563,13 @@ test("restartFor refuses while the gate is held and starts nothing behind a live
   const held = routerHarness();
   const gate = held.gates.gate(ISSUE.id);
   assert.ok(gate);
-  await assert.rejects(held.router.restartFor(ISSUE.id, ISSUE.identifier), /A launch for this ticket is under way\./);
+  assert.deepEqual(await held.router.restartFor(ISSUE.id, ISSUE.identifier), { kind: "deferred", reason: "A launch for this ticket is under way." });
   gate.release();
   assertGateFree(held.gates);
   await held.cleanup();
 
   const live = routerHarness({ agents: [ticketAgent("agent-live", "2026-01-02T00:00:00Z")] });
-  await live.router.restartFor(ISSUE.id, ISSUE.identifier);
+  assert.deepEqual(await live.router.restartFor(ISSUE.id, ISSUE.identifier), { kind: "live" });
   assert.equal(live.starts.length, 0, "a live successor is no planner to restart");
   assert.deepEqual(live.calls, []);
   assertGateFree(live.gates);
@@ -581,7 +581,7 @@ test("restartFor refuses while the gate is held and starts nothing behind a live
       ticketAgent("agent-error", "2026-01-02T00:00:00Z", { status: "error", lastError: "OMP RPC process is closed" }),
     ],
   });
-  await stopped.router.restartFor(ISSUE.id, ISSUE.identifier);
+  assert.equal((await stopped.router.restartFor(ISSUE.id, ISSUE.identifier)).kind, "started");
   assert.equal(stopped.starts.length, 1, "closed and crashed agents are no live successor");
   assert.equal(stopped.starts[0].options.retryHint, "the project's next read starts it again");
   assertGateFree(stopped.gates);
@@ -1102,7 +1102,8 @@ test("native auto-resume and planner restart wait for terminal processes without
   try {
     await h.store.put(thread({ agentId: "agent-old" }));
     assert.equal(await h.router.resumeNow("s1"), false);
-    await assert.rejects(h.router.restartFor(ISSUE.id, ISSUE.identifier), /OMP worker.*still alive/);
+    const waited = await h.router.restartFor(ISSUE.id, ISSUE.identifier);
+    assert.match(waited.kind === "deferred" ? waited.reason : waited.kind, /OMP worker.*still alive/);
     assert.deepEqual(h.starts, []);
     assert.deepEqual(h.calls, []);
     assert.deepEqual(h.daemon.archived, []);
