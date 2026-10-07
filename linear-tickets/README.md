@@ -2598,6 +2598,35 @@ not. A one-week post-release check uses the minute-precise restart record, not h
 outside full exhaustion across all candidate models, median failure-to-start must be <30 min;
 unrestarted qualifying failures count as never cleared, forwarded ones remain unverified.
 
+**Planning without Plannotator's instructions.** On 2026-10-07 omp re-ran its
+`before_agent_start` handlers and dropped the first round's messages, so Plannotator's planning
+instructions never reached 34 planning agents on server087 and their plans came out in the wrong
+layout. The digest reads every host's omp session files (`~/.omp/agent/sessions/<cwd>/*.jsonl`;
+subagent transcripts in deeper folders are skipped) that started in the last 24 h
+(`PLANNING_WINDOW_S`, from the file name; files not modified within it are not opened) and reads
+each only up to its first assistant message. A session counts when it has the plan-first launch
+marker (`linear-tickets.plan-first`, reason `launch`), an assistant message, and no
+`plannotator-framing` message before that first assistant message (instructions that arrive later
+count as missing). Each such session is one attention item, keyed by host and session id
+(`planning-missing:<host>:<session id>`), so the owner is notified once; it clears when the
+session leaves the 24 h window. The line names the host, the ticket (from the launch prompt's
+`Work on the Linear ticket TUC-N` / `continuing work on Linear ticket TUC-N`, else the worktree
+folder, else `project planner`), the start in Berlin time and what to do: check that plan's layout
+and send the plan back if it lacks the instructions' layout. History kind:
+`planning: instructions missing`.
+
+The digest also reads each host's planning smoke result,
+`~/.paseo/linear-tickets/planning-smoke.json` (version 1, written by `npm run smoke:planning`).
+A failed check (`ok: false`) is one attention item per host and checked setup
+(`planning-smoke:<host>:<fingerprint>`) naming each failed `check` and its `detail` (reduced to
+plain words) and the command to run the smoke check again by hand once fixed; history kind
+`planning: smoke check failed`. A passed check gives no item; a missing file means the smoke check
+has not run on that host yet (no item, no failure). An unreadable or invalid file, an unreadable
+sessions folder, an unreachable host or an older host snapshot without `planningSessions` /
+`planningSmoke` (category `not in host snapshot`) is that host's `planning_sessions` or
+`planning_smoke` unit not read: only that host's previous items stay, marked stale. Both appear
+in the document's **Planning without Plannotator's instructions** section.
+
 **Project planners (usage-limit recovery).** The digest reads `projects.json` once per host/run.
 Scheduled waits show `usage-limit restart scheduled (at …; subject to automatic dispatch and the
 project trigger)`, claimed attempts show `usage-limit restart in progress`, and an exhausted
@@ -2677,15 +2706,16 @@ systemctl --user start paseo-ops-digest.service             # one real run
 ```
 
 `--at <ISO time>` pretends another "now"; `--agents-json` prints this host's agents and sanitized
-`projectPlanners` source for another host's digest (what the Mac runs for server087; its format is
-a contract with the remote).
+`projectPlanners`, `planningSessions` (session id, start, ticket) and `planningSmoke` sources for
+another host's digest (what the Mac runs for server087; its format is a contract with the remote).
 
 **History.** Every publishing run appends JSON lines, one `run` line and one line per item:
 
 - `{"t", "event": "run", "host", "units": {unit: read?}, "hosts": [...], "items": n}`: every unit
   the run attempted (`repo`, the repository script's own units such as `queue`, `pulls/917`,
-  `deploy:production/x`, `agents`, `silent`, `locks`, `planner_recovery`, and
-  `agents@<host>`/`silent@<host>`/`planner_recovery@<host>` for each
+  `deploy:production/x`, `agents`, `silent`, `locks`, `planner_recovery`, `planning_sessions`,
+  `planning_smoke`, and `agents@<host>`/`silent@<host>`/`planner_recovery@<host>`/
+  `planning_sessions@<host>`/`planning_smoke@<host>` for each
   remote), read or not, and every host whose agents were read. It is the proof that a source was
   looked at, whether or not anything was found.
 - `{"t", "event": "opened" | "open" | "cleared", "key", "kind", "unit", "first", "attention",
@@ -2727,7 +2757,8 @@ most 10 % of their `pulls/<n>` or `deploy:<env>/<service>` sub-units failed; age
 `agents`/`agents@<host>` (and `silent`/`silent@<host>` for silent agents, `locks` for orphaned
 labels) read, judged per host. Planner kinds require their own `planner_recovery` or
 `planner_recovery@<host>` unit, independently of agent reads; missing units are unknown coverage.
-Non-attention planner notes do not affect headline problem completeness.
+Non-attention planner notes do not affect headline problem completeness. The review does not know
+the `planning_*` units yet: it judges the `planning` kinds like a repository section, by `repo`.
 An hour without a `run` line, a `gap` and backfilled hours are
 never covered. A window is complete with at least 90 % covered hours and less than 1 % malformed
 lines; agent kinds count only the hosts complete in every window compared, and server087 must be

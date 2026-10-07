@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -84,6 +84,8 @@ class FakeIO:
         self.usage_error = None
         self.planner_sources_data = {digest.HOST_NAME: {"ok": True, "failures": []}}
         self.planner_recovery_sources = {"": {"version": 1, "pending": [], "completed": []}}
+        self.planning_sources_data = {digest.HOST_NAME: {"planning_sessions": {"ok": True, "sessions": []},
+                                                         "planning_smoke": {"ok": True, "smoke": None}}}
 
     def dispatch_quarantine(self):
         self.dispatches += 1
@@ -117,6 +119,9 @@ class FakeIO:
 
     def planner_sources(self):
         return self.planner_sources_data
+
+    def planning_sources(self, now):
+        return {host: dict(sources) for host, sources in self.planning_sources_data.items()}
 
     def permissions(self):
         return self.perms
@@ -1928,6 +1933,268 @@ class PlannerDigestRunTest(RunCase):
         self.assertEqual([line["t"] for line in lines if line["event"] == "opened" and line["key"] == key],
                          ["2026-09-30T07:05:00Z"])
         self.assertEqual(self.saved()["historyOutbox"], [])
+
+
+# 2026-10-07 17:00 Berlin. Planning sessions of the 24 h before count.
+PLAN_NOW = at("2026-10-07T15:00:00Z")
+FRAMING = {"type": "custom_message", "customType": "plannotator-framing",
+           "content": "[PLANNOTATOR - PLANNING PHASE]\n# Part 1 — Overview"}
+
+
+def session_entries(*, cwd="/home/m/dev/tuchel-platform", launch=True, framing="before", reply=True,
+                    user="Work on the Linear ticket TUC-1208 in the JSON snapshot below, using the current workspace."):
+    """An omp session file's entries as a planning launch writes them (2026-10-07, server087)."""
+    entries = [{"type": "title", "v": 1, "title": ""}, {"type": "session", "version": 3, "id": "x", "cwd": cwd},
+               {"type": "custom", "customType": "plannotator", "data": {"phase": "planning"}}]
+    if launch:
+        entries.append({"type": "custom", "customType": "linear-tickets.plan-first",
+                        "data": {"reason": "launch", "policy": "required"}})
+    if framing == "before":
+        entries.append(FRAMING)
+    entries.append({"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": user}]}})
+    if reply:
+        entries.append({"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "OK"}]}})
+    if framing == "after":
+        entries.append(FRAMING)
+    return entries
+
+
+def write_session(root, session_id, entries, *, start=PLAN_NOW - 3600, folder="-home-m-dev-tuchel-platform",
+                  mtime=None, tail=""):
+    """One omp session file `<root>/<cwd folder>/<UTC start>_<id>.jsonl`, modified a minute after its start."""
+    directory = os.path.join(root, folder)
+    os.makedirs(directory, exist_ok=True)
+    stamp = datetime.fromtimestamp(start, timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%f")[:-3]
+    path = os.path.join(directory, f"{stamp}Z_{session_id}.jsonl")
+    with open(path, "w") as f:
+        f.write("".join(json.dumps(entry) + "\n" for entry in entries) + tail)
+    modified = mtime if mtime is not None else start + 60
+    os.utime(path, (modified, modified))
+
+
+class PlanningSessionsTest(unittest.TestCase):
+    """Planning sessions started without Plannotator's planning instructions, from omp's files."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "sessions")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, session_id, entries, **options):
+        write_session(self.root, session_id, entries, **options)
+
+    def found(self):
+        return {s["sessionId"]: s for s in digest.planning_sessions(self.root, PLAN_NOW)}
+
+    def test_only_launches_whose_first_reply_came_without_the_instructions_count(self):
+        self.write("s-missing", session_entries(framing=None))
+        self.write("s-framed", session_entries())
+        self.write("s-late", session_entries(framing="after"))  # instructions after the first reply: too late
+        self.write("s-no-launch", session_entries(launch=False, framing=None))
+        self.write("s-no-reply", session_entries(framing=None, reply=False))
+        self.write("s-torn", session_entries(framing=None, reply=False),
+                   tail='{"type": "message", "message": {"role": "assist')
+        self.write("s-subagent", session_entries(framing=None),
+                   folder=os.path.join("-home-m-dev-tuchel-platform", "01a116c4-parent"))
+        self.write("s-old", session_entries(framing=None), start=PLAN_NOW - 25 * 3600, mtime=PLAN_NOW)
+        self.write("s-untouched", session_entries(framing=None), mtime=PLAN_NOW - 25 * 3600)
+        with open(os.path.join(self.root, "-home-m-dev-tuchel-platform", "notes.jsonl"), "w") as f:
+            f.write(json.dumps(session_entries(framing=None)[-1]) + "\n")
+        found = self.found()
+        self.assertEqual(set(found), {"s-missing", "s-late"})
+        self.assertEqual(found["s-missing"], {"sessionId": "s-missing", "startedAt": iso(PLAN_NOW - 3600),
+                                              "ticket": "TUC-1208"})
+
+    def test_ticket_from_the_launch_prompt_else_the_worktree_else_a_project_planner(self):
+        self.write("s-handover", session_entries(
+            framing=None, user="You are continuing work on Linear ticket TUC-7 that another Paseo agent started."))
+        self.write("s-worktree", session_entries(
+            framing=None, user="Plan it.", cwd="/home/m/.paseo/worktrees/21hi019m/tuc-42-fix-the-thing"))
+        self.write("s-planner", session_entries(
+            framing=None, user="Paseo hands the open tickets of **Agent tooling** to agents on its own.",
+            cwd="/home/m/dev/paseo-plugins"))
+        self.assertEqual({k: s["ticket"] for k, s in self.found().items()},
+                         {"s-handover": "TUC-7", "s-worktree": "TUC-42", "s-planner": None})
+
+    def test_a_missing_folder_is_no_sessions_and_an_unreadable_one_is_not_read(self):
+        host = digest.HostIO(sync_repo=False, remotes=False)
+        with mock.patch.object(digest, "OMP_SESSIONS", os.path.join(self.tmp.name, "missing")):
+            self.assertEqual(host.planning_sessions(PLAN_NOW), {"ok": True, "sessions": []})
+        not_a_folder = os.path.join(self.tmp.name, "file")
+        with open(not_a_folder, "w") as f:
+            f.write("x")
+        with mock.patch.object(digest, "OMP_SESSIONS", not_a_folder):
+            self.assertEqual(host.planning_sessions(PLAN_NOW), {"ok": False, "category": "error"})
+
+
+SMOKE_FINGERPRINT = "a" * 64
+
+
+def smoke_result(ok, failures=(), fingerprint=SMOKE_FINGERPRINT):
+    """planning-smoke.json as `npm run smoke:planning` writes it (version 1 contract)."""
+    return {"version": 1, "checkedAt": "2026-09-30T07:00:00Z", "fingerprint": fingerprint, "ok": ok,
+            "failures": list(failures)}
+
+
+class PlanningSmokeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "planning-smoke.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_passed_check_and_no_check_yet_are_no_item(self):
+        self.assertEqual(digest.planning_smoke_items({"ok": True, "smoke": smoke_result(True)}, "mac"), [])
+        self.assertEqual(digest.planning_smoke_items({"ok": True, "smoke": None}, "mac"), [])
+
+    def test_a_failed_check_names_each_failure_in_plain_words_and_the_command(self):
+        items = digest.planning_smoke_items({"ok": True, "smoke": smoke_result(False, [
+            {"check": "framing", "detail": "instructions not delivered"},
+            {"check": "system-prompt-hook", "detail": "hook `x` (returned systemPrompt)\nline two"}])}, "mac")
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertEqual((item["key"], item["unit"], item["attention"]),
+                         (f"planning-smoke:mac:{SMOKE_FINGERPRINT}", "planning_smoke@mac", True))
+        self.assertEqual(item["detail"], "smoke check failed (framing: instructions not delivered; system-prompt-hook: "
+                                         "hook x returned systemPrompt line two; checked 30.09. 09:00 Berlin; "
+                                         "fix it, then run the smoke check again by hand)")
+        self.assertEqual(item["command"], "cd ~/dev/paseo-plugins/linear-tickets && npm run smoke:planning")
+        self.assertEqual(digest.item_kind(item), "planning: smoke check failed")
+
+    def test_anything_but_the_version_1_contract_is_rejected(self):
+        bad = [[], {**smoke_result(True), "version": 2}, {**smoke_result(True), "version": True},
+               {**smoke_result(True), "checkedAt": "yesterday"}, {**smoke_result(True), "fingerprint": "abc"},
+               {**smoke_result(True), "ok": "yes"}, smoke_result(True, [{"check": "framing", "detail": "x"}]),
+               {**smoke_result(False), "failures": "framing"},
+               smoke_result(False, [{"check": "Framing!", "detail": "x"}]),
+               smoke_result(False, [{"check": "framing", "detail": 5}])]
+        for data in bad:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                digest.parse_planning_smoke(data)
+
+    def test_host_reader_missing_file_is_not_checked_yet_and_a_bad_one_is_not_read(self):
+        host = digest.HostIO(sync_repo=False, remotes=False)
+        with mock.patch.object(digest, "PLANNING_SMOKE", self.path):
+            self.assertEqual(host.planning_smoke(), {"ok": True, "smoke": None})
+            for text in ("{not json", json.dumps({**smoke_result(True), "version": 2})):
+                with open(self.path, "w") as f:
+                    f.write(text)
+                self.assertEqual(host.planning_smoke(), {"ok": False, "category": "unreadable response"})
+            with open(self.path, "w") as f:
+                json.dump(smoke_result(False, [{"check": "launch", "detail": "no launch marker"}]), f)
+            self.assertEqual(host.planning_smoke()["smoke"]["failures"], [{"check": "launch", "detail": "no launch marker"}])
+
+
+class PlanningRunTest(RunCase):
+    TICKET_SESSION = {"sessionId": "01a116c4-60d1-7595-a7e9-731ebebbfe38", "startedAt": "2026-09-30T07:30:00Z",
+                      "ticket": "TUC-1208"}
+    PLANNER_SESSION = {"sessionId": "01a116c5-0000-7000-8000-000000000000", "startedAt": "2026-09-30T07:40:00Z",
+                       "ticket": None}
+
+    def key(self, session, host=None):
+        return f"planning-missing:{host or digest.HOST_NAME}:{session['sessionId']}"
+
+    def set(self, host, unit, source):
+        self.io.planning_sources_data.setdefault(host, {
+            "planning_sessions": {"ok": True, "sessions": []}, "planning_smoke": {"ok": True, "smoke": None}})[unit] = source
+
+    def test_missing_instructions_notify_once_and_clear_when_the_session_leaves_the_window(self):
+        self.set(digest.HOST_NAME, "planning_sessions", {"ok": True, "sessions": [self.TICKET_SESSION, self.PLANNER_SESSION]})
+        self.run_at(WED_10_05)
+        self.assertEqual(set(self.saved()["items"]), {self.key(self.TICKET_SESSION), self.key(self.PLANNER_SESSION)})
+        self.assertEqual(len(self.io.comments), 1)
+        body = self.io.comments[0][2]
+        self.assertIn(f"- planning session 01a116c4 on {digest.HOST_NAME} TUC-1208: instructions missing (started 30.09. "
+                      "09:30 Berlin; the agent planned without Plannotator's planning instructions: check that plan's "
+                      "layout and send the plan back if it lacks their layout)", body)
+        self.assertIn(f"- project planner session 01a116c5 on {digest.HOST_NAME}: instructions missing", body)
+        self.assertIn("## Planning without Plannotator's instructions", self.io.published[-1])
+        self.run_at(WED_11_05)
+        self.assertEqual(len(self.io.comments), 1)
+        opened = [line for line in read_lines(os.path.join(self.history, "history.jsonl")) if line["event"] == "opened"]
+        self.assertEqual({(line["kind"], line["host"], line["ticket"]) for line in opened},
+                         {("planning: instructions missing", digest.HOST_NAME, "TUC-1208"),
+                          ("planning: instructions missing", digest.HOST_NAME, None)})
+        self.set(digest.HOST_NAME, "planning_sessions", {"ok": True, "sessions": []})
+        self.run_at(at("2026-09-30T10:05:00Z"))
+        self.assertEqual(self.saved()["items"], {})
+        self.assertEqual({e["payload"]["key"] for e in self.saved()["cleared"]},
+                         {self.key(self.TICKET_SESSION), self.key(self.PLANNER_SESSION)})
+
+    def test_an_unreadable_host_keeps_only_its_own_items_stale(self):
+        self.set(digest.HOST_NAME, "planning_sessions", {"ok": True, "sessions": [self.TICKET_SESSION]})
+        self.set("mac", "planning_sessions", {"ok": True, "sessions": [self.PLANNER_SESSION]})
+        self.run_at(WED_10_05)
+        self.set(digest.HOST_NAME, "planning_sessions", {"ok": False, "category": "error"})
+        self.set("mac", "planning_sessions", {"ok": True, "sessions": []})
+        self.run_at(WED_11_05)
+        self.assertEqual(set(self.saved()["items"]), {self.key(self.TICKET_SESSION)})
+        self.assertTrue(self.saved()["items"][self.key(self.TICKET_SESSION)]["stale"])
+        self.assertIn(self.key(self.PLANNER_SESSION, "mac"), [e["payload"]["key"] for e in self.saved()["cleared"]])
+        self.assertIn("- planning_sessions: error (previous items kept)", self.io.published[-1])
+
+    def test_a_failed_smoke_check_is_one_item_per_host_and_fingerprint(self):
+        failed = smoke_result(False, [{"check": "framing", "detail": "instructions not delivered"}])
+        self.set("mac", "planning_smoke", {"ok": True, "smoke": failed})
+        first = f"planning-smoke:mac:{SMOKE_FINGERPRINT}"
+        self.run_at(WED_10_05)
+        self.run_at(WED_11_05)
+        self.assertEqual(set(self.saved()["items"]), {first})
+        self.assertEqual(len(self.io.comments), 1)
+        self.assertIn("planning smoke check on mac: smoke check failed (framing: instructions not delivered;", self.io.comments[0][2])
+        self.set("mac", "planning_smoke", {"ok": True, "smoke": {**failed, "fingerprint": "b" * 64}})
+        self.run_at(at("2026-09-30T10:05:00Z"))
+        self.assertEqual(set(self.saved()["items"]), {f"planning-smoke:mac:{'b' * 64}"})
+        self.assertEqual(len(self.io.comments), 2)
+        self.set("mac", "planning_smoke", {"ok": True, "smoke": {**failed, "version": 2}})
+        self.run_at(at("2026-09-30T11:05:00Z"))
+        self.assertTrue(self.saved()["items"][f"planning-smoke:mac:{'b' * 64}"]["stale"])
+        self.assertIn("- planning_smoke@mac: unreadable response (previous items kept)", self.io.published[-1])
+        self.set("mac", "planning_smoke", {"ok": True, "smoke": smoke_result(True, fingerprint="b" * 64)})
+        self.run_at(at("2026-09-30T12:05:00Z"))
+        self.assertEqual(self.saved()["items"], {})
+
+    def test_remote_snapshots_carry_both_sources_and_an_older_remote_is_not_read(self):
+        sessions = os.path.join(self.tmp.name, "sessions")
+        smoke = os.path.join(self.tmp.name, "planning-smoke.json")
+        now = time.time()
+        write_session(sessions, "01a116c4-60d1-7595-a7e9-731ebebbfe38", session_entries(framing=None), start=now - 3600)
+        with open(smoke, "w") as f:
+            json.dump(smoke_result(False, [{"check": "framing", "detail": "`cat secret` (raw)"}]), f)
+        with mock.patch.object(digest, "OMP_SESSIONS", sessions), mock.patch.object(digest, "PLANNING_SMOKE", smoke), \
+             mock.patch.object(digest, "PROJECTS", os.path.join(self.tmp.name, "missing.json")), \
+             mock.patch.object(digest.HostIO, "agents", return_value=([], {})), \
+             mock.patch.object(digest.HostIO, "permissions", return_value={}), \
+             mock.patch.object(digest.HostIO, "open_reviews", return_value={}), \
+             mock.patch.object(digest.HostIO, "limit_resumes", return_value={"pending": {}, "started": set()}):
+            snapshot = json.loads(json.dumps(digest.HostIO(sync_repo=False, remotes=False).snapshot()))
+        self.assertNotIn("`", json.dumps(snapshot["planningSmoke"]))
+        receiver = digest.HostIO(sync_repo=False)
+        receiver._targets = ["mirko@mac", "old@mini", "down@x"]
+        receiver._remotes = [{**snapshot, "_host": "mirko@mac"}, {"agents": [], "_host": "old@mini"}]
+        receiver._unreachable = {"down@x": "timeout"}
+        with mock.patch.object(digest, "OMP_SESSIONS", os.path.join(self.tmp.name, "none")), \
+             mock.patch.object(digest, "PLANNING_SMOKE", os.path.join(self.tmp.name, "none.json")):
+            sources = receiver.planning_sources(now)
+        self.io.planning_sources = lambda now: sources
+        self.run_at(WED_10_05)
+        self.assertEqual(set(self.saved()["items"]),
+                         {"planning-missing:mirko@mac:01a116c4-60d1-7595-a7e9-731ebebbfe38",
+                          f"planning-smoke:mirko@mac:{SMOKE_FINGERPRINT}"})
+        run_line = read_lines(os.path.join(self.history, "history.jsonl"))[0]
+        self.assertEqual({unit: ok for unit, ok in run_line["units"].items() if unit.startswith("planning")}, {
+            "planning_sessions": True, "planning_smoke": True,
+            "planning_sessions@mirko@mac": True, "planning_smoke@mirko@mac": True,
+            "planning_sessions@old@mini": False, "planning_smoke@old@mini": False,
+            "planning_sessions@down@x": False, "planning_smoke@down@x": False})
+        doc = self.io.published[-1]
+        self.assertIn("- planning_sessions@old@mini: not in host snapshot (previous items kept)", doc)
+        self.assertIn("- planning_smoke@down@x: timeout (previous items kept)", doc)
+        self.assertNotIn("secret`", doc)
+
 
 
 if __name__ == "__main__":
