@@ -7,6 +7,7 @@ import { deliverToAgent } from "./relay";
 import { ResumeUnavailableError, type TicketStarter, type Started } from "./starter";
 import type { Settings } from "./settings";
 import type { SessionRouter } from "./sessions";
+import { parseHistory, WATCHDOG_LABEL, type WatchdogStore } from "./watchdog";
 import {
   activationDirectory,
   activationEnvelopeSchema,
@@ -75,6 +76,9 @@ export type IntakeDeps = {
   launcher: () => Pick<Launcher, "gate"> | null;
   // The session router, to open this host's own thread for an agent a forwarded activation started.
   sessions?: () => Pick<SessionRouter, "openFor"> | null;
+  // Takes over the ticket's watchdog history from the envelope before an agent starts here
+  // (watchdog.ts, WatchdogStore.adopt); throws when it cannot be saved.
+  watchdog?: Pick<WatchdogStore, "adopt">;
   sessionFor?: (agentId: string) => Promise<{ closed?: boolean } | null>;
   deliver?: (paseo: PaseoApi, agentId: string, message: string) => Promise<void>;
   request?: RequestLike;
@@ -515,6 +519,22 @@ export class ActivationIntake implements ActivationSink {
       const linear = this.deps.linear?.();
       if (envelope.kind === "ticket" && linear) await linear.removeLabel(envelope.issueId, trigger).catch(() => {});
       if (envelope.kind === "ticket" && linear) await linear.addLabel(envelope.issueId, labels.running).catch(() => {});
+      // The ticket's recovery history comes along before its agent starts here, so the transfer
+      // never resets the watchdog's daily budget; a missing one holds recovery for a day. A save
+      // that fails starts nothing.
+      if (this.deps.watchdog) {
+        try {
+          const adopted = await this.deps.watchdog.adopt(envelope.issueId, envelope.identifier, envelope.watchdog, settings.watchdog, this.now());
+          if (adopted === "quarantined") this.log(`activation routing: ${envelope.identifier} came from ${envelope.host} without watchdog history; no automatic recovery of it for 24 hours`);
+        } catch (error) {
+          if (envelope.kind === "ticket" && linear) await linear.removeLabel(envelope.issueId, labels.running).catch(() => {});
+          await this.settle(envelope.id, "pending", `The ticket's watchdog history could not be saved: ${reason(error)}`, this.minutesToWait(entry.attempts));
+          return reload();
+        }
+      }
+      // A replacement the peer's watchdog forwarded carries its cycle's label, so this host's
+      // watchdog binds it and continues the same cycle.
+      const marker = parseHistory(envelope.watchdog)?.cycle?.marker;
       let started: Started;
       try {
         started = await starter.start(envelope.issueId, paseo, settings, {
@@ -522,6 +542,7 @@ export class ActivationIntake implements ActivationSink {
           ...(envelope.strictResume ? { resumeOnly: true } : {}),
           ...(envelope.resume ? { resume: envelope.resume } : {}),
           ...(envelope.text ? { lead: envelope.text } : {}),
+          ...(marker ? { labels: { [WATCHDOG_LABEL]: marker } } : {}),
         });
       } catch (error) {
         if (envelope.kind === "ticket" && linear) await linear.removeLabel(envelope.issueId, labels.running).catch(() => {});

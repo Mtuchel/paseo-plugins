@@ -9,20 +9,21 @@ import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { HealthMonitor } from "./health";
 import { reviewChange, type PullRequestView } from "./pr-watch";
 import { decidePlannotatorReview, describeTool, questionPrompt, SessionRouter, SessionStore } from "./sessions";
-import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { approveForLater, splitIntoSubIssues } from "./split";
 import { AWAY_REASON } from "./scheduler";
 import { advisorNote, isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, TicketStarter, QUESTIONS_NOTE, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
 import { planPolicy } from "./plan-policy";
 import { ReviewDeletions } from "./review-deletions";
+import { WatchdogStore } from "./watchdog";
 
 const OWNER = "owner-1";
 const APP = "paseo-app";
 const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: "omp", launchPreferences: { omp: { model: "omp/opus", modeId: "full" } },
   projectMappings: { "team:t1": { projectId: "p1", label: "Team", baseBranch: "refs/heads/main" } }, agentLinearAccess: false,
-  dispatch: { ...DEFAULT_DISPATCH, maxRunning: 2 }, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION,
+  dispatch: { ...DEFAULT_DISPATCH, maxRunning: 2 }, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION,
 };
 
 const twoPart: AgentPermissionRequest = {
@@ -133,6 +134,22 @@ test("after Stop, a turn the provider starts on its own is stopped again until t
   await h.router.prompted("s1", { id: "p2", content: { body: "carry on" } });
   assert.equal(await h.router.holdIfStopped("a1"), false);
   await h.cleanup();
+});
+
+test("the owner's Stop holds the ticket for the watchdog across a reload until the owner replies", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-flow-watchdog-"));
+  const watchdog = new WatchdogStore(join(directory, "watchdog.json"));
+  const order: string[] = [];
+  const h = routerHarness([], { watchdog: { hold: async (issueId, agentId) => { order.push("hold"); await watchdog.hold(issueId, agentId); }, continued: (issueId) => watchdog.continued(issueId) }, stop: async () => { order.push("stop"); } });
+  await h.store.put(link);
+  await h.router.prompted("s1", { id: "p1", signal: "stop", content: { body: "stop" } });
+  assert.deepEqual(order, ["hold", "stop"], "the hold is saved before the Stop goes out");
+  // A new plugin instance reads the same file: the hold does not expire.
+  assert.deepEqual(Object.keys((await new WatchdogStore(watchdog.path).read()).holds), ["i1"]);
+  await h.router.prompted("s1", { id: "p2", content: { body: "carry on" } });
+  assert.deepEqual((await watchdog.read()).holds, {}, "the owner's reply continues the ticket");
+  await h.cleanup();
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("while a question is open the live feed holds its actions, so Linear keeps showing the options", async () => {

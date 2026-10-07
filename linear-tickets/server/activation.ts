@@ -109,7 +109,8 @@ export type ActivationResume = z.infer<typeof resumeSchema>;
 // What a start path asks the activation routing (sessions.ts, dispatch.ts, relay.ts): the original
 // action is named (`id`, or its parts) so both hosts deduplicate by it. `text` is the owner's
 // message, `strictResume` forbids a fresh branch (pull-request successors), `resume` is the
-// draining host's handover snapshot.
+// draining host's handover snapshot, `watchdog` the ticket's recovery history (watchdog.ts) when
+// the caller already snapshotted it; else the router reads it itself.
 export type ActivationRequest = {
   kind: ActivationKind;
   issueId: string;
@@ -121,6 +122,7 @@ export type ActivationRequest = {
   text?: string;
   strictResume?: boolean;
   resume?: ActivationResume;
+  watchdog?: unknown;
 };
 // What a start path gets back: `{ peer }` -- handed over, the caller starts nothing; `null` --
 // stays on this host; `{ held }` -- nothing started anywhere, because this host could not confirm
@@ -145,6 +147,10 @@ export const activationEnvelopeSchema = z.object({
   label: z.string().max(80).optional(),
   strictResume: z.boolean().optional(),
   resume: resumeSchema.optional(),
+  // The ticket's watchdog history (watchdog.ts, WatchdogHistory), opaque here: the receiving host
+  // parses it and treats an unknown or missing one as unknown history, so a newer or older peer
+  // never makes the envelope itself invalid.
+  watchdog: z.unknown().optional(),
   host: z.string().min(1).max(100),
   requestedAt: z.string().max(40),
 });
