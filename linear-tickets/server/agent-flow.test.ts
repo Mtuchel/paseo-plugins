@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { setImmediate } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
-import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
+import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
+import { fingerprint } from "./deputy";
 import { HealthMonitor } from "./health";
 import { reviewChange, type PullRequestView } from "./pr-watch";
-import { decidePlannotatorReview, describeTool, questionPrompt, SessionRouter, SessionStore } from "./sessions";
+import { PermissionReplies } from "./permission-replies";
+import { decidePlannotatorReview, describeTool, questionPrompt, SessionRouter, SessionStore, type SessionLink } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { approveForLater, splitIntoSubIssues } from "./split";
@@ -43,7 +45,7 @@ test("question parts are asked one at a time, and Other is a hint rather than a 
   assert.match(questionPrompt(twoPart, 1).body, /^Format\? \(2\/2\)/);
 });
 
-function routerHarness(pending: AgentPermissionRequest[], extra: Partial<ConstructorParameters<typeof SessionRouter>[0]> = {}, listed: { id: string; title: string }[] = []) {
+function routerHarness(pending: AgentPermissionRequest[], extra: Partial<ConstructorParameters<typeof SessionRouter>[0]> = {}, listed: { id: string; title: string }[] = [], checked: boolean | (() => Promise<void>) = false) {
   const calls: string[] = [];
   const feeds: ((event: unknown) => void)[] = [];
   const paseo = {
@@ -57,8 +59,17 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
       }),
     },
   } as unknown as PaseoApi;
-  const directory = join(tmpdir(), `paseo-flow-${process.pid}-${Math.random().toString(36).slice(2)}`);
-  const store = new SessionStore(join(directory, "sessions.json"));
+  const directory = extra.store ? dirname(extra.store.path) : join(tmpdir(), `paseo-flow-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  const store = extra.store ?? new SessionStore(join(directory, "sessions.json"));
+  const replies = extra.replies ?? new PermissionReplies({
+    directory,
+    daemon: async () => checked ? {
+      respondToPermissionAndWait: async (_agentId: string, requestId: string, response: AgentPermissionResponse) => {
+        calls.push(`checked ${requestId} ${JSON.stringify(response)}`);
+        if (typeof checked === "function") await checked();
+      },
+    } : null,
+  });
   const router = new SessionRouter({
     api: { activity: async (_s: string, content: { type: string; body?: string }) => { calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); }, openSessions: async () => [], activities: async () => [] } as never,
     linear: { viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, issueState: async () => { throw new Error("unused"); }, issueGroup: async () => { throw new Error("unused"); }, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {}, comment: async () => {}, hasComment: async () => false, userUrl: async () => "https://linear.app/owner" },
@@ -67,13 +78,15 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
     launcher: { gate: () => ({ release: () => {} }) },
     settings: { read: async () => settings },
     store,
+    replies,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     ...extra,
   });
   // Connected without attach(): its startup sweep would run alongside the test and, once the
   // daemon's server id is cached, post "Open in Paseo" links mid-test. Tests call sweep() themselves.
   Object.assign(router, { paseo });
-  return { router, store, calls, feeds, cleanup: () => rm(directory, { recursive: true, force: true }) };
+  replies.attach(paseo);
+  return { router, store, replies, calls, feeds, paseo, directory, cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
 
 const link = { sessionId: "s1", agentId: "a1", issueId: "i1", identifier: "TUC-1", createdAt: "2026-01-01T00:00:00Z", handled: [], review: null, offer: null };
@@ -123,6 +136,140 @@ test("a multi-part question collects every answer before answering the agent onc
   await h.router.prompted("s1", { id: "p2", content: { body: "CSV" } });
   assert.equal(h.calls.at(-1), 'respond {"behavior":"allow","updatedInput":{"answers":{"transfer":"SFTP","format":"CSV","Comment":""}}}');
   await h.cleanup();
+});
+
+test("the first multipart part holds the old question before its store write, and final delivery takes over before release", async (t) => {
+  const h = routerHarness([twoPart], {}, [], true);
+  t.after(h.cleanup);
+  await h.store.put(link);
+  const patch = h.store.patch.bind(h.store);
+  let releaseWrite: (() => void) | undefined;
+  let writeStarted: (() => void) | undefined;
+  const writing = new Promise<void>((resolve) => { writeStarted = resolve; });
+  const heldWrite = new Promise<void>((resolve) => { releaseWrite = resolve; });
+  t.mock.method(h.store, "patch", async (sessionId: string, change: Partial<SessionLink>) => {
+    if (change.questions) {
+      writeStarted!();
+      await heldWrite;
+    }
+    await patch(sessionId, change);
+  });
+  const first = h.router.prompted("s1", { id: "p1", userId: OWNER, body: "sftp" });
+  await writing;
+  assert.equal(await h.replies.respond({ agentId: "a1", requestId: twoPart.id, fingerprint: fingerprint(twoPart), intentId: "D-first-part", response: { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } } }), "owner-first");
+  assert.ok(!h.calls.some((call) => call.startsWith("checked ")));
+  releaseWrite!();
+  await first;
+  const order: string[] = [];
+  const deliver = h.replies.deliver.bind(h.replies);
+  const releaseOwner = h.replies.releaseOwner.bind(h.replies);
+  t.mock.method(h.replies, "deliver", (...args: Parameters<PermissionReplies["deliver"]>) => { order.push("deliver"); return deliver(...args); });
+  t.mock.method(h.replies, "releaseOwner", (...args: Parameters<PermissionReplies["releaseOwner"]>) => { order.push("release"); releaseOwner(...args); });
+  await h.router.prompted("s1", { id: "p2", userId: OWNER, body: "CSV" });
+  assert.deepEqual(order, ["deliver", "release"]);
+  assert.deepEqual(h.calls.filter((call) => call.startsWith("checked ")), ['checked q {"behavior":"allow","updatedInput":{"answers":{"transfer":"SFTP","format":"CSV","Comment":""}}}']);
+  assert.equal((await h.store.get("s1"))?.questions, null);
+});
+
+test("seedHolds restores only nonclosed multipart vetoes from disk before deputy recovery", async (t) => {
+  const h = routerHarness([twoPart], {}, [], true);
+  t.after(h.cleanup);
+  const questions = { requestId: twoPart.id, request: twoPart, index: 1, answers: { transfer: "SFTP" } };
+  await h.store.put({ ...link, questions });
+  await h.store.put({ ...link, sessionId: "closed", agentId: "closed-agent", closed: true, questions });
+  const restarted = routerHarness([twoPart], { store: new SessionStore(h.store.path) }, [], true);
+  t.after(restarted.cleanup);
+  await restarted.router.seedHolds();
+  const response: AgentPermissionResponse = { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } };
+  assert.equal(await restarted.replies.respond({ agentId: "a1", requestId: twoPart.id, fingerprint: fingerprint(twoPart), intentId: "D-restored", response }), "owner-first");
+  assert.equal(await restarted.replies.respond({ agentId: "closed-agent", requestId: twoPart.id, fingerprint: fingerprint(twoPart), intentId: "D-closed", response }), "applied");
+  assert.equal(restarted.calls.filter((call) => call.startsWith("checked ")).length, 1);
+});
+
+test("a new question cannot discard multipart progress or receive its old answer, and the old hold is released", async (t) => {
+  const newer: AgentPermissionRequest = { ...twoPart, id: "newer", input: { questions: [{ question: "Deploy?", header: "deploy", options: [{ label: "Yes" }, { label: "No" }] }] } };
+  const pending = [twoPart];
+  const routes: string[] = [];
+  const h = routerHarness(pending, { route: { take: async (request) => {
+    routes.push(request.text ?? "");
+    return routes.length === 1 ? null : { peer: "peer-host" };
+  } } }, [], true);
+  t.after(h.cleanup);
+  await h.store.put(link);
+  await h.router.prompted("s1", { id: "p1", userId: OWNER, body: "sftp" });
+  pending.splice(0, 1, newer);
+  await h.router.askQuestion("s1", newer);
+  assert.equal((await h.store.get("s1"))?.questions?.requestId, "q");
+  assert.deepEqual(h.calls, ["elicitation:Format? (2/2)"]);
+  await h.router.prompted("s1", { id: "p2", userId: OWNER, body: "CSV" });
+  assert.deepEqual(routes, ["sftp"], "the old final part is not forwarded into a peer's newer question");
+  assert.ok(h.calls.some((call) => call.startsWith("error:Your answer was not delivered:")));
+  assert.equal(h.calls.at(-1), "elicitation:Deploy?");
+  assert.ok(!h.calls.some((call) => /^(checked |respond |send )/.test(call)));
+  assert.equal((await h.store.get("s1"))?.questions, null);
+  pending.splice(0, 1, twoPart);
+  assert.equal(await h.replies.respond({ agentId: "a1", requestId: "q", fingerprint: fingerprint(twoPart), intentId: "D-released", response: { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } } }), "applied");
+});
+
+test("legacy multipart progress without a saved request never answers a newer question even without a checked connection", async (t) => {
+  const newer: AgentPermissionRequest = { ...twoPart, id: "newer", input: { questions: [{ question: "Deploy?", header: "deploy", options: [] }] } };
+  for (const checked of [false, true]) {
+    const h = routerHarness([newer], {}, [], checked);
+    t.after(h.cleanup);
+    await h.store.put({ ...link, questions: { requestId: "old", index: 1, answers: { transfer: "SFTP" } } });
+    await h.router.seedHolds();
+    await h.router.prompted("s1", { id: "finish-old", userId: OWNER, body: "CSV" });
+    assert.ok(h.calls.some((call) => call.startsWith("error:Your answer was not delivered:")));
+    assert.equal(h.calls.at(-1), "elicitation:Deploy?");
+    assert.ok(!h.calls.some((call) => /^(respond |checked |send )/.test(call)));
+    assert.equal((await h.store.get("s1"))?.questions, null);
+  }
+});
+
+test("superseding a multipart thread drops its saved progress and releases its deputy veto", async (t) => {
+  const h = routerHarness([twoPart], {}, [], true);
+  t.after(h.cleanup);
+  await h.store.put({ ...link, questions: { requestId: "q", request: twoPart, index: 1, answers: { transfer: "SFTP" } } });
+  await h.store.put({ ...link, sessionId: "newest", agentId: "a2", createdAt: "2026-01-02T00:00:00Z" });
+  await h.router.seedHolds();
+  await h.router.closeSuperseded();
+  assert.equal((await h.store.get("s1"))?.closed, true);
+  assert.equal((await h.store.get("s1"))?.questions, null);
+  assert.equal(await h.replies.respond({ agentId: "a1", requestId: "q", fingerprint: fingerprint(twoPart), intentId: "D-superseded", response: { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } } }), "applied");
+});
+
+test("when a deputy resolved the multipart question, all collected parts become one correction and never answer the newer question", async (t) => {
+  const pending = [twoPart];
+  let submitted: (() => void) | undefined;
+  let acknowledge: (() => void) | undefined;
+  const onWire = new Promise<void>((resolve) => { submitted = resolve; });
+  const acknowledgement = new Promise<void>((resolve) => { acknowledge = resolve; });
+  const h = routerHarness(pending, {}, [], async () => { submitted!(); await acknowledgement; });
+  t.after(h.cleanup);
+  await h.store.put(link);
+  const deputy = h.replies.respond({ agentId: "a1", requestId: "q", fingerprint: fingerprint(twoPart), intentId: "D-late-part", response: { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } } });
+  await onWire;
+  await h.router.prompted("s1", { id: "p1", userId: OWNER, body: "sftp" });
+  acknowledge!();
+  assert.equal(await deputy, "applied");
+  const corrections: string[] = [];
+  h.replies.recordEffects({
+    ownerAnswered: async () => { throw new Error("a correction is not owner answer evidence"); },
+    correctLate: async (_agentId, requestId, text) => {
+      corrections.push(`${requestId}: ${text}`);
+      return { delivered: true, reply: "The deputy had already answered this question (D-late-part); your answer went to the agent as your correction." };
+    },
+    needsYou: async () => {},
+  });
+  const newer: AgentPermissionRequest = { ...twoPart, id: "newer", input: { questions: [{ question: "Deploy?", header: "deploy", options: [] }] } };
+  pending.splice(0, 1, newer);
+  await h.router.prompted("s1", { id: "p2", userId: OWNER, body: "CSV" });
+  assert.deepEqual(corrections, ["q: transfer: SFTP\nformat: CSV"]);
+  assert.ok(h.calls.some((call) => call.startsWith("response:The deputy had already answered this question")));
+  assert.equal(h.calls.at(-1), "elicitation:Deploy?");
+  assert.equal(h.calls.filter((call) => call.startsWith("checked ")).length, 1);
+  assert.ok(!h.calls.some((call) => call.startsWith("checked newer ")));
+  assert.equal((await h.store.get("s1"))?.questions, null);
 });
 
 test("after Stop, a turn the provider starts on its own is stopped again until the owner replies", async () => {

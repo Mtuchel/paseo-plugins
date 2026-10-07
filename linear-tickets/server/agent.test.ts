@@ -7,13 +7,14 @@ import { join } from "node:path";
 import { setImmediate as setImmediatePromise } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
-import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
+import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { AgentApi, AppAuth } from "./agent-app";
 import { verifyWebhook } from "./agent-webhook";
-import type { Candidate } from "./deputy";
+import { fingerprint, type Candidate, type CorrectionActivity } from "./deputy";
 import { Handover, handoverPrompt, progressBody, type HandoverRecord } from "./handover";
 import { AuthenticationError, LinearApiError, type GroupChild, type IssueGroup, type IssueState } from "./linear";
-import { NeedsYouIssues } from "./needs-you";
+import { closeAnswered, NeedsYouIssues } from "./needs-you";
+import { PermissionReplies } from "./permission-replies";
 import { planSteps, SessionRouter, SessionStore, type SessionLink } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
@@ -185,7 +186,7 @@ test("plan checklists come from checkboxes, or numbered steps under a Steps head
 type Call = string;
 // `reload`: the daemon's agent reload (null: the plugin has no daemon connection); `send`: runs
 // before each send is recorded.
-function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector } = {}) {
+function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -194,6 +195,7 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
     viewer: async () => ({ id: "paseo-app", name: "Paseo" }),
     openSessions: async () => [],
     activities: async () => [],
+    sessionStatus: async () => "stale",
   };
   const paseo = {
     agents: {
@@ -211,8 +213,28 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
       }),
     },
   } as unknown as PaseoApi;
-  const directory = join(tmpdir(), `paseo-sessions-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  const directory = options.directory ?? join(tmpdir(), `paseo-sessions-${process.pid}-${Math.random().toString(36).slice(2)}`);
   const store = new SessionStore(join(directory, "sessions.json"));
+  const replies = new PermissionReplies({
+    directory,
+    daemon: async () => options.checked ? {
+      respondToPermissionAndWait: async (_agentId: string, requestId: string, response: AgentPermissionResponse) => {
+        calls.push(`checked ${requestId} ${JSON.stringify(response)}`);
+        await options.answer?.();
+      },
+    } : null,
+  });
+  const answered: { agentId: string; request: AgentPermissionRequest; response: AgentPermissionResponse; activity: CorrectionActivity; at: string }[] = [];
+  replies.recordEffects({
+    ownerAnswered: async (agentId, request, response, activity, at) => { answered.push({ agentId, request, response, activity, at }); },
+    correctLate: async () => ({ delivered: false, reply: "No deputy answer to correct." }),
+    needsYou: async (agentId, issueId) => {
+      if (issueId && options.needsYou && (await options.needsYou.all()).some((entry) => entry.id === issueId && entry.agentId === agentId)) {
+        await closeAnswered(options.needsYou, { complete: async (id) => { calls.push(`complete ${id}`); } }, issueId);
+      }
+    },
+  });
+  replies.attach(paseo);
   const router = new SessionRouter({
     api: api as never,
     linear: {
@@ -230,17 +252,18 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
     launcher: { gate: () => ({ release: () => {} }) },
     settings: { read: async () => settings },
     store,
+    replies,
     needsYou: options.needsYou,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     decideReview: async (url, approve, feedback) => { calls.push(`review ${url} ${approve ? "approve" : `deny:${feedback}`}`); },
     ...("reload" in options ? { reloader: async () => options.reload ? async (agentId: string) => { calls.push(`reload ${agentId}`); await options.reload!(agentId); } : null } : {}),
     ...(options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector) } : {}),
   });
-  // Group tests drive the sweep themselves: the startup sweep would advance the group alongside them.
-  if (options.groups) Object.assign(router, { paseo });
+  // Deterministic session/queue tests drive the sweep themselves, as do the group tests.
+  if (options.groups || options.manual) Object.assign(router, { paseo });
   else if (options.attach ?? true) router.attach(paseo);
   router.stop();
-  return { router, store, calls, cleanup: () => rm(directory, { recursive: true, force: true }) };
+  return { router, store, replies, answered, calls, paseo, directory, cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
 
 const link = (change: Partial<SessionLink> = {}): SessionLink => ({ sessionId: "s1", agentId: "agent-1", issueId: "i1", identifier: "TUC-1", createdAt: "2026-01-01T00:00:00Z", handled: [], review: null, offer: null, ...change });
@@ -378,13 +401,198 @@ test("a label or sidebar launch delegates its ticket to the Paseo app once the s
 
 test("a mention to a running agent that waits on a question answers it, like a relayed comment, and is recorded as the owner's answer", async () => {
   const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Format?", header: "Response", options: [{ label: "CSV" }] }] } };
-  const h = harness({ activeAgent: { id: "agent-1", title: "TUC-1: Fix" }, pending: [question] });
-  const answered: string[] = [];
-  h.router.recordDeputy({ byRef: async () => null, correct: async () => ({ delivered: true, reply: "" }), ownerAnswered: async (agentId, request, _response, activity) => { answered.push(`${agentId} ${request.id} ${activity.via} ${activity.activityId} ${activity.userId}`); } });
+  const h = harness({ activeAgent: { id: "agent-1", title: "TUC-1: Fix" }, pending: [question], checked: true });
   await h.router.created({ id: "s3", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" }, comment: { body: "@paseo csv" } });
-  assert.equal(h.calls[0], `respond q ${JSON.stringify({ behavior: "allow", updatedInput: { answers: { Response: "CSV" } } })}`);
-  assert.deepEqual(answered, [`agent-1 q linear-session session:s3 ${OWNER}`]);
+  assert.equal(h.calls[0], `checked q ${JSON.stringify({ behavior: "allow", updatedInput: { answers: { Response: "CSV" } } })}`);
+  assert.deepEqual(h.answered.map(({ agentId, request, activity }) => `${agentId} ${request.id} ${activity.via} ${activity.activityId} ${activity.userId}`), [`agent-1 q linear-session s3 ${OWNER}`]);
   await h.cleanup();
+});
+
+test("session question outcomes show durable rejection or uncertainty and count only confirmed owner answers", async (t) => {
+  const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Format?", header: "Response", options: [{ label: "CSV" }] }] } };
+  const cases = [
+    { error: null, evidence: 1, reply: null },
+    { error: "No pending permission request with id 'q'", evidence: 0, reply: /^error:Your answer was not delivered:/ },
+    { error: "Timed out waiting for agent_permission_resolved", evidence: 0, reply: /^error:Paseo could not confirm that your answer reached the agent:/ },
+    { error: "persistSnapshot failed after application", evidence: 0, reply: /^error:Paseo could not confirm that your answer reached the agent:/ },
+  ];
+  for (const item of cases) {
+    const pending = [question];
+    const h = harness({ pending, checked: true, manual: true, answer: async () => { if (item.error) throw new Error(item.error); } });
+    t.after(h.cleanup);
+    await h.store.put(link());
+    const activity = { id: "answer-1", userId: OWNER, body: "csv" };
+    await h.router.prompted("s1", activity);
+    assert.equal(h.answered.length, item.evidence, item.error ?? "confirmed");
+    if (item.reply) assert.ok(h.calls.some((call) => item.reply!.test(call)), JSON.stringify(h.calls));
+    else {
+      // The owner identity the evidence carries, not the whole activity object's shape.
+      const recorded = h.answered[0].activity;
+      assert.equal(recorded.via, "linear-session");
+      assert.equal(recorded.activityId, "answer-1");
+      assert.equal(recorded.userId, OWNER);
+    }
+    pending.splice(0, 1, { ...question, id: "newer" });
+    // An interrupted caller can read the old activity again; the delivery ledger still owns it.
+    await h.store.patch("s1", { handled: [] });
+    await h.router.prompted("s1", activity);
+    assert.equal(h.calls.filter((call) => call.startsWith("checked ")).length, 1, "never resubmitted to the newer question");
+    assert.equal(h.answered.length, item.evidence, "no repeated evidence");
+    assert.ok(!h.calls.some((call) => call.startsWith("send ")));
+  }
+});
+
+test("session replies without an author remain allowed but unattributed, and a nonowner still cannot answer", async (t) => {
+  const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Format?", header: "Response", options: [{ label: "CSV" }] }] } };
+  for (const userId of [undefined, "", "someone-else"]) {
+    const h = harness({ pending: [question], checked: true, manual: true });
+    t.after(h.cleanup);
+    await h.store.put(link());
+    await h.router.prompted("s1", { id: "answer-1", userId, body: "CSV" });
+    assert.deepEqual(h.answered, []);
+    assert.equal(h.calls.filter((call) => call.startsWith("checked ")).length, userId === "someone-else" ? 0 : 1);
+    if (userId === "someone-else") assert.ok(h.calls.includes("error:Only the workspace owner can steer Paseo agents."));
+  }
+});
+
+test("a session question without a checked connection is sent once and is never counted as the owner's answer", async (t) => {
+  const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Format?", header: "Response", options: [{ label: "CSV" }] }] } };
+  const pending = [question];
+  const h = harness({ pending, manual: true });
+  t.after(h.cleanup);
+  await h.store.put(link());
+  const activity = { id: "answer-1", userId: OWNER, body: "CSV" };
+  await h.router.prompted("s1", activity);
+  pending.splice(0);
+  await h.store.patch("s1", { handled: [] });
+  await h.router.prompted("s1", activity);
+  assert.deepEqual(h.calls.filter((call) => /^(respond |send )/.test(call)), ['respond q {"behavior":"allow","updatedInput":{"answers":{"Response":"CSV"}}}']);
+  assert.deepEqual(h.answered, []);
+});
+
+test("queued session answers retain verified authors or a stable unverified origin and replay safely after a failed store patch and restart", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Format?", header: "Response", options: [{ label: "CSV" }] }] } };
+  const agents: ProcessAgent[] = [{ id: "agent-1", status: "idle", labels: { "linear.issueId": "i1" } }];
+  for (const pendingFrom of [{ activityId: "owner-activity", userId: OWNER }, null, { activityId: "unverified-activity", userId: "" }]) {
+    const pending = [question];
+    const h = harness({ pending, agents, checked: true, manual: true });
+    t.after(h.cleanup);
+    await h.store.put(link({ sessionId: "queued", agentId: null, queued: true, pendingText: "CSV", pendingFrom }));
+    const deliveries = t.mock.method(h.replies, "deliver");
+    const patch = h.store.patch.bind(h.store);
+    t.mock.method(h.store, "patch", async (sessionId: string, change: Partial<SessionLink>) => {
+      if (change.agentId) throw new Error("session store unavailable after delivery");
+      await patch(sessionId, change);
+    });
+    await h.router.startQueued();
+    assert.equal(h.calls.filter((call) => call.startsWith("checked ")).length, 1);
+    assert.equal(h.answered.length, pendingFrom?.userId ? 1 : 0);
+    const firstOrigin = deliveries.mock.calls[0].arguments[3];
+    assert.equal(firstOrigin.issueId, "i1");
+    assert.equal(firstOrigin.responder.kind, pendingFrom?.userId ? "owner" : "linear-unverified");
+    if (pendingFrom?.userId) {
+      assert.equal(firstOrigin.ref, "session:owner-activity");
+      // The recorded evidence carries the verified owner, not the origin object's whole shape.
+      const recorded = h.answered[0].activity;
+      assert.equal(recorded.via, "linear-session");
+      assert.equal(recorded.activityId, "owner-activity");
+      assert.equal(recorded.userId, OWNER);
+    } else assert.match(firstOrigin.ref, /^queued:queued:[a-f0-9]{64}$/);
+    assert.equal((await h.store.get("queued"))?.queued, true);
+    pending.splice(0, 1, { ...question, id: "newer" });
+    const restarted = harness({ pending, agents, checked: true, manual: true, directory: h.directory });
+    const replays = t.mock.method(restarted.replies, "deliver");
+    await restarted.router.startQueued();
+    assert.equal(replays.mock.calls[0].arguments[3].ref, firstOrigin.ref);
+    assert.ok(!restarted.calls.some((call) => /^(checked |respond |send )/.test(call)));
+    assert.deepEqual(restarted.answered, []);
+    assert.equal((await restarted.store.get("queued"))?.queued, false);
+    assert.equal((await restarted.store.get("queued"))?.pendingText, null);
+  }
+});
+
+test("a queued approval or plain message is never resent or rerouted into a newer multipart question after its session patch failed", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const approval: AgentPermissionRequest = { id: "tool", provider: "omp", name: "bash", kind: "tool", title: "Allow tool: bash" };
+  const newer: AgentPermissionRequest = { id: "newer", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Deploy?", header: "deploy", options: [] }, { question: "Region?", header: "region", options: [] }] } };
+  const agents: ProcessAgent[] = [{ id: "agent-1", status: "idle", labels: { "linear.issueId": "i1" } }];
+  const cases: { pending: AgentPermissionRequest[]; text: string; sent: RegExp }[] = [
+    { pending: [approval], text: "approve", sent: /^respond tool / },
+    { pending: [], text: "Also update the README", sent: /^send agent-1: Also update the README$/ },
+  ];
+  for (const item of cases) {
+    const h = harness({ pending: item.pending, agents, manual: true });
+    t.after(h.cleanup);
+    await h.store.put(link({ sessionId: "queued", agentId: null, queued: true, pendingText: item.text, pendingFrom: { activityId: "queued-activity", userId: OWNER } }));
+    t.mock.method(h.store, "patch", async () => { throw new Error("session store unavailable after send"); });
+    await h.router.startQueued();
+    assert.equal(h.calls.filter((call) => item.sent.test(call)).length, 1);
+    item.pending.splice(0, item.pending.length, newer);
+    const restarted = harness({ pending: item.pending, agents, manual: true, directory: h.directory });
+    await restarted.router.startQueued();
+    assert.ok(!restarted.calls.some((call) => /^(respond |send )/.test(call)), JSON.stringify(restarted.calls));
+    assert.equal((await restarted.store.get("queued"))?.questions, undefined);
+    assert.equal((await restarted.store.get("queued"))?.queued, false);
+  }
+});
+
+test("an unconfirmed queued message replay reports the original uncertainty and sends nothing into a later question", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const attempts: string[] = [];
+  const pending: AgentPermissionRequest[] = [];
+  const agents: ProcessAgent[] = [{ id: "agent-1", status: "idle", labels: { "linear.issueId": "i1" } }];
+  const h = harness({ pending, agents, manual: true, send: async () => { attempts.push("attempt"); throw new Error("connection lost after send"); } });
+  t.after(h.cleanup);
+  await h.store.put(link({ sessionId: "queued", agentId: null, queued: true, pendingText: "carry on" }));
+  await h.router.startQueued();
+  assert.deepEqual(attempts, ["attempt"]);
+  assert.ok(h.calls.some((call) => call.startsWith("error:Paseo could not confirm")));
+  pending.push({ id: "newer", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Deploy?", header: "deploy", options: [] }] } });
+  const restarted = harness({ pending, agents, manual: true, directory: h.directory });
+  await restarted.router.startQueued();
+  assert.ok(!restarted.calls.some((call) => /^(respond |send )/.test(call)));
+  assert.ok(restarted.calls.some((call) => call.startsWith("error:Paseo could not confirm")));
+  assert.equal((await restarted.store.get("queued"))?.queued, true, "uncertainty remains visible rather than silently declaring delivery");
+});
+
+test("needs-you completion follows confirmed session outcomes, including a delivered late correction, not rejected or unconfirmed answers", async (t) => {
+  const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Format?", header: "Response", options: [{ label: "CSV" }] }] } };
+  for (const error of [null, "No pending permission request with id 'q'", "Timed out waiting for agent_permission_resolved"]) {
+    const directory = await mkdtemp(join(tmpdir(), "needs-you-session-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const needsYou = new NeedsYouIssues(directory);
+    await needsYou.add({ id: "sub-1", identifier: "TUC-2", parentId: "i1", agentId: "agent-1" });
+    const h = harness({ pending: [question], needsYou, checked: true, manual: true, answer: async () => { if (error) throw new Error(error); } });
+    t.after(h.cleanup);
+    await h.store.put(link({ issueId: "sub-1" }));
+    await h.router.prompted("s1", { id: "answer-1", userId: OWNER, body: "CSV" });
+    assert.equal((await needsYou.all()).length, error ? 1 : 0);
+    assert.equal(h.calls.includes("complete sub-1"), !error);
+  }
+  const directory = await mkdtemp(join(tmpdir(), "needs-you-correction-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const needsYou = new NeedsYouIssues(directory);
+  await needsYou.add({ id: "sub-1", identifier: "TUC-2", parentId: "i1", agentId: "agent-1" });
+  const pending = [question];
+  const h = harness({ pending, needsYou, checked: true, manual: true });
+  t.after(h.cleanup);
+  await h.store.put(link({ issueId: "sub-1" }));
+  assert.equal(await h.replies.respond({ agentId: "agent-1", requestId: "q", fingerprint: fingerprint(question), intentId: "D-needs-you", response: { behavior: "allow", updatedInput: { answers: { Response: "CSV" } } } }), "applied");
+  pending.splice(0);
+  await h.store.patch("s1", { questions: { requestId: "q", request: question, index: 0, answers: {} } });
+  h.replies.recordEffects({
+    ownerAnswered: async () => { throw new Error("a correction is not owner evidence"); },
+    correctLate: async () => ({ delivered: true, reply: "The deputy had already answered this question (D-needs-you); your answer went to the agent as your correction." }),
+    needsYou: async (_agentId, issueId) => {
+      assert.equal(issueId, "sub-1");
+      await closeAnswered(needsYou, { complete: async (id) => { h.calls.push(`complete ${id}`); } }, issueId!);
+    },
+  });
+  await h.router.prompted("s1", { id: "correction-1", userId: OWNER, body: "XML" });
+  assert.deepEqual(await needsYou.all(), []);
+  assert.ok(h.calls.includes("complete sub-1"));
+  assert.equal(h.calls.filter((call) => call.startsWith("checked ")).length, 1);
 });
 
 test("an override that opens a session corrects the deputy's answer and neither answers the pending question nor starts an agent", async () => {
@@ -395,10 +603,9 @@ test("an override that opens a session corrects the deputy's answer and neither 
   h.router.recordDeputy({
     byRef: async (ref) => ref === applied.ref ? applied : null,
     correct: async (candidate, text, activity) => { corrections.push(`${candidate.ref} ${text} ${activity.activityId} ${activity.userId}`); return { delivered: true, reply: "Passed to the agent as your correction of D-1a2b3c4d." }; },
-    ownerAnswered: async () => { throw new Error("not an answer"); },
   });
   await h.router.created({ id: "s4", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" }, comment: { body: "@paseo override D-1a2b3c4d use vitest" } });
-  assert.deepEqual(corrections, [`D-1a2b3c4d use vitest session:s4 ${OWNER}`]);
+  assert.deepEqual(corrections, [`D-1a2b3c4d use vitest s4 ${OWNER}`]);
   assert.deepEqual(h.calls, ["response:Passed to the agent as your correction of D-1a2b3c4d."]);
   await h.router.created({ id: "s5", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" }, comment: { body: "@paseo override D-0000000f keep" } });
   assert.match(h.calls.at(-1) ?? "", /^error:D-0000000f is not an answer the deputy gave/);

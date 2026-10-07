@@ -50,7 +50,10 @@ export async function internalDaemon(): Promise<DaemonClient | null> {
   internalClient ??= (async () => {
     const target = await localDaemon();
     if (!target) return null;
-    const client = new DaemonClient({ ...target, clientId: "linear-tickets-internal", connectTimeoutMs: 5_000 } as DaemonClientConfig);
+    // Sender-specific permission acknowledgements require owned subscriptions. The 0.8.0
+    // tooling client does not advertise this by default; a broadcast resolution is not proof
+    // that our answer was applied.
+    const client = new DaemonClient({ ...target, clientId: "linear-tickets-internal", connectTimeoutMs: 5_000, capabilities: { owned_subscriptions: true } } as DaemonClientConfig);
     try {
       await client.connect();
       connectFailure = null;

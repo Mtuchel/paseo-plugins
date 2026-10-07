@@ -44,7 +44,7 @@ export const MAX_DISPATCH_INTERVAL_SECONDS = 3_600;
 export const MAX_DISPATCH_TEAMS = 20;
 // The deputy for agent questions (README, "Deputy for agent questions"): `off` (the default) does
 // nothing, `shadow` records what it would answer without answering, `live` may answer once the
-// shadow evidence and the daemon's owner-priority responses allow it. `model`: the evaluator's
+// shadow evidence and the plugin's checked owner-priority reply path allow it. `model`: the evaluator's
 // OMP model (none: every question stays with the owner); `principlesRepository`: the local
 // tuchel-platform checkout whose `origin/main` holds `docs/principles/`.
 export type DeputyMode = "off" | "shadow" | "live";

@@ -19,6 +19,7 @@ import { reviewOutcome } from "./server/review-outcome";
 import { Writeback } from "./server/writeback";
 import { DecisionLog } from "./server/owner-decisions";
 import { Deputy, DEPUTY_DIRECTORY } from "./server/deputy";
+import { PermissionReplies } from "./server/permission-replies";
 import { evaluateWithOmp } from "./server/deputy-evaluator";
 import { hostReaders, recallAccess } from "./server/deputy-sources";
 import { AgentApi, AppAuth } from "./server/agent-app";
@@ -35,7 +36,7 @@ import { PullRequestWatch } from "./server/pr-watch";
 import { PullRequestBoard } from "./server/pull-requests";
 import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
-import { NeedsYouIssues } from "./server/needs-you";
+import { closeAnswered, NeedsYouIssues } from "./server/needs-you";
 import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, ReviewDecisionAppliedError, SessionRouter, SessionStore, stopAgentTurn, type HostOwnership } from "./server/sessions";
 import { LimitResumeStore, UsageReader } from "./server/limit-resume";
 import { approveForLater, splitIntoSubIssues } from "./server/split";
@@ -105,6 +106,7 @@ export default function contribute(server: PluginServerContext) {
   // Waits on tickets already closed live in "Needs you" sub-issues; replies there (a relayed
   // comment or an @mention of the app) go to the agent that asked.
   const needsYou = new NeedsYouIssues();
+  const replies = new PermissionReplies();
   // The owner's Approve / Send back from the Linear panel or the review inbox: as on the review page.
   const decideReview = async (localUrl: string, approve: boolean, feedback: string, agentId: string) => {
     const planContent = await readReviewPlan(localUrl).catch(() => "");
@@ -127,7 +129,7 @@ export default function contribute(server: PluginServerContext) {
   // Which host owns a ticket's automatic work, read only (SessionRouter.whileIdle, see
   // ticketOwnership): assigned once the activation routers exist below.
   let ticketOwner: (issueId: string) => Promise<HostOwnership> = async () => "unknown";
-  const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, needsYou, route, deletions, watchdog: watchdogStore,
+  const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, needsYou, route, deletions, watchdog: watchdogStore, replies,
     limitResumes: new LimitResumeStore(), usage: new UsageReader(),
     owner: (issueId) => ticketOwner(issueId),
     decideReview,
@@ -148,10 +150,10 @@ export default function contribute(server: PluginServerContext) {
   });
   let pipelineServerId: string | null = null;
   void daemonServerId().then((id) => { pipelineServerId = id; });
-  const drain = new DrainRouter({ settings, paseo: () => attachedPaseo, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName,
+  const drain = new DrainRouter({ settings, paseo: () => attachedPaseo, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName, replies,
     ticketState: async (issueId) => { const state = await linear.issueState(issueId).catch(() => null); return state ? { statusType: state.statusType } : null; },
     watchdog: { history: (issueId, now) => watchdogStore.history(issueId, now), transferred: (issueId, identifier) => watchdogStore.transferred(issueId, identifier) } });
-  const intake = new ActivationIntake({ settings, paseo: () => attachedPaseo, linear: () => linear, starter: () => starter, launcher: () => launcher, sessions: () => sessions, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName, watchdog: watchdogStore });
+  const intake = new ActivationIntake({ settings, paseo: () => attachedPaseo, linear: () => linear, starter: () => starter, launcher: () => launcher, sessions: () => sessions, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName, watchdog: watchdogStore, replies });
   activationGuard = async (issueId) => {
     const { mode, peer } = (await settings.read()).activation;
     // A guard that cannot read its own state refuses: it starts nothing on a guess, and the
@@ -188,7 +190,7 @@ export default function contribute(server: PluginServerContext) {
   // Stale `-running` and `-failed` labels are reconciled, and their tickets started again (README,
   // "Repairing stale running and failed labels"); its records share projects.json with the projects.
   const labelRepair = new LabelRepair({ linear, store: projectStore, launcher, intake, deletions, restart: (issueId, identifier, options) => sessions.restartFor(issueId, identifier, options) });
-  const relay = new CommentRelay(linear, undefined, needsYou, route);
+  const relay = new CommentRelay(linear, undefined, needsYou, route, replies);
   const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, repairs: labelRepair });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
@@ -201,10 +203,20 @@ export default function contribute(server: PluginServerContext) {
     readers: hostReaders({ linear, log: decisions, home: paseoHome(), directory: deputyDirectory, template: async () => (await settings.read()).template ?? DEFAULT_PROMPT_TEMPLATE }),
     evaluate: (input, model) => evaluateWithOmp(input, model, deputyDirectory),
     directory: deputyDirectory,
+    arbiter: () => replies.available(),
   });
   writeback.recordDeputy(deputy);
   relay.recordDeputy(deputy);
   sessions.recordDeputy(deputy);
+  replies.recordEffects({
+    ownerAnswered: (agentId, request, response, activity, at) => deputy.ownerAnswered(agentId, request, response, activity, at),
+    correctLate: (agentId, requestId, text, activity) => deputy.correctLate(agentId, requestId, text, activity),
+    needsYou: async (agentId, issueId) => {
+      for (const entry of await needsYou.all()) {
+        if (entry.agentId === agentId && (!issueId || entry.id === issueId)) await closeAnswered(needsYou, linear, entry.id);
+      }
+    },
+  });
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   // Its root is the review inbox, listing the peer hosts' reviews too (README, "Review inbox").
   const reviewLinks = new ReviewLinks({
@@ -337,10 +349,18 @@ export default function contribute(server: PluginServerContext) {
   plannotator.useTiers({ store: tiers, apply: (agentId) => modelGuard.apply(agentId), replan: (agent, message) => planRequests.send(agent, message) });
   // The central Plannotator host starts once, after the hook it runs for each parked review exists.
   const startHost = async () => { if (await plannotatorHook() && !stopped) await plannotatorHost.start(); };
+  let holdSeed: Promise<void> | null = null;
   const attach = (paseo: PaseoApi) => {
     const first = !attached;
     attached = true;
     attachedPaseo = paseo;
+    replies.attach(paseo);
+    holdSeed ??= sessions.seedHolds();
+    void holdSeed.then(() => {
+      if (stopped) return;
+      asCaller("deputy", () => deputy.attach(paseo));
+      asCaller("session-sweep", () => sessions.attach(paseo));
+    }).catch((error: unknown) => console.error(`[linear-tickets] restoring owner question holds failed: ${error instanceof Error ? error.message : error}`));
     if (!stopped) {
       asCaller("review-links", () => { void reviewLinks.start(); });
       asCaller("drain", () => drain.start());
@@ -350,10 +370,8 @@ export default function contribute(server: PluginServerContext) {
     asCaller("plan-pipeline", () => pipeline.attach(paseo));
     asCaller("dispatch", () => dispatcher.attach(paseo));
     asCaller("plan-decisions", () => plannotator.attach(paseo));
-    asCaller("session-sweep", () => sessions.attach(paseo));
     asCaller("model-guard", () => modelGuard.attach(paseo));
     asCaller("plan-requests", () => planRequests.attach(paseo));
-    asCaller("deputy", () => deputy.attach(paseo));
     void startAgent();
   };
   const cacheIdentity = async () => {
@@ -490,5 +508,5 @@ export default function contribute(server: PluginServerContext) {
   startSoon.unref?.();
   const usageTimer = setInterval(() => { for (const line of usageLines(linearUsage.snapshot())) console.log(line); }, 60 * 60 * 1000);
   usageTimer.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); clearInterval(usageTimer); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); pipeline.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop(); void closeInternalDaemon(); };
+  return () => { stopped = true; replies.stop(); clearTimeout(startSoon); clearInterval(usageTimer); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); pipeline.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop(); void closeInternalDaemon(); };
 }

@@ -197,8 +197,8 @@ test("unverified, blank, late and deputy-answered cases never count as agreement
 
 // --- The lifecycle ----------------------------------------------------------------------------------
 
-// The grace timers run on node:test's mocked setTimeout, moved by `advance` together with the
-// deputy's clock.
+// Grace and settlement retry timers use node:test's mocked setTimeout, moved by `advance` together
+// with the deputy's clock.
 async function harness(t: TestContext, deputy: Partial<DeputySettings> = {}, options: { arbiter?: PermissionArbiter | null; pending?: AgentPermissionRequest[]; verdictSelections?: Record<string, string> } = {}) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const directory = await mkdtemp(join(tmpdir(), "deputy-"));
@@ -225,7 +225,7 @@ async function harness(t: TestContext, deputy: Partial<DeputySettings> = {}, opt
   } as unknown as PaseoApi;
   let clock = Date.parse("2026-10-07T10:00:00Z");
   let evaluations = 0;
-  const instance = new Deputy({
+  const deps: ConstructorParameters<typeof Deputy>[0] = {
     settings: { read: async () => settings },
     log,
     linear: {
@@ -243,11 +243,13 @@ async function harness(t: TestContext, deputy: Partial<DeputySettings> = {}, opt
     arbiter: async () => options.arbiter ?? null,
     directory,
     now: () => clock,
-  });
+  };
+  const instance = new Deputy(deps);
+  t.after(() => instance.stop());
   instance.attach(paseo);
   const agent = { id: "a1", cwd: "/repo", title: "TUC-1: Add module" };
   return {
-    deputy: instance, log, settings, state, comments, said, sent, responses, daemon, paseo, directory, agent,
+    deputy: instance, deps, log, settings, state, comments, said, sent, responses, daemon, paseo, directory, agent,
     evaluations: () => evaluations,
     advance: (ms: number) => { clock += ms; t.mock.timers.tick(ms); },
     // Waits for the background work started so far (evaluations, dispatches).
@@ -293,7 +295,7 @@ test("a refused question is logged with its reason and stays with the owner", as
   assert.equal((await h.candidate()).status, "refused");
 });
 
-test("live without the daemon's owner-priority response stays blocked and answers nothing", async (t) => {
+test("live without a checked answer connection stays blocked and answers nothing", async (t) => {
   const h = await harness(t, { mode: "live" });
   await h.log.append({ kind: "question", id: "seed", at: "2026-10-01T00:00:00Z", identifier: "TUC-0", issueId: "i0", questions: [] });
   for (const entry of cases(LIVE_MIN_CASES, LIVE_MIN_CASES)) await h.log.append(entry);
@@ -304,16 +306,21 @@ test("live without the daemon's owner-priority response stays blocked and answer
   await h.settle();
   const candidate = await h.candidate();
   assert.equal(candidate.status, "blocked");
-  assert.match(candidate.reason ?? "", /TUC-1258/);
+  assert.equal(candidate.reason, "no checked answer connection to the local Paseo daemon");
   assert.deepEqual([h.responses, h.comments], [[], []]);
-  assert.deepEqual(await h.deputy.liveBlockers(h.settings), ["the Paseo daemon does not offer owner-priority permission responses with an authoritative responder yet (TUC-1258)"]);
+  assert.deepEqual(await h.deputy.liveBlockers(h.settings), ["no checked answer connection to the local Paseo daemon"]);
 });
 
 function arbiter(result: ArbitratedOutcome = "applied") {
   const calls: { requestId: string; fingerprint: string; answers: unknown }[] = [];
+  const outcomes = new Map<string, ArbitratedOutcome>();
   const value: PermissionArbiter = {
-    respond: async (input) => { calls.push({ requestId: input.requestId, fingerprint: input.fingerprint, answers: input.response.behavior === "allow" ? input.response.updatedInput : undefined }); return result; },
-    outcome: async () => null,
+    respond: async (input) => {
+      calls.push({ requestId: input.requestId, fingerprint: input.fingerprint, answers: input.response.behavior === "allow" ? input.response.updatedInput : undefined });
+      outcomes.set(input.intentId, result);
+      return result;
+    },
+    outcome: async (intentId) => outcomes.get(intentId) ?? null,
   };
   return { value, calls };
 }
@@ -327,6 +334,7 @@ async function liveHarness(t: TestContext, result: ArbitratedOutcome = "applied"
 
 test("live answers after the grace period through the arbitrated response, then shows the answer, its sources and how to override", async (t) => {
   const h = await liveHarness(t);
+  assert.deepEqual(await h.deputy.liveBlockers(h.settings), [], "confirmed connection and passing evidence open the live gate");
   await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
   await h.settle();
   assert.deepEqual(h.calls, [], "nothing before the grace period ends");
@@ -355,6 +363,43 @@ test("an owner answer during the grace period wins: nothing is sent", async (t) 
   assert.equal((await h.candidate()).status, "owner-answered");
 });
 
+test("an owner answer whose evidence could not be written is not marked recorded and is written once when it can", async (t) => {
+  const h = await harness(t, { mode: "shadow" });
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  const append = h.log.append.bind(h.log);
+  let failing = true;
+  t.mock.method(h.log, "append", async (entry: LogEntry) => {
+    if (failing && entry.kind === "owner-answer") throw new Error("owner evidence unavailable");
+    return append(entry);
+  });
+  const response = { behavior: "allow" as const, updatedInput: { answers: { Runner: "vitest" } } };
+  const activity = { via: "linear-comment" as const, activityId: "c1", userId: OWNER };
+  const at = "2026-10-07T10:01:00Z";
+  await assert.rejects(h.deputy.ownerAnswered("a1", question(), response, activity, at), /owner evidence unavailable/);
+  assert.equal((await h.candidate()).status, "predicted");
+  assert.equal((await kinds(h)).includes("owner-answer"), false);
+  failing = false;
+  await h.deputy.ownerAnswered("a1", question(), response, activity, at);
+  await h.deputy.ownerAnswered("a1", question(), response, activity, at);
+  assert.equal((await h.candidate()).status, "owner-answered");
+  assert.deepEqual((await h.log.entries()).filter((entry) => entry.kind === "owner-answer"), [
+    { kind: "owner-answer", id: "a1:r1", at, key: "c1", via: "linear-comment", userId: OWNER, answers: { Runner: "vitest" } },
+  ]);
+});
+
+test("blank owner identities and non-question responses leave legacy answers unchanged and add no owner evidence", async (t) => {
+  const h = await harness(t);
+  const at = "2026-10-07T10:00:00Z";
+  const legacy: LogEntry = { kind: "answer", id: "a0:r0", at, answers: { Runner: "vitest" } };
+  await h.log.append(legacy);
+  const response = { behavior: "allow" as const, updatedInput: { answers: { Runner: "node:test" } } };
+  await h.deputy.ownerAnswered("a1", question(), response, { via: "linear-session", activityId: "s1", userId: " " }, at);
+  await h.deputy.ownerAnswered("a1", question("approval", undefined, { kind: "tool" }), response, { via: "linear-comment", activityId: "c1", userId: OWNER }, at);
+  await h.deputy.ownerAnswered("a1", question(), { behavior: "deny" }, { via: "linear-comment", activityId: "c2", userId: OWNER }, at);
+  assert.deepEqual(await h.log.entries(), [legacy]);
+});
+
 test("a request that changed since the prediction is not answered", async (t) => {
   const changed = await liveHarness(t);
   await changed.deputy.observe(changed.agent, question(), { issueId: "i1", identifier: "TUC-1" });
@@ -375,7 +420,7 @@ test("a request answered elsewhere during the grace period is not answered, and 
   assert.deepEqual([gone.calls, (await gone.candidate()).status], [[], "resolved"]);
 });
 
-test("an owner who answers at the same moment wins at the daemon: no deputy answer is recorded or shown", async (t) => {
+test("an owner who answers at the same moment wins through the plugin: no deputy answer is recorded or shown", async (t) => {
   const raced = await liveHarness(t, "owner-first");
   await raced.deputy.observe(raced.agent, question(), { issueId: "i1", identifier: "TUC-1" });
   await raced.settle();
@@ -414,6 +459,291 @@ test("an answer interrupted by a reload is never submitted again", async (t) => 
   await reloaded.idle();
   assert.deepEqual(fake.calls, []);
   assert.equal((await readCandidates(h.directory))[key].status, "unknown");
+});
+
+test("a dispatch interrupted in a reload settles once the checked connection is back, never resubmitted", async (t) => {
+  const h = await harness(t, { mode: "shadow" });
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.deputy.stop();
+  // The plugin stopped between recording the intent and hearing back.
+  const store = await readCandidates(h.directory);
+  store["a1:r1"] = { ...store["a1:r1"], status: "dispatching", intentId: "intent-1" };
+  await writeFile(join(h.directory, "candidates.json"), JSON.stringify(store));
+  const fake = arbiter();
+  t.mock.method(fake.value, "outcome", async () => "applied" as const);
+  let connected = false;
+  const reloaded = new Deputy({ ...h.deps, arbiter: async () => (connected ? fake.value : null) });
+  t.after(() => reloaded.stop());
+  reloaded.attach(h.paseo);
+  await reloaded.idle();
+  assert.equal((await h.candidate()).status, "dispatching", "with no checked connection nothing is concluded: the settlement stays owed");
+  connected = true;
+  h.advance(5 * 60_000);
+  await reloaded.idle();
+  assert.equal((await h.candidate()).status, "applied");
+  assert.deepEqual((await h.candidate()).notice, { comment: true, session: true, commentId: "notice-1" });
+  assert.deepEqual([fake.calls, h.responses, h.comments.length, h.said.length], [[], [], 1, 1], "no second submission; the answer and its notice appear once the connection is there");
+});
+
+test("a reload finishes the notice of a durable applied answer once, without another response", async (t) => {
+  const h = await harness(t, { mode: "shadow" });
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.deputy.stop();
+  // The answer was confirmed and logged; the notice was not written yet.
+  await h.log.append({ kind: "deputy-answer", id: "a1:r1", at: "2026-10-07T10:00:00Z", identifier: "TUC-1", issueId: "i1", version: VERSION, key: "intent-1", answers: { Runner: "node:test" }, citations: [] });
+  const store = await readCandidates(h.directory);
+  store["a1:r1"] = { ...store["a1:r1"], status: "applied", intentId: "intent-1", notice: { comment: false, session: false, commentId: null } };
+  await writeFile(join(h.directory, "candidates.json"), JSON.stringify(store));
+  const fake = arbiter();
+  const reloaded = new Deputy({ ...h.deps, arbiter: async () => fake.value });
+  t.after(() => reloaded.stop());
+  reloaded.attach(h.paseo);
+  await reloaded.idle();
+  h.advance(5 * 60_000);
+  await reloaded.idle();
+  assert.deepEqual((await h.candidate()).notice, { comment: true, session: true, commentId: "notice-1" });
+  assert.equal((await h.log.entries()).filter((entry) => entry.kind === "deputy-answer").length, 1, "the answer was already recorded and is not recorded again");
+  assert.deepEqual([fake.calls, h.responses, h.comments.length, h.said.length], [[], [], 1, 1]);
+});
+
+test("a late correction survives a settlement append failure and arms its own retry without a restart", async (t) => {
+  const fake = arbiter();
+  t.mock.method(fake.value, "outcome", async () => "applied" as const);
+  const h = await harness(t, { mode: "shadow" }, { arbiter: fake.value });
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  const store = await readCandidates(h.directory);
+  const candidate = store["a1:r1"];
+  store[candidate.key] = { ...candidate, status: "dispatching", intentId: "confirmed-intent" };
+  await writeFile(join(h.directory, "candidates.json"), JSON.stringify(store));
+  const append = h.log.append.bind(h.log);
+  let failing = true;
+  t.mock.method(h.log, "append", async (entry: LogEntry) => {
+    if (failing && entry.kind === "deputy-answer") throw new Error("settlement storage unavailable");
+    return append(entry);
+  });
+  h.daemon.pending = [question("r2", ["Keep", "Split"])];
+  const activity = { via: "linear-session" as const, activityId: "late-1", userId: OWNER };
+  const result = await h.deputy.correctLate("a1", "r1", "Use vitest instead.", activity);
+  assert.deepEqual(result, {
+    delivered: true,
+    reply: `The deputy had already answered this question (${candidate.ref}); your answer went to the agent as your correction.`,
+  });
+  await h.deputy.correctLate("a1", "r1", "Use vitest instead.", activity);
+  assert.equal(h.sent.length, 1, "the correction is deduplicated independently of settlement");
+  assert.match(h.sent[0], /request r1/);
+  assert.match(h.sent[0], /Use vitest instead\./);
+  assert.equal((await h.candidate()).status, "dispatching", "the owed settlement stays on disk");
+  assert.equal((await kinds(h)).includes("deputy-answer"), false);
+  assert.deepEqual([h.comments, h.said, fake.calls, h.responses], [[], [], [], []]);
+  failing = false;
+  h.advance(5 * 60_000 - 1);
+  await h.settle();
+  assert.equal((await kinds(h)).includes("deputy-answer"), false);
+  h.advance(1);
+  await h.settle();
+  assert.equal((await h.candidate()).status, "applied");
+  assert.deepEqual((await h.candidate()).notice, { comment: true, session: true, commentId: "notice-1" });
+  assert.equal((await h.log.entries()).filter((entry) => entry.kind === "deputy-answer").length, 1);
+  assert.equal(h.comments.length, 1);
+  assert.equal(h.said.length, 1);
+  assert.deepEqual([fake.calls, h.responses, h.daemon.pending.map((request) => request.id)], [[], [], ["r2"]]);
+  h.advance(10 * 60_000);
+  await h.settle();
+  assert.deepEqual([h.sent.length, h.comments.length, h.said.length], [1, 1, 1]);
+});
+
+test("a confirmed dispatch whose settlement fails is completed by the timer without another response", async (t) => {
+  const h = await liveHarness(t);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  const append = h.log.append.bind(h.log);
+  let failing = true;
+  t.mock.method(h.log, "append", async (entry: LogEntry) => {
+    if (failing && entry.kind === "deputy-answer") throw new Error("settlement append failed");
+    return append(entry);
+  });
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal((await h.candidate()).status, "dispatching");
+  assert.equal(h.calls.length, 1);
+  assert.deepEqual([h.comments, h.said], [[], []]);
+  failing = false;
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal((await h.candidate()).status, "applied");
+  assert.equal((await h.log.entries()).filter((entry) => entry.kind === "deputy-answer").length, 1);
+  assert.deepEqual([h.calls.length, h.comments.length, h.said.length], [1, 1, 1]);
+});
+
+test("the retry timer stays alive for unfinished notices after the answer has settled", async (t) => {
+  const h = await liveHarness(t);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  const say = h.deps.sessions!.say;
+  let failing = true;
+  t.mock.method(h.deps.sessions!, "say", async (sessionId: string, type: "thought" | "response" | "error", body: string) => {
+    if (failing) throw new Error("session notice unavailable");
+    await say(sessionId, type, body);
+  });
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal((await h.candidate()).status, "applied");
+  assert.deepEqual((await h.candidate()).notice, { comment: true, session: false, commentId: "notice-1" });
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.deepEqual([h.comments.length, h.said.length], [1, 0]);
+  failing = false;
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.deepEqual((await h.candidate()).notice, { comment: true, session: true, commentId: "notice-1" });
+  assert.deepEqual([h.calls.length, h.comments.length, h.said.length], [1, 1, 1]);
+  assert.equal((await h.log.entries()).filter((entry) => entry.kind === "deputy-answer").length, 1);
+});
+
+test("reload settles a durable applied outcome once, with notices and no second submission", async (t) => {
+  const h = await harness(t, { mode: "shadow" });
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.deputy.stop();
+  const store = await readCandidates(h.directory);
+  store["a1:r1"] = { ...store["a1:r1"], status: "dispatching", intentId: "confirmed-intent" };
+  await writeFile(join(h.directory, "candidates.json"), JSON.stringify(store));
+  const fake = arbiter();
+  t.mock.method(fake.value, "outcome", async () => "applied" as const);
+  const reloaded = new Deputy({ ...h.deps, arbiter: async () => fake.value });
+  t.after(() => reloaded.stop());
+  reloaded.attach(h.paseo);
+  await reloaded.idle();
+  assert.equal((await h.candidate()).status, "applied");
+  assert.deepEqual((await h.candidate()).notice, { comment: true, session: true, commentId: "notice-1" });
+  assert.deepEqual([fake.calls, h.responses], [[], []]);
+  assert.deepEqual([h.comments.length, h.said.length], [1, 1]);
+  reloaded.stop();
+  const again = new Deputy({ ...h.deps, arbiter: async () => fake.value });
+  t.after(() => again.stop());
+  again.attach(h.paseo);
+  await again.idle();
+  assert.equal((await h.log.entries()).filter((entry) => entry.kind === "deputy-answer").length, 1);
+  assert.deepEqual([fake.calls.length, h.comments.length, h.said.length], [0, 1, 1]);
+});
+
+test("one failed candidate does not stop recovery of the others and its settlement retries later", async (t) => {
+  const h = await harness(t, { mode: "shadow" });
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  await h.deputy.observe({ ...h.agent, id: "a2" }, question("r2"), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.deputy.stop();
+  const store = await readCandidates(h.directory);
+  for (const [key, candidate] of Object.entries(store)) store[key] = { ...candidate, status: "dispatching", intentId: `confirmed:${key}` };
+  await writeFile(join(h.directory, "candidates.json"), JSON.stringify(store));
+  const append = h.log.append.bind(h.log);
+  let failing = true;
+  t.mock.method(h.log, "append", async (entry: LogEntry) => {
+    if (failing && entry.kind === "deputy-answer" && entry.id === "a1:r1") throw new Error("first candidate append failed");
+    return append(entry);
+  });
+  const fake = arbiter();
+  t.mock.method(fake.value, "outcome", async () => "applied" as const);
+  const reloaded = new Deputy({ ...h.deps, arbiter: async () => fake.value });
+  t.after(() => reloaded.stop());
+  reloaded.attach(h.paseo);
+  await reloaded.idle();
+  const afterRecovery = await readCandidates(h.directory);
+  assert.deepEqual([afterRecovery["a1:r1"].status, afterRecovery["a2:r2"].status], ["dispatching", "applied"]);
+  assert.deepEqual([h.comments.length, h.said.length, fake.calls.length], [1, 1, 0]);
+  h.advance(5 * 60_000);
+  await reloaded.idle();
+  assert.equal((await readCandidates(h.directory))["a1:r1"].status, "dispatching");
+  assert.deepEqual([h.comments.length, h.said.length], [1, 1]);
+  failing = false;
+  h.advance(5 * 60_000);
+  await reloaded.idle();
+  assert.deepEqual((await reloaded.candidates()).map((candidate) => candidate.status), ["applied", "applied"]);
+  assert.equal((await h.log.entries()).filter((entry) => entry.kind === "deputy-answer").length, 2);
+  assert.deepEqual([h.comments.length, h.said.length, fake.calls.length, h.responses.length], [2, 2, 0, 0]);
+});
+
+test("stop fences a dispatch queued behind its candidate lane before it can submit", async (t) => {
+  const h = await liveHarness(t);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.advance(5 * 60_000);
+  h.deputy.stop();
+  await h.settle();
+  assert.deepEqual([h.calls, h.responses, h.comments], [[], [], []]);
+  assert.equal((await h.candidate()).status, "canceled");
+});
+
+test("stop during asynchronous dispatch checks prevents the final external submission", async (t) => {
+  const h = await liveHarness(t);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  let entered!: () => void;
+  const checking = new Promise<void>((resolve) => { entered = resolve; });
+  let resume!: () => void;
+  const paused = new Promise<void>((resolve) => { resume = resolve; });
+  t.mock.method(h.deps.linear, "issueState", async () => {
+    entered();
+    await paused;
+    return h.state;
+  });
+  h.advance(5 * 60_000);
+  await checking;
+  h.deputy.stop();
+  resume();
+  await h.settle();
+  assert.deepEqual([h.calls, h.responses, h.comments], [[], [], []]);
+  assert.equal((await h.candidate()).status, "canceled");
+});
+
+test("a late correction waits for the candidate's in-flight checked response before sending a message", async (t) => {
+  const fake = arbiter();
+  let entered!: () => void;
+  const submitting = new Promise<void>((resolve) => { entered = resolve; });
+  let resume!: () => void;
+  const paused = new Promise<void>((resolve) => { resume = resolve; });
+  const respond = fake.value.respond;
+  t.mock.method(fake.value, "respond", async (input: Parameters<PermissionArbiter["respond"]>[0]) => {
+    entered();
+    await paused;
+    return respond(input);
+  });
+  const h = await harness(t, { mode: "live" }, { arbiter: fake.value });
+  for (const entry of cases(LIVE_MIN_CASES, LIVE_MIN_CASES)) await h.log.append(entry);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.advance(5 * 60_000);
+  await submitting;
+  const correction = h.deputy.correctLate("a1", "r1", "Use vitest.", { via: "linear-session", activityId: "late-1", userId: OWNER });
+  await Promise.resolve();
+  assert.equal(h.sent.length, 0, "an unconfirmed in-flight answer does not authorise a correction");
+  h.daemon.pending = [question("r2")];
+  resume();
+  assert.equal((await correction).delivered, true);
+  await h.settle();
+  assert.deepEqual([fake.calls.length, h.sent.length, h.responses.length], [1, 1, 0]);
+  assert.match(h.sent[0], /request r1/);
+  assert.deepEqual(h.daemon.pending.map((request) => request.id), ["r2"]);
+});
+
+test("a late answer with no confirmed deputy outcome does not become a correction or answer a newer question", async (t) => {
+  const fake = arbiter();
+  const h = await harness(t, { mode: "shadow" }, { arbiter: fake.value });
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  const store = await readCandidates(h.directory);
+  store["a1:r1"] = { ...store["a1:r1"], status: "dispatching", intentId: "unconfirmed" };
+  await writeFile(join(h.directory, "candidates.json"), JSON.stringify(store));
+  h.daemon.pending = [question("r2")];
+  assert.equal((await h.deputy.correctLate("a1", "r1", "Use vitest.", { via: "linear-session", activityId: "late-1", userId: OWNER })).delivered, false);
+  assert.equal((await h.deputy.correctLate("a1", "missing", "Use vitest.", { via: "linear-session", activityId: "late-2", userId: OWNER })).delivered, false);
+  assert.deepEqual([h.sent, fake.calls, h.responses], [[], [], []]);
+  assert.deepEqual(h.daemon.pending.map((request) => request.id), ["r2"]);
+  assert.equal((await kinds(h)).includes("deputy-override"), false);
 });
 
 test("an override goes to the agent that got the deputy's answer, once per owner activity, never as an answer", async (t) => {

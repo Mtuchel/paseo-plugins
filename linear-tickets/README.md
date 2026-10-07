@@ -538,9 +538,14 @@ its branch and handover context and never silently starts on an unrelated fresh 
 Mac-only uncommitted changes are not transferred: a replacement whose branch cannot safely
 be resumed remains a queued handoff rather than discarding that work.
 The destination acknowledges a forwarded activation after persisting it, then processes it
-asynchronously. Delivery receipts avoid repeats after a lost HTTP response. Delivery is
-at-least-once across a crash between the daemon send and the durable receipt, so that narrow
-crash window may repeat a message. Pending source activations are never evicted.
+asynchronously. Delivery receipts avoid repeats after a lost HTTP response, and a message a host
+passes to its own live agent -- the destination's intake, or the draining host for a ticket one of
+its allowlisted agents still owns -- carries the activation id into the checked answer path
+([Answers to agent questions](#answers-to-agent-questions)), whose record outlives the receipt: a
+retry after a delivery whose outcome was lost is answered from that record instead of reaching the
+agent twice, and a delivery Paseo does not confirm is reported unconfirmed, never repeated.
+Delivering a message never changes the agents a host keeps.
+Pending source activations are never evicted.
 
 
 **In the panel.**
@@ -1907,7 +1912,9 @@ independently of the agent's own `linear_ticket` tools:
   option). If it is waiting on an approval, `approve` / `deny <reason>` decides it. Otherwise
   the text is sent as a message. Its reply comes back as a turn summary (or its own comment),
   so the conversation stays in Linear. Delivered comments get a 👀 reaction; undeliverable ones
-  get ❌ and a reply saying why. All watched issues are read in one request per poll, each from
+  get ❌ and a reply saying why, and a comment handled twice is not delivered again, nor to a
+  later question ([Answers to agent questions](#answers-to-agent-questions)). All watched issues
+  are read in one request per poll, each from
   a cursor kept in `$PASEO_HOME/linear-tickets/relay-cursors.json`, so neither a restart nor a
   long pause delivers a comment twice or skips one. Comments by other people are ignored, and
   so are the comments the agents and the plugin wrote themselves, even when they show you as
@@ -2413,6 +2420,84 @@ and stops updating); to go back to the program before the move, copy
 history files can stay. Before changing a host copy by hand, keep it as
 `<file>.bak-<date>-<reason>` next to it.
 
+## Answers to agent questions
+
+Everything the plugin sends to an agent question goes through one checked path
+(`server/permission-replies.ts`): your answer from a Linear comment, from an agent session, from a
+reply the other host forwarded or queued for a later poll, and the deputy's answer in live mode.
+The path decides what the text is (the answer to the pending question, an approve/deny for a
+pending approval, or a message), submits it to Paseo and records what came of it. Every
+delivery carries one stable ref -- the comment id, the session activity, the queued text, or the
+forwarded activation's id -- which is reserved before anything is routed, so the same Linear
+activity is never delivered twice and a repeat never lands on a later question.
+
+The internal connection explicitly negotiates Paseo's `owned_subscriptions` capability so the
+confirmation is the reply to this submission, not a broadcast saying somebody answered. This was
+exercised with the bundled 0.8.0 client against Paseo 0.10.3 on server087.
+
+**Owner first.** An answer of yours that the plugin is already sending beats a deputy answer that
+is not yet sent; a deputy answer that reached Paseo first ends yours as a correction. An agent
+session's answer with several parts counts as yours from its first part, so the deputy stays out of
+that question from then on. The check is plugin-local: the plugin asks Paseo to apply exactly this
+answer to exactly this request and waits for Paseo's confirmation, but Paseo does not compare the
+question's content for it and names no responder, so an answer given in the Paseo app at the same
+moment as a deputy answer can lose.
+
+**What you see.** A delivered answer changes nothing (👀). Otherwise:
+
+- The deputy had already answered that question: your answer goes to the agent as your correction,
+  and you get "The deputy had already answered this question (D-1a2b3c4d); your answer went to the
+  agent as your correction." An agent session whose collected parts are affected sends all of them
+  as one correction.
+- Paseo turned your answer down (the question was no longer waiting, or Paseo was already
+  processing another answer to it): ❌ and "Your answer was not delivered: the question was no
+  longer waiting, or Paseo was already processing another answer to it."
+- Paseo did not confirm it (timeout, a lost connection, another error): ❌ and "Paseo could not
+  confirm that your answer reached the agent: <reason>. It is not sent again; check the agent."
+  Your answer is not counted as yours, and it never answers a later question: if the question it
+  was meant for went away, that is what you are told, and a question that arrived in the meantime
+  is shown as what it is.
+
+**Handled twice.** A comment, a session activity or a forwarded activation that is handled a
+second time (a poll retried after a restart, a repeated forward) is not sent again and never
+answers a newer question: the second attempt reports what happened the first time. An attempt that
+was interrupted before its outcome was recorded is reported unconfirmed the same way, and is never
+sent again either. The records live in `$PASEO_HOME/linear-tickets/permission-replies.json`
+(`0600` in the plugin's `0700` directory) and are kept 30 days. Approvals ("approve" / "deny
+<reason>") and plain messages are covered by the same records for this replay protection; how they
+are sent and who may send them is unchanged.
+
+**Without a checked connection.** On a host where the plugin's own connection to the local Paseo
+daemon is missing, your answers are sent as today (fire-and-forget, recorded as unchecked) and are
+not counted as yours, and the deputy cannot answer there at all: its live candidate ends `blocked`
+with "no checked answer connection to the local Paseo daemon". The forwarded activations and
+queued messages that host delivers to its agents are sent and recorded the same way.
+
+**Who counts as the answerer** (only ever after Paseo confirmed the answer):
+
+| Where the answer was given | Through the checked path | Recorded as |
+|---|---|---|
+| A Linear comment or agent session written as you | always, ahead of the deputy | owner |
+| A forwarded or queued activation (no verified author) | always, ahead of the deputy | nobody (`linear-unverified`) |
+| The deputy, in live mode | only with no owner answer in flight and the same request still pending | deputy |
+| The Paseo app, the CLI, a daemon auto-decision | not at all | unattributed |
+
+**Limits.**
+
+- The pending request's content is compared once more immediately before the submission (its
+  fingerprint). A change Paseo makes between that check and its applying the answer is not caught:
+  the daemon takes no expected fingerprint.
+- A refusal is recognised from Paseo's own message. The two messages that mean "not applied" are
+  matched exactly, which depends on the daemon and provider version; every other error counts as
+  unconfirmed. An answer Paseo applied but whose confirmation was lost is reported unconfirmed too,
+  and is never sent again.
+- A correction (a reply in a deputy answer's thread, or `override D-…`, see **Override**) is
+  claimed and sent before it is recorded. A crash in that window can lose the correction without a
+  ❌ reply, or send it twice; making corrections durable is a follow-up.
+- The checked path is the plugin's. On a host without a checked connection the sending stays the
+  old fire-and-forget one: the records still prevent a repeat, and nothing confirms that Paseo took
+  the answer.
+
 ## Deputy for agent questions
 
 Routine questions ticket agents ask the owner can be answered by a deputy, but only when recorded
@@ -2471,21 +2556,29 @@ they keep saying what they relied on after the source changes.
   evaluator, agent running and still linked, the same request still pending and unchanged (a
   newer question is never answered in its place), the ticket still qualifies, every cited quote
   still in today's sources, and the live gate below. Only then is one answer submitted through
-  the daemon's owner-priority response. The intent is recorded first: an answer interrupted by a
-  reload or without a confirmation is never submitted again (`unknown`), and it is not reported
-  as applied.
+  the checked path ([Answers to agent questions](#answers-to-agent-questions)). The intent is
+  recorded first: an answer interrupted by a reload or without a confirmation is never submitted
+  again (`unknown`), and it is not reported as applied.
 
 **Live gate.** Live answers need both: at least 30 real paired shadow cases at 90% agreement or
 more for the current evaluator version (`deputy-2/<model>/low`; a model or policy change starts
-over), and a daemon that submits a response only while no owner response for the request is in,
-bound to the request and idempotent, and tells who actually answered. No released Paseo daemon
-offers that yet ([TUC-1258](https://linear.app/tuchel/issue/TUC-1258)), so on every host a live
-candidate ends `blocked` with the reason and the question stays with the owner. The settings
-show `deputy.live.ready` and `deputy.live.blockers`.
+over), and a submission path that applies a response only while no owner response for the request
+is in, bound to the request, idempotent, and reports what happened to it. The owner accepted the
+plugin's own checked path ([Answers to agent questions](#answers-to-agent-questions)) in place of
+the daemon half (2026-10-07): for the answers it submits for the deputy, that path holds the
+owner's answer ahead of it, binds the submission to the request whose content it last read, records
+one outcome per Linear activity, and never submits an unconfirmed answer again. What Paseo itself
+would have to provide stays outside the promise: the daemon names no responder, so answers from the
+Paseo app remain unattributed and can win a race against a deputy answer, and it takes no expected
+fingerprint. On a host whose plugin has no checked connection to its Paseo daemon the deputy cannot
+answer at all (blocker "no checked answer connection to the local Paseo daemon"); there a live
+candidate ends `blocked` with the reason and the question stays with the owner. The settings show
+`deputy.live.ready` and `deputy.live.blockers`.
 
 **Evidence.** A pair is a prediction recorded before the owner answered and the owner's answer to
 the same request, delivered by the plugin for the authenticated owner (a Linear comment written
-with the owner's key, or an agent-session reply whose author is the owner). Answers the daemon
+with the owner's key, or an agent-session reply whose author is the owner) and confirmed by Paseo;
+an answer that was turned down or not confirmed leaves no pair. Answers the daemon
 reports (Paseo app, other clients) name no responder and never count, nor do identical answer
 text, timing, blank identities, legacy `answer` entries, duplicates or deputy answers. All parts
 must match (option labels case-insensitively). Unpaired predictions and refusals are reported as
@@ -2502,7 +2595,9 @@ starts nothing) or the agent session, goes to the agent that got the deputy's an
 correction message naming the original question; it never answers the agent's newer
 question. Only replies whose author is the owner count; each owner activity is handled once, and
 a failed delivery is replied to as failed, never claimed. Without a reference or a notice thread,
-an owner reply is handled as before. Normal answers, messages and approvals are unchanged.
+an owner reply is handled as before. Normal answers, messages and approvals keep how and by whom
+they are sent; only a repeat of the same Linear activity is refused (see **Answers to agent
+questions**).
 
 **Log and weekly review.** The decision log (`owner-decisions/log.jsonl`, see [Decision
 candidates](#decision-candidates)) gains `owner-answer` (an answer the plugin delivered for the
@@ -2535,7 +2630,9 @@ says whether access exists.
 **Setup and rollout.** Set through `linear.set-settings`, for example
 `{ "deputy": { "mode": "shadow", "model": "openai-codex/gpt-6.1-sol", "principlesRepository": "/home/mirko/paseo/tuchel-platform" } }`,
 or edit `deputy` in `settings.json`. Start in shadow on one host, link a report with at least 30
-real paired cases, and switch to live only once TUC-1258's response is deployed too.
+real paired cases, and switch to live once the checked path ([Answers to agent
+questions](#answers-to-agent-questions)) is deployed on that host. The deputy stays off by
+default.
 
 **Off switch.** `"deputy": { "mode": "off" }` stops new evaluations and ends candidates waiting
 for their grace period at once; `shadow` ends waiting live candidates too. Neither undoes an
@@ -2586,6 +2683,9 @@ merge queue parsing, polling cadence, the GitHub budget's reserve and its routed
 labelling) against a fake GitHub, the decision candidates (the log, the collector's sources
 and exclusions, window limits, candidate identity, one ticket per project, app-only filing)
 and the weekly ops review (history reading, coverage, per-kind numbers, dedupe, the cap, checks
-and reopens, the review lock, create reservations) against a fake Linear. It also runs the ops
+and reopens, the review lock, create reservations) against a fake Linear, the checked answer path
+(owner precedence, replay protection, refusals) with the refs it takes from forwarded and queued
+activations, and the cutover's activation routing (claims, deferral, delivery over the wire)
+between two host fixtures. It also runs the ops
 digest's Python tests (`python3 -m unittest discover -s ops -p 'test_*.py'`).
 Live account authentication and agent execution require your configured host and key.

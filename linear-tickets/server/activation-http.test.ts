@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -108,7 +108,7 @@ async function hostOverHttp(t: TestContext, options: { name: string; activation:
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise<void>((resolve) => { server.close(() => resolve()); }));
-  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, daemon, starts, comments, intake, drain };
+  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, root: home, daemon, starts, comments, intake, drain };
 }
 
 // The draining host without a listener of its own: it observes (take) and pushes (fetch).
@@ -183,6 +183,33 @@ test("a peer that refuses (it drains too) leaves the activation durable, and a l
   assert.deepEqual((await mac.drain.status()).outbox, 0);
   await mac.drain.sweep();
   assert.equal(server.starts.length, 1, "the sweep delivers a finished activation exactly once");
+});
+
+// TUC-1258 AC-5: a forwarded message is kept on the destination under the sender's own receipt, so
+// the sender's retry -- its answer to the POST was lost, or the receipt could not be written -- is
+// answered from that record: the agent gets the message once, and nothing lands on a newer
+// question.
+test("a forwarded message is kept under its receipt: the sender's retry reaches the agent once", async (t) => {
+  const host = await hostOverHttp(t, { name: "server087", activation: () => ({ mode: "local", peer: null }), agents: [{ id: "a-run", issueId: "i1", identifier: "TUC-1", status: "running" }] });
+  const deliver = (issueId: string, text: string, receipt: string) => fetch(`${host.url}/activation/deliver`, {
+    method: "POST", headers: { "content-type": "application/json", "x-paseo-activation": SECRET }, body: JSON.stringify({ issueId, text, receipt }),
+  });
+
+  // Warm the claims file into the intake's cache (this ticket has no agent), then make that path
+  // unwritable for the receipt: the message goes out, the receipt cannot be recorded.
+  assert.equal((await deliver("i9", "Nobody works on this ticket.", "warm")).status, 409);
+  const claimsPath = join(host.root, "server087", "activation-claims.json");
+  await mkdir(claimsPath, { recursive: true });
+  assert.equal((await deliver("i1", "Any news?", "session:s2")).status, 500, "the message went out, the receipt could not be written");
+  await rm(claimsPath, { recursive: true });
+
+  const retry = await deliver("i1", "Any news?", "session:s2");
+  assert.equal(retry.status, 200, "the retry is answered from the record, not from the agent");
+  assert.equal((await retry.json() as { ok: boolean }).ok, true);
+  assert.deepEqual(host.daemon.sent, [{ agentId: "a-run", message: "Any news?" }], "the agent got the message exactly once");
+  const again = await deliver("i1", "Any news?", "session:s2");
+  assert.equal(again.status, 200, "the receipt the retry wrote answers the next repeat");
+  assert.deepEqual(host.daemon.sent, [{ agentId: "a-run", message: "Any news?" }]);
 });
 
 test("the health route answers the routing state the smoke run reads", async (t) => {

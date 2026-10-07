@@ -11,6 +11,7 @@ import type { ReviewThread } from "./pr-nudge";
 import { activityBullets, ConditionalPullView, githubReader, GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft } from "./pr-watch";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, GREPTILE_RETRIGGER, marker, RETARGET_ORPHAN, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
 import { GitHubBudget, GitHubPausedError, withPriority } from "./rate-budget";
+import { PermissionReplies } from "./permission-replies";
 import { SessionRouter, type IdleRun, type Succession } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { githubRouted } from "./github-cli";
@@ -112,6 +113,10 @@ const RESTARTED = { status: "idle", lastError: CRASH, pendingPermissions: [] };
 function crashDaemon(calls: string[]) {
   const daemon = { agent: CRASHED as Record<string, unknown>, reloaded: RESTARTED as Record<string, unknown>, send: async () => {}, router: null as unknown as SessionRouter };
   let held = false;
+  // The fake store has no path, so the router cannot derive its ledger directory from it: give it
+  // an isolated one of its own (these paths send through the agent handle, not the reply ledger,
+  // so no file is written).
+  const replies = new PermissionReplies({ directory: join(tmpdir(), `paseo-pr-watch-${process.pid}-${Math.random().toString(36).slice(2)}`), daemon: async () => null });
   daemon.router = new SessionRouter({
     launcher: { gate: () => {
       if (held) return null;
@@ -119,6 +124,7 @@ function crashDaemon(calls: string[]) {
       return { release: () => { held = false; } };
     } },
     store: { forAgent: async () => null },
+    replies,
     reloader: async () => async (agentId: string) => { calls.push(`reload ${agentId}`); daemon.agent = daemon.reloaded; },
   } as never);
   Object.assign(daemon.router, { paseo: { agents: {

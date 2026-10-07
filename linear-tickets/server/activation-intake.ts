@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { dispatchLabels } from "./dispatch";
 import type { Launcher } from "./launch";
 import type { LinearService } from "./linear";
+import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./permission-replies";
 import { LIVE_AGENT } from "./process-liveness";
 import { deliverToAgent } from "./relay";
 import { ResumeUnavailableError, type TicketStarter, type Started } from "./starter";
@@ -32,6 +34,8 @@ const RECEIPT_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_PENDING_ENTRIES = 1_000;
 const RETRY_CAP_MINUTES = 15;
 const HANDFOFF_NOTE_LIMIT = 1_500;
+// Only for a checked path that returns no reply of its own (it always should for a refusal).
+const UNCONFIRMED_DELIVERY = "Paseo did not confirm the delivery; it is not sent again.";
 
 // `host` is the source host label the draining host registered with its claim (never a URL; the
 // peer's configured origin is what deliveries are sent to). `appliedAt` is the handshake: set
@@ -80,7 +84,12 @@ export type IntakeDeps = {
   // (watchdog.ts, WatchdogStore.adopt); throws when it cannot be saved.
   watchdog?: Pick<WatchdogStore, "adopt">;
   sessionFor?: (agentId: string) => Promise<{ closed?: boolean } | null>;
-  deliver?: (paseo: PaseoApi, agentId: string, message: string) => Promise<void>;
+  // The checked answer path (permission-replies.ts). Production passes the plugin's one shared
+  // instance; without one this intake keeps its own host-local, unchecked one (see the
+  // constructor), so a test harness never reaches a live Paseo through it.
+  replies?: PermissionReplies;
+  // Tests replace the relay wrapper; production uses it with `replies`.
+  deliver?: (paseo: PaseoApi, agentId: string, message: string, origin: DeliveryOrigin, replies: PermissionReplies) => Promise<DeliveryResult>;
   request?: RequestLike;
   home?: string;
   host?: string;
@@ -169,6 +178,7 @@ export class ActivationIntake implements ActivationSink {
   private readonly sweepMs: number;
   private readonly claimsFile: JsonFile<ClaimsFile>;
   private readonly pendingFile: JsonFile<PendingFile>;
+  private readonly replies: PermissionReplies;
   private readonly inFlight = new Map<string, Promise<PendingEntry>>();
   private background: Promise<unknown> = Promise.resolve();
   private timer: NodeJS.Timeout | null = null;
@@ -183,6 +193,11 @@ export class ActivationIntake implements ActivationSink {
     this.sweepMs = deps.sweepMs ?? SWEEP_MS;
     this.claimsFile = new JsonFile(`${this.home}/activation-claims.json`, () => claimsFrom(null), claimsFrom);
     this.pendingFile = new JsonFile(`${this.home}/activation-pending.json`, () => pendingFrom(null), pendingFrom);
+    // `home` is the plugin's own linear-tickets directory (activationDirectory), so the fallback
+    // ledger lands next to the other stores. It has no daemon connection (`daemon: null`): it
+    // never reaches Paseo through a second connection, and a host that has one passes the shared
+    // instance in (index.server.ts).
+    this.replies = deps.replies ?? new PermissionReplies({ directory: this.home, daemon: async () => null });
   }
 
   start(): void {
@@ -325,21 +340,18 @@ export class ActivationIntake implements ActivationSink {
   }
 
   // A message for this host's live agent on the ticket. `receipt` is the sender's stable id for
-  // this message: a delivery that was answered too late to be read is not delivered twice. The
-  // receipt is written only after the message went out, so a crash in between repeats the message
-  // (at-least-once) instead of losing it.
+  // this message: it is also the message's ref in the checked answer path, so a retry of the same
+  // sender id is reported from that record instead of delivered twice. The receipt is still
+  // written only after the message went out; a crash in between is reported unconfirmed by the
+  // retry, never repeated.
   async deliverLocal(issueId: string, text: string, receipt?: string): Promise<{ ok: boolean; reason?: string; duplicate?: boolean }> {
     if (receipt && (await this.claimsFile.load()).receipts[receipt]) return { ok: true, duplicate: true };
     const paseo = this.deps.paseo();
     if (!paseo) return { ok: false, reason: "Paseo is not connected on this host." };
     const agent = await this.liveAgent(paseo, issueId);
     if (!agent) return { ok: false, reason: "No agent of this host is working on the ticket." };
-    const deliver = this.deps.deliver ?? deliverToAgent;
-    try {
-      await deliver(paseo, agent.id, text);
-    } catch (error) {
-      return { ok: false, reason: reason(error) };
-    }
+    const failure = await this.sendMessage(paseo, agent.id, text, this.deliveryOrigin(issueId, receipt, text));
+    if (failure) return { ok: false, reason: failure };
     if (receipt) {
       const at = new Date(this.now()).toISOString();
       await this.claimsFile.update((file) => {
@@ -479,13 +491,9 @@ export class ActivationIntake implements ActivationSink {
     }
     if (local) {
       if (envelope.text) {
-        const deliver = this.deps.deliver ?? deliverToAgent;
-        try {
-          await deliver(paseo, local.id, envelope.text);
-          await this.settle(envelope.id, "done", `Delivered to the agent working on the ticket (${local.id.slice(0, 8)}).`);
-        } catch (error) {
-          await this.settle(envelope.id, "pending", `The agent working on the ticket could not take the message: ${reason(error)}`, this.minutesToWait(entry.attempts));
-        }
+        const failure = await this.sendMessage(paseo, local.id, envelope.text, this.deliveryOrigin(envelope.issueId, envelope.id, envelope.text));
+        if (failure) await this.settle(envelope.id, "pending", `The agent working on the ticket could not take the message: ${failure}`, this.minutesToWait(entry.attempts));
+        else await this.settle(envelope.id, "done", `Delivered to the agent working on the ticket (${local.id.slice(0, 8)}).`);
       } else {
         await this.settle(envelope.id, "done", `An agent already works on the ticket (${local.id.slice(0, 8)}).`);
       }
@@ -590,6 +598,33 @@ export class ActivationIntake implements ActivationSink {
       return { ok: true };
     } catch (error) {
       return { ok: false, reason: reason(error) };
+    }
+  }
+
+  // A message of an activation goes through the checked answer path (permission-replies.ts) like
+  // every other Linear-originated text: it may answer the question the agent is waiting for, and
+  // the path decides what it is and whether it may still go out. The envelope carries no author,
+  // so none is invented: the origin is unverified, which keeps the owner's precedence without
+  // attributing the text to him.
+  private deliveryOrigin(issueId: string, receipt: string | undefined, text: string): DeliveryOrigin {
+    // The sender's receipt is the delivery's stable ref: a forwarded envelope carries its id, the
+    // delivery POST its receipt. A sender without one (an older host) is covered by the ticket and
+    // the text instead, so the same retry still reaches the same ledger record.
+    const ref = receipt ? `activation:${receipt}` : `activation:${createHash("sha256").update(`${issueId}:${text}`).digest("hex").slice(0, 16)}`;
+    return { ref, responder: { kind: "linear-unverified", via: "activation", ref }, issueId };
+  }
+
+  // One activation message through the checked path. Answers with the reason it did not go out,
+  // or null when it did (or had already gone out: the ledger then reports its recorded result
+  // instead of sending again). The ref is reserved before anything is routed, so the caller's
+  // retry can neither repeat the message nor land it on a newer question.
+  private async sendMessage(paseo: PaseoApi, agentId: string, text: string, origin: DeliveryOrigin): Promise<string | null> {
+    const deliver = this.deps.deliver ?? deliverToAgent;
+    try {
+      const result: DeliveryResult = await deliver(paseo, agentId, text, origin, this.replies);
+      return result.delivered ? null : result.reply ?? UNCONFIRMED_DELIVERY;
+    } catch (error) {
+      return reason(error);
     }
   }
 

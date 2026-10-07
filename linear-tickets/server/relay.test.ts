@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -8,9 +8,10 @@ import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/
 import type { RelayComment } from "./linear";
 import type { Candidate } from "./deputy";
 import { RateLimitedError } from "./rate-budget";
-import { NeedsYouIssues } from "./needs-you";
+import { closeAnswered, NeedsYouIssues } from "./needs-you";
 import { recordPluginComment } from "./agent-records";
 import { approvalDecision, CommentRelay, mentionMessage, questionAnswer } from "./relay";
+import { PermissionReplies } from "./permission-replies";
 
 const ME = "user-me";
 const APP = "paseo-app";
@@ -48,7 +49,7 @@ type AgentFixture = { id: string; issueId: string; createdAt: string; updatedAt:
 type Fake = { comments: Record<string, RelayComment[]>; appId: string | null; failRead?: Error | null; failReact?: Error | null };
 
 // A throwaway cursor file per setup; pass `path` to reuse one (a plugin restart).
-function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>, path = join(mkdtempSync(join(tmpdir(), "relay-")), "cursors.json"), needsYou?: NeedsYouIssues) {
+function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>, path = join(mkdtempSync(join(tmpdir(), "relay-")), "cursors.json"), needsYou?: NeedsYouIssues, checked = false) {
   const events: string[] = [];
   const since: string[] = [];
   const reads: number[] = [];
@@ -87,7 +88,22 @@ function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>,
       }),
     },
   } as unknown as PaseoApi;
-  return { relay: new CommentRelay(linear, path, needsYou), paseo, events, since, reads, fake, path };
+  let answerError: Error | null = null;
+  const answers: string[] = [];
+  const replies = new PermissionReplies({ directory: dirname(path), daemon: async () => checked ? {
+    respondToPermissionAndWait: async (agentId, requestId, response) => {
+      if (answerError) throw answerError;
+      events.push(`respond ${agentId} ${requestId} ${JSON.stringify(response)}`);
+    },
+  } : null });
+  replies.recordEffects({
+    ownerAnswered: async (agentId, request, _response, activity) => { answers.push(`${agentId} ${request.id} ${activity.via} ${activity.activityId} ${activity.userId}`); },
+    correctLate: async () => ({ delivered: false, reply: "unused correction" }),
+    needsYou: async (agentId, issueId) => {
+      if (needsYou && (await needsYou.all()).some((entry) => entry.id === issueId && entry.agentId === agentId)) await closeAnswered(needsYou, linear, issueId!);
+    },
+  });
+  return { relay: new CommentRelay(linear, path, needsYou, undefined, replies), paseo, events, since, reads, fake, path, replies, answers, failAnswer: (error: Error) => { answerError = error; } };
 }
 
 const comment = (id: string, body: string, extra: Partial<RelayComment> = {}): RelayComment => ({ id, body, createdAt: `2026-02-01T00:00:0${id.length}Z`, userId: ME, reactions: [], sessionId: null, parent: null, ...extra });
@@ -298,23 +314,71 @@ test("a reaction the key cannot send yet stays queued; the comment is not delive
 test("a reply to a deputy answer corrects that answer, not the newer question pending meanwhile; my answers are recorded as mine", async () => {
   const newer: AgentPermissionRequest = { id: "q2", provider: "omp", name: "ask", kind: "question", title: "Split?", input: { questions: [{ question: "Split the module?", header: "Response", options: [{ label: "Keep" }, { label: "Split" }] }] } };
   const agent = { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", pending: [newer] };
-  const { relay, paseo, events } = setup([agent], { i1: [
+  const { relay, paseo, events, answers } = setup([agent], { i1: [
     comment("c1", "use vitest instead", { parent: { id: "notice-1", userId: APP, sessionId: null } }),
     comment("c22", "override D-0000000f not mine"),
     comment("c333", "Keep"),
-  ] });
+  ] }, undefined, undefined, true);
   const corrections: string[] = [];
-  const answers: string[] = [];
   const applied = { ref: "D-1a2b3c4d", identifier: "TUC-1" } as Candidate;
   relay.recordDeputy({
     noticeFor: async (commentId) => commentId === "notice-1" ? applied : null,
     byRef: async () => null,
     correct: async (candidate, text, activity) => { corrections.push(`${candidate.ref} ${text} ${activity.activityId} ${activity.userId}`); return { delivered: true, reply: "" }; },
-    ownerAnswered: async (agentId, request, _response, activity) => { answers.push(`${agentId} ${request.id} ${activity.via} ${activity.activityId} ${activity.userId}`); },
   });
   await relay.poll(paseo);
   assert.deepEqual(corrections, [`D-1a2b3c4d use vitest instead c1 ${ME}`]);
   assert.deepEqual(answers, [`a q2 linear-comment c333 ${ME}`]);
   assert.deepEqual(events.filter((event) => event.startsWith("respond") || event.startsWith("send")), [`respond a q2 ${JSON.stringify({ behavior: "allow", updatedInput: { answers: { Response: "Keep" } } })}`], "only my plain answer answers the pending question");
   assert.ok(events.includes("react c22 x"), "an override of an unknown deputy answer is refused, not delivered");
+});
+
+test("comment outcomes count only confirmed owners and close Needs you only after delivery", async (t) => {
+  const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ header: "Response", question: "Format?", options: [{ label: "CSV" }] }] } };
+  for (const failure of [null, "No pending permission request with id 'q'", "Timeout waiting for message (60000ms)", "persistSnapshot failed after application"]) {
+    const directory = mkdtempSync(join(tmpdir(), "relay-outcome-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const needsYou = new NeedsYouIssues(directory);
+    await needsYou.add({ id: "sub", identifier: "TUC-2", parentId: "i1", agentId: "a" });
+    const h = setup([{ id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", pending: [question] }], { sub: [comment("c1", "@paseo CSV")] }, join(directory, "cursor.json"), needsYou, true);
+    if (failure) h.failAnswer(new Error(failure));
+    await h.relay.poll(h.paseo);
+    assert.deepEqual(h.answers, failure ? [] : [`a q linear-comment c1 ${ME}`]);
+    assert.deepEqual((await needsYou.all()).map(entry => entry.id), failure ? ["sub"] : []);
+    assert.ok(h.events.includes(`react c1 ${failure ? "x" : "eyes"}`));
+    if (failure) assert.match(h.events.find(event => event.startsWith("comment sub:"))!, failure.startsWith("No pending") ? /Your answer was not delivered:/ : /Paseo could not confirm that your answer reached the agent:/);
+  }
+});
+
+test("a lost cursor after answer, approval or message delivery cannot replay into a new question or message", async (t) => {
+  const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ header: "Response", question: "Format?", options: [{ label: "CSV" }] }] } };
+  for (const kind of ["answer", "approval", "message", "unchecked"] as const) {
+    const directory = mkdtempSync(join(tmpdir(), "relay-replay-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const pending: AgentPermissionRequest[] = kind === "message" ? [] : kind === "approval" ? [{ id: "tool", provider: "omp", name: "bash", kind: "tool" }] : [question];
+    const agent = { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", pending };
+    const comments = { i1: [comment("c1", kind === "approval" ? "@paseo approve" : "@paseo CSV")] };
+    const h = setup([agent], comments, join(directory, "cursor.json"), undefined, kind !== "unchecked");
+    const deliver = h.replies.deliver.bind(h.replies);
+    t.mock.method(h.replies, "deliver", async (...args: Parameters<PermissionReplies["deliver"]>) => {
+      const result = await deliver(...args);
+      mkdirSync(h.path);
+      return result;
+    });
+    await assert.rejects(h.relay.poll(h.paseo));
+    assert.equal(h.events.filter(event => /^(respond|send) /.test(event)).length, 1);
+    assert.equal(h.answers.length, kind === "answer" ? 1 : 0);
+    rmSync(h.path, { recursive: true });
+    agent.pending = [{ ...question, id: "new-question" }];
+    const replay = setup([agent], comments, h.path, undefined, true);
+    await replay.relay.poll(replay.paseo);
+    assert.deepEqual(replay.events, ["react c1 eyes"]);
+    assert.deepEqual(replay.answers, []);
+    // Lose the cursor once more with no pending request: replay must not become a message.
+    rmSync(h.path);
+    agent.pending = [];
+    const again = setup([agent], comments, h.path, undefined, true);
+    await again.relay.poll(again.paseo);
+    assert.deepEqual(again.events, ["react c1 eyes"]);
+  }
 });
