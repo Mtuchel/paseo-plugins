@@ -257,10 +257,10 @@ test("a delegation from someone else is refused; the owner's starts an agent lin
   await mine.cleanup();
 });
 
-test("a project planner is started again with a new agent and thread: its errored thread is closed and its stopped agent archived", async () => {
+test("a stalled ticket is started again with a new agent and thread: its errored thread is closed and its stopped agent archived", async () => {
   const h = harness();
   // TUC-678: the thread whose launch timed out (in error in Linear, no agent), and an older thread
-  // whose agent was closed without a plan.
+  // whose agent was closed.
   await h.store.put(link({ sessionId: "s0", agentId: "agent-old", createdAt: "2025-12-31T00:00:00Z" }));
   await h.store.put(link({ agentId: null }));
   await h.router.restartFor("i1", "TUC-1");
@@ -436,7 +436,7 @@ test("a stopped agent's Resume choice starts its successor and closes the old ag
   await h.cleanup();
 });
 
-test("a plan approved for later offers no Resume when the planner is archived, and any reply starts the implementer", async () => {
+test("a plan approved for later offers no Resume when its agent is archived, and any reply starts the implementer", async () => {
   const h = harness();
   await h.store.put(link({ offer: "later" }));
   await h.router.offerResume("s1");

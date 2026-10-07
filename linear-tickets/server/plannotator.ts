@@ -69,7 +69,7 @@ type Linear = Pick<LinearService, "comment" | "upsertIssueDocument" | "issueDocu
 // What the risk policy made of an opened review: `line` tells the owner, in the panel and on Linear;
 // `reasons` why it needs the owner (empty when approved).
 type Judgement = { approved: boolean; line: string; reasons: string[] };
-type ProjectPlans = Pick<ProjectFlow, "isPlanner" | "applyPlan">;
+type ProjectPlans = Pick<ProjectFlow, "isPlannerRun" | "applyPlan">;
 // Parked plans (README, "Parked plans"): `available` while the central Plannotator host runs;
 // `retire` closes the agent's own review (when it has one) with the reason, stops and archives the agent.
 export type Parking = {
@@ -175,7 +175,7 @@ export class PlannotatorBridge {
   // A decision taken in Linear is also reported by the omp plan extension; the second report
   // within this window is the same decision and is skipped.
   private readonly lastDecision = new Map<string, number>();
-  // A project's planner tickets and their work orders (project-flow.ts).
+  // A project's planner runs and their work orders (project-flow.ts).
   private projectPlans: ProjectPlans | null = null;
   // Files an approved plan's follow-ups (plan-follow-ups.ts); its retries run on this bridge's sweep.
   private followUps: Pick<PlanFollowUps, "file" | "retryPending"> | null = null;
@@ -396,7 +396,7 @@ export class PlannotatorBridge {
   // behalf when its `## Risk and impact` rating is within the threshold, the advisor review the
   // extension recorded is for exactly this text, and nothing about the ticket needs the owner.
   // A plan that came back only for its `## Model` section (README, "Model tiers") keeps the
-  // approval it had when nothing else changed. A project planner's work order never comes here
+  // approval it had when nothing else changed. A planner run's work order never comes here
   // (deliverWorkOrder).
   // null: the plan has no readable rating.
   private async judge(localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
@@ -520,9 +520,19 @@ export class PlannotatorBridge {
     const refreshed = await handle.refresh();
     const labels = refreshed?.agent.labels ?? {};
     const model = activeModel(refreshed?.agent);
+    // A planner run's agent (README, "Projects"): no Linear ticket, and its plan is a work order.
+    const runId = labels["paseo.parent-agent-id"] ? undefined : labels["linear.plannerRun"];
+    if (runId) {
+      if (!this.projectPlans || !await this.projectPlans.isPlannerRun(runId)) {
+        this.settled(agentId);
+        if (event.type === "opened") await this.decide(event.localUrl, true, "This planner run is no longer open. Ignore this work order and stop.");
+        console.log(`[linear-tickets] the obsolete planner run ${runId.slice(0, 8)} report was ignored`);
+        return;
+      }
+      return this.deliverWorkOrder(event, agentId, runId, `planner run ${runId.slice(0, 8)}`, paseo);
+    }
     const issueId = labels["paseo.parent-agent-id"] ? undefined : labels["linear.issueId"];
     const identifier = labels["linear.identifier"] || "this ticket";
-    if (issueId && this.projectPlans && await this.projectPlans.isPlanner(issueId)) return this.deliverWorkOrder(event, agentId, issueId, identifier, paseo);
     if (event.type === "decided" && issueId) await this.logFeedback(agentId, event, { id: issueId, identifier });
     const planText = event.type === "opened" ? await this.fetchPlan(event.localUrl).catch(() => "") : "";
     // A ticket plan without a complete `## Model` section (README, "Model tiers") goes back to its
@@ -612,25 +622,25 @@ export class PlannotatorBridge {
     console.log(`[linear-tickets] ${plan.identifier}: plan parked for the owner (${plan.reasons.join("; ")})`);
   }
 
-  // A project planner's work order needs nobody (README, "Projects"): it only orders the project's
+  // A planner run's work order needs nobody (README, "Projects"): it only orders the project's
   // tickets, each of which plans on its own. It is approved as soon as it is submitted, with no
   // risk check or Linear read that could fail and send it to the owner, and the project flow writes
-  // it into Linear, retrying on later polls. Nothing of a ticket approval (state, plan-ready, a new
+  // it into Linear, retrying on later reads. Nothing of a ticket approval (state, plan-ready, a new
   // agent) applies to it. One whose order cannot be read line by line is sent back to the planner
   // instead, so a broken block never closes as an empty order. A plan that cannot be read is
   // retried and, after that, opens for the owner like any review; their approval then arrives as
   // a `decided` event.
-  private async deliverWorkOrder(event: OpenedEvent | DecidedEvent, agentId: string, issueId: string, identifier: string, paseo: PaseoApi): Promise<void> {
+  private async deliverWorkOrder(event: OpenedEvent | DecidedEvent, agentId: string, runId: string, name: string, paseo: PaseoApi): Promise<void> {
     const settings = await this.settings.read();
     if (event.type === "decided") {
       // A send-back reaches the agent through Plannotator itself; it submits again.
       if (!event.approved) return;
-      if (!event.planContent?.trim()) { console.error(`[linear-tickets] ${identifier}: the approved work order arrived without its text, so it was not written`); return; }
-      await this.applyWorkOrder(issueId, agentId, identifier, event.planContent, paseo, settings);
+      if (!event.planContent?.trim()) { console.error(`[linear-tickets] ${name}: the approved work order arrived without its text, so it was not written`); return; }
+      await this.applyWorkOrder(runId, agentId, name, event.planContent, paseo, settings);
       return;
     }
     const plan = await this.fetchPlan(event.localUrl);
-    if (!plan.trim()) throw new Error(`the work order of ${identifier} could not be read from Plannotator`);
+    if (!plan.trim()) throw new Error(`the work order of ${name} could not be read from Plannotator`);
     const problems = orderProblems(plan);
     if (problems.length) {
       await this.decide(event.localUrl, false, [
@@ -638,19 +648,19 @@ export class PlannotatorBridge {
         problems.map((problem) => `- ${problem}`).join("\n"),
         "The `## Work order` section needs one fenced ```project-order block with one change per line: `TUC-1 blocks TUC-2`, `hold TUC-3: reason`, `release TUC-4`, `attended TUC-5: reason` or `unattended TUC-6`. A reason goes after a colon. An empty block means no changes. Fix the block and submit the plan again.",
       ].join("\n\n"));
-      console.log(`[linear-tickets] ${identifier}: work order sent back to the planner: ${problems.join("; ")}`);
+      console.log(`[linear-tickets] ${name}: work order sent back to the planner: ${problems.join("; ")}`);
       return;
     }
     // The plugin approves it: the extension's report of that approval is not a second decision.
     this.settled(agentId);
     await this.decide(event.localUrl, true, "Work order approved automatically: it only orders the project's tickets, each of which plans on its own. Paseo writes it into Linear; stop now.")
-      .catch((error: unknown) => console.error(`[linear-tickets] ${identifier}: closing the work order's review failed: ${error instanceof Error ? error.message : error}`));
-    await this.applyWorkOrder(issueId, agentId, identifier, plan, paseo, settings);
+      .catch((error: unknown) => console.error(`[linear-tickets] ${name}: closing the work order's review failed: ${error instanceof Error ? error.message : error}`));
+    await this.applyWorkOrder(runId, agentId, name, plan, paseo, settings);
   }
 
-  private async applyWorkOrder(issueId: string, agentId: string, identifier: string, plan: string, paseo: PaseoApi, settings: PluginSettings): Promise<void> {
-    if (await this.projectPlans!.applyPlan(issueId, agentId, plan, paseo, settings)) return;
-    console.error(`[linear-tickets] ${identifier}: the work order was not written: the ticket is no longer its project's open planner`);
+  private async applyWorkOrder(runId: string, agentId: string, name: string, plan: string, paseo: PaseoApi, settings: PluginSettings): Promise<void> {
+    if (await this.projectPlans!.applyPlan(runId, agentId, plan, paseo, settings)) return;
+    console.error(`[linear-tickets] ${name}: the work order was not written: the planner run is no longer open`);
   }
 
   // A parked plan's events, all from the central host: `opened` binds the stable link, inbox and

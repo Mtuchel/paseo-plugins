@@ -48,7 +48,9 @@ async function reusable(path: string, source: string): Promise<boolean> {
 
 // Only the issue id and a path go into the saved agent config; the key is read at call time.
 // The daemon's own runtime avoids the agent's PATH; under Electron it runs as Node only with ELECTRON_RUN_AS_NODE.
-export function ticketMcpServer(scriptPath: string, issueId: string, home = paseoHome(), runtime = daemonRuntime): TicketMcpServer {
-  const server: TicketMcpServer = { type: "stdio", command: runtime.execPath, args: [scriptPath, "--issue", issueId, "--paseo-home", home] };
+// A null issue id launches the same script read-only: it reads any Linear issue and writes nothing.
+export function ticketMcpServer(scriptPath: string, issueId: string | null, home = paseoHome(), runtime = daemonRuntime): TicketMcpServer {
+  const args = issueId === null ? [scriptPath, "--read-only", "--paseo-home", home] : [scriptPath, "--issue", issueId, "--paseo-home", home];
+  const server: TicketMcpServer = { type: "stdio", command: runtime.execPath, args };
   return runtime.electron ? { ...server, env: { ELECTRON_RUN_AS_NODE: "1" } } : server;
 }

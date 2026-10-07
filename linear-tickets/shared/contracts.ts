@@ -313,13 +313,22 @@ export const dispatchStatusRpc = defineRpc({
   output: dispatchStatusSchema,
 });
 
-// Labelled projects (README, "Projects"): how many new tickets wait for a plan, and the planner
-// waiting for the owner's approval, if any.
+// Labelled projects (README, "Projects"): how many new tickets wait for a plan, when the batching
+// rule will start planning them, and the planning run, if one is open.
 export const projectStatusSchema = z.object({
   id: z.string(),
   name: z.string(),
   toPlan: z.number().int(),
-  planner: z.object({ identifier: z.string(), url: z.string(), tickets: z.number().int() }).nullable(),
+  // When the batching rule will start a run; null while one is open or nothing waits.
+  plansAt: z.string().nullable(),
+  planner: z.object({
+    runId: z.string(),
+    agentId: z.string().nullable(),
+    startedAt: z.string().nullable(),
+    tickets: z.number().int(),
+    restarts: z.number().int(),
+    error: z.string().nullable(),
+  }).nullable(),
   readAt: z.string(),
 });
 export type ProjectStatus = z.infer<typeof projectStatusSchema>;
@@ -330,6 +339,11 @@ export const projectsStatusRpc = defineRpc({
 });
 export const planProjectRpc = defineRpc({
   name: "linear.plan-project",
+  input: z.object({ projectId: z.string().min(1).max(200) }),
+  output: projectStatusSchema,
+});
+export const skipPlanRpc = defineRpc({
+  name: "linear.skip-plan",
   input: z.object({ projectId: z.string().min(1).max(200) }),
   output: projectStatusSchema,
 });

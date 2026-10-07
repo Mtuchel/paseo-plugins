@@ -476,6 +476,11 @@ function projectIssue(node: Record<string, unknown>, projectId: string): Project
 export const CREATE_ISSUE_QUERY = `mutation issueCreate($input: IssueCreateInput!) {
   issueCreate(input: $input) { success issue { id identifier url } }
 }`;
+// The project update a run's outcome is posted as (README, "Projects"): one per run, written as
+// the Paseo app, so the project's overview shows how its tickets came to be ordered.
+export const PROJECT_UPDATE_QUERY = `mutation projectUpdate($input: ProjectUpdateCreateInput!) {
+  projectUpdateCreate(input: $input) { success projectUpdate { id url } }
+}`;
 export const DELEGATE_QUERY = `mutation delegate($id: String!, $delegateId: String!) {
   issueUpdate(id: $id, input: { delegateId: $delegateId }) { success }
 }`;
@@ -1155,6 +1160,14 @@ export class LinearService {
     const payload = await this.issuePayload(input);
     const data = this.app ? await this.app.mutate(CREATE_ISSUE_QUERY, { input: payload }) : null;
     return data ? createdIssue(record(data)) : null;
+  }
+
+  // A project update a planner run leaves on its project (README, "Projects"). `atRisk` only for the
+  // notice that asks the owner, so it stands out in Linear's overview; an applied order leaves the
+  // project's health alone. Written like every automated write (as the Paseo app), and the caller
+  // treats a failure as best effort: a lost update never blocks the project.
+  async projectUpdate(projectId: string, body: string, atRisk = false): Promise<void> {
+    succeeded(record(await this.write(PROJECT_UPDATE_QUERY, { input: { projectId, body, ...(atRisk ? { health: "atRisk" } : {}) } })), "projectUpdateCreate", "write the project update");
   }
 
   private async issuePayload(input: CreateIssueInput): Promise<Record<string, unknown>> {

@@ -7,10 +7,22 @@ import { join } from "node:path";
 
 const argv = process.argv.slice(2);
 function arg(name) { const index = argv.indexOf(name); return index >= 0 ? argv[index + 1] : undefined; }
-const issueId = arg("--issue");
 const paseoHome = arg("--paseo-home");
-if (!issueId || !/^[A-Za-z0-9-]{1,100}$/.test(issueId) || !paseoHome) {
-  process.stderr.write("linear-ticket MCP: --issue <id> and --paseo-home <path> are required\n");
+const readOnly = argv.includes("--read-only");
+const issueArg = arg("--issue");
+if (readOnly === argv.includes("--issue")) {
+  process.stderr.write("linear-ticket MCP: pass exactly one of --issue <id> or --read-only, plus --paseo-home <path>\n");
+  process.exit(2);
+}
+if (!paseoHome) {
+  process.stderr.write("linear-ticket MCP: --paseo-home <path> is required\n");
+  process.exit(2);
+}
+// Read-only (a project planner): no ticket, so only the two read tools are mounted, nothing is
+// written and no directory is keyed by an issue id.
+const issueId = readOnly ? null : issueArg;
+if (!readOnly && (!issueId || !/^[A-Za-z0-9-]{1,100}$/.test(issueId))) {
+  process.stderr.write("linear-ticket MCP: --issue <id> must be 1 to 100 characters of letters, digits or dashes\n");
   process.exit(2);
 }
 const override = process.env.LINEAR_TICKET_MCP_ENDPOINT;
@@ -157,12 +169,14 @@ async function recordedManualTasks() {
 
 // Issues this agent created (create_issue), one private file each under the agent's ticket, so
 // parallel calls cannot overwrite each other's record. Recorded issues count as the agent's own:
-// it may edit them. The directory name is the launch's issue ID, checked above.
-const CREATED_DIRECTORY = join(paseoHome, "linear-tickets", "agent-issues", issueId || "none");
+// it may edit them. The directory name is the launch's issue ID, checked above; null in read-only
+// mode, where no ticket exists and it is neither created nor read.
+const CREATED_DIRECTORY = issueId === null ? null : join(paseoHome, "linear-tickets", "agent-issues", issueId);
 // Follow-ups land in Todo and may start agents of their own; the cap stops a runaway chain.
 const MAX_CREATED = 10;
 
 async function createdIssues() {
+  if (CREATED_DIRECTORY === null) return [];
   const names = await readdir(CREATED_DIRECTORY).catch(() => []);
   const records = await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readFile(join(CREATED_DIRECTORY, name), "utf8").then(JSON.parse, () => null)));
   return records.filter((record) => record && typeof record.id === "string" && typeof record.title === "string");
@@ -171,12 +185,13 @@ async function createdIssues() {
 // Comments this agent posted (add_comment, set_status reasons), one private file each like the
 // issues above (format: agent-records.ts). The plugin's comment relay never takes them for the
 // owner's (the key writes them as the owner when the app cannot be used), and the owner's replies
-// to one on another issue reach this agent.
-const COMMENTS_DIRECTORY = join(paseoHome, "linear-tickets", "agent-comments", issueId || "none");
+// to one on another issue reach this agent. Null in read-only mode, where nothing posts.
+const COMMENTS_DIRECTORY = issueId === null ? null : join(paseoHome, "linear-tickets", "agent-comments", issueId);
 
 // Posts and records the comment; null when Linear did not create it. "recorded" false: posted, but
 // the record failed.
 async function postComment(target, body) {
+  if (COMMENTS_DIRECTORY === null) throw new Error("This server is read-only and does not write to Linear.");
   const data = await linear("mutation comment($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id url createdAt } } }", { input: { issueId: target.id, body } });
   const result = data.commentCreate || {};
   if (!result.success || !result.comment || typeof result.comment.id !== "string") return null;
@@ -189,8 +204,10 @@ async function postComment(target, body) {
   }
 }
 
-// "own": the ticket the agent was launched from; "created": an issue it filed; "other": anything else.
+// "own": the ticket the agent was launched from; "created": an issue it filed; "other": anything
+// else; "read_only": no ticket and no writes, so every issue reads the same.
 async function scopeOf(issue) {
+  if (readOnly) return "read_only";
   if (issue.id === issueId || issue.identifier === issueId) return "own";
   return (await createdIssues()).some((record) => record.id === issue.id) ? "created" : "other";
 }
@@ -199,6 +216,7 @@ const ALLOWED = {
   own: ["add_comment", "set_status", "link_url", "add_relation", "add_manual_task"],
   created: ["add_comment", "set_status", "link_url", "add_relation", "update_issue"],
   other: ["add_comment", "add_relation (from your ticket or an issue you created)"],
+  read_only: [],
 };
 
 // The issue a write targets, when the agent may do that there.
@@ -474,6 +492,10 @@ const tools = [
   },
 ];
 
+// Write tools are simply not mounted in read-only mode: tools/call for one answers "Unknown tool",
+// the same as for a name that was never a tool.
+const exposed = readOnly ? tools.filter((tool) => tool.name === "get_issue" || tool.name === "search_issues") : tools;
+
 function send(message) { process.stdout.write(JSON.stringify(message) + "\n"); }
 
 async function handle(message) {
@@ -492,13 +514,15 @@ async function handle(message) {
       protocolVersion: (params && params.protocolVersion) || "2025-06-18",
       capabilities: { tools: {} },
       serverInfo: { name: "linear-ticket", version: "1.0.0" },
-      instructions: "Reads cover any Linear issue. Writes go out as Paseo: comments and relations on any issue; status and links on the ticket this agent was launched from and the issues it created; title and description only on the issues it created.",
+      instructions: readOnly
+        ? "Reads cover any Linear issue: search with search_issues, then open one with get_issue. This server is read-only and writes nothing to Linear."
+        : "Reads cover any Linear issue. Writes go out as Paseo: comments and relations on any issue; status and links on the ticket this agent was launched from and the issues it created; title and description only on the issues it created.",
     });
   }
   if (method === "ping") return reply({});
-  if (method === "tools/list") return reply({ tools: tools.map(({ run, ...tool }) => tool) });
+  if (method === "tools/list") return reply({ tools: exposed.map(({ run, ...tool }) => tool) });
   if (method === "tools/call") {
-    const tool = tools.find((t) => t.name === (params && params.name));
+    const tool = exposed.find((t) => t.name === (params && params.name));
     if (!tool) return fail(-32602, "Unknown tool");
     const args = params && params.arguments;
     if (args !== undefined && (!args || typeof args !== "object" || Array.isArray(args))) return fail(-32602, "arguments must be an object");

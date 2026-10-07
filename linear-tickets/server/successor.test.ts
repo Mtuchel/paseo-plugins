@@ -567,7 +567,7 @@ test("a dispatch paused inside the start holds the ticket's gate: the watch wait
   dispatcher.stop();
 });
 
-// --- AC-16: the project planner restart ---------------------------------------------------------
+// --- AC-16: restarting a stalled ticket (SessionRouter.restartFor) ---------------------------------
 
 test("restartFor refuses while the gate is held and starts nothing behind a live successor", async () => {
   const held = routerHarness();
@@ -580,7 +580,7 @@ test("restartFor refuses while the gate is held and starts nothing behind a live
 
   const live = routerHarness({ agents: [ticketAgent("agent-live", "2026-01-02T00:00:00Z")] });
   assert.deepEqual(await live.router.restartFor(ISSUE.id, ISSUE.identifier), { kind: "live" });
-  assert.equal(live.starts.length, 0, "a live successor is no planner to restart");
+  assert.equal(live.starts.length, 0, "a live successor is no ticket to restart");
   assert.deepEqual(live.calls, []);
   assertGateFree(live.gates);
   await live.cleanup();
@@ -1104,7 +1104,7 @@ test("process inspection failure leaves successor dispatch pending", async () =>
   } finally { await h.cleanup(); }
 });
 
-test("native auto-resume and planner restart wait for terminal processes without consuming a retry", async () => {
+test("native auto-resume and a ticket restart wait for terminal processes without consuming a retry", async () => {
   let output = "2100185 omp --mode rpc-ui\n";
   const inspect = processInspection("");
   inspect.processes = async () => output;
@@ -1125,11 +1125,11 @@ test("native auto-resume and planner restart wait for terminal processes without
   } finally { await h.cleanup(); }
 });
 
-test("a planner restart replaces a root agent that shows running without a process, and keeps one whose process works", async () => {
+test("a ticket restart replaces a root agent that shows running without a process, and keeps one whose process works", async () => {
   let output = `2100185 omp --mode rpc-ui --session ${NATIVE_HANDLE}\n`;
   const inspect = processInspection("", "/repo/other");
   inspect.processes = async () => output;
-  // As the TUC-949 planner stood after the 2026-10-05 daemon crash: running, last updated at the crash.
+  // As a ticket's root agent stood after the 2026-10-05 daemon crash: running, last updated at the crash.
   const h = routerHarness({ agents: [ompRoot("agent-ghost", { status: "running", updatedAt: "2026-01-01T00:09:44Z" })], processInspector: inspect });
   try {
     await h.router.restartFor(ISSUE.id, ISSUE.identifier);

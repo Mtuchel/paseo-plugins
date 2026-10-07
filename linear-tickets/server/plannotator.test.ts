@@ -300,9 +300,9 @@ test("approving a plan files its follow-ups, on the Plannotator page or as a par
   assert.deepEqual(filed, ["issue-1 TUC-25 https://linear.app/doc/1 # Plan A", "issue-1 TUC-25 https://linear.app/doc/1 # Parked plan"]);
 });
 
-test("a project planner's work order is approved on submission and handed to the project flow, without a Linear read that could fail", async () => {
+test("a planner run's work order is approved on submission and handed to the project flow, without a Linear read that could fail", async () => {
   const order = `# Work order\n\n## Work order\n\n\`\`\`project-order\nTUC-12 blocks TUC-15\n\`\`\`\n\n${RISKY(3).replace(/^# Plan\n\n1\. Add the column to the report\.\n\n/, "")}`;
-  const { calls, linear, paseo } = setup({ "linear.issueId": "planner-1", "linear.identifier": "TUC-90" });
+  const { calls, linear, paseo } = setup({ "linear.plannerRun": "run-1" });
   // Linear's hourly limit: the old risk check failed here and parked the work order for the owner.
   linear.issueState = async () => { throw new Error("Linear's hourly request limit is reached"); };
   const decisions: string[] = [];
@@ -314,25 +314,54 @@ test("a project planner's work order is approved on submission and handed to the
     const decide = async (url: string, approve: boolean) => { decisions.push(`${url} ${approve}`); };
     const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => order, undefined, undefined, undefined, decide, undefined, parkingFake(calls).parking);
     bridge.onProjectPlan({
-      isPlanner: async (issueId) => issueId === "planner-1",
-      applyPlan: async (issueId, agentId, plan) => { calls.push(`apply ${issueId} ${agentId} ${plan === order}`); return true; },
+      isPlannerRun: async (runId) => runId === "run-1",
+      applyPlan: async (runId, agentId, plan) => { calls.push(`apply ${runId} ${agentId} ${plan === order}`); return true; },
     });
     bridge.attach(paseo);
     await bridge.drain();
     bridge.stop();
   });
   assert.deepEqual(decisions, ["http://localhost:4000/ true"]);
-  assert.deepEqual(calls, ["apply planner-1 agent-1 true"], "applied once; never parked, and nothing of a ticket approval (state, plan-ready, comments) applies");
+  assert.deepEqual(calls, ["apply run-1 agent-1 true"], "applied once; never parked, and nothing of a ticket approval (state, plan-ready, comments) applies");
+});
+
+test("a work order of a run the flow no longer accepts is reported, not written, and nothing of a ticket review applies", async () => {
+  const order = "```project-order\nTUC-1 blocks TUC-2\n```";
+  const { calls, linear, paseo } = setup({ "linear.plannerRun": "run-1" });
+  await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: null, at: "2026-01-01T10:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => order);
+    bridge.onProjectPlan({ isPlannerRun: async () => true, applyPlan: async () => { calls.push("apply"); return false; } });
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.deepEqual(calls, ["apply"], "the flow rejected the write (the run is already closed)");
+});
+
+test("an obsolete run report is closed without being handed to the owner or written", async () => {
+  const { calls, linear, paseo } = setup({ "linear.plannerRun": "old-run" });
+  const decisions: boolean[] = [];
+  await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: null, at: "2026-01-01T10:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory,
+      undefined, async () => { throw new Error("An obsolete run must not fetch its plan"); },
+      undefined, undefined, undefined, async (_url, approved) => { decisions.push(approved); });
+    bridge.onProjectPlan({ isPlannerRun: async () => false, applyPlan: async () => { calls.push("apply"); return true; } });
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.deepEqual(calls, [], "no owner review, no order write");
+  assert.deepEqual(decisions, [true], "the obsolete review is dismissed so its agent can stop");
 });
 
 test("a work order Paseo cannot read line by line is sent back to the planner, never applied as an empty order", async () => {
   for (const order of ["# Work order\n\nTUC-12 blocks TUC-15", "## Work order\n\n```project-order\nTUC-12 blocks TUC-15 and TUC-16\n```"]) {
-    const { calls, linear, paseo } = setup({ "linear.issueId": "planner-1", "linear.identifier": "TUC-90" });
+    const { calls, linear, paseo } = setup({ "linear.plannerRun": "run-1" });
     const decisions: string[] = [];
     await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" }], async (directory) => {
       const decide = async (url: string, approve: boolean, feedback: string) => { decisions.push(`${approve} ${feedback.split("\n\n")[1]}`); };
       const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => order, undefined, undefined, undefined, decide, undefined, parkingFake(calls).parking);
-      bridge.onProjectPlan({ isPlanner: async () => true, applyPlan: async () => { calls.push("apply"); return true; } });
+      bridge.onProjectPlan({ isPlannerRun: async () => true, applyPlan: async () => { calls.push("apply"); return true; } });
       bridge.attach(paseo);
       await bridge.drain();
       bridge.stop();

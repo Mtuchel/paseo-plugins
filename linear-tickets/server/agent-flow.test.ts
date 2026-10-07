@@ -13,8 +13,8 @@ import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHD
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { approveForLater, splitIntoSubIssues } from "./split";
 import { AWAY_REASON } from "./scheduler";
-import { advisorNote, isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, TicketStarter, QUESTIONS_NOTE, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
-import { planPolicy } from "./plan-policy";
+import { isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
+import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, planPolicy } from "./plan-policy";
 import { ReviewDeletions } from "./review-deletions";
 import { WatchdogStore } from "./watchdog";
 
@@ -540,18 +540,6 @@ test("an agent waiting for the owner's answer or approval frees its slot; one at
   assert.match((await working.starter.admission("i1", busy, settings) as { reason: string }).reason, /Queued: 2 of 2/);
 });
 
-test("a project planner starts even when every agent slot is taken, also under a memory lease of 0", async () => {
-  const planner = { creatorId: APP, labels: [{ id: "p", name: "paseo-planner" }], blockedBy: [] };
-  const full = starterHarness(planner, 2);
-  assert.deepEqual(await full.starter.admission("i1", full.paseo, settings), { ok: true }, "2 of 2 slots used");
-  const leased = starterHarness(planner, 2);
-  leased.starter.capacity.set({ limit: 0, ttlSeconds: 60, reason: "low memory" });
-  assert.deepEqual(await leased.starter.admission("i1", leased.paseo, settings), { ok: true }, "a lease of 0 starts nothing else");
-  const ticket = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
-  ticket.starter.capacity.set({ limit: 0, ttlSeconds: 60, reason: "low memory" });
-  assert.match((await ticket.starter.admission("i1", ticket.paseo, settings) as { reason: string }).reason, /RAM-limited/);
-});
-
 test("while the owner is away, only the implementation of an attended ticket waits; planning never does, even with no agent limit", async () => {
   const unlimited = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 0 } };
   const approved = starterHarness({ creatorId: OWNER, labels: [{ id: "l1", name: "paseo-attended" }, { id: "r", name: "plan-ready" }], blockedBy: [] }, 0, APP, true);
@@ -611,12 +599,6 @@ test("a plan starts in the provider's safe mode, and not in progress", async () 
   const started = await h.starter.start("i1", h.paseo, { ...settings, markInProgress: true, lastProvider: "claude", launchPreferences: { claude: { model: "claude/opus", modeId: "default" } } }, { retryHint: "retry" });
   assert.deepEqual({ untrusted: started.untrusted, plan: started.plan }, { untrusted: false, plan: "required" });
   assert.deepEqual(h.launches[0], { provider: "claude/opus", thinkingOptionId: undefined, modeId: "plan", instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("claude")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
-});
-
-test("a project's planner gets no ticket overlap or model note: its work order picks no tier", async () => {
-  const h = starterHarness({ creatorId: APP, labels: [{ id: "p", name: "paseo-planner" }], blockedBy: [] }, 0);
-  await h.starter.start("i1", h.paseo, settings, { retryHint: "retry" });
-  assert.deepEqual(h.launches[0].instructions, `${PLAN_REQUIRED_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`);
 });
 
 test("a plan-first ticket is not marked in progress; once its plan is approved (plan-ready) the next agent implements it in the usual mode", async () => {
