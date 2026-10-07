@@ -54,6 +54,8 @@ export type InboxRow = {
   approved?: boolean;
   applyError?: string;
   nextAttemptAt?: string;
+  // An unconfirmed decision Plannotator can no longer confirm: the owner carries it out or drops it.
+  ownerNeeded?: boolean;
 };
 // `unreachable`: peers whose inbox did not answer, so their reviews are missing.
 export type InboxView = { open: InboxRow[]; decided: InboxRow[]; applying: InboxRow[]; unreachable: string[]; hosts: string[]; push: boolean; pipeline?: PipelineHost[] };
@@ -315,14 +317,17 @@ function applyChip(row: InboxRow): string {
   }
 }
 
-// What the owner may do about a "Being applied" row: a decision the journal is unsure about is
-// carried out or dropped, a conflict keeps this decision or the other one; once the accepted one
-// went through anyway, only Dismiss remains. Buttons post /resolve like the decision buttons.
+// What the owner may do about a "Being applied" row: a decision Plannotator can no longer confirm,
+// or a report not matched to a review, is carried out or dropped; a conflict keeps this decision
+// or the other one; once the accepted one went through anyway, only Dismiss remains. An
+// unconfirmed decision still being sent again has no buttons. Buttons post /resolve like the
+// decision buttons.
 function applyActions(row: InboxRow): string {
   const button = (action: string, label: string, tone = "") => `<button type="button"${tone} data-act="resolve" data-entry="${escapeHtml(row.entryId ?? "")}" data-action="${action}">${label}</button>`;
+  const carryOrDrop = `<span class="acts">${button("carry-out", "Carry it out", " class=\"approve\"")}${button("drop", "Drop it", " class=\"danger\"")}</span>`;
   switch (row.applyState) {
-    case "uncertain":
-    case "unbound": return `<span class="acts">${button("carry-out", "Carry it out", " class=\"approve\"")}${button("drop", "Drop it", " class=\"danger\"")}</span>`;
+    case "uncertain": return row.ownerNeeded ? carryOrDrop : "";
+    case "unbound": return carryOrDrop;
     case "conflict": return `<span class="acts">${button("keep", "Keep this one")}${button("other", "Carry out the other")}</span>`;
     case "conflict-applied": return `<span class="acts">${button("dismiss", "Dismiss", " class=\"approve\"")}</span>`;
     default: return "";
@@ -330,10 +335,13 @@ function applyActions(row: InboxRow): string {
 }
 
 function applyingRow(row: InboxRow, now: Date, dates: Dates, multiHost: boolean): string {
-  // Pending rows say what carrying the decision out is doing; the other kinds wait for the owner.
+  // Pending rows say what carrying the decision out is doing; an unconfirmed one why it is not
+  // carried out yet; the other kinds wait for the owner.
   const line = row.applyState === "pending"
     ? `<p class="why">${row.applyError ? `Last try failed: ${escapeHtml(row.applyError)}${row.nextAttemptAt ? ` · next try ${dates.clock.format(new Date(row.nextAttemptAt))}` : ""}` : "Applying…"}</p>`
-    : "";
+    : row.applyState === "uncertain"
+      ? `<p class="why">${row.ownerNeeded && row.applyError ? escapeHtml(row.applyError) : "Sending it to Plannotator again; it is carried out once Plannotator confirms it."}</p>`
+      : "";
   const tone = row.applyState === "pending" || row.applyState === "uncertain" ? (row.approved === false ? " back" : " approved") : "";
   const extra = facts(row, multiHost);
   const actions = applyActions(row);

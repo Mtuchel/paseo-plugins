@@ -1196,21 +1196,21 @@ export class PlannotatorBridge {
     const now = this.journal.now();
     if (now - (this.rechecked.get(attempt.id) ?? Number.NEGATIVE_INFINITY) < RECHECK_MS) return;
     this.rechecked.set(attempt.id, now);
-    const note = async (text: string) => {
-      const current = this.journal.attempt(attempt.id);
-      if (current?.state === "uncertain" && current.lastError !== text) await this.journal.later(current, now, text);
-    };
+    // Plannotator can no longer confirm the decision: it waits for the owner (Carry it out / Drop it).
+    const owner = (text: string) => this.journal.awaitOwner(attempt.id, true, text);
     try {
       await this.journal.run(async () => {
         const review = this.journal.review(attempt.reviewId);
-        if (!review || review.legacy) { await note("Plannotator did not confirm this decision: carry it out or drop it."); return; }
+        if (!review || review.legacy) { await owner("Plannotator did not confirm this decision: carry it out or drop it."); return; }
         // Plannotator reuses ports: a newer review on the address is not this one.
         const reused = this.journal.all().some((entry) => entry.kind === "review" && entry.localUrl === review.localUrl && entry.openedAt > review.openedAt);
         const outcome = await this.outcomes({ localUrl: review.localUrl, openedAt: review.openedAt, planHash: review.planHash ?? attempt.planHash }, !reused);
         if (outcome && typeof outcome === "object") { await this.journal.evidence(attempt.id, outcome.approved, `saved-${review.id}`); return; }
-        if (outcome !== "open") { await note("Plannotator closed the review without a decision Paseo can find: carry it out or drop it."); return; }
+        if (outcome !== "open") { await owner("Plannotator closed the review without a decision Paseo can find: carry it out or drop it."); return; }
         const shown = await this.fetchPlan(review.localUrl).catch(() => "");
-        if (!shown.trim() || planHash(shown) !== attempt.planHash) { await note("The review's address shows another plan now: carry it out or drop it."); return; }
+        if (!shown.trim() || planHash(shown) !== attempt.planHash) { await owner("The review's address shows another plan now: carry it out or drop it."); return; }
+        // Still open with this plan: sent again, so it is not the owner's to settle.
+        await this.journal.awaitOwner(attempt.id, false);
         try {
           await this.decide(review.localUrl, attempt.transport, attempt.feedback ?? "");
           await this.journal.settle(attempt.id, "accepted");

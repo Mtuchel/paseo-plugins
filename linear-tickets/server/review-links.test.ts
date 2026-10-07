@@ -844,6 +844,7 @@ test("a decision being applied shows its last failure and next try, an unconfirm
     await journal.failed(pending, new Error("Linear is down"));
     const lost = await journal.begin({ review: second, agentId: "agent-2", planContent: "# TUC-2\n", approved: false, source: "inbox", state: "deciding", snapshot: SNAPSHOT });
     await journal.settle(lost.id, "unknown");
+    await journal.awaitOwner(lost.id, true, "Plannotator did not confirm this decision: carry it out or drop it.");
     await withLinks(async (links, get, live) => {
       live.add(50_001).add(50_002);
       await links.opened("agent-1", opened(50_001), { identifier: "TUC-1", reviewId: first.id });
@@ -965,6 +966,18 @@ test("the owner carries out or drops an unconfirmed decision, and a stale answer
       await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, { identifier: "TUC-2", reviewId: second.id });
       assert.equal((await action(links, "/api/reviews/agent-1/resolve", { entryId: carry.id, action: "carry-out" }, {})).status, 403, "resolving needs the inbox's own header");
       assert.equal((await action(links, "/api/reviews/agent-1/resolve", { entryId: carry.id, action: "explode" })).status, 400, "only the five actions");
+      // While Plannotator may still confirm it, the decision is sent again, not the owner's to settle.
+      const early = await action(links, "/api/reviews/agent-1/resolve", { entryId: carry.id, action: "carry-out" });
+      assert.equal(early.status, 409);
+      assert.equal(journal.attempt(carry.id)?.state, "uncertain");
+      const button = `data-entry="${carry.id}" data-action="carry-out"`;
+      const sending = await (await get("/")).text();
+      assert.ok(!sending.includes(button) && sending.includes("Sending it to Plannotator again"), "no buttons while it is sent again");
+      await journal.awaitOwner(carry.id, true, "Plannotator did not confirm this decision: carry it out or drop it.");
+      await journal.awaitOwner(drop.id, true, "Plannotator did not confirm this decision: carry it out or drop it.");
+      const waiting = await (await get("/")).text();
+      assert.ok(waiting.includes(button) && waiting.includes("Plannotator did not confirm this decision"), "the owner's buttons once Plannotator cannot confirm it");
+      calls.length = 0;
       assert.equal((await action(links, "/api/reviews/agent-1/resolve", { entryId: carry.id, action: "carry-out" })).status, 200);
       assert.deepEqual(calls, [[carry.id, "carry-out"]]);
       assert.equal(journal.attempt(carry.id)?.state, "pending", "carrying it out accepts the decision");

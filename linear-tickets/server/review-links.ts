@@ -185,6 +185,7 @@ const PeerRow = z.object({
   approved: z.boolean().optional(),
   applyError: text(500).optional(),
   nextAttemptAt: text(40).refine((value) => !Number.isNaN(Date.parse(value))).optional(),
+  ownerNeeded: z.boolean().optional(),
 });
 const PeerInbox = z.object({ host: text(100), open: z.array(z.unknown()), decided: z.array(z.unknown()), applying: z.array(z.unknown()).optional(), pipeline: z.unknown().optional() });
 const DecisionRequest = z.object({ approve: z.boolean(), feedback: z.string().optional() });
@@ -883,6 +884,11 @@ export class ReviewLinks {
         ...(journal.kind === "attempt" && journal.state === "pending" ? {
           ...(journal.lastError ? { applyError: journal.lastError.slice(0, 500) } : {}),
           ...(journal.nextAttemptAt ? { nextAttemptAt: journal.nextAttemptAt } : {}),
+        } : {}),
+        // An unconfirmed decision gets its buttons only once Plannotator can no longer confirm it.
+        ...(journal.kind === "attempt" && journal.state === "uncertain" ? {
+          ...(journal.lastError ? { applyError: journal.lastError.slice(0, 500) } : {}),
+          ...(journal.waitsForOwner ? { ownerNeeded: true } : {}),
         } : {}),
       } : {}),
     };

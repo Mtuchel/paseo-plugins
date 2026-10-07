@@ -809,10 +809,11 @@ Your decision there, or **Approve plan** / **Send back** in the panel:
   Paseo again);
 - send back: the plan document with your feedback, and a fresh agent that plans again from it.
 
-Plans stay parked across plugin and host restarts, and until your decision has been handed on:
-when Linear fails (an outage, the hourly request limit), the decision is retried every few seconds
-for about a minute, then once a minute until it goes through; it is never dropped, and the host
-does not serve that plan again meanwhile, even after a restart. The host needs
+Plans stay parked across plugin and host restarts, and until your decision has been carried out
+(see **Decision journal** below): when Linear fails (an outage, the hourly request limit), the
+decision is retried every few seconds for about a minute, then once a minute until it goes
+through; it is never dropped, and the host does not serve that plan again meanwhile, even after a
+restart (it reads the journal on every sweep). The host needs
 Bun (`~/.bun/bin/bun`, Homebrew or `LINEAR_TICKETS_BUN`) and the Plannotator omp plugin
 (`~/.omp/plugins/node_modules/@plannotator/pi-extension`, or `LINEAR_TICKETS_PLANNOTATOR_PACKAGE`);
 without them plans are not parked and their agents wait for you as before.
@@ -835,6 +836,38 @@ text after the plan was parked (a planner resumed for that, e.g. one whose sessi
 `record_plan_advice`): within your threshold it is approved like your approval above, otherwise it
 stays parked with the new reasons in the inbox. The planner is retired again either way.
 
+**Decision journal.** Every decision on a plan — yours in the review inbox, on Plannotator's page
+(an agent's own review or a parked plan), **Approve plan** / **Approve, implement later** /
+**Approve & split** / **Send back** in the panel, and the risk policy's approvals — is written to
+`$PASEO_HOME/linear-tickets/plannotator/decisions/` (one private file per entry) before anything
+is done about it, also when it carries no note. An entry names the agent, the ticket, the exact
+review it was taken on (its server's address and the time it opened, since Plannotator reuses
+ports), the plan's hash and text, approve or send back, your note and where it came from. A
+worker carries it out step by step (chat row, ticket state, labels, plan document, follow-ups,
+comment, queueing the next agent, …) and records each step, so after a failure, a plugin reload
+or a daemon restart it continues where it stopped instead of starting over. Comments, panel
+replies, sub-issues and follow-up tickets get their Linear id before they are sent and are looked
+up by it before any retry, so a write whose answer was lost is never made twice. Failed steps are
+retried every 3 seconds for a minute, then once a minute, without giving up; a ticket's decisions
+are carried out in the order they were taken. Only one decision is accepted per review: a second
+click on a plan whose decision is being applied answers `Already decided; it is being applied.`,
+while a click Plannotator refused does not count and the plan stays decidable. While the plugin
+reloads, it first stops taking decisions (the inbox and panel answer `The plugin is restarting;
+try again in a few seconds.`), lets every running step finish, and only then hands the journal to
+the new instance. The plugin's own closings of a review (retiring a planner, sending a plan back
+for its `## Model` section, approving a project work order, the send-back with which **Approve,
+implement later** and **Approve & split** close Plannotator) are journaled too, so their echo is
+never taken for your decision. Plannotator's answer can be lost (the connection broke after the
+request was sent): the decision then counts as not confirmed, is sent again while the review is
+still open, and is carried out once Plannotator confirms it; if the review is gone without a
+saved outcome, it waits for you (**Carry it out** / **Drop it** in the inbox). The same applies
+to a report the plugin cannot tie to one plan, and to Plannotator reporting the opposite of a
+decision not yet carried out (**Keep this one** / **Carry out the other**). Settled entries are
+kept for 60 days. Two limits: a decision on Plannotator's page is protected once Plannotator's omp
+extension has written its report, and the "Plan approved" chat row in Paseo can appear twice if
+the plugin dies right after posting it. To roll back the journal, revert the change only while
+the inbox's **Being applied** is empty.
+
 **Plan follow-ups.** When a ticket plan is approved, by you on Plannotator's page, by **Approve
 plan**, **Approve, implement later** or **Approve & split** in the panel, as a parked plan or by
 the risk policy, every `follow-up — <title>` line of its `## Reach` and `## Principles and rules`
@@ -846,10 +879,11 @@ the comment says so ("file them by hand or approve again later"). For a ticket s
 or one labelled `feedback`, nothing is filed; the comment lists the titles for you instead. Paseo
 keeps what it filed per ticket in `$PASEO_HOME/linear-tickets/plan-follow-ups/<issue>.json`, so a
 repeated approval files nothing twice, and a ticket filed but not yet linked is only linked on the
-next try. Linear failures are retried every 10 minutes, at most five times (the trust check is
-repeated before each pending creation), then listed for you in the comment. A duplicate is still
-possible in one case: Linear created the ticket but its answer was lost on the way back. A planner
-run's work order files nothing.
+next try. Linear failures are retried every 10 minutes until every item is filed (the trust check
+is repeated before each pending creation); the approval counts as carried out only once they are.
+Each ticket and the comment get their Linear id before they are sent, so a retry whose first
+answer was lost finds them instead of filing a second one. A planner run's work order files
+nothing.
 
 **The omp extension.** The planning phase and the plan advisor gate come from
 [`omp/linear-tickets-plan-first.ts`](omp/linear-tickets-plan-first.ts), which omp loads from its
@@ -883,7 +917,10 @@ again.
 **Approve, implement later.** The plan review also offers **Approve, implement later**. The
 plan is saved as the plan document, the planning agent is closed (no Resume offer), and the
 ticket goes back to Todo with `plan-ready`. Reply in the panel, assign Paseo again or add the
-trigger label to start the implementing agent.
+trigger label to start the implementing agent. Like **Approve & split**, it is journaled first
+(see **Decision journal**): if a step fails, the panel answers `Approved — being applied:
+<reason>. Retried every minute until it goes through.` and the rest follows on its own, without a
+second set of sub-issues, follow-up tickets or agents.
 
 **Link to the agent.** Each ticket gets an attachment "Paseo agent · <agent title>" next to its
 pull requests, linking to the agent in the Paseo web app (app.paseo.sh opens it on devices paired
@@ -1824,6 +1861,20 @@ host it runs on when the inbox lists several. Decided rows keep the title and th
 (plans that predate the rating have no badge). The page refreshes in place every 30 s and when
 you return to it, keeping your scroll position and search (not while you are writing a note);
 when the host cannot be reached it says so and keeps retrying.
+
+A review you decided stays out of **Recently decided** until the decision journal (see
+**Decision journal**) carried it out: until then it is listed under **Being applied**, between
+the waiting reviews and the decided ones, with `approved — being applied` or `sent back — being
+applied` and below it `Applying…`, or after a failure `Last try failed: <reason> · next try
+<time>`. The review's own link (`/review/<agent>`) says the same. A decision Plannotator did not
+confirm shows `not confirmed by Plannotator`; while its review is still open with the same plan
+the plugin sends it again (`Sending it to Plannotator again…`, no buttons). Once the review is
+gone or closed without a saved outcome, or its address shows another plan, it gets **Carry it
+out** and **Drop it** with the reason, as does a `report not matched to a review`;
+`conflicting decisions` gets **Keep this one** and **Carry out the other**, and a conflict found
+after the decision was carried out gets **Dismiss**. A record the plugin cannot read shows as
+`Unreadable decision record <file>` and is kept on disk. Rows from peer hosts carry their host,
+and their buttons are forwarded to it.
 
 - **Plan pipeline** shows preparing, advisor review, publishing, ready, and any queued or
   owner-waiting plans above the review queue. Expand **Pipeline details** for **On the way**,

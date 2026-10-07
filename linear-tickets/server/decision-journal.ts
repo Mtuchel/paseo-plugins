@@ -84,6 +84,9 @@ export type DecisionAttempt = {
   attempts: number;
   lastError?: string;
   nextAttemptAt?: string;
+  // An uncertain decision Plannotator can no longer confirm (its review is gone or shows another
+  // plan): only the owner settles it (Carry it out / Drop it).
+  waitsForOwner?: boolean;
   appliedAt?: string;
   voidReason?: string;
   // An unresolved conflict that holds this attempt.
@@ -504,6 +507,7 @@ export class DecisionJournal {
       const current = this.entries.get(entryId)!;
       if (current.kind === "attempt") {
         if (current.state !== "uncertain" || action !== "carry-out" && action !== "drop") throw new StaleResolutionError("That decision changed meanwhile; reload the inbox.");
+        if (!current.waitsForOwner) throw new StaleResolutionError("Paseo is still sending that decision to Plannotator; it waits for you only once Plannotator can no longer confirm it.");
         if (action === "carry-out") await this.accept({ ...current, lastError: undefined });
         else await this.write({ ...current, state: "void", voidReason: "Dropped by the owner." });
         return;
@@ -563,6 +567,19 @@ export class DecisionJournal {
   async later(attempt: DecisionAttempt, at: number, reason: string): Promise<DecisionAttempt> {
     const current = this.attempt(attempt.id) ?? attempt;
     return this.write({ ...current, lastError: reason, nextAttemptAt: new Date(at).toISOString() });
+  }
+
+  // Whether an uncertain decision waits for the owner (Plannotator can no longer confirm it) or is
+  // still being sent again; written only when that changes.
+  async awaitOwner(attemptId: string, waits: boolean, reason?: string): Promise<void> {
+    const attempt = this.attempt(attemptId);
+    if (!attempt) return;
+    await this.withReview(attempt.reviewId, async () => {
+      const current = this.attempt(attemptId)!;
+      if (current.state !== "uncertain") return;
+      if (Boolean(current.waitsForOwner) === waits && (!reason || current.lastError === reason)) return;
+      await this.write({ ...current, waitsForOwner: waits || undefined, ...(reason ? { lastError: reason } : {}) });
+    });
   }
 
   async applied(attempt: DecisionAttempt): Promise<DecisionAttempt> {
@@ -664,7 +681,7 @@ export class DecisionJournal {
   }
 
   private accept(attempt: DecisionAttempt): Promise<DecisionAttempt> {
-    return this.write({ ...attempt, state: "pending", acceptedAt: attempt.acceptedAt ?? new Date(this.now()).toISOString(), lastError: undefined, nextAttemptAt: undefined });
+    return this.write({ ...attempt, state: "pending", acceptedAt: attempt.acceptedAt ?? new Date(this.now()).toISOString(), lastError: undefined, nextAttemptAt: undefined, waitsForOwner: undefined });
   }
 
   private assertHeld(): void {
