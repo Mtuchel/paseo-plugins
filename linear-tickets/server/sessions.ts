@@ -71,6 +71,10 @@ export function crashResume(error: string, next: string): string {
 // or approval, so nothing was sent; unlike `busy` it does not end by itself (README, "Stalled pull
 // requests").
 export type PromptOutcome = "sent" | "restarted" | "reloaded" | "crashed" | "busy" | "waiting" | "gone" | "unavailable";
+// Which host owns a ticket's automatic work (see Deps.owner).
+export type HostOwnership = "here" | "elsewhere" | "unknown";
+// What SessionRouter.whileIdle came to: `ran` with the work's value, or why the work did not run.
+export type IdleRun<T> = { outcome: "ran"; value: T } | { outcome: "busy" | "waiting" | "elsewhere" | "unavailable" };
 // What a successor start for a gone agent (SessionRouter.succeed) came to. `started`: a new agent
 // runs with the message as the last part of its first prompt. `live`: another live agent of the
 // ticket now owns its record and takes the message from the next poll. `wait`: nothing claimed, try
@@ -359,6 +363,9 @@ type Deps = {
   watchdog?: Pick<WatchdogStore, "hold" | "continued">;
   // How a bounded wait for a stopped turn pauses between reads; the tests inject one.
   sleep?: (ms: number) => Promise<void>;
+  // Whether this host owns the ticket's automatic work (activation.ts claims, read only): `here`,
+  // `elsewhere` (the peer host does), or `unknown` (its state is unreadable). Absent: here.
+  owner?: (issueId: string) => Promise<HostOwnership>;
 };
 
 // How long a watchdog Stop waits for the turn to end before it counts as failed.
@@ -1347,6 +1354,46 @@ export class SessionRouter {
     } catch {
       return "the OMP workers for this ticket could not be inspected";
     }
+  }
+
+  // Runs `work` only while no agent of the ticket works, in the ticket's turn with its start gate
+  // held: every agent of the ticket (successors and subagents too) is read, and `work` runs when
+  // each is idle, closed, crashed or gone and no OMP worker process of the ticket lives (or is
+  // unobservable). Otherwise it does not run: `busy` (an agent is in a turn, a launch is under way,
+  // or a worker process lives), `waiting` (an agent waits for the owner's answer), `elsewhere`
+  // (the peer host owns the ticket's work), `unavailable` (Paseo is not connected, the ticket is
+  // being deleted, or its agents or owner cannot be read). It reads only: nothing is forwarded or
+  // started. A turn the owner starts directly does not take the gate, so it is not serialized.
+  async whileIdle<T>(issueId: string, work: () => Promise<T>): Promise<IdleRun<T>> {
+    if (!this.paseo) return { outcome: "unavailable" };
+    return this.exclusive(issueId, async (): Promise<IdleRun<T>> => {
+      const unreadable = (error: unknown): IdleRun<T> => {
+        console.error(`[linear-tickets] reading whether an agent of ${issueId} works failed: ${error instanceof Error ? error.message : error}`);
+        return { outcome: "unavailable" };
+      };
+      try {
+        if (await this.deps.deletions?.blocked(issueId)) return { outcome: "unavailable" };
+        const owner = this.deps.owner ? await this.deps.owner(issueId) : "here";
+        if (owner !== "here") return { outcome: owner === "elsewhere" ? "elsewhere" : "unavailable" };
+      } catch (error) {
+        return unreadable(error);
+      }
+      const gate = this.deps.launcher.gate(issueId);
+      if (!gate) return { outcome: "busy" };
+      try {
+        let agents: PaseoAgent[];
+        try {
+          agents = await issueAgents(this.paseo!, issueId);
+        } catch (error) {
+          return unreadable(error);
+        }
+        if (agents.some((agent) => agent.pendingPermissions?.length)) return { outcome: "waiting" };
+        if (agents.some(busy) || await this.processWait(issueId, agents)) return { outcome: "busy" };
+        return { outcome: "ran", value: await work() };
+      } finally {
+        gate.release();
+      }
+    });
   }
 
   async say(sessionId: string, type: "thought" | "response" | "error", body: string, ephemeral = false): Promise<void> {

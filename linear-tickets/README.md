@@ -1236,6 +1236,8 @@ with the poll:
    A worker's stale branch, unpublished commits, dirty files or changed Graphite parents cannot
    block this enqueue and are never overwritten. The expected-head, author, veto, main-health,
    queue-conflict and gate checks still apply.
+5. Open stacks stranded on an orphaned `graphite-base/<n>` branch are moved onto `main` (see
+   "Stranded stacks" below), only when the checkout's `main` has `tools/ci/retarget-orphan.mjs`.
 
 Every enqueue is an action (`drop:<drop key>:<top>`, since one queue draft can test several
 stacks, or `ready:<top>@<heads>`) saved in `pr-watch.json` before each step: the number and last
@@ -1273,6 +1275,37 @@ the backstop still delivers the repair to that ticket's agent through the same c
 recovery path. Busy agents keep their requests pending across restarts; in-flight claims prevent
 duplicate sends. Owner fallback is reserved for escalation or a missing/unrecoverable agent record.
 
+**Stranded stacks.** When the bottom of a stack lands, Graphite sometimes leaves the pull request
+above it based on a helper branch `graphite-base/<n>` that no open pull request owns; it cannot
+reach the merge queue until it is moved onto `main` (the ops digest's "base branch
+graphite-base/N has no open PR"). The repo's `tools/ci/retarget-orphan.mjs` decides and writes,
+always in a fresh private clone like the enqueue: `--list` names such stacks and whether each may
+move (the pull request below demonstrably landed on `main`; one linear stack; every pull request
+the shared login's own, none `do-not-merge`), `--prepare <pr> --expect <heads> --stamp <unix>`
+computes the new heads without writing (a conflict with `main` is reported, nothing else), and
+`--apply <pr> --record <file>` pushes every branch at once with explicit leases and points the
+bottom pull request at `main`, or finishes or refuses by exact SHAs when it ran before. The
+plugin moves a stack only when it names exactly one ticket and nothing holds it back (escalated,
+blocked at its head, a message about it pending that is not its own, open before-merge manual
+tasks), at most three per run, and only while no agent of the ticket works and this host owns
+the ticket (`SessionRouter.whileIdle`: every agent of the ticket idle, closed or gone, no OMP
+worker process left, the activation claims read without forwarding anything: a draining host
+owns only the roots it still runs, a receiving host with a peer only after the claims handshake
+and while the peer claims none). The move is saved on the bottom pull request in `pr-watch.json`
+before each step: the preparation (old and new heads, `onto`, stamp) before anything is written,
+`applying` right before `--apply`, which a restart runs again with the saved record, never a new
+listing. Moved: a comment on the bottom pull request (marked
+`<!-- queue-backstop:retarget:<pr>@<old bottom head> -->`) and on the ticket with old and new
+base and every head plus the agent's local sync commands, each claimed before it goes out and
+found by its marker after a restart (at least once, never twice while the marker reads), then the
+same as a note to a living agent, at most once. While an agent of the ticket works or waits for
+the owner, the agent is asked once to move the stack by hand, and a later run moves it once no
+agent works (an instruction that had not gone out yet is dropped). A conflict, a stack of several
+tickets (to the bottom ticket's agent) and a stack that changed while it was moved go to the
+agent like a drop: a successor when it is gone, the ticket when none can start. A turn the owner
+starts directly is not serialized with a move; the leases keep the push safe, the final base
+change has no compare-and-swap.
+
 The poll and backstop also recover a missing handover PR link before deciding the ticket's next
 step. They identify the repository from the recorded worktree's validated GitHub origin, or
 from canonical PR attachments on the ticket when that source is unavailable. Conflicting
@@ -1297,11 +1330,12 @@ onto a deleted base). For a ticket's pull request closed without merging, the pl
 an open pull request from the same branch in the repo's open pull requests on every poll; when
 there is one, the ticket links it, the agent panel and the handover record point at it, and the
 plugin watches it from the next poll. Without one, the closure is looked at once: when the base
-branch is gone, the agent is told once to replay the rest of its stack onto
-main from the landed branch (`git fetch origin main && git rebase --update-refs --onto
-origin/main <landed branch>` on the top branch), `git push --force-with-lease` each replayed
-branch, open a new pull request onto main whose body links the old one, and `gt track <branch>
---parent main`. It is claimed and delivered like a nudge; a gone or archived agent's message
+branch is gone, the agent is told once, as one `sh` block on the top branch of its stack, to
+replay the rest of its stack onto main from the landed branch (`git rebase --update-refs --onto
+origin/main <landed branch>`), `git push --force-with-lease` each replayed branch, open a new
+pull request onto main whose body links the old one, and `gt track <branch> --parent main`; the
+same builder writes the open stranded stack's instruction above. It is claimed and delivered like
+a nudge; a gone or archived agent's message
 starts a successor or, when none can, goes to the ticket. After that request an archived agent's
 closed pull request stays watched for its
 replacement until 14 days pass without activity.

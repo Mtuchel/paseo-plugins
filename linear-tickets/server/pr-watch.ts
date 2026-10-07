@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
@@ -15,9 +16,10 @@ import { STAGE_STEP, stalledStage, type ReviewThread, type Stage } from "./pr-nu
 // `activityBullets` back from here) is resolved at call time, never at module load.
 import { ghGet, type RestGet, type RestResponse } from "./pull-requests";
 import {
-  activityBoundary, BACKSTOP_ENQUEUE, BackstopCheckout, CLASS_TEXT, commentOnce, dropWhy, ENQUEUE_READY, enqueueArgs, enqueuedComment, HELD_KINDS, parseEnqueue, parseExpect, parseJudgment, parseReady,
-  READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, originRepo, runGit, runIsolatedEnqueue, runNodeScript, ticketMarker, WAIT_QUEUE, waitQueueArgs,
-  type ActionRecord, type DropClass, type DropJudgment, type GitRunner, type Problem, type Refusal, type ScriptRunner,
+  activityBoundary, BACKSTOP_ENQUEUE, BackstopCheckout, CLASS_TEXT, commentOnce, dropWhy, ENQUEUE_READY, enqueueArgs, enqueuedComment, HELD_KINDS, openReplayText, parseEnqueue, parseExpect, parseJudgment,
+  parseReady, parseRetarget, parseRetargetList, READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, originRepo, RETARGET_ORPHAN, RETARGET_PER_RUN,
+  replayCommands, retargetedComment, retargetId, retargetKey, retargetNote, retargetPrepareArgs, runGit, runIsolatedEnqueue, runIsolatedRetarget, runNodeScript, ticketMarker, WAIT_QUEUE, waitQueueArgs, withRecordFile,
+  type ActionRecord, type DropClass, type DropJudgment, type GitRunner, type PreparedRetarget, type Problem, type Refusal, type RetargetRecord, type ScriptRunner,
 } from "./queue-backstop";
 import { githubBudget, GitHubPausedError, RateLimitedError, withPriority, type GitHubBudget } from "./rate-budget";
 import type { PromptOutcome, Recovery, SessionRouter, Succession } from "./sessions";
@@ -104,6 +106,9 @@ export type PullRequestView = {
 type Seen = {
   reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; conflicts?: string[]; mainBroken?: string[]; escalated?: boolean; pending?: PendingDrop | null; queued?: PendingDrop[]; replay?: "due" | "asked"; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean; advance?: "due";
   blockedAt?: string; actions?: ActionRecord[]; refusals?: Refusal[];
+  // The move of the open stack whose bottom this is off its orphaned `graphite-base/<n>` base
+  // (see retargets).
+  retarget?: RetargetRecord;
   // Since when the agent has waited for the owner's answer while the message `key` waited for it
   // (see waitFor): `stage:<stage>:<key>`, `drop:<key>` or `replay:<head>`.
   waits?: Record<string, string>;
@@ -140,8 +145,9 @@ export type GitHubReader = {
   commentOnPull(repo: string, number: number, body: string): Promise<void>;
 };
 // The queue backstop's runners (see queueBackstop): the repo's scripts, the checkout they run in,
-// and the clock its hourly retries use.
-export type BackstopDeps = { run?: ScriptRunner; checkout?: Pick<BackstopCheckout, "prepare" | "commentFile">; now?: () => number };
+// the clock its hourly retries use, and whether the checkout has a script (`retarget-orphan.mjs`
+// runs only where it exists).
+export type BackstopDeps = { run?: ScriptRunner; checkout?: Pick<BackstopCheckout, "prepare" | "commentFile">; now?: () => number; has?: (checkout: string, script: string) => boolean };
 // `repo` is the pull request's `owner/name` and `number` its number; `draft.headSha` is null when
 // the draft is no longer listed, and `draft.pulls` are the pull requests its body lists (none then).
 type Drop = { key: string; reason: string; repo: string; number: number; draft: { number: number; url: string; headSha: string | null; pulls: number[] } | null };
@@ -638,6 +644,18 @@ function recordFor(tickets: string[], records: HandoverRecord[]): HandoverRecord
   return own.find((record) => record.status !== "archived") ?? own[0] ?? null;
 }
 
+// A move with nothing left to do: not prepared or being written, and its reports out.
+function settled(move: RetargetRecord): boolean {
+  return move.step !== "prepared" && move.step !== "applying" && !["due", "sending"].includes(move.prComment) && !["due", "sending"].includes(move.linearComment) && !["due", "started"].includes(move.note);
+}
+
+// Whether `--prepare` answered for exactly the stack the move recorded: its bottom, base and every
+// pull request's branch and head. Anything else is never written.
+function samePrepared(move: RetargetRecord, prepared: PreparedRetarget): boolean {
+  const key = (range: RetargetRecord["range"]) => range.map((item) => `${item.pr}:${item.branch}:${item.base}:${item.sha}`).join(",");
+  return prepared.pr === move.pr && prepared.base === move.base && prepared.baseSha === move.baseSha && key(prepared.range) === key(move.range);
+}
+
 // What changed since the last look, as one panel thought, a progress line and an optional state.
 // The review loop itself runs in Paseo; this only makes it visible on the ticket.
 export function reviewChange(view: PullRequestView, seen: Seen): { change: Change | null; seen: Seen } {
@@ -700,7 +718,7 @@ export class PullRequestWatch {
   constructor(
     private readonly deps: {
       handover: Pick<Handover, "all" | "update">;
-      sessions: Pick<SessionRouter, "sessionFor" | "say" | "prompt" | "link" | "crashed" | "succeed">;
+      sessions: Pick<SessionRouter, "sessionFor" | "say" | "prompt" | "link" | "crashed" | "succeed" | "whileIdle">;
       // `issueState` finds a ticket that has no handover record by its identifier, and tells
       // whether a crashed agent's ticket is still started.
       linear: Pick<LinearService, "moveToStateNamed" | "comment" | "hasComment" | "viewerId" | "userUrl" | "linkUrl" | "issueState">;
@@ -1289,10 +1307,13 @@ export class PullRequestWatch {
     return judged.result === "dropped" ? judged : null;
   }
 
-  private run(checkout: string, script: string, args: string[], repo: string) {
+  // `record`, for `retarget-orphan.mjs --apply`, goes to the script as the file `--record` names.
+  private run(checkout: string, script: string, args: string[], repo: string, record: unknown | null = null) {
     const env = { GITHUB_REPOSITORY: repo };
-    if (!this.deps.backstop?.run && script === BACKSTOP_ENQUEUE) return runIsolatedEnqueue(checkout, args, env);
-    return (this.deps.backstop?.run ?? runNodeScript)(checkout, script, args, env);
+    const injected = this.deps.backstop?.run;
+    if (script === RETARGET_ORPHAN) return injected ? withRecordFile(record, (extra) => injected(checkout, script, [...args, ...extra], env)) : runIsolatedRetarget(checkout, args, env, record);
+    if (!injected && script === BACKSTOP_ENQUEUE) return runIsolatedEnqueue(checkout, args, env);
+    return (injected ?? runNodeScript)(checkout, script, args, env);
   }
 
   // A message goes to the ticket record's linked pull request, delivered by the
@@ -1462,6 +1483,7 @@ export class PullRequestWatch {
     // The ready stacks, and the drops claimed above, are enqueued right away.
     await advance();
     await this.routeRefusals(repo, seenByUrl, context, save);
+    if ((this.deps.backstop?.has ?? ((dir, script) => existsSync(join(dir, script))))(checkout, RETARGET_ORPHAN)) await this.retargets(repo, checkout, seenByUrl, context, save);
     // Unlinked messages still belong to the ticket's agent. A busy agent keeps its message pending.
     const reserved = new Set<string>();
     for (const [url, seen] of inRepo()) {
@@ -1698,6 +1720,212 @@ export class PullRequestWatch {
         await save();
       }
     }
+  }
+
+  // Open stacks stranded on an orphaned `graphite-base/<n>` base (TUC-1209; the repo's
+  // docs/automation/merge-queue.md, "Queue backstop"). The repo's `retarget-orphan.mjs` decides and
+  // writes; the plugin orchestrates, with each move saved on its bottom pull request (`retarget`,
+  // see RetargetRecord). First every saved move goes on: a prepared or applying one runs `--apply`
+  // again with its saved record (discovery is never rerun for it), and the comments and note of a
+  // done one go out. Then `--list` names the stranded stacks, and each eligible one that nothing
+  // holds back (see retargetBlocked) is moved while no agent of its single ticket works (see
+  // SessionRouter.whileIdle). While one does, its agent gets the instruction to move the stack by
+  // hand, once, and a later run moves it once no agent works. A conflict, or a stack that changed
+  // while it was moved, goes to the agent like a drop (a successor, the ticket). At most
+  // RETARGET_PER_RUN stacks are prepared or written per run.
+  private async retargets(repo: string, checkout: string, seenByUrl: Record<string, Seen>, context: RunContext, save: () => Promise<void>): Promise<void> {
+    const budget = { left: RETARGET_PER_RUN };
+    const open = await context.pulls(repo);
+    const gated = await this.gatedTickets(context.records);
+    const each = async (move: RetargetRecord, work: () => Promise<void>) => {
+      try {
+        await work();
+      } catch (error) {
+        if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) throw error;
+        console.error(`[linear-tickets] queue backstop: moving the stack of ${pullUrl(repo, move.pr)} onto main stopped: ${error instanceof Error ? error.message : error}`);
+      }
+    };
+    for (const [url, seen] of Object.entries(seenByUrl)) {
+      const move = seen.retarget;
+      if (PULL_URL.exec(url)?.[1] !== repo || !move) continue;
+      await each(move, async () => {
+        if (move.step === "prepared" || move.step === "applying") await this.resumeRetarget(move, checkout, seenByUrl, context, gated, budget, save);
+        if (move.step === "done") await this.reportRetarget(move, context, save);
+      });
+      if (settled(move) && context.now - Date.parse(move.since) >= BACKSTOP_MEMORY_MS) {
+        delete seen.retarget;
+        await save();
+      }
+    }
+    for (const candidate of parseRetargetList(await this.run(checkout, RETARGET_ORPHAN, ["--list"], repo))) {
+      if (!candidate.eligible) continue;
+      const holder = entry(seenByUrl, pullUrl(repo, candidate.pr));
+      const known = holder.retarget;
+      if (!known || (settled(known) && (known.old !== candidate.expect || known.baseSha !== candidate.baseSha))) {
+        holder.retarget = {
+          repo, pr: candidate.pr, base: candidate.base, baseSha: candidate.baseSha, range: candidate.range, old: candidate.expect, tickets: candidate.tickets,
+          since: new Date(context.now).toISOString(), step: "due", prComment: "none", linearComment: "none", note: "none",
+        };
+        await save();
+      }
+      const move = holder.retarget!;
+      if (move.step !== "due" || move.old !== candidate.expect) continue;
+      await each(move, async () => {
+        await this.startRetarget(move, checkout, seenByUrl, context, open, gated, budget, save);
+        if (move.step === "done") await this.reportRetarget(move, context, save);
+      });
+    }
+  }
+
+  // A listed stack: moved when no agent of its ticket works, else its agent is asked once.
+  private async startRetarget(move: RetargetRecord, checkout: string, seenByUrl: Record<string, Seen>, context: RunContext, open: OpenPull[], gated: Set<string>, budget: { left: number }, save: () => Promise<void>): Promise<void> {
+    if (this.retargetBlocked(move, seenByUrl, context.records, gated)) return;
+    if (move.tickets.length !== 1) {
+      // A stack of several tickets (or of none) is left to its agents, as for the enqueue.
+      const bottom = ticketsOf(move.repo, [move.pr], open, context.records, null);
+      if (move.tickets.length > 1 && bottom.length && !move.asked) {
+        this.askRetarget(move, bottom, "busy", `Its pull requests name several tickets (${move.tickets.join(", ")}), so Paseo's queue backstop does not move it.`, seenByUrl, context);
+        await save();
+      }
+      return;
+    }
+    if (!budget.left) return;
+    const issueId = (await this.issueIds(move.tickets, context.records))[0]?.issueId;
+    if (!issueId) return;
+    const run = await this.deps.sessions.whileIdle(issueId, async () => {
+      budget.left--;
+      move.stamp = Math.floor(context.now / 1000);
+      await save();
+      const outcome = parseRetarget(await this.run(checkout, RETARGET_ORPHAN, retargetPrepareArgs({ pr: move.pr, expect: move.old }, move.stamp), move.repo));
+      if (outcome.result === "prepared" && samePrepared(move, outcome.prepared!)) {
+        move.prepared = outcome.prepared!;
+        move.step = "prepared";
+        await save();
+        await this.applyRetarget(move, checkout, seenByUrl, context, save);
+      } else if (outcome.result === "conflict") {
+        move.step = "conflict";
+        this.askRetarget(move, move.tickets, "conflict", "Its own commits do not apply cleanly onto `main`, so Paseo's queue backstop did not move it.", seenByUrl, context);
+        await save();
+      } else console.error(`[linear-tickets] queue backstop: the stack of ${pullUrl(move.repo, move.pr)} was not prepared (${outcome.result}${outcome.error ? `: ${outcome.error}` : ""}${outcome.problems.map((problem) => `; ${problem.kind}: ${problem.text}`).join("")}); the next run decides again`);
+    });
+    if ((run.outcome === "busy" || run.outcome === "waiting") && !move.asked) {
+      this.askRetarget(move, move.tickets, "busy", "An agent of the ticket is working, so Paseo's queue backstop left the stack alone. If it is still stranded once no agent of the ticket works, the backstop moves it itself.", seenByUrl, context);
+      await save();
+    }
+  }
+
+  // A prepared or applying move after a restart (or an apply that failed): `--apply` again with
+  // its saved record, under the same conditions as the first time. Held back, it keeps its record.
+  private async resumeRetarget(move: RetargetRecord, checkout: string, seenByUrl: Record<string, Seen>, context: RunContext, gated: Set<string>, budget: { left: number }, save: () => Promise<void>): Promise<void> {
+    if (!move.prepared || !budget.left || move.tickets.length !== 1 || this.retargetBlocked(move, seenByUrl, context.records, gated)) return;
+    const issueId = (await this.issueIds(move.tickets, context.records))[0]?.issueId;
+    if (!issueId) return;
+    await this.deps.sessions.whileIdle(issueId, async () => {
+      budget.left--;
+      await this.applyRetarget(move, checkout, seenByUrl, context, save);
+    });
+  }
+
+  // `--apply` with the saved record, `applying` saved first: moved (the comments and the note are
+  // due, this move's unsent instruction is dropped), an error (applied again on the next run), or
+  // anything else, which goes to the agent and is never written again.
+  private async applyRetarget(move: RetargetRecord, checkout: string, seenByUrl: Record<string, Seen>, context: RunContext, save: () => Promise<void>): Promise<void> {
+    move.step = "applying";
+    await save();
+    const outcome = parseRetarget(await this.run(checkout, RETARGET_ORPHAN, ["--apply", String(move.pr)], move.repo, move.prepared));
+    if (outcome.result === "retargeted") {
+      move.step = "done";
+      move.prComment = "due";
+      move.linearComment = move.tickets.length ? "due" : "none";
+      move.note = "due";
+      const own = (pending: PendingDrop) => pending.key.startsWith(retargetKey(move)) && !pending.sending;
+      for (const seen of Object.values(seenByUrl)) {
+        const rest = seen.queued?.filter((pending) => !own(pending));
+        if (rest) seen.queued = rest.length ? rest : undefined;
+        if (seen.pending && own(seen.pending)) Object.assign(seen, nextMessage(seen));
+      }
+    } else if (outcome.result === "error") {
+      console.error(`[linear-tickets] queue backstop: applying the move of ${pullUrl(move.repo, move.pr)} failed (${outcome.error}); the next run applies it again`);
+      return;
+    } else {
+      move.step = "unclear";
+      const why = outcome.problems.map((problem) => `${problem.kind}${problem.text ? ` (${problem.text})` : ""}`).join(", ") || outcome.result;
+      this.askRetarget(move, move.tickets, "unclear", `Paseo's queue backstop prepared a move of it, but when it went to write it, \`retarget-orphan.mjs\` refused: ${why}. It does not try again. If the stack is already on \`main\`, nothing is needed.`, seenByUrl, context);
+    }
+    await save();
+  }
+
+  // The comments on the bottom pull request and the ticket, then the note to the living agent.
+  // Each comment is claimed `sending` before it goes out and found by its marker after a restart,
+  // so it goes out at least once (a crash between the post and the save is found by the marker);
+  // the note is claimed right before it goes out and never sent twice.
+  private async reportRetarget(move: RetargetRecord, context: RunContext, save: () => Promise<void>): Promise<void> {
+    const prepared = move.prepared;
+    if (!prepared) return;
+    const id = retargetId(move);
+    const body = retargetedComment({ ...move, prepared });
+    if (move.prComment === "due" || move.prComment === "sending") {
+      move.prComment = "sending";
+      await save();
+      await commentOnce(this.github(), move.repo, move.pr, id, body);
+      move.prComment = "done";
+      await save();
+    }
+    if (move.linearComment === "due" || move.linearComment === "sending") {
+      const mark = ticketMarker(id);
+      move.linearComment = "sending";
+      await save();
+      for (const { identifier, issueId } of await this.issueIds(move.tickets, context.records)) {
+        if ((move.linearDone ?? []).includes(identifier)) continue;
+        if (!await this.deps.linear.hasComment(issueId, mark)) await this.deps.linear.comment(issueId, `${body}\n\n${mark}`);
+        move.linearDone = [...(move.linearDone ?? []), identifier];
+        await save();
+      }
+      move.linearComment = "done";
+      await save();
+    }
+    if (move.note === "due" || move.note === "started") {
+      const living = recordFor(move.tickets, context.records);
+      if (move.note === "due" && living && living.status !== "archived") {
+        const outcome = await this.deps.sessions.prompt(living.agentId, retargetNote({ ...move, prepared }), async () => {
+          move.note = "started";
+          await save();
+        });
+        if (outcome === "busy" || outcome === "waiting" || outcome === "unavailable") return;
+      }
+      move.note = "done";
+      await save();
+    }
+  }
+
+  // Why a move may not start or go on now, or null: a pull request of its stack escalated to the
+  // owner, is blocked at its head or has a message pending that is not this move's own (also in
+  // its agent's slot), or a before-merge manual task of its ticket is open (or cannot be read).
+  private retargetBlocked(move: RetargetRecord, seenByUrl: Record<string, Seen>, records: HandoverRecord[], gated: Set<string>): string | null {
+    const foreign = (seen: Seen | undefined) => [seen?.pending, ...(seen?.queued ?? [])].some((pending) => pending && !pending.key.startsWith(retargetKey(move)));
+    for (const { pr } of move.range) {
+      const seen = seenByUrl[pullUrl(move.repo, pr)];
+      if (escalated(seen)) return `#${pr} escalated to the owner`;
+      if (seen?.blockedAt) return `#${pr} is blocked at its head`;
+      if (foreign(seen)) return `a message about #${pr} is still pending`;
+    }
+    const link = recordFor(move.tickets, records)?.links["Pull request"];
+    if (link && foreign(seenByUrl[link])) return "a message to the ticket's agent is still pending";
+    if (move.tickets.some((ticket) => gated.has(ticket))) return "a manual task due before the merge is open, or cannot be read";
+    return null;
+  }
+
+  // The instruction to move the stack by hand, routed like a drop: `busy` (an agent works, or the
+  // stack names several tickets) at most once per move, `conflict` and `unclear` once each as the
+  // move ends there.
+  private askRetarget(move: RetargetRecord, tickets: string[], kind: "busy" | "conflict" | "unclear", why: string, seenByUrl: Record<string, Seen>, context: RunContext): void {
+    const record = recordFor(tickets, context.records);
+    const text = openReplayText(move, record?.worktreePath ?? null, why);
+    this.route(seenByUrl, { record, url: pullUrl(move.repo, move.pr), tickets }, {
+      key: kind === "busy" ? retargetKey(move) : `${retargetKey(move)}:${kind}`, reason: `its base \`${move.base}\` has no open pull request`, facts: text, fix: text,
+      subject: `The stack of #${move.pr} is stranded on the orphaned base \`${move.base}\``,
+    });
+    move.asked = true;
   }
 
   // A missing/moved PR link does not make the owner the repair worker. Reuse normal agent delivery
@@ -1942,11 +2170,9 @@ export class PullRequestWatch {
     }
     const text = [
       `[The pull request](${url}) was closed without merging: its base branch \`${view.baseBranch}\` is gone (Graphite deletes a branch once the merge queue landed it), and no open pull request has its branch \`${view.headBranch}\`.`,
-      `Next step, in your stack's worktree${record.worktreePath ? ` (\`${record.worktreePath}\`)` : ""}:`,
-      `1. On the top branch of the stack, replay the remaining branches onto main from the landed branch: \`git fetch origin main && git rebase --update-refs --onto origin/main ${view.baseBranch}\`. It moves only your own branches; never \`gt sync\` or \`gt restack\`.`,
-      "2. Push each replayed branch with `git push --force-with-lease origin <branch>`.",
-      `3. Open a new pull request from \`${view.headBranch}\` onto main whose body links [the old one](${url}): \`gh pr create --base main --head ${view.headBranch}\`.`,
-      `4. Run \`gt track ${view.headBranch} --parent main\` so Graphite links the new pull request; never recreate \`${view.baseBranch}\`.`,
+      `Next step, in your stack's worktree${record.worktreePath ? ` (\`${record.worktreePath}\`)` : ""}, on the top branch of the stack: replay the remaining branches onto main from the landed branch, push each replayed branch, open a new pull request from \`${view.headBranch}\` onto main whose body links [the old one](${url}), and let Graphite track it:`,
+      replayCommands({ kind: "closed", base: view.baseBranch, head: view.headBranch, url }),
+      `It moves only your own branches; never \`gt sync\` or \`gt restack\`, and never recreate \`${view.baseBranch}\`.`,
     ].join("\n");
     let claimed = false;
     const toAgent = async () => {

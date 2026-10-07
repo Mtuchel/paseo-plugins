@@ -9,7 +9,7 @@ import { Dispatcher } from "./dispatch";
 import { Handover } from "./handover";
 import { Launcher, LEAD_INTRO, type ResumeTarget } from "./launch";
 import type { IssueState, LabeledIssue } from "./linear";
-import { SessionRouter, SessionStore, type SessionLink, type Succession } from "./sessions";
+import { SessionRouter, SessionStore, type HostOwnership, type SessionLink, type Succession } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { ResumeUnavailableError, TicketStarter, type Started } from "./starter";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
@@ -199,6 +199,7 @@ function routerHarness(options: {
   onStop?: (agentId: string) => void;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
+  owner?: (issueId: string) => Promise<HostOwnership>;
 } = {}) {
   const calls: string[] = [];
   const daemon = options.daemon ?? fakeDaemon(options.agents ?? [], { pageSize: options.pageSize });
@@ -244,6 +245,7 @@ function routerHarness(options: {
     settings: { read: async () => settings },
     store,
     route: options.route,
+    owner: options.owner,
     processLiveness: options.processLiveness,
     stop: async (agentId: string) => { calls.push(`stop ${agentId}`); options.onStop?.(agentId); },
     ...(options.sleep ? { sleep: options.sleep } : {}),
@@ -1265,4 +1267,60 @@ test("an owner Stop that arrives while a watchdog step is prepared keeps the ste
   assert.equal(replacement.starts.length, 0);
   assertGateFree(replacement.gates);
   await replacement.cleanup();
+});
+
+// TUC-1209 AC-5/AC-16: SessionRouter.whileIdle runs the queue backstop's move only while no agent
+// of the ticket works and this host owns the ticket; it never starts or forwards anything.
+test("whileIdle runs its work only while no agent of the ticket works and this host owns the ticket", async (t) => {
+  const idle = ticketAgent("agent-1", "2026-02-01T00:00:01Z");
+  const cases: { name: string; agents: FakeAgent[]; liveness?: "absent" | "alive" | "unknown"; owner?: HostOwnership | "throws"; launching?: boolean; disconnected?: boolean; expected: string }[] = [
+    { name: "idle, closed and archived agents", agents: [idle, ticketAgent("agent-2", "2026-02-01T00:00:02Z", { status: "closed" }), ticketAgent("agent-3", "2026-02-01T00:00:03Z", { status: "running", archivedAt: "then" })], expected: "ran" },
+    { name: "no agent at all", agents: [], expected: "ran" },
+    { name: "an agent in a turn", agents: [ticketAgent("agent-1", "2026-02-01T00:00:01Z", { status: "running" })], expected: "busy" },
+    { name: "an agent waiting for the owner", agents: [ticketAgent("agent-1", "2026-02-01T00:00:01Z", { pendingPermissions: [{ id: "p1", kind: "question" }] })], expected: "waiting" },
+    { name: "a live successor in a turn next to an idle predecessor", agents: [idle, ticketAgent("agent-2", "2026-02-01T00:00:02Z", { status: "running" })], expected: "busy" },
+    { name: "an orphan worker process", agents: [idle], liveness: "alive", expected: "busy" },
+    { name: "worker processes that cannot be inspected", agents: [idle], liveness: "unknown", expected: "busy" },
+    { name: "a launch under way", agents: [idle], launching: true, expected: "busy" },
+    { name: "the peer host owns the ticket", agents: [idle], owner: "elsewhere", expected: "elsewhere" },
+    { name: "ownership not confirmed (no handshake yet)", agents: [idle], owner: "unknown", expected: "unavailable" },
+    { name: "ownership unreadable", agents: [idle], owner: "throws", expected: "unavailable" },
+    { name: "Paseo not connected", agents: [idle], disconnected: true, expected: "unavailable" },
+  ];
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const h = routerHarness({
+        agents: item.agents,
+        processLiveness: async () => item.liveness ?? "absent",
+        owner: async () => {
+          if (item.owner === "throws") throw new Error("the activation claims cannot be read");
+          return item.owner ?? "here";
+        },
+      });
+      try {
+        if (item.disconnected) Object.assign(h.router, { paseo: null });
+        const held = item.launching ? h.gates.gate(ISSUE.id) : null;
+        let ran = 0;
+        const run = await h.router.whileIdle(ISSUE.id, async () => { ran++; return "moved"; });
+        held?.release();
+        assert.equal(run.outcome, item.expected);
+        assert.equal(ran, item.expected === "ran" ? 1 : 0);
+        if (run.outcome === "ran") assert.equal(run.value, "moved");
+        assert.deepEqual(h.starts, [], "nothing is started");
+        assert.deepEqual(h.daemon.sent, [], "nothing is sent");
+        assertGateFree(h.gates);
+      } finally { await h.cleanup(); }
+    });
+  }
+});
+
+test("whileIdle holds the ticket's start gate while its work runs, and frees it when the work throws", async () => {
+  const h = routerHarness({ agents: [ticketAgent("agent-1", "2026-02-01T00:00:01Z")], processLiveness: async () => "absent" });
+  try {
+    await h.router.whileIdle(ISSUE.id, async () => {
+      assert.equal(h.gates.gate(ISSUE.id), null, "no start of the ticket can begin during the move");
+    });
+    await assert.rejects(h.router.whileIdle(ISSUE.id, async () => { throw new Error("the script failed"); }), /the script failed/);
+    assertGateFree(h.gates);
+  } finally { await h.cleanup(); }
 });

@@ -35,7 +35,7 @@ import { PullRequestBoard } from "./server/pull-requests";
 import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
 import { NeedsYouIssues } from "./server/needs-you";
-import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, ReviewDecisionAppliedError, SessionRouter, SessionStore, stopAgentTurn } from "./server/sessions";
+import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, ReviewDecisionAppliedError, SessionRouter, SessionStore, stopAgentTurn, type HostOwnership } from "./server/sessions";
 import { approveForLater, splitIntoSubIssues } from "./server/split";
 import { planSetup, TicketStarter } from "./server/starter";
 import { PLAN_TICKET_ENV } from "./server/plan-policy";
@@ -52,7 +52,7 @@ import { readActivationSecret, type ActivationSink } from "./server/activation";
 import { activationEndpoints } from "./server/activation-endpoints";
 import { ActivationIntake } from "./server/activation-intake";
 import { DrainRouter } from "./server/drain";
-import { resumeGuard } from "./server/activation-guard";
+import { resumeGuard, ticketOwnership } from "./server/activation-guard";
 import { ReviewDeletions } from "./server/review-deletions";
 import { ReviewIssueInfos } from "./server/review-issue-info";
 import { PlanPipeline } from "./server/plan-pipeline";
@@ -120,7 +120,11 @@ export default function contribute(server: PluginServerContext) {
   const sessionStore = new SessionStore();
   // The silent-agent watchdog's durable state (README, "Silent and stuck agents").
   const watchdogStore = new WatchdogStore();
+  // Which host owns a ticket's automatic work, read only (SessionRouter.whileIdle, see
+  // ticketOwnership): assigned once the activation routers exist below.
+  let ticketOwner: (issueId: string) => Promise<HostOwnership> = async () => "unknown";
   const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, needsYou, route, deletions, watchdog: watchdogStore,
+    owner: (issueId) => ticketOwner(issueId),
     decideReview,
     reviewOutcome: (review) => reviewOutcome(review),
     recordOutcome: (agentId, outcome) => recordDecision({ type: "decided", agentId, ...outcome, at: new Date().toISOString() }),
@@ -162,6 +166,7 @@ export default function contribute(server: PluginServerContext) {
       return "This host could not read which tickets still run elsewhere, so it started nothing. Try again in a minute.";
     }
   };
+  ticketOwner = ticketOwnership({ settings, drain, intake });
   const openSession = async (issueId: string, identifier: string, agentId: string) => Boolean(await auth.credentials() && await sessions.openFor(issueId, identifier, agentId));
   // Labelled projects: a planner ticket sets the work order, then tickets are handed out as slots free up.
   // A planner without a live agent, and a ticket assigned to Paseo whose start failed, is started

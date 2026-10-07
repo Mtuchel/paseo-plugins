@@ -8,6 +8,7 @@ import test, { type TestContext } from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { activationEndpoints } from "./activation-endpoints";
+import { ticketOwnership } from "./activation-guard";
 import { ActivationIntake } from "./activation-intake";
 import { DrainRouter } from "./drain";
 import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type ActivationSettings, type PluginSettings } from "./settings";
@@ -198,4 +199,33 @@ test("the health route answers the routing state the smoke run reads", async (t)
   assert.equal(answer.status, 200);
   const health = await answer.json() as { role: string; mode: string; drain: { seededAt: string | null; seedSource: string; agents: number; claims: number } };
   assert.deepEqual({ role: health.role, mode: health.mode, seedSource: health.drain.seedSource, agents: health.drain.agents, claims: health.drain.claims, seeded: health.drain.seededAt !== null }, { role: "drain", mode: "remote", seedSource: "daemon", agents: 1, claims: 1, seeded: true });
+});
+
+// TUC-1209 AC-16: the queue backstop moves a stranded stack only on the host that owns its ticket,
+// read from the real claims of both hosts; neither reader forwards or starts anything.
+test("ticket ownership for the queue backstop's moves follows the two hosts' real claims", async (t) => {
+  let macUrl = "";
+  const server = await hostOverHttp(t, { name: "server087", activation: () => ({ mode: "local", peer: macUrl }) });
+  const mac = await hostOverHttp(t, {
+    name: "mac",
+    activation: () => ({ mode: "remote", peer: server.url }),
+    agents: [{ id: "a-run", issueId: "i1", identifier: "TUC-1", status: "running" }],
+  });
+  macUrl = mac.url;
+  const serverOwns = ticketOwnership({ settings: { read: async () => settingsFor({ mode: "local", peer: macUrl }) }, drain: server.drain, intake: server.intake });
+  const macOwns = ticketOwnership({ settings: { read: async () => settingsFor({ mode: "remote", peer: server.url }) }, drain: mac.drain, intake: mac.intake });
+  assert.equal(await serverOwns("i1"), "unknown", "before the claims handshake the receiving host moves nothing");
+  assert.equal(await serverOwns("i2"), "unknown");
+
+  await mac.drain.readyNow();
+  assert.deepEqual([await macOwns("i1"), await serverOwns("i1")], ["here", "elsewhere"], "the ticket the Mac still runs is the Mac's alone");
+  assert.deepEqual([await macOwns("i2"), await serverOwns("i2")], ["elsewhere", "here"], "every other ticket is the server's alone");
+
+  mac.daemon.agents[0].status = "error";
+  await mac.drain.sweep();
+  assert.deepEqual([await macOwns("i1"), await serverOwns("i1")], ["elsewhere", "here"], "a released ticket moves to the server");
+  assert.deepEqual([server.starts, mac.daemon.sent], [[], []], "reading ownership started and sent nothing");
+
+  const alone = ticketOwnership({ settings: { read: async () => settingsFor({ mode: "local", peer: null }) }, drain: server.drain, intake: server.intake });
+  assert.equal(await alone("i1"), "here", "a host without a peer owns every ticket");
 });

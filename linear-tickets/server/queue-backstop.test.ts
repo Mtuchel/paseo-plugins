@@ -14,6 +14,8 @@ import {
   parseEnqueue,
   parseJudgment,
   parseReady,
+  parseRetarget,
+  parseRetargetList,
   readyArgs,
   reconcile,
   refusalKey,
@@ -71,6 +73,29 @@ test("backstop-enqueue.mjs: the exit code and the JSON result have to agree; any
   }
   assert.deepEqual(enqueueArgs("mtuchel/tuc-1-fix", "419@a1b2c3d", "ready:419@a1b2c3d", "/c/r.md"), ["mtuchel/tuc-1-fix", "--expect", "419@a1b2c3d", "--action", "ready:419@a1b2c3d", "--comment-file", "/c/r.md"]);
   assert.deepEqual(enqueueArgs("b", "1@a1b2c3d", "drop:#4", null), ["b", "--expect", "1@a1b2c3d", "--action", "drop:#4"]);
+});
+
+test("retarget-orphan.mjs: a move counts as prepared only with its full record, and exit code and result have to agree; anything else is an error", () => {
+  const sha = (digit: string) => digit.repeat(40);
+  const range = [{ pr: 419, branch: "mtuchel/tuc-1-fix", base: "graphite-base/418", sha: sha("1") }];
+  const prepared = { result: "prepared", pr: 419, base: "graphite-base/418", baseSha: sha("b"), range, onto: sha("c"), stamp: 1_700_000_000, new: { base: "main", heads: `419@${sha("3")}` }, sync: "git fetch origin", problems: [] };
+  assert.deepEqual(parseRetarget(out(0, prepared)), { result: "prepared", prepared: { pr: 419, base: "graphite-base/418", baseSha: sha("b"), range, onto: sha("c"), stamp: 1_700_000_000, new: { base: "main", heads: `419@${sha("3")}` }, sync: "git fetch origin" }, problems: [], error: null });
+  assert.equal(parseRetarget(out(0, { result: "retargeted" })).result, "retargeted");
+  assert.deepEqual(parseRetarget(out(2, { result: "refused", problems: [{ kind: "remote-differs", text: "moved" }] })).problems, [{ kind: "remote-differs", draft: null, text: "moved" }]);
+  for (const [output, why] of [
+    [out(0, { ...prepared, new: { base: "main", heads: "not heads" } }), "no new heads"],
+    [out(0, { ...prepared, stamp: "now" }), "no stamp"],
+    [out(0, { ...prepared, onto: "main" }), "onto not a SHA"],
+    [out(0, { ...prepared, range: [{ ...range[0], branch: "" }] }), "a range member without its branch"],
+    [out(2, prepared), "prepared with exit 2"],
+    [out(0, { result: "conflict" }), "conflict with exit 0"],
+    [out(null, { result: "retargeted" }), "killed"],
+    [{ code: 0, stdout: "moved\n", stderr: "" }, "not JSON"],
+  ] as const) assert.equal(parseRetarget(output).result, "error", why);
+
+  const candidate = { pr: 419, branch: "mtuchel/tuc-1-fix", base: "graphite-base/418", baseSha: sha("b"), expect: `419@${sha("1")}`, range, tickets: ["TUC-1"], eligible: true, reason: null };
+  assert.deepEqual(parseRetargetList(out(0, { result: "listed", candidates: [candidate, { ...candidate, pr: 420 }, { ...candidate, baseSha: "b" }] })), [candidate], "a candidate whose stack does not start at it, or without its base head, is left out");
+  assert.throws(() => parseRetargetList(out(1, { result: "error" })), BackstopScriptError);
 });
 
 test("enqueue-ready.mjs: stacks without their action, branch or heads are left out; a run without stacks is an error", () => {
