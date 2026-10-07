@@ -25,7 +25,8 @@
     "typecheck": "tsc --noEmit",
     "generate:icons": "node scripts/generate-provider-icons.mjs",
     "test": "node --import tsx --test server/*.test.ts client/*.test.ts scripts/*.test.mjs && python3 -m unittest discover -s ops -p 'test_*.py'",
-    "tier-report": "node scripts/tier-report.mjs"
+    "tier-report": "node scripts/tier-report.mjs",
+    "smoke:planning": "node scripts/planning-smoke.mjs"
   },
   "dependencies": {
     "simple-icons": "^16.30.0",

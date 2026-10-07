@@ -923,6 +923,54 @@ them a resumed agent had no
 `record_plan_advice`, no submission gate and no Linear write guard, and its plan reached the risk
 policy with "no advisor review was recorded for this plan text".
 
+**Planning smoke check.** On 2026-10-07 ticket agents started planning without Plannotator's
+planning instructions (its "framing"), so their plans came out in the wrong layout: omp 18.7
+re-runs every extension's `before_agent_start` handler when one of them returns `systemPrompt`
+and the base system prompt changed meanwhile, and drops the messages of the first round, the
+framing included. [`scripts/planning-smoke.mjs`](scripts/planning-smoke.mjs) checks each host for
+this:
+
+- **framing** / **launch**: it starts omp in `rpc-ui` mode as a fresh ticket agent
+  (`LINEAR_TICKETS_PLAN=required`, model `deepseek/deepseek-flash`, no ticket, so nothing touches
+  Linear) in a temporary git repository, sends one prompt and reads the session file: the
+  plan-first launch marker must be there (else `launch`: omp did not start, did not answer within
+  3 minutes, or did not enter planning) and Plannotator's framing must come before the first reply
+  (else `framing`). The temporary directory and omp's processes are always removed.
+- **system-prompt-hook**: no omp extension (the `extensions:` list of `~/.omp/agent/config.yml`
+  and everything in `~/.omp/agent/extensions/`) may return `systemPrompt` from
+  `before_agent_start`. Each one is loaded in its own child process (TypeScript through the
+  plugin's `tsx`) against a stub `pi`, with a private `HOME` and `PASEO_HOME`; its `session_start`
+  handlers run first, then every `before_agent_start` handler with a stub event and a
+  non-DeepSeek model. An extension that cannot be loaded or called under the stub is listed as
+  not checked, not as a failure. Blind spots: a handler that returns `systemPrompt` only for
+  some prompts, models, environment variables (a real ticket agent's) or session states, and
+  extensions loaded some other way (omp plugins such as Plannotator itself, project
+  `.omp` directories); the framing check still catches their effect.
+
+The result goes to `$PASEO_HOME/linear-tickets/planning-smoke.json` (private, replaced
+atomically), which the ops digest reads:
+`{"version":1,"checkedAt":…,"fingerprint":…,"ok":…,"failures":[{"check":"framing|system-prompt-hook|launch","detail":…}]}`.
+The fingerprint is a SHA-256 of `omp --version`, `~/.omp/plugins/omp-plugins.lock.json`, the
+Plannotator package's version, `~/.omp/agent/config.yml`, every configured extension, every file
+in `~/.omp/agent/extensions/` (links followed) and Plannotator's `plannotator.json`; a missing
+input counts as absent. The plugin runs the check on every host two minutes after it starts and
+then every 15 minutes in its `--if-changed` mode, one run at a time and stopped after 10 minutes:
+it runs only when the fingerprint differs from the stored result's, and a failed result is tried
+again for the same fingerprint at most once an hour. Passes and failures go to the plugin's log;
+skipped rounds are silent. The plugin finds the script through the plan-first extension's link
+(above), so a host without that link logs once that the check is skipped. By hand, in this
+directory (always runs, prints a summary, exits non-zero on a failure):
+
+```sh
+npm run smoke:planning                       # add -- --if-changed for the plugin's mode
+npm run smoke:planning -- --omp-config /tmp/config.yml --omp-extensions /tmp/extensions
+```
+
+`--omp-config` / `--omp-extensions` replace omp's config and extensions directory for the
+extension check and the fingerprint only (to try a hook before installing it); the omp run always
+uses omp's own setup. Every run writes the result file; point `PASEO_HOME` at a temporary
+directory to keep a trial out of the ops digest.
+
 **`plan-ready`.** Every approved plan adds the `plan-ready` label: always for a split or
 “Approve, implement later”, and with status write-back on for Plannotator and panel approvals,
 where a new review round or a plan sent back removes it again.
