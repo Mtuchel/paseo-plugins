@@ -566,11 +566,14 @@ const members = (value: unknown): RetargetMember[] | null => {
   return list.length && list.every((item) => item !== null) ? (list as RetargetMember[]) : null;
 };
 
-// Exit 0 with `listed` and its candidates; anything else is an error. A candidate whose stack or
-// heads are not named is left out.
+// Exit 0 with `listed` and its candidates; anything else is an error that keeps the script's reason
+// (its `error`, else its last stderr line). A candidate whose stack or heads are not named is left out.
 export function parseRetargetList(output: ScriptOutput): RetargetCandidate[] {
   const found = answer(RETARGET_ORPHAN, output);
-  if (output.code !== 0 || text(found.result) !== "listed" || !Array.isArray(found.candidates)) throw new BackstopScriptError(`${RETARGET_ORPHAN} --list exited ${output.code} without its candidates`);
+  if (output.code !== 0 || text(found.result) !== "listed" || !Array.isArray(found.candidates)) {
+    const reason = text(found.error) || (output.stderr.trim().split("\n").at(-1) ?? "");
+    throw new BackstopScriptError(`${RETARGET_ORPHAN} --list exited ${output.code} without its candidates${reason ? `: ${reason.slice(0, 300)}` : ""}`);
+  }
   return found.candidates.map(record).filter((item): item is Record<string, unknown> => item !== null).flatMap((item) => {
     const pr = count(item.pr);
     const range = members(item.range);
