@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -43,10 +43,11 @@ const issue = (n: number, change: Partial<ProjectIssue> = {}): ProjectIssue => (
 });
 
 // `inspect`: the provider process table ghost agents are checked against.
-async function room(t: TestContext, issues: ProjectIssue[], running: string[] = [], inspect?: ProcessInspector) {
+async function room(t: TestContext, issues: ProjectIssue[], running: string[] = [], inspect?: ProcessInspector, readSettings?: () => Promise<PluginSettings>) {
   const directory = await mkdtemp(join(tmpdir(), "project-flow-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const calls: string[] = [];
+  const reads: string[] = [];
   let now = Date.parse("2026-01-02T00:00:00Z");
   let created = 0;
   let away = false;
@@ -54,7 +55,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   // Linear writes that fail (`update`: the next n project updates; one relation refused or never
   // reaching Linear); `start`: how a planner start fails (`setup`: a SetupError, `always`: a
   // timeout); `restart`: every stalled-ticket restart. `starts`: every planner start, in order.
-  const fail: { update?: number; relation?: string; unreached?: string; restart?: boolean; start?: "setup" | "always"; startError?: string } = {};
+  const fail: { read?: boolean; update?: number; relation?: string; unreached?: string; restart?: boolean; start?: "setup" | "always"; startError?: string } = {};
   const starts: PlannerStart[] = [];
   const comments: string[] = [];
   const updates: string[] = [];
@@ -72,6 +73,8 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   let readGate: Promise<void> | null = null;
   let reading = false;
   const projectIssues = async (_projectId: string, full: boolean) => {
+    reads.push("projectIssues");
+    if (fail.read) throw outage();
     if (full) { reading = true; await readGate; cachedRelations = written.length; }
     return issues.map((item) => {
       const added = written.slice(0, cachedRelations).filter(([blocker, blocked]) => blocked === item.id && !item.blockers.some((known) => known.id === blocker));
@@ -79,11 +82,11 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
     });
   };
   const linear = {
-    labeledProjects: async () => labelled ? [{ id: "erp", name: "ERP" }] : [],
-    projectIssues: async () => issues,
-    issueDescriptions: async () => descriptions,
-    openTeamIssues: async (_teams: string[], limit: number) => team.slice(0, limit),
-    issueRef: async (identifier: string) => elsewhere.get(identifier) ?? null,
+    labeledProjects: async () => { reads.push("labeledProjects"); if (fail.read) throw outage(); return labelled ? [{ id: "erp", name: "ERP" }] : []; },
+    projectIssues: async () => { reads.push("projectIssues"); if (fail.read) throw outage(); return issues; },
+    issueDescriptions: async () => { reads.push("issueDescriptions"); if (fail.read) throw outage(); return descriptions; },
+    openTeamIssues: async (_teams: string[], limit: number) => { reads.push("openTeamIssues"); if (fail.read) throw outage(); return team.slice(0, limit); },
+    issueRef: async (identifier: string) => { reads.push("issueRef"); if (fail.read) throw outage(); return elsewhere.get(identifier) ?? null; },
     relate: async (id: string, other: string, type: string) => { calls.push(`${id} ${type} ${other}`); },
     addLabel: async (id: string, name: string) => { calls.push(`label ${id} +${name}`); },
     removeLabel: async (id: string, name: string) => { calls.push(`label ${id} -${name}`); },
@@ -101,8 +104,8 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
       calls.push(`update ${id} ${body.split("\n")[0]}`);
       updates.push(body);
     },
-    appUserId: async () => APP,
-    viewerId: async () => OWNER,
+    appUserId: async () => { reads.push("appUserId"); if (fail.read) throw outage(); return APP; },
+    viewerId: async () => { reads.push("viewerId"); if (fail.read) throw outage(); return OWNER; },
   };
   const path = join(directory, "projects.json");
   const store = new ProjectStore(path);
@@ -112,6 +115,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   const usage = { reports: null as UsageReport[] | null, chains: {} as Record<string, string[]>, refresh: true };
   const launchedSelectors: string[] = [];
   const deps = { linear, projectIssues, scheduler, capacity: new Capacity(() => now), store,
+    settings: readSettings ? { read: readSettings } : undefined,
     startPlanner: async (input: PlannerStart, _paseo: PaseoApi, current: PluginSettings) => {
       launchedSelectors.push(current.launchPreferences[current.lastProvider!].model);
       starts.push(input);
@@ -137,7 +141,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   const makeFlow = () => new ProjectFlow({ ...deps, store: new ProjectStore(path) });
   const flow = makeFlow();
   return {
-    flow, makeFlow, calls, store, issues, fail, comments, updates, starts, descriptions, team, elsewhere, held, usage, launchedSelectors,
+    flow, makeFlow, calls, reads, path, store, issues, fail, comments, updates, starts, descriptions, team, elsewhere, held, usage, launchedSelectors,
     now: () => now,
     notificationAttempts,
     setLabelled: (value: boolean) => { labelled = value; },
@@ -155,12 +159,249 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
 // The open run an earlier read left, as the next read finds it.
 const runRecord = (change: Partial<PlannerRecord> = {}): PlannerRecord => ({ id: "run-1", listedAt: "2026-01-01T23:00:00Z", tickets: 1, started: true, startedAt: "2026-01-01T23:00:00Z", ...change });
 
+test("a forwarding host refuses Plan, replacement Plan, Skip and approved orders before reads or side effects", async (t) => {
+  const remote: PluginSettings = { ...settings, activation: { mode: "remote", peer: "https://server087.example:8444" } };
+  for (const action of ["plan", "replace", "skip", "apply"] as const) {
+    const r = await room(t, [issue(1)]);
+    await r.seed({ planned: [], planner: action === "plan" ? null : runRecord({ listed: ["i1"], agentId: "stuck", ownerAsked: true, error: "Needs owner" }) });
+    const before = await readFile(r.path, "utf8");
+    const archived: string[] = [];
+    const agentReads: string[] = [];
+    const paseo = paseoWith(() => { agentReads.push("agents"); return [{ id: "stuck", status: "closed", labels: { "linear.projectId": "erp", "linear.plannerRun": "run-1" } }]; }, archived);
+    const operation = action === "skip" ? r.flow.skipPlan("erp", remote, paseo)
+      : action === "apply" ? r.flow.applyPlan("run-1", "stuck", "```project-order\nhold TUC-1: wait\n```", paseo, remote)
+      : r.flow.planNow("erp", remote, paseo, true);
+    await assert.rejects(operation, /server087\.example:8444.*use Plan or Skip there/);
+    assert.deepEqual(r.reads, [], `${action} must not read Linear`);
+    assert.equal(await readFile(r.path, "utf8"), before, `${action} must leave durable state untouched`);
+    assert.deepEqual(r.starts, []);
+    assert.deepEqual(r.calls, [], `${action} must not write, delegate, restart or retire`);
+    assert.deepEqual(r.notificationAttempts, []);
+    assert.deepEqual(agentReads, []);
+    assert.deepEqual(archived, []);
+  }
+});
+
+test("a forwarding poll leaves pending, failed and approved planners and planned tickets untouched", async (t) => {
+  const remote: PluginSettings = { ...settings, activation: { mode: "remote", peer: null } };
+  const planners = [
+    null,
+    runRecord({ started: false, startedAt: undefined }),
+    runRecord({ agentId: "failed" }),
+    runRecord({ approved: { agentId: "failed", plan: "```project-order\nhold TUC-2: wait\n```" } }),
+  ];
+  for (const planner of planners) {
+    const r = await room(t, [issue(1), issue(2), issue(3, { delegateId: APP })]);
+    await r.seed({ planned: ["i1"], planner, waiting: { i2: "2026-01-01T23:00:00Z" }, stalled: { i3: { since: "2026-01-01T23:00:00Z", restarts: 0 } } });
+    const before = await readFile(r.path, "utf8");
+    const archived: string[] = [];
+    const agentReads: string[] = [];
+    const paseo = paseoWith(() => { agentReads.push("agents"); return []; }, archived);
+    await r.flow.tick(paseo, remote);
+    assert.deepEqual(r.reads, []);
+    assert.equal(await readFile(r.path, "utf8"), before);
+    assert.deepEqual(r.calls, []);
+    assert.deepEqual(r.starts, []);
+    assert.deepEqual(r.notificationAttempts, []);
+    assert.deepEqual(agentReads, []);
+    assert.deepEqual(archived, []);
+    await assert.rejects(r.flow.planNow("erp", remote, paseo), /the peer host.*use Plan or Skip there/);
+  }
+});
+
+test("manual Plan on the local owner starts a planner with automatic dispatch disabled", async (t) => {
+  const r = await room(t, [issue(1)]);
+  const manual: PluginSettings = { ...settings, dispatch: { ...settings.dispatch, enabled: false } };
+  const status = await r.flow.planNow("erp", manual, paseoWith(() => []));
+  assert.equal(status.planner?.agentId, "run-agent-1");
+  assert.equal(r.starts.length, 1);
+  assert.equal(r.starts[0].runId, status.planner?.runId);
+  assert.equal((await r.store.all()).erp.planner?.started, true);
+  assert.deepEqual(r.calls, ["start run"]);
+});
+
+test("queued background Plan rechecks ownership and leaves its run unattempted when the host switches remote", async (t) => {
+  let current = settings;
+  let waiting = false;
+  let hold = true;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  async function readSettings(): Promise<PluginSettings> {
+    if (hold && (await r.store.all()).erp?.planner) {
+      waiting = true;
+      await gate;
+    }
+    return current;
+  }
+  const r = await room(t, [issue(1)], [], undefined, readSettings);
+  const archived: string[] = [];
+  const paseo = paseoWith(() => [], archived);
+  const status = await r.flow.planNow("erp", settings, paseo, true);
+  while (!waiting) await setImmediate();
+  const before = await readFile(r.path, "utf8");
+  r.reads.length = 0;
+  try {
+    current = { ...settings, activation: { mode: "remote", peer: "https://server087.example:8444" } };
+  } finally { hold = false; release(); }
+  // Queued behind the background operation; its stale local snapshot must also be refused.
+  await assert.rejects(r.flow.skipPlan("erp", settings, paseo), /server087\.example:8444/);
+  assert.equal(await readFile(r.path, "utf8"), before);
+  assert.deepEqual(r.reads, []);
+  assert.equal(r.starts.length, 0);
+  assert.deepEqual(r.calls, []);
+  assert.deepEqual(archived, []);
+  current = settings;
+  await r.flow.tick(paseo, settings);
+  assert.equal(r.starts.length, 1, "returning ownership launches the existing unattempted run");
+  assert.equal(r.starts[0].runId, status.planner?.runId);
+});
+
+test("fresh remote settings reject manual actions, approved orders and polling despite a stale local snapshot", async (t) => {
+  const remote: PluginSettings = { ...settings, activation: { mode: "remote", peer: "https://server087.example:8444" } };
+  const r = await room(t, [issue(1)], [], undefined, async () => remote);
+  await r.seed({ planned: [], planner: runRecord({ ownerAsked: true, agentId: "failed" }) });
+  const before = await readFile(r.path, "utf8");
+  const paseo = paseoWith(() => []);
+  await assert.rejects(r.flow.planNow("erp", settings, paseo, true), /server087\.example:8444/);
+  await assert.rejects(r.flow.skipPlan("erp", settings, paseo), /server087\.example:8444/);
+  await assert.rejects(r.flow.applyPlan("run-1", "failed", "```project-order\nhold TUC-1: wait\n```", paseo, settings), /server087\.example:8444/);
+  await r.flow.tick(paseo, settings);
+  assert.equal(await readFile(r.path, "utf8"), before);
+  assert.deepEqual(r.reads, []);
+  assert.deepEqual(r.calls, []);
+  assert.deepEqual(r.starts, []);
+});
+
+test("status exposes persisted owner-held runs after reload without any successful Linear read or notification", async (t) => {
+  for (const name of ["ERP", undefined]) {
+    const r = await room(t, [issue(1)]);
+    await r.seed({ name, planned: [], planner: runRecord({ agentId: "failed", ownerAsked: true, error: "No mapping" }) });
+    r.fail.read = true;
+    r.fail.update = 1;
+    const flow = r.makeFlow();
+    const status = (await flow.status())[0];
+    assert.equal(status.id, "erp");
+    assert.equal(status.name, name ?? "erp");
+    assert.equal(status.toPlan, 0);
+    assert.equal(status.plansAt, null);
+    assert.equal(status.readAt, "2026-01-01T23:00:00Z");
+    assert.equal(status.planner?.runId, "run-1");
+    assert.equal(status.planner?.ownerAsked, true);
+    assert.equal(status.planner?.error, "No mapping");
+    assert.deepEqual(r.reads, []);
+    assert.deepEqual(r.notificationAttempts, []);
+    await assert.rejects(flow.tick(paseoWith(() => []), settings), /HTTP 503/);
+    assert.deepEqual(await flow.status(), [status], "an outage must not hide a durable failure");
+    await r.store.update("erp", (record) => ({ ...record!, planner: runRecord({ id: "replacement", ownerAsked: false, error: "Usage limit: waiting for reset" }) }));
+    assert.deepEqual(await flow.status(), [], "the old held run is not emitted after replacement");
+    await r.store.update("erp", (record) => ({ ...record!, planner: null, closedPlanner: "replacement" }));
+    assert.deepEqual(await flow.status(), []);
+  }
+});
+
+test("a failed owner notification cannot hide the named planner failure across reload", async (t) => {
+  const r = await room(t, [issue(1)]);
+  r.fail.start = "setup";
+  r.fail.update = 1;
+  await r.flow.planNow("erp", settings, paseoWith(() => []));
+  assert.equal((await r.store.all()).erp.name, "ERP");
+  assert.equal(r.notificationAttempts.length, 1);
+  assert.deepEqual(r.updates, []);
+  r.fail.read = true;
+  const status = (await r.makeFlow().status())[0];
+  assert.equal(status.name, "ERP");
+  assert.equal(status.planner?.ownerAsked, true);
+  assert.match(status.planner!.error!, /No Paseo project is mapped/);
+});
+
+test("an accepted owner-held order awaiting Linear retry no longer requests owner input", async (t) => {
+  const r = await room(t, [issue(1), issue(2)]);
+  const paseo = paseoWith(() => []);
+  const order = "```project-order\nTUC-1 blocks TUC-2\n```";
+  await r.seed({ name: "ERP", planned: [], planner: runRecord({ listed: ["i1", "i2"], ownerAsked: true, error: "Needs owner" }) });
+  await r.flow.tick(paseo, settings);
+  r.fail.unreached = "i1 blocks i2";
+  await r.flow.applyPlan("run-1", null, order, paseo, settings);
+  const pending = (await r.store.all()).erp.planner!;
+  assert.equal(pending.approved?.plan, order);
+  assert.equal((await r.flow.status())[0].planner?.ownerAsked, false);
+  assert.deepEqual(await r.makeFlow().status(), []);
+  await r.store.update("erp", (record) => ({ ...record!, planner: { ...record!.planner!, ownerAsked: true } }));
+  assert.equal((await r.flow.status())[0].planner?.ownerAsked, false, "old approved records must not reappear as owner-needed");
+  assert.deepEqual(await r.makeFlow().status(), []);
+  r.fail.unreached = undefined;
+  r.advance(HOUR);
+  await r.flow.tick(paseo, settings);
+  assert.equal((await r.store.all()).erp.planner, null);
+  assert.ok(r.calls.includes("i1 blocks i2"));
+});
+
+test("durable status replaces cached failures after closure, replacement or recovery without losing the successful ticket read", async (t) => {
+  for (const resolution of ["closed", "replaced", "recovered"] as const) {
+    const r = await room(t, [issue(1), issue(2)]);
+    await r.seed({ planned: [], planner: runRecord({ listed: ["i1"], ownerAsked: true, error: "Needs owner" }) });
+    await r.flow.tick(paseoWith(() => []), settings);
+    const before = (await r.flow.status())[0];
+    assert.equal(before.toPlan, 1);
+    assert.equal(before.planner?.ownerAsked, true);
+    r.fail.read = true;
+    await r.store.update("erp", (record) => ({
+      ...record!,
+      planner: resolution === "closed" ? null : runRecord({
+        id: resolution === "replaced" ? "replacement" : "run-1",
+        listed: ["i1"], ownerAsked: false, error: resolution === "replaced" ? "Usage limit: waiting for reset" : undefined,
+      }),
+    }));
+    const after = (await r.flow.status())[0];
+    assert.equal(after.name, before.name);
+    assert.equal(after.toPlan, before.toPlan);
+    assert.equal(after.plansAt, before.plansAt);
+    assert.equal(after.readAt, before.readAt);
+    if (resolution === "closed") assert.equal(after.planner, null);
+    else {
+      assert.equal(after.planner?.ownerAsked, false);
+      assert.equal(after.planner?.runId, resolution === "replaced" ? "replacement" : "run-1");
+      assert.equal(after.planner?.error, resolution === "replaced" ? "Usage limit: waiting for reset" : null);
+    }
+    assert.deepEqual(await r.makeFlow().status(), [], "a healthy or closed durable run is not a reload alert");
+  }
+});
+
+test("durable status adds uncached held projects while preserving cached successful project reads", async (t) => {
+  const r = await room(t, [issue(1)]);
+  await r.flow.tick(paseoWith(() => []), settings);
+  const before = (await r.flow.status())[0];
+  await r.store.update("other", () => ({ name: "Other project", planned: [], planner: runRecord({ id: "other-run", ownerAsked: true, error: "Needs owner" }) }));
+  const statuses = await r.flow.status();
+  assert.deepEqual(statuses[0], before);
+  assert.equal(statuses[1].id, "other");
+  assert.equal(statuses[1].name, "Other project");
+  assert.equal(statuses[1].planner?.ownerAsked, true);
+});
+
+test("status distinguishes a missing store from unreadable or malformed durable state", async (t) => {
+  const r = await room(t, [issue(1)]);
+  assert.deepEqual(await r.flow.status(), [], "a store not created yet is empty");
+  await r.seed({ name: "ERP", planned: [], planner: runRecord({ ownerAsked: true, error: "Needs owner" }) });
+  await r.flow.tick(paseoWith(() => []), settings);
+  assert.equal((await r.flow.status())[0].planner?.ownerAsked, true);
+  for (const source of ["{", "null", "[]", '{"erp":null}', '{"erp":{"planner":false}}', JSON.stringify({ erp: { planner: { ...runRecord(), ownerAsked: "yes" } } })]) {
+    await writeFile(r.path, source);
+    await assert.rejects(r.flow.status(), /JSON|malformed/, "unknown state must not look like an empty or resolved alert");
+  }
+  await rm(r.path);
+  await mkdir(r.path);
+  await assert.rejects(r.flow.status(), { code: "EISDIR" }, "filesystem read errors must reach the caller");
+});
+
+
 test("new tickets get a planner run once they have waited the quiet time, and its brief carries every one of them", async (t) => {
   const r = await room(t, [issue(1), issue(2)]);
   const paseo = paseoWith(() => []);
   await r.flow.tick(paseo, settings);
   assert.deepEqual(r.calls, [], "the tickets only arrived");
-  assert.deepEqual({ toPlan: r.flow.status()[0].toPlan, plansAt: r.flow.status()[0].plansAt, planner: r.flow.status()[0].planner },
+  const waiting = (await r.flow.status())[0];
+  assert.deepEqual({ toPlan: waiting.toPlan, plansAt: waiting.plansAt, planner: waiting.planner },
     { toPlan: 2, plansAt: "2026-01-02T00:15:00.000Z", planner: null }, "the run starts 15 minutes after the newest ticket");
   r.advance(14 * MINUTE);
   await r.flow.tick(paseo, settings);
@@ -168,9 +409,7 @@ test("new tickets get a planner run once they have waited the quiet time, and it
   r.advance(2 * MINUTE);
   await r.flow.tick(paseo, settings);
   assert.deepEqual(r.calls, ["start run"]);
-  const status = r.flow.status()[0];
-  assert.deepEqual(Object.keys(status).sort(), ["id", "name", "planner", "plansAt", "readAt", "toPlan"]);
-  assert.deepEqual(Object.keys(status.planner!).sort(), ["agentId", "error", "restarts", "runId", "startedAt", "tickets"]);
+  const status = (await r.flow.status())[0];
   assert.deepEqual({ toPlan: status.toPlan, plansAt: status.plansAt, tickets: status.planner?.tickets, restarts: status.planner?.restarts, agentId: status.planner?.agentId },
     { toPlan: 0, plansAt: null, tickets: 2, restarts: 0, agentId: "run-agent-1" });
   const start = r.starts[0];
@@ -310,7 +549,7 @@ test("a start that cannot succeed (no mapping, no provider) is left to the owner
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);
   assert.deepEqual(r.calls, [], "asked once, then left to the owner");
-  assert.equal(r.flow.status()[0].planner?.error, "No Paseo project is mapped to ERP or its team. Open the Paseo plugin settings and map one.");
+  assert.equal((await r.flow.status())[0].planner?.error, "No Paseo project is mapped to ERP or its team. Open the Paseo plugin settings and map one.");
 });
 
 test("Plan replaces a run left to the owner, archiving its agent and starting over", async (t) => {
@@ -409,7 +648,7 @@ test("a planner ticket of an older version is dropped: the ticket is left alone 
   const stored = (await r.store.all()).erp;
   assert.deepEqual({ planner: stored.planner, planned: stored.planned }, { planner: null, planned: ["i1"] });
   assert.deepEqual(r.calls, ["delegate i1"], "TUC-1 was planned by the old record; the planner ticket is not a ticket to hand out");
-  assert.equal(r.flow.status()[0].toPlan, 0);
+  assert.equal((await r.flow.status())[0].toPlan, 0);
   r.calls.length = 0;
   r.issues[0] = issue(1, { delegateId: APP });
   r.advance(HOUR);
@@ -424,7 +663,7 @@ test("a run whose start fails never stops the hand-out of tickets already planne
   await r.flow.tick(paseoWith(() => []), settings);
   assert.deepEqual(r.calls, ["start run", "delegate i1"], "the run's start failed: the planned ticket goes out anyway");
   assert.equal((await r.store.all()).erp.planner?.restarts, 0, "the run's first start is not a restart");
-  assert.equal(r.flow.status()[0].planner?.restarts, 0);
+  assert.equal((await r.flow.status())[0].planner?.restarts, 0);
   r.fail.start = undefined;
   r.advance(2 * MINUTE);
   await r.flow.tick(paseoWith(() => []), settings);
@@ -444,7 +683,7 @@ test("a ticket is planned only once a run listed it: one created while the run s
   r.advance(2 * MINUTE);
   await r.flow.tick(paseo, settings);
   assert.equal(r.starts.length, 1, "the open run lists the others as unplanned; no second run starts");
-  assert.equal(r.flow.status()[0].toPlan, 2);
+  assert.equal((await r.flow.status())[0].toPlan, 2);
   await r.flow.applyPlan(run, "run-agent-1", "```project-order\n```", paseo, settings);
   r.calls.length = 0;
   r.advance(16 * MINUTE);
@@ -465,7 +704,7 @@ test("first-seen times are kept per ticket and pruned when one leaves the waitin
   r.advance(2 * MINUTE);
   await r.flow.tick(paseo, settings);
   assert.deepEqual((await r.store.all()).erp.waiting, { i2: "2026-01-02T00:00:00.000Z" });
-  assert.equal(r.flow.status()[0].plansAt, "2026-01-02T00:15:00.000Z", "TUC-2 keeps its own first-seen time");
+  assert.equal((await r.flow.status())[0].plansAt, "2026-01-02T00:15:00.000Z", "TUC-2 keeps its own first-seen time");
 });
 
 test("the approved work order is written as one project update, then planned tickets are handed out in order up to the agent limit", async (t) => {
@@ -652,15 +891,16 @@ test("only new tickets the project could hand out get a run", async (t) => {
   r.calls.length = 0;
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);
-  assert.deepEqual({ toPlan: r.flow.status()[0].toPlan, planner: r.flow.status()[0].planner }, { toPlan: 0, planner: null }, "none of them could be handed out");
+  const read = (await r.flow.status())[0];
+  assert.deepEqual({ toPlan: read.toPlan, planner: read.planner }, { toPlan: 0, planner: null }, "none of them could be handed out");
   await assert.rejects(r.flow.planNow("erp", settings, paseo), /No new tickets to plan/);
   r.issues.push(issue(2, { createdAt: "2026-01-02T00:40:00Z" }), issue(7, { createdAt: "2026-01-02T00:40:00Z", assigneeId: OWNER, statusType: "triage", status: "Triage" }));
   r.advance(2 * MINUTE);
   await r.flow.tick(paseo, settings);
-  assert.equal(r.flow.status()[0].toPlan, 2, "first seen now");
+  assert.equal((await r.flow.status())[0].toPlan, 2, "first seen now");
   r.advance(16 * MINUTE);
   await r.flow.tick(paseo, settings);
-  assert.equal(r.flow.status()[0].planner?.tickets, 2);
+  assert.equal((await r.flow.status())[0].planner?.tickets, 2);
   await r.flow.skipPlan("erp", settings, paseo);
   await assert.rejects(r.flow.planNow("erp", settings, paseo), /No new tickets to plan/);
 });
@@ -1052,7 +1292,7 @@ test("a provider limit during replacement startup spends one claim, preserves ge
   assert.equal(failed.recovery!.claims.length, 1);
   assert.equal(failed.restarts ?? 0, 0);
   assert.equal(failed.recovery!.pending!.identity, r.starts[0].requestId);
-  assert.match(r.flow.status()[0].planner!.error!, /Berlin time/);
+  assert.match((await r.flow.status())[0].planner!.error!, /Berlin time/);
   r.fail.startError = undefined;
   r.advance(14 * MINUTE);
   await r.makeFlow().tick(r.paseo, settings);

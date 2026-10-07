@@ -1003,11 +1003,17 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   first seen, or an hour after the oldest one at the latest, so a steady trickle still gets its
   order within the hour. The Paseo Agents menu bar app uses three RPCs: `linear.projects-status`
   lists each labelled project with how many new tickets wait for a plan, when a run would start
-  (`plansAt`) and the open run (its id, agent, start time, tickets and restarts); `linear.plan-project`
+  (`plansAt`) and the open run (its id, agent, start time, tickets, restarts and `ownerAsked`);
+  persisted owner-needed failures remain visible after reload or a Linear outage. `linear.plan-project`
   saves a run right away and returns it before agent startup finishes, instead of waiting for the
   next read. Startup continues in the project's queue; the request does not wait for provider
   readiness. It replaces a run left to you; `linear.skip-plan` stops the open run, whose tickets are
   then handed out without a work order.
+- **Host ownership.** Project planning belongs to the host with `activation.mode: "local"`.
+  A forwarding host (`"remote"`) refuses Plan and Skip and names its configured peer; it never
+  starts, restarts, skips or applies a project work order. Queued starts re-read ownership before
+  launching, so a handover cannot launch a planner on the old host from captured settings.
+  Turning off auto-dispatch on a local host still permits an intentional manual Plan.
 - **Planner run.** The plugin launches the run's agent itself, in the Paseo project the
   [project mappings](#project-mappings) give the Linear project (else the busiest team of its
   tickets), in that project's own checkout with no worktree or branch: the run changes no code. No agent slot and no memory lease holds it back: it only
@@ -1098,6 +1104,12 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   ordinary restart still keeps the full ten-minute grace, including after reload.
   At the limit bound, one project-update notification is attempted and the run stays owner-held
   until Plan or Skip, even after day rollover. A failed notification is logged, not repeated.
+  The saved `ownerAsked` failure also appears in the menu bar's **Needs your input** list and
+  count, with Plan and Skip actions, and in the hourly ops digest's **Needs attention** and
+  **Waiting on you** lists. These do not depend on the Linear project update succeeding.
+  A scheduled automatic retry alone is not an owner-needed planner failure. A failed menu-bar
+  status refresh retains known failures with a stale-state warning; a successful refresh removes
+  a failure once its run is replaced, skipped or completed.
   Auto-dispatch controls automatic project recovery; the ticket-only automatic-start switch
   does not. Disabling dispatch or removing the project's trigger prevents automatic attempts
   and retains the wait for revalidation when enabled again. Approved work orders and already
@@ -2339,6 +2351,19 @@ starts tuchel-platform's *Flaky quarantine* workflow (`gh workflow run flaky-qua
 text never reaches Linear or the history: errors are reduced to categories, and each line names
 the local command that shows the details. The script's docstring describes one run in detail.
 
+Owner-needed project planners are read directly from `linear-tickets/projects.json` on every
+host, even when no agent exists or the planner's Linear notification failed. Items identify the
+owning host, project and run, use the saved project name when available (else its UUID), and tell
+you to use Plan or Skip there. Error text is reduced to a category. The `planners` source is
+independent of agent/repository reads: unreadable state, unreachable peers and older peers without
+planner snapshots retain that host's previous items as stale rather than clearing them. Missing
+local state means no failures. Recovered, replaced, approved and closed runs clear the old item;
+undelivered notifications remain pending under the existing delivery policy.
+The menu bar app includes owner-needed planners in **Needs your input** and its count, with Plan
+and Skip on the selected tickets host. Temporary errors scheduled for recovery do not enter that
+list. A failed status read keeps the previous list, marked stale; an absent or archived planner's
+Open action still links to its owning host.
+
 Scheduled limit restarts show `in error: rate limit (resumes at HH:MM)` in Berlin time
 (`DD.MM. HH:MM` on another day), still requiring attention. The host snapshot's `limitResumes`
 field keeps remote agents' own times; an older remote script shows the bare error until updated.
@@ -2382,8 +2407,9 @@ that the kind got at least twice as rare, reopening it otherwise.
 systemctl --user start paseo-ops-digest.service             # one real run
 ```
 
-`--at <ISO time>` pretends another "now"; `--agents-json` prints this host's agents for another
-host's digest (what the Mac runs for server087; its format is a contract with the remote).
+`--at <ISO time>` pretends another "now"; `--agents-json` prints this host's agents and sanitized
+`projectPlanners` source for another host's digest (what the Mac runs for server087; its format is
+a contract with the remote).
 
 **History.** Every publishing run appends JSON lines, one `run` line and one line per item:
 

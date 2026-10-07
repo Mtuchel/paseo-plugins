@@ -13,7 +13,7 @@ import { classifyRunAgents, classifyTicketAgents, type ProcessInspector, type Ti
 import { SetupError, type PlannerStart } from "./launch";
 import type { RepairRecord } from "./label-repair";
 import { withPriority } from "./rate-budget";
-import type { PluginSettings } from "./settings";
+import type { PluginSettings, Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 import { activeModel } from "./model";
 import { availability, candidates, LIMIT_DAY, LIMIT_SPACING, limitError, limitSchedule, limitTime, normalizeModel, type UsageReader } from "./limit-resume";
@@ -116,7 +116,19 @@ export type PlannerRecord = {
 // A ticket assigned to Paseo whose start failed: `since` it was first seen so or last started
 // again, `restarts` so far, `ownerAsked` past RESTART_CAP.
 export type StalledRecord = { since: string; restarts: number; ownerAsked?: boolean };
-export type ProjectRecord = { planned?: string[]; plannedThrough?: string | null; planner: PlannerRecord | null; closedPlanner?: string; waiting?: Record<string, string>; withheld?: string[]; stalled?: Record<string, StalledRecord> };
+export type ProjectRecord = { name?: string; planned?: string[]; plannedThrough?: string | null; planner: PlannerRecord | null; closedPlanner?: string; waiting?: Record<string, string>; withheld?: string[]; stalled?: Record<string, StalledRecord> };
+
+// Validate the durable status fields without stripping lifecycle/recovery metadata or legacy
+// planner-ticket fields. Unknown state must fail the status read, not dismiss an owner's alert.
+const projectRecordSchema = z.object({
+  name: z.string().optional(),
+  planner: z.object({
+    id: z.string(), listedAt: z.string(), tickets: z.number().int().nonnegative(),
+    agentId: z.string().optional(), startedAt: z.string().optional(),
+    restarts: z.number().int().nonnegative().optional(), ownerAsked: z.boolean().optional(),
+    error: z.string().optional(),
+  }).passthrough().nullable(),
+}).passthrough();
 
 type Read = { work: ProjectIssue[]; record: ProjectRecord; owner: string; readAt: string; planned: (issue: ProjectIssue) => boolean; unplanned: ProjectIssue[]; status: ProjectStatus };
 
@@ -155,11 +167,24 @@ export class ProjectStore {
   constructor(private readonly path = join(paseoHome(), "linear-tickets", "projects.json")) {}
 
   private async raw(): Promise<Record<string, unknown>> {
-    return JSON.parse(await readFile(this.path, "utf8").catch(() => "{}")) as Record<string, unknown>;
+    const source = await readFile(this.path, "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return "{}";
+      throw error;
+    });
+    const value: unknown = JSON.parse(source);
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("The durable project state is malformed: expected a project record object.");
+    }
+    return value as Record<string, unknown>;
   }
 
   async all(): Promise<Record<string, ProjectRecord>> {
     const { [REPAIRS_KEY]: _repairs, ...projects } = await this.raw();
+    for (const [id, record] of Object.entries(projects)) {
+      if (!projectRecordSchema.safeParse(record).success) {
+        throw new Error(`The durable project state for ${id} is malformed; planner status is unknown.`);
+      }
+    }
     return projects as Record<string, ProjectRecord>;
   }
 
@@ -266,6 +291,8 @@ type Deps = {
   // be handed out (README, "Who starts next").
   capacity: Pick<Capacity, "limit">;
   store?: ProjectStore;
+  // Queued operations and launch preparation must not retain ownership after this host drains.
+  settings?: Pick<Settings, "read">;
   // A project's open tickets; `full`: read all of them now (after this flow wrote to Linear). The
   // host passes ProjectIssueCache.read; without it every read is a full `linear.projectIssues`.
   projectIssues?: (projectId: string, full: boolean) => Promise<ProjectIssue[]>;
@@ -317,6 +344,22 @@ export class ProjectFlow {
     return (this.deps.now ?? Date.now)();
   }
 
+  private async currentSettings(settings: PluginSettings): Promise<PluginSettings> {
+    return this.deps.settings ? this.deps.settings.read() : settings;
+  }
+
+  private requireOwner(settings: PluginSettings): void {
+    if (settings.activation.mode === "remote") {
+      throw new Error(`This host forwards new Linear work to ${settings.activation.peer ?? "the peer host"}; open that host in Paseo and use Plan or Skip there. Project planners are not forwarded.`);
+    }
+  }
+
+  private async ownerSettings(settings: PluginSettings): Promise<PluginSettings> {
+    this.requireOwner(await this.currentSettings(settings));
+    // Keep the operation's label/model snapshot coherent; only fresh ownership can abort it.
+    return settings;
+  }
+
   // Whether a top-level agent works on the ticket: live by its status and not a ghost, on any page
   // of its agents. A ghost is logged, so a restart it causes is explained.
   private async working(paseo: PaseoApi, issueId: string, identifier: string): Promise<boolean> {
@@ -331,9 +374,23 @@ export class ProjectFlow {
     return new Set(Object.entries(await this.store.repairs()).filter(([, record]) => record.state !== "resolved").map(([id]) => id));
   }
 
-  // The labelled projects as of the last read (`linear.projects-status`).
-  status(): ProjectStatus[] {
-    return this.statuses.map((status) => ({ ...status }));
+  // Keep the last successful ticket read, but take planner state from disk: a reload or Linear
+  // outage must neither hide a held run nor keep a failure that has since recovered or closed.
+  async status(): Promise<ProjectStatus[]> {
+    const records = await this.store.all();
+    const cached = new Set(this.statuses.map((status) => status.id));
+    const statuses = this.statuses.map((status) => ({
+      ...status,
+      planner: records[status.id]?.planner ? plannerSummary(records[status.id].planner!) : null,
+    }));
+    for (const [id, record] of Object.entries(records)) {
+      if (cached.has(id) || !record.planner?.ownerAsked || record.planner.approved) continue;
+      statuses.push({
+        id, name: record.name ?? id, toPlan: 0, plansAt: null,
+        planner: plannerSummary(record.planner), readAt: record.planner.listedAt,
+      });
+    }
+    return statuses;
   }
 
   // Called on every dispatch poll; reads the projects at most every POLL_MS. Each project runs on
@@ -343,6 +400,9 @@ export class ProjectFlow {
   // pool's reserve too (see rate-budget.ts).
   async tick(paseo: PaseoApi, settings: PluginSettings): Promise<void> {
     await withPriority("background", "project-flow", async () => {
+      if (settings.activation.mode === "remote") return;
+      settings = await this.currentSettings(settings);
+      if (settings.activation.mode === "remote") return;
       if (this.now() - this.lastPoll < POLL_MS) return;
       this.lastPoll = this.now();
       const appId = await this.deps.linear.appUserId();
@@ -352,7 +412,10 @@ export class ProjectFlow {
       for (const project of await this.deps.linear.labeledProjects(settings.dispatch.label)) {
         try {
           await this.exclusive(project.id, async () => {
+            settings = await this.currentSettings(settings);
+            if (settings.activation.mode === "remote") return;
             let read = await this.read(project, settings);
+            settings = await this.ownerSettings(settings);
             await this.retireObsolete(project.id, paseo);
             const planner = read.record.planner;
             if (planner?.approved) {
@@ -375,6 +438,8 @@ export class ProjectFlow {
                 .catch((error: unknown) => { console.error(`[linear-tickets] project ${project.name}: starting the planner failed, the next read retries: ${message(error)}`); return read.status; });
             }
             statuses.push(await this.runStatus(project.id, status));
+            settings = await this.currentSettings(settings);
+            if (settings.activation.mode === "remote") return;
             await this.handOut(project.id, read, appId, paseo, settings);
             await this.reviveStalled(project.id, read, appId, paseo, settings)
               .catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: restarting stalled tickets failed, the next read retries: ${message(error)}`));
@@ -417,7 +482,7 @@ export class ProjectFlow {
     const updated = await this.store.update(project.id, (current) => {
       const base = current ?? record;
       const waiting = Object.fromEntries(unplanned.map((issue) => [issue.id, base.waiting?.[issue.id] ?? readAt]));
-      return { ...base, waiting };
+      return { ...base, name: project.name, waiting };
     });
     record = updated ?? record;
     const planner = record.planner ? plannerSummary(record.planner) : null;
@@ -428,7 +493,9 @@ export class ProjectFlow {
   // at the next read, and replaces a run left to the owner (its agent is archived, the new run
   // starts over). One run per project at a time.
   async planNow(projectId: string, settings: PluginSettings, paseo: PaseoApi, background = false): Promise<ProjectStatus> {
+    this.requireOwner(settings);
     return this.exclusive(projectId, async () => {
+      settings = await this.ownerSettings(settings);
       const appId = await this.deps.linear.appUserId();
       if (!appId) throw new Error("The Paseo Linear app is not installed on this host, so nothing would start the planner.");
       const project = (await this.deps.linear.labeledProjects(settings.dispatch.label)).find((item) => item.id === projectId);
@@ -452,7 +519,9 @@ export class ProjectFlow {
   // `linear.skip-plan`: stops the open run without an order (README, "Projects"). Its listed
   // tickets count as planned and are handed out unordered, and its agent is archived.
   async skipPlan(projectId: string, settings: PluginSettings, paseo: PaseoApi): Promise<ProjectStatus> {
+    this.requireOwner(settings);
     return this.exclusive(projectId, async () => {
+      settings = await this.ownerSettings(settings);
       const project = (await this.deps.linear.labeledProjects(settings.dispatch.label)).find((item) => item.id === projectId);
       if (!project) throw new Error(`This project no longer carries the "${settings.dispatch.label}" label.`);
       const read = await this.read(project, settings);
@@ -500,9 +569,11 @@ export class ProjectFlow {
       // The RPC acknowledges the persisted run, not provider readiness (which can take minutes).
       // Queue behind this operation; a poll already queued may start it first, so recheck attempts.
       void this.exclusive(project.id, async () => {
+        const currentSettings = await this.currentSettings(settings);
+        if (currentSettings.activation.mode === "remote") return;
         const pending = (await this.store.all())[project.id]?.planner;
         if (pending?.id !== run.id || pending.startedAt || pending.approved || pending.ownerAsked) return;
-        await this.launchRun(project, pending, read, settings, paseo);
+        await this.launchRun(project, pending, read, currentSettings, paseo);
       }).catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: starting the planner failed; the next read after the grace retries: ${message(error)}`));
     } else await this.launchRun(project, run, read, settings, paseo);
     const stored = (await this.store.all())[project.id]?.planner ?? run;
@@ -582,6 +653,7 @@ export class ProjectFlow {
   }
 
   private async restartLimit(project: { id: string; name: string }, run: PlannerRecord, read: Read, settings: PluginSettings, paseo: PaseoApi): Promise<ProjectStatus> {
+    settings = await this.ownerSettings(settings);
     if (!await this.limitReady(project.id, run, settings)) return this.runStatus(project.id, read.status);
     const brief = await this.brief(project, read, settings);
     // Broker/brief reads can outlive an uncertain creation: inspect again before spending a slot.
@@ -591,6 +663,7 @@ export class ProjectFlow {
     if (await this.adoptLive(project.id, run, agents, paseo)) return this.runStatus(project.id, read.status);
     if (!await this.limitReady(project.id, run, settings)) return this.runStatus(project.id, read.status);
     run = (await this.store.all())[project.id].planner!;
+    settings = await this.ownerSettings(settings);
     const recovery = recoveryOf(run)!;
     if (recovery.claims.length >= 4) {
       await this.askOwner(project, run, "The planner reached four usage-limit restart attempts in twenty-four hours.");
@@ -629,6 +702,7 @@ export class ProjectFlow {
   // Inspect roots before either retry budget. Provider limits use durable reset-aware claims;
   // other failures keep the original grace/cap, and SetupError immediately leaves the run held.
   private async launchRun(project: { id: string; name: string }, run: PlannerRecord, read: Read, settings: PluginSettings, paseo: PaseoApi): Promise<ProjectStatus> {
+    settings = await this.ownerSettings(settings);
     const again = run.startedAt !== undefined;
     const agents = await classifyRunAgents(paseo, run.id, this.now(), this.deps.inspect);
     for (const ghost of agents.ghosts) console.log(`[linear-tickets] project ${project.name}: planner agent ${ghost.id.slice(0, 8)} shows ${ghost.status} but its OMP process is gone; it counts as stopped`);
@@ -647,6 +721,7 @@ export class ProjectFlow {
       return this.runStatus(project.id, read.status);
     }
     const brief = await this.brief(project, read, settings);
+    settings = await this.ownerSettings(settings);
     const counted = again ? restarts + 1 : restarts;
     const attemptAt = new Date(this.now()).toISOString();
     await this.store.update(project.id, (current) => current?.planner?.id === run.id ? { ...current, planner: { ...current.planner, restarts: counted, startedAt: attemptAt } } : null);
@@ -680,6 +755,7 @@ export class ProjectFlow {
   // RESTART_GRACE_MS after its last start without a live agent it is started again for the same
   // run; a few tries, then the owner is asked once (README, "Projects").
   private async revive(project: { id: string; name: string }, run: PlannerRecord, read: Read, settings: PluginSettings, paseo: PaseoApi): Promise<void> {
+    settings = await this.ownerSettings(settings);
     // Inspect every poll for live/limit roots; only the generic path obeys its ten-minute grace.
     recoveryOf(run);
     if (!run.recovery?.pending && this.now() - Date.parse(run.startedAt ?? run.listedAt) < RESTART_GRACE_MS) {
@@ -852,9 +928,12 @@ export class ProjectFlow {
   // retried by the next read, then written. False when the run is no longer open — a report of a
   // closed run's review is ignored rather than applied twice.
   async applyPlan(runId: string, agentId: string | null, plan: string, paseo: PaseoApi, settings: PluginSettings): Promise<boolean> {
+    this.requireOwner(settings);
+    settings = await this.ownerSettings(settings);
     const projectId = Object.entries(await this.store.all()).find(([, record]) => record.planner?.id === runId)?.[0];
     if (!projectId) return false;
     return this.exclusive(projectId, async () => {
+      settings = await this.ownerSettings(settings);
       const run = (await this.store.all())[projectId]?.planner;
       if (run?.recovery) {
         recoveryOf(run);
@@ -865,7 +944,7 @@ export class ProjectFlow {
         const canonical = (await this.store.all())[projectId]?.planner?.agentId;
         if (!agentId || canonical !== agentId) return false;
       }
-      const stored = await this.store.update(projectId, (current) => current?.planner?.id === runId ? { ...current, planner: { ...current.planner, approved: { agentId, plan } } } : null);
+      const stored = await this.store.update(projectId, (current) => current?.planner?.id === runId ? { ...current, planner: { ...current.planner, ownerAsked: false, error: undefined, approved: { agentId, plan } } } : null);
       const planner = stored?.planner;
       if (!planner) return false;
       await this.write(projectId, planner, paseo, settings)
@@ -881,9 +960,11 @@ export class ProjectFlow {
   // refuses for APPLY_TRIES reads are skipped, and a ticket whose `hold` or blocker was skipped is
   // withheld instead of handed out unordered.
   private async write(projectId: string, planner: PlannerRecord, paseo: PaseoApi, settings: PluginSettings): Promise<boolean> {
+    settings = await this.ownerSettings(settings);
     const labels = dispatchLabels(settings.dispatch.label);
     const issues = await this.projectIssues(projectId, true);
     if ((await this.store.all())[projectId]?.planner?.id !== planner.id || !planner.approved) return false;
+    this.requireOwner(await this.currentSettings(settings));
     const byIdentifier = new Map(issues.map((issue) => [issue.identifier, issue]));
     const done: string[] = [];
     const skipped: string[] = [];
@@ -980,7 +1061,7 @@ export class ProjectFlow {
 
 // The status contract's view of the open run (shared/contracts.ts projectStatusSchema).
 function plannerSummary(planner: PlannerRecord): NonNullable<ProjectStatus["planner"]> {
-  return { runId: planner.id, agentId: planner.agentId ?? null, startedAt: planner.startedAt ?? null, tickets: planner.tickets, restarts: planner.restarts ?? 0, error: planner.error ?? null };
+  return { runId: planner.id, agentId: planner.agentId ?? null, startedAt: planner.startedAt ?? null, tickets: planner.tickets, restarts: planner.restarts ?? 0, ownerAsked: !planner.approved && (planner.ownerAsked ?? false), error: planner.error ?? null };
 }
 
 function message(error: unknown): string {
