@@ -9,7 +9,7 @@ import type { ParkedPlan } from "./parked";
 import { ghostAgents, type ProcessInspector } from "./process-liveness";
 import type { SessionLink } from "./sessions";
 import { paseoHome } from "./ticket-mcp";
-import { diagnostic, NativeReader, timestamp, type NativeCursor, type NativeEvidence } from "./plan-pipeline-source";
+import { diagnostic, NativeReader, pipelinePlannerEvidence, timestamp, type NativeCursor, type NativeEvidence } from "./plan-pipeline-source";
 
 export type PipelineReview = {
   agentId: string; name: string; since: string; link: string; outcome?: string; decidedAt?: string;
@@ -357,11 +357,11 @@ export class PlanPipeline {
 
   private async run(): Promise<void> {
     await this.load();
-    const [agentSource, sessionSource, parkedSource] = await Promise.allSettled([this.agents(), this.sessions(), this.parked()]);
+    const [agentSource, sessionSource, parkedSource, plannerSource] = await Promise.allSettled([this.agents(), this.sessions(), this.parked(), pipelinePlannerEvidence(this.home)]);
     const agents = agentSource.status === "fulfilled" ? agentSource.value : [];
     const links = sessionSource.status === "fulfilled" ? sessionSource.value : [];
     const parked = parkedSource.status === "fulfilled" ? parkedSource.value : [];
-    const sourceProblems = [agentSource, sessionSource, parkedSource].flatMap((source) => source.status === "rejected" ? [diagnostic(source.reason)] : []);
+    const sourceProblems = [agentSource, sessionSource, parkedSource, plannerSource].flatMap((source) => source.status === "rejected" ? [diagnostic(source.reason)] : []);
     if (agentSource.status === "rejected") for (const record of this.records.values()) {
       if (!TERMINAL[record.row.stage] && record.row.stage !== "ready" && record.row.status !== "failed") this.change(record, record.row.stage, "unknown", record.row.since, "Agent source unavailable; retaining last evidence");
     }
