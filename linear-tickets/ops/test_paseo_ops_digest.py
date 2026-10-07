@@ -80,6 +80,7 @@ class FakeIO:
         self.evidence_data = {"prWatch": None, "crashes": None, "limitResumes": {"pending": {}, "started": set()}}
         self.usage_data = {"version": 1, "hours": {}}
         self.usage_error = None
+        self.planner_sources_data = {digest.HOST_NAME: {"ok": True, "failures": []}}
 
     def dispatch_quarantine(self):
         self.dispatches += 1
@@ -105,6 +106,9 @@ class FakeIO:
 
     def evidence(self):
         return dict(self.evidence_data)
+
+    def planner_sources(self):
+        return self.planner_sources_data
 
     def permissions(self):
         return self.perms
@@ -781,6 +785,249 @@ class LimitResumeRunTest(RunCase):
         self.assertEqual({line["key"]: line["auto"] for line in lines
                           if line.get("key", "").startswith("agent-error")},
                          {f"agent-error:{local['id']}": True, f"agent-error:{remote['id']}": None})
+
+
+class ProjectPlannerRunTest(RunCase):
+    PROJECT = "0f1ef7f6-a8d6-4fd5-bb7a-549344761229"
+    RUN = "669bd1e6-f9aa-40a3-b7f7-bd7ea8a0c599"
+
+    def setUp(self):
+        super().setUp()
+        self.projects = os.path.join(self.tmp.name, "projects.json")
+        self.host = digest.HostIO(sync_repo=False, remotes=False)
+        self._projects = mock.patch.object(digest, "PROJECTS", self.projects)
+        self._projects.start()
+        self.addCleanup(self._projects.stop)
+        self.io.planner_sources = self.host.planner_sources
+
+    def store(self, planner, **extra):
+        with open(self.projects, "w") as f:
+            json.dump({self.PROJECT: {"planner": planner, **extra}, "~repairs": {"unrelated": "record"}}, f)
+
+    def failed(self, **extra):
+        return {"id": self.RUN, "ownerAsked": True, "error": "tool failed: SECRET456",
+                "listedAt": "2026-09-30T06:00:00Z", **extra}
+
+    def key(self, host=None, run=None):
+        return f"project-planner:{host or digest.HOST_NAME}:{self.PROJECT}:{run or self.RUN}"
+
+    def test_persisted_failure_without_agent_or_linear_notice_is_durable_and_sanitized(self):
+        # The plugin saved ownerAsked, then its Linear project-update notice failed.
+        self.store(self.failed())
+        self.io.publish_error = digest.LinearError("Linear unavailable")
+        self.assertEqual(self.run_at(WED_10_05), 1)
+        saved = self.saved()
+        item = saved["items"][self.key()]["payload"]
+        self.assertEqual(item["title"], f"project {self.PROJECT}")
+        self.assertEqual((item["group"], item["attention"]), ("waiting", True))
+        self.assertIn(self.key(), saved["pending"])
+        self.assertNotIn("SECRET456", json.dumps(saved))
+        self.io.publish_error = None
+        self.assertEqual(self.run_at(WED_11_05), 0)
+        self.assertIn("## Needs attention (1)", self.io.published[-1])
+        self.assertIn("**Waiting on you**", self.io.published[-1])
+        self.assertIn(f"Plan / Skip on {digest.HOST_NAME}", self.io.comments[0][2])
+        self.assertEqual(self.saved()["items"][self.key()]["firstSeen"], WED_10_05)
+        self.assertEqual(self.saved()["pending"], {})
+        events = read_lines(os.path.join(self.history, "history.jsonl"))
+        opened = next(e for e in events if e.get("event") == "opened" and e.get("key") == self.key())
+        self.assertEqual((opened["host"], opened["owner"]), (digest.HOST_NAME, True))
+        self.assertNotIn("SECRET456", json.dumps(events))
+
+    def test_saved_name_identifies_failure_without_rejecting_idle_project_records(self):
+        self.store(self.failed(), name="ERP")
+        with open(self.projects) as f:
+            projects = json.load(f)
+        projects["other-project"] = {"planned": []}
+        with open(self.projects, "w") as f:
+            json.dump(projects, f)
+        self.run_at(WED_10_05)
+        item = self.saved()["items"][self.key()]["payload"]
+        self.assertEqual(item["title"], "ERP")
+        self.assertFalse(self.saved()["items"][self.key()]["stale"])
+
+    def test_remote_rpc_failure_still_delivers_new_planner_alert_and_keeps_agent_items_stale(self):
+        target = "mirko@remote"
+        old_agent = {"id": "old-remote", "name": "old agent", "status": "error", "_host": target}
+        self.store(None)
+        self.io.agent_list = [old_agent]
+        self.io.targets = [target]
+        self.run_at(WED_10_05)
+        self.store(self.failed())
+        self.io.agent_list = []
+        self.io.publish_error = digest.LinearError("Linear unavailable")
+        for failed_call in ("agents", "permissions"):
+            with self.subTest(rpc=failed_call), \
+                 mock.patch.object(self.host, "agents", return_value=([], {})), \
+                 mock.patch.object(self.host, "permissions", return_value={}), \
+                 mock.patch.object(self.host, "limit_resumes", return_value={"pending": {}, "started": set()}), \
+                 mock.patch.object(self.host, failed_call, side_effect=TimeoutError("SECRET_RPC")):
+                snapshot = self.host.snapshot()
+            receiver = digest.HostIO(sync_repo=False, remotes=False)
+            receiver._targets = [target]
+            receiver._remotes = [{**snapshot, "_host": target}]
+            self.io.planner_sources = lambda: {target: receiver.planner_sources()[target]}
+            self.io.unreachable_hosts = receiver.unreachable_hosts
+            self.run_at(WED_11_05)
+            saved = self.saved()
+            self.assertIn(self.key(target), saved["pending"])
+            self.assertFalse(saved["items"][self.key(target)]["stale"])
+            self.assertTrue(saved["items"]["agent-error:old-remote"]["stale"])
+            self.assertNotIn("SECRET_RPC", json.dumps(saved))
+
+    def test_unreadable_and_malformed_source_retains_previous_alert_stale(self):
+        self.store(self.failed())
+        self.run_at(WED_10_05)
+        for bad in ("{not json", "[]", json.dumps({self.PROJECT: "broken"}),
+                    json.dumps({self.PROJECT: {"planner": {"ownerAsked": True}}})):
+            with self.subTest(bad=bad):
+                with open(self.projects, "w") as f:
+                    f.write(bad)
+                self.assertEqual(self.run_at(WED_11_05), 0)
+                self.assertTrue(self.saved()["items"][self.key()]["stale"])
+                self.assertIn("planners: unreadable response (previous items kept)", self.io.published[-1])
+                self.assertIn("not refreshed since", self.io.published[-1])
+        with mock.patch("builtins.open", side_effect=PermissionError("SECRET456")):
+            unavailable = self.host.project_planners()
+        self.io.planner_sources = lambda: {digest.HOST_NAME: unavailable}
+        self.run_at(WED_11_05)
+        self.assertTrue(self.saved()["items"][self.key()]["stale"])
+        self.assertNotIn("SECRET456", self.io.published[-1])
+
+    def test_missing_local_file_is_empty_and_clears_previous_failure(self):
+        self.assertEqual(self.host.project_planners(), {"ok": True, "failures": []})
+        self.store(self.failed())
+        self.run_at(WED_10_05)
+        os.remove(self.projects)
+        self.run_at(WED_11_05)
+        self.assertEqual(self.saved()["items"], {})
+        self.assertIn("## Cleared since last update", self.io.published[-1])
+
+    def test_running_retrying_resolved_closed_and_replaced_runs_clear(self):
+        retry = {"id": self.RUN, "error": "429 usage limit", "restarts": 2,
+                 "recovery": {"pending": {"resumeAt": "2026-09-30T12:05:00Z"}}}
+        cases = [(None, {}), ({"id": self.RUN, "agentId": "running-agent"}, {}),
+                 (retry, {}), (self.failed(ownerAsked=False), {}),
+                 (self.failed(approved={"plan": "approved"}), {}),
+                 (self.failed(), {"closedPlanner": self.RUN}),
+                 ({"id": "new-run", "agentId": "replacement"}, {})]
+        for planner, extra in cases:
+            with self.subTest(planner=planner, extra=extra):
+                self.store(self.failed())
+                self.run_at(WED_10_05)
+                self.store(planner, **extra)
+                self.run_at(WED_11_05)
+                self.assertNotIn(self.key(), self.saved()["items"])
+                self.assertIn(self.key(), [e["payload"]["key"] for e in self.saved()["cleared"]])
+        self.store(self.failed(id="new-failed-run"))
+        self.run_at(WED_11_05)
+        self.assertEqual(set(self.saved()["items"]), {self.key(run="new-failed-run")})
+        self.assertIn(self.PROJECT, self.io.comments[-1][2])
+
+    def test_pending_failure_survives_delivery_failure_even_after_resolution(self):
+        self.store(self.failed())
+        self.io.comment_error = digest.LinearError("cannot notify")
+        self.run_at(WED_10_05)
+        self.assertIn(self.key(), self.saved()["pending"])
+        self.store(None)
+        self.run_at(WED_11_05)
+        self.assertEqual(self.saved()["items"], {})
+        self.assertEqual(self.saved()["pending"][self.key()]["clearedAt"], WED_11_05)
+        self.io.comment_error = None
+        self.run_at(at("2026-09-30T10:05:00Z"))
+        self.assertIn("cleared", self.io.comments[-1][2])
+        self.assertIn(f"Plan / Skip on {digest.HOST_NAME}", self.io.comments[-1][2])
+        self.assertEqual(self.saved()["pending"], {})
+
+    def test_remote_snapshot_identity_and_unknown_sources_are_independent(self):
+        self.store(self.failed())
+        with mock.patch.object(self.host, "agents", return_value=([], {})), \
+             mock.patch.object(self.host, "permissions", return_value={}), \
+             mock.patch.object(self.host, "open_reviews", return_value={}), \
+             mock.patch.object(self.host, "limit_resumes", return_value={"pending": {}, "started": set()}):
+            snapshot = json.loads(json.dumps(self.host.snapshot()))
+        self.assertNotIn("SECRET456", json.dumps(snapshot))
+        remote = digest.HostIO(sync_repo=False)
+        remote._targets = ["mirko@mac", "server087"]
+        remote._remotes = None
+        with mock.patch.object(digest, "run_cmd", return_value=json.dumps(snapshot)):
+            remote.remotes()
+        self.io.planner_sources = remote.planner_sources
+        self.run_at(WED_10_05)
+        self.assertEqual(set(self.saved()["items"]),
+                         {self.key(), self.key("mirko@mac"), self.key("server087")})
+        self.assertEqual(self.saved()["items"][self.key("mirko@mac")]["payload"]["unit"],
+                         "planners@mirko@mac")
+        self.assertIn("Plan / Skip on mirko@mac", self.io.published[-1])
+        self.store(None)
+        remote._remotes[0].pop("projectPlanners")  # old peer: unknown, not healthy/empty
+        remote._remotes[1]["projectPlanners"] = {"ok": False, "category": "unreadable response"}
+        self.run_at(WED_11_05)
+        self.assertEqual(set(self.saved()["items"]), {self.key("mirko@mac"), self.key("server087")})
+        self.assertTrue(all(e["stale"] for e in self.saved()["items"].values()))
+        remote._remotes = []
+        remote._unreachable = {"mirko@mac": "timeout", "server087": "network"}
+        self.run_at(WED_11_05)
+        self.assertTrue(all(e["stale"] for e in self.saved()["items"].values()))
+        self.assertIn("planners@mirko@mac: timeout", self.io.published[-1])
+        remote._unreachable = {}
+        remote._remotes = [{"_host": h, "projectPlanners": {"ok": True, "failures": []}}
+                           for h in remote._targets]
+        self.run_at(at("2026-09-30T10:05:00Z"))
+        self.assertEqual(self.saved()["items"], {})
+
+    def test_unknown_local_source_does_not_keep_resolved_remote_failure(self):
+        self.store(self.failed())
+        source = self.host.project_planners()
+        self.io.planner_sources = lambda: {digest.HOST_NAME: self.host.project_planners(), "mac": source}
+        self.run_at(WED_10_05)
+        source = {"ok": True, "failures": []}
+        with open(self.projects, "w") as f:
+            f.write("{not json")
+        self.run_at(WED_11_05)
+        self.assertEqual(set(self.saved()["items"]), {self.key()})
+        self.assertTrue(self.saved()["items"][self.key()]["stale"])
+        self.assertIn(self.key("mac"), [e["payload"]["key"] for e in self.saved()["cleared"]])
+
+    def test_failed_replacement_has_new_identity_and_notification(self):
+        self.store(self.failed())
+        self.run_at(WED_10_05)
+        self.store(self.failed(id="new-failed-run", agentId="replacement"))
+        self.run_at(WED_11_05)
+        self.assertEqual(set(self.saved()["items"]), {self.key(run="new-failed-run")})
+        self.assertEqual(self.saved()["items"][self.key(run="new-failed-run")]["firstSeen"], WED_11_05)
+        self.assertEqual(len(self.io.comments), 2)
+        self.assertIn(self.key(), [e["payload"]["key"] for e in self.saved()["cleared"]])
+
+    def test_malformed_remote_source_is_unknown_and_never_publishes_its_raw_error(self):
+        self.store(self.failed())
+        good = self.host.project_planners()
+        source = good
+        self.io.planner_sources = lambda: {digest.HOST_NAME: good, "mac": source}
+        self.run_at(WED_10_05)
+        for bad in ([], {"ok": True, "failures": "SECRET456"},
+                    {"ok": True, "failures": [{"projectId": self.PROJECT, "runId": self.RUN,
+                                               "category": "SECRET456"}]},
+                    {"ok": False, "category": "SECRET456"}):
+            with self.subTest(source=bad):
+                source = bad
+                self.run_at(WED_11_05)
+                self.assertTrue(self.saved()["items"][self.key("mac")]["stale"])
+                self.assertFalse(self.saved()["items"][self.key()]["stale"])
+                self.assertNotIn("SECRET456", self.io.published[-1])
+
+    def test_planner_collection_is_independent_of_agents_and_repository_reads(self):
+        self.store(self.failed())
+        self.run_at(WED_10_05)
+        self.store(None)
+        self.io.repo_error = TimeoutError()
+        with mock.patch.object(self.io, "agents", side_effect=TimeoutError()):
+            self.run_at(WED_11_05)
+        self.assertNotIn(self.key(), self.saved()["items"])
+        self.store(self.failed())
+        with mock.patch.object(self.io, "agents", side_effect=TimeoutError()):
+            self.run_at(at("2026-09-30T10:05:00Z"))
+        self.assertFalse(self.saved()["items"][self.key()]["stale"])
 
 
 class BackfillTest(unittest.TestCase):

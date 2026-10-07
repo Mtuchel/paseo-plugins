@@ -93,6 +93,7 @@ PR_WATCH = f"{HOME}/linear-tickets/pr-watch.json"
 CRASHES = f"{HOME}/linear-tickets/crash-recovery.json"
 LIMIT_RESUMES = f"{HOME}/linear-tickets/limit-resumes.json"
 LINEAR_USAGE = f"{HOME}/linear-tickets/linear-usage.json"  # the plugin's own Linear API usage per UTC hour
+PROJECTS = f"{HOME}/linear-tickets/projects.json"
 PULL_URL = "https://github.com/tuchel-sohn/tuchel-platform/pull/{}"
 HISTORY = "history.jsonl"
 HISTORY_BACKFILL = "history-backfill.jsonl"
@@ -117,7 +118,7 @@ WORKTREE_TICKET = re.compile(r"/worktrees/[^/]+/[^/]*?\b([a-z][a-z0-9]+)-(\d+)-"
 REPO_SECTIONS = ("main", "queue", "drops", "pulls", "deploys")
 GITHUB_REPO = "tuchel-sohn/tuchel-platform"
 QUARANTINE_WORKFLOW = "flaky-quarantine.yml"
-HOST_UNITS = ("agents", "silent", "locks")
+HOST_UNITS = ("agents", "silent", "locks", "planners")
 CANDIDATES_MARKER = re.compile(r"^Marker: `decision-candidates (?:ERP|Agent tooling) \d{4}-W\d{2}(?: run \d+)?`", re.M)
 PROPOSAL = re.compile(r"^## Q-(\d+) — ", re.M)
 ANSWERED = re.compile(r"\*\*Q-(\d+) answered\*\*")
@@ -327,6 +328,64 @@ def lock_items(running_identifiers, agents, metas, teams):
              "detail": "labelled as having a running agent, but no agent works on it",
              "command": None}
             for ident in sorted(running_identifiers) if ident not in held]
+
+
+# ---------------------------------------------------------------------------- project planners (pure)
+
+def project_planner_failures(data):
+    """Current owner-blocked runs only. Reject a malformed source instead of treating it as
+    empty and clearing an earlier alert. Use the saved name when available, else the UUID.
+    Return only identities and sanitized categories, never the error or recovery record."""
+    if not isinstance(data, dict):
+        raise TypeError("invalid projects")
+    failures = []
+    for project_id, record in data.items():
+        if project_id == "~repairs":
+            continue
+        if not isinstance(record, dict):
+            raise TypeError("invalid project")
+        planner = record.get("planner")
+        if planner is None:
+            continue
+        if not isinstance(planner, dict) or not isinstance(planner.get("id"), str) or not planner["id"]:
+            raise TypeError("invalid planner")
+        if "ownerAsked" in planner and not isinstance(planner["ownerAsked"], bool):
+            raise TypeError("invalid owner flag")
+        if planner.get("error") is not None and not isinstance(planner["error"], str):
+            raise TypeError("invalid planner error")
+        if planner.get("approved") is not None and not isinstance(planner["approved"], dict):
+            raise TypeError("invalid planner approval")
+        if record.get("closedPlanner") is not None and not isinstance(record["closedPlanner"], str):
+            raise TypeError("invalid closed planner")
+        if (planner.get("ownerAsked") is not True or planner.get("approved")
+                or record.get("closedPlanner") == planner["id"]):
+            continue
+        failures.append({"projectId": project_id, "runId": planner["id"],
+                         "name": record.get("name") if isinstance(record.get("name"), str) else None,
+                         "category": agent_error_category(planner.get("error"))})
+    return failures
+
+
+def project_planner_items(source, host):
+    """Sanitized local/remote snapshot into the existing waiting/attention rendering.
+    Invalid or absent snapshots raise so only this host's previous planner items stay stale."""
+    if not isinstance(source, dict) or source.get("ok") is not True or not isinstance(source.get("failures"), list):
+        raise TypeError("unknown project planners")
+    categories = {"no message", "rate limit", "provider or network error", "tool error", "other error"}
+    unit = "planners" if host == HOST_NAME else f"planners@{host}"
+    items = []
+    for failure in source["failures"]:
+        if (not isinstance(failure, dict) or not isinstance(failure.get("projectId"), str)
+                or not failure["projectId"] or not isinstance(failure.get("runId"), str)
+                or not failure["runId"] or failure.get("category") not in categories):
+            raise TypeError("invalid project planner failure")
+        project_id, run_id = failure["projectId"], failure["runId"]
+        items.append({"key": f"project-planner:{host}:{project_id}:{run_id}", "unit": unit,
+                      "section": "agents", "group": "waiting", "attention": True,
+                      "title": failure.get("name") if isinstance(failure.get("name"), str) and failure["name"] else f"project {project_id}", "ticket": None,
+                      "detail": f"project planner failed: {failure['category']}",
+                      "command": f"linear-tickets Projects: Plan / Skip on {host}"})
+    return items
 
 
 # ---------------------------------------------------------------------------- decision candidates (pure)
@@ -539,6 +598,8 @@ def unit_failed(unit, failed_units):
     `pulls/917`), or the whole repository script — which covers every item of the repository
     part, but none of this host's own units, the plugin's `linear_budget` included."""
     unit = unit or ""
+    if unit.split("@", 1)[0] == "planners":
+        return unit in failed_units  # each project store is independent, including the local one
     if "repo" in failed_units and unit.split("@")[0] not in HOST_UNITS + ("linear_budget",):
         return True
     return any(unit == f or unit.startswith(f + "/") or unit.startswith(f + "@") for f in failed_units)
@@ -1075,18 +1136,25 @@ class HostIO:
                     out = run_cmd(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", target,
                                    "bash -lc 'python3 .paseo/bin/paseo-ops-digest.py --agents-json'"])
                     snapshot = json.loads(out.strip().splitlines()[-1])
+                    snapshot["_host"] = target
+                    for agent in snapshot["agents"]:
+                        agent["_host"] = target
                 except Exception as exc:
                     self._unreachable[target] = error_category(exc)
                     continue
-                for agent in snapshot["agents"]:
-                    agent["_host"] = target
                 self._remotes.append(snapshot)
         return self._remotes
 
     def unreachable_hosts(self):
         """{ssh target: error category} of remotes that could not be read this run."""
         self.remotes()
-        return dict(self._unreachable)
+        failed = dict(self._unreachable)
+        for snapshot in self._remotes:
+            outcome = snapshot.get("agentSource")
+            if isinstance(outcome, dict) and outcome.get("ok") is False:
+                reported = outcome.get("category")
+                failed[snapshot["_host"]] = reported if reported in ("timeout", "network", "rate limit", "error", "unreadable response", "missing file") else "error"
+        return failed
 
     def limit_resumes(self):
         """The limit-resume store of the linear-tickets plugin, with every other host's store
@@ -1100,6 +1168,28 @@ class HostIO:
         except (OSError, ValueError):
             local = None
         return merge_limit_resumes(local, self.remotes())
+
+    def project_planners(self):
+        """This host's durable planner failures, independent of agents and Linear notices.
+        Missing local state means no projects; unreadable state means UNKNOWN."""
+        try:
+            with open(PROJECTS) as f:
+                failures = project_planner_failures(json.load(f))
+            return {"ok": True, "failures": failures}
+        except FileNotFoundError:
+            return {"ok": True, "failures": []}
+        except (OSError, ValueError, TypeError) as exc:
+            return {"ok": False, "category": error_category(exc)}
+
+    def planner_sources(self):
+        """Each host has its own source outcome. An old peer without projectPlanners is
+        UNKNOWN, never an empty read; a failed SSH read keeps that host's alerts stale."""
+        sources = {HOST_NAME: self.project_planners()}
+        for snapshot in self.remotes():
+            sources[snapshot["_host"]] = snapshot.get("projectPlanners")
+        for target in self.remote_targets():
+            sources.setdefault(target, {"ok": False, "category": self._unreachable.get(target, "unreadable response")})
+        return sources
 
     def evidence(self):
         """The pull request watch, crash recovery and limit-resume records of the linear-tickets
@@ -1123,17 +1213,24 @@ class HostIO:
         return load_linear_usage(LINEAR_USAGE)
 
     def snapshot(self):
-        """This host's agent data for another host's digest (--agents-json), JSON-safe (the
-        limit-resume store's set becomes a sorted list)."""
-        agents, metas = self.agents()
-        live_ids = {a["id"] for a in agents if a.get("status") != "closed"}
+        """Independent planner evidence survives failed agent/permission RPCs on this host."""
+        snapshot = {"projectPlanners": self.project_planners(),
+                    "agents": [], "metas": {}, "permissions": {}, "reviews": {},
+                    "errorLines": {}, "limitResumes": None}
+        try:
+            agents, metas = self.agents()
+            live_ids = {a["id"] for a in agents if a.get("status") != "closed"}
+            snapshot.update({"agents": agents, "metas": metas, "permissions": self.permissions(),
+                             "reviews": self.open_reviews(live_ids),
+                             "errorLines": {a["id"]: self.error_line(a["id"]) for a in agents if a.get("status") == "error"}})
+            snapshot["agentSource"] = {"ok": True}
+        except Exception as exc:
+            snapshot.update({"agents": [], "metas": {}, "permissions": {}, "reviews": {},
+                             "errorLines": {}, "agentSource": {"ok": False, "category": error_category(exc)}})
         resumes = self.limit_resumes()
-        safe_resumes = None
         if resumes is not None:
-            safe_resumes = {"pending": resumes["pending"], "started": sorted(resumes["started"])}
-        return {"agents": agents, "metas": metas, "permissions": self.permissions(),
-                "reviews": self.open_reviews(live_ids), "limitResumes": safe_resumes,
-                "errorLines": {a["id"]: self.error_line(a["id"]) for a in agents if a.get("status") == "error"}}
+            snapshot["limitResumes"] = {"pending": resumes["pending"], "started": sorted(resumes["started"])}
+        return snapshot
 
     def key(self):
         if self._key is None:
@@ -1520,6 +1617,20 @@ def collect(io, now, started):
         units.append({"unit": "repo", "ok": True})
     except Exception as exc:
         units.append({"unit": "repo", "ok": False, "category": error_category(exc)})
+    for host, source in io.planner_sources().items():
+        unit = "planners" if host == HOST_NAME else f"planners@{host}"
+        try:
+            items += project_planner_items(source, host)
+            units.append({"unit": unit, "ok": True})
+        except Exception as exc:
+            # Source outcomes and snapshot omissions are UNKNOWN, not a successful empty read.
+            category = error_category(exc)
+            if isinstance(source, dict) and source.get("ok") is False:
+                reported = source.get("category")
+                if (reported in ("error", "unreadable response", "missing file", "timeout", "network", "rate limit")
+                        or isinstance(reported, str) and re.fullmatch(r"(?:HTTP|exit) \d+", reported)):
+                    category = reported
+            units.append({"unit": unit, "ok": False, "category": category})
     agents, metas = [], {}
     try:
         agents, metas = io.agents()

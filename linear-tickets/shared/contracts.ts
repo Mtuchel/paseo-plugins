@@ -328,6 +328,7 @@ export const projectStatusSchema = z.object({
     tickets: z.number().int(),
     restarts: z.number().int(),
     error: z.string().nullable(),
+    ownerAsked: z.boolean(),
   }).nullable(),
   readAt: z.string(),
 });
