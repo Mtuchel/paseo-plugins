@@ -27,7 +27,7 @@ import { issueAgents, type TicketStarter } from "./starter";
 import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 import { WATCHDOG_LABEL, type TicketRoots, type WatchdogOutcome, type WatchdogRequest, type WatchdogStore } from "./watchdog";
 import type { ReviewDeletions } from "./review-deletions";
-import { availability, candidates, claims, finishPending, incidentFor, LIMIT_SPACING, limitError, limitTime, normalizeModel, updateEpisode, type LimitPending, type LimitResumeStore, type UsageReader } from "./limit-resume";
+import { availability, candidates, claims, finishPending, incidentFor, LIMIT_SPACING, limitError, limitSchedule, limitTime, normalizeModel, updateEpisode, type LimitPending, type LimitResumeStore, type UsageReader } from "./limit-resume";
 
 const exec = promisify(execFile);
 const HANDLED_LIMIT = 200;
@@ -1622,8 +1622,9 @@ export class SessionRouter {
         const now = this.clock(); // A report refreshed while awaiting the broker is still fresh.
         const reading = reports ? availability(reports, models, now) : null;
         const recovery = reading?.recovery;
-        const basis = recovery?.roomNow ? "room" : recovery?.earliestReset !== null && recovery?.earliestReset !== undefined ? "reset" : error.retryAfterMs ? "retry-after" : "default";
-        let resumeAt = basis === "room" ? now : basis === "reset" ? recovery!.earliestReset! + this.limitJitter() : basis === "retry-after" ? now + error.retryAfterMs! + this.limitJitter() : now + 30 * 60_000;
+        const timing = limitSchedule(recovery, error.retryAfterMs, now, () => this.limitJitter());
+        const basis = timing.basis;
+        let resumeAt = timing.resumeAt;
         const scheduled = await store.update((file) => {
           const recent = claims(file, link.issueId, now);
           if (recent.length) resumeAt = Math.max(resumeAt, Math.max(...recent) + LIMIT_SPACING);

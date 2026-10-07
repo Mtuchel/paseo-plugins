@@ -91,6 +91,13 @@ export function availability(reports: UsageReport[], models: string[], now: numb
   };
 }
 
+// Shared initial timing; callers own durable budgets, deadlines and due-time revalidation.
+export function limitSchedule(recovery: Availability["recovery"] | null | undefined, retryAfterMs: number | null, now: number, jitter: () => number): { basis: LimitPending["basis"]; resumeAt: number } {
+  const basis = recovery?.roomNow ? "room" : recovery?.earliestReset !== null && recovery?.earliestReset !== undefined ? "reset" : retryAfterMs ? "retry-after" : "default";
+  const resumeAt = basis === "room" ? now : basis === "reset" ? recovery!.earliestReset! + jitter() : basis === "retry-after" ? now + retryAfterMs! + jitter() : now + 30 * MINUTE;
+  return { basis, resumeAt };
+}
+
 const exec = promisify(execFile);
 const reportSchema = z.object({ provider: z.string(), fetchedAt: z.union([z.number(), z.string()]).optional(), limits: z.array(z.object({ scope: z.object({ tier: z.string().optional() }).optional(), amount: z.object({ usedFraction: z.number().optional(), remainingFraction: z.number().optional() }).optional(), status: z.string().optional(), window: z.object({ resetsAt: z.union([z.number(), z.string()]).optional() }).optional() })) });
 
