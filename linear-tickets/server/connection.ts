@@ -41,35 +41,41 @@ export async function ownConnection(): Promise<PaseoClient | null> {
   }
 }
 
-// Calls the plugin SDK does not offer (model and thinking changes, workspace labels) use the daemon
-// client the SDK is built on: one connection, opened on first use and closed with the plugin.
-// A failed connection is retried on the next use; each distinct failure is logged once.
-let internalClient: Promise<DaemonClient | null> | null = null;
-let connectFailure: string | null = null;
-export async function internalDaemon(): Promise<DaemonClient | null> {
-  internalClient ??= (async () => {
-    const target = await localDaemon();
-    if (!target) return null;
-    // Sender-specific permission acknowledgements require owned subscriptions. The 0.8.0
-    // tooling client does not advertise this by default; a broadcast resolution is not proof
-    // that our answer was applied.
-    const client = new DaemonClient({ ...target, clientId: "linear-tickets-internal", connectTimeoutMs: 5_000, capabilities: { owned_subscriptions: true } } as DaemonClientConfig);
-    try {
-      await client.connect();
-      connectFailure = null;
-      return client;
-    } catch (error) {
-      await client.close().catch(() => {});
-      const message = error instanceof Error ? error.message : String(error);
-      if (message !== connectFailure) console.error(`[linear-tickets] internal daemon connection failed: ${message}`);
-      connectFailure = message;
-      return null;
-    }
-  })();
-  const client = await internalClient;
-  if (!client) internalClient = null;
+// Calls missing from the plugin SDK retain its client's legacy subscription protocol.
+// Permission submissions need their own owned-subscription connection: the 0.8.0 client's
+// workspace-label subscriptions send client-assigned IDs, which that protocol rejects.
+const internalClients = new Map<"general" | "permission", Promise<DaemonClient | null>>();
+const connectFailures = new Map<"general" | "permission", string>();
+async function daemonConnection(kind: "general" | "permission"): Promise<DaemonClient | null> {
+  let connecting = internalClients.get(kind);
+  if (!connecting) {
+    connecting = (async () => {
+      const target = await localDaemon();
+      if (!target) return null;
+      const client = new DaemonClient({ ...target, clientId: `linear-tickets-internal-${kind}`, connectTimeoutMs: 5_000,
+        ...(kind === "permission" ? { capabilities: { owned_subscriptions: true } } : {}),
+      } as DaemonClientConfig);
+      try {
+        await client.connect();
+        connectFailures.delete(kind);
+        return client;
+      } catch (error) {
+        await client.close().catch(() => {});
+        const message = error instanceof Error ? error.message : String(error);
+        if (message !== connectFailures.get(kind)) console.error(`[linear-tickets] ${kind} daemon connection failed: ${message}`);
+        connectFailures.set(kind, message);
+        return null;
+      }
+    })();
+    internalClients.set(kind, connecting);
+  }
+  const client = await connecting;
+  if (!client && internalClients.get(kind) === connecting) internalClients.delete(kind);
   return client;
 }
+
+export function internalDaemon(): Promise<DaemonClient | null> { return daemonConnection("general"); }
+export function permissionDaemon(): Promise<DaemonClient | null> { return daemonConnection("permission"); }
 
 export async function modelSetter(): Promise<ModelSetter | null> {
   const client = await internalDaemon();
@@ -81,7 +87,7 @@ export async function modelSetter(): Promise<ModelSetter | null> {
 }
 
 export async function closeInternalDaemon(): Promise<void> {
-  const client = await internalClient?.catch(() => null);
-  internalClient = null;
-  await client?.close().catch(() => {});
+  const connecting = [...internalClients.values()];
+  internalClients.clear();
+  await Promise.all(connecting.map(async (pending) => { const client = await pending.catch(() => null); await client?.close().catch(() => {}); }));
 }
