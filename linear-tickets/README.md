@@ -2014,6 +2014,31 @@ every key of the same Linear user) and **5,000** for the Paseo app's token. Both
 steadily, so the plugin estimates each pool's room from the `X-RateLimit-Requests-Remaining`
 header of the last answer plus the refill since then.
 
+Linear also meters **complexity points**: currently **3,000,000/h** for the key's user and
+**2,000,000/h** for the app user. `X-Complexity` is the response's query cost;
+`X-RateLimit-Complexity-Remaining` and `-Limit` describe that credential's budget. On 2026-10-07
+the app exhausted complexity while thousands of requests remained. The admission reserve above
+still only checks requests; complexity admission is tracked in TUC-1291, not implemented here.
+
+**Usage per caller.** `linear.agent-status` includes `usage`: `since`, `until`, `pools` and
+`rows`. Each row names the credential pool (`app` or `key`), caller and GraphQL operation,
+with sent `requests`, measured `points`, and `unmetered` requests whose cost is unknown
+(missing/invalid `X-Complexity`, including network failures). Local budget refusals count
+neither a request nor points; Linear's error responses do count. The totals cover at most
+60 minute buckets, including the current partial minute, and reset when the plugin reloads.
+Calls are counted when their fetch settles. Caller context follows awaited work and timers;
+nested callers override it. Unscoped requests remain visible as `other`, with their operation.
+
+The caller names distinguish dispatch, project flow, comment relay, label repair, PR watch,
+session-sweep parts, session webhooks, lifecycle write-backs, sidebar reads, health, manual
+tasks, state labels, label rules and plan handling. Each pool also includes the most recently
+observed request/complexity limits and remaining budget, with `observedAt` (not an extrapolation).
+Once an hour the plugin logs totals and its twelve most expensive caller/operation rows.
+Counters only cover this daemon's GraphQL transport: other hosts, agents' MCP processes and
+host scripts are **not** attributed. The remaining-budget headers include their use, but cannot
+identify them; subtracting adjacent responses is unreliable when responses arrive out of order
+or the bucket refills to its ceiling. No tokens, query bodies or ticket text appear in the report.
+
 - **Reads that pollers repeat use the app's pool** when the Paseo app is installed: the relay's
   comment read, the auto-dispatch label query, ticket state, manual-task status, the sidebar
   state labels, the agent session sweep and the label rules' sweeps. The key reads them only when the app is not installed, its token cannot be

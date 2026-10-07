@@ -61,6 +61,7 @@ import { ReviewIssueInfos } from "./server/review-issue-info";
 import { PlanPipeline } from "./server/plan-pipeline";
 import { pipelineOwnerEvidence } from "./server/plan-pipeline-source";
 import { Watchdog, WatchdogStore } from "./server/watchdog";
+import { asCaller, linearUsage, usageLines } from "./server/linear-usage";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -267,7 +268,7 @@ export default function contribute(server: PluginServerContext) {
   const watchdog = new Watchdog({ store: watchdogStore, sessions, linear, settings, handover, needsYou });
   const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog, outage: new GreptileOutage(linear, settings) });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });
-  const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => sessions.receive(event));
+  const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => asCaller("session-webhook", () => sessions.receive(event)));
   // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").
   const stateLabels = new StateLabels({ linear, daemon: async () => { const client = await internalDaemon(); return client ? labelDaemon(client) : null; } });
   linear.onStateWritten((issueId, state) => stateLabels.noteState(issueId, state));
@@ -300,11 +301,11 @@ export default function contribute(server: PluginServerContext) {
   let stopKeepingFresh = () => {};
   const startAgent = () => agentReady ??= auth.credentials().then(async (app) => {
     if (stopped) return false;
-    health.start();
-    pullRequests.start();
-    manualTasks.start();
-    stateLabels.start();
-    labelSync.start();
+    asCaller("health", () => health.start());
+    asCaller("pr-watch", () => pullRequests.start());
+    asCaller("manual-tasks", () => manualTasks.start());
+    asCaller("state-labels", () => stateLabels.start());
+    asCaller("label-sync", () => labelSync.start());
     if (!app) return false;
     stopKeepingFresh = auth.keepFresh();
     await webhook.start();
@@ -336,7 +337,25 @@ export default function contribute(server: PluginServerContext) {
   plannotator.useTiers({ store: tiers, apply: (agentId) => modelGuard.apply(agentId), replan: (agent, message) => planRequests.send(agent, message) });
   // The central Plannotator host starts once, after the hook it runs for each parked review exists.
   const startHost = async () => { if (await plannotatorHook() && !stopped) await plannotatorHost.start(); };
-  const attach = (paseo: PaseoApi) => { const first = !attached; attached = true; attachedPaseo = paseo; if (!stopped) { void reviewLinks.start(); drain.start(); intake.start(); if (first) void startHost(); } pipeline.attach(paseo); dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); deputy.attach(paseo); void startAgent(); };
+  const attach = (paseo: PaseoApi) => {
+    const first = !attached;
+    attached = true;
+    attachedPaseo = paseo;
+    if (!stopped) {
+      asCaller("review-links", () => { void reviewLinks.start(); });
+      asCaller("drain", () => drain.start());
+      asCaller("intake", () => intake.start());
+      if (first) asCaller("parked-plans", () => { void startHost(); });
+    }
+    asCaller("plan-pipeline", () => pipeline.attach(paseo));
+    asCaller("dispatch", () => dispatcher.attach(paseo));
+    asCaller("plan-decisions", () => plannotator.attach(paseo));
+    asCaller("session-sweep", () => sessions.attach(paseo));
+    asCaller("model-guard", () => modelGuard.attach(paseo));
+    asCaller("plan-requests", () => planRequests.attach(paseo));
+    asCaller("deputy", () => deputy.attach(paseo));
+    void startAgent();
+  };
   const cacheIdentity = async () => {
     const connection = await credentials.read();
     return connection.key ? cacheScope(connection.key) : null;
@@ -349,12 +368,12 @@ export default function contribute(server: PluginServerContext) {
   // ticket root that this host no longer owns, and the env hook below then only ever runs for the
   // opens this one lets through.
   server.before("agent.session_open", resumeGuard({ settings, drain, attach, ready: () => drain.readyNow(), known: (agentId) => sessionStore.agentTicket(agentId) }));
-  server.on("agent.turn_started", (event, { paseo }) => { attach(paseo); return writeback.turnStarted(event, paseo); });
-  server.on("agent.turn_ended", (event, { paseo }) => { attach(paseo); return writeback.turnEnded(event, paseo); });
-  server.on("agent.permission_requested", (event, { paseo }) => { attach(paseo); return writeback.permissionRequested(event, paseo); });
-  server.on("agent.permission_resolved", (event, { paseo }) => writeback.permissionResolved(event, paseo));
-  server.on("agent.archived", (event, { paseo }) => writeback.archived(event, paseo));
-  server.on("agent.created", (_event, { paseo }) => { attach(paseo); stateLabels.soon(); });
+  server.on("agent.turn_started", (event, { paseo }) => { attach(paseo); return asCaller("writeback.turn-started", () => writeback.turnStarted(event, paseo)); });
+  server.on("agent.turn_ended", (event, { paseo }) => { attach(paseo); return asCaller("writeback.turn-ended", () => writeback.turnEnded(event, paseo)); });
+  server.on("agent.permission_requested", (event, { paseo }) => { attach(paseo); return asCaller("writeback.permission-requested", () => writeback.permissionRequested(event, paseo)); });
+  server.on("agent.permission_resolved", (event, { paseo }) => asCaller("writeback.permission-resolved", () => writeback.permissionResolved(event, paseo)));
+  server.on("agent.archived", (event, { paseo }) => asCaller("writeback.archived", () => writeback.archived(event, paseo)));
+  server.on("agent.created", (_event, { paseo }) => { attach(paseo); asCaller("state-labels", () => stateLabels.soon()); });
   server.on("workspace.created", (_event, { paseo }) => attach(paseo));
   server.before("agent.session_open", async ({ request }, { paseo }) => {
     attach(paseo);
@@ -371,8 +390,8 @@ export default function contribute(server: PluginServerContext) {
   server.handle(statusRpc, (_input, { paseo }) => { attach(paseo); return linear.status(); });
   server.handle(dispatchStatusRpc, (_input, { paseo }) => { attach(paseo); return dispatcher.snapshot(); });
   server.handle(projectsStatusRpc, (_input, { paseo }) => { attach(paseo); return projects.status(); });
-  server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { attach(paseo); return projects.planNow(projectId, await settings.read(), paseo, true); });
-  server.handle(skipPlanRpc, async ({ projectId }, { paseo }) => { attach(paseo); return projects.skipPlan(projectId, await settings.read(), paseo); });
+  server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { attach(paseo); return asCaller("project-flow", async () => projects.planNow(projectId, await settings.read(), paseo, true)); });
+  server.handle(skipPlanRpc, async ({ projectId }, { paseo }) => { attach(paseo); return asCaller("project-flow", async () => projects.skipPlan(projectId, await settings.read(), paseo)); });
   server.handle(presenceRpc, () => presence.state());
   server.handle(setPresenceRpc, (change) => presence.update(change));
   // Memory lease (README, "Memory lease"): the menu bar app's RAM cap on new starts.
@@ -387,11 +406,11 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(pullRequestsRpc, ({ repository }) => pullBoard.read(repository));
   server.handle(labelPullsRpc, ({ repository, label, numbers }) => pullBoard.label(repository, label, numbers));
-  server.handle(connectRpc, ({ apiKey }) => linear.authenticate(apiKey));
+  server.handle(connectRpc, ({ apiKey }) => asCaller("sidebar", () => linear.authenticate(apiKey)));
   server.handle(disconnectRpc, () => linear.disconnect());
   server.handle(listIssuesRpc, async ({ cursor, stateNames, relation }) => {
     const showClosed = (await settings.read()).showClosed;
-    const page = await linear.issues(cursor, stateNames, showClosed, relation);
+    const page = await asCaller("sidebar", () => linear.issues(cursor, stateNames, showClosed, relation));
     if (!cursor && !stateNames?.length && !relation) {
       const scope = await cacheIdentity();
       if (scope) await cache.saveIssues(scope, showClosed, page);
@@ -400,7 +419,7 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(countIssuesRpc, async () => {
     const showClosed = (await settings.read()).showClosed;
-    const counts = await linear.countIssues(showClosed);
+    const counts = await asCaller("sidebar", () => linear.countIssues(showClosed));
     const scope = await cacheIdentity();
     if (scope) await cache.saveCounts(scope, showClosed, counts);
     return counts;
@@ -409,8 +428,8 @@ export default function contribute(server: PluginServerContext) {
     const scope = await cacheIdentity();
     return scope ? cache.read(scope, (await settings.read()).showClosed) : null;
   });
-  server.handle(searchIssuesRpc, ({ term, cursor }) => linear.searchIssues(term, cursor));
-  server.handle(issueContextRpc, ({ id }) => linear.detail(id));
+  server.handle(searchIssuesRpc, ({ term, cursor }) => asCaller("sidebar", () => linear.searchIssues(term, cursor)));
+  server.handle(issueContextRpc, ({ id }) => asCaller("sidebar", () => linear.detail(id)));
   server.handle(branchesRpc, ({ projectId }, { paseo }) => projectBranches(paseo, projectId));
   server.handle(getDefaultPromptRpc, async () => ({ template: (await settings.read()).template, builtin: DEFAULT_PROMPT_TEMPLATE }));
   server.handle(setDefaultPromptRpc, ({ template }) => settings.save(template).then((saved) => ({ ...saved, builtin: DEFAULT_PROMPT_TEMPLATE })));
@@ -454,7 +473,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(agentStatusRpc, async (_input, { paseo }) => {
     attach(paseo);
     const installed = await startAgent();
-    return { installed, funnel: funnel?.active ?? false, funnelNote: funnel?.note ?? null, lastWebhookAt: webhook.lastEventAt, webhooks: webhook.events, ...sessions.readStats() };
+    return { installed, funnel: funnel?.active ?? false, funnelNote: funnel?.note ?? null, lastWebhookAt: webhook.lastEventAt, webhooks: webhook.events, ...sessions.readStats(), usage: linearUsage.snapshot() };
   });
   // No hook within a few seconds of loading (typically a reload): use the plugin's own connection.
   let own: PaseoClient | null = null;
@@ -469,5 +488,7 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); pipeline.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop(); void closeInternalDaemon(); };
+  const usageTimer = setInterval(() => { for (const line of usageLines(linearUsage.snapshot())) console.log(line); }, 60 * 60 * 1000);
+  usageTimer.unref?.();
+  return () => { stopped = true; clearTimeout(startSoon); clearInterval(usageTimer); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); pipeline.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop(); void closeInternalDaemon(); };
 }
