@@ -21,7 +21,7 @@ import { AuthenticationError, refusedByLinear } from "./linear";
 import { ReviewDeletions } from "./review-deletions";
 import type { ReviewIssueInfo } from "./review-issue-info";
 import type { PipelineReview } from "./plan-pipeline";
-import { ReviewClosedError, ReviewDecisionAppliedError } from "./sessions";
+import { ReviewClosedError } from "./sessions";
 
 const exec = promisify(execFile);
 export const REVIEW_PORT = 47_832;
@@ -636,7 +636,7 @@ export class ReviewLinks {
       // own answer decides, and only a lost answer leaves the outcome unknown.
       if (error instanceof DecisionPendingError) throw new DecisionError(409, error.message);
       if (error instanceof FencedError) throw new DecisionError(503, error.message);
-      const uncertain = error instanceof ReviewDecisionAppliedError || error instanceof ReviewClosedError && error.outcomeUnknown;
+      const uncertain = error instanceof ReviewClosedError && error.outcomeUnknown;
       throw new DecisionError(uncertain ? 502 : 409, error instanceof Error ? error.message : String(error), uncertain);
     }
     // The review is listed decided by the worker once the journal carried the decision out; the

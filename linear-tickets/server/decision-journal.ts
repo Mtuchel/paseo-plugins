@@ -216,8 +216,9 @@ export type ReportInput = {
   planContent?: string;
   at: string;
   review: ReviewGeneration;
-  source: "plannotator-page" | "parked-page";
-  // Exact binding (the central host names its review): the plan text is not compared.
+  source: "plannotator-page" | "parked-page" | "recovered";
+  // Exact binding (the central host names its review, a recovered outcome carries the stored
+  // review): the plan text is not compared.
   exact: boolean;
   snapshot: () => Promise<RouteSnapshot>;
 };
@@ -236,7 +237,7 @@ export class DecisionJournal {
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly instance = randomUUID();
 
-  constructor(readonly directory = decisionsDirectory(), private readonly now: () => number = Date.now) {}
+  constructor(readonly directory = decisionsDirectory(), readonly now: () => number = () => Date.now()) {}
 
   // Whether this instance may write and carry out decisions now.
   get active(): boolean {
@@ -326,13 +327,14 @@ export class DecisionJournal {
     return this.all().filter((entry): entry is DecisionAttempt => entry.kind === "attempt" && (!reviewId || entry.reviewId === reviewId));
   }
 
-  // The agent's latest review generation, optionally only those written before an event file and
-  // only on one address.
-  latestReview(agentId: string, options: { before?: string; localUrl?: string } = {}): ReviewGeneration | null {
+  // The agent's latest review generation, optionally only those written before an event file,
+  // only on one address, and only the central host's (parked) or only the agent's own.
+  latestReview(agentId: string, options: { before?: string; localUrl?: string; parked?: boolean } = {}): ReviewGeneration | null {
     let found: ReviewGeneration | null = null;
     for (const entry of this.entries.values()) {
       if (entry.kind !== "review" || entry.agentId !== agentId) continue;
       if (options.localUrl && entry.localUrl !== options.localUrl) continue;
+      if (options.parked !== undefined && entry.parked !== options.parked) continue;
       if (options.before && reviewOrder(entry) >= options.before) continue;
       if (!found || reviewOrder(entry) > reviewOrder(found)) found = entry;
     }
@@ -493,7 +495,7 @@ export class DecisionJournal {
   }
 
   // The owner settles an entry the plugin cannot settle from Plannotator's answers alone.
-  async resolve(entryId: string, action: ResolveAction, snapshot: (agentId: string) => Promise<RouteSnapshot>): Promise<void> {
+  async resolve(entryId: string, action: ResolveAction, snapshot: (agentId: string, review: ReviewGeneration) => Promise<RouteSnapshot>): Promise<void> {
     const entry = this.entries.get(entryId);
     if (!entry || entry.kind === "review" || entry.kind === "closing") throw new StaleResolutionError("That entry is not waiting for you any more.");
     // Carrying out an unbound report creates an attempt on the agent's latest review: its lock.
@@ -514,7 +516,7 @@ export class DecisionJournal {
         if (!review) throw new StaleResolutionError("The agent has no review to carry this decision out on.");
         const busy = this.attempts(review.id).some((attempt) => OPEN_STATES.has(attempt.state) || ACCEPTED_STATES.has(attempt.state));
         if (busy || this.unresolvedConflict(review.id)) throw new StaleResolutionError("That review has a decision already; drop this report instead.");
-        const attempt = await this.createAttempt({ review, agentId: current.agentId, planContent: current.planContent, approved: current.approved, ...(current.feedback ? { feedback: current.feedback } : {}), source: "plannotator-page", state: "pending", snapshot: await snapshot(current.agentId), at: current.at });
+        const attempt = await this.createAttempt({ review, agentId: current.agentId, planContent: current.planContent, approved: current.approved, ...(current.feedback ? { feedback: current.feedback } : {}), source: "plannotator-page", state: "pending", snapshot: await snapshot(current.agentId, review), at: current.at });
         await this.write({ ...current, state: "carried", attemptId: attempt.id, resolvedAt });
         return;
       }
@@ -536,7 +538,7 @@ export class DecisionJournal {
       if (attempt) await this.write({ ...attempt, state: "void", voidReason: "The owner chose the other decision.", pausedBy: undefined });
       const review = this.review(current.reviewId);
       if (review) {
-        await this.createAttempt({ review, agentId: current.agentId, planContent: current.report.planContent ?? attempt?.planContent ?? "", approved: current.reportOutcome, ...(current.report.feedback ? { feedback: current.report.feedback } : {}), source: review.parked ? "parked-page" : "plannotator-page", state: "pending", snapshot: await snapshot(current.agentId), at: current.report.at });
+        await this.createAttempt({ review, agentId: current.agentId, planContent: current.report.planContent ?? attempt?.planContent ?? "", approved: current.reportOutcome, ...(current.report.feedback ? { feedback: current.report.feedback } : {}), source: review.parked ? "parked-page" : "plannotator-page", state: "pending", snapshot: await snapshot(current.agentId, review), at: current.report.at });
       }
       await this.write({ ...current, resolution: "other", resolvedAt });
     });

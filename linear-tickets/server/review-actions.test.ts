@@ -7,7 +7,7 @@ import { Credentials } from "./credentials";
 import { LinearRefusedError, LinearService } from "./linear";
 import { ReviewDeletions } from "./review-deletions";
 import { ReviewLinks, type ReviewLinksOptions } from "./review-links";
-import { ReviewClosedError, ReviewDecisionAppliedError } from "./sessions";
+import { ReviewClosedError } from "./sessions";
 
 const ISSUE = "3b241101-e2bb-4255-8caf-4136c566a962";
 const OTHER = "0c7f5f9e-83a5-4e4b-b7f3-2f7d3c1b5a10";
@@ -161,6 +161,9 @@ test("recheck sends back and requires owner approval across review rounds, while
     await links.opened("agent-2", { ...event, agentId: "agent-2", localUrl: "http://localhost:50002/", remoteUrl: "https://host.tail.ts.net:50002/" }, { identifier: IDENTIFIER, issueId: ISSUE });
     assert.equal(await links.requiresOwner(ISSUE), true);
     assert.equal((await post("/api/reviews/agent-2/decision", { approve: true })).status, 200);
+    assert.equal(await links.requiresOwner(ISSUE), true, "a decision being applied still requires the owner");
+    // The decision worker marks the review decided once the journal carried the approval out.
+    await links.decided("agent-2", true);
     assert.equal(await links.requiresOwner(ISSUE), false);
     assert.match(feedback[0], /current code and main branch.*recently merged pull requests.*related Linear issues and plans.*active reviews/);
     assert.match(feedback[0], /fresh advisor review of the exact revised text.*user's review.*Do not implement anything and do not auto-approve/);
@@ -172,7 +175,7 @@ test("recheck sends back and requires owner approval across review rounds, while
   await fixture(async ({ post, links }) => {
     assert.equal((await post(RECHECK, {})).status, 502);
     assert.equal(await links.requiresOwner(ISSUE), true);
-  }, { decide: async () => { throw new ReviewDecisionAppliedError("Feedback delivered; recording failed."); } });
+  }, { decide: async () => { throw new ReviewClosedError("Plannotator did not answer.", true); } });
 });
 
 test("tombstones suppress replayed opened reviews after a fixture restart", async () => {

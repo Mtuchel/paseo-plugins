@@ -208,7 +208,7 @@ type Call = string;
 type RouterLinear = Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
 // `reload`: the daemon's agent reload (null: the plugin has no daemon connection); `send`: runs
 // before each send is recorded.
-function harness(options: { now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; splitPlan?: (link: SessionLink, url: string, paseo: PaseoApi) => Promise<string>; approveLater?: (link: SessionLink, url: string, paseo: PaseoApi) => Promise<string> } = {}) {
+function harness(options: { now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null> } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -279,8 +279,7 @@ function harness(options: { now?: () => number; pending?: AgentPermissionRequest
     needsYou: options.needsYou,
     budget: options.budget,
     now: options.now,
-    splitPlan: options.splitPlan,
-    approveLater: options.approveLater,
+    decidePlan: options.decidePlan,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     decideReview: options.decideReview ?? (async (url, approve, feedback) => { calls.push(`review ${url} ${approve ? "approve" : `deny:${feedback}`}`); }),
     ...("reload" in options ? { reloader: async () => options.reload ? async (agentId: string) => { calls.push(`reload ${agentId}`); await options.reload!(agentId); } : null } : {}),
@@ -1005,7 +1004,7 @@ test("Linear-panel approve, split and approve-later protect their owner check, c
       await admission.linear.comment("i1", `Owner decision: ${command}`);
       return `Handled ${command}`;
     };
-    const h = harness({ ...admission, groups: {}, decideReview: async () => { await decide(); }, splitPlan: decide, approveLater: decide });
+    const h = harness({ ...admission, groups: {}, decideReview: async () => { await decide(); }, decidePlan: decide });
     try {
       await h.store.put(link({ review: { localUrl: "http://localhost:5000/" } }));
       await withPriority("background", "panel ingress test", () => h.router.prompted("s1", { id: `activity-${command}`, userId: OWNER, content: { body: command } }));
@@ -1016,9 +1015,8 @@ test("Linear-panel approve, split and approve-later protect their owner check, c
       assert.ok(admission.sent.some((call) => call.operation === "issueUpdateState"), command);
       assert.ok(admission.sent.some((call) => call.operation === "comment"), command);
       assert.equal(admission.sent.at(-1)?.operation, "agentActivity", `${command}: the acknowledgement also gets owner priority`);
-      assert.equal((await h.store.get("s1"))?.review, null);
-      if (command === "approve-later") assert.equal((await h.store.get("s1"))?.offer, "later");
-      if (command === "split-plan") assert.deepEqual((await h.store.get("s1"))?.group, { delegated: false });
+      // Approve-later and split leave the session to the journaled workflow (plannotator.ts).
+      if (command === "approve-plan" || command === "send-back") assert.equal((await h.store.get("s1"))?.review, null);
     } finally { await h.cleanup(); }
   }
 });

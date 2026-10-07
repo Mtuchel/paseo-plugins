@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { setImmediate } from "node:timers/promises";
+import { once } from "node:events";
+import { createServer, type AddressInfo } from "node:net";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { fingerprint } from "./deputy";
@@ -13,7 +15,6 @@ import { PermissionReplies } from "./permission-replies";
 import { decidePlannotatorReview, describeTool, questionPrompt, SessionRouter, SessionStore, type SessionLink } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
-import { approveForLater, splitIntoSubIssues } from "./split";
 import { AWAY_REASON } from "./scheduler";
 import { isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
 import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, planPolicy } from "./plan-policy";
@@ -360,8 +361,15 @@ test("while a question is open the live feed holds its actions, so Linear keeps 
 });
 
 test("feedback for a review whose Plannotator server is gone reaches the agent instead of failing", async () => {
+  // A port nothing listens on any more: the connection is refused, so the decision never reached Plannotator.
+  const server = createServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const port = (server.address() as AddressInfo).port;
+  server.close();
+  await once(server, "close");
   const h = routerHarness([], { decideReview: (url, approve, feedback) => decidePlannotatorReview(url, approve, feedback) });
-  await h.store.put({ ...link, review: { localUrl: "http://127.0.0.1:1" } });
+  await h.store.put({ ...link, review: { localUrl: `http://127.0.0.1:${port}` } });
   await h.router.prompted("s1", { id: "p1", content: { body: "Split step 2 in two" } });
   assert.equal((await h.store.get("s1"))?.review, null);
   assert.match(h.calls.at(-1) ?? "", /^send a1: Your Plannotator plan review closed[\s\S]*Split step 2 in two/);
@@ -636,12 +644,13 @@ test("a parked plan's thread offers no resume when its agent is retired, and sta
   assert.deepEqual([(await h.store.get("s1"))?.offer, (await h.store.get("s1"))?.review], ["parked", null]);
   await h.router.offerResume("s1");
   assert.ok(!h.calls.some((call) => call.includes("Resume")), "the retired agent offers no resume");
-  assert.equal(await h.router.requeue("a1", "Plan approved. A new agent implements it as soon as a slot is free."), true);
-  assert.ok(h.calls.includes("thought:Plan approved. A new agent implements it as soon as a slot is free."));
+  assert.equal(await h.router.requeueSession("s1", "a1"), "queued");
+  // A retried decision (the worker's step ran but was not recorded) resets nothing.
+  assert.equal(await h.router.requeueSession("s1", "a1"), "moved-on");
   await h.router.startQueued();
   assert.deepEqual(starts, ["i1"]);
   assert.deepEqual([(await h.store.get("s1"))?.agentId, (await h.store.get("s1"))?.queued, (await h.store.get("s1"))?.offer], ["fresh", false, null]);
-  assert.equal(await h.router.requeue("a1", "again"), false, "the retired agent no longer owns the thread");
+  assert.equal(await h.router.requeueSession("s1", "a1"), "moved-on", "the retired agent no longer owns the thread");
   await h.cleanup();
 });
 
@@ -848,21 +857,6 @@ test("an approved plan that names no tier goes back to planning for its model se
   assert.ok(!h.launches[0].instructions.includes(OVERLAP_NOTE), "the approved plan already looked for overlaps");
 });
 
-test("approve, implement later: plan recorded, planner retired, ticket back in Todo with plan-ready", async () => {
-  const calls: string[] = [];
-  const summary = await approveForLater({
-    linear: {
-      upsertIssueDocument: async (_id: string, title: string) => { calls.push(`document ${title}`); return "https://linear.app/doc/plan"; },
-      moveToReady: async (id: string) => { calls.push(`todo ${id}`); return { changed: true }; },
-      addLabel: async (id: string, name: string) => { calls.push(`+${name} ${id}`); },
-    },
-    readPlan: async () => "# Plan\n1. Step",
-    retirePlanner: async (_url: string, agentId: string, _paseo: PaseoApi, reason: string) => { calls.push(`retire ${agentId}: ${reason.slice(0, 40)}`); },
-  }, { issueId: "i1", identifier: "TUC-1", agentId: "planner" }, "http://localhost:5000/", { agents: { ref: () => ({ refresh: async () => ({ agent: { model: "omp/opus" } }) }) } } as unknown as PaseoApi);
-  assert.deepEqual(calls, ["document Plan: TUC-1", "retire planner: The owner approved this plan for later i", "todo i1", "+plan-ready i1"]);
-  assert.match(summary, /back in Todo with `plan-ready`/);
-});
-
 const PR: PullRequestView = { state: "OPEN", isDraft: false, headSha: "h", headBranch: "tuc-1", baseBranch: "main", updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, comments: [], reviews: [], lastCommitAt: null, checks: [], mergeable: null };
 
 test("the review mirror: approval means ready to merge, and commits after it send the ticket back to review", () => {
@@ -887,48 +881,6 @@ test("pull request reviews become ticket updates: changes requested, fixes pushe
   const merged = reviewChange({ ...PR, state: "MERGED", reviews: [], lastCommitAt: null }, approved.seen);
   assert.equal(merged.change?.review, "merged");
   assert.equal(reviewChange({ ...PR, state: "MERGED", reviews: [], lastCommitAt: null }, merged.seen).change, null);
-});
-
-test("splitting creates one sub-issue per step, each blocked by the previous, all assigned to Paseo", async () => {
-  const calls: string[] = [];
-  let n = 0;
-  const deps = {
-    linear: {
-      issueState: async () => ({ id: "parent", identifier: "TUC-1", status: "Planning", statusId: "planning", statusType: "started", teamId: "t1", projectId: "p9", creatorId: OWNER, labels: [], attachmentUrls: [], blockedBy: [], priority: 0, createdAt: "", unblocks: 0 }),
-      upsertIssueDocument: async (_id: string, _title: string, body: string) => { calls.push(`document ${body.split("\n").find((line) => line.includes("Planned with"))}`); return "https://linear.app/doc/plan"; },
-      createIssue: async (input: { title: string; parentId?: string; projectId?: string | null; ready?: boolean }) => { n++; calls.push(`create ${input.title} parent=${input.parentId} project=${input.projectId}${input.ready ? " ready" : ""}`); return { id: `s${n}`, identifier: `TUC-${10 + n}`, url: "" }; },
-      addBlocker: async (blocker: string, blocked: string) => { calls.push(`${blocker} blocks ${blocked}`); },
-      delegate: async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); },
-      moveToStateNamed: async (id: string, name: string) => { calls.push(`move ${id} to ${name}`); return { changed: true }; },
-      addLabel: async (id: string, name: string) => { calls.push(`+${name} ${id}`); },
-    },
-    appUserId: async () => APP,
-    readPlan: async () => "# Plan\n## Steps\n1. Add the domain\n2. Add the migration\n3. Wire the API",
-    retirePlanner: async (_url: string, agentId: string) => { calls.push(`retire ${agentId}`); },
-  };
-  const planner = { agents: { ref: () => ({ refresh: async () => ({ agent: { model: "omp/opus", effectiveThinkingOptionId: "medium" } }) }) } } as unknown as PaseoApi;
-  const summary = await splitIntoSubIssues(deps, { issueId: "parent", identifier: "TUC-1", agentId: "planner" }, "http://localhost:5000/", planner);
-  assert.deepEqual(calls, [
-    "document > **Planned with:** `omp/opus · thinking medium`",
-    "retire planner",
-    "create Add the domain parent=parent project=p9 ready",
-    "create Add the migration parent=parent project=p9 ready",
-    "s1 blocks s2",
-    "create Wire the API parent=parent project=p9 ready",
-    "s2 blocks s3",
-    "delegate s1 to paseo-app", "delegate s2 to paseo-app", "delegate s3 to paseo-app",
-    "move parent to In Progress",
-    "+plan-ready parent",
-  ]);
-  assert.match(summary, /Split into 3 sub-issues \(TUC-11, TUC-12, TUC-13\)/);
-  await assert.rejects(splitIntoSubIssues({ ...deps, readPlan: async () => "just prose" }, { issueId: "parent", identifier: "TUC-1", agentId: "planner" }, "http://localhost:5000/", {} as PaseoApi), /fewer than two/);
-  const tiered = async (model: string) => {
-    calls.length = 0;
-    await splitIntoSubIssues({ ...deps, readPlan: async () => `# Plan\n## Steps\n1. Add the domain\n2. Add the migration\n3. Wire the API\n\n## Model\n\n${model}` }, { issueId: "parent", identifier: "TUC-1", agentId: null }, "http://localhost:5000/", planner);
-    return calls.filter((call) => call.startsWith("+model:"));
-  };
-  assert.deepEqual(await tiered("- Tier: cheap — routine\n- Strong steps: 2 — the migration\n"), ["+model:strong s5"], "only the strong step is raised; the others plan their own tier");
-  assert.deepEqual(await tiered("- Tier: strong — four layers\n- Strong steps: none — all of it\n"), ["+model:strong s7", "+model:strong s8", "+model:strong s9"]);
 });
 
 test("health problems open one urgent ticket after two failed checks, update it, and complete it on recovery", async () => {
@@ -1000,7 +952,7 @@ test("deleted tickets lose parked and queued sessions, archive every affected ag
       await restarted.router.created({ id: "stale", issueId, issue: { identifier: "TUC-1" }, creatorId: OWNER });
       await restarted.router.restartFor(issueId, "TUC-1");
       assert.equal((await restarted.router.succeed(issueId, "TUC-1", "a1", "Continue", async () => {})).kind, "impossible");
-      assert.equal(await restarted.router.requeue("a1", "Try planning again"), false);
+      assert.equal(await restarted.router.requeueSession("s1", "a1"), "none");
       assert.deepEqual(await restarted.store.all(), []);
       assert.equal(launches, 0);
     } finally { await restarted.cleanup(); }

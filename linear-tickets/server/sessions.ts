@@ -27,6 +27,7 @@ import { issueAgents, type TicketStarter } from "./starter";
 import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 import { WATCHDOG_LABEL, type TicketRoots, type WatchdogOutcome, type WatchdogRequest, type WatchdogStore } from "./watchdog";
 import type { ReviewDeletions } from "./review-deletions";
+import { DecisionPendingError, FencedError } from "./decision-journal";
 import { availability, candidates, claims, finishPending, incidentFor, LIMIT_SPACING, limitError, limitSchedule, limitTime, normalizeModel, updateEpisode, type LimitPending, type LimitResumeStore, type UsageReader } from "./limit-resume";
 import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
 
@@ -346,12 +347,14 @@ type Deps = {
   store: SessionStore;
   replies?: PermissionReplies;
   stop?: (agentId: string) => Promise<void>;
-  decideReview?: (localUrl: string, approve: boolean, feedback: string, agentId: string) => Promise<void>;
-  splitPlan?: (link: SessionLink, localUrl: string, paseo: PaseoApi) => Promise<string>;
-  approveLater?: (link: SessionLink, localUrl: string, paseo: PaseoApi) => Promise<string>;
-  // A review decided on Plannotator's own page, found after its server is gone.
+  // The owner's decisions in the panel, journaled before anything happens (plannotator.ts,
+  // decideOwner / decidePanel). `decidePlan` answers null when the workflow replied itself.
+  decideReview?: (localUrl: string, approve: boolean, feedback: string, agentId: string, origin: { reviewId?: string; openedAt?: string; source: "linear-panel" }) => Promise<void>;
+  decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null>;
+  // A review decided on Plannotator's own page, found after its server is gone; journaled for the
+  // stored review before the session lets go of it.
   reviewOutcome?: (review: PendingReview) => Promise<ReviewOutcome>;
-  recordOutcome?: (agentId: string, outcome: Exclude<ReviewOutcome, "open" | null>) => Promise<void>;
+  recordOutcome?: (agentId: string, outcome: Exclude<ReviewOutcome, "open" | null>, review: PendingReview) => Promise<void>;
   // Open "Needs you" sub-issues: an @mention there goes to the agent that asked, not a new one.
   needsYou?: NeedsYouIssues;
   // The daemon's agent reload (`paseo agent reload`), resolved per use: null while the plugin has
@@ -860,33 +863,34 @@ export class SessionRouter {
       await this.say(sessionId, "response", "Stopped the agent's current turn. Reply here to continue.");
       return;
     }
-    if (link.review && body.toLowerCase() === SPLIT_PLAN && this.deps.splitPlan) {
-      // Marked first: the planner is archived during the split, which must not offer a resume.
-      await this.deps.store.patch(sessionId, { offer: "split" });
-      const summary = await this.deps.splitPlan(link, link.review.localUrl, this.paseo!);
-      // The steps are the parent's sub-issues now: the parent closes when they are finished.
-      await this.deps.store.patch(sessionId, { group: { delegated: false } });
-      await this.clearReview(sessionId);
-      await this.say(sessionId, "response", summary);
-      return;
-    }
-    if (link.review && body.toLowerCase() === APPROVE_LATER && this.deps.approveLater) {
-      await this.deps.store.patch(sessionId, { offer: "later" });
-      const summary = await this.deps.approveLater(link, link.review.localUrl, this.paseo!);
-      await this.clearReview(sessionId);
-      await this.say(sessionId, "response", summary);
+    const later = body.toLowerCase() === APPROVE_LATER;
+    if (link.review && (later || body.toLowerCase() === SPLIT_PLAN) && this.deps.decidePlan) {
+      // Journaled first; the workflow holds the session (no Resume while the planner is retired),
+      // groups it for a split, clears the review and replies with its summary.
+      try {
+        const reply = await this.deps.decidePlan(link, later ? "later" : "split");
+        if (reply) await this.say(sessionId, "response", reply);
+      } catch (error) {
+        if (!(error instanceof DecisionPendingError || error instanceof FencedError)) throw error;
+        await this.say(sessionId, "response", error.message);
+      }
       return;
     }
     if (link.review && this.deps.decideReview) {
       const approve = body.toLowerCase() === APPROVE_PLAN || /^(approve|approved|yes|ok|looks good)\b/i.test(body);
       const feedback = body.toLowerCase() === SEND_BACK ? "Sent back from Linear." : body;
       try {
-        await this.deps.decideReview(link.review.localUrl, approve, approve ? "" : feedback, link.agentId);
+        await this.deps.decideReview(link.review.localUrl, approve, approve ? "" : feedback, link.agentId, { reviewId: link.review.reviewId, openedAt: link.review.openedAt, source: "linear-panel" });
         await this.clearReview(sessionId);
         await this.say(sessionId, "thought", approve ? "Plan approved." : "Plan sent back with your feedback.");
         return;
       } catch (error) {
+        if (error instanceof DecisionPendingError || error instanceof FencedError) { await this.say(sessionId, "response", error.message); return; }
         if (!(error instanceof ReviewClosedError)) throw error;
+        if (error.outcomeUnknown) {
+          await this.say(sessionId, "response", "Plannotator did not answer, so it is not confirmed that it took your decision. Paseo asks it again and carries the decision out once it is confirmed; the review inbox shows it under Being applied.");
+          return;
+        }
         // The review died with its agent process (restart, cancelled turn). The reply still reaches the agent.
         await this.clearReview(sessionId);
         await this.say(sessionId, "thought", "That plan review had already closed, so your reply goes to the agent, which submits the plan again.");
@@ -1509,8 +1513,14 @@ export class SessionRouter {
     });
   }
 
-  async say(sessionId: string, type: "thought" | "response" | "error", body: string, ephemeral = false): Promise<void> {
-    await this.deps.api.activity(sessionId, { type, body }, { ephemeral });
+  // `id`: a reserved activity id (a decision's step), so a retry finds it with `said` instead of
+  // posting it twice.
+  async say(sessionId: string, type: "thought" | "response" | "error", body: string, ephemeral = false, id?: string): Promise<void> {
+    await this.deps.api.activity(sessionId, { type, body }, { ephemeral, ...(id ? { id } : {}) });
+  }
+
+  async said(id: string): Promise<boolean> {
+    return Boolean(await this.deps.api.activityById(id));
   }
 
   async action(sessionId: string, action: string, parameter: string, result?: string): Promise<void> {
@@ -1606,10 +1616,11 @@ export class SessionRouter {
   }
 
   // The review a plain reply decides; its tailnet link is shown in the panel while it is open.
-  async expectReview(sessionId: string, localUrl: string | null, plan = "", remoteUrl: string | null = null): Promise<void> {
+  // `reviewId`: the decision journal's generation of it (decision-journal.ts).
+  async expectReview(sessionId: string, localUrl: string | null, plan = "", remoteUrl: string | null = null, reviewId?: string): Promise<void> {
     if (!localUrl) { await this.clearReview(sessionId); return; }
     await this.clearReview(sessionId);
-    await this.deps.store.patch(sessionId, { review: { localUrl, openedAt: new Date().toISOString(), ...(remoteUrl ? { remoteUrl } : {}), ...(plan.trim() ? { planHash: planHash(plan) } : {}) } });
+    await this.deps.store.patch(sessionId, { review: { localUrl, openedAt: new Date().toISOString(), ...(remoteUrl ? { remoteUrl } : {}), ...(plan.trim() ? { planHash: planHash(plan) } : {}), ...(reviewId ? { reviewId } : {}) } });
     if (remoteUrl) await this.link(sessionId, "Plan review", remoteUrl);
   }
 
@@ -1621,7 +1632,8 @@ export class SessionRouter {
   }
 
   // A review whose server is gone was decided on Plannotator's page (or closed without a
-  // decision, e.g. by a restart). Its saved decision is recorded like one taken in Linear.
+  // decision, e.g. by a restart). Its saved decision is journaled for the stored review before the
+  // session lets go of it; a failed journal write keeps the review for the next sweep.
   async settleReviews(): Promise<void> {
     const { reviewOutcome, recordOutcome } = this.deps;
     if (!reviewOutcome || !recordOutcome) return;
@@ -1630,9 +1642,9 @@ export class SessionRouter {
       if (!link.review || link.closed || !link.agentId || link.offer === "parked") continue;
       const outcome = await reviewOutcome(link.review).catch(() => "open" as const);
       if (outcome === "open") continue;
+      if (outcome) await recordOutcome(link.agentId, outcome, link.review);
       await this.clearReview(link.sessionId);
-      if (outcome) await recordOutcome(link.agentId, outcome);
-      else await this.say(link.sessionId, "thought", "The plan review closed without a decision (for example after a restart). Reply here if the agent should submit the plan again.").catch(() => {});
+      if (!outcome) await this.say(link.sessionId, "thought", "The plan review closed without a decision (for example after a restart). Reply here if the agent should submit the plan again.").catch(() => {});
     }
   }
 
@@ -2242,16 +2254,29 @@ export class SessionRouter {
   }
 
   // The owner decided a parked plan: the thread waits for a slot like a queued one, and the queue
-  // sweep starts a fresh agent that implements the approved plan or plans again. False: no thread.
-  async requeue(agentId: string, note: string): Promise<boolean> {
-    const link = await this.sessionFor(agentId);
-    if (!link) return false;
-    if (await this.deps.deletions?.blocked(link.issueId)) return false;
-    await this.clearReview(link.sessionId);
-    await this.deps.store.patch(link.sessionId, { agentId: null, questions: null, queued: true, queueReason: undefined, restartRequested: true, offer: null });
+  // sweep starts a fresh agent that implements the approved plan or plans again. Only while the
+  // session still names the retired agent: "moved-on" once it was queued (or has a successor)
+  // already, so a retried decision resets nothing; "none" without an open thread.
+  async requeueSession(sessionId: string, agentId: string): Promise<"queued" | "moved-on" | "none"> {
+    const link = await this.deps.store.get(sessionId);
+    if (!link || link.closed) return "none";
+    if (link.agentId !== agentId) return "moved-on";
+    if (await this.deps.deletions?.blocked(link.issueId)) return "none";
+    await this.clearReview(sessionId);
+    await this.deps.store.patch(sessionId, { agentId: null, questions: null, queued: true, queueReason: undefined, restartRequested: true, offer: null });
     this.releaseQuestions(link);
-    await this.say(link.sessionId, "thought", note);
-    return true;
+    return "queued";
+  }
+
+  // "Approve, implement later" and "Approve & split" hold the session first: retiring the planner
+  // then offers no Resume and starts no agent.
+  async holdSession(sessionId: string, offer: "later" | "split"): Promise<void> {
+    await this.deps.store.patch(sessionId, { offer });
+  }
+
+  // A split plan's steps are the parent's sub-issues: the parent closes when they are finished.
+  async groupSession(sessionId: string): Promise<void> {
+    await this.deps.store.patch(sessionId, { group: { delegated: false } });
   }
 
   async linkToPaseo(sessionId: string, agentId: string): Promise<void> {
@@ -2291,9 +2316,6 @@ export class ReviewClosedError extends Error {
   constructor(message: string, readonly outcomeUnknown = false) { super(message); }
 }
 
-// The review server accepted the decision, but recording its lifecycle event failed.
-export class ReviewDecisionAppliedError extends Error {}
-
 // `feedback` on an approval reaches the agent as Plannotator's approval notes.
 export async function decidePlannotatorReview(localUrl: string, approve: boolean, feedback: string): Promise<void> {
   const origin = new URL(localUrl).origin;
@@ -2304,7 +2326,10 @@ export async function decidePlannotatorReview(localUrl: string, approve: boolean
     body: JSON.stringify(approve && !feedback ? {} : { feedback }),
     signal: AbortSignal.timeout(10_000),
   }).catch((error: unknown) => {
-    throw new ReviewClosedError(`Plannotator is not reachable at ${origin}: ${error instanceof Error ? error.message : error}`, true);
+    // A refused connection never reached Plannotator (its server is gone): the decision was not
+    // taken. Any later failure (reset, timeout) may come after Plannotator acted on it.
+    const code = error instanceof Error && error.cause && typeof error.cause === "object" && "code" in error.cause ? error.cause.code : null;
+    throw new ReviewClosedError(`Plannotator is not reachable at ${origin}: ${error instanceof Error ? error.message : error}`, code !== "ECONNREFUSED");
   });
   if (!response.ok) throw new ReviewClosedError(`Plannotator answered HTTP ${response.status}; the review is already closed.`);
 }

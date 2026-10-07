@@ -83,8 +83,14 @@ const settings: PluginSettings = {
 function setup(labels: Record<string, string>, ticket: { creatorId: string; labels: string[] } = { creatorId: "owner", labels: [] }) {
   const calls: string[] = [];
   const documents: Record<string, string> = {};
+  const comments = new Set<string>();
   const linear = {
-    async comment(issueId: string, body: string) { calls.push(`comment ${issueId}: ${body}`); },
+    async comment(issueId: string, body: string, id?: string) { calls.push(`comment ${issueId}: ${body}`); if (id) comments.add(id); },
+    async commentById(id: string) { return comments.has(id) ? { id } : null; },
+    async issueById(_id: string) { return null; },
+    async createIssue() { throw new Error("createIssue is not expected here"); },
+    async addBlocker() {},
+    async delegate() {},
     async upsertIssueDocument(issueId: string, title: string) { calls.push(`document ${issueId} ${title}`); return "https://linear.app/doc/1"; },
     async issueDocument(_issueId: string, title: string) { return title in documents ? { url: "https://linear.app/doc/1", content: documents[title] } : null; },
     async moveToStateNamed(issueId: string, name: string) { calls.push(`state ${issueId} ${name}`); return { changed: true }; },
@@ -155,12 +161,17 @@ test("a plan sent back loses plan-ready, and a review the plugin closed itself i
     assert.ok(!calls.some((call) => call.startsWith("+plan-ready")));
   });
   calls.length = 0;
-  await withEvents([{ type: "decided", agentId: "agent-2", approved: false, feedback: "The owner approved this plan for later implementation", at: new Date().toISOString() }], async (directory) => {
+  await withEvents([{ type: "opened", agentId: "agent-2", localUrl: "http://localhost:4002/", remoteUrl: null, at: "2026-01-01T10:00:00Z" }], async (directory) => {
     const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
-    bridge.settled("agent-2");
     bridge.attach(paseo);
     await bridge.drain();
-    bridge.stop();
+    // The plugin closes the review itself (implement later): journaled before Plannotator is told.
+    const journal = bridge.decisionJournal;
+    await journal.addClosing(journal.latestReview("agent-2")!, false, "The owner approved this plan for later implementation");
+    calls.length = 0;
+    await writeFile(join(directory, `${Date.now()}-echo.json`), JSON.stringify({ type: "decided", agentId: "agent-2", approved: false, feedback: "The owner approved this plan for later implementation", at: new Date().toISOString() }));
+    await bridge.drain();
+    await bridge.stop();
     assert.deepEqual(calls, []);
     assert.deepEqual(await readdir(directory), []);
   });
@@ -191,7 +202,7 @@ test("with review links, the agent's stable link is posted instead of the review
   };
   await withEvents([
     { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
-    { type: "decided", agentId: "agent-1", approved: true, planContent: "# Plan", at: "2026-01-01T10:05:00Z" },
+    { type: "decided", agentId: "agent-1", approved: true, planContent: RISKY(2), at: "2026-01-01T10:05:00Z" },
   ], async (directory) => {
     const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, reviews, async () => {}, (url) => tabs.push(url));
     bridge.attach(paseo);
@@ -503,7 +514,15 @@ test("a parked plan is judged again once its advisor review is recorded for exac
   ]);
 });
 
-test("a parked decision whose hand-off fails on a Linear error is delivered in full by the retry, not dropped", async () => {
+// The journal's one attempt of a test's bridge.
+function onlyAttempt(bridge: PlannotatorBridge) {
+  const attempts = bridge.decisionJournal.attempts();
+  assert.equal(attempts.length, 1);
+  return attempts[0];
+}
+
+test("a parked decision whose hand-off fails on a Linear error is delivered in full by the retry, not dropped", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-01-01T12:00:00Z") });
   const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
   const { plans, parking } = parkingFake(calls);
   plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T10:00:00Z", announced: true });
@@ -513,14 +532,19 @@ test("a parked decision whose hand-off fails on a Linear error is delivered in f
     if (outage) { outage = false; throw new Error("The Linear API request failed (HTTP 503). Try again."); }
     return upsert(issueId, title);
   };
-  const errors = test.mock.method(console, "error", () => {});
+  t.mock.method(console, "error", () => {});
   await withEvents([{ type: "decided", agentId: "agent-1", approved: false, parked: true, feedback: "Cover every table", at: "2026-01-01T12:00:00Z" }], async (directory) => {
     const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
     bridge.attach(paseo);
     await bridge.drain();
-    bridge.stop();
+    assert.deepEqual(await readdir(directory), [], "the journal holds the decision once its event is read");
+    assert.equal(onlyAttempt(bridge).state, "pending");
+    assert.equal(plans.size, 1, "the parked plan stays until the decision went through");
+    t.mock.timers.tick(3_000);
+    await bridge.drain();
+    assert.equal(onlyAttempt(bridge).state, "applied");
+    await bridge.stop();
   });
-  errors.mock.restore();
   assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "comment issue-1: ↩️ **Plan sent back** in Plannotator ([plan](https://linear.app/doc/1))\n\nCover every table\n\nAssign Paseo again to plan it again."]);
   assert.equal(plans.size, 0);
 });
@@ -537,29 +561,33 @@ test("a non-parked approval retries its Linear writes after a rate limit instead
   };
   await withEvents([{ type: "decided", agentId: "agent-1", approved: true, at: new Date().toISOString() }], async (directory) => {
     const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
-    Object.assign(bridge, { paseo });
+    bridge.attach(paseo);
     await bridge.drain();
-    assert.deepEqual(await readdir(directory), ["0.json"]);
+    assert.equal(onlyAttempt(bridge).state, "pending", "not delivered while Linear pauses");
+    // A retry before the pause ends sends nothing, however often the sweep runs.
+    await bridge.drain();
+    await bridge.drain();
+    assert.deepEqual(calls.filter((call) => call.startsWith("document ") || call.startsWith("comment ")), []);
     limited = false;
     t.mock.timers.tick(60_000);
     await bridge.drain();
     await bridge.drain();
-    assert.deepEqual(await readdir(directory), []);
+    assert.equal(onlyAttempt(bridge).state, "applied");
     assert.deepEqual(calls.filter((call) => call.startsWith("document ")), ["document issue-1 Plan: TUC-25"]);
     assert.deepEqual(calls.filter((call) => call.startsWith("comment ")), ["comment issue-1: ✅ **Plan approved** in Plannotator — [plan](https://linear.app/doc/1)"]);
+    await bridge.stop();
   });
 });
 
-test("parked rate-limited decisions keep their event and attempt count until resumeAt, however often Linear pauses", async (t) => {
+test("parked rate-limited decisions wait until resumeAt without counting a failed try, however often Linear pauses", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-07T12:00:00Z") });
-  const errors = t.mock.method(console, "error", () => {});
+  t.mock.method(console, "error", () => {});
   const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
   const { plans, parking } = parkingFake(calls);
   plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-10-07T10:00:00Z", announced: true });
   const upsert = linear.upsertIssueDocument;
   let requests = 0;
   let limited = true;
-  const maxAttempts = 20;
   linear.upsertIssueDocument = async (issueId, title) => {
     requests++;
     if (limited) throw new RateLimitedError("app", Date.now() + 60_000);
@@ -567,32 +595,25 @@ test("parked rate-limited decisions keep their event and attempt count until res
   };
   await withEvents([{ type: "decided", agentId: "agent-1", approved: true, parked: true, at: new Date().toISOString() }], async (directory) => {
     const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
-    Object.assign(bridge, { paseo });
-    // The in-process retry map is private; inspect it to prove the pre-existing attempts stay intact.
-    const retryState = bridge as unknown as { attempts: Map<string, number> };
-    const attempts = retryState.attempts;
-    attempts.set("0.json", 2);
-    for (let pause = 0; pause < maxAttempts + 2; pause++) {
+    bridge.attach(paseo);
+    for (let pause = 0; pause < 22; pause++) {
       await bridge.drain();
       assert.equal(requests, pause + 1);
-      assert.equal(attempts.get("0.json"), 2, "rate limits never count as a failed attempt");
-      assert.deepEqual(await readdir(directory), ["0.json"]);
+      assert.equal(onlyAttempt(bridge).attempts, 0, "rate limits never count as a failed try");
+      assert.equal(onlyAttempt(bridge).state, "pending");
       assert.equal(plans.size, 1);
       t.mock.timers.tick(59_999);
       await bridge.drain();
-      await bridge.drain();
       assert.equal(requests, pause + 1, "not retried before resumeAt");
-      assert.equal(errors.mock.callCount(), pause + 1, "one log per event and pause");
       t.mock.timers.tick(1);
     }
     limited = false;
     await bridge.drain();
-    await bridge.drain();
-    assert.deepEqual(await readdir(directory), []);
-    assert.equal(attempts.has("0.json"), false);
+    assert.equal(onlyAttempt(bridge).state, "applied");
     assert.equal(plans.size, 0);
     assert.equal(calls.filter((call) => call.startsWith("document ")).length, 1);
     assert.equal(calls.filter((call) => call.startsWith("comment ")).length, 1);
+    await bridge.stop();
   });
 });
 
@@ -633,23 +654,45 @@ test("a Plannotator decision reaches its cold-cache reads and writes through rea
   assert.equal(sent.length, 8, "ordinary interactive comments cannot consume the owner's last share");
 });
 
-test("a parked decision is never given up while Linear stays unavailable", async () => {
+test("a parked decision is never given up while Linear stays unavailable for over an hour, and is applied once afterwards", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-01-01T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
   const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
   const { plans, parking } = parkingFake(calls);
   plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T10:00:00Z", announced: true });
-  linear.upsertIssueDocument = async () => { throw new Error("Linear's hourly request limit is reached for the Paseo Linear app"); };
-  const errors = test.mock.method(console, "error", () => {});
+  const upsert = linear.upsertIssueDocument;
+  let down = true;
+  let requests = 0;
+  linear.upsertIssueDocument = async (issueId: string, title: string) => {
+    requests++;
+    if (down) throw new Error("Linear's hourly request limit is reached for the Paseo Linear app");
+    return upsert(issueId, title);
+  };
   await withEvents([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: RISKY(2), at: "2026-01-01T12:00:00Z" }], async (directory) => {
     const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
     bridge.attach(paseo);
-    for (let attempt = 0; attempt < 25; attempt++) await bridge.drain();
-    bridge.stop();
-    assert.deepEqual(await readdir(directory), ["0.json"], "the decision waits for the next retry");
+    // Quick tries every 3 s for a minute, then once a minute: 20 + 75 tries over 76 minutes.
+    for (let sweep = 0; sweep < 20; sweep++) { await bridge.drain(); t.mock.timers.tick(3_000); }
+    assert.equal(requests, 20);
+    await bridge.drain();
+    assert.equal(requests, 21);
+    await bridge.drain();
+    assert.equal(requests, 21, "past the quick tries it waits a minute instead of retrying every sweep");
+    for (let minute = 0; minute < 75; minute++) { t.mock.timers.tick(60_000); await bridge.drain(); }
+    assert.equal(requests, 96);
+    assert.equal(onlyAttempt(bridge).state, "pending");
+    assert.match(onlyAttempt(bridge).lastError ?? "", /hourly request limit/);
+    assert.equal(plans.size, 1);
+    down = false;
+    t.mock.timers.tick(60_000);
+    await bridge.drain();
+    await bridge.drain();
+    assert.equal(onlyAttempt(bridge).state, "applied");
+    await bridge.stop();
   });
-  const failures = errors.mock.callCount();
-  errors.mock.restore();
-  assert.equal(failures, 20, "past the quick attempts it waits instead of retrying every sweep");
-  assert.equal(plans.size, 1);
+  assert.equal(plans.size, 0);
+  assert.equal(calls.filter((call) => call.startsWith("document ")).length, 1);
+  assert.equal(calls.filter((call) => call.startsWith("comment ")).length, 1);
 });
 
 test("without the central host a plan that needs the owner keeps its agent and opens as before", async () => {
@@ -878,4 +921,87 @@ test("rechecked plans cannot auto-approve even with matching fresh advice or an 
   });
   assert.equal(plans.get("issue-1")?.identifier, "TUC-25");
   assert.deepEqual(decisions, []);
+});
+
+// The Linear panel's session as the decision worker uses it, and a Linear fake that creates
+// sub-issues under the id the worker reserved.
+function panelFakes(calls: string[]) {
+  const replies = new Set<string>();
+  const sessions = {
+    sessionFor: async () => null,
+    holdSession: async (_sessionId: string, offer: string) => { calls.push(`hold ${offer}`); },
+    groupSession: async () => { calls.push("group"); },
+    clearReview: async () => { calls.push("clear review"); },
+    say: async (_sessionId: string, _type: string, body: string, _ephemeral?: boolean, id?: string) => { calls.push(`reply ${body.split(" (")[0]}`); if (id) replies.add(id); },
+    said: async (id: string) => replies.has(id),
+  };
+  const issues = new Map<string, { id: string; identifier: string; url: string }>();
+  const subIssues = {
+    issues,
+    issueState: async () => ({ id: "issue-1", identifier: "TUC-25", teamId: "team-1", projectId: "project-1", labels: [] }) as never,
+    createIssue: async (input: { id?: string; title: string }) => {
+      const issue = { id: input.id!, identifier: `TUC-${100 + issues.size}`, url: "" };
+      issues.set(issue.id, issue);
+      calls.push(`create ${input.title}`);
+      return issue;
+    },
+    issueById: async (id: string) => issues.get(id) ?? null,
+    addBlocker: async (blocker: string, blocked: string) => { calls.push(`${issues.get(blocker)?.identifier} blocks ${issues.get(blocked)?.identifier}`); },
+    delegate: async (id: string) => { calls.push(`delegate ${issues.get(id)?.identifier}`); },
+  };
+  return { sessions, subIssues };
+}
+
+const SPLIT_PLAN = "# Plan\n## Steps\n1. Add the domain\n2. Add the migration\n3. Wire the API\n";
+const PANEL = { sessionId: "session-1", agentId: "agent-1", issueId: "issue-1", identifier: "TUC-25", createdAt: "", handled: [], offer: null, review: { localUrl: "http://localhost:5000/", openedAt: "2026-01-01T10:00:00Z" } };
+
+test("approve, implement later: the session is held before the planner retires, the plan is recorded and the ticket goes back to Todo with plan-ready", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { sessions } = panelFakes(calls);
+  const { parking } = parkingFake(calls);
+  await withEvents([], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, sessions as never, async () => "# Plan\n1. Step", undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.attach(paseo);
+    assert.equal(await bridge.decidePanel(PANEL as never, "later"), null, "the workflow replied itself");
+    assert.equal(onlyAttempt(bridge).state, "applied");
+    await bridge.stop();
+  });
+  assert.deepEqual(calls, ["hold later", "document issue-1 Plan: TUC-25", "retire agent-1 null", "ready issue-1", "+plan-ready issue-1", "clear review", "reply Plan approved for later"]);
+});
+
+test("approve & split: a sub-issue Linear created whose answer was lost, then a plugin reload, still leaves every sub-issue created once", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-01-01T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { sessions, subIssues } = panelFakes(calls);
+  const { parking } = parkingFake(calls);
+  const create = subIssues.createIssue;
+  let lost = true;
+  // Linear creates the second sub-issue, but its answer never arrives.
+  subIssues.createIssue = async (input) => {
+    const issue = await create(input);
+    if (input.title === "Add the migration" && lost) { lost = false; throw new Error("socket hang up"); }
+    return issue;
+  };
+  Object.assign(linear, subIssues);
+  await withEvents([], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, sessions as never, async () => SPLIT_PLAN, undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.attach(paseo);
+    assert.match(await bridge.decidePanel(PANEL as never, "split") ?? "", /^Approved — being applied: socket hang up\. Retried every minute/);
+    assert.equal(onlyAttempt(bridge).state, "pending");
+    await bridge.stop();
+    // A reload: the next instance carries the journaled decision on from its recorded steps.
+    const reloaded = new PlannotatorBridge(linear, { read: async () => settings }, directory, sessions as never, async () => SPLIT_PLAN, undefined, undefined, undefined, async () => {}, () => {}, parking);
+    reloaded.attach(paseo);
+    t.mock.timers.tick(3_000);
+    await reloaded.drain();
+    assert.equal(onlyAttempt(reloaded).state, "applied");
+    await reloaded.stop();
+  });
+  assert.equal(subIssues.issues.size, 3, "no step became a second sub-issue");
+  assert.deepEqual(calls.filter((call) => call.startsWith("create ")), ["create Add the domain", "create Add the migration", "create Wire the API"]);
+  assert.deepEqual(calls.filter((call) => call.includes(" blocks ")), ["TUC-100 blocks TUC-101", "TUC-101 blocks TUC-102"]);
+  assert.deepEqual(calls.filter((call) => call.startsWith("delegate ")), ["delegate TUC-100", "delegate TUC-101", "delegate TUC-102"]);
+  assert.deepEqual(calls.filter((call) => ["hold split", "retire agent-1 null", "group", "clear review"].includes(call)), ["hold split", "retire agent-1 null", "group", "clear review"]);
+  assert.deepEqual(calls.filter((call) => call.startsWith("reply ")), ["reply Split into 3 sub-issues"]);
 });

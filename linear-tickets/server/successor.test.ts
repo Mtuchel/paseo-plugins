@@ -959,7 +959,7 @@ test("an explicitly decided parked plan still starts after reload despite its re
   const h = routerHarness({ agents: [retired] });
   t.after(h.cleanup);
   await h.store.put(thread({ agentId: "planner", offer: "parked" }));
-  assert.equal(await h.router.requeue("planner", "The owner approved implementation."), true);
+  assert.equal(await h.router.requeueSession("s1", "planner"), "queued");
   const restored = routerHarness({ daemon: h.daemon, store: new SessionStore(join(h.directory, "sessions.json")) });
   t.after(restored.cleanup);
   await restored.router.startQueued();

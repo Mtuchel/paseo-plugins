@@ -13,7 +13,8 @@ import { CommentRelay } from "./server/relay";
 import { recordPluginComment } from "./server/agent-records";
 import { paseoHome } from "./server/ticket-mcp";
 import { join } from "node:path";
-import { PlannotatorBridge, readReviewPlan, recordDecision, writeOpenScript } from "./server/plannotator";
+import { PlannotatorBridge, writeOpenScript, type OwnerOrigin } from "./server/plannotator";
+import { DecisionJournal } from "./server/decision-journal";
 import { ParkedPlans, PlannotatorHost } from "./server/parked";
 import { reviewOutcome } from "./server/review-outcome";
 import { Writeback } from "./server/writeback";
@@ -37,9 +38,8 @@ import { PullRequestBoard } from "./server/pull-requests";
 import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
 import { closeAnswered, NeedsYouIssues } from "./server/needs-you";
-import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, ReviewDecisionAppliedError, SessionRouter, SessionStore, stopAgentTurn, type HostOwnership } from "./server/sessions";
+import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, SessionRouter, SessionStore, stopAgentTurn, type HostOwnership } from "./server/sessions";
 import { LimitResumeStore, UsageReader } from "./server/limit-resume";
-import { approveForLater, splitIntoSubIssues } from "./server/split";
 import { planSetup, TicketStarter } from "./server/starter";
 import { PLAN_TICKET_ENV } from "./server/plan-policy";
 import { AgentEnvs, sessionEnv } from "./server/agent-env";
@@ -103,30 +103,19 @@ export default function contribute(server: PluginServerContext) {
   // Model tiers (README, "Model tiers"): the tier each ticket implements on.
   const tiers = new TierStore();
   const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, deletions });
-  // The plugin itself closes the review (split, implement later): the extension's report of that
-  // closing is not the owner's decision, so the bridge skips it.
-  const retirePlanner = async (reviewUrl: string, agentId: string, api: PaseoApi, reason: string) => {
-    plannotator.settled(agentId);
-    await decidePlannotatorReview(reviewUrl, false, reason);
-    await stopAgentTurn(agentId).catch(() => {});
-    await api.agents.ref(agentId).archive().catch(() => {});
-  };
+  // The decision journal (README, "Decision journal"): every owner decision on a plan is written
+  // here first and carried out by the bridge's worker; the inbox lists what is being applied.
+  const decisionJournal = new DecisionJournal();
   // Every approval path files the approved plan's follow-ups (README, "Plan follow-ups").
   const followUps = new PlanFollowUps(linear);
   // Waits on tickets already closed live in "Needs you" sub-issues; replies there (a relayed
   // comment or an @mention of the app) go to the agent that asked.
   const needsYou = new NeedsYouIssues();
   const replies = new PermissionReplies();
-  // The owner's Approve / Send back from the Linear panel or the review inbox: as on the review page.
-  const decideReview = (localUrl: string, approve: boolean, feedback: string, agentId: string) => withPriority("owner", "plan decision", async () => {
-    const planContent = await readReviewPlan(localUrl).catch(() => "");
-    await decidePlannotatorReview(localUrl, approve, feedback);
-    try {
-      await recordDecision({ type: "decided", agentId, approved: approve, ...(feedback ? { feedback } : {}), planContent, at: new Date().toISOString() });
-    } catch (error) {
-      throw new ReviewDecisionAppliedError(`The review decision was already delivered, but recording its lifecycle failed: ${error instanceof Error ? error.message : error}`);
-    }
-  });
+  // The owner's Approve / Send back from the Linear panel or the review inbox: journaled for its
+  // review, then sent to Plannotator as on the review page (plannotator.ts, decideOwner).
+  const decideReview = (localUrl: string, approve: boolean, feedback: string, agentId: string, origin: OwnerOrigin): Promise<void> =>
+    plannotator.decideOwner(localUrl, approve, feedback, agentId, origin);
   // Activation routing (README, "Draining a host"): every automatic start path calls `take`
   // before it starts. Remote mode forwards to the peer through the drain router; local mode
   // answers the peer's activations and defers the tickets it still claims. The two routers are
@@ -144,10 +133,9 @@ export default function contribute(server: PluginServerContext) {
     limitResumes: new LimitResumeStore(), usage,
     owner: (issueId) => ticketOwner(issueId),
     decideReview,
+    decidePlan: (link, mode): Promise<string | null> => plannotator.decidePanel(link, mode),
     reviewOutcome: (review) => reviewOutcome(review),
-    recordOutcome: (agentId, outcome) => recordDecision({ type: "decided", agentId, ...outcome, at: new Date().toISOString() }),
-    splitPlan: (link, localUrl, paseo) => withPriority("owner", "plan decision", () => splitIntoSubIssues({ linear, appUserId: async () => (await agentApi.viewer()).id, readPlan: readReviewPlan, retirePlanner, followUps }, link, localUrl, paseo)),
-    approveLater: (link, localUrl, paseo) => withPriority("owner", "plan decision", () => approveForLater({ linear, readPlan: readReviewPlan, retirePlanner, followUps }, link, localUrl, paseo)),
+    recordOutcome: (agentId, outcome, review): Promise<void> => plannotator.recovered(agentId, review, outcome),
     // `paseo agent reload` for crashed agents (README, "Crashed agents"); the plugin SDK has no reload.
     reloader: async () => {
       const client = await internalDaemon();
@@ -234,6 +222,7 @@ export default function contribute(server: PluginServerContext) {
   const reviewLinks = new ReviewLinks({
     peers: async () => (await settings.read()).reviewPeers,
     decide: decideReview,
+    decisions: { applying: () => decisionJournal.applying(), resolve: (entryId, action): Promise<void> => plannotator.resolve(entryId, action) },
     linearWorkspace: () => linear.workspaceUrl(),
     pipeline: async (open, decided) => {
       const snapshot = await pipeline.snapshot(open, decided);
@@ -283,6 +272,7 @@ export default function contribute(server: PluginServerContext) {
     },
   };
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks, undefined, undefined, parking);
+  plannotator.useJournal(decisionJournal);
   plannotator.useDeletions(deletions);
   plannotator.observeDeliveryFailures((event, error, attempts) => pipeline.recordDeliveryError(event, error, attempts));
   plannotator.onProjectPlan(projects);
@@ -523,12 +513,15 @@ export default function contribute(server: PluginServerContext) {
   usageTimer.unref?.();
   return async () => {
     stopped = true;
+    // The bridge stops admitting decisions and lets every admitted one finish (each call is
+    // bounded) before anything it uses closes; only then does the journal's lease move on.
+    await plannotator.stop();
     replies.stop();
     clearTimeout(startSoon);
     clearInterval(usageTimer);
     stopKeepingFresh();
     void own?.close();
-    dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop();
+    dispatcher.stop(); plannotatorHost.stop(); sessions.stop();
     webhook.stop(); reviewLinks.stop(); pipeline.stop(); health.stop();
     const stoppedPullRequests = pullRequests.stop();
     pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop();
