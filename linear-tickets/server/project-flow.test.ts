@@ -183,6 +183,23 @@ test("Plan and a dispatch poll share one in-flight launch", async (t) => {
   assert.equal((await r.store.all()).erp.planner?.restarts, 0);
 });
 
+test("the Plan RPC can return its durable run while agent startup is still waiting", async (t) => {
+  const r = await room(t, [issue(1)]);
+  const paseo = paseoWith(() => []);
+  const gate = r.holdStart();
+  let returned: { planner: { runId: string; agentId: string | null } | null } | undefined;
+  const planned = r.flow.planNow("erp", settings, paseo, true).then((status) => { returned = status; });
+  while (!gate.starting()) await setImmediate();
+  try {
+    assert.ok(returned?.planner, "Plan acknowledges the durable run before provider readiness");
+    assert.equal(returned.planner.agentId, null);
+    assert.equal(returned.planner.runId, (await r.store.all()).erp.planner!.id);
+  } finally { gate.open(); await planned; }
+  await r.flow.tick(paseo, settings);
+  assert.equal(r.starts.length, 1, "the poll and queued background launch cannot double-start");
+  assert.equal((await r.store.all()).erp.planner?.agentId, "run-agent-1");
+});
+
 test("Skip during launch retires the returned agent before handing tickets out", async (t) => {
   const r = await room(t, [issue(1)]);
   const paseo = paseoWith(() => []);

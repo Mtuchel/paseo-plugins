@@ -371,7 +371,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(statusRpc, (_input, { paseo }) => { attach(paseo); return linear.status(); });
   server.handle(dispatchStatusRpc, (_input, { paseo }) => { attach(paseo); return dispatcher.snapshot(); });
   server.handle(projectsStatusRpc, (_input, { paseo }) => { attach(paseo); return projects.status(); });
-  server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { attach(paseo); return projects.planNow(projectId, await settings.read(), paseo); });
+  server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { attach(paseo); return projects.planNow(projectId, await settings.read(), paseo, true); });
   server.handle(skipPlanRpc, async ({ projectId }, { paseo }) => { attach(paseo); return projects.skipPlan(projectId, await settings.read(), paseo); });
   server.handle(presenceRpc, () => presence.state());
   server.handle(setPresenceRpc, (change) => presence.update(change));
