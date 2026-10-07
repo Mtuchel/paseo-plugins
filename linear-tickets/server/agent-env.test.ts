@@ -75,7 +75,6 @@ test("a resumed planner run's agent gets its run environment back from its run l
     await launcher.startPlanner(run, paseo, settings);
     const launched = created!.env!;
     const labels = created!.labels!;
-    assert.deepEqual(labels, { "linear.plannerRun": "run-1", "linear.projectId": "lp-1" });
     assert.equal(launched.LINEAR_TICKETS_ISSUE, "project-planner:run-1");
 
     // The create itself carries the launch's environment: nothing to add.

@@ -2398,9 +2398,11 @@ The additive `plannerRecovery` version-1 snapshot exports only project/run/reque
 state and timestamps, never error text, plans, ticket lists, selectors or credentials. Local
 planner collection and remote attempts do not depend on successful local agent or Linear reads.
 A delivered remote snapshot with unreadable planner data refreshes its agents but retains its
-planner rows stale. A failed agent collector on that remote still aborts its entire snapshot;
-missing/old/unknown-version planner fields and unreachable hosts mean not-read, not an empty
-successful source. Each host's old rows are retained independently as “not refreshed since”.
+planner rows stale. A failed agent/permission collector leaves `plannerRecovery` unavailable and
+its recovery rows stale; the independently delivered `projectPlanners` owner alerts and explicit
+`agentSource` failure outcome introduced by the host-ownership work stay intact. Missing/old/
+unknown-version recovery fields and unreachable hosts mean not-read, not an empty successful
+source. Each host's old rows are retained independently as “not refreshed since”.
 
 History keeps the existing fixed fields and digest observation time; producer `confirmedAt`
 is display/evidence data, not an exact restart timestamp exported in history. Confirmed rows

@@ -1334,6 +1334,12 @@ class HostIO:
     def project_planners(self):
         """This host's durable planner failures, independent of agents and Linear notices.
         Missing local state means no projects; unreadable state means UNKNOWN."""
+        # Standalone owner-status reads remain fresh. Once recovery is normalized, both
+        # consumers use that run's frozen observation (HostIO is created per digest run).
+        if not self._local_planner_loaded:
+            self._projects_loaded = False
+            self._projects_data = None
+            self._projects_problem = None
         try:
             records = self.project_records()
             if self._projects_problem:

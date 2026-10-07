@@ -871,16 +871,21 @@ class ProjectPlannerRunTest(RunCase):
                  mock.patch.object(self.host, "limit_resumes", return_value={"pending": {}, "started": set()}), \
                  mock.patch.object(self.host, failed_call, side_effect=TimeoutError("SECRET_RPC")):
                 snapshot = self.host.snapshot()
+            self.assertIsNone(snapshot["plannerRecovery"], "failed agent collection must not publish recovery as successful-empty")
             receiver = digest.HostIO(sync_repo=False, remotes=False)
             receiver._targets = [target]
             receiver._remotes = [{**snapshot, "_host": target}]
             self.io.planner_sources = lambda: {target: receiver.planner_sources()[target]}
             self.io.unreachable_hosts = receiver.unreachable_hosts
+            self.io.planner_recovery_sources = receiver.planner_recovery(WED_11_05)
             self.run_at(WED_11_05)
             saved = self.saved()
             self.assertIn(self.key(target), saved["pending"])
             self.assertFalse(saved["items"][self.key(target)]["stale"])
             self.assertTrue(saved["items"]["agent-error:old-remote"]["stale"])
+            events = read_lines(os.path.join(self.history, "history.jsonl"))
+            outcome = [event for event in events if event["event"] == "run"][-1]["units"]
+            self.assertFalse(outcome[f"planner_recovery@{target}"])
             self.assertNotIn("SECRET_RPC", json.dumps(saved))
 
     def test_unreadable_and_malformed_source_retains_previous_alert_stale(self):
