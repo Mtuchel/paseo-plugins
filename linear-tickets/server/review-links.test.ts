@@ -531,3 +531,227 @@ test("each review that starts waiting is pushed once to the subscribed browsers;
     },
   });
 });
+
+// A review replaced in the same millisecond, or one republished on its old URL: the registry is
+// keyed by the review's URL, so the current review is the one with the newest timestamp and, among
+// equal ones, the publication this plugin recorded last.
+
+// The event's URLs, as `opened` builds them.
+function reviewLocal(port: number): string { return `http://localhost:${port}/?r=1`; }
+function reviewRemote(port: number): string { return `https://host.tail1.ts.net:${port}/?r=1`; }
+
+// One frozen instant: every publication in a test shares one millisecond, so their timestamps tie.
+function frozen(iso = "2026-01-01T10:00:00.000Z"): () => Date {
+  const at = Date.parse(iso);
+  return () => new Date(at);
+}
+
+// What these tests read from `/api/inbox`.
+type InboxRowJson = { agentId: string; name: string; details?: { title: string | null; summary: string | null; risk: { impact: number; text: string } | null; reasons?: string[]; autoApproved?: boolean } };
+
+// The plugin restarted: a second instance over the registry JSON alone, with every review alive.
+async function withRestarted(file: string, run: (links: ReviewLinks, get: (path: string) => Promise<Response>) => Promise<void>): Promise<void> {
+  const links = new ReviewLinks({
+    port: 0, proxyPort: 0, file, sweepMs: 3_600_000, timeZone: "Europe/Berlin",
+    now: () => new Date("2026-01-01T10:00:00.000Z"),
+    alive: async () => true,
+    serve: async () => ORIGIN,
+    route: async () => {},
+    unserve: async () => {},
+    fetchPlan: async () => "",
+  });
+  try {
+    await links.start();
+    await run(links, (path) => fetch(`http://127.0.0.1:${links.listeningPort}${path}`, { redirect: "manual" }));
+  } finally {
+    links.stop();
+  }
+}
+
+test("a review republished on its own URL wins a tied instant at its stable link and row", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-review-links-"));
+  const file = join(directory, "reviews.json");
+  try {
+    await withLinks(async (links, get, live) => {
+      live.add(50_001).add(50_002).add(50_009);
+      // agent-1's plan, a review in between, then the first URL published again — all one instant.
+      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1-old" });
+      await links.described(reviewLocal(50_001), `# TUC-1 — Old plan\n\nWhat the agent first planned.\n\n${RISK(3, "data-fix")}`, { approved: false, reasons: ["impact 3 is above the threshold 1"] });
+      await links.opened("agent-1", opened(50_002), { identifier: "TUC-1-mid" });
+      await links.described(reviewLocal(50_002), `# TUC-1 — Middle plan\n\nWhat the agent planned in between.\n\n${RISK(2)}`, { approved: false, reasons: [] });
+      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" });
+      await links.described(reviewLocal(50_001), `# TUC-1 — Current plan\n\nWhat the review shows now.\n\n${RISK(1)}`, { approved: true, reasons: [] });
+      await links.opened("agent-2", { ...opened(50_009), agentId: "agent-2" }, { identifier: "TUC-2" });
+
+      assert.equal((await get("/review/agent-1")).headers.get("location"), reviewRemote(50_001), "the publication recorded last on the reused URL wins the tie");
+      assert.equal((await get("/review/agent-2")).headers.get("location"), reviewRemote(50_009), "another agent's link is untouched");
+      const [waiting] = (await (await get("/")).text()).split("Recently decided");
+      assert.deepEqual([...waiting.matchAll(/data-agent="([^"]+)"/g)].map((match) => match[1]), ["agent-1", "agent-2"]);
+      assert.match(waiting, /<span class="id">TUC-1<\/span>/);
+      assert.match(waiting, /<div class="title">Current plan<\/div>/);
+      assert.match(waiting, /<div class="summary">What the review shows now\.<\/div>/);
+      assert.match(waiting, /<span class="chip low">Risk: impact 1\/4 · revert<\/span>/);
+      assert.doesNotMatch(waiting, /TUC-1-old|TUC-1-mid|Old plan|Middle plan|impact 3\/4/);
+
+      await withRestarted(file, async (_reloaded, restartedGet) => {
+        assert.equal((await restartedGet("/review/agent-1")).headers.get("location"), reviewRemote(50_001), "the reloaded registry keeps the same winner");
+        const [reloadedWaiting] = (await (await restartedGet("/")).text()).split("Recently decided");
+        assert.deepEqual([...reloadedWaiting.matchAll(/data-agent="([^"]+)"/g)].map((match) => match[1]), ["agent-1", "agent-2"]);
+        assert.match(reloadedWaiting, /<div class="title">Current plan<\/div>/);
+        assert.doesNotMatch(reloadedWaiting, /TUC-1-old|TUC-1-mid|Old plan|Middle plan/);
+      });
+    }, undefined, { file, now: frozen() });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a registry loaded from disk keeps the newest timestamp and the last stored entry of a tie", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-review-links-"));
+  const file = join(directory, "reviews.json");
+  const entry = (port: number, agentId: string, identifier: string, openedAt: string) => ({ agentId, localUrl: reviewLocal(port), remoteUrl: reviewRemote(port), identifier, openedAt });
+  try {
+    // What the previous plugin version wrote: no new fields, and an order that does not match the
+    // timestamps (a review recorded later can still be older).
+    await writeFile(file, JSON.stringify({
+      [reviewLocal(50_001)]: entry(50_001, "agent-1", "TUC-1-newest", "2026-01-01T10:00:05.000Z"),
+      [reviewLocal(50_002)]: entry(50_002, "agent-1", "TUC-1-recorded-last", "2026-01-01T10:00:00.000Z"),
+      [reviewLocal(50_003)]: entry(50_003, "agent-2", "TUC-2-tied-first", "2026-01-01T10:00:05.000Z"),
+      [reviewLocal(50_004)]: entry(50_004, "agent-2", "TUC-2-tied-last", "2026-01-01T10:00:05.000Z"),
+    }));
+    await withRestarted(file, async (_reloaded, get) => {
+      assert.equal((await get("/review/agent-1")).headers.get("location"), reviewRemote(50_001), "the newest timestamp wins although the file stores it first");
+      assert.equal((await get("/review/agent-2")).headers.get("location"), reviewRemote(50_004), "of a tie, the entry stored last wins");
+      const [waiting] = (await (await get("/")).text()).split("Recently decided");
+      assert.deepEqual([...waiting.matchAll(/data-agent="([^"]+)"/g)].map((match) => match[1]), ["agent-1", "agent-2"]);
+      assert.match(waiting, /TUC-1-newest/);
+      assert.match(waiting, /TUC-2-tied-last/);
+      assert.doesNotMatch(waiting, /TUC-1-recorded-last|TUC-2-tied-first/);
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("describedFor re-describes the tied replacement, not the reviews it replaced", async () => {
+  await withLinks(async (links, get, live) => {
+    live.add(50_001).add(50_002);
+    await links.opened("agent-1", opened(50_001), { identifier: "TUC-1-old" });
+    await links.described(reviewLocal(50_001), `# TUC-1 — Old plan\n\nWhat the agent first planned.\n\n${RISK(3, "data-fix")}`, { approved: false, reasons: ["impact 3 is above the threshold 1"] });
+    await links.opened("agent-1", opened(50_002), { identifier: "TUC-1-mid" });
+    await links.described(reviewLocal(50_002), `# TUC-1 — Middle plan\n\nWhat the agent planned in between.\n\n${RISK(2)}`, { approved: false, reasons: [] });
+    await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" });
+    const plan = `# TUC-1 — Latest plan\n\nWhat the review now shows.\n\n${RISK(2, "data-fix")}`;
+    await links.describedFor("agent-1", plan, { approved: true, reasons: [] });
+
+    const inbox = await (await get("/api/inbox")).json() as { open: InboxRowJson[] };
+    const row = inbox.open.find((item) => item.agentId === "agent-1");
+    assert.equal(row?.name, "TUC-1");
+    assert.equal(row?.details?.title, "Latest plan");
+    assert.equal(row?.details?.summary, "What the review now shows.");
+    assert.deepEqual(row?.details?.risk, { impact: 2, text: "impact 2/4, data-fix" });
+    assert.deepEqual(row?.details?.reasons, []);
+    assert.equal(row?.details?.autoApproved, true, "the replacement's fresh judgement");
+    const [waiting] = (await (await get("/")).text()).split("Recently decided");
+    assert.match(waiting, /<div class="title">Latest plan<\/div>/);
+    assert.doesNotMatch(waiting, /Old plan|Middle plan|TUC-1-old|TUC-1-mid/);
+  }, undefined, { now: frozen() });
+});
+
+test("the sweep closes the superseded review of a tie and keeps the last publication's link", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-review-links-"));
+  const file = join(directory, "reviews.json");
+  try {
+    await withLinks(async (links, get, live, unserved) => {
+      live.add(50_001);
+      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1-old" });
+      await links.opened("agent-1", opened(50_002), { identifier: "TUC-1-mid" });
+      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" });
+      await links.sweep();
+      await links.sweep();
+      assert.deepEqual(unserved, [50_002], "only the superseded review's route is removed");
+      assert.equal((await get("/review/agent-1")).headers.get("location"), reviewRemote(50_001), "the tie winner stays open");
+      const page = await (await get("/")).text();
+      const [waiting] = page.split("Recently decided");
+      assert.match(waiting, /<span class="id">TUC-1<\/span>/);
+      assert.doesNotMatch(page, /TUC-1-old|TUC-1-mid/, "the closed review is dropped, not listed as decided");
+      await withRestarted(file, async (_reloaded, restartedGet) => {
+        assert.equal((await restartedGet("/review/agent-1")).headers.get("location"), reviewRemote(50_001), "the reloaded registry keeps the same link");
+        const [reloadedWaiting] = (await (await restartedGet("/")).text()).split("Recently decided");
+        assert.match(reloadedWaiting, /<span class="id">TUC-1<\/span>/);
+        assert.doesNotMatch(reloadedWaiting, /TUC-1-old|TUC-1-mid/);
+      });
+    }, undefined, { file, now: frozen() });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("approving from the inbox decides a tied replacement republished on its old URL", async () => {
+  const decided: string[] = [];
+  await withLinks(async (links, get, live) => {
+    live.add(50_001).add(50_002);
+    await links.opened("agent-1", opened(50_001), { identifier: "TUC-1-old" });
+    await links.opened("agent-1", opened(50_002), { identifier: "TUC-1-mid" });
+    await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" });
+    assert.equal((await action(links, "/api/reviews/agent-1/decision", { approve: true })).status, 200);
+    assert.deepEqual(decided, [`${reviewLocal(50_001)} true  agent-1`], "the review republished on the old URL is the one decided");
+    const [waiting, recent] = (await (await get("/")).text()).split("Recently decided");
+    assert.doesNotMatch(waiting, /data-agent="agent-1"/);
+    assert.match(recent, /TUC-1<\/span><span class="outcome[^"]*">approved/);
+    assert.equal((await action(links, "/api/reviews/agent-1/decision", { approve: true })).status, 409, "an approved review is not decided twice");
+  }, undefined, {
+    now: frozen(),
+    decide: async (localUrl, approve, feedback, agentId) => { decided.push(`${localUrl} ${approve} ${feedback} ${agentId}`); },
+  });
+});
+
+test("sending back and rechecking decide a tied replacement published at a new URL", async () => {
+  const decided: string[] = [];
+  await withLinks(async (links, get, live) => {
+    live.add(50_001).add(50_002).add(50_003).add(50_004);
+    await links.opened("agent-1", opened(50_001), { identifier: "TUC-1-old" });
+    await links.opened("agent-1", opened(50_002), { identifier: "TUC-1" });
+    assert.equal((await action(links, "/api/reviews/agent-1/decision", { approve: false, feedback: " Split step 2 " })).status, 200);
+    assert.deepEqual(decided, [`${reviewLocal(50_002)} false Split step 2 agent-1`], "the replacement is the one sent back");
+    await links.opened("agent-2", { ...opened(50_003), agentId: "agent-2" }, { identifier: "TUC-2-old" });
+    await links.opened("agent-2", { ...opened(50_004), agentId: "agent-2" }, { identifier: "TUC-2" });
+    assert.equal((await action(links, "/api/reviews/agent-2/recheck", {})).status, 200);
+    assert.match(decided[1], /^http:\/\/localhost:50004\/\?r=1 false Recheck this plan against the current code/, "recheck sends the replacement back first");
+    assert.equal(await links.requiresOwner("issue-2"), true, "the replacement is the review marked for recheck");
+    assert.equal((await action(links, "/api/reviews/agent-2/recheck", {})).status, 409, "a review already sent back is not rechecked twice");
+    const [, recent] = (await (await get("/")).text()).split("Recently decided");
+    assert.match(recent, /TUC-1<\/span><span class="outcome[^"]*">sent back/);
+    assert.match(recent, /TUC-2<\/span><span class="outcome[^"]*">sent back/);
+  }, undefined, {
+    now: frozen(),
+    decide: async (localUrl, approve, feedback, agentId) => { decided.push(`${localUrl} ${approve} ${feedback} ${agentId}`); },
+    issueLink: async () => ({ issueId: "issue-2", identifier: "TUC-2" }),
+  });
+});
+
+test("a tied replacement keeps the announced push key and resolves the stable link", async () => {
+  const sent: string[] = [];
+  await withLinks(async (links, get, live) => {
+    const subscription = { endpoint: "https://push.example/1", keys: { p256dh: "p", auth: "a" } };
+    assert.match((await (await get("/api/push/key")).json()).publicKey, /^[A-Za-z0-9_-]{80,}$/);
+    assert.equal((await action(links, "/api/push/subscribe", subscription)).status, 200);
+    live.add(50_001).add(50_002).add(50_003);
+    await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, { identifier: "TUC-2" });
+    await links.announce();
+    await links.opened("agent-1", opened(50_001), { identifier: "TUC-1-old" });
+    await links.announce();
+    assert.deepEqual(sent, [`https://push.example/1 Plan review: TUC-1-old ${ORIGIN}/review/agent-1 2`]);
+
+    // The same agent's replacement at the same instant: the same `agentId@since` key, so no second push.
+    await links.opened("agent-1", opened(50_003), { identifier: "TUC-1" });
+    await links.announce();
+    assert.equal(sent.length, 1, "the announced key is not pushed again");
+    const [waiting] = (await (await get("/")).text()).split("Recently decided");
+    assert.match(waiting, /<span class="id">TUC-1<\/span>/, "the row already shows the replacement");
+    assert.equal((await get("/review/agent-1")).headers.get("location"), reviewRemote(50_003), "the pushed stable link resolves to the replacement");
+  }, undefined, {
+    now: frozen(),
+    sendPush: async (subscription, message) => { sent.push(`${subscription.endpoint} ${message.title} ${message.url} ${message.count}`); },
+  });
+});

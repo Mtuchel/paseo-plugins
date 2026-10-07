@@ -230,6 +230,79 @@ test("deletion rejects a newer waiting review that arrived during fresh identity
   });
 });
 
+for (const reuse of [false, true]) {
+  test(`deletion preserves a same-tick replacement during fresh verification (${reuse ? "A → B → A" : "A → B"})`, async () => {
+    let replace: (() => Promise<void>) | null = null;
+    const effects = { prepare: 0, delete: 0, cleanup: 0, unserve: 0 };
+    const replacement = { ...event, localUrl: "http://localhost:50002/", remoteUrl: "https://host.tail.ts.net:50002/" };
+    await fixture(async ({ links, post, journal, rows }) => {
+      replace = async () => {
+        await links.opened("agent-1", replacement, { identifier: IDENTIFIER, issueId: ISSUE });
+        if (reuse) await links.opened("agent-1", event, { identifier: IDENTIFIER, issueId: ISSUE });
+      };
+      const response = await post(DELETE, { identifier: IDENTIFIER });
+      assert.equal(response.status, 409);
+      assert.deepEqual(await response.json(), { error: "The waiting review changed while its ticket was verified; nothing was deleted." });
+      assert.deepEqual(effects, { prepare: 0, delete: 0, cleanup: 0, unserve: 0 });
+      assert.equal(await journal.get(ISSUE), null);
+      assert.deepEqual((await rows()).open.map((row) => row.name), [IDENTIFIER]);
+      const redirect = await fetch(`http://127.0.0.1:${links.listeningPort}/review/agent-1`, { redirect: "manual" });
+      assert.equal(redirect.status, 302);
+      assert.equal(redirect.headers.get("location"), (reuse ? event : replacement).remoteUrl);
+    }, {
+      now: () => new Date("2026-01-01T10:00:00Z"),
+      issueInfo: async (_identifier, options) => { if (options?.fresh) await replace?.(); return { issueId: ISSUE, areas: [] }; },
+      prepareDelete: async () => { effects.prepare++; },
+      deleteIssue: async () => { effects.delete++; },
+      cleanupIssue: async () => { effects.cleanup++; },
+      unserve: async () => { effects.unserve++; },
+    });
+  });
+}
+
+test("an unchanged frozen-clock review deletes once and retries cleanup without another deletion", async () => {
+  let mutations = 0;
+  await fixture(async ({ post, journal, rows }) => {
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 200);
+    assert.equal((await journal.get(ISSUE))?.phase, "deleted");
+    assert.deepEqual((await rows()).open, []);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 200);
+    assert.equal(mutations, 1);
+  }, { now: () => new Date("2026-01-01T10:00:00Z"), deleteIssue: async () => { mutations++; } });
+});
+
+test("peer-forwarded deletion rejects the owner's tied replacement without mutations on either host", async () => {
+  let replace: (() => Promise<void>) | null = null;
+  const effects = { prepare: 0, delete: 0, cleanup: 0, unserve: 0 };
+  const options: ReviewLinksOptions = {
+    now: () => new Date("2026-01-01T10:00:00Z"),
+    prepareDelete: async () => { effects.prepare++; },
+    deleteIssue: async () => { effects.delete++; },
+    cleanupIssue: async () => { effects.cleanup++; },
+    unserve: async () => { effects.unserve++; },
+  };
+  await fixture(async (owner) => {
+    await owner.links.opened("agent-9", { ...event, agentId: "agent-9", localUrl: "http://localhost:50009/", remoteUrl: "https://host.tail.ts.net:50009/" }, { identifier: IDENTIFIER, issueId: ISSUE });
+    replace = async () => {
+      await owner.links.opened("agent-9", { ...event, agentId: "agent-9", localUrl: "http://localhost:50010/", remoteUrl: "https://host.tail.ts.net:50010/" }, { identifier: IDENTIFIER, issueId: ISSUE });
+    };
+    await fixture(async ({ post, journal }) => {
+      const response = await post("/api/reviews/agent-9/delete", { identifier: IDENTIFIER });
+      assert.equal(response.status, 409);
+      assert.match((await response.json()).error, /waiting review changed/);
+      assert.equal(await journal.get(ISSUE), null);
+      assert.equal(await owner.journal.get(ISSUE), null);
+      assert.deepEqual(effects, { prepare: 0, delete: 0, cleanup: 0, unserve: 0 });
+      const redirect = await fetch(`http://127.0.0.1:${owner.links.listeningPort}/review/agent-9`, { redirect: "manual" });
+      assert.equal(redirect.status, 302);
+      assert.equal(redirect.headers.get("location"), "https://host.tail.ts.net:50010/");
+    }, { ...options, peers: async () => [`http://127.0.0.1:${owner.links.listeningPort}`] });
+  }, {
+    ...options,
+    issueInfo: async (_identifier, options) => { if (options?.fresh) await replace?.(); return { issueId: ISSUE, areas: [] }; },
+  });
+});
+
 test("cached row linkage cannot authorize deletion when its independent fresh read fails", async () => {
   let mutations = 0;
   await fixture(async ({ rows, post }) => {

@@ -1724,6 +1724,10 @@ round. The link the plugin posts is therefore the agent's stable one,
   sent back or ended) and the ticket;
 - an agent the plugin never saw a review for gets 404.
 
+Current-review selection uses the opening timestamp first. When timestamps are equal, the last
+publication wins, including a new plan served again at an earlier review's URL. Stable links,
+inbox details and actions use that same selection; saved registries preserve it across reloads.
+
 Reviews are tracked in `$PASEO_HOME/linear-tickets/plannotator/reviews.json`. Every 30 s the
 plugin checks each open review's server; after two failed checks it removes that review's
 `tailscale serve` route and marks the review closed. Only ports recorded there are ever turned
@@ -1825,6 +1829,10 @@ when the host cannot be reached it says so and keeps retrying.
   completed-deletion guard survive a restart. An inconclusive Linear response keeps work paused;
   retry requires a fresh check of the captured ticket identity. A missing or inaccessible ticket
   is not treated as proof that deletion succeeded.
+  If the agent publishes a replacement during that fresh identity check, deletion stops with
+  “The waiting review changed while its ticket was verified; nothing was deleted.” This also
+  applies to equal-time publications: the issue and replacement stay available, and the owner
+  must review the replacement before trying deletion again.
 - **Review pane on a wide screen.** From 1100 px wide the list sits on the left and a row opens
   its review on the right, inside the inbox: the full Plannotator page (annotate, comment, Approve,
   Send Feedback), as on its own tab. Each review you open keeps its page, so switching between rows

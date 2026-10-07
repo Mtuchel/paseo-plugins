@@ -376,6 +376,8 @@ export class ReviewLinks {
     if (issueId && await this.deletions.blocked(issueId) || await this.deletions.forAgent(agentId)) return null;
     const recheckRequested = issueId ? await this.requiresOwner(issueId) : false;
     await this.change((registry) => {
+      // Reused URLs must move to the end: publication order breaks equal-time ties.
+      delete registry[event.localUrl];
       registry[event.localUrl] = { agentId, localUrl: event.localUrl, remoteUrl: event.remoteUrl, ...(identifier ? { identifier } : {}), ...(issueId ? { issueId } : {}), ...(recheckRequested ? { recheckRequested } : {}), openedAt: this.now().toISOString(), ...(since ? { since } : {}), ...(model ? { model } : {}) };
     });
     this.misses.delete(event.localUrl);
@@ -804,7 +806,7 @@ export class ReviewLinks {
 function latest(registry: Registry, agentId: string): ReviewEntry | undefined {
   let found: ReviewEntry | undefined;
   for (const entry of Object.values(registry)) {
-    if (entry.agentId === agentId && (!found || entry.openedAt > found.openedAt)) found = entry;
+    if (entry.agentId === agentId && (!found || entry.openedAt >= found.openedAt)) found = entry;
   }
   return found;
 }
