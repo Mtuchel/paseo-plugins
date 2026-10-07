@@ -14,6 +14,7 @@ import { Launcher } from "./launch";
 import { SessionStore } from "./sessions";
 import { ResumeUnavailableError } from "./starter";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, Settings, type ActivationSettings, type PluginSettings } from "./settings";
+import { WATCHDOG_LABEL, WatchdogStore } from "./watchdog";
 
 const OWNER = "owner-1";
 const ISSUE = "i1";
@@ -336,6 +337,54 @@ test("the intake starts an unclaimed activation through admission, with the orig
   await intake.idle();
   assert.equal((await intake.status()).done, 1, "the forwarded activation was processed");
   assert.deepEqual(options, [{ retryHint: "mac forwarded it again, or assign Paseo on the ticket here", lead: "Please fix the login." }]);
+});
+
+test("a forwarded ticket carries its watchdog history; the receiving host takes it over before the start and labels the watchdog's replacement", async (t) => {
+  const home = await withHome(t);
+  const now = Date.now();
+  const source = new WatchdogStore(join(home, "source-watchdog.json"));
+  const started = new Date(now - 60 * 60_000).toISOString();
+  await source.update((file) => { file.tickets.i9 = { identifier: "TUC-9", starts: [started], cycle: null, exhausted: null }; });
+  const { request, calls } = fakeRequest();
+  const drain = new DrainRouter({
+    settings: { read: async () => settingsFor({ mode: "remote", peer: PEER }) }, paseo: () => fakeDaemon([]).paseo, request, home, host: "mac", log: () => {},
+    ghosts: async () => new Set<string>(),
+    watchdog: { history: (issueId, at) => source.history(issueId, at), transferred: (issueId, identifier) => source.transferred(issueId, identifier) },
+  });
+  assert.deepEqual(await drain.take({ kind: "session", issueId: "i9", identifier: "TUC-9", sessionId: "sess-9", text: "Please fix the login." }), { peer: "server087" });
+  const envelope = calls.find((call) => call.url === `${PEER}/activation`)!.body as ActivationEnvelope;
+  assert.deepEqual(envelope.watchdog, { v: 1, starts: [started], exhaustedAt: null, cycle: null });
+  assert.ok((await source.read()).tickets.i9.transferredAt, "the source stops recovering the ticket");
+
+  const target = new WatchdogStore(join(home, "target-watchdog.json"));
+  const options: { labels?: Record<string, string> }[] = [];
+  const order: string[] = [];
+  const intake = new ActivationIntake({
+    settings: { read: async () => settingsFor() }, home, host: "server087", log: () => {},
+    paseo: () => fakeDaemon([]).paseo,
+    linear: () => ({ comment: async () => {}, addLabel: async () => {}, removeLabel: async () => {} }),
+    launcher: () => ({ gate: () => ({ release: () => {} }) }),
+    watchdog: { adopt: async (...args) => { order.push("adopt"); return target.adopt(...args); } },
+    starter: () => ({
+      admission: async () => ({ ok: true as const }),
+      start: async (_issueId, _paseo, _settings, startOptions) => {
+        order.push("start");
+        options.push(startOptions);
+        return { agentId: "agent-1", warnings: [], provider: "omp/opus", target: "App", resumed: true, untrusted: false, plan: null };
+      },
+    }),
+  });
+  await intake.applyClaims({ host: "mac", seed: "seed-1", revision: 1, claims: [] });
+  const marker = "cycle-1:succeed";
+  await intake.accept({ ...envelope, id: "watchdog:i9:cycle-1:succeed", kind: "recover", strictResume: true, watchdog: { v: 1, starts: [started], exhaustedAt: null, cycle: { id: "cycle-1", kind: "ghost", startedAt: started, marker } } });
+  await intake.accept({ id: "session:sess-8", kind: "session", issueId: "i8", identifier: "TUC-8", sessionId: "sess-8", host: "mac", requestedAt: "2026-01-01T00:00:00Z" });
+  await intake.idle();
+  assert.deepEqual(order, ["adopt", "start", "adopt", "start"], "the history is saved before each start");
+  const file = await target.read();
+  assert.deepEqual(file.tickets.i9.starts, [started], "the budget is not reset by the transfer");
+  assert.equal(file.tickets.i9.cycle?.successor?.marker, marker, "the forwarded replacement continues its cycle");
+  assert.deepEqual(options[0].labels, { [WATCHDOG_LABEL]: marker });
+  assert.ok(file.tickets.i8.quarantineUntil, "a ticket that came without history waits a day");
 });
 
 test("a claimed ticket defers to its owner host, and a replayed activation starts nothing", async (t) => {

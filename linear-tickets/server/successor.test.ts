@@ -14,6 +14,7 @@ import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHD
 import { ResumeUnavailableError, TicketStarter, type Started } from "./starter";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
+import { WATCHDOG_LABEL, type WatchdogHistory, type WatchdogRequest } from "./watchdog";
 
 const OWNER = "owner-1";
 const APP = "paseo-app";
@@ -41,6 +42,7 @@ type FakeAgent = {
   pendingPermissions?: { id: string; kind: string }[];
   lastError?: string | null;
   archivedAt?: string | null;
+  activeTurn?: { turnId: string; startedAt: string } | null;
 } & Pick<ProcessAgent, "provider" | "runtimeInfo" | "persistence" | "updatedAt">;
 
 type StartOptions = { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string };
@@ -193,6 +195,10 @@ function routerHarness(options: {
   daemon?: Daemon;
   store?: SessionStore;
   processInspector?: ProcessInspector;
+  // Called with the agent a Stop went to (the watchdog's interrupt and retirement).
+  onStop?: (agentId: string) => void;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
 } = {}) {
   const calls: string[] = [];
   const daemon = options.daemon ?? fakeDaemon(options.agents ?? [], { pageSize: options.pageSize });
@@ -239,7 +245,9 @@ function routerHarness(options: {
     store,
     route: options.route,
     processLiveness: options.processLiveness,
-    stop: async (agentId: string) => { calls.push(`stop ${agentId}`); },
+    stop: async (agentId: string) => { calls.push(`stop ${agentId}`); options.onStop?.(agentId); },
+    ...(options.sleep ? { sleep: options.sleep } : {}),
+    ...(options.now ? { now: options.now } : {}),
     ...(options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector), processInspector: options.processInspector } : {}),
   });
   // Connected without attach(): the startup sweep would run alongside the test.
@@ -1149,4 +1157,95 @@ test("the process inspection and dispatch claim both execute under the ticket st
     assert.deepEqual(h.calls.slice(0, 4), ["inspect", "claim", "+paseo-running", "start"]);
     assertGateFree(h.gates);
   } finally { await h.cleanup(); }
+});
+
+// --- The watchdog's effects (watchdog.ts) -------------------------------------------------------
+
+const watchdogRequest = (calls: string[], change: Partial<WatchdogRequest> = {}): WatchdogRequest => ({
+  issueId: ISSUE.id, identifier: ISSUE.identifier, rootId: "agent-old", action: "steer", text: "Report and continue.", marker: "cycle-1:steer", turnId: "turn-1",
+  check: async () => null, alive: () => true, claim: async () => { calls.push("claim"); }, ...change,
+});
+const silent = (change: Partial<FakeAgent> = {}) => ticketAgent("agent-old", "2026-01-01T00:00:00Z", { provider: "omp", status: "running", activeTurn: { turnId: "turn-1", startedAt: "2026-01-01T00:00:00Z" }, ...change });
+
+test("the watchdog steers an OMP turn without stopping it, and never steers a provider that would lose its turn", async () => {
+  const h = routerHarness({ agents: [silent()] });
+  assert.deepEqual(await h.router.watchdogAct(watchdogRequest(h.calls)), { kind: "done" });
+  assert.deepEqual(h.calls, ["claim"], "claimed, and no Stop");
+  assert.deepEqual(h.daemon.sent, ["agent-old: /steer Report and continue."]);
+  assertGateFree(h.gates);
+  await h.cleanup();
+
+  const other = routerHarness({ agents: [silent({ provider: "claude" })] });
+  const outcome = await other.router.watchdogAct(watchdogRequest(other.calls));
+  assert.equal(outcome.kind, "skipped");
+  assert.deepEqual(other.calls, [], "nothing is claimed");
+  assert.deepEqual(other.daemon.sent, []);
+  await other.cleanup();
+});
+
+test("a watchdog step whose re-check fails, or whose turn already ended, claims and sends nothing", async () => {
+  const h = routerHarness({ agents: [silent()] });
+  assert.deepEqual(await h.router.watchdogAct(watchdogRequest(h.calls, { check: async () => "the agent waits for the owner's answer or approval" })),
+    { kind: "skipped", reason: "the agent waits for the owner's answer or approval", end: true });
+  assert.deepEqual(await h.router.watchdogAct(watchdogRequest(h.calls, { turnId: "turn-0" })), { kind: "skipped", reason: "the silent turn already ended", end: true });
+  assert.deepEqual(await h.router.watchdogAct(watchdogRequest(h.calls, { alive: () => false })), { kind: "skipped", reason: "the plugin is unloading", end: false });
+  assert.deepEqual(h.calls, []);
+  assert.deepEqual(h.daemon.sent, []);
+  await h.cleanup();
+});
+
+test("the watchdog's interrupt stops the turn before its resume, and a turn that will not stop gets no resume", async () => {
+  const agents = [silent()];
+  const h = routerHarness({ agents, onStop: () => { agents[0].activeTurn = null; agents[0].status = "idle"; } });
+  assert.deepEqual(await h.router.watchdogAct(watchdogRequest(h.calls, { action: "interrupt", marker: "cycle-1:interrupt" })), { kind: "done" });
+  assert.deepEqual(h.calls, ["claim", "stop agent-old"]);
+  assert.deepEqual(h.daemon.sent, ["agent-old: Report and continue."]);
+  await h.cleanup();
+
+  let clock = Date.parse("2026-02-01T00:00:00Z");
+  const stuck = routerHarness({ agents: [silent()], now: () => clock, sleep: async (ms) => { clock += ms; } });
+  const outcome = await stuck.router.watchdogAct(watchdogRequest(stuck.calls, { action: "interrupt" }));
+  assert.deepEqual(outcome, { kind: "failed", reason: "the turn did not stop within 60 seconds" });
+  assert.deepEqual(stuck.daemon.sent, [], "a resume would have gone into the still running turn");
+  assertGateFree(stuck.gates);
+  await stuck.cleanup();
+});
+
+test("a watchdog replacement retires its predecessor, waits while a worker lives, and then starts on the recorded branch with the cycle's label", async () => {
+  let liveness: "alive" | "absent" = "alive";
+  const agents = [silent()];
+  const h = routerHarness({ agents, processLiveness: async () => liveness, onStop: () => { agents[0].activeTurn = null; agents[0].status = "idle"; } });
+  const request = watchdogRequest(h.calls, { action: "succeed", marker: "cycle-1:succeed", text: "The previous agent stopped making progress." });
+  const waiting = await h.router.watchdogAct(request);
+  assert.equal(waiting.kind, "failed");
+  assert.ok(waiting.kind === "failed" && waiting.retry, "retried until the retirement window ends");
+  assert.deepEqual(h.calls, ["claim", "stop agent-old"]);
+  assert.deepEqual(h.daemon.archived, ["agent-old"], "the predecessor is retired so it cannot come back");
+  assert.equal(h.starts.length, 0, "no replacement beside a live worker");
+
+  liveness = "absent";
+  const started = await h.router.watchdogAct(request);
+  assert.equal(started.kind, "done");
+  assert.equal(started.kind === "done" ? started.successor?.id : null, "agent-new");
+  assert.deepEqual(h.starts[0].options, { retryHint: "assign Paseo again", resumeOnly: true, lead: "The previous agent stopped making progress.", labels: { [WATCHDOG_LABEL]: "cycle-1:succeed" } });
+  assertGateFree(h.gates);
+  await h.cleanup();
+});
+
+test("a watchdog replacement bound for the peer is forwarded with its history and never starts here", async () => {
+  const taken: unknown[] = [];
+  const history: WatchdogHistory = { v: 1, starts: ["2026-01-01T00:00:00.000Z"], exhaustedAt: null, cycle: { id: "cycle-1", kind: "ghost", startedAt: "2026-01-01T00:00:00.000Z", marker: "cycle-1:succeed" } };
+  const forwarded = routerHarness({ processLiveness: async () => "absent", route: { take: async (request) => { taken.push(request); return { peer: "server087" }; } } });
+  const outcome = await forwarded.router.watchdogAct(watchdogRequest(forwarded.calls, { action: "succeed", rootId: "agent-gone", marker: "cycle-1:succeed", history }));
+  assert.deepEqual(outcome, { kind: "done", peer: "server087" });
+  assert.equal(forwarded.starts.length, 0);
+  assert.deepEqual(forwarded.calls, ["claim"], "claimed before it was handed to the router");
+  assert.deepEqual(taken, [{ kind: "recover", issueId: ISSUE.id, identifier: ISSUE.identifier, id: `watchdog:${ISSUE.id}:cycle-1:succeed`, text: "Report and continue.", strictResume: true, watchdog: history }]);
+  await forwarded.cleanup();
+
+  const held = routerHarness({ processLiveness: async () => "absent", route: { take: async () => ({ held: "the other host has not acknowledged this host's agents yet" }) } });
+  const waiting = await held.router.watchdogAct(watchdogRequest(held.calls, { action: "succeed", rootId: "agent-gone" }));
+  assert.equal(waiting.kind, "failed");
+  assert.equal(held.starts.length, 0, "a held forward never falls back to a local start");
+  await held.cleanup();
 });

@@ -342,7 +342,7 @@ list and the launch flow.
 - **Default prompt** — replace the built-in launch prompt with a template (below).
 - **Auto-dispatch** — start agents for labeled tickets without opening Paseo (off by default; see below).
 - **Linear agent** — whether the native Linear agent is installed and receiving webhooks (see [Native Linear agent](#native-linear-agent)).
-- **Write back to Linear** — report ticket-linked agents' progress on the ticket, and start new agents automatically (all off by default; see below).
+- **Write back to Linear** — report ticket-linked agents' progress on the ticket, and start new agents automatically (off by default, except the silent-agent watchdog; see below).
 
 The last successful model, mode, and reasoning choices are stored in the same per-host
 settings file. They update automatically and do not need a separate settings toggle. The cheap
@@ -1417,6 +1417,63 @@ restarted the same way while its ticket is in a started state: up to two restart
 comment to the owner, then nothing. The state lives in `$PASEO_HOME/linear-tickets/crash-recovery.json`.
 A plan request (see `plan` label) waits until the watch restarted the agent.
 
+**Silent and stuck agents.** A ticket agent that stops making progress is recovered by the
+watchdog ([`server/watchdog.ts`](server/watchdog.ts)), which runs first in every two-minute poll
+of the pull request watch. It judges each ticket's current root agent (never a subagent) and
+walks it through bounded steps, each one leaving a line in the agent panel (else a ticket
+comment):
+
+| Situation | Step | Next look |
+| --- | --- | --- |
+| Running, no progress for 45 min | OMP `/steer` (the turn keeps running): report the lifecycle step and continue it — "Watchdog: asked the silent agent to report and continue." | 20 min |
+| Still silent | Stop the turn (waiting up to 60 s for it to end), then a resume that runs `git status` first — "Watchdog: stopped the silent turn and asked the agent to continue." | 20 min |
+| Still silent | Stop if needed, reload the agent (`paseo agent reload`), resume — "Watchdog: reloaded the silent agent and asked it to continue." | 20 min |
+| Still silent | Retire the agent (Stop, archive), prove no OMP process of the ticket remains, start a successor on the recorded branch and worktree — "Watchdog: started a replacement on the recorded branch." | 20 min |
+| Closed or idle for 2 h, ticket open, no open pull request, nobody waited on | One resume ("continue the lifecycle step you were on"); an agent that cannot be loaded goes to the replacement step — "Watchdog: asked the stopped agent to continue the lifecycle step it was on." | 20 min |
+| A ghost (see **Ghost agents**) | The replacement step at once | 20 min |
+| No progress after the last step, or a predecessor that cannot be proven gone within 20 min | One comment mentioning you: "Automatic recovery could not restore progress on this ticket. Please take over." No further agent. | — |
+
+A failed step says so ("Watchdog: <action> failed; <reason>.") and the next step follows.
+Progress means a new assistant message, tool start or tool result on the current branch of the
+agent's OMP session file (its public persistence handle), or of a subagent's transcript while
+the root waits on it; a user message, a title, a reload's bookkeeping or the file's time stamp
+alone never ends a cycle (a recent message or file change only postpones the first step). Only
+OMP agents with a readable session are judged: other providers, a missing, malformed, cut or
+future-dated session, or a process table that cannot be read leave the agent alone and log why.
+
+Nothing is done while the agent waits for you (a question, a permission, a plan review, a
+waiting handover record, a "Needs you" sub-issue, the ticket in Needs input or carrying
+`<label>-needs-you` or `<label>-hold`), while the ticket is done or canceled, carries
+`do-not-merge` (the ticket or any open pull request of it; pull requests that cannot be read
+count as a veto), is queued, forwarded to the peer, handing out sub-issues, parked or approved
+for later, paused for deletion, or has two live root agents. Your Stop in Linear holds the ticket
+until you reply, resume or open a new thread: it is saved before the Stop goes out and survives
+reloads. Every step is re-checked inside the ticket's turn and start gate right before it, and
+claimed in `$PASEO_HOME/linear-tickets/watchdog.json` before its effect. A claim whose outcome a
+restart lost is never repeated: the next step follows after its window, and an unproven
+replacement is awaited by its label (`linear-tickets.watchdog`) or ends with the mention. A turn,
+message or session the watchdog did not cause (yours, another nudge's) ends the cycle; new
+progress ends it too. At most two cycles start per ticket in any 24 hours; a third silence gets
+the mention once and nothing more until the agent makes progress or you continue. A corrupt or
+unreadable `watchdog.json` stops all recovery (it is never reset). Unloading the plugin stops new
+steps; a step in flight finishes under a host-local lease the next instance waits for.
+
+The ticket's watchdog history (cycle starts of the last 24 hours, an exhausted budget, a
+forwarded replacement's cycle) travels with every activation a draining host forwards (see
+**Drain one host into another** under [Native Linear agent](#native-linear-agent)), and the receiving host saves it before the agent starts,
+so a transfer never resets the budget. A ticket that arrives without it (an older peer) is not
+recovered for 24 hours; the forwarding host stops recovering it. A replacement for the peer is
+claimed before it is forwarded and never falls back to a local start.
+
+**Watchdog** has its own switch, independent of *Start a new agent automatically*, and is on by
+default. Turn it off, or change the minutes (whole numbers 1–1440), with `linear.set-settings`:
+`"writeback": { "watchdog": false }` and `"watchdog": { "silentMinutes": 45, "steerGraceMinutes": 20,
+"recoveryGraceMinutes": 20, "idleMinutes": 120 }` (omitted fields keep their value). Turning it
+off stops further steps; it does not undo a step already taken. To roll back, revert the change
+and reload the plugin; keep `watchdog.json`, which holds the claims and budgets. A long quiet
+command (a build, a test run) without output can be interrupted after 45 minutes: raise
+`silentMinutes` where that is normal.
+
 **Health.** Every 5 minutes the plugin checks the Linear key, the Paseo app, Tailscale Funnel
 and the local receiver. A problem confirmed twice opens one urgent ticket, "⚠️ Paseo needs
 attention", assigned to you (in the first auto-dispatch team), so Linear notifies you. The ticket
@@ -1685,7 +1742,7 @@ independently of the agent's own `linear_ticket` tools:
   `link_url`. Completion is left to Linear's GitHub integration and to the agent itself
   ([Agent access to Linear](#agent-access-to-linear)).
 
-- **Start a new agent automatically** — its texts are "Start a new agent automatically when one fails, or when its pull request needs work after it is gone (failed agents at most once an hour per ticket)" (on) and "Offer Resume in Linear when an agent stops; a gone agent's pull request work goes to the ticket as a comment" (off). When on, an agent that stops with an error can be replaced by a new agent on its branch, at most once an hour per ticket; when that is not possible (the hour is not over, another start of the ticket is under way), the **Resume with a new agent** offer stays (see **Durable record and resume**). Archiving an agent never starts one by itself. A nudge, merge queue fix request or replacement request for an archived or missing agent can start a successor under the conditions in **Gone agents**. When off, a failed agent gets the offer and that pull request work goes to the ticket as a comment mentioning you.
+- **Start a new agent automatically** — its texts are "Start a new agent automatically when one fails, or when its pull request needs work after it is gone (failed agents at most once an hour per ticket)" (on) and "Offer Resume in Linear when an agent stops; a gone agent's pull request work goes to the ticket as a comment" (off). When on, an agent that stops with an error can be replaced by a new agent on its branch, at most once an hour per ticket; when that is not possible (the hour is not over, another start of the ticket is under way), the **Resume with a new agent** offer stays (see **Durable record and resume**). Archiving an agent never starts one by itself. A nudge, merge queue fix request or replacement request for an archived or missing agent can start a successor under the conditions in **Gone agents**. When off, a failed agent gets the offer and that pull request work goes to the ticket as a comment mentioning you. This switch does not govern the watchdog's replacements: those follow **Silent and stuck agents** and its own **Watchdog** switch.
 
 - **Replies from Linear** — your comments reach the agent within one poll interval, no
   `@paseo` needed, on every issue it watches:
