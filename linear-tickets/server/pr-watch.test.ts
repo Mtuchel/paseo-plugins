@@ -3028,6 +3028,7 @@ test("a checkout without the script counts as skipped, and a script error is the
 
   h.scripts.greptile.present = true;
   h.scripts.greptile.answers = { [PLATFORM]: { code: 0, answer: { pulls: [{ pr: 419, state: "asked" }], followed: [], triggered: [], errors: [] } } };
+  h.scripts.runs.length = 0;
   await h.backstop();
   assert.equal(h.scripts.outage.syncs.at(-1)?.[0].result, "failed");
   assert.ok(h.scripts.runs.some((line) => line.startsWith(ENQUEUE_READY)), "the enqueue pass still ran");
@@ -3041,4 +3042,28 @@ test("once GitHub's budget stops the backstop, the remaining repos count as fail
   await h.backstop();
   assert.deepEqual(greptileRuns(h.scripts.runs), [`${GREPTILE_RETRIGGER} --trigger`], "the stopped repo's script is not run");
   assert.deepEqual(h.scripts.outage.syncs[0].map((found) => [found.repo, found.result]), [[PLATFORM, "answer"], ["o/other", "failed"]]);
+});
+
+test("a discovery rate limit still synchronizes the incident once without running GitHub scripts (AC-4)", async (t) => {
+  const h = harness(t, { dispatch: true });
+  t.mock.method(console, "error", () => {});
+  h.records[0] = { ...h.records[0], branch: OPEN_PR.headBranch, links: {} };
+  h.git.origin = "git@github.com:tuchel-sohn/tuchel-platform.git";
+  h.scripts.outage.follow = new Map([[PLATFORM, [419]], ["o/other", [5]]]);
+  h.github.listFailure = new GitHubRateLimitedError("GitHub is throttling gh");
+  await h.backstop();
+  assert.deepEqual(h.scripts.runs, []);
+  assert.deepEqual(h.scripts.outage.syncs.map((run) => run.map((found) => [found.repo, found.result])), [[[PLATFORM, "failed"], ["o/other", "failed"]]]);
+});
+
+test("Greptile evidence expires even on non-writers and when the script is absent (AC-4)", async (t) => {
+  t.mock.method(console, "log", () => {});
+  for (const dispatch of [false, true]) {
+    const h = harness(t, { dispatch });
+    h.scripts.greptile.present = false;
+    await h.state({ [PR]: { greptile: [{ head: GREPTILE_HEAD, at: new Date(h.scripts.now - 15 * 24 * 60 * 60_000).toISOString() }] } });
+    await h.backstop();
+    const saved = JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"));
+    assert.equal(saved[PR].greptile, undefined);
+  }
 });

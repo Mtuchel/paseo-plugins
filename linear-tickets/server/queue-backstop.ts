@@ -716,8 +716,8 @@ export function parseRetrigger(output: ScriptOutput): RetriggerRun {
   const pulls = entries(found, "pulls").map((item): RetriggerPull => {
     const pr = count(item.pr);
     const state = RETRIGGER_STATES.find((known) => known === item.state) ?? null;
-    if (pr === null || state === null || !text(item.url).startsWith("https://github.com/")) return malformed("pulls");
-    return { pr, url: text(item.url), title: text(item.title), head: text(item.head), since: text(item.since), triggers: texts(item.triggers), state, overdue: item.overdue === true };
+    if (pr === null || state === null || typeof item.overdue !== "boolean" || !text(item.url).startsWith("https://github.com/")) return malformed("pulls");
+    return { pr, url: text(item.url), title: text(item.title), head: text(item.head), since: text(item.since), triggers: texts(item.triggers), state, overdue: item.overdue };
   });
   const followed = entries(found, "followed").map((item) => {
     const pr = count(item.pr);

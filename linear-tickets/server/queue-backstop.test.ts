@@ -127,6 +127,9 @@ test("greptile-retrigger.mjs: exit 0 with all four lists; a wrong exit, a missin
   for (const field of ["pulls", "followed", "triggered", "errors"]) assert.throws(() => parseRetrigger(out(0, { ...answer, [field]: undefined })), BackstopScriptError, field);
   assert.throws(() => parseRetrigger(out(0, { ...answer, pulls: [{ ...pull, state: "asked" }] })), BackstopScriptError);
   assert.throws(() => parseRetrigger(out(0, { ...answer, pulls: [{ ...pull, pr: null }] })), BackstopScriptError);
+  for (const overdue of [undefined, "true", 1, null]) {
+    assert.throws(() => parseRetrigger(out(0, { ...answer, pulls: [{ ...pull, overdue }] })), BackstopScriptError);
+  }
   assert.throws(() => parseRetrigger(out(0, { ...answer, followed: [{ pr: 12, state: "gone" }] })), BackstopScriptError);
   assert.throws(() => parseRetrigger(out(0, { ...answer, triggered: [{ pr: 419, head: "a" }] })), BackstopScriptError);
   assert.deepEqual(retriggerArgs([]), ["--trigger"]);

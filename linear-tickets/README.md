@@ -1346,7 +1346,7 @@ published `complex-review` pull request without a Greptile review gets one comme
 (marked `<!-- greptile-retrigger:<head sha> -->`, from the bot) once 30 minutes have passed since
 it was published, labelled or last asked. The repo caps it from the markers on the pull request,
 so a restart or a lost state file never asks again: once per head, at most twice in any 24 hours,
-never after any Greptile review. Every request is also kept on the pull request's entry in
+never after a Greptile review has been observed. Every request is also kept on the pull request's entry in
 `pr-watch.json` (`greptile`, evidence for the ops digest only, kept 14 days). **One writer:** only
 the host whose `dispatch.enabled` is on runs it (README "Several hosts" allows that on one host
 only), one backstop run at a time; every other host logs `greptile re-request: skipped, dispatch

@@ -95,13 +95,15 @@ export class GreptileOutage {
   }
 
   // The listed pull requests still without an outcome, per repo: this run passes them to the
-  // script as `--follow`, so a reviewed, closed or unmarked one is told from one not read.
+  // script as `--follow`, so a reviewed, closed or unmarked one is told from one not read. A repo
+  // whose listed pull requests all have an outcome stays in (with none), so it is still read
+  // until the incident is over.
   async follow(): Promise<Map<string, number[]>> {
     const follow = new Map<string, number[]>();
     for (const [url, entry] of Object.entries((await this.load()).listed)) {
       const found = PULL_URL.exec(url);
-      if (!found || entry.outcome !== null) continue;
-      follow.set(found[1], [...(follow.get(found[1]) ?? []), Number(found[2])]);
+      if (!found) continue;
+      follow.set(found[1], [...(follow.get(found[1]) ?? []), ...(entry.outcome === null ? [Number(found[2])] : [])]);
     }
     return follow;
   }
@@ -133,7 +135,9 @@ export class GreptileOutage {
       if (entry.outcome !== null && found === undefined) return [];
       return !answered || found === undefined || found === "unread" ? [url] : [];
     }));
-    const complete = !results.some((found) => found.result === "failed") && ![...answers.values()].some((run) => run.errors.length > 0) && unread.size === 0;
+    // Every repo must answer, including those retained after its listed PRs resolved.
+    const listedRepos = new Set(Object.keys(state.listed).map((url) => PULL_URL.exec(url)?.[1] ?? ""));
+    const complete = results.every((found) => found.result === "answer") && [...listedRepos].every((repo) => answers.has(repo)) && ![...answers.values()].some((run) => run.errors.length > 0 || run.followed.some((item) => item.state === "unread")) && unread.size === 0;
     const overdue = [...waiting.values()].some((pull) => pull.overdue);
     const list = (urls: Iterable<[string, Waiting]>) => {
       for (const [url, pull] of urls) state.listed[url] ??= { title: pull.title, triggers: pull.triggers, outcome: null };
@@ -146,8 +150,8 @@ export class GreptileOutage {
         state.issueId = found.id;
         state.reserved = null;
         await this.save(state);
-      } else if (!overdue) {
-        // The create never went through and nothing is overdue any more: no obsolete issue.
+      } else if (!overdue && complete) {
+        // The create never went through and a complete run finds nothing overdue: no obsolete issue.
         await this.save(empty());
         return;
       }

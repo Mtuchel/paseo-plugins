@@ -102,7 +102,7 @@ test("a failed repo keeps the issue open with its pull requests not read; outcom
   assert.ok(issue, "nothing completes while a repo failed");
   assert.ok(issue.description.includes(`[#7 PR 7](${url("o/x", 7)}) — Greptile re-requested 10:05 (1×) (not read this run)`), issue.description);
   assert.ok(issue.description.includes(`[#1 PR 1](${url("o/r", 1)}) — reviewed`), issue.description);
-  assert.deepEqual([...(await outage().follow())], [["o/x", [7]]], "a pull request with an outcome is no longer followed");
+  assert.deepEqual([...(await outage().follow())], [["o/r", []], ["o/x", [7]]], "resolved PRs stop being followed, but their repo is still read");
 
   await outage().sync([answer("o/r", []), answer("o/x", [], [{ pr: 7, state: "closed" }])]);
   assert.equal(issue.statusType, "completed");
@@ -142,6 +142,35 @@ test("a create that never went through is retried under the same id while a pull
   assert.equal(linear.creates.length, 2);
   assert.equal(linear.creates[1].id, linear.creates[0].id, "the reserved id is reused");
   assert.equal(linear.issues.size, 1);
+});
+
+test("unread GitHub runs retain a failed create's reserved id (AC-5)", async (t) => {
+  const { linear, outage } = await setup(t);
+  linear.create = "refused";
+  await assert.rejects(outage().sync([answer("o/r", [pull("o/r", 1, true)])]));
+  for (const result of [
+    { repo: "o/r", result: "failed", error: "HTTP 502" } as const,
+    { repo: "o/r", result: "skipped" } as const,
+  ]) await outage().sync([result]);
+  linear.create = "ok";
+  await outage().sync([answer("o/r", [pull("o/r", 1, true)])]);
+  assert.equal(linear.creates[1].id, linear.creates[0].id);
+  assert.equal(linear.issues.size, 1);
+});
+
+test("resolved repos remain required until the whole incident recovers (AC-5)", async (t) => {
+  const { linear, outage } = await setup(t);
+  await outage().sync([answer("o/r", [pull("o/r", 1, true)]), answer("o/x", [pull("o/x", 7, false)])]);
+  const [issue] = linear.open();
+  await outage().sync([answer("o/r", [], [{ pr: 1, state: "reviewed" }]), answer("o/x", [pull("o/x", 7, false)])]);
+  await outage().sync([{ repo: "o/r", result: "skipped" }, answer("o/x", [], [{ pr: 7, state: "reviewed" }])]);
+  assert.equal(issue.statusType, "unstarted");
+  assert.deepEqual([...(await outage().follow())], [["o/r", []], ["o/x", []]]);
+  await outage().sync([answer("o/r", [pull("o/r", 2, false)]), answer("o/x", [])]);
+  assert.equal(issue.statusType, "unstarted");
+  await outage().sync([answer("o/r", [], [{ pr: 2, state: "closed" }]), answer("o/x", [])]);
+  assert.equal(issue.statusType, "completed");
+  assert.equal(linear.creates.length, 1);
 });
 
 test("a reservation whose issue never came into being is cleared once nothing is overdue, without filing one (AC-5)", async (t) => {

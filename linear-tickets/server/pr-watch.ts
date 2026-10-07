@@ -1399,16 +1399,27 @@ export class PullRequestWatch {
     const records = await this.deps.handover.all();
     const context = this.context(records);
     const save = () => this.save(seenByUrl);
+    // Set once GitHub's budget stopped the run: the rest neither runs nor counts as read, and the
+    // outage issue still gets its one sync with those repos failed.
+    let stopped: string | null = null;
     for (const record of records) {
       try {
         await this.discover(record, context);
       } catch (error) {
-        console.error(`[linear-tickets] queue backstop discovery for ${record.identifier} stopped: ${error instanceof Error ? error.message : error}`);
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[linear-tickets] queue backstop discovery for ${record.identifier} stopped: ${message}`);
         if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) {
-          await save();
-          return;
+          stopped = message;
+          break;
         }
       }
+    }
+    // Greptile request evidence expires like the other backstop memory, on every host and run.
+    for (const seen of Object.values(seenByUrl)) {
+      if (!seen.greptile) continue;
+      const kept = seen.greptile.filter((found) => context.now - Date.parse(found.at) < BACKSTOP_MEMORY_MS);
+      if (kept.length) seen.greptile = kept;
+      else delete seen.greptile;
     }
     const repos = new Set([...records.map((record) => record.links["Pull request"] ?? ""), ...Object.keys(seenByUrl)].map((url) => PULL_URL.exec(url)?.[1] ?? "").filter(Boolean));
     // Only the dispatch host asks Greptile and files the outage issue: README allows dispatch on
@@ -1420,8 +1431,6 @@ export class PullRequestWatch {
     }
     const follow = writer && this.deps.outage ? await this.deps.outage.follow() : new Map<string, number[]>();
     const greptile: RetriggerResult[] = [];
-    // Set once GitHub's budget stopped the run: the rest of the repos neither run nor count as read.
-    let stopped: string | null = null;
     for (const repo of new Set([...repos, ...follow.keys()])) {
       if (writer) greptile.push(stopped ? { repo, result: "failed", error: stopped } : await this.retrigger(repo, follow.get(repo) ?? [], seenByUrl, context));
       if (stopped || !repos.has(repo)) continue;
@@ -1456,9 +1465,6 @@ export class PullRequestWatch {
       const checkout = await context.checkout(repo);
       if (!checkout || !this.hasScript(checkout, GREPTILE_RETRIGGER)) return { repo, result: "skipped" };
       const run = parseRetrigger(await this.run(checkout, GREPTILE_RETRIGGER, retriggerArgs(follow), repo));
-      for (const [url, seen] of Object.entries(seenByUrl)) {
-        if (PULL_URL.exec(url)?.[1] === repo && seen.greptile) seen.greptile = seen.greptile.filter((found) => context.now - Date.parse(found.at) < BACKSTOP_MEMORY_MS);
-      }
       for (const found of run.triggered) {
         const seen = entry(seenByUrl, pullUrl(repo, found.pr));
         seen.greptile = [...(seen.greptile ?? []), { head: found.head, at: found.at }];
