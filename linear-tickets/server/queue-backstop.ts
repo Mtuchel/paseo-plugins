@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { githubShimDir } from "./github-cli";
 import { paseoHome } from "./ticket-mcp";
@@ -14,7 +14,9 @@ const exec = promisify(execFile);
 // - `wait-queue.mjs <pr> --draft <n>` / `--last`: one queue round judged, with the drop's `class`,
 //   `requeue`, `evidence` and `revision`;
 // - `enqueue-ready.mjs`: the stacks that are ready to enqueue, and the drops it saw;
-// - `backstop-enqueue.mjs`: the one enqueue path of the automation.
+// - `backstop-enqueue.mjs`: the one enqueue path of the automation;
+// - `retarget-orphan.mjs`: moves an open stack stranded on an orphaned `graphite-base/<n>` branch
+//   onto `main` (TUC-1209), in the plugin's private clone.
 // Every script prints one JSON line on stdout. This module is the only place that reads those
 // shapes: a stdout that is not that JSON, or an exit code the script does not document, is an
 // error, and an error never counts as an enqueue.
@@ -22,6 +24,10 @@ const exec = promisify(execFile);
 export const WAIT_QUEUE = "tools/ci/wait-queue.mjs";
 export const ENQUEUE_READY = "tools/ci/enqueue-ready.mjs";
 export const BACKSTOP_ENQUEUE = "tools/ci/backstop-enqueue.mjs";
+export const RETARGET_ORPHAN = "tools/ci/retarget-orphan.mjs";
+// At most this many stacks are prepared or moved per repo and run: each move restarts the checks of
+// every pull request of its stack, so a backlog clears over several runs.
+export const RETARGET_PER_RUN = 3;
 // A stack counts as ready once it has been for this long (the repo's `--ready-minutes`).
 export const READY_MINUTES = 10;
 // Refusals a person can repair without a new remote SHA are retried silently at most this often.
@@ -101,6 +107,34 @@ export async function runIsolatedEnqueue(checkout: string, args: string[], env: 
     await exec("gt", ["init", "--trunk", "main", "--no-interactive"], { cwd: clone, timeout: 60_000, env: { ...process.env, PATH: TOOL_PATH } });
     return runNodeScript(clone, resolve(checkout, BACKSTOP_ENQUEUE), args, env);
   });
+}
+
+// The retarget script in a fresh private clone of the trusted checkout (see inEnqueueClone):
+// every mode fetches what it reads from GitHub there. `record`, for `--apply`, is written as the
+// file `--record` names, inside the clone's own temporary folder.
+export async function runIsolatedRetarget(checkout: string, args: string[], env: Record<string, string>, record: unknown | null): Promise<ScriptOutput> {
+  return inEnqueueClone(checkout, async (clone) => {
+    const extra: string[] = [];
+    if (record !== null) {
+      const file = join(dirname(clone), "retarget-record.json");
+      await writeFile(file, JSON.stringify(record), { mode: 0o600 });
+      extra.push("--record", file);
+    }
+    return runNodeScript(clone, resolve(checkout, RETARGET_ORPHAN), [...args, ...extra], env);
+  });
+}
+
+// `record` as a temporary file for an injected runner (the tests), removed after `run`.
+export async function withRecordFile(record: unknown | null, run: (extra: string[]) => Promise<ScriptOutput>): Promise<ScriptOutput> {
+  if (record === null) return run([]);
+  const directory = await mkdtemp(join(tmpdir(), "paseo-retarget-record-"));
+  try {
+    const file = join(directory, "retarget-record.json");
+    await writeFile(file, JSON.stringify(record), { mode: 0o600 });
+    return await run(["--record", file]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 }
 
 // `<owner>/<repo>` (lower case) of a GitHub remote: `https://github.com/o/r(.git)`,
@@ -476,5 +510,171 @@ export function refusalText(action: Pick<ActionRecord, "repo" | "prs" | "branch"
     "",
     ...(extra ? [extra, ""] : []),
     `This is a repair request for the ticket's agent, not a command for the owner to run. Resolve the refusal without discarding local work, then \`git switch ${action.branch} && node tools/ci/enqueue.mjs\` and \`node tools/ci/wait-queue.mjs ${action.top}\`. The backstop uses private Git refs, so it never overwrites a worker's local branches. It retries after a new head for a conflict with \`main\`, the queue draft's end for a conflict with the queue tip, and at most hourly for other repairable conditions.`,
+  ].join("\n");
+}
+
+// --- retarget-orphan.mjs --------------------------------------------------------------------
+
+// A pull request of a stranded stack: its head branch, its base and head as the script read them.
+export type RetargetMember = { pr: number; branch: string; base: string; sha: string };
+// One stack `--list` found on an orphaned `graphite-base/<n>` base; `range` bottom first, `expect`
+// its heads, `reason` the first reason it may not be moved (null when `eligible`).
+export type RetargetCandidate = { pr: number; branch: string; base: string; baseSha: string; expect: string; range: RetargetMember[]; tickets: string[]; eligible: boolean; reason: string | null };
+// What `--prepare` computed, saved before anything is written and handed back to `--apply` as its
+// record: the new heads are reproducible from the old ones, `onto` and `stamp`.
+export type PreparedRetarget = { pr: number; base: string; baseSha: string; range: RetargetMember[]; onto: string; stamp: number; new: { base: string; heads: string }; sync: string };
+export type RetargetOutcome = { result: "prepared" | "retargeted" | "conflict" | "refused" | "error"; prepared: PreparedRetarget | null; problems: Problem[]; error: string | null };
+// `due`: to prepare once no agent of the ticket works; `conflict`: its commits did not apply onto
+// `main`, so the agent got the instruction to move it by hand (new heads are a new move);
+// `prepared`: the new SHAs are saved, nothing written yet; `applying`: saved right before
+// `--apply`, which a restart runs again with the same record; `done`: moved; `unclear`: `--apply`
+// found the stack changed meanwhile, so it went to the agent and is never written again. `asked`:
+// the agent got the instruction to move it by hand. The comments are claimed `sending` before they
+// go out and found by their marker after a restart; `linearDone` the tickets whose comment is
+// confirmed. The note is claimed `started` right before it goes out and never sent twice.
+export type RetargetStep = "due" | "conflict" | "prepared" | "applying" | "done" | "unclear";
+export type RetargetComment = "none" | "due" | "sending" | "done";
+export type RetargetRecord = {
+  repo: string;
+  pr: number;
+  base: string;
+  baseSha: string;
+  range: RetargetMember[];
+  old: string;
+  tickets: string[];
+  since: string;
+  step: RetargetStep;
+  stamp?: number;
+  prepared?: PreparedRetarget;
+  asked?: boolean;
+  prComment: RetargetComment;
+  linearComment: RetargetComment;
+  linearDone?: string[];
+  note: MessageStep;
+};
+
+const member = (value: unknown): RetargetMember | null => {
+  const found = record(value);
+  const pr = count(found?.pr);
+  return found && pr !== null && text(found.branch) && text(found.base) && /^[0-9a-f]{40}$/.test(text(found.sha)) ? { pr, branch: text(found.branch), base: text(found.base), sha: text(found.sha) } : null;
+};
+const members = (value: unknown): RetargetMember[] | null => {
+  const list = Array.isArray(value) ? value.map(member) : [];
+  return list.length && list.every((item) => item !== null) ? (list as RetargetMember[]) : null;
+};
+
+// Exit 0 with `listed` and its candidates; anything else is an error. A candidate whose stack or
+// heads are not named is left out.
+export function parseRetargetList(output: ScriptOutput): RetargetCandidate[] {
+  const found = answer(RETARGET_ORPHAN, output);
+  if (output.code !== 0 || text(found.result) !== "listed" || !Array.isArray(found.candidates)) throw new BackstopScriptError(`${RETARGET_ORPHAN} --list exited ${output.code} without its candidates`);
+  return found.candidates.map(record).filter((item): item is Record<string, unknown> => item !== null).flatMap((item) => {
+    const pr = count(item.pr);
+    const range = members(item.range);
+    if (pr === null || !range || range[0].pr !== pr || !text(item.base) || !/^[0-9a-f]{40}$/.test(text(item.baseSha)) || !parseExpect(text(item.expect))) return [];
+    return [{ pr, branch: text(item.branch), base: text(item.base), baseSha: text(item.baseSha), expect: text(item.expect), range, tickets: texts(item.tickets), eligible: item.eligible === true, reason: text(item.reason) || null }];
+  });
+}
+
+function preparedOf(found: Record<string, unknown>): PreparedRetarget | null {
+  const pr = count(found.pr);
+  const range = members(found.range);
+  const next = record(found.new);
+  const stamp = typeof found.stamp === "number" && Number.isInteger(found.stamp) ? found.stamp : null;
+  if (pr === null || !range || stamp === null || !next || !parseExpect(text(next.heads)) || !/^[0-9a-f]{40}$/.test(text(found.baseSha)) || !/^[0-9a-f]{40}$/.test(text(found.onto))) return null;
+  return { pr, base: text(found.base), baseSha: text(found.baseSha), range, onto: text(found.onto), stamp, new: { base: text(next.base) || "main", heads: text(next.heads) }, sync: text(found.sync) };
+}
+
+const RETARGET_EXITS: Record<number, RetargetOutcome["result"][]> = { 0: ["prepared", "retargeted"], 1: ["error"], 2: ["conflict", "refused"] };
+
+// `--prepare` / `--apply`: exit 0 prepared or retargeted, 2 conflict or refused, 1 error; the JSON's
+// `result` has to agree. A prepared answer without its full record is an error: nothing may be
+// written for a move whose new SHAs are not saved.
+export function parseRetarget(output: ScriptOutput): RetargetOutcome {
+  let found: Record<string, unknown>;
+  try { found = answer(RETARGET_ORPHAN, output); } catch (error) {
+    return { result: "error", prepared: null, problems: [], error: error instanceof Error ? error.message : String(error) };
+  }
+  const result = text(found.result) as RetargetOutcome["result"];
+  if (output.code === null || !(RETARGET_EXITS[output.code] ?? []).includes(result)) return { result: "error", prepared: null, problems: problems(found.problems), error: `${RETARGET_ORPHAN} answered ${result || "nothing"} with exit ${output.code}${text(found.error) ? `: ${text(found.error)}` : ""}` };
+  const prepared = result === "prepared" ? preparedOf(found) : null;
+  if (result === "prepared" && !prepared) return { result: "error", prepared: null, problems: [], error: `${RETARGET_ORPHAN} prepared a move without its full record` };
+  return { result, prepared, problems: problems(found.problems), error: text(found.error) || null };
+}
+
+export function retargetPrepareArgs(candidate: Pick<RetargetCandidate, "pr" | "expect">, stamp: number): string[] {
+  return ["--prepare", String(candidate.pr), "--expect", candidate.expect, "--stamp", String(stamp)];
+}
+
+// The marker of a move's comments: the bottom pull request at its old head.
+export function retargetId(move: Pick<RetargetRecord, "pr" | "range">): string {
+  return `retarget:${move.pr}@${move.range[0].sha}`;
+}
+
+// The key of the instruction to move a stack by hand (see route in pr-watch.ts), qualified by its
+// repository: two repositories can share a pull request number and a helper base commit.
+export function retargetKey(move: Pick<RetargetRecord, "repo" | "pr" | "baseSha">): string {
+  return `retarget:${move.repo}#${move.pr}:${move.baseSha}`;
+}
+
+// The comment on the pull request and the ticket after a move: old and new base and every head.
+export function retargetedComment(move: Pick<RetargetRecord, "repo" | "pr" | "base" | "baseSha" | "range"> & { prepared: PreparedRetarget }): string {
+  const heads = new Map((parseExpect(move.prepared.new.heads) ?? []).map((head) => [head.pr, head.sha]));
+  return [
+    `Paseo's queue backstop moved ${pullList(move.repo, move.range.map((item) => item.pr))} onto \`main\`: the base \`${move.base}\` of [#${move.pr}](https://github.com/${move.repo}/pull/${move.pr}) had no open pull request, and the pull request below it landed on \`main\`. The checks run again on the new heads.`,
+    "",
+    `Base: \`${move.base}\` (\`${move.baseSha}\`) → \`main\` (\`${move.prepared.onto}\`).`,
+    "",
+    "| Pull request | Branch | Old head | New head |",
+    "| --- | --- | --- | --- |",
+    ...move.range.map((item) => `| #${item.pr} | \`${item.branch}\` | \`${item.sha}\` | \`${heads.get(item.pr) ?? "?"}\` |`),
+    "",
+    "Before pushing again, bring the local branches up to date (unpushed local commits stay on top):",
+    "",
+    "```sh",
+    move.prepared.sync,
+    "```",
+  ].join("\n");
+}
+
+// The note to the ticket's living agent after a move.
+export function retargetNote(move: Pick<RetargetRecord, "repo" | "pr" | "base" | "baseSha" | "range"> & { prepared: PreparedRetarget }): string {
+  return `${retargetedComment(move)}\n\nDo not push the old heads again, and do not move the stack yourself: it is done.`;
+}
+
+// The commands that move the rest of a stack onto `main` by hand, as one sh block with the values
+// filled in. `closed`: GitHub closed the bottom pull request with its deleted base, so a new pull
+// request from its branch `head` replaces it; run on the stack's top branch, which pushes every
+// branch the replay moved (the ones on top of `main` that the top contains). `open`: the bottom
+// pull request is still open on an orphaned base, so its base changes to `main`; `branches`
+// bottom first.
+export function replayCommands(stack: { kind: "closed"; base: string; head: string; url: string } | { kind: "open"; base: string; branches: string[]; pr: number }): string {
+  const lines = stack.kind === "closed"
+    ? [
+      "git fetch origin main",
+      `git rebase --update-refs --onto origin/main ${stack.base}`,
+      "git push --force-with-lease origin $(git branch --format='%(refname:short)' --merged HEAD --no-merged origin/main)",
+      `gh pr create --base main --head ${stack.head} --title "$(git log -1 --format=%s ${stack.head})" --body "Replaces ${stack.url}"`,
+      `gt track ${stack.head} --parent main`,
+    ]
+    : [
+      `git fetch origin main ${stack.base}`,
+      `git switch ${stack.branches.at(-1)}`,
+      `git rebase --update-refs --onto origin/main origin/${stack.base}`,
+      `git push --force-with-lease origin ${stack.branches.join(" ")}`,
+      `gh pr edit ${stack.pr} --base main`,
+      `gt track ${stack.branches[0]} --parent main`,
+    ];
+  return ["```sh", ...lines, "```"].join("\n");
+}
+
+// The instruction to move an open stack off its orphaned `graphite-base/<n>` base by hand; `why`
+// says why the backstop did not.
+export function openReplayText(move: Pick<RetargetRecord, "repo" | "pr" | "base" | "range">, worktree: string | null, why: string): string {
+  return [
+    `[#${move.pr}](https://github.com/${move.repo}/pull/${move.pr}) is based on \`${move.base}\`, a branch Graphite left behind when the pull request below it landed; no open pull request has it, so the stack cannot reach the merge queue. ${why}`,
+    `Next step, in your stack's worktree${worktree ? ` (\`${worktree}\`)` : ""}: replay the stack's own commits onto main, push each branch, point #${move.pr} at main and re-track it:`,
+    replayCommands({ kind: "open", base: move.base, branches: move.range.map((item) => item.branch), pr: move.pr }),
+    `It moves only your own branches; never \`gt sync\` or \`gt restack\`, and never recreate \`${move.base}\`. When the commits do not apply cleanly, resolve the conflicts during the rebase without discarding work.`,
   ].join("\n");
 }

@@ -78,7 +78,9 @@ function rpcProcesses(output: string): { pid: number; session?: string; ambiguou
 
 // Every page, archived roots included: checking only the predecessor misses an older writable
 // owner. Public snapshots carry provider runtime/persistence identities; no private disk schema.
-export async function ticketProcessLiveness(paseo: PaseoApi, issueId: string, extra: ProcessAgent[] = [], inspect: ProcessInspector = inspector): Promise<ProcessLiveness> {
+// `subagents`: closed or archived subagents' workers count too (SessionRouter.whileIdle, which
+// must not run while any worker of the ticket lives); otherwise only roots are inspected.
+export async function ticketProcessLiveness(paseo: PaseoApi, issueId: string, extra: ProcessAgent[] = [], inspect: ProcessInspector = inspector, options: { subagents?: boolean } = {}): Promise<ProcessLiveness> {
   try {
     const agents = new Map<string, ProcessAgent>();
     let cursor: string | undefined;
@@ -96,7 +98,7 @@ export async function ticketProcessLiveness(paseo: PaseoApi, issueId: string, ex
     // The caller refreshed before this listing. Include a missing target, but never let that
     // earlier snapshot erase a newly closed/archived identity returned by the listing.
     for (const agent of extra) if (agent.id && !agents.has(agent.id)) agents.set(agent.id, agent);
-    const candidates = [...agents.values()].filter((agent) => agent.provider === "omp" && !agent.labels?.["paseo.parent-agent-id"]
+    const candidates = [...agents.values()].filter((agent) => agent.provider === "omp" && (options.subagents || !agent.labels?.["paseo.parent-agent-id"])
       && Boolean(agent.archivedAt || agent.status === "closed"
         || (agent.status === "error" && agent.lastError && CLOSED_PROCESS.test(agent.lastError))));
     if (!candidates.length) return "absent";

@@ -1,6 +1,8 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
+import type { ActivationIntake } from "./activation-intake";
 import type { DrainRouter } from "./drain";
+import type { HostOwnership } from "./sessions";
 import type { Settings } from "./settings";
 
 // The resume guard (README, "Draining a host"): this host's Paseo asks before it opens a stopped
@@ -49,5 +51,24 @@ export function resumeGuard(deps: ResumeGuardDeps): (input: { request: PluginSes
     if (held) return;
     log(`activation routing: refused to resume retired ticket agent ${request.agentId.slice(0, 8)} (${ticket.identifier})`);
     throw new Error(`This host no longer runs new work for ${ticket.identifier}: Linear ticket work is routed to ${peer}. The ticket continues on the other host; open a new chat for anything else.`);
+  };
+}
+
+// Which host owns a ticket's automatic work, read from the same claims as the activation guard
+// but without forwarding or starting anything (SessionRouter.whileIdle, TUC-1209): a draining host
+// owns only the roots it still runs; a receiving host with a peer owns a ticket only after the
+// claims handshake and while the peer claims none for it; a host without a peer owns every ticket.
+// A read that fails throws, which the caller takes as unknown.
+export function ticketOwnership(deps: {
+  settings: Pick<Settings, "read">;
+  drain: Pick<DrainRouter, "ownerFor">;
+  intake: Pick<ActivationIntake, "status" | "claimFor">;
+}): (issueId: string) => Promise<HostOwnership> {
+  return async (issueId) => {
+    const { mode, peer } = (await deps.settings.read()).activation;
+    if (mode === "remote") return (await deps.drain.ownerFor(issueId)) ? "here" : "elsewhere";
+    if (!peer) return "here";
+    if (!(await deps.intake.status()).appliedAt) return "unknown";
+    return (await deps.intake.claimFor(issueId)) ? "elsewhere" : "here";
   };
 }

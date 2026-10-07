@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,9 +8,9 @@ import { test, type TestContext } from "node:test";
 import type { HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
 import { activityBullets, ConditionalPullView, githubReader, GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft } from "./pr-watch";
-import { BACKSTOP_ENQUEUE, ENQUEUE_READY, marker, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
+import { BACKSTOP_ENQUEUE, ENQUEUE_READY, marker, RETARGET_ORPHAN, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
 import { GitHubBudget, GitHubPausedError, withPriority } from "./rate-budget";
-import { SessionRouter, type Succession } from "./sessions";
+import { SessionRouter, type IdleRun, type Succession } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { githubRouted } from "./github-cli";
 import { ghGet } from "./pull-requests";
@@ -168,7 +170,10 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // default). `onEnqueue`: what an enqueue changes (Graphite's bullets); `answered` runs before
   // the script's answer reaches the plugin and `beforeEnqueue` before the comment file is written
   // (stalling them is a crash after or before the enqueue); `runs`: every run, as
-  // `<script> <args>`; `now`: the backstop's clock.
+  // `<script> <args>`; `now`: the backstop's clock. `retarget`: `retarget-orphan.mjs` (see
+  // retargets), run only while `present`: `list` the candidates `--list` names, `prepare` and
+  // `apply` its answers in turn (the last one repeats), `records` every record `--apply` read,
+  // `beforeApply` runs before its answer (a hanging one is a crash during the write).
   const scripts = {
     checkout: "/backstop" as string | null,
     judgment: GENUINE as Judgment | null,
@@ -183,6 +188,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     runs: [] as string[],
     now: Date.now(),
     checkouts: [] as { repo: string; sources: string[] }[],
+    retarget: { present: false, list: [] as unknown[], prepare: [] as { code: number; answer: Record<string, unknown> }[], apply: [] as { code: number; answer: Record<string, unknown> }[], records: [] as unknown[], beforePrepare: async () => {}, beforeApply: async () => {} },
   };
   // `failure`: what linking a URL on the ticket throws; `arrive`: runs before a ticket comment
   // reaches Linear (a hanging one is a crash before it went out), `stall` after it did (a crash
@@ -199,12 +205,14 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // successor start for a gone agent comes to (impossible by default: the message goes to the
   // ticket as before); `claim` is the watch's claim, which a start runs right before it creates
   // the agent (see `started`). A start or a live agent moves the record to it, as
-  // SessionRouter.succeed does.
-  const paseo: { answer: () => Promise<Outcome>; send: () => Promise<void>; session: () => Promise<unknown>; succeed: (claim: () => Promise<void>) => Promise<Succession> } = {
+  // SessionRouter.succeed does. `idle`: what SessionRouter.whileIdle finds for the ticket (its
+  // work runs only when `ran`).
+  const paseo: { answer: () => Promise<Outcome>; send: () => Promise<void>; session: () => Promise<unknown>; succeed: (claim: () => Promise<void>) => Promise<Succession>; idle: (issueId: string) => Promise<IdleRun<unknown>["outcome"]> } = {
     answer: async () => (agent.live ?? true) ? "sent" : "gone",
     send: async () => {},
     session: async () => ({ sessionId: "s" }),
     succeed: async () => ({ kind: "impossible", reason: "no branch is recorded for the ticket" }),
+    idle: async () => "ran",
   };
   const calls: string[] = [];
   const daemon = agent.crash ? crashDaemon(calls) : null;
@@ -236,6 +244,11 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         if (next.kind === "started") calls.push(`succeed ${predecessor}\n${lead}`);
         if (next.kind === "started" || next.kind === "live") records[0] = { ...records[0], agentId: next.agent.id, agentTitle: next.agent.title ?? "", status: "working" };
         return next;
+      },
+      whileIdle: async <T>(issueId: string, work: () => Promise<T>): Promise<IdleRun<T>> => {
+        const outcome = await paseo.idle(issueId);
+        calls.push(`idle ${issueId} ${outcome}`);
+        return outcome === "ran" ? { outcome, value: await work() } : { outcome };
       },
     },
     linear: {
@@ -308,6 +321,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     },
     backstop: {
       now: () => scripts.now,
+      has: (_checkout, script) => script !== RETARGET_ORPHAN || scripts.retarget.present,
       checkout: {
         prepare: async (repo, sources) => {
           scripts.checkouts.push({ repo, sources });
@@ -329,6 +343,23 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
           return answer(2, { result: "dropped", reason: "", ...(scripts.judgments[Number(args[0])] ?? scripts.judgment), queueDraft: draft });
         }
         if (script === ENQUEUE_READY) return answer(0, scripts.ready);
+        if (script === RETARGET_ORPHAN) {
+          const { retarget } = scripts;
+          const next = (list: { code: number; answer: Record<string, unknown> }[]) => (list.length > 1 ? list.shift() : list[0]) ?? { code: 1, answer: { result: "error", error: "no answer" } };
+          if (args[0] === "--list") return answer(0, { result: "listed", candidates: retarget.list });
+          if (args[0] === "--prepare") {
+            calls.push(`retarget ${args.slice(0, 4).join(" ")}`);
+            const found = next(retarget.prepare);
+            await retarget.beforePrepare();
+            return answer(found.code, found.answer);
+          }
+          assert.equal(args[0], "--apply");
+          retarget.records.push(JSON.parse(await readFile(args[args.indexOf("--record") + 1], "utf8")));
+          calls.push(`retarget --apply ${args[1]}`);
+          const found = next(retarget.apply);
+          await retarget.beforeApply();
+          return answer(found.code, found.answer);
+        }
         assert.equal(script, BACKSTOP_ENQUEUE);
         const option = (name: string) => args[args.indexOf(name) + 1] ?? "";
         calls.push(`enqueue ${args[0]} --expect ${option("--expect")} --action ${option("--action")}`);
@@ -1010,6 +1041,61 @@ test("drops claimed before drops had kinds count as plain ones", async (t) => {
 const PARENT = "mtuchel/tuc-0-parent";
 const NEXT = "https://github.com/tuchel-sohn/tuchel-platform/pull/1500";
 
+// The commands of a replay message: its one ```sh block.
+function blockOf(text: string): string {
+  const block = /```sh\n([^]*?)\n```/.exec(text);
+  assert.ok(block, `no sh block in:\n${text}`);
+  return block[1];
+}
+
+// A throwaway agent clone for a replay message's sh block (AC-12, AC-13): on a bare origin, `main`,
+// the parent branch `base` (one commit), the stack `mtuchel/tuc-1-fix` <- `mtuchel/tuc-1-top` on
+// it (one commit each), then the parent landed on `main` as a squash. `deleted`: Graphite deleted
+// `base` on origin and the clone still has it locally (the closed pull request's case); else `base`
+// stays on origin as a leftover and the clone never had it (the orphaned `graphite-base/<n>`
+// case). The clone stands on the top branch. Stub `gh` and `gt` on PATH record their arguments.
+async function replayRepo(t: TestContext, options: { base: string; deleted: boolean }) {
+  const root = await mkdtemp(join(tmpdir(), "paseo-replay-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t", PATH: `${join(root, "bin")}:${process.env.PATH}` };
+  const sh = (cwd: string, script: string) => execFileSync("bash", ["-ec", script], { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const [fix, top] = ["mtuchel/tuc-1-fix", "mtuchel/tuc-1-top"];
+  await mkdir(join(root, "bin"));
+  for (const tool of ["gh", "gt"]) {
+    await writeFile(join(root, "bin", tool), `#!/bin/sh\necho "$*" >> "${join(root, `${tool}.log`)}"\n`);
+    await chmod(join(root, "bin", tool), 0o755);
+  }
+  sh(root, `git init -q --bare -b main origin.git && git clone -q origin.git seed 2>/dev/null && cd seed
+    echo base > base.txt && git add . && git commit -qm Base && git push -q origin main
+    git switch -qc '${options.base}' && echo parent > parent.txt && git add . && git commit -qm Parent && git push -q origin '${options.base}'
+    git switch -qc '${fix}' && echo fix > fix.txt && git add . && git commit -qm 'Fix the upload' && git push -q origin '${fix}'
+    git switch -qc '${top}' && echo top > top.txt && git add . && git commit -qm Top && git push -q origin '${top}'
+    cd .. && git clone -q origin.git work && cd work
+    ${options.deleted ? `git branch -q '${options.base}' 'origin/${options.base}'` : ""}
+    git branch -q '${fix}' 'origin/${fix}' && git switch -q '${top}'
+    cd ../seed && git switch -q main && git merge -q --squash '${options.base}' && git commit -qm 'Parent (#418)' && git push -q origin main
+    ${options.deleted ? `git push -q origin --delete '${options.base}'` : ""}`);
+  const work = join(root, "work");
+  const read = (file: string) => readFileSync(join(root, file), "utf8");
+  return {
+    run: (script: string) => sh(work, script),
+    gh: () => read("gh.log"),
+    gt: () => read("gt.log"),
+    // Each branch holds exactly its own commit, on `main` (the bottom) or on the branch below,
+    // and origin has exactly the local branch.
+    assertReplayed: () => {
+      const git = (...args: string[]) => execFileSync("git", args, { cwd: work, env, encoding: "utf8" }).trim();
+      git("fetch", "-q", "origin");
+      for (const [branch, below, file] of [[fix, "origin/main", "fix.txt"], [top, fix, "top.txt"]]) {
+        assert.equal(git("rev-parse", `origin/${branch}`), git("rev-parse", branch), `${branch} was pushed`);
+        assert.equal(git("rev-parse", `${branch}^`), git("rev-parse", below), `${branch} sits on ${below}`);
+        assert.equal(git("diff", "--name-only", `${branch}^`, branch), file, `${branch} holds only its own change`);
+      }
+      assert.equal(git("ls-remote", "origin", `refs/heads/${options.base}`) !== "", !options.deleted, `${options.base} is not recreated`);
+    },
+  };
+}
+
 test("a pull request closed without merging follows the open pull request from its branch", async (t) => {
   for (const base of [PARENT, "main"]) {
     const h = harness(t);
@@ -1031,14 +1117,15 @@ test("without a replacement, a pull request closed because its base branch is go
   assert.deepEqual(await h.poll(), [], "in a turn: waits");
   h.paseo.answer = async () => "sent";
   const calls = await h.poll();
-  assert.equal(promptOf(calls), [
-    `[The pull request](${PR}) was closed without merging: its base branch \`${PARENT}\` is gone (Graphite deletes a branch once the merge queue landed it), and no open pull request has its branch \`mtuchel/tuc-1-fix\`.`,
-    "Next step, in your stack's worktree (`/wt/tuc-1`):",
-    `1. On the top branch of the stack, replay the remaining branches onto main from the landed branch: \`git fetch origin main && git rebase --update-refs --onto origin/main ${PARENT}\`. It moves only your own branches; never \`gt sync\` or \`gt restack\`.`,
-    "2. Push each replayed branch with `git push --force-with-lease origin <branch>`.",
-    `3. Open a new pull request from \`mtuchel/tuc-1-fix\` onto main whose body links [the old one](${PR}): \`gh pr create --base main --head mtuchel/tuc-1-fix\`.`,
-    `4. Run \`gt track mtuchel/tuc-1-fix --parent main\` so Graphite links the new pull request; never recreate \`${PARENT}\`.`,
-  ].join("\n"));
+  const prompt = promptOf(calls) ?? "";
+  assert.match(prompt, new RegExp(`^\\[The pull request\\]\\(${PR}\\) was closed without merging: its base branch \`${PARENT}\` is gone`));
+  // AC-12: the message's commands, run on the stack's top branch, replay the stack onto main and
+  // open the replacement.
+  const repo = await replayRepo(t, { base: PARENT, deleted: true });
+  repo.run(blockOf(prompt));
+  repo.assertReplayed();
+  assert.match(repo.gh(), /^pr create --base main --head mtuchel\/tuc-1-fix --title Fix the upload --body Replaces https:\/\/github\.com\/tuchel-sohn\/tuchel-platform\/pull\/419$/m);
+  assert.equal(repo.gt(), "track mtuchel/tuc-1-fix --parent main\n");
   assert.equal(calls.at(-1), "say thought The pull request was closed because the branch below it landed; the agent was asked to open its replacement.");
   assert.equal(calls.length, 2);
   assert.deepEqual(await h.poll(), [], "told once");
@@ -2619,4 +2706,270 @@ test("the backstop's enqueued note waits while the agent waits for the owner, an
   h.paseo.answer = async () => "sent";
   assert.match(promptOf(await h.backstop()) ?? "", /Do not enqueue it again yourself\.$/);
   assert.ok(!(await h.backstop()).some((call) => call.startsWith("prompt")), "once");
+});
+
+// --- TUC-1209: open stacks stranded on an orphaned graphite-base/<n> branch -----------------------
+
+const ORPHAN_BASE = "graphite-base/418";
+const sha = (digit: string) => digit.repeat(40);
+const TOP_URL = "https://github.com/tuchel-sohn/tuchel-platform/pull/420";
+const RANGE = [{ pr: 419, branch: "mtuchel/tuc-1-fix", base: ORPHAN_BASE, sha: sha("1") }, { pr: 420, branch: "mtuchel/tuc-1-top", base: "mtuchel/tuc-1-fix", sha: sha("2") }];
+const OLD_HEADS = `419@${sha("1")},420@${sha("2")}`;
+const NEW_HEADS = `419@${sha("3")},420@${sha("4")}`;
+const CANDIDATE = { pr: 419, branch: RANGE[0].branch, base: ORPHAN_BASE, baseSha: sha("b"), expect: OLD_HEADS, range: RANGE, tickets: ["TUC-1"], eligible: true, reason: null };
+const SYNC = `git fetch origin\ngit rebase --onto origin/mtuchel/tuc-1-fix ${sha("1")} mtuchel/tuc-1-fix\ngit rebase --onto origin/mtuchel/tuc-1-top ${sha("2")} mtuchel/tuc-1-top\ngt track mtuchel/tuc-1-fix --parent main`;
+// What `--prepare` saves and `--apply` gets back as its record.
+const PREPARED_MOVE = { pr: 419, base: ORPHAN_BASE, baseSha: sha("b"), range: RANGE, onto: sha("c"), stamp: 1_700_000_000, new: { base: "main", heads: NEW_HEADS }, sync: SYNC };
+const PREPARE_RUN = `retarget --prepare 419 --expect ${OLD_HEADS}`;
+const APPLY_RUN = "retarget --apply 419";
+const MOVED = "Paseo's queue backstop moved";
+const STRANDED = "is based on `graphite-base/418`";
+
+// The watched pull request #419 is the bottom of the stack #419 <- #420 on `graphite-base/418`,
+// which `retarget-orphan.mjs` lists, prepares and moves.
+function stranded(t: TestContext, agent: Parameters<typeof harness>[1] = {}) {
+  const h = harness(t, agent);
+  h.github.view = { ...OPEN_PR, headSha: sha("1"), baseBranch: ORPHAN_BASE };
+  h.github.open = [listed(TOP_URL, { ...OPEN_PR, headBranch: "mtuchel/tuc-1-top", headSha: sha("2"), baseBranch: "mtuchel/tuc-1-fix" }, "Top TUC-1 [plugin] Retry the upload")];
+  h.scripts.retarget.present = true;
+  h.scripts.retarget.list = [CANDIDATE];
+  h.scripts.retarget.prepare = [{ code: 0, answer: { result: "prepared", ...PREPARED_MOVE, problems: [] } }];
+  h.scripts.retarget.apply = [{ code: 0, answer: { result: "retargeted", pr: 419, problems: [] } }];
+  return h;
+}
+const retargetCalls = (calls: string[]) => calls.filter((call) => call.startsWith("retarget ") || call.startsWith("idle "));
+
+test("an idle ticket's stranded stack is moved, commented on once on the pull request and the ticket, and its agent gets the sync commands (AC-6)", async (t) => {
+  const h = stranded(t);
+  const calls = await h.backstop();
+  assert.deepEqual(retargetCalls(calls), ["idle i1 ran", PREPARE_RUN, APPLY_RUN]);
+  assert.deepEqual(h.scripts.retarget.records, [PREPARED_MOVE], "--apply gets exactly the saved preparation");
+  const [comment, ...more] = h.github.comments[419] ?? [];
+  assert.deepEqual(more, [], "one pull request comment");
+  for (const fact of [`\`${ORPHAN_BASE}\` (\`${sha("b")}\`) → \`main\` (\`${sha("c")}\`)`, `| #419 | \`mtuchel/tuc-1-fix\` | \`${sha("1")}\` | \`${sha("3")}\` |`, `| #420 | \`mtuchel/tuc-1-top\` | \`${sha("2")}\` | \`${sha("4")}\` |`, SYNC]) assert.ok(comment.includes(fact), `the comment names ${fact}`);
+  assert.match(comment, new RegExp(`<!-- queue-backstop:retarget:419@${sha("1")} -->$`));
+  assert.equal(h.linear.comments.i1?.length, 1, "one ticket comment");
+  assert.ok(h.linear.comments.i1[0].includes(`| #420 | \`mtuchel/tuc-1-top\` | \`${sha("2")}\` | \`${sha("4")}\` |`));
+  const note = promptOf(calls) ?? "";
+  assert.ok(note.includes(SYNC) && note.endsWith("Do not push the old heads again, and do not move the stack yourself: it is done."), "the living agent gets the sync commands");
+
+  h.scripts.retarget.list = [];
+  const again = await h.backstop();
+  assert.deepEqual(retargetCalls(again), [], "moved once");
+  assert.equal(count(again, "prompt"), 0);
+  assert.equal(h.github.comments[419].length, 1);
+});
+
+test("a gone or archived agent's stranded stack is moved too, and only the comments report it (AC-6)", async (t) => {
+  for (const agent of [{ live: false }, { status: "archived" as const }]) {
+    const h = stranded(t, agent);
+    const calls = await h.backstop();
+    assert.deepEqual(retargetCalls(calls), ["idle i1 ran", PREPARE_RUN, APPLY_RUN], JSON.stringify(agent));
+    assert.equal(h.github.comments[419]?.length, 1);
+    assert.equal(h.linear.comments.i1?.length, 1);
+    assert.equal(promptOf(calls), undefined, "no note to an agent that is gone");
+  }
+});
+
+test("the backstop moves at most three stacks per run, and nothing without the script or without the ticket's confirmed ownership (AC-6)", async (t) => {
+  const many = stranded(t);
+  many.scripts.retarget.list = [501, 502, 503, 504].map((pr) => ({ ...CANDIDATE, pr, expect: `${pr}@${sha("1")}`, range: [{ ...RANGE[0], pr }] }));
+  many.scripts.retarget.prepare = [501, 502, 503, 504].map((pr) => ({ code: 0, answer: { result: "prepared", ...PREPARED_MOVE, pr, range: [{ ...RANGE[0], pr }], new: { base: "main", heads: `${pr}@${sha("3")}` }, problems: [] } }));
+  const calls = await many.backstop();
+  assert.deepEqual(retargetCalls(calls).filter((call) => !call.startsWith("idle")), ["--prepare 501", "--apply 501", "--prepare 502", "--apply 502", "--prepare 503", "--apply 503"].map((run) => `retarget ${run}${run.startsWith("--prepare") ? ` --expect ${run.slice(10)}@${sha("1")}` : ""}`));
+  assert.deepEqual(retargetCalls(await many.backstop()).filter((call) => !call.startsWith("idle")), [`retarget --prepare 504 --expect 504@${sha("1")}`, "retarget --apply 504"], "the fourth on the next run");
+
+  const absent = stranded(t);
+  absent.scripts.retarget.present = false;
+  await absent.backstop();
+  assert.ok(!absent.scripts.runs.some((run) => run.startsWith(RETARGET_ORPHAN)), "no script on main: nothing runs");
+
+  for (const outcome of ["elsewhere", "unavailable"] as const) {
+    const peer = stranded(t);
+    peer.paseo.idle = async () => outcome;
+    const runs = [...await peer.backstop(), ...await peer.poll()];
+    assert.deepEqual(retargetCalls(runs), [`idle i1 ${outcome}`], `${outcome}: no prepare or apply`);
+    assert.ok(!runs.some((call) => call.includes(STRANDED)), `${outcome}: no message either`);
+  }
+
+  const unknown = stranded(t);
+  unknown.scripts.retarget.list = [{ ...CANDIDATE, tickets: ["TUC-7"] }];
+  unknown.linear.state = { ...unknown.linear.state, id: "i7" } as typeof unknown.linear.state;
+  assert.deepEqual(retargetCalls([...await unknown.backstop(), ...await unknown.backstop()]), [], "a ticket Linear knows but this host has no record of: nothing");
+});
+
+test("while an agent of the ticket works, the stack is left alone and the agent asked once; once none works, it is moved (AC-5, AC-13)", async (t) => {
+  for (const outcome of ["busy", "waiting"] as const) {
+    const h = stranded(t);
+    h.paseo.idle = async () => outcome;
+    h.paseo.answer = async () => outcome;
+    assert.deepEqual(retargetCalls(await h.backstop()), [`idle i1 ${outcome}`], `${outcome}: no prepare`);
+    assert.deepEqual(retargetCalls(await h.backstop()), [`idle i1 ${outcome}`], `${outcome}: still none`);
+    h.paseo.answer = async () => "sent";
+    const told = await h.poll();
+    assert.equal(count(told, "prompt a1"), 1, `${outcome}: asked once across both runs`);
+    const instruction = promptOf(told) ?? "";
+    assert.ok(instruction.includes(STRANDED) && instruction.includes("An agent of the ticket is working"), instruction);
+    assert.equal(count(await h.poll(), "prompt a1"), 0);
+
+    if (outcome === "busy") {
+      // AC-13: the instruction's commands move the stack by hand.
+      const repo = await replayRepo(t, { base: ORPHAN_BASE, deleted: false });
+      repo.run(blockOf(instruction));
+      repo.assertReplayed();
+      assert.equal(repo.gh(), "pr edit 419 --base main\n");
+      assert.equal(repo.gt(), "track mtuchel/tuc-1-fix --parent main\n");
+    }
+
+    h.paseo.idle = async () => "ran";
+    const moved = await h.backstop();
+    assert.deepEqual(retargetCalls(moved), ["idle i1 ran", PREPARE_RUN, APPLY_RUN], `${outcome}: moved once no agent works`);
+    assert.equal(h.github.comments[419]?.length, 1);
+  }
+
+  const asked = stranded(t);
+  asked.paseo.idle = async () => "busy";
+  asked.paseo.answer = async () => "busy";
+  await asked.backstop();
+  asked.paseo.idle = async () => "ran";
+  asked.paseo.answer = async () => "sent";
+  await asked.backstop();
+  assert.ok(!(await asked.poll()).some((call) => call.includes(STRANDED)), "a move drops its instruction that had not gone out yet");
+});
+
+test("commits that do not apply onto main go to the agent once, else a successor, else the ticket (AC-4)", async (t) => {
+  const conflict = { code: 2, answer: { result: "conflict", pr: 419, problems: [{ kind: "conflict", text: "s2's commits do not apply onto main" }] } };
+  for (const who of ["agent", "successor", "ticket"] as const) {
+    const h = stranded(t, who === "agent" ? {} : { live: false, autoResume: who === "successor" });
+    h.scripts.retarget.prepare = [conflict];
+    if (who === "successor") h.paseo.succeed = startSuccessor;
+    assert.deepEqual(retargetCalls(await h.backstop()), ["idle i1 ran", PREPARE_RUN], `${who}: nothing applied`);
+    const told = await h.poll();
+    const text = who === "agent" ? promptOf(told) : who === "successor" ? told.find((call) => call.startsWith("succeed a1\n")) : told.find((call) => HANDED_BACK.test(call));
+    assert.ok(text?.includes(STRANDED) && text.includes("Its own commits do not apply cleanly onto `main`"), `${who}:\n${told.join("\n")}`);
+    if (who === "ticket") assert.equal(told.filter((call) => call.startsWith(`comment ${OWNER}`)).length, 1, "one owner mention");
+    assert.deepEqual(retargetCalls(await h.backstop()), [], `${who}: the same heads are not prepared again`);
+    assert.ok(!(await h.poll()).some((call) => call.includes(STRANDED)), `${who}: told once`);
+  }
+});
+
+test("escalated, gated, blocked or otherwise messaged stacks are not moved, and a stack of several tickets goes to its bottom ticket's agent (AC-11)", async (t) => {
+  const seen = (extra: Record<string, unknown>) => ({ reviewedAt: null, decision: null, merged: false, ...extra });
+  const cases: { name: string; arrange: (h: ReturnType<typeof stranded>) => Promise<void> }[] = [
+    { name: "escalated", arrange: (h) => h.state({ [PR]: seen({ escalated: true }) }) },
+    { name: "before-merge manual task", arrange: async (h) => { h.blockers.push("TUC-9"); } },
+    { name: "blocked at its head", arrange: (h) => h.state({ [TOP_URL]: seen({ blockedAt: sha("2") }) }) },
+    { name: "a foreign message pending", arrange: (h) => h.state({ [PR]: seen({ pending: { key: "drop:#900:419", reason: "", facts: "Fix the drop.", fix: "Fix the drop." } }) }) },
+  ];
+  for (const item of cases) {
+    const h = stranded(t);
+    h.paseo.answer = async () => "busy";
+    await item.arrange(h);
+    const runs = [...await h.backstop(), ...await h.poll()];
+    assert.deepEqual(retargetCalls(runs), [], `${item.name}: no prepare, apply or idle check`);
+    assert.ok(!runs.some((call) => call.includes(STRANDED)), `${item.name}: no message`);
+  }
+
+  const shared = stranded(t);
+  shared.scripts.retarget.list = [{ ...CANDIDATE, tickets: ["TUC-1", "TUC-2"] }];
+  assert.deepEqual(retargetCalls(await shared.backstop()), [], "several tickets: no move");
+  const told = promptOf(await shared.poll()) ?? "";
+  assert.ok(told.includes(STRANDED) && told.includes("Its pull requests name several tickets (TUC-1, TUC-2)"), told);
+  await shared.backstop();
+  assert.ok(!(await shared.poll()).some((call) => call.includes(STRANDED)), "asked once");
+});
+
+test("a ticket named on the stack after it was first listed counts before the move, and a block that appears while it is prepared holds the write (AC-11)", async (t) => {
+  const renamed = stranded(t);
+  renamed.paseo.idle = async () => "busy";
+  assert.deepEqual(retargetCalls(await renamed.backstop()), ["idle i1 busy"]);
+  renamed.paseo.idle = async () => "ran";
+  renamed.scripts.retarget.list = [{ ...CANDIDATE, tickets: ["TUC-1", "TUC-2"] }];
+  assert.deepEqual(retargetCalls(await renamed.backstop()), [], "same heads, now several tickets: no move");
+
+  const gated = stranded(t);
+  gated.scripts.retarget.beforePrepare = async () => { gated.blockers.push("TUC-1"); };
+  assert.deepEqual(retargetCalls(await gated.backstop()), ["idle i1 ran", PREPARE_RUN], "a manual task opened during the preparation: no write");
+  gated.scripts.retarget.beforePrepare = async () => {};
+  assert.deepEqual(retargetCalls(await gated.backstop()), [], "still open: no write");
+  gated.blockers.length = 0;
+  assert.deepEqual(retargetCalls(await gated.backstop()), ["idle i1 ran", APPLY_RUN], "the saved preparation is written once the task is done");
+  assert.equal(gated.github.comments[419]?.length, 1);
+});
+
+test("a stack still stranded at the same heads keeps its conflict past the backstop's memory, so it is neither asked nor prepared again (AC-4)", async (t) => {
+  const h = stranded(t);
+  h.scripts.retarget.prepare = [{ code: 2, answer: { result: "conflict", pr: 419, problems: [{ kind: "conflict", text: "s2's commits do not apply onto main" }] } }];
+  await h.backstop();
+  assert.ok((promptOf(await h.poll()) ?? "").includes(STRANDED));
+  h.scripts.now += 15 * 24 * HOUR;
+  const later = [...await h.backstop(), ...await h.poll(), ...await h.backstop()];
+  assert.deepEqual(retargetCalls(later), [], "not prepared again");
+  assert.ok(!later.some((call) => call.includes(STRANDED)), "not asked again");
+});
+
+test("a restart at any point of a move ends with it moved, one pull request comment, one ticket comment and one note (AC-7)", async (t) => {
+  for (const crash of ["during the write", "after the pull request comment", "before the ticket comment", "after the ticket comment"] as const) {
+    const h = stranded(t);
+    const stop = hang();
+    if (crash === "during the write") h.scripts.retarget.beforeApply = stop.point;
+    if (crash === "after the pull request comment") h.github.stall = stop.point;
+    if (crash === "before the ticket comment") h.linear.arrive = stop.point;
+    if (crash === "after the ticket comment") h.linear.stall = stop.point;
+    void h.backstop();
+    await stop.reached;
+    const crashed = [...h.calls];
+    h.scripts.retarget.beforeApply = h.github.stall = h.linear.arrive = h.linear.stall = async () => {};
+    // The stack may already be on main: the saved move goes on without a new listing.
+    h.scripts.retarget.list = [];
+    await h.restart();
+    const all = [...crashed, ...await h.backstop(), ...await h.backstop()];
+    assert.equal(count(all, "retarget --prepare"), 1, `${crash}: prepared once`);
+    assert.equal(count(all, `pr comment #419 ${MOVED}`), 1, `${crash}: one pull request comment`);
+    assert.equal(count(all, `comment ${MOVED}`), 1, `${crash}: one ticket comment`);
+    assert.equal(count(all, "prompt a1\n"), 1, `${crash}: one note`);
+    assert.equal(h.github.comments[419].length, 1, crash);
+    assert.equal(h.linear.comments.i1.length, 1, crash);
+    for (const record of h.scripts.retarget.records) assert.deepEqual(record, PREPARED_MOVE, `${crash}: every --apply gets the saved preparation`);
+  }
+});
+
+test("a saved move waits while a block holds it, an apply error is retried, and a stack that changed meanwhile goes to the agent (AC-7)", async (t) => {
+  const h = stranded(t);
+  h.scripts.retarget.apply = [{ code: 1, answer: { result: "error", pr: 419, error: "the push timed out", problems: [] } }, { code: 0, answer: { result: "retargeted", pr: 419, problems: [] } }];
+  assert.deepEqual(retargetCalls(await h.backstop()), ["idle i1 ran", PREPARE_RUN, APPLY_RUN]);
+  h.scripts.retarget.list = [];
+  await h.restart();
+  h.blockers.push("TUC-1");
+  assert.deepEqual(retargetCalls(await h.backstop()), [], "a before-merge manual task: no write");
+  h.blockers.length = 0;
+  assert.deepEqual(retargetCalls(await h.backstop()), ["idle i1 ran", APPLY_RUN], "resumed once the block cleared, without preparing again");
+  assert.equal(h.github.comments[419]?.length, 1);
+  assert.deepEqual(h.scripts.retarget.records, [PREPARED_MOVE, PREPARED_MOVE]);
+
+  const changed = stranded(t);
+  changed.scripts.retarget.apply = [{ code: 2, answer: { result: "refused", pr: 419, problems: [{ kind: "remote-differs", text: "origin/mtuchel/tuc-1-top is not #420's head" }] } }];
+  await changed.backstop();
+  const told = promptOf(await changed.poll()) ?? "";
+  assert.ok(told.includes(STRANDED) && told.includes("refused: remote-differs (origin/mtuchel/tuc-1-top is not #420's head)"), told);
+  assert.equal(changed.github.comments[419], undefined, "no success comment");
+  assert.deepEqual(retargetCalls(await changed.backstop()), [], "never written again");
+});
+
+test("a second host that moved the same stack reports nothing twice, and one that lost the race reports no success (AC-16)", async (t) => {
+  const h = stranded(t);
+  await h.backstop();
+  // The other host, with its own state, saw the same stack and prepared the same new heads.
+  await h.state({});
+  await h.restart();
+  await h.backstop();
+  assert.equal(h.github.comments[419].length, 1, "the marker keeps the pull request comment single");
+  assert.equal(h.linear.comments.i1.length, 1, "the ticket marker keeps the ticket comment single");
+
+  await h.state({});
+  await h.restart();
+  h.scripts.retarget.apply = [{ code: 2, answer: { result: "refused", pr: 419, problems: [{ kind: "remote-differs", text: "origin/mtuchel/tuc-1-fix is not #419's head" }] } }];
+  await h.backstop();
+  assert.equal(h.github.comments[419].length, 1, "the loser posts no success comment");
+  assert.equal(h.linear.comments.i1.length, 1);
 });
