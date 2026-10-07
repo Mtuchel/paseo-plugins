@@ -120,7 +120,7 @@ test("recovered debt survives fence expiry, headers and a second restart without
   assert.equal((await call(second.broker.socketPath)).kind, "answer");
 });
 
-test("unknown outcomes retain debt and a definitive late answer releases it without recounting", async (t) => {
+test("unknown outcomes retain debt and a definitive late answer releases it without recounting", { timeout: 5_000 }, async (t) => {
   let finish!: (response: Response) => void;
   // This integration case exercises the platform's upstream/socket deadline, not the budget clock.
   const { broker, budget, usage, home } = await fixture(t, { deadlineMs: 20,
@@ -131,13 +131,18 @@ test("unknown outcomes retain debt and a definitive late answer releases it with
   const row = usage.snapshot().rows.find((entry) => entry.caller === "mcp:get_issue")!;
   assert.equal(row.requests, 1); assert.equal(row.unmetered, 1);
   assert.equal(budget.estimate("app", "points"), 110_000);
+  // Observe real settlement after durable fsync, without polling or delaying the test.
+  const settled = new Promise<void>((resolve) => {
+    const releaseDebt = budget.releaseDebt.bind(budget);
+    t.mock.method(budget, "releaseDebt", (...args: Parameters<RateBudget["releaseDebt"]>) => {
+      releaseDebt(...args);
+      resolve();
+    });
+  });
   finish(Response.json({ data: {} }, { headers: headers(119_999) }));
-  // A read-only file condition observes the actual settlement, not a fixed timing assertion.
-  for (let attempt = 0; attempt < 100; attempt++) {
-    const journal = JSON.parse(await readFile(join(home, "linear-tickets", "linear-broker-journal.json"), "utf8"));
-    if (journal.intents.length === 0 && budget.estimate("app", "points") === 119_999) break;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
+  await settled;
+  const journal = JSON.parse(await readFile(join(home, "linear-tickets", "linear-broker-journal.json"), "utf8"));
+  assert.deepEqual(journal.intents, []);
   assert.equal(budget.estimate("app", "points"), 119_999);
   assert.equal(usage.snapshot().rows.find((entry) => entry.caller === "mcp:get_issue")!.requests, 1);
 });
