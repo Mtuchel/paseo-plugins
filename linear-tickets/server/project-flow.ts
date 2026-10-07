@@ -603,8 +603,10 @@ export class ProjectFlow {
     } catch (error) {
       const current = (await this.store.all())[project.id].planner!;
       if (error instanceof SetupError) await this.askOwner(project, current, message(error));
-      else if (limitError(message(error))) await this.scheduleLimit(project.id, current, requestId, message(error), /\bmodel=([^\s,)]+)/i.exec(message(error))?.[1] ?? null, settings);
-      else if (/Agent creation could not be confirmed/i.test(message(error))) {
+      else if (limitError(message(error))) {
+        await this.scheduleLimit(project.id, current, requestId, message(error), /\bmodel=([^\s,)]+)/i.exec(message(error))?.[1] ?? null, settings);
+        await this.limitReady(project.id, (await this.store.all())[project.id].planner!, settings);
+      } else if (/Agent creation could not be confirmed/i.test(message(error))) {
         // The response is uncertain, not proof no agent was created. Keep the spent claim and
         // pending limit until adoption or the next separately bounded identity after the grace.
         console.error(`[linear-tickets] project ${project.name}: uncertain limit restart: ${message(error)}`);
@@ -617,11 +619,8 @@ export class ProjectFlow {
     return this.runStatus(project.id, read.status);
   }
 
-  // One start of the run's agent, through Launcher.startPlanner. A live agent carrying the run's
-  // label is adopted instead of starting a second (a start whose response was lost created it); a
-  // live check runs first for every attempt, restarts included. A start that cannot succeed
-  // (SetupError: no mapping, no provider, no project root) leaves the run to the owner; anything
-  // else is retried by a later read, counted like a restart so it still reaches RESTART_CAP.
+  // Inspect roots before either retry budget. Provider limits use durable reset-aware claims;
+  // other failures keep the original grace/cap, and SetupError immediately leaves the run held.
   private async launchRun(project: { id: string; name: string }, run: PlannerRecord, read: Read, settings: PluginSettings, paseo: PaseoApi): Promise<ProjectStatus> {
     const again = run.startedAt !== undefined;
     const agents = await classifyRunAgents(paseo, run.id, this.now(), this.deps.inspect);

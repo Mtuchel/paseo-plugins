@@ -11,13 +11,15 @@ import { SetupError, type PlannerStart } from "./launch";
 import type { ProcessInspector } from "./process-liveness";
 import { orderProblems, parseOrder, plannerBrief, ProjectFlow, ProjectStore, type PlannerRecord, type ProjectRecord } from "./project-flow";
 import { Scheduler } from "./scheduler";
-import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { type UsageReport } from "./limit-resume";
+import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 
 const OWNER = "owner-1";
 const APP = "paseo-app";
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
-type Agent = { id: string; status: string; labels: Record<string, string>; provider?: string; cwd?: string; updatedAt?: string; persistence?: { provider: string; sessionId: string; nativeHandle: string } };
+type Agent = { id: string; status: string; labels: Record<string, string>; provider?: string; model?: string; lastError?: string; createdAt?: string; cwd?: string; updatedAt?: string; persistence?: { provider: string; sessionId: string; nativeHandle: string } };
 // Paseo listing the agents of whatever label the caller filters on (a ticket's `linear.issueId`, a
 // run's `linear.plannerRun`), and recording the agents archived through it.
 const paseoWith = (agents: () => Agent[], archived: string[] = []) => ({ agents: {
@@ -27,7 +29,13 @@ const paseoWith = (agents: () => Agent[], archived: string[] = []) => ({ agents:
   },
   ref: (id: string) => ({ archive: async () => { archived.push(id); }, refresh: async () => ({ agent: agents().find((agent) => agent.id === id) ?? null }) }),
 } }) as unknown as PaseoApi;
-const settings = { dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["TUC"], maxRunning: 2 }, writeback: DEFAULT_WRITEBACK } as PluginSettings;
+const settings: PluginSettings = {
+  template: null, markInProgress: false, showClosed: false, lastProvider: "omp",
+  launchPreferences: { omp: { model: "anthropic/claude-opus-5-5", modeId: "full" } }, projectMappings: {}, agentLinearAccess: false,
+  dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["TUC"], maxRunning: 2 }, writeback: DEFAULT_WRITEBACK,
+  watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [],
+  activation: DEFAULT_ACTIVATION, deputy: DEFAULT_DEPUTY,
+};
 
 const issue = (n: number, change: Partial<ProjectIssue> = {}): ProjectIssue => ({
   id: `i${n}`, identifier: `TUC-${n}`, title: `Ticket ${n}`, priority: 3, createdAt: `2026-01-01T00:00:0${n}Z`, status: "Todo", statusType: "unstarted",
@@ -42,6 +50,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   let now = Date.parse("2026-01-02T00:00:00Z");
   let created = 0;
   let away = false;
+  let labelled = true;
   // Linear writes that fail (`update`: the next n project updates; one relation refused or never
   // reaching Linear); `start`: how a planner start fails (`setup`: a SetupError, `always`: a
   // timeout); `restart`: every stalled-ticket restart. `starts`: every planner start, in order.
@@ -49,6 +58,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   const starts: PlannerStart[] = [];
   const comments: string[] = [];
   const updates: string[] = [];
+  const notificationAttempts: string[] = [];
   let gate: Promise<void> | null = null;
   let starting = false;
   const outage = () => new LinearApiError("The Linear API request failed (HTTP 503). Try again.", 503);
@@ -69,7 +79,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
     });
   };
   const linear = {
-    labeledProjects: async () => [{ id: "erp", name: "ERP" }],
+    labeledProjects: async () => labelled ? [{ id: "erp", name: "ERP" }] : [],
     projectIssues: async () => issues,
     issueDescriptions: async () => descriptions,
     openTeamIssues: async (_teams: string[], limit: number) => team.slice(0, limit),
@@ -86,6 +96,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
     },
     comment: async (id: string, body: string) => { calls.push(`comment ${id} ${body.split("\n")[0]}`); comments.push(body); },
     projectUpdate: async (id: string, body: string) => {
+      notificationAttempts.push(body);
       if (fail.update) { fail.update--; throw new Error("Linear's hourly request limit is reached"); }
       calls.push(`update ${id} ${body.split("\n")[0]}`);
       updates.push(body);
@@ -98,8 +109,11 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   const scheduler = new Scheduler({ running: async () => running, projectOf: async () => "erp", away: async () => away, now: () => now });
   // Tickets a start under way, or their newest thread, accounts for.
   const held = new Set<string>();
-  const flow = new ProjectFlow({ linear, projectIssues, scheduler, capacity: new Capacity(() => now), store,
-    startPlanner: async (input: PlannerStart) => {
+  const usage = { reports: null as UsageReport[] | null, chains: {} as Record<string, string[]>, refresh: true };
+  const launchedSelectors: string[] = [];
+  const deps = { linear, projectIssues, scheduler, capacity: new Capacity(() => now), store,
+    startPlanner: async (input: PlannerStart, _paseo: PaseoApi, current: PluginSettings) => {
+      launchedSelectors.push(current.launchPreferences[current.lastProvider!].model);
       starts.push(input);
       calls.push("start run");
       if (fail.start === "setup") throw new SetupError("No Paseo project is mapped to ERP or its team. Open the Paseo plugin settings and map one.");
@@ -117,9 +131,16 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
       calls.push(`restart ${id}`);
       if (fail.restart) throw new Error("Agent creation could not be confirmed (Timed out waiting for OMP to become ready).");
     },
-    accountedFor: async (id: string) => held.has(id) });
+    accountedFor: async (id: string) => held.has(id),
+    usage: { chains: async () => usage.chains, read: async () => usage.refresh ? usage.reports?.map((report) => ({ ...report, fetchedAt: now })) ?? null : usage.reports },
+    jitter: () => MINUTE };
+  const makeFlow = () => new ProjectFlow({ ...deps, store: new ProjectStore(path) });
+  const flow = makeFlow();
   return {
-    flow, calls, store, issues, fail, comments, updates, starts, descriptions, team, elsewhere, held,
+    flow, makeFlow, calls, store, issues, fail, comments, updates, starts, descriptions, team, elsewhere, held, usage, launchedSelectors,
+    now: () => now,
+    notificationAttempts,
+    setLabelled: (value: boolean) => { labelled = value; },
     advance: (ms: number) => { now += ms; },
     setAway: (value: boolean) => { away = value; },
     // The project's record as an earlier read left it.
@@ -781,4 +802,277 @@ test("a stalled ticket waits for a free slot without using up a restart, and is 
   assert.deepEqual(await poll(8), []);
   assert.deepEqual(await poll(2), ["restart i7"]);
   assert.deepEqual((await r.store.all()).erp.stalled, { i7: { since: "2026-01-02T00:42:00.000Z", restarts: 1 } }, "TUC-1 is forgotten once its agent works");
+});
+
+async function limitedRoom(t: TestContext, error = "usage limit model=anthropic/claude-opus-5-5", delay = 5 * HOUR) {
+  const r = await room(t, [issue(1)]);
+  const agents: Agent[] = [{ id: "failed", status: "error", lastError: error, model: "anthropic/claude-opus-5-5", createdAt: "2026-01-01T23:00:00Z",
+    labels: { "linear.plannerRun": "run-1", "linear.projectId": "erp" } }];
+  const paseo = paseoWith(() => agents);
+  r.usage.reports = [{ provider: "anthropic", fetchedAt: r.now(), limits: [{ amount: { usedFraction: 1 }, window: { resetsAt: r.now() + delay } }] }];
+  await r.seed({ planned: [], planner: runRecord({ agentId: "failed" }) });
+  await r.flow.tick(paseo, settings);
+  return { ...r, agents, paseo };
+}
+
+test("planner reset waits survive reload and repeated errors while planned tickets go out", async (t) => {
+  const r = await limitedRoom(t);
+  const deadline = (await r.store.all()).erp.planner!.recovery!.pending!.resumeAt;
+  r.issues.push(issue(2));
+  await r.store.update("erp", (record) => ({ ...record!, planned: ["i2"] }));
+  let flow = r.makeFlow();
+  for (let poll = 0; poll < 30; poll++) {
+    r.advance(10 * MINUTE);
+    await flow.tick(r.paseo, settings);
+    assert.equal(r.starts.length, 0);
+    assert.equal((await r.store.all()).erp.planner!.recovery!.pending!.resumeAt, deadline);
+    flow = r.makeFlow();
+  }
+  assert.ok(r.calls.includes("delegate i2"));
+  assert.equal((await r.store.all()).erp.planner?.ownerAsked, undefined);
+  r.advance(2 * MINUTE);
+  await flow.tick(r.paseo, settings);
+  assert.equal(r.starts.length, 1);
+  assert.equal(r.starts[0].runId, "run-1");
+  assert.equal((await r.store.all()).erp.planner!.recovery!.claims.length, 1);
+  assert.equal((await r.store.all()).erp.planner!.restarts ?? 0, 0);
+});
+
+test("new account or configured fallback capacity advances a persisted planner wait", async (t) => {
+  for (const fallback of [false, true]) {
+    const r = await limitedRoom(t);
+    const provider = fallback ? "openai-codex" : "anthropic";
+    if (fallback) r.usage.chains = { "anthropic/claude-opus-5-5": ["openai-codex/gpt-6"] };
+    r.advance(HOUR);
+    r.usage.reports!.push({ provider, fetchedAt: r.now(), limits: [{ amount: { usedFraction: 0 } }] });
+    await r.flow.tick(r.paseo, settings);
+    assert.equal(r.starts.length, 1);
+    assert.equal(r.starts[0].runId, "run-1");
+    assert.equal((await r.store.all()).erp.planner!.recovery!.pending, undefined);
+  }
+});
+
+test("changed launch preferences cannot use old-model room to authorize the new selector", async (t) => {
+  const r = await limitedRoom(t);
+  const current = { ...settings, launchPreferences: { omp: { ...settings.launchPreferences.omp, model: "openai-codex/gpt-6" } } };
+  r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+  r.usage.reports!.push({ provider: "openai-codex", fetchedAt: r.now(), limits: [{ amount: { usedFraction: 1 }, window: { resetsAt: r.now() + 4 * HOUR } }] });
+  r.advance(2 * MINUTE);
+  await r.flow.tick(r.paseo, current);
+  assert.equal(r.starts.length, 0);
+  assert.equal((await r.store.all()).erp.planner!.recovery!.pending!.selector, "openai-codex/gpt-6");
+  r.usage.reports![1].limits = [{ amount: { usedFraction: 0 } }];
+  r.advance(2 * MINUTE);
+  await r.flow.tick(r.paseo, current);
+  assert.deepEqual(r.launchedSelectors, ["openai-codex/gpt-6"]);
+});
+
+test("unreadable or stale usage preserves retry-after and default deadlines", async (t) => {
+  for (const hint of ["", " retry-after: 720"]) {
+    const r = await room(t, [issue(1)]);
+    const paseo = paseoWith(() => [{ id: "failed", status: "error", lastError: `usage limit${hint}`, labels: { "linear.plannerRun": "run-1" } }]);
+    await r.seed({ planned: [], planner: runRecord({ agentId: "failed" }) });
+    r.usage.refresh = false;
+    r.usage.reports = [{ provider: "anthropic", fetchedAt: r.now() - 31 * MINUTE, limits: [{ amount: { usedFraction: 0 } }] }];
+    await r.flow.tick(paseo, settings);
+    const deadline = (await r.store.all()).erp.planner!.recovery!.pending!.resumeAt;
+    r.usage.reports = null;
+    r.advance((hint ? 12 : 28) * MINUTE);
+    await r.flow.tick(paseo, settings);
+    assert.equal(r.starts.length, 0);
+    assert.equal((await r.store.all()).erp.planner!.recovery!.pending!.resumeAt, deadline);
+    r.advance(2 * MINUTE);
+    await r.flow.tick(paseo, settings);
+    assert.equal(r.starts.length, 1);
+  }
+});
+
+test("planner limit spacing and daily bound are independent of generic retries and hold after failed notification", async (t) => {
+  for (const failedNotice of [false, true]) {
+    const r = await limitedRoom(t);
+    await r.store.update("erp", (record) => ({ ...record!, planner: { ...record!.planner!, restarts: 3 } }));
+    r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+    if (failedNotice) r.fail.update = 1;
+    let flow = r.makeFlow();
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      r.advance(attempt === 1 ? 2 * MINUTE : 14 * MINUTE);
+      await flow.tick(r.paseo, settings);
+      if (attempt > 1) {
+        assert.equal(r.starts.length, attempt - 1);
+        r.advance(2 * MINUTE);
+        await flow.tick(r.paseo, settings);
+      }
+      assert.equal(r.starts.length, attempt);
+      const run = (await r.store.all()).erp.planner!;
+      assert.equal(run.restarts, 3);
+      assert.equal(run.recovery!.claims.length, attempt);
+      r.agents.splice(0, r.agents.length, { id: run.agentId!, status: "error", lastError: "usage limit", labels: { "linear.plannerRun": "run-1", "linear.projectId": "erp" } });
+      flow = r.makeFlow();
+    }
+    r.advance(16 * MINUTE);
+    await flow.tick(r.paseo, settings);
+    assert.equal(r.starts.length, 4);
+    assert.equal((await r.store.all()).erp.planner!.ownerAsked, true);
+    assert.equal(r.notificationAttempts.length, 1);
+    assert.equal(r.updates.length, failedNotice ? 0 : 1);
+    r.advance(25 * HOUR);
+    await r.makeFlow().tick(r.paseo, settings);
+    assert.equal(r.starts.length, 4);
+    assert.equal(r.notificationAttempts.length, 1);
+  }
+});
+
+test("expired claims free capacity without reusing planner attempt identities", async (t) => {
+  const r = await limitedRoom(t);
+  await r.store.update("erp", (record) => ({ ...record!, planner: { ...record!.planner!, recovery: { ...record!.planner!.recovery!, attempt: 4,
+    claims: [new Date(r.now() - 25 * HOUR).toISOString(), new Date(r.now() - HOUR).toISOString()] } } }));
+  r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+  r.advance(2 * MINUTE);
+  await r.makeFlow().tick(r.paseo, settings);
+  assert.equal(r.starts[0].requestId, "planner-run-1-limit-5");
+  assert.equal((await r.store.all()).erp.planner!.recovery!.claims.length, 2);
+  assert.equal((await r.store.all()).erp.planner!.ownerAsked, undefined);
+});
+
+test("uncertain creation survives reload and a late first root cannot replace its live successor or approve", async (t) => {
+  for (const close of ["skip", "approve"]) {
+    const r = await limitedRoom(t);
+    r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+    r.fail.start = "always";
+    r.advance(2 * MINUTE);
+    await r.flow.tick(r.paseo, settings);
+    assert.equal((await r.store.all()).erp.planner!.recovery!.claim!.requestId, "planner-run-1-limit-1");
+    let flow = r.makeFlow();
+    r.advance(14 * MINUTE);
+    await flow.tick(r.paseo, settings);
+    assert.equal(r.starts.length, 1);
+    r.fail.start = undefined;
+    r.advance(2 * MINUTE);
+    await flow.tick(r.paseo, settings);
+    assert.deepEqual(r.starts.map((start) => start.requestId), ["planner-run-1-limit-1", "planner-run-1-limit-2"]);
+    const canonical = (await r.store.all()).erp.planner!.agentId!;
+    r.agents.splice(0, r.agents.length,
+      { id: canonical, status: "running", createdAt: new Date(r.now()).toISOString(), labels: { "linear.plannerRun": "run-1", "linear.projectId": "erp" } },
+      { id: "late-first", status: "running", createdAt: new Date(r.now() + MINUTE).toISOString(), labels: { "linear.plannerRun": "run-1", "linear.projectId": "erp" } });
+    flow = r.makeFlow();
+    r.advance(2 * MINUTE);
+    await flow.tick(r.paseo, settings);
+    assert.equal((await r.store.all()).erp.planner!.agentId, canonical);
+    assert.ok(r.calls.includes("retire late-first"));
+    assert.equal(await flow.applyPlan("run-1", "late-first", "```project-order\nTUC-1 hold\n```", r.paseo, settings), false);
+    assert.ok(!r.calls.includes("label i1 +paseo-hold"));
+    if (close === "skip") await flow.skipPlan("erp", settings, r.paseo);
+    else assert.equal(await flow.applyPlan("run-1", canonical, "```project-order\n```", r.paseo, settings), true);
+    assert.equal((await r.store.all()).erp.planner, null);
+    assert.ok(r.calls.includes(`retire ${canonical}`));
+    r.agents.push({ id: "late-after-close", status: "running", labels: { "linear.plannerRun": "run-1", "linear.projectId": "erp" } });
+    r.advance(2 * MINUTE);
+    await flow.tick(r.paseo, settings);
+    assert.ok(r.calls.includes("retire late-after-close"));
+  }
+});
+
+test("a late live result before another uncertain attempt is adopted without spending a claim", async (t) => {
+  const r = await limitedRoom(t);
+  r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+  r.fail.start = "always";
+  r.advance(2 * MINUTE);
+  await r.flow.tick(r.paseo, settings);
+  r.agents.push({ id: "late-live", status: "running", labels: { "linear.plannerRun": "run-1" } });
+  r.advance(2 * MINUTE);
+  await r.makeFlow().tick(r.paseo, settings);
+  assert.equal(r.starts.length, 1);
+  assert.equal((await r.store.all()).erp.planner!.agentId, "late-live");
+  assert.equal((await r.store.all()).erp.planner!.recovery!.claims.length, 1);
+  assert.equal((await r.store.all()).erp.planner!.recovery!.claim, undefined);
+});
+
+test("Skip waits for a claimed limit launch and retires its returned agent", async (t) => {
+  const r = await limitedRoom(t);
+  const gate = r.holdStart();
+  r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+  r.advance(2 * MINUTE);
+  const tick = r.flow.tick(r.paseo, settings);
+  while (!gate.starting()) await setImmediate();
+  const skip = r.flow.skipPlan("erp", settings, r.paseo);
+  gate.open();
+  await tick;
+  await skip;
+  assert.ok(r.calls.includes("retire run-agent-1"));
+  r.advance(HOUR);
+  await r.makeFlow().tick(r.paseo, settings);
+  assert.equal(r.starts.length, 1);
+  assert.equal((await r.store.all()).erp.planner, null);
+});
+
+test("disabled dispatch and removed trigger preserve waits; child and predecessor errors cannot restart a live root", async (t) => {
+  const r = await limitedRoom(t);
+  r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+  r.advance(HOUR);
+  await r.flow.tick(r.paseo, { ...settings, dispatch: { ...settings.dispatch, enabled: false } });
+  assert.equal(r.starts.length, 0);
+  r.setLabelled(false);
+  r.advance(2 * MINUTE);
+  await r.flow.tick(r.paseo, settings);
+  assert.equal(r.starts.length, 0);
+  r.setLabelled(true);
+  r.advance(2 * MINUTE);
+  await r.flow.tick(r.paseo, settings);
+  assert.equal(r.starts.length, 1);
+  const canonical = (await r.store.all()).erp.planner!.agentId!;
+  r.agents.push({ id: canonical, status: "running", labels: { "linear.plannerRun": "run-1" } },
+    { id: "child", status: "error", lastError: "usage limit", labels: { "linear.plannerRun": "run-1", "paseo.parent-agent-id": canonical } });
+  r.advance(HOUR);
+  await r.flow.tick(r.paseo, settings);
+  assert.equal(r.starts.length, 1);
+  assert.equal((await r.store.all()).erp.planner!.recovery!.pending, undefined);
+});
+
+test("corrupt planner recovery metadata fails closed without resetting its budget", async (t) => {
+  const r = await limitedRoom(t);
+  const messages: string[] = [];
+  t.mock.method(console, "error", (text: string) => { messages.push(text); });
+  const record = (await r.store.all()).erp;
+  await r.seed({ ...record, planner: { ...record.planner!, recovery: { attempt: 4, claims: ["not-a-timestamp"] } } });
+  r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+  r.advance(HOUR);
+  await r.makeFlow().tick(r.paseo, settings);
+  assert.equal(r.starts.length, 0);
+  assert.deepEqual((await r.store.all()).erp.planner!.recovery!.claims, ["not-a-timestamp"]);
+  assert.ok(messages.some((message) => message.includes("corrupt usage-limit recovery metadata")));
+});
+
+test("a provider limit during replacement startup spends one claim, preserves generic count, and reports the next wait", async (t) => {
+  const r = await limitedRoom(t);
+  r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+  r.fail.startError = "429 usage limit retry-after: 3600 model=anthropic/claude-opus-5-5";
+  r.advance(2 * MINUTE);
+  await r.flow.tick(r.paseo, settings);
+  const failed = (await r.store.all()).erp.planner!;
+  assert.equal(failed.recovery!.claims.length, 1);
+  assert.equal(failed.restarts ?? 0, 0);
+  assert.equal(failed.recovery!.pending!.identity, r.starts[0].requestId);
+  assert.match(r.flow.status()[0].planner!.error!, /Berlin time/);
+  r.fail.startError = undefined;
+  r.advance(14 * MINUTE);
+  await r.makeFlow().tick(r.paseo, settings);
+  assert.equal(r.starts.length, 1);
+  r.advance(2 * MINUTE);
+  await r.makeFlow().tick(r.paseo, settings);
+  assert.equal(r.starts.length, 2);
+  assert.equal((await r.store.all()).erp.planner!.recovery!.claims.length, 2);
+});
+
+test("a later provider reset postpones recovery without redrawing jitter or spending attempts", async (t) => {
+  const r = await limitedRoom(t);
+  const first = (await r.store.all()).erp.planner!.recovery!.pending!;
+  r.usage.reports![0].limits[0].window = { resetsAt: r.now() + 7 * HOUR };
+  r.advance(2 * MINUTE);
+  await r.flow.tick(r.paseo, settings);
+  const postponed = (await r.store.all()).erp.planner!.recovery!;
+  assert.equal(postponed.pending!.resumeAt, new Date(Date.parse(first.failedAt) + 7 * HOUR + MINUTE).toISOString());
+  assert.equal(postponed.pending!.jitterMs, first.jitterMs);
+  assert.equal(postponed.pending!.fallbackAt, first.fallbackAt);
+  assert.equal(postponed.claims.length, 0);
+  assert.equal(r.starts.length, 0);
 });
