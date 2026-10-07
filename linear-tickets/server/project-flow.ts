@@ -116,7 +116,6 @@ export type PlannerRecord = {
 // A ticket assigned to Paseo whose start failed: `since` it was first seen so or last started
 // again, `restarts` so far, `ownerAsked` past RESTART_CAP.
 export type StalledRecord = { since: string; restarts: number; ownerAsked?: boolean };
-export type ProjectRecord = { name?: string; planned?: string[]; plannedThrough?: string | null; planner: PlannerRecord | null; closedPlanner?: string; waiting?: Record<string, string>; withheld?: string[]; stalled?: Record<string, StalledRecord> };
 
 // Validate the durable status fields without stripping lifecycle/recovery metadata or legacy
 // planner-ticket fields. Unknown state must fail the status read, not dismiss an owner's alert.
@@ -129,6 +128,18 @@ const projectRecordSchema = z.object({
     error: z.string().optional(),
   }).passthrough().nullable(),
 }).passthrough();
+type PlannerLimitRestart = { runId: string; requestId: string; agentId: string; confirmedAt: string; failedAgentId?: string };
+const RESTART_HISTORY_MS = 8 * 24 * 60 * 60_000;
+
+function confirmedRestart(record: ProjectRecord, run: PlannerRecord, requestId: string, agentId: string, now: number): ProjectRecord {
+  const entries = record.plannerLimitRestarts ?? [];
+  if (entries.some((entry) => entry.runId === run.id && entry.requestId === requestId)) return record;
+  return { ...record, plannerLimitRestarts: [...entries, {
+    runId: run.id, requestId, agentId, confirmedAt: new Date(now).toISOString(),
+    ...(run.recovery?.handledAgentId ? { failedAgentId: run.recovery.handledAgentId } : {}),
+  }] };
+}
+export type ProjectRecord = { name?: string; planned?: string[]; plannedThrough?: string | null; planner: PlannerRecord | null; closedPlanner?: string; waiting?: Record<string, string>; withheld?: string[]; stalled?: Record<string, StalledRecord>; plannerLimitRestarts?: PlannerLimitRestart[] };
 
 type Read = { work: ProjectIssue[]; record: ProjectRecord; owner: string; readAt: string; planned: (issue: ProjectIssue) => boolean; unplanned: ProjectIssue[]; status: ProjectStatus };
 
@@ -164,7 +175,7 @@ const REPAIRS_KEY = "~repairs";
 export class ProjectStore {
   private queue: Promise<unknown> = Promise.resolve();
 
-  constructor(private readonly path = join(paseoHome(), "linear-tickets", "projects.json")) {}
+  constructor(private readonly path = join(paseoHome(), "linear-tickets", "projects.json"), private readonly now = Date.now) {}
 
   private async raw(): Promise<Record<string, unknown>> {
     const source = await readFile(this.path, "utf8").catch((error: NodeJS.ErrnoException) => {
@@ -198,7 +209,10 @@ export class ProjectStore {
     return this.queued(async () => {
       const file = await this.raw();
       const next = change(file[projectId] as ProjectRecord | undefined);
-      if (next) await this.save({ ...file, [projectId]: next });
+      if (next) {
+        if (next.plannerLimitRestarts) next.plannerLimitRestarts = next.plannerLimitRestarts.filter((entry) => Date.parse(entry.confirmedAt) >= this.now() - RESTART_HISTORY_MS);
+        await this.save({ ...file, [projectId]: next });
+      }
       return next;
     });
   }
@@ -586,9 +600,19 @@ export class ProjectFlow {
     const live = (run.recovery && agents.live.find((agent) => agent.id === run.agentId))
       || agents.live.slice().sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? "") || a.id.localeCompare(b.id))[0];
     if (!live) return false;
-    await this.store.update(projectId, (current) => current?.planner?.id === run.id && !current.planner.approved && !current.planner.ownerAsked
-      ? { ...current, planner: { ...current.planner, started: true, agentId: live.id, startedAt: current.planner.startedAt ?? new Date(this.now()).toISOString(), error: undefined,
-        ...(run.recovery ? { recovery: { ...recoveryOf(current.planner)!, pending: undefined, claim: undefined, handledAgentId: undefined } } : {}) } } : null);
+    await this.store.update(projectId, (current) => {
+      if (current?.planner?.id !== run.id || current.planner.approved || current.planner.ownerAsked) return null;
+      const recovery = recoveryOf(current.planner);
+      const requestId = live.labels?.["linear.plannerRequest"];
+      const prefix = `planner-${run.id}-limit-`;
+      const suffix = requestId?.startsWith(prefix) ? requestId.slice(prefix.length) : "";
+      const attempt = /^[1-9]\d*$/.test(suffix) ? Number(suffix) : 0;
+      const evidence = recovery?.pending && attempt > 0 && attempt <= recovery.attempt
+        && live.id !== current.planner.agentId && live.id !== recovery.handledAgentId
+        ? confirmedRestart(current, current.planner, requestId!, live.id, this.now()) : current;
+      return { ...evidence, planner: { ...current.planner, started: true, agentId: live.id, startedAt: current.planner.startedAt ?? new Date(this.now()).toISOString(), error: undefined,
+        ...(run.recovery ? { recovery: { ...recovery!, pending: undefined, claim: undefined, handledAgentId: undefined } } : {}) } };
+    });
     if (run.recovery) {
       for (const agent of [...agents.live, ...agents.stopped, ...agents.ghosts]) {
         if (agent.id !== live.id) await this.deps.retire(agent.id, paseo);
@@ -674,12 +698,9 @@ export class ProjectFlow {
     const requestId = `planner-${run.id}-limit-${attempt}`;
     await this.store.update(project.id, (current) => current?.planner?.id === run.id && !current.planner.approved && !current.planner.ownerAsked
       ? { ...current, planner: { ...current.planner, startedAt: at, recovery: { ...recovery, attempt, claims: [...recovery.claims, at], claim: { requestId, at } } } } : null);
+    let agentId: string;
     try {
-      const { agentId } = await this.deps.startPlanner({ runId: run.id, linearProjectId: project.id, projectName: project.name, teamId: this.busiestTeam(read.work), requestId, brief }, paseo, settings);
-      await this.store.update(project.id, (current) => current?.planner?.id === run.id
-        ? { ...current, planner: { ...current.planner, started: true, agentId, error: undefined,
-          recovery: { ...recoveryOf(current.planner)!, pending: undefined, claim: undefined } } } : null);
-      for (const stopped of [...agents.stopped, ...agents.ghosts]) await this.deps.retire(stopped.id, paseo);
+      ({ agentId } = await this.deps.startPlanner({ runId: run.id, linearProjectId: project.id, projectName: project.name, teamId: this.busiestTeam(read.work), requestId, brief }, paseo, settings));
     } catch (error) {
       const current = (await this.store.all())[project.id].planner!;
       if (error instanceof SetupError) await this.askOwner(project, current, message(error));
@@ -695,7 +716,13 @@ export class ProjectFlow {
           recovery: { ...recoveryOf(record.planner)!, pending: undefined, claim: undefined } } } : null);
         throw error;
       }
+      return this.runStatus(project.id, read.status);
     }
+    // External creation has succeeded. Persistence/retirement failures are not failed creations.
+    await this.store.update(project.id, (current) => current?.planner?.id === run.id
+      ? { ...confirmedRestart(current, current.planner, requestId, agentId, this.now()), planner: { ...current.planner, started: true, agentId, error: undefined,
+        recovery: { ...recoveryOf(current.planner)!, pending: undefined, claim: undefined } } } : null);
+    for (const stopped of [...agents.stopped, ...agents.ghosts]) await this.deps.retire(stopped.id, paseo);
     return this.runStatus(project.id, read.status);
   }
 
