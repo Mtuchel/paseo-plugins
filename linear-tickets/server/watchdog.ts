@@ -32,6 +32,10 @@ const FUTURE_SKEW_MS = 5 * 60_000;
 const TAIL_BYTES = 1024 * 1024;
 const CHILD_FILES = 16;
 const MINUTE = 60_000;
+// How long a quiet but excluded root is left before its exclusions are read again (README,
+// "Silent and stuck agents"): the deep check reads Linear and GitHub, whose hourly budgets the
+// plugin's other polls share.
+const EXCLUSION_RECHECK_MS = 15 * MINUTE;
 const DO_NOT_MERGE = "do-not-merge";
 const NEEDS_INPUT = "needs input";
 const TERMINAL = ["completed", "canceled", "duplicate"];
@@ -557,6 +561,10 @@ export class Watchdog {
   private revoked = false;
   private readonly instance = randomUUID();
   private readonly logged = new Map<string, string>();
+  // A quiet root that an exclusion keeps out (a Done ticket, an owner wait, an open pull request)
+  // is judged again after EXCLUSION_RECHECK_MS, not every poll: each judgement reads Linear and
+  // GitHub. Keyed by ticket, root and kind, so a new root or a new kind of silence is judged at once.
+  private readonly excludedUntil = new Map<string, number>();
 
   constructor(private readonly deps: WatchdogDeps) {}
 
@@ -751,8 +759,15 @@ export class Watchdog {
     else if (root.status === "running" && now - since >= timings.silentMinutes * MINUTE) kind = "silent";
     else if ((root.status === "idle" || root.status === "closed") && now - since >= timings.idleMinutes * MINUTE) kind = "idle";
     if (!kind) return;
+    const excludedKey = `${issueId}:${root.id}:${kind}`;
+    if ((this.excludedUntil.get(excludedKey) ?? 0) > now) return;
     const reason = await this.exclusion(issueId, identifier, root, true, poll, kind, settings);
-    if (reason) { this.once(`excluded:${issueId}`, `${label}: ${short(root.id)} is ${kind === "silent" ? "silent" : kind === "ghost" ? "a ghost" : `${root.status} and quiet`}, but ${reason}`); return; }
+    if (reason) {
+      this.excludedUntil.set(excludedKey, now + EXCLUSION_RECHECK_MS);
+      this.once(`excluded:${issueId}`, `${label}: ${short(root.id)} is ${kind === "silent" ? "silent" : kind === "ghost" ? "a ghost" : `${root.status} and quiet`}, but ${reason}`);
+      return;
+    }
+    this.excludedUntil.delete(excludedKey);
     this.logged.delete(`excluded:${issueId}`);
     const starts = entry?.starts ?? [];
     if (!budgetLeft(starts, now)) {
