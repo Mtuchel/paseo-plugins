@@ -209,6 +209,19 @@ const activationSettingsSchema = z.object({
   peer: z.string().nullable(),
   secretConfigured: z.boolean(),
 });
+// The deputy for agent questions (server/settings.ts DeputySettings). Read-only fields:
+// `recallConfigured` (the host-local Hindsight access exists; its token is never sent) and `live`
+// (whether live answers are allowed now, and every reason they are not).
+const deputySettingsSchema = z.object({
+  mode: z.enum(["off", "shadow", "live"]),
+  graceMinutes: z.number().int(),
+  model: z.string().max(200).nullable(),
+  principlesRepository: z.string().max(500).nullable(),
+});
+const deputyViewSchema = deputySettingsSchema.extend({
+  recallConfigured: z.boolean(),
+  live: z.object({ ready: z.boolean(), blockers: z.array(z.string()) }),
+});
 export type DispatchSettingsValue = z.infer<typeof dispatchSettingsSchema>;
 export type WritebackSettingsValue = z.infer<typeof writebackSettingsSchema>;
 const settingsOutputSchema = z.object({
@@ -228,6 +241,8 @@ const settingsOutputSchema = z.object({
   standardModels: tierModelsSchema,
   // README, "Draining a host".
   activation: activationSettingsSchema,
+  // README, "Deputy for agent questions".
+  deputy: deputyViewSchema,
 });
 export const getSettingsRpc = defineRpc({
   name: "linear.get-settings",
@@ -260,6 +275,8 @@ export const setSettingsRpc = defineRpc({
       peer: z.string().max(500).nullable().optional(),
       secret: z.string().max(500).nullable().optional(),
     }).optional(),
+    // README, "Deputy for agent questions"; `mode: "off"` stops it at once.
+    deputy: deputySettingsSchema.partial().optional(),
   }),
   output: settingsOutputSchema,
 });

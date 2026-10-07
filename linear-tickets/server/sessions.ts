@@ -18,6 +18,7 @@ import type { IssueGroup, LinearService } from "./linear";
 import type { Launcher } from "./launch";
 import { CODING_STATE } from "./plannotator";
 import { closeAnswered, type NeedsYouIssues } from "./needs-you";
+import { overrideCommand, type Deputy } from "./deputy";
 import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, questionAnswer, questionsOf } from "./relay";
 import type { PluginSettings, Settings } from "./settings";
 import { issueAgents, type TicketStarter } from "./starter";
@@ -379,7 +380,15 @@ export class SessionRouter {
   // Reads webhooks started (`receive` is fire-and-forget), awaited by `settled`.
   private readonly inflightReads = new Set<Promise<unknown>>();
 
+  // The deputy for agent questions (README, "Deputy for agent questions"): overrides of its answers
+  // are routed before pending questions, and the owner's answers here are recorded for it.
+  private deputy: Pick<Deputy, "byRef" | "correct" | "ownerAnswered"> | null = null;
+
   constructor(private readonly deps: Deps) {}
+
+  recordDeputy(deputy: Pick<Deputy, "byRef" | "correct" | "ownerAnswered">): void {
+    this.deputy = deputy;
+  }
 
   attach(paseo: PaseoApi): void {
     if (this.paseo) return;
@@ -704,6 +713,17 @@ export class SessionRouter {
       await this.advanceGroup({ ...link, group: { ...link.group, status: undefined } });
       return;
     }
+    // "override D-…": the owner corrects a deputy answer. It goes to the agent that got that answer
+    // as a message, before this reply could answer a newer question.
+    const command = this.deputy ? overrideCommand(body) : null;
+    if (command && this.deputy) {
+      const target = await this.deputy.byRef(command.ref);
+      const result = target
+        ? await this.deputy.correct(target, command.text, { via: "linear-session", activityId, userId })
+        : { delivered: false, reply: `${command.ref} is not an answer the deputy gave on this host, so nothing was passed on.` };
+      await this.say(sessionId, result.delivered ? "response" : "error", result.reply);
+      return;
+    }
     if (body && this.deps.route) {
       const routed = await this.deps.route.take({ kind: "reply", issueId: link.issueId, identifier: link.identifier, sessionId, ...(activityId ? { activityId } : {}), text: body });
       if (routed && "held" in routed) {
@@ -778,7 +798,11 @@ export class SessionRouter {
         return;
       }
       await this.deps.store.patch(sessionId, { questions: null });
-      await handle.respondToPermission({ requestId: question.id, response: questionAnswer(question, "", answers) });
+      const response = questionAnswer(question, "", answers);
+      const at = new Date().toISOString();
+      await handle.respondToPermission({ requestId: question.id, response });
+      await this.deputy?.ownerAnswered(link.agentId, question, response, { via: "linear-session", activityId, userId }, at)
+        .catch((error: unknown) => console.error(`[linear-tickets] recording the owner's answer in session ${sessionId} failed: ${error instanceof Error ? error.message : error}`));
       return;
     }
     if (approval) {

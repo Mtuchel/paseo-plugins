@@ -12,7 +12,7 @@ import type { IssueState } from "./linear";
 import { GitHubRateLimitedError } from "./pr-watch";
 import { ticketPullRequest, type PullRequestText } from "./pull-request-check";
 import { RateLimitedError } from "./rate-budget";
-import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { NeedsYouIssues } from "./needs-you";
 import { MAX_SUMMARY_LENGTH, ownerRequest, turnPullRequests, turnReply, Writeback } from "./writeback";
@@ -28,7 +28,7 @@ type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
 const allOn: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true,
   dispatch: DEFAULT_DISPATCH,
-  writeback: { status: true, summaries: true, blocked: true, pullRequests: true, mentions: true, autoResume: false }, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION,
+  writeback: { status: true, summaries: true, blocked: true, pullRequests: true, mentions: true, autoResume: false }, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, deputy: DEFAULT_DEPUTY,
 };
 const root: PluginHookAgent = { id: "agent-1", workspaceId: "w1", parentAgentId: null, provider: "claude", cwd: "/repo", title: "ENG-1: Fix sign-in" };
 

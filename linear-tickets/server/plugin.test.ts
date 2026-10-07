@@ -10,7 +10,7 @@ import type { PaseoApi, PaseoWorkspaceAgentCreateOptions, PaseoWorkspaceCreateOp
 import { buildContext, buildPrompt, issuePage, normalizeIssue, connection, relationships, stateHistorySpans, ticketRelations } from "./context";
 import { Credentials } from "./credentials";
 import { Launcher, safeBranchName } from "./launch";
-import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_CHEAP_MODELS, DEFAULT_STANDARD_MODELS, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_ACTIVATION } from "./settings";
+import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_CHEAP_MODELS, DEFAULT_STANDARD_MODELS, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_ACTIVATION, DEFAULT_DEPUTY } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { LinearService, postGraphQL, ADD_LABEL_QUERY, CREATE_LABEL_QUERY, LABEL_BY_NAME_QUERY, resolveReviewState, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
 import { RateBudget, RateLimitedError } from "./rate-budget";
@@ -43,7 +43,7 @@ const detail = { issue: normalizeIssue(rawIssue), teamId: "team-1", projectId: "
 const input = { id: "ENG-42", projectId: "project-1", provider: "test/model", instructions: "Add a regression check.", markInProgress: false, requestId: "5f6f1154-5838-4439-b981-b3c9d9831488" };
 // Test fakes that exercise neither the state transition nor finished blockers: no-op stubs keep the contract strict.
 const noMark = { markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] };
-const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: DEFAULT_CHEAP_MODELS, standardModels: DEFAULT_STANDARD_MODELS, reviewPeers: [], activation: DEFAULT_ACTIVATION };
+const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: DEFAULT_CHEAP_MODELS, standardModels: DEFAULT_STANDARD_MODELS, reviewPeers: [], activation: DEFAULT_ACTIVATION, deputy: DEFAULT_DEPUTY };
 
 test("server entrypoint loads and registers valid Paseo RPC contracts", () => {
   const names: string[] = [];

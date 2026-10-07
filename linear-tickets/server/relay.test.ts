@@ -6,6 +6,7 @@ import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import type { RelayComment } from "./linear";
+import type { Candidate } from "./deputy";
 import { RateLimitedError } from "./rate-budget";
 import { NeedsYouIssues } from "./needs-you";
 import { recordPluginComment } from "./agent-records";
@@ -292,4 +293,28 @@ test("a reaction the key cannot send yet stays queued; the comment is not delive
   const restarted = setup([agent], { i1: [comment("c1", "@paseo go")] }, path);
   await restarted.relay.poll(restarted.paseo);
   assert.deepEqual(restarted.events, ["react c1 eyes"]);
+});
+
+test("a reply to a deputy answer corrects that answer, not the newer question pending meanwhile; my answers are recorded as mine", async () => {
+  const newer: AgentPermissionRequest = { id: "q2", provider: "omp", name: "ask", kind: "question", title: "Split?", input: { questions: [{ question: "Split the module?", header: "Response", options: [{ label: "Keep" }, { label: "Split" }] }] } };
+  const agent = { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", pending: [newer] };
+  const { relay, paseo, events } = setup([agent], { i1: [
+    comment("c1", "use vitest instead", { parent: { id: "notice-1", userId: APP, sessionId: null } }),
+    comment("c22", "override D-0000000f not mine"),
+    comment("c333", "Keep"),
+  ] });
+  const corrections: string[] = [];
+  const answers: string[] = [];
+  const applied = { ref: "D-1a2b3c4d", identifier: "TUC-1" } as Candidate;
+  relay.recordDeputy({
+    noticeFor: async (commentId) => commentId === "notice-1" ? applied : null,
+    byRef: async () => null,
+    correct: async (candidate, text, activity) => { corrections.push(`${candidate.ref} ${text} ${activity.activityId} ${activity.userId}`); return { delivered: true, reply: "" }; },
+    ownerAnswered: async (agentId, request, _response, activity) => { answers.push(`${agentId} ${request.id} ${activity.via} ${activity.activityId} ${activity.userId}`); },
+  });
+  await relay.poll(paseo);
+  assert.deepEqual(corrections, [`D-1a2b3c4d use vitest instead c1 ${ME}`]);
+  assert.deepEqual(answers, [`a q2 linear-comment c333 ${ME}`]);
+  assert.deepEqual(events.filter((event) => event.startsWith("respond") || event.startsWith("send")), [`respond a q2 ${JSON.stringify({ behavior: "allow", updatedInput: { answers: { Response: "Keep" } } })}`], "only my plain answer answers the pending question");
+  assert.ok(events.includes("react c22 x"), "an override of an unknown deputy answer is refused, not delivered");
 });

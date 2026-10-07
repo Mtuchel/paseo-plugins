@@ -13,7 +13,7 @@ import { DrainRouter } from "./drain";
 import { Launcher } from "./launch";
 import { SessionStore } from "./sessions";
 import { ResumeUnavailableError } from "./starter";
-import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, Settings, type ActivationSettings, type PluginSettings } from "./settings";
+import { DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, Settings, type ActivationSettings, type PluginSettings } from "./settings";
 
 const OWNER = "owner-1";
 const ISSUE = "i1";
@@ -26,7 +26,7 @@ process.env.PASEO_ACTIVATION_SECRET = SECRET;
 function settingsFor(activation: ActivationSettings = DEFAULT_ACTIVATION): PluginSettings {
   return {
     template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: false,
-    dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation,
+    dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation, deputy: DEFAULT_DEPUTY,
   };
 }
 
