@@ -148,6 +148,21 @@ test("delegating a ticket and the owner's own reads use the key, not the app", a
   assert.deepEqual(forces, [], "the app's token is never asked for");
 });
 
+test("a reserved comment id is sent with the create, and a comment lookup tells 'no such comment' apart from a failure", async () => {
+  const { linear, sent } = harness({ answers: { commentById: () => ({ comment: { id: "c1" } }) } });
+  await linear.comment("i1", "hello", "11111111-1111-4111-8111-111111111111");
+  assert.deepEqual(sent[0], { auth: APP, op: "comment", mutation: true, variables: { input: { issueId: "i1", body: "hello", id: "11111111-1111-4111-8111-111111111111" } } });
+  assert.deepEqual(await linear.commentById("c1"), { id: "c1" });
+  assert.deepEqual(sent[1], { auth: KEY, op: "commentById", mutation: false, variables: { id: "c1" } }, "the lookup reads with the key, like issueById");
+
+  const gone = new LinearApiError("The Linear API request failed: Entity not found: Comment", 400, ["INPUT_ERROR"], ["Entity not found: Comment"]);
+  const missing = harness({ fail: (request) => (request.op === "commentById" ? gone : undefined) });
+  assert.equal(await missing.linear.commentById("gone"), null);
+  const down = new Error("Could not reach the Linear API. Check the host's network connection and try again.");
+  const offline = harness({ fail: (request) => (request.op === "commentById" ? down : undefined) });
+  await assert.rejects(offline.linear.commentById("gone"), (error: unknown) => error === down);
+});
+
 test("without a usable app on this host, writes go out with the key and say so once", async (t) => {
   const notInstalled = () => { throw new Error("The Paseo Linear app is not installed on this host."); };
   for (const options of [{ app: "none" as const }, { token: notInstalled }]) {

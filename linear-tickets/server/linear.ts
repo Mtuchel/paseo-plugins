@@ -36,6 +36,13 @@ export function refusedByLinear(error: unknown): boolean {
   return error instanceof LinearApiError && !(error instanceof AuthenticationError) && error.status !== 429 && error.status < 500;
 }
 
+// Linear answers a lookup of an id it has no entity for with an "Entity not found" error: a caller
+// deciding whether to write (or whether its write landed) can tell "there is none" apart from a
+// failure that may have run; network, rate-limit and auth failures all propagate.
+export function entityNotFound(error: unknown): boolean {
+  return error instanceof LinearApiError && error.reasons.some((reason) => /^Entity not found\b/.test(reason));
+}
+
 function errorDetails(payload: unknown): { codes: string[]; reasons: string[] } {
   const codes: string[] = [];
   const reasons: string[] = [];
@@ -558,6 +565,11 @@ export const REMOVE_LABEL_QUERY = `mutation removeLabel($id: String!, $labelId: 
 }`;
 export const CREATE_COMMENT_QUERY = `mutation comment($input: CommentCreateInput!) {
   commentCreate(input: $input) { success comment { id } }
+}`;
+// `comment(id:)` is a lookup, not the issue's comment list: an id Linear has no comment for comes
+// back as an "Entity not found" error, which `commentById` maps to null.
+export const COMMENT_BY_ID_QUERY = `query commentById($id: String!) {
+  comment(id: $id) { id }
 }`;
 export const UPDATE_COMMENT_QUERY = `mutation commentUpdate($id: String!, $input: CommentUpdateInput!) {
   commentUpdate(id: $id, input: $input) { success }
@@ -1413,8 +1425,23 @@ export class LinearService {
     succeeded(record(await this.write(CHANGE_LABELS_QUERY, { id: issueId, added, removed })), "issueUpdate", "change the ticket's labels");
   }
 
-  async comment(issueId: string, body: string): Promise<void> {
-    succeeded(record(await this.write(CREATE_COMMENT_QUERY, { input: { issueId, body } })), "commentCreate", "create the comment");
+  // `id`: a client-chosen UUID, so a comment whose answer was lost can be looked up (commentById)
+  // and only posted once under it.
+  async comment(issueId: string, body: string, id?: string): Promise<void> {
+    succeeded(record(await this.write(CREATE_COMMENT_QUERY, { input: { issueId, body, ...(id ? { id } : {}) } })), "commentCreate", "create the comment");
+  }
+
+  // One comment by its id, with the key like `issueById`; null when Linear has no comment with that
+  // id, so a caller that may have posted it already retries under the same id instead of trusting
+  // its own record. Any other failure (network, rate limit, auth) propagates.
+  async commentById(id: string): Promise<{ id: string } | null> {
+    try {
+      const comment = record(record(await this.withKey((key) => this.post(key, COMMENT_BY_ID_QUERY, { id }))).comment ?? {});
+      return label(comment.id) ? { id: label(comment.id) } : null;
+    } catch (error) {
+      if (entityNotFound(error)) return null;
+      throw error;
+    }
   }
 
   // Whether one of the ticket's comments contains `text`, checked on the bodies Linear returns
@@ -1443,7 +1470,7 @@ export class LinearService {
         succeeded(record(data), "commentUpdate", "update the comment");
         return commentId;
       } catch (error) {
-        if (!(error instanceof LinearApiError && error.reasons.some((reason) => /^Entity not found\b/.test(reason)))) throw error;
+        if (!entityNotFound(error)) throw error;
       }
     }
     const data = record(await this.write(CREATE_COMMENT_QUERY, { input: { issueId, body } }));

@@ -76,6 +76,25 @@ test("a refused request (403) is not a reason to refresh the app token", async (
   assert.deepEqual(posted, ["Bearer t"]);
 });
 
+test("a reserved activity id is sent with the create, and an activity lookup tells 'no such activity' apart from a failure", async () => {
+  const sent: { query: string; variables: Record<string, unknown> }[] = [];
+  const notFound = new LinearApiError("The Linear API request failed: Entity not found: AgentActivity", 400, ["INPUT_ERROR"], ["Entity not found: AgentActivity"]);
+  let lookup: Error | null = null;
+  const api = new AgentApi({ accessToken: async () => "t" }, async (_key, query, variables) => {
+    sent.push({ query, variables });
+    if (query.includes("agentActivityById")) { if (lookup) throw lookup; return { agentActivity: { id: String(variables.id) } }; }
+    return { agentActivityCreate: { success: true } };
+  });
+  await api.activity("session-1", { type: "thought", body: "hi" }, { id: "11111111-1111-4111-8111-111111111111" });
+  const create = sent[0].variables.input;
+  assert.ok(create && typeof create === "object" && "id" in create && create.id === "11111111-1111-4111-8111-111111111111", "the reserved id is carried into the create input");
+  assert.deepEqual(await api.activityById("a1"), { id: "a1" });
+  lookup = notFound;
+  assert.equal(await api.activityById("gone"), null);
+  lookup = new Error("Could not reach the Linear API. Check the host's network connection and try again.");
+  await assert.rejects(api.activityById("gone"), /Could not reach the Linear API/);
+});
+
 test("only this app's sessions are open here: another host's app never has its threads adopted", async () => {
   const node = (id: string, app: string | null) => ({ id, status: "pending", createdAt: "2026-01-01T00:00:00Z", appUser: app ? { id: app } : null, creator: { id: OWNER }, issue: { id: `i-${id}`, identifier: `TUC-${id}` } });
   const answer = (viewer: string | null) => async () => ({ viewer: viewer ? { id: viewer } : null, agentSessions: { nodes: [node("1", "server-app"), node("2", "mac-app"), node("3", null), node("4", "server-app")] } });
