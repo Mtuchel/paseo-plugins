@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { agentAppDirectory, type AgentApi } from "./agent-app";
 import { record } from "./context";
-import { CREATE_ISSUE_QUERY, type IssueLink, type LinearService, type MentioningIssue } from "./linear";
+import { CREATE_COMMENT_QUERY, CREATE_ISSUE_QUERY, UPDATE_ISSUE_STATE_QUERY, type IssueLink, type LinearService, type MentioningIssue } from "./linear";
 import { questionKey, questionsOf } from "./relay";
 import { paseoHome } from "./ticket-mcp";
 
@@ -602,7 +602,10 @@ function ticketDescription(project: Project, marker: Marker, blocks: string[]): 
   ].join("\n").trimEnd();
 }
 
-export type FileWriter = { createIssue(input: { teamId: string; projectId: string; stateId: string; title: string; description: string }): Promise<{ id: string; identifier: string; url: string }>; updateDescription(issueId: string, description: string): Promise<void> };
+// `id`: a client-chosen issue id (UUID v4) Linear refuses to create twice (the ops review's
+// create reservation, ops-review.ts); decision candidates leave it out.
+export type FileWriter = { createIssue(input: { id?: string; teamId: string; projectId: string; stateId: string; title: string; description: string }): Promise<{ id: string; identifier: string; url: string }>; updateDescription(issueId: string, description: string): Promise<void> };
+export type OpsWriter = FileWriter & { comment(issueId: string, body: string): Promise<void>; moveToState(issueId: string, stateId: string): Promise<void> };
 export type ProjectReport = { project: Project; action: "none" | "created" | "appended"; ticket: string | null; proposals: string[]; skipped: string[] };
 
 // One ticket per project per run at most: candidates whose key any candidate ticket of the project
@@ -664,7 +667,7 @@ export class AppOnlyToken {
 
 const DESCRIBE_QUERY = `mutation describe($id: String!, $description: String!) { issueUpdate(id: $id, input: { description: $description }) { success } }`;
 
-export class AppWriter implements FileWriter {
+export class AppWriter implements OpsWriter {
   constructor(private readonly api: Pick<AgentApi, "mutate">) {}
 
   private async mutate(query: string, variables: Record<string, unknown>, field: string): Promise<Record<string, unknown>> {
@@ -675,13 +678,21 @@ export class AppWriter implements FileWriter {
     return result;
   }
 
-  async createIssue(input: { teamId: string; projectId: string; stateId: string; title: string; description: string }): Promise<{ id: string; identifier: string; url: string }> {
+  async createIssue(input: { id?: string; teamId: string; projectId: string; stateId: string; title: string; description: string }): Promise<{ id: string; identifier: string; url: string }> {
     const issue = record((await this.mutate(CREATE_ISSUE_QUERY, { input }, "issueCreate")).issue ?? {});
     return { id: String(issue.id ?? ""), identifier: String(issue.identifier ?? ""), url: String(issue.url ?? "") };
   }
 
   async updateDescription(issueId: string, description: string): Promise<void> {
     await this.mutate(DESCRIBE_QUERY, { id: issueId, description }, "issueUpdate");
+  }
+
+  async comment(issueId: string, body: string): Promise<void> {
+    await this.mutate(CREATE_COMMENT_QUERY, { input: { issueId, body } }, "commentCreate");
+  }
+
+  async moveToState(issueId: string, stateId: string): Promise<void> {
+    await this.mutate(UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId }, "issueUpdate");
   }
 }
 

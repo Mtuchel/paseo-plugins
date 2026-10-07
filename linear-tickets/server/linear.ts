@@ -612,6 +612,27 @@ export const ISSUE_LINKS_QUERY = `query issueLinks($ids: [ID!]!) {
 export const PROJECT_BY_NAME_QUERY = `query projectByName($name: String!) {
   projects(first: 1, filter: { name: { eqIgnoreCase: $name } }) { nodes { id } }
 }`;
+// The weekly ops review (ops-review.ts): the team's tickets with an `ops-kind ` marker in the
+// description or in a comment, archived ones too, with every comment holding an `ops-` marker
+// (paged per ticket past the first 100); and one ticket by its id, in any state.
+export const OPS_MARKER_ISSUES_QUERY = `query opsMarkerIssues($filter: IssueFilter!, $after: String) {
+  issues(first: 50, after: $after, includeArchived: true, filter: $filter) {
+    nodes { id identifier url createdAt completedAt creator { id } state { type } description
+      comments(first: 100, filter: { body: { contains: "ops-" } }) { nodes { body createdAt } pageInfo { hasNextPage endCursor } } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export const OPS_MARKER_COMMENTS_QUERY = `query opsMarkerComments($id: String!, $after: String) {
+  issue(id: $id) { comments(first: 100, after: $after, filter: { body: { contains: "ops-" } }) { nodes { body createdAt } pageInfo { hasNextPage endCursor } } }
+}`;
+export const ISSUE_BY_ID_QUERY = `query issueById($id: ID!) {
+  issues(first: 1, includeArchived: true, filter: { id: { eq: $id } }) { nodes { id identifier url createdAt } }
+}`;
+export type OpsMarkerIssue = {
+  id: string; identifier: string; url: string; createdAt: string; completedAt: string | null; creatorId: string | null; statusType: string; description: string;
+  comments: { body: string; createdAt: string }[];
+};
+export type CreatedIssueRef = { id: string; identifier: string; url: string; createdAt: string };
 const WINDOW_PAGES = 50;
 export type IssueLink = { id: string; identifier: string; url: string; project: string };
 // `issue.parentId`: the ticket's parent (a "Needs you" sub-issue's ticket); `parentBody`: the
@@ -1479,6 +1500,40 @@ export class LinearService {
           .sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
       }];
     });
+  }
+
+  // The ops review's marker tickets (see OPS_MARKER_ISSUES_QUERY), each with all its `ops-`
+  // comments, oldest first; a ticket whose comments do not fit one page is read on until complete.
+  async opsMarkerIssues(teamId: string): Promise<OpsMarkerIssue[]> {
+    const filter = { team: { id: { eq: teamId } }, or: [{ description: { contains: "ops-kind " } }, { comments: { some: { body: { contains: "ops-kind " } } } }] };
+    const issues: OpsMarkerIssue[] = [];
+    for (const node of await this.allPages(OPS_MARKER_ISSUES_QUERY, { filter }, "issues")) {
+      const id = label(node.id);
+      if (!id) continue;
+      const page = connection(record(node.comments ?? { nodes: [] }));
+      const comments = page.nodes.map((item) => record(item));
+      let after = page.hasNextPage ? page.endCursor : null;
+      for (let round = 0; after; round++) {
+        if (round >= WINDOW_PAGES) throw new Error(`Linear returned more than ${WINDOW_PAGES} pages of comments on ${label(node.identifier)}.`);
+        const data = record(await this.withKey((key) => this.post(key, OPS_MARKER_COMMENTS_QUERY, { id, after })));
+        const next = connection(record(record(data.issue ?? {}).comments ?? {}));
+        comments.push(...next.nodes.map((item) => record(item)));
+        after = next.hasNextPage ? next.endCursor : null;
+      }
+      issues.push({
+        id, identifier: label(node.identifier), url: label(node.url), createdAt: label(node.createdAt), completedAt: label(node.completedAt) || null,
+        creatorId: label(record(node.creator ?? {}).id) || null, statusType: label(record(node.state ?? {}).type), description: label(node.description),
+        comments: comments.map((item) => ({ body: label(item.body), createdAt: label(item.createdAt) })).sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+      });
+    }
+    return issues;
+  }
+
+  // One ticket by its id (archived too); null when Linear has none with that id.
+  async issueById(id: string): Promise<CreatedIssueRef | null> {
+    const data = record(await this.withKey((key) => this.post(key, ISSUE_BY_ID_QUERY, { id })));
+    const node = connection(record(data.issues ?? {})).nodes.map((item) => record(item))[0];
+    return node && label(node.id) ? { id: label(node.id), identifier: label(node.identifier), url: label(node.url), createdAt: label(node.createdAt) } : null;
   }
 
   // Identifier, URL and project of tickets by id; tickets the key cannot see are missing.
