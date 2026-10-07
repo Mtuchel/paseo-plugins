@@ -217,6 +217,7 @@ function harness(options: { pending?: AgentPermissionRequest[]; activeAgent?: { 
     api: api as never,
     linear: {
       viewerId: async () => OWNER, appUserId: async () => "paseo-app",
+      comment: async () => {}, hasComment: async () => false, userUrl: async () => "https://linear.app/owner",
       addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); },
       complete: async (id: string) => { calls.push(`complete ${id}`); }, cancel: async (id: string, reason: string) => { calls.push(`cancel ${id}: ${reason.split("\n")[0]}`); },
       issueState: async (id: string) => ({ id, status: "Todo", statusType: "unstarted", blockedBy: options.blockedBy?.[id] ?? [] }) as IssueState,
@@ -527,6 +528,7 @@ test("a permission shows in the agent panel only while still pending, and the ti
     };
     const sessions = {
       sessionFor: async () => ({ sessionId: "s1" }), say: async () => {}, action: async () => {}, link: async () => {}, offerResume: async () => {}, resumeNow: async () => false,
+      scheduleLimitResume: async () => false,
       ask: async (_s: string, body: string, options: { value: string }[]) => { calls.push(`ask ${body.split("\n")[0]} [${options.map((o) => o.value).join("|")}]`); },
     };
     const handover = { read: async () => null, update: async () => ({}) as never, finish: async () => ({}) as never, handOff: async () => true, waiting: async () => null, setWaiting: async () => {} };

@@ -25,6 +25,7 @@ import { issueAgents, type TicketStarter } from "./starter";
 import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 import { WATCHDOG_LABEL, type TicketRoots, type WatchdogOutcome, type WatchdogRequest, type WatchdogStore } from "./watchdog";
 import type { ReviewDeletions } from "./review-deletions";
+import { availability, candidates, claims, finishPending, incidentFor, LIMIT_SPACING, limitError, limitTime, normalizeModel, updateEpisode, type LimitPending, type LimitResumeStore, type UsageReader } from "./limit-resume";
 
 const exec = promisify(execFile);
 const HANDLED_LIMIT = 200;
@@ -329,7 +330,7 @@ export function planSteps(markdown: string): string[] {
 
 type Deps = {
   api: AgentApi;
-  linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueGroup" | "delegate" | "moveToStateNamed">;
+  linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
   starter: Pick<TicketStarter, "start" | "admission">;
   // The ticket's handover record: a successor resumes from it and takes it over (succeed).
   handover: Pick<Handover, "resumeTarget" | "handOff">;
@@ -360,7 +361,10 @@ type Deps = {
   now?: () => number;
   deletions?: Pick<ReviewDeletions, "get" | "blocked" | "forAgent">;
   // The watchdog's durable owner Stop and owner continuations (watchdog.ts).
-  watchdog?: Pick<WatchdogStore, "hold" | "continued">;
+  watchdog?: Pick<WatchdogStore, "hold" | "continued" | "read">;
+  limitResumes?: LimitResumeStore;
+  usage?: Pick<UsageReader, "read" | "chains">;
+  jitter?: () => number;
   // How a bounded wait for a stopped turn pauses between reads; the tests inject one.
   sleep?: (ms: number) => Promise<void>;
   // Whether this host owns the ticket's automatic work (activation.ts claims, read only): `here`,
@@ -742,17 +746,26 @@ export class SessionRouter {
     const content = (activity.content ?? {}) as { body?: string };
     let body = String(content.body ?? activity.body ?? "").trim();
     const signal = typeof activity.signal === "string" ? activity.signal : null;
-    const link = await this.deps.store.get(sessionId);
+    let link = await this.deps.store.get(sessionId);
     if (!link) { await this.say(sessionId, "error", "No Paseo agent is linked to this session. Assign Paseo to the ticket again."); return; }
     if (await this.deps.deletions?.blocked(link.issueId)) return;
     if (activityId && !await this.deps.store.claim(sessionId, activityId)) return;
     const userId = typeof activity.userId === "string" ? activity.userId : String(((activity.user ?? {}) as { id?: string }).id ?? "");
     if (userId && userId !== await this.owner()) { await this.say(sessionId, "error", "Only the workspace owner can steer Paseo agents."); return; }
-    // The owner's Stop holds the ticket for the watchdog until the owner continues; it is saved
-    // before the Stop goes out, and any other reply of the owner is that continuation.
-    const watchdogNote = (error: unknown) => console.error(`[linear-tickets] ${link.identifier}: recording the owner's ${signal === "stop" ? "Stop" : "continuation"} for the watchdog failed: ${error instanceof Error ? error.message : error}`);
-    if (signal === "stop") await this.deps.watchdog?.hold(link.issueId, link.agentId).catch(watchdogNote);
-    else await this.deps.watchdog?.continued(link.issueId).catch(watchdogNote);
+    // The ticket lock orders owner cancellation against a due start. Re-read after waiting:
+    // a start that won the lock may have replaced the agent this reply originally named.
+    const issueId = link.issueId;
+    link = await this.exclusive(issueId, async () => {
+      const current = await this.deps.store.get(sessionId);
+      if (!current) return null;
+      const watchdogNote = (error: unknown) => console.error(`[linear-tickets] ${current.identifier}: recording the owner's ${signal === "stop" ? "Stop" : "continuation"} for the watchdog failed: ${error instanceof Error ? error.message : error}`);
+      if (signal === "stop") await this.deps.watchdog?.hold(issueId, current.agentId).catch(watchdogNote);
+      else await this.deps.watchdog?.continued(issueId).catch(watchdogNote);
+      await this.deps.limitResumes?.update((file) => finishPending(file, issueId, "cancelled"))
+        .catch((error: unknown) => console.error(`[linear-tickets] cancelling limit resume failed: ${error instanceof Error ? error.message : error}`));
+      return current;
+    });
+    if (!link) return;
 
     if (link.offer === "resume") {
       if (body.toLowerCase() === RESUME || /resume/i.test(body)) { await this.startFor(link, false); return; }
@@ -1122,6 +1135,7 @@ export class SessionRouter {
     // One listing for this sweep's parts, and a fresh one next minute.
     this.sessionList = null;
     try {
+      await this.sweepPart("limit resumes", () => this.resumeLimits());
       await this.sweepPart("queued threads", () => this.startQueued());
       await this.sweepPart("groups", () => this.advanceGroups());
       await this.sweepPart("superseded threads", () => this.closeSuperseded());
@@ -1521,6 +1535,185 @@ export class SessionRouter {
       if (outcome) await recordOutcome(link.agentId, outcome);
       else await this.say(link.sessionId, "thought", "The plan review closed without a decision (for example after a restart). Reply here if the agent should submit the plan again.").catch(() => {});
     }
+  }
+
+  // Rate/usage limits keep a durable schedule and a separate rolling-day budget.
+  async scheduleLimitResume(sessionId: string, errorText: string, model: string | null): Promise<boolean> {
+    const error = limitError(errorText);
+    const store = this.deps.limitResumes;
+    const known = await this.deps.store.get(sessionId);
+    if (!error || !store || !known || !this.paseo) return false;
+    return this.exclusive(known.issueId, async () => {
+      const link = await this.deps.store.get(sessionId);
+      if (!link?.agentId || link.closed || await this.deps.deletions?.blocked(link.issueId)) return false;
+      try {
+        await store.read(); // Never schedule by resetting an unreadable budget.
+        if ((await this.deps.watchdog?.read())?.holds[link.issueId]) return false;
+        if (!(await this.deps.settings.read()).writeback.autoResume) return false;
+        const failedAt = new Date(this.clock()).toISOString();
+        const selected = normalizeModel(/\bmodel=((?:omp\/)?[^\s,)]+)/i.exec(errorText)?.[1] ?? model ?? `${error.provider ?? "unknown"}/unknown`);
+        const provider = error.provider ?? selected.split("/")[0];
+        const models = candidates(await this.deps.usage?.chains() ?? {}, selected);
+        const reports = await this.deps.usage?.read() ?? null;
+        const now = this.clock(); // A report refreshed while awaiting the broker is still fresh.
+        const reading = reports ? availability(reports, models, now) : null;
+        const recovery = reading?.recovery;
+        const basis = recovery?.roomNow ? "room" : recovery?.earliestReset !== null && recovery?.earliestReset !== undefined ? "reset" : error.retryAfterMs ? "retry-after" : "default";
+        let resumeAt = basis === "room" ? now : basis === "reset" ? recovery!.earliestReset! + this.limitJitter() : basis === "retry-after" ? now + error.retryAfterMs! + this.limitJitter() : now + 30 * 60_000;
+        const scheduled = await store.update((file) => {
+          const recent = claims(file, link.issueId, now);
+          if (recent.length) resumeAt = Math.max(resumeAt, Math.max(...recent) + LIMIT_SPACING);
+          finishPending(file, link.issueId, "superseded");
+          (file.incidents[link.issueId] ??= []).push({ failedAgentId: link.agentId!, failedAt, provider, exhausted: recovery?.exhausted ?? false, basis, resolution: recent.length >= 4 ? "bounded" : "pending" });
+          if (reading) updateEpisode(file, provider, reading.episode, now);
+          if (recent.length >= 4) return false;
+          file.pending[link.issueId] = { identifier: link.identifier, sessionId, agentId: link.agentId!, provider, model: selected, failedAt, resumeAt: new Date(resumeAt).toISOString(), basis };
+          return true;
+        });
+        if (!scheduled) return false;
+        const text = basis === "room" && resumeAt <= now
+          ? `Usage limit on ${provider}: another account has room, so Paseo starts a new agent now.`
+          : reading?.episode.state === "exhausted"
+            ? `Usage limit on ${provider}: every account is used up. Paseo starts a new agent at ${limitTime(resumeAt, now)}, when the first one has room again.`
+            : `Usage limit on ${provider}: Paseo starts a new agent at ${limitTime(resumeAt, now)}.`;
+        await this.say(sessionId, "thought", text).catch((error: unknown) => console.error(`[linear-tickets] reporting limit resume failed: ${error instanceof Error ? error.message : error}`));
+        return true;
+      } catch (error) {
+        console.error(`[linear-tickets] scheduling limit resume failed: ${error instanceof Error ? error.message : error}`);
+        return false;
+      }
+    });
+  }
+
+  private limitJitter(): number {
+    return this.deps.jitter?.() ?? 60_000 + Math.floor(Math.random() * 240_001);
+  }
+
+  async resumeLimits(): Promise<void> {
+    const store = this.deps.limitResumes;
+    if (!store || !this.paseo) return;
+    const file = await store.read();
+    for (const [issueId, entry] of Object.entries(file.pending)) {
+      if (Date.parse(entry.resumeAt) > this.clock()) continue;
+      await this.exclusive(issueId, () => this.resumeLimit(issueId, entry)).catch((error: unknown) => console.error(`[linear-tickets] ${entry.identifier}: due limit resume failed: ${error instanceof Error ? error.message : error}`));
+    }
+    // Confirm recovery even when nothing is due, so a later exhaustion is a new episode.
+    const episodes = (await store.read()).episodes;
+    if (Object.keys(episodes).length) {
+      const reports = await this.deps.usage?.read() ?? null;
+      if (reports) await store.update((current) => {
+        for (const provider of Object.keys(current.episodes)) updateEpisode(current, provider, availability(reports, [`${provider}/unknown`], this.clock()).episode, this.clock());
+      });
+    }
+    await this.reportLimitEpisodes();
+  }
+
+  private async resumeLimit(issueId: string, expected: LimitPending): Promise<void> {
+    const store = this.deps.limitResumes!;
+    const entry = (await store.read()).pending[issueId];
+    if (!entry || entry.agentId !== expected.agentId || entry.failedAt !== expected.failedAt || Date.parse(entry.resumeAt) > this.clock()) return;
+    if (!(await this.deps.settings.read()).writeback.autoResume) {
+      await store.update((file) => finishPending(file, issueId, "switched-off"));
+      await this.offerResume(entry.sessionId);
+      return;
+    }
+    if ((await this.deps.watchdog?.read())?.holds[issueId]) {
+      await store.update((file) => finishPending(file, issueId, "cancelled"));
+      return;
+    }
+    const link = await this.deps.store.get(entry.sessionId);
+    if (!link || link.closed || link.agentId !== entry.agentId || await this.deps.deletions?.blocked(issueId)
+      || (await this.agent(entry.agentId))?.agent.status !== "error" || await this.liveSuccessorFor(issueId, [entry.agentId])) {
+      await store.update((file) => finishPending(file, issueId, "superseded"));
+      return;
+    }
+    const gate = this.deps.launcher.gate(issueId);
+    if (!gate) return;
+    try {
+      if (await this.processWait(issueId)) return;
+      if (entry.basis === "reset" || entry.basis === "default") {
+        const reports = await this.deps.usage?.read() ?? null;
+        if (reports) {
+          const reading = availability(reports, candidates(await this.deps.usage?.chains() ?? {}, entry.model), this.clock());
+          const postponed = await store.update((file) => {
+            updateEpisode(file, entry.provider, reading.episode, this.clock());
+            if (!reading.recovery.roomNow && reading.recovery.earliestReset !== null && reading.recovery.earliestReset > this.clock()) {
+              file.pending[issueId].resumeAt = new Date(reading.recovery.earliestReset + this.limitJitter()).toISOString();
+              return true;
+            }
+            return false;
+          });
+          if (postponed) return;
+        }
+      }
+      const result = await store.update((file) => {
+        const current = file.pending[issueId];
+        if (!current || current.agentId !== entry.agentId || current.failedAt !== entry.failedAt) return "gone";
+        if (claims(file, issueId, this.clock()).length >= 4) { finishPending(file, issueId, "bounded"); return "bounded"; }
+        const incident = incidentFor(file, issueId, current);
+        incident.claimedAt = new Date(this.clock()).toISOString();
+        incident.resolution = "claimed";
+        delete file.pending[issueId];
+        return "claimed";
+      });
+      if (result === "bounded") { await this.offerResume(entry.sessionId); return; }
+      if (result !== "claimed") return;
+      let failure: unknown;
+      try { await this.startNow(link, false); } catch (error) { failure = error; }
+      const after = await this.deps.store.get(entry.sessionId);
+      const outcome = after?.agentId && after.agentId !== entry.agentId ? "started" : after?.remote ? "forwarded" : after?.queued ? "pending" : "failed";
+      await store.update((file) => {
+        const incident = incidentFor(file, issueId, entry);
+        incident.resolution = outcome;
+        if (outcome === "started") incident.startedAt = new Date(this.clock()).toISOString();
+        if (outcome === "pending") {
+          delete incident.claimedAt;
+          file.pending[issueId] = { ...entry, resumeAt: new Date(this.clock() + 5 * 60_000).toISOString() };
+        }
+      });
+      if (outcome === "pending") await this.deps.store.patch(entry.sessionId, { queued: false, queueReason: undefined });
+      if (failure) console.error(`[linear-tickets] ${entry.identifier}: limit resume ${outcome}: ${failure instanceof Error ? failure.message : failure}`);
+      if (outcome === "failed") await this.offerResume(entry.sessionId);
+    } finally { gate.release(); }
+  }
+
+  // Serialized across tickets: one durable mention per provider episode, including lost replies.
+  private limitReports: Promise<unknown> = Promise.resolve();
+  private reportLimitEpisodes(): Promise<void> {
+    const run = this.limitReports.then(async () => {
+      const store = this.deps.limitResumes!;
+      await store.update((file) => {
+        for (const [provider, episode] of Object.entries(file.episodes)) {
+          if (episode.mention || Math.max(Date.parse(episode.until ?? episode.since), Date.parse(episode.lastConfirmedAt)) - Date.parse(episode.since) <= 6 * 60 * 60_000) continue;
+          const waiting = Object.entries(file.pending).find(([, entry]) => entry.provider === provider);
+          if (waiting) episode.mention = { issueId: waiting[0], key: `limit-resume:${provider}:${episode.since}`, attempted: false, posted: false };
+        }
+      });
+      for (const [provider, episode] of Object.entries((await store.read()).episodes)) {
+        const mention = episode.mention;
+        if (!mention || mention.posted) continue;
+        try {
+          const mark = `\`${mention.key}\``;
+          if (mention.attempted && await this.deps.linear.hasComment(mention.issueId, mark)) {
+            await store.update((file) => { const current = file.episodes[provider]?.mention; if (current?.key === mention.key) current.posted = true; });
+            continue;
+          }
+          const owner = await this.deps.linear.userUrl(await this.owner());
+          const attempted = await store.update((file) => {
+            const current = file.episodes[provider];
+            if (!current?.mention || current.mention.key !== mention.key) return null;
+            current.mention.attempted = true;
+            return { until: current.until };
+          });
+          if (!attempted) continue;
+          const until = attempted.until ? `until ${limitTime(Date.parse(attempted.until), this.clock(), true)}` : "with no known reset time";
+          await this.deps.linear.comment(mention.issueId, `${owner} All ${provider} accounts are used up ${until}. The agent on this ticket continues then; other tickets stopped by the same limit wait for the same time without another mention.\n\n${mark}`);
+          await store.update((file) => { const current = file.episodes[provider]?.mention; if (current?.key === mention.key) current.posted = true; });
+        } catch (error) { console.error(`[linear-tickets] reporting ${provider} usage exhaustion failed: ${error instanceof Error ? error.message : error}`); }
+      }
+    });
+    this.limitReports = run.catch(() => undefined);
+    return run;
   }
 
   // Automatic retry after a failure, at most once an hour per ticket. In the ticket's turn and under

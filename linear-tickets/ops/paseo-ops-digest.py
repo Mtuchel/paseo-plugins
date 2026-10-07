@@ -7,7 +7,8 @@ on the Mac). Each run:
      (merge queue, drops, PRs open > 5 h, Railway deploys) in its own detached worktree at
      origin/main (never the shared local `main`, never `gt`);
   2. reads the Paseo agents of this host and of every host in ~/.paseo/ops-digest/remotes
-     (over SSH, `--agents-json`): in error, waiting on the owner (permission or open plan
+     (over SSH, `--agents-json`): in error (a rate-limited agent names the restart the plugin
+     scheduled for it, TUC-1206), waiting on the owner (permission or open plan
      review), ticket agents silent for more than 2 h, and tickets still labelled
      `<dispatch label>-running` without a live agent; and how many proposals in open
      "Decision candidates" tickets still wait for the owner's answer (TUC-748; a count only,
@@ -86,6 +87,7 @@ REMOTES = f"{DIR}/remotes"
 TREND = f"{DIR}/trend.json"
 PR_WATCH = f"{HOME}/linear-tickets/pr-watch.json"
 CRASHES = f"{HOME}/linear-tickets/crash-recovery.json"
+LIMIT_RESUMES = f"{HOME}/linear-tickets/limit-resumes.json"
 PULL_URL = "https://github.com/tuchel-sohn/tuchel-platform/pull/{}"
 HISTORY = "history.jsonl"
 HISTORY_BACKFILL = "history-backfill.jsonl"
@@ -185,6 +187,58 @@ def agent_error_category(line):
     return "other error"
 
 
+# ---------------------------------------------------------------------------- limit resumes (pure)
+
+def parse_limit_resumes(data):
+    """The linear-tickets limit-resume store (TUC-1206) as {"pending", "started"}, or None when
+    it is not a version 1 record. `pending` maps a failed agent's id to the epoch second its
+    restart is scheduled for; `started` names the agents whose scheduled restart has started.
+    Malformed entries are skipped: one bad record never hides the others."""
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return None
+    pending = {}
+    for entry in (data.get("pending") if isinstance(data.get("pending"), dict) else {}).values():
+        if not isinstance(entry, dict):
+            continue
+        agent_id = entry.get("agentId")
+        resume_at = parse_iso(entry.get("resumeAt")) if isinstance(entry.get("resumeAt"), str) else None
+        if isinstance(agent_id, str) and agent_id and resume_at is not None:
+            pending[agent_id] = resume_at
+    started = set()
+    incidents = data.get("incidents") if isinstance(data.get("incidents"), dict) else {}
+    for found in incidents.values():
+        for incident in found if isinstance(found, list) else ():
+            agent_id = incident.get("failedAgentId") if isinstance(incident, dict) else None
+            if isinstance(agent_id, str) and agent_id and incident.get("resolution") == "started":
+                started.add(agent_id)
+    return {"pending": pending, "started": started}
+
+
+def merge_limit_resumes(local, snapshots):
+    """The local store plus every other host's store from its snapshot: entries name their own
+    host's agents, so they merge by failed agent id. None when the local store is unreadable
+    (the digest then names no restart at all rather than guessing); a snapshot without the key
+    adds nothing (an older host: its agents show the bare error)."""
+    if local is None:
+        return None
+    pending, started = dict(local["pending"]), set(local["started"])
+    for snapshot in snapshots:
+        data = snapshot.get("limitResumes") if isinstance(snapshot, dict) else None
+        if not isinstance(data, dict):
+            continue
+        remote = data.get("pending") if isinstance(data.get("pending"), dict) else {}
+        pending.update({k: v for k, v in remote.items() if isinstance(k, str) and isinstance(v, (int, float))})
+        started |= {i for i in (data.get("started") if isinstance(data.get("started"), list) else [])
+                    if isinstance(i, str)}
+    return {"pending": pending, "started": started}
+
+
+def resume_time(ts, now):
+    """A scheduled restart as HH:MM, with its day (DD.MM.) in front when it is not today (Berlin)."""
+    at, today = datetime.fromtimestamp(ts, TZ), datetime.fromtimestamp(now, TZ)
+    return at.strftime("%d.%m. %H:%M" if at.date() != today.date() else "%H:%M")
+
+
 # ---------------------------------------------------------------------------- agents (pure)
 
 def tickets_of(agent, meta, teams):
@@ -206,11 +260,13 @@ def agent_title(agent):
     return f"agent {agent['id'][:7]} \"{(agent.get('name') or '')[:60]}\""
 
 
-def agent_items(agents, metas, *, now, error_lines, permissions, open_reviews, teams, ticket_states):
+def agent_items(agents, metas, *, now, error_lines, permissions, open_reviews, teams, ticket_states, limit_resumes):
     """Items for the agents section. `ticket_states` is None when Linear could not be read:
     then silent agents cannot be judged (their unit fails, previous items are kept).
     Closed agents are parked, not gone (paseo-archive-done.py closes long-idle ones; the next
-    message loads them again), so they are judged for silence like idle ones."""
+    message loads them again), so they are judged for silence like idle ones.
+    `limit_resumes` is the plugin's limit-resume store with every host's entries merged in (None
+    when unreadable): an error agent with a pending restart names the time it comes back."""
     items = []
     for agent in agents:
         meta = metas.get(agent["id"], {})
@@ -225,9 +281,12 @@ def agent_items(agents, metas, *, now, error_lines, permissions, open_reviews, t
         at_host = f"@{agent['_host']}" if agent.get("_host") else ""
         base = {"title": agent_title(agent), "ticket": ticket, "command": f"{paseo} logs {short} --tail 5"}
         if agent.get("status") == "error":
+            detail = f"in error: {agent_error_category(error_lines.get(agent['id']))}"
+            resume = (limit_resumes or {}).get("pending", {}).get(agent["id"])
+            if resume is not None:
+                detail += f" (resumes at {resume_time(resume, now)})"
             items.append({**base, "key": f"agent-error:{agent['id']}", "unit": f"agents{at_host}", "section": "agents",
-                          "group": "error", "attention": True,
-                          "detail": f"in error: {agent_error_category(error_lines.get(agent['id']))}"})
+                          "group": "error", "attention": True, "detail": detail})
         for perm in permissions.get(agent["id"], []):
             items.append({**base, "key": f"agent-waiting:{agent['id']}:{perm['id']}", "unit": f"agents{at_host}",
                           "section": "agents", "group": "waiting", "attention": True,
@@ -574,16 +633,20 @@ def item_host(payload, host):
 def item_evidence(key, payload, at, host, evidence):
     """(owner, auto) as observed at this run. owner: the item waits on the owner, or its pull
     request watch / crash record escalated to the owner. auto: the watch nudged, handled a drop,
-    ran a queue action or re-requested a Greptile review, or the agent was restarted. None: unknown
-    (another host's item, an unreadable record file, a kind without a record). Only these two flags
-    leave the records."""
+    ran a queue action or re-requested a Greptile review, or the agent was restarted (crash
+    recovery, or the limit-resume store where the incident resolved `started`; a pending,
+    cancelled or claimed one earns nothing). None: unknown (another host's item, an unreadable
+    record file, a kind without a record). Only these two flags leave the records."""
     waiting = True if payload.get("group") == "waiting" else None
     pull, agent = PULL_KEY.match(key), AGENT_KEY.match(key)
     if (at is not None and at != host) or not (pull or agent):
         return waiting, None
     records = evidence.get("prWatch") if pull else evidence.get("crashes")
+    resumes = None if pull else evidence.get("limitResumes")
+    credited = (not pull and key.startswith("agent-error:") and isinstance(resumes, dict)
+                and agent.group(1) in (resumes.get("started") or ()))
     if records is None:
-        return waiting, None
+        return (waiting, True) if credited else (waiting, None)
     record = records.get(PULL_URL.format(pull.group(1)) if pull else agent.group(1))
     record = record if isinstance(record, dict) else {}
     owner = waiting or bool(record.get("escalated"))
@@ -591,10 +654,11 @@ def item_evidence(key, payload, at, host, evidence):
         nudges = record.get("nudges")
         auto = (isinstance(nudges, dict) and any(isinstance(v, list) and v for v in nudges.values())
                 or bool(record.get("drops")) or bool(record.get("actions")) or bool(record.get("greptile")))
-    else:
-        restarts = record.get("restarts")
-        auto = isinstance(restarts, (int, float)) and restarts > 0
-    return owner, bool(auto)
+        return owner, bool(auto)
+    restarts = record.get("restarts")
+    if (isinstance(restarts, (int, float)) and restarts > 0) or credited:
+        return owner, True
+    return owner, None if key.startswith("agent-error:") and resumes is None else False
 
 
 def item_line(event, key, payload, first_seen, t, at, *, stale, owner, auto):
@@ -778,9 +842,23 @@ class HostIO:
         self.remotes()
         return dict(self._unreachable)
 
+    def limit_resumes(self):
+        """The limit-resume store of the linear-tickets plugin, with every other host's store
+        from its snapshot merged in (TUC-1206; their entries name their own agents). None when
+        the local file is unreadable or invalid; a missing file is "nothing scheduled"."""
+        try:
+            with open(LIMIT_RESUMES) as f:
+                local = parse_limit_resumes(json.load(f))
+        except FileNotFoundError:
+            local = {"pending": {}, "started": set()}
+        except (OSError, ValueError):
+            local = None
+        return merge_limit_resumes(local, self.remotes())
+
     def evidence(self):
-        """The pull request watch and crash recovery records of the linear-tickets plugin, as
-        they are now (each None when unreadable); history lines keep only owner/auto flags."""
+        """The pull request watch, crash recovery and limit-resume records of the linear-tickets
+        plugin, as they are now (each None when unreadable); history lines keep only owner/auto
+        flags."""
         found = {}
         for name, path in (("prWatch", PR_WATCH), ("crashes", CRASHES)):
             try:
@@ -789,14 +867,20 @@ class HostIO:
             except (OSError, ValueError):
                 data = None
             found[name] = data if isinstance(data, dict) else None
+        found["limitResumes"] = self.limit_resumes()
         return found
 
     def snapshot(self):
-        """This host's agent data for another host's digest (--agents-json)."""
+        """This host's agent data for another host's digest (--agents-json), JSON-safe (the
+        limit-resume store's set becomes a sorted list)."""
         agents, metas = self.agents()
         live_ids = {a["id"] for a in agents if a.get("status") != "closed"}
+        resumes = self.limit_resumes()
+        safe_resumes = None
+        if resumes is not None:
+            safe_resumes = {"pending": resumes["pending"], "started": sorted(resumes["started"])}
         return {"agents": agents, "metas": metas, "permissions": self.permissions(),
-                "reviews": self.open_reviews(live_ids),
+                "reviews": self.open_reviews(live_ids), "limitResumes": safe_resumes,
                 "errorLines": {a["id"]: self.error_line(a["id"]) for a in agents if a.get("status") == "error"}}
 
     def key(self):
@@ -1213,7 +1297,8 @@ def collect(io, now, started):
         except Exception as exc:
             units.append({"unit": "silent", "ok": False, "category": error_category(exc)})
         items += agent_items(agents, metas, now=now, error_lines=error_lines, permissions=permissions,
-                             open_reviews=reviews, teams=teams or {"TUC"}, ticket_states=states)
+                             open_reviews=reviews, teams=teams or {"TUC"}, ticket_states=states,
+                             limit_resumes=io.limit_resumes())
         silent = units[-1]
         down = io.unreachable_hosts()
         for host, category in sorted(down.items()):
