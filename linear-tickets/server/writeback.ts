@@ -12,6 +12,7 @@ import type { NeedsYouIssues } from "./needs-you";
 import { PLANNING_STATE } from "./plannotator";
 import { PLAN_POLICY_LABEL } from "./plan-policy";
 import { logQuietly, questionEntry, type DecisionLog } from "./owner-decisions";
+import type { Deputy } from "./deputy";
 import { ticketPullRequest, type PullRequestCheck } from "./pull-request-check";
 import { RateLimitedError } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
@@ -175,6 +176,9 @@ export class Writeback {
   private recovered = false;
   // Where the owner's answers to questions are kept for the weekly decision candidates.
   private decisions: Pick<DecisionLog, "append" | "answer"> | null = null;
+  // The deputy for agent questions (README, "Deputy for agent questions"), shown each question
+  // after the owner was, and told when a request is resolved.
+  private deputy: Pick<Deputy, "observe" | "resolved"> | null = null;
 
   // `needsYou`: where waits on closed tickets keep their sub-issues; without it such a wait only
   // labels and comments on the closed ticket. `checkPullRequest`: whether a pull request URL from
@@ -183,6 +187,10 @@ export class Writeback {
 
   recordDecisions(log: Pick<DecisionLog, "append" | "answer">): void {
     this.decisions = log;
+  }
+
+  recordDeputy(deputy: Pick<Deputy, "observe" | "resolved">): void {
+    this.deputy = deputy;
   }
 
   // The running model, and the agent with its title: hook events can carry none.
@@ -611,7 +619,10 @@ export class Writeback {
         });
         return asked;
       }) ?? false;
-      if (!settings.writeback.blocked) return;
+      // The owner sees the question first; the deputy only starts looking at it now, in the
+      // background, and never answers before the owner's grace period ends.
+      const observe = () => this.deputy?.observe(agent, request, { issueId, identifier });
+      if (!settings.writeback.blocked) { await observe(); return; }
       // Posted even with the agent panel: only a mention reaches the owner's inbox and phone.
       const what = request.kind === "question" ? "an answer" : request.kind === "plan" ? "plan approval" : "permission";
       const subject = request.title || request.name;
@@ -622,6 +633,7 @@ export class Writeback {
         ? `\n\nReply here with ${request.kind === "question" ? "“@paseo <your answer>”" : "“@paseo approve” or “@paseo deny <reason>”"}.`
         : "";
       await this.markWaiting({ id: issueId, identifier }, agent, settings, subject, `**${agent.title ?? "Paseo agent"}** (Paseo) is waiting for ${what}: ${subject}${description}${options}${hint}`, inSession, context);
+      await observe();
     });
   }
 
@@ -631,6 +643,7 @@ export class Writeback {
     return this.run("permission_resolved", agent, paseo, async ({ issueId, identifier }, settings) => {
       const log = this.decisions;
       if (log) await logQuietly(() => log.answer(`${agent.id}:${requestId}`, resolution), `answer on ${identifier}`);
+      await this.deputy?.resolved(agent.id, requestId);
       if (!settings.writeback.blocked) return;
       await new Promise((resolve) => setTimeout(resolve, this.settleMs));
       const refreshed = await paseo.agents.ref(agent.id).refresh().catch(() => null);
