@@ -2263,6 +2263,20 @@ No tokens, query bodies or ticket text appear in the report.
   `webhooks` (delivered since the plugin loaded), `sweepReads`, `sweepSkips` and `webhookReads`;
   `sweepSkips` against `sweepReads + sweepSkips` is how much of the saving the webhooks actually
   cover.
+- **Waiting threads are read in batches.** Every sweep checks each queued thread (waiting for
+  blockers, a slot, or a live OMP worker of its ticket to exit) for a session that ended in Linear
+  and, once nothing local holds it, for a ticket moved to Done or Canceled. These reads used to
+  be one request per thread: on server087 on 2026-10-07, 62 waiting threads (55 behind a live OMP
+  worker) made `session-sweep.queued threads` 1,678–1,951 requests an hour, 34–39% of the app's
+  5,000. Now the sweep reads all waiting threads' session states up front, 50 aliased
+  `agentSession` lookups per request (`sessionStatuses`, about 2 points each), and the first
+  thread that needs its ticket's state reads it for every later thread in one `issueStatuses`
+  request. Those 62 threads cost 2 + 1 requests a sweep instead of 62 + 7, plus the unchanged
+  dependency read of `starter.admission` for each of the 7 that reached it. A session Linear no
+  longer has makes Linear refuse the whole batch; its alias is dropped, the rest are read again,
+  and that thread is read alone as before. Anything a batch does not return is read alone, and a
+  failed batch fails each thread's check as its own read did. The per-thread order, gates and
+  outcomes are unchanged; the states are read up to one sweep pass earlier than before.
 - **Three priorities reserve room for owner intent on both dimensions.**
   - Background work leaves **20%**: auto-dispatch, comment relay, project flow, label repair,
     health, label rules, manual tasks, plan requests, PR watch, queue backstop, state labels
@@ -3011,7 +3025,8 @@ and validation, repository orientation (guide matching, ranking and the cap), cr
 settings persistence, ticket retrieval, state-transition
 resolution and failure handling, agent creation/retries with mocked Linear and Paseo
 calls, the session sweep's webhook-driven activity reads (skipped while a webhook is fresh, the
-5-minute fallback, the minute sweep without webhooks), and the pull request view (CI summaries,
+5-minute fallback, the minute sweep without webhooks), the waiting threads' batched status reads
+(120 threads in four requests; a session Linear no longer has is dropped and read alone), and the pull request view (CI summaries,
 merge queue parsing, polling cadence, the GitHub budget's reserve and its routed bypass,
 labelling) against a fake GitHub, the decision candidates (the log, the collector's sources
 and exclusions, window limits, candidate identity, one ticket per project, app-only filing)

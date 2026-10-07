@@ -15,7 +15,7 @@ import { groupProgress, groupStatus, isGroup } from "./groups";
 import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
 import { dispatchLabels } from "./dispatch";
 import type { Handover } from "./handover";
-import type { IssueGroup, LinearService } from "./linear";
+import type { IssueGroup, IssueState, IssueStatus, LinearService } from "./linear";
 import type { Launcher } from "./launch";
 import { CODING_STATE } from "./plannotator";
 import type { NeedsYouIssues } from "./needs-you";
@@ -334,7 +334,7 @@ export function planSteps(markdown: string): string[] {
 
 type Deps = {
   api: AgentApi;
-  linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
+  linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "issueStatuses" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
   starter: Pick<TicketStarter, "start" | "admission">;
   // The ticket's handover record: a successor resumes from it and takes it over (succeed).
   handover: Pick<Handover, "resumeTarget" | "handOff">;
@@ -379,6 +379,10 @@ type Deps = {
   // `elsewhere` (the peer host does), or `unknown` (its state is unreadable). Absent: here.
   owner?: (issueId: string) => Promise<HostOwnership>;
 };
+
+// One queue pass's Linear reads (see startQueued): the waiting threads' session states, or the
+// error their batched read failed with, and each ticket's workflow state on demand.
+type QueuedReads = { sessions: Map<string, string> | Error; ticket: (issueId: string) => Promise<Pick<IssueState, "status" | "statusType">> };
 
 // How long a watchdog Stop waits for the turn to end before it counts as failed.
 const STOP_WAIT_MS = 60_000;
@@ -977,9 +981,21 @@ export class SessionRouter {
   // (or a failed send of its comment) leaves it queued for the next sweep, a failed start ends the
   // wait with an error in the thread (as for a ticket that was never queued). A ticket that has an
   // agent meanwhile is linked to it without waiting for a slot: linking starts nothing.
+  // Linear counts requests, not threads: the waiting threads' session states are read in batches
+  // up front, and their tickets' workflow states in one batch once a thread first needs one
+  // (README, "Rate limits").
   async startQueued(): Promise<void> {
-    for (const link of await this.deps.store.all()) {
-      if (!link.queued || link.agentId || link.closed) continue;
+    const waiting = (await this.deps.store.all()).filter((link) => link.queued && !link.agentId && !link.closed);
+    if (!waiting.length) return;
+    let sessions: Map<string, string> | Error;
+    try {
+      sessions = await this.deps.api.sessionStatuses(waiting.map((link) => link.sessionId));
+    } catch (error) {
+      if (error instanceof RateLimitedError) throw error;
+      sessions = error instanceof Error ? error : new Error(String(error));
+    }
+    const reads: QueuedReads = { sessions, ticket: this.ticketStatuses(waiting.map((link) => link.issueId)) };
+    for (const link of waiting) {
       if (await this.deps.deletions?.blocked(link.issueId)) continue;
       const gate = this.deps.launcher.gate(link.issueId);
       if (!gate) {
@@ -987,18 +1003,31 @@ export class SessionRouter {
         continue;
       }
       try {
-        await this.startQueuedThread(link);
+        await this.startQueuedThread(link, reads);
       } finally {
         gate.release();
       }
     }
   }
 
-  private async startQueuedThread(link: SessionLink): Promise<void> {
+  // A ticket's workflow state for this queue pass. The first thread that needs one reads it for
+  // itself and every ticket after it in one batch; a ticket the batch does not return is read alone,
+  // as before batching. A failed batch fails each thread that needs it, as its own read would.
+  private ticketStatuses(issueIds: string[]): (issueId: string) => Promise<Pick<IssueState, "status" | "statusType">> {
+    let batch: Promise<Map<string, IssueStatus>> | null = null;
+    return async (issueId) => {
+      batch ??= this.deps.linear.issueStatuses([...new Set(issueIds.slice(issueIds.indexOf(issueId)))]);
+      const found = (await batch).get(issueId);
+      return found ?? this.deps.linear.issueStatus(issueId);
+    };
+  }
+
+  private async startQueuedThread(link: SessionLink, reads: QueuedReads): Promise<void> {
     try {
       // Terminal Linear threads must not wait behind capacity, dependencies, routing or orphans.
       // A failed read leaves the queue and its owner's undelivered text intact.
-      const status = await this.deps.api.sessionStatus(link.sessionId);
+      if (reads.sessions instanceof Error) throw reads.sessions;
+      const status = reads.sessions.get(link.sessionId) ?? await this.deps.api.sessionStatus(link.sessionId);
       if (!status || status === "complete" || status === "error") {
         await this.deps.store.patch(link.sessionId, { queued: false, queueReason: undefined, restartRequested: undefined, ...(status === "complete" ? { closed: true } : {}) });
         console.log(`[linear-tickets] ${link.identifier}: queued thread ended in Linear (${status ?? "gone"}); no agent started`);
@@ -1025,7 +1054,7 @@ export class SessionRouter {
         if (link.queueReason !== wait) await this.deps.store.patch(link.sessionId, { queueReason: wait });
         return;
       }
-      const ticket = await this.deps.linear.issueStatus(link.issueId);
+      const ticket = await reads.ticket(link.issueId);
       if (await this.deps.deletions?.blocked(link.issueId)) return;
       if (ticket.statusType === "completed" || ticket.statusType === "canceled") {
         await this.deps.store.patch(link.sessionId, { queued: false, queueReason: undefined, restartRequested: undefined });

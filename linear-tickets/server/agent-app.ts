@@ -124,6 +124,13 @@ const OPEN_SESSIONS_QUERY = `query openSessions($first: Int!) {
 const SESSION_STATUS_QUERY = `query sessionStatus($id: String!) {
   agentSession(id: $id) { status }
 }`;
+// Aliased lookups: `s0`…`s<n-1>` bound to the session ids. At about 2 points each, a full batch
+// stays far below Linear's 10,000-point query ceiling.
+export const SESSION_STATUSES_BATCH = 50;
+function sessionStatusesQuery(count: number): string {
+  const indexes = Array.from({ length: count }, (_, index) => index);
+  return `query sessionStatuses(${indexes.map((index) => `$s${index}: String!`).join(", ")}) {\n${indexes.map((index) => `  s${index}: agentSession(id: $s${index}) { status }`).join("\n")}\n}`;
+}
 const SESSION_ACTIVITIES_QUERY = `query sessionActivities($id: String!) {
   agentSession(id: $id) { activities(first: 50) { nodes { id createdAt signal user { id } content {
     __typename
@@ -246,6 +253,37 @@ export class AgentApi {
   async sessionStatus(sessionId: string): Promise<string | null> {
     const session = record(await this.call(SESSION_STATUS_QUERY, { id: sessionId })).agentSession;
     return session ? String(record(session).status ?? "") || null : null;
+  }
+
+  // Several sessions' statuses, one request per SESSION_STATUSES_BATCH ids (Linear has no id filter
+  // on `agentSessions`, so each id is an aliased `agentSession` lookup). Linear answers a batch
+  // that names an id it has no session for with no data at all, so those ids are dropped and the
+  // rest read again; a dropped id is absent from the result, as is one Linear returned no status
+  // for, and its caller reads it alone (`sessionStatus`). Every other failure propagates.
+  async sessionStatuses(sessionIds: string[]): Promise<Map<string, string>> {
+    const result = new Map<string, string>();
+    const ids = [...new Set(sessionIds)];
+    for (let start = 0; start < ids.length; start += SESSION_STATUSES_BATCH) {
+      let chunk = ids.slice(start, start + SESSION_STATUSES_BATCH);
+      while (chunk.length) {
+        let data: Record<string, unknown>;
+        try {
+          data = await this.call(sessionStatusesQuery(chunk.length), Object.fromEntries(chunk.map((id, index) => [`s${index}`, id])));
+        } catch (error) {
+          const missing = new Set(error instanceof LinearApiError && entityNotFound(error) && error.reasons.every((reason) => /^Entity not found\b/.test(reason)) ? error.fields : []);
+          const rest = chunk.filter((_, index) => !missing.has(`s${index}`));
+          if (!missing.size || rest.length === chunk.length) throw error;
+          chunk = rest;
+          continue;
+        }
+        chunk.forEach((id, index) => {
+          const status = String(record(data[`s${index}`] ?? {}).status ?? "");
+          if (status) result.set(id, status);
+        });
+        break;
+      }
+    }
+    return result;
   }
 
   async activities(sessionId: string): Promise<AgentActivity[]> {

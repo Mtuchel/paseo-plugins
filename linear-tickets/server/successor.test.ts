@@ -11,7 +11,7 @@ import type { ActivationResume } from "./activation";
 import { Dispatcher } from "./dispatch";
 import { Handover } from "./handover";
 import { Launcher, LEAD_INTRO, type ResumeTarget } from "./launch";
-import type { IssueState, LabeledIssue } from "./linear";
+import type { IssueState, IssueStatus, LabeledIssue } from "./linear";
 import { SessionRouter, SessionStore, type HostOwnership, type SessionLink, type Succession } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { ResumeUnavailableError, TicketStarter, type Started } from "./starter";
@@ -160,6 +160,11 @@ class FakeLinear {
     return { status: this.status, statusType: this.statusType };
   }
 
+  // Returns nothing, so each ticket is read alone through `issueStatus` (the batch's fallback).
+  async issueStatuses(_ids: string[]): Promise<Map<string, IssueStatus>> {
+    return new Map();
+  }
+
   async detail(id: string): Promise<TicketDetail> {
     return {
       issue: { id, identifier: identifierOf(id), title: "Fix the sign-in flow", url: `https://linear.app/i/${id}`, branchName: BRANCH, project: "App", team: "Engineering", labels: [] },
@@ -246,6 +251,7 @@ function routerHarness(options: {
       openSessions: async () => [],
       activities: async () => [],
       sessionStatus: options.sessionStatus ?? (async () => "active"),
+      sessionStatuses: async () => new Map(),
     } as never,
     linear: linear as never,
     starter: starter as never,
@@ -462,7 +468,7 @@ test("the claimed instruction is the last part of the created agent's first prom
 
     const calls: string[] = [];
     const router = new SessionRouter({
-      api: { activity: async () => {}, updateSession: async () => {}, createSessionOnIssue: async () => "s-new", openSessions: async () => [], activities: async () => [], sessionStatus: async () => "active" } as never,
+      api: { activity: async () => {}, updateSession: async () => {}, createSessionOnIssue: async () => "s-new", openSessions: async () => [], activities: async () => [], sessionStatus: async () => "active", sessionStatuses: async () => new Map() } as never,
       linear: linear as never,
       starter: starter as never,
       handover,
@@ -502,7 +508,7 @@ test("a real admission refusal leaves the instruction unclaimed", async (t) => {
   } as never);
   const calls: string[] = [];
   const router = new SessionRouter({
-    api: { activity: async () => {}, updateSession: async () => {}, createSessionOnIssue: async () => "s-new", openSessions: async () => [], activities: async () => [], sessionStatus: async () => "active" } as never,
+    api: { activity: async () => {}, updateSession: async () => {}, createSessionOnIssue: async () => "s-new", openSessions: async () => [], activities: async () => [], sessionStatus: async () => "active", sessionStatuses: async () => new Map() } as never,
     linear: linear as never,
     starter: starter as never,
     handover: { resumeTarget: async () => ({ branch: BRANCH, worktreePath: null, handover: "Continue." }), handOff: async () => true } as never,
@@ -591,7 +597,7 @@ test("a dispatch paused inside the start holds the ticket's gate: the watch wait
   const calls: string[] = [];
   const claim = async () => { calls.push("claim"); };
   const router = new SessionRouter({
-    api: { activity: async () => {}, updateSession: async () => {}, createSessionOnIssue: async () => "s-new", openSessions: async () => [], activities: async () => [], sessionStatus: async () => "active" } as never,
+    api: { activity: async () => {}, updateSession: async () => {}, createSessionOnIssue: async () => "s-new", openSessions: async () => [], activities: async () => [], sessionStatus: async () => "active", sessionStatuses: async () => new Map() } as never,
     linear: linear as never,
     starter: starter as never,
     handover: { resumeTarget: async () => ({ branch: BRANCH, worktreePath: null, handover: "Continue." }), handOff: async () => true } as never,
@@ -1029,7 +1035,7 @@ test("an explicitly resumed queued owner message reaches the real successor's fi
   } as never);
   const store = new SessionStore(join(directory, "sessions.json"));
   const router = new SessionRouter({
-    api: { activity: async () => {}, updateSession: async () => {}, sessionStatus: async () => "active" } as never,
+    api: { activity: async () => {}, updateSession: async () => {}, sessionStatus: async () => "active", sessionStatuses: async () => new Map() } as never,
     linear: linear as never, starter, handover, launcher: gates, settings: { read: async () => settings }, store,
   });
   Object.assign(router, { paseo: daemon.paseo });

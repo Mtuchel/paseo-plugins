@@ -16,10 +16,11 @@ export type App = {
   viewer(): Promise<{ id: string; name: string }>;
 };
 
-// A Linear request that Linear answered with an error: its HTTP status (200 for GraphQL errors) and
-// the errors' codes and raw messages, so callers decide on the failure, not on its wording.
+// A Linear request that Linear answered with an error: its HTTP status (200 for GraphQL errors),
+// the errors' codes and raw messages, and the top-level field each error names (its alias in a
+// batched read), so callers decide on the failure, not on its wording.
 export class LinearApiError extends Error {
-  constructor(message: string, readonly status: number, readonly codes: string[] = [], readonly reasons: string[] = []) {
+  constructor(message: string, readonly status: number, readonly codes: string[] = [], readonly reasons: string[] = [], readonly fields: string[] = []) {
     super(message);
   }
 }
@@ -43,16 +44,18 @@ export function entityNotFound(error: unknown): boolean {
   return error instanceof LinearApiError && error.reasons.some((reason) => /^Entity not found\b/.test(reason));
 }
 
-function errorDetails(payload: unknown): { codes: string[]; reasons: string[] } {
+function errorDetails(payload: unknown): { codes: string[]; reasons: string[]; fields: string[] } {
   const codes: string[] = [];
   const reasons: string[] = [];
+  const fields: string[] = [];
   const errors = payload && typeof payload === "object" && "errors" in payload && Array.isArray(payload.errors) ? payload.errors : [];
   for (const error of errors) {
     if (!error || typeof error !== "object") continue;
     if ("message" in error && typeof error.message === "string") reasons.push(error.message);
     if ("extensions" in error && error.extensions && typeof error.extensions === "object" && "code" in error.extensions && typeof error.extensions.code === "string") codes.push(error.extensions.code);
+    if ("path" in error && Array.isArray(error.path) && typeof error.path[0] === "string") fields.push(error.path[0]);
   }
-  return { codes, reasons };
+  return { codes, reasons, fields };
 }
 
 // GraphQL error payloads carry a user-facing message, sometimes clearer than the HTTP status alone.
@@ -95,7 +98,7 @@ export async function postGraphQL(key: string, query: string, variables: Record<
       && typeof error.extensions === "object" && "code" in error.extensions && error.extensions.code === "RATELIMITED")));
   ticket.done(response.headers, limited);
   if (limited) throw new RateLimitedError(pool, budget.blockedUntil(pool));
-  const { codes, reasons } = errorDetails(payload);
+  const { codes, reasons, fields } = errorDetails(payload);
   if (!response.ok) {
     const message = apiMessage(payload);
     if (response.status === 401 || response.status === 403 || codes.includes("AUTHENTICATION_ERROR")) {
@@ -104,8 +107,8 @@ export async function postGraphQL(key: string, query: string, variables: Record<
       if (response.status === 403 && !codes.includes("AUTHENTICATION_ERROR")) throw new LinearApiError(text, 403, codes, reasons);
       throw new AuthenticationError(text, response.status, codes, reasons);
     }
-    if (message) throw new LinearApiError(`The Linear API request failed: ${message}`, response.status, codes, reasons);
-    throw new LinearApiError(`The Linear API request failed (HTTP ${response.status}). Try again.`, response.status, codes, reasons);
+    if (message) throw new LinearApiError(`The Linear API request failed: ${message}`, response.status, codes, reasons, fields);
+    throw new LinearApiError(`The Linear API request failed (HTTP ${response.status}). Try again.`, response.status, codes, reasons, fields);
   }
   if (payload == null) throw new Error("Linear returned an invalid response.");
   const body = record(payload);
@@ -121,7 +124,7 @@ export async function postGraphQL(key: string, query: string, variables: Record<
       })
       .filter(Boolean).join("; ");
     const text = `The Linear API request failed${message ? `: ${message}` : "."} Check your API key and ticket access, then retry.`;
-    throw codes.includes("AUTHENTICATION_ERROR") ? new AuthenticationError(text, response.status, codes, reasons) : new LinearApiError(text, response.status, codes, reasons);
+    throw codes.includes("AUTHENTICATION_ERROR") ? new AuthenticationError(text, response.status, codes, reasons, fields) : new LinearApiError(text, response.status, codes, reasons, fields);
   }
   return record(body.data);
 }
