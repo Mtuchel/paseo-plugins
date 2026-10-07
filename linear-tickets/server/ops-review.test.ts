@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
 import { LinearService, type CreatedIssueRef, type IssueStatus, type OpsMarkerIssue } from "./linear";
-import { analyse, berlinWeek, pidLock, readHistory, runCollect, runFile, type FileDeps, type OpsReader } from "./ops-review";
+import { analyse, berlinWeek, pidLock, readHistory, runCollect, runFile, sourceOf, type FileDeps, type OpsReader } from "./ops-review";
 import { AppOnlyToken, AppWriter, type OpsWriter } from "./owner-decisions";
 
 const HOUR = 3_600_000;
@@ -18,7 +21,10 @@ const MAC = "mirko@mac";
 const DRAFT = "pulls: draft, not published";
 const WAITING = "agents: waits for your permission: OMP select";
 const ERROR = "agents: in error: rate limit";
+const PLANNER_SCHEDULED = "agents: usage-limit restart scheduled";
+const PLANNER_CONFIRMED = "agents: usage-limit restart confirmed";
 const at = (ms: number) => new Date(ms).toISOString();
+const exec = promisify(execFile);
 const UNITS: Record<string, boolean> = {
   repo: true, main: true, "main-hold": true, "main-security-scan": true, "core-web-bundle": true, queue: true, drops: true, pulls: true,
   agents: true, silent: true, locks: true, [`agents@${MAC}`]: true, [`silent@${MAC}`]: true,
@@ -44,7 +50,7 @@ class Log {
 
   problem(kind: string, opened: number, options: { cleared?: number | null; host?: string | null; owner?: boolean | null; auto?: boolean | null; attention?: boolean; key?: string; ticket?: string | null; open?: { t: number; owner?: boolean | null; auto?: boolean | null }[] } = {}): this {
     const section = kind.split(": ")[0];
-    const group = section === "agents" ? (kind.startsWith("agents: waits") ? "waiting" : kind.startsWith("agents: in error") ? "error" : "silent") : null;
+    const group = section === "agents" ? (kind.startsWith("agents: waits") ? "waiting" : kind.startsWith("agents: in error") ? "error" : kind.startsWith("agents: usage-limit") ? "planners" : "silent") : null;
     const key = options.key ?? `${section}:${++this.problems}`;
     const base = {
       key, kind, unit: section, first: at(opened), attention: options.attention ?? true, section, group, ticket: options.ticket ?? "TUC-1",
@@ -128,11 +134,11 @@ function deps(directory: string, world: World, overrides: Partial<FileDeps> = {}
   return { directory, linear: world, appViewerId: async () => "app", mergedPullRequests: async () => 20, teamKey: "TUC", now: NOW, writer: world.writer, dryRun: false, ...overrides };
 }
 
-async function analysis(log: Log, now = NOW) {
+async function analysis(log: Log, now = NOW, extraKinds: string[] = []) {
   const directory = await temporary();
   try {
     await log.write(directory);
-    return analyse(await readHistory(directory, now - 35 * DAY, now), now, { this: 20, last: 10 });
+    return analyse(await readHistory(directory, now - 35 * DAY, now), now, { this: 20, last: 10 }, extraKinds);
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
@@ -203,6 +209,144 @@ test("coverage: a window is complete only when the kind's own sources were read 
   for (let index = 0; index < 40; index++) noisy.lines.splice(noisy.lines.length - 300 + index * 5, 0, `{"t": "2026-10-1${index}`);
   result = await analysis(noisy);
   assert.equal(result.rows[0].coverage.complete, false);
+});
+
+test("planner coverage: the planner source decides, not the agent listing", async () => {
+  // No planner unit in the history: healthy agents are not enough data for planner kinds.
+  let result = await analysis(healthy(), NOW, [PLANNER_SCHEDULED]);
+  const row = result.rows.find((found) => found.kind === PLANNER_SCHEDULED)!;
+  assert.deepEqual(row.source, { section: "agents", group: "planners" });
+  assert.equal(row.coverage.complete, false);
+  assert.equal(result.headline.this.complete, true, "missing planner evidence must not invalidate unrelated problem trends");
+  // A failed planner unit is not covered even with every agent source healthy.
+  result = await analysis(new Log().runs(NOW - 40 * DAY, NOW, () => ({ planner_recovery: false })), NOW, [PLANNER_SCHEDULED]);
+  assert.equal(result.rows.find((found) => found.kind === PLANNER_SCHEDULED)!.coverage.complete, false);
+  // The planner file read covers its kinds although the agent listing failed.
+  result = await analysis(new Log().runs(NOW - 40 * DAY, NOW, () => ({ agents: false, silent: false, planner_recovery: true })), NOW, [PLANNER_SCHEDULED]);
+  assert.equal(result.rows.find((found) => found.kind === PLANNER_SCHEDULED)!.coverage.complete, true);
+  // An unseen kind falls back on its text; a recorded group stays authoritative.
+  const unseen = { kinds: new Map<string, { section: string; group: string | null }>() };
+  assert.equal(sourceOf(PLANNER_SCHEDULED, unseen).group, "planners");
+  assert.equal(sourceOf("agents: usage-limit recovery held for owner", unseen).group, "planners");
+  assert.equal(sourceOf(PLANNER_SCHEDULED, { kinds: new Map<string, { section: string; group: string | null }>([[PLANNER_SCHEDULED, { section: "agents", group: "error" }]]) }).group, "error");
+});
+
+test("planner coverage: a remote host whose agents were not read is judged by its planner unit", async () => {
+  const macUnread = { [`agents@${MAC}`]: false, [`silent@${MAC}`]: false };
+  // The Mac's planner file is read while its agents are not: it stays a candidate and is covered.
+  let result = await analysis(new Log().runs(NOW - 40 * DAY, NOW, () => ({ ...macUnread, planner_recovery: true, [`planner_recovery@${MAC}`]: true })), NOW, [PLANNER_SCHEDULED]);
+  let covered = result.rows.find((found) => found.kind === PLANNER_SCHEDULED)!.coverage;
+  assert.deepEqual(covered.hosts, [MAC, SERVER]);
+  assert.equal(covered.complete, true);
+  // The Mac's planner file unread: named as not counted, server087 stays complete.
+  result = await analysis(new Log().runs(NOW - 40 * DAY, NOW, () => ({ ...macUnread, planner_recovery: true, [`planner_recovery@${MAC}`]: false })), NOW, [PLANNER_SCHEDULED]);
+  covered = result.rows.find((found) => found.kind === PLANNER_SCHEDULED)!.coverage;
+  assert.deepEqual(covered.hosts, [SERVER]);
+  assert.deepEqual(covered.excluded, [MAC]);
+  assert.equal(covered.complete, true);
+  // The local planner file unread: not complete although the Mac is covered.
+  result = await analysis(new Log().runs(NOW - 40 * DAY, NOW, () => ({ ...macUnread, planner_recovery: false, [`planner_recovery@${MAC}`]: true })), NOW, [PLANNER_SCHEDULED]);
+  covered = result.rows.find((found) => found.kind === PLANNER_SCHEDULED)!.coverage;
+  assert.deepEqual(covered.hosts, [MAC]);
+  assert.equal(covered.complete, false);
+});
+
+test("planner completion rows are non-attention: no counts, no recurring ticket, while auto is observed", async () => {
+  const home = await temporary();
+  try {
+    const log = new Log().runs(NOW - 40 * DAY, NOW, () => ({ planner_recovery: true }));
+    for (let index = 0; index < 5; index++) {
+      log.problem(PLANNER_CONFIRMED, NOW - 7 * DAY + index * HOUR, { attention: false, auto: true, key: `planner-confirmed:${SERVER}:p1:run${index}:req${index}`, cleared: null });
+    }
+    log.problem(PLANNER_SCHEDULED, NOW - 7 * DAY, { attention: false, auto: false, key: `planner-pending:${SERVER}:p1:run`, cleared: null });
+    await log.write(home);
+    const result = analyse(await readHistory(home, NOW - 35 * DAY, NOW), NOW, { this: 20, last: 10 }, [PLANNER_CONFIRMED, PLANNER_SCHEDULED]);
+    const confirmed = result.rows.find((found) => found.kind === PLANNER_CONFIRMED)!;
+    assert.equal(confirmed.this.count, 0);
+    assert.equal(confirmed.last.count, 0);
+    assert.equal(confirmed.all.count, 0);
+    assert.equal(confirmed.recurring, false);
+    assert.ok(result.byKind.get(PLANNER_CONFIRMED)!.every((occurrence) => occurrence.attentionAt === null && occurrence.autoTrueAt !== null));
+    assert.ok(result.byKind.get(PLANNER_SCHEDULED)!.every((occurrence) => occurrence.autoTrueAt === null));
+    // The file run files and comments nothing: planner rows never rank as problems.
+    const world = new World();
+    const report = await runFile(deps(home, world));
+    assert.deepEqual(report.created, []);
+    assert.deepEqual(world.writes, []);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+// The fixture driver: the real digest module produces its own history lines (planner_items +
+// history_events) for a local scheduled restart and a confirmed one on the Mac, whose agents stay
+// unread while its planner file is read.
+const PLANNER_DRIVER = `
+import importlib.util
+import json
+import sys
+from datetime import datetime, timezone
+
+module, out, start, hours, host, mac = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
+spec = importlib.util.spec_from_file_location("paseo_ops_digest", module)
+digest = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(digest)
+
+def iso(at):
+    return datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+sources = {
+    "": {"version": 1, "pending": [{"projectId": "proj-1", "runId": "run-1", "resumeAt": iso(start + 3600), "state": "scheduled"}], "completed": []},
+    mac: {"version": 1, "pending": [], "completed": [{"projectId": "proj-2", "runId": "run-2", "requestId": "req-1", "agentId": "agent-1", "confirmedAt": iso(start + 600)}]},
+}
+units = [
+    {"unit": "agents", "ok": True},
+    {"unit": "planner_recovery", "ok": True},
+    {"unit": "agents@" + mac, "ok": False},
+    {"unit": "planner_recovery@" + mac, "ok": True},
+]
+evidence = {"prWatch": None, "crashes": {}, "limitResumes": None, "plannerRecovery": sources}
+state = digest.empty_state()
+lines = []
+previous = state["items"]
+for hour in range(hours):
+    now = start + hour * 3600
+    items = digest.planner_items(sources, now)
+    state, _ = digest.merge_run(state, items, [], now)
+    lines += digest.history_events(previous, state, units, now, host=host, read_hosts=digest.hosts_read(units, host), evidence=evidence)
+    previous = state["items"]
+with open(out, "w") as handle:
+    json.dump(lines, handle)
+`;
+
+test("planner history from the real Python digest feeds the weekly review", async () => {
+  const home = await temporary();
+  try {
+    const module = fileURLToPath(new URL("../ops/paseo-ops-digest.py", import.meta.url));
+    const driver = join(home, "driver.py");
+    const written = join(home, "lines.json");
+    await writeFile(driver, PLANNER_DRIVER);
+    await exec("python3", [driver, module, written, String(Math.floor((NOW - 14 * DAY) / 1000)), String(14 * 24), SERVER, MAC]);
+    const lines: unknown[] = JSON.parse(await readFile(written, "utf8"));
+    await writeFile(join(home, "history.jsonl"), `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+    const history = await readHistory(home, NOW - 35 * DAY, NOW);
+    assert.equal(history.malformed.size, 0);
+    assert.equal(history.duplicates, 0);
+    const result = analyse(history, NOW, { this: 20, last: 10 }, [PLANNER_SCHEDULED, PLANNER_CONFIRMED]);
+    for (const kind of [PLANNER_SCHEDULED, PLANNER_CONFIRMED]) {
+      const row = result.rows.find((found) => found.kind === kind)!;
+      assert.equal(row.source.group, "planners");
+      assert.equal(row.coverage.complete, true);
+      // The Mac's agents were never read: only its planner unit makes it a covered host.
+      assert.deepEqual(row.coverage.hosts, [MAC, SERVER]);
+      assert.equal(row.all.count, 0);
+      assert.equal(row.recurring, false);
+    }
+    assert.ok(result.byKind.get(PLANNER_CONFIRMED)!.every((occurrence) => occurrence.attentionAt === null && occurrence.autoTrueAt !== null));
+    assert.ok(result.byKind.get(PLANNER_SCHEDULED)!.every((occurrence) => occurrence.autoTrueAt === null));
+    const world = new World();
+    const report = await runFile(deps(home, world));
+    assert.deepEqual(report.created, []);
+    assert.deepEqual(world.writes, []);
+  } finally { await rm(home, { recursive: true, force: true }); }
 });
 
 test("duplicate lines from a replayed run count once", async () => {
