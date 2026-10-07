@@ -59,7 +59,7 @@ export class PlanRequests {
 
   poll(): Promise<void> {
     if (this.polling) return this.polling;
-    this.polling = withPriority("background", () => this.run()).catch((error: unknown) => {
+    this.polling = withPriority("background", "plan-requests", () => this.run()).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       const kind = error instanceof RateLimitedError ? `rate:${error.pool}` : message;
       if (kind !== this.lastError) console.error(`[linear-tickets] plan request poll failed: ${message}`);

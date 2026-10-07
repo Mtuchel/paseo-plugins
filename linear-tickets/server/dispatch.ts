@@ -124,7 +124,7 @@ export class Dispatcher {
     }
     let intervalSeconds = IDLE_POLL_SECONDS;
     // Background priority: every request stops at its pool's reserve (see rate-budget.ts).
-    this.polling = asCaller("dispatch", () => withPriority("background", async () => {
+    this.polling = withPriority("background", "dispatch", async () => {
       try {
         const settings = await this.deps.settings.read();
         intervalSeconds = settings.dispatch.intervalSeconds;
@@ -144,7 +144,7 @@ export class Dispatcher {
         this.status.lastPollAt = new Date().toISOString();
         this.status.lastError = pool ? `paused: ${message}` : message;
       }
-    }));
+    });
     try {
       await this.polling;
     } finally {
@@ -160,13 +160,13 @@ export class Dispatcher {
     // Sequential on purpose: each launch creates a worktree, and Linear rate-limits writes.
     for (const issue of issues) {
       if (this.stopped) return;
-      const until = (this.deps.budget ?? rateBudget).pausedUntil("key", LAUNCH_ROOM);
+      const until = (this.deps.budget ?? rateBudget).pausedUntil("key", "background", LAUNCH_ROOM);
       if (until !== null) throw new RateLimitedError("key", until, "reserve");
       await this.dispatch(issue, settings, paseo);
     }
     for (const next of [this.deps.projects, this.deps.repairs]) {
       if (this.stopped || !next) continue;
-      const until = (this.deps.budget ?? rateBudget).pausedUntil("key", LAUNCH_ROOM);
+      const until = (this.deps.budget ?? rateBudget).pausedUntil("key", "background", LAUNCH_ROOM);
       if (until !== null) throw new RateLimitedError("key", until, "reserve");
       await asCaller(next === this.deps.projects ? "project-flow" : "label-repair", () => next.tick(paseo, settings));
     }
@@ -258,7 +258,7 @@ export class Dispatcher {
       this.record(issue.identifier, "failed", message);
       // Best-effort: surface the failure on the ticket; `<trigger>-failed` keeps it out of the next poll.
       // Reported at interactive priority: a launch that ran into the key's reserve must still say so.
-      await withPriority("interactive", async () => {
+      await withPriority("interactive", "dispatch failure report", async () => {
         for (const step of [
           () => linear.removeLabel(issue.id, labels.running),
           () => linear.addLabel(issue.id, labels.failed),

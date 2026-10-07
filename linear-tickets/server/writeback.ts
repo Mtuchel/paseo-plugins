@@ -15,7 +15,7 @@ import { PLAN_POLICY_LABEL } from "./plan-policy";
 import { logQuietly, questionEntry, type DecisionLog } from "./owner-decisions";
 import type { Deputy } from "./deputy";
 import { ticketPullRequest, type PullRequestCheck } from "./pull-request-check";
-import { RateLimitedError } from "./rate-budget";
+import { RateLimitedError, withPriority } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
 import { issueAgents } from "./starter";
@@ -331,7 +331,7 @@ export class Writeback {
   // A closed ticket stays closed: a "Needs you" sub-issue in Needs input carries the label and the
   // comment instead. `subject` (one line) titles that sub-issue.
   private markWaiting(issue: { id: string; identifier: string }, agent: PluginHookAgent, settings: PluginSettings, subject: string, body: string, inSession: boolean, { once }: WritebackContext): Promise<void> {
-    return this.serialize(issue.id, async () => {
+    return this.serialize(issue.id, () => withPriority("owner", "owner question", async () => {
       const waiting = await this.waitingFor(issue.id);
       const state = await this.linear.issueState(issue.id);
       const needsYou = dispatchLabels(settings.dispatch.label).needsYou;
@@ -384,7 +384,7 @@ export class Writeback {
       // The waiting period's comment is edited, not repeated.
       const commentId = await once("waiting-comment", async () => this.linear.upsertComment(subIssueId ?? issue.id, `${await this.linear.userUrl(ownerId)} ${body}`, waiting?.commentId ?? null)) ?? null;
       await this.setWaiting(issue, agent, { previousStateId, commentId, subIssueId });
-    });
+    }));
   }
 
   // Ends the waiting period: the label comes off and the ticket goes back where it was, unless
@@ -502,6 +502,20 @@ export class Writeback {
     return this.run("turn_started", agent, paseo, async ({ issueId, identifier, planFirst }, settings, { once }) => {
       const sessions = this.agentBridge?.sessions;
       if (sessions && await sessions.holdIfStopped(agent.id).catch(() => false)) return;
+      // State changes keep their prerequisite reads in the owner's reserve, before ordinary
+      // panel progress can be refused. A failed read does not mark this agent as started.
+      await withPriority("owner", "status change", async () => {
+        if (settings.writeback.blocked && await this.waitingFor(issueId)) await this.clearWaiting({ id: issueId, identifier }, agent, settings);
+        if (!settings.writeback.status || this.started.has(agent.id)) return;
+        const state = await this.linear.issueState(issueId);
+        // Work after merge (for example a deploy watch) never reopens a closed ticket.
+        if (!CLOSED_TYPES.includes(state.statusType.trim().toLowerCase())) {
+          const outcome = !planFirst ? await this.linear.markInProgress(state, state.teamId)
+            : state.statusType.trim().toLowerCase() === "started" ? { changed: false } : await this.linear.moveToStateNamed(issueId, PLANNING_STATE);
+          if (outcome.note) console.error(`[linear-tickets] ${issueId}: ${outcome.note}`);
+        }
+        this.started.add(agent.id);
+      });
       const { model, named } = await this.snapshot(agent, paseo);
       const previous = this.models.get(agent.id);
       if (model) this.models.set(agent.id, model);
@@ -515,19 +529,6 @@ export class Writeback {
       if (model && (changed || !previous) && handover && settings.writeback.summaries) {
         await handover.update({ id: issueId, identifier }, named, { model }).catch(() => {});
       }
-      // The agent works again, so a wait it ended its last turn with is over.
-      if (settings.writeback.blocked && await this.waitingFor(issueId)) await this.clearWaiting({ id: issueId, identifier }, agent, settings);
-      if (!settings.writeback.status || this.started.has(agent.id)) return;
-      this.started.add(agent.id);
-      const state = await this.linear.issueState(issueId);
-      // A closed ticket stays closed: its agent still working after the merge (a deploy watch, a
-      // step after merge) is often first seen after a plugin restart, and is not new work.
-      if (CLOSED_TYPES.includes(state.statusType.trim().toLowerCase())) return;
-      // A plan-first agent only plans: its ticket goes to Planning, not In Progress. A ticket
-      // already started (for example after the plan was approved) is left where it is.
-      const outcome = !planFirst ? await this.linear.markInProgress(state, state.teamId)
-        : state.statusType.trim().toLowerCase() === "started" ? { changed: false } : await this.linear.moveToStateNamed(issueId, PLANNING_STATE);
-      if (outcome.note) console.error(`[linear-tickets] ${issueId}: ${outcome.note}`);
     });
   }
 
@@ -544,16 +545,21 @@ export class Writeback {
         const added = urls.map((url): OutboxEntry => ({ agentId: agent.id, agentTitle: named.title, cwd: agent.cwd, issueId, identifier, url, done: { linear: false, session: false, handover: false } }));
         await once("outbox", () => this.changeOutbox((entries) => [...entries, ...added.filter((entry) => !entries.some((known) => known.agentId === entry.agentId && known.url === entry.url))]));
       }
-      const blocked = dispatchLabels(settings.dispatch.label).blocked;
-      const state = writeback.blocked ? await this.linear.issueState(issueId) : null;
       const reply = outcome.kind === "completed" ? turnReply(timeline) : "";
-      // A reply that asks the owner keeps (or opens) the waiting period until the next turn starts;
-      // otherwise the turn is over and nothing waits for the owner. `paseo-blocked` marks errors only.
-      const request = state ? ownerRequest(reply) : null;
-      if (state && !request) await this.clearWaiting({ id: issueId, identifier }, agent, settings, state);
+      const request = writeback.blocked ? ownerRequest(reply) : null;
       const title = agent.title ?? "Paseo agent";
       const handover = this.agentBridge?.handover;
       const issue = { id: issueId, identifier };
+      // Deliver the owner's notification before ordinary progress work can hit its reserve.
+      if (request) {
+        const inSession = Boolean(await this.agentBridge?.sessions.sessionFor(agent.id).catch(() => null));
+        const hint = writeback.mentions ? "\n\nReply here with “@paseo <your answer>”." : "";
+        await once("owner-question", () => this.markWaiting(issue, agent, settings, request, `**${title}** (Paseo) finished its turn and is waiting for you:\n\n${truncateSummary(request)}${hint}`, inSession, context));
+      }
+      const blocked = dispatchLabels(settings.dispatch.label).blocked;
+      const state = writeback.blocked ? await this.linear.issueState(issueId) : null;
+      // Without a new question the turn is over; `paseo-blocked` marks errors only.
+      if (state && !request) await this.clearWaiting(issue, agent, settings, state);
       if (outcome.kind === "completed") {
         await once("session:response", () => this.session(agent.id, async (sessionId, sessions) => {
           // The live feed already showed the commands; otherwise post the turn's last few.
@@ -566,11 +572,6 @@ export class Writeback {
           else await once("comment", () => this.linear.comment(issueId, `**${title}** (Paseo) finished a turn:\n\n${truncateSummary(reply)}`));
         }
         if (state) await this.linear.removeLabel(issueId, blocked, state.labels);
-        if (request) {
-          const inSession = Boolean(await this.agentBridge?.sessions.sessionFor(agent.id).catch(() => null));
-          const hint = writeback.mentions ? "\n\nReply here with “@paseo <your answer>”." : "";
-          await this.markWaiting(issue, agent, settings, request, `**${title}** (Paseo) finished its turn and is waiting for you:\n\n${truncateSummary(request)}${hint}`, inSession, context);
-        }
       } else if (outcome.kind === "failed") {
         await once("session:error", () => this.session(agent.id, async (sessionId, sessions) => {
           await sessions.unfollow(agent.id);
@@ -611,7 +612,7 @@ export class Writeback {
       const refreshed = await paseo.agents.ref(agent.id).refresh().catch(() => null);
       const stillPending = refreshed?.agent.pendingPermissions;
       if (Array.isArray(stillPending) && !stillPending.some((pending) => pending.id === request.id)) return;
-      const inSession = await context.once("session:ask", async () => {
+      const inSession = await context.once("session:ask", () => withPriority("owner", "owner question", async () => {
         let asked = false;
         await this.session(agent.id, (sessionId, sessions) => {
           asked = true;
@@ -621,7 +622,7 @@ export class Writeback {
             : sessions.ask(sessionId, `Approve this action?\n\n${subject}`, [{ label: "Approve", value: "approve" }, { label: "Deny", value: "deny" }]);
         });
         return asked;
-      }) ?? false;
+      })) ?? false;
       // The owner sees the question first; the deputy only starts looking at it now, in the
       // background, and never answers before the owner's grace period ends.
       const observe = () => this.deputy?.observe(agent, request, { issueId, identifier });

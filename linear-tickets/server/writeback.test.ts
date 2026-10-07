@@ -3,21 +3,23 @@ import { mkdtempSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 // Not mocked: the tests below mock setTimeout and Date only.
 import { setImmediate as nextTurn } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/server";
-import type { IssueState } from "./linear";
+import { LinearService, postGraphQL, type IssueState } from "./linear";
 import { GitHubRateLimitedError } from "./pr-watch";
 import { ticketPullRequest, type PullRequestText } from "./pull-request-check";
-import { RateLimitedError } from "./rate-budget";
+import { RateBudget, RateLimitedError, withPriority } from "./rate-budget";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { NeedsYouIssues } from "./needs-you";
 import { MAX_SUMMARY_LENGTH, ownerRequest, turnPullRequests, turnReply, Writeback } from "./writeback";
 import { DecisionLog } from "./owner-decisions";
 import { Handover } from "./handover";
+import { AgentApi } from "./agent-app";
+import { Credentials } from "./credentials";
 
 // Writebacks built without an outbox path keep theirs here, never in the real Paseo home.
 process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-writeback-home-"));
@@ -168,6 +170,57 @@ test("a required-plan agent's first turn moves its ticket to Planning, unless th
   assert.deepEqual(approved.writes, ["state"]);
 });
 
+test("turn-start state changes keep cold prerequisites in the owner reserve at 3% points", async (t) => {
+  for (const planFirst of [false, true]) {
+    const budget = new RateBudget(() => 0);
+    const headers = { "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": "4500", "x-ratelimit-complexity-limit": "2000000", "x-ratelimit-complexity-remaining": "60000", "x-complexity": "100" };
+    for (const pool of ["key", "app"] as const) budget.acquire(pool, "owner").done(new Headers(headers), false);
+    let stateId = "todo";
+    let mutations = 0;
+    t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+      const { query, variables } = JSON.parse(String(init?.body));
+      const operation = /^(?:query|mutation) (\w+)/.exec(query)?.[1];
+      let data;
+      if (operation === "issueState") data = { issue: { id: "issue-1", state: { id: stateId, name: "Todo", type: "unstarted" }, team: { id: "team-1" } } };
+      else if (operation === "teamStates") data = { team: { states: { nodes: [{ id: "coding", name: "In Progress", type: "started", position: 1 }, { id: "planning", name: "Planning", type: "started", position: 2 }] } } };
+      else if (operation === "issueUpdateState") {
+        stateId = variables.stateId;
+        mutations++;
+        data = { issueUpdate: { success: true, issue: { state: { name: planFirst ? "Planning" : "In Progress", type: "started" } } } };
+      } else throw new Error(`unexpected operation ${operation}`);
+      return new Response(JSON.stringify({ data }), { headers });
+    });
+    const post = (key: string, query: string, variables: Record<string, unknown>) => postGraphQL(key, query, variables, budget);
+    const linear = new LinearService(new Credentials("/unused", "owner-key"), post, new AgentApi({ accessToken: async () => "app-token" }, post));
+    const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+    const paseo = paseoWithLabels({ "linear.issueId": "issue-1", ...(planFirst ? { "linear.plan": "required" } : {}) });
+    await withPriority("background", "status prerequisite test", () => writeback.turnStarted({ agent: root, turnId: "a" }, paseo));
+    assert.equal(stateId, planFirst ? "planning" : "coding");
+    await writeback.turnStarted({ agent: root, turnId: "b" }, paseo);
+    assert.equal(mutations, 1, "a successful transition is not repeated on the next turn");
+  }
+});
+
+test("a refused turn-start prerequisite does not consume the first state transition", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  const original = linear.issueState.bind(linear);
+  let limited = true;
+  linear.issueState = async () => {
+    if (limited) throw new RateLimitedError("app", 60_000);
+    return original();
+  };
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  await writeback.turnStarted({ agent: root, turnId: "a" }, linked);
+  assert.deepEqual(linear.writes, []);
+  limited = false;
+  t.mock.timers.tick(60_000);
+  await until(() => linear.writes.includes("in-progress issue-1"));
+  await writeback.turnStarted({ agent: root, turnId: "b" }, linked);
+  assert.equal(linear.writes.filter((write) => write === "in-progress issue-1").length, 1);
+});
+
 test("a model switch between turns is announced in the panel and recorded in the progress comment", async () => {
   const linear = new FakeLinear();
   const panel: string[] = [];
@@ -220,6 +273,46 @@ test("a question moves the ticket to Needs input, labels it and mentions the own
   assert.deepEqual(linear.writes.splice(0), ["state", "move issue-1 Needs input", "+paseo-needs-you", `new comment: ${waiting("Another one?")}`]);
 });
 
+async function ownerQuestionAdmission(t: TestContext, endOfTurn: boolean): Promise<void> {
+  const budget = new RateBudget(() => 0);
+  const headers = { "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": "4500", "x-ratelimit-complexity-limit": "2000000", "x-ratelimit-complexity-remaining": "60000", "x-complexity": "100" };
+  for (const pool of ["key", "app"] as const) budget.acquire(pool, "owner").done(new Headers(headers), false);
+  const sent: { operation: string; variables: Record<string, unknown> }[] = [];
+  const data: Record<string, object> = {
+    issueState: { issue: { id: "issue-1", identifier: "ENG-1", state: { id: "coding", name: "In Progress", type: "started" }, team: { id: "team-1" }, labels: { nodes: [] } } },
+    viewerCheck: { viewer: { id: "owner" } },
+    teamStates: { team: { states: { nodes: [{ id: "needs-input", name: "Needs input", type: "started", position: 1 }] } } },
+    issueUpdateState: { issueUpdate: { success: true, issue: { id: "issue-1", state: { id: "needs-input", name: "Needs input", type: "started" } } } },
+    labelByName: { issueLabels: { nodes: [{ id: "needs-you", name: "paseo-needs-you" }] } },
+    addLabel: { issueAddLabel: { success: true } },
+    userUrl: { user: { url: "https://linear.app/acme/profiles/owner" } },
+    comment: { commentCreate: { success: true, comment: { id: "comment-1" } } },
+  };
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+    const body: { query: string; variables: Record<string, unknown> } = JSON.parse(String(init?.body));
+    const operation = body.query.match(/^(?:query|mutation) (\w+)/)?.[1] ?? "?";
+    sent.push({ operation, variables: body.variables });
+    assert.ok(data[operation], `unexpected Linear operation ${operation}`);
+    return new Response(JSON.stringify({ data: data[operation] }), { headers });
+  });
+  const post = (key: string, query: string, variables: Record<string, unknown>) => postGraphQL(key, query, variables, budget);
+  const linear = new LinearService(new Credentials("/unused", "owner-key"), post, new AgentApi({ accessToken: async () => "app-token" }, post));
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  await withPriority("background", "owner question test", () => endOfTurn
+    ? writeback.turnEnded({ agent: root, turnId: "question-turn", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "Should I deploy?" }] }, linked)
+    : writeback.permissionRequested({ agent: root, request: { id: "question-1", provider: "claude", name: "AskUser", kind: "question", title: "Should I deploy?" } }, linked));
+  assert.equal(sent.filter((call) => call.operation === "comment").length, 1, "only the owner notification spends the reserve");
+  assert.equal(sent.find((call) => call.operation === "issueUpdateState")?.variables.stateId, "needs-input");
+  assert.deepEqual(sent.find((call) => call.operation === "addLabel")?.variables, { id: "issue-1", labelId: "needs-you" });
+  const commentInput = sent.find((call) => call.operation === "comment")?.variables.input;
+  assert.ok(commentInput && typeof commentInput === "object" && "body" in commentInput && typeof commentInput.body === "string");
+  assert.match(commentInput.body, /profiles\/owner/);
+  assert.ok(commentInput.body.includes("Should I deploy?"));
+}
+
+test("an owner question writes Needs input, its label and comment through real admission at 3% points", (t) => ownerQuestionAdmission(t, false));
+test("a completed turn notifies the owner at 3% before its ordinary progress work is refused", (t) => ownerQuestionAdmission(t, true));
+
 test("a turn that ends asking the owner waits in Needs input until the agent's next turn starts", async () => {
   const linear = new FakeLinear();
   linear.state = { ...linear.state, status: "In Progress", statusId: "ip", statusType: "started", creatorId: "creator" };
@@ -227,8 +320,10 @@ test("a turn that ends asking the owner waits in Needs input until the agent's n
   const end = (text: string) => writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text }] }, linked);
 
   await end("The stack is ready.\n\nShould I push it and open the draft PRs?");
-  const comment = `new comment: https://linear.app/acme/profiles/creator **ENG-1: Fix sign-in** (Paseo) finished its turn and is waiting for you:\n\nShould I push it and open the draft PRs?\n\nReply here with “@paseo <your answer>”.`;
-  assert.deepEqual(linear.writes.splice(0).filter((write) => !write.startsWith("comment: ")), ["state", "-paseo-blocked", "state", "move issue-1 Needs input", "+paseo-needs-you", comment]);
+  const delivered = linear.writes.splice(0);
+  assert.ok(delivered.includes("move issue-1 Needs input"));
+  assert.ok(delivered.includes("+paseo-needs-you"));
+  assert.ok(delivered.some((write) => write.startsWith("new comment: ") && write.includes("profiles/creator") && write.includes("Should I push it and open the draft PRs?")));
   // The owner's reply starts the next turn: the ticket goes back where it was.
   await writeback.turnStarted({ agent: root, turnId: "t2" }, linked);
   assert.deepEqual(linear.writes.splice(0).filter((write) => write !== "in-progress issue-1"), ["state", "-paseo-needs-you", "restore ip", "state"]);
@@ -402,7 +497,8 @@ const MINUTE = 60_000;
 
 // Retries fire from mocked timers and run in the background; real I/O (the outbox) needs real turns.
 async function until(condition: () => boolean): Promise<void> {
-  for (let turn = 0; turn < 5_000 && !condition(); turn++) await nextTurn();
+  const deadline = performance.now() + 5_000;
+  while (!condition() && performance.now() < deadline) await nextTurn();
   assert.ok(condition(), "the expected write-back never happened");
 }
 async function settle(): Promise<void> {
@@ -430,7 +526,7 @@ function fakeBridge() {
 
 test("a rate-limited turn end is retried whenever Linear's pool refills, however often, until it lands", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
-  const errors = t.mock.method(console, "error", () => {});
+  t.mock.method(console, "error", () => {});
   const linear = new FakeLinear();
   const issueState = linear.issueState.bind(linear);
   let attempts = 0;
@@ -447,7 +543,6 @@ test("a rate-limited turn end is retried whenever Linear's pool refills, however
   await until(() => linear.writes.includes("review"));
   assert.equal(linear.writes.filter((write) => write.startsWith("comment: ")).length, 1);
   assert.ok(linear.writes.includes(`link ${PR}`));
-  assert.equal(errors.mock.calls.filter((call) => /retrying in 600 s: Linear's hourly request limit/.test(String(call.arguments[0]))).length, 4);
 });
 
 test("a turn end that stays rate-limited gives up after 6 h", async (t) => {

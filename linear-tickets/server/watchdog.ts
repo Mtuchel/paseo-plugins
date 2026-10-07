@@ -542,7 +542,7 @@ export type WatchdogPoll = {
 export type WatchdogDeps = {
   store: WatchdogStore;
   sessions: WatchdogSessions;
-  linear: Pick<LinearService, "issueState" | "comment" | "hasComment" | "viewerId" | "userUrl">;
+  linear: Pick<LinearService, "issueWatchState" | "comment" | "hasComment" | "viewerId" | "userUrl">;
   settings: Pick<Settings, "read">;
   handover: { all(): Promise<HandoverRecord[]> };
   needsYou?: Pick<NeedsYouIssues, "all">;
@@ -710,7 +710,7 @@ export class Watchdog {
     if (thread?.group) return "the ticket hands out sub-issues";
     if (thread?.offer && ["split", "later", "parked"].includes(thread.offer)) return `the ticket's plan is ${thread.offer === "later" ? "approved for later" : thread.offer}`;
     if (!deep) return null;
-    const state = await this.deps.linear.issueState(issueId);
+    const state = await this.deps.linear.issueWatchState(issueId);
     if (TERMINAL.includes(state.statusType.trim().toLowerCase())) return `${identifier} is ${state.status}`;
     if (state.status.trim().toLowerCase() === NEEDS_INPUT) return `${identifier} waits for the owner in ${state.status}`;
     const labels = dispatchLabels(current.dispatch.label);

@@ -2,7 +2,7 @@ import { areaLabels, type AreaLabels } from "./area-labels";
 import { UUID, type LinearService } from "./linear";
 
 export type ReviewIssueInfo = { issueId: string; areas: string[] };
-type Reader = Pick<LinearService, "issueState" | "labelCatalog">;
+type Reader = Pick<LinearService, "issueMetadata" | "labelCatalog">;
 type Entry = { value: ReviewIssueInfo | null; expiresAt: number; retryAt: number };
 const TTL = 5 * 60_000;
 const FAILURE_DELAY = 30_000;
@@ -54,7 +54,7 @@ export class ReviewIssueInfos {
 
   private async read(key: string, fresh: boolean): Promise<ReviewIssueInfo | null> {
     try {
-      const state = await this.linear.issueState(key);
+      const state = await this.linear.issueMetadata(key);
       if (state.identifier !== key || !UUID.test(state.id)) {
         this.save(key, { value: null, expiresAt: this.now() + TTL, retryAt: 0 });
         return null;

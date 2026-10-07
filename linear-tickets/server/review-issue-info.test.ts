@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { areaLabels } from "./area-labels";
-import type { CatalogLabel, IssueState } from "./linear";
+import type { CatalogLabel, IssueMetadata } from "./linear";
 import { ReviewIssueInfos } from "./review-issue-info";
 
 const ISSUE_ID = "3b241101-e2bb-4255-8caf-4136c566a962";
@@ -26,16 +26,11 @@ function harness() {
     catalog, block: null as Promise<void> | null,
   };
   const infos = new ReviewIssueInfos({
-    issueState: async (identifier): Promise<IssueState> => {
+    issueMetadata: async (identifier): Promise<IssueMetadata> => {
       h.reads++;
       if (h.block) await h.block;
       if (h.failIssue) throw new Error("Linear temporarily unavailable");
-      return {
-        id: h.issueId, identifier: h.identifier ?? identifier, labels: h.labels,
-        status: "Todo", statusId: "todo", statusType: "unstarted", teamId: null,
-        projectId: null, creatorId: null, attachmentUrls: [], blockedBy: [], priority: 0,
-        createdAt: "", unblocks: 0,
-      };
+      return { id: h.issueId, identifier: h.identifier ?? identifier, labels: h.labels };
     },
     labelCatalog: async () => {
       h.catalogReads++;

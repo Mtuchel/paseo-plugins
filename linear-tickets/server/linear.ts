@@ -3,8 +3,8 @@ import type { Issue, TicketDetail } from "../shared/contracts";
 import { buildContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations, type FinishedBlocker } from "./context";
 import { Credentials } from "./credentials";
 import type { LabelEvent, SweptIssue } from "./label-rules";
-import { poolOf, rateBudget, RateLimitedError, type RateBudget } from "./rate-budget";
-import { linearUsage } from "./linear-usage";
+import { currentCaller, poolOf, rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
+import { operationName } from "./linear-usage";
 
 const endpoint = "https://api.linear.app/graphql";
 export type Post = (key: string, query: string, variables: Record<string, unknown>) => Promise<Record<string, unknown>>;
@@ -64,7 +64,8 @@ function apiMessage(payload: unknown): string {
 // Every request passes the pool's budget first (see rate-budget.ts); the response headers update it.
 export async function postGraphQL(key: string, query: string, variables: Record<string, unknown>, budget: RateBudget = rateBudget): Promise<Record<string, unknown>> {
   const pool = poolOf(key);
-  const ticket = budget.acquire(pool);
+  const operation = operationName(query);
+  const ticket = budget.acquire(pool, undefined, currentCaller(operation), operation);
   let response: Response;
   try {
     response = await fetch(endpoint, {
@@ -76,11 +77,9 @@ export async function postGraphQL(key: string, query: string, variables: Record<
       signal: AbortSignal.timeout(30_000),
     });
   } catch {
-    linearUsage.record(pool, query, null);
     ticket.done(null, false);
     throw new Error("Could not reach the Linear API. Check the host's network connection and try again.");
   }
-  linearUsage.record(pool, query, response.headers);
   let payload: unknown = null;
   try { payload = await response.json(); } catch { /* Mapped by status below. */ }
   // Linear answers an exhausted limit with HTTP 400 and the RATELIMITED code, not with 429.
@@ -88,7 +87,7 @@ export async function postGraphQL(key: string, query: string, variables: Record<
     && payload.errors.some((error: unknown) => Boolean(error && typeof error === "object" && "extensions" in error && error.extensions
       && typeof error.extensions === "object" && "code" in error.extensions && error.extensions.code === "RATELIMITED")));
   ticket.done(response.headers, limited);
-  if (limited) throw new RateLimitedError(pool, budget.pausedUntil(pool) ?? Date.now());
+  if (limited) throw new RateLimitedError(pool, budget.blockedUntil(pool));
   const { codes, reasons } = errorDetails(payload);
   if (!response.ok) {
     const message = apiMessage(payload);
@@ -317,11 +316,27 @@ export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
     relations(first: 50) { nodes { type relatedIssue { state { type } } } }
   }
 }`;
+// Review inbox enrichment must not read blockers or PR attachments.
+export const ISSUE_METADATA_QUERY = `query issueMetadata($id: String!) {
+  issue(id: $id) { id identifier labels(first: 50) { nodes { id name } } }
+}`;
+// PR discovery needs URLs, not dependency relations or ticket metadata.
+export const ISSUE_ATTACHMENT_URLS_QUERY = `query issueAttachmentUrls($id: String!) {
+  issue(id: $id) { attachments(first: 50) { nodes { url } } }
+}`;
+// Watchdog exclusions need only workflow state and veto/owner/hold labels.
+export const ISSUE_WATCH_STATE_QUERY = `query issueWatchState($id: String!) {
+  issue(id: $id) { state { name type } labels(first: 50) { nodes { id name } } }
+}`;
+// Queued threads check terminal state before capacity; admission separately reads dependencies.
+export const ISSUE_STATUS_QUERY = `query issueStatus($id: String!) {
+  issue(id: $id) { state { name type } }
+}`;
 // `status`: the workflow state's name ("In Review"); `statusType` its kind ("started").
 export type IssueStatus = { status: string; statusType: string; completedAt: string | null };
 export const ISSUE_STATUSES_BATCH = 250;
-export const ISSUE_STATUSES_QUERY = `query issueStatuses($ids: [ID!]!) {
-  issues(first: ${ISSUE_STATUSES_BATCH}, filter: { id: { in: $ids } }) { nodes { id state { name type } completedAt } }
+export const ISSUE_STATUSES_QUERY = `query issueStatuses($ids: [ID!]!, $first: Int!) {
+  issues(first: $first, filter: { id: { in: $ids } }) { nodes { id state { name type } completedAt } }
 }`;
 // A state the plugin itself just moved a ticket into, from the mutation's own answer.
 export type WrittenState = { name: string; type: string };
@@ -373,6 +388,7 @@ export type IssueState = {
   id: string; identifier: string; status: string; statusId: string; statusType: string; teamId: string | null; projectId: string | null; creatorId: string | null;
   labels: { id: string; name: string }[]; attachmentUrls: string[]; blockedBy: string[]; priority: number; createdAt: string; unblocks: number;
 };
+export type IssueMetadata = Pick<IssueState, "id" | "identifier" | "labels">;
 
 // Projects carrying the trigger label (README, "Projects"), and their open tickets with what the
 // project flow reads: state, team, parent, who has it, labels, blockers, what they block and links.
@@ -794,7 +810,10 @@ export class LinearService {
   // The Paseo app's own user; null when the app cannot be used here. Cached once known.
   async appUserId(): Promise<string | null> {
     if (this.appUser || !this.app) return this.appUser;
-    this.appUser = await this.app.viewer().then((viewer) => viewer.id || null, () => null);
+    this.appUser = await this.app.viewer().then((viewer) => viewer.id || null, (error: unknown) => {
+      if (error instanceof RateLimitedError) throw error;
+      return null;
+    });
     return this.appUser;
   }
 
@@ -935,31 +954,32 @@ export class LinearService {
   // Best-effort by design: callers surface `note` as a warning,
   // and a failure here must never turn into a launch failure.
   async markInProgress(issue: Pick<Issue, "id" | "status" | "statusType">, teamId: string | null): Promise<{ changed: boolean; note?: string }> {
-    // Already in the team's "started" state (e.g. "In Progress"): leave it. A repeat
-    // write would only add audit noise to a ticket the agent is about to work on.
-    if (issue.statusType.trim().toLowerCase() === "started") return { changed: false };
-    if (!teamId) return { changed: false, note: "The ticket has no team, so it could not be marked in progress." };
-    let states: TeamState[];
-    try {
-      states = await this.teamStates(teamId);
-    } catch (error) {
-      return { changed: false, note: `Could not load the ticket team's states: ${error instanceof Error ? error.message : "unknown error"}` };
-    }
-    const target = resolveStartedState(states);
-    if (!target) {
-      return { changed: false, note: `The ticket's team has no \"In Progress\" state, so it was left in ${issue.status || "its current state"}.` };
-    }
-    let data: Record<string, unknown>;
-    try {
-      data = await this.writeState(issue.id, target.id);
-    } catch (error) {
-      return { changed: false, note: `Linear rejected the change to ${target.name}: ${error instanceof Error ? error.message : "unknown error"}` };
-    }
-    const result = data.issueUpdate && typeof data.issueUpdate === "object" ? record(data.issueUpdate) : {};
-    if (result.success === false) {
-      return { changed: false, note: `Linear reported that the change to ${target.name} was not applied; the ticket is unchanged.` };
-    }
-    return { changed: true };
+    return withPriority("owner", "status change", async () => {
+      // Already started: avoid a repeat write and needless audit noise.
+      if (issue.statusType.trim().toLowerCase() === "started") return { changed: false };
+      if (!teamId) return { changed: false, note: "The ticket has no team, so it could not be marked in progress." };
+      let states: TeamState[];
+      try {
+        states = await this.teamStates(teamId);
+      } catch (error) {
+        return { changed: false, note: `Could not load the ticket team's states: ${error instanceof Error ? error.message : "unknown error"}` };
+      }
+      const target = resolveStartedState(states);
+      if (!target) {
+        return { changed: false, note: `The ticket's team has no \"In Progress\" state, so it was left in ${issue.status || "its current state"}.` };
+      }
+      let data: Record<string, unknown>;
+      try {
+        data = await this.writeState(issue.id, target.id);
+      } catch (error) {
+        return { changed: false, note: `Linear rejected the change to ${target.name}: ${error instanceof Error ? error.message : "unknown error"}` };
+      }
+      const result = data.issueUpdate && typeof data.issueUpdate === "object" ? record(data.issueUpdate) : {};
+      if (result.success === false) {
+        return { changed: false, note: `Linear reported that the change to ${target.name} was not applied; the ticket is unchanged.` };
+      }
+      return { changed: true };
+    });
   }
 
   async labeledIssues(labelName: string, teamKeys: string[]): Promise<LabeledIssue[]> {
@@ -1040,6 +1060,34 @@ export class LinearService {
       labels: labelNodes(issue.labels), attachmentUrls, blockedBy,
       priority: typeof issue.priority === "number" ? issue.priority : 0, createdAt: label(issue.createdAt), unblocks,
     };
+  }
+
+  async issueMetadata(id: string): Promise<IssueMetadata> {
+    const data = await this.read(ISSUE_METADATA_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object"));
+    if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
+    const issue = record(data.issue);
+    return { id: label(issue.id), identifier: label(issue.identifier), labels: labelNodes(issue.labels) };
+  }
+
+  async issueStatus(id: string): Promise<Pick<IssueState, "status" | "statusType">> {
+    const data = await this.read(ISSUE_STATUS_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object"));
+    if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
+    const state = record(record(data.issue).state ?? {});
+    return { status: label(state.name), statusType: label(state.type) };
+  }
+
+  async issueAttachments(id: string): Promise<string[]> {
+    const data = await this.read(ISSUE_ATTACHMENT_URLS_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object"));
+    if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
+    return connection(record(data.issue).attachments ?? { nodes: [] }).nodes.map((node) => label(record(node).url)).filter(Boolean);
+  }
+
+  async issueWatchState(id: string): Promise<Pick<IssueState, "status" | "statusType" | "labels">> {
+    const data = await this.read(ISSUE_WATCH_STATE_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object"));
+    if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
+    const issue = record(data.issue);
+    const state = record(issue.state ?? {});
+    return { status: label(state.name), statusType: label(state.type), labels: labelNodes(issue.labels) };
   }
 
   async labeledProjects(labelName: string): Promise<LabeledProject[]> {
@@ -1226,21 +1274,25 @@ export class LinearService {
 
   // Moves the ticket to its team's first completed state (Done).
   async complete(issueId: string): Promise<void> {
-    const state = await this.issueState(issueId);
-    if (!state.teamId || state.statusType === "completed") return;
-    const done = (await this.teamStates(state.teamId)).filter((item) => item.type === "completed").sort((a, b) => a.position - b.position)[0];
-    if (!done) return;
-    succeeded(await this.writeState(issueId, done.id), "issueUpdate", "complete the ticket");
+    return withPriority("owner", "status change", async () => {
+      const state = await this.issueState(issueId);
+      if (!state.teamId || state.statusType === "completed") return;
+      const done = (await this.teamStates(state.teamId)).filter((item) => item.type === "completed").sort((a, b) => a.position - b.position)[0];
+      if (!done) return;
+      succeeded(await this.writeState(issueId, done.id), "issueUpdate", "complete the ticket");
+    });
   }
 
   // Moves the ticket to its team's first canceled state, with the reason posted first.
   async cancel(issueId: string, reason: string): Promise<void> {
-    const state = await this.issueState(issueId);
-    if (!state.teamId || ["completed", "canceled", "duplicate"].includes(state.statusType)) return;
-    const canceled = (await this.teamStates(state.teamId)).filter((item) => item.type === "canceled").sort((a, b) => a.position - b.position)[0];
-    if (!canceled) return;
-    await this.comment(issueId, reason);
-    succeeded(await this.writeState(issueId, canceled.id), "issueUpdate", "cancel the ticket");
+    return withPriority("owner", "status change", async () => {
+      const state = await this.issueState(issueId);
+      if (!state.teamId || ["completed", "canceled", "duplicate"].includes(state.statusType)) return;
+      const canceled = (await this.teamStates(state.teamId)).filter((item) => item.type === "canceled").sort((a, b) => a.position - b.position)[0];
+      if (!canceled) return;
+      await this.comment(issueId, reason);
+      succeeded(await this.writeState(issueId, canceled.id), "issueUpdate", "cancel the ticket");
+    });
   }
 
   async deleteIssue(issueId: string): Promise<void> {
@@ -1664,42 +1716,50 @@ export class LinearService {
   // In Progress), unless it is already there or finished. Teams without it are left alone.
   // `current`: the ticket's state when the caller already read it.
   async moveToStateNamed(issueId: string, name: string, current?: IssueState): Promise<{ changed: boolean; note?: string }> {
-    const state = current ?? await this.issueState(issueId);
-    const type = state.statusType.trim().toLowerCase();
-    if (type === "completed" || type === "canceled" || type === "duplicate") return { changed: false };
-    if (state.status.trim().toLowerCase() === name.toLowerCase()) return { changed: false };
-    if (!state.teamId) return { changed: false, note: "The ticket has no team." };
-    const target = (await this.teamStates(state.teamId)).find((item) => item.type.trim().toLowerCase() === "started" && item.name.trim().toLowerCase() === name.toLowerCase());
-    if (!target) return { changed: false, note: `The ticket's team has no started state named "${name}".` };
-    succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
-    return { changed: true };
+    return withPriority("owner", "status change", async () => {
+      const state = current ?? await this.issueState(issueId);
+      const type = state.statusType.trim().toLowerCase();
+      if (type === "completed" || type === "canceled" || type === "duplicate") return { changed: false };
+      if (state.status.trim().toLowerCase() === name.toLowerCase()) return { changed: false };
+      if (!state.teamId) return { changed: false, note: "The ticket has no team." };
+      const target = (await this.teamStates(state.teamId)).find((item) => item.type.trim().toLowerCase() === "started" && item.name.trim().toLowerCase() === name.toLowerCase());
+      if (!target) return { changed: false, note: `The ticket's team has no started state named "${name}".` };
+      succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
+      return { changed: true };
+    });
   }
 
   // Moves the ticket to one known state of its team (for example back to where it was).
   async moveToState(issueId: string, stateId: string): Promise<void> {
-    succeeded(await this.writeState(issueId, stateId), "issueUpdate", "move the ticket");
+    return withPriority("owner", "status change", async () => {
+      succeeded(await this.writeState(issueId, stateId), "issueUpdate", "move the ticket");
+    });
   }
 
   // Moves the ticket back to its team's first unstarted state (Todo): planned, not being worked on.
   async moveToReady(issueId: string): Promise<{ changed: boolean; note?: string }> {
-    const state = await this.issueState(issueId);
-    const type = state.statusType.trim().toLowerCase();
-    if (type === "completed" || type === "canceled" || type === "duplicate" || type === "unstarted") return { changed: false };
-    if (!state.teamId) return { changed: false, note: "The ticket has no team." };
-    const target = (await this.teamStates(state.teamId)).filter((item) => item.type === "unstarted").sort((a, b) => a.position - b.position)[0];
-    if (!target) return { changed: false, note: "The ticket's team has no unstarted state." };
-    succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
-    return { changed: true };
+    return withPriority("owner", "status change", async () => {
+      const state = await this.issueState(issueId);
+      const type = state.statusType.trim().toLowerCase();
+      if (type === "completed" || type === "canceled" || type === "duplicate" || type === "unstarted") return { changed: false };
+      if (!state.teamId) return { changed: false, note: "The ticket has no team." };
+      const target = (await this.teamStates(state.teamId)).filter((item) => item.type === "unstarted").sort((a, b) => a.position - b.position)[0];
+      if (!target) return { changed: false, note: "The ticket's team has no unstarted state." };
+      succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
+      return { changed: true };
+    });
   }
 
   // Moves a finished ticket back to its team's first unstarted state (Todo), for example a manual
   // task whose check failed after it was marked done.
   async reopen(issueId: string): Promise<void> {
-    const state = await this.issueState(issueId);
-    if (!state.teamId) return;
-    const target = (await this.teamStates(state.teamId)).filter((item) => item.type === "unstarted").sort((a, b) => a.position - b.position)[0];
-    if (!target || target.id === state.statusId) return;
-    succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
+    return withPriority("owner", "status change", async () => {
+      const state = await this.issueState(issueId);
+      if (!state.teamId) return;
+      const target = (await this.teamStates(state.teamId)).filter((item) => item.type === "unstarted").sort((a, b) => a.position - b.position)[0];
+      if (!target || target.id === state.statusId) return;
+      succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
+    });
   }
 
   // State name, type and completion time of up to 250 issues per request. Deleted, archived or
@@ -1708,7 +1768,7 @@ export class LinearService {
     const result = new Map<string, IssueStatus>();
     for (let start = 0; start < ids.length; start += ISSUE_STATUSES_BATCH) {
       const chunk = ids.slice(start, start + ISSUE_STATUSES_BATCH);
-      const data = record(await this.read(ISSUE_STATUSES_QUERY, { ids: chunk }, (found) => connection(record(found.issues ?? {})).nodes.length === new Set(chunk).size));
+      const data = record(await this.read(ISSUE_STATUSES_QUERY, { ids: chunk, first: chunk.length }, (found) => connection(record(found.issues ?? {})).nodes.length === new Set(chunk).size));
       for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) {
         const state = record(node.state ?? {});
         result.set(label(node.id), { status: label(state.name), statusType: label(state.type), completedAt: label(node.completedAt) || null });
@@ -1752,14 +1812,16 @@ export class LinearService {
   // Moves the ticket to its team's review state unless it is already there or past
   // started work (completed or canceled tickets are left to people and integrations).
   async moveToReview(issueId: string): Promise<{ changed: boolean; note?: string }> {
-    const state = await this.issueState(issueId);
-    const type = state.statusType.trim().toLowerCase();
-    if (type === "completed" || type === "canceled") return { changed: false };
-    if (/review/i.test(state.status) && type === "started") return { changed: false };
-    if (!state.teamId) return { changed: false, note: "The ticket has no team." };
-    const target = resolveReviewState(await this.teamStates(state.teamId));
-    if (!target) return { changed: false, note: "The ticket's team has no review state." };
-    succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
-    return { changed: true };
+    return withPriority("owner", "status change", async () => {
+      const state = await this.issueState(issueId);
+      const type = state.statusType.trim().toLowerCase();
+      if (type === "completed" || type === "canceled") return { changed: false };
+      if (/review/i.test(state.status) && type === "started") return { changed: false };
+      if (!state.teamId) return { changed: false, note: "The ticket has no team." };
+      const target = resolveReviewState(await this.teamStates(state.teamId));
+      if (!target) return { changed: false, note: "The ticket's team has no review state." };
+      succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
+      return { changed: true };
+    });
   }
 }

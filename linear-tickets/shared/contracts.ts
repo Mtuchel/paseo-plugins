@@ -437,6 +437,24 @@ export const agentStatusRpc = defineRpc({
     sweepSkips: z.number().int().nonnegative(),
     webhookReads: z.number().int().nonnegative(),
     usage: linearUsageSchema,
+    budget: z.object({
+      pools: z.array(z.object({
+        pool: z.enum(["app", "key"]),
+        requests: z.object({ limit: z.number(), remaining: z.number() }).nullable(),
+        points: z.object({ limit: z.number(), remaining: z.number() }).nullable(),
+        blockedUntil: z.number(),
+        pausedUntil: z.object({ background: z.number().nullable(), interactive: z.number().nullable() }),
+      })),
+      hours: z.array(z.object({
+        pool: z.enum(["app", "key"]),
+        start: z.string(),
+        callers: z.array(z.object({ caller: z.string(), requests: z.number(), points: z.number() })),
+        outside: z.object({
+          requests: z.object({ spent: z.number(), observedShare: z.number() }),
+          points: z.object({ spent: z.number(), observedShare: z.number() }),
+        }),
+      })),
+    }),
   }),
 });
 

@@ -8,7 +8,7 @@ import type { LinearService, RelayComment } from "./linear";
 import type { ActivationSink, ActivationTake } from "./activation";
 import { overrideCommand, type Deputy } from "./deputy";
 import type { NeedsYouIssues } from "./needs-you";
-import { RateLimitedError } from "./rate-budget";
+import { RateLimitedError, withPriority } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
 import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./permission-replies";
 
@@ -165,54 +165,58 @@ export class CommentRelay {
     this.deputy = deputy;
   }
 
+  // Background priority is set here, not left to the dispatch tick that usually calls it: a direct
+  // poll (a peer, a test) must pause at the pool's reserve too (see rate-budget.ts).
   async poll(paseo: PaseoApi): Promise<void> {
-    const state = await this.load();
-    await this.acknowledge(state);
-    const linked = await this.linkedAgents(paseo);
-    const { watches, written } = await this.watches(linked);
-    const active = watches.filter((watch) => !this.unseen.has(watch.issueId));
-    const cursors: Record<string, Cursor> = {};
-    for (const watch of active) cursors[watch.issueId] = nextCursor(state.cursors[watch.issueId], watch);
-    state.cursors = cursors;
-    if (active.length) {
-      const viewerId = await this.linear.viewerId();
-      // Reactions are written as the Paseo app (or the owner when the app is not usable, and before
-      // writes moved to the app): either one marks the comment as handled.
-      const appId = await this.linear.appUserId();
-      const plain = appId !== null;
-      const { comments, unseen } = await this.linear.relayComments(viewerId, active.map((watch) => ({ issueId: watch.issueId, since: cursors[watch.issueId].since })), plain);
-      for (const issueId of unseen) this.unseen.add(issueId);
-      for (const watch of active) {
-        const cursor = cursors[watch.issueId];
-        for (const comment of comments.get(watch.issueId) ?? []) {
-          if (comment.createdAt < cursor.since || (comment.createdAt === cursor.since && cursor.boundaryIds.includes(comment.id))) continue;
-          // An @mention of the Paseo app opens (or replies in) an agent session, and so does a reply
-          // in a session's thread; the session webhook delivers those, and relaying them too would
-          // hand the agent the same message twice.
-          const handled = comment.userId !== viewerId
-            || written.has(comment.id)
-            || comment.sessionId !== null
-            || comment.parent?.sessionId != null
-            || comment.reactions.some((reaction) => (reaction.userId === viewerId || (appId !== null && reaction.userId === appId)) && (reaction.emoji === ACK_EMOJI || reaction.emoji === FAILED_EMOJI))
-            || state.acks.some((ack) => ack.commentId === comment.id);
-          // A correction of a deputy answer (a reply to its notice, or "override D-…") goes to the
-          // agent that got that answer, before the comment could answer a newer question.
-          const correction = handled ? null : await this.correction(comment);
-          const route = handled || correction ? null : routeComment(watch, comment, plain, appId);
-          if (correction) state.acks.push({ commentId: comment.id, issueId: watch.issueId, reacted: false, ...correction });
-          if (route) {
-            const outcome = await this.deliver(paseo, route.reader.agent, comment, route.message, watch.issueId);
-            state.acks.push({ commentId: comment.id, issueId: watch.issueId, reacted: false, ...outcome });
+    await withPriority("background", "comment-relay", async () => {
+      const state = await this.load();
+      await this.acknowledge(state);
+      const linked = await this.linkedAgents(paseo);
+      const { watches, written } = await this.watches(linked);
+      const active = watches.filter((watch) => !this.unseen.has(watch.issueId));
+      const cursors: Record<string, Cursor> = {};
+      for (const watch of active) cursors[watch.issueId] = nextCursor(state.cursors[watch.issueId], watch);
+      state.cursors = cursors;
+      if (active.length) {
+        const viewerId = await this.linear.viewerId();
+        // Reactions are written as the Paseo app (or the owner when the app is not usable, and before
+        // writes moved to the app): either one marks the comment as handled.
+        const appId = await this.linear.appUserId();
+        const plain = appId !== null;
+        const { comments, unseen } = await this.linear.relayComments(viewerId, active.map((watch) => ({ issueId: watch.issueId, since: cursors[watch.issueId].since })), plain);
+        for (const issueId of unseen) this.unseen.add(issueId);
+        for (const watch of active) {
+          const cursor = cursors[watch.issueId];
+          for (const comment of comments.get(watch.issueId) ?? []) {
+            if (comment.createdAt < cursor.since || (comment.createdAt === cursor.since && cursor.boundaryIds.includes(comment.id))) continue;
+            // An @mention of the Paseo app opens (or replies in) an agent session, and so does a reply
+            // in a session's thread; the session webhook delivers those, and relaying them too would
+            // hand the agent the same message twice.
+            const handled = comment.userId !== viewerId
+              || written.has(comment.id)
+              || comment.sessionId !== null
+              || comment.parent?.sessionId != null
+              || comment.reactions.some((reaction) => (reaction.userId === viewerId || (appId !== null && reaction.userId === appId)) && (reaction.emoji === ACK_EMOJI || reaction.emoji === FAILED_EMOJI))
+              || state.acks.some((ack) => ack.commentId === comment.id);
+            // A correction of a deputy answer (a reply to its notice, or "override D-…") goes to the
+            // agent that got that answer, before the comment could answer a newer question.
+            const correction = handled ? null : await this.correction(comment);
+            const route = handled || correction ? null : routeComment(watch, comment, plain, appId);
+            if (correction) state.acks.push({ commentId: comment.id, issueId: watch.issueId, reacted: false, ...correction });
+            if (route) {
+              const outcome = await this.deliver(paseo, route.reader.agent, comment, route.message, watch.issueId);
+              state.acks.push({ commentId: comment.id, issueId: watch.issueId, reacted: false, ...outcome });
+            }
+            if (comment.createdAt === cursor.since) cursor.boundaryIds.push(comment.id);
+            else Object.assign(cursor, { since: comment.createdAt, boundaryIds: [comment.id] });
+            // Recorded before the reaction: a restart in between must not deliver the comment again.
+            if (route || correction) await this.save(state);
           }
-          if (comment.createdAt === cursor.since) cursor.boundaryIds.push(comment.id);
-          else Object.assign(cursor, { since: comment.createdAt, boundaryIds: [comment.id] });
-          // Recorded before the reaction: a restart in between must not deliver the comment again.
-          if (route || correction) await this.save(state);
         }
       }
-    }
-    await this.acknowledge(state);
-    await this.save(state);
+      await this.acknowledge(state);
+      await this.save(state);
+    });
   }
 
   // The issues the linked agents watch, and the ids of the comments agents and the plugin wrote.

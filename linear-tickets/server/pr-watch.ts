@@ -726,7 +726,7 @@ export class PullRequestWatch {
       sessions: Pick<SessionRouter, "sessionFor" | "say" | "prompt" | "link" | "crashed" | "succeed" | "whileIdle">;
       // `issueState` finds a ticket that has no handover record by its identifier, and tells
       // whether a crashed agent's ticket is still started.
-      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "hasComment" | "viewerId" | "userUrl" | "linkUrl" | "issueState">;
+      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "hasComment" | "viewerId" | "userUrl" | "linkUrl" | "issueState" | "issueAttachments">;
       // `tasks` finds the before-merge tasks of tickets that have no handover record.
       manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge"> & Partial<Pick<ManualTasks, "tasks">>;
       settings: Pick<Settings, "read">;
@@ -752,7 +752,7 @@ export class PullRequestWatch {
     if (this.timer) return;
     this.timer = setInterval(() => {
       void this.poll().then(() => {
-        if (!this.kicked) return;
+        if (!this.timer || !this.kicked) return;
         this.kicked = false;
         void this.backstop();
       });
@@ -762,13 +762,16 @@ export class PullRequestWatch {
     this.backstopTimer.unref?.();
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     clearInterval(this.backstopTimer ?? undefined);
     this.timer = null;
     this.backstopTimer = null;
     // No watchdog effect starts after the unload; one in flight drains under its lease.
     this.deps.watchdog?.stop();
+    // These runs may be awaiting GitHub before their next Linear write. Finish them
+    // before the plugin's final hourly-usage flush and replacement instance start.
+    await Promise.allSettled([this.running, this.backstopping]);
   }
 
   private async load(): Promise<Record<string, Seen>> {
@@ -847,13 +850,13 @@ export class PullRequestWatch {
   // per pool); unsaved records are retried on the next poll. One poll at a time: a tick while the
   // last one still runs joins it.
   poll(): Promise<void> {
-    this.running ??= this.exclusive(() => withPriority("background", () => this.watch())).finally(() => { this.running = null; });
+    this.running ??= this.exclusive(() => withPriority("background", "pr-watch", () => this.watch())).finally(() => { this.running = null; });
     return this.running;
   }
 
   // One queue backstop run at a time (see queueBackstop); a tick while one runs joins it.
   backstop(): Promise<void> {
-    this.backstopping ??= this.exclusive(() => withPriority("background", () => this.queueBackstop())).finally(() => { this.backstopping = null; });
+    this.backstopping ??= this.exclusive(() => withPriority("background", "queue backstop", () => this.queueBackstop())).finally(() => { this.backstopping = null; });
     return this.backstopping;
   }
 
@@ -930,8 +933,8 @@ export class PullRequestWatch {
     if (!repo) {
       // Removed worker folders can still have a landed PR attached to the ticket. It supplies
       // only the repo, never the candidate: list what remains open and match the whole ticket.
-      const state = await this.deps.linear.issueState(record.issueId);
-      const repos = new Set((state.attachmentUrls ?? []).flatMap((url) => {
+      const attachments = await this.deps.linear.issueAttachments(record.issueId);
+      const repos = new Set(attachments.flatMap((url) => {
         const source = /^https:\/\/github\.com\/([A-Za-z0-9-]+\/[A-Za-z0-9_.-]+)\/pull\/[1-9]\d*\/?$/.exec(url);
         return source ? [source[1].toLowerCase()] : [];
       }));
@@ -960,8 +963,8 @@ export class PullRequestWatch {
       const own = ticket.worktree ? await context.repo(ticket.worktree) : null;
       if (own) repos.add(own.toLowerCase());
       if (!repos.size) {
-        const state = await this.deps.linear.issueState(ticket.issueId);
-        for (const url of state.attachmentUrls ?? []) {
+        const attachments = await this.deps.linear.issueAttachments(ticket.issueId);
+        for (const url of attachments) {
           const source = /^https:\/\/github\.com\/([A-Za-z0-9-]+\/[A-Za-z0-9_.-]+)\/pull\/[1-9]\d*\/?$/.exec(url);
           if (source) repos.add(source[1].toLowerCase());
         }

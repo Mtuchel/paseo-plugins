@@ -12,6 +12,7 @@ import { needsOwner } from "./presence";
 import { classifyRunAgents, classifyTicketAgents, type ProcessInspector, type TicketAgents } from "./process-liveness";
 import { SetupError, type PlannerStart } from "./launch";
 import type { RepairRecord } from "./label-repair";
+import { withPriority } from "./rate-budget";
 import type { PluginSettings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 import { activeModel } from "./model";
@@ -337,49 +338,53 @@ export class ProjectFlow {
 
   // Called on every dispatch poll; reads the projects at most every POLL_MS. Each project runs on
   // its own, so one failing project does not stop the others, and within a project a failing
-  // work order or planner never stops the hand-out of tickets already planned.
+  // work order or planner never stops the hand-out of tickets already planned. Background priority
+  // is set here, not left to the dispatch tick that usually calls it, so a direct call pauses at the
+  // pool's reserve too (see rate-budget.ts).
   async tick(paseo: PaseoApi, settings: PluginSettings): Promise<void> {
-    if (this.now() - this.lastPoll < POLL_MS) return;
-    this.lastPoll = this.now();
-    const appId = await this.deps.linear.appUserId();
-    // Hand-outs start through Linear agent sessions; without the Paseo app nothing would start.
-    if (!appId) { this.statuses = []; return; }
-    const statuses: ProjectStatus[] = [];
-    for (const project of await this.deps.linear.labeledProjects(settings.dispatch.label)) {
-      try {
-        await this.exclusive(project.id, async () => {
-          let read = await this.read(project, settings);
-          await this.retireObsolete(project.id, paseo);
-          const planner = read.record.planner;
-          if (planner?.approved) {
-            const written = await this.write(project.id, planner, paseo, settings)
-              .catch((error: unknown) => { console.error(`[linear-tickets] project ${project.name}: writing the work order failed, the next read retries: ${message(error)}`); return false; });
-            if (written) read = await this.read(project, settings, true);
-          }
-          const open = read.record.planner;
-          let status = read.status;
-          if (settings.dispatch.enabled && open && !open.startedAt && !open.approved && !open.ownerAsked) {
-            status = await this.launchRun(project, open, read, settings, paseo)
-              .catch((error: unknown) => { console.error(`[linear-tickets] project ${project.name}: starting the planner failed: ${message(error)}`); return read.status; });
-          } else if (settings.dispatch.enabled && open && !open.approved && !open.ownerAsked) {
-            await this.revive(project, open, read, settings, paseo)
-              .catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: restarting the planner failed, the first read after ${RESTART_GRACE_MS / 60_000} minutes retries: ${message(error)}`));
-          } else if (settings.dispatch.enabled && !open && read.unplanned.length && this.settled(read.record.waiting ?? {}, read.unplanned)) {
-            // The tickets have waited for their plan (none newer than the quiet time, or the oldest
-            // at the max wait): start the run.
-            status = await this.startRun(project, read, settings, paseo)
-              .catch((error: unknown) => { console.error(`[linear-tickets] project ${project.name}: starting the planner failed, the next read retries: ${message(error)}`); return read.status; });
-          }
-          statuses.push(await this.runStatus(project.id, status));
-          await this.handOut(project.id, read, appId, paseo, settings);
-          await this.reviveStalled(project.id, read, appId, paseo, settings)
-            .catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: restarting stalled tickets failed, the next read retries: ${message(error)}`));
-        });
-      } catch (error) {
-        console.error(`[linear-tickets] project ${project.name}: ${message(error)}`);
+    await withPriority("background", "project-flow", async () => {
+      if (this.now() - this.lastPoll < POLL_MS) return;
+      this.lastPoll = this.now();
+      const appId = await this.deps.linear.appUserId();
+      // Hand-outs start through Linear agent sessions; without the Paseo app nothing would start.
+      if (!appId) { this.statuses = []; return; }
+      const statuses: ProjectStatus[] = [];
+      for (const project of await this.deps.linear.labeledProjects(settings.dispatch.label)) {
+        try {
+          await this.exclusive(project.id, async () => {
+            let read = await this.read(project, settings);
+            await this.retireObsolete(project.id, paseo);
+            const planner = read.record.planner;
+            if (planner?.approved) {
+              const written = await this.write(project.id, planner, paseo, settings)
+                .catch((error: unknown) => { console.error(`[linear-tickets] project ${project.name}: writing the work order failed, the next read retries: ${message(error)}`); return false; });
+              if (written) read = await this.read(project, settings, true);
+            }
+            const open = read.record.planner;
+            let status = read.status;
+            if (settings.dispatch.enabled && open && !open.startedAt && !open.approved && !open.ownerAsked) {
+              status = await this.launchRun(project, open, read, settings, paseo)
+                .catch((error: unknown) => { console.error(`[linear-tickets] project ${project.name}: starting the planner failed: ${message(error)}`); return read.status; });
+            } else if (settings.dispatch.enabled && open && !open.approved && !open.ownerAsked) {
+              await this.revive(project, open, read, settings, paseo)
+                .catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: restarting the planner failed, the first read after ${RESTART_GRACE_MS / 60_000} minutes retries: ${message(error)}`));
+            } else if (settings.dispatch.enabled && !open && read.unplanned.length && this.settled(read.record.waiting ?? {}, read.unplanned)) {
+              // The tickets have waited for their plan (none newer than the quiet time, or the oldest
+              // at the max wait): start the run.
+              status = await this.startRun(project, read, settings, paseo)
+                .catch((error: unknown) => { console.error(`[linear-tickets] project ${project.name}: starting the planner failed, the next read retries: ${message(error)}`); return read.status; });
+            }
+            statuses.push(await this.runStatus(project.id, status));
+            await this.handOut(project.id, read, appId, paseo, settings);
+            await this.reviveStalled(project.id, read, appId, paseo, settings)
+              .catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: restarting stalled tickets failed, the next read retries: ${message(error)}`));
+          });
+        } catch (error) {
+          console.error(`[linear-tickets] project ${project.name}: ${message(error)}`);
+        }
       }
-    }
-    this.statuses = statuses;
+      this.statuses = statuses;
+    });
   }
 
   // The project's open tickets and what is planned. Only tickets the hand-out could take need a

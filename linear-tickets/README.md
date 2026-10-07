@@ -464,9 +464,9 @@ webhook. A session it never webhooked for, or without one for over 5 minutes, is
 as before, so a missed webhook costs what the sweep always cost and no reply is missed (see
 [Rate limits](#rate-limits) for what that saves and how it is measured); the sweep also picks up a
 new thread Linear already marked stale because this host was down when it arrived (up to two hours
-old, unless the ticket got a newer thread since). Each of the sweep's parts (waiting tickets,
-superseded threads, reviews, "Open in Paseo" links, missed replies) and each thread's replies are
-handled on their own: a failed Linear request skips only what it hit until the next minute.
+old, unless the ticket got a newer thread since). Ordinary failures skip only the affected sweep
+part or thread. A rate limit stops the part with one pause log; while the app's background budget
+is paused, the whole sweep is skipped until it refills.
 The Paseo Agents menu bar app's **Control panel → Linear agent** shows the state.
 
 **Several hosts.** Each host that runs the plugin installs its own app (for example "Paseo" on the
@@ -2046,16 +2046,18 @@ Editing the file takes effect at the next cycle.
 
 ## Rate limits
 
-Linear meters requests per credential and hour: **2,500** for the personal API key (shared by
-every key of the same Linear user) and **5,000** for the Paseo app's token. Both refill
-steadily, so the plugin estimates each pool's room from the `X-RateLimit-Requests-Remaining`
-header of the last answer plus the refill since then.
+Linear meters **requests and complexity points** per credential and hour:
 
-Linear also meters **complexity points**: currently **3,000,000/h** for the key's user and
-**2,000,000/h** for the app user. `X-Complexity` is the response's query cost;
-`X-RateLimit-Complexity-Remaining` and `-Limit` describe that credential's budget. On 2026-10-07
-the app exhausted complexity while thousands of requests remained. The admission reserve above
-still only checks requests; complexity admission is tracked in TUC-1291, not implemented here.
+| Pool | Requests/hour | Complexity points/hour |
+|---|---:|---:|
+| Personal API key (shared by that user's keys) | 2,500 | 3,000,000 |
+| Paseo app token (per app user) | 5,000 | 2,000,000 |
+
+Both dimensions refill steadily. The plugin reads `X-RateLimit-Requests-*` and
+`X-RateLimit-Complexity-*`, estimates refill since each dimension's last sample, and reserves
+in-flight requests and their estimated points. `X-Complexity` updates the pool's average query
+cost (EWMA, starting at 100 points). A dimension not learned yet does not restrict admission;
+a missing header leaves its last sample unchanged. Whichever dimension resumes later sets the wait.
 
 **Usage per caller.** `linear.agent-status` includes `usage`: `since`, `until`, `pools` and
 `rows`. Each row names the credential pool (`app` or `key`), caller and GraphQL operation,
@@ -2064,7 +2066,7 @@ with sent `requests`, measured `points`, and `unmetered` requests whose cost is 
 neither a request nor points; Linear's error responses do count. The totals cover at most
 60 minute buckets, including the current partial minute, and reset when the plugin reloads.
 Calls are counted when their fetch settles. Caller context follows awaited work and timers;
-nested callers override it. Unscoped requests remain visible as `other`, with their operation.
+nested callers override it. Unscoped requests are labelled `op:<operation>`.
 
 The caller names distinguish dispatch, project flow, comment relay, label repair, PR watch,
 session-sweep parts, session webhooks, lifecycle write-backs, sidebar reads, health, manual
@@ -2072,9 +2074,9 @@ tasks, state labels, label rules and plan handling. Each pool also includes the 
 observed request/complexity limits and remaining budget, with `observedAt` (not an extrapolation).
 Once an hour the plugin logs totals and its twelve most expensive caller/operation rows.
 Counters only cover this daemon's GraphQL transport: other hosts, agents' MCP processes and
-host scripts are **not** attributed. The remaining-budget headers include their use, but cannot
-identify them; subtracting adjacent responses is unreliable when responses arrive out of order
-or the bucket refills to its ceiling. No tokens, query bodies or ticket text appear in the report.
+host scripts are **not** attributed. Hourly history adds a partial outside estimate only for
+isolated fresh header intervals (see below), never as exact per-caller attribution.
+No tokens, query bodies or ticket text appear in the report.
 
 - **Reads that pollers repeat use the app's pool** when the Paseo app is installed: the relay's
   comment read, the auto-dispatch label query, ticket state, manual-task status, the sidebar
@@ -2094,14 +2096,65 @@ or the bucket refills to its ceiling. No tokens, query bodies or ticket text app
   `webhooks` (delivered since the plugin loaded), `sweepReads`, `sweepSkips` and `webhookReads`;
   `sweepSkips` against `sweepReads + sweepSkips` is how much of the saving the webhooks actually
   cover.
-- **Background work stops at a 15% reserve** of the pool it needs: auto-dispatch, the relay,
-  manual tasks, the pull request watch, the state labels, the label rules and the health check. It resumes on its
-  own as the pool refills. Session prompts, write-backs, agents' `linear_ticket` tools and the
-  sidebar ticket list still use the reserve. The **Auto-dispatch** status shows `paused: …` with
-  the estimated time, and the plugin log records each pause once.
-- **When Linear answers `RATELIMITED`**, requests on that pool wait until the estimate reaches
-  the reserve again (at least a minute). Then exactly one request tries, and a second limit
-  doubles the wait, up to 15 minutes. Session errors and agent tools say when to try again.
+- **Three priorities reserve room for owner intent on both dimensions.**
+  - Background work leaves **20%**: auto-dispatch, comment relay, project flow, label repair,
+    health, label rules, manual tasks, plan requests, PR watch, queue backstop, state labels
+    and the session sweep. Polls resume as the budget refills; the sweep skips its whole round
+    while paused. Auto-dispatch shows `paused: …`, and persistent pauses are logged once per pool/cause.
+  - Interactive agent work leaves **5%**: progress write-backs, session replies and sidebar reads.
+  - Owner work may use the final **5%**: plan approval/send-back (review page, inbox and Linear
+    panel, including split and approve-later), plan follow-up filing and its retry worker,
+    ticket status changes, and owner questions (panel prompt, Needs input, label and comment).
+    The whole operation runs at owner priority, prerequisite reads included. A turn-end question
+    is delivered before ordinary progress work, which still leaves the owner's reserve untouched.
+    Nested work never lowers priority. Pending session links are only recorded after successful
+    delivery; a reserve refusal leaves them for the next sweep.
+- **When Linear answers `RATELIMITED`**, every priority waits at least one minute. After that,
+  reserve admission runs before the single probe slot: background or interactive work below
+  its reserve cannot steal the owner's probe. Only one eligible request probes; a network
+  failure releases its slot, an answered success clears the block, and a limited probe doubles
+  the backoff up to 15 minutes. Background still waits for its 20% share to refill.
+  Rate-limit refusals of Plannotator events and plan follow-ups retry at the advertised resume
+  time without consuming an attempt; already-created tickets and relations stay recorded.
+  This does not fix decisions lost halfway through delivery (tracked separately in TUC-1288).
+- **Hourly usage is persisted** in `$PASEO_HOME/linear-tickets/linear-usage.json` (version 1,
+  mode 0600), atomically every minute and on unload, with eight days retained. It counts answered
+  requests, complexity points (missing costs estimated separately), local reserve refusals,
+  upstream limits, minimum remaining fractions, elapsed blocked time and spend by caller/pool.
+  Corrupt input starts empty with a warning; persistence failures do not block requests.
+  Unload drains admitted Linear responses and the PR watch's in-progress runs before its final
+  flush. Initial turn-start status changes run before ordinary panel progress; a refused
+  prerequisite read leaves that transition eligible for retry.
+  `linear.agent-status` adds `budget.pools` with both dimensions, block/pause times, and
+  `budget.hours` with each pool's current-hour top ten callers and outside estimates.
+- **The ops digest's “Linear budget” section** shows the last full UTC hour per pool, its top
+  three callers, and every limited or blocked hour in the last seven days with its largest
+  spender. Limited hours within 24 hours also become non-attention `linear: limit reached`
+  history items, once per pool/hour, for the weekly review. Missing/unreadable usage is reported
+  under `linear_budget`, keeping previous items rather than failing the digest.
+- **Outside the plugin is an estimate, not a complete meter.** Agent MCP processes, scripts
+  and the digest use the same credentials without daemon admission. Their spend appears as
+  “≈ outside the plugin” only between fresh (at most five minutes), non-overlapping own
+  responses carrying that dimension's headers. Observation coverage is shown separately for
+  requests and points; gaps and concurrent requests are unobserved, not zero outside spend.
+  Negative corrections are retained in the file but displays clamp at zero. A different host's
+  app is a separate pool, not part of this estimate. These external callers can still consume
+  the owner's reserve; sharing admission with agent MCP processes is tracked in TUC-1323.
+  The laptop's digest aggregation, menu-bar budget view, comment webhooks and one-week budget
+  review are separate follow-ups. Status batches request only the number of IDs in each chunk.
+  Review inbox metadata reads only issue id, identifier and labels; queued threads read only
+  the workflow state before capacity admission. `starter.admission` still checks dependencies
+  and merged-review blockers using the full state query. On 2026-10-07 the old full state read
+  measured 498 points, while `issueStatuses` measured 4: declared page size is not measured cost.
+  PR discovery reads only attachment URLs (the same first 50 as before); watchdog exclusions
+  read only workflow state and labels. Both retain app-first reads, access fallback to the key
+  and propagation of app rate limits without key fallback. Discovery's repository/title matching,
+  ambiguous-repository refusal and watchdog owner/hold/veto exclusions are unchanged.
+  A read-only production probe on this ticket measured the new attachment-URL query at
+  4 points and the watchdog state/label query at 5 points (2026-10-07); costs vary with data.
+  A steady Mac interval on 2026-10-07 (11:11:13–11:22:46 UTC) measured PR-watch state reads at
+  307,266 points, 81.15% of daemon points; label-history reads were second at 45,084 points.
+  Comment relay used 2,188 points, disproving the original comment-relay estimate for that host.
 - **Write-backs are not dropped.** A rate-limited write-back is retried when the pool refills,
   for up to 6 hours. A retry that a newer event for the same agent overtook only links its
   pull requests: those are kept in `$PASEO_HOME/linear-tickets/writeback-outbox.json` until

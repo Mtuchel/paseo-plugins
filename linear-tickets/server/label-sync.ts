@@ -155,12 +155,14 @@ export class LabelSync {
   }
 
   private async run(): Promise<void> {
-    if (this.stopped) return;
-    const rules = await (this.deps.rules ?? readLabelRules)();
-    if (!rules) { this.groups = null; return; }
-    const pluginUser = await this.deps.linear.appUserId();
-    if (!pluginUser) throw new Error("the Paseo Linear app is not usable on this host; labels wait for it, since the app's authorship tells the plugin's labels from people's.");
-    await withPriority("background", async () => {
+    // Background priority covers the whole round, the rules read and the app check included, so a
+    // direct call pauses at the pool's reserve before its first request (see rate-budget.ts).
+    await withPriority("background", "label-sync", async () => {
+      if (this.stopped) return;
+      const rules = await (this.deps.rules ?? readLabelRules)();
+      if (!rules) { this.groups = null; return; }
+      const pluginUser = await this.deps.linear.appUserId();
+      if (!pluginUser) throw new Error("the Paseo Linear app is not usable on this host; labels wait for it, since the app's authorship tells the plugin's labels from people's.");
       const now = this.deps.now?.() ?? Date.now();
       const full = now - this.lastFull >= FULL_SWEEP_MS;
       if (this.groups?.hash !== rules.hash || (!this.groups.complete && full)) {

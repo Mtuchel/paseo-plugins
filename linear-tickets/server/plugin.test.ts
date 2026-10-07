@@ -13,8 +13,11 @@ import { Launcher, safeBranchName } from "./launch";
 import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_CHEAP_MODELS, DEFAULT_STANDARD_MODELS, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, DEFAULT_ACTIVATION } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { LinearService, postGraphQL, ADD_LABEL_QUERY, CREATE_LABEL_QUERY, LABEL_BY_NAME_QUERY, resolveReviewState, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
-import { RateBudget, RateLimitedError } from "./rate-budget";
-import { cachedOverviewRpc, countIssuesRpc, listIssuesRpc, searchIssuesRpc, setSettingsRpc } from "../shared/contracts";
+import { rateBudget, RateBudget, RateLimitedError, withPriority } from "./rate-budget";
+import { linearUsage } from "./linear-usage";
+import { PlannotatorHost } from "./parked";
+import { ReviewLinks } from "./review-links";
+import { agentStatusRpc, cachedOverviewRpc, countIssuesRpc, listIssuesRpc, searchIssuesRpc, setSettingsRpc } from "../shared/contracts";
 
 // Launches save the ticket prompt for the plan advisor under PASEO_HOME; keep it out of the real one.
 process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-plugin-home-"));
@@ -45,11 +48,39 @@ const input = { id: "ENG-42", projectId: "project-1", provider: "test/model", in
 const noMark = { markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] };
 const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: DEFAULT_CHEAP_MODELS, standardModels: DEFAULT_STANDARD_MODELS, reviewPeers: [], activation: DEFAULT_ACTIVATION, deputy: DEFAULT_DEPUTY };
 
-test("server entrypoint loads and registers valid Paseo RPC contracts", () => {
-  const names: string[] = [];
-  const cleanup = contribute({ handle(contract: { name: string }) { names.push(contract.name); }, on() { return () => {}; }, before() { return () => {}; } } as unknown as PluginServerContext);
-  assert.deepEqual(names, ["linear.status", "linear.dispatch-status", "linear.projects-status", "linear.plan-project", "linear.skip-plan", "linear.presence", "linear.set-presence", "linear.capacity", "linear.set-capacity", "linear.pull-requests", "linear.label-pulls", "linear.connect", "linear.disconnect", "linear.list-issues", "linear.count-issues", "linear.cached-overview", "linear.search-issues", "linear.issue-context", "linear.project-branches", "linear.get-default-prompt", "linear.set-default-prompt", "linear.get-settings", "linear.set-settings", "linear.launch-agent", "linear.agent-status"]);
-  cleanup();
+test("agent status reports each credential's dimensions, pause and hourly callers separately", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  // No review listener or host process is needed to exercise the status RPC.
+  t.mock.method(ReviewLinks.prototype, "start", async () => {});
+  t.mock.method(PlannotatorHost.prototype, "start", async () => {});
+  await linearUsage.start();
+  const headers = (requestLimit: number, pointLimit: number, pointsLeft: number) => new Headers({
+    "x-ratelimit-requests-limit": String(requestLimit), "x-ratelimit-requests-remaining": String(requestLimit * 0.9),
+    "x-ratelimit-complexity-limit": String(pointLimit), "x-ratelimit-complexity-remaining": String(pointsLeft),
+    "x-complexity": "12",
+  });
+  await withPriority("owner", "app decision", async () => rateBudget.acquire("app").done(headers(5000, 2_000_000, 380_000), false));
+  await withPriority("owner", "key decision", async () => rateBudget.acquire("key").done(headers(2500, 3_000_000, 600_000), false));
+  const rpc: { read?: (input: object, context: { paseo: PaseoApi }) => Promise<unknown> } = {};
+  const cleanup = contribute({
+    handle(contract: { name: string }, handler: typeof rpc.read) { if (contract.name === "linear.agent-status") rpc.read = handler; },
+    on() { return () => {}; }, before() { return () => {}; },
+  } as unknown as PluginServerContext);
+  t.after(cleanup);
+  const paseo = { agents: { list: async () => ({ entries: [] }), subscribe: () => () => {} } } as unknown as PaseoApi;
+  assert.ok(rpc.read);
+  const result = agentStatusRpc.output.parse(await rpc.read({}, { paseo }));
+  const app = result.budget.pools.find((entry) => entry.pool === "app")!;
+  const key = result.budget.pools.find((entry) => entry.pool === "key")!;
+  assert.equal(app.requests?.limit, 5000);
+  assert.equal(app.points?.limit, 2_000_000);
+  assert.ok(app.points!.remaining >= 380_000 && app.points!.remaining < 400_000);
+  assert.ok(app.pausedUntil.background! > Date.now());
+  assert.equal(app.pausedUntil.interactive, null);
+  assert.equal(key.requests?.limit, 2500);
+  assert.equal(key.points?.limit, 3_000_000);
+  assert.deepEqual(result.budget.hours.find((entry) => entry.pool === "app")!.callers, [{ caller: "app decision", requests: 1, points: 12 }]);
+  assert.deepEqual(result.budget.hours.find((entry) => entry.pool === "key")!.callers, [{ caller: "key decision", requests: 1, points: 12 }]);
 });
 
 function mockFetch(t: TestContext, makeResponse: () => Response): void {
@@ -81,9 +112,6 @@ test("authentication, rate-limit and server failures map to user-actionable erro
   const cases: Array<{ status: number; body: unknown; message: RegExp }> = [
     { status: 401, body: { errors: [{ message: "Authentication required" }] }, message: /rejected this API key. Authentication required/ },
     { status: 403, body: { errors: [{ message: "forbidden" }] }, message: /rejected this API key. forbidden/ },
-    { status: 429, body: { errors: [{ message: "rate limited" }] }, message: /hourly request limit is reached for the Linear API key/ },
-    // What Linear actually sends when the hourly limit is used up.
-    { status: 400, body: { errors: [{ message: "Rate limit exceeded. Only 2500 requests are allowed per 1 hour.", extensions: { code: "RATELIMITED" } }] }, message: /hourly request limit is reached for the Linear API key/ },
     { status: 400, body: { errors: [{ message: "Remove the Bearer prefix from the Authorization header." }] }, message: /request failed: Remove the Bearer prefix/ },
     { status: 500, body: { errors: [{ message: "boom" }] }, message: /request failed: boom/ },
     { status: 502, body: "gateway html", message: /HTTP 502/ },
@@ -94,22 +122,23 @@ test("authentication, rate-limit and server failures map to user-actionable erro
   }
 });
 
-test("a RATELIMITED answer blocks only its own pool, and later calls on it fail without reaching Linear", async (t) => {
-  let calls = 0;
-  t.mock.method(globalThis, "fetch", (() => {
-    calls++;
-    return Promise.resolve(new Response(JSON.stringify({ data: null, errors: [{ message: "Rate limit exceeded.", extensions: { code: "RATELIMITED" } }] }), {
-      status: 200, headers: { "content-type": "application/json", "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": "0" },
-    }));
-  }) as typeof fetch);
-  const budget = new RateBudget();
-  const error = await postGraphQL("Bearer app-token", "q", {}, budget).then(() => null, (failure: unknown) => failure);
-  assert.ok(error instanceof RateLimitedError);
-  assert.equal(error.pool, "app");
-  assert.ok(error.resumeAt > Date.now());
-  await assert.rejects(postGraphQL("Bearer app-token", "q", {}, budget), RateLimitedError);
-  assert.equal(calls, 1);
-  assert.equal(budget.pausedUntil("key"), null);
+test("HTTP and GraphQL rate refusals block only their pool without sending subsequent requests", async (t) => {
+  for (const status of [200, 400, 429]) {
+    let calls = 0;
+    t.mock.method(globalThis, "fetch", async () => {
+      calls++;
+      const payload = status === 429 ? {} : { errors: [{ message: "Rate limit exceeded.", extensions: { code: "RATELIMITED" } }] };
+      return new Response(JSON.stringify(payload), {
+        status, headers: { "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": "0" },
+      });
+    });
+    const budget = new RateBudget();
+    await assert.rejects(postGraphQL("Bearer app-token", "q", {}, budget), (error: unknown) =>
+      error instanceof RateLimitedError && error.pool === "app" && error.reason === "limited" && error.resumeAt > Date.now());
+    await assert.rejects(postGraphQL("Bearer app-token", "q", {}, budget), RateLimitedError);
+    assert.equal(calls, 1);
+    assert.equal(budget.pausedUntil("key"), null);
+  }
 });
 
 test("GraphQL error payloads fail visibly with the API message", async (t) => {

@@ -1,20 +1,15 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { githubRouted } from "./github-cli";
+import { asCaller, currentCallerName, linearUsage, type LinearUsage } from "./linear-usage";
 
-// Linear meters requests per credential: the owner's API key (2,500/h, shared by every key of
-// that user) and the Paseo app token (5,000/h per app user) are separate pools. Both refill at a
-// constant rate (a leaky bucket: limit / 1 h), so the budget of a pool is estimated from the last
-// response's `X-RateLimit-Requests-Remaining` plus the refill since then. The `-Reset` header is
-// not used: Linear always reports it as one hour from now.
+// Linear's app and API-key pools each meter requests and complexity independently.
 export type Pool = "key" | "app";
-export type Priority = "interactive" | "background";
+export type Priority = "owner" | "interactive" | "background";
 
 const PERIOD_MS = 60 * 60 * 1000;
-// Background work leaves this share of a pool to interactive work (sessions, write-backs, MCP).
-export const RESERVE_FRACTION = 0.15;
+export const RESERVES: Record<Priority, number> = { background: 0.20, interactive: 0.05, owner: 0 };
 const MIN_BLOCK_MS = 60 * 1000;
 const MAX_BACKOFF_MS = 15 * 60 * 1000;
-// While the single probe after a block is in flight, other callers are told to come back shortly.
 const PROBE_WAIT_MS = 10 * 1000;
 
 export function poolOf(authorization: string): Pool {
@@ -31,101 +26,127 @@ function clock(at: number): string {
 }
 
 export class RateLimitedError extends Error {
-  // `reserve`: the pool still has requests, but they are kept for interactive work.
-  constructor(readonly pool: Pool, readonly resumeAt: number, readonly reason: "limited" | "reserve" = "limited") {
+  constructor(readonly pool: Pool, readonly resumeAt: number, readonly reason: "limited" | "reserve" = "limited", level: Priority = "background") {
     super(reason === "limited"
-      ? `Linear's hourly request limit is reached for ${poolName(pool)}; try again after ~${clock(resumeAt)}.`
-      : `Background Linear work is paused to keep ${poolName(pool)}'s last requests for agents; it resumes ~${clock(resumeAt)}.`);
+      ? `Linear's hourly request or complexity limit is reached for ${poolName(pool)}; try again after ~${clock(resumeAt)}.`
+      : `${level === "interactive" ? "Agent" : "Background"} Linear work is paused to keep ${poolName(pool)}'s last budget for ${level === "interactive" ? "owner decisions" : "agents and owner decisions"}; it resumes ~${clock(resumeAt)}.`);
     this.name = "RateLimitedError";
   }
 }
 
+type Dimension = { limit: number; remaining: number; at: number };
 type PoolState = {
-  limit: number | null;
-  remaining: number;
-  at: number;
+  requests: Dimension | null;
+  points: Dimension | null;
+  avgPoints: number;
   inFlight: number;
   blockedUntil: number;
   backoffMs: number;
   probing: boolean;
 };
 
-export type Ticket = {
-  // `headers` of the response, when there was one.
-  done(headers: Headers | null, rateLimited: boolean): void;
-};
-
-const UNKNOWN: PoolState = { limit: null, remaining: 0, at: 0, inFlight: 0, blockedUntil: 0, backoffMs: 0, probing: false };
-
+export type Ticket = { done(headers: Headers | null, rateLimited: boolean): void };
 const priority = new AsyncLocalStorage<Priority>();
+export function currentPriority(): Priority { return priority.getStore() ?? "interactive"; }
+// The caller name carried by `asCaller` (linear-usage.ts); a request outside any such context is
+// labelled by the operation it runs, so unattributed spend is still attributable per operation.
+export function currentCaller(operation: string): string { return currentCallerName() ?? `op:${operation}`; }
 
-// Everything `work` sends to Linear, including awaited calls deep inside it, runs at this priority.
-// Pollers and sweeps run at background priority, which pauses before a pool's reserve is touched.
-export function withPriority<T>(level: Priority, work: () => Promise<T>): Promise<T> {
-  return priority.run(level, work);
+// The level and the caller are separate contexts: `asCaller` names who spends, this storage
+// only says how urgent they are. Nested work can raise priority, but cannot demote an owner's
+// prerequisite reads or writes.
+export function withPriority<T>(level: Priority, caller: string, work: () => Promise<T>): Promise<T> {
+  const parent = priority.getStore();
+  const rank = { background: 0, interactive: 1, owner: 2 };
+  return asCaller(caller, () => priority.run(parent && rank[parent] > rank[level] ? parent : level, work));
 }
 
 export class RateBudget {
-  private readonly pools: Record<Pool, PoolState> = { key: { ...UNKNOWN }, app: { ...UNKNOWN } };
+  private readonly pools: Record<Pool, PoolState> = {
+    key: { requests: null, points: null, avgPoints: 100, inFlight: 0, blockedUntil: 0, backoffMs: 0, probing: false },
+    app: { requests: null, points: null, avgPoints: 100, inFlight: 0, blockedUntil: 0, backoffMs: 0, probing: false },
+  };
 
-  constructor(private readonly now: () => number = () => Date.now()) {}
+  constructor(private readonly now: () => number = () => Date.now(), private readonly usage?: LinearUsage) {}
 
-  private rate(state: PoolState): number {
-    return (state.limit ?? 0) / PERIOD_MS;
-  }
-
-  // Requests the pool can take now, minus those already on their way. Unknown before the
-  // first response: Infinity, so a fresh plugin never waits on a guess.
-  estimate(pool: Pool): number {
+  estimate(pool: Pool, dimension: "requests" | "points" = "requests"): number {
     const state = this.pools[pool];
-    if (state.limit === null) return Infinity;
-    const refilled = Math.min(state.limit, state.remaining + this.rate(state) * (this.now() - state.at));
-    return refilled - state.inFlight;
+    const known = state[dimension];
+    if (!known) return Infinity;
+    return Math.min(known.limit, known.remaining + known.limit / PERIOD_MS * Math.max(0, this.now() - known.at))
+      - state.inFlight * (dimension === "points" ? state.avgPoints : 1);
   }
 
-  private reserve(state: PoolState): number {
-    return Math.ceil((state.limit ?? 0) * RESERVE_FRACTION);
-  }
+  averagePoints(pool: Pool): number { return this.pools[pool].avgPoints; }
 
-  // When background work on this pool may run again, or null when it may run now. `room` asks
-  // for that many requests above the reserve (a dispatch launch needs several in a row).
-  pausedUntil(pool: Pool, room = 1): number | null {
+  private reserveUntil(pool: Pool, level: Priority, room: number): number | null {
     const state = this.pools[pool];
-    const now = this.now();
-    if (state.blockedUntil > now) return state.blockedUntil;
-    if (state.blockedUntil) return state.probing ? now + PROBE_WAIT_MS : null;
-    if (state.limit === null) return null;
-    const missing = this.reserve(state) + room - this.estimate(pool);
-    if (missing <= 0) return null;
-    return now + Math.ceil(missing / this.rate(state));
+    let until: number | null = null;
+    for (const dimension of ["requests", "points"] as const) {
+      const known = state[dimension];
+      if (!known) continue;
+      const missing = Math.ceil(known.limit * RESERVES[level]) + room * (dimension === "points" ? state.avgPoints : 1) - this.estimate(pool, dimension);
+      if (missing > 0) until = Math.max(until ?? 0, this.now() + Math.ceil(missing * PERIOD_MS / known.limit));
+    }
+    return until;
   }
 
-  // Admission for one request. Interactive requests always pass unless the pool is blocked by a
-  // rate-limit response; background requests also stop at the reserve. The check and the
-  // in-flight count happen together, so concurrent callers near the reserve cannot all pass.
-  acquire(pool: Pool, level: Priority = priority.getStore() ?? "interactive"): Ticket {
+  pausedUntil(pool: Pool, level: Priority = "background", room = 1): number | null {
+    const state = this.pools[pool];
+    const reserve = this.reserveUntil(pool, level, room);
+    const blocked = state.blockedUntil > this.now() ? state.blockedUntil : state.probing ? this.now() + PROBE_WAIT_MS : null;
+    return reserve === null ? blocked : blocked === null ? reserve : Math.max(reserve, blocked);
+  }
+
+  blockedUntil(pool: Pool): number { return this.pools[pool].blockedUntil; }
+
+  snapshot() {
+    return (["app", "key"] as const).map((pool) => {
+      const state = this.pools[pool];
+      const dimension = (name: "requests" | "points") => state[name] ? { limit: state[name]!.limit, remaining: Math.max(0, this.estimate(pool, name)) } : null;
+      return { pool, requests: dimension("requests"), points: dimension("points"), blockedUntil: state.blockedUntil,
+        pausedUntil: { background: this.pausedUntil(pool, "background"), interactive: this.pausedUntil(pool, "interactive") } };
+    });
+  }
+
+  acquire(pool: Pool, level: Priority = currentPriority(), caller?: string, operation = "anonymous"): Ticket {
+    const named = caller ?? currentCaller(operation);
     const state = this.pools[pool];
     const now = this.now();
     if (state.blockedUntil > now) throw new RateLimitedError(pool, state.blockedUntil);
+    // Reserve admission precedes the probe slot: a poll cannot steal the owner's probe.
+    const until = this.reserveUntil(pool, level, 1);
+    if (until !== null) {
+      if (level !== "owner") this.usage?.refused(pool, named, level);
+      throw new RateLimitedError(pool, until, "reserve", level);
+    }
     let probe = false;
     if (state.blockedUntil) {
       if (state.probing) throw new RateLimitedError(pool, now + PROBE_WAIT_MS);
       state.probing = probe = true;
-    } else if (level === "background") {
-      const until = this.pausedUntil(pool);
-      if (until !== null) throw new RateLimitedError(pool, until, "reserve");
     }
     state.inFlight++;
+    // One handle per admitted request, settled exactly once by `done`; local refusals above
+    // never reach it, so the recorded traffic and the sent traffic agree.
+    const accounting = this.usage?.begin(pool, named, operation);
     let settled = false;
     return {
-      done: (headers, rateLimited) => {
+      done: (headers, limited) => {
         if (settled) return;
         settled = true;
         state.inFlight--;
         if (probe) state.probing = false;
+        accounting?.done(headers, limited, state.avgPoints);
         this.record(pool, headers);
-        if (rateLimited) this.block(pool);
-        else if (probe && headers) {
+        if (limited) {
+          if (!headers?.has("x-ratelimit-requests-remaining") && !headers?.has("x-ratelimit-complexity-remaining")) {
+            const known = state.requests;
+            if (known) { known.remaining = 0; known.at = this.now(); }
+          }
+          state.backoffMs = probe ? Math.min(state.backoffMs * 2, MAX_BACKOFF_MS) : state.backoffMs || MIN_BLOCK_MS;
+          state.blockedUntil = this.now() + state.backoffMs;
+          this.usage?.block(pool, state.blockedUntil);
+        } else if (probe && headers) {
           state.blockedUntil = 0;
           state.backoffMs = 0;
         }
@@ -135,29 +156,21 @@ export class RateBudget {
 
   private record(pool: Pool, headers: Headers | null): void {
     if (!headers) return;
-    const limit = Number(headers.get("x-ratelimit-requests-limit"));
-    const remaining = Number(headers.get("x-ratelimit-requests-remaining"));
-    if (!headers.has("x-ratelimit-requests-remaining") || !Number.isFinite(remaining)) return;
     const state = this.pools[pool];
-    if (Number.isFinite(limit) && limit > 0) state.limit = limit;
-    state.remaining = remaining;
-    state.at = this.now();
-  }
-
-  // A rate-limit response: the pool waits until the refill estimate reaches the reserve again,
-  // at least a minute, doubling (to 15 min) when the probe after a block is limited again.
-  private block(pool: Pool): void {
-    const state = this.pools[pool];
-    const now = this.now();
-    state.remaining = 0;
-    state.at = now;
-    state.backoffMs = state.backoffMs ? Math.min(state.backoffMs * 2, MAX_BACKOFF_MS) : MIN_BLOCK_MS;
-    const refill = state.limit ? Math.ceil(this.reserve(state) / this.rate(state)) : 0;
-    state.blockedUntil = now + Math.max(state.backoffMs, refill);
+    for (const [dimension, name] of [["requests", "requests"], ["points", "complexity"]] as const) {
+      if (!headers.has(`x-ratelimit-${name}-remaining`)) continue;
+      const remaining = Number(headers.get(`x-ratelimit-${name}-remaining`));
+      const limit = Number(headers.get(`x-ratelimit-${name}-limit`) ?? state[dimension]?.limit);
+      if (Number.isFinite(limit) && limit > 0 && Number.isFinite(remaining) && remaining >= 0) state[dimension] = { limit, remaining, at: this.now() };
+    }
+    if (headers.has("x-complexity")) {
+      const cost = Number(headers.get("x-complexity"));
+      if (Number.isFinite(cost) && cost >= 0) state.avgPoints = 0.2 * cost + 0.8 * state.avgPoints;
+    }
   }
 }
 
-export const rateBudget = new RateBudget();
+export const rateBudget = new RateBudget(() => Date.now(), linearUsage);
 
 // GitHub's REST budget without the account router: the one shared gh login, which every agent
 // uses too. Unlike Linear's refill it is a fixed window: `x-ratelimit-remaining` requests until
@@ -222,8 +235,7 @@ export class GitHubBudget {
     return this.known && this.known.resetAt > this.now() ? this.known : null;
   }
 
-  // Admission for one request; background requests also stop at the reserve.
-  admit(level: Priority = priority.getStore() ?? "interactive"): void {
+  admit(level: Priority = currentPriority()): void {
     if (this.routed) return;
     const now = this.now();
     if (this.blockedUntil > now) throw new GitHubPausedError(this.blockedUntil, "throttled", this.current()?.remaining ?? null);

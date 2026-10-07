@@ -151,6 +151,10 @@ class FakeLinear {
     };
   }
 
+  async issueStatus(_id: string) {
+    return { status: this.status, statusType: this.statusType };
+  }
+
   async detail(id: string): Promise<TicketDetail> {
     return {
       issue: { id, identifier: identifierOf(id), title: "Fix the sign-in flow", url: `https://linear.app/i/${id}`, branchName: BRANCH, project: "App", team: "Engineering", labels: [] },
@@ -946,8 +950,8 @@ test("retirement after the agent directory read cannot send queued text to the n
   const owner = ticketAgent("owner", "2026-01-02T00:00:00Z", { labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "s1" } });
   const h = routerHarness({ agents: [owner] });
   t.after(h.cleanup);
-  const issueState = h.linear.issueState.bind(h.linear);
-  h.linear.issueState = async (id) => { owner.status = "closed"; return issueState(id); };
+  const issueStatus = h.linear.issueStatus.bind(h.linear);
+  h.linear.issueStatus = async (id) => { owner.status = "closed"; return issueStatus(id); };
   await h.store.put(thread({ queued: true, pendingText: "Keep this instruction queued." }));
   await h.router.startQueued();
   await h.router.startQueued();
