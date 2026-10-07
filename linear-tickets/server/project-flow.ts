@@ -395,7 +395,7 @@ export class ProjectFlow {
   // `linear.plan-project`: starts a run for the project's unplanned tickets right away instead of
   // at the next read, and replaces a run left to the owner (its agent is archived, the new run
   // starts over). One run per project at a time.
-  async planNow(projectId: string, settings: PluginSettings, paseo: PaseoApi): Promise<ProjectStatus> {
+  async planNow(projectId: string, settings: PluginSettings, paseo: PaseoApi, background = false): Promise<ProjectStatus> {
     return this.exclusive(projectId, async () => {
       const appId = await this.deps.linear.appUserId();
       if (!appId) throw new Error("The Paseo Linear app is not installed on this host, so nothing would start the planner.");
@@ -410,7 +410,7 @@ export class ProjectFlow {
         read = await this.read(project, settings);
       }
       if (!read.unplanned.length) throw new Error("No new tickets to plan.");
-      const status = await this.startRun(project, read, settings, paseo);
+      const status = await this.startRun(project, read, settings, paseo, background);
       if (!status.planner) throw new Error("A planner for this project is being started right now.");
       this.statuses = [...this.statuses.filter((item) => item.id !== project.id), status];
       return status;
@@ -457,14 +457,22 @@ export class ProjectFlow {
   // Starts a run for the project's unplanned tickets: the record first (the next read retries
   // whatever the store says is missing, and no second run starts while one is open), then its
   // agent. A read and Plan at the same time start one run: the other returns the status unchanged.
-  private async startRun(project: { id: string; name: string }, read: Read, settings: PluginSettings, paseo: PaseoApi): Promise<ProjectStatus> {
+  private async startRun(project: { id: string; name: string }, read: Read, settings: PluginSettings, paseo: PaseoApi, background = false): Promise<ProjectStatus> {
     // Started since this read (by the other path).
     const current = (await this.store.all())[project.id]?.planner;
     if (current) return { ...read.status, toPlan: 0, plansAt: null, planner: plannerSummary(current) };
     const run: PlannerRecord = { id: randomUUID(), listedAt: read.readAt, listed: read.work.map((issue) => issue.id), tickets: read.unplanned.length, started: false };
     await this.store.update(project.id, (record) => ({ ...(record ?? read.record), planner: run }));
     console.log(`[linear-tickets] project ${project.name}: planner run ${run.id.slice(0, 8)} for ${read.unplanned.length} new ticket${read.unplanned.length === 1 ? "" : "s"}`);
-    await this.launchRun(project, run, read, settings, paseo);
+    if (background) {
+      // The RPC acknowledges the persisted run, not provider readiness (which can take minutes).
+      // Queue behind this operation; a poll already queued may start it first, so recheck attempts.
+      void this.exclusive(project.id, async () => {
+        const pending = (await this.store.all())[project.id]?.planner;
+        if (pending?.id !== run.id || pending.startedAt || pending.approved || pending.ownerAsked) return;
+        await this.launchRun(project, pending, read, settings, paseo);
+      }).catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: starting the planner failed; the next read after the grace retries: ${message(error)}`));
+    } else await this.launchRun(project, run, read, settings, paseo);
     const stored = (await this.store.all())[project.id]?.planner ?? run;
     return { ...read.status, toPlan: 0, plansAt: null, planner: plannerSummary(stored) };
   }

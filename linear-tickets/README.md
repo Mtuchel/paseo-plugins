@@ -998,9 +998,11 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   first seen, or an hour after the oldest one at the latest, so a steady trickle still gets its
   order within the hour. The Paseo Agents menu bar app uses three RPCs: `linear.projects-status`
   lists each labelled project with how many new tickets wait for a plan, when a run would start
-  (`plansAt`) and the open run (its id, agent, start time, tickets and restarts); `linear.plan-project` starts a run right away instead of at the next read, and
-  replaces one left to you; `linear.skip-plan` stops the open run, whose tickets are then handed
-  out without a work order.
+  (`plansAt`) and the open run (its id, agent, start time, tickets and restarts); `linear.plan-project`
+  saves a run right away and returns it before agent startup finishes, instead of waiting for the
+  next read. Startup continues in the project's queue; the request does not wait for provider
+  readiness. It replaces a run left to you; `linear.skip-plan` stops the open run, whose tickets are
+  then handed out without a work order.
 - **Planner run.** The plugin launches the run's agent itself, in the Paseo project the
   [project mappings](#project-mappings) give the Linear project (else the busiest team of its
   tickets), in that project's own checkout with no worktree or branch: the run changes no code. No agent slot and no memory lease holds it back: it only
