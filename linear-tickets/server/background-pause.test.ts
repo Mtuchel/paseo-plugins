@@ -19,7 +19,7 @@ import { ProjectFlow, ProjectStore } from "./project-flow";
 import { PullRequestWatch } from "./pr-watch";
 import { RateBudget, RateLimitedError, withPriority, type Pool } from "./rate-budget";
 import { CommentRelay } from "./relay";
-import { SessionRouter } from "./sessions";
+import { SessionRouter, SessionStore } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { StateLabels } from "./state-labels";
 import { Writeback } from "./writeback";
@@ -378,7 +378,7 @@ test("AC-4: at 4% of either dimension a write-back comment, a session reply and 
     f.sample("app", dimension === "requests" ? 200 : PLENTY_REQUESTS, dimension === "points" ? 80_000 : HIGH_POINTS);
     f.sample("key", dimension === "requests" ? 200 : PLENTY_REQUESTS, dimension === "points" ? 80_000 : HIGH_POINTS);
     const writeback = new Writeback(f.linear, { read: async () => summaryWriteback }, undefined, 0, join(dir, "outbox.json"));
-    const router = new SessionRouter({ api: new AgentApi({ accessToken: async () => APP_TOKEN }, f.post) } as never);
+    const router = new SessionRouter({ api: new AgentApi({ accessToken: async () => APP_TOKEN }, f.post), store: new SessionStore(join(dir, "sessions.json")) } as never);
     const turn = { agent: AGENT, outcome: { kind: "failed", error: new Error("boom") }, timeline: [] } as never;
 
     // Interactive work is refused on both pools, before any request goes out.
