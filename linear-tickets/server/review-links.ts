@@ -428,8 +428,11 @@ export class ReviewLinks {
       this.misses.set(entry.localUrl, misses);
       if (misses >= MISSES_TO_CLOSE) dead.push(entry);
     }
-    const closed = new Set<string>();
+    // A parked plan's review comes back on the port it had (a restarted central host): one served
+    // again while this sweep ran keeps its route and stays open.
+    const closed = new Map<string, string>();
     for (const entry of dead) {
+      if (await this.alive(entry.localUrl)) { this.misses.delete(entry.localUrl); continue; }
       const port = reviewPort(entry.remoteUrl);
       if (port !== null) {
         // Left open on failure, so the next sweep retries. A route that no longer exists (removed
@@ -442,17 +445,21 @@ export class ReviewLinks {
           }
         }
       }
-      closed.add(entry.localUrl);
+      closed.set(entry.localUrl, entry.openedAt);
     }
     if (!closed.size) return;
     const at = this.now().toISOString();
+    const reopened: ReviewEntry[] = [];
     await this.change((registry) => {
-      for (const localUrl of closed) {
+      for (const [localUrl, openedAt] of closed) {
         const entry = registry[localUrl];
-        if (entry && !entry.closedAt) entry.closedAt = at;
         this.misses.delete(localUrl);
+        if (!entry || entry.closedAt) continue;
+        if (entry.openedAt === openedAt) entry.closedAt = at;
+        else reopened.push(entry);
       }
     });
+    for (const entry of reopened) await this.routeThroughProxy(entry.remoteUrl);
   }
 
   // Tells the subscribed browsers about reviews that started waiting since the last sweep, here or
