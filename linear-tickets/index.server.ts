@@ -129,8 +129,9 @@ export default function contribute(server: PluginServerContext) {
   // Which host owns a ticket's automatic work, read only (SessionRouter.whileIdle, see
   // ticketOwnership): assigned once the activation routers exist below.
   let ticketOwner: (issueId: string) => Promise<HostOwnership> = async () => "unknown";
+  const usage = new UsageReader();
   const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, needsYou, route, deletions, watchdog: watchdogStore, replies,
-    limitResumes: new LimitResumeStore(), usage: new UsageReader(),
+    limitResumes: new LimitResumeStore(), usage,
     owner: (issueId) => ticketOwner(issueId),
     decideReview,
     reviewOutcome: (review) => reviewOutcome(review),
@@ -181,7 +182,7 @@ export default function contribute(server: PluginServerContext) {
   const projectStore = new ProjectStore();
   // Project tickets are read in full every 30 minutes and only as changed in between (project-issues.ts).
   const projectIssues = new ProjectIssueCache(linear);
-  const projects = new ProjectFlow({ linear, projectIssues: (projectId, full) => projectIssues.read(projectId, full), scheduler: starter.scheduler, capacity: starter.capacity, store: projectStore,
+  const projects = new ProjectFlow({ linear, projectIssues: (projectId, full) => projectIssues.read(projectId, full), scheduler: starter.scheduler, capacity: starter.capacity, store: projectStore, usage,
     startPlanner: (input, paseo, current) => launcher.startPlanner(input, paseo, current),
     retire: async (agentId, api) => {
       await stopAgentTurn(agentId).catch(() => {});

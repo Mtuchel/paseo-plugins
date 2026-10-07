@@ -1070,14 +1070,44 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   submitting a plan (closed after idling, or archived) would hold the project: no new run starts
   while it is open. So every project read checks the open run without an approved order for a live
   agent (one labelled with the run's `linear.plannerRun` that is initializing, idle or running,
-  and no ghost: see **Ghost agents**). Ten minutes after its last start without one (a start takes a couple of
-  minutes, so one still under way is never doubled), the plugin starts another agent for the same
-  run; its stopped agents are archived. A start that cannot succeed (no project mapped, no
-  provider chosen) leaves the run to you right away instead of retrying. After three restarts
-  without a live agent the plugin posts one update on the project, marked at risk, and stops: press Plan in the
-  menu bar app to start again, or Skip to hand the tickets out without an order. Every start and
-  restart is kept with the project's record in `projects.json`, and a late report of a run you
-  skipped or replaced is ignored rather than written.
+  and no ghost: see **Ghost agents**). For failures other than provider rate/usage limits, ten
+  minutes after its last start without one, the plugin starts another agent for the same run;
+  its stopped agents are archived. A start that cannot succeed (no project mapped, no provider
+  chosen) leaves the run to you right away instead of retrying. After three ordinary restarts
+  without a live agent the plugin posts one update on the project, marked at risk, and stops:
+  press Plan in the menu bar app to start again, or Skip to hand the tickets out without an order.
+  Every start and restart is kept with the project's record in `projects.json`, and a late
+  report of a run you skipped or replaced is ignored rather than written.
+  **Provider rate/usage limits** use the same broker account/fallback availability and initial
+  timing as ticket-agent usage-limit recovery below: room on a configured account/model, the
+  earliest usable reset plus one-to-five-minute jitter, retry-after plus that jitter, or thirty
+  minutes without a reliable hint. A pending planner checks fresh capacity every project read,
+  even before its scheduled reset. New room can advance the wait; stale/missing usage never
+  proves room. Changed saved provider/model preferences are revalidated for the actual launch,
+  not authorized by the old model's capacity. Repeated errors do not redraw jitter or move the
+  original fallback deadline; a renewed exhausted window can postpone the restart.
+  Limit replacements are at least fifteen minutes apart and at most four in a rolling
+  twenty-four hours per host/run, independent of the ordinary three-restart counter. Waiting
+  spends neither counter. A lost creation response keeps its claim and ten-minute startup
+  grace; a later bounded attempt has a unique durable request identity. External creation is
+  not exactly once: a late duplicate may briefly exist, but the recorded live planner stays
+  authoritative, redundant same-run roots are retired, and their stale orders are rejected.
+  If a replacement fails before creation for an ordinary reason, its retry returns to the
+  ordinary grace/cap; the already handled predecessor limit cannot be scheduled again.
+  A predecessor agent id is not confirmation of a new creation: an unconfirmed usage-limited
+  ordinary restart still keeps the full ten-minute grace, including after reload.
+  At the limit bound, one project-update notification is attempted and the run stays owner-held
+  until Plan or Skip, even after day rollover. A failed notification is logged, not repeated.
+  Auto-dispatch controls automatic project recovery; the ticket-only automatic-start switch
+  does not. Disabling dispatch or removing the project's trigger prevents automatic attempts
+  and retains the wait for revalidation when enabled again. Approved work orders and already
+  planned tickets keep their existing paths.
+  The project status reports “Usage limit on {provider}: Paseo starts a new agent at {time}.”
+  with Berlin time. Optional `planner.recovery` metadata in `projects.json` survives reload,
+  needs no backfill and preserves existing label-repair records. Malformed recovery metadata
+  stops automatic recovery with a logged reason, never resets its budget. Planner reset-time
+  display in planning activity and planner restart display/history in the ops digest are
+  tracked separately (TUC-1347 and TUC-1346); ticket-agent digest behavior is unchanged.
   Skip and order application wait for any start or write already in flight. Each later project
   poll also archives obsolete run agents, including one whose creation response was lost and
   became visible only after Skip.
