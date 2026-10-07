@@ -2949,8 +2949,8 @@ Rollback: drain affected MCP processes, run the installed standalone helper with
 rollout manifest, newest first:
 
 ```sh
-node \"$PASEO_HOME/linear-tickets/ticket-mcp-restore.mjs\" \\
-  \"$PASEO_HOME/linear-tickets/mcp-upgrades/rollout-<timestamp>-<id>.json\"
+node "$PASEO_HOME/linear-tickets/ticket-mcp-restore.mjs" \
+  "$PASEO_HOME/linear-tickets/mcp-upgrades/rollout-<timestamp>-<id>.json"
 ```
 
 It restores checksum-verified previous bytes for all affected saved paths, including commands

@@ -103,6 +103,21 @@ async function durablePrivateWrite(path: string, content: string): Promise<void>
   } finally { await rm(temporary, { force: true }); }
 }
 
+// Stage first, then recheck the target right before the rename: a concurrent edit or symlink
+// swap during staging leaves the target untouched.
+async function replaceVerified(path: string, content: string, expectedHash: string): Promise<void> {
+  const temporary = path + "." + randomUUID() + ".tmp";
+  try {
+    const file = await open(temporary, "wx", 0o600);
+    try { await file.writeFile(content); await file.sync(); } finally { await file.close(); }
+    const before = await privateSource(path);
+    if (before === null || sourceHash(before) !== expectedHash) throw new Error("Saved MCP source changed during cutover: " + path);
+    await rename(temporary, path);
+    const directory = await open(join(path, ".."), "r");
+    try { await directory.sync(); } finally { await directory.close(); }
+  } finally { await rm(temporary, { force: true }); }
+}
+
 // Single-process serialization also covers simultaneous launch calls. Manifests are persisted
 // before replacement, so interruption is recoverable without a content-hash filename invariant.
 let upgrades = Promise.resolve();
@@ -173,9 +188,7 @@ async function upgradeScripts(home: string, source: string): Promise<{ manifest:
   await durablePrivateWrite(path, JSON.stringify(manifest));
   for (const entry of entries) {
     const target = join(directory, entry.name);
-    const before = await privateSource(target);
-    if (before === null || sourceHash(before) !== entry.previousHash) throw new Error("Saved MCP source changed during cutover: " + target);
-    await durablePrivateWrite(target, source);
+    await replaceVerified(target, source, entry.previousHash);
     entry.applied = true;
     await durablePrivateWrite(path, JSON.stringify(manifest));
   }
@@ -217,7 +230,10 @@ for (const name of await readdir(archive)) {
   const other = JSON.parse(await privateBytes(join(archive, name)));
   if (other.version !== 1 || !Array.isArray(other.entries)) throw new Error("Invalid restoration history");
   for (const entry of other.entries) {
-    if (other.sourceHash === manifest.sourceHash || entry.previousHash === manifest.sourceHash) known.set(entry.name, true);
+    // A resumed rollout lists only paths still pending; paths an interrupted rollout of the same
+    // source already replaced keep their own original from that manifest.
+    if (other.sourceHash === manifest.sourceHash && entry.previousHash !== manifest.sourceHash) known.set(entry.name, entry.previousHash);
+    else if (entry.previousHash === manifest.sourceHash && !known.has(entry.name)) known.set(entry.name, null);
   }
 }
 const rollbackHash = manifest.rollbackHash || manifest.entries[0]?.previousHash;
@@ -227,7 +243,7 @@ for (const name of await readdir(directory)) {
   if (!match || manifest.entries.some((entry) => entry.name === name)) continue;
   if (match[1] !== manifest.sourceHash.slice(0, 12) && !known.has(name)) continue;
   if (hash(await privateBytes(join(directory, name))) !== manifest.sourceHash) continue;
-  manifest.entries.push({ name, previousHash: rollbackHash, applied: true });
+  manifest.entries.push({ name, previousHash: known.get(name) || rollbackHash, applied: true });
 }
 await writePrivate(manifestPath, JSON.stringify(manifest));
 let restored = 0;

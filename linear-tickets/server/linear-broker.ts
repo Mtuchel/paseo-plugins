@@ -42,6 +42,8 @@ export class LinearBroker {
   private server: Server | null = null;
   private starting: Promise<void> | null = null;
   private stopped = false;
+  // Set once stop has drained: the journal then belongs to whichever broker starts next.
+  private closed = false;
   private broken = false;
   private socketIdentity: { ino: number; dev: number } | null = null;
 
@@ -126,6 +128,8 @@ export class LinearBroker {
 
   private persist(): Promise<void> {
     const write = this.writes.then(async () => {
+      // After stop the journal belongs to the next broker; a stale snapshot must never replace it.
+      if (this.closed) throw new Error("Linear broker stopped");
       const temporary = this.journalPath + "." + randomUUID() + ".tmp";
       try {
         const file = await open(temporary, "wx", 0o600);
@@ -256,7 +260,8 @@ export class LinearBroker {
       try { await this.persist(); } catch { this.broken = true; }
       // A transport ignoring abort can answer late. Release safety debt, never recount usage.
       const late = attempt.then(async ({ response }) => {
-        if (!this.intents.has(intent.id)) return;
+        // A replaced broker recovered this marker as its own debt; only it may settle the journal.
+        if (this.stopped || !this.intents.has(intent.id)) return;
         this.intents.delete(intent.id);
         try { await this.persist(); this.budget.releaseDebt(pool, intent.id, response.headers); } catch {
           this.intents.set(intent.id, uncertain); this.broken = true;
@@ -279,6 +284,7 @@ export class LinearBroker {
     }
     await Promise.allSettled([...this.active]);
     await this.writes;
+    this.closed = true;
     server?.closeAllConnections();
     if (this.socketIdentity) {
       const current = await lstat(this.socketPath).catch(() => null);

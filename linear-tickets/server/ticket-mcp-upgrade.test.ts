@@ -311,3 +311,30 @@ test("an interrupted rollout resumes and keeps the originals restorable", async 
   assertVersion(agentPath, home, "agent", "original-agent");
   assertVersion(plannerPath, home, "planner", "original-planner");
 });
+
+test("a resumed rollout restores each path to its own original, not a shared one", async (t) => {
+  const home = await installHome(t, "paseo-ticket-mcp-upgrade-per-path-");
+  const originalAgent = fixtureSource("original-agent");
+  const originalPlanner = fixtureSource("original-planner");
+  const versionA = fixtureSource("version-a");
+  const agentPath = await savedScript(home, originalAgent);
+  const plannerPath = await savedScript(home, originalPlanner);
+  // The first rollout to A crashed after replacing only the agent's path.
+  await mkdir(archiveDir(home), { recursive: true, mode: 0o700 });
+  await writeFile(join(manifestDir(home), `rollout-${Date.now()}-${randomUUID()}.json`), JSON.stringify({
+    version: 1, sourceHash: digest(versionA), rollbackHash: digest(originalPlanner),
+    entries: [
+      { name: basename(agentPath), previousHash: digest(originalAgent), applied: true },
+      { name: basename(plannerPath), previousHash: digest(originalPlanner), applied: false },
+    ],
+  }), { mode: 0o600 });
+  for (const source of [originalAgent, originalPlanner]) await writeFile(join(archiveDir(home), `${digest(source)}.mjs`), source, { mode: 0o600 });
+  await writeFile(agentPath, versionA, { mode: 0o600 });
+
+  const resumed = await upgradeTicketMcpScripts(home, versionA);
+  assertVersion(plannerPath, home, "planner", "version-a");
+  const restored = restoreManifest(home, manifestFile(home, resumed.manifest));
+  assert.equal(restored.status, 0, restored.stderr);
+  assertVersion(agentPath, home, "agent", "original-agent");
+  assertVersion(plannerPath, home, "planner", "original-planner");
+});

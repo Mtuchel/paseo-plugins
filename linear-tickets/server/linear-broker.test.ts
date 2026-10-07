@@ -142,6 +142,22 @@ test("unknown outcomes retain debt and a definitive late answer releases it with
   assert.equal(usage.snapshot().rows.find((entry) => entry.caller === "mcp:get_issue")!.requests, 1);
 });
 
+test("a stopped broker's late answer never rewrites the next broker's journal", async (t) => {
+  let finish!: (response: Response) => void;
+  const first = await fixture(t, { deadlineMs: 20, upstream: () => new Promise<Response>((resolve) => { finish = resolve; }) });
+  first.budget.acquire("app", "owner").done(headers(120_000), false);
+  assert.equal((await call(first.broker.socketPath)).kind, "unknown");
+  await first.broker.stop();
+  const second = await fixture(t, { home: first.home });
+  const path = join(first.home, "linear-tickets", "linear-broker-journal.json");
+  const recovered = await readFile(path, "utf8");
+  assert.equal(JSON.parse(recovered).intents.length, 1);
+  finish(Response.json({ data: {} }, { headers: headers(119_999) }));
+  // The old handler's write takes several fsyncs; stop observing as soon as anything changes.
+  for (let turn = 0; turn < 50 && await readFile(path, "utf8") === recovered; turn++) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  assert.equal(await readFile(path, "utf8"), recovered, "only the current broker may settle the recovered debt");
+});
+
 test("corrupt recovery state fails closed instead of using elapsed time to discard debt", async (t) => {
   const { broker, home } = await fixture(t);
   await broker.stop();
