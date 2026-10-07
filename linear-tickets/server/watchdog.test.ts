@@ -52,6 +52,7 @@ type HarnessState = {
   thread: SessionLink | null;
   settings: PluginSettings;
   answer: (request: WatchdogRequest) => Promise<WatchdogOutcome>;
+  manualTasks: string[];
 };
 type Harness = { state: HarnessState; store: WatchdogStore };
 
@@ -71,6 +72,7 @@ async function harness(options: { settings?: PluginSettings } = {}) {
     thread: null,
     settings: options.settings ?? settings(),
     answer: async () => ({ kind: "done" }),
+    manualTasks: [],
   };
   const acts: { action: string; text: string; marker: string; claimedBefore: boolean }[] = [];
   const said: string[] = [];
@@ -101,6 +103,7 @@ async function harness(options: { settings?: PluginSettings } = {}) {
   const deps: WatchdogDeps = {
     store, sessions, linear, settings: { read: async () => state.settings },
     handover: { all: async () => state.records }, needsYou: { all: async () => [] },
+    manualTasks: { tasks: async () => state.manualTasks.map((identifier) => ({ parentId: ISSUE.id, identifier })) },
     activity: async () => state.activity, now: () => state.now,
   };
   const watchdog = new Watchdog(deps);
@@ -272,6 +275,13 @@ test("a closed agent quiet for two hours is resumed once unless its ticket has a
   await open.poll(130);
   assert.equal(open.acts.length, 0, "an open pull request has its own nudges");
   await open.cleanup();
+
+  const manual = await harness();
+  manual.state.roots = [closed()];
+  manual.state.manualTasks = ["TUC-2"];
+  await manual.poll(130);
+  assert.equal(manual.acts.length, 0, "a ticket waiting for the owner's manual task is not resumed");
+  await manual.cleanup();
 
   const h = await harness();
   h.state.roots = [closed()];

@@ -280,7 +280,7 @@ export default function contribute(server: PluginServerContext) {
   plannotator.useFollowUps(followUps);
   plannotator.recordDecisions(decisions);
   const manualTasks = new ManualTasks({ linear, settings });
-  const watchdog = new Watchdog({ store: watchdogStore, sessions, linear, settings, handover, needsYou });
+  const watchdog = new Watchdog({ store: watchdogStore, sessions, linear, settings, handover, needsYou, manualTasks });
   const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog, outage: new GreptileOutage(linear, settings) });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => asCaller("session-webhook", () => sessions.receive(event)));
