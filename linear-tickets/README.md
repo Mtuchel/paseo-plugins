@@ -2586,6 +2586,14 @@ text, timing, blank identities, legacy `answer` entries, duplicates or deputy an
 must match (option labels case-insensitively). Unpaired predictions and refusals are reported as
 coverage.
 
+**Upstream attribution — proposal; not available.** The
+[question-answer provenance proposal](https://github.com/Mtuchel/paseo-plugins/blob/main/linear-tickets/proposals/question-answer-attribution.md) asks Paseo to
+record the daemon-established responder consistently in confirmations, live updates, plugin
+events and retained question history, without guessing a human identity. It is published as
+[Paseo Ideas discussion #6298](https://github.com/getpaseo/paseo/discussions/6298).
+This documentation ships no capability and changes no evidence computation,
+settings or live gate; attribution alone would not satisfy the other live-gate requirements.
+
 **Answers shown.** After a confirmed live answer the deputy posts on the ticket (whatever the
 write-back settings): the agent, the question and chosen option, each source with its link,
 revision and quote, the request id and "Reply to override". The linked agent session shows the
