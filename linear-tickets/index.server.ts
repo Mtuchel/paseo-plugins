@@ -66,6 +66,7 @@ import { Watchdog, WatchdogStore } from "./server/watchdog";
 import { asCaller, linearUsage, usageLines } from "./server/linear-usage";
 import { LinearBroker } from "./server/linear-broker";
 import { upgradeTicketMcpScripts } from "./server/ticket-mcp";
+import { PlanningSmoke } from "./server/planning-smoke";
 
 export default function contribute(server: PluginServerContext) {
   void linearUsage.start();
@@ -511,6 +512,10 @@ export default function contribute(server: PluginServerContext) {
   startSoon.unref?.();
   const usageTimer = setInterval(() => { for (const line of usageLines(linearUsage.snapshot())) console.log(line); }, 60 * 60 * 1000);
   usageTimer.unref?.();
+  // Whether fresh ticket agents still plan with Plannotator's framing (README, "Planning smoke
+  // check"): first run two minutes after load, then every 15 minutes when an input changed.
+  const planningSmoke = new PlanningSmoke();
+  planningSmoke.start();
   return async () => {
     stopped = true;
     // The bridge stops admitting decisions and lets every admitted one finish (each call is
@@ -519,6 +524,7 @@ export default function contribute(server: PluginServerContext) {
     replies.stop();
     clearTimeout(startSoon);
     clearInterval(usageTimer);
+    planningSmoke.stop();
     stopKeepingFresh();
     void own?.close();
     dispatcher.stop(); plannotatorHost.stop(); sessions.stop();
