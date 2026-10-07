@@ -205,10 +205,10 @@ test("plan checklists come from checkboxes, or numbered steps under a Steps head
 });
 
 type Call = string;
-type RouterLinear = Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
+type RouterLinear = Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "issueStatuses" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
 // `reload`: the daemon's agent reload (null: the plugin has no daemon connection); `send`: runs
 // before each send is recorded.
-function harness(options: { now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null> } = {}) {
+function harness(options: { now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; processLiveness?: typeof ticketProcessLiveness; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; admission?: (issueId: string) => Promise<{ ok: true } | { ok: false; reason: string }>; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null> } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -218,6 +218,7 @@ function harness(options: { now?: () => number; pending?: AgentPermissionRequest
     openSessions: async () => [],
     activities: async () => [],
     sessionStatus: async () => "stale",
+    sessionStatuses: async (ids: string[]) => new Map(ids.map((id) => [id, "stale"])),
   };
   const paseo = {
     agents: {
@@ -266,11 +267,12 @@ function harness(options: { now?: () => number; pending?: AgentPermissionRequest
       complete: async (id: string) => { calls.push(`complete ${id}`); }, cancel: async (id: string, reason: string) => { calls.push(`cancel ${id}: ${reason.split("\n")[0]}`); },
       issueState: async (id: string) => ({ id, status: "Todo", statusType: "unstarted", blockedBy: options.blockedBy?.[id] ?? [] }) as IssueState,
       issueStatus: async () => ({ status: "Todo", statusType: "unstarted" }),
+      issueStatuses: async (ids: string[]) => new Map(ids.map((id) => [id, { status: "Todo", statusType: "unstarted", completedAt: null }])),
       issueGroup: async (id: string) => options.groups?.[id] ?? { id, identifier: "TUC-1", status: "Todo", statusType: "unstarted", delegateId: "paseo-app", finished: false, children: [] },
       moveToStateNamed: async (id: string, name: string) => { calls.push(`move ${id} to ${name}`); return { changed: true }; },
       delegate: options.delegate ?? (async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); }),
     },
-    starter: { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false, untrusted: false, plan: null }; }, admission: async () => ({ ok: true as const }) },
+    starter: { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false, untrusted: false, plan: null }; }, admission: options.admission ?? (async () => ({ ok: true as const })) },
     handover: { resumeTarget: async () => null, handOff: async () => true },
     launcher: { gate: () => ({ release: () => {} }) },
     settings: { read: async () => settings },
@@ -283,7 +285,7 @@ function harness(options: { now?: () => number; pending?: AgentPermissionRequest
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     decideReview: options.decideReview ?? (async (url, approve, feedback) => { calls.push(`review ${url} ${approve ? "approve" : `deny:${feedback}`}`); }),
     ...("reload" in options ? { reloader: async () => options.reload ? async (agentId: string) => { calls.push(`reload ${agentId}`); await options.reload!(agentId); } : null } : {}),
-    ...(options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector) } : {}),
+    ...(options.processLiveness ? { processLiveness: options.processLiveness } : options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector) } : {}),
   });
   // Deterministic session/queue tests drive the sweep themselves, as do the group tests.
   if (options.groups || options.manual) Object.assign(router, { paseo });
@@ -962,7 +964,9 @@ test("a normal idle OMP target stays usable but an archived live-process sibling
   } finally { await sibling.cleanup(); }
 });
 
-function routerAdmission(t: TestContext, points = 60_000, limitedOperation?: string) {
+// `answer`: a response for an operation whose answer depends on its variables (batched reads);
+// undefined falls through to the fixed answers below.
+function routerAdmission(t: TestContext, points = 60_000, limitedOperation?: string, answer?: (operation: string, variables: Record<string, unknown>) => object | undefined) {
   const budget = new RateBudget(() => 0);
   const headers = { "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": "4500", "x-ratelimit-complexity-limit": "2000000", "x-ratelimit-complexity-remaining": String(points), "x-complexity": "100" };
   for (const pool of ["app", "key"] as const) budget.acquire(pool, "owner").done(new Headers(headers), false);
@@ -984,6 +988,8 @@ function routerAdmission(t: TestContext, points = 60_000, limitedOperation?: str
     const operation = body.query.match(/^(?:query|mutation) (\w+)/)?.[1] ?? "?";
     sent.push({ operation, variables: body.variables });
     if (operation === limitedOperation) return new Response(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] }), { status: 400, headers });
+    const dynamic = answer?.(operation, body.variables);
+    if (dynamic) return new Response(JSON.stringify(dynamic), { headers });
     assert.ok(data[operation], `unexpected Linear operation ${operation}`);
     return new Response(JSON.stringify({ data: data[operation] }), { headers });
   });
@@ -1055,18 +1061,67 @@ test("two whole session sweeps send nothing and log one pause while the app has 
 
 test("a queued-thread rate limit stops its loop and logs once across the remaining parts and the next sweep", async (t) => {
   const errors = t.mock.method(console, "error", () => {});
-  const admission = routerAdmission(t, 420_000, "sessionStatus");
+  const admission = routerAdmission(t, 420_000, "sessionStatuses");
   const h = harness({ ...admission, groups: {} });
   try {
     await h.store.put(link({ agentId: null, queued: true, queueReason: "a slot is full" }));
     await h.store.put(link({ sessionId: "s2", agentId: null, issueId: "i2", queued: true }));
     await h.router.sweep();
     await h.router.sweep();
-    assert.deepEqual(admission.sent.map((call) => call.operation), ["sessionStatus"], "no other queued thread or sweep part sends after the app refuses");
+    assert.deepEqual(admission.sent.map((call) => call.operation), ["sessionStatuses"], "no other queued thread or sweep part sends after the app refuses");
     assert.equal(errors.mock.callCount(), 1);
     assert.match(String(errors.mock.calls[0].arguments[0]), /agent session sweep \(queued threads\) paused:/);
     assert.equal((await h.store.get("s1"))?.queueReason, "a slot is full");
     assert.equal((await h.store.get("s2"))?.queued, true);
+  } finally { await h.cleanup(); }
+});
+
+// server087, 2026-10-07: 62 waiting threads, 55 of them held by a live OMP worker, cost one session
+// read each a minute, about 1,900 of the app's 5,000 requests an hour (README, "Rate limits").
+test("a queue pass reads 120 waiting threads' Linear states in four requests, not one per thread", async (t) => {
+  const admission = routerAdmission(t, 1_000_000, undefined, (operation, variables) => {
+    if (operation === "sessionStatuses") return { data: Object.fromEntries(Object.keys(variables).map((alias) => [alias, { status: "active" }])) };
+    if (operation === "issueStatuses") return { data: { issues: { nodes: (variables.ids as string[]).map((id) => ({ id, state: { name: "Todo", type: "unstarted" }, completedAt: null })) } } };
+    return undefined;
+  });
+  const h = harness({
+    ...admission,
+    manual: true,
+    processLiveness: async (_paseo, issueId) => Number(issueId.slice(1)) < 100 ? "alive" : "absent",
+    admission: async () => ({ ok: false, reason: "Waiting for TUC-9 to finish." }),
+  });
+  try {
+    for (let n = 0; n < 120; n += 1) await h.store.put(link({ sessionId: `s${n}`, issueId: `i${n}`, identifier: `TUC-${n}`, agentId: null, queued: true }));
+    await h.router.startQueued();
+    assert.deepEqual(admission.sent.map((call) => call.operation), ["sessionStatuses", "sessionStatuses", "sessionStatuses", "issueStatuses"]);
+    assert.deepEqual(admission.sent.slice(0, 3).map((call) => Object.keys(call.variables).length), [50, 50, 20]);
+    assert.deepEqual(admission.sent[3].variables.ids, Array.from({ length: 20 }, (_, n) => `i${100 + n}`), "the tickets from the first thread that needs a state on");
+    assert.equal((await h.store.get("s0"))?.queueReason, "an OMP worker for this ticket is still alive");
+    assert.equal((await h.store.get("s119"))?.queueReason, "Waiting for TUC-9 to finish.");
+    assert.equal((await h.store.get("s119"))?.queued, true);
+  } finally { await h.cleanup(); }
+});
+
+test("a waiting thread Linear has no session for leaves the batch and is read alone; the batch still ends a completed thread", async (t) => {
+  const errors = t.mock.method(console, "error", () => {});
+  const notFound = (path: string) => ({ data: null, errors: [{ message: "Entity not found: AgentSession", path: [path], extensions: { code: "INPUT_ERROR" } }] });
+  const admission = routerAdmission(t, 1_000_000, undefined, (operation, variables) => {
+    if (operation === "sessionStatus" && variables.id === "s1") return notFound("agentSession");
+    if (operation !== "sessionStatuses") return undefined;
+    const gone = Object.entries(variables).find(([, id]) => id === "s1");
+    if (gone) return notFound(gone[0]);
+    return { data: Object.fromEntries(Object.entries(variables).map(([alias, id]) => [alias, { status: id === "s2" ? "complete" : "active" }])) };
+  });
+  const h = harness({ ...admission, manual: true, processLiveness: async () => "alive" });
+  try {
+    for (const n of [0, 1, 2]) await h.store.put(link({ sessionId: `s${n}`, issueId: `i${n}`, identifier: `TUC-${n}`, agentId: null, queued: true }));
+    await h.router.startQueued();
+    assert.deepEqual(admission.sent.map((call) => call.operation), ["sessionStatuses", "sessionStatuses", "sessionStatus"]);
+    assert.deepEqual(Object.values(admission.sent[1].variables), ["s0", "s2"]);
+    assert.equal((await h.store.get("s0"))?.queueReason, "an OMP worker for this ticket is still alive");
+    assert.equal((await h.store.get("s1"))?.queued, true, "a failed read leaves the thread queued, as before batching");
+    assert.match(String(errors.mock.calls[0]?.arguments[0]), /TUC-1: checking the queued thread failed: .*Entity not found/);
+    assert.deepEqual([(await h.store.get("s2"))?.queued, (await h.store.get("s2"))?.closed], [false, true]);
   } finally { await h.cleanup(); }
 });
 
