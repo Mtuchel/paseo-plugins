@@ -27,7 +27,8 @@
 //   event with the verdict and the plan text's hash, from which the plugin's Plannotator bridge
 //   decides whether the plan is approved without the owner (README, "Plan risk and
 //   auto-approval"). The record also needs the plan's `## Model` section (shared/plan-model.ts):
-//   the tier its implementation runs on.
+//   the tier its implementation runs on; and a ticket plan follows the part layout of the owner's
+//   Plannotator planning instructions (shared/plan-layout.ts), whether or not they reached the agent.
 // - LINEAR_TICKETS_ISSUE=<ticket>: `escalate_model` (README, "Model tiers") lets a ticket agent on
 //   the cheap or standard tier ask for the strong model; it drops an `escalated` event and the
 //   plugin switches the agent's model. Subagents cannot call it.
@@ -52,6 +53,7 @@ import { ADVISOR_MODEL, ADVISOR_SECTION, ADVISOR_THINKING, advisorSteps, RECORD_
 import { combinedRating, parsePlanRisk, sectionBody } from "../shared/plan-risk";
 import { parsePlanSections, ruleMismatch, sectionSteps } from "../shared/plan-sections";
 import { ESCALATE_TOOL, parsePlanModel } from "../shared/plan-model";
+import { layoutProblem, requiredParts } from "../shared/plan-layout";
 
 type Phase = "idle" | "planning" | "executing";
 type Entry = { type: string; customType?: string; data?: { reason?: string; path?: string; hash?: string }; message?: { role?: string } };
@@ -83,6 +85,9 @@ const AGENT_ID = process.env.PASEO_AGENT_ID;
 const PASEO_CLI = process.env.PASEO_CLI || "paseo";
 const HOME = process.env.PASEO_HOME?.replace(/^~(?=\/|$)/, homedir()) || join(homedir(), ".paseo");
 const EVENTS = join(HOME, "linear-tickets", "plannotator", "events");
+// Plannotator's global config, resolved as Plannotator resolves it (its config.ts): the owner's
+// planning instructions, whose plan layout the record gate checks (shared/plan-layout.ts).
+const PLANNOTATOR_CONFIG = join(process.env.PI_CODING_AGENT_DIR || join(process.env.HOME || process.env.USERPROFILE || homedir(), ".pi", "agent"), "plannotator.json");
 const MARKER = "linear-tickets.plan-first";
 const ADVICE_MARKER = "linear-tickets.plan-advice";
 const SUBMIT_TOOL = "plannotator_submit_plan";
@@ -133,6 +138,22 @@ function planPath(ctx: Context | undefined, file: string): string | null {
     return artifacts ? join(artifacts, "local", local[1]) : null;
   }
   return resolvePath(ctx?.cwd ?? process.cwd(), file);
+}
+
+// The part headings the owner's planning instructions require; [] when the file or its planning
+// instructions are missing or unreadable (Plannotator then uses its built-in ones, which name none).
+function planningParts(): string[] {
+  let value: unknown;
+  try {
+    value = JSON.parse(readFileSync(PLANNOTATOR_CONFIG, "utf8"));
+  } catch {
+    return [];
+  }
+  for (const key of ["phases", "planning", "instructions"]) {
+    if (typeof value !== "object" || value === null || !(key in value)) return [];
+    value = Reflect.get(value, key);
+  }
+  return typeof value === "string" ? requiredParts(value) : [];
 }
 
 function readPlan(path: string | null): string | null {
@@ -303,6 +324,10 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     // A planner run's work order only orders tickets; each ticket's own plan picks its tier.
     const model = sectionBody(content, "Work order") === null ? parsePlanModel(content, rated.risk) : null;
     if (model && "problem" in model) return text(`${file}: ${model.problem}\n\nFix the section, then record again.`);
+    // Read at every record, so an edited template applies at once. No readable instructions: the
+    // built-in ones, which name no parts, so nothing to check.
+    const layout = model ? layoutProblem(content, planningParts()) : null;
+    if (layout) return text(`${file}: ${layout}\n\nLay the plan out as the planning instructions in ${PLANNOTATOR_CONFIG} (phases.planning.instructions, "Plan File Structure") say, then record again.`);
     if (verdict === "unavailable") {
       const reason = params.reason?.trim();
       if (!reason) return text("Give the reason the advisor could not be created.");
