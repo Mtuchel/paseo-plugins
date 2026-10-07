@@ -1,5 +1,7 @@
 import { open, opendir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import { z } from "zod";
+import { plannerRecoverySchema } from "./project-flow";
 import type { HandoverRecord } from "./handover";
 import type { PipelineOwnerEvidence } from "./plan-pipeline";
 
@@ -22,7 +24,7 @@ export type NativeState = {
 export type NativeCursor = { path: string; inode: string; offset: number; anchor: string; state: NativeState };
 export type NativeEvidence = { state: NativeState; cursor: NativeCursor; complete: boolean; problem?: string };
 
-async function sourceJson(path: string, limit: number): Promise<ObjectValue | null> {
+async function sourceJson(path: string, limit: number, strictEnvelope = false): Promise<ObjectValue | null> {
   const file = await open(path, "r").catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return null; throw error; });
   if (!file) return null;
   try {
@@ -36,7 +38,9 @@ async function sourceJson(path: string, limit: number): Promise<ObjectValue | nu
       bytes += chunk.bytesRead;
     }
     if (bytes !== stat.size) throw new Error("Owner evidence changed during read");
-    return object(JSON.parse(buffer.subarray(0, bytes).toString("utf8")));
+    const parsed: unknown = JSON.parse(buffer.subarray(0, bytes).toString("utf8"));
+    if (strictEnvelope && (!parsed || typeof parsed !== "object" || Array.isArray(parsed))) throw new Error("Planner evidence malformed");
+    return object(parsed);
   } finally { await file.close(); }
 }
 
@@ -89,6 +93,50 @@ export async function pipelineOwnerEvidence(home: string, issueIds: readonly str
   }
   if (unresolvedWaits.size) throw new Error("Needs-you wait evidence unavailable");
   return [...owners.values()];
+}
+
+const plannerIdentity = z.string().min(1).max(200);
+const plannerTime = z.string().refine((value) => Boolean(timestamp(value)));
+const plannerEvidenceSchema = z.object({
+  closedPlanner: plannerIdentity.optional(),
+  planner: z.object({
+    id: plannerIdentity, agentId: plannerIdentity.optional(), listedAt: plannerTime,
+    startedAt: plannerTime.optional(), ownerAsked: z.boolean().optional(),
+    approved: z.object({ agentId: plannerIdentity.nullable(), plan: z.string(), done: z.array(z.string()).optional() }).optional(),
+    recovery: plannerRecoverySchema.optional(),
+  }).nullable(),
+});
+type Recovery = z.infer<typeof plannerRecoverySchema>;
+export type PipelinePlannerEvidence = {
+  projectId: string; closedRunId?: string;
+  run?: {
+    runId: string; agentId?: string; listedAt: string; ownerAsked: boolean; approved: boolean;
+    pending?: Pick<NonNullable<Recovery["pending"]>, "identity" | "failedAt" | "resumeAt">;
+    claim?: Recovery["claim"];
+  };
+};
+
+/** Observe only persisted recovery ownership and times; never expose plans or provider errors. */
+export async function pipelinePlannerEvidence(home: string): Promise<PipelinePlannerEvidence[]> {
+  const raw = await sourceJson(join(home, "linear-tickets", "projects.json"), 4 * 1024 * 1024, true);
+  if (!raw) return [];
+  const entries = Object.entries(raw).filter(([id]) => id !== "~repairs");
+  if (entries.length > 512) throw new Error("Planner evidence exceeds safe bound");
+  return entries.map(([projectId, value]) => {
+    const parsed = plannerEvidenceSchema.safeParse(value);
+    if (!plannerIdentity.safeParse(projectId).success || !parsed.success) throw new Error("Planner evidence malformed");
+    const { planner, closedPlanner } = parsed.data;
+    const pending = planner?.recovery?.pending;
+    return {
+      projectId, ...(closedPlanner ? { closedRunId: closedPlanner } : {}),
+      ...(planner ? { run: {
+        runId: planner.id, agentId: planner.agentId, listedAt: timestamp(planner.listedAt)!,
+        ownerAsked: planner.ownerAsked === true, approved: Boolean(planner.approved),
+        ...(pending ? { pending: { identity: pending.identity, failedAt: timestamp(pending.failedAt)!, resumeAt: timestamp(pending.resumeAt)! } } : {}),
+        ...(planner.recovery?.claim ? { claim: { ...planner.recovery.claim, at: timestamp(planner.recovery.claim.at)! } } : {}),
+      } } : {}),
+    };
+  });
 }
 
 function object(value: unknown): ObjectValue { return value && typeof value === "object" && !Array.isArray(value) ? value as ObjectValue : {}; }

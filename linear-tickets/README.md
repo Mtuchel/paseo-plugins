@@ -1122,8 +1122,8 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   so Skip, a replaced run or a finished plan does not erase their reporting evidence. Confirmation
   is saved atomically with the run update; a failed save retains the claim for labeled-root
   reconciliation, and retirement failure cannot turn saved confirmation into failed creation.
-  Planner reset-time display in planning activity stays separate (TUC-1347); ticket-agent
-  digest behavior is unchanged.
+  **Plan pipeline** in the review inbox observes the saved restart time as described below;
+  ticket-agent digest behavior is unchanged.
   Skip and order application wait for any start or write already in flight. Each later project
   poll also archives obsolete run agents, including one whose creation response was lost and
   became visible only after Skip.
@@ -1794,6 +1794,26 @@ when the host cannot be reached it says so and keeps retrying.
   planning rather than declaring a crash. Actual submission/delivery errors, abnormal exits,
   confirmed stopped unfinished planners and provider rate limits remain failures; rate-limit
   diagnostics show a recorded retry delay without retrying the provider.
+  Direct project planners with current persisted usage-limit recovery instead show
+  **Waiting · Normal**: “Usage limit: restart scheduled for {Berlin date and time}.
+  Recovery is checked when automatic dispatch is active and the project is eligible.”
+  This is the saved schedule, not proof a restart occurred; disabled dispatch or a removed
+  project trigger retains the wait without launching. Dates are always included in Berlin time.
+  An unconfirmed launch says “Usage-limit restart requested at {Berlin date and time};
+  waiting for agent confirmation.” A retained claim followed by another recorded limit failure
+  shows the new saved deadline instead. Held recovery is **Needs attention**:
+  “Automatic planner recovery stopped; owner action required. Use Plan or Skip.”
+  Initial failed launches stay visible without an agent link. Exact project/run/root ownership
+  prevents transferring a wait to a ticket planner, another run or a late duplicate.
+  Successful replacements supersede predecessor waits; recorded approvals or run closure
+  complete them. Missing records/agents alone never prove closure. Reload revalidates the saved
+  observation against current project evidence, and unreadable recovery or malformed saved
+  ownership removes the restart promise as **Unknown**. A ghost predecessor with a genuinely live
+  duplicate stays unconfirmed until ownership is reconciled. Owner-source failures also keep
+  recovery Unknown. Submission alone never preserves an obsolete restart promise after root loss;
+  actual submission/delivery failures remain visible across reload even when that root is absent.
+  Delivered reviews, owner waits and newer actual progress keep precedence; polling does not count
+  as progress or recompute the schedule.
   Missing, unreadable, unsupported, incomplete, stale or unreachable evidence is **Unknown**,
   never an all-clear; known failures remain visible.
   Auto-approved, completed, superseded and explicitly cancelled revisions are accounted for,

@@ -69,7 +69,7 @@ const RESTART_GRACE_MS = 10 * 60_000;
 const RESTART_CAP = 3;
 
 const recoveryTime = z.string().refine((value) => Number.isFinite(Date.parse(value)));
-const plannerRecoverySchema = z.object({
+export const plannerRecoverySchema = z.object({
   attempt: z.number().int().nonnegative(),
   claims: z.array(recoveryTime),
   handledAgentId: z.string().optional(),
