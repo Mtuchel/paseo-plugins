@@ -10,11 +10,11 @@ import type { PaseoApi, PaseoWorkspaceAgentCreateOptions, PaseoWorkspaceCreateOp
 import { buildContext, buildPrompt, issuePage, normalizeIssue, connection, relationships, stateHistorySpans, ticketRelations } from "./context";
 import { Credentials } from "./credentials";
 import { Launcher, safeBranchName } from "./launch";
-import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_CHEAP_MODELS, DEFAULT_STANDARD_MODELS, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_ACTIVATION } from "./settings";
+import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_CHEAP_MODELS, DEFAULT_STANDARD_MODELS, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_ACTIVATION } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { LinearService, postGraphQL, ADD_LABEL_QUERY, CREATE_LABEL_QUERY, LABEL_BY_NAME_QUERY, resolveReviewState, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
 import { RateBudget, RateLimitedError } from "./rate-budget";
-import { cachedOverviewRpc, countIssuesRpc, listIssuesRpc, searchIssuesRpc } from "../shared/contracts";
+import { cachedOverviewRpc, countIssuesRpc, listIssuesRpc, searchIssuesRpc, setSettingsRpc } from "../shared/contracts";
 
 // Launches save the ticket prompt for the plan advisor under PASEO_HOME; keep it out of the real one.
 process.env.PASEO_HOME = mkdtempSync(join(tmpdir(), "paseo-plugin-home-"));
@@ -43,7 +43,7 @@ const detail = { issue: normalizeIssue(rawIssue), teamId: "team-1", projectId: "
 const input = { id: "ENG-42", projectId: "project-1", provider: "test/model", instructions: "Add a regression check.", markInProgress: false, requestId: "5f6f1154-5838-4439-b981-b3c9d9831488" };
 // Test fakes that exercise neither the state transition nor finished blockers: no-op stubs keep the contract strict.
 const noMark = { markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] };
-const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: DEFAULT_CHEAP_MODELS, standardModels: DEFAULT_STANDARD_MODELS, reviewPeers: [], activation: DEFAULT_ACTIVATION };
+const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: DEFAULT_CHEAP_MODELS, standardModels: DEFAULT_STANDARD_MODELS, reviewPeers: [], activation: DEFAULT_ACTIVATION };
 
 test("server entrypoint loads and registers valid Paseo RPC contracts", () => {
   const names: string[] = [];
@@ -1077,6 +1077,69 @@ test("dispatch settings normalize team keys, reject invalid edits, and are forgo
     await settings.patch({ dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK });
     await assert.rejects(stat(path), { code: "ENOENT" });
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("the watchdog switch and thresholds save independently of auto-resume and are forgotten at their defaults", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-linear-watchdog-settings-"));
+  const path = join(directory, "settings.json");
+  const settings = new Settings(path);
+  try {
+    const fresh = await settings.read();
+    assert.equal(fresh.writeback.watchdog, true, "the watchdog is on by default");
+    assert.deepEqual(fresh.watchdog, DEFAULT_WATCHDOG);
+    await settings.patch({ writeback: { watchdog: false } });
+    assert.equal((await settings.read()).writeback.watchdog, false);
+    await settings.patch({ writeback: { autoResume: true } });
+    const resumed = await settings.read();
+    assert.equal(resumed.writeback.autoResume, true);
+    assert.equal(resumed.writeback.watchdog, false, "auto-resume does not turn the watchdog back on");
+    await settings.patch({ writeback: { watchdog: true } });
+    const watching = await settings.read();
+    assert.equal(watching.writeback.watchdog, true);
+    assert.equal(watching.writeback.autoResume, true, "the watchdog switch does not touch auto-resume");
+    await settings.patch({ watchdog: { idleMinutes: 90 } });
+    assert.deepEqual((await settings.read()).watchdog, { ...DEFAULT_WATCHDOG, idleMinutes: 90 });
+    await settings.patch({ writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG });
+    await assert.rejects(stat(path), { code: "ENOENT" });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("watchdog threshold edits outside 1–1440 minutes are rejected and leave the saved settings unchanged", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-linear-watchdog-bounds-"));
+  const path = join(directory, "settings.json");
+  const settings = new Settings(path);
+  try {
+    await settings.patch({ watchdog: { idleMinutes: 90 } });
+    for (const field of ["silentMinutes", "steerGraceMinutes", "recoveryGraceMinutes", "idleMinutes"] as const) {
+      const before = await settings.read();
+      for (const invalid of [0, 1441, 1.5, Number.NaN]) {
+        await assert.rejects(settings.patch({ watchdog: { [field]: invalid } }), /whole number of minutes from 1 to 1440/);
+        assert.deepEqual(await settings.read(), before, `${field} at ${invalid} must leave the saved settings unchanged`);
+      }
+      await settings.patch({ watchdog: { [field]: 1 } });
+      assert.equal((await settings.read()).watchdog[field], 1, `${field} accepts the minimum`);
+      await settings.patch({ watchdog: { [field]: 1440 } });
+      assert.equal((await settings.read()).watchdog[field], 1440, `${field} accepts the maximum`);
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a malformed saved watchdog setting falls back to the defaults field by field", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-linear-watchdog-stored-"));
+  const path = join(directory, "settings.json");
+  try {
+    await writeFile(path, JSON.stringify({ watchdog: { silentMinutes: "x", idleMinutes: 0, steerGraceMinutes: 30 }, writeback: { watchdog: "no" } }));
+    const saved = await new Settings(path).read();
+    assert.deepEqual(saved.watchdog, { silentMinutes: 45, steerGraceMinutes: 30, recoveryGraceMinutes: 20, idleMinutes: 120 });
+    assert.equal(saved.writeback.watchdog, true, "only an explicit false turns the watchdog off");
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("the settings RPC validates watchdog thresholds and keeps the field optional", () => {
+  assert.equal(setSettingsRpc.input.safeParse({ watchdog: { silentMinutes: 0 } }).success, false);
+  assert.equal(setSettingsRpc.input.safeParse({ watchdog: { idleMinutes: 1441 } }).success, false);
+  assert.equal(setSettingsRpc.input.safeParse({ watchdog: { silentMinutes: 90 } }).success, true);
+  assert.equal(setSettingsRpc.input.safeParse({ writeback: { autoResume: true } }).success, true, "a client that omits watchdog still validates");
 });
 
 test("a pull request only moves the ticket to a started state named for review", () => {

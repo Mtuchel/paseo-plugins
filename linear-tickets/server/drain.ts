@@ -147,6 +147,9 @@ export type DrainDeps = {
   ghosts?: (agents: PaseoAgent[], now: number) => Promise<Set<string>>;
   processInspector?: ProcessInspector;
   sweepMs?: number;
+  // The ticket's watchdog history travels with every forwarded activation, and a forwarded ticket
+  // is no longer this host's to recover (watchdog.ts).
+  watchdog?: { history(issueId: string, now: number): Promise<unknown>; transferred(issueId: string, identifier: string): Promise<void> };
 };
 
 function allowlistFrom(raw: unknown): Allowlist {
@@ -324,6 +327,9 @@ export class DrainRouter implements ActivationSink {
     });
     if (crossedCap) this.log(`activation routing: more than ${MAX_OUTBOX_ENTRIES} activations wait for ${this.peerLabel(peer)} (nothing is dropped; they are forwarded in order)`);
     if (ownershipError) return { held: `whether this host still owns the ticket could not be read (${ownershipError}); nothing was started and the ticket is queued` };
+    // The work goes to the peer: this host's watchdog stops recovering the ticket's older roots. A
+    // failure is logged; the ticket's agents here are then still judged, as before the forward.
+    await this.deps.watchdog?.transferred(request.issueId, request.identifier).catch((error: unknown) => this.log(`activation routing: recording ${request.identifier} as handed over for the watchdog failed: ${this.reason(error)}`));
     let state: { ok: true } | { ok: false; reason: string };
     try { state = await this.routable(); }
     catch (error) { state = { ok: false, reason: `this host's own state is unreadable (${this.reason(error)})` }; }
@@ -399,6 +405,9 @@ export class DrainRouter implements ActivationSink {
   private async envelope(request: ActivationRequest): Promise<ActivationEnvelope> {
     const text = activationText(request.text);
     const id = request.id ?? await this.idFor(request);
+    // An unreadable history is left out: the receiving host then holds recovery for a day rather
+    // than starting with a fresh budget.
+    const watchdog = request.watchdog ?? await this.deps.watchdog?.history(request.issueId, this.now()).catch(() => undefined);
     return {
       id,
       kind: request.kind,
@@ -409,6 +418,7 @@ export class DrainRouter implements ActivationSink {
       ...(request.label ? { label: request.label } : {}),
       ...(request.strictResume ? { strictResume: true } : {}),
       ...(request.resume ? { resume: request.resume } : {}),
+      ...(watchdog ? { watchdog } : {}),
       host: this.host,
       requestedAt: new Date(this.now()).toISOString(),
     };

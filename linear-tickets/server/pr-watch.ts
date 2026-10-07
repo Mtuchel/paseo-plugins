@@ -23,6 +23,7 @@ import { githubBudget, GitHubPausedError, RateLimitedError, withPriority, type G
 import type { PromptOutcome, Recovery, SessionRouter, Succession } from "./sessions";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
+import type { Watchdog } from "./watchdog";
 
 const exec = promisify(execFile);
 const INTERVAL_MS = 2 * 60 * 1000;
@@ -715,6 +716,8 @@ export class PullRequestWatch {
       // Read-only worktree discovery; defaults to the queue backstop's git runner.
       git?: GitRunner;
       backstop?: BackstopDeps;
+      // The silent-agent watchdog (watchdog.ts): it runs first in every poll.
+      watchdog?: Pick<Watchdog, "pass" | "stop">;
     },
     private readonly path = join(paseoHome(), "linear-tickets", "pr-watch.json"),
   ) {}
@@ -738,6 +741,8 @@ export class PullRequestWatch {
     clearInterval(this.backstopTimer ?? undefined);
     this.timer = null;
     this.backstopTimer = null;
+    // No watchdog effect starts after the unload; one in flight drains under its lease.
+    this.deps.watchdog?.stop();
   }
 
   private async load(): Promise<Record<string, Seen>> {
@@ -916,6 +921,35 @@ export class PullRequestWatch {
     record.links = { ...record.links, "Pull request": url };
   }
 
+  // The open pull requests of a ticket, for the watchdog: those of its worktree's repo (else the one
+  // repo its attachments name) whose title names the ticket or whose branch is the recorded one.
+  // Null: they cannot be read, which is not "none" (a missing link proves nothing).
+  private async ticketPulls(ticket: { issueId: string; identifier: string; worktree: string | null; link: string | null }, context: RunContext): Promise<OpenPull[] | null> {
+    try {
+      const repos = new Set<string>();
+      const linked = PULL_URL.exec(ticket.link ?? "")?.[1];
+      if (linked) repos.add(linked.toLowerCase());
+      const own = ticket.worktree ? await context.repo(ticket.worktree) : null;
+      if (own) repos.add(own.toLowerCase());
+      if (!repos.size) {
+        const state = await this.deps.linear.issueState(ticket.issueId);
+        for (const url of state.attachmentUrls ?? []) {
+          const source = /^https:\/\/github\.com\/([A-Za-z0-9-]+\/[A-Za-z0-9_.-]+)\/pull\/[1-9]\d*\/?$/.exec(url);
+          if (source) repos.add(source[1].toLowerCase());
+        }
+      }
+      if (!repos.size) return null;
+      const record = context.records.find((item) => item.issueId === ticket.issueId);
+      const names = namesTicket(ticket.identifier);
+      const open: OpenPull[] = [];
+      for (const repo of repos) open.push(...(await context.pulls(repo)).filter((pull) => names.test(pull.title) || (record?.branch && pull.headBranch === record.branch)));
+      return open;
+    } catch (error) {
+      if (error instanceof RateLimitedError) throw error;
+      return null;
+    }
+  }
+
   private async watch(): Promise<void> {
     const seenByUrl = await this.load();
     this.crashes = await readFile(this.crashPath, "utf8").then((text) => JSON.parse(text) as Record<string, Crash>, () => ({}));
@@ -969,6 +1003,18 @@ export class PullRequestWatch {
         stopped.paused = error;
       }
     };
+    // The watchdog goes first: the agents of tickets in a recovery cycle are reserved, so no other
+    // pass messages them this poll. Its own failures are logged; they never end the poll.
+    if (this.deps.watchdog) {
+      await pass(async () => {
+        try {
+          await this.deps.watchdog!.pass({ records: all, reserved, pulls: (ticket) => this.ticketPulls(ticket, context) });
+        } catch (error) {
+          if (error instanceof RateLimitedError) throw error;
+          console.error(`[linear-tickets] watchdog: ${error instanceof Error ? error.message : error}`);
+        }
+      });
+    }
     // Resumes left by an earlier restart go out first.
     await pass(() => this.pendingResumes(all, reserved));
     // Stalled pull requests are nudged, and closed ones followed to their replacement, after every

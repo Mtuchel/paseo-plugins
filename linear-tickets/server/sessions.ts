@@ -22,6 +22,7 @@ import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, que
 import type { PluginSettings, Settings } from "./settings";
 import { issueAgents, type TicketStarter } from "./starter";
 import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
+import { WATCHDOG_LABEL, type TicketRoots, type WatchdogOutcome, type WatchdogRequest, type WatchdogStore } from "./watchdog";
 import type { ReviewDeletions } from "./review-deletions";
 
 const exec = promisify(execFile);
@@ -349,7 +350,14 @@ type Deps = {
   // The clock the webhook fallback windows are measured against.
   now?: () => number;
   deletions?: Pick<ReviewDeletions, "get" | "blocked" | "forAgent">;
+  // The watchdog's durable owner Stop and owner continuations (watchdog.ts).
+  watchdog?: Pick<WatchdogStore, "hold" | "continued">;
+  // How a bounded wait for a stopped turn pauses between reads; the tests inject one.
+  sleep?: (ms: number) => Promise<void>;
 };
+
+// How long a watchdog Stop waits for the turn to end before it counts as failed.
+const STOP_WAIT_MS = 60_000;
 
 // Linear agent sessions ↔ Paseo agents. Inbound: `created` starts or links an agent, and
 // `prompted` answers its question, decides its approval or plan review, stops it, or sends a
@@ -533,6 +541,8 @@ export class SessionRouter {
       await this.say(session.id, "error", "Only the workspace owner can start Paseo agents.");
       return;
     }
+    // A new thread from the owner is an explicit continuation: the watchdog's hold on the ticket ends.
+    await this.deps.watchdog?.continued(issueId).catch((error: unknown) => console.error(`[linear-tickets] ${identifier}: recording the owner's continuation for the watchdog failed: ${error instanceof Error ? error.message : error}`));
     const comment = (session.comment ?? {}) as { body?: string };
     const text = typeof comment.body === "string" && !/^This thread is for an agent session/.test(comment.body) ? comment.body.replace(/@paseo\b/gi, "").trim() : "";
     // Another automatic start of the ticket is under way: the thread waits for it, and the queue
@@ -685,6 +695,11 @@ export class SessionRouter {
     if (activityId && !await this.deps.store.claim(sessionId, activityId)) return;
     const userId = typeof activity.userId === "string" ? activity.userId : String(((activity.user ?? {}) as { id?: string }).id ?? "");
     if (userId && userId !== await this.owner()) { await this.say(sessionId, "error", "Only the workspace owner can steer Paseo agents."); return; }
+    // The owner's Stop holds the ticket for the watchdog until the owner continues; it is saved
+    // before the Stop goes out, and any other reply of the owner is that continuation.
+    const watchdogNote = (error: unknown) => console.error(`[linear-tickets] ${link.identifier}: recording the owner's ${signal === "stop" ? "Stop" : "continuation"} for the watchdog failed: ${error instanceof Error ? error.message : error}`);
+    if (signal === "stop") await this.deps.watchdog?.hold(link.issueId, link.agentId).catch(watchdogNote);
+    else await this.deps.watchdog?.continued(link.issueId).catch(watchdogNote);
 
     if (link.offer === "resume") {
       if (body.toLowerCase() === RESUME || /resume/i.test(body)) { await this.startFor(link, false); return; }
@@ -1245,7 +1260,7 @@ export class SessionRouter {
   }
 
   // The agent's current snapshot; null when it no longer exists or is archived.
-  private async agent(agentId: string): Promise<{ handle: PaseoAgentHandle; agent: Snapshot } | null> {
+  private async agent(agentId: string): Promise<{ handle: PaseoAgentHandle; agent: PaseoAgent } | null> {
     const handle = this.paseo!.agents.ref(agentId);
     const refreshed = await handle.refresh().catch((error: unknown) => {
       if (error instanceof Error && /not found/i.test(error.message)) return null;
@@ -1586,6 +1601,205 @@ export class SessionRouter {
     } finally {
       gate.release();
     }
+  }
+
+  // Every ticket's unarchived root agents (no subagents) and its proven ghosts, for the watchdog.
+  async watchdogRoots(): Promise<Map<string, TicketRoots>> {
+    const tickets = new Map<string, TicketRoots>();
+    if (!this.paseo) return tickets;
+    let cursor: string | undefined;
+    const cursors = new Set<string>();
+    for (let pageNumber = 0; ; pageNumber++) {
+      if (pageNumber === QUEUED_OWNER_MAX_PAGES) throw new Error("The agent list could not be fully read.");
+      const page = await this.paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
+      for (const { agent } of page.entries) {
+        const issueId = agent.labels?.["linear.issueId"];
+        if (!issueId || agent.labels?.["paseo.parent-agent-id"] || agent.archivedAt) continue;
+        const ticket = tickets.get(issueId) ?? { issueId, identifier: agent.labels?.["linear.identifier"] ?? issueId, roots: [], ghosts: new Set<string>() };
+        ticket.roots.push(agent);
+        tickets.set(issueId, ticket);
+      }
+      if (!page.pageInfo) throw new Error("The agent list could not be fully read.");
+      if (!page.pageInfo.hasMore) break;
+      cursor = page.pageInfo.nextCursor ?? undefined;
+      if (!cursor || cursors.has(cursor)) throw new Error("The agent list could not be fully read.");
+      cursors.add(cursor);
+    }
+    const ghosts = await ghostAgents([...tickets.values()].flatMap((ticket) => ticket.roots), this.clock(), this.deps.processInspector);
+    for (const ticket of tickets.values()) for (const agent of ticket.roots) if (ghosts.has(agent.id)) ticket.ghosts.add(agent.id);
+    return tickets;
+  }
+
+  // The ticket's newest thread: queued, forwarded, split, parked or reviewing threads keep the
+  // watchdog away.
+  async watchdogThread(issueId: string): Promise<SessionLink | null> {
+    return (await this.deps.store.all()).filter((link) => link.issueId === issueId).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ?? null;
+  }
+
+  // One watchdog step (watchdog.ts), in the ticket's turn and under its start gate like every
+  // recovery: the step is checked again there (`check`, deep before the first effect, cheap after
+  // every later await), claimed right before its first effect, and stops at once when the plugin
+  // instance unloads. An ordinary message to a running agent stays `busy` (see prompt); only the
+  // watchdog steers (OMP's `/steer`, which keeps the turn) or stops a turn on purpose.
+  watchdogAct(request: WatchdogRequest): Promise<WatchdogOutcome> {
+    if (!this.paseo) return Promise.resolve({ kind: "skipped", reason: "Paseo is not connected yet", end: false });
+    return this.exclusive(request.issueId, async (): Promise<WatchdogOutcome> => {
+      if (await this.deps.deletions?.blocked(request.issueId)) return { kind: "skipped", reason: "the ticket is paused for deletion", end: true };
+      const gate = this.deps.launcher.gate(request.issueId);
+      if (!gate) return { kind: "skipped", reason: "a launch for this ticket is under way", end: false };
+      try {
+        return await this.watchdogEffect(request);
+      } catch (error) {
+        return { kind: "failed", reason: error instanceof Error ? error.message : String(error) };
+      } finally {
+        gate.release();
+      }
+    });
+  }
+
+  private async watchdogEffect(request: WatchdogRequest): Promise<WatchdogOutcome> {
+    const { issueId, rootId, action, text, marker } = request;
+    const unloading: WatchdogOutcome = { kind: "skipped", reason: "the plugin is unloading", end: false };
+    const found = rootId ? await this.agent(rootId) : null;
+    if (!request.alive()) return unloading;
+    if (!found && action !== "succeed") return { kind: "skipped", reason: "the agent is gone", end: true };
+    const reason = await request.check(found?.agent ?? null, true);
+    if (reason) return { kind: "skipped", reason, end: true };
+    if (!request.alive()) return unloading;
+    if (action === "succeed") return this.watchdogSucceed(request, found);
+    const { handle, agent } = found!;
+    const running = Boolean(agent.activeTurn || agent.status === "running");
+    if (action === "steer" || action === "interrupt") {
+      if (!running || (agent.activeTurn?.turnId ?? null) !== request.turnId) return { kind: "skipped", reason: "the silent turn already ended", end: true };
+      if (agent.provider !== "omp") return { kind: "skipped", reason: `${agent.provider} agents cannot be steered without cancelling their turn`, end: true };
+      await request.claim();
+      if (action === "interrupt") return this.watchdogResume(request, found!, true, null);
+      await handle.send(`/steer ${text}`, { messageId: marker });
+      return { kind: "done" };
+    }
+    if (action === "reload") {
+      const reload = await this.deps.reloader?.();
+      if (!reload) return { kind: "skipped", reason: "the daemon's agent reload is not available", end: false };
+      await request.claim();
+      return this.watchdogResume(request, found!, running, reload);
+    }
+    // `resume`: a closed or idle agent. A closed one is loaded again by the message itself, once its
+    // ticket's terminal OMP roots are proven gone; a crashed one is reloaded first.
+    if (running) return { kind: "skipped", reason: "the agent is working again", end: true };
+    const crashed = crashedProcess(agent);
+    if (agent.status === "closed" || crashed) {
+      const wait = await this.processWait(issueId, [{ ...agent, id: rootId }]);
+      if (wait) return { kind: "skipped", reason: wait, end: false };
+    }
+    const reload = crashed ? await this.deps.reloader?.() : null;
+    if (crashed && !reload) return { kind: "skipped", reason: "the daemon's agent reload is not available", end: false };
+    if (!request.alive()) return unloading;
+    await request.claim();
+    try {
+      if (reload) await reload(rootId);
+      await handle.send(text, { messageId: marker });
+    } catch (error) {
+      return { kind: "failed", reason: `the agent could not be loaded (${error instanceof Error ? error.message : error})`, unloadable: true };
+    }
+    return { kind: "done" };
+  }
+
+  // Stops the agent's turn and waits up to STOP_WAIT_MS for it to end. Returns the last snapshot.
+  private async stopTurn(agentId: string): Promise<{ handle: PaseoAgentHandle; agent: PaseoAgent } | null> {
+    const deadline = this.clock() + STOP_WAIT_MS;
+    await (this.deps.stop ?? stopAgentTurn)(agentId);
+    for (;;) {
+      const current = await this.agent(agentId);
+      if (!current || !(current.agent.activeTurn || current.agent.status === "running") || this.clock() >= deadline) return current;
+      await (this.deps.sleep ?? ((wait: number) => new Promise<void>((resolve) => setTimeout(resolve, wait))))(2_000);
+    }
+  }
+
+  // The interrupt and reload steps: stop the turn when one runs, reload when asked, look again, and
+  // send the resume. Everything after the claim reports what happened instead of throwing.
+  private async watchdogResume(request: WatchdogRequest, found: { handle: PaseoAgentHandle; agent: PaseoAgent }, stop: boolean, reload: ((agentId: string) => Promise<void>) | null): Promise<WatchdogOutcome> {
+    const { rootId } = request;
+    try {
+      let current: { handle: PaseoAgentHandle; agent: PaseoAgent } | null = found;
+      if (stop) {
+        current = await this.stopTurn(rootId);
+        if (!current) return { kind: "failed", reason: "the agent disappeared after the stop" };
+        if (current.agent.activeTurn || current.agent.status === "running") return { kind: "failed", reason: `the turn did not stop within ${STOP_WAIT_MS / 1000} seconds` };
+      }
+      if (!request.alive()) return { kind: "failed", reason: "the plugin unloaded before the resume went out" };
+      if (reload) {
+        await reload(rootId);
+        current = await this.agent(rootId);
+        if (!current) return { kind: "failed", reason: "the agent is gone after the reload" };
+        if (current.agent.status === "error") return { kind: "failed", reason: `the agent is in error after the reload${current.agent.lastError ? ` (${current.agent.lastError})` : ""}` };
+      }
+      const reason = await request.check(current.agent, false);
+      if (reason) return { kind: "skipped", reason, end: true, dispatched: true };
+      if (!request.alive()) return { kind: "failed", reason: "the plugin unloaded before the resume went out" };
+      if (busy(current.agent)) return { kind: "failed", reason: "the agent started another turn before the resume went out" };
+      await current.handle.send(request.text, { messageId: `${request.marker}:resume` });
+      return { kind: "done" };
+    } catch (error) {
+      return { kind: "failed", reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  // The replacement: the predecessor is retired first (its Stop and archive are claimed), its
+  // workers must be proven gone (`retry` until then; the watchdog's deadline ends that), and only
+  // then a successor starts on the recorded branch and worktree, carrying the cycle's label. A
+  // peer-bound replacement is forwarded with the cycle's history after the claim and never falls
+  // back to a local start. Branch, worktree and uncommitted files stay as they are.
+  private async watchdogSucceed(request: WatchdogRequest, found: { handle: PaseoAgentHandle; agent: PaseoAgent } | null): Promise<WatchdogOutcome> {
+    const { issueId, identifier, rootId } = request;
+    const paseo = this.paseo!;
+    await request.claim();
+    if (found) {
+      let current: { handle: PaseoAgentHandle; agent: PaseoAgent } | null = found;
+      if (current.agent.activeTurn || current.agent.status === "running") {
+        current = await this.stopTurn(rootId);
+        if (current && (current.agent.activeTurn || current.agent.status === "running")) return { kind: "failed", reason: `the silent agent's turn did not stop within ${STOP_WAIT_MS / 1000} seconds`, retry: true };
+      }
+      const reason = await request.check(current?.agent ?? null, false);
+      if (reason) return { kind: "skipped", reason, end: true, dispatched: true };
+      if (!request.alive()) return { kind: "failed", reason: "the plugin unloaded during the retirement", retry: true };
+      if (current) await paseo.agents.ref(rootId).archive();
+    }
+    const wait = await this.processWait(issueId, found ? [{ ...found.agent, id: rootId }] : []);
+    if (wait) return { kind: "failed", reason: wait, retry: true };
+    const live = await this.liveSuccessorFor(issueId, [rootId]);
+    if (live) {
+      const marked = (await this.agent(live.id))?.agent.labels?.[WATCHDOG_LABEL] === request.marker;
+      return marked ? { kind: "done", successor: live } : { kind: "skipped", reason: `agent ${live.id.slice(0, 8)} took over the ticket`, end: true, dispatched: true };
+    }
+    if (!request.alive()) return { kind: "failed", reason: "the plugin unloaded before the replacement started", retry: true };
+    const routed = await this.deps.route?.take({
+      kind: "recover", issueId, identifier, id: `watchdog:${issueId}:${request.marker}`,
+      text: request.text, strictResume: true, ...(request.history ? { watchdog: request.history } : {}),
+    });
+    if (routed && "held" in routed) return { kind: "failed", reason: `the replacement is not routed yet: ${routed.held}`, retry: true };
+    if (routed) return { kind: "done", peer: routed.peer };
+    if (!await this.deps.handover.resumeTarget(issueId)) return { kind: "failed", reason: "no branch is recorded for the ticket" };
+    const settings = await this.deps.settings.read();
+    const admission = await this.deps.starter.admission(issueId, paseo, settings);
+    if (!admission.ok) return { kind: "failed", reason: admission.reason, retry: true };
+    const running = dispatchLabels(settings.dispatch.label).running;
+    await this.deps.linear.addLabel(issueId, running).catch(() => {});
+    let agentId: string;
+    try {
+      agentId = (await this.deps.starter.start(issueId, paseo, settings, { retryHint: "assign Paseo again", resumeOnly: true, lead: request.text, labels: { [WATCHDOG_LABEL]: request.marker } })).agentId;
+    } catch (error) {
+      await this.deps.linear.removeLabel(issueId, running).catch(() => {});
+      return { kind: "failed", reason: error instanceof Error ? error.message : String(error) };
+    }
+    const later = (step: string, work: () => Promise<unknown>) => work().catch((error: unknown) => {
+      console.error(`[linear-tickets] ${identifier}: ${step} failed: ${error instanceof Error ? error.message : error}`);
+    });
+    const snapshot = (await paseo.agents.ref(agentId).refresh().catch(() => null))?.agent;
+    const agent = { id: agentId, title: snapshot?.title ?? null, cwd: snapshot?.cwd ?? "" };
+    await later("opening the replacement's thread", () => this.openFor(issueId, identifier, agentId));
+    await later("closing superseded threads", () => this.closeSuperseded());
+    if (snapshot) await later("handing the record to the replacement", () => this.deps.handover.handOff({ id: issueId, identifier }, rootId, agent));
+    return { kind: "done", successor: agent };
   }
 
   async offerResume(sessionId: string): Promise<void> {

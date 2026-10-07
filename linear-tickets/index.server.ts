@@ -54,6 +54,7 @@ import { ReviewDeletions } from "./server/review-deletions";
 import { ReviewIssueInfos } from "./server/review-issue-info";
 import { PlanPipeline } from "./server/plan-pipeline";
 import { pipelineOwnerEvidence } from "./server/plan-pipeline-source";
+import { Watchdog, WatchdogStore } from "./server/watchdog";
 
 export default function contribute(server: PluginServerContext) {
   const credentials = new Credentials();
@@ -114,7 +115,9 @@ export default function contribute(server: PluginServerContext) {
   let attachedPaseo: PaseoApi | null = null;
   const route: ActivationSink = { take: async (request) => ((await settings.read()).activation.mode === "remote" ? drain.take(request) : intake.take(request)) };
   const sessionStore = new SessionStore();
-  const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, needsYou, route, deletions,
+  // The silent-agent watchdog's durable state (README, "Silent and stuck agents").
+  const watchdogStore = new WatchdogStore();
+  const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, needsYou, route, deletions, watchdog: watchdogStore,
     decideReview,
     reviewOutcome: (review) => reviewOutcome(review),
     recordOutcome: (agentId, outcome) => recordDecision({ type: "decided", agentId, ...outcome, at: new Date().toISOString() }),
@@ -134,8 +137,9 @@ export default function contribute(server: PluginServerContext) {
   let pipelineServerId: string | null = null;
   void daemonServerId().then((id) => { pipelineServerId = id; });
   const drain = new DrainRouter({ settings, paseo: () => attachedPaseo, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName,
-    ticketState: async (issueId) => { const state = await linear.issueState(issueId).catch(() => null); return state ? { statusType: state.statusType } : null; } });
-  const intake = new ActivationIntake({ settings, paseo: () => attachedPaseo, linear: () => linear, starter: () => starter, launcher: () => launcher, sessions: () => sessions, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName });
+    ticketState: async (issueId) => { const state = await linear.issueState(issueId).catch(() => null); return state ? { statusType: state.statusType } : null; },
+    watchdog: { history: (issueId, now) => watchdogStore.history(issueId, now), transferred: (issueId, identifier) => watchdogStore.transferred(issueId, identifier) } });
+  const intake = new ActivationIntake({ settings, paseo: () => attachedPaseo, linear: () => linear, starter: () => starter, launcher: () => launcher, sessions: () => sessions, sessionFor: (agentId) => sessions.sessionFor(agentId), host: hostName, watchdog: watchdogStore });
   activationGuard = async (issueId) => {
     const { mode, peer } = (await settings.read()).activation;
     // A guard that cannot read its own state refuses: it starts nothing on a guess, and the
@@ -232,7 +236,8 @@ export default function contribute(server: PluginServerContext) {
   plannotator.useFollowUps(followUps);
   plannotator.recordDecisions(decisions);
   const manualTasks = new ManualTasks({ linear, settings });
-  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks });
+  const watchdog = new Watchdog({ store: watchdogStore, sessions, linear, settings, handover, needsYou });
+  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => sessions.receive(event));
   // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").

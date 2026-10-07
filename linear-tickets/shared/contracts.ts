@@ -193,6 +193,15 @@ const writebackSettingsSchema = z.object({
   pullRequests: z.boolean(),
   mentions: z.boolean(),
   autoResume: z.boolean(),
+  watchdog: z.boolean(),
+});
+// The watchdog's silence thresholds (README, "Silent and stuck agents"), in minutes
+// (server/settings.ts WatchdogTimings).
+const watchdogSettingsSchema = z.object({
+  silentMinutes: z.number().int().min(1).max(1440),
+  steerGraceMinutes: z.number().int().min(1).max(1440),
+  recoveryGraceMinutes: z.number().int().min(1).max(1440),
+  idleMinutes: z.number().int().min(1).max(1440),
 });
 // Plan auto-approval (shared/plan-risk.ts): impact levels 0–4.
 const autoApproveSettingsSchema = z.object({
@@ -211,6 +220,7 @@ const activationSettingsSchema = z.object({
 });
 export type DispatchSettingsValue = z.infer<typeof dispatchSettingsSchema>;
 export type WritebackSettingsValue = z.infer<typeof writebackSettingsSchema>;
+export type WatchdogSettingsValue = z.infer<typeof watchdogSettingsSchema>;
 const settingsOutputSchema = z.object({
   template: z.string().nullable(),
   builtin: z.string(),
@@ -222,6 +232,7 @@ const settingsOutputSchema = z.object({
   agentLinearAccess: z.boolean(),
   dispatch: dispatchSettingsSchema,
   writeback: writebackSettingsSchema,
+  watchdog: watchdogSettingsSchema,
   autoApprove: autoApproveSettingsSchema,
   // README, "Model tiers": the cheap and standard tiers' models per provider.
   cheapModels: tierModelsSchema,
@@ -246,6 +257,8 @@ export const setSettingsRpc = defineRpc({
     launchPreference: launchPreferenceSchema.extend({ provider: z.string().min(1).max(500) }).optional(),
     dispatch: dispatchSettingsSchema.partial().optional(),
     writeback: writebackSettingsSchema.partial().optional(),
+    // Omitted fields keep their saved values, so an older partial client preserves them.
+    watchdog: watchdogSettingsSchema.partial().optional(),
     autoApprove: autoApproveSettingsSchema.partial().optional(),
     // One provider's model for the cheap or standard tier; `model: null` removes it.
     tierModel: z.object({

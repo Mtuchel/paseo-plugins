@@ -21,10 +21,16 @@ export const DEFAULT_STANDARD_MODELS: Record<string, TierModel> = { omp: { model
 export type DispatchSettings = { enabled: boolean; label: string; teamKeys: string[]; intervalSeconds: number; maxRunning: number };
 // Which lifecycle events of ticket-linked agents are written back to their Linear ticket.
 // `mentions` is the inbound direction: "@paseo" comments and replies to Paseo's comments by the key's user reach the agent.
-export type WritebackSettings = { status: boolean; summaries: boolean; blocked: boolean; pullRequests: boolean; mentions: boolean; autoResume: boolean };
+// `watchdog` (README, "Silent and stuck agents") has its own switch; `autoResume` keeps controlling the existing successors.
+export type WritebackSettings = { status: boolean; summaries: boolean; blocked: boolean; pullRequests: boolean; mentions: boolean; autoResume: boolean; watchdog: boolean };
 export const DEFAULT_DISPATCH: DispatchSettings = { enabled: false, label: "paseo", teamKeys: [], intervalSeconds: 60, maxRunning: 0 };
 export const MAX_RUNNING_LIMIT = 50;
-export const DEFAULT_WRITEBACK: WritebackSettings = { status: false, summaries: false, blocked: false, pullRequests: false, mentions: false, autoResume: false };
+export const DEFAULT_WRITEBACK: WritebackSettings = { status: false, summaries: false, blocked: false, pullRequests: false, mentions: false, autoResume: false, watchdog: true };
+// The watchdog's silence thresholds (README, "Silent and stuck agents"), in minutes.
+export type WatchdogTimings = { silentMinutes: number; steerGraceMinutes: number; recoveryGraceMinutes: number; idleMinutes: number };
+export const DEFAULT_WATCHDOG: WatchdogTimings = { silentMinutes: 45, steerGraceMinutes: 20, recoveryGraceMinutes: 20, idleMinutes: 120 };
+export const MIN_WATCHDOG_MINUTES = 1;
+export const MAX_WATCHDOG_MINUTES = 1440;
 // Draining a host (README, "Draining a host"): which host starts the agents Linear asks for.
 // `local` (the default) starts them here. `remote` starts none here: every new automatic
 // activation for a ticket without an allowed local owner is forwarded to `peer`, the other host's
@@ -46,6 +52,8 @@ export type PluginSettings = {
   agentLinearAccess: boolean;
   dispatch: DispatchSettings;
   writeback: WritebackSettings;
+  // The watchdog's timing thresholds (README, "Silent and stuck agents").
+  watchdog: WatchdogTimings;
   // Plans rated at or below the threshold are approved without the owner (README, "Plan risk and auto-approval").
   autoApprove: AutoApprovePolicy;
   // The cheap and standard tiers' models per provider; `{}` turns that tier's own model off.
@@ -67,6 +75,7 @@ type SettingsFile = {
   agentLinearAccess?: boolean;
   dispatch?: Partial<DispatchSettings>;
   writeback?: Partial<WritebackSettings>;
+  watchdog?: Partial<WatchdogTimings>;
   autoApprove?: Partial<AutoApprovePolicy>;
   cheapModels?: Record<string, TierModel>;
   standardModels?: Record<string, TierModel>;
@@ -170,7 +179,36 @@ export function normalizeWriteback(value: unknown): WritebackSettings {
     pullRequests: candidate.pullRequests === true,
     mentions: candidate.mentions === true,
     autoResume: candidate.autoResume === true,
+    // Omitted or malformed means on; only an explicit false turns the watchdog off.
+    watchdog: candidate.watchdog !== false,
   };
+}
+
+// Malformed stored values fall back to that field's default rather than breaking the settings read.
+export function normalizeWatchdog(value: unknown): WatchdogTimings {
+  const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const [silentMinutes, steerGraceMinutes, recoveryGraceMinutes, idleMinutes] = (["silentMinutes", "steerGraceMinutes", "recoveryGraceMinutes", "idleMinutes"] as const).map((key) => {
+    const raw = candidate[key];
+    return typeof raw === "number" && Number.isInteger(raw) && raw >= MIN_WATCHDOG_MINUTES && raw <= MAX_WATCHDOG_MINUTES ? raw : DEFAULT_WATCHDOG[key];
+  });
+  return { silentMinutes, steerGraceMinutes, recoveryGraceMinutes, idleMinutes };
+}
+
+// A user edit is rejected rather than silently repaired, so the settings form can say why.
+function validWatchdog(value: WatchdogTimings): WatchdogTimings {
+  if (!Number.isInteger(value.silentMinutes) || value.silentMinutes < MIN_WATCHDOG_MINUTES || value.silentMinutes > MAX_WATCHDOG_MINUTES) {
+    throw new Error(`The silence threshold must be a whole number of minutes from ${MIN_WATCHDOG_MINUTES} to ${MAX_WATCHDOG_MINUTES}.`);
+  }
+  if (!Number.isInteger(value.steerGraceMinutes) || value.steerGraceMinutes < MIN_WATCHDOG_MINUTES || value.steerGraceMinutes > MAX_WATCHDOG_MINUTES) {
+    throw new Error(`The steer grace period must be a whole number of minutes from ${MIN_WATCHDOG_MINUTES} to ${MAX_WATCHDOG_MINUTES}.`);
+  }
+  if (!Number.isInteger(value.recoveryGraceMinutes) || value.recoveryGraceMinutes < MIN_WATCHDOG_MINUTES || value.recoveryGraceMinutes > MAX_WATCHDOG_MINUTES) {
+    throw new Error(`The recovery grace period must be a whole number of minutes from ${MIN_WATCHDOG_MINUTES} to ${MAX_WATCHDOG_MINUTES}.`);
+  }
+  if (!Number.isInteger(value.idleMinutes) || value.idleMinutes < MIN_WATCHDOG_MINUTES || value.idleMinutes > MAX_WATCHDOG_MINUTES) {
+    throw new Error(`The idle threshold must be a whole number of minutes from ${MIN_WATCHDOG_MINUTES} to ${MAX_WATCHDOG_MINUTES}.`);
+  }
+  return normalizeWatchdog(value);
 }
 
 // Anything that is not a usable http(s) origin is dropped, so a half-typed address cannot make
@@ -214,6 +252,7 @@ export type SettingsPatch = {
   forgetProjectMapping?: string;
   dispatch?: Partial<DispatchSettings>;
   writeback?: Partial<WritebackSettings>;
+  watchdog?: Partial<WatchdogTimings>;
   autoApprove?: Partial<AutoApprovePolicy>;
   // Sets one provider's model for the cheap or standard tier; `model: null` removes it (that
   // tier then implements on the provider's launch model).
@@ -272,6 +311,7 @@ export class Settings {
       agentLinearAccess: value.agentLinearAccess !== false,
       dispatch: normalizeDispatch(value.dispatch),
       writeback: normalizeWriteback(value.writeback),
+      watchdog: normalizeWatchdog(value.watchdog),
       autoApprove: normalizeAutoApprove(value.autoApprove),
       cheapModels: normalizeTierModels(value.cheapModels, DEFAULT_CHEAP_MODELS),
       standardModels: normalizeTierModels(value.standardModels, DEFAULT_STANDARD_MODELS),
@@ -304,6 +344,7 @@ export class Settings {
       agentLinearAccess: patch.agentLinearAccess ?? current.agentLinearAccess,
       dispatch: patch.dispatch ? validDispatch({ ...current.dispatch, ...patch.dispatch }) : current.dispatch,
       writeback: patch.writeback ? normalizeWriteback({ ...current.writeback, ...patch.writeback }) : current.writeback,
+      watchdog: patch.watchdog ? validWatchdog({ ...current.watchdog, ...patch.watchdog }) : current.watchdog,
       autoApprove: patch.autoApprove ? normalizeAutoApprove({ ...current.autoApprove, ...patch.autoApprove }) : current.autoApprove,
     };
     if (patch.launchPreference) {
@@ -343,11 +384,12 @@ export class Settings {
     const hasMappings = Object.keys(value.projectMappings).length > 0;
     const customDispatch = JSON.stringify(value.dispatch) !== JSON.stringify(DEFAULT_DISPATCH);
     const customWriteback = JSON.stringify(value.writeback) !== JSON.stringify(DEFAULT_WRITEBACK);
+    const customWatchdog = JSON.stringify(value.watchdog) !== JSON.stringify(DEFAULT_WATCHDOG);
     const customAutoApprove = JSON.stringify(value.autoApprove) !== JSON.stringify(DEFAULT_AUTO_APPROVE);
     const customCheapModels = JSON.stringify(value.cheapModels) !== JSON.stringify(DEFAULT_CHEAP_MODELS);
     const customStandardModels = JSON.stringify(value.standardModels) !== JSON.stringify(DEFAULT_STANDARD_MODELS);
     const customActivation = JSON.stringify(value.activation) !== JSON.stringify(DEFAULT_ACTIVATION);
-    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length && !customActivation) {
+    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customWatchdog && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length && !customActivation) {
       await rm(this.path, { force: true });
       return value;
     }
@@ -364,6 +406,7 @@ export class Settings {
     if (!value.agentLinearAccess) fileValue.agentLinearAccess = false;
     if (customDispatch) fileValue.dispatch = value.dispatch;
     if (customWriteback) fileValue.writeback = value.writeback;
+    if (customWatchdog) fileValue.watchdog = value.watchdog;
     if (customAutoApprove) fileValue.autoApprove = value.autoApprove;
     if (customCheapModels) fileValue.cheapModels = value.cheapModels;
     if (customStandardModels) fileValue.standardModels = value.standardModels;
