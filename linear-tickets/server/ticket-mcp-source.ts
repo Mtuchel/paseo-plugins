@@ -161,7 +161,7 @@ function states(issue) {
 // never runs text taken from Linear.
 const MANUAL_WHEN = ["before_merge", "after_merge", "anytime"];
 const WHEN_TEXT = { before_merge: "due before the pull request is merged", after_merge: "due once the pull request is merged", anytime: "due now, independent of the merge" };
-const MANUAL = "query manual($id: String!) { issue(id: $id) { id identifier team { id states(first: 50) { nodes { id name type position } } } children(first: 100) { nodes { id identifier url title state { type } } } } }";
+const MANUAL = "query manual($id: String!) { issue(id: $id) { id identifier project { id } team { id states(first: 50) { nodes { id name type position } } } children(first: 100) { nodes { id identifier url title state { type } } } } }";
 const MANUAL_DIRECTORY = join(paseoHome, "linear-tickets", "manual-tasks");
 const FINISHED_TYPES = ["completed", "canceled", "duplicate"];
 
@@ -490,6 +490,7 @@ const tools = [
       const description = steps + "\n\n---\nManual task for " + issue.identifier + ", " + WHEN_TEXT[input.when] + "." + (check ? " Marking it done runs this check, and a failing check reopens it:\n\n    " + check.split("\n").join("\n    ") : "");
       const payload = { teamId: issue.team.id, title, description, parentId: issue.id, assigneeId: viewer };
       if (target) payload.stateId = target.id;
+      if (issue.project) payload.projectId = issue.project.id;
       const created = await linear("mutation manualTask($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier url } } }", { input: payload });
       const task = created.issueCreate && created.issueCreate.success && created.issueCreate.issue;
       if (!task) throw new Error("Linear did not create the task.");

@@ -2118,7 +2118,7 @@ independently of the agent's own `linear_ticket` tools:
 - **Waits after the ticket closed** — a merge commit's `Closes` moves the ticket to Done while
   its agent may still need you (a deploy decision, a step after merge). A closed ticket stays
   closed: the wait opens a **"Needs you: …" sub-issue** instead, in Needs input (Todo on teams
-  without it), assigned to you, with the `<label>-needs-you` label and the mention comment.
+  without it), assigned to you, explicitly in the parent's project, with the `<label>-needs-you` label and the mention comment.
   Further questions in the same wait edit that comment, and while the sub-issue is open the
   agent's later waits on the ticket reuse it. It is closed for you when the question or
   approval is answered (in Paseo or in Linear), or when you comment on it, which
@@ -2445,7 +2445,7 @@ instead of two:
 Some steps only a person can do: environment variables and secrets, Railway, Linear, GitHub or
 Paseo settings, webhooks, integrations. Agents register each one with `add_manual_task` instead
 of leaving it in a comment. Each task is a **sub-issue of the ticket, assigned to you** (the
-owner of the plugin's key), with the steps in its description and one of three due points:
+owner of the plugin's key), explicitly in the parent's project, with the steps in its description and one of three due points:
 
 | `when` | Created in | Effect |
 |---|---|---|

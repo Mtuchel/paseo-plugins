@@ -360,6 +360,7 @@ export class Writeback {
           const created = await once("needs-you-issue", () => this.linear.createIssue({
             teamId: state.teamId!,
             parentId: issue.id,
+            projectId: state.projectId,
             assigneeId: ownerId,
             startedState: NEEDS_INPUT_STATE,
             ready: true,
