@@ -890,6 +890,12 @@ async function stoppedPlanner(h: Harness, change: Partial<PlannerRecord> = {}): 
   await h.refresh();
   return path;
 }
+// A submission can precede the quota failure without having delivered a review.
+async function submittedPlanner(h: Harness): Promise<string> {
+  await h.append(submit(HASH_A, "submit-old", SUBMIT));
+  return stoppedPlanner(h);
+}
+
 
 test("a stopped planner with persisted limit recovery shows the saved Berlin restart time", async () => {
   await harness(async (h) => {
@@ -1059,6 +1065,8 @@ test("a newer live duplicate root never inherits the recorded wait", async () =>
       persistence: { provider: "omp", sessionId: "duplicate", nativeHandle: native } }));
     await h.refresh();
     const rows = (await h.snapshot()).rows;
+    const predecessor = rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(predecessor.status, "unknown", "a ghost predecessor with a live duplicate stays unconfirmed, not failed");
     assert.equal(rows.find((entry) => entry.agentId === "duplicate")?.stage, "preparing");
     assert.equal(noPromise(rows), true);
   });
@@ -1248,6 +1256,13 @@ test("an actual submission failure after the wait stays failed", async () => {
     assert.equal(row.status, "failed");
     assert.match(row.detail, /dependency\/import/);
     assert.doesNotMatch(row.detail, /restart scheduled|waiting for agent confirmation/);
+    h.agents = [];
+    await h.restart();
+    const reloaded = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(reloaded.stage, "publishing");
+    assert.equal(reloaded.status, "failed");
+    assert.match(reloaded.detail, /dependency\/import/);
+    assert.doesNotMatch(reloaded.detail, /restart scheduled|waiting for agent confirmation/);
   });
 });
 
@@ -1288,3 +1303,133 @@ test("planner source failures leave ordinary ticket classification untouched", a
   });
 });
 
+
+test("an unrelated native failure after the wait stays failed across root removal and reload", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    const late = "2026-10-07T11:45:00.000Z";
+    await h.append([{ type: "message", timestamp: late, message: { role: "assistant", stopReason: "error", errorMessage: "Planner IPC channel closed unexpectedly", content: [] } }]);
+    await h.refresh();
+    const failed = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(failed.status, "failed");
+    assert.doesNotMatch(failed.detail, /restart scheduled|waiting for agent confirmation/);
+    h.agents = [];
+    await h.restart();
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.status, "failed");
+    assert.equal(row.detail, failed.detail, "the observed failure survives reload");
+    assert.doesNotMatch(row.detail, /restart scheduled|waiting for agent confirmation/);
+  });
+});
+
+test("a stored planner identity that fails validation never resurrects the wait on reload", async () => {
+  const corruptions: [string, (planner: Record<string, unknown>) => void][] = [
+    ["empty run id", (planner) => { planner.runId = ""; }],
+    ["oversized project id", (planner) => { planner.projectId = "p".repeat(201); }],
+    ["non-string run id", (planner) => { planner.runId = 7; }],
+  ];
+  for (const [name, corrupt] of corruptions) {
+    await harness(async (h) => {
+      const path = await stoppedPlanner(h);
+      assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.detail, scheduled(RESUME, NOW), `${name}: the scheduled wait is observed first`);
+      h.pipeline.stop();
+      await h.pipeline.refresh();
+      const journal = JSON.parse(await readFile(h.file, "utf8")) as { records: { planner?: Record<string, unknown> }[] };
+      const stored = journal.records.find((entry) => entry.planner)!;
+      corrupt(stored.planner!);
+      await writeFile(h.file, JSON.stringify(journal));
+      await rm(path);
+      h.agents = [];
+      await h.restart();
+      const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+      assert.equal(row.status, "unknown", `${name}: an unvalidated journal identity is not a restart promise`);
+      assert.doesNotMatch(row.detail, /restart scheduled|waiting for agent confirmation/, name);
+      assert.equal(["auto-approved", "completed", "superseded", "cancelled"].includes(row.stage), false, `${name}: no false closure`);
+    });
+  }
+});
+
+test("a native submission before the quota failure drops the wait when project evidence disappears", async () => {
+  await harness(async (h) => {
+    const path = await submittedPlanner(h);
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.stage, "waiting", "the scheduled wait is observed first");
+    h.agents = [];
+    await rm(path);
+    await h.refresh();
+    const host = await h.snapshot();
+    const row = host.rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.status, "unknown");
+    assert.equal(noPromise(host.rows), true);
+  });
+});
+
+test("a native submission before the quota failure drops the wait when the pending recovery clears", async () => {
+  await harness(async (h) => {
+    await submittedPlanner(h);
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.stage, "waiting", "the scheduled wait is observed first");
+    h.agents = [];
+    await projects(h, { [PROJECT]: project(runRecord({ agentId: "root" })) });
+    await h.refresh();
+    const host = await h.snapshot();
+    const row = host.rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.status, "unknown");
+    assert.equal(noPromise(host.rows), true);
+  });
+});
+
+test("a native submission before the quota failure drops the wait for an explicit successor", async () => {
+  await harness(async (h) => {
+    await submittedPlanner(h);
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.stage, "waiting", "the scheduled wait is observed first");
+    h.agents = [];
+    await projects(h, { [PROJECT]: project(runRecord({ agentId: "successor", recovery: recovery({ pending: pending() }) })) });
+    await h.refresh();
+    // The unobserved successor owns a separate wait; only the predecessor loses its promise.
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.stage, "superseded");
+    assert.equal(row.status, "normal");
+    assert.doesNotMatch(row.detail, /restart scheduled|waiting for agent confirmation/);
+  });
+});
+
+test("a native submission before the quota failure drops the wait when the recorded run closes", async () => {
+  await harness(async (h) => {
+    await submittedPlanner(h);
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.stage, "waiting", "the scheduled wait is observed first");
+    h.agents = [];
+    await projects(h, { [PROJECT]: project(null, { closedPlanner: RUN }) });
+    await h.refresh();
+    const host = await h.snapshot();
+    const row = host.rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.stage, "completed");
+    assert.equal(row.status, "normal");
+    assert.equal(noPromise(host.rows), true);
+  });
+});
+
+test("an unreadable owner record leaves the planner wait unconfirmed until the record is repaired", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    const checkedAt = (await h.snapshot()).checkedAt;
+    assert.equal(checkedAt, NOW, "the successful check time is recorded before the failure");
+    h.agents.push({ ...h.agents[0], id: "ticket-owner", labels: { "linear.issueId": "owner-issue", "linear.identifier": "TUC-98" } });
+    h.ownerFiles = true;
+    const directory = join(h.home, "linear-tickets", "handover");
+    await mkdir(directory, { recursive: true });
+    const path = join(directory, "owner-issue.json");
+    await writeFile(path, "{");
+    await h.refresh();
+    const host = await h.snapshot();
+    const row = host.rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.status, "unknown", "an owner source failure removes the restart promise");
+    assert.doesNotMatch(row.detail, /restart scheduled|waiting for agent confirmation/);
+    assert.equal(noPromise(host.rows), true);
+    assert.ok(host.error);
+    assert.equal(host.checkedAt, checkedAt, "the last successful check time is retained");
+    await rm(path);
+    await h.refresh();
+    const restored = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(restored.stage, "waiting");
+    assert.equal(restored.detail, scheduled(RESUME, NOW));
+  });
+});

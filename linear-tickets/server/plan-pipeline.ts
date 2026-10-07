@@ -647,9 +647,10 @@ export class PlanPipeline {
       const agent = record.row.agentId ? agents.find((candidate) => candidate.id === record.row.agentId) : undefined;
       const pending = planners.get(record.planner.projectId)?.run?.pending;
       const link = links.find((session) => session.agentId === record.row.agentId && !session.closed && !session.remote);
+      const delivery = this.deliveries[record.row.agentId];
       const protectedEvidence = parked.some((plan) => plan.agentId === record.row.agentId) || agent?.pendingPermissions?.length || link?.questions || link?.review
         || record.row.status === "failed" && !/^(Provider rate limit \(429\)|Provider process exited or is closed|Provider process proven absent)/.test(record.row.detail)
-        || this.deliveries[record.row.agentId] && this.deliveries[record.row.agentId].at >= (record.submittedAt ?? record.observedAt)
+        || delivery && delivery.at >= attemptTime(record)
         || pending && record.row.lastProgressAt && record.row.lastProgressAt > pending.failedAt;
       this.observeRecovery(record, planners.get(record.planner.projectId), agent,
         liveRuns.has(JSON.stringify([record.planner.projectId, record.planner.runId])) ? liveRoots.some((root) => root.id === agent?.id) ? "root" : "other" : "none",
