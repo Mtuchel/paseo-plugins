@@ -11,6 +11,7 @@ import io
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from unittest import mock
@@ -19,6 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location("ops_digest", os.path.join(HERE, "paseo-ops-digest.py"))
 digest = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(digest)
+iso = digest.iso
 
 
 def at(text):
@@ -81,6 +83,7 @@ class FakeIO:
         self.usage_data = {"version": 1, "hours": {}}
         self.usage_error = None
         self.planner_sources_data = {digest.HOST_NAME: {"ok": True, "failures": []}}
+        self.planner_recovery_sources = {"": {"version": 1, "pending": [], "completed": []}}
 
     def dispatch_quarantine(self):
         self.dispatches += 1
@@ -101,11 +104,16 @@ class FakeIO:
     def limit_resumes(self):
         return self.limit_resumes_data
 
+    def planner_recovery(self, now):
+        return {host: data for host, data in self.planner_recovery_sources.items()}
+
     def remote_targets(self):
         return list(self.targets)
 
     def evidence(self):
-        return dict(self.evidence_data)
+        found = dict(self.evidence_data)
+        found["plannerRecovery"] = {host: data for host, data in self.planner_recovery_sources.items()}
+        return found
 
     def planner_sources(self):
         return self.planner_sources_data
@@ -863,16 +871,21 @@ class ProjectPlannerRunTest(RunCase):
                  mock.patch.object(self.host, "limit_resumes", return_value={"pending": {}, "started": set()}), \
                  mock.patch.object(self.host, failed_call, side_effect=TimeoutError("SECRET_RPC")):
                 snapshot = self.host.snapshot()
+            self.assertIsNone(snapshot["plannerRecovery"], "failed agent collection must not publish recovery as successful-empty")
             receiver = digest.HostIO(sync_repo=False, remotes=False)
             receiver._targets = [target]
             receiver._remotes = [{**snapshot, "_host": target}]
             self.io.planner_sources = lambda: {target: receiver.planner_sources()[target]}
             self.io.unreachable_hosts = receiver.unreachable_hosts
+            self.io.planner_recovery_sources = receiver.planner_recovery(WED_11_05)
             self.run_at(WED_11_05)
             saved = self.saved()
             self.assertIn(self.key(target), saved["pending"])
             self.assertFalse(saved["items"][self.key(target)]["stale"])
             self.assertTrue(saved["items"]["agent-error:old-remote"]["stale"])
+            events = read_lines(os.path.join(self.history, "history.jsonl"))
+            outcome = [event for event in events if event["event"] == "run"][-1]["units"]
+            self.assertFalse(outcome[f"planner_recovery@{target}"])
             self.assertNotIn("SECRET_RPC", json.dumps(saved))
 
     def test_unreadable_and_malformed_source_retains_previous_alert_stale(self):
@@ -1389,6 +1402,514 @@ class LinearUsageTest(unittest.TestCase):
                 self.write(json.dumps(valid).replace('"blockedMs": 0', '"blockedMs": ' + value))
                 with self.assertRaises(digest.UsageUnreadable):
                     digest.HostIO().linear_usage()
+
+
+def planner_row(project, run, resume, state="scheduled", failed=None):
+    """One normalized pending planner row as the digest consumes it."""
+    row = {"projectId": project, "runId": run, "resumeAt": iso(resume), "state": state}
+    if failed:
+        row["failedAgentId"] = failed
+    return row
+
+
+def planner_confirmed(project, run, request, agent, confirmed, failed=None):
+    """One normalized completed planner restart (plannerLimitRestarts evidence)."""
+    row = {"projectId": project, "runId": run, "requestId": request, "agentId": agent, "confirmedAt": iso(confirmed)}
+    if failed:
+        row["failedAgentId"] = failed
+    return row
+
+
+def planner_source(pending=(), completed=()):
+    """One host's normalized version 1 planner recovery source."""
+    return {"version": 1, "pending": list(pending), "completed": list(completed)}
+
+
+def raw_planner_run(identity="root-1", resume_at="2026-09-30T12:05:00Z", *, handled=None, agent_id=None,
+                    claim=None, owner_asked=False):
+    """One raw projects.json run record as project-flow.ts writes it (TUC-1303/TUC-1346)."""
+    run = {"id": "run-1", "listedAt": "2026-09-28T00:00:00Z", "tickets": 0}
+    if agent_id is not None:
+        run["agentId"] = agent_id
+    if owner_asked:
+        run["ownerAsked"] = True
+    recovery = {"attempt": 0, "claims": [],
+                "pending": {"identity": identity, "error": "usage limit", "model": None,
+                            "failedAt": "2026-09-30T08:05:00Z", "resumeAt": resume_at,
+                            "fallbackAt": resume_at, "jitterMs": 60_000, "basis": "default", "selector": None}}
+    if handled is not None:
+        recovery["handledAgentId"] = handled
+    if claim is not None:
+        recovery["claim"] = {"requestId": claim, "at": "2026-09-30T08:05:00Z"}
+    run["recovery"] = recovery
+    return run
+
+
+class PlannerRecoveryParseTest(unittest.TestCase):
+    """TUC-1346: projects.json evidence normalizes to opaque, versioned planner rows only."""
+
+    def test_legacy_and_missing_evidence_is_an_empty_version_one_record(self):
+        empty = {"version": 1, "pending": [], "completed": []}
+        for raw in ({}, {"~repairs": None}, {"p1": {"planner": None}},
+                    {"p1": {"planner": {"id": "run-1", "listedAt": "2026-09-28T00:00:00Z", "tickets": 0}}}):
+            self.assertEqual(digest.parse_planner_recovery(raw, WED_10_05), empty)
+
+    def test_a_malformed_consumed_field_rejects_the_whole_read(self):
+        valid = raw_planner_run()
+        bad = [None, [],
+               {"p1": []},
+               {"p1": {"planner": "run-1"}},
+               {"p1": valid | {"plannerLimitRestarts": {}}},
+               {"p1": {"planner": {"id": 7, "recovery": valid["recovery"]}}},
+               {"p1": {"planner": {"id": "run-1", "ownerAsked": "yes", "recovery": valid["recovery"]}}},
+               {"p1": {"planner": {"id": "run-1", "recovery": {"pending": "junk"}}}},
+               {"p1": {"planner": {"id": "run-1", "recovery": {"pending": valid["recovery"]["pending"], "claim": {}}}}},
+               {"p1": {"planner": {"id": "run-1", "recovery": {"pending": valid["recovery"]["pending"],
+                                                               "claim": {"requestId": "saved", "at": "not a time"}}}}},
+               {"p1": {"planner": {"id": "run-1", "recovery": {"pending": {"identity": "a", "resumeAt": "not a time"}}}}},
+               {"p1": {"planner": None, "plannerLimitRestarts": ["junk"]}},
+               {"p1": {"planner": None, "plannerLimitRestarts": [{"runId": "r", "requestId": "q"}]}},
+               {"p1": {"planner": None, "plannerLimitRestarts": [{"runId": "r", "requestId": "q", "agentId": "a",
+                                                                  "confirmedAt": "yesterday"}]}}]
+        for raw in bad:
+            self.assertIsNone(digest.parse_planner_recovery(raw, WED_10_05))
+
+    def test_repairs_are_ignored_even_when_they_are_malformed(self):
+        raw = {"~repairs": {"p1": {"planner": {"id": "run-9",
+                                               "recovery": {"pending": {"identity": "x", "resumeAt": "garbage"}}}}},
+               "p1": {"planner": None, "plannerLimitRestarts": []}}
+        self.assertEqual(digest.parse_planner_recovery(raw, WED_10_05), {"version": 1, "pending": [], "completed": []})
+
+    def test_pending_normalizes_state_and_only_an_explicit_failed_root(self):
+        raw = {
+            "p-scheduled": {"planner": raw_planner_run(identity="root-1", handled="root-1")},
+            "p-claimed": {"planner": raw_planner_run(identity="root-1", handled="root-1", claim="planner-run-1-limit-1")},
+            "p-held": {"planner": raw_planner_run(identity="root-1", handled="root-1", owner_asked=True)},
+            "p-agent": {"planner": raw_planner_run(identity="root-2", agent_id="root-2")},
+            "p-request": {"planner": raw_planner_run(identity="planner-run-1-limit-1")}}
+        rows = {row["projectId"]: row for row in digest.parse_planner_recovery(raw, WED_10_05)["pending"]}
+        self.assertEqual(rows["p-scheduled"], {"projectId": "p-scheduled", "runId": "run-1",
+                                               "resumeAt": "2026-09-30T12:05:00Z", "state": "scheduled",
+                                               "failedAgentId": "root-1"})
+        self.assertEqual([rows[p]["state"] for p in ("p-claimed", "p-held")], ["claimed", "held"])
+        self.assertEqual(rows["p-agent"]["failedAgentId"], "root-2")
+        self.assertNotIn("failedAgentId", rows["p-request"])
+
+    def test_only_structured_fields_survive_and_no_free_text_is_emitted(self):
+        raw = {"p1": {
+            "planner": {**raw_planner_run(identity="root-1", handled="root-1"),
+                        "error": "usage limit SECRET-ERROR", "listed": ["TUC-1"], "approved": {"plan": "SECRET-PLAN"}},
+            "waiting": {"TUC-2": "SECRET-WAITING"},
+            "plannerLimitRestarts": [{"runId": "run-1", "requestId": "req-1", "agentId": "agent-1",
+                                      "confirmedAt": "2026-09-30T07:00:00Z", "error": "SECRET-ERROR",
+                                      "plan": "SECRET-PLAN"}]}}
+        found = digest.parse_planner_recovery(raw, WED_10_05)
+        text = json.dumps(found, sort_keys=True)
+        for sentinel in ("SECRET-ERROR", "SECRET-PLAN", "SECRET-WAITING", "TUC-1", "TUC-2"):
+            self.assertNotIn(sentinel, text)
+        self.assertEqual(found["pending"], [{"projectId": "p1", "runId": "run-1", "resumeAt": "2026-09-30T12:05:00Z",
+                                             "state": "scheduled", "failedAgentId": "root-1"}])
+        self.assertEqual(found["completed"], [{"projectId": "p1", "runId": "run-1", "requestId": "req-1",
+                                               "agentId": "agent-1", "confirmedAt": "2026-09-30T07:00:00Z"}])
+
+    def test_completions_expire_at_read_time_and_the_eight_day_boundary_is_inclusive(self):
+        now = at("2026-10-07T09:00:00Z")
+        raw = {"p1": {"planner": None, "plannerLimitRestarts": [
+            {"runId": "r-fresh", "requestId": "q1", "agentId": "a1", "confirmedAt": iso(now)},
+            {"runId": "r-keep", "requestId": "q2", "agentId": "a2",
+             "confirmedAt": iso(now - digest.PLANNER_HISTORY_S)},
+            {"runId": "r-old", "requestId": "q3", "agentId": "a3",
+             "confirmedAt": iso(now - digest.PLANNER_HISTORY_S - 1)},
+            {"runId": "r-future", "requestId": "q4", "agentId": "a4", "confirmedAt": iso(now + 60)}]}}
+        self.assertEqual([row["runId"] for row in digest.parse_planner_recovery(raw, now)["completed"]],
+                         ["r-fresh", "r-keep"])
+
+    def test_the_snapshot_form_rejects_unknown_versions_and_strips_extras(self):
+        for version in (2, "1", True, 1.0, None):
+            self.assertIsNone(digest.parse_planner_snapshot({"version": version, "pending": [], "completed": []},
+                                                            WED_10_05))
+        for bad in (None, {}, {"version": 1}, {"version": 1, "pending": {}, "completed": []},
+                    {"version": 1, "pending": [{"projectId": "p1", "runId": "run-1", "resumeAt": "x",
+                                                "state": "scheduled"}], "completed": []},
+                    {"version": 1, "pending": [{"projectId": "p1", "runId": "run-1",
+                                                "resumeAt": "2026-09-30T12:05:00Z", "state": "waiting"}],
+                     "completed": []}):
+            self.assertIsNone(digest.parse_planner_snapshot(bad, WED_10_05))
+        good = {"version": 1,
+                "pending": [{"projectId": "p1", "runId": "run-1", "resumeAt": "2026-09-30T12:05:00Z",
+                             "state": "scheduled", "error": "SECRET"}],
+                "completed": [{"projectId": "p1", "runId": "run-1", "requestId": "q1", "agentId": "a1",
+                               "confirmedAt": "2026-09-30T07:00:00Z", "plan": "SECRET"}],
+                "extra": "SECRET"}
+        self.assertEqual(digest.parse_planner_snapshot(good, WED_10_05),
+                         {"version": 1,
+                          "pending": [{"projectId": "p1", "runId": "run-1",
+                                       "resumeAt": "2026-09-30T12:05:00Z", "state": "scheduled"}],
+                          "completed": [{"projectId": "p1", "runId": "run-1", "requestId": "q1",
+                                         "agentId": "a1", "confirmedAt": "2026-09-30T07:00:00Z"}]})
+
+
+class PlannerHostIOTest(unittest.TestCase):
+    """The real HostIO reader of $PASEO_HOME/linear-tickets/projects.json (TUC-1346)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "projects.json")
+        self._real = digest.PROJECTS
+        digest.PROJECTS = self.path
+
+    def tearDown(self):
+        digest.PROJECTS = self._real
+        self.tmp.cleanup()
+
+    def write(self, data):
+        with open(self.path, "w") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+
+    def test_a_missing_file_is_empty_legacy_data_and_a_broken_one_is_not_read(self):
+        self.assertEqual(digest.HostIO(sync_repo=False, remotes=False).planner_recovery(WED_10_05),
+                         {"": {"version": 1, "pending": [], "completed": []}})
+        for text in ("{not json",
+                     json.dumps({"p1": {"planner": {"id": "run-1",
+                                                    "recovery": {"pending": {"identity": "a",
+                                                                             "resumeAt": "bad"}}}}}),
+                     json.dumps({"p1": {"planner": None, "plannerLimitRestarts": {}}})):
+            self.write(text)
+            self.assertIsNone(digest.HostIO(sync_repo=False, remotes=False).planner_recovery(WED_10_05)[""])
+
+    def test_the_file_is_read_once_and_the_normalized_expiry_is_cached(self):
+        now = at("2026-10-07T09:00:00Z")
+        self.write({"p1": {"planner": None, "plannerLimitRestarts": [
+            {"runId": "r1", "requestId": "q1", "agentId": "a1",
+             "confirmedAt": iso(now - digest.PLANNER_HISTORY_S)}]}})
+        host = digest.HostIO(sync_repo=False, remotes=False)
+        first = host.planner_recovery(now)
+        self.assertEqual([row["runId"] for row in first[""]["completed"]], ["r1"])
+        self.write({"p1": {"planner": None, "plannerLimitRestarts": [
+            {"runId": "r2", "requestId": "q2", "agentId": "a2", "confirmedAt": iso(now)}]}})
+        self.assertEqual(host.planner_recovery(now + digest.PLANNER_HISTORY_S + 1), first)
+        self.assertEqual([row["runId"] for row in digest.HostIO(sync_repo=False, remotes=False)
+                          .planner_recovery(now)[""]["completed"]], ["r2"])
+
+    def test_the_snapshot_round_trips_normalized_planner_data_between_hosts(self):
+        now = time.time()
+        confirmed = iso(now - 3600)
+        self.write({"p1": {"planner": None, "plannerLimitRestarts": [
+            {"runId": "run-1", "requestId": "req-1", "agentId": "agent-1", "confirmedAt": confirmed}]}})
+        with mock.patch.object(digest.HostIO, "agents", return_value=([], {})), \
+             mock.patch.object(digest.HostIO, "permissions", return_value={}), \
+             mock.patch.object(digest.HostIO, "open_reviews", return_value={}), \
+             mock.patch.object(digest.HostIO, "limit_resumes", return_value={"pending": {}, "started": set()}):
+            snapshot = json.loads(json.dumps(digest.HostIO(sync_repo=False, remotes=False).snapshot()))
+        expected = {"version": 1, "pending": [], "completed": [
+            {"projectId": "p1", "runId": "run-1", "requestId": "req-1", "agentId": "agent-1",
+             "confirmedAt": confirmed}]}
+        self.assertEqual(snapshot["plannerRecovery"], expected)
+        remotes_file = os.path.join(self.tmp.name, "remotes")
+        with open(remotes_file, "w") as f:
+            f.write("mac\n")
+        with mock.patch.object(digest, "REMOTES", remotes_file), \
+             mock.patch.object(digest, "PROJECTS", os.path.join(self.tmp.name, "missing.json")), \
+             mock.patch.object(digest.HostIO, "remotes", return_value=[{**snapshot, "_host": "mac"}]):
+            sources = digest.HostIO(sync_repo=False).planner_recovery(now)
+        self.assertEqual(sources["mac"], expected)
+        self.assertEqual(sources[""], {"version": 1, "pending": [], "completed": []})
+
+    def test_a_remote_snapshot_that_fails_agent_validation_is_not_read_for_either(self):
+        now = time.time()
+        valid = {"version": 1, "pending": [], "completed": [
+            {"projectId": "p1", "runId": "run-1", "requestId": "req-1", "agentId": "agent-1",
+             "confirmedAt": iso(now - 60)}]}
+        remotes_file = os.path.join(self.tmp.name, "remotes")
+        with open(remotes_file, "w") as f:
+            f.write("mac\n")
+        with mock.patch.object(digest, "REMOTES", remotes_file), \
+             mock.patch.object(digest, "run_cmd", return_value=json.dumps({"plannerRecovery": valid})):
+            host = digest.HostIO(sync_repo=False)
+            self.assertEqual(host.remotes(), [])
+            self.assertEqual(host.unreachable_hosts(), {"mac": "error"})
+            self.assertIsNone(host.planner_recovery(now)["mac"])
+        for response in ({"agents": [], "plannerRecovery": {"version": 2, "pending": [], "completed": []}},
+                         {"agents": []},
+                         {"agents": [], "plannerRecovery": None}):
+            with mock.patch.object(digest, "REMOTES", remotes_file), \
+                 mock.patch.object(digest, "run_cmd", return_value=json.dumps(response)):
+                host = digest.HostIO(sync_repo=False)
+                self.assertEqual(host.remotes(), [{**response, "_host": "mac"}])
+                self.assertIsNone(host.planner_recovery(now)["mac"])
+        with mock.patch.object(digest, "REMOTES", remotes_file), \
+             mock.patch.object(digest, "run_cmd", return_value=json.dumps({"agents": [], "plannerRecovery": valid})):
+            self.assertEqual(digest.HostIO(sync_repo=False).planner_recovery(now)["mac"], valid)
+
+
+class PlannerDigestRunTest(RunCase):
+    """TUC-1346: planner usage-limit recovery rows in a digest run (FakeIO, temp files)."""
+
+    def planner_payloads(self, state):
+        return {key: entry["payload"] for key, entry in state["items"].items() if key.startswith("planner-")}
+
+    def history_lines(self):
+        return read_lines(os.path.join(self.history, "history.jsonl"))
+
+    def test_scheduled_claimed_and_held_rows_never_notify_and_keep_their_kind(self):
+        self.io.planner_recovery_sources = {"": planner_source(pending=[
+            planner_row("proj-1", "run-aaaa1111", at("2026-09-30T12:05:00Z")),
+            planner_row("proj-1", "run-bbbb2222", at("2026-10-01T12:05:00Z"), state="claimed"),
+            planner_row("proj-1", "run-cccc3333", at("2026-09-30T12:05:00Z"), state="held")])}
+        self.assertEqual(self.run_at(WED_10_05), 0)
+        state = self.saved()
+        rows = self.planner_payloads(state)
+        self.assertEqual(set(rows), {"planner-pending::proj-1:run-aaaa1111",
+                                     "planner-pending::proj-1:run-bbbb2222",
+                                     "planner-pending::proj-1:run-cccc3333"})
+        self.assertEqual(rows["planner-pending::proj-1:run-aaaa1111"]["detail"],
+                         "usage-limit restart scheduled (at 14:05; subject to automatic dispatch and the project trigger)")
+        self.assertEqual(rows["planner-pending::proj-1:run-bbbb2222"]["detail"], "usage-limit restart in progress")
+        self.assertEqual(rows["planner-pending::proj-1:run-cccc3333"]["detail"],
+                         "usage-limit recovery held for owner")
+        for row in rows.values():
+            self.assertEqual((row["section"], row["group"], row["attention"], row["ticket"], row["unit"]),
+                             ("agents", "planners", False, None, "planner_recovery"))
+        self.assertEqual((state["pending"], self.io.comments, self.io.desktops), ({}, [], []))
+        doc = self.io.published[-1]
+        self.assertIn("## Needs attention (0)", doc)
+        self.assertIn("**Project planners (usage-limit recovery)**", doc)
+        lines = self.history_lines()
+        self.assertEqual(set(lines[0]), {"t", "event", "host", "units", "hosts", "items"})
+        self.assertEqual(lines[0]["units"]["planner_recovery"], True)
+        for line in lines[1:]:
+            self.assertEqual(set(line), ITEM_FIELDS)
+        flags = {line["key"]: (line["owner"], line["auto"]) for line in lines
+                 if line.get("key", "").startswith("planner-")}
+        self.assertEqual(flags, {"planner-pending::proj-1:run-aaaa1111": (False, False),
+                                 "planner-pending::proj-1:run-bbbb2222": (False, False),
+                                 "planner-pending::proj-1:run-cccc3333": (True, False)})
+        kinds = {line["key"]: line["kind"] for line in lines if line.get("key", "").startswith("planner-")}
+        self.assertEqual(kinds, {"planner-pending::proj-1:run-aaaa1111": "agents: usage-limit restart scheduled",
+                                 "planner-pending::proj-1:run-bbbb2222": "agents: usage-limit restart in progress",
+                                 "planner-pending::proj-1:run-cccc3333": "agents: usage-limit recovery held for owner"})
+
+    def test_planner_times_are_berlin_today_next_day_and_across_dst(self):
+        self.io.planner_recovery_sources = {"": planner_source(pending=[
+            planner_row("proj-1", "run-today111", at("2026-09-30T12:05:00Z")),
+            planner_row("proj-1", "run-next2222", at("2026-10-01T12:05:00Z"))])}
+        self.run_at(WED_10_05)
+        doc = self.io.published[-1]
+        self.assertIn("(at 14:05; subject to automatic dispatch and the project trigger)", doc)
+        self.assertIn("(at 01.10. 14:05; subject to automatic dispatch and the project trigger)", doc)
+        self.io.planner_recovery_sources = {"": planner_source(pending=[
+            planner_row("proj-1", "run-dst-111", at("2026-10-25T09:00:00Z"))])}
+        self.run_at(at("2026-10-24T10:00:00Z"))  # 12:00 CEST; the restart is 10:00 CET after the change
+        self.assertIn("(at 25.10. 10:00; subject to automatic dispatch and the project trigger)",
+                      self.io.published[-1])
+        self.io.planner_recovery_sources = {"": planner_source(pending=[
+            planner_row("proj-1", "run-dst-222", at("2026-10-25T14:00:00Z"))])}
+        self.run_at(at("2026-10-25T08:00:00Z"))  # 09:00 CET: the same day, after the change
+        self.assertIn("(at 15:00; subject to automatic dispatch and the project trigger)", self.io.published[-1])
+
+    def test_closed_run_completions_and_each_request_stand_alone(self):
+        self.io.planner_recovery_sources = {"": planner_source(completed=[
+            planner_confirmed("proj-TUC-991-instead", "run-closed1", "req-1", "agent-new1",
+                              at("2026-09-30T07:00:00Z")),
+            planner_confirmed("proj-TUC-991-instead", "run-closed1", "req-2", "agent-new2",
+                              at("2026-09-30T07:30:00Z"))])}
+        self.run_at(WED_10_05)
+        rows = self.planner_payloads(self.saved())
+        self.assertEqual(set(rows), {"planner-confirmed::proj-TUC-991-instead:run-closed1:req-1",
+                                     "planner-confirmed::proj-TUC-991-instead:run-closed1:req-2"})
+        first = rows["planner-confirmed::proj-TUC-991-instead:run-closed1:req-1"]
+        self.assertEqual(first["detail"], "usage-limit restart confirmed (at 09:00)")
+        self.assertIsNone(first["ticket"])
+        self.assertEqual(rows["planner-confirmed::proj-TUC-991-instead:run-closed1:req-2"]["detail"],
+                         "usage-limit restart confirmed (at 09:30)")
+        self.assertEqual((self.saved()["pending"], self.io.comments, self.io.desktops), ({}, [], []))
+        lines = self.history_lines()
+        self.assertEqual({line["kind"] for line in lines if line.get("key", "").startswith("planner-")},
+                         {"agents: usage-limit restart confirmed"})
+        self.assertEqual({line["auto"] for line in lines if line.get("key", "").startswith("planner-")}, {True})
+
+    def test_a_confirmed_start_is_reported_beside_a_claimed_retry(self):
+        self.io.planner_recovery_sources = {"": planner_source(
+            pending=[planner_row("proj-1", "run-mixed11", at("2026-09-30T12:05:00Z"), state="claimed")],
+            completed=[planner_confirmed("proj-1", "run-mixed11", "req-1", "agent-new1",
+                                         at("2026-09-30T07:00:00Z"))])}
+        self.run_at(WED_10_05)
+        self.assertEqual(set(self.planner_payloads(self.saved())),
+                         {"planner-pending::proj-1:run-mixed11",
+                          "planner-confirmed::proj-1:run-mixed11:req-1"})
+        self.assertEqual((self.saved()["pending"], self.io.comments, self.io.desktops), ({}, [], []))
+
+    def test_a_failed_local_agent_read_keeps_agent_items_stale_while_planners_refresh(self):
+        agent = {"id": "aaaaaaa111", "name": "TUC-301 work", "status": "error", "cwd": "/tmp"}
+        self.io.agent_list = [agent]
+        self.io.error_lines = {agent["id"]: "429 rate limit"}
+        self.io.planner_recovery_sources = {"": planner_source(pending=[
+            planner_row("proj-1", "run-1", at("2026-09-30T13:00:00Z"))])}
+        self.run_at(WED_10_05)
+
+        def broken():
+            raise subprocess.CalledProcessError(1, ["paseo"])
+        self.io.agents = broken
+        self.run_at(WED_11_05)
+        state = self.saved()
+        self.assertEqual(set(state["items"]), {f"agent-error:{agent['id']}", "planner-pending::proj-1:run-1"})
+        self.assertTrue(state["items"][f"agent-error:{agent['id']}"]["stale"])
+        self.assertFalse(state["items"]["planner-pending::proj-1:run-1"]["stale"])
+        doc = self.io.published[-1]
+        self.assertIn("- agents: exit 1 (previous items kept)", doc)
+        self.assertNotIn("- planner_recovery:", doc)
+
+    def test_planner_units_are_isolated_per_host(self):
+        self.io.planner_recovery_sources = {"": planner_source(pending=[
+            planner_row("proj-1", "run-local1", at("2026-09-30T12:05:00Z"))]), "mac": planner_source(pending=[
+            planner_row("proj-2", "run-remote", at("2026-09-30T12:05:00Z"))])}
+        self.run_at(WED_10_05)
+        self.io.planner_recovery_sources = {"": None, "mac": planner_source(pending=[
+            planner_row("proj-2", "run-remote", at("2026-09-30T12:05:00Z"))])}
+        self.run_at(WED_11_05)
+        state = self.saved()
+        self.assertTrue(state["items"]["planner-pending::proj-1:run-local1"]["stale"])
+        self.assertFalse(state["items"]["planner-pending:mac:proj-2:run-remote"]["stale"])
+        doc = self.io.published[-1]
+        self.assertIn("- planner_recovery: planner data not read (previous items kept)", doc)
+        self.assertNotIn("- planner_recovery@mac:", doc)
+        run = [line for line in self.history_lines() if line["event"] == "run"][-1]
+        self.assertEqual((run["units"]["planner_recovery"], run["units"]["planner_recovery@mac"]), (False, True))
+        self.io.planner_recovery_sources = {"": planner_source(pending=[
+            planner_row("proj-1", "run-local1", at("2026-09-30T12:05:00Z"))]), "mac": None}
+        self.run_at(at("2026-09-30T10:05:00Z"))
+        state = self.saved()
+        self.assertFalse(state["items"]["planner-pending::proj-1:run-local1"]["stale"])
+        self.assertTrue(state["items"]["planner-pending:mac:proj-2:run-remote"]["stale"])
+        self.assertIn("- planner_recovery@mac: planner data not read (previous items kept)", self.io.published[-1])
+
+    def test_an_unreachable_host_keeps_both_agent_and_planner_items_stale(self):
+        local = {"id": "aaaaaaa111", "name": "TUC-301 work", "status": "error", "cwd": "/tmp"}
+        remote = {"id": "bbbbbbb222", "name": "TUC-302 work", "status": "error", "cwd": "/tmp", "_host": "mac"}
+        self.io.agent_list = [local, remote]
+        self.io.targets = ["mac"]
+        self.io.error_lines = {a["id"]: "429 rate limit" for a in (local, remote)}
+        pending = planner_row("proj-1", "run-local1", at("2026-09-30T12:05:00Z"))
+        remote_pending = planner_row("proj-2", "run-remote", at("2026-09-30T12:05:00Z"))
+        self.io.planner_recovery_sources = {"": planner_source(pending=[pending]),
+                                   "mac": planner_source(pending=[remote_pending])}
+        self.run_at(WED_10_05)
+        self.io.agent_list = [local]
+        self.io.unreachable = {"mac": "timeout"}
+        self.io.planner_recovery_sources = {"": planner_source(pending=[pending]), "mac": None}
+        self.run_at(WED_11_05)
+        state = self.saved()
+        self.assertEqual(set(state["items"]), {f"agent-error:{local['id']}", f"agent-error:{remote['id']}",
+                                               "planner-pending::proj-1:run-local1",
+                                               "planner-pending:mac:proj-2:run-remote"})
+        self.assertTrue(state["items"][f"agent-error:{remote['id']}"]["stale"])
+        self.assertTrue(state["items"]["planner-pending:mac:proj-2:run-remote"]["stale"])
+        self.assertFalse(state["items"][f"agent-error:{local['id']}"]["stale"])
+        self.assertFalse(state["items"]["planner-pending::proj-1:run-local1"]["stale"])
+        doc = self.io.published[-1]
+        self.assertIn("- agents@mac: timeout (previous items kept)", doc)
+        self.assertIn("- planner_recovery@mac: planner data not read (previous items kept)", doc)
+
+    def test_only_a_scheduled_same_host_failed_root_gets_the_resume_suffix(self):
+        agents = [{"id": "aaaaaaa111", "name": "TUC-1 work", "status": "error", "cwd": "/tmp"},
+                  {"id": "bbbbbbb222", "name": "TUC-2 work", "status": "error", "cwd": "/tmp"},
+                  {"id": "ccccccc333", "name": "TUC-3 work", "status": "error", "cwd": "/tmp"},
+                  {"id": "ddddddd444", "name": "TUC-4 work", "status": "error", "cwd": "/tmp", "_host": "mac"},
+                  {"id": "eeeeeee555", "name": "TUC-5 work", "status": "error", "cwd": "/tmp", "_host": "mac"}]
+        self.io.agent_list = agents
+        self.io.targets = ["mac"]
+        self.io.error_lines = {a["id"]: "429 rate limit" for a in agents}
+        self.io.planner_recovery_sources = {
+            "": planner_source(pending=[
+                planner_row("proj-1", "run-1", at("2026-09-30T12:05:00Z"), failed="aaaaaaa111"),
+                planner_row("proj-1", "run-2", at("2026-09-30T12:05:00Z"), state="claimed", failed="bbbbbbb222"),
+                planner_row("proj-1", "run-3", at("2026-09-30T12:05:00Z"), state="held", failed="ccccccc333"),
+                planner_row("proj-2", "run-4", at("2026-09-30T12:05:00Z"), failed="eeeeeee555")]),
+            "mac": planner_source(pending=[
+                planner_row("proj-2", "run-5", at("2026-09-30T12:05:00Z"), failed="ddddddd444")])}
+        self.run_at(WED_10_05)
+        items = self.saved()["items"]
+        self.assertEqual(items["agent-error:aaaaaaa111"]["payload"]["detail"],
+                         "in error: rate limit (resumes at 14:05)")
+        self.assertEqual(items["agent-error:bbbbbbb222"]["payload"]["detail"], "in error: rate limit")
+        self.assertEqual(items["agent-error:ccccccc333"]["payload"]["detail"], "in error: rate limit")
+        self.assertEqual(items["agent-error:ddddddd444"]["payload"]["detail"],
+                         "in error: rate limit (resumes at 14:05)")
+        self.assertEqual(items["agent-error:eeeeeee555"]["payload"]["detail"], "in error: rate limit")
+        self.assertEqual(digest.item_kind(items["agent-error:aaaaaaa111"]["payload"]), "agents: in error: rate limit")
+
+    def test_only_an_explicit_same_host_completion_credits_a_failed_root(self):
+        a = {"id": "aaaaaaa111", "name": "TUC-1 work", "status": "error", "cwd": "/tmp"}
+        b = {"id": "bbbbbbb222", "name": "TUC-2 work", "status": "error", "cwd": "/tmp"}
+        c = {"id": "ccccccc333", "name": "TUC-3 work", "status": "error", "cwd": "/tmp"}
+        d = {"id": "ddddddd444", "name": "TUC-4 work", "status": "error", "cwd": "/tmp", "_host": "mac"}
+        e = {"id": "eeeeeee555", "name": "TUC-5 work", "status": "error", "cwd": "/tmp", "_host": "mac"}
+        self.io.agent_list = [a, b, c, d, e]
+        self.io.targets = ["mac"]
+        self.io.error_lines = {agent["id"]: "429 rate limit" for agent in (a, b, c, d, e)}
+        self.io.evidence_data = {"prWatch": None, "crashes": {}, "limitResumes": {"pending": {}, "started": set()}}
+        self.io.planner_recovery_sources = {
+            "": planner_source(
+                pending=[planner_row("proj-1", "run-1", at("2026-09-30T12:05:00Z"), failed=b["id"])],
+                completed=[planner_confirmed("proj-1", "run-2", "req-1", "agent-n1",
+                                             at("2026-09-30T07:00:00Z"), failed=a["id"]),
+                           planner_confirmed("proj-1", "run-3", "req-2", "agent-n2",
+                                             at("2026-09-30T07:00:00Z"), failed=d["id"])]),
+            "mac": planner_source(completed=[
+                planner_confirmed("proj-2", "run-4", "req-3", "agent-n3",
+                                  at("2026-09-30T07:00:00Z"), failed=c["id"]),
+                planner_confirmed("proj-2", "run-5", "req-4", "agent-n4",
+                                  at("2026-09-30T07:00:00Z"), failed=e["id"])])}
+        self.run_at(WED_10_05)
+        auto = {line["key"]: line["auto"] for line in self.history_lines()
+                if line.get("key", "").startswith("agent-error:")}
+        self.assertEqual(auto, {f"agent-error:{a['id']}": True, f"agent-error:{b['id']}": False,
+                                f"agent-error:{c['id']}": False, f"agent-error:{d['id']}": None,
+                                f"agent-error:{e['id']}": True})
+        self.assertEqual(self.saved()["items"][f"agent-error:{b['id']}"]["payload"]["detail"],
+                         "in error: rate limit (resumes at 14:05)")
+
+    def test_a_publication_failure_keeps_confirmations_and_writes_them_once(self):
+        self.io.planner_recovery_sources = {"": planner_source(completed=[
+            planner_confirmed("proj-1", "run-closed1", "req-1", "agent-new1", at("2026-09-30T07:00:00Z"))])}
+        key = "planner-confirmed::proj-1:run-closed1:req-1"
+        self.io.publish_error = digest.LinearError("down")
+        self.assertEqual(self.run_at(WED_09_05), 1)
+        self.assertIn(key, self.saved()["items"])
+        self.assertEqual(self.io.published, [])
+        self.assertEqual([(line["t"], line["event"], line["auto"]) for line in self.history_lines()
+                          if line["event"] != "run"], [("2026-09-30T07:05:00Z", "opened", True)])
+        self.io.publish_error = None
+        self.assertEqual(self.run_at(WED_10_05), 0)
+        self.assertEqual([(line["t"], line["event"], line["key"]) for line in self.history_lines()
+                          if line.get("key") == key],
+                         [("2026-09-30T07:05:00Z", "opened", key), ("2026-09-30T08:05:00Z", "open", key)])
+        self.assertEqual(self.saved()["historyOutbox"], [])
+
+    def test_a_torn_confirmation_line_is_completed_exactly_once(self):
+        self.io.planner_recovery_sources = {"": planner_source(completed=[
+            planner_confirmed("proj-1", "run-closed1", "req-1", "agent-new1", at("2026-09-30T07:00:00Z"))])}
+        key = "planner-confirmed::proj-1:run-closed1:req-1"
+        self.assertEqual(self.run_at(WED_09_05), 0)
+        real = digest.append_history
+
+        def torn(target, encoded):
+            with open(target, "ab") as f:
+                f.write(encoded[0] + encoded[1][:20])
+            raise OSError("disk full")
+        digest.append_history = torn
+        try:
+            self.assertEqual(self.run_at(WED_10_05), 0)
+        finally:
+            digest.append_history = real
+        self.assertEqual(len(self.saved()["historyOutbox"]), 1)
+        self.assertEqual(self.run_at(WED_11_05), 0)
+        lines = self.history_lines()
+        ids = [(line["t"], line["event"], line.get("key")) for line in lines]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual([line["t"] for line in lines if line["event"] == "opened" and line["key"] == key],
+                         ["2026-09-30T07:05:00Z"])
+        self.assertEqual(self.saved()["historyOutbox"], [])
 
 
 if __name__ == "__main__":

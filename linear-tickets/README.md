@@ -1117,9 +1117,13 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   The project status reports “Usage limit on {provider}: Paseo starts a new agent at {time}.”
   with Berlin time. Optional `planner.recovery` metadata in `projects.json` survives reload,
   needs no backfill and preserves existing label-repair records. Malformed recovery metadata
-  stops automatic recovery with a logged reason, never resets its budget. Planner reset-time
-  display in planning activity and planner restart display/history in the ops digest are
-  tracked separately (TUC-1347 and TUC-1346); ticket-agent digest behavior is unchanged.
+  stops automatic recovery with a logged reason, never resets its budget. Confirmed usage-limit
+  replacements are retained outside the open run in optional `plannerLimitRestarts` for eight days,
+  so Skip, a replaced run or a finished plan does not erase their reporting evidence. Confirmation
+  is saved atomically with the run update; a failed save retains the claim for labeled-root
+  reconciliation, and retirement failure cannot turn saved confirmation into failed creation.
+  Planner reset-time display in planning activity stays separate (TUC-1347); ticket-agent
+  digest behavior is unchanged.
   Skip and order application wait for any start or write already in flight. Each later project
   poll also archives obsolete run agents, including one whose creation response was lost and
   became visible only after Skip.
@@ -2374,6 +2378,49 @@ not. A one-week post-release check uses the minute-precise restart record, not h
 outside full exhaustion across all candidate models, median failure-to-start must be <30 min;
 unrestarted qualifying failures count as never cleared, forwarded ones remain unverified.
 
+**Project planners (usage-limit recovery).** The digest reads `projects.json` once per host/run.
+Scheduled waits show `usage-limit restart scheduled (at …; subject to automatic dispatch and the
+project trigger)`, claimed attempts show `usage-limit restart in progress`, and an exhausted
+recovery held for the owner shows `usage-limit recovery held for owner`. These rows name the
+project/run, not an inferred ticket. An existing failed-root error gains the Berlin-time
+`(resumes at …)` suffix only for a matching scheduled wait on its own host, never a held or
+claimed attempt. Existing errors still require attention; the additional planner rows never
+notify the owner.
+
+Explicit confirmations show `usage-limit restart confirmed (at …)`: a replacement was created
+or a new live root with a claimed `linear.plannerRequest` label was adopted. This is **not**
+confirmation that the plan finished. Run/request evidence is deduplicated and retained for
+eight days, pruned on project updates and filtered when read even for untouched closed projects.
+Counters, failed/uncertain claims, ordinary starts and old unlabeled agents earn no inferred
+success. There is no reconstruction of restarts before this evidence existed.
+Malformed confirmation evidence is preserved and marks recovery reporting unavailable; it
+cannot block automatic recovery or Plan/Skip. No usable success history is inferred from it.
+
+The additive `plannerRecovery` version-1 snapshot exports only project/run/request/root IDs,
+state and timestamps, never error text, plans, ticket lists, selectors or credentials. Local
+planner collection and remote attempts do not depend on successful local agent or Linear reads.
+A delivered remote snapshot with unreadable planner data refreshes its agents but retains its
+planner rows stale. A failed agent/permission collector leaves `plannerRecovery` unavailable and
+its recovery rows stale; the independently delivered `projectPlanners` owner alerts and explicit
+`agentSource` failure outcome introduced by the host-ownership work stay intact. Missing/old/
+unknown-version recovery fields and unreachable hosts mean not-read, not an empty successful
+source. Each host's old rows are retained independently as “not refreshed since”.
+
+History keeps the existing fixed fields and digest observation time; producer `confirmedAt`
+is display/evidence data, not an exact restart timestamp exported in history. Confirmed rows
+have `auto=true`; scheduled/claimed/held rows do not earn restart credit, and held rows have
+`owner=true`. Explicit same-host completion can credit the failed-root error, without guessing
+about unrelated remote automation. These non-attention rows do not count as recurring problems
+or change unrelated weekly problem trends.
+
+Isolated verification uses disposable project files, fake SDK/Linear adapters and a localhost
+usage broker with the real `ProjectFlow`, `ProjectStore`, `Launcher`, `UsageReader`, Python
+snapshot/digest/history and weekly reader. It checks a scheduled wait, two confirmed starts,
+Skip closure, JSON transport and exactly-once history without production agents or publishing.
+Regression checks: `node --import tsx --test server/project-flow.test.ts server/ops-review.test.ts`
+and `python3 -m unittest discover -s ops -p 'test_*.py'`. After pulling/reloading the server,
+use the read-only commands below; laptop snapshot installation remains TUC-1253/TUC-1352.
+
 Once a week the review (`scripts/ops-review.ts`) reads the digest's history, files one ticket
 per kind of problem that keeps coming back, and checks two weeks after such a ticket is Done
 that the kind got at least twice as rare, reopening it otherwise.
@@ -2405,6 +2452,7 @@ that the kind got at least twice as rare, reopening it otherwise.
 ```sh
 /usr/bin/python3 ~/.paseo/bin/paseo-ops-digest.py --print    # render to stdout: no state, no history, no publish
 /usr/bin/python3 ~/.paseo/bin/paseo-ops-digest.py --dry-run  # log what would happen: no state, no history
+/usr/bin/python3 ~/.paseo/bin/paseo-ops-digest.py --agents-json # read-only local host snapshot
 systemctl --user start paseo-ops-digest.service             # one real run
 ```
 
@@ -2416,7 +2464,8 @@ a contract with the remote).
 
 - `{"t", "event": "run", "host", "units": {unit: read?}, "hosts": [...], "items": n}`: every unit
   the run attempted (`repo`, the repository script's own units such as `queue`, `pulls/917`,
-  `deploy:production/x`, `agents`, `silent`, `locks`, and `agents@<host>`/`silent@<host>` for each
+  `deploy:production/x`, `agents`, `silent`, `locks`, `planner_recovery`, and
+  `agents@<host>`/`silent@<host>`/`planner_recovery@<host>` for each
   remote), read or not, and every host whose agents were read. It is the proof that a source was
   looked at, whether or not anything was found.
 - `{"t", "event": "opened" | "open" | "cleared", "key", "kind", "unit", "first", "attention",
@@ -2456,7 +2505,10 @@ verify or reopen a ticket.
 did not happen is still judged. Repository sections need `repo` and their own unit read, with at
 most 10 % of their `pulls/<n>` or `deploy:<env>/<service>` sub-units failed; agent kinds need
 `agents`/`agents@<host>` (and `silent`/`silent@<host>` for silent agents, `locks` for orphaned
-labels) read, judged per host. An hour without a `run` line, a `gap` and backfilled hours are
+labels) read, judged per host. Planner kinds require their own `planner_recovery` or
+`planner_recovery@<host>` unit, independently of agent reads; missing units are unknown coverage.
+Non-attention planner notes do not affect headline problem completeness.
+An hour without a `run` line, a `gap` and backfilled hours are
 never covered. A window is complete with at least 90 % covered hours and less than 1 % malformed
 lines; agent kinds count only the hosts complete in every window compared, and server087 must be
 one of them (the Mac asleep at night does not spoil the comparison). Otherwise the review says

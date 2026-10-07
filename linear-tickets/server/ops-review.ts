@@ -43,7 +43,7 @@ const REPO_SECTIONS = ["main", "queue", "drops", "pulls", "deploys"];
 // The repository units (tuchel-platform `tools/ci/ops-digest.mjs`) behind each section's items.
 const SECTION_UNITS: Record<string, string[]> = { main: ["main", "main-hold", "main-security-scan", "core-web-bundle"], queue: ["queue"], drops: ["drops"], pulls: ["pulls"], deploys: [] };
 const SUBUNITS: Record<string, RegExp> = { pulls: /^pulls\//, deploys: /^deploy:[^/]+\/./ };
-const AGENT_GROUPS = ["error", "waiting", "silent", "locks"];
+const AGENT_GROUPS = ["error", "waiting", "silent", "locks", "planners"];
 export const KIND_MARKER = "ops-kind";
 export const REVIEW_MARKER = "ops-review";
 const KIND_LINE = /^Marker: `ops-kind ([^`\r\n]+)`[ \t]*$/gm;
@@ -234,7 +234,7 @@ export function sourceOf(kind: string, history: Pick<History, "kinds">): Source 
   if (section !== "agents") return { section, group: null };
   if (seen?.group && AGENT_GROUPS.includes(seen.group)) return { section, group: seen.group };
   const detail = kind.slice("agents: ".length);
-  return { section, group: /^in error/.test(detail) ? "error" : /^waits for/.test(detail) ? "waiting" : /running agent/.test(detail) ? "locks" : "silent" };
+  return { section, group: /^in error/.test(detail) ? "error" : /^waits for/.test(detail) ? "waiting" : /running agent/.test(detail) ? "locks" : /^usage-limit (restart|recovery)/.test(detail) ? "planners" : "silent" };
 }
 
 function repositoryRead(run: RunRecord, section: string): boolean {
@@ -253,6 +253,8 @@ function repositoryRead(run: RunRecord, section: string): boolean {
 function agentsRead(run: RunRecord, group: string | null, host: string): boolean {
   if (group === "locks") return host === run.host && run.units.locks === true;
   const at = host === run.host ? "" : `@${host}`;
+  // The planner file is read on its own: a healthy agent listing says nothing about it (TUC-1346).
+  if (group === "planners") return run.units[`planner_recovery${at}`] === true;
   if (run.units[`agents${at}`] !== true) return false;
   return group !== "silent" || run.units[`silent${at}`] === true;
 }
@@ -278,6 +280,19 @@ function malformedShare(history: History, window: Window): number {
   return lines ? malformed / lines : 0;
 }
 
+// The planner file is read per host, so a planner kind's hosts are this host plus every target the
+// digest tried — a target stays a candidate although its agents were never read (TUC-1346).
+function plannerTargets(history: History): string[] {
+  const targets = new Set<string>();
+  for (const run of history.runs) {
+    for (const unit of Object.keys(run.units)) {
+      const match = /^planner_recovery@(.+)$/.exec(unit);
+      if (match) targets.add(match[1]);
+    }
+  }
+  return [...targets];
+}
+
 // `hosts`: for agent kinds, the hosts complete in every window (only their problems are counted);
 // null for repository kinds. Complete needs the digest's own host among them.
 export type Coverage = { complete: boolean; hosts: string[] | null; excluded: string[] };
@@ -289,7 +304,8 @@ export function coverage(history: History, source: Source, windows: Window[]): C
     return { complete, hosts: null, excluded: [] };
   }
   const primary = history.primaryHost;
-  const candidates = source.group === "locks" ? (primary ? [primary] : []) : [...new Set([...(primary ? [primary] : []), ...history.hosts])].sort();
+  const targets = source.group === "planners" ? plannerTargets(history) : [];
+  const candidates = source.group === "locks" ? (primary ? [primary] : []) : [...new Set([...(primary ? [primary] : []), ...history.hosts, ...targets])].sort();
   const hosts = candidates.filter((host) => windows.every((window) => coveredShare(history, window, (run) => agentsRead(run, source.group, host)) >= COVERED_SHARE));
   return { complete: clean && primary !== null && hosts.includes(primary), hosts, excluded: candidates.filter((host) => !hosts.includes(host)) };
 }
@@ -388,7 +404,8 @@ function headline(history: History, window: Window, mergedPrs: number | null): H
   const known = owners.filter((owner) => owner !== "unknown").length;
   const durations = cleared.map((occurrence) => (occurrence.clearedAt! - occurrence.first) / HOUR).sort((a, b) => a - b);
   const median = quantile(durations, 0.5);
-  const sources: Source[] = [...REPO_SECTIONS.map((section) => ({ section, group: null })), ...AGENT_GROUPS.map((group) => ({ section: "agents", group }))];
+  // Planner recovery rows never need attention, so their new coverage cannot invalidate problem trends.
+  const sources: Source[] = [...REPO_SECTIONS.map((section) => ({ section, group: null })), ...AGENT_GROUPS.filter((group) => group !== "planners").map((group) => ({ section: "agents", group }))];
   return {
     ownerTrue, mergedPrs, ownerPerMergedPr: mergedPrs ? Math.round((ownerTrue / mergedPrs) * 100) / 100 : null,
     clearedWithoutOwner: without, clearedKnownOwner: known, clearedUnknownOwner: owners.length - known,

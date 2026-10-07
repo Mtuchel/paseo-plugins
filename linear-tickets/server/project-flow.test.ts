@@ -55,7 +55,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   // Linear writes that fail (`update`: the next n project updates; one relation refused or never
   // reaching Linear); `start`: how a planner start fails (`setup`: a SetupError, `always`: a
   // timeout); `restart`: every stalled-ticket restart. `starts`: every planner start, in order.
-  const fail: { read?: boolean; update?: number; relation?: string; unreached?: string; restart?: boolean; start?: "setup" | "always"; startError?: string } = {};
+  const fail: { read?: boolean; update?: number; relation?: string; unreached?: string; restart?: boolean; retire?: boolean; start?: "setup" | "always"; startError?: string } = {};
   const starts: PlannerStart[] = [];
   const comments: string[] = [];
   const updates: string[] = [];
@@ -108,7 +108,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
     viewerId: async () => { reads.push("viewerId"); if (fail.read) throw outage(); return OWNER; },
   };
   const path = join(directory, "projects.json");
-  const store = new ProjectStore(path);
+  const store = new ProjectStore(path, () => now);
   const scheduler = new Scheduler({ running: async () => running, projectOf: async () => "erp", away: async () => away, now: () => now });
   // Tickets a start under way, or their newest thread, accounts for.
   const held = new Set<string>();
@@ -128,7 +128,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
       created++;
       return { agentId: `run-agent-${created}` };
     },
-    retire: async (agentId: string) => { calls.push(`retire ${agentId}`); },
+    retire: async (agentId: string) => { calls.push(`retire ${agentId}`); if (fail.retire) throw new Error("retirement unavailable"); },
     now: () => now,
     inspect,
     restart: async (id: string) => {
@@ -138,7 +138,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
     accountedFor: async (id: string) => held.has(id),
     usage: { chains: async () => usage.chains, read: async () => usage.refresh ? usage.reports?.map((report) => ({ ...report, fetchedAt: now })) ?? null : usage.reports },
     jitter: () => MINUTE };
-  const makeFlow = () => new ProjectFlow({ ...deps, store: new ProjectStore(path) });
+  const makeFlow = () => new ProjectFlow({ ...deps, store: new ProjectStore(path, () => now) });
   const flow = makeFlow();
   return {
     flow, makeFlow, calls, reads, path, store, issues, fail, comments, updates, starts, descriptions, team, elsewhere, held, usage, launchedSelectors,
@@ -1361,4 +1361,143 @@ test("an unconfirmed usage-limited ordinary restart retains grace despite a pred
   assert.equal(r.starts.length, 2);
   assert.notEqual(r.starts[0].requestId, r.starts[1].requestId);
   assert.equal((await r.store.all()).erp.planner!.recovery!.claims.length, 1);
+});
+
+test("confirmed limit restarts survive multiple attempts, closure and reload without crediting claims", async (t) => {
+  for (const close of ["skip", "approve", "replace"]) {
+    const r = await limitedRoom(t);
+    assert.equal((await r.store.all()).erp.plannerLimitRestarts, undefined);
+    r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+    r.advance(2 * MINUTE);
+    await r.flow.tick(r.paseo, settings);
+    const first = (await r.store.all()).erp.plannerLimitRestarts!;
+    assert.deepEqual(first, [{ runId: "run-1", requestId: "planner-run-1-limit-1", agentId: "run-agent-1", failedAgentId: "failed", confirmedAt: new Date(r.now()).toISOString() }]);
+    r.agents.splice(0, r.agents.length, { id: "run-agent-1", status: "error", lastError: "usage limit", labels: { "linear.plannerRun": "run-1" } });
+    r.advance(16 * MINUTE);
+    await r.makeFlow().tick(r.paseo, settings);
+    const expected = (await r.store.all()).erp.plannerLimitRestarts!;
+    assert.equal(expected[1].requestId, "planner-run-1-limit-2");
+    assert.equal(expected[1].failedAgentId, "run-agent-1");
+    r.agents.splice(0, r.agents.length, { id: "run-agent-2", status: "running", labels: { "linear.plannerRun": "run-1", "linear.plannerRequest": "planner-run-1-limit-2" } });
+    const flow = r.makeFlow();
+    if (close === "skip") await flow.skipPlan("erp", settings, r.paseo);
+    else if (close === "approve") await flow.applyPlan("run-1", "run-agent-2", "```project-order\n```", r.paseo, settings);
+    else {
+      await r.store.update("erp", (record) => ({ ...record!, planner: { ...record!.planner!, ownerAsked: true } }));
+      await flow.planNow("erp", settings, r.paseo);
+    }
+    assert.deepEqual((await r.store.all()).erp.plannerLimitRestarts, expected);
+  }
+});
+
+test("uncertain labeled adoption credits only the canonical new usage-limit root once", async (t) => {
+  for (const label of ["planner-run-1-limit-1", undefined, "planner-run-1-limit-2", "planner-run-1-1"]) {
+    const r = await limitedRoom(t);
+    r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+    r.fail.start = "always";
+    r.advance(2 * MINUTE);
+    await r.flow.tick(r.paseo, settings);
+    assert.equal((await r.store.all()).erp.plannerLimitRestarts, undefined);
+    r.agents.push({ id: "adopted", status: "running", labels: { "linear.plannerRun": "run-1", ...(label ? { "linear.plannerRequest": label } : {}) } });
+    r.advance(2 * MINUTE);
+    await r.makeFlow().tick(r.paseo, settings);
+    const expected = label === "planner-run-1-limit-1"
+      ? [{ runId: "run-1", requestId: label, agentId: "adopted", failedAgentId: "failed", confirmedAt: new Date(r.now()).toISOString() }] : undefined;
+    assert.deepEqual((await r.store.all()).erp.plannerLimitRestarts, expected);
+    r.agents.push({ id: "duplicate", status: "running", labels: { "linear.plannerRun": "run-1", "linear.plannerRequest": "planner-run-1-limit-1" } });
+    r.advance(2 * MINUTE);
+    await r.makeFlow().tick(r.paseo, settings);
+    assert.deepEqual((await r.store.all()).erp.plannerLimitRestarts, expected);
+    assert.ok(r.calls.includes("retire duplicate"));
+  }
+});
+
+test("failed confirmation save keeps the claim for exactly one labeled adoption after reload", async (t) => {
+  const r = await limitedRoom(t);
+  r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+  const update = ProjectStore.prototype.update;
+  let fail = true;
+  t.mock.method(ProjectStore.prototype, "update", function (this: ProjectStore, id: string, change: (record: ProjectRecord | undefined) => ProjectRecord | null) {
+    return update.call(this, id, (record) => {
+      const next = change(record);
+      if (fail && next?.plannerLimitRestarts?.length) { fail = false; throw new Error("confirmation disk failure"); }
+      return next;
+    });
+  });
+  r.advance(2 * MINUTE);
+  await r.flow.tick(r.paseo, settings);
+  const waiting = (await r.store.all()).erp;
+  assert.equal(waiting.plannerLimitRestarts, undefined);
+  assert.equal(waiting.planner!.recovery!.claim!.requestId, "planner-run-1-limit-1");
+  assert.ok(waiting.planner!.recovery!.pending);
+  r.agents.push({ id: "run-agent-1", status: "running", labels: { "linear.plannerRun": "run-1", "linear.plannerRequest": r.starts[0].requestId } });
+  r.advance(2 * MINUTE);
+  await r.makeFlow().tick(r.paseo, settings);
+  const confirmed = (await r.store.all()).erp.plannerLimitRestarts!;
+  assert.equal(confirmed.length, 1);
+  assert.equal(confirmed[0].agentId, "run-agent-1");
+  r.advance(2 * MINUTE);
+  await r.makeFlow().tick(r.paseo, settings);
+  assert.deepEqual((await r.store.all()).erp.plannerLimitRestarts, confirmed);
+  assert.equal(r.starts.length, 1);
+});
+
+test("retirement failure cannot rewrite a persisted successful restart as failed creation", async (t) => {
+  const r = await limitedRoom(t);
+  r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+  r.fail.retire = true;
+  r.advance(2 * MINUTE);
+  await r.flow.tick(r.paseo, settings);
+  const record = (await r.store.all()).erp;
+  assert.equal(record.planner!.error, undefined);
+  assert.equal(record.planner!.recovery!.pending, undefined);
+  assert.equal(record.plannerLimitRestarts![0].agentId, "run-agent-1");
+  r.agents.push({ id: "run-agent-1", status: "running", labels: { "linear.plannerRun": "run-1", "linear.plannerRequest": r.starts[0].requestId } });
+  r.fail.retire = false;
+  r.advance(2 * MINUTE);
+  await r.makeFlow().tick(r.paseo, settings);
+  assert.deepEqual((await r.store.all()).erp.plannerLimitRestarts, record.plannerLimitRestarts);
+  assert.equal(r.starts.length, 1);
+});
+
+test("project updates expire restart evidence after eight days while preserving repair records", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "restart-history-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const now = Date.parse("2026-01-10T00:00:00Z");
+  const store = new ProjectStore(join(directory, "projects.json"), () => now);
+  const boundary = { runId: "run", requestId: "request", agentId: "agent", confirmedAt: new Date(now - 8 * 24 * HOUR).toISOString() };
+  await writeFile(join(directory, "projects.json"), JSON.stringify({ erp: { planner: null, plannerLimitRestarts: [boundary, { ...boundary, requestId: "expired", confirmedAt: new Date(now - 8 * 24 * HOUR - 1).toISOString() }] }, "~repairs": { sentinel: { incident: "unchanged" } } }));
+  await store.update("erp", (record) => ({ ...record!, planned: ["i1"] }));
+  assert.deepEqual((await store.all()).erp.plannerLimitRestarts, [boundary]);
+  assert.deepEqual(await store.repairs(), { sentinel: { incident: "unchanged" } });
+});
+
+test("malformed restart reporting evidence cannot block Skip or erase the unreadable evidence", async (t) => {
+  for (const bad of [{}, [null], [{ runId: "old", requestId: "old", agentId: "old", confirmedAt: "invalid" }], [{ runId: "old", requestId: "req:1", agentId: "old", confirmedAt: "2020-01-01T00:00:00Z" }],
+    // Date.parse rolls this over to the next day; the digest's fromisoformat rejects it.
+    [{ runId: "old", requestId: "old", agentId: "old", confirmedAt: "2020-01-01T24:00:00Z" }]]) {
+    const r = await room(t, [issue(1)]);
+    await writeFile(r.path, JSON.stringify({ erp: { planned: [], planner: runRecord({ ownerAsked: true }), plannerLimitRestarts: bad } }));
+    await r.flow.skipPlan("erp", settings, paseoWith(() => []));
+    const stored = (await r.store.all()).erp;
+    assert.equal(stored.planner, null);
+    assert.deepEqual(stored.planned, ["i1"]);
+    assert.deepEqual(stored.plannerLimitRestarts, bad);
+  }
+});
+
+test("malformed restart reporting evidence does not stop automatic recovery or invent usable history", async (t) => {
+  for (const bad of [{}, [null], [{ runId: "old", requestId: "old", agentId: "old", confirmedAt: "invalid" }]]) {
+    const r = await limitedRoom(t);
+    const file = JSON.parse(await readFile(r.path, "utf8"));
+    file.erp.plannerLimitRestarts = bad;
+    await writeFile(r.path, JSON.stringify(file));
+    r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+    r.advance(2 * MINUTE);
+    await r.flow.tick(r.paseo, settings);
+    const stored = (await r.store.all()).erp;
+    assert.equal(stored.planner!.agentId, "run-agent-1");
+    assert.equal(stored.planner!.recovery!.pending, undefined);
+    assert.deepEqual(stored.plannerLimitRestarts, bad);
+  }
 });

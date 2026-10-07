@@ -92,6 +92,7 @@ TREND = f"{DIR}/trend.json"
 PR_WATCH = f"{HOME}/linear-tickets/pr-watch.json"
 CRASHES = f"{HOME}/linear-tickets/crash-recovery.json"
 LIMIT_RESUMES = f"{HOME}/linear-tickets/limit-resumes.json"
+PROJECTS = f"{HOME}/linear-tickets/projects.json"
 LINEAR_USAGE = f"{HOME}/linear-tickets/linear-usage.json"  # the plugin's own Linear API usage per UTC hour
 PROJECTS = f"{HOME}/linear-tickets/projects.json"
 PULL_URL = "https://github.com/tuchel-sohn/tuchel-platform/pull/{}"
@@ -118,7 +119,7 @@ WORKTREE_TICKET = re.compile(r"/worktrees/[^/]+/[^/]*?\b([a-z][a-z0-9]+)-(\d+)-"
 REPO_SECTIONS = ("main", "queue", "drops", "pulls", "deploys")
 GITHUB_REPO = "tuchel-sohn/tuchel-platform"
 QUARANTINE_WORKFLOW = "flaky-quarantine.yml"
-HOST_UNITS = ("agents", "silent", "locks", "planners")
+HOST_UNITS = ("agents", "silent", "locks", "planners", "planner_recovery")
 CANDIDATES_MARKER = re.compile(r"^Marker: `decision-candidates (?:ERP|Agent tooling) \d{4}-W\d{2}(?: run \d+)?`", re.M)
 PROPOSAL = re.compile(r"^## Q-(\d+) — ", re.M)
 ANSWERED = re.compile(r"\*\*Q-(\d+) answered\*\*")
@@ -244,6 +245,129 @@ def resume_time(ts, now):
     at, today = datetime.fromtimestamp(ts, TZ), datetime.fromtimestamp(now, TZ)
     return at.strftime("%d.%m. %H:%M" if at.date() != today.date() else "%H:%M")
 
+# ---------------------------------------------------------------------------- planner recovery (pure)
+
+PLANNER_HISTORY_S = 8 * 24 * 3600
+
+
+def planner_id(value):
+    """Opaque record identities, never text, labels or commands."""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.@-]{1,256}", value):
+        raise ValueError("invalid planner identity")
+    return value
+
+
+def planner_time(value):
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)", value):
+        raise ValueError("invalid planner time")
+    ts = parse_iso(value)
+    if ts is None or not math.isfinite(ts):
+        raise ValueError("invalid planner time")
+    return value
+
+
+def parse_planner_snapshot(data, now):
+    """Validate and strip all but the versioned, structured recovery fields."""
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
+        return None
+    try:
+        pending, completed = [], []
+        for name in ("pending", "completed"):
+            if not isinstance(data.get(name), list):
+                raise ValueError("invalid planner rows")
+            for row in data[name]:
+                if not isinstance(row, dict):
+                    raise ValueError("invalid planner row")
+                safe = {field: planner_id(row.get(field)) for field in ("projectId", "runId")}
+                if "failedAgentId" in row:
+                    safe["failedAgentId"] = planner_id(row["failedAgentId"])
+                if name == "pending":
+                    if row.get("state") not in ("scheduled", "claimed", "held"):
+                        raise ValueError("invalid planner state")
+                    safe.update(resumeAt=planner_time(row.get("resumeAt")), state=row["state"])
+                    pending.append(safe)
+                else:
+                    safe.update({field: planner_id(row.get(field)) for field in ("requestId", "agentId")})
+                    safe["confirmedAt"] = planner_time(row.get("confirmedAt"))
+                    if 0 <= now - parse_iso(safe["confirmedAt"]) <= PLANNER_HISTORY_S:
+                        completed.append(safe)
+        return {"version": 1, "pending": pending, "completed": completed}
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def parse_planner_recovery(data, now):
+    """Read producer evidence only; attempt counters and cleared pending cannot prove success."""
+    if not isinstance(data, dict):
+        return None
+    pending, completed = [], []
+    try:
+        for project, record in data.items():
+            if project.startswith("~"):
+                continue
+            planner_id(project)
+            if not isinstance(record, dict):
+                raise ValueError("invalid project")
+            run = record.get("planner")
+            if run is not None and not isinstance(run, dict):
+                raise ValueError("invalid run")
+            recovery = run.get("recovery") if run else None
+            if recovery is not None:
+                if not isinstance(recovery, dict):
+                    raise ValueError("invalid recovery")
+                wait = recovery.get("pending")
+                if wait is not None:
+                    if not isinstance(wait, dict):
+                        raise ValueError("invalid pending")
+                    owner = run.get("ownerAsked", False)
+                    claim = recovery.get("claim")
+                    if not isinstance(owner, bool) or (claim is not None and not isinstance(claim, dict)):
+                        raise ValueError("invalid recovery state")
+                    if claim is not None:
+                        planner_id(claim.get("requestId"))
+                        planner_time(claim.get("at"))
+                    row = {"projectId": project, "runId": run.get("id"), "resumeAt": wait.get("resumeAt"),
+                           "state": "held" if owner else "claimed" if claim is not None else "scheduled"}
+                    # Only a stopped-root identity, not an older stored predecessor of failed creation.
+                    failed = recovery.get("handledAgentId") or run.get("agentId")
+                    if failed is not None and wait.get("identity") == failed:
+                        row["failedAgentId"] = failed
+                    pending.append(row)
+            entries = record.get("plannerLimitRestarts", [])
+            if not isinstance(entries, list):
+                raise ValueError("invalid completions")
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("invalid completion")
+                completed.append({**entry, "projectId": project})
+        return parse_planner_snapshot({"version": 1, "pending": pending, "completed": completed}, now)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def planner_items(sources, now):
+    items = []
+    for host, data in sorted((sources or {}).items()):
+        if data is None:
+            continue
+        for name in ("pending", "completed"):
+            for row in data[name]:
+                base = {"unit": "planner_recovery" + (f"@{host}" if host else ""), "section": "agents",
+                        "group": "planners", "attention": False, "ticket": None,
+                        "title": f"project {row['projectId']} run {row['runId'][:8]}" + (f" on {host}" if host else "")}
+                identity = f"{host}:{row['projectId']}:{row['runId']}"
+                if name == "completed":
+                    detail = f"usage-limit restart confirmed (at {resume_time(parse_iso(row['confirmedAt']), now)})"
+                    key = f"planner-confirmed:{identity}:{row['requestId']}"
+                else:
+                    key = f"planner-pending:{identity}"
+                    detail = ("usage-limit recovery held for owner" if row["state"] == "held" else
+                              "usage-limit restart in progress" if row["state"] == "claimed" else
+                              f"usage-limit restart scheduled (at {resume_time(parse_iso(row['resumeAt']), now)}; subject to automatic dispatch and the project trigger)")
+                items.append({**base, "key": key, "detail": detail})
+    return items
+
+
 
 # ---------------------------------------------------------------------------- agents (pure)
 
@@ -266,7 +390,7 @@ def agent_title(agent):
     return f"agent {agent['id'][:7]} \"{(agent.get('name') or '')[:60]}\""
 
 
-def agent_items(agents, metas, *, now, error_lines, permissions, open_reviews, teams, ticket_states, limit_resumes):
+def agent_items(agents, metas, *, now, error_lines, permissions, open_reviews, teams, ticket_states, limit_resumes, planner_recovery=None):
     """Items for the agents section. `ticket_states` is None when Linear could not be read:
     then silent agents cannot be judged (their unit fails, previous items are kept).
     Closed agents are parked, not gone (paseo-archive-done.py closes long-idle ones; the next
@@ -289,6 +413,9 @@ def agent_items(agents, metas, *, now, error_lines, permissions, open_reviews, t
         if agent.get("status") == "error":
             detail = f"in error: {agent_error_category(error_lines.get(agent['id']))}"
             resume = (limit_resumes or {}).get("pending", {}).get(agent["id"])
+            for row in ((planner_recovery or {}).get(agent.get("_host", "")) or {}).get("pending", []):
+                if row.get("failedAgentId") == agent["id"] and row["state"] == "scheduled":
+                    resume = parse_iso(row["resumeAt"])
             if resume is not None:
                 detail += f" (resumes at {resume_time(resume, now)})"
             items.append({**base, "key": f"agent-error:{agent['id']}", "unit": f"agents{at_host}", "section": "agents",
@@ -602,6 +729,8 @@ def unit_failed(unit, failed_units):
         return unit in failed_units  # each project store is independent, including the local one
     if "repo" in failed_units and unit.split("@")[0] not in HOST_UNITS + ("linear_budget",):
         return True
+    if unit.split("@")[0] == "planner_recovery":
+        return unit in failed_units
     return any(unit == f or unit.startswith(f + "/") or unit.startswith(f + "@") for f in failed_units)
 
 
@@ -661,7 +790,7 @@ def line(payload, *, new=False, stale_since=None, agent_note=None):
 
 
 AGENT_GROUPS = [("error", "In error"), ("waiting", "Waiting on you"), ("silent", "Ticket agents silent > 2 h"),
-                ("locks", "Tickets marked running without an agent")]
+                ("locks", "Tickets marked running without an agent"), ("planners", "Project planners (usage-limit recovery)")]
 SECTION_TITLES = [("queue", "Merge queue"), ("pulls", "Pull requests open > 5 h"),
                   ("deploys", "Deploys (staging, production)"), ("agents", "Agents")]
 
@@ -945,6 +1074,15 @@ def item_evidence(key, payload, at, host, evidence):
     cancelled or claimed one earns nothing). None: unknown (another host's item, an unreadable
     record file, a kind without a record). Only these two flags leave the records."""
     waiting = True if payload.get("group") == "waiting" else None
+    sources = evidence.get("plannerRecovery") or {}
+    planner = sources.get("" if at == host else at)
+    if payload.get("group") == "planners":
+        return (True if payload.get("detail") == "usage-limit recovery held for owner" else False,
+                key.startswith("planner-confirmed:"))
+    if key.startswith("agent-error:") and planner is not None:
+        matched = AGENT_KEY.match(key)
+        if matched and any(row.get("failedAgentId") == matched.group(1) for row in planner["completed"]):
+            return waiting, True
     pull, agent = PULL_KEY.match(key), AGENT_KEY.match(key)
     if (at is not None and at != host) or not (pull or agent):
         return waiting, None
@@ -1114,6 +1252,12 @@ class HostIO:
         self._remotes = None if remotes else []
         self._targets = None if remotes else []
         self._unreachable = {}
+        self._local_planner_loaded = False
+        self._local_planner = None
+        self._planner_sources = None
+        self._projects_loaded = False
+        self._projects_data = None
+        self._projects_problem = None
 
     def remote_targets(self):
         """The SSH targets of the other hosts in REMOTES (read once per run)."""
@@ -1136,12 +1280,17 @@ class HostIO:
                     out = run_cmd(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", target,
                                    "bash -lc 'python3 .paseo/bin/paseo-ops-digest.py --agents-json'"])
                     snapshot = json.loads(out.strip().splitlines()[-1])
-                    snapshot["_host"] = target
+                    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("agents"), list):
+                        raise ValueError("invalid agent snapshot")
                     for agent in snapshot["agents"]:
+                        if not isinstance(agent, dict):
+                            raise ValueError("invalid snapshot agent")
                         agent["_host"] = target
                 except Exception as exc:
                     self._unreachable[target] = error_category(exc)
                     continue
+                snapshot["_host"] = target
+                # Planner data shares the successfully delivered host snapshot, not agent identity.
                 self._remotes.append(snapshot)
         return self._remotes
 
@@ -1169,15 +1318,33 @@ class HostIO:
             local = None
         return merge_limit_resumes(local, self.remotes())
 
+    def project_records(self):
+        """One file observation shared by owner alerts and usage-limit reporting."""
+        if not self._projects_loaded:
+            self._projects_loaded = True
+            try:
+                with open(PROJECTS) as f:
+                    self._projects_data = json.load(f)
+            except FileNotFoundError:
+                self._projects_data = {}
+            except (OSError, ValueError) as exc:
+                self._projects_problem = error_category(exc)
+        return self._projects_data
+
     def project_planners(self):
         """This host's durable planner failures, independent of agents and Linear notices.
         Missing local state means no projects; unreadable state means UNKNOWN."""
+        # Standalone owner-status reads remain fresh. Once recovery is normalized, both
+        # consumers use that run's frozen observation (HostIO is created per digest run).
+        if not self._local_planner_loaded:
+            self._projects_loaded = False
+            self._projects_data = None
+            self._projects_problem = None
         try:
-            with open(PROJECTS) as f:
-                failures = project_planner_failures(json.load(f))
-            return {"ok": True, "failures": failures}
-        except FileNotFoundError:
-            return {"ok": True, "failures": []}
+            records = self.project_records()
+            if self._projects_problem:
+                return {"ok": False, "category": self._projects_problem}
+            return {"ok": True, "failures": project_planner_failures(records)}
         except (OSError, ValueError, TypeError) as exc:
             return {"ok": False, "category": error_category(exc)}
 
@@ -1204,6 +1371,7 @@ class HostIO:
                 data = None
             found[name] = data if isinstance(data, dict) else None
         found["limitResumes"] = self.limit_resumes()
+        found["plannerRecovery"] = self.planner_recovery(time.time())
         return found
 
     def linear_usage(self):
@@ -1211,6 +1379,21 @@ class HostIO:
         UsageUnreadable) when the file is missing or malformed: `collect` reports the unit
         `linear_budget` as not read and the run goes on with that unit's previous items."""
         return load_linear_usage(LINEAR_USAGE)
+
+    def local_planner_recovery(self, now):
+        if not self._local_planner_loaded:
+            self._local_planner_loaded = True
+            self._local_planner = parse_planner_recovery(self.project_records(), now)
+        return self._local_planner
+
+    def planner_recovery(self, now):
+        if self._planner_sources is None:
+            snapshots = {snapshot["_host"]: snapshot for snapshot in self.remotes()}
+            self._planner_sources = {"": self.local_planner_recovery(now)}
+            for target in self.remote_targets():
+                self._planner_sources[target] = parse_planner_snapshot(snapshots.get(target, {}).get("plannerRecovery"), now)
+        return self._planner_sources
+
 
     def snapshot(self):
         """Independent planner evidence survives failed agent/permission RPCs on this host."""
@@ -1230,6 +1413,7 @@ class HostIO:
         resumes = self.limit_resumes()
         if resumes is not None:
             snapshot["limitResumes"] = {"pending": resumes["pending"], "started": sorted(resumes["started"])}
+        snapshot["plannerRecovery"] = self.local_planner_recovery(time.time()) if snapshot["agentSource"]["ok"] else None
         return snapshot
 
     def key(self):
@@ -1631,6 +1815,14 @@ def collect(io, now, started):
                         or isinstance(reported, str) and re.fullmatch(r"(?:HTTP|exit) \d+", reported)):
                     category = reported
             units.append({"unit": unit, "ok": False, "category": category})
+    try:
+        planners = io.planner_recovery(now)
+    except Exception:
+        planners = {"": None, **{target: None for target in io.remote_targets()}}
+    for host, data in planners.items():
+        units.append({"unit": "planner_recovery" + (f"@{host}" if host else ""), "ok": data is not None,
+                      **({"category": "planner data not read"} if data is None else {})})
+    items += planner_items(planners, now)
     agents, metas = [], {}
     try:
         agents, metas = io.agents()
@@ -1662,7 +1854,7 @@ def collect(io, now, started):
             units.append({"unit": "silent", "ok": False, "category": error_category(exc)})
         items += agent_items(agents, metas, now=now, error_lines=error_lines, permissions=permissions,
                              open_reviews=reviews, teams=teams or {"TUC"}, ticket_states=states,
-                             limit_resumes=io.limit_resumes())
+                             limit_resumes=io.limit_resumes(), planner_recovery=planners)
         silent = units[-1]
         down = io.unreachable_hosts()
         for host, category in sorted(down.items()):

@@ -330,7 +330,7 @@ export class Launcher {
       modeId: SAFE_MODES[providerKey] ?? preference.modeId,
       thinkingOptionId: preference.thinkingOptionId,
       prompt: () => prompt,
-      labels: { "linear.plannerRun": input.runId, "linear.projectId": input.linearProjectId },
+      labels: { "linear.plannerRun": input.runId, "linear.projectId": input.linearProjectId, "linear.plannerRequest": input.requestId },
       // The ticket env is a flag for the plugin's omp extension (its plan gate, record_plan_advice
       // and ticket tools); no Linear ticket is behind it.
       env: { [PLAN_POLICY_ENV]: "required", [PLAN_TICKET_ENV]: `project-planner:${input.runId}` },
