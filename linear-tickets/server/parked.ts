@@ -39,6 +39,9 @@ export function parkedPaths(home?: string) {
     alive: join(directory, "plugin.alive"),
     ports: join(directory, "ports.json"),
     events: plannotator.events,
+    // The decision journal (decision-journal.ts `decisionsDirectory()`: the same directory under
+    // the same home). The host checks it so a plan whose decision is not settled is not served.
+    decisions: join(directory, "decisions"),
     open: plannotator.launcher,
   };
 }
@@ -213,6 +216,7 @@ export class PlannotatorHost {
           ...process.env,
           LINEAR_TICKETS_PARKED: this.paths.parked,
           LINEAR_TICKETS_PLANNOTATOR_EVENTS: this.paths.events,
+          LINEAR_TICKETS_DECISIONS: this.paths.decisions,
           LINEAR_TICKETS_PLANNOTATOR_OPEN: this.paths.open,
           LINEAR_TICKETS_PLANNOTATOR_PACKAGE: found.plannotator,
           LINEAR_TICKETS_PLANNOTATOR_HOST_STATE: this.paths.state,

@@ -18,8 +18,13 @@
 // each issue's review comes back on the port it had (LINEAR_TICKETS_PLANNOTATOR_PORTS), so a page
 // left open reaches the new server, which asks it to reload instead of taking a decision meant for
 // the old one; Plannotator's unsent annotations are kept per plan text and come back with the page.
-// A plan whose decision is recorded but not yet handed on (an undelivered `decided` event) is not
-// served again.
+// A plan whose decision is not settled yet is not served again: the host reads the decision journal
+// (decision-journal.ts) on every sweep, so a `deciding`, `uncertain` or `pending` attempt, an open
+// `unbound` report or an unresolved `conflict` from the plan's current review holds it back until
+// the entry turns `void` (or is resolved) — then it serves the plan again without a host restart;
+// an undelivered `decided` event (the plugin has not handed it to Linear yet) holds it back just as
+// long. Its `decided` event names the review generation it was taken on (`review.localUrl` and
+// `review.servedAt`, captured before the hook opens the review) for the plugin to bind to.
 export const PLANNOTATOR_HOST_SOURCE = String.raw`import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
@@ -28,6 +33,7 @@ import { join } from "node:path";
 
 const PARKED = process.env.LINEAR_TICKETS_PARKED;
 const EVENTS = process.env.LINEAR_TICKETS_PLANNOTATOR_EVENTS;
+const DECISIONS = process.env.LINEAR_TICKETS_DECISIONS;
 const OPEN = process.env.LINEAR_TICKETS_PLANNOTATOR_OPEN;
 const PACKAGE = process.env.LINEAR_TICKETS_PLANNOTATOR_PACKAGE;
 const STATE = process.env.LINEAR_TICKETS_PLANNOTATOR_HOST_STATE;
@@ -95,6 +101,40 @@ function pendingDecisions() {
   return [...decisions.values()].filter(Boolean);
 }
 
+// The decision journal (decision-journal.ts), read fresh on every sweep: one JSON object per file,
+// and entries change by being renamed over their file, so nothing may be cached. Dot-files are
+// half-written temporaries and a file that does not parse is kept and reported by the plugin; both
+// are skipped here.
+function journalEntries() {
+  if (!DECISIONS) return [];
+  let names = [];
+  try { names = readdirSync(DECISIONS).filter((name) => name.endsWith(".json") && !name.startsWith(".")); } catch {}
+  const entries = [];
+  for (const name of names) {
+    try { entries.push(JSON.parse(readFileSync(join(DECISIONS, name), "utf8"))); } catch {}
+  }
+  return entries;
+}
+
+// Whether the agent's decision is in the journal and not settled: a decision being made or carried
+// out, an open unbound report, or an unresolved conflict. Only entries of the plan's current review
+// count (opened at or after the plan was parked); older ones belong to an earlier review. Such a
+// plan is not served — but nothing is remembered about it, so once the entry turns void (or is
+// resolved) the next sweep serves the plan again, without a host restart.
+function decisionInProgress(entries, plan) {
+  const parkedAt = String(plan.parkedAt ?? "");
+  return entries.some((entry) => {
+    if (!entry || entry.agentId !== plan.agentId) return false;
+    if (entry.kind === "attempt") {
+      const open = entry.state === "deciding" || entry.state === "uncertain" || entry.state === "pending";
+      return open && String(entry.reviewOpenedAt ?? "") >= parkedAt;
+    }
+    if (entry.kind === "unbound") return entry.state === "open" && String(entry.at ?? "") >= parkedAt;
+    if (entry.kind === "conflict") return !entry.resolution && String(entry.reviewOpenedAt ?? "") >= parkedAt;
+    return false;
+  });
+}
+
 // Issue -> port, kept while the issue is parked. New issues take the next free port of the range
 // in turn, so a port freed by a decided plan is not handed straight to the next one.
 function readPorts() {
@@ -158,10 +198,14 @@ async function serve(key, plan) {
     }
   }
   served.set(key, server);
+  // The review generation's clock: taken after the server started and before the hook below runs,
+  // so the hook's opened event time is at or after it. The plugin binds this decision to the
+  // generation of exactly this address and servedAt (DecisionJournal.reviewServedSince).
+  const servedAt = new Date().toISOString();
   server.onDecision((decision) => {
     if (decided.has(key)) return;
     decided.add(key);
-    record({ type: "decided", parked: true, agentId: plan.agentId, approved: decision.approved === true, ...(typeof decision.feedback === "string" && decision.feedback.trim() ? { feedback: decision.feedback } : {}), planContent: plan.plan, at: new Date().toISOString() });
+    record({ type: "decided", parked: true, agentId: plan.agentId, approved: decision.approved === true, ...(typeof decision.feedback === "string" && decision.feedback.trim() ? { feedback: decision.feedback } : {}), planContent: plan.plan, review: { localUrl: server.url, servedAt }, at: new Date().toISOString() });
     setTimeout(() => { server.stop(); served.delete(key); }, 5000);
   });
   spawn(OPEN, [server.url], { env: { ...process.env, PASEO_AGENT_ID: plan.agentId }, stdio: "ignore" }).on("error", (error) => console.error("opening " + plan.identifier + " failed: " + error.message));
@@ -193,6 +237,7 @@ async function sweep() {
   heartbeat();
   const plans = parkedPlans();
   const pending = pendingDecisions();
+  const journal = journalEntries();
   for (const [key, server] of served) if (!plans.has(key)) { server.stop(); served.delete(key); }
   for (const key of decided) if (!plans.has(key)) decided.delete(key);
   const issues = new Set([...plans.values()].map((plan) => plan.issueId));
@@ -202,7 +247,11 @@ async function sweep() {
   }
   for (const [key, plan] of plans) {
     if (served.has(key) || decided.has(key)) continue;
-    if (pending.some((decision) => decision.agentId === plan.agentId && decision.at >= String(plan.parkedAt ?? ""))) { decided.add(key); continue; }
+    // Neither a decision waiting in the event queue nor one in the journal is remembered as
+    // decided: each is re-checked every sweep, so once it is handed on (or turned void) the plan
+    // is served again. Only this host's own onDecision is sticky.
+    if (pending.some((decision) => decision.agentId === plan.agentId && decision.at >= String(plan.parkedAt ?? ""))) continue;
+    if (decisionInProgress(journal, plan)) continue;
     try { await serve(key, plan); } catch (error) { console.error("serving " + plan.identifier + " failed: " + (error instanceof Error ? error.message : error)); }
   }
 }
