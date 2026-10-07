@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -35,7 +35,8 @@ chmodSync(cli, 0o755);
 // A ticket agent running these tests carries its own LINEAR_TICKETS_* (its policy, and the host's
 // real linear_ticket server in LINEAR_TICKETS_MCP); none of it belongs in the extension under test.
 for (const name of Object.keys(process.env)) if (name.startsWith("LINEAR_TICKETS_")) delete process.env[name];
-Object.assign(process.env, { PASEO_AGENT_ID: "planner-1", PASEO_HOME: root, PASEO_CLI: cli, LINEAR_TICKETS_ISSUE: "ENG-1", LINEAR_TICKETS_CONTEXT: join(root, "ticket.md") });
+// PI_CODING_AGENT_DIR: the owner's own Plannotator template must not decide these tests' layout.
+Object.assign(process.env, { PASEO_AGENT_ID: "planner-1", PASEO_HOME: root, PASEO_CLI: cli, LINEAR_TICKETS_ISSUE: "ENG-1", LINEAR_TICKETS_CONTEXT: join(root, "ticket.md"), PI_CODING_AGENT_DIR: root });
 const { default: extension, submittedPlan } = await import("../omp/linear-tickets-plan-first");
 
 type Result = { content: { text: string }[] };
@@ -198,6 +199,33 @@ test("the record needs readable Reach and Principles sections: one line each at 
   const order = `# Work order\n\n## Work order\n\n\`\`\`project-order\nTUC-1 blocks TUC-2\n\`\`\`\n\n## Reach\n\nOnly this project's tickets in Linear; each ticket's own plan answers where else it applies.\n\n## Principles and rules\n\nNone apply; no new rule.\n\n${RISK.replace("- Impact: 1 — read-only", "- Impact: 0 — Linear only").replace("impact 1, reversibility revert", "impact 0, reversibility revert")}## Advisor review\n\nGPT-6 Astra, 1 round, agreed.\n`;
   writeFileSync(join(h.cwd, "PLAN.md"), order);
   assert.match(await record(), /recorded/);
+});
+
+test("with a template that names its parts, the record needs them in order, with the sections the gate reads after the last one; a work order is exempt", async () => {
+  const h = load();
+  const record = () => h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" });
+  const config = join(root, "plannotator.json");
+  writeFileSync(config, JSON.stringify({ phases: { planning: { instructions: "Use `# Part 1 — Overview` and `# Part 2 — Implementation` as the part headings, and `##` for the sections." } } }));
+  try {
+    writeFileSync(join(h.cwd, "PLAN.md"), PLAN);
+    const refused = await record();
+    assert.match(refused, /no "# Part 1 — Overview" and no "# Part 2 — Implementation" heading/);
+    assert.ok(refused.includes(config), "the refusal names the template to follow");
+    writeFileSync(join(h.cwd, "PLAN.md"), `# Plan\n\n# Part 2 — Implementation\n\nSteps.\n\n# Part 1 — Overview\n\n${SECTIONS}${RISK}## Advisor review\n\nGPT-6 Astra, 2 rounds, agreed.\n`);
+    assert.match(await record(), /parts are out of order/);
+    writeFileSync(join(h.cwd, "PLAN.md"), `# Plan\n\n# Part 1 — Overview\n\n${SECTIONS}# Part 2 — Implementation\n\n${RISK}## Advisor review\n\nGPT-6 Astra, 2 rounds, agreed.\n`);
+    assert.match(await record(), /"## Reach", "## Principles and rules", "## Model" must come after "# Part 2 — Implementation"/);
+    assert.equal((await h.submit("PLAN.md"))?.block, true, "no refused record opens the gate");
+    writeFileSync(join(h.cwd, "PLAN.md"), `# Plan\n\n# Part 1 - Overview\n\n## Summary\n\nDo the thing.\n\n# Part 2 — Implementation\n\n${SECTIONS}${RISK}## Advisor review\n\nGPT-6 Astra, 2 rounds, agreed.\n`);
+    assert.match(await record(), /recorded/, "any dash in a part heading counts");
+    assert.equal(await h.submit("PLAN.md"), undefined);
+
+    const order = `# Work order\n\n## Work order\n\n\`\`\`project-order\nTUC-1 blocks TUC-2\n\`\`\`\n\n## Reach\n\nOnly this project's tickets.\n\n## Principles and rules\n\nNone apply; no new rule.\n\n${RISK.replace("- Impact: 1 — read-only", "- Impact: 0 — Linear only").replace("impact 1, reversibility revert", "impact 0, reversibility revert")}## Advisor review\n\nGPT-6 Astra, 1 round, agreed.\n`;
+    writeFileSync(join(h.cwd, "PLAN.md"), order);
+    assert.match(await record(), /recorded/, "a planner run's work order has its own format");
+  } finally {
+    rmSync(config, { force: true });
+  }
 });
 
 test("the record needs a readable model tier, and a plan rated above impact 2 or not reversible by a revert cannot pick the cheap or standard one", async () => {

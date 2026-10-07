@@ -768,6 +768,19 @@ readable section (or with `agreed`/`disagreements` but no advisor rating, or a `
 disagrees with `## Principles and rules`) and tells the plugin which verdict was recorded for which
 plan text.
 
+It also refuses a ticket plan that does not follow the owner's plan layout
+([`shared/plan-layout.ts`](shared/plan-layout.ts)). The layout is read at every record from
+Plannotator's global config (`$PI_CODING_AGENT_DIR/plannotator.json`, by default
+`~/.pi/agent/plannotator.json`, `phases.planning.instructions`): every part heading the
+instructions name in backticks (e.g. `` `# Part 1 — Overview` ``, `` `# Part 2 — Implementation` ``)
+must be a `#` heading of the plan, in that order (any dash counts), and `## Reach`,
+`## Principles and rules`, `## Model`, `## Risk and impact` and `## Advisor review` come after the
+last one. Instructions that name no parts (Plannotator's built-in ones) or a missing or unreadable
+file ask for nothing; a planner run's work order is exempt. The check does not rely on the agent
+having received the instructions: on 2026-10-07 omp dropped them for some sessions (a hook
+returning `systemPrompt` made it re-run the start hooks after Plannotator had marked them
+delivered), and their plans reached the owner in the wrong layout for hours.
+
 When the review opens, the plugin approves it on your behalf only if all of these hold:
 
 - impact at or below `maxImpact` (default 1), or `maxImpactWithFlag` (default 2) behind a feature flag;
