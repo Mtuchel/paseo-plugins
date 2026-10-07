@@ -250,7 +250,7 @@ function routerHarness(options: {
     stop: async (agentId: string) => { calls.push(`stop ${agentId}`); options.onStop?.(agentId); },
     ...(options.sleep ? { sleep: options.sleep } : {}),
     ...(options.now ? { now: options.now } : {}),
-    ...(options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector), processInspector: options.processInspector } : {}),
+    ...(options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[], _inspect?: ProcessInspector, mode?: { subagents?: boolean }) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector, mode), processInspector: options.processInspector } : {}),
   });
   // Connected without attach(): the startup sweep would run alongside the test.
   Object.assign(router, { paseo: daemon.paseo });
@@ -1323,4 +1323,22 @@ test("whileIdle holds the ticket's start gate while its work runs, and frees it 
     await assert.rejects(h.router.whileIdle(ISSUE.id, async () => { throw new Error("the script failed"); }), /the script failed/);
     assertGateFree(h.gates);
   } finally { await h.cleanup(); }
+});
+
+test("whileIdle does not run while a closed or archived subagent's worker of the ticket still lives", async () => {
+  for (const change of [{}, { archivedAt: "now" }]) {
+    const subagent = ompRoot("agent-sub", { ...change, labels: { "linear.issueId": ISSUE.id, "linear.identifier": ISSUE.identifier, "paseo.parent-agent-id": "agent-1" } });
+    const live = routerHarness({ agents: [ticketAgent("agent-1", "2026-02-01T00:00:01Z"), subagent], processInspector: processInspection(`2100185 omp --mode rpc-ui --session ${NATIVE_HANDLE}\n`) });
+    const gone = routerHarness({ agents: [ticketAgent("agent-1", "2026-02-01T00:00:01Z"), subagent], processInspector: processInspection("2100185 omp --mode rpc-ui --session /home/mirko/.omp/agent/sessions/other.jsonl\n") });
+    try {
+      let ran = 0;
+      assert.equal((await live.router.whileIdle(ISSUE.id, async () => { ran++; })).outcome, "busy", JSON.stringify(change));
+      assert.equal((await gone.router.whileIdle(ISSUE.id, async () => { ran++; })).outcome, "ran", JSON.stringify(change));
+      assert.equal(ran, 1);
+      assertGateFree(live.gates);
+    } finally {
+      await live.cleanup();
+      await gone.cleanup();
+    }
+  }
 });

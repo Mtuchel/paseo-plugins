@@ -188,7 +188,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     runs: [] as string[],
     now: Date.now(),
     checkouts: [] as { repo: string; sources: string[] }[],
-    retarget: { present: false, list: [] as unknown[], prepare: [] as { code: number; answer: Record<string, unknown> }[], apply: [] as { code: number; answer: Record<string, unknown> }[], records: [] as unknown[], beforeApply: async () => {} },
+    retarget: { present: false, list: [] as unknown[], prepare: [] as { code: number; answer: Record<string, unknown> }[], apply: [] as { code: number; answer: Record<string, unknown> }[], records: [] as unknown[], beforePrepare: async () => {}, beforeApply: async () => {} },
   };
   // `failure`: what linking a URL on the ticket throws; `arrive`: runs before a ticket comment
   // reaches Linear (a hanging one is a crash before it went out), `stall` after it did (a crash
@@ -350,6 +350,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
           if (args[0] === "--prepare") {
             calls.push(`retarget ${args.slice(0, 4).join(" ")}`);
             const found = next(retarget.prepare);
+            await retarget.beforePrepare();
             return answer(found.code, found.answer);
           }
           assert.equal(args[0], "--apply");
@@ -2793,8 +2794,8 @@ test("the backstop moves at most three stacks per run, and nothing without the s
 
   const unknown = stranded(t);
   unknown.scripts.retarget.list = [{ ...CANDIDATE, tickets: ["TUC-7"] }];
-  unknown.linear.state = { ...unknown.linear.state };
-  assert.deepEqual(retargetCalls(await unknown.backstop()), [], "a ticket this host cannot resolve: nothing");
+  unknown.linear.state = { ...unknown.linear.state, id: "i7" } as typeof unknown.linear.state;
+  assert.deepEqual(retargetCalls([...await unknown.backstop(), ...await unknown.backstop()]), [], "a ticket Linear knows but this host has no record of: nothing");
 });
 
 test("while an agent of the ticket works, the stack is left alone and the agent asked once; once none works, it is moved (AC-5, AC-13)", async (t) => {
@@ -2876,6 +2877,35 @@ test("escalated, gated, blocked or otherwise messaged stacks are not moved, and 
   assert.ok(told.includes(STRANDED) && told.includes("Its pull requests name several tickets (TUC-1, TUC-2)"), told);
   await shared.backstop();
   assert.ok(!(await shared.poll()).some((call) => call.includes(STRANDED)), "asked once");
+});
+
+test("a ticket named on the stack after it was first listed counts before the move, and a block that appears while it is prepared holds the write (AC-11)", async (t) => {
+  const renamed = stranded(t);
+  renamed.paseo.idle = async () => "busy";
+  assert.deepEqual(retargetCalls(await renamed.backstop()), ["idle i1 busy"]);
+  renamed.paseo.idle = async () => "ran";
+  renamed.scripts.retarget.list = [{ ...CANDIDATE, tickets: ["TUC-1", "TUC-2"] }];
+  assert.deepEqual(retargetCalls(await renamed.backstop()), [], "same heads, now several tickets: no move");
+
+  const gated = stranded(t);
+  gated.scripts.retarget.beforePrepare = async () => { gated.blockers.push("TUC-1"); };
+  assert.deepEqual(retargetCalls(await gated.backstop()), ["idle i1 ran", PREPARE_RUN], "a manual task opened during the preparation: no write");
+  gated.scripts.retarget.beforePrepare = async () => {};
+  assert.deepEqual(retargetCalls(await gated.backstop()), [], "still open: no write");
+  gated.blockers.length = 0;
+  assert.deepEqual(retargetCalls(await gated.backstop()), ["idle i1 ran", APPLY_RUN], "the saved preparation is written once the task is done");
+  assert.equal(gated.github.comments[419]?.length, 1);
+});
+
+test("a stack still stranded at the same heads keeps its conflict past the backstop's memory, so it is neither asked nor prepared again (AC-4)", async (t) => {
+  const h = stranded(t);
+  h.scripts.retarget.prepare = [{ code: 2, answer: { result: "conflict", pr: 419, problems: [{ kind: "conflict", text: "s2's commits do not apply onto main" }] } }];
+  await h.backstop();
+  assert.ok((promptOf(await h.poll()) ?? "").includes(STRANDED));
+  h.scripts.now += 15 * 24 * HOUR;
+  const later = [...await h.backstop(), ...await h.poll(), ...await h.backstop()];
+  assert.deepEqual(retargetCalls(later), [], "not prepared again");
+  assert.ok(!later.some((call) => call.includes(STRANDED)), "not asked again");
 });
 
 test("a restart at any point of a move ends with it moved, one pull request comment, one ticket comment and one note (AC-7)", async (t) => {

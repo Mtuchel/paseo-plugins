@@ -1745,19 +1745,26 @@ export class PullRequestWatch {
         console.error(`[linear-tickets] queue backstop: moving the stack of ${pullUrl(repo, move.pr)} onto main stopped: ${error instanceof Error ? error.message : error}`);
       }
     };
-    for (const [url, seen] of Object.entries(seenByUrl)) {
-      const move = seen.retarget;
-      if (PULL_URL.exec(url)?.[1] !== repo || !move) continue;
+    const saved = Object.entries(seenByUrl).filter(([url, seen]) => PULL_URL.exec(url)?.[1] === repo && seen.retarget);
+    for (const [, seen] of saved) {
+      const move = seen.retarget!;
       await each(move, async () => {
         if (move.step === "prepared" || move.step === "applying") await this.resumeRetarget(move, checkout, seenByUrl, context, gated, budget, save);
         if (move.step === "done") await this.reportRetarget(move, context, save);
       });
-      if (settled(move) && context.now - Date.parse(move.since) >= BACKSTOP_MEMORY_MS) {
+    }
+    const candidates = parseRetargetList(await this.run(checkout, RETARGET_ORPHAN, ["--list"], repo));
+    // A move is forgotten only once its stack is no longer listed at the same heads: a stack still
+    // stranded keeps its conflict, unclear or asked state, so it is never asked or written again.
+    const listed = new Set(candidates.map((candidate) => `${candidate.pr}:${candidate.expect}:${candidate.baseSha}`));
+    for (const [, seen] of saved) {
+      const move = seen.retarget;
+      if (move && settled(move) && !listed.has(`${move.pr}:${move.old}:${move.baseSha}`) && context.now - Date.parse(move.since) >= BACKSTOP_MEMORY_MS) {
         delete seen.retarget;
         await save();
       }
     }
-    for (const candidate of parseRetargetList(await this.run(checkout, RETARGET_ORPHAN, ["--list"], repo))) {
+    for (const candidate of candidates) {
       if (!candidate.eligible) continue;
       const holder = entry(seenByUrl, pullUrl(repo, candidate.pr));
       const known = holder.retarget;
@@ -1766,6 +1773,12 @@ export class PullRequestWatch {
           repo, pr: candidate.pr, base: candidate.base, baseSha: candidate.baseSha, range: candidate.range, old: candidate.expect, tickets: candidate.tickets,
           since: new Date(context.now).toISOString(), step: "due", prComment: "none", linearComment: "none", note: "none",
         };
+        await save();
+      } else if (known.step === "due" && known.old === candidate.expect && known.baseSha === candidate.baseSha
+        && JSON.stringify([known.base, known.range, known.tickets]) !== JSON.stringify([candidate.base, candidate.range, candidate.tickets])) {
+        // Same heads, but a title, branch or base changed: a move not yet prepared takes the
+        // listing as it is now, so its tickets (and their agents) are the stack's current ones.
+        Object.assign(known, { base: candidate.base, range: candidate.range, tickets: candidate.tickets });
         await save();
       }
       const move = holder.retarget!;
@@ -1777,7 +1790,8 @@ export class PullRequestWatch {
     }
   }
 
-  // A listed stack: moved when no agent of its ticket works, else its agent is asked once.
+  // A listed stack: moved when no agent of its ticket works, else its agent is asked once. Only a
+  // host with the ticket's handover record moves it (the record names the ticket's agents here).
   private async startRetarget(move: RetargetRecord, checkout: string, seenByUrl: Record<string, Seen>, context: RunContext, open: OpenPull[], gated: Set<string>, budget: { left: number }, save: () => Promise<void>): Promise<void> {
     if (this.retargetBlocked(move, seenByUrl, context.records, gated)) return;
     if (move.tickets.length !== 1) {
@@ -1789,10 +1803,10 @@ export class PullRequestWatch {
       }
       return;
     }
-    if (!budget.left) return;
-    const issueId = (await this.issueIds(move.tickets, context.records))[0]?.issueId;
-    if (!issueId) return;
-    const run = await this.deps.sessions.whileIdle(issueId, async () => {
+    const record = recordFor(move.tickets, context.records);
+    if (!budget.left || !record) return;
+    const run = await this.deps.sessions.whileIdle(record.issueId, async () => {
+      if (await this.retargetHeld(move, seenByUrl, context)) return;
       budget.left--;
       move.stamp = Math.floor(context.now / 1000);
       await save();
@@ -1801,6 +1815,8 @@ export class PullRequestWatch {
         move.prepared = outcome.prepared!;
         move.step = "prepared";
         await save();
+        // A block that appeared while it was prepared holds the write; the move stays prepared.
+        if (await this.retargetHeld(move, seenByUrl, context)) return;
         await this.applyRetarget(move, checkout, seenByUrl, context, save);
       } else if (outcome.result === "conflict") {
         move.step = "conflict";
@@ -1817,13 +1833,21 @@ export class PullRequestWatch {
   // A prepared or applying move after a restart (or an apply that failed): `--apply` again with
   // its saved record, under the same conditions as the first time. Held back, it keeps its record.
   private async resumeRetarget(move: RetargetRecord, checkout: string, seenByUrl: Record<string, Seen>, context: RunContext, gated: Set<string>, budget: { left: number }, save: () => Promise<void>): Promise<void> {
-    if (!move.prepared || !budget.left || move.tickets.length !== 1 || this.retargetBlocked(move, seenByUrl, context.records, gated)) return;
-    const issueId = (await this.issueIds(move.tickets, context.records))[0]?.issueId;
-    if (!issueId) return;
-    await this.deps.sessions.whileIdle(issueId, async () => {
+    const record = recordFor(move.tickets, context.records);
+    if (!move.prepared || !budget.left || move.tickets.length !== 1 || !record || this.retargetBlocked(move, seenByUrl, context.records, gated)) return;
+    await this.deps.sessions.whileIdle(record.issueId, async () => {
+      if (await this.retargetHeld(move, seenByUrl, context)) return;
       budget.left--;
       await this.applyRetarget(move, checkout, seenByUrl, context, save);
     });
+  }
+
+  // retargetBlocked with the before-merge manual tasks read again, inside the ticket's turn right
+  // before a remote step: a task opened since the run began holds the move too.
+  private async retargetHeld(move: RetargetRecord, seenByUrl: Record<string, Seen>, context: RunContext): Promise<boolean> {
+    const why = this.retargetBlocked(move, seenByUrl, context.records, await this.gatedTickets(context.records, move.tickets));
+    if (why) console.log(`[linear-tickets] queue backstop: the move of ${pullUrl(move.repo, move.pr)} waits: ${why}`);
+    return why !== null;
   }
 
   // `--apply` with the saved record, `applying` saved first: moved (the comments and the note are

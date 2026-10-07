@@ -1285,16 +1285,21 @@ the shared login's own, none `do-not-merge`), `--prepare <pr> --expect <heads> -
 computes the new heads without writing (a conflict with `main` is reported, nothing else), and
 `--apply <pr> --record <file>` pushes every branch at once with explicit leases and points the
 bottom pull request at `main`, or finishes or refuses by exact SHAs when it ran before. The
-plugin moves a stack only when it names exactly one ticket and nothing holds it back (escalated,
-blocked at its head, a message about it pending that is not its own, open before-merge manual
-tasks), at most three per run, and only while no agent of the ticket works and this host owns
-the ticket (`SessionRouter.whileIdle`: every agent of the ticket idle, closed or gone, no OMP
-worker process left, the activation claims read without forwarding anything: a draining host
-owns only the roots it still runs, a receiving host with a peer only after the claims handshake
-and while the peer claims none). The move is saved on the bottom pull request in `pr-watch.json`
-before each step: the preparation (old and new heads, `onto`, stamp) before anything is written,
-`applying` right before `--apply`, which a restart runs again with the saved record, never a new
-listing. Moved: a comment on the bottom pull request (marked
+plugin moves a stack only when it names exactly one ticket, this host has that ticket's handover
+record, and nothing holds it back (escalated, blocked at its head, a message about it pending
+that is not its own, open before-merge manual tasks, read again in the ticket's turn right before
+the preparation and before the write: a task opened meanwhile keeps a prepared move waiting), at
+most three per run, and only while no agent of the ticket works and this host owns the ticket
+(`SessionRouter.whileIdle`: every agent of the ticket idle, closed or gone, no OMP worker process
+left, a closed or archived subagent's included, the activation claims read without forwarding
+anything: a draining host owns only the roots it still runs, a receiving host with a peer only
+after the claims handshake and while the peer claims none). A move not yet prepared takes each
+listing's tickets, branches and bases as they are now. The move is saved on the bottom pull
+request in `pr-watch.json` before each step: the preparation (old and new heads, `onto`, stamp)
+before anything is written, `applying` right before `--apply`, which a restart runs again with
+the saved record, never a new listing. A finished, conflicting or refused move is forgotten only
+once its stack is no longer listed at the same heads, so a stack still stranded is never asked
+about or written again. Moved: a comment on the bottom pull request (marked
 `<!-- queue-backstop:retarget:<pr>@<old bottom head> -->`) and on the ticket with old and new
 base and every head plus the agent's local sync commands, each claimed before it goes out and
 found by its marker after a restart (at least once, never twice while the marker reads), then the

@@ -611,9 +611,10 @@ export function retargetId(move: Pick<RetargetRecord, "pr" | "range">): string {
   return `retarget:${move.pr}@${move.range[0].sha}`;
 }
 
-// The key of the instruction to move a stack by hand (see route in pr-watch.ts).
-export function retargetKey(move: Pick<RetargetRecord, "pr" | "baseSha">): string {
-  return `retarget:${move.pr}:${move.baseSha}`;
+// The key of the instruction to move a stack by hand (see route in pr-watch.ts), qualified by its
+// repository: two repositories can share a pull request number and a helper base commit.
+export function retargetKey(move: Pick<RetargetRecord, "repo" | "pr" | "baseSha">): string {
+  return `retarget:${move.repo}#${move.pr}:${move.baseSha}`;
 }
 
 // The comment on the pull request and the ticket after a move: old and new base and every head.

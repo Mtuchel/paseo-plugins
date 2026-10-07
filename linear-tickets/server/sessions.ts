@@ -1346,9 +1346,9 @@ export class SessionRouter {
 
   // Called only with the Launcher gate held; successor/recovery paths also hold the ticket's turn.
   // Unobservable is a pending wait, not exit; no dispatch claim, send, reload or launch precedes it.
-  private async processWait(issueId: string, extra: ProcessAgent[] = []): Promise<string | null> {
+  private async processWait(issueId: string, extra: ProcessAgent[] = [], options: { subagents?: boolean } = {}): Promise<string | null> {
     try {
-      const state = await (this.deps.processLiveness ?? ticketProcessLiveness)(this.paseo!, issueId, extra);
+      const state = await (this.deps.processLiveness ?? ticketProcessLiveness)(this.paseo!, issueId, extra, undefined, options);
       if (state === "absent") return null;
       return state === "alive" ? "an OMP worker for this ticket is still alive" : "the OMP workers for this ticket could not be inspected";
     } catch {
@@ -1358,9 +1358,10 @@ export class SessionRouter {
 
   // Runs `work` only while no agent of the ticket works, in the ticket's turn with its start gate
   // held: every agent of the ticket (successors and subagents too) is read, and `work` runs when
-  // each is idle, closed, crashed or gone and no OMP worker process of the ticket lives (or is
-  // unobservable). Otherwise it does not run: `busy` (an agent is in a turn, a launch is under way,
-  // or a worker process lives), `waiting` (an agent waits for the owner's answer), `elsewhere`
+  // each is idle, closed, crashed or gone and no OMP worker process of the ticket lives (a closed
+  // or archived subagent's included) or is unobservable. Otherwise it does not run: `busy` (an
+  // agent is in a turn, a launch is under way, or a worker process lives), `waiting` (an agent
+  // waits for the owner's answer), `elsewhere`
   // (the peer host owns the ticket's work), `unavailable` (Paseo is not connected, the ticket is
   // being deleted, or its agents or owner cannot be read). It reads only: nothing is forwarded or
   // started. A turn the owner starts directly does not take the gate, so it is not serialized.
@@ -1388,7 +1389,7 @@ export class SessionRouter {
           return unreadable(error);
         }
         if (agents.some((agent) => agent.pendingPermissions?.length)) return { outcome: "waiting" };
-        if (agents.some(busy) || await this.processWait(issueId, agents)) return { outcome: "busy" };
+        if (agents.some(busy) || await this.processWait(issueId, agents, { subagents: true })) return { outcome: "busy" };
         return { outcome: "ran", value: await work() };
       } finally {
         gate.release();
