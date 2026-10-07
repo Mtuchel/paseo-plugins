@@ -7,21 +7,24 @@ import { RateLimitedError, withPriority } from "./rate-budget";
 import { isUntrusted } from "./starter";
 import { paseoHome } from "./ticket-mcp";
 
-// Rounds of Linear failures before the owner is told to file the rest by hand, and their spacing.
-export const MAX_ATTEMPTS = 5;
+// Spacing between the sweep's retries of a record whose last round failed.
 export const RETRY_MS = 10 * 60_000;
 // How often the sweep looks for records with a retry due.
 const SCAN_MS = 60_000;
 
-type Linear = Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "createIssueAsApp" | "relateAsApp" | "comment">;
+type Linear = Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "createIssueAsApp" | "relateAsApp" | "comment" | "issueById" | "commentById">;
 type Item = {
   title: string;
+  // The Linear id reserved before the create, saved first: a retry looks it up and only creates
+  // when Linear has none (a create whose answer was lost must not file a second ticket).
+  reservedId?: string;
   id?: string;
   identifier?: string;
   url?: string;
   related: boolean;
-  // Why the item is no longer worked on: the Paseo app could not be used, Linear kept failing, or
-  // the ticket is untrusted. A new approval clears it and tries again.
+  // Why the item is no longer worked on: the Paseo app could not be used, the ticket is not
+  // trusted, or (records written before the step stopped giving up) Linear kept failing. A new
+  // approval clears it and tries again.
   stopped?: "no-app" | "gave-up" | "untrusted";
 };
 export type FollowUpRecord = {
@@ -34,7 +37,11 @@ export type FollowUpRecord = {
   items: Record<string, Item>;
   // sha256 of the last comment posted about them.
   notice: string | null;
-  // Failed rounds since the last approval; the sweep retries at `retryAt` (epoch ms).
+  // A comment reserved before it was posted: its id and the sha256 of the body it carries, so a
+  // retry looks it up instead of posting a second one.
+  noticeId?: string;
+  noticePending?: string;
+  // Rounds that failed since the last approval; the sweep retries at `retryAt` (epoch ms).
   attempts: number;
   retryAt: number | null;
 };
@@ -45,7 +52,12 @@ export type FollowUpRecord = {
 // origin lists them. A ticket not written by the owner or Paseo, or labelled feedback, gets the
 // list only. One private record per origin under $PASEO_HOME/linear-tickets/plan-follow-ups,
 // written after every Linear write, so a repeated approval files nothing twice and only retries
-// what failed. Work for one origin runs one call at a time (the plugin is one process).
+// what failed. Work for one origin runs one call at a time (the plugin is one process). `file()`
+// runs one round and rejects until every follow-up of the latest approved plan is filed and
+// related (or stopped for `no-app`/`untrusted`, which an approval cannot fix) and the notice about
+// them is posted; the decision worker calls it again on its own retry schedule. The ids of tickets
+// and of the notice are reserved before their creates, so an answer lost on the way back is
+// recovered by lookup instead of writing twice.
 export class PlanFollowUps {
   private readonly chains = new Map<string, Promise<void>>();
   private lastScan = Number.NEGATIVE_INFINITY;
@@ -57,7 +69,10 @@ export class PlanFollowUps {
     private readonly now: () => number = Date.now,
   ) {}
 
-  // Never rejects: filing is not part of the approval, which is never repeated because of it.
+  // One round of filing. Rejects — a rate limit as the same RateLimitedError — while anything is
+  // left: an item of the latest approved plan that is neither filed and related nor stopped for
+  // `no-app`/`untrusted`, or a notice that is still owed. Resolves only when the record is
+  // complete; the decision worker calls it again until then.
   file(origin: { issueId: string; identifier: string; plan: string; documentUrl: string | null }): Promise<void> {
     const titles = planFollowUps(origin.plan);
     if (!titles.length) return Promise.resolve();
@@ -78,7 +93,9 @@ export class PlanFollowUps {
     });
   }
 
-  // Called from the Plannotator bridge's sweep: retries records whose retry is due.
+  // Called from the Plannotator bridge's sweep: retries records with a retry due, including ones
+  // written before `file()` started rejecting. Never rejects itself: a failed round is logged and
+  // left for the next sweep.
   async retryPending(): Promise<void> {
     if (this.scanning || this.now() - this.lastScan < SCAN_MS) return;
     this.scanning = true;
@@ -92,6 +109,8 @@ export class PlanFollowUps {
         await this.serial(found.issueId, async () => {
           const record = await this.load(found.issueId);
           if (due(record)) await this.process(record);
+        }).catch((error: unknown) => {
+          console.error(`[linear-tickets] retrying the plan follow-ups of ${found.issueId} failed: ${error instanceof Error ? error.message : error}`);
         });
       }
     } finally {
@@ -99,28 +118,32 @@ export class PlanFollowUps {
     }
   }
 
+  // Work for one origin runs one call at a time. The caller gets its own outcome (file() rejects
+  // while incomplete); the chain keeps a settled entry so the next call waits for it and runs
+  // whatever that one did.
   private serial(issueId: string, work: () => Promise<void>): Promise<void> {
-    const run = (this.chains.get(issueId) ?? Promise.resolve()).then(work).catch((error: unknown) => {
-      console.error(`[linear-tickets] filing the plan follow-ups of ${issueId} failed: ${error instanceof Error ? error.message : error}`);
-    });
-    this.chains.set(issueId, run);
-    void run.then(() => { if (this.chains.get(issueId) === run) this.chains.delete(issueId); });
+    const run = (this.chains.get(issueId) ?? Promise.resolve()).then(work);
+    const chain = run.catch(() => {});
+    this.chains.set(issueId, chain);
+    void chain.then(() => { if (this.chains.get(issueId) === chain) this.chains.delete(issueId); });
     return run;
   }
 
-  // One round: create what is not created, link what is not linked, then tell the owner.
+  // One round: create what is not created, link what is not linked, then tell the owner. A rate
+  // limit propagates as such — it spends no round, and the record keeps its resume time for the
+  // sweep too.
   private process(record: FollowUpRecord): Promise<void> {
     return withPriority("owner", "plan follow-ups", async () => {
       const attempts = record.attempts;
-      const active = record.titles.flatMap((key) => record.items[key] && !record.items[key].stopped ? [record.items[key]] : []);
       try {
         await this.processRound(record);
       } catch (error) {
-        if (!(error instanceof RateLimitedError)) throw error;
-        record.attempts = attempts;
-        for (const item of active) if (item.stopped === "gave-up") delete item.stopped;
-        record.retryAt = error.resumeAt;
-        await this.save(record);
+        if (error instanceof RateLimitedError) {
+          record.attempts = attempts;
+          record.retryAt = error.resumeAt;
+          await this.save(record);
+        }
+        throw error;
       }
     });
   }
@@ -139,7 +162,23 @@ export class PlanFollowUps {
           if (untrusted) { item.stopped = "untrusted"; continue; }
           if (!state.teamId) throw new Error("the ticket has no team");
           try {
+            // A reserved id means an earlier round may have created the ticket: only a confirmed
+            // absence creates, and a lookup that failed never creates (the create error is never
+            // taken as "it already exists").
+            if (item.reservedId) {
+              const found = await this.linear.issueById(item.reservedId);
+              if (found) {
+                Object.assign(item, { id: found.id, identifier: found.identifier, url: found.url, related: false });
+                await this.save(record);
+                link.push(item);
+                continue;
+              }
+            } else {
+              item.reservedId = randomUUID();
+              await this.save(record);
+            }
             const created = await this.linear.createIssueAsApp({
+              id: item.reservedId,
               teamId: state.teamId,
               projectId: state.projectId,
               ready: true,
@@ -176,30 +215,51 @@ export class PlanFollowUps {
       }
     }
     record.retryAt = null;
-    if (failed) this.failedRound(record, items);
+    if (failed) this.failedRound(record);
     await this.save(record);
     await this.announce(record, items);
+    if (!this.settled(record, items)) throw new Error(`The plan follow-ups of ${record.identifier} are not filed yet.`);
   }
 
-  private failedRound(record: FollowUpRecord, items: Item[]): void {
+  // The step is complete only when every item of the latest approved plan is filed and related, or
+  // stopped for a reason a new approval cannot fix, and the notice about them is posted.
+  private settled(record: FollowUpRecord, items: Item[]): boolean {
+    const terminal = (item: Item) => Boolean(item.id && item.related) || item.stopped === "no-app" || item.stopped === "untrusted";
+    if (!items.length || !items.every(terminal)) return false;
+    const body = noticeText(record, items);
+    return body !== null && createHash("sha256").update(body).digest("hex") === record.notice;
+  }
+
+  private failedRound(record: FollowUpRecord): void {
     record.attempts += 1;
-    if (record.attempts < MAX_ATTEMPTS) { record.retryAt = this.now() + RETRY_MS; return; }
-    for (const item of items) if (!item.related && !item.stopped) item.stopped = "gave-up";
+    record.retryAt = this.now() + RETRY_MS;
   }
 
-  // One comment per distinct outcome; none while a creation still waits for its retry.
+  // One comment per distinct outcome; none while a creation still waits for its retry. The id is
+  // reserved (and saved) before the post, and a pending notice is looked up by it, so a lost
+  // answer or a crash between the post and the save never posts it twice.
   private async announce(record: FollowUpRecord, items: Item[]): Promise<void> {
     const body = noticeText(record, items);
     if (!body) return;
     const hash = createHash("sha256").update(body).digest("hex");
     if (hash === record.notice) return;
     try {
-      await this.linear.comment(record.issueId, body);
+      const reserved = record.noticePending === hash ? record.noticeId : undefined;
+      const id = reserved ?? randomUUID();
+      const posted = reserved ? (await this.linear.commentById(reserved)) !== null : false;
+      if (!reserved) {
+        record.noticeId = id;
+        record.noticePending = hash;
+        await this.save(record);
+      }
+      if (!posted) await this.linear.comment(record.issueId, body, id);
       record.notice = hash;
+      delete record.noticeId;
+      delete record.noticePending;
     } catch (error) {
       if (error instanceof RateLimitedError) throw error;
       console.error(`[linear-tickets] ${record.identifier}: the follow-up comment failed: ${error instanceof Error ? error.message : error}`);
-      if (record.retryAt === null) this.failedRound(record, []);
+      if (record.retryAt === null) this.failedRound(record);
     }
     await this.save(record);
   }
@@ -241,7 +301,6 @@ export function noticeText(record: Pick<FollowUpRecord, "documentUrl">, items: I
     ["Created, but Paseo could not link them to this ticket; link them by hand:", items.filter((item) => item.id && !item.related && item.stopped)],
     [`📌 Follow-ups in the approved plan${plan}, not filed because this ticket was not written by you or Paseo:`, items.filter((item) => !item.id && item.stopped === "untrusted")],
     ["Not filed: Paseo could not write to Linear as itself; file them by hand or approve again later:", items.filter((item) => !item.id && item.stopped === "no-app")],
-    [`Not filed: Linear failed ${MAX_ATTEMPTS} times; file them by hand or approve again later:`, items.filter((item) => !item.id && item.stopped === "gave-up")],
   ];
   return groups.filter(([, list]) => list.length).map(([head, list]) => `${head}\n${list.map((item) => `- ${item.id ? `${item.url ? `[${item.identifier}](${item.url})` : item.identifier} ` : ""}${item.title}`).join("\n")}`).join("\n\n");
 }

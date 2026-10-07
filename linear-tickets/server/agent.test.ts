@@ -76,6 +76,25 @@ test("a refused request (403) is not a reason to refresh the app token", async (
   assert.deepEqual(posted, ["Bearer t"]);
 });
 
+test("a reserved activity id is sent with the create, and an activity lookup tells 'no such activity' apart from a failure", async () => {
+  const sent: { query: string; variables: Record<string, unknown> }[] = [];
+  const notFound = new LinearApiError("The Linear API request failed: Entity not found: AgentActivity", 400, ["INPUT_ERROR"], ["Entity not found: AgentActivity"]);
+  let lookup: Error | null = null;
+  const api = new AgentApi({ accessToken: async () => "t" }, async (_key, query, variables) => {
+    sent.push({ query, variables });
+    if (query.includes("agentActivityById")) { if (lookup) throw lookup; return { agentActivity: { id: String(variables.id) } }; }
+    return { agentActivityCreate: { success: true } };
+  });
+  await api.activity("session-1", { type: "thought", body: "hi" }, { id: "11111111-1111-4111-8111-111111111111" });
+  const create = sent[0].variables.input;
+  assert.ok(create && typeof create === "object" && "id" in create && create.id === "11111111-1111-4111-8111-111111111111", "the reserved id is carried into the create input");
+  assert.deepEqual(await api.activityById("a1"), { id: "a1" });
+  lookup = notFound;
+  assert.equal(await api.activityById("gone"), null);
+  lookup = new Error("Could not reach the Linear API. Check the host's network connection and try again.");
+  await assert.rejects(api.activityById("gone"), /Could not reach the Linear API/);
+});
+
 test("only this app's sessions are open here: another host's app never has its threads adopted", async () => {
   const node = (id: string, app: string | null) => ({ id, status: "pending", createdAt: "2026-01-01T00:00:00Z", appUser: app ? { id: app } : null, creator: { id: OWNER }, issue: { id: `i-${id}`, identifier: `TUC-${id}` } });
   const answer = (viewer: string | null) => async () => ({ viewer: viewer ? { id: viewer } : null, agentSessions: { nodes: [node("1", "server-app"), node("2", "mac-app"), node("3", null), node("4", "server-app")] } });
@@ -189,7 +208,7 @@ type Call = string;
 type RouterLinear = Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
 // `reload`: the daemon's agent reload (null: the plugin has no daemon connection); `send`: runs
 // before each send is recorded.
-function harness(options: { now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; splitPlan?: (link: SessionLink, url: string, paseo: PaseoApi) => Promise<string>; approveLater?: (link: SessionLink, url: string, paseo: PaseoApi) => Promise<string> } = {}) {
+function harness(options: { now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null> } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -260,8 +279,7 @@ function harness(options: { now?: () => number; pending?: AgentPermissionRequest
     needsYou: options.needsYou,
     budget: options.budget,
     now: options.now,
-    splitPlan: options.splitPlan,
-    approveLater: options.approveLater,
+    decidePlan: options.decidePlan,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     decideReview: options.decideReview ?? (async (url, approve, feedback) => { calls.push(`review ${url} ${approve ? "approve" : `deny:${feedback}`}`); }),
     ...("reload" in options ? { reloader: async () => options.reload ? async (agentId: string) => { calls.push(`reload ${agentId}`); await options.reload!(agentId); } : null } : {}),
@@ -986,7 +1004,7 @@ test("Linear-panel approve, split and approve-later protect their owner check, c
       await admission.linear.comment("i1", `Owner decision: ${command}`);
       return `Handled ${command}`;
     };
-    const h = harness({ ...admission, groups: {}, decideReview: async () => { await decide(); }, splitPlan: decide, approveLater: decide });
+    const h = harness({ ...admission, groups: {}, decideReview: async () => { await decide(); }, decidePlan: decide });
     try {
       await h.store.put(link({ review: { localUrl: "http://localhost:5000/" } }));
       await withPriority("background", "panel ingress test", () => h.router.prompted("s1", { id: `activity-${command}`, userId: OWNER, content: { body: command } }));
@@ -997,9 +1015,8 @@ test("Linear-panel approve, split and approve-later protect their owner check, c
       assert.ok(admission.sent.some((call) => call.operation === "issueUpdateState"), command);
       assert.ok(admission.sent.some((call) => call.operation === "comment"), command);
       assert.equal(admission.sent.at(-1)?.operation, "agentActivity", `${command}: the acknowledgement also gets owner priority`);
-      assert.equal((await h.store.get("s1"))?.review, null);
-      if (command === "approve-later") assert.equal((await h.store.get("s1"))?.offer, "later");
-      if (command === "split-plan") assert.deepEqual((await h.store.get("s1"))?.group, { delegated: false });
+      // Approve-later and split leave the session to the journaled workflow (plannotator.ts).
+      if (command === "approve-plan" || command === "send-back") assert.equal((await h.store.get("s1"))?.review, null);
     } finally { await h.cleanup(); }
   }
 });

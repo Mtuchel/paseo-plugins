@@ -7,11 +7,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
+import { DecisionJournal, FencedError, type ResolveAction, type RouteSnapshot } from "./decision-journal";
+import type { PipelineReview } from "./plan-pipeline";
 import type { OpenedEvent } from "./plannotator";
-import { ReviewLinks, type ReviewLinksOptions } from "./review-links";
+import { ReviewLinks, type DecideReview, type ReviewLinksOptions } from "./review-links";
 import { planDetails } from "./review-page";
 
 const ORIGIN = "https://host.tail1.ts.net:8444";
+// What the bridge knows locally about the agent: the journal entry carries it, never the review.
+const SNAPSHOT: RouteSnapshot = { route: "live", issueId: null, identifier: "TUC-1", sessionId: null };
 
 function opened(port: number): OpenedEvent {
   return { type: "opened", agentId: "agent-1", localUrl: `http://localhost:${port}/?r=1`, remoteUrl: `https://host.tail1.ts.net:${port}/?r=1`, at: "t" };
@@ -54,6 +58,41 @@ async function withLinks(run: (links: ReviewLinks, get: (path: string, method?: 
 }
 
 const PAGE = `<!doctype html>${"<p>A plan review page.</p>".repeat(40_000)}`;
+
+// A decision journal on its own temp directory, held for the duration of one test.
+async function withJournal(run: (journal: DecisionJournal) => Promise<void>): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-review-decisions-"));
+  const journal = new DecisionJournal(join(directory, "decisions"));
+  try {
+    assert.equal(await journal.acquire(), true);
+    await run(journal);
+  } finally {
+    await journal.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+type ProducerCall = { localUrl: string; approve: boolean; feedback: string; agentId: string; review: { reviewId?: string; source: "inbox" } };
+
+// The inbox's lists: everything before "Being applied", its list, and the recent decisions. A
+// section is absent from the page while its list is empty, so its part reads "".
+function sections(page: string): { waiting: string; applying: string; recent: string } {
+  const [waiting, afterWaiting = ""] = page.split("Being applied");
+  const [applying, recent = ""] = afterWaiting.split("Recently decided");
+  return { waiting, applying, recent };
+}
+
+// The producer side of an inbox decision, as plannotator.ts runs it: journal it on the review
+// generation the click names, then record Plannotator's answer (`unknown` loses it).
+function producer(journal: DecisionJournal, answer: "accepted" | "unknown", calls: ProducerCall[]): DecideReview {
+  return async (localUrl, approve, feedback, agentId, review) => {
+    calls.push({ localUrl, approve, feedback, agentId, review });
+    const generation = review.reviewId ? journal.review(review.reviewId) : null;
+    if (!generation) throw new Error(`no review generation ${review.reviewId ?? ""}`);
+    const attempt = await journal.begin({ review: generation, agentId, planContent: "# TUC-1 — Plan\n", approved: approve, ...(feedback ? { feedback } : {}), source: review.source, state: "deciding", snapshot: SNAPSHOT });
+    await journal.settle(attempt.id, answer);
+  };
+}
 
 // A stand-in Plannotator server: its big page, an event stream that stays open, a binary file,
 // and WebSockets that echo.
@@ -419,7 +458,7 @@ async function withPeer(inbox: unknown, run: (origin: string, decisions: string[
     incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
     incoming.on("end", () => {
       if (incoming.url === "/api/inbox") { response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(inbox)); return; }
-      if (incoming.method === "POST" && incoming.url?.endsWith("/decision")) {
+      if (incoming.method === "POST" && (incoming.url?.endsWith("/decision") || incoming.url?.endsWith("/resolve"))) {
         decisions.push(`${incoming.url} ${incoming.headers["x-review-action"]} ${Buffer.concat(chunks).toString()}`);
         response.writeHead(409, { "content-type": "application/json" }).end(JSON.stringify({ error: "This review is already closed." }));
         return;
@@ -472,7 +511,7 @@ test("approve and send back from the inbox decide this host's review, forward a 
   await withPeer(PEER_INBOX, async (peer, forwarded) => {
     await withLinks(async (links, get, live) => {
       live.add(50_001).add(50_002);
-      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" });
+      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1", reviewId: "review-1" });
       await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, { identifier: "TUC-2" });
       await get("/");
 
@@ -483,18 +522,25 @@ test("approve and send back from the inbox decide this host's review, forward a 
 
       assert.equal((await action(links, "/api/reviews/agent-1/decision", { approve: true, feedback: "ignored" })).status, 200);
       assert.equal((await action(links, "/api/reviews/agent-2/decision", { approve: false, feedback: " Split step 2 " })).status, 200);
-      assert.deepEqual(decided, ["http://localhost:50001/?r=1 true  agent-1", "http://localhost:50002/?r=1 false Split step 2 agent-2"]);
+      assert.deepEqual(decided, [
+        'http://localhost:50001/?r=1 true  agent-1 {"reviewId":"review-1","source":"inbox"}',
+        'http://localhost:50002/?r=1 false Split step 2 agent-2 {"source":"inbox"}',
+      ], "the review generation and the inbox as the source are journaled with the decision");
+      // Only after the worker reports what the journal applied does the inbox list them decided.
+      await links.decided("agent-1", true, { localUrl: "http://localhost:50001/?r=1", at: "2026-01-01T10:00:05.000Z" });
+      await links.decided("agent-2", false, { localUrl: "http://localhost:50002/?r=1", at: "2026-01-01T10:00:06.000Z" });
       const again = await action(links, "/api/reviews/agent-1/decision", { approve: true });
-      assert.equal(again.status, 409, "a decided review is not decided twice");
+      assert.equal(again.status, 409, "a review carried out is not decided twice");
       const [waiting, recent] = (await (await get("/")).text()).split("Recently decided");
       assert.doesNotMatch(waiting, /data-agent="agent-[12]"/);
+      assert.match(recent, /TUC-1<\/span><span class="outcome[^"]*">approved/);
       assert.match(recent, /TUC-2<\/span><span class="outcome[^"]*">sent back/);
 
       const remote = await action(links, "/api/reviews/agent-9/decision", { approve: true });
       assert.deepEqual([remote.status, await remote.json()], [409, { error: "This review is already closed." }], "the peer's answer is passed on");
       assert.deepEqual(forwarded, ['/api/reviews/agent-9/decision 1 {"approve":true,"feedback":""}']);
       assert.equal((await action(links, "/api/reviews/agent-unknown/decision", { approve: true })).status, 404);
-    }, undefined, { peers: async () => [peer], decide: async (localUrl, approve, feedback, agentId) => { decided.push(`${localUrl} ${approve} ${feedback} ${agentId}`); } });
+    }, undefined, { peers: async () => [peer], decide: async (localUrl, approve, feedback, agentId, review) => { decided.push(`${localUrl} ${approve} ${feedback} ${agentId} ${JSON.stringify(review)}`); } });
   });
 });
 
@@ -695,14 +741,16 @@ test("approving from the inbox decides a tied replacement republished on its old
     await links.opened("agent-1", opened(50_002), { identifier: "TUC-1-mid" });
     await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" });
     assert.equal((await action(links, "/api/reviews/agent-1/decision", { approve: true })).status, 200);
-    assert.deepEqual(decided, [`${reviewLocal(50_001)} true  agent-1`], "the review republished on the old URL is the one decided");
+    assert.deepEqual(decided, [`${reviewLocal(50_001)} true  agent-1 {"source":"inbox"}`], "the review republished on the old URL is the one decided");
+    // The worker reports the applied decision for that same review, not the agent's latest other one.
+    await links.decided("agent-1", true, { localUrl: reviewLocal(50_001), at: "2026-01-01T10:00:05.000Z" });
     const [waiting, recent] = (await (await get("/")).text()).split("Recently decided");
     assert.doesNotMatch(waiting, /data-agent="agent-1"/);
     assert.match(recent, /TUC-1<\/span><span class="outcome[^"]*">approved/);
     assert.equal((await action(links, "/api/reviews/agent-1/decision", { approve: true })).status, 409, "an approved review is not decided twice");
   }, undefined, {
     now: frozen(),
-    decide: async (localUrl, approve, feedback, agentId) => { decided.push(`${localUrl} ${approve} ${feedback} ${agentId}`); },
+    decide: async (localUrl, approve, feedback, agentId, review) => { decided.push(`${localUrl} ${approve} ${feedback} ${agentId} ${JSON.stringify(review)}`); },
   });
 });
 
@@ -713,19 +761,21 @@ test("sending back and rechecking decide a tied replacement published at a new U
     await links.opened("agent-1", opened(50_001), { identifier: "TUC-1-old" });
     await links.opened("agent-1", opened(50_002), { identifier: "TUC-1" });
     assert.equal((await action(links, "/api/reviews/agent-1/decision", { approve: false, feedback: " Split step 2 " })).status, 200);
-    assert.deepEqual(decided, [`${reviewLocal(50_002)} false Split step 2 agent-1`], "the replacement is the one sent back");
+    assert.deepEqual(decided, [`${reviewLocal(50_002)} false Split step 2 agent-1 {"source":"inbox"}`], "the replacement is the one sent back");
+    await links.decided("agent-1", false, { localUrl: reviewLocal(50_002), at: "2026-01-01T10:00:05.000Z" });
     await links.opened("agent-2", { ...opened(50_003), agentId: "agent-2" }, { identifier: "TUC-2-old" });
     await links.opened("agent-2", { ...opened(50_004), agentId: "agent-2" }, { identifier: "TUC-2" });
     assert.equal((await action(links, "/api/reviews/agent-2/recheck", {})).status, 200);
     assert.match(decided[1], /^http:\/\/localhost:50004\/\?r=1 false Recheck this plan against the current code/, "recheck sends the replacement back first");
     assert.equal(await links.requiresOwner("issue-2"), true, "the replacement is the review marked for recheck");
+    await links.decided("agent-2", false, { localUrl: reviewLocal(50_004), at: "2026-01-01T10:00:06.000Z" });
     assert.equal((await action(links, "/api/reviews/agent-2/recheck", {})).status, 409, "a review already sent back is not rechecked twice");
     const [, recent] = (await (await get("/")).text()).split("Recently decided");
     assert.match(recent, /TUC-1<\/span><span class="outcome[^"]*">sent back/);
     assert.match(recent, /TUC-2<\/span><span class="outcome[^"]*">sent back/);
   }, undefined, {
     now: frozen(),
-    decide: async (localUrl, approve, feedback, agentId) => { decided.push(`${localUrl} ${approve} ${feedback} ${agentId}`); },
+    decide: async (localUrl, approve, feedback, agentId, review) => { decided.push(`${localUrl} ${approve} ${feedback} ${agentId} ${JSON.stringify(review)}`); },
     issueLink: async () => ({ issueId: "issue-2", identifier: "TUC-2" }),
   });
 });
@@ -753,5 +803,202 @@ test("a tied replacement keeps the announced push key and resolves the stable li
   }, undefined, {
     now: frozen(),
     sendPush: async (subscription, message) => { sent.push(`${subscription.endpoint} ${message.title} ${message.url} ${message.count}`); },
+  });
+});
+
+test("an inbox approval journals the decision on its review generation, lists it as being applied, and refuses a second one", async () => {
+  await withJournal(async (journal) => {
+    const calls: ProducerCall[] = [];
+    const generation = await journal.ensureReview({ agentId: "agent-1", localUrl: reviewLocal(50_001), openedAt: "2026-01-01T10:00:00.000Z" });
+    await withLinks(async (links, get, live) => {
+      live.add(50_001);
+      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1", reviewId: generation.id });
+      assert.equal((await action(links, "/api/reviews/agent-1/decision", { approve: true })).status, 200);
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0].review, { reviewId: generation.id, source: "inbox" }, "the click journals against the review's own generation");
+      const { waiting, applying, recent } = sections(await (await get("/")).text());
+      assert.doesNotMatch(waiting, /data-agent="agent-1"/, "a decision being applied is not waiting");
+      assert.match(applying, /data-agent="agent-1"/);
+      assert.match(applying, /approved — being applied/);
+      assert.doesNotMatch(recent, /TUC-1/, "listed decided only once the journal applied it");
+      const again = await action(links, "/api/reviews/agent-1/decision", { approve: false, feedback: "no" });
+      assert.deepEqual([again.status, (await again.json()).error], [409, "Already decided; it is being applied."]);
+    }, undefined, { decide: producer(journal, "accepted", calls), decisions: { applying: () => journal.applying(), resolve: async () => {} } });
+  });
+});
+
+test("an inbox decision the restarting plugin fences is answered 503", async () => {
+  await withLinks(async (links, get, live) => {
+    live.add(50_001);
+    await links.opened("agent-1", opened(50_001), { identifier: "TUC-1" });
+    const response = await action(links, "/api/reviews/agent-1/decision", { approve: true });
+    assert.deepEqual([response.status, (await response.json()).error], [503, "The plugin is restarting; try again in a few seconds."]);
+  }, undefined, { decide: async () => { throw new FencedError(); } });
+});
+
+test("a decision being applied shows its last failure and next try, an unconfirmed one is not confirmed, and neither waits or is decided", async () => {
+  await withJournal(async (journal) => {
+    const first = await journal.ensureReview({ agentId: "agent-1", localUrl: reviewLocal(50_001), openedAt: "2026-01-01T10:00:00.000Z" });
+    const second = await journal.ensureReview({ agentId: "agent-2", localUrl: reviewLocal(50_002), openedAt: "2026-01-01T10:00:00.000Z" });
+    const pending = await journal.begin({ review: first, agentId: "agent-1", planContent: "# TUC-1\n", approved: true, source: "inbox", state: "pending", snapshot: SNAPSHOT });
+    await journal.failed(pending, new Error("Linear is down"));
+    const lost = await journal.begin({ review: second, agentId: "agent-2", planContent: "# TUC-2\n", approved: false, source: "inbox", state: "deciding", snapshot: SNAPSHOT });
+    await journal.settle(lost.id, "unknown");
+    await journal.awaitOwner(lost.id, true, "Plannotator did not confirm this decision: carry it out or drop it.");
+    await withLinks(async (links, get, live) => {
+      live.add(50_001).add(50_002);
+      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1", reviewId: first.id });
+      await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, { identifier: "TUC-2", reviewId: second.id });
+      const { waiting, applying, recent } = sections(await (await get("/")).text());
+      assert.doesNotMatch(waiting, /data-agent="agent-[12]"/);
+      assert.doesNotMatch(recent, /TUC-[12]/);
+      assert.match(applying, /TUC-1[\s\S]*?approved — being applied/);
+      assert.match(applying, /Last try failed: Linear is down · next try \d{2}:\d{2}/);
+      assert.match(applying, /TUC-2[\s\S]*?sent back — not confirmed by Plannotator/);
+      assert.match(applying, /data-action="carry-out">Carry it out</);
+      assert.match(applying, /data-action="drop">Drop it</);
+      // The worker reports the applied decision: recently decided, and no longer being applied.
+      await journal.applied(pending);
+      await links.decided("agent-1", true, { localUrl: reviewLocal(50_001), at: "2026-01-01T10:00:05.000Z" });
+      const after = await (await get("/")).text();
+      const { waiting: waitingAfter, applying: applyingAfter, recent: recentAfter } = sections(after);
+      assert.doesNotMatch(waitingAfter, /data-agent="agent-1"/);
+      assert.doesNotMatch(applyingAfter, /TUC-1/);
+      assert.match(recentAfter, /TUC-1<\/span><span class="outcome[^"]*">approved/);
+      assert.match(applyingAfter, /TUC-2/, "the unconfirmed decision still waits for the owner");
+    }, undefined, { decisions: { applying: () => journal.applying(), resolve: async () => {} } });
+  });
+});
+
+const PEER_APPLYING = {
+  host: "server087",
+  open: [],
+  decided: [],
+  applying: [
+    { agentId: "agent-9", name: "TUC-9", link: "https://server087.tail1.ts.net:8444/review/agent-9", since: "2026-01-01T10:00:30.000Z", applyState: "pending", entryId: "entry-9", approved: true, applyError: "Linear is down", nextAttemptAt: "2026-01-01T10:01:00.000Z" },
+  ],
+};
+
+test("a peer's being-applied rows render with their host, and a peer answer without any parses", async () => {
+  await withPeer(PEER_APPLYING, async (peer) => {
+    await withLinks(async (links, get) => {
+      const page = await (await get("/")).text();
+      const [waiting, rest] = page.split("Being applied");
+      const [applying] = rest.split("Recently decided");
+      assert.match(waiting, /Nothing to review/, "the peer's applied review is not waiting");
+      assert.match(applying, /data-agent="agent-9"/);
+      assert.match(applying, /approved — being applied/);
+      assert.match(applying, /Last try failed: Linear is down/);
+      assert.match(applying, /<span>server087<\/span>/);
+    }, undefined, { peers: async () => [peer] });
+  });
+  await withPeer(PEER_INBOX, async (peer) => {
+    await withLinks(async (links, get) => {
+      const answer = await (await get("/api/inbox")).json() as { applying: unknown };
+      assert.deepEqual(answer.applying, [], "this host is applying nothing itself");
+      const page = await (await get("/")).text();
+      assert.match(page, /TUC-9/, "a peer answer without applying parses as before");
+      assert.doesNotMatch(page, /Being applied/);
+    }, undefined, { peers: async () => [peer] });
+  });
+});
+
+test("a closed review's page says its decision is being applied until the journal carried it out", async () => {
+  await withJournal(async (journal) => {
+    const generation = await journal.ensureReview({ agentId: "agent-1", localUrl: reviewLocal(50_001), openedAt: "2026-01-01T10:00:00.000Z" });
+    const attempt = await journal.begin({ review: generation, agentId: "agent-1", planContent: "# TUC-1\n", approved: true, source: "inbox", state: "pending", snapshot: SNAPSHOT });
+    await withLinks(async (links, get) => {
+      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1", reviewId: generation.id });
+      // The review's server stopped: the sweep closes it and its stable link shows the closed page.
+      await links.sweep();
+      await links.sweep();
+      assert.match(await (await get("/review/agent-1")).text(), /Review closed — approved — being applied/);
+      await journal.applied(attempt);
+      await links.decided("agent-1", true, { localUrl: reviewLocal(50_001), at: "2026-01-01T10:00:05.000Z" });
+      const after = await (await get("/review/agent-1")).text();
+      assert.match(after, /Review closed — approved</);
+      assert.doesNotMatch(after, /being applied/);
+    }, undefined, { decisions: { applying: () => journal.applying(), resolve: async () => {} } });
+  });
+});
+
+test("a pending decision counts as decided for the plan pipeline; an unconfirmed one counts as open", async () => {
+  await withJournal(async (journal) => {
+    const first = await journal.ensureReview({ agentId: "agent-1", localUrl: reviewLocal(50_001), openedAt: "2026-01-01T10:00:00.000Z" });
+    const second = await journal.ensureReview({ agentId: "agent-2", localUrl: reviewLocal(50_002), openedAt: "2026-01-01T10:00:00.000Z" });
+    await journal.begin({ review: first, agentId: "agent-1", planContent: "# TUC-1\n", approved: true, source: "inbox", state: "pending", snapshot: SNAPSHOT });
+    const lost = await journal.begin({ review: second, agentId: "agent-2", planContent: "# TUC-2\n", approved: false, source: "inbox", state: "deciding", snapshot: SNAPSHOT });
+    await journal.settle(lost.id, "unknown");
+    const observed: { open: (PipelineReview & { applyState?: string })[]; decided: (PipelineReview & { applyState?: string })[] }[] = [];
+    await withLinks(async (links, get, live) => {
+      live.add(50_001).add(50_002);
+      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1", reviewId: first.id });
+      await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, { identifier: "TUC-2", reviewId: second.id });
+      await get("/");
+      assert.equal(observed.length, 1);
+      const decidedRow = observed[0].decided.find((row) => row.agentId === "agent-1");
+      assert.deepEqual([decidedRow?.applyState, decidedRow?.outcome], ["pending", "approved"]);
+      const openRow = observed[0].open.find((row) => row.agentId === "agent-2");
+      assert.deepEqual([openRow?.applyState, openRow?.outcome], ["uncertain", undefined]);
+    }, undefined, {
+      pipeline: async (open, decided) => { observed.push({ open: [...open], decided: [...decided] }); return { host: "self", checkedAt: null, lastArrivalAt: null, rows: [] }; },
+      decisions: { applying: () => journal.applying(), resolve: async () => {} },
+    });
+  });
+});
+
+test("the owner carries out or drops an unconfirmed decision, and a stale answer is refused", async () => {
+  await withJournal(async (journal) => {
+    const calls: [string, string][] = [];
+    const first = await journal.ensureReview({ agentId: "agent-1", localUrl: reviewLocal(50_001), openedAt: "2026-01-01T10:00:00.000Z" });
+    const second = await journal.ensureReview({ agentId: "agent-2", localUrl: reviewLocal(50_002), openedAt: "2026-01-01T10:00:00.000Z" });
+    const carry = await journal.begin({ review: first, agentId: "agent-1", planContent: "# TUC-1\n", approved: true, source: "inbox", state: "deciding", snapshot: SNAPSHOT });
+    await journal.settle(carry.id, "unknown");
+    const drop = await journal.begin({ review: second, agentId: "agent-2", planContent: "# TUC-2\n", approved: false, source: "inbox", state: "deciding", snapshot: SNAPSHOT });
+    await journal.settle(drop.id, "unknown");
+    const decisions = {
+      applying: () => journal.applying(),
+      resolve: async (entryId: string, action: ResolveAction) => { calls.push([entryId, action]); await journal.resolve(entryId, action, async () => SNAPSHOT); },
+    };
+    await withLinks(async (links, get, live) => {
+      live.add(50_001).add(50_002);
+      await links.opened("agent-1", opened(50_001), { identifier: "TUC-1", reviewId: first.id });
+      await links.opened("agent-2", { ...opened(50_002), agentId: "agent-2" }, { identifier: "TUC-2", reviewId: second.id });
+      assert.equal((await action(links, "/api/reviews/agent-1/resolve", { entryId: carry.id, action: "carry-out" }, {})).status, 403, "resolving needs the inbox's own header");
+      assert.equal((await action(links, "/api/reviews/agent-1/resolve", { entryId: carry.id, action: "explode" })).status, 400, "only the five actions");
+      // While Plannotator may still confirm it, the decision is sent again, not the owner's to settle.
+      const early = await action(links, "/api/reviews/agent-1/resolve", { entryId: carry.id, action: "carry-out" });
+      assert.equal(early.status, 409);
+      assert.equal(journal.attempt(carry.id)?.state, "uncertain");
+      const button = `data-entry="${carry.id}" data-action="carry-out"`;
+      const sending = await (await get("/")).text();
+      assert.ok(!sending.includes(button) && sending.includes("Sending it to Plannotator again"), "no buttons while it is sent again");
+      await journal.awaitOwner(carry.id, true, "Plannotator did not confirm this decision: carry it out or drop it.");
+      await journal.awaitOwner(drop.id, true, "Plannotator did not confirm this decision: carry it out or drop it.");
+      const waiting = await (await get("/")).text();
+      assert.ok(waiting.includes(button) && waiting.includes("Plannotator did not confirm this decision"), "the owner's buttons once Plannotator cannot confirm it");
+      calls.length = 0;
+      assert.equal((await action(links, "/api/reviews/agent-1/resolve", { entryId: carry.id, action: "carry-out" })).status, 200);
+      assert.deepEqual(calls, [[carry.id, "carry-out"]]);
+      assert.equal(journal.attempt(carry.id)?.state, "pending", "carrying it out accepts the decision");
+      const stale = await action(links, "/api/reviews/agent-1/resolve", { entryId: carry.id, action: "drop" });
+      assert.deepEqual([stale.status, (await stale.json()).error], [409, "That decision changed meanwhile; reload the inbox."]);
+      assert.equal((await action(links, "/api/reviews/agent-2/resolve", { entryId: drop.id, action: "drop" })).status, 200);
+      assert.equal(journal.attempt(drop.id)?.state, "void", "dropping voids the decision");
+      assert.equal((await action(links, "/api/reviews/agent-2/resolve", { entryId: "nobody", action: "drop" })).status, 404);
+    }, undefined, { decisions });
+  });
+});
+
+test("a resolve for a decision only a peer lists is forwarded to that peer", async () => {
+  await withPeer(PEER_APPLYING, async (peer, forwarded) => {
+    await withLinks(async (links, get) => {
+      await get("/");
+      const response = await action(links, "/api/reviews/agent-9/resolve", { entryId: "entry-9", action: "carry-out" });
+      assert.equal(response.status, 409, "the peer's answer is passed on");
+      assert.equal(forwarded.length, 1);
+      assert.match(forwarded[0], /^\/api\/reviews\/agent-9\/resolve 1 /);
+      assert.deepEqual(JSON.parse(forwarded[0].slice(forwarded[0].indexOf("{"))), { entryId: "entry-9", action: "carry-out" });
+    }, undefined, { peers: async () => [peer], decisions: { applying: () => [], resolve: async () => { throw new Error("resolved locally"); } } });
   });
 });

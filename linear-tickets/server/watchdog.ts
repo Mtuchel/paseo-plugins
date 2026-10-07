@@ -443,7 +443,7 @@ function processAlive(pid: number): boolean {
 // never both pass; the lease file is created exclusively (`wx`), and a file left by a dead process
 // (or an unreadable one older than a minute) is removed and the creation retried once. The file is
 // read back afterwards: a second daemon that replaced it in between keeps it, this pass yields.
-async function takeLease(path: string, instance: string): Promise<boolean> {
+export async function takeLease(path: string, instance: string): Promise<boolean> {
   if (leases.has(path)) return false;
   leases.set(path, instance);
   const file = `${path}.lease`;
@@ -471,7 +471,7 @@ async function takeLease(path: string, instance: string): Promise<boolean> {
 // A lease file whose holder is gone: its process is dead, or (in this process) no instance holds
 // the reservation any more. Unreadable content counts only once it is a minute old (a holder may be
 // writing it right now).
-async function staleLease(file: string): Promise<boolean> {
+export async function staleLease(file: string): Promise<boolean> {
   let text: string;
   try { text = await readFile(file, "utf8"); } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
   try {
@@ -487,7 +487,7 @@ function releaseReservation(path: string, instance: string): false {
   return false;
 }
 
-async function releaseLease(path: string, instance: string): Promise<void> {
+export async function releaseLease(path: string, instance: string): Promise<void> {
   if (leases.get(path) !== instance) return;
   await rm(`${path}.lease`, { force: true }).catch(() => {});
   leases.delete(path);

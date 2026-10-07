@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { record } from "./context";
-import { AuthenticationError, LinearApiError, postGraphQL, type Post } from "./linear";
+import { AuthenticationError, entityNotFound, LinearApiError, postGraphQL, type Post } from "./linear";
 import { paseoHome } from "./ticket-mcp";
 
 // The "Paseo" Linear app (actor=app): its credentials and tokens live next to the plugin's
@@ -103,6 +103,11 @@ export class AppAuth {
 const ACTIVITY_MUTATION = `mutation agentActivity($input: AgentActivityCreateInput!) {
   agentActivityCreate(input: $input) { success }
 }`;
+// `agentActivity(id:)` is a lookup: an id Linear has no activity for comes back as an "Entity not
+// found" error, which `activityById` maps to null.
+const ACTIVITY_BY_ID_QUERY = `query agentActivityById($id: String!) {
+  agentActivity(id: $id) { id }
+}`;
 const SESSION_UPDATE_MUTATION = `mutation agentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
   agentSessionUpdate(id: $id, input: $input) { success }
 }`;
@@ -182,14 +187,30 @@ export class AgentApi {
   }
 
   // Activities are what the user sees in the agent panel. `ephemeral` ones (thoughts,
-  // actions) are replaced by the next activity.
-  async activity(sessionId: string, content: { type: string; body?: string; action?: string; parameter?: string; result?: string }, options: { signal?: string; options?: SelectOption[]; ephemeral?: boolean } = {}): Promise<void> {
+  // actions) are replaced by the next activity. `id`: a client-chosen UUID, so an activity whose
+  // answer was lost can be looked up (activityById) and only posted once under it.
+  async activity(sessionId: string, content: { type: string; body?: string; action?: string; parameter?: string; result?: string }, options: { signal?: string; options?: SelectOption[]; ephemeral?: boolean; id?: string } = {}): Promise<void> {
     const input: Record<string, unknown> = { agentSessionId: sessionId, content };
+    if (options.id) input.id = options.id;
     if (options.signal) input.signal = options.signal;
     if (options.options) input.signalMetadata = { options: options.options };
     if (options.ephemeral) input.ephemeral = true;
     const result = record(record(await this.call(ACTIVITY_MUTATION, { input })).agentActivityCreate ?? {});
     if (result.success !== true) throw new Error("Linear did not accept the agent activity.");
+  }
+
+  // One activity by its id; null when Linear has no activity with that id, so a caller that may
+  // have posted it already retries under the same id instead of trusting its own record. Any other
+  // failure (network, rate limit, auth) propagates.
+  async activityById(id: string): Promise<{ id: string } | null> {
+    try {
+      const activity = record(record(await this.call(ACTIVITY_BY_ID_QUERY, { id })).agentActivity ?? {});
+      const found = String(activity.id ?? "");
+      return found ? { id: found } : null;
+    } catch (error) {
+      if (entityNotFound(error)) return null;
+      throw error;
+    }
   }
 
   async updateSession(sessionId: string, input: { plan?: SessionPlanStep[]; addedExternalUrls?: ExternalUrl[]; externalUrls?: ExternalUrl[]; removedExternalUrls?: string[] }): Promise<void> {

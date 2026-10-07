@@ -26,9 +26,16 @@ export type PlanDetails = {
   newRule?: boolean;
 };
 
+// How far the journal got with carrying a decision out (a "Being applied" row): pending is being
+// applied now, uncertain waits for the owner because Plannotator's answer was lost, unbound is a
+// report no review matches, conflict is two contradicting decisions (conflict-applied: reported
+// after the accepted one was carried out), unreadable a decision record that cannot be read.
+export type ApplyState = "pending" | "uncertain" | "unbound" | "conflict" | "conflict-applied" | "unreadable";
+
 // One row of the inbox, from this host or a peer's /api/inbox. `link` opens the review (the
 // agent's stable link); `since` is when the owner got the plan; decided rows add `outcome` (as
-// shown: approved, auto-approved, sent back, ended) and `decidedAt`.
+// shown: approved, auto-approved, sent back, ended) and `decidedAt`; a "Being applied" row adds
+// the journal entry to settle, the decision itself and its last failure.
 export type InboxRow = {
   agentId: string;
   name: string;
@@ -42,9 +49,16 @@ export type InboxRow = {
   issueUrl?: string;
   areas?: string[];
   deleteable?: boolean;
+  applyState?: ApplyState;
+  entryId?: string;
+  approved?: boolean;
+  applyError?: string;
+  nextAttemptAt?: string;
+  // An unconfirmed decision Plannotator can no longer confirm: the owner carries it out or drops it.
+  ownerNeeded?: boolean;
 };
 // `unreachable`: peers whose inbox did not answer, so their reviews are missing.
-export type InboxView = { open: InboxRow[]; decided: InboxRow[]; unreachable: string[]; hosts: string[]; push: boolean; pipeline?: PipelineHost[] };
+export type InboxView = { open: InboxRow[]; decided: InboxRow[]; applying: InboxRow[]; unreachable: string[]; hosts: string[]; push: boolean; pipeline?: PipelineHost[] };
 
 export function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
@@ -240,7 +254,7 @@ queue.scrollTop=top;queue.scrollLeft=left;
 }catch{document.querySelector(".sub")?.classList.add("offline");pipelineFetchFailed()}finally{busy=false}
 }
 async function post(path,body){const response=await fetch(path,{method:"POST",headers:{"content-type":"application/json","x-review-action":"1"},body:JSON.stringify(body)});const answer=await response.json().catch(()=>({}));if(!response.ok)throw new Error(answer.error||("HTTP "+response.status));return answer}
-async function act(item,action,body){const id=item.dataset.agent,status=item.querySelector(".status");pending.add(id);for(const b of item.querySelectorAll("button"))b.disabled=true;status.className="status";status.textContent=action==="delete"?"Deleting plan and issue…":action==="recheck"?"Sending landscape recheck…":body.approve?"Approving…":"Sending back…";try{await post("/api/reviews/"+encodeURIComponent(id)+"/"+action,body);status.textContent=action==="delete"?"Plan and Linear issue deleted.":action==="recheck"?"Sent back to check code, PRs and issues, then resubmit for review.":body.approve?"Approved. The agent takes it from here.":"Sent back with your note.";item.classList.add("done");if(action==="delete"){for(const f of frames())if(f.dataset.agent===id)f.remove();if(selected===id){selected=null;document.querySelector(".pane-bar").hidden=true;document.querySelector(".pick").hidden=false;history.replaceState(null,"",location.pathname)}}setTimeout(()=>refresh(),2500)}catch(error){status.className="status failed";status.textContent=(action==="delete"?"Deletion not completed: ":action==="recheck"?"Recheck not sent: ":"Not decided: ")+error.message;for(const b of item.querySelectorAll("button"))b.disabled=false}finally{pending.delete(id)}}
+async function act(item,action,body,label){const id=item.dataset.agent,status=item.querySelector(".status");pending.add(id);for(const b of item.querySelectorAll("button"))b.disabled=true;status.className="status";status.textContent=label?label+"…":action==="delete"?"Deleting plan and issue…":action==="recheck"?"Sending landscape recheck…":body.approve?"Approving…":"Sending back…";try{await post("/api/reviews/"+encodeURIComponent(id)+"/"+action,body);status.textContent=label?label+" done.":action==="delete"?"Plan and Linear issue deleted.":action==="recheck"?"Sent back to check code, PRs and issues, then resubmit for review.":body.approve?"Approved. The agent takes it from here.":"Sent back with your note.";item.classList.add("done");if(action==="delete"){for(const f of frames())if(f.dataset.agent===id)f.remove();if(selected===id){selected=null;document.querySelector(".pane-bar").hidden=true;document.querySelector(".pick").hidden=false;history.replaceState(null,"",location.pathname)}}setTimeout(()=>refresh(),2500)}catch(error){status.className="status failed";status.textContent=(action==="delete"?"Deletion not completed: ":action==="recheck"?"Recheck not sent: ":"Not decided: ")+error.message;for(const b of item.querySelectorAll("button"))b.disabled=false}finally{pending.delete(id)}}
 const decide=(item,approve,feedback)=>act(item,"decision",{approve,feedback});
 function confirmDelete(item){const dialog=document.querySelector("#delete-dialog");dialog.dataset.agent=item.dataset.agent;dialog.querySelector("[data-delete-issue]").textContent=item.dataset.name;dialog.querySelector("[data-delete-confirm]").textContent=item.dataset.name;const input=dialog.querySelector("input");input.value="";input.setCustomValidity("");dialog.showModal();input.focus()}
 const urlKey=(key)=>{const padded=(key+"=".repeat((4-key.length%4)%4)).replace(/-/g,"+").replace(/_/g,"/");return Uint8Array.from(atob(padded),(c)=>c.charCodeAt(0))};
@@ -250,7 +264,7 @@ document.addEventListener("mouseover",(event)=>{const item=event.target.closest(
 document.addEventListener("input",(event)=>{if(event.target.id==="review-search"){query=event.target.value;filter()}else if(event.target.id==="delete-identifier")event.target.setCustomValidity("")});
 document.addEventListener("compositionstart",(event)=>{if(event.target.id==="review-search")composing=true});
 document.addEventListener("compositionend",(event)=>{if(event.target.id==="review-search"){composing=false;query=event.target.value;filter()}});
-document.addEventListener("click",(event)=>{const button=event.target.closest("button[data-act]");if(!button)return;const action=button.dataset.act;if(action==="notify")return void subscribe(button);if(action==="cancel-delete")return void document.querySelector("#delete-dialog").close();const item=button.closest("[data-agent]");if(!item)return;const form=item.querySelector("form.back");if(action==="approve"){if(confirm("Approve the plan for "+item.dataset.name+"?"))decide(item,true,"")}else if(action==="back"){form.hidden=false;form.querySelector("textarea").focus()}else if(action==="cancel")form.hidden=true;else if(action==="recheck"){if(confirm("Send "+item.dataset.name+" back to check current code, PRs and issues, resolve conflicts, and resubmit for review? This does not approve or start implementation."))act(item,"recheck",{})}else if(action==="delete")confirmDelete(item)});
+document.addEventListener("click",(event)=>{const button=event.target.closest("button[data-act]");if(!button)return;const action=button.dataset.act;if(action==="notify")return void subscribe(button);if(action==="cancel-delete")return void document.querySelector("#delete-dialog").close();const item=button.closest("[data-agent]");if(!item)return;const form=item.querySelector("form.back");if(action==="approve"){if(confirm("Approve the plan for "+item.dataset.name+"?"))decide(item,true,"")}else if(action==="back"){form.hidden=false;form.querySelector("textarea").focus()}else if(action==="cancel")form.hidden=true;else if(action==="recheck"){if(confirm("Send "+item.dataset.name+" back to check current code, PRs and issues, resolve conflicts, and resubmit for review? This does not approve or start implementation."))act(item,"recheck",{})}else if(action==="delete")confirmDelete(item);else if(action==="resolve")act(item,"resolve",{entryId:button.dataset.entry,action:button.dataset.action},button.textContent)});
 document.addEventListener("submit",(event)=>{const deletion=event.target.closest("#delete-form");if(deletion){event.preventDefault();const dialog=document.querySelector("#delete-dialog"),item=items().find((li)=>li.dataset.agent===dialog.dataset.agent),input=deletion.querySelector("input");if(!item){dialog.close();return}if(input.value!==item.dataset.name){input.setCustomValidity("Type "+item.dataset.name+" exactly to confirm.");input.reportValidity();return}dialog.close();act(item,"delete",{identifier:input.value});return}const form=event.target.closest("form.back");if(!form)return;event.preventDefault();const note=form.querySelector("textarea").value.trim();if(!note)return;form.hidden=true;decide(form.closest("[data-agent]"),false,note)});
 document.addEventListener("DOMContentLoaded",()=>{settle();const id=decodeURIComponent(location.hash.slice(1));const item=id&&wide()&&items().find((li)=>li.dataset.agent===id);if(item)select(item)});setInterval(()=>refresh(),${INBOX_REFRESH_S * 1000});document.addEventListener("visibilitychange",()=>refresh());addEventListener("focus",()=>refresh());addEventListener("pageshow",(event)=>{if(event.persisted)refresh()})})()`;
 
@@ -290,11 +304,57 @@ function decidedRow(row: InboxRow, now: Date, dates: Dates, multiHost: boolean):
   return `<li data-search="${searchText(row)}"><div class="row"><div class="top"><span class="id">${escapeHtml(row.name)}</span><span class="outcome${tone}">${escapeHtml(outcome)}</span>${when}</div>${areaChips(row)}${detailRows(row.details, false)}</div>${extra.length ? `<div class="facts">${extra.join("<span aria-hidden=\"true\">·</span>")}</div>` : ""}</li>`;
 }
 
+// The chip of a "Being applied" row: the decision and what the journal still has to do about it.
+function applyChip(row: InboxRow): string {
+  const outcome = row.approved === false ? "sent back" : "approved";
+  switch (row.applyState) {
+    case "uncertain": return `${outcome} — not confirmed by Plannotator`;
+    case "unbound": return "report not matched to a review";
+    case "conflict": return "conflicting decisions";
+    case "conflict-applied": return "Plannotator reported the other decision after this one was carried out";
+    case "unreadable": return row.name;
+    default: return `${outcome} — being applied`;
+  }
+}
+
+// What the owner may do about a "Being applied" row: a decision Plannotator can no longer confirm,
+// or a report not matched to a review, is carried out or dropped; a conflict keeps this decision
+// or the other one; once the accepted one went through anyway, only Dismiss remains. An
+// unconfirmed decision still being sent again has no buttons. Buttons post /resolve like the
+// decision buttons.
+function applyActions(row: InboxRow): string {
+  const button = (action: string, label: string, tone = "") => `<button type="button"${tone} data-act="resolve" data-entry="${escapeHtml(row.entryId ?? "")}" data-action="${action}">${label}</button>`;
+  const carryOrDrop = `<span class="acts">${button("carry-out", "Carry it out", " class=\"approve\"")}${button("drop", "Drop it", " class=\"danger\"")}</span>`;
+  switch (row.applyState) {
+    case "uncertain": return row.ownerNeeded ? carryOrDrop : "";
+    case "unbound": return carryOrDrop;
+    case "conflict": return `<span class="acts">${button("keep", "Keep this one")}${button("other", "Carry out the other")}</span>`;
+    case "conflict-applied": return `<span class="acts">${button("dismiss", "Dismiss", " class=\"approve\"")}</span>`;
+    default: return "";
+  }
+}
+
+function applyingRow(row: InboxRow, now: Date, dates: Dates, multiHost: boolean): string {
+  // Pending rows say what carrying the decision out is doing; an unconfirmed one why it is not
+  // carried out yet; the other kinds wait for the owner.
+  const line = row.applyState === "pending"
+    ? `<p class="why">${row.applyError ? `Last try failed: ${escapeHtml(row.applyError)}${row.nextAttemptAt ? ` · next try ${dates.clock.format(new Date(row.nextAttemptAt))}` : ""}` : "Applying…"}</p>`
+    : row.applyState === "uncertain"
+      ? `<p class="why">${row.ownerNeeded && row.applyError ? escapeHtml(row.applyError) : "Sending it to Plannotator again; it is carried out once Plannotator confirms it."}</p>`
+      : "";
+  const tone = row.applyState === "pending" || row.applyState === "uncertain" ? (row.approved === false ? " back" : " approved") : "";
+  const extra = facts(row, multiHost);
+  const actions = applyActions(row);
+  const name = row.applyState === "unreadable" ? "" : `<span class="id">${escapeHtml(row.name)}</span>`;
+  const footer = extra.length || actions ? `<div class="facts">${extra.join("<span aria-hidden=\"true\">·</span>")}${actions}</div>` : "";
+  return `<li data-agent="${escapeHtml(row.agentId)}" data-name="${escapeHtml(row.name)}" data-search="${searchText(row)}"><div class="row"><div class="top">${name}<span class="outcome${tone}">${escapeHtml(applyChip(row))}</span></div>${areaChips(row)}${detailRows(row.details, false)}${line}</div>${footer}<p class="status" role="status"></p></li>`;
+}
+
 // The root of :8444: every review waiting for the owner on this host and its peers, newest first
 // and grouped by the day the owner got it, plus the latest decisions. On a wide screen the pane
 // beside the list shows the selected review's Plannotator page.
 export function inboxPage(view: InboxView, now: Date, timeZone: string | undefined): string {
-  const { open, decided } = view;
+  const { open, decided, applying } = view;
   const dates = new Dates(now, timeZone);
   const multiHost = view.hosts.length > 1;
   const days: { label: string; rows: string[] }[] = [];
@@ -307,6 +367,9 @@ export function inboxPage(view: InboxView, now: Date, timeZone: string | undefin
   const waiting = open.length
     ? `<section data-review-section><h2>Waiting <span class="n" data-filter-count>${open.length}</span><span class="hint">newest first</span></h2>${days.map((day) => `<div class="day-group"><h3>${escapeHtml(day.label)}</h3><ul class="list">${day.rows.join("")}</ul></div>`).join("")}</section>`
     : `<section data-review-section><h2>Waiting</h2><p class="empty"><b>Nothing to review.</b>New plan reviews show up here on their own.</p></section>`;
+  const beingApplied = applying.length
+    ? `<section data-review-section><h2>Being applied <span class="n" data-filter-count>${applying.length}</span></h2><ul class="list">${applying.map((row) => applyingRow(row, now, dates, multiHost)).join("")}</ul></section>`
+    : "";
   const recent = decided.length
     ? `<section data-review-section><h2>Recently decided <span class="n" data-filter-count>${decided.length}</span></h2><ul class="list">${decided.map((row) => decidedRow(row, now, dates, multiHost)).join("")}</ul></section>`
     : "";
@@ -319,5 +382,5 @@ export function inboxPage(view: InboxView, now: Date, timeZone: string | undefin
   const pane = `<aside class="pane" aria-label="Plan review"><div class="pane-bar" hidden><b></b><a target="_blank" rel="noopener">Open in new tab ↗</a></div><div class="frames"><p class="pick"><b>Pick a review</b>It opens here in Plannotator: annotate, comment, approve or send back as on its own page.</p></div></aside>`;
   const deletion = `<dialog id="delete-dialog" class="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-explanation"><form id="delete-form"><h2 id="delete-title">Delete plan and issue?</h2><p id="delete-explanation">This removes the waiting plan and moves its underlying Linear issue <strong data-delete-issue></strong> to Linear’s Trash. Its queued work is stopped. This is not a send-back or an approval.</p><label for="delete-identifier">Type <strong data-delete-confirm></strong> to confirm</label><input id="delete-identifier" name="identifier" required autocomplete="off" spellcheck="false"><div class="dialog-acts"><button type="button" data-act="cancel-delete">Cancel</button><button type="submit" class="danger">Delete plan + issue</button></div></form></dialog>`;
   const pipeline = pipelinePage({ pipeline: view.pipeline, hosts: view.hosts, unreachable: view.unreachable, ready: open.length, now, escapeHtml });
-  return page(open.length ? `Plan reviews (${open.length})` : "Plan reviews", `<div class="queue">${header}<main id="review-list">${pipeline}${waiting}${recent}<p class="empty search-empty" data-search-empty role="status" hidden><b>No matching reviews.</b>Try another issue, plan title or area.</p></main></div>${pane}${deletion}`, head);
+  return page(open.length ? `Plan reviews (${open.length})` : "Plan reviews", `<div class="queue">${header}<main id="review-list">${pipeline}${waiting}${beingApplied}${recent}<p class="empty search-empty" data-search-empty role="status" hidden><b>No matching reviews.</b>Try another issue, plan title or area.</p></main></div>${pane}${deletion}`, head);
 }

@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 // `remoteUrl`: the tailnet link shown in the Linear panel, removed again when the review ends.
-export type PendingReview = { localUrl: string; remoteUrl?: string; openedAt?: string; planHash?: string };
+// `reviewId`: the decision journal's generation of the review (decision-journal.ts).
+export type PendingReview = { localUrl: string; remoteUrl?: string; openedAt?: string; planHash?: string; reviewId?: string };
 export type ReviewOutcome = "open" | { approved: boolean; feedback?: string; planContent: string } | null;
 
 // A plan text's identity, also for the risk policy: the omp extension hashes the plan it records
