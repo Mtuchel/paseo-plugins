@@ -1249,3 +1249,20 @@ test("a watchdog replacement bound for the peer is forwarded with its history an
   assert.equal(held.starts.length, 0, "a held forward never falls back to a local start");
   await held.cleanup();
 });
+
+test("an owner Stop that arrives while a watchdog step is prepared keeps the steer and the replacement from going out", async () => {
+  // The deep check before the claim passes; the owner's Stop is saved while the step prepares.
+  const stopped = async (_agent: unknown, deep: boolean) => deep ? null : "the owner stopped the agent";
+  const h = routerHarness({ agents: [silent()] });
+  const steer = await h.router.watchdogAct(watchdogRequest(h.calls, { check: stopped }));
+  assert.deepEqual(steer, { kind: "skipped", reason: "the owner stopped the agent", end: true });
+  assert.deepEqual(h.daemon.sent, []);
+  await h.cleanup();
+
+  const replacement = routerHarness({ processLiveness: async () => "absent" });
+  const outcome = await replacement.router.watchdogAct(watchdogRequest(replacement.calls, { action: "succeed", rootId: "agent-gone", marker: "cycle-1:succeed", check: stopped }));
+  assert.deepEqual(outcome, { kind: "skipped", reason: "the owner stopped the agent", end: true });
+  assert.equal(replacement.starts.length, 0);
+  assertGateFree(replacement.gates);
+  await replacement.cleanup();
+});

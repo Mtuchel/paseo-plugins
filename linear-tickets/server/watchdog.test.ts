@@ -292,6 +292,53 @@ test("a replacement that cannot prove its predecessor gone is retried until its 
   await h.cleanup();
 });
 
+test("an idle agent that cannot be loaded is replaced, and a quiet replacement ends in the owner mention, never a second resume", async (t) => {
+  quiet(t);
+  const h = await harness();
+  h.state.roots = [agent("agent-1", { status: "closed", activeTurn: null })];
+  h.state.answer = async (request) => {
+    if (request.action === "resume") return { kind: "failed", reason: "the agent could not be loaded", unloadable: true };
+    h.state.roots = [agent("agent-2", { status: "idle", activeTurn: null, createdAt: iso(h.state.now), labels: { "linear.issueId": ISSUE.id, [WATCHDOG_LABEL]: request.marker } })];
+    return { kind: "done", successor: { id: "agent-2", title: null, cwd: "/repo/wt" } };
+  };
+  await h.poll(121);
+  await h.poll(123);
+  assert.deepEqual(h.acts.map((act) => act.action), ["resume", "succeed"]);
+  await h.poll(150);
+  assert.deepEqual(h.acts.map((act) => act.action), ["resume", "succeed"], "the replacement is not resumed");
+  assert.equal(h.comments.filter((body) => body.includes(WATCHDOG_MENTION)).length, 1, "the cycle ends with the mention");
+  await h.cleanup();
+});
+
+test("a ticket that waits for the owner by the end of a cycle is not reported as unrecoverable", async (t) => {
+  quiet(t);
+  const h = await harness();
+  h.state.roots = [agent("agent-1", { status: "idle", activeTurn: null })];
+  h.state.ghosts.add("agent-1");
+  h.state.answer = async (request) => {
+    h.state.ghosts.clear();
+    h.state.roots = [agent("agent-2", { status: "idle", activeTurn: null, labels: { "linear.issueId": ISSUE.id, [WATCHDOG_LABEL]: request.marker } })];
+    return { kind: "done", successor: { id: "agent-2", title: null, cwd: "/repo/wt" } };
+  };
+  await h.poll(1);
+  h.state.status = { status: "Needs input", statusType: "started", labels: [] };
+  await h.poll(30);
+  assert.equal(h.comments.some((body) => body.includes(WATCHDOG_MENTION)), false);
+  assert.equal((await h.store.read()).tickets[ISSUE.id].cycle, null, "the cycle ends without the mention");
+  await h.cleanup();
+});
+
+test("two watchdog instances of one host never run a pass at the same time", async (t) => {
+  quiet(t);
+  const h = await harness();
+  const next = new Watchdog(h.deps);
+  h.state.now = T0 + 46 * MINUTE;
+  const poll = (watchdog: Watchdog) => watchdog.pass({ records: h.state.records, reserved: new Set(), pulls: async () => h.state.pulls });
+  await Promise.all([poll(h.watchdog), poll(next)]);
+  assert.deepEqual(h.acts.map((act) => act.action), ["steer"]);
+  await h.cleanup();
+});
+
 test("the owner's continuation ends a cycle, and an unloaded watchdog starts nothing", async (t) => {
   quiet(t);
   const h = await harness();
@@ -332,6 +379,13 @@ test("recovery history travels with the ticket: starts merge, and a ticket witho
   await h.poll(24 * 60 + 1);
   assert.deepEqual(h.acts.map((act) => act.action), ["steer"]);
   await h.cleanup();
+
+  const back = await harness();
+  await back.store.transferred(ISSUE.id, ISSUE.identifier, iso(T0 - 10 * MINUTE));
+  await back.store.adopt(ISSUE.id, ISSUE.identifier, history, DEFAULT_WATCHDOG, T0);
+  await back.poll(46);
+  assert.deepEqual(back.acts.map((act) => act.action), ["steer"], "a ticket that comes back with its history is recovered here again");
+  await back.cleanup();
 });
 
 test("native evidence counts assistant and tool records on the current branch only", async () => {

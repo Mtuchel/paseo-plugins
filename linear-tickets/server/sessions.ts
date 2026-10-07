@@ -1674,6 +1674,8 @@ export class SessionRouter {
       if (agent.provider !== "omp") return { kind: "skipped", reason: `${agent.provider} agents cannot be steered without cancelling their turn`, end: true };
       await request.claim();
       if (action === "interrupt") return this.watchdogResume(request, found!, true, null);
+      const fenced = await this.watchdogFence(request, agent);
+      if (fenced) return fenced;
       await handle.send(`/steer ${text}`, { messageId: marker });
       return { kind: "done" };
     }
@@ -1695,6 +1697,8 @@ export class SessionRouter {
     if (crashed && !reload) return { kind: "skipped", reason: "the daemon's agent reload is not available", end: false };
     if (!request.alive()) return unloading;
     await request.claim();
+    const fenced = await this.watchdogFence(request, agent);
+    if (fenced) return fenced;
     try {
       if (reload) await reload(rootId);
       await handle.send(text, { messageId: marker });
@@ -1702,6 +1706,18 @@ export class SessionRouter {
       return { kind: "failed", reason: `the agent could not be loaded (${error instanceof Error ? error.message : error})`, unloadable: true };
     }
     return { kind: "done" };
+  }
+
+  // The last look before an effect goes out, after every await that prepared it: the plugin still
+  // runs and nothing (an owner Stop, a wait, a veto) excludes the ticket now. An unload keeps the
+  // step for the next instance (its claim is released, nothing went out); `dispatched` says an
+  // earlier part of the step (a retirement) already happened.
+  private async watchdogFence(request: WatchdogRequest, agent: PaseoAgent | null, dispatched = false): Promise<WatchdogOutcome | null> {
+    const unloading: WatchdogOutcome = { kind: "failed", reason: "the plugin unloaded before the step went out", retry: true };
+    if (!request.alive()) return unloading;
+    const reason = await request.check(agent, false);
+    if (!request.alive()) return unloading;
+    return reason ? { kind: "skipped", reason, end: true, ...(dispatched ? { dispatched } : {}) } : null;
   }
 
   // Stops the agent's turn and waits up to STOP_WAIT_MS for it to end. Returns the last snapshot.
@@ -1771,7 +1787,8 @@ export class SessionRouter {
       const marked = (await this.agent(live.id))?.agent.labels?.[WATCHDOG_LABEL] === request.marker;
       return marked ? { kind: "done", successor: live } : { kind: "skipped", reason: `agent ${live.id.slice(0, 8)} took over the ticket`, end: true, dispatched: true };
     }
-    if (!request.alive()) return { kind: "failed", reason: "the plugin unloaded before the replacement started", retry: true };
+    const fenced = await this.watchdogFence(request, null, Boolean(found));
+    if (fenced) return fenced;
     const routed = await this.deps.route?.take({
       kind: "recover", issueId, identifier, id: `watchdog:${issueId}:${request.marker}`,
       text: request.text, strictResume: true, ...(request.history ? { watchdog: request.history } : {}),
@@ -1784,6 +1801,11 @@ export class SessionRouter {
     if (!admission.ok) return { kind: "failed", reason: admission.reason, retry: true };
     const running = dispatchLabels(settings.dispatch.label).running;
     await this.deps.linear.addLabel(issueId, running).catch(() => {});
+    const last = await this.watchdogFence(request, null, Boolean(found));
+    if (last) {
+      await this.deps.linear.removeLabel(issueId, running).catch(() => {});
+      return last;
+    }
     let agentId: string;
     try {
       agentId = (await this.deps.starter.start(issueId, paseo, settings, { retryHint: "assign Paseo again", resumeOnly: true, lead: request.text, labels: { [WATCHDOG_LABEL]: request.marker } })).agentId;

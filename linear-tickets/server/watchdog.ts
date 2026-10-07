@@ -35,6 +35,12 @@ const MINUTE = 60_000;
 const DO_NOT_MERGE = "do-not-merge";
 const NEEDS_INPUT = "needs input";
 const TERMINAL = ["completed", "canceled", "duplicate"];
+// Exclusions that say nothing about the ticket itself: a cycle's end waits them out instead of
+// ending without the owner mention.
+const UNKNOWN_VETOES = new Set([
+  "the plugin is unloading", "the watchdog is turned off", "the watchdog state cannot be read",
+  "the ticket's open pull requests cannot be read", "the agent is starting",
+]);
 
 export type WatchdogKind = "silent" | "idle" | "ghost";
 export type WatchdogAction = "steer" | "interrupt" | "reload" | "resume" | "succeed" | "mention";
@@ -259,6 +265,8 @@ export function parseHistory(value: unknown): WatchdogHistory | null {
 export function importHistory(file: WatchdogFile, issueId: string, identifier: string, value: unknown, now: number, timings: WatchdogTimings): "imported" | "quarantined" {
   file.tickets[issueId] ??= { identifier, starts: [], cycle: null, exhausted: null };
   const ticket = file.tickets[issueId];
+  // The ticket comes back to this host: an earlier hand-over to the peer no longer applies.
+  ticket.transferredAt = null;
   const history = parseHistory(value);
   if (!history) {
     const until = now + WATCHDOG_QUARANTINE_MS;
@@ -289,9 +297,12 @@ export function budgetLeft(starts: string[], now: number): number {
   return Math.max(0, WATCHDOG_CYCLES - recentStarts(starts, now).length);
 }
 
+// An action outside the kind's own sequence (the replacement an idle cycle takes when its agent
+// cannot be loaded) is followed by the kind's last step, the owner mention.
 export function nextStep(kind: WatchdogKind, action: WatchdogAction): WatchdogAction {
   const steps = STEPS[kind];
-  return steps[Math.min(steps.length - 1, steps.indexOf(action) + 1)];
+  const index = steps.indexOf(action);
+  return steps[index < 0 ? steps.length - 1 : Math.min(steps.length - 1, index + 1)];
 }
 
 export function graceMinutes(action: WatchdogAction, timings: WatchdogTimings): number {
@@ -392,7 +403,10 @@ export async function readActivity(handle: unknown, now: number): Promise<Activi
     if (openTasks.size) {
       // A root that waits on its subagents: their transcripts sit next to its session file.
       const directory = handle.slice(0, -".jsonl".length);
-      const names = (await readdir(directory).catch(() => [] as string[])).filter((name) => name.endsWith(".jsonl"));
+      // No directory yet means no subagent transcript was written; any other failure is unreadable
+      // evidence (the outer catch).
+      const listed = await readdir(directory).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return [] as string[]; throw error; });
+      const names = listed.filter((name) => name.endsWith(".jsonl"));
       const files = (await Promise.all(names.map(async (name) => ({ path: join(directory, name), mtime: (await stat(join(directory, name)).catch(() => null))?.mtimeMs ?? 0 }))))
         .sort((a, b) => b.mtime - a.mtime).slice(0, CHILD_FILES);
       for (const child of files) {
@@ -421,25 +435,52 @@ function processAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
 }
 
+// The process-local reservation is taken before the first await, so two instances of this process
+// never both pass; the lease file is created exclusively (`wx`), and a file left by a dead process
+// (or an unreadable one older than a minute) is removed and the creation retried once. The file is
+// read back afterwards: a second daemon that replaced it in between keeps it, this pass yields.
 async function takeLease(path: string, instance: string): Promise<boolean> {
-  const holder = leases.get(path);
-  if (holder && holder !== instance) return false;
-  const file = `${path}.lease`;
-  try {
-    const held = JSON.parse(await readFile(file, "utf8")) as { pid?: unknown; instance?: unknown };
-    if (typeof held.pid === "number" && held.pid !== process.pid && processAlive(held.pid)) return false;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) return false;
-  }
+  if (leases.has(path)) return false;
   leases.set(path, instance);
+  const file = `${path}.lease`;
+  const body = JSON.stringify({ pid: process.pid, instance });
   try {
     await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-    await writeFile(file, JSON.stringify({ pid: process.pid, instance }), { mode: 0o600 });
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await writeFile(file, body, { mode: 0o600, flag: "wx" });
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt > 0) return releaseReservation(path, instance);
+      }
+      if (!await staleLease(file)) return releaseReservation(path, instance);
+      await rm(file, { force: true });
+    }
+    const written = JSON.parse(await readFile(file, "utf8")) as { pid?: unknown; instance?: unknown };
+    if (written.pid !== process.pid || written.instance !== instance) return releaseReservation(path, instance);
+    return true;
   } catch {
-    leases.delete(path);
-    return false;
+    return releaseReservation(path, instance);
   }
-  return true;
+}
+
+// A lease file whose holder is gone: its process is dead, or (in this process) no instance holds
+// the reservation any more. Unreadable content counts only once it is a minute old (a holder may be
+// writing it right now).
+async function staleLease(file: string): Promise<boolean> {
+  let text: string;
+  try { text = await readFile(file, "utf8"); } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+  try {
+    const held = JSON.parse(text) as { pid?: unknown };
+    if (typeof held.pid === "number") return held.pid === process.pid || !processAlive(held.pid);
+  } catch { /* judged by age below */ }
+  const changed = await stat(file).then((info) => info.mtimeMs, () => null);
+  return changed !== null && Date.now() - changed > MINUTE;
+}
+
+function releaseReservation(path: string, instance: string): false {
+  if (leases.get(path) === instance) leases.delete(path);
+  return false;
 }
 
 async function releaseLease(path: string, instance: string): Promise<void> {
@@ -842,6 +883,18 @@ export class Watchdog {
   private async act(issueId: string, identifier: string, cycle: WatchdogCycle, root: WatchedAgent | null, record: HandoverRecord | null, poll: WatchdogPoll, settings: PluginSettings): Promise<void> {
     const label = `${identifier}: watchdog`;
     const now = this.clock();
+    // The final mention and a replacement past its retirement deadline answer to the same
+    // exclusions as an effect: a ticket that meanwhile waits for the owner, closed or got vetoed
+    // ends its cycle without a mention; one whose state cannot be read waits.
+    if (cycle.stage === "mention" || (cycle.stage === "succeed" && cycle.retireBy && now >= ms(cycle.retireBy)!)) {
+      let veto: string | null;
+      try { veto = await this.exclusion(issueId, identifier, root, true, poll, cycle.kind, settings); } catch (error) {
+        this.once(`wait:${issueId}`, `${label}: the end of cycle ${short(cycle.id)} waits: ${error instanceof Error ? error.message : error}`);
+        return;
+      }
+      if (veto && UNKNOWN_VETOES.has(veto)) { this.once(`wait:${issueId}`, `${label}: the end of cycle ${short(cycle.id)} waits: ${veto}`); return; }
+      if (veto) return this.endCycle(issueId, `${label}: ${veto}; cycle ${short(cycle.id)} ends without mentioning the owner`);
+    }
     if (cycle.stage === "mention") {
       await this.exhaust(issueId, identifier, root?.id ?? cycle.rootId, `cycle ${short(cycle.id)} did not restore progress`);
       return;
@@ -896,13 +949,16 @@ export class Watchdog {
     await this.deps.store.update((file) => {
       const ticket = this.deps.store.ticket(file, issueId, identifier);
       if (!ticket.cycle) return;
-      ticket.cycle.claim = { action, marker, at: ticket.cycle.claim?.at ?? iso(at), state: "done", ...(outcome.note ? { result: outcome.note } : {}) };
+      // Progress counts from the claim, the last moment before the effect, never from after the
+      // effect's own bookkeeping (a replacement may work while its thread is opened).
+      const claimedAt = ticket.cycle.claim?.at ?? iso(at);
+      ticket.cycle.claim = { action, marker, at: claimedAt, state: "done", ...(outcome.note ? { result: outcome.note } : {}) };
       ticket.cycle.stage = nextStep(ticket.cycle.kind, action);
       ticket.cycle.dueAt = iso(at + grace);
-      ticket.cycle.dispatchedAt = iso(at);
-      if (action !== "steer") ticket.cycle.baseline = iso(at);
+      ticket.cycle.dispatchedAt = claimedAt;
+      if (action !== "steer") ticket.cycle.baseline = claimedAt;
       if (action === "succeed") {
-        ticket.cycle.successor = { marker, at: iso(at) };
+        ticket.cycle.successor = { marker, at: claimedAt };
         if (outcome.successor) {
           ticket.cycle.rootId = outcome.successor.id;
           ticket.cycle.turnId = null;
