@@ -2,7 +2,7 @@ import type { PullRequestView } from "./pr-watch";
 
 // The next lifecycle step a stalled pull request is waiting on its agent for. The watch sends it
 // to an idle agent (see PullRequestWatch.nudge); this module only decides the step and its text.
-export type Stage = "draft" | "red" | "changes" | "findings";
+export type Stage = "draft" | "red" | "conflict" | "changes" | "findings";
 export type ReviewThread = {
   resolved: boolean;
   path: string | null;
@@ -21,6 +21,7 @@ const DECISIVE = ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"];
 export const STAGE_STEP: Record<Stage, string> = {
   draft: "publish the draft",
   red: "fix the failing checks",
+  conflict: "resolve the base conflict",
   changes: "address the requested changes",
   findings: "resolve the review findings",
 };
@@ -70,6 +71,14 @@ export async function stalledStage(view: PullRequestView, url: string, now: numb
       `Checks failed on the head of [the pull request](${url}) (\`${head}\`):`,
       ...failed.map((check) => `- [${check.name}](${check.url}) — ${check.conclusion}`),
       "Next step: fix them, then `gt submit --stack`.",
+    ].join("\n") };
+  }
+  // Only GitHub's confirmed conflict counts; a mergeability it is still computing is no conflict.
+  if (view.mergeable === "CONFLICTING") {
+    return { stage: "conflict", key, text: [
+      `GitHub reports that [the pull request](${url}) (\`${view.headBranch}\` at \`${head}\`) conflicts with its base \`${view.baseBranch}\`.`,
+      `Next step: rebase only your own stack onto the current \`${view.baseBranch}\`: this branch and your branches above it, resolving the conflicts. Run the checks your repository's AGENTS.md requires, then push and resubmit the rebased branches the way it prescribes (its review and publication rules still hold).`,
+      "Do not run `gt sync` or `gt restack`, never rebase, restack or push another ticket's branches, and never enqueue around this pull request's parent.",
     ].join("\n") };
   }
   const requested = changeRequests(view);

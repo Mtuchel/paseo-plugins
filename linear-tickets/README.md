@@ -1232,7 +1232,10 @@ its Merge activity comment in place), its reviews, and the head's check runs and
 unchanged resource answers `304 Not Modified`, which GitHub does not meter, so a quiet pull request
 costs the GraphQL budget nothing; the detail read runs only when one of them moved, while the
 merge queue is testing the pull request (its comment can end the attempt at any poll), or when the
-cached view is older than 10 minutes. Every one of those REST reads passes the GitHub budget
+cached view is older than 10 minutes. The detail read includes GitHub's mergeability against the
+base; a base that moved without touching the pull request shows its conflict at that 10-minute
+refresh at the latest. The members of a ticket's connected stack (see **Stalled pull requests**)
+are read the same way, each once per poll. Every one of those REST reads passes the GitHub budget
 first — the router's account pick where it is installed, the [single-login
 reserve](#pull-request-view) that keeps the agents' own `gh` calls working where it is not.
 Requested changes post a panel update and move the ticket back to In Progress; fixes
@@ -1499,18 +1502,43 @@ new message, the first that applies:
 |---|---|---|
 | Draft | a draft with no new commit and no pull request activity for 30 minutes | run the background Sol review if not done, then publish only the reviewed part of the stack, bottom first: `git switch <branch> && node tools/ci/publish.mjs` once the branch and every branch below it are reviewed and each passed `verify:pre-pr --body-file` (`publish.mjs` is the only way to publish: it refuses until PR metadata is green and prints any owner question). **Exception (owner, Q-29, 2026-10-05):** a branch whose local `verify:pre-pr` was killed from outside, timed out, or failed twice only on tests unrelated to its change may be published without a passing receipt. Everything else still holds: only the reviewed part of the stack, bottom first; the branches above stay drafts. In order: (1) write the evidence into each such PR's `## Verification` section, outside code fences: `- CI is the proof: <killed \| timed out \| failed twice on unrelated tests> — <evidence>` (for `failed twice on unrelated tests`: `run 1: …; run 2: …; unrelated because …`); (2) make sure every branch up to this one is reviewed and none of the ticket's questions to the owner is still unanswered; (3) run `git switch <branch> && node tools/ci/publish.mjs --ci-proof`, which still checks everything else, and run it again until it publishes. CI is the proof; continue to the merge. |
 | Failed checks | a ready pull request whose latest run of a check failed (pending runs and `Graphite / mergeability_check` do not count) | the failed checks with links; fix, then `gt submit --stack` |
+| Base conflict | GitHub confirms the pull request conflicts with its base (`mergeable: CONFLICTING`; a mergeability GitHub is still computing never counts) | the branch, head and base; rebase only the agent's own stack onto the current base, run the checks and resubmit the way the repository's AGENTS.md prescribes; never `gt sync` or `gt restack`, never another ticket's branches, never an enqueue around the parent |
 | Changes requested | a reviewer's latest approving, change-requesting or dismissed review asks for changes (on any commit), or GitHub's review decision is "changes requested" | each such review and the unresolved review threads; address them, then `gt submit --stack` (for a review on an earlier commit: reply on its threads and re-request the review) |
 | Findings | unresolved review threads a bot started (Greptile, any bot reviewer) | the findings; run the AGENTS.md review loop |
 
-The stages look at the ticket's recorded pull request. A ready pull request gets no nudge: the
-[queue backstop](#queue-backstop) enqueues it.
+The stages look at the ticket's recorded pull request and, where the repository's pull request
+titles name their ticket (tuchel-platform), at its **connected stack**: the open pull requests of
+the same repository, from branches of that repository (never a fork's), whose titles name the
+same ticket as a whole word (`TUC-1`, never `TUC-10`), joined to the recorded one by exact
+base → head branch edges, below and above it. The repo's
+trunk and another ticket's pull request end the stack and are never nudged; a pull request of the
+ticket that is not on the chain is not part of it. Every member is a candidate, bottom first,
+whatever the recorded one's position, so a green pull request waiting for a red, conflicting or
+unreviewed one below it (the ops digest's "green; waits for #N") gets that one repaired, and so
+does a blocked branch above the recorded one. Each member keeps its own stages, claims and budget
+in `pr-watch.json`; members are only nudged: their reviews are not mirrored into the ticket, their
+merge queue drops are not claimed here, and the ticket's link does not move. Before anything is
+sent the whole stack is read and checked; it falls back to the recorded pull request alone, and
+the log says why once, when the branches are not one plain chain (a base branch without an open
+pull request, a branch two open pull requests share, two of the ticket's pull requests on one
+branch, a cycle), when a member cannot be read or no longer matches the listing (state, head,
+branch, base), or when a hold covers any member: `do-not-merge`, a drop escalated to you (also
+the third drop from before drops had kinds), a merge queue message still to deliver, the head a
+genuine drop left, or another ticket's record linking it (compared by repository and number,
+whatever the URL's spelling). While the stack is deferred its other pull requests are not
+nudged, so a permission wait of theirs starts from zero once they are again. In a repository
+whose titles carry no ticket identifier only the recorded pull request is nudged. A ready pull
+request gets no nudge:
+the [queue backstop](#queue-backstop) enqueues it.
 
 Nothing is sent for a pull request labelled `do-not-merge`, while [manual tasks](#manual-tasks)
 due before the merge are open, while the merge queue has it (its last Merge activity bullet
 queues it, runs its CI or merged it, or an open queue draft lists it), or while a merge queue
 drop is being handled; these are settled before review threads are read. An agent gets at most
 one message per poll: merge queue drops of all its pull requests come first, then nudges, so the
-pull requests of one stack take turns. Each stage is claimed per head right before it goes out:
+pull requests of one stack take turns; within a connected stack, the first member whose step went
+(or tried to go) to the agent ends the poll's pass, so a busy or waiting agent is asked about one
+pull request at a time. Each stage is claimed per head right before it goes out:
 a new head can be nudged again, at most twice per stage and pull request. Requested changes are
 claimed per review instead: a change request is sent once, however many commits follow it (it
 keeps holding the merge until the reviewer settles it), and a new request is sent again. The next time that
