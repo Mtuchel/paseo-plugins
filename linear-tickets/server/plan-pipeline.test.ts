@@ -11,6 +11,8 @@ import type { HandoverRecord } from "./handover";
 import { ADVISOR_MODEL } from "../shared/plan-advisor";
 import { PlanPipeline, type PipelineReview } from "./plan-pipeline";
 import { NativeReader, pipelineOwnerEvidence } from "./plan-pipeline-source";
+import { limitTime } from "./limit-resume";
+import type { PlannerRecord, ProjectRecord } from "./project-flow";
 import type { PipelineHost } from "../shared/plan-pipeline";
 
 const START = "2026-10-06T12:00:00.000Z";
@@ -832,3 +834,457 @@ test("a known provider error stays visible when both native and owner evidence b
     assert.ok((await h.snapshot()).error); assert.doesNotMatch(await readFile(h.file, "utf8"), /private-request-token/);
   });
 });
+
+// TUC-1347 direct planner recovery: the observer reads the producer's persisted records
+// (PlannerRecord/ProjectRecord, project-flow.ts) from a REAL projects.json; no reader is mocked.
+// Times are fixed; expected copy is computed with the same Berlin formatter the product uses.
+const PROJECT = "erp";
+const RUN = "a1b2c3d4-1111-4111-8111-111111111111";
+const LISTED = "2026-10-07T09:00:00.000Z";
+const FAILED = "2026-10-07T10:00:00.000Z";
+const RESUME = "2026-10-07T14:00:00.000Z";
+const NOW = "2026-10-07T12:00:00.000Z";
+
+type Recovery = NonNullable<PlannerRecord["recovery"]>;
+type Pending = NonNullable<Recovery["pending"]>;
+function pending(change: Partial<Pending> = {}): Pending {
+  return {
+    identity: "root", error: "429 retry-after-ms=274228000 private-token=planner-secret", model: null,
+    failedAt: FAILED, resumeAt: RESUME, fallbackAt: RESUME, jitterMs: 60_000, basis: "reset", selector: null,
+    ...change,
+  };
+}
+function recovery(change: Partial<Recovery> = {}): Recovery { return { attempt: 1, claims: [FAILED], ...change }; }
+function runRecord(change: Partial<PlannerRecord> = {}): PlannerRecord { return { id: RUN, listedAt: LISTED, tickets: 2, ...change }; }
+function project(planner: PlannerRecord | null, change: Partial<ProjectRecord> = {}): ProjectRecord { return { planner, ...change }; }
+const scheduled = (resumeAt: string, now: string) => `Usage limit: restart scheduled for ${limitTime(Date.parse(resumeAt), Date.parse(now), true)}. Recovery is checked when automatic dispatch is active and the project is eligible.`;
+const requested = (at: string, now: string) => `Usage-limit restart requested at ${limitTime(Date.parse(at), Date.parse(now), true)}; waiting for agent confirmation.`;
+const noPromise = (rows: PipelineHost["rows"]) => rows.every((entry) => !/restart scheduled|waiting for agent confirmation/.test(entry.detail));
+
+async function projects(h: Harness, value: unknown): Promise<string> {
+  const directory = join(h.home, "linear-tickets");
+  await mkdir(directory, { recursive: true });
+  const path = join(directory, "projects.json");
+  await writeFile(path, typeof value === "string" ? value : JSON.stringify(value));
+  return path;
+}
+function plannerRoot(h: Harness, change: Partial<PaseoAgent> = {}): PaseoAgent {
+  return { ...h.agents[0], id: "root", title: "Plan the work order of ERP", labels: { "linear.plannerRun": RUN, "linear.projectId": PROJECT }, ...change } as PaseoAgent;
+}
+// A real OMP native session for a replacement root, so the ordinary observer can classify it.
+async function nativeSession(h: Harness, name: string): Promise<string> {
+  const path = join(h.home, `${name}.jsonl`);
+  await writeFile(path, [
+    { type: "session", version: 3, id: `${name}-session`, timestamp: NOW, cwd: h.home },
+    { type: "custom", id: `${name}-1`, parentId: null, timestamp: NOW, customType: "plannotator", data: { phase: "planning" } },
+  ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  return path;
+}
+// The stopped direct planner the recovery evidence owns: process gone, recorded provider limit.
+async function stoppedPlanner(h: Harness, change: Partial<PlannerRecord> = {}): Promise<string> {
+  h.clock = new Date(NOW);
+  h.agents.splice(0, 1, plannerRoot(h));
+  h.absent = true;
+  await h.append([{ type: "message", timestamp: FAILED, message: { role: "assistant", stopReason: "error", errorMessage: "429 retry-after-ms=274228000 private-token=planner-secret", content: [] } }]);
+  const path = await projects(h, { [PROJECT]: project(runRecord({ agentId: "root", recovery: recovery({ pending: pending() }), ...change })) });
+  await h.refresh();
+  return path;
+}
+
+test("a stopped planner with persisted limit recovery shows the saved Berlin restart time", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    const host = await h.snapshot();
+    const row = host.rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.identifier, "Plan the work order of ERP");
+    assert.equal(row.stage, "waiting");
+    assert.equal(row.status, "normal");
+    assert.equal(row.detail, scheduled(RESUME, NOW));
+    assert.equal(host.checkedAt, NOW);
+  });
+});
+
+test("a changed saved deadline refreshes without counting polling as progress", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    const before = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    const later = "2026-10-07T22:00:00.000Z", after = "2026-10-07T12:30:00.000Z";
+    h.clock = new Date(after);
+    await projects(h, { [PROJECT]: project(runRecord({ agentId: "root", recovery: recovery({ pending: pending({ resumeAt: later }) }) })) });
+    await h.refresh();
+    await h.refresh();
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.detail, scheduled(later, after));
+    assert.equal(row.lastProgressAt, before.lastProgressAt);
+    assert.equal(row.since, before.since);
+  });
+});
+
+test("the restart time keeps its Berlin date across midnight and the daylight-saving change", async () => {
+  await harness(async (h) => {
+    const now = "2026-10-24T20:00:00.000Z", across = "2026-10-25T01:30:00.000Z";
+    h.clock = new Date(now);
+    h.agents.splice(0, 1, plannerRoot(h));
+    h.absent = true;
+    await projects(h, { [PROJECT]: project(runRecord({ listedAt: "2026-10-24T19:00:00.000Z", agentId: "root",
+      recovery: recovery({ claims: ["2026-10-24T19:00:00.000Z"], pending: pending({ failedAt: "2026-10-24T19:00:00.000Z", resumeAt: across }) }) })) });
+    await h.refresh();
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.stage, "waiting");
+    assert.equal(row.detail, scheduled(across, now));
+    assert.match(row.detail, /25\/10/);
+  });
+});
+
+test("reload, archived and absent roots keep the validated wait until the record clears it", async () => {
+  await harness(async (h) => {
+    const path = await stoppedPlanner(h);
+    await h.restart();
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.detail, scheduled(RESUME, NOW));
+    h.agents[0].status = "closed";
+    h.agents[0].archivedAt = NOW;
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.detail, scheduled(RESUME, NOW));
+    h.agents = [];
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.stage, "waiting");
+    const later = "2026-10-07T22:00:00.000Z", after = "2026-10-07T12:30:00.000Z";
+    h.clock = new Date(after);
+    await projects(h, { [PROJECT]: project(runRecord({ agentId: "root", recovery: recovery({ pending: pending({ resumeAt: later }) }) })) });
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.detail, scheduled(later, after));
+    await rm(path);
+    await h.refresh();
+    const cleared = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(cleared.status, "unknown");
+    assert.doesNotMatch(cleared.detail, /restart scheduled|waiting for agent confirmation/);
+  });
+});
+
+test("an unconfirmed limit restart request waits for agent confirmation at its request time", async () => {
+  await harness(async (h) => {
+    const request = `planner-${RUN}-limit-2`, claimAt = "2026-10-07T11:30:00.000Z";
+    await stoppedPlanner(h, { recovery: recovery({ attempt: 2, claims: [FAILED, claimAt],
+      pending: pending({ identity: `planner-${RUN}-limit-1` }), claim: { requestId: request, at: claimAt } }) });
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.stage, "waiting");
+    assert.equal(row.status, "normal");
+    assert.equal(row.detail, requested(claimAt, NOW));
+    assert.notEqual(row.detail, scheduled(RESUME, NOW));
+  });
+});
+
+test("a confirmed limit claim shows the newest saved deadline across refresh and reload", async () => {
+  await harness(async (h) => {
+    const request = `planner-${RUN}-limit-2`, claimAt = "2026-10-07T11:30:00.000Z", next = "2026-10-07T16:00:00.000Z";
+    await stoppedPlanner(h, { recovery: recovery({ attempt: 2, claims: [FAILED, claimAt],
+      pending: pending({ identity: request, resumeAt: next }), claim: { requestId: request, at: claimAt } }) });
+    const first = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(first.detail, scheduled(next, NOW));
+    assert.doesNotMatch(first.detail, /waiting for agent confirmation/);
+    const later = "2026-10-07T20:00:00.000Z", after = "2026-10-07T13:00:00.000Z";
+    h.clock = new Date(after);
+    await projects(h, { [PROJECT]: project(runRecord({ agentId: "root",
+      recovery: recovery({ attempt: 2, claims: [FAILED, claimAt], pending: pending({ identity: request, resumeAt: later }), claim: { requestId: request, at: claimAt } }) })) });
+    await h.restart();
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.detail, scheduled(later, after));
+    assert.doesNotMatch(row.detail, /waiting for agent confirmation/);
+  });
+});
+
+test("a pending initial launch without any agent keeps a rootless Waiting row", async () => {
+  await harness(async (h) => {
+    h.clock = new Date(NOW);
+    h.agents = [];
+    await projects(h, { [PROJECT]: project(runRecord({ recovery: recovery({ pending: pending({ identity: `planner-${RUN}-limit-1` }) }) })) });
+    await h.refresh();
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "")!;
+    assert.equal(row.identifier, `Planner run ${RUN.slice(0, 8)}`);
+    assert.equal(row.stage, "waiting");
+    assert.equal(row.status, "normal");
+    assert.equal(row.detail, scheduled(RESUME, NOW));
+  });
+});
+
+test("two rootless planner runs stay distinct from a queued ticket admission", async () => {
+  await harness(async (h) => {
+    h.clock = new Date(NOW);
+    h.agents = [];
+    h.sessions = [link({ agentId: null, queued: true })];
+    const other = "b2c3d4e5-2222-4222-8222-222222222222";
+    const first = "2026-10-07T15:00:00.000Z", second = "2026-10-07T17:00:00.000Z";
+    await projects(h, {
+      [PROJECT]: project(runRecord({ recovery: recovery({ pending: pending({ identity: `planner-${RUN}-limit-1`, resumeAt: first }) }) })),
+      crm: project(runRecord({ id: other, recovery: recovery({ pending: pending({ identity: `planner-${other}-limit-1`, resumeAt: second }) }) })),
+    });
+    await h.refresh();
+    const rows = (await h.snapshot()).rows;
+    const queue = rows.find((entry) => entry.agentId === "" && entry.identifier === "TUC-99")!;
+    assert.equal(queue.stage, "queued");
+    assert.equal(queue.detail, "Waiting for admission or agent capacity");
+    const rootless = rows.filter((entry) => entry.agentId === "" && entry.stage === "waiting");
+    assert.equal(rootless.length, 2);
+    assert.deepEqual(rootless.map((entry) => entry.identifier).sort(), [`Planner run ${RUN.slice(0, 8)}`, `Planner run ${other.slice(0, 8)}`].sort());
+    assert.deepEqual(rootless.map((entry) => entry.detail).sort(), [scheduled(first, NOW), scheduled(second, NOW)].sort());
+    assert.equal(new Set(rootless.map((entry) => entry.id)).size, 2);
+  });
+});
+
+test("a recorded successor retires the predecessor's recovery wait", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.stage, "waiting");
+    const native = await nativeSession(h, "successor");
+    h.agents.splice(0, 1, plannerRoot(h, { id: "successor", updatedAt: NOW,
+      persistence: { provider: "omp", sessionId: "successor", nativeHandle: native } }));
+    await projects(h, { [PROJECT]: project(runRecord({ agentId: "successor", started: true, startedAt: NOW })) });
+    await h.refresh();
+    const rows = (await h.snapshot()).rows;
+    const predecessor = rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(predecessor.stage, "superseded");
+    assert.equal(predecessor.status, "normal");
+    const current = rows.find((entry) => entry.agentId === "successor")!;
+    assert.equal(current.stage, "preparing");
+    assert.equal(current.status, "normal");
+    assert.equal(noPromise(rows), true);
+  });
+});
+
+test("a newer live duplicate root never inherits the recorded wait", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    const native = await nativeSession(h, "duplicate");
+    h.agents.push(plannerRoot(h, { id: "duplicate", updatedAt: NOW,
+      persistence: { provider: "omp", sessionId: "duplicate", nativeHandle: native } }));
+    await h.refresh();
+    const rows = (await h.snapshot()).rows;
+    assert.equal(rows.find((entry) => entry.agentId === "duplicate")?.stage, "preparing");
+    assert.equal(noPromise(rows), true);
+  });
+});
+
+test("a different current run retires the previous run's wait", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    const next = "c3d4e5f6-3333-4333-8333-333333333333";
+    const native = await nativeSession(h, "root-2");
+    h.agents.splice(0, 1, plannerRoot(h, { id: "root-2", labels: { "linear.plannerRun": next, "linear.projectId": PROJECT }, updatedAt: NOW,
+      persistence: { provider: "omp", sessionId: "root-2", nativeHandle: native } }));
+    await projects(h, { [PROJECT]: project(runRecord({ id: next, agentId: "root-2", started: true, startedAt: NOW })) });
+    await h.refresh();
+    const rows = (await h.snapshot()).rows;
+    assert.equal(rows.find((entry) => entry.agentId === "root")?.stage, "superseded");
+    assert.equal(rows.find((entry) => entry.agentId === "root-2")?.stage, "preparing");
+    assert.equal(noPromise(rows), true);
+  });
+});
+
+test("cleared recovery returns the run to ordinary classification, or unknown when unobservable", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.stage, "waiting");
+    await projects(h, { [PROJECT]: project(runRecord({ agentId: "root" })) });
+    await h.refresh();
+    const ordinary = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(ordinary.stage, "preparing");
+    assert.equal(ordinary.status, "failed");
+    assert.match(ordinary.detail, /Provider rate limit \(429\)/);
+    h.agents = [];
+    await h.refresh();
+    const unobservable = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(unobservable.status, "unknown");
+    assert.doesNotMatch(unobservable.detail, /restart scheduled|waiting for agent confirmation/);
+  });
+});
+
+test("a conflicting project identity never transfers the wait or fabricates a placeholder", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    h.agents.splice(0, 1, plannerRoot(h, { labels: { "linear.plannerRun": RUN, "linear.projectId": "other" } }));
+    await h.refresh();
+    const rows = (await h.snapshot()).rows;
+    const row = rows.find((entry) => entry.agentId === "root")!;
+    assert.doesNotMatch(row.detail, /restart scheduled|waiting for agent confirmation/);
+    assert.equal(rows.some((entry) => entry.identifier === `Planner run ${RUN.slice(0, 8)}`), false, "no fabricated placeholder");
+  });
+});
+
+test("owner-held planner recovery needs attention instead of a restart promise", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h, { ownerAsked: true, error: "The planner reached four usage-limit restart attempts in twenty-four hours." });
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.stage, "waiting");
+    assert.equal(row.status, "attention");
+    assert.equal(row.detail, "Automatic planner recovery stopped; owner action required. Use Plan or Skip.");
+  });
+});
+
+test("an approved work order or a matching closed run completes the recorded wait", async () => {
+  await harness(async (h) => {
+    const marker = "PRIVATE-APPROVED-PLAN-MARKER";
+    await stoppedPlanner(h);
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.stage, "waiting");
+    await projects(h, { [PROJECT]: project(runRecord({ agentId: "root", approved: { agentId: null, plan: `# ${marker}`, done: [] } })) });
+    await h.refresh();
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.stage, "completed");
+    assert.equal(row.status, "normal");
+    assert.equal(row.detail, "Project planner run closed; no automatic restart is pending");
+    assert.doesNotMatch(JSON.stringify(await h.snapshot()), new RegExp(marker));
+    assert.doesNotMatch(await readFile(h.file, "utf8"), new RegExp(marker));
+  });
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")?.stage, "waiting");
+    await projects(h, { [PROJECT]: project(null, { closedPlanner: RUN }) });
+    await h.refresh();
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.stage, "completed");
+    assert.equal(row.status, "normal");
+    assert.equal(row.detail, "Project planner run closed; no automatic restart is pending");
+  });
+});
+
+test("missing, unreadable, oversized or malformed project evidence drops the promise without leaking", async () => {
+  await harness(async (h) => {
+    const path = await stoppedPlanner(h);
+    const valid: Record<string, ProjectRecord> = { [PROJECT]: project(runRecord({ agentId: "root", recovery: recovery({ pending: pending() }) })) };
+    let expectedCheck = (await h.snapshot()).checkedAt;
+    assert.equal(expectedCheck, NOW);
+    let tick = 0;
+    const variants: [string, string | Buffer][] = [
+      ["malformed", "{"],
+      ["scalar envelope", JSON.stringify("private-token=planner-secret")],
+      ["array envelope", JSON.stringify([{ planner: null }])],
+      ["null envelope", "null"],
+      ["invalid timestamp", JSON.stringify({ [PROJECT]: project(runRecord({ agentId: "root", recovery: recovery({ pending: pending({ resumeAt: "not-a-time" }) }) })) })],
+      ["oversized", Buffer.alloc(4 * 1024 * 1024 + 1)],
+    ];
+    for (const [name, value] of variants) {
+      h.clock = new Date(Date.parse(NOW) + ++tick * 60_000);
+      await writeFile(path, value);
+      await h.refresh();
+      const host = await h.snapshot();
+      const row = host.rows.find((entry) => entry.agentId === "root")!;
+      assert.equal(row.status, "unknown", `${name}: promise removed`);
+      assert.doesNotMatch(row.detail, /restart scheduled|waiting for agent confirmation/, name);
+      assert.ok(host.error, `${name}: source problem reported`);
+      assert.equal(host.checkedAt, expectedCheck, `${name}: last successful check retained`);
+      await projects(h, valid);
+      await h.refresh();
+      assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")!.stage, "waiting", `${name}: display restored`);
+      expectedCheck = (await h.snapshot()).checkedAt;
+    }
+    h.clock = new Date(Date.parse(NOW) + ++tick * 60_000);
+    await rm(path);
+    await mkdir(path);
+    await h.refresh();
+    const unreadable = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(unreadable.status, "unknown");
+    assert.doesNotMatch(unreadable.detail, /restart scheduled|waiting for agent confirmation/);
+    assert.equal((await h.snapshot()).checkedAt, expectedCheck, "unreadable source retains the last successful check");
+    await rm(path, { recursive: true });
+    await projects(h, valid);
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")!.stage, "waiting");
+    await rm(path);
+    await h.refresh();
+    const missing = await h.snapshot();
+    const missingRow = missing.rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(missingRow.status, "unknown");
+    assert.doesNotMatch(missingRow.detail, /restart scheduled|waiting for agent confirmation/);
+    assert.ok(missing.checkedAt && Date.parse(missing.checkedAt) >= Date.parse(NOW), "check time never regresses");
+    await projects(h, valid);
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")!.stage, "waiting");
+    const leaked = JSON.stringify(await h.snapshot()) + await readFile(h.file, "utf8");
+    assert.doesNotMatch(leaked, /planner-secret|not-a-time/);
+  });
+});
+
+test("owner permissions and a delivered review keep precedence over the recovery wait", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    h.agents[0].pendingPermissions = [{ id: "permission", kind: "tool", name: "shell" }] as unknown as PaseoAgent["pendingPermissions"];
+    await h.refresh();
+    const waiting = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(waiting.stage, "waiting");
+    assert.equal(waiting.status, "normal");
+    assert.equal(waiting.detail, "Waiting for owner's question or permission response");
+    h.agents[0].pendingPermissions = [];
+    await h.refresh();
+    assert.equal((await h.snapshot()).rows.find((entry) => entry.agentId === "root")!.detail, scheduled(RESUME, NOW));
+    await h.snapshot([review({ agentId: "root", since: NOW })]);
+    await h.refresh();
+    const host = await h.snapshot();
+    assert.equal(host.rows.some((entry) => entry.agentId === "root" && entry.stage === "ready"), true, "actual delivery wins");
+    assert.equal(noPromise(host.rows), true);
+  });
+});
+
+test("newer real planner progress suppresses the stale limit wait", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    const resumed = "2026-10-07T11:30:00.000Z";
+    h.absent = false;
+    await h.append([{ type: "message", timestamp: resumed, message: { role: "assistant", content: [{ type: "text", text: "Resumed planning after the limit" }] } }]);
+    await h.refresh();
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.stage, "preparing");
+    assert.equal(row.lastProgressAt, resumed);
+    assert.doesNotMatch(row.detail, /restart scheduled|waiting for agent confirmation/);
+  });
+});
+
+test("an actual submission failure after the wait stays failed", async () => {
+  await harness(async (h) => {
+    await stoppedPlanner(h);
+    const late = "2026-10-07T11:45:00.000Z";
+    await h.append([...submit(HASH_A, "submit-recovered", late), result({}, true, "Cannot find module '/private/tools/plan.mjs'", "submit-recovered", late)]);
+    await h.refresh();
+    const row = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.stage, "publishing");
+    assert.equal(row.status, "failed");
+    assert.match(row.detail, /dependency\/import/);
+    assert.doesNotMatch(row.detail, /restart scheduled|waiting for agent confirmation/);
+  });
+});
+
+test("planner recovery evidence leaves unrelated ticket rows and its source bytes untouched", async () => {
+  await harness(async (h) => {
+    await h.append([...submit(), result({}, true, "ERR_MODULE_NOT_FOUND")]);
+    const path = await projects(h, { [PROJECT]: project(runRecord({ agentId: "root", recovery: recovery({ pending: pending() }) })) });
+    const before = await readFile(path);
+    h.clock = new Date(NOW);
+    await h.refresh();
+    const rows = (await h.snapshot()).rows;
+    const ticket = rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(ticket.stage, "publishing");
+    assert.equal(ticket.status, "failed");
+    assert.equal(noPromise(rows), true);
+    await h.refresh();
+    assert.deepEqual(await readFile(path), before, "the observed record is never rewritten");
+  });
+});
+
+test("planner source failures leave ordinary ticket classification untouched", async () => {
+  await harness(async (h) => {
+    h.clock = new Date(ARRIVED);
+    await h.refresh();
+    const before = (await h.snapshot()).rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(before.status, "normal");
+    const checkedAt = (await h.snapshot()).checkedAt;
+    const path = await projects(h, "{");
+    await h.refresh();
+    const host = await h.snapshot();
+    const row = host.rows.find((entry) => entry.agentId === "root")!;
+    assert.equal(row.stage, before.stage);
+    assert.equal(row.status, before.status);
+    assert.equal(row.detail, before.detail);
+    assert.ok(host.error, "host source health reports the corrupt recovery source");
+    assert.equal(host.checkedAt, checkedAt, "last successful check retained");
+    assert.deepEqual(await readFile(path), Buffer.from("{"), "source bytes untouched");
+  });
+});
+
