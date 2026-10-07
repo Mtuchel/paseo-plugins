@@ -7,7 +7,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { Deputy, fingerprint, overrideCommand, readCandidates, type ArbitratedOutcome, type PermissionArbiter } from "./deputy";
-import { checkVerdict, evaluationPrompt } from "./deputy-evaluator";
+import { checkVerdict, evaluationPrompt, policyVersion } from "./deputy-evaluator";
 import { LIVE_MIN_CASES, shadowEvidence } from "./deputy-evidence";
 import { renderReport, verdict, waitStats } from "./deputy-report";
 import { assessRisk, type Part } from "./deputy-risk";
@@ -18,7 +18,7 @@ import { DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WATCHDOG,
 
 const OWNER = "owner-1";
 const APP = "paseo-app";
-const VERSION = "deputy-1/omp/test-model/low";
+const VERSION = policyVersion("omp/test-model");
 const trusted = { trusted: true, planning: false, attended: false };
 
 function question(id = "r1", options = ["node:test", "vitest"], extra: Partial<AgentPermissionRequest> = {}): AgentPermissionRequest {
@@ -180,7 +180,7 @@ test("live needs at least 30 real paired cases at 90% agreement for the current 
   assert.equal(shadowEvidence(cases(LIVE_MIN_CASES, 27), VERSION).ready, true, "27 of 30 is 90%");
   assert.equal(shadowEvidence(cases(LIVE_MIN_CASES, 26), VERSION).ready, false);
   assert.equal(shadowEvidence(cases(LIVE_MIN_CASES - 1, LIVE_MIN_CASES - 1), VERSION).ready, false);
-  assert.equal(shadowEvidence(cases(LIVE_MIN_CASES, LIVE_MIN_CASES, "deputy-1/omp/older/low"), VERSION).pairs.length, 0, "a model or policy change starts over");
+  assert.equal(shadowEvidence(cases(LIVE_MIN_CASES, LIVE_MIN_CASES, policyVersion("omp/older")), VERSION).pairs.length, 0, "a model or policy change starts over");
 });
 
 test("unverified, blank, late and deputy-answered cases never count as agreement", () => {
@@ -465,6 +465,6 @@ test("waiting time counts every question asked in the window, unanswered ones li
   const baseline = waitStats([], { since: "2026-09-30T00:00:00.000Z", until: "2026-10-01T00:00:00.000Z" }, 0);
   assert.equal(verdict(baseline, live).pass, null, "no comparable history is inconclusive, not a pass");
   const report = renderReport({ entries, candidates: [], version: VERSION, now: "2026-10-07T00:00:00Z" });
-  assert.match(report, /Shadow evidence for deputy-1\/omp\/test-model\/low/);
+  assert.ok(report.includes(`Shadow evidence for ${VERSION}`));
   assert.match(report, /Answered by the deputy: 1/);
 });

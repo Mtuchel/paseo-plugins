@@ -2290,7 +2290,7 @@ they keep saying what they relied on after the source changes.
   as applied.
 
 **Live gate.** Live answers need both: at least 30 real paired shadow cases at 90% agreement or
-more for the current evaluator version (`deputy-1/<model>/low`; a model or policy change starts
+more for the current evaluator version (`deputy-2/<model>/low`; a model or policy change starts
 over), and a daemon that submits a response only while no owner response for the request is in,
 bound to the request and idempotent, and tells who actually answered. No released Paseo daemon
 offers that yet ([TUC-1258](https://linear.app/tuchel/issue/TUC-1258)), so on every host a live

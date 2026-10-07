@@ -130,6 +130,10 @@ export type SessionLink = {
   // The comment a thread queued behind another start of its ticket came with, passed on to the
   // agent it is linked to (see startQueued).
   pendingText?: string | null;
+  // Who wrote `pendingText`, when that was verified as the owner (the thread's creator, or a reply
+  // whose author was checked): only then does its delivery count as the owner's answer (README,
+  // "Deputy for agent questions"). Null for a reply that named no author.
+  pendingFrom?: { activityId: string; userId: string } | null;
   // A question with several parts, asked one part at a time.
   questions?: { requestId: string; index: number; answers: Record<string, string> } | null;
   // Replaced by a newer thread on the same ticket (every @mention opens one); told so and completed.
@@ -577,9 +581,11 @@ export class SessionRouter {
     await this.deps.watchdog?.continued(issueId).catch((error: unknown) => console.error(`[linear-tickets] ${identifier}: recording the owner's continuation for the watchdog failed: ${error instanceof Error ? error.message : error}`));
     const comment = (session.comment ?? {}) as { body?: string };
     const text = typeof comment.body === "string" && !/^This thread is for an agent session/.test(comment.body) ? comment.body.replace(/@paseo\b/gi, "").trim() : "";
+    // The thread's creator was checked as the owner above.
+    const from = { activityId: `session:${session.id}`, userId: owner };
     // A correction of a deputy answer starts nothing and answers nothing: the thread only
     // reports where it went.
-    const corrected = text ? await this.override(text, { via: "linear-session", activityId: `session:${session.id}`, userId: owner }) : null;
+    const corrected = text ? await this.override(text, { via: "linear-session", ...from }) : null;
     if (corrected) {
       await this.deps.store.put({ ...link, closed: true });
       await this.say(session.id, corrected.delivered ? "response" : "error", corrected.reply);
@@ -589,14 +595,14 @@ export class SessionRouter {
     // sweep links it to the agent it made (passing the comment on) or starts one.
     const gate = this.deps.launcher.gate(issueId);
     if (!gate) {
-      await this.deps.store.put({ ...link, queued: true, queueReason: "a launch for this ticket is under way", pendingText: text || null });
+      await this.deps.store.put({ ...link, queued: true, queueReason: "a launch for this ticket is under way", pendingText: text || null, pendingFrom: text ? from : null });
       await this.say(session.id, "thought", "A launch for this ticket is under way; this thread joins its agent once it is up, or starts one.");
       return;
     }
     try {
       const wait = await this.processWait(issueId);
       if (wait) {
-        await this.deps.store.put({ ...link, queued: true, queueReason: wait, pendingText: text || null });
+        await this.deps.store.put({ ...link, queued: true, queueReason: wait, pendingText: text || null, pendingFrom: text ? from : null });
         await this.say(session.id, "thought", `Queued: ${wait}; this thread waits for confirmed process exit.`);
         return;
       }
@@ -608,7 +614,7 @@ export class SessionRouter {
         await this.deps.store.put({ ...link, agentId: existing.id });
         await this.linkToPaseo(session.id, existing.id);
         // Same as a relayed comment: answers a pending question or decides a pending approval.
-        if (text) await this.passOn(existing.id, text, { activityId: `session:${session.id}`, userId: owner });
+        if (text) await this.passOn(existing.id, text, from);
         if (text && asked) await closeAnswered(this.deps.needsYou!, this.deps.linear, issueId);
         await this.say(session.id, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.${text ? " Your message was passed on." : ""}`);
         await this.closeSuperseded();
@@ -620,7 +626,7 @@ export class SessionRouter {
       // host's to start.
       const routed = await this.deps.route?.take({ kind: "session", issueId, identifier, sessionId: session.id, ...(text ? { text } : {}) });
       if (routed && "held" in routed) {
-        await this.deps.store.put({ ...link, queued: true, queueReason: routed.held, pendingText: text || null });
+        await this.deps.store.put({ ...link, queued: true, queueReason: routed.held, pendingText: text || null, pendingFrom: text ? from : null });
         await this.say(session.id, "thought", `Not started yet: ${routed.held}. This thread stays queued here.`);
         return;
       }
@@ -634,7 +640,7 @@ export class SessionRouter {
       await this.deps.store.put(link);
       const admission = await this.deps.starter.admission(issueId, this.paseo!, await this.deps.settings.read());
       if (!admission.ok) {
-        await this.deps.store.patch(session.id, { queued: true, queueReason: admission.reason, pendingText: text || null });
+        await this.deps.store.patch(session.id, { queued: true, queueReason: admission.reason, pendingText: text || null, pendingFrom: text ? from : null });
         await this.say(session.id, "thought", admission.reason);
         return;
       }
@@ -769,7 +775,7 @@ export class SessionRouter {
       if (routed && "held" in routed) {
         // Nothing was started or sent anywhere; the answer stays with the thread and the sweep
         // tries again (the owner sees why here).
-        await this.deps.store.patch(sessionId, { queued: true, queueReason: routed.held, pendingText: body });
+        await this.deps.store.patch(sessionId, { queued: true, queueReason: routed.held, pendingText: body, pendingFrom: userId ? { activityId: activityId || `session:${sessionId}`, userId } : null });
         await this.say(sessionId, "thought", `Not passed on yet: ${routed.held}. Your message stays queued here.`);
         return;
       }
@@ -939,8 +945,9 @@ export class SessionRouter {
         if (text) {
           const found = await this.agent(existing.id);
           if (!found || found.agent.status === "closed" || crashedProcess(found.agent)) return;
-          // Queued only from the owner's own thread (its creator or a reply checked as his).
-          await this.passOn(existing.id, text, { activityId: `session:${link.sessionId}`, userId: await this.owner() });
+          // Counted as the owner's answer only with a verified author.
+          if (link.pendingFrom) await this.passOn(existing.id, text, link.pendingFrom);
+          else await deliverToAgent(this.paseo!, existing.id, text);
           if (needsYou && (await needsYou.all()).some((entry) => entry.id === link.issueId && entry.agentId === existing.id)) await closeAnswered(needsYou, this.deps.linear, link.issueId);
         }
         await this.deps.store.patch(link.sessionId, { agentId: existing.id, queued: false, queueReason: undefined, restartRequested: undefined, pendingText: null, ...(link.offer === "resume" ? { offer: null } : {}) });

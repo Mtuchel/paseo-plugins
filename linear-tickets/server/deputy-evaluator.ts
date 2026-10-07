@@ -18,7 +18,7 @@ import { verifyCitation, type Source } from "./deputy-sources";
 export const EVALUATOR_THINKING = "low";
 // Changing the prompt, the checks or the source handling makes earlier shadow evidence stale:
 // readiness counts only cases recorded under the current version.
-export const POLICY_VERSION = "deputy-1";
+export const POLICY_VERSION = "deputy-2";
 export const policyVersion = (model: string) => `${POLICY_VERSION}/${model}/${EVALUATOR_THINKING}`;
 
 const DEADLINE_MS = 150_000;
