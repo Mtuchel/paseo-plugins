@@ -97,7 +97,7 @@ test("retarget-orphan.mjs: a move counts as prepared only with its full record, 
 
   const candidate = { pr: 419, branch: "mtuchel/tuc-1-fix", base: "graphite-base/418", baseSha: sha("b"), expect: `419@${sha("1")}`, range, tickets: ["TUC-1"], eligible: true, reason: null };
   assert.deepEqual(parseRetargetList(out(0, { result: "listed", candidates: [candidate, { ...candidate, pr: 420 }, { ...candidate, baseSha: "b" }] })), [candidate], "a candidate whose stack does not start at it, or without its base head, is left out");
-  assert.throws(() => parseRetargetList(out(1, { result: "error" })), BackstopScriptError);
+  assert.throws(() => parseRetargetList(out(1, { result: "error", error: "gh api repos/o/r/pulls failed: HTTP 403" })), (error: unknown) => error instanceof BackstopScriptError && error.message.includes("HTTP 403"), "a read failure keeps the script's reason");
 });
 
 test("enqueue-ready.mjs: stacks without their action, branch or heads are left out; a run without stacks is an error", () => {
