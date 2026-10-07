@@ -3,6 +3,7 @@ import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promise
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import type { ActivationResume } from "./activation";
 import type { ResumeTarget } from "./launch";
 import type { LinearService } from "./linear";
 import { paseoHome } from "./ticket-mcp";
@@ -49,6 +50,20 @@ export async function readGitState(cwd: string): Promise<GitState> {
   const git = async (args: string[]) => (await exec("git", ["-C", cwd, ...args], { timeout: 10_000 })).stdout.trim();
   const [branch, lastCommit] = await Promise.all([git(["rev-parse", "--abbrev-ref", "HEAD"]).catch(() => ""), git(["log", "-1", "--format=%h %s"]).catch(() => "")]);
   return { branch: branch && branch !== "HEAD" ? branch : null, lastCommit: lastCommit || null };
+}
+
+// The exact state of the branch work a strict resume continues on: the branch the worktree is on,
+// its commit (the full SHA, so the receiving host can require exactly that commit) and whether
+// uncommitted changes sit next to it. Null when any of it cannot be read.
+async function readWorkState(cwd: string): Promise<{ branch: string | null; commit: string; dirty: boolean } | null> {
+  const git = async (args: string[]) => (await exec("git", ["-C", cwd, ...args], { timeout: 10_000 })).stdout.trim();
+  const [branch, commit, status] = await Promise.all([
+    git(["rev-parse", "--abbrev-ref", "HEAD"]).catch(() => null),
+    git(["rev-parse", "HEAD"]).catch(() => null),
+    git(["status", "--porcelain"]).catch(() => null),
+  ]);
+  if (commit === null || status === null || !/^[0-9a-f]{40}$/.test(commit)) return null;
+  return { branch: branch && branch !== "HEAD" ? branch : null, commit, dirty: status !== "" };
 }
 
 const clip = (text: string, limit: number) => (text.length <= limit ? text : `${text.slice(0, limit).trimEnd()} …`);
@@ -235,5 +250,19 @@ export class Handover {
     const record = await this.read(issueId);
     if (!record?.branch) return null;
     return { branch: record.branch, worktreePath: record.worktreePath, handover: handoverPrompt(record) };
+  }
+
+  // The handover snapshot that travels with a strict resume to the peer host (drain.ts): the
+  // recorded branch, its exact commit and whether uncommitted changes are next to it, plus the
+  // same prompt the next agent reads. The worktree path stays on this host (the receiving host
+  // opens its own checkout), and nothing is offered that could not be verified: no record, no
+  // branch, no worktree, or a worktree that is gone or off the recorded branch means no snapshot,
+  // so the peer holds the resume instead of continuing on a guess.
+  async resumeSnapshot(issueId: string): Promise<ActivationResume | null> {
+    const record = await this.read(issueId);
+    if (!record?.branch || !record.worktreePath) return null;
+    const state = await readWorkState(record.worktreePath);
+    if (!state || state.branch !== record.branch) return null;
+    return { branch: record.branch, commit: state.commit, dirty: state.dirty, handover: handoverPrompt({ ...record, worktreePath: null }) };
   }
 }

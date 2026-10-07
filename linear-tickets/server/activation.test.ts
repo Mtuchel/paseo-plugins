@@ -1,21 +1,27 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
+import { promisify } from "node:util";
 import type { PaseoApi } from "@getpaseo/client";
+import type { TicketDetail } from "../shared/contracts";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
-import type { ActivationEnvelope, ActivationRoute, RequestLike } from "./activation";
-import { ACTIVATION_HEADER, recoverActivationId } from "./activation";
+import type { ActivationEnvelope, ActivationResume, ActivationRoute, RequestLike } from "./activation";
+import { ACTIVATION_HEADER, activationEnvelopeSchema, recoverActivationId } from "./activation";
 import { activationEndpoints } from "./activation-endpoints";
 import { ActivationIntake } from "./activation-intake";
 import { DrainRouter, SEED_FILE } from "./drain";
-import { Launcher } from "./launch";
+import { Handover } from "./handover";
+import { Launcher, type ResumeTarget } from "./launch";
 import { PermissionReplies } from "./permission-replies";
 import { SessionStore } from "./sessions";
-import { ResumeUnavailableError } from "./starter";
+import { ResumeUnavailableError, TicketStarter } from "./starter";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, Settings, type ActivationSettings, type PluginSettings } from "./settings";
 import { WATCHDOG_LABEL, WatchdogStore } from "./watchdog";
+
+const exec = promisify(execFile);
 
 const OWNER = "owner-1";
 const ISSUE = "i1";
@@ -69,8 +75,17 @@ function fakeAgent(spec: FakeAgentSpec): FakeAgent {
   };
 }
 
+// The daemon fake as the routers read it, named for the helpers that thread it through.
+type FakeDaemon = {
+  paseo: PaseoApi;
+  agents: FakeAgent[];
+  sent: { agentId: string; message: string }[];
+  answers: { agentId: string; requestId: string; response: unknown }[];
+  archived: Set<string>;
+};
+
 // A daemon in memory: exactly what the routers read (agents.list / agents.ref).
-function fakeDaemon(specs: FakeAgentSpec[]) {
+function fakeDaemon(specs: FakeAgentSpec[]): FakeDaemon {
   const agents = specs.map(fakeAgent);
   const archived = new Set(specs.filter((spec) => spec.archived).map((spec) => spec.id));
   const sent: { agentId: string; message: string }[] = [];
@@ -114,12 +129,13 @@ async function withHome(t: TestContext): Promise<string> {
   return home;
 }
 
-function drainFor(home: string, daemon: ReturnType<typeof fakeDaemon>, options: {
+function drainFor(home: string, daemon: FakeDaemon, options: {
   request?: RequestLike;
   settings?: ActivationSettings;
   sessionFor?: (agentId: string) => Promise<{ closed?: boolean } | null>;
   ticketState?: (issueId: string) => Promise<{ statusType: string } | null>;
   ghosts?: (agents: FakeAgent[]) => Promise<Set<string>>;
+  resumeSnapshot?: (issueId: string) => Promise<ActivationResume | null>;
 } = {}) {
   return new DrainRouter({
     settings: { read: async () => settingsFor(options.settings ?? { mode: "remote", peer: PEER }) },
@@ -130,6 +146,7 @@ function drainFor(home: string, daemon: ReturnType<typeof fakeDaemon>, options: 
     home, host: "mac", log: () => {},
     // The process check has its own tests; these fixtures' in-memory agents have no process.
     ghosts: (options.ghosts ?? (async () => new Set<string>())) as never,
+    handover: options.resumeSnapshot ? { resumeSnapshot: options.resumeSnapshot } : undefined,
   });
 }
 
@@ -359,7 +376,7 @@ test("a forwarded ticket carries its watchdog history; the receiving host takes 
   assert.ok((await source.read()).tickets.i9.transferredAt, "the source stops recovering the ticket");
 
   const target = new WatchdogStore(join(home, "target-watchdog.json"));
-  const options: { labels?: Record<string, string> }[] = [];
+  const options: { labels?: Record<string, string>; resume?: ActivationResume }[] = [];
   const order: string[] = [];
   const intake = new ActivationIntake({
     settings: { read: async () => settingsFor() }, home, host: "server087", log: () => {},
@@ -378,7 +395,8 @@ test("a forwarded ticket carries its watchdog history; the receiving host takes 
   });
   await intake.applyClaims({ host: "mac", seed: "seed-1", revision: 1, claims: [] });
   const marker = "cycle-1:succeed";
-  await intake.accept({ ...envelope, id: "watchdog:i9:cycle-1:succeed", kind: "recover", strictResume: true, watchdog: { v: 1, starts: [started], exhaustedAt: null, cycle: { id: "cycle-1", kind: "ghost", startedAt: started, marker } } });
+  const snapshot: ActivationResume = { branch: "mtuchel/tuc-9-fix", commit: "9".repeat(40), dirty: false, handover: "Continue the recorded work." };
+  await intake.accept({ ...envelope, id: "watchdog:i9:cycle-1:succeed", kind: "recover", strictResume: true, resume: snapshot, watchdog: { v: 1, starts: [started], exhaustedAt: null, cycle: { id: "cycle-1", kind: "ghost", startedAt: started, marker } } });
   await intake.accept({ id: "session:sess-8", kind: "session", issueId: "i8", identifier: "TUC-8", sessionId: "sess-8", host: "mac", requestedAt: "2026-01-01T00:00:00Z" });
   await intake.idle();
   assert.deepEqual(order, ["adopt", "start", "adopt", "start"], "the history is saved before each start");
@@ -386,6 +404,7 @@ test("a forwarded ticket carries its watchdog history; the receiving host takes 
   assert.deepEqual(file.tickets.i9.starts, [started], "the budget is not reset by the transfer");
   assert.equal(file.tickets.i9.cycle?.successor?.marker, marker, "the forwarded replacement continues its cycle");
   assert.deepEqual(options[0].labels, { [WATCHDOG_LABEL]: marker });
+  assert.deepEqual(options[0].resume, snapshot, "the replacement's recorded work travels with it");
   assert.ok(file.tickets.i8.quarantineUntil, "a ticket that came without history waits a day");
 });
 
@@ -824,4 +843,230 @@ test("a queued activation never crosses during a sweep before claims are acknowl
   await drain.sweep();
   assert.equal((await drain.status()).outbox, 0);
   assert.equal(calls.filter((call) => call.url.endsWith("/activation")).length, 1);
+});
+
+
+// The receiving host of the resume tests: the real TicketStarter imports the envelope's resume
+// against a real repository (the branch and commit checks are real git), while a launcher records
+// the resume it was handed instead of starting an agent.
+const RESUME_SETTINGS: PluginSettings = {
+  ...settingsFor(),
+  lastProvider: "claude",
+  launchPreferences: { claude: { model: "claude/opus", modeId: "default" } },
+  projectMappings: { "project:lp-1": { projectId: "p1", label: "App", baseBranch: "refs/heads/dev" } },
+};
+
+function resumeDestination(home: string, repo: string): { intake: ActivationIntake; resumes: (ResumeTarget | undefined)[]; comments: string[] } {
+  const daemon = fakeDaemon([]);
+  Object.assign(daemon.paseo, { projects: { list: async () => ({ projects: [{ projectId: "p1", projectKind: "git", projectRootPath: repo, projectDisplayName: "repo" }] }) } });
+  const resumes: (ResumeTarget | undefined)[] = [];
+  const comments: string[] = [];
+  const linear = {
+    detail: async () => ({
+      issue: { id: ISSUE, identifier: "TUC-1", title: "Fix the sign-in flow", url: "https://linear.app/i/i1", branchName: "mtuchel/tuc-1-fix", project: "App", team: "Engineering", labels: [] },
+      teamId: "t1", projectId: "lp-1", context: "{}", warnings: [], relations: { related: [] },
+    } as unknown as TicketDetail),
+    issueState: async () => ({ id: ISSUE, identifier: "TUC-1", projectId: "lp-1", creatorId: OWNER, blockedBy: [], status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", labels: [], attachmentUrls: [], priority: 0, createdAt: "2026-01-01T00:00:00Z", unblocks: 0 }),
+    viewerId: async () => OWNER,
+    appUserId: async () => "app-1",
+    issueDocument: async () => null,
+  };
+  const starter = new TicketStarter({
+    linear: linear as never,
+    launcher: { start: async (_input: unknown, _paseo: unknown, launchOptions: { resume?: ResumeTarget }) => { resumes.push(launchOptions.resume); return { agentId: "agent-1", warnings: [] }; } } as never,
+    // A record of this host's own, which a forwarded resume must never silently fall back to.
+    handover: { resumeTarget: async () => ({ branch: "local-old-work", worktreePath: null, handover: "This host's own record." }) } as never,
+    branches: async () => ({ branches: [{ id: "refs/heads/mtuchel/tuc-1-fix", label: "mtuchel/tuc-1-fix" }], defaultBranch: null }),
+  });
+  const intake = new ActivationIntake({
+    settings: { read: async () => RESUME_SETTINGS }, home, host: "server087", log: () => {},
+    paseo: () => daemon.paseo,
+    linear: () => ({ comment: async (_issue: string, body: string) => { comments.push(body); }, addLabel: async () => {}, removeLabel: async () => {} }),
+    launcher: () => ({ gate: () => ({ release: () => {} }) }),
+    starter: () => starter,
+  });
+  return { intake, resumes, comments };
+}
+
+// The actual failure, end to end with real git on both sides: the source host has the record and
+// the worktree, the receiving host has neither -- and the resume still continues exactly the
+// recorded commit (dirty source work holds instead of starting on a fresh branch).
+test("a source-only handover resume starts on the receiving host at the exact recorded commit, and dirty work holds", async (t) => {
+  const home = await withHome(t);
+  const source = await mkdtemp(join(tmpdir(), "paseo-resume-source-"));
+  const destination = await mkdtemp(join(tmpdir(), "paseo-resume-destination-"));
+  t.after(() => rm(source, { recursive: true, force: true }));
+  t.after(() => rm(destination, { recursive: true, force: true }));
+  const git = async (cwd: string, args: string[]) => (await exec("git", ["-C", cwd, ...args], { maxBuffer: 1_000_000 })).stdout.trim();
+  await git(source, ["init", "--quiet"]);
+  await git(source, ["config", "user.email", "test@example.com"]);
+  await git(source, ["config", "user.name", "Test"]);
+  await writeFile(join(source, "work.txt"), "the fix\n");
+  await git(source, ["add", "work.txt"]);
+  await git(source, ["commit", "--quiet", "-m", "fix"]);
+  await git(source, ["checkout", "--quiet", "-b", "mtuchel/tuc-1-fix"]);
+  const head = await git(source, ["rev-parse", "HEAD"]);
+
+  // The source keeps the ticket's record; the worktree is read with real git.
+  const handover = new Handover({ upsertComment: async () => "c1", comment: async () => {}, upsertAttachment: async () => {}, removeAttachments: async () => {} } as never, join(home, "handover-records"));
+  await handover.update({ id: ISSUE, identifier: "TUC-1" }, { id: "agent-1", title: "TUC-1: Fix sign-in", cwd: source }, { summary: "Rebased on main and pushed the fix." });
+
+  const { request, calls } = fakeRequest();
+  const drain = drainFor(home, fakeDaemon([]), { request, resumeSnapshot: (issueId) => handover.resumeSnapshot(issueId) });
+  const cycle = { v: 1, starts: ["2026-01-01T00:00:00.000Z"], exhaustedAt: null, cycle: { id: "cycle-1", kind: "ghost", startedAt: "2026-01-01T00:00:00.000Z", marker: "cycle-1:succeed" } };
+  assert.deepEqual(await drain.take({ kind: "recover", issueId: ISSUE, identifier: "TUC-1", id: "watchdog:i1:cycle-1:succeed", text: "The previous agent stopped making progress.", strictResume: true, watchdog: cycle }), { peer: "server087" });
+  const envelope = activationEnvelopeSchema.parse(calls.find((call) => call.url === `${PEER}/activation`)!.body);
+  assert.equal(envelope.strictResume, true);
+  assert.deepEqual({ branch: envelope.resume?.branch, commit: envelope.resume?.commit, dirty: envelope.resume?.dirty }, { branch: "mtuchel/tuc-1-fix", commit: head, dirty: false });
+  assert.match(envelope.resume?.handover ?? "", /continuing work on Linear ticket TUC-1/);
+  assert.ok(!JSON.stringify(envelope).includes(source), "the source worktree path never travels");
+
+  // The receiving host: a clone that has the branch at exactly that commit, and no record of the ticket.
+  await exec("git", ["clone", "--quiet", "--shared", source, destination]);
+  await git(destination, ["update-ref", "refs/heads/mtuchel/tuc-1-fix", head]);
+  const dest = resumeDestination(home, destination);
+
+  assert.equal((await dest.intake.accept(envelope)).status, 202);
+  await dest.intake.idle();
+  assert.equal(dest.resumes.length, 1, "the source-only snapshot starts exactly one agent");
+  assert.deepEqual(dest.resumes[0], { branch: "mtuchel/tuc-1-fix", worktreePath: null, handover: envelope.resume!.handover }, "it continues the recorded branch, never the source's worktree");
+  assert.equal((await dest.intake.status()).done, 1);
+  assert.deepEqual(dest.comments, [], "nothing waits as a handoff");
+  // A retry of the same envelope starts nothing again.
+  assert.equal((await dest.intake.accept(envelope)).status, 202);
+  await dest.intake.idle();
+  assert.equal(dest.resumes.length, 1);
+
+  // The same resume with uncommitted work on the source side is a queued handoff, never a fresh start.
+  await writeFile(join(source, "work.txt"), "uncommitted\n");
+  const cycle2 = { ...cycle, cycle: { ...cycle.cycle, id: "cycle-2", marker: "cycle-2:succeed" } };
+  assert.deepEqual(await drain.take({ kind: "recover", issueId: ISSUE, identifier: "TUC-1", id: "watchdog:i1:cycle-2:succeed", text: "The previous agent stopped making progress again.", strictResume: true, watchdog: cycle2 }), { peer: "server087" });
+  const dirty = calls.filter((call) => call.url === `${PEER}/activation`).map((call) => activationEnvelopeSchema.parse(call.body)).filter((sent) => sent.id === "watchdog:i1:cycle-2:succeed").at(-1)!;
+  assert.equal(dirty.resume?.dirty, true);
+  assert.equal((await dest.intake.accept(dirty)).status, 202);
+  await dest.intake.idle();
+  assert.equal(dest.resumes.length, 1, "dirty work is never continued as if it were pushed");
+  assert.equal((await dest.intake.status()).handoffs, 1);
+  assert.match(dest.comments.join("\n"), /uncommitted changes/);
+  assert.match(dest.comments.join("\n"), /mtuchel\/tuc-1-fix/, "the ticket says which branch must be made available");
+
+  // A strict resume that arrives without any snapshot is held: this host's own record for the
+  // ticket is different work and is never silently continued in its place.
+  const bare = activationEnvelopeSchema.parse({ id: "watchdog:i1:cycle-3:succeed", kind: "recover", issueId: ISSUE, identifier: "TUC-1", text: "The previous agent stopped making progress a third time.", strictResume: true, host: "mac", requestedAt: "2026-01-01T00:00:00Z" });
+  assert.equal((await dest.intake.accept(bare)).status, 202);
+  await dest.intake.idle();
+  assert.equal(dest.resumes.length, 1, "without a snapshot nothing resumes, this host's own record included");
+  assert.equal((await dest.intake.status()).handoffs, 2, "it waits as a queued handoff for the sending host's snapshot");
+  assert.match(dest.comments.at(-1) ?? "", /did not come with the forwarded request/);
+});
+
+// A queued strict resume whose snapshot did not travel when it was first forwarded (the six
+// watchdog envelopes): the same action re-sent with the snapshot fills the stored envelope in
+// place and runs under the original identity, exactly once.
+test("a queued strict resume is enriched by the same action re-sent with its snapshot, and starts exactly once", async (t) => {
+  const home = await withHome(t);
+  const daemon = fakeDaemon([]);
+  const attempts: { resumeOnly?: boolean; resume?: ActivationResume }[] = [];
+  const comments: string[] = [];
+  let ready = false;
+  const intake = new ActivationIntake({
+    settings: { read: async () => settingsFor() }, home, host: "server087", log: () => {},
+    paseo: () => daemon.paseo,
+    linear: () => ({ comment: async (_issue: string, body: string) => { comments.push(body); }, addLabel: async () => {}, removeLabel: async () => {} }),
+    launcher: () => ({ gate: () => ({ release: () => {} }) }),
+    starter: () => ({
+      admission: async () => ({ ok: true as const }),
+      start: async (_issueId: string, _paseo: unknown, _settings: unknown, startOptions: { resumeOnly?: boolean; resume?: ActivationResume }) => {
+        attempts.push(startOptions);
+        if (!ready) throw new ResumeUnavailableError("TUC-1 has no recorded branch to continue on.");
+        return { agentId: "agent-1", warnings: [], provider: "claude/opus", target: "App", resumed: true, untrusted: false, plan: null };
+      },
+    }),
+  });
+  await intake.applyClaims({ host: "mac", seed: "seed-1", revision: 1, claims: [] });
+  const envelope: ActivationEnvelope = {
+    id: "watchdog:i1:cycle-1:succeed", kind: "recover", issueId: ISSUE, identifier: "TUC-1", text: "The previous agent stopped making progress.", strictResume: true,
+    watchdog: { v: 1, starts: [], exhaustedAt: null, cycle: { id: "cycle-1", kind: "ghost", startedAt: "2026-01-01T00:00:00.000Z", marker: "cycle-1:succeed" } },
+    host: "mac", requestedAt: "2026-01-01T00:00:00Z",
+  };
+  assert.equal((await intake.accept(envelope)).status, 202);
+  await intake.idle();
+  assert.equal((await intake.status()).handoffs, 1, "without a snapshot the resume is a queued handoff");
+  assert.equal(attempts.length, 0, "nothing started, not even an attempt");
+
+  ready = true;
+  const snapshot: ActivationResume = { branch: "mtuchel/tuc-1-fix", commit: "1".repeat(40), dirty: false, handover: "Continue the recorded work." };
+  const enriched = await intake.accept({ ...envelope, resume: snapshot });
+  assert.deepEqual(JSON.parse(enriched.body), { ok: true, id: envelope.id, state: "handoff", duplicate: true, enriched: true });
+  await intake.idle();
+  assert.equal(attempts.length, 1, "the enriched retry runs under the original identity");
+  assert.equal(attempts[0].resumeOnly, true);
+  assert.deepEqual(attempts[0].resume, snapshot);
+  assert.equal((await intake.status()).done, 1);
+  assert.equal(comments.length, 1, "the queued-handoff note is posted once, before the enrichment");
+
+  // A sender retrying the enriched action starts nothing again.
+  const again = await intake.accept({ ...envelope, resume: snapshot });
+  assert.deepEqual(JSON.parse(again.body), { ok: true, id: envelope.id, state: "done", duplicate: true });
+  await intake.idle();
+  assert.equal(attempts.length, 1);
+});
+
+// The enrichment's safeguards: only the queued action's own snapshot is accepted, a stored
+// snapshot is never redirected, and a finished activation is never reopened.
+test("enrichment never rewrites a stored resume, a changed action or a finished activation", async (t) => {
+  const home = await withHome(t);
+  const daemon = fakeDaemon([]);
+  let attempts = 0;
+  const intake = new ActivationIntake({
+    settings: { read: async () => settingsFor() }, home, host: "server087", log: () => {},
+    paseo: () => daemon.paseo,
+    linear: () => ({ comment: async () => {}, addLabel: async () => {}, removeLabel: async () => {} }),
+    launcher: () => ({ gate: () => ({ release: () => {} }) }),
+    starter: () => ({
+      admission: async () => ({ ok: true as const }),
+      start: async (_issueId: string, _paseo: unknown, _settings: unknown, startOptions: { resume?: ActivationResume }) => {
+        attempts += 1;
+        if (!startOptions.resume) throw new ResumeUnavailableError("TUC-1 has no recorded branch to continue on.");
+        return { agentId: "agent-1", warnings: [], provider: "claude/opus", target: "App", resumed: true, untrusted: false, plan: null };
+      },
+    }),
+  });
+  await intake.applyClaims({ host: "mac", seed: "seed-1", revision: 1, claims: [] });
+  const base: ActivationEnvelope = { id: "watchdog:i1:cycle-1:succeed", kind: "recover", issueId: ISSUE, identifier: "TUC-1", text: "The previous agent stopped making progress.", strictResume: true, watchdog: { v: 1 }, host: "mac", requestedAt: "2026-01-01T00:00:00Z" };
+  // The pending file is the intake's own record; JSON.parse's any is narrowed here for the test's reads.
+  const pending = async () => {
+    const file = JSON.parse(await readFile(join(home, "activation-pending.json"), "utf8")) as { entries: Record<string, { state: string; envelope: ActivationEnvelope }> };
+    return file.entries[base.id];
+  };
+  const enrichedFlag = (body: string): unknown => JSON.parse(body).enriched;
+
+  await intake.accept(base);
+  await intake.idle();
+  assert.equal(attempts, 0);
+  assert.equal((await pending()).state, "handoff");
+
+  // A re-send whose text or watchdog differs is a different action: it never rewrites this one.
+  assert.equal(enrichedFlag((await intake.accept({ ...base, text: "A different demand.", resume: { branch: "b", handover: null } })).body), undefined);
+  assert.equal(enrichedFlag((await intake.accept({ ...base, watchdog: { v: 1, other: true }, resume: { branch: "b", handover: null } })).body), undefined);
+  await intake.idle();
+  assert.equal(attempts, 0, "a different action does not re-run the queued one");
+  assert.equal((await pending()).envelope.text, base.text, "the stored action keeps its text");
+  assert.deepEqual((await pending()).envelope.watchdog, base.watchdog, "and its watchdog history");
+
+  // A resume without a branch points the work nowhere: not a snapshot.
+  assert.equal(enrichedFlag((await intake.accept({ ...base, resume: { branch: null, handover: "Somewhere." } })).body), undefined);
+  assert.equal((await pending()).envelope.resume, undefined);
+
+  // The queued action's own snapshot is accepted and starts it; after that a late re-send cannot
+  // start a second agent, whatever it carries.
+  const snapshot: ActivationResume = { branch: "mtuchel/tuc-1-fix", commit: "1".repeat(40), dirty: false, handover: "Continue." };
+  assert.deepEqual(JSON.parse((await intake.accept({ ...base, resume: snapshot })).body), { ok: true, id: base.id, state: "handoff", duplicate: true, enriched: true });
+  await intake.idle();
+  assert.equal(attempts, 1, "the enriched queued action runs once");
+  assert.equal((await pending()).state, "done");
+  assert.deepEqual((await pending()).envelope.resume, snapshot, "the stored envelope keeps the accepted snapshot");
+  assert.deepEqual(JSON.parse((await intake.accept({ ...base, resume: { ...snapshot, branch: "somewhere-else" } })).body), { ok: true, id: base.id, state: "done", duplicate: true });
+  await intake.idle();
+  assert.equal(attempts, 1, "a finished activation is never enriched or restarted");
 });

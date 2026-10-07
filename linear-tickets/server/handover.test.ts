@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import { Handover, type GitState, type HandoverStatus } from "./handover";
+
+const exec = promisify(execFile);
 
 const ISSUE = { id: "issue-1", identifier: "ENG-1" };
 const PREDECESSOR = { id: "agent-1", title: "ENG-1: Fix sign-in", cwd: "/wt/eng-1" };
@@ -132,4 +136,74 @@ test("a ticket with no record yet gets the successor's record from the hand-off"
     assert.equal(reports.length, 1);
     assert.equal(reports[0].body, "🏁 **Paseo final report** — ENG-1: Fix sign-in\n\n**Outcome:** Agent closed — handed over to ENG-1: Fix sign-in (resumed)");
   });
+});
+
+// The snapshot a strict resume carries to the peer host: real git, so the branch, the full SHA
+// and the dirty state are exactly what a forwarded replacement would travel with.
+async function withWorktree(): Promise<{ cwd: string; git: (...args: string[]) => Promise<string>; done: () => Promise<void> }> {
+  const cwd = await mkdtemp(join(tmpdir(), "paseo-handover-worktree-"));
+  const git = async (...args: string[]) => (await exec("git", ["-C", cwd, ...args], { maxBuffer: 1_000_000 })).stdout.trim();
+  await git("init", "--quiet");
+  await git("config", "user.email", "test@example.com");
+  await git("config", "user.name", "Test");
+  await writeFile(join(cwd, "work.txt"), "one\n");
+  await git("add", "work.txt");
+  await git("commit", "--quiet", "-m", "first");
+  return { cwd, git, done: () => rm(cwd, { recursive: true, force: true }) };
+}
+
+test("the resume snapshot carries the recorded branch's exact commit and dirty state, never the worktree path", async () => {
+  const worktree = await withWorktree();
+  const directory = await mkdtemp(join(tmpdir(), "paseo-handover-snapshot-"));
+  try {
+    await worktree.git("checkout", "--quiet", "-b", "mtuchel/eng-1-fix");
+    const head = await worktree.git("rev-parse", "HEAD");
+    const { linear } = fakeLinear();
+    const handover = new Handover(linear, directory, undefined, () => "2026-01-01T10:00:00.000Z");
+    await handover.update(ISSUE, { ...PREDECESSOR, cwd: worktree.cwd }, { summary: "Rebased on main and pushed the fix." });
+
+    const snapshot = await handover.resumeSnapshot(ISSUE.id);
+    assert.equal(snapshot?.branch, "mtuchel/eng-1-fix");
+    assert.equal(snapshot?.commit, head);
+    assert.match(snapshot?.commit ?? "", /^[0-9a-f]{40}$/, "the commit is the full SHA the receiving host can require");
+    assert.equal(snapshot?.dirty, false);
+    assert.ok(!snapshot!.handover!.includes(worktree.cwd), "the worktree path never travels");
+    assert.match(snapshot!.handover!, /continuing work on Linear ticket ENG-1/);
+    assert.match(snapshot!.handover!, /Worktree: a fresh checkout/, "the receiving host opens its own checkout");
+
+    // Uncommitted work does not move the commit; it is what blocks the resume on the other side.
+    await writeFile(join(worktree.cwd, "work.txt"), "two\n");
+    const dirty = await handover.resumeSnapshot(ISSUE.id);
+    assert.equal(dirty?.dirty, true);
+    assert.equal(dirty?.commit, head);
+
+    // A worktree off the recorded branch cannot vouch for an exact commit on it.
+    await worktree.git("checkout", "--quiet", "-b", "another-branch");
+    assert.equal(await handover.resumeSnapshot(ISSUE.id), null);
+  } finally {
+    await worktree.done();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("no resume snapshot is offered without a record, a recorded branch or a readable worktree", async () => {
+  const worktree = await withWorktree();
+  const directory = await mkdtemp(join(tmpdir(), "paseo-handover-snapshot-"));
+  try {
+    const { linear } = fakeLinear();
+    const handover = new Handover(linear, directory, undefined, () => "2026-01-01T10:00:00.000Z");
+    assert.equal(await handover.resumeSnapshot("nothing"), null);
+
+    // A worktree that was pruned after the record: the branch is still recorded, but its state
+    // cannot be verified any more.
+    const pruned = `${worktree.cwd}-pruned`;
+    await worktree.git("worktree", "add", "--quiet", pruned, "-b", "mtuchel/eng-2-fix");
+    await handover.update({ id: "issue-2", identifier: "ENG-2" }, { id: "agent-1", title: null, cwd: pruned }, {});
+    assert.ok((await handover.read("issue-2"))?.branch, "the record names the branch");
+    await rm(pruned, { recursive: true, force: true });
+    assert.equal(await handover.resumeSnapshot("issue-2"), null, "an unreadable worktree offers no snapshot");
+  } finally {
+    await worktree.done();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
