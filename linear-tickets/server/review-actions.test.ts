@@ -215,13 +215,16 @@ test("peer actions reach the owner without a previous inbox load and preserve pa
 test("deletion rejects a newer waiting review that arrived during fresh identity verification", async () => {
   let replace: (() => Promise<void>) | null = null;
   let mutations = 0;
+  let now = new Date("2026-01-01T10:00:00Z");
   await fixture(async ({ links, post }) => {
     replace = async () => {
+      now = new Date(now.getTime() + 1);
       await links.opened("agent-1", { ...event, localUrl: "http://localhost:50002/", remoteUrl: "https://host.tail.ts.net:50002/" }, { identifier: IDENTIFIER, issueId: ISSUE });
     };
     assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 409);
     assert.equal(mutations, 0);
   }, {
+    now: () => now,
     issueInfo: async (_identifier, options) => { if (options?.fresh) await replace?.(); return { issueId: ISSUE, areas: [] }; },
     deleteIssue: async () => { mutations++; },
   });
