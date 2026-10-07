@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
-import { internalDaemon } from "./connection";
+import { permissionDaemon } from "./connection";
 import { fingerprint, type ArbitratedOutcome, type Correction, type CorrectionActivity, type PermissionArbiter } from "./deputy";
 import { approvalDecision, questionAnswer } from "./relay";
 import { paseoHome } from "./ticket-mcp";
@@ -82,7 +82,7 @@ export class PermissionReplies implements PermissionArbiter {
 
   constructor(private readonly deps: Deps = {}) {
     this.directory = deps.directory ?? join(paseoHome(), "linear-tickets");
-    this.daemon = deps.daemon ?? internalDaemon;
+    this.daemon = deps.daemon ?? permissionDaemon;
     this.now = deps.now ?? Date.now;
   }
   recordEffects(effects: Effects): void { this.effects = effects; }

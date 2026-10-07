@@ -2431,9 +2431,11 @@ delivery carries one stable ref -- the comment id, the session activity, the que
 forwarded activation's id -- which is reserved before anything is routed, so the same Linear
 activity is never delivered twice and a repeat never lands on a later question.
 
-The internal connection explicitly negotiates Paseo's `owned_subscriptions` capability so the
-confirmation is the reply to this submission, not a broadcast saying somebody answered. This was
-exercised with the bundled 0.8.0 client against Paseo 0.10.3 on server087.
+The dedicated permission connection explicitly negotiates Paseo's `owned_subscriptions`
+capability so confirmation is the reply to this submission, not a broadcast saying somebody
+answered. Other daemon calls retain the bundled 0.8.0 client's legacy subscription protocol:
+its workspace-label subscriptions supply their own IDs, which owned subscriptions reject.
+Both connections close on unload. This was exercised against Paseo 0.10.3 on server087.
 
 **Owner first.** An answer of yours that the plugin is already sending beats a deputy answer that
 is not yet sent; a deputy answer that reached Paseo first ends yours as a correction. An agent
