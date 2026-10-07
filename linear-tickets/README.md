@@ -770,11 +770,11 @@ extension's record their plans always reach you.
 **Parked plans.** A plan that needs you does not keep its agent (an agent slot and its memory)
 waiting. The plugin saves it to `$PASEO_HOME/linear-tickets/plannotator/parked/<issue>.json`,
 closes the agent's own review, archives the agent, and moves the ticket to **Planning** without
-`plan-ready`. A central Plannotator host the plugin runs (`plannotator/host.mjs`, started with Bun
-on plugin start, restarted when it exits, stopped with the plugin) serves every parked plan with
-Plannotator's own review page, published in the tailnet like any review, so the review inbox, the
-agent's stable link, the panel and the Linear comment work as before; like any review with a
-stable link, it opens no browser tab (the inbox and its notification take that place).
+`plan-ready`. A central Plannotator host the plugin runs (`plannotator/host.mjs`, a detached Bun
+process) serves every parked plan with Plannotator's own review page, published in the tailnet
+like any review, so the review inbox, the agent's stable link, the panel and the Linear comment
+work as before; like any review with a stable link, it opens no browser tab (the inbox and its
+notification take that place).
 Your decision there, or **Approve plan** / **Send back** in the panel:
 
 - approve: the plan document, `plan-ready`, the ticket back to Todo, and a fresh agent that
@@ -784,10 +784,24 @@ Your decision there, or **Approve plan** / **Send back** in the panel:
 
 Plans stay parked across plugin and host restarts, and until your decision has been handed on:
 when Linear fails (an outage, the hourly request limit), the decision is retried every few seconds
-for about a minute, then once a minute until it goes through; it is never dropped. The host needs
+for about a minute, then once a minute until it goes through; it is never dropped, and the host
+does not serve that plan again meanwhile, even after a restart. The host needs
 Bun (`~/.bun/bin/bun`, Homebrew or `LINEAR_TICKETS_BUN`) and the Plannotator omp plugin
 (`~/.omp/plugins/node_modules/@plannotator/pi-extension`, or `LINEAR_TICKETS_PLANNOTATOR_PACKAGE`);
 without them plans are not parked and their agents wait for you as before.
+
+The host outlives plugin reloads (a deploy runs `paseo plugin reload`): the next plugin run adopts
+it through its heartbeat (`plannotator/host.json`), so a review you have open keeps its server and
+your annotations. During the reload itself (about a minute on the server) the page cannot reach
+its server, because the tailnet route goes through the plugin's compressing proxy: a note saved
+or a decision sent then fails visibly and goes through when you try again. The plugin replaces
+the host when its version changes (this plugin's host code, Bun, or the Plannotator package) and
+starts it again within seconds when it stops answering; its output goes to `plannotator/host.log`
+and into the plugin's log. Each parked issue keeps its port (from 28600–28699, recorded in
+`plannotator/ports.json`), so after such a restart an open page reaches the new server on the same
+address: Plannotator asks you to reload the page instead of taking a decision meant for the old
+server, and your unsent annotations come back with it. The host exits by itself ten minutes after
+the plugin stopped running (disabled or removed).
 
 A parked plan is judged again when its planner records the advisor review for exactly the parked
 text after the plan was parked (a planner resumed for that, e.g. one whose session had lost
@@ -1591,7 +1605,7 @@ for you, newest first and grouped by day (Today, Yesterday, then the date, in th
 zone), each with the clock time you got it and how long it has waited (amber after 12 hours), and
 the last ten decisions below with their outcome and when they were decided. The header counts the
 waiting reviews and how long the oldest has waited. A parked plan the central host serves again
-after a restart keeps the time it was parked. A review
+after a restart keeps the time it was parked, and its address. A review
 is listed while it is the agent's latest, undecided, was published in the tailnet and its server
 still answers; each row opens the agent's stable link. Each waiting row shows the plan's title
 (its `# ` heading without the ticket number), its opening paragraph, the
