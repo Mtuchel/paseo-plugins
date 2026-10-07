@@ -55,6 +55,13 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   const team: TeamIssue[] = [];
   const elsewhere = new Map<string, TicketRef>();
   const briefs: string[] = [];
+  // Blocking relations written by the flow: a full read shows them on the blocked ticket; a
+  // changed-only read (the host's cache) may not yet.
+  const written: [string, string][] = [];
+  const projectIssues = async (_projectId: string, full: boolean) => !full ? issues : issues.map((item) => {
+    const added = written.filter(([blocker, blocked]) => blocked === item.id && !item.blockers.some((known) => known.id === blocker));
+    return added.length ? { ...item, blockers: [...item.blockers, ...added.map(([id]) => ({ id, identifier: issues.find((other) => other.id === id)?.identifier ?? id, status: "Todo", statusType: "unstarted", delegateId: null, finished: false }))] } : item;
+  });
   const linear = {
     labeledProjects: async () => [{ id: "erp", name: "ERP" }],
     projectIssues: async () => issues,
@@ -84,6 +91,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
       if (fail.relation === `${blocker} blocks ${blocked}`) throw new LinearRefusedError("Linear refused the relation");
       if (fail.unreached === `${blocker} blocks ${blocked}`) throw outage();
       calls.push(`${blocker} blocks ${blocked}`);
+      written.push([blocker, blocked]);
     },
     complete: async (id: string) => { calls.push(`complete ${id}`); },
     comment: async (id: string, body: string) => {
@@ -100,7 +108,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   const scheduler = new Scheduler({ running: async () => running, projectOf: async () => "erp", away: async () => away, now: () => now });
   // Tickets a start under way, or their newest thread, accounts for.
   const held = new Set<string>();
-  const flow = new ProjectFlow({ linear, scheduler, capacity: new Capacity(() => now), store, retire: async (agentId) => { calls.push(`retire ${agentId}`); }, now: () => now, inspect,
+  const flow = new ProjectFlow({ linear, projectIssues, scheduler, capacity: new Capacity(() => now), store, retire: async (agentId) => { calls.push(`retire ${agentId}`); }, now: () => now, inspect,
     restart: async (id) => {
       calls.push(`restart ${id}`);
       if (fail.restart) throw new Error("Agent creation could not be confirmed (Timed out waiting for OMP to become ready).");
@@ -271,8 +279,7 @@ test("a change Linear keeps refusing is retried for three polls, then the order 
     "complete planner1",
     "retire agent-p",
     "delegate i1",
-    "delegate i3",
-  ], "only the refused change is tried again; TUC-2's blocker was refused, so it is not handed out unordered");
+  ], "only the refused change is tried again; TUC-2's blocker was refused, so it is not handed out unordered, and TUC-3 waits for TUC-2");
   assert.match(r.comments.at(-1)!, /Skipped:\n- TUC-1 blocks TUC-2 \(Linear refused the relation\)/);
   assert.match(r.comments.at(-1)!, /Not handed out, because Linear refused their hold or blocker: TUC-2\./);
 });
@@ -556,6 +563,15 @@ test("while an approved order waits to be written, the tickets it blocks, holds 
   await r.flow.tick(paseo, settings);
   assert.ok(!r.calls.includes("complete planner1"), "the order is not written yet");
   assert.deepEqual(r.calls.filter((call) => call.startsWith("delegate")), ["delegate i1", "delegate i5"]);
+});
+
+test("a poll that writes the approved order reads the project in full before handing out, so a ticket it just blocked waits", async (t) => {
+  const r = await room(t, [issue(1), issue(2), issue(100, { id: "planner1", labels: ["paseo-planner"], delegateId: APP })]);
+  await r.seed({ plannedThrough: "2026-01-01T12:00:00Z", planner: { id: "planner1", identifier: "TUC-101", url: "", listedAt: "2026-01-01T23:00:00Z", tickets: 1, started: true,
+    approved: { agentId: "agent-p", plan: "```project-order\nTUC-1 blocks TUC-2\n```" } } });
+  await r.flow.tick(paseo, settings);
+  assert.ok(r.calls.includes("i1 blocks i2"));
+  assert.deepEqual(r.calls.filter((call) => call.startsWith("delegate")), ["delegate i1"], "TUC-2 waits for TUC-1, though the project's changed-only view does not show that yet");
 });
 
 test("changes to the project store made at the same time all land", async (t) => {

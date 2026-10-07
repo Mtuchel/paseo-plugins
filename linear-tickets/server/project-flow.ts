@@ -29,7 +29,8 @@ import { paseoHome } from "./ticket-mcp";
 // 5. So is a ticket assigned to Paseo whose start failed or never came (README, "Projects"): it
 //    stays assigned to Paseo, so the hand-out would never take it again.
 
-// How often a project's tickets are read: a project is a few paginated queries.
+// How often the projects are checked; their tickets are read through `projectIssues`, which on the
+// host reads only what changed most of the time (project-issues.ts).
 const POLL_MS = 2 * 60_000;
 // The planner ticket's description stays within this. Linear's agent prompt carries the ticket and
 // its comments as one JSON text of at most 200,000 characters (context.ts `buildContext`), and JSON
@@ -219,6 +220,9 @@ type Deps = {
   // The cap the starter's start paths admit under (max agents, or a memory lease).
   capacity: Pick<Capacity, "limit">;
   store?: ProjectStore;
+  // A project's open tickets; `full`: read all of them now (after this flow wrote to Linear). The
+  // host passes ProjectIssueCache.read; without it every read is a full `linear.projectIssues`.
+  projectIssues?: (projectId: string, full: boolean) => Promise<ProjectIssue[]>;
   // Stops the planner's turn and archives it once its plan is applied.
   retire: (agentId: string, paseo: PaseoApi) => Promise<void>;
   // Starts a new agent with a new Linear thread for a planner ticket (SessionRouter.restartFor).
@@ -236,6 +240,7 @@ type Deps = {
 
 export class ProjectFlow {
   private readonly store: ProjectStore;
+  private readonly projectIssues: (projectId: string, full: boolean) => Promise<ProjectIssue[]>;
   private lastPoll = 0;
   private statuses: ProjectStatus[] = [];
   // Planner tickets whose work order is being written, so a poll and an approval never write it twice.
@@ -247,6 +252,7 @@ export class ProjectFlow {
 
   constructor(private readonly deps: Deps) {
     this.store = deps.store ?? new ProjectStore();
+    this.projectIssues = deps.projectIssues ?? ((projectId) => deps.linear.projectIssues(projectId));
   }
 
   private now(): number {
@@ -289,7 +295,7 @@ export class ProjectFlow {
         if (planner) {
           const written = await this.applyApproved(project.id, planner, read.plannerIssue, paseo, settings)
             .catch((error: unknown) => { console.error(`[linear-tickets] ${planner.identifier}: writing the work order failed, the next poll retries: ${message(error)}`); return false; });
-          if (written) read = await this.read(project, settings);
+          if (written) read = await this.read(project, settings, true);
         }
         const open = read.record.planner;
         if (open?.started === false && read.plannerIssue) {
@@ -317,11 +323,11 @@ export class ProjectFlow {
   // The project's open tickets and what is planned. Only tickets the hand-out could take need a
   // plan: sub-issues (their group hands them out), tickets already with Paseo or someone else, and
   // started work never count.
-  private async read(project: { id: string; name: string }, settings: PluginSettings): Promise<Read> {
+  private async read(project: { id: string; name: string }, settings: PluginSettings, full = false): Promise<Read> {
     const labels = dispatchLabels(settings.dispatch.label);
     // Taken before the tickets are read: a planner filed from this read lists no ticket newer.
     const readAt = new Date(this.now()).toISOString();
-    const issues = await this.deps.linear.projectIssues(project.id);
+    const issues = await this.projectIssues(project.id, full);
     const stored = (await this.store.all())[project.id];
     let record: ProjectRecord = stored ? migrated(stored, issues) : { planned: [], planner: null };
     if (stored && record !== stored) await this.store.update(project.id, (current) => current ? migrated(current, issues) : null);
@@ -570,7 +576,7 @@ export class ProjectFlow {
     this.applying.add(planner.id);
     try {
       const labels = dispatchLabels(settings.dispatch.label);
-      const issues = await this.deps.linear.projectIssues(projectId);
+      const issues = await this.projectIssues(projectId, true);
       const byIdentifier = new Map(issues.map((issue) => [issue.identifier, issue]));
       const done: string[] = [];
       const skipped: string[] = [];

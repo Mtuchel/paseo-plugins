@@ -380,17 +380,37 @@ export const LABELED_PROJECTS_QUERY = `query labeledProjects($label: String!) {
 // read from the ticket's side: as the relation's subject, and as its object.
 const FORWARD_LINKS: Record<string, "related" | "duplicates"> = { related: "related", duplicate: "duplicates" };
 const INVERSE_LINKS: Record<string, "related" | "duplicated by"> = { related: "related", duplicate: "duplicated by", duplicated: "duplicated by" };
+const PROJECT_ISSUE_FIELDS = `id identifier title priority createdAt state { name type } team { id key } creator { id } assignee { id } delegate { id } labels(first: 20) { nodes { name } }
+      parent { id state { type } project { id } }
+      inverseRelations(first: 15) { nodes { type issue { id identifier state { name type } delegate { id } attachments(first: 10) { nodes { url sourceType metadata } } } } }
+      relations(first: 15) { nodes { type relatedIssue { id identifier state { type } } } }`;
 export const PROJECT_ISSUES_QUERY = `query projectIssues($id: String!, $after: String) {
   project(id: $id) { issues(first: 25, after: $after, filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } } }) {
     nodes {
-      id identifier title priority createdAt state { name type } team { id key } creator { id } assignee { id } delegate { id } labels(first: 20) { nodes { name } }
-      parent { id state { type } project { id } }
-      inverseRelations(first: 15) { nodes { type issue { id identifier state { name type } delegate { id } attachments(first: 10) { nodes { url sourceType metadata } } } } }
-      relations(first: 15) { nodes { type relatedIssue { id identifier state { type } } } }
+      ${PROJECT_ISSUE_FIELDS}
     }
     pageInfo { hasNextPage endCursor }
   } }
 }`;
+// The tickets changed since `$since` (ProjectIssueCache, README "Projects"): the project's, and the
+// ones known as its so far (`$ids`), in any state and archived ones too, so a ticket that was
+// closed, archived or moved to another project is seen leaving.
+export const PROJECT_ISSUES_CHANGED_QUERY = `query projectIssuesChanged($id: ID!, $ids: [ID!], $since: DateTimeOrDuration!, $after: String) {
+  issues(first: 25, after: $after, includeArchived: true, filter: { updatedAt: { gte: $since }, or: [{ project: { id: { eq: $id } } }, { id: { in: $ids } }] }) {
+    nodes {
+      ${PROJECT_ISSUE_FIELDS}
+      archivedAt project { id }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+// Blockers as `ProjectIssue.blockers` reads them, by id: whether each is finished yet.
+export const BLOCKER_STATES_QUERY = `query blockerStates($first: Int!, $ids: [ID!]) {
+  issues(first: $first, includeArchived: true, filter: { id: { in: $ids } }) {
+    nodes { id identifier state { name type } delegate { id } attachments(first: 10) { nodes { url sourceType metadata } } }
+  }
+}`;
+const BLOCKER_STATES_BATCH = 50;
 export const ISSUE_DESCRIPTIONS_QUERY = `query issueDescriptions($ids: [ID!]!) {
   issues(first: 50, filter: { id: { in: $ids } }) { nodes { id description } }
 }`;
@@ -422,6 +442,37 @@ export type ProjectIssue = {
   teamId: string; teamKey: string; creatorId: string | null; assigneeId: string | null; delegateId: string | null; labels: string[];
   parentId: string | null; blockers: GroupIssue[]; blocks: string[]; linked: ProjectLink[];
 };
+// What changed in a project since a time (`projectIssuesChanged`): `open`, its open tickets that
+// changed; `closed`, tickets that were its own and are finished or archived now; `moved`, open
+// tickets that are in another project now (or in none).
+export type ProjectChanges = { open: ProjectIssue[]; closed: string[]; moved: string[] };
+const FINISHED_TYPES = ["completed", "canceled", "duplicate"];
+function projectIssue(node: Record<string, unknown>, projectId: string): ProjectIssue {
+  const team = record(node.team ?? {});
+  const parent = record(node.parent ?? {});
+  return {
+    id: label(node.id), identifier: label(node.identifier), title: label(node.title),
+    priority: typeof node.priority === "number" ? node.priority : 0, createdAt: label(node.createdAt),
+    status: label(record(node.state ?? {}).name), statusType: label(record(node.state ?? {}).type),
+    teamId: label(team.id), teamKey: label(team.key), creatorId: label(record(node.creator ?? {}).id) || null,
+    assigneeId: label(record(node.assignee ?? {}).id) || null, delegateId: label(record(node.delegate ?? {}).id) || null,
+    labels: connection(node.labels ?? { nodes: [] }).nodes.map((item) => label(record(item).name)).filter(Boolean),
+    parentId: label(parent.id) && label(record(parent.project ?? {}).id) === projectId && !FINISHED_TYPES.includes(label(record(parent.state ?? {}).type)) ? label(parent.id) : null,
+    blockers: connection(node.inverseRelations ?? { nodes: [] }).nodes.map((item) => record(item))
+      .filter((relation) => label(relation.type) === "blocks").map((relation) => groupIssue(record(relation.issue ?? {}))).filter((blocker) => blocker.id),
+    blocks: connection(node.relations ?? { nodes: [] }).nodes.map((item) => record(item))
+      .filter((relation) => label(relation.type) === "blocks").map((relation) => record(relation.relatedIssue ?? {}))
+      .filter((related) => !FINISHED_TYPES.includes(label(record(related.state ?? {}).type))).map((related) => label(related.id)).filter(Boolean),
+    linked: [
+      ...connection(node.relations ?? { nodes: [] }).nodes.map((item) => record(item))
+        .filter((relation) => Object.hasOwn(FORWARD_LINKS, label(relation.type)))
+        .map((relation) => ({ other: record(relation.relatedIssue ?? {}), kind: FORWARD_LINKS[label(relation.type)] })),
+      ...connection(node.inverseRelations ?? { nodes: [] }).nodes.map((item) => record(item))
+        .filter((relation) => Object.hasOwn(INVERSE_LINKS, label(relation.type)))
+        .map((relation) => ({ other: record(relation.issue ?? {}), kind: INVERSE_LINKS[label(relation.type)] })),
+    ].map(({ other, kind }) => ({ id: label(other.id), identifier: label(other.identifier), kind })).filter((other) => other.id),
+  };
+}
 export const CREATE_ISSUE_QUERY = `mutation issueCreate($input: IssueCreateInput!) {
   issueCreate(input: $input) { success issue { id identifier url } }
 }`;
@@ -994,36 +1045,46 @@ export class LinearService {
       const data = record(await this.read(PROJECT_ISSUES_QUERY, { id: projectId, after }, (found) => Boolean(found.project && typeof found.project === "object")));
       if (!data.project || typeof data.project !== "object") throw new Error("Linear did not return this project. Check that you have access to it.");
       const page = record(record(data.project).issues ?? {});
-      for (const node of connection(page).nodes.map((item) => record(item))) {
-        const team = record(node.team ?? {});
-        const parent = record(node.parent ?? {});
-        issues.push({
-          id: label(node.id), identifier: label(node.identifier), title: label(node.title),
-          priority: typeof node.priority === "number" ? node.priority : 0, createdAt: label(node.createdAt),
-          status: label(record(node.state ?? {}).name), statusType: label(record(node.state ?? {}).type),
-          teamId: label(team.id), teamKey: label(team.key), creatorId: label(record(node.creator ?? {}).id) || null,
-          assigneeId: label(record(node.assignee ?? {}).id) || null, delegateId: label(record(node.delegate ?? {}).id) || null,
-          labels: connection(node.labels ?? { nodes: [] }).nodes.map((item) => label(record(item).name)).filter(Boolean),
-          parentId: label(parent.id) && label(record(parent.project ?? {}).id) === projectId && !["completed", "canceled", "duplicate"].includes(label(record(parent.state ?? {}).type)) ? label(parent.id) : null,
-          blockers: connection(node.inverseRelations ?? { nodes: [] }).nodes.map((item) => record(item))
-            .filter((relation) => label(relation.type) === "blocks").map((relation) => groupIssue(record(relation.issue ?? {}))).filter((blocker) => blocker.id),
-          blocks: connection(node.relations ?? { nodes: [] }).nodes.map((item) => record(item))
-            .filter((relation) => label(relation.type) === "blocks").map((relation) => record(relation.relatedIssue ?? {}))
-            .filter((related) => !["completed", "canceled", "duplicate"].includes(label(record(related.state ?? {}).type))).map((related) => label(related.id)).filter(Boolean),
-          linked: [
-            ...connection(node.relations ?? { nodes: [] }).nodes.map((item) => record(item))
-              .filter((relation) => Object.hasOwn(FORWARD_LINKS, label(relation.type)))
-              .map((relation) => ({ other: record(relation.relatedIssue ?? {}), kind: FORWARD_LINKS[label(relation.type)] })),
-            ...connection(node.inverseRelations ?? { nodes: [] }).nodes.map((item) => record(item))
-              .filter((relation) => Object.hasOwn(INVERSE_LINKS, label(relation.type)))
-              .map((relation) => ({ other: record(relation.issue ?? {}), kind: INVERSE_LINKS[label(relation.type)] })),
-          ].map(({ other, kind }) => ({ id: label(other.id), identifier: label(other.identifier), kind })).filter((other) => other.id),
-        });
-      }
+      for (const node of connection(page).nodes.map((item) => record(item))) issues.push(projectIssue(node, projectId));
       const info = record(page.pageInfo ?? {});
       after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
     } while (after);
     return issues;
+  }
+
+  // The project's tickets changed since `since` (an ISO time), and of `known` (the tickets last
+  // read as the project's) the ones that left it, all pages.
+  async projectIssuesChanged(projectId: string, since: string, known: string[]): Promise<ProjectChanges> {
+    const changes: ProjectChanges = { open: [], closed: [], moved: [] };
+    let after: string | null = null;
+    do {
+      const page = record(record(await this.read(PROJECT_ISSUES_CHANGED_QUERY, { id: projectId, ids: known, since, after })).issues ?? {});
+      for (const node of connection(page).nodes.map((item) => record(item))) {
+        const id = label(node.id);
+        if (!id) continue;
+        if (node.archivedAt || FINISHED_TYPES.includes(label(record(node.state ?? {}).type))) changes.closed.push(id);
+        else if (label(record(node.project ?? {}).id) !== projectId) changes.moved.push(id);
+        else changes.open.push(projectIssue(node, projectId));
+      }
+      const info = record(page.pageInfo ?? {});
+      after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
+    } while (after);
+    return changes;
+  }
+
+  // Blockers by id as they stand now (finished or not). Ids Linear does not return are left out.
+  async blockerStates(ids: string[]): Promise<GroupIssue[]> {
+    const states: GroupIssue[] = [];
+    const valid = [...new Set(ids)].filter((id) => UUID.test(id));
+    for (let start = 0; start < valid.length; start += BLOCKER_STATES_BATCH) {
+      const batch = valid.slice(start, start + BLOCKER_STATES_BATCH);
+      const data = record(await this.read(BLOCKER_STATES_QUERY, { first: batch.length, ids: batch }, (found) => connection(record(found.issues)).nodes.length === batch.length));
+      for (const node of connection(record(data.issues)).nodes.map((item) => record(item))) {
+        const state = groupIssue(node);
+        if (state.id) states.push(state);
+      }
+    }
+    return states;
   }
 
   // Descriptions by ticket id, for the project planner's ticket list.
