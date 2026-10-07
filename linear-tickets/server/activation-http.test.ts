@@ -10,7 +10,7 @@ import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { activationEndpoints } from "./activation-endpoints";
 import { ActivationIntake } from "./activation-intake";
 import { DrainRouter } from "./drain";
-import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, type ActivationSettings, type PluginSettings } from "./settings";
+import { DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type ActivationSettings, type PluginSettings } from "./settings";
 
 // The two hosts over real HTTP (the review service's :8444 listener, activation-endpoints.ts):
 // the Mac drains, the server answers, and both talk to each other exactly as they do in the
@@ -21,7 +21,7 @@ process.env.PASEO_ACTIVATION_SECRET = SECRET;
 function settingsFor(activation: ActivationSettings): PluginSettings {
   return {
     template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: false,
-    dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation,
+    dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation, deputy: DEFAULT_DEPUTY,
   };
 }
 

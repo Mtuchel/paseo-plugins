@@ -6,6 +6,7 @@ import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/
 import { filedIssues, pluginComments, postedComments } from "./agent-records";
 import type { LinearService, RelayComment } from "./linear";
 import type { ActivationSink, ActivationTake } from "./activation";
+import { overrideCommand, type Deputy } from "./deputy";
 import { closeAnswered, type NeedsYouIssues } from "./needs-you";
 import { RateLimitedError } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
@@ -148,12 +149,19 @@ export class CommentRelay {
   private readonly unseen = new Set<string>();
   // The plugin's state directory, where the cursor file and the agents' records live.
   private readonly directory: string;
+  // The deputy for agent questions (README, "Deputy for agent questions"): corrections of its
+  // answers are routed before anything else, and the owner's answers are recorded for it.
+  private deputy: Pick<Deputy, "byRef" | "noticeFor" | "correct" | "ownerAnswered"> | null = null;
 
   // `needsYou`: the open "Needs you" sub-issues, whose replies go to the agent that asked.
   // `route`: activation routing, so a comment for a ticket this host no longer owns goes to the
   // host that owns it instead of being delivered (or reported ❌) here.
   constructor(private readonly linear: Linear, private readonly path = join(paseoHome(), "linear-tickets", "relay-cursors.json"), private readonly needsYou?: NeedsYouIssues, private readonly route?: ActivationSink) {
     this.directory = dirname(path);
+  }
+
+  recordDeputy(deputy: Pick<Deputy, "byRef" | "noticeFor" | "correct" | "ownerAnswered">): void {
+    this.deputy = deputy;
   }
 
   async poll(paseo: PaseoApi): Promise<void> {
@@ -186,7 +194,11 @@ export class CommentRelay {
             || comment.parent?.sessionId != null
             || comment.reactions.some((reaction) => (reaction.userId === viewerId || (appId !== null && reaction.userId === appId)) && (reaction.emoji === ACK_EMOJI || reaction.emoji === FAILED_EMOJI))
             || state.acks.some((ack) => ack.commentId === comment.id);
-          const route = handled ? null : routeComment(watch, comment, plain, appId);
+          // A correction of a deputy answer (a reply to its notice, or "override D-…") goes to the
+          // agent that got that answer, before the comment could answer a newer question.
+          const correction = handled ? null : await this.correction(comment);
+          const route = handled || correction ? null : routeComment(watch, comment, plain, appId);
+          if (correction) state.acks.push({ commentId: comment.id, issueId: watch.issueId, reacted: false, ...correction });
           if (route) {
             const outcome = await this.deliver(paseo, route.reader.agent, comment, route.message);
             state.acks.push({ commentId: comment.id, issueId: watch.issueId, reacted: false, ...outcome });
@@ -195,7 +207,7 @@ export class CommentRelay {
           if (comment.createdAt === cursor.since) cursor.boundaryIds.push(comment.id);
           else Object.assign(cursor, { since: comment.createdAt, boundaryIds: [comment.id] });
           // Recorded before the reaction: a restart in between must not deliver the comment again.
-          if (route) await this.save(state);
+          if (route || correction) await this.save(state);
         }
       }
     }
@@ -300,6 +312,22 @@ export class CommentRelay {
     return [...byIssue.values()];
   }
 
+  private async correction(comment: RelayComment): Promise<{ emoji: string; reply: string | null } | null> {
+    const deputy = this.deputy;
+    if (!deputy) return null;
+    const body = mentionMessage(comment.body) ?? comment.body.trim();
+    const command = overrideCommand(body);
+    const target = command ? await deputy.byRef(command.ref) : await deputy.noticeFor(comment.parent?.id);
+    if (!target) return command ? { emoji: FAILED_EMOJI, reply: `${command.ref} is not an answer the deputy gave on this host, so nothing was passed on.` } : null;
+    try {
+      const result = await deputy.correct(target, command ? command.text : body, { via: "linear-comment", activityId: comment.id, userId: comment.userId });
+      return { emoji: result.delivered ? ACK_EMOJI : FAILED_EMOJI, reply: result.delivered ? null : result.reply };
+    } catch (error) {
+      console.error(`[linear-tickets] correcting deputy answer ${target.ref} from comment ${comment.id} failed: ${error instanceof Error ? error.message : error}`);
+      return { emoji: FAILED_EMOJI, reply: `Your correction of ${target.ref} could not be passed on: ${error instanceof Error ? error.message : "unknown error"}. Tell the agent working on ${target.identifier} directly.` };
+    }
+  }
+
   // Hands the comment to the agent; the outcome is the reaction (and, on failure, the reply) to queue.
   private async deliver(paseo: PaseoApi, agent: LinkedAgent, comment: RelayComment, message: string): Promise<{ emoji: string; reply: string | null }> {
     if (this.route) {
@@ -318,7 +346,9 @@ export class CommentRelay {
       if (routed) return { emoji: ACK_EMOJI, reply: `Passed to the agent working on ${agent.identifier} on ${routed.peer}.` };
     }
     try {
-      await deliverToAgent(paseo, agent.id, message);
+      const answered = await deliverToAgent(paseo, agent.id, message);
+      // Written with the owner's key (only those comments are delivered): the owner's own answer.
+      if (answered) await this.deputy?.ownerAnswered(agent.id, answered.request, answered.response, { via: "linear-comment", activityId: comment.id, userId: comment.userId }, answered.at).catch((error: unknown) => console.error(`[linear-tickets] recording the owner's answer from comment ${comment.id} failed: ${error instanceof Error ? error.message : error}`));
       return { emoji: ACK_EMOJI, reply: null };
     } catch (error) {
       const reason = error instanceof Error ? error.message : "unknown error";
@@ -330,8 +360,9 @@ export class CommentRelay {
 
 // A message from Linear for a running agent: the answer to its pending question, an approve/deny
 // decision for a pending approval, or otherwise a new message. Throws the reason, for the person
-// who wrote it, when the message cannot be used.
-export async function deliverToAgent(paseo: PaseoApi, agentId: string, message: string): Promise<void> {
+// who wrote it, when the message cannot be used. Returns the question it answered, if any, with
+// the time just before the answer was submitted.
+export async function deliverToAgent(paseo: PaseoApi, agentId: string, message: string): Promise<{ request: AgentPermissionRequest; response: AgentPermissionResponse; at: string } | null> {
   const handle = paseo.agents.ref(agentId);
   const refreshed = await handle.refresh();
   const pending = refreshed?.agent.pendingPermissions ?? [];
@@ -340,8 +371,12 @@ export async function deliverToAgent(paseo: PaseoApi, agentId: string, message: 
   const decision = approval ? approvalDecision(message) : null;
   if (question) {
     if (!message) throw new Error("The agent is waiting for an answer; write it after @paseo.");
-    await handle.respondToPermission({ requestId: question.id, response: questionAnswer(question, message) });
-  } else if (approval && decision) {
+    const response = questionAnswer(question, message);
+    const at = new Date().toISOString();
+    await handle.respondToPermission({ requestId: question.id, response });
+    return { request: question, response, at };
+  }
+  if (approval && decision) {
     await handle.respondToPermission({ requestId: approval.id, response: decision });
   } else if (approval) {
     throw new Error(`The agent is waiting for approval of "${approval.title || approval.name}". Reply "@paseo approve" or "@paseo deny <reason>".`);
@@ -349,4 +384,5 @@ export async function deliverToAgent(paseo: PaseoApi, agentId: string, message: 
     if (!message) throw new Error("Write the message after @paseo.");
     await handle.send(message);
   }
+  return null;
 }

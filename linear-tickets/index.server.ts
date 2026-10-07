@@ -18,6 +18,9 @@ import { ParkedPlans, PlannotatorHost } from "./server/parked";
 import { reviewOutcome } from "./server/review-outcome";
 import { Writeback } from "./server/writeback";
 import { DecisionLog } from "./server/owner-decisions";
+import { Deputy, DEPUTY_DIRECTORY } from "./server/deputy";
+import { evaluateWithOmp } from "./server/deputy-evaluator";
+import { hostReaders, recallAccess } from "./server/deputy-sources";
 import { AgentApi, AppAuth } from "./server/agent-app";
 import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
 import { ensureFunnel, type FunnelStatus } from "./server/funnel";
@@ -171,11 +174,23 @@ export default function contribute(server: PluginServerContext) {
   // Stale `-running` and `-failed` labels are reconciled, and their tickets started again (README,
   // "Repairing stale running and failed labels"); its records share projects.json with the projects.
   const labelRepair = new LabelRepair({ linear, store: projectStore, launcher, intake, deletions, restart: (issueId, identifier, options) => sessions.restartFor(issueId, identifier, options) });
-  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay: new CommentRelay(linear, undefined, needsYou, route), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, repairs: labelRepair });
+  const relay = new CommentRelay(linear, undefined, needsYou, route);
+  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, repairs: labelRepair });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
   const decisions = new DecisionLog();
   writeback.recordDecisions(decisions);
+  // The deputy for agent questions (README, "Deputy for agent questions"); off unless set otherwise.
+  const deputyDirectory = DEPUTY_DIRECTORY();
+  const deputy = new Deputy({
+    settings, log: decisions, linear, sessions,
+    readers: hostReaders({ linear, log: decisions, home: paseoHome(), directory: deputyDirectory, template: async () => (await settings.read()).template ?? DEFAULT_PROMPT_TEMPLATE }),
+    evaluate: (input, model) => evaluateWithOmp(input, model, deputyDirectory),
+    directory: deputyDirectory,
+  });
+  writeback.recordDeputy(deputy);
+  relay.recordDeputy(deputy);
+  sessions.recordDeputy(deputy);
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   // Its root is the review inbox, listing the peer hosts' reviews too (README, "Review inbox").
   const reviewLinks = new ReviewLinks({
@@ -308,7 +323,7 @@ export default function contribute(server: PluginServerContext) {
   plannotator.useTiers({ store: tiers, apply: (agentId) => modelGuard.apply(agentId), replan: (agent, message) => planRequests.send(agent, message) });
   // The central Plannotator host starts once, after the hook it runs for each parked review exists.
   const startHost = async () => { if (await plannotatorHook() && !stopped) await plannotatorHost.start(); };
-  const attach = (paseo: PaseoApi) => { const first = !attached; attached = true; attachedPaseo = paseo; if (!stopped) { void reviewLinks.start(); drain.start(); intake.start(); if (first) void startHost(); } pipeline.attach(paseo); dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); void startAgent(); };
+  const attach = (paseo: PaseoApi) => { const first = !attached; attached = true; attachedPaseo = paseo; if (!stopped) { void reviewLinks.start(); drain.start(); intake.start(); if (first) void startHost(); } pipeline.attach(paseo); dispatcher.attach(paseo); plannotator.attach(paseo); sessions.attach(paseo); modelGuard.attach(paseo); planRequests.attach(paseo); deputy.attach(paseo); void startAgent(); };
   const cacheIdentity = async () => {
     const connection = await credentials.read();
     return connection.key ? cacheScope(connection.key) : null;
@@ -386,17 +401,22 @@ export default function contribute(server: PluginServerContext) {
   server.handle(getDefaultPromptRpc, async () => ({ template: (await settings.read()).template, builtin: DEFAULT_PROMPT_TEMPLATE }));
   server.handle(setDefaultPromptRpc, ({ template }) => settings.save(template).then((saved) => ({ ...saved, builtin: DEFAULT_PROMPT_TEMPLATE })));
   // The settings screen sees the routing mode and whether a secret is stored; the secret itself
-  // never leaves the host (README, "Draining a host").
-  const settingsView = async (saved: PluginSettings) => ({
-    ...saved,
-    activation: { ...saved.activation, secretConfigured: Boolean(await readActivationSecret()) },
-    builtin: DEFAULT_PROMPT_TEMPLATE,
-  });
+  // never leaves the host (README, "Draining a host"). Neither does the deputy's recall token.
+  const settingsView = async (saved: PluginSettings) => {
+    const blockers = await deputy.liveBlockers(saved);
+    return {
+      ...saved,
+      activation: { ...saved.activation, secretConfigured: Boolean(await readActivationSecret()) },
+      deputy: { ...saved.deputy, recallConfigured: Boolean(await recallAccess(deputyDirectory)), live: { ready: !blockers.length, blockers } },
+      builtin: DEFAULT_PROMPT_TEMPLATE,
+    };
+  };
   server.handle(getSettingsRpc, async () => settingsView(await settings.read()));
   server.handle(setSettingsRpc, async (input, { paseo }) => {
     const saved = await settings.patch(input);
     attach(paseo);
     if (input.dispatch) dispatcher.wake();
+    if (input.deputy) await deputy.settingsChanged();
     return settingsView(saved);
   });
   server.handle(launchAgentRpc, async (input, { paseo }) => {
@@ -435,5 +455,5 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); pipeline.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); void closeInternalDaemon(); };
+  return () => { stopped = true; clearTimeout(startSoon); stopKeepingFresh(); void own?.close(); dispatcher.stop(); plannotator.stop(); plannotatorHost.stop(); sessions.stop(); webhook.stop(); reviewLinks.stop(); pipeline.stop(); health.stop(); pullRequests.stop(); pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop(); stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop(); void closeInternalDaemon(); };
 }

@@ -18,6 +18,7 @@ import type { IssueGroup, LinearService } from "./linear";
 import type { Launcher } from "./launch";
 import { CODING_STATE } from "./plannotator";
 import { closeAnswered, type NeedsYouIssues } from "./needs-you";
+import { overrideCommand, type Correction, type CorrectionActivity, type Deputy } from "./deputy";
 import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, questionAnswer, questionsOf } from "./relay";
 import type { PluginSettings, Settings } from "./settings";
 import { issueAgents, type TicketStarter } from "./starter";
@@ -129,6 +130,10 @@ export type SessionLink = {
   // The comment a thread queued behind another start of its ticket came with, passed on to the
   // agent it is linked to (see startQueued).
   pendingText?: string | null;
+  // Who wrote `pendingText`, when that was verified as the owner (the thread's creator, or a reply
+  // whose author was checked): only then does its delivery count as the owner's answer (README,
+  // "Deputy for agent questions"). Null for a reply that named no author.
+  pendingFrom?: { activityId: string; userId: string } | null;
   // A question with several parts, asked one part at a time.
   questions?: { requestId: string; index: number; answers: Record<string, string> } | null;
   // Replaced by a newer thread on the same ticket (every @mention opens one); told so and completed.
@@ -387,7 +392,15 @@ export class SessionRouter {
   // Reads webhooks started (`receive` is fire-and-forget), awaited by `settled`.
   private readonly inflightReads = new Set<Promise<unknown>>();
 
+  // The deputy for agent questions (README, "Deputy for agent questions"): overrides of its answers
+  // are routed before pending questions, and the owner's answers here are recorded for it.
+  private deputy: Pick<Deputy, "byRef" | "correct" | "ownerAnswered"> | null = null;
+
   constructor(private readonly deps: Deps) {}
+
+  recordDeputy(deputy: Pick<Deputy, "byRef" | "correct" | "ownerAnswered">): void {
+    this.deputy = deputy;
+  }
 
   attach(paseo: PaseoApi): void {
     if (this.paseo) return;
@@ -492,6 +505,28 @@ export class SessionRouter {
     return this.deps.linear.viewerId();
   }
 
+  // "override D-…" (README, "Deputy for agent questions"): the owner corrects a deputy answer. It
+  // goes to the agent that got that answer as a message, before the text could answer a newer
+  // question or start anything. Null when the text is no override.
+  private async override(text: string, activity: CorrectionActivity): Promise<Correction | null> {
+    const command = this.deputy ? overrideCommand(text) : null;
+    if (!command || !this.deputy) return null;
+    const target = await this.deputy.byRef(command.ref);
+    return target
+      ? this.deputy.correct(target, command.text, activity)
+      : { delivered: false, reply: `${command.ref} is not an answer the deputy gave on this host, so nothing was passed on.` };
+  }
+
+  // The owner's text from a thread for a running agent: answers its pending question (recorded
+  // as the owner's answer for the deputy) or decides a pending approval, else it is a message.
+  private async passOn(agentId: string, text: string, activity: Omit<CorrectionActivity, "via">): Promise<void> {
+    const answered = await deliverToAgent(this.paseo!, agentId, text);
+    if (answered) {
+      await this.deputy?.ownerAnswered(agentId, answered.request, answered.response, { via: "linear-session", ...activity }, answered.at)
+        .catch((error: unknown) => console.error(`[linear-tickets] recording the owner's answer for agent ${agentId} failed: ${error instanceof Error ? error.message : error}`));
+    }
+  }
+
   private async activeAgentFor(issueId: string): Promise<{ id: string; title: string | null } | null> {
     const page = await this.paseo!.agents.list({ filter: { labels: { "linear.issueId": issueId }, includeArchived: false }, page: { limit: 20 } });
     const agent = page.entries.map((entry) => entry.agent).find((candidate) => !candidate.labels?.["paseo.parent-agent-id"]);
@@ -536,7 +571,8 @@ export class SessionRouter {
     const link: SessionLink = { sessionId: session.id, agentId: null, issueId, identifier, createdAt: new Date().toISOString(), handled: [], review: null, offer: null };
     // One-person workspace: other integrations acting in Linear must not start agents here. Kept
     // as closed, so the ticket left assigned to Paseo is not taken for a failed start either.
-    if (String(session.creatorId ?? "") !== await this.owner()) {
+    const owner = await this.owner();
+    if (String(session.creatorId ?? "") !== owner) {
       await this.deps.store.put({ ...link, closed: true });
       await this.say(session.id, "error", "Only the workspace owner can start Paseo agents.");
       return;
@@ -545,18 +581,28 @@ export class SessionRouter {
     await this.deps.watchdog?.continued(issueId).catch((error: unknown) => console.error(`[linear-tickets] ${identifier}: recording the owner's continuation for the watchdog failed: ${error instanceof Error ? error.message : error}`));
     const comment = (session.comment ?? {}) as { body?: string };
     const text = typeof comment.body === "string" && !/^This thread is for an agent session/.test(comment.body) ? comment.body.replace(/@paseo\b/gi, "").trim() : "";
+    // The thread's creator was checked as the owner above.
+    const from = { activityId: `session:${session.id}`, userId: owner };
+    // A correction of a deputy answer starts nothing and answers nothing: the thread only
+    // reports where it went.
+    const corrected = text ? await this.override(text, { via: "linear-session", ...from }) : null;
+    if (corrected) {
+      await this.deps.store.put({ ...link, closed: true });
+      await this.say(session.id, corrected.delivered ? "response" : "error", corrected.reply);
+      return;
+    }
     // Another automatic start of the ticket is under way: the thread waits for it, and the queue
     // sweep links it to the agent it made (passing the comment on) or starts one.
     const gate = this.deps.launcher.gate(issueId);
     if (!gate) {
-      await this.deps.store.put({ ...link, queued: true, queueReason: "a launch for this ticket is under way", pendingText: text || null });
+      await this.deps.store.put({ ...link, queued: true, queueReason: "a launch for this ticket is under way", pendingText: text || null, pendingFrom: text ? from : null });
       await this.say(session.id, "thought", "A launch for this ticket is under way; this thread joins its agent once it is up, or starts one.");
       return;
     }
     try {
       const wait = await this.processWait(issueId);
       if (wait) {
-        await this.deps.store.put({ ...link, queued: true, queueReason: wait, pendingText: text || null });
+        await this.deps.store.put({ ...link, queued: true, queueReason: wait, pendingText: text || null, pendingFrom: text ? from : null });
         await this.say(session.id, "thought", `Queued: ${wait}; this thread waits for confirmed process exit.`);
         return;
       }
@@ -568,7 +614,7 @@ export class SessionRouter {
         await this.deps.store.put({ ...link, agentId: existing.id });
         await this.linkToPaseo(session.id, existing.id);
         // Same as a relayed comment: answers a pending question or decides a pending approval.
-        if (text) await deliverToAgent(this.paseo!, existing.id, text);
+        if (text) await this.passOn(existing.id, text, from);
         if (text && asked) await closeAnswered(this.deps.needsYou!, this.deps.linear, issueId);
         await this.say(session.id, "thought", `Linked to the running agent “${existing.title ?? existing.id}”.${text ? " Your message was passed on." : ""}`);
         await this.closeSuperseded();
@@ -580,7 +626,7 @@ export class SessionRouter {
       // host's to start.
       const routed = await this.deps.route?.take({ kind: "session", issueId, identifier, sessionId: session.id, ...(text ? { text } : {}) });
       if (routed && "held" in routed) {
-        await this.deps.store.put({ ...link, queued: true, queueReason: routed.held, pendingText: text || null });
+        await this.deps.store.put({ ...link, queued: true, queueReason: routed.held, pendingText: text || null, pendingFrom: text ? from : null });
         await this.say(session.id, "thought", `Not started yet: ${routed.held}. This thread stays queued here.`);
         return;
       }
@@ -594,7 +640,7 @@ export class SessionRouter {
       await this.deps.store.put(link);
       const admission = await this.deps.starter.admission(issueId, this.paseo!, await this.deps.settings.read());
       if (!admission.ok) {
-        await this.deps.store.patch(session.id, { queued: true, queueReason: admission.reason, pendingText: text || null });
+        await this.deps.store.patch(session.id, { queued: true, queueReason: admission.reason, pendingText: text || null, pendingFrom: text ? from : null });
         await this.say(session.id, "thought", admission.reason);
         return;
       }
@@ -719,12 +765,17 @@ export class SessionRouter {
       await this.advanceGroup({ ...link, group: { ...link.group, status: undefined } });
       return;
     }
+    const corrected = await this.override(body, { via: "linear-session", activityId, userId });
+    if (corrected) {
+      await this.say(sessionId, corrected.delivered ? "response" : "error", corrected.reply);
+      return;
+    }
     if (body && this.deps.route) {
       const routed = await this.deps.route.take({ kind: "reply", issueId: link.issueId, identifier: link.identifier, sessionId, ...(activityId ? { activityId } : {}), text: body });
       if (routed && "held" in routed) {
         // Nothing was started or sent anywhere; the answer stays with the thread and the sweep
         // tries again (the owner sees why here).
-        await this.deps.store.patch(sessionId, { queued: true, queueReason: routed.held, pendingText: body });
+        await this.deps.store.patch(sessionId, { queued: true, queueReason: routed.held, pendingText: body, pendingFrom: userId ? { activityId: activityId || `session:${sessionId}`, userId } : null });
         await this.say(sessionId, "thought", `Not passed on yet: ${routed.held}. Your message stays queued here.`);
         return;
       }
@@ -793,7 +844,11 @@ export class SessionRouter {
         return;
       }
       await this.deps.store.patch(sessionId, { questions: null });
-      await handle.respondToPermission({ requestId: question.id, response: questionAnswer(question, "", answers) });
+      const response = questionAnswer(question, "", answers);
+      const at = new Date().toISOString();
+      await handle.respondToPermission({ requestId: question.id, response });
+      await this.deputy?.ownerAnswered(link.agentId, question, response, { via: "linear-session", activityId, userId }, at)
+        .catch((error: unknown) => console.error(`[linear-tickets] recording the owner's answer in session ${sessionId} failed: ${error instanceof Error ? error.message : error}`));
       return;
     }
     if (approval) {
@@ -890,7 +945,9 @@ export class SessionRouter {
         if (text) {
           const found = await this.agent(existing.id);
           if (!found || found.agent.status === "closed" || crashedProcess(found.agent)) return;
-          await deliverToAgent(this.paseo!, existing.id, text);
+          // Counted as the owner's answer only with a verified author.
+          if (link.pendingFrom) await this.passOn(existing.id, text, link.pendingFrom);
+          else await deliverToAgent(this.paseo!, existing.id, text);
           if (needsYou && (await needsYou.all()).some((entry) => entry.id === link.issueId && entry.agentId === existing.id)) await closeAnswered(needsYou, this.deps.linear, link.issueId);
         }
         await this.deps.store.patch(link.sessionId, { agentId: existing.id, queued: false, queueReason: undefined, restartRequested: undefined, pendingText: null, ...(link.offer === "resume" ? { offer: null } : {}) });

@@ -68,15 +68,35 @@ export const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
 // The log
 
 type LoggedQuestion = { key: string; question: string; options: string[] };
+// Where a deputy's knowledge came from (README, "Deputy for agent questions"): the source's stable
+// id and revision (a document's content hash, a commit, a log entry or memory id) and the verbatim
+// passage, so a citation still says what it relied on after the source changes.
+export type CitationKind = "plan" | "principles" | "rules" | "owner-answer" | "memory";
+export type Citation = { sourceId: string; kind: CitationKind; title: string; revision: string; quote: string; url?: string };
+export type DeputyMode = "shadow" | "live";
+// `owner-answer`: an answer the plugin itself delivered for the authenticated owner (a Linear
+// comment written with the owner's key, or an agent-session reply whose author is the owner),
+// bound to the request it answered; the only answers the deputy treats as the owner's. `answer`
+// records resolutions as the daemon reports them: they name no responder, so they never count as
+// verified. `key` makes an entry unique beside (kind, id): an activity id, an intent or a status.
 export type LogEntry =
   | { kind: "plan-feedback"; id: string; at: string; identifier: string; issueId: string; approved: boolean; text: string }
   | { kind: "question"; id: string; at: string; identifier: string; issueId: string; questions: LoggedQuestion[] }
-  | { kind: "answer"; id: string; at: string; answers?: Record<string, string>; denyMessage?: string };
+  | { kind: "answer"; id: string; at: string; answers?: Record<string, string>; denyMessage?: string }
+  | { kind: "owner-answer"; id: string; at: string; key: string; via: "linear-comment" | "linear-session"; userId: string; answers: Record<string, string> }
+  | { kind: "deputy-prediction"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; selections: Record<string, string>; citations: Citation[] }
+  | { kind: "deputy-refusal"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; reason: string; category?: string }
+  | { kind: "deputy-answer"; id: string; at: string; identifier: string; issueId: string; version: string; key: string; answers: Record<string, string>; citations: Citation[] }
+  | { kind: "deputy-outcome"; id: string; at: string; key: "blocked" | "canceled" | "owner-won" | "unknown"; reason: string }
+  | { kind: "deputy-override"; id: string; at: string; key: string; via: "linear-comment" | "linear-session"; userId: string; text: string; disposition: "delivered" | "failed"; detail?: string };
+
+const KINDS: LogEntry["kind"][] = ["plan-feedback", "question", "answer", "owner-answer", "deputy-prediction", "deputy-refusal", "deputy-answer", "deputy-outcome", "deputy-override"];
+const entryKey = (entry: LogEntry) => `${entry.kind}\n${entry.id}\n${"key" in entry ? entry.key : ""}`;
 
 function validEntry(value: unknown): value is LogEntry {
   if (!value || typeof value !== "object") return false;
   const entry = value as Record<string, unknown>;
-  return ["plan-feedback", "question", "answer"].includes(String(entry.kind)) && text(entry.id) && text(entry.at) && !Number.isNaN(Date.parse(entry.at));
+  return KINDS.includes(entry.kind as LogEntry["kind"]) && text(entry.id) && text(entry.at) && !Number.isNaN(Date.parse(entry.at));
 }
 
 function stringRecord(value: unknown): Record<string, string> {
@@ -117,7 +137,7 @@ export class DecisionLog {
   }
 
   private async write(entries: LogEntry[], entry: LogEntry): Promise<void> {
-    if (entries.some((known) => known.kind === entry.kind && known.id === entry.id)) return;
+    if (entries.some((known) => entryKey(known) === entryKey(entry))) return;
     const cutoff = this.now() - LOG_KEEP_MS;
     const kept = [...entries.filter((known) => Date.parse(known.at) >= cutoff), entry];
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
@@ -173,7 +193,10 @@ export async function logQuietly(work: () => Promise<void>, what: string): Promi
 // ---------------------------------------------------------------------------------------------
 // The collector
 
-export type ItemKind = "plan-feedback" | "answer" | "comment";
+// `deputy-answer`: what the deputy answered and why, review evidence only (its `words` are empty,
+// so no candidate can quote it as the owner's decision); `deputy-override`: the owner correcting
+// a deputy answer, in the owner's words.
+export type ItemKind = "plan-feedback" | "answer" | "comment" | "deputy-answer" | "deputy-override";
 // `sourceId`: stable per event (a Linear comment id, a log entry, a plan document's id plus its
 // update time), so a candidate citing it keeps its identity however it is worded. `text`: what the
 // sorting agent reads (for an answer also the agent's question and options); `words`: only what
@@ -222,6 +245,16 @@ function answerWords(question: Extract<LogEntry, { kind: "question" }>, answer: 
   return question.questions.map((item) => answer.answers?.[item.key] ?? "").filter(Boolean).join("\n\n");
 }
 
+function citationLines(citations: Citation[]): string {
+  return citations.map((citation) => `- ${citation.title} (${citation.sourceId} @ ${citation.revision}${citation.url ? `, ${citation.url}` : ""}): “${citation.quote}”`).join("\n");
+}
+
+function deputyAnswerText(question: Extract<LogEntry, { kind: "question" }> | undefined, entry: Extract<LogEntry, { kind: "deputy-answer" }>): string {
+  const parts = question?.questions.map((item) => [`Question: ${item.question}`, item.options.length ? `Options: ${item.options.join(" / ")}` : "", `Deputy answered: ${entry.answers[item.key] || "(nothing)"}`].filter(Boolean).join("\n"))
+    ?? Object.entries(entry.answers).map(([key, value]) => `${key}: ${value}`);
+  return [`Answered automatically by the deputy (${entry.version}); not an owner decision.`, ...parts, "Sources:", citationLines(entry.citations)].join("\n\n");
+}
+
 // `commentsFrom`: owner comments before it are left out, since a comment written with the key then
 // has no record and cannot be told from the owner's own (see collectWindow).
 export async function collectOwnerDecisions(sources: CollectSources, window: { since: string; until: string; commentsFrom?: string }): Promise<Item[]> {
@@ -235,11 +268,16 @@ export async function collectOwnerDecisions(sources: CollectSources, window: { s
   const entries = await sources.log.entries();
   const questions = new Map(entries.flatMap((entry) => entry.kind === "question" ? [[entry.id, entry] as const] : []));
   const feedback = entries.filter((entry): entry is Extract<LogEntry, { kind: "plan-feedback" }> => entry.kind === "plan-feedback" && inWindow(entry.at));
+  // A resolution the deputy caused is not the owner's answer, whatever the daemon reports.
+  const deputyAnswers = new Map(entries.flatMap((entry) => entry.kind === "deputy-answer" ? [[entry.id, entry] as const] : []));
   const answers = entries.flatMap((entry) => {
-    const question = entry.kind === "answer" && inWindow(entry.at) ? questions.get(entry.id) : undefined;
+    const question = entry.kind === "answer" && inWindow(entry.at) && !deputyAnswers.has(entry.id) ? questions.get(entry.id) : undefined;
     return entry.kind === "answer" && question ? [{ answer: entry, question }] : [];
   });
-  const links = await linear.issueLinks([...feedback.map((entry) => entry.issueId), ...answers.map(({ question }) => question.issueId)]);
+  const deputyEntries = entries.filter((entry): entry is Extract<LogEntry, { kind: "deputy-answer" | "deputy-override" }> => (entry.kind === "deputy-answer" || entry.kind === "deputy-override") && inWindow(entry.at));
+  const deputyIssue = (entry: { id: string }) => questions.get(entry.id)?.issueId ?? deputyAnswers.get(entry.id)?.issueId ?? null;
+  const overrideComments = new Set(deputyEntries.flatMap((entry) => entry.kind === "deputy-override" && entry.via === "linear-comment" ? [entry.key] : []));
+  const links = await linear.issueLinks([...feedback.map((entry) => entry.issueId), ...answers.map(({ question }) => question.issueId), ...deputyEntries.flatMap((entry) => deputyIssue(entry) ?? [])]);
   const allowed = (issueId: string) => !sources.excluded.has(issueId);
   const item = (kind: ItemKind, sourceId: string, at: string, link: IssueLink, sourceUrl: string, body: string, words: string): Item =>
     ({ kind, sourceId, at, identifier: link.identifier, ticketUrl: link.url, project: link.project, sourceUrl, text: body, words });
@@ -270,18 +308,27 @@ export async function collectOwnerDecisions(sources: CollectSources, window: { s
     const link = links.get(question.issueId);
     return link && allowed(question.issueId) ? [item("answer", `log:answer:${answer.id}`, answer.at, link, link.url, answerText(question, answer), answerWords(question, answer))] : [];
   });
+  const deputyItems = deputyEntries.flatMap((entry) => {
+    const issueId = deputyIssue(entry);
+    const link = issueId ? links.get(issueId) : undefined;
+    if (!link || !issueId || !allowed(issueId)) return [];
+    if (entry.kind === "deputy-answer") return [item("deputy-answer", `log:deputy-answer:${entry.id}`, entry.at, link, link.url, deputyAnswerText(questions.get(entry.id), entry), "")];
+    const answered = deputyAnswers.get(entry.id);
+    const body = [`The owner overrode the deputy's answer${answered ? ` (${Object.values(answered.answers).filter(Boolean).join(" / ")})` : ""}:`, entry.text, `Correction ${entry.disposition === "delivered" ? "delivered to the agent" : `not delivered: ${entry.detail ?? "unknown reason"}`}.`, ...(answered ? ["Deputy sources:", citationLines(answered.citations)] : [])].join("\n\n");
+    return [item("deputy-override", `log:deputy-override:${entry.id}:${entry.key}`, entry.at, link, link.url, body, entry.text)];
+  });
 
   const owner = await linear.viewerId();
   const commentsFrom = Math.max(since, window.commentsFrom ? Date.parse(window.commentsFrom) : since);
   const commentItems = (await linear.ownerCommentsSince(owner, new Date(commentsFrom).toISOString())).flatMap((comment) => {
     const issue = comment.issue;
-    if (!issue || comment.userId !== owner || !inWindow(comment.createdAt) || Date.parse(comment.createdAt) < commentsFrom || sources.recorded.has(comment.id) || !allowed(issue.id)) return [];
+    if (!issue || comment.userId !== owner || !inWindow(comment.createdAt) || Date.parse(comment.createdAt) < commentsFrom || sources.recorded.has(comment.id) || overrideComments.has(comment.id) || !allowed(issue.id)) return [];
     if (!sources.agentTickets.has(issue.id) && !(issue.parentId && sources.agentTickets.has(issue.parentId))) return [];
     const answered = issue.title.startsWith("Needs you:") || Boolean(comment.parentBody?.includes("is waiting for"));
     return [item(answered ? "answer" : "comment", `comment:${comment.id}`, comment.createdAt, issue, comment.url, comment.body.trim(), comment.body.trim())];
   }).filter((found) => found.text);
 
-  return [...kept, ...answerItems, ...commentItems].sort((a, b) => a.at.localeCompare(b.at) || a.sourceId.localeCompare(b.sourceId));
+  return [...kept, ...answerItems, ...deputyItems, ...commentItems].sort((a, b) => a.at.localeCompare(b.at) || a.sourceId.localeCompare(b.sourceId));
 }
 
 // Tickets that had an agent: a handover record (any agent run) or a "Needs you" sub-issue record.
@@ -535,6 +582,7 @@ export function validateInput(raw: unknown, batch: Batch): { input: FileInput; e
         const entry = item && typeof item === "object" ? item as Record<string, unknown> : {};
         const source = text(entry.sourceId) ? items.get(entry.sourceId) : undefined;
         if (!source) { errors.push(`${where}, evidence ${at + 1}: \`sourceId\` ${JSON.stringify(entry.sourceId)} is not in batch ${batch.until}.`); return; }
+        if (source.kind === "deputy-answer") { errors.push(`${where}, evidence ${at + 1}: ${entry.sourceId} is a deputy answer, not an owner decision; cite the owner's override or another owner source.`); return; }
         if (!text(entry.url) || !/^https:\/\/\S+$/.test(entry.url)) errors.push(`${where}, evidence ${at + 1}: \`url\` must be an https link.`);
         if (!text(entry.quote) || !normalize(entry.quote)) errors.push(`${where}, evidence ${at + 1}: \`quote\` is required.`);
         else if (!normalize(source.words ?? "").includes(normalize(entry.quote))) errors.push(`${where}, evidence ${at + 1}: \`quote\` must be the owner's own words verbatim from ${entry.sourceId} (not the question or options an agent asked).`);
@@ -748,9 +796,15 @@ export function renderCollection(batch: Batch, register: Register, tickets: Ment
     "## Items",
     "",
   ];
-  if (!batch.items.length) lines.push("None in this window.", "");
-  for (const found of batch.items) {
-    lines.push(`### ${found.identifier} · ${found.kind} · ${found.at}`, "", `- sourceId: \`${found.sourceId}\``, `- Ticket: ${found.ticketUrl} (project: ${found.project || "none"})`, `- Source: ${found.sourceUrl}`, "", fenced(found.text), "");
+  const deputyKinds: ItemKind[] = ["deputy-answer", "deputy-override"];
+  const ownerItems = batch.items.filter((found) => !deputyKinds.includes(found.kind));
+  const deputyItems = batch.items.filter((found) => deputyKinds.includes(found.kind));
+  const render = (found: Item) => lines.push(`### ${found.identifier} · ${found.kind} · ${found.at}`, "", `- sourceId: \`${found.sourceId}\``, `- Ticket: ${found.ticketUrl} (project: ${found.project || "none"})`, `- Source: ${found.sourceUrl}`, "", fenced(found.text), "");
+  if (!ownerItems.length) lines.push("None in this window.", "");
+  ownerItems.forEach(render);
+  if (deputyItems.length) {
+    lines.push("## Deputy answers and overrides", "", "Review evidence, never decisions: a deputy answer shows which recorded knowledge it relied on; an override is the owner's correction (its words may be quoted). A wrong deputy answer becomes a rule only through a proposal the owner answers.", "");
+    deputyItems.forEach(render);
   }
   lines.push("## Earlier candidate tickets (all states)", "");
   if (!tickets.length) lines.push("None yet.", "");

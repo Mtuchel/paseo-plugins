@@ -343,6 +343,7 @@ list and the launch flow.
 - **Auto-dispatch** — start agents for labeled tickets without opening Paseo (off by default; see below).
 - **Linear agent** — whether the native Linear agent is installed and receiving webhooks (see [Native Linear agent](#native-linear-agent)).
 - **Write back to Linear** — report ticket-linked agents' progress on the ticket, and start new agents automatically (off by default, except the silent-agent watchdog; see below).
+- **Deputy for agent questions** — off, shadow or live, its grace period, evaluator model and principles repository; set through `linear.set-settings` (`deputy`) for now (off by default; see [Deputy for agent questions](#deputy-for-agent-questions)).
 
 The last successful model, mode, and reasoning choices are stored in the same per-host
 settings file. They update automatically and do not need a separate settings toggle. The cheap
@@ -2225,6 +2226,134 @@ and stops updating); to go back to the program before the move, copy
 `~/.paseo/bin/paseo-ops-digest.py.bak-20261007-repo-move` (and its test) over the symlinks. The
 history files can stay. Before changing a host copy by hand, keep it as
 `<file>.bak-<date>-<reason>` next to it.
+
+## Deputy for agent questions
+
+Routine questions ticket agents ask the owner can be answered by a deputy, but only when recorded
+knowledge decides the answer. Risky, unsupported or ambiguous questions wait for the owner exactly
+as before, and the owner always has the last word. Plan, tool and mode approvals are never
+delegated.
+
+**Order.** A question is first logged and shown to the owner as before (write-back's settle
+window and "waiting for an answer" comment are unchanged). Then, in the background, it becomes a
+candidate in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (directory `0700`, file `0600`,
+one per agent and request, kept 14 days):
+
+1. **Risk first.** Only a `question` from an agent linked to a ticket the owner wrote (or the
+   Paseo app in a flow he started; not `feedback`), whose plan is approved (`plan-ready`) and that
+   is not marked attended, qualifies. Every required part needs at least two offered options;
+   free text ("Other (type your own)"), multiple choice and parts without options leave the whole
+   request with the owner (an optional empty comment stays empty). Words in the title,
+   description, any question or any option (label and description, English and German) put it in
+   an owner-kept category and refuse it: open business decisions, user-facing wording or layout,
+   production data, external accounts or spend, security or permissions, deleting data or
+   history, irreversible operations, destructive git, and what the launch template or AGENTS.md
+   reserve for the owner (approvals, pushes, labels, settings, manual steps, plans, deploys,
+   anything sent outside). The evaluator rates the risk too; anything but `low` refuses, and
+   unknown counts as high.
+2. **Knowledge second.** Sources, in this order of authority: the ticket's approved `Plan:`
+   document; `docs/principles/` (`approved.md`, `decisions.md`, `decision-queue.md`) at one
+   `origin/main` commit of `deputy.principlesRepository`; this README, the effective launch template (custom or built-in) and the
+   agent repository's `AGENTS.md`; earlier owner answers the plugin itself delivered for the
+   authenticated owner (`owner-answer` log entries); Hindsight recall. Only sections sharing words
+   with the question are shown. Open proposals (the decision queue), rejected, superseded,
+   withdrawn or deferred decisions (every excerpt of such an entry, its subsections included) and
+   memories can only block an answer, never decide one. An earlier source that should exist but
+   is missing or cannot be read (the plan document of the plan-ready ticket, or one not marked
+   approved; the register; recall without access) makes the deputy abstain.
+3. **Evaluation.** One OMP call (`deputy.model`, thinking `low`, 150 s deadline) with no tools, MCP
+   servers, extensions, skills, rules, memory or saved session, from an empty directory under a
+   private OMP agent directory (`deputy/omp-agent/`, only the isolated configuration plus the
+   owner's `auth:` block), with no Paseo, Linear or GitHub credentials in its environment. It sees
+   only the question, each option with what it says it does (its description), and the excerpts,
+   and returns per part an offered option and the sources that
+   decide it. Every selection must be an offered option verbatim, every citation must name a
+   source that can decide and quote it verbatim (at least 12 characters); a tool event, timeout,
+   oversized or unreadable answer, abstention or one failed check refuses the whole request. The
+   agent's own "(Recommended)" never decides.
+
+Citations store the source's id, revision (document hash, commit or memory id) and the quote, so
+they keep saying what they relied on after the source changes.
+
+**Modes** (`deputy.mode`):
+
+- `off` (default): nothing is evaluated.
+- `shadow`: the prediction or refusal is logged (`deputy-prediction`, `deputy-refusal`) and
+  nothing is written to the agent, the ticket or the session. The owner answers as before.
+- `live`: the owner keeps the grace period (`deputy.graceMinutes`, default 5, 1–120). An owner
+  answer in it ends the candidate. After it every gate is checked again: still live, same
+  evaluator, agent running and still linked, the same request still pending and unchanged (a
+  newer question is never answered in its place), the ticket still qualifies, every cited quote
+  still in today's sources, and the live gate below. Only then is one answer submitted through
+  the daemon's owner-priority response. The intent is recorded first: an answer interrupted by a
+  reload or without a confirmation is never submitted again (`unknown`), and it is not reported
+  as applied.
+
+**Live gate.** Live answers need both: at least 30 real paired shadow cases at 90% agreement or
+more for the current evaluator version (`deputy-2/<model>/low`; a model or policy change starts
+over), and a daemon that submits a response only while no owner response for the request is in,
+bound to the request and idempotent, and tells who actually answered. No released Paseo daemon
+offers that yet ([TUC-1258](https://linear.app/tuchel/issue/TUC-1258)), so on every host a live
+candidate ends `blocked` with the reason and the question stays with the owner. The settings
+show `deputy.live.ready` and `deputy.live.blockers`.
+
+**Evidence.** A pair is a prediction recorded before the owner answered and the owner's answer to
+the same request, delivered by the plugin for the authenticated owner (a Linear comment written
+with the owner's key, or an agent-session reply whose author is the owner). Answers the daemon
+reports (Paseo app, other clients) name no responder and never count, nor do identical answer
+text, timing, blank identities, legacy `answer` entries, duplicates or deputy answers. All parts
+must match (option labels case-insensitively). Unpaired predictions and refusals are reported as
+coverage.
+
+**Answers shown.** After a confirmed live answer the deputy posts on the ticket (whatever the
+write-back settings): the agent, the question and chosen option, each source with its link,
+revision and quote, the request id and "Reply to override". The linked agent session shows the
+same. A failed notice is retried every 5 minutes; the answer never is.
+
+**Override.** A reply in the thread of that comment, or `override D-1a2b3c4d <your answer>` in
+a ticket comment (with or without `@paseo`, also one that opens a new agent session, which then
+starts nothing) or the agent session, goes to the agent that got the deputy's answer as a
+correction message naming the original question; it never answers the agent's newer
+question. Only replies whose author is the owner count; each owner activity is handled once, and
+a failed delivery is replied to as failed, never claimed. Without a reference or a notice thread,
+an owner reply is handled as before. Normal answers, messages and approvals are unchanged.
+
+**Log and weekly review.** The decision log (`owner-decisions/log.jsonl`, see [Decision
+candidates](#decision-candidates)) gains `owner-answer` (an answer the plugin delivered for the
+owner), `deputy-prediction`, `deputy-refusal`, `deputy-answer` (with version and citations),
+`deputy-outcome` (blocked, canceled, owner won, unknown) and `deputy-override` (with delivery
+result). Existing entries are kept as they are. `collect` lists deputy answers and overrides in
+their own section as review evidence: a deputy answer cannot be cited as the owner's decision;
+an override can (the owner's words).
+
+**Report.** From the plugin folder, read-only:
+
+```sh
+node --import tsx scripts/deputy-report.ts
+node --import tsx scripts/deputy-report.ts --baseline <since>..<until> --live <since>..<until> --repo tuchel-sohn/tuchel-platform
+```
+
+It prints the shadow evidence for the configured evaluator (pairs, matches, mismatches,
+coverage, readiness), refusals by category, live answers, overrides and open cases. With two
+equally long windows it also prints, per window, the questions asked, their median wait from
+question to resolution (unanswered ones listed), owner answers and merged pull requests (GitHub,
+per `--repo`) and a verdict: the live median under 15 minutes and fewer owner answers per merged
+pull request pass; no merged pull request or no comparable baseline is inconclusive. Each run is
+archived in `deputy/reports/`, so cases outlive the log's 60 days.
+
+**Recall access.** `deputy/recall.json` (`{ "url", "bank", "token" }`, `0600`), else omp's
+`hindsight.apiUrl` with bank `omp` and `HINDSIGHT_API_TOKEN` in the daemon's environment. The
+token stays on the host: never in settings, prompts, citations or reports. `deputy.recallConfigured`
+says whether access exists.
+
+**Setup and rollout.** Set through `linear.set-settings`, for example
+`{ "deputy": { "mode": "shadow", "model": "openai-codex/gpt-6.1-sol", "principlesRepository": "/home/mirko/paseo/tuchel-platform" } }`,
+or edit `deputy` in `settings.json`. Start in shadow on one host, link a report with at least 30
+real paired cases, and switch to live only once TUC-1258's response is deployed too.
+
+**Off switch.** `"deputy": { "mode": "off" }` stops new evaluations and ends candidates waiting
+for their grace period at once; `shadow` ends waiting live candidates too. Neither undoes an
+answer already given or work an agent did after it; override those.
 
 ## Connection storage
 

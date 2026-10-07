@@ -42,6 +42,17 @@ export const DEFAULT_ACTIVATION: ActivationSettings = { mode: "local", peer: nul
 export const MIN_DISPATCH_INTERVAL_SECONDS = 30;
 export const MAX_DISPATCH_INTERVAL_SECONDS = 3_600;
 export const MAX_DISPATCH_TEAMS = 20;
+// The deputy for agent questions (README, "Deputy for agent questions"): `off` (the default) does
+// nothing, `shadow` records what it would answer without answering, `live` may answer once the
+// shadow evidence and the daemon's owner-priority responses allow it. `model`: the evaluator's
+// OMP model (none: every question stays with the owner); `principlesRepository`: the local
+// tuchel-platform checkout whose `origin/main` holds `docs/principles/`.
+export type DeputyMode = "off" | "shadow" | "live";
+export type DeputySettings = { mode: DeputyMode; graceMinutes: number; model: string | null; principlesRepository: string | null };
+export const DEFAULT_DEPUTY: DeputySettings = { mode: "off", graceMinutes: 5, model: null, principlesRepository: null };
+export const MIN_DEPUTY_GRACE_MINUTES = 1;
+export const MAX_DEPUTY_GRACE_MINUTES = 120;
+const DEPUTY_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}$/;
 export type PluginSettings = {
   template: string | null;
   markInProgress: boolean;
@@ -63,6 +74,7 @@ export type PluginSettings = {
   reviewPeers: string[];
   // Activation routing (README, "Draining a host"); the secret is a separate host-local file.
   activation: ActivationSettings;
+  deputy: DeputySettings;
 };
 
 type SettingsFile = {
@@ -81,6 +93,7 @@ type SettingsFile = {
   standardModels?: Record<string, TierModel>;
   reviewPeers?: string[];
   activation?: { mode?: unknown; peer?: unknown };
+  deputy?: Partial<DeputySettings>;
 };
 
 function savedString(value: unknown): string | undefined {
@@ -242,6 +255,31 @@ export function normalizeAutoApprove(value: unknown): AutoApprovePolicy {
   return { enabled: typeof candidate.enabled === "boolean" ? candidate.enabled : DEFAULT_AUTO_APPROVE.enabled, maxImpact, maxImpactWithFlag };
 }
 
+export function normalizeDeputy(value: unknown): DeputySettings {
+  const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const grace = candidate.graceMinutes;
+  const model = typeof candidate.model === "string" ? candidate.model.trim() : "";
+  const repository = typeof candidate.principlesRepository === "string" ? candidate.principlesRepository.trim() : "";
+  return {
+    mode: candidate.mode === "shadow" || candidate.mode === "live" ? candidate.mode : "off",
+    graceMinutes: typeof grace === "number" && Number.isInteger(grace) && grace >= MIN_DEPUTY_GRACE_MINUTES && grace <= MAX_DEPUTY_GRACE_MINUTES ? grace : DEFAULT_DEPUTY.graceMinutes,
+    model: DEPUTY_MODEL.test(model) ? model : null,
+    principlesRepository: repository.startsWith("/") && repository.length <= 500 ? repository : null,
+  };
+}
+
+// A user edit is rejected rather than silently repaired, so the settings form can say why.
+function validDeputy(value: { mode?: unknown; graceMinutes?: unknown; model?: unknown; principlesRepository?: unknown }): DeputySettings {
+  if (!["off", "shadow", "live"].includes(String(value.mode))) throw new Error("The deputy mode must be off, shadow or live.");
+  const grace = value.graceMinutes;
+  if (typeof grace !== "number" || !Number.isInteger(grace) || grace < MIN_DEPUTY_GRACE_MINUTES || grace > MAX_DEPUTY_GRACE_MINUTES) {
+    throw new Error(`The deputy's grace period must be a whole number of minutes from ${MIN_DEPUTY_GRACE_MINUTES} to ${MAX_DEPUTY_GRACE_MINUTES}.`);
+  }
+  if (value.model !== null && (typeof value.model !== "string" || !DEPUTY_MODEL.test(value.model.trim()))) throw new Error("The deputy's evaluator model must be an OMP model id such as openai-codex/gpt-6.1-sol, or null.");
+  if (value.principlesRepository !== null && (typeof value.principlesRepository !== "string" || !value.principlesRepository.trim().startsWith("/"))) throw new Error("The principles repository must be an absolute path to a tuchel-platform checkout, or null.");
+  return normalizeDeputy(value);
+}
+
 export type SettingsPatch = {
   template?: string;
   markInProgress?: boolean;
@@ -259,6 +297,7 @@ export type SettingsPatch = {
   tierModel?: { tier: "cheap" | "standard"; provider: string; model: string | null; thinkingOptionId?: string };
   // Activation routing; `secret` is write-only (the host-local file) and `null`/`""` removes it.
   activation?: { mode?: "local" | "remote"; peer?: string | null; secret?: string | null };
+  deputy?: Partial<DeputySettings>;
 };
 
 // Returns null for an empty template (meaning: use the built-in default).
@@ -317,6 +356,7 @@ export class Settings {
       standardModels: normalizeTierModels(value.standardModels, DEFAULT_STANDARD_MODELS),
       reviewPeers: normalizeReviewPeers(value.reviewPeers),
       activation: normalizeActivation(value.activation),
+      deputy: normalizeDeputy(value.deputy),
     };
   }
 
@@ -346,6 +386,7 @@ export class Settings {
       writeback: patch.writeback ? normalizeWriteback({ ...current.writeback, ...patch.writeback }) : current.writeback,
       watchdog: patch.watchdog ? validWatchdog({ ...current.watchdog, ...patch.watchdog }) : current.watchdog,
       autoApprove: patch.autoApprove ? normalizeAutoApprove({ ...current.autoApprove, ...patch.autoApprove }) : current.autoApprove,
+      deputy: patch.deputy ? validDeputy({ ...current.deputy, ...patch.deputy }) : current.deputy,
     };
     if (patch.launchPreference) {
       const { provider, model, modeId, thinkingOptionId } = patch.launchPreference;
@@ -389,7 +430,8 @@ export class Settings {
     const customCheapModels = JSON.stringify(value.cheapModels) !== JSON.stringify(DEFAULT_CHEAP_MODELS);
     const customStandardModels = JSON.stringify(value.standardModels) !== JSON.stringify(DEFAULT_STANDARD_MODELS);
     const customActivation = JSON.stringify(value.activation) !== JSON.stringify(DEFAULT_ACTIVATION);
-    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customWatchdog && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length && !customActivation) {
+    const customDeputy = JSON.stringify(value.deputy) !== JSON.stringify(DEFAULT_DEPUTY);
+    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customWatchdog && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length && !customActivation && !customDeputy) {
       await rm(this.path, { force: true });
       return value;
     }
@@ -412,6 +454,7 @@ export class Settings {
     if (customStandardModels) fileValue.standardModels = value.standardModels;
     if (value.reviewPeers.length) fileValue.reviewPeers = value.reviewPeers;
     if (customActivation) fileValue.activation = value.activation;
+    if (customDeputy) fileValue.deputy = value.deputy;
     const temporary = `${this.path}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, JSON.stringify(fileValue), { mode: 0o600, flag: "wx" });
