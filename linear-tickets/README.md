@@ -1508,8 +1508,9 @@ new message, the first that applies:
 
 The stages look at the ticket's recorded pull request and, where the repository's pull request
 titles name their ticket (tuchel-platform), at its **connected stack**: the open pull requests of
-the same repository whose titles name the same ticket as a whole word (`TUC-1`, never `TUC-10`),
-joined to the recorded one by exact base → head branch edges, below and above it. The repo's
+the same repository, from branches of that repository (never a fork's), whose titles name the
+same ticket as a whole word (`TUC-1`, never `TUC-10`), joined to the recorded one by exact
+base → head branch edges, below and above it. The repo's
 trunk and another ticket's pull request end the stack and are never nudged; a pull request of the
 ticket that is not on the chain is not part of it. Every member is a candidate, bottom first,
 whatever the recorded one's position, so a green pull request waiting for a red, conflicting or
@@ -1523,8 +1524,11 @@ pull request, a branch two open pull requests share, two of the ticket's pull re
 branch, a cycle), when a member cannot be read or no longer matches the listing (state, head,
 branch, base), or when a hold covers any member: `do-not-merge`, a drop escalated to you (also
 the third drop from before drops had kinds), a merge queue message still to deliver, the head a
-genuine drop left, or another ticket's record linking it. In a repository whose titles carry no
-ticket identifier only the recorded pull request is nudged. A ready pull request gets no nudge:
+genuine drop left, or another ticket's record linking it (compared by repository and number,
+whatever the URL's spelling). While the stack is deferred its other pull requests are not
+nudged, so a permission wait of theirs starts from zero once they are again. In a repository
+whose titles carry no ticket identifier only the recorded pull request is nudged. A ready pull
+request gets no nudge:
 the [queue backstop](#queue-backstop) enqueues it.
 
 Nothing is sent for a pull request labelled `do-not-merge`, while [manual tasks](#manual-tasks)

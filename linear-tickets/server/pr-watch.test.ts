@@ -139,8 +139,8 @@ const RUNNING_CI: CheckRun = { name: "Code validation / Core (core-web)", url: "
 // An open, ready pull request whose CI still runs: no lifecycle stage applies to it.
 const OPEN_PR: PullRequestView = { state: "OPEN", isDraft: false, headSha: HEAD, headBranch: "mtuchel/tuc-1-fix", baseBranch: "main", updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, comments: [], reviews: [], lastCommitAt: null, checks: [RUNNING_CI], mergeable: null };
 // A pull request as the repo's open listing shows it.
-const listed = (url: string, view: PullRequestView, title = "Fix TUC-1 [plugin] Retry the upload"): OpenPull => ({
-  number: Number(url.split("/").at(-1)), url, title, headBranch: view.headBranch, headSha: view.headSha, baseBranch: view.baseBranch, trunk: "main", draft: view.isDraft, labels: view.labels,
+const listed = (url: string, view: PullRequestView, title = "Fix TUC-1 [plugin] Retry the upload", headRepo: string | null = /github\.com\/([^/]+\/[^/]+)\/pull/.exec(url)?.[1] ?? null): OpenPull => ({
+  number: Number(url.split("/").at(-1)), url, title, headBranch: view.headBranch, headRepo, headSha: view.headSha, baseBranch: view.baseBranch, trunk: "main", draft: view.isDraft, labels: view.labels,
 });
 
 // The repo's `wait-queue.mjs` judgment of a dropped round (see queue-backstop.ts): genuine, and
@@ -3334,4 +3334,55 @@ test("TUC-1265: an agent waiting for the owner holds the whole stack's repairs, 
   assert.equal(state[prUrl(418)]?.nudges, undefined, "the middle was not even tried");
   h.paseo.answer = async () => "sent";
   assert.deepEqual(prompted(await h.poll()), [prUrl(418)], "the bottom's stage is exhausted; the middle goes next");
+});
+
+test("TUC-1265: a member the stack held back starts its permission wait from zero once the hold lifts", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const h = harness(t);
+  const start = h.scripts.now;
+  stackOf(h, 2, {}, RED);
+  h.paseo.answer = async () => "waiting";
+  assert.deepEqual(await h.poll(), [], "the middle's wait starts");
+  stackOf(h, 2, { labels: ["do-not-merge"] }, RED);
+  h.scripts.now = start + 30 * MINUTE;
+  assert.deepEqual(await h.poll(), [], "vetoed: the stack is deferred");
+  stackOf(h, 2, {}, RED);
+  h.scripts.now = start + HOUR;
+  assert.deepEqual(await h.poll(), [], "the veto lifted: the wait starts again instead of reminding the owner");
+  h.scripts.now = start + 2 * HOUR;
+  assert.equal(count(await h.poll(), `comment ${OWNER} The agent has waited over 60 minutes`), 1);
+});
+
+test("TUC-1265: members compare by repo and number whatever the URL's spelling, and a fork's same-named branch is never a member", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const mixed = (number: number) => `https://github.com/Tuchel-Sohn/tuchel-platform/pull/${number}`;
+  const spelled = (h: ReturnType<typeof harness>) => {
+    stackOf(h, 2, {}, RED);
+    h.records[0] = { ...h.records[0], links: { "Pull request": mixed(419) } };
+    h.github.open.push(listed(PR, h.github.view));
+    for (const number of [417, 418]) h.github.views[mixed(number)] = h.github.views[prUrl(number)];
+  };
+  const plain = harness(t);
+  spelled(plain);
+  assert.deepEqual(prompted(await plain.poll()), [mixed(418)], "a differently spelled link still finds its stack");
+  const owned = harness(t);
+  spelled(owned);
+  owned.records.push({ ...owned.records[0], issueId: "i2", identifier: "TUC-2", agentId: "a2", links: { "Pull request": prUrl(418) } });
+  assert.ok(!(await owned.poll()).some((call) => call.startsWith("prompt a1")), "the parent is TUC-2's linked pull request: never TUC-1's agent's");
+  const escalatedSpelling = harness(t);
+  spelled(escalatedSpelling);
+  await escalatedSpelling.state({ [prUrl(417)]: { reviewedAt: null, decision: null, merged: false, escalated: true } });
+  assert.deepEqual(await escalatedSpelling.poll(), [], "an escalation saved under another spelling still holds the stack");
+
+  const fork = harness(t);
+  stackOf(fork, 2, {}, RED);
+  fork.github.open.push(listed(prUrl(440), { ...READY, ...RED, headBranch: CHAIN_BRANCHES[1], baseBranch: CHAIN_BRANCHES[0] }, "Fix TUC-1 [plugin] From a fork", "someone/tuchel-platform"));
+  assert.deepEqual(prompted(await fork.poll()), [prUrl(418)], "the fork's branch of the same name neither joins nor breaks the stack");
+  assert.deepEqual(prompted(await fork.poll()), []);
+  const orphan = harness(t);
+  stackOf(orphan, 2, {}, RED);
+  orphan.github.open = [listed(prUrl(417), orphan.github.views[prUrl(417)], "Fix TUC-1 [plugin] Part 1"), listed(prUrl(440), { ...READY, ...RED, headBranch: CHAIN_BRANCHES[1], baseBranch: CHAIN_BRANCHES[0] }, "Fix TUC-1 [plugin] From a fork", "someone/tuchel-platform")];
+  assert.deepEqual(await orphan.poll(), [], "with the repo's own parent gone, a fork's same-named branch is no parent");
+  assert.ok(!orphan.github.reads.includes(prUrl(440)));
 });

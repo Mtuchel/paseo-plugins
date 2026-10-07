@@ -134,8 +134,9 @@ type Change = { thought: string; review: string; state?: string };
 // A draft pull request the merge queue tests a stack on; `base` is the branch it lands on.
 export type QueueDraft = { number: number; title: string; body: string; state: string; headSha: string; base: string };
 // An open pull request of the repo, from one listing per repo and poll; `trunk` is the repo's
-// default branch.
-export type OpenPull = { number: number; url: string; title: string; headBranch: string; headSha: string; baseBranch: string; trunk: string; draft: boolean; labels: string[] };
+// default branch; `headRepo` the `owner/name` its branch lives in (another one for a fork, null
+// once the fork is gone).
+export type OpenPull = { number: number; url: string; title: string; headBranch: string; headRepo: string | null; headSha: string; baseBranch: string; trunk: string; draft: boolean; labels: string[] };
 // The GitHub reads beyond the pull request itself, and the queue backstop's pull request comments;
 // `repo` is `owner/name`.
 export type GitHubReader = {
@@ -167,6 +168,11 @@ type RunContext = { records: HandoverRecord[]; repo(worktree: string): Promise<s
 
 const pullUrl = (repo: string, number: number) => `https://github.com/${repo}/pull/${number}`;
 const PULL_URL = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/;
+// A pull request's identity whatever its URL's spelling: `owner/name#number`, the repo lower case.
+function pullKey(url: string): string {
+  const source = PULL_URL.exec(url);
+  return source ? `${source[1].toLowerCase()}#${source[2]}` : url;
+}
 
 // The pull request's entry, created when it has none.
 function entry(seenByUrl: Record<string, Seen>, url: string): Seen {
@@ -193,7 +199,9 @@ function lowestPull(open: OpenPull[]): OpenPull | undefined {
 // open pull requests share, two of the ticket's pull requests on one branch, or a cycle.
 function connectedStack(identifier: string, repo: string, linked: number, listing: OpenPull[]): { stack: OpenPull[] } | { invalid: string } | null {
   const names = namesTicket(identifier);
-  const open = listing.filter((pull) => pull.url.toLowerCase() === pullUrl(repo, pull.number).toLowerCase());
+  // Only pull requests whose branch lives in the repo itself: a fork's branch of the same name is
+  // not the repo's branch, and no agent of the ticket owns it.
+  const open = listing.filter((pull) => pullKey(pull.url) === pullKey(pullUrl(repo, pull.number)) && pull.headRepo?.toLowerCase() === repo.toLowerCase());
   const link = open.find((pull) => pull.number === linked);
   if (!link || !names.test(link.title)) return null;
   // Every open pull request by its branch, and the ticket's by the branch they sit on.
@@ -545,7 +553,7 @@ export const githubReader: GitHubReader = {
     return status === "identical" || status === "ahead";
   },
   async openPullRequests(repo) {
-    const open = await ghJson(["api", "--paginate", `repos/${repo}/pulls?state=open&per_page=100`, "--jq", "[.[] | {number, url: .html_url, title, headBranch: .head.ref, headSha: .head.sha, baseBranch: .base.ref, trunk: .base.repo.default_branch, draft, labels: [.labels[].name]}]"], pages<OpenPull>);
+    const open = await ghJson(["api", "--paginate", `repos/${repo}/pulls?state=open&per_page=100`, "--jq", "[.[] | {number, url: .html_url, title, headBranch: .head.ref, headRepo: .head.repo.full_name, headSha: .head.sha, baseBranch: .base.ref, trunk: .base.repo.default_branch, draft, labels: [.labels[].name]}]"], pages<OpenPull>);
     return open.sort((a, b) => b.number - a.number);
   },
   async branchExists(repo, branch) {
@@ -2209,25 +2217,39 @@ export class PullRequestWatch {
   // chain, a member cannot be read or no longer matches the listing (state, head, branch, base), or
   // a hold covers any member: `do-not-merge`, a drop escalated to the owner (also the legacy third
   // drop), a merge queue message still pending or queued, the head a genuine drop left
-  // (`blockedAt`), or another ticket's record links it. A rate limit ends the poll as elsewhere.
+  // (`blockedAt`), or another ticket's record links it. While it is deferred, the ticket's other
+  // pull requests are not nudged, so a permission wait of theirs starts from zero later, as for a
+  // vetoed link (see nudge). A pull request's state and links compare by repo and number, whatever
+  // the URL's spelling: a member keeps the key its state was saved under. A rate limit ends the
+  // poll as elsewhere.
   private async stackMembers(record: HandoverRecord, url: string, seenByUrl: Record<string, Seen>, context: RunContext, views: Map<string, Promise<PullRequestView>>): Promise<{ url: string; view: PullRequestView }[] | null> {
     const source = PULL_URL.exec(url);
     if (!source) return null;
     const repo = source[1];
+    const linked = Number(source[2]);
+    const urlOf = (number: number) => (number === linked ? url : Object.keys(seenByUrl).find((key) => pullKey(key) === pullKey(pullUrl(repo, number))) ?? pullUrl(repo, number));
+    let ticket: string[] = [];
     const defer = (why: string | null) => {
       if (why !== null && this.deferredStacks.get(url) !== why) console.error(`[linear-tickets] ${record.identifier}: only ${url} is nudged; its connected stack is deferred: ${why}`);
       if (why === null) this.deferredStacks.delete(url);
       else this.deferredStacks.set(url, why);
+      for (const other of why === null ? [] : ticket) {
+        if (!context.records.some((item) => pullKey(item.links["Pull request"] ?? "") === pullKey(other))) this.clearWaits(seenByUrl, other, "stage:");
+      }
       return null;
     };
     const members: { url: string; view: PullRequestView }[] = [];
     try {
-      const found = connectedStack(record.identifier, repo, Number(source[2]), await context.pulls(repo));
+      // Keyed like the watchdog's and discovery's listing, so the repo is listed once per poll.
+      const listing = await context.pulls(repo.toLowerCase());
+      const names = namesTicket(record.identifier);
+      ticket = listing.filter((pull) => names.test(pull.title) && pullKey(pull.url) === pullKey(pullUrl(repo, pull.number))).map((pull) => urlOf(pull.number));
+      const found = connectedStack(record.identifier, repo, linked, listing);
       if (!found) return defer(null);
       if ("invalid" in found) return defer(found.invalid);
       if (found.stack.length < 2) return defer(null);
       for (const pull of found.stack) {
-        const memberUrl = pull.number === Number(source[2]) ? url : pullUrl(repo, pull.number);
+        const memberUrl = urlOf(pull.number);
         if (!views.has(memberUrl)) views.set(memberUrl, this.view(memberUrl));
         members.push({ url: memberUrl, view: await views.get(memberUrl)! });
       }
@@ -2240,7 +2262,7 @@ export class PullRequestWatch {
         if (seen?.missing) return defer(`GitHub once had no pull request #${pull.number}`);
         if (seen?.pending || seen?.queued?.length) return defer(`#${pull.number} still has a merge queue message to deliver`);
         if (seen?.blockedAt === member.view.headSha) return defer(`#${pull.number}'s head is held after a genuine merge queue drop`);
-        const other = context.records.find((item) => item.issueId !== record.issueId && item.links["Pull request"] === member.url);
+        const other = context.records.find((item) => item.issueId !== record.issueId && pullKey(item.links["Pull request"] ?? "") === pullKey(member.url));
         if (other) return defer(`#${pull.number} is the linked pull request of ${other.identifier}`);
       }
     } catch (error) {

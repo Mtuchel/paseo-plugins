@@ -38,7 +38,7 @@ const record = (change: Partial<HandoverRecord> = {}): HandoverRecord => ({
 });
 
 const pull = (change: Partial<OpenPull> = {}): OpenPull => ({
-  number: 7, url: "https://github.com/o/r/pull/7", title: "TUC-1: work", headBranch: "mtuchel/tuc-1-work", headSha: "abc", baseBranch: "main", trunk: "main", draft: false, labels: [], ...change,
+  number: 7, url: "https://github.com/o/r/pull/7", title: "TUC-1: work", headBranch: "mtuchel/tuc-1-work", headRepo: "o/r", headSha: "abc", baseBranch: "main", trunk: "main", draft: false, labels: [], ...change,
 });
 // What a test changes between polls.
 type HarnessState = {
