@@ -1,3 +1,4 @@
+import { asCaller } from "./linear-usage";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
@@ -1152,7 +1153,7 @@ export class SessionRouter {
 
   private async sweepPart(part: string, run: () => Promise<void>): Promise<void> {
     try {
-      await run();
+      await asCaller(`session-sweep.${part}`, run);
     } catch (error) {
       console.error(`[linear-tickets] agent session sweep (${part}) failed: ${error instanceof Error ? error.message : error}`);
     }

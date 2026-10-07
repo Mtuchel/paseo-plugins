@@ -8,6 +8,7 @@ import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./r
 import type { CommentRelay } from "./relay";
 import type { PluginSettings, Settings } from "./settings";
 import type { TicketStarter } from "./starter";
+import { asCaller } from "./linear-usage";
 
 const RECENT_LIMIT = 10;
 const IDLE_POLL_SECONDS = 60;
@@ -123,11 +124,11 @@ export class Dispatcher {
     }
     let intervalSeconds = IDLE_POLL_SECONDS;
     // Background priority: every request stops at its pool's reserve (see rate-budget.ts).
-    this.polling = withPriority("background", async () => {
+    this.polling = asCaller("dispatch", () => withPriority("background", async () => {
       try {
         const settings = await this.deps.settings.read();
         intervalSeconds = settings.dispatch.intervalSeconds;
-        if (settings.writeback.mentions && this.deps.relay && this.paseo) await this.relayComments(this.deps.relay, this.paseo);
+        if (settings.writeback.mentions && this.deps.relay && this.paseo) await asCaller("comment-relay", () => this.relayComments(this.deps.relay!, this.paseo!));
         this.status.active = settings.dispatch.enabled && settings.dispatch.teamKeys.length > 0;
         if (!this.status.active || !this.paseo) return;
         await this.poll(settings, this.paseo);
@@ -143,7 +144,7 @@ export class Dispatcher {
         this.status.lastPollAt = new Date().toISOString();
         this.status.lastError = pool ? `paused: ${message}` : message;
       }
-    });
+    }));
     try {
       await this.polling;
     } finally {
@@ -167,7 +168,7 @@ export class Dispatcher {
       if (this.stopped || !next) continue;
       const until = (this.deps.budget ?? rateBudget).pausedUntil("key", LAUNCH_ROOM);
       if (until !== null) throw new RateLimitedError("key", until, "reserve");
-      await next.tick(paseo, settings);
+      await asCaller(next === this.deps.projects ? "project-flow" : "label-repair", () => next.tick(paseo, settings));
     }
   }
 

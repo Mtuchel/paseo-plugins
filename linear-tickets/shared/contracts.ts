@@ -401,6 +401,25 @@ export const setCapacityRpc = defineRpc({
   output: capacityStateSchema,
 });
 
+// Daemon-only Linear traffic; credential-wide headers also include other hosts and MCP servers.
+export const linearUsageSchema = z.object({
+  since: z.string(),
+  until: z.string(),
+  pools: z.array(z.object({
+    pool: z.enum(["app", "key"]),
+    observedAt: z.string().nullable(),
+    requestsRemaining: z.number().nullable(), requestsLimit: z.number().nullable(),
+    pointsRemaining: z.number().nullable(), pointsLimit: z.number().nullable(),
+    requests: z.number().int().nonnegative(), points: z.number().nonnegative(),
+    unmetered: z.number().int().nonnegative(),
+  })),
+  rows: z.array(z.object({
+    pool: z.enum(["app", "key"]), caller: z.string(), operation: z.string(),
+    requests: z.number().int().nonnegative(), points: z.number().nonnegative(),
+    unmetered: z.number().int().nonnegative(),
+  })),
+});
+
 // The native Linear agent's health for the settings screen.
 export const agentStatusRpc = defineRpc({
   name: "linear.agent-status",
@@ -417,6 +436,7 @@ export const agentStatusRpc = defineRpc({
     sweepReads: z.number().int().nonnegative(),
     sweepSkips: z.number().int().nonnegative(),
     webhookReads: z.number().int().nonnegative(),
+    usage: linearUsageSchema,
   }),
 });
 

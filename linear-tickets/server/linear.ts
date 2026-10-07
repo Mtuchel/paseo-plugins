@@ -4,6 +4,7 @@ import { buildContext, normalizeIssue, issuePage, connection, record, stateHisto
 import { Credentials } from "./credentials";
 import type { LabelEvent, SweptIssue } from "./label-rules";
 import { poolOf, rateBudget, RateLimitedError, type RateBudget } from "./rate-budget";
+import { linearUsage } from "./linear-usage";
 
 const endpoint = "https://api.linear.app/graphql";
 export type Post = (key: string, query: string, variables: Record<string, unknown>) => Promise<Record<string, unknown>>;
@@ -75,9 +76,11 @@ export async function postGraphQL(key: string, query: string, variables: Record<
       signal: AbortSignal.timeout(30_000),
     });
   } catch {
+    linearUsage.record(pool, query, null);
     ticket.done(null, false);
     throw new Error("Could not reach the Linear API. Check the host's network connection and try again.");
   }
+  linearUsage.record(pool, query, response.headers);
   let payload: unknown = null;
   try { payload = await response.json(); } catch { /* Mapped by status below. */ }
   // Linear answers an exhausted limit with HTTP 400 and the RATELIMITED code, not with 429.
