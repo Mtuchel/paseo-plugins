@@ -7,11 +7,12 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 import { isActivationPath, MAX_ACTIVATION_BODY_BYTES, type ActivationRoute } from "./activation";
+import { DecisionPendingError, FencedError, StaleResolutionError, type ApplyingEntry, type ResolveAction } from "./decision-journal";
 import { FUNNEL_PORT } from "./funnel";
 import { plannotatorPaths, readReviewPlan, type OpenedEvent } from "./plannotator";
 import { ReviewBundles } from "./review-bundle";
 import { REVIEW_ICON_PNG } from "./review-icon";
-import { closedPage, inboxPage, MANIFEST, planDetails, SERVICE_WORKER, type InboxRow, type InboxView, type PlanDetails } from "./review-page";
+import { closedPage, inboxPage, MANIFEST, planDetails, SERVICE_WORKER, type ApplyState, type InboxRow, type InboxView, type PlanDetails } from "./review-page";
 import { createReviewProxy } from "./review-proxy";
 import { pushSubscription, ReviewPush, type PushSend } from "./review-push";
 import { tailscaleBinary } from "./tailscale";
@@ -51,15 +52,27 @@ export type ReviewEntry = {
   since?: string;
   // The model that wrote the plan.
   model?: string;
+  // The journal review generation this entry is (decision-journal.ts), when the journal knows it.
+  reviewId?: string;
   outcome?: ReviewOutcome;
   closedAt?: string;
+  // When the worker carried the decision out (see `decided`).
+  decidedAt?: string;
   details?: PlanDetails;
   revision?: string;
 };
 type Registry = Record<string, ReviewEntry>;
 
-// Decides an open review as the owner would on its page (Approve / Send back with a note).
-export type DecideReview = (localUrl: string, approve: boolean, feedback: string, agentId: string) => Promise<void>;
+// Decides an open review as the owner would on its page (Approve / Send back with a note). The
+// implementation journals the decision for its review generation before anything happens.
+export type DecideReview = (localUrl: string, approve: boolean, feedback: string, agentId: string, review: { reviewId?: string; source: "inbox" }) => Promise<void>;
+
+// The decision journal (decision-journal.ts), for the "Being applied" list and the owner's
+// resolutions. `resolve` settles an entry the inbox lists.
+export type ReviewDecisions = {
+  applying(): ApplyingEntry[] | Promise<ApplyingEntry[]>;
+  resolve(entryId: string, action: ResolveAction): Promise<void>;
+};
 
 export type ReviewLinksOptions = {
   port?: number;
@@ -84,6 +97,8 @@ export type ReviewLinksOptions = {
   // Other hosts' inbox origins, read on every inbox load (settings `reviewPeers`).
   peers?: () => Promise<string[]>;
   decide?: DecideReview;
+  // The decision journal: what is being applied now and how the owner settles it.
+  decisions?: ReviewDecisions;
   // The Linear workspace's web address (https://linear.app/<urlKey>), for the rows' ticket links.
   linearWorkspace?: () => Promise<string>;
   issueInfo?: (identifier: string, options?: { fresh?: boolean }) => Promise<ReviewIssueInfo | null>;
@@ -164,9 +179,16 @@ const PeerRow = z.object({
   areas: z.array(text(200)).max(50).optional(),
   deleteable: z.boolean().optional(),
   issueUrl: text(2_000).regex(/^https:\/\/linear\.app\//).optional(),
+  // A "Being applied" row of the peer's journal.
+  applyState: z.enum(["pending", "uncertain", "unbound", "conflict", "conflict-applied", "unreadable"]).optional(),
+  entryId: text(200).optional(),
+  approved: z.boolean().optional(),
+  applyError: text(500).optional(),
+  nextAttemptAt: text(40).refine((value) => !Number.isNaN(Date.parse(value))).optional(),
 });
-const PeerInbox = z.object({ host: text(100), open: z.array(z.unknown()), decided: z.array(z.unknown()), pipeline: z.unknown().optional() });
+const PeerInbox = z.object({ host: text(100), open: z.array(z.unknown()), decided: z.array(z.unknown()), applying: z.array(z.unknown()).optional(), pipeline: z.unknown().optional() });
 const DecisionRequest = z.object({ approve: z.boolean(), feedback: z.string().optional() });
+const ResolveRequest = z.object({ entryId: z.string().min(1).max(200), action: z.enum(["carry-out", "drop", "keep", "other", "dismiss"]) }).strict();
 const RecheckRequest = z.object({}).strict();
 const DeleteRequest = z.object({ identifier: z.string() }).strict();
 const ErrorAnswer = z.object({ error: z.string() });
@@ -184,6 +206,17 @@ function peerRows(rows: unknown[], host: string): InboxRow[] {
 function peerName(origin: string): string {
   const { hostname, host } = new URL(origin);
   return /^[\d.]+$|:/.test(hostname) ? host : hostname.split(".")[0];
+}
+
+// The listed review showing an applying decision's own generation: the journal names it by its id;
+// a review recorded before the journal has none, and its address names it then.
+function listedGeneration(registry: Registry, item: ApplyingEntry): ReviewEntry | null {
+  const generation = item.kind === "unreadable" ? null : item.review;
+  const id = generation?.id ?? (item.kind === "attempt" || item.kind === "conflict" ? item.entry.reviewId : undefined);
+  const named = id ? Object.values(registry).find((entry) => entry.reviewId === id) ?? null : null;
+  if (named) return named;
+  if (!generation) return null;
+  return Object.values(registry).find((entry) => entry.reviewId === undefined && entry.localUrl === generation.localUrl && entry.agentId === generation.agentId) ?? null;
 }
 
 function json(status: number, value: unknown): { status: number; headers: Record<string, string>; body: string } {
@@ -224,6 +257,7 @@ export class ReviewLinks {
   private readonly host: string;
   private readonly peers: () => Promise<string[]>;
   private readonly decide: DecideReview | null;
+  private readonly decisions: ReviewDecisions | null;
   private readonly issueInfo: ReviewLinksOptions["issueInfo"];
   private readonly issueLink: ReviewLinksOptions["issueLink"];
   private readonly deleteIssue: ReviewLinksOptions["deleteIssue"];
@@ -252,6 +286,7 @@ export class ReviewLinks {
     this.host = options.host ?? hostname().replace(/\.local$/, "");
     this.peers = options.peers ?? (async () => []);
     this.decide = options.decide ?? null;
+    this.decisions = options.decisions ?? null;
     this.linearWorkspace = options.linearWorkspace ?? null;
     this.issueInfo = options.issueInfo;
     this.issueLink = options.issueLink;
@@ -369,16 +404,17 @@ export class ReviewLinks {
   // Records a new review and returns the agent's stable link, or null when there is none to give
   // (the server is not published, or the review itself is not reachable in the tailnet). `since`
   // is when the owner first got the plan, for a review served again (a parked plan after a restart
-  // of the central host); without it the review opened now. `model` wrote the plan.
-  async opened(agentId: string, event: OpenedEvent, review: { identifier?: string; issueId?: string; since?: string; model?: string | null } = {}): Promise<string | null> {
+  // of the central host); without it the review opened now. `model` wrote the plan; `reviewId` is
+  // the journal's generation for it (decision-journal.ts), so its decisions can be listed.
+  async opened(agentId: string, event: OpenedEvent, review: { identifier?: string; issueId?: string; since?: string; model?: string | null; reviewId?: string } = {}): Promise<string | null> {
     await this.starting;
-    const { identifier, issueId, since, model } = review;
+    const { identifier, issueId, since, model, reviewId } = review;
     if (issueId && await this.deletions.blocked(issueId) || await this.deletions.forAgent(agentId)) return null;
     const recheckRequested = issueId ? await this.requiresOwner(issueId) : false;
     await this.change((registry) => {
       // Reused URLs must move to the end: publication order breaks equal-time ties.
       delete registry[event.localUrl];
-      registry[event.localUrl] = { agentId, localUrl: event.localUrl, remoteUrl: event.remoteUrl, ...(identifier ? { identifier } : {}), ...(issueId ? { issueId } : {}), ...(recheckRequested ? { recheckRequested } : {}), openedAt: this.now().toISOString(), ...(since ? { since } : {}), ...(model ? { model } : {}) };
+      registry[event.localUrl] = { agentId, localUrl: event.localUrl, remoteUrl: event.remoteUrl, ...(identifier ? { identifier } : {}), ...(issueId ? { issueId } : {}), ...(recheckRequested ? { recheckRequested } : {}), openedAt: this.now().toISOString(), ...(since ? { since } : {}), ...(model ? { model } : {}), ...(reviewId ? { reviewId } : {}) };
     });
     this.misses.delete(event.localUrl);
     // Before the link is handed out, so the first tap already gets the compressed page.
@@ -386,12 +422,17 @@ export class ReviewLinks {
     return this.origin && event.remoteUrl && AGENT_ID.test(agentId) ? `${this.origin}/review/${encodeURIComponent(agentId)}` : null;
   }
 
-  // The review stays open until its server stops; the outcome is what the closed page shows.
-  async decided(agentId: string, approved: boolean): Promise<void> {
+  // The worker writes this once the journal carried the owner's decision out; the review stays
+  // open until its server stops. `localUrl` names the review the decision was taken on (the
+  // agent's replacement on a reused URL), else the agent's latest counts; `at` is when it applied.
+  async decided(agentId: string, approved: boolean, options: { localUrl?: string; at?: string } = {}): Promise<void> {
     await this.change((registry) => {
-      const entry = latest(registry, agentId);
-      if (entry) entry.outcome = approved ? "approved" : "sent back";
-      if (approved && entry?.issueId) for (const review of Object.values(registry)) if (review.issueId === entry.issueId) delete review.recheckRequested;
+      const named = options.localUrl ? registry[options.localUrl] : undefined;
+      const entry = named?.agentId === agentId ? named : latest(registry, agentId);
+      if (!entry) return;
+      entry.outcome = approved ? "approved" : "sent back";
+      entry.decidedAt = options.at ?? this.now().toISOString();
+      if (approved && entry.issueId) for (const review of Object.values(registry)) if (review.issueId === entry.issueId) delete review.recheckRequested;
     });
   }
 
@@ -486,7 +527,7 @@ export class ReviewLinks {
       const custom = await this.routes({ method, path, headers, body });
       if (custom) return custom;
     }
-    const action = /^\/api\/reviews\/([^/]+)\/(decision|recheck|delete)$/.exec(path);
+    const action = /^\/api\/reviews\/([^/]+)\/(decision|recheck|delete|resolve)$/.exec(path);
     if (action || path === "/api/push/subscribe") {
       if (method !== "POST") return { status: 405, headers: { allow: "POST" } };
       // A page on another site cannot send these: the custom header needs a CORS preflight, which
@@ -514,6 +555,7 @@ export class ReviewLinks {
         const previous = this.actions.get(actionKey) ?? Promise.resolve();
         const work = previous.catch(() => {}).then(async () => {
           if (operation === "delete") return this.deleteFor(agentId, parsed);
+          if (operation === "resolve") return this.resolveFor(agentId, parsed);
           if (operation === "recheck") {
             if (!RecheckRequest.safeParse(parsed).success) throw new DecisionError(400, "Recheck takes an empty JSON object.");
             const entry = latest(await this.load(), agentId);
@@ -563,10 +605,16 @@ export class ReviewLinks {
     const match = /^\/review\/([^/]+)\/?$/.exec(path);
     const agentId = match ? decodeURIComponent(match[1]) : null;
     if (!agentId || !AGENT_ID.test(agentId)) return { status: 404 };
-    const entry = latest(await this.load(), agentId);
+    const registry = await this.load();
+    const entry = latest(registry, agentId);
     if (!entry) return { status: 404 };
     if (!entry.closedAt && entry.remoteUrl && await this.alive(entry.localUrl)) return { status: 302, headers: { location: entry.remoteUrl } };
-    return { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: closedPage(entry.identifier, entry.outcome ?? "ended") };
+    // While the journal carries this review's decision out the page says so; afterwards the
+    // outcome the worker recorded (`decided`).
+    const applying = this.decisions ? await this.decisions.applying() : [];
+    const pending = applying.find((item) => item.kind === "attempt" && item.entry.state === "pending" && listedGeneration(registry, item) === entry);
+    const outcome = pending && pending.kind === "attempt" ? `${pending.entry.approved ? "approved" : "sent back"} — being applied` : entry.outcome ?? "ended";
+    return { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: closedPage(entry.identifier, outcome) };
   }
 
   // Approve, or send back with the owner's note, the agent's waiting review: here when it is this
@@ -583,12 +631,33 @@ export class ReviewLinks {
     }
     await this.waiting(entry);
     if (!this.decide) throw new DecisionError(503, "This host cannot decide reviews.");
-    try { await this.decide(entry.localUrl, approve, approve ? "" : feedback, agentId); } catch (error) {
+    try { await this.decide(entry.localUrl, approve, approve ? "" : feedback, agentId, { reviewId: entry.reviewId, source: "inbox" }); } catch (error) {
+      // The journal refused: a decision for this review is in progress. Otherwise Plannotator's
+      // own answer decides, and only a lost answer leaves the outcome unknown.
+      if (error instanceof DecisionPendingError) throw new DecisionError(409, error.message);
+      if (error instanceof FencedError) throw new DecisionError(503, error.message);
       const uncertain = error instanceof ReviewDecisionAppliedError || error instanceof ReviewClosedError && error.outcomeUnknown;
       throw new DecisionError(uncertain ? 502 : 409, error instanceof Error ? error.message : String(error), uncertain);
     }
-    // Listed as decided at once; the decision's own event reports the same outcome again.
-    await this.decided(agentId, approve);
+    // The review is listed decided by the worker once the journal carried the decision out; the
+    // inbox shows it under "Being applied" until then.
+  }
+
+  // The owner settles a decision the journal cannot settle on its own from Plannotator's answers
+  // (an uncertain attempt, an unbound report, a conflict): here when this host's journal lists
+  // that entry for the agent, else on the peer host whose inbox listed it.
+  private async resolveFor(agentId: string, raw: unknown): Promise<void> {
+    const request = ResolveRequest.safeParse(raw);
+    if (!request.success) throw new DecisionError(400, "Pick what to do about that decision.");
+    if (!this.decisions) throw new DecisionError(503, "This host cannot resolve decisions.");
+    const applying = await this.decisions.applying();
+    const local = applying.some((item) => item.kind !== "unreadable" && item.entry.id === request.data.entryId && item.entry.agentId === agentId);
+    if (!local) return this.forward(agentId, "resolve", request.data);
+    try { await this.decisions.resolve(request.data.entryId, request.data.action); } catch (error) {
+      if (error instanceof StaleResolutionError) throw new DecisionError(409, error.message);
+      if (error instanceof FencedError) throw new DecisionError(503, error.message);
+      throw error;
+    }
   }
 
   private async waiting(entry: ReviewEntry): Promise<void> {
@@ -683,31 +752,34 @@ export class ReviewLinks {
         const pipeline: HostPipeline = status.success
           ? { ...status.data, host: answer.host, rows: status.data.rows.map((row) => ({ ...row, host: answer.host })) }
           : { host: answer.host, checkedAt: null, lastArrivalAt: null, rows: [], error: "Plan monitoring is unavailable on this host." };
-        return { peer, host: answer.host, open: peerRows(answer.open, answer.host), decided: peerRows(answer.decided, answer.host), pipeline };
-      } catch { return { peer, host: peerName(peer), unreachable: true as const, pipeline: { host: peerName(peer), checkedAt: null, lastArrivalAt: null, rows: [], error: "Host unreachable; plan progress is unknown." } satisfies HostPipeline }; }
+        return { peer, host: answer.host, open: peerRows(answer.open, answer.host), decided: peerRows(answer.decided, answer.host), applying: peerRows(answer.applying ?? [], answer.host), pipeline };
+      } catch { return { peer, host: peerName(peer), unreachable: true as const, applying: [], pipeline: { host: peerName(peer), checkedAt: null, lastArrivalAt: null, rows: [], error: "Host unreachable; plan progress is unknown." } satisfies HostPipeline }; }
     }));
     const open = [...own.open];
     const decided = [...own.decided];
+    const applying = [...own.applying];
     const unreachable: string[] = [];
     const pipeline = [own.pipeline];
     this.peerOf.clear();
     for (const answer of answers) {
       pipeline.push(answer.pipeline);
       if ("unreachable" in answer) { unreachable.push(answer.host); continue; }
-      for (const row of [...answer.open, ...answer.decided]) this.peerOf.set(row.agentId, answer.peer);
+      for (const row of [...answer.open, ...answer.decided, ...answer.applying]) this.peerOf.set(row.agentId, answer.peer);
       open.push(...answer.open);
       decided.push(...answer.decided);
+      applying.push(...answer.applying);
     }
     open.sort((a, b) => b.since.localeCompare(a.since));
     decided.sort((a, b) => (b.decidedAt ?? b.since).localeCompare(a.decidedAt ?? a.since));
+    applying.sort((a, b) => b.since.localeCompare(a.since));
     const hosts = [this.host, ...answers.map((answer) => answer.host)];
-    return { open, decided: decided.slice(0, RECENT_DECISIONS), unreachable, hosts, push: !!this.origin, pipeline };
+    return { open, decided: decided.slice(0, RECENT_DECISIONS), applying, unreachable, hosts, push: !!this.origin, pipeline };
   }
 
-  // This host's waiting and recently decided reviews as inbox rows, with absolute links when the
-  // inbox is published (a peer's inbox links back here).
-  private async rows(): Promise<{ open: InboxRow[]; decided: InboxRow[]; pipeline: HostPipeline }> {
-    const { open, decided } = await this.inbox();
+  // This host's waiting, recently decided and being-applied reviews as inbox rows, with absolute
+  // links when the inbox is published (a peer's inbox links back here).
+  private async rows(): Promise<{ open: InboxRow[]; decided: InboxRow[]; applying: InboxRow[]; pipeline: HostPipeline }> {
+    const { open, decided, applying } = await this.inbox();
     const workspace = this.linearWorkspace ? await this.linearWorkspace().catch(() => null) : null;
     const row = (entry: ReviewEntry): InboxRow => ({
       agentId: entry.agentId,
@@ -729,16 +801,21 @@ export class ReviewLinks {
     };
     const result = {
       open: await Promise.all(open.map(enrich)),
-      decided: await Promise.all(decided.map(async (entry) => ({ ...await enrich(entry), outcome: outcomeText(entry), decidedAt: entry.closedAt ?? entry.openedAt }))),
+      decided: await Promise.all(decided.map(async (entry) => ({ ...await enrich(entry), outcome: outcomeText(entry), decidedAt: entry.decidedAt ?? entry.closedAt ?? entry.openedAt }))),
+      applying,
     };
     let pipeline: HostPipeline = { host: this.host, checkedAt: null, lastArrivalAt: null, rows: [], error: "Plan monitoring is not connected." };
     if (this.pipelineSource) {
       try {
         const observed = (rows: readonly InboxRow[], entries: readonly ReviewEntry[]): PipelineReview[] => rows.map((row) => {
-          const entry = entries.find((entry) => entry.agentId === row.agentId)!;
-          return { ...row, revision: entry.revision, autoApproved: entry.details?.autoApproved };
+          const entry = entries.find((entry) => entry.agentId === row.agentId);
+          return { ...row, revision: entry?.revision, autoApproved: entry?.details?.autoApproved };
         });
-        const status = PipelineHost.parse(await this.pipelineSource(observed(result.open, open), observed(result.decided, decided)));
+        // A decision being applied now counts as decided for the plan's progress; one whose answer
+        // is unconfirmed counts as still open. The other kinds wait for the owner, not the plan.
+        const pending = result.applying.filter((row) => row.applyState === "pending").map((row) => ({ ...row, outcome: row.approved ? "approved" : "sent back" }));
+        const uncertain = result.applying.filter((row) => row.applyState === "uncertain");
+        const status = PipelineHost.parse(await this.pipelineSource(observed([...result.open, ...uncertain], open), observed([...result.decided, ...pending], decided)));
         pipeline = { ...status, host: this.host, rows: status.rows.map((row) => ({ ...row, host: this.host })) };
       } catch {
         pipeline.error = "Plan monitoring failed; progress is unknown.";
@@ -749,10 +826,15 @@ export class ReviewLinks {
 
   // Only each agent's latest review counts. Waiting means undecided, reachable from the tailnet
   // and still answering now, so a review that died since the last sweep is not listed. Reviews
-  // opened before the plugin recorded details get them from their running server here.
-  private async inbox(): Promise<{ open: ReviewEntry[]; decided: ReviewEntry[] }> {
+  // opened before the plugin recorded details get them from their running server here. A review
+  // whose generation the journal is still carrying a decision out for is listed under "Being
+  // applied" instead of waiting or decided.
+  private async inbox(): Promise<{ open: ReviewEntry[]; decided: ReviewEntry[]; applying: InboxRow[] }> {
     const registry = await this.load();
-    const current = Object.values(registry).filter((entry) => AGENT_ID.test(entry.agentId) && latest(registry, entry.agentId) === entry);
+    const journalEntries = this.decisions ? await this.decisions.applying() : [];
+    const applying = journalEntries.map((item) => this.applyingRow(registry, item));
+    const beingApplied = new Set(journalEntries.map((item) => listedGeneration(registry, item)?.localUrl).filter((localUrl): localUrl is string => Boolean(localUrl)));
+    const current = Object.values(registry).filter((entry) => AGENT_ID.test(entry.agentId) && latest(registry, entry.agentId) === entry && !beingApplied.has(entry.localUrl));
     const deletionStates = await Promise.all(current.map((entry) => this.deletions.forAgent(entry.agentId)));
     const retrying = current.filter((_, index) => deletionStates[index]);
     const candidates = current.filter((entry, index) => !deletionStates[index] && !entry.closedAt && !entry.outcome && entry.remoteUrl);
@@ -770,9 +852,40 @@ export class ReviewLinks {
       });
     }
     const decided = current.filter((entry) => !retrying.includes(entry) && (entry.closedAt || entry.outcome))
-      .sort((a, b) => (b.closedAt ?? b.openedAt).localeCompare(a.closedAt ?? a.openedAt))
+      .sort((a, b) => (b.decidedAt ?? b.closedAt ?? b.openedAt).localeCompare(a.decidedAt ?? a.closedAt ?? a.openedAt))
       .slice(0, RECENT_DECISIONS);
-    return { open, decided };
+    return { open, decided, applying };
+  }
+
+  // One "Being applied" row: it shows the journal entry's own review generation, named by the
+  // listed review when the inbox still has it and built from the journal record otherwise. A
+  // pending row carries why the last try failed and when the next one is due.
+  private applyingRow(registry: Registry, item: ApplyingEntry): InboxRow {
+    const generation = item.kind === "unreadable" ? null : item.review;
+    const listed = listedGeneration(registry, item);
+    const journal = item.kind === "unreadable" ? null : item.entry;
+    const agentId = listed?.agentId ?? generation?.agentId ?? journal?.agentId ?? "";
+    const identifier = listed?.identifier ?? (journal && "identifier" in journal ? journal.identifier ?? undefined : undefined);
+    const since = listed ? waitingSince(listed) : generation?.openedAt ?? (journal && "reviewOpenedAt" in journal ? journal.reviewOpenedAt : journal?.at) ?? "";
+    const applyState: ApplyState = item.kind === "unreadable" ? "unreadable" : item.kind === "unbound" ? "unbound" : item.kind === "conflict" ? (item.entry.afterApply ? "conflict-applied" : "conflict") : item.entry.state === "pending" ? "pending" : "uncertain";
+    return {
+      agentId,
+      name: item.kind === "unreadable" ? `Unreadable decision record ${item.file}` : identifier ?? `Plan review · agent ${agentId.slice(0, 8)}`,
+      link: `${this.origin ?? ""}/review/${encodeURIComponent(agentId)}`,
+      since,
+      host: this.host,
+      ...(listed?.details ? { details: listed.details } : {}),
+      ...(listed?.model ? { model: listed.model } : {}),
+      applyState,
+      ...(journal ? {
+        entryId: journal.id,
+        approved: journal.kind === "conflict" ? journal.reportOutcome : journal.approved,
+        ...(journal.kind === "attempt" && journal.state === "pending" ? {
+          ...(journal.lastError ? { applyError: journal.lastError.slice(0, 500) } : {}),
+          ...(journal.nextAttemptAt ? { nextAttemptAt: journal.nextAttemptAt } : {}),
+        } : {}),
+      } : {}),
+    };
   }
 
   private async load(): Promise<Registry> {
