@@ -2002,6 +2002,172 @@ tooling a change to this README or the launch template. The ops digest shows
 
 **Undo.** Pause or delete the schedule; tickets already filed are closed by hand.
 
+## Ops digest and weekly ops review
+
+The ops digest (`ops/paseo-ops-digest.py`, Python stdlib) is an hourly job on **server087**
+that publishes the Linear document "Ops digest" (project Agent tooling): the merge queue,
+drops, pull requests open > 5 h, deploys, and the Paseo agents of this host and of every host
+in `~/.paseo/ops-digest/remotes` that are in error, wait on the owner, are silent for > 2 h or
+hold a ticket's running label without an agent. Inside Mon-Fri 08:00-19:00 Berlin it comments
+on the document as the Paseo app, mentioning the owner, with the problems not delivered yet (at
+most 25 items plus counts per kind, never more than `NOTIFY_MAX_CHARS`). Each scheduled run also
+starts tuchel-platform's *Flaky quarantine* workflow (`gh workflow run flaky-quarantine.yml
+--ref main`, TUC-614); a failed start is logged and never stops the digest. Raw log and error
+text never reaches Linear or the history: errors are reduced to categories, and each line names
+the local command that shows the details. The script's docstring describes one run in detail.
+
+Once a week the review (`scripts/ops-review.ts`) reads the digest's history, files one ticket
+per kind of problem that keeps coming back, and checks two weeks after such a ticket is Done
+that the kind got at least twice as rare, reopening it otherwise.
+
+**Files (server087).**
+
+- `~/.paseo/bin/paseo-ops-digest.py` and `~/.paseo/bin/test_paseo_ops_digest.py`: symlinks into
+  `~/dev/paseo-plugins/linear-tickets/ops/`, so a merged change goes live with the checkout's
+  next `git pull --ff-only`.
+- `~/.config/systemd/user/paseo-ops-digest.{service,timer}`: `/usr/bin/python3
+  %h/.paseo/bin/paseo-ops-digest.py` at minute 5 of every hour; log `~/.paseo/ops-digest.log`.
+- `~/.paseo/ops-digest/state.json`: items, pending notifications, the document id and the
+  history outbox (below).
+- `~/.paseo/ops-digest/tuchel-platform/`: detached worktree of `~/paseo/tuchel-platform` at
+  `origin/main` (`OPS_DIGEST_REPO` overrides the clone); the digest runs its
+  `tools/ci/ops-digest.mjs --json` (limit `REPO_SCRIPT_S`, 600 s).
+- `~/.paseo/ops-digest/remotes`: one SSH target per line, today `mirko@100.81.37.89` (the Mac
+  over Tailscale). The server reads the Mac's agents with `~/.ssh/id_ed25519_ops_digest`; on the
+  Mac that key is restricted to `command=...--agents-json` and can run nothing else. A Mac that
+  is asleep keeps only its own items (stale); server087's items still refresh.
+- `~/.paseo/ops-digest/history.jsonl`, `history-YYYY-MM.jsonl`, `history-backfill.jsonl`: the
+  history. `trend.json`, `review.lock`, `review-creates.json`: the review's.
+- Credentials, read only: `~/.paseo/linear-tickets/credentials.json` (the key: reads and the
+  document) and `~/.paseo/linear-tickets/agent-app/token.json` (the Paseo app: the notification
+  comment; used only while valid for 5 more minutes, never refreshed by the digest).
+
+**Run by hand.**
+
+```sh
+/usr/bin/python3 ~/.paseo/bin/paseo-ops-digest.py --print    # render to stdout: no state, no history, no publish
+/usr/bin/python3 ~/.paseo/bin/paseo-ops-digest.py --dry-run  # log what would happen: no state, no history
+systemctl --user start paseo-ops-digest.service             # one real run
+```
+
+`--at <ISO time>` pretends another "now"; `--agents-json` prints this host's agents for another
+host's digest (what the Mac runs for server087; its format is a contract with the remote).
+
+**History.** Every publishing run appends JSON lines, one `run` line and one line per item:
+
+- `{"t", "event": "run", "host", "units": {unit: read?}, "hosts": [...], "items": n}`: every unit
+  the run attempted (`repo`, the repository script's own units such as `queue`, `pulls/917`,
+  `deploy:production/x`, `agents`, `silent`, `locks`, and `agents@<host>`/`silent@<host>` for each
+  remote), read or not, and every host whose agents were read. It is the proof that a source was
+  looked at, whether or not anything was found.
+- `{"t", "event": "opened" | "open" | "cleared", "key", "kind", "unit", "first", "attention",
+  "section", "group", "ticket", "host", "stale", "owner", "auto"}`: an item that is new, still
+  there (`stale` when its source could not be read) or gone. Never a title, detail, command or
+  URL. `owner` is `true` when the item waits on the owner or the plugin escalated it to the owner
+  (`pr-watch.json`, `crash-recovery.json`), `false` when those records are readable and show
+  neither, `null` (unknown) for another host's items or unreadable records. `auto` is `true` when
+  the plugin acted on it (pull request nudges, drop handling or queue actions; agent restarts),
+  `false` or `null` likewise. Both are read at that run, so later changes never rewrite old lines.
+
+`kind` is `item_kind()`: the section plus the detail without parenthesised parts, with `#N` for
+pull request references and `N` for every other number (`pulls: draft, not published`,
+`agents: running, no activity for N h`). Changing `item_kind()` starts new kinds; earlier lines
+keep their wording, and the review compares by the stored kind.
+
+The lines first go into the state's `historyOutbox` and are saved with the observations, then
+appended to the file of their UTC month (`history.jsonl` for the current one,
+`history-YYYY-MM.jsonl` for earlier ones) and leave the outbox only once written and fsynced. At
+a month change `history.jsonl` is appended to its month's file, then removed. A failed append is
+logged (`WARN history not written (<category>)`) and retried by the next run; a torn last line is
+cut off before the retry, and lines a file already ends with are not written twice. At most 72
+runs wait; older ones are dropped and named by one `gap` line. Nothing is deleted (about 2 MB a
+day).
+
+`--backfill-history` (one-off, done on 2026-10-07) wrote `history-backfill.jsonl` from what
+`state.json` remembered (open items and recently cleared ones, latest occurrence each, owner and
+automation unknown, `"src": "backfill"`), after copying `state.json` to
+`state.json.bak-<date>-backfill`. It refuses when that file exists. Backfilled lines have no
+`run` lines, so their hours never count as covered: they can show a kind as recurring, never
+verify or reopen a ticket.
+
+**Coverage.** A kind's sources follow from its section, not from its incidents, so a kind that
+did not happen is still judged. Repository sections need `repo` and their own unit read, with at
+most 10 % of their `pulls/<n>` or `deploy:<env>/<service>` sub-units failed; agent kinds need
+`agents`/`agents@<host>` (and `silent`/`silent@<host>` for silent agents, `locks` for orphaned
+labels) read, judged per host. An hour without a `run` line, a `gap` and backfilled hours are
+never covered. A window is complete with at least 90 % covered hours and less than 1 % malformed
+lines; agent kinds count only the hosts complete in every window compared, and server087 must be
+one of them (the Mac asleep at night does not spoil the comparison). Otherwise the review says
+"not enough data" for that kind and window.
+
+**Review.** From the plugin folder:
+
+```sh
+node --import tsx scripts/ops-review.ts collect          # numbers and the kinds' tickets; writes nothing
+node --import tsx scripts/ops-review.ts file --dry-run   # what `file` would do; writes nothing
+node --import tsx scripts/ops-review.ts file             # do it (server087 only)
+```
+
+Options: `--now <iso>`, `--history <dir>` (default `$PASEO_HOME/ops-digest`), `--team <key>`
+(default `TUC`). Exits non-zero on any failure. Per kind of problem that needed attention, for
+the last 7 days against the 7 before: count, still open, median and p90 hours to clear, needed
+the owner (yes / no / unknown), the plugin acted on it (yes / no / unknown; acting is not proof
+it fixed anything), hours open, and whether the data is complete. Headline numbers: problems that
+needed the owner per merged tuchel-platform pull request (observed owner involvement, not every
+touch; merged counts GitHub's `is:merged` plus pull requests the Graphite queue landed and
+closed as `externally-merged`; unknown when `gh` fails), the share of cleared problems that
+cleared without the owner (unknowns shown apart), and the median time to clear.
+
+A kind **keeps coming back** at 3 or more problems in the last 7 days (`RECURRING_MIN`). Its
+ticket carries ``Marker: `ops-kind <kind>` `` on a line of its own: in the description of a
+ticket the review filed (created by the Paseo app), or in a comment of an **adopted** ticket
+(an existing fix ticket; anyone may post that comment, archived tickets count too). `file` then:
+
+1. **Creates** *Recurring ops problem: &lt;kind&gt;* in Agent tooling, team Todo, for each
+   recurring kind without a ticket, ranked by hours open, then count: at most 3 filed tickets
+   per Berlin ISO week (`NEW_TICKETS_PER_WEEK`; adopted tickets never count); the rest is listed
+   for next week. The description holds the numbers, examples and "Done when: the weekly count is
+   at most half of the week before this ticket closes, measured in the second week after it
+   closes". Before creating, the run writes a reservation with a new issue id to
+   `review-creates.json` and creates with that id, so a create that timed out and lands later is
+   found by the next run instead of filed twice. Only `file` without `--dry-run` reconciles
+   reservations.
+2. **Comments** once per Berlin ISO week on each open marker ticket with its kinds' numbers
+   (``Marker: `ops-review <year>-W<week>` ``).
+3. **Checks** a completed marker ticket 14 days after it closed: per kind, the week before the
+   close against the second week after. At most half: verified; nothing in the week before: "no
+   baseline" (neither verified nor failed); more than half: failed. Any failed kind reopens the
+   ticket to Todo with the numbers (``ops-review reopen <completedAt>``); no failed kind but a
+   window without enough data: nothing is written, the check is repeated next week; otherwise one
+   ``ops-review checked <completedAt>`` comment listing each kind.
+4. **Reopens on relapse** a checked ticket whose kind later climbs back: at least 3 in a later
+   complete week and more than half of its count before the close (or any 3 after "no
+   baseline"), with ``ops-review reopen <completedAt> relapse``.
+5. Ignores canceled and duplicate marker tickets. A kind with two or more marker tickets that
+   are not canceled is a **conflict**: no action, named in the output until a person removes a
+   marker.
+
+Every comment carries its marker and is skipped when present, so reruns write nothing twice; a
+reopen re-reads the state right before the move and moves only a ticket still Done. Writes go
+only through the Paseo app (`agent-app/token.json`); a missing or expiring token stops the run
+before its first write, never a write with the key. `review.lock` keeps one `file` at a time; it
+is taken over only when it names this host and its process is gone. `file` also writes
+`trend.json`, which the digest's next run shows as the **Trend** section of the document (top 5
+kinds this week against last week and the headline numbers; "Trend: not computed yet" before
+that).
+
+**Schedule.** The Paseo schedule `ops-review` on server087 (Mondays 07:30 Europe/Berlin) starts
+an agent in a scratch folder that runs, from `~/dev/paseo-plugins/linear-tickets`, `collect`,
+`file --dry-run` and `file`, reports their output, and never edits a repository or writes Linear
+otherwise.
+
+**Undo.** Pause or delete the schedule; tickets already filed or reopened are closed by hand.
+The digest: `systemctl --user disable --now paseo-ops-digest.timer` stops it (the document stays
+and stops updating); to go back to the program before the move, copy
+`~/.paseo/bin/paseo-ops-digest.py.bak-20261007-repo-move` (and its test) over the symlinks. The
+history files can stay. Before changing a host copy by hand, keep it as
+`<file>.bak-<date>-<reason>` next to it.
+
 ## Connection storage
 
 The API-key form stores the key on the daemon host in
@@ -2044,7 +2210,9 @@ resolution and failure handling, agent creation/retries with mocked Linear and P
 calls, the session sweep's webhook-driven activity reads (skipped while a webhook is fresh, the
 5-minute fallback, the minute sweep without webhooks), and the pull request view (CI summaries,
 merge queue parsing, polling cadence, the GitHub budget's reserve and its routed bypass,
-labelling) against a fake GitHub, and the decision candidates (the log, the collector's sources
+labelling) against a fake GitHub, the decision candidates (the log, the collector's sources
 and exclusions, window limits, candidate identity, one ticket per project, app-only filing)
-against a fake Linear.
+and the weekly ops review (history reading, coverage, per-kind numbers, dedupe, the cap, checks
+and reopens, the review lock, create reservations) against a fake Linear. It also runs the ops
+digest's Python tests (`python3 -m unittest discover -s ops -p 'test_*.py'`).
 Live account authentication and agent execution require your configured host and key.
