@@ -775,6 +775,106 @@ class LimitResumesTest(unittest.TestCase):
                              {"pending": {"local1": at("2026-09-30T12:05:00Z")}, "started": {"local1"}})
 
 
+class SnapshotSourceTest(unittest.TestCase):
+    """TUC-1253: a snapshot names the script file and the checkout HEAD of the host it ran on."""
+
+    GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def git(self, cwd, *args):
+        return subprocess.run([*self.GIT, *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+    def checkout_head(self, path):
+        done = subprocess.run([*self.GIT, "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True)
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    def snapshot_patches(self, limit_resumes):
+        """Every collector a snapshot would run against this machine, kept on temp files."""
+        return [
+            mock.patch.object(digest, "PROJECTS", os.path.join(self.tmp.name, "projects.json")),
+            mock.patch.object(digest, "OMP_SESSIONS", os.path.join(self.tmp.name, "sessions")),
+            mock.patch.object(digest, "PLANNING_SMOKE", os.path.join(self.tmp.name, "planning-smoke.json")),
+            mock.patch.object(digest, "LIMIT_RESUMES", limit_resumes),
+            mock.patch.object(digest.HostIO, "permissions", return_value={}),
+            mock.patch.object(digest.HostIO, "open_reviews", return_value={}),
+        ]
+
+    def test_a_symlinked_script_names_its_target_and_the_checkouts_head(self):
+        repo = tempfile.TemporaryDirectory()
+        self.addCleanup(repo.cleanup)
+        target = os.path.join(repo.name, "paseo-ops-digest.py")
+        with open(target, "w") as f:
+            f.write("# the script\n")
+        self.git(repo.name, "init", "-q")
+        self.git(repo.name, "add", "paseo-ops-digest.py")
+        self.git(repo.name, "commit", "-q", "-m", "x")
+        sha = self.checkout_head(repo.name)
+        self.assertRegex(sha, r"\A[0-9a-f]{40}\Z")
+        link = os.path.join(self.tmp.name, "bin", "paseo-ops-digest.py")
+        os.makedirs(os.path.dirname(link))
+        os.symlink(target, link)
+        self.assertEqual(digest.snapshot_source(link), {"script": os.path.realpath(target), "rev": sha})
+
+    def test_a_file_outside_a_checkout_has_the_realpath_but_no_rev(self):
+        path = os.path.join(self.tmp.name, "copy", "paseo-ops-digest.py")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            f.write("# no checkout around this one\n")
+        self.assertEqual(digest.snapshot_source(path), {"script": os.path.realpath(path), "rev": None})
+
+    def test_git_missing_or_hanging_leaves_rev_none_within_the_source_timeout(self):
+        path = os.path.join(self.tmp.name, "paseo-ops-digest.py")
+        with open(path, "w") as f:
+            f.write("# x\n")
+        for failure in (FileNotFoundError("git"), subprocess.TimeoutExpired(["git"], digest.SOURCE_S)):
+            with self.subTest(git=failure.__class__.__name__):
+                with mock.patch.object(digest, "run_cmd", side_effect=failure) as run_cmd:
+                    self.assertEqual(digest.snapshot_source(path),
+                                     {"script": os.path.realpath(path), "rev": None})
+                self.assertEqual(run_cmd.call_args.kwargs["timeout"], digest.SOURCE_S)
+                self.assertEqual(run_cmd.call_args.args[0],
+                                 ["git", "-C", os.path.dirname(os.path.realpath(path)), "rev-parse", "HEAD"])
+
+    def test_a_snapshot_names_its_running_script_on_success_and_on_a_failed_agent_read(self):
+        script = os.path.realpath(digest.__file__)
+        expected = {"script": script, "rev": self.checkout_head(os.path.dirname(script))}
+        with contextlib.ExitStack() as stack:
+            for patch in self.snapshot_patches(os.path.join(self.tmp.name, "limit-resumes.json")):
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(digest.HostIO, "agents", return_value=([], {})))
+            read = digest.HostIO(sync_repo=False, remotes=False).snapshot()
+        with contextlib.ExitStack() as stack:
+            for patch in self.snapshot_patches(os.path.join(self.tmp.name, "limit-resumes.json")):
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(digest.HostIO, "agents", side_effect=TimeoutError()))
+            failed = digest.HostIO(sync_repo=False, remotes=False).snapshot()
+        self.assertEqual(read["agentSource"], {"ok": True})
+        self.assertEqual(failed["agentSource"], {"ok": False, "category": "timeout"})
+        self.assertEqual(read["source"], expected)
+        self.assertEqual(failed["source"], expected)
+
+    def test_the_store_round_trips_through_the_snapshot_for_the_reading_host(self):
+        resumes = os.path.join(self.tmp.name, "limit-resumes.json")
+        with open(resumes, "w") as f:
+            json.dump({"version": 1,
+                       "pending": {"TUC-1": {"agentId": "resuming1", "resumeAt": "2026-09-30T12:05:00Z"}},
+                       "incidents": {"TUC-2": [{"failedAgentId": "started1", "resolution": "started"}]}}, f)
+        with contextlib.ExitStack() as stack:
+            for patch in self.snapshot_patches(resumes):
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(digest.HostIO, "agents", return_value=([], {})))
+            snapshot = digest.HostIO(sync_repo=False, remotes=False).snapshot()
+        self.assertEqual(snapshot["limitResumes"],
+                         {"pending": {"resuming1": at("2026-09-30T12:05:00Z")}, "started": ["started1"]})
+        merged = digest.merge_limit_resumes({"pending": {}, "started": set()},
+                                            [json.loads(json.dumps(snapshot))])
+        self.assertEqual(merged, {"pending": {"resuming1": at("2026-09-30T12:05:00Z")},
+                                  "started": {"started1"}})
+
+
 class LimitResumeRunTest(RunCase):
     def test_error_agents_name_their_restart_and_a_started_one_counts_as_automation(self):
         local = {"id": "local1234567", "name": "TUC-1206 work", "status": "error", "cwd": "/tmp"}

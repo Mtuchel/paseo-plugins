@@ -7,7 +7,8 @@ on the Mac). Each run:
      (merge queue, drops, PRs open > 5 h, Railway deploys) in its own detached worktree at
      origin/main (never the shared local `main`, never `gt`);
   2. reads the Paseo agents of this host and of every host in ~/.paseo/ops-digest/remotes
-     (over SSH, `--agents-json`): in error (a rate-limited agent names the restart the plugin
+     (over SSH, `--agents-json`; each snapshot names the resolved script file and its checkout's
+     HEAD as `source`, TUC-1253): in error (a rate-limited agent names the restart the plugin
      scheduled for it, TUC-1206), waiting on the owner (permission or open plan
      review), ticket agents silent for more than 2 h, and tickets still labelled
      `<dispatch label>-running` without a live agent; and how many proposals in open
@@ -109,6 +110,9 @@ WINDOW_DAYS = range(0, 5)  # Monday-Friday
 WINDOW_HOURS = (8, 19)  # 08:00 <= now < 19:00
 SILENT_S = 2 * 3600
 SUBPROCESS_S = 60
+# Bounds only the `git rev-parse` behind a snapshot's `source`: at most 5 s more for an answer
+# the reading host waits SUBPROCESS_S for over SSH.
+SOURCE_S = 5
 # 2026-10-07: ops-digest.mjs took 336 s on the Mac with every unit fine; the old 300 s limit
 # failed the whole repository part on most runs since ~2026-10-05.
 REPO_SCRIPT_S = 600
@@ -1471,6 +1475,19 @@ def run_cmd(args, timeout=SUBPROCESS_S, cwd=None):
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd, check=True).stdout
 
 
+def snapshot_source(path=__file__):
+    """Which file produced this snapshot and the HEAD of the checkout holding it (TUC-1253), so
+    the reading host can tell a host's copy from its paseo-plugins checkout. `rev` is the
+    checkout's HEAD, not proof that the file has no local edits; None when git is missing, the
+    file is outside a checkout or git does not answer within SOURCE_S. Never raises."""
+    script = os.path.realpath(path)
+    try:
+        rev = run_cmd(["git", "-C", os.path.dirname(script), "rev-parse", "HEAD"], timeout=SOURCE_S).strip() or None
+    except Exception:
+        rev = None
+    return {"script": script, "rev": rev}
+
+
 class HostIO:
     """Real collectors and publishers; tests inject a fake with the same methods."""
 
@@ -1673,6 +1690,7 @@ class HostIO:
         if resumes is not None:
             snapshot["limitResumes"] = {"pending": resumes["pending"], "started": sorted(resumes["started"])}
         snapshot["plannerRecovery"] = self.local_planner_recovery(time.time()) if snapshot["agentSource"]["ok"] else None
+        snapshot["source"] = snapshot_source()
         return snapshot
 
     def key(self):

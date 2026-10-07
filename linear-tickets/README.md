@@ -2668,7 +2668,8 @@ snapshot/digest/history and weekly reader. It checks a scheduled wait, two confi
 Skip closure, JSON transport and exactly-once history without production agents or publishing.
 Regression checks: `node --import tsx --test server/project-flow.test.ts server/ops-review.test.ts`
 and `python3 -m unittest discover -s ops -p 'test_*.py'`. After pulling/reloading the server,
-use the read-only commands below; laptop snapshot installation remains TUC-1253/TUC-1352.
+use the read-only commands below; the Mac's snapshot runs from its checkout once the switch-over
+under **Mac** below is done (TUC-1253).
 
 Once a week the review (`scripts/ops-review.ts`) reads the digest's history, files one ticket
 per kind of problem that keeps coming back, and checks two weeks after such a ticket is Done
@@ -2696,6 +2697,105 @@ that the kind got at least twice as rare, reopening it otherwise.
   document) and `~/.paseo/linear-tickets/agent-app/token.json` (the Paseo app: the notification
   comment; used only while valid for 5 more minutes, never refreshed by the digest).
 
+**Mac.** The server can only ask the Mac for its snapshot: the restricted key's forced command
+runs `~/.paseo/bin/paseo-ops-digest.py --agents-json`, whatever the server sends. That file is a
+symlink into the Mac's `~/dev/paseo-plugins/linear-tickets/ops/`, like server087's; the private
+copy from before the move is kept as `paseo-ops-digest.py.bak-<date>-mac-checkout` next to it.
+Every snapshot names the file and checkout HEAD it ran from (`source`, below); a snapshot
+without `source` comes from an old copy.
+
+Switch-over, once, in a terminal on the Mac (about 2 minutes; do the open laptop roll-out tasks
+first, since its pull brings their changes too). It checks everything before changing anything
+and stops with `STOP: <reason>` on the first failed check. A stop before the pull changes
+nothing; a stop after the pull leaves only the checkout moved forward; when the link does not
+answer right after switching, it puts the old copy back, or names where the backup is if even
+that fails. Running it again is harmless. `K` is the key part of server087's
+`~/.ssh/id_ed25519_ops_digest.pub`: the block finds that key's single active line in
+`authorized_keys` and, after switching, runs its forced command the way sshd does (the login
+shell's `-c`, from `$HOME`). Every program it starts reads `/dev/null`, since bash reads the block
+itself from standard input.
+
+```sh
+bash -u <<'EOF'
+P="$HOME/dev/paseo-plugins"; T="$P/linear-tickets/ops/paseo-ops-digest.py"
+L="$HOME/.paseo/bin/paseo-ops-digest.py"; B="$L.bak-$(date +%Y%m%d)-mac-checkout"
+K="AAAAC3NzaC1lZDI1NTE5AAAAINRZoRGRaUAjyP4G1YUwPKQD1eIPdSOGEI/RJ4SvlLlD"
+stop() { echo "STOP: $*"; exit 1; }
+check() {  # $1: command run like sshd runs the forced command; ok when the answer is a full read from the checkout's file at HEAD
+  head=$(git -C "$P" rev-parse HEAD) || return 1
+  raw=$(cd "$HOME" && "${SHELL:-/bin/sh}" -c "$1" </dev/null) || return 1
+  printf '%s\n' "$raw" | HEAD="$head" T="$T" python3 -c 'import json,os,sys
+d=json.loads(sys.stdin.read().strip().splitlines()[-1]); s=d["source"]
+assert {"agents","metas","permissions","reviews","errorLines"} <= set(d) and d["agentSource"]["ok"] is True, "agent read"
+assert d["projectPlanners"]["ok"] is True and isinstance(d["plannerRecovery"], dict), "planner read"
+assert isinstance(d["limitResumes"], dict), "limit-resume read"
+assert s["script"] == os.path.realpath(os.environ["T"]) and s["rev"] == os.environ["HEAD"], "source"'
+}
+fc=$(python3 -c 'import os,sys
+k=sys.argv[1]; q=chr(34)
+m=[l.strip() for l in open(os.path.expanduser("~/.ssh/authorized_keys")) if not l.lstrip().startswith("#") and k in l.split()]
+assert len(m) == 1, "the digest key has %d active entries" % len(m)
+o=m[0].split(k)[0]; i=o.find("command=" + q)
+assert i == 0 or (i > 0 and o[i - 1] == ","), "the digest key has no forced command"
+c=o[i + 9:].split(q)[0]
+assert chr(92) not in c, "the forced command uses quoting this block does not read"
+print(c)' "$K" </dev/null) || stop "cannot read the digest key's forced command"
+case "$fc" in *python3*.paseo/bin/paseo-ops-digest.py\ --agents-json*) echo "forced command: $fc";; *) stop "the forced command does not run $L: $fc";; esac
+if [ -L "$L" ] && [ "$(readlink "$L")" = "$T" ]; then check "$fc" && { echo "already linked and answering"; exit 0; }; stop "linked but not answering"; fi
+for old in "$L".bak-*-mac-checkout; do
+  if [ -e "$old" ] || [ -L "$old" ]; then stop "$old exists: a previous switch-over was undone or is half done; look first"; fi
+done
+[ -f "$L" ] && [ ! -L "$L" ] || stop "$L is not the old copy"
+jobs=$(launchctl list </dev/null) || stop "launchctl list failed"
+case "$jobs" in *ops-digest*) stop "the old hourly ops-digest launch job is loaded";; esac
+branch=$(git -C "$P" rev-parse --abbrev-ref HEAD) || stop "git rev-parse failed"
+[ "$branch" = main ] || stop "$P is on $branch, not main"
+dirty=$(git -C "$P" status --porcelain) || stop "git status failed"
+[ -z "$dirty" ] || stop "$P has local changes"
+git -C "$P" pull --ff-only </dev/null || stop "pull failed; entrypoint unchanged"
+check "python3 '$T' --agents-json" || stop "the checkout's script does not answer; entrypoint unchanged (the checkout was pulled)"
+mv "$L" "$B" || stop "backup failed; entrypoint unchanged"
+if ln -s "$T" "$L" && check "$fc"; then echo "switched: $(readlink "$L") at $(git -C "$P" rev-parse --short HEAD)"; exit 0; fi
+if rm -f "$L" && mv "$B" "$L"; then stop "the link did not answer; old copy restored"; fi
+stop "the link did not answer and restoring failed: the old copy is at $B"
+EOF
+```
+
+The check before switching runs the checkout's file with the login shell's `python3`; the checks
+after switching run the real forced command. The terminal's environment is not sshd's, so the
+check from server087 below stays the end-to-end proof. The Mac's old `test_paseo_ops_digest.py`,
+if any, stays as it is: the forced command never runs it.
+
+Undo on the Mac (also its own bash block: zsh fails on an unmatched glob). It moves the single
+backup back over the link and changes nothing when there is none or more than one:
+
+```sh
+bash -u <<'EOF'
+L="$HOME/.paseo/bin/paseo-ops-digest.py"; n=0; B=
+for b in "$L".bak-*-mac-checkout; do if [ -f "$b" ] && [ ! -L "$b" ]; then n=$((n + 1)); B="$b"; fi; done
+[ "$n" = 1 ] || { echo "STOP: $n backups found; nothing changed"; exit 1; }
+mv -f "$B" "$L" && echo "restored $L from $B"
+EOF
+```
+
+Check from server087, through the same SSH path and forced command as the digest's read, with
+`<commit>` the commit that must have reached the Mac; then the latest hourly `run` line, so run it
+after the first hourly run following the switch (the Mac's `planners@…` unit is `false` on every
+run before it):
+
+```sh
+rev=$(ssh -o BatchMode=yes -o ConnectTimeout=15 mirko@100.81.37.89 x | tail -1 | python3 -c 'import json,sys
+d=json.load(sys.stdin); s=d["source"]; r=d.get("limitResumes")
+assert {"agents","metas","permissions","reviews","errorLines"} <= set(d) and d["agentSource"]["ok"] is True, "AC-4 agent read"
+assert s["script"].endswith("/dev/paseo-plugins/linear-tickets/ops/paseo-ops-digest.py") and s["rev"], "AC-4 source"
+assert isinstance(r, dict) and isinstance(r.get("pending"), dict) and isinstance(r.get("started"), list), "AC-9 limit resumes"
+print(s["rev"])') && git -C ~/dev/paseo-plugins fetch -q origin && git -C ~/dev/paseo-plugins merge-base --is-ancestor <commit> "$rev" && python3 -c 'import json,os
+runs=[d for d in (json.loads(l) for l in open(os.path.expanduser("~/.paseo/ops-digest/history.jsonl")) if l.strip()) if d.get("event") == "run"]
+u=runs[-1]["units"]; h="@mirko@100.81.37.89"
+assert u.get("agents" + h) is True, "AC-5 Mac agents unit"
+assert u.get("planners" + h) is True and u.get("planner_recovery" + h) is True, "AC-8 Mac planner units"'
+```
+
 **Run by hand.**
 
 ```sh
@@ -2708,6 +2808,11 @@ systemctl --user start paseo-ops-digest.service             # one real run
 `--at <ISO time>` pretends another "now"; `--agents-json` prints this host's agents and sanitized
 `projectPlanners`, `planningSessions` (session id, start, ticket) and `planningSmoke` sources for
 another host's digest (what the Mac runs for server087; its format is a contract with the remote).
+It also carries `source`: `script`, the resolved file that ran, and `rev`, the HEAD of the
+checkout holding it (not proof that the file has no local edits; `null` when git cannot answer
+within 5 s or the file is outside a checkout). A change to the snapshot reaches the Mac with the
+Mac checkout's `git pull --ff-only`; no plugin reload is needed for it, because every call starts
+the script fresh. Other plugin changes in that pull keep their own reload steps.
 
 **History.** Every publishing run appends JSON lines, one `run` line and one line per item:
 
