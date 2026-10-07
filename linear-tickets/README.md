@@ -1596,10 +1596,11 @@ caused by outages (HTTP 5xx, rate limits, network) are retried after 30 s and 2 
 **Durable record and resume.** Every ticket agent keeps one "Paseo progress" comment, edited
 in place: phase, branch, last commit, links, latest report. When the agent fails or is
 archived while the ticket is open, it also posts a final report. For a failed agent,
-*Start a new agent automatically* (see **Write back to Linear**) can start a replacement, at
-most once an hour per ticket; when the hourly limit or another start prevents that, the panel
-offers **Resume with a new agent**. Archiving alone never starts one: for an open ticket without
-another agent, the panel offers **Resume with a new agent**.
+*Start a new agent automatically* (see **Write back to Linear**) can start a replacement.
+Other failures retain the hourly retry; when its cap or another start prevents that, the panel
+offers **Resume with a new agent**. Rate/usage limits follow the durable schedule below.
+Archiving alone never starts one: for an open ticket without another agent, the panel offers
+**Resume with a new agent**.
 Assigning Paseo again, @mentioning it or re-adding the label
 also resumes. The new agent continues on the same branch, reusing the old worktree while it
 exists so uncommitted work survives. It starts with a handover of the previous agent's reports,
@@ -1608,6 +1609,40 @@ record, so the pull request watch keeps following them; only "Open in Paseo" mov
 agent. The record changes owner at a takeover only while it still names the old agent (or none):
 once the new agent wrote to it, the old agent's archive leaves it alone, and the old agent's final
 report then only says who took over. A third agent's record is never touched.
+
+**Usage-limit resumes.** With the automatic-start switch on, a failed turn whose error says
+429, rate limit or usage limit is checked against the OMP broker's `/v1/usage` reports. A fresh,
+measurable shared window is required: stale (>30 min), empty, tier-only or unknown readings
+never prove room. The agent's model and configured `retry.fallbackChains` are considered,
+including matching tier windows; exact selector keys and prefix `*` keys are supported, role
+keys are not. OMP chooses the account and fallback model, not the plugin.
+
+If any candidate account has room, a replacement starts on the next minute sweep. Otherwise
+it waits until the earliest account reset (the latest exhausted window on that account),
+plus 1–5 min jitter. Without a broker reset it uses the provider's retry hint plus jitter,
+or 30 min when neither is known. Every basis waits at least 15 min after the previous claim.
+At most four limit restarts are claimed per ticket in a rolling 24 h **on each host**, separate
+from the hourly retry for other errors; a fifth gets the usual Resume offer.
+
+The schedule, incidents (kept eight days) and provider episodes live in the owner-only,
+atomically written `$PASEO_HOME/linear-tickets/limit-resumes.json`. Reloads preserve them.
+Unreadable state fails closed, never resets the budget. Before a due start, the switch, owner
+Stop, thread's agent, live successors, deletion, start gate and process ownership are checked
+again. A held route returns the claim to the schedule for five minutes later; a peer handoff
+counts here as forwarded, with its remote start unverified. A crash between claim and start
+is counted but never replayed and makes no Resume offer: the digest still shows the error.
+
+Your reply or Stop cancels a pending schedule durably. Reply and due start take the same ticket
+lock: the first wins; a reply arriving during a start reaches its replacement. Stop also holds
+later failures until you continue. Turning the switch off makes a due schedule offer Resume
+instead of starting.
+
+When fresh shared-window reports show every account of the failed agent's provider used up
+for over six hours (including a known reset over six hours away), one waiting ticket gets one
+owner mention with the Berlin reset time. Unknown readings neither open nor end an episode;
+confirmed room ends it even when no restart is due. Tier-only exhaustion never mentions you.
+Failed mention posts retry with a durable marker, preventing another post after a lost reply.
+No broker reading means no exhaustion mention.
 
 ## Plannotator reviews
 
@@ -1855,7 +1890,7 @@ independently of the agent's own `linear_ticket` tools:
   `link_url`. Completion is left to Linear's GitHub integration and to the agent itself
   ([Agent access to Linear](#agent-access-to-linear)).
 
-- **Start a new agent automatically** — its texts are "Start a new agent automatically when one fails, or when its pull request needs work after it is gone (failed agents at most once an hour per ticket)" (on) and "Offer Resume in Linear when an agent stops; a gone agent's pull request work goes to the ticket as a comment" (off). When on, an agent that stops with an error can be replaced by a new agent on its branch, at most once an hour per ticket; when that is not possible (the hour is not over, another start of the ticket is under way), the **Resume with a new agent** offer stays (see **Durable record and resume**). Archiving an agent never starts one by itself. A nudge, merge queue fix request or replacement request for an archived or missing agent can start a successor under the conditions in **Gone agents**. When off, a failed agent gets the offer and that pull request work goes to the ticket as a comment mentioning you. This switch does not govern the watchdog's replacements: those follow **Silent and stuck agents** and its own **Watchdog** switch.
+- **Start a new agent automatically** — its texts are "Start a new agent automatically when one fails (after a usage limit when it resets, at most 4 a day per ticket on each host; other failures at most once an hour per ticket), or when its pull request needs work after it is gone" (on) and "Offer Resume in Linear when an agent stops; a gone agent's pull request work goes to the ticket as a comment" (off). Limit failures use **Usage-limit resumes**; other failures retain the hourly retry and Resume offer. Archiving an agent never starts one by itself. A nudge, merge queue fix request or replacement request for an archived or missing agent can start a successor under the conditions in **Gone agents**. When off, a failed agent gets the offer and that pull request work goes to the ticket as a comment mentioning you. This switch does not govern the watchdog's replacements: those follow **Silent and stuck agents** and its own **Watchdog** switch.
 
 - **Replies from Linear** — your comments reach the agent within one poll interval, no
   `@paseo` needed, on every issue it watches:
@@ -2185,6 +2220,15 @@ starts tuchel-platform's *Flaky quarantine* workflow (`gh workflow run flaky-qua
 --ref main`, TUC-614); a failed start is logged and never stops the digest. Raw log and error
 text never reaches Linear or the history: errors are reduced to categories, and each line names
 the local command that shows the details. The script's docstring describes one run in detail.
+
+Scheduled limit restarts show `in error: rate limit (resumes at HH:MM)` in Berlin time
+(`DD.MM. HH:MM` on another day), still requiring attention. The host snapshot's `limitResumes`
+field keeps remote agents' own times; an older remote script shows the bare error until updated.
+The history kind remains `agents: in error: rate limit`. A local incident whose resolution is
+`started` counts as **Plugin acted**; pending, cancelled, claimed and forwarded schedules do
+not. A one-week post-release check uses the minute-precise restart record, not hourly samples:
+outside full exhaustion across all candidate models, median failure-to-start must be <30 min;
+unrestarted qualifying failures count as never cleared, forwarded ones remain unverified.
 
 Once a week the review (`scripts/ops-review.ts`) reads the digest's history, files one ticket
 per kind of problem that keeps coming back, and checks two weeks after such a ticket is Done

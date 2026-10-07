@@ -5,6 +5,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { dispatchLabels } from "./dispatch";
 import { activeModel } from "./model";
+import { limitError } from "./limit-resume";
 import { questionsOf } from "./relay";
 import type { Handover, WaitingPeriod } from "./handover";
 import type { IssueState, LinearService } from "./linear";
@@ -49,7 +50,7 @@ type OutboxEntry = { agentId: string; agentTitle: string | null; cwd: string; is
 // The native Linear agent: the session panel and the durable handover record. Optional, so ticket
 // write-back keeps working without the Paseo Linear app installed.
 export type AgentBridge = {
-  sessions: Pick<SessionRouter, "sessionFor" | "say" | "action" | "ask" | "askQuestion" | "link" | "offerResume" | "resumeNow" | "holdIfStopped" | "follow" | "unfollow">;
+  sessions: Pick<SessionRouter, "sessionFor" | "say" | "action" | "ask" | "askQuestion" | "link" | "offerResume" | "resumeNow" | "scheduleLimitResume" | "holdIfStopped" | "follow" | "unfollow">;
   handover: Pick<Handover, "read" | "update" | "finish" | "handOff" | "waiting" | "setWaiting">;
 };
 type Linear = Pick<LinearService, "issueState" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "upsertComment" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "isPerson" | "userUrl" | "createIssue" | "complete">;
@@ -579,7 +580,9 @@ export class Writeback {
         else if (writeback.summaries || writeback.blocked) await once("comment", () => this.linear.comment(issueId, `**${title}** (Paseo) stopped with an error: ${outcome.error.message}`));
         if (writeback.blocked) await this.linear.addLabel(issueId, blocked);
         await once("session:resume", () => this.session(agent.id, async (sessionId, sessions) => {
-          if (!writeback.autoResume || !await sessions.resumeNow(sessionId)) await sessions.offerResume(sessionId);
+          if (writeback.autoResume && limitError(outcome.error.message)) {
+            if (!await sessions.scheduleLimitResume(sessionId, outcome.error.message, model)) await sessions.offerResume(sessionId);
+          } else if (!writeback.autoResume || !await sessions.resumeNow(sessionId)) await sessions.offerResume(sessionId);
         }));
       }
       if (outcome.kind === "canceled") await this.session(agent.id, async (_sessionId, sessions) => { await sessions.unfollow(agent.id); });

@@ -76,7 +76,8 @@ class FakeIO:
         self.candidates_error = None
         self.unreachable = {}
         self.targets = []
-        self.evidence_data = {"prWatch": None, "crashes": None}
+        self.limit_resumes_data = {"pending": {}, "started": set()}
+        self.evidence_data = {"prWatch": None, "crashes": None, "limitResumes": {"pending": {}, "started": set()}}
 
     def dispatch_quarantine(self):
         self.dispatches += 1
@@ -93,6 +94,9 @@ class FakeIO:
 
     def unreachable_hosts(self):
         return dict(self.unreachable)
+
+    def limit_resumes(self):
+        return self.limit_resumes_data
 
     def remote_targets(self):
         return list(self.targets)
@@ -635,12 +639,141 @@ class ItemKindTest(unittest.TestCase):
         self.assertEqual(self.kind("draft, not published (since 2026-10-01)"), "pulls: draft, not published")
         self.assertEqual(self.kind("waits for your permission: OMP select", "agents"),
                          "agents: waits for your permission: OMP select")
+        self.assertEqual(self.kind("in error: rate limit (resumes at 14:05)", "agents"),
+                         "agents: in error: rate limit")
+        self.assertEqual(self.kind("in error: rate limit (resumes at 01.10. 14:05)", "agents"),
+                         "agents: in error: rate limit")
         self.assertEqual(self.kind("unbalanced ) and ( parens"), "pulls: unbalanced and parens")
 
     def test_greptile_re_request_suffix_keeps_the_kind(self):  # TUC-1208 AC-6
         self.assertEqual(self.kind("complex-review: no Greptile review yet (Greptile re-requested 14:05)"),
                          "pulls: complex-review: no Greptile review yet")
         self.assertEqual(self.kind("complex-review: no Greptile review yet"), "pulls: complex-review: no Greptile review yet")
+
+
+class LimitResumesTest(unittest.TestCase):
+    """TUC-1206: an agent stopped by a rate limit names the restart the plugin scheduled for it;
+    only a started restart counts as automation."""
+
+    ID = "abcdef1234567890"
+
+    def item(self, limit_resumes, now=WED_10_05):
+        agent = {"id": self.ID, "name": "TUC-1206 work", "status": "error", "cwd": "/tmp"}
+        return digest.agent_items([agent], {}, now=now, error_lines={self.ID: "429 rate limit"},
+                                  permissions={}, open_reviews={}, teams={"TUC"}, ticket_states=None,
+                                  limit_resumes=limit_resumes)[0]
+
+    def test_pending_restart_names_the_time_and_the_day_only_when_it_is_not_today(self):
+        today = self.item({"pending": {self.ID: at("2026-09-30T12:05:00Z")}, "started": set()})
+        self.assertEqual(today["detail"], "in error: rate limit (resumes at 14:05)")
+        self.assertTrue(today["attention"])
+        self.assertEqual(digest.item_kind(today), "agents: in error: rate limit")
+        later = self.item({"pending": {self.ID: at("2026-10-01T12:05:00Z")}, "started": set()})
+        self.assertEqual(later["detail"], "in error: rate limit (resumes at 01.10. 14:05)")
+        self.assertEqual(digest.item_kind(later), "agents: in error: rate limit")
+
+    def test_without_an_entry_or_a_readable_store_the_detail_stays_bare(self):
+        for resumes in ({"pending": {}, "started": set()},
+                        {"pending": {"otheragent": at("2026-09-30T12:05:00Z")}, "started": set()},
+                        None):
+            item = self.item(resumes)
+            self.assertEqual(item["detail"], "in error: rate limit")
+            self.assertTrue(item["attention"])
+
+    def store(self, data):
+        with open(self.path, "w") as f:
+            json.dump(data, f)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "limit-resumes.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_missing_file_is_no_data_and_a_broken_one_is_unknown(self):
+        host = digest.HostIO(sync_repo=False, remotes=False)
+        with mock.patch.object(digest, "LIMIT_RESUMES", self.path):
+            self.assertEqual(host.limit_resumes(), {"pending": {}, "started": set()})
+            broken = ("{not json", json.dumps({"version": 2, "pending": {}, "incidents": {}}),
+                      json.dumps({"pending": {}, "incidents": {}}), json.dumps([]))
+            for text in broken:
+                with open(self.path, "w") as f:
+                    f.write(text)
+                self.assertIsNone(host.limit_resumes())
+
+    def test_parse_keeps_the_pending_times_and_only_started_incidents(self):
+        data = {"version": 1,
+                "pending": {"TUC-1": {"agentId": "a1", "resumeAt": "2026-09-30T12:05:00Z"},
+                            "TUC-2": {"agentId": 42, "resumeAt": "2026-09-30T12:05:00Z"},
+                            "TUC-3": {"agentId": "a3", "resumeAt": "not a time"},
+                            "TUC-4": "junk"},
+                "incidents": {"TUC-1": [{"failedAgentId": "a1", "resolution": "started"},
+                                        {"failedAgentId": "a0", "resolution": "superseded"}],
+                              "TUC-2": [{"failedAgentId": "a2", "resolution": "pending"}],
+                              "TUC-3": [{"failedAgentId": "a3", "resolution": "claimed"}],
+                              "TUC-4": [{"failedAgentId": "a4", "resolution": "cancelled"}],
+                              "TUC-5": [{"failedAgentId": "a5", "resolution": "started"}],
+                              "TUC-6": "junk"}}
+        self.assertEqual(digest.parse_limit_resumes(data),
+                         {"pending": {"a1": at("2026-09-30T12:05:00Z")}, "started": {"a1", "a5"}})
+
+    def test_malformed_resume_timestamp_types_do_not_hide_valid_entries(self):
+        for bad in (1791367200000, True, [], {}, None):
+            self.store({"version": 1, "pending": {
+                "bad": {"agentId": "bad", "resumeAt": bad},
+                "good": {"agentId": "good", "resumeAt": "2026-09-30T12:05:00Z"}},
+                "incidents": {}})
+            with mock.patch.object(digest, "LIMIT_RESUMES", self.path):
+                self.assertEqual(digest.HostIO(sync_repo=False, remotes=False).limit_resumes(),
+                                 {"pending": {"good": at("2026-09-30T12:05:00Z")}, "started": set()})
+
+    def test_snapshot_carries_the_store_and_remote_stores_merge_with_it(self):
+        self.store({"version": 1, "pending": {"TUC-1": {"agentId": "local1", "resumeAt": "2026-09-30T12:05:00Z"}},
+                    "incidents": {"TUC-1": [{"failedAgentId": "local1", "resolution": "started"}]}})
+        with mock.patch.object(digest, "LIMIT_RESUMES", self.path), \
+             mock.patch.object(digest.HostIO, "agents", return_value=([], {})), \
+             mock.patch.object(digest.HostIO, "permissions", return_value={}), \
+             mock.patch.object(digest.HostIO, "open_reviews", return_value={}):
+            snapshot = digest.HostIO(sync_repo=False, remotes=False).snapshot()
+        self.assertEqual(snapshot["limitResumes"], {"pending": {"local1": at("2026-09-30T12:05:00Z")},
+                                                    "started": ["local1"]})
+        remote = {"limitResumes": {"pending": {"remote1": at("2026-10-01T12:05:00Z")}, "started": ["remote1"]}}
+        with mock.patch.object(digest, "LIMIT_RESUMES", self.path), \
+             mock.patch.object(digest.HostIO, "remotes", return_value=[remote]):
+            self.assertEqual(digest.HostIO(sync_repo=False).limit_resumes(),
+                             {"pending": {"local1": at("2026-09-30T12:05:00Z"),
+                                          "remote1": at("2026-10-01T12:05:00Z")},
+                              "started": {"local1", "remote1"}})
+        with mock.patch.object(digest, "LIMIT_RESUMES", self.path), \
+             mock.patch.object(digest.HostIO, "remotes", return_value=[{"agents": [], "metas": {}}]):
+            self.assertEqual(digest.HostIO(sync_repo=False).limit_resumes(),
+                             {"pending": {"local1": at("2026-09-30T12:05:00Z")}, "started": {"local1"}})
+
+
+class LimitResumeRunTest(RunCase):
+    def test_error_agents_name_their_restart_and_a_started_one_counts_as_automation(self):
+        local = {"id": "local1234567", "name": "TUC-1206 work", "status": "error", "cwd": "/tmp"}
+        remote = {"id": "remote1234567", "name": "TUC-1206 remote", "status": "error", "cwd": "/tmp",
+                  "_host": "mac"}
+        self.io.agent_list = [local, remote]
+        self.io.targets = ["mac"]
+        self.io.error_lines = {a["id"]: "429 rate limit" for a in (local, remote)}
+        self.io.limit_resumes_data = {"pending": {local["id"]: at("2026-09-30T12:05:00Z"),
+                                                  remote["id"]: at("2026-10-01T12:05:00Z")},
+                                      "started": {local["id"]}}
+        self.io.evidence_data = {"prWatch": None, "crashes": {}, "limitResumes": self.io.limit_resumes_data}
+        self.assertEqual(self.run_at(WED_10_05), 0)
+        items = self.saved()["items"]
+        self.assertEqual(items[f"agent-error:{local['id']}"]["payload"]["detail"],
+                         "in error: rate limit (resumes at 14:05)")
+        self.assertEqual(items[f"agent-error:{remote['id']}"]["payload"]["detail"],
+                         "in error: rate limit (resumes at 01.10. 14:05)")
+        self.assertEqual(items[f"agent-error:{remote['id']}"]["payload"]["unit"], "agents@mac")
+        lines = read_lines(os.path.join(self.history, "history.jsonl"))
+        self.assertEqual({line["key"]: line["auto"] for line in lines
+                          if line.get("key", "").startswith("agent-error")},
+                         {f"agent-error:{local['id']}": True, f"agent-error:{remote['id']}": None})
 
 
 class BackfillTest(unittest.TestCase):
@@ -793,6 +926,25 @@ class EvidenceTest(unittest.TestCase):
             "agent-error:r1": (None, None), "agent-waiting:r2:p1": (True, None), "agent-error:l1": (None, None),
             "agent-waiting:l2:2026-10-01T10:00:00Z": (True, None), "pr:917:draft": (None, None),
             "pr:918:draft": (None, None), "lock-orphan:TUC-301": (None, None)})
+
+    def test_started_limit_resume_credits_automation_others_and_an_unreadable_store_do_not(self):  # TUC-1206
+        def flags(evidence):
+            lines = self.events(evidence)
+            return {line["key"]: (line["owner"], line["auto"]) for line in lines[1:]
+                    if line["key"].startswith("agent-")}
+        started = flags({"prWatch": None, "crashes": {},
+                         "limitResumes": {"pending": {"l1": 1.0}, "started": {"l1"}}})
+        self.assertEqual(started["agent-error:l1"], (False, True))
+        self.assertEqual(started["agent-waiting:l2:2026-10-01T10:00:00Z"], (True, False))
+        for schedules in ({"pending": {"l1": 1.0}, "started": set()}, {"pending": {}, "started": set()}):
+            self.assertEqual(flags({"prWatch": None, "crashes": {}, "limitResumes": schedules})["agent-error:l1"],
+                             (False, False))
+        self.assertEqual(flags({"prWatch": None, "crashes": {}, "limitResumes": None})["agent-error:l1"], (False, None))
+        # A started schedule is known automation even when the crash record cannot be read.
+        unreadable_crashes = flags({"prWatch": None, "crashes": None,
+                                    "limitResumes": {"pending": {}, "started": {"l1"}}})
+        self.assertEqual(unreadable_crashes["agent-error:l1"], (None, True))
+        self.assertEqual(unreadable_crashes["agent-error:r1"], (None, None))  # another host's item
 
     def test_unit_listed_read_and_failed_counts_as_failed(self):
         lines = self.events({"prWatch": None, "crashes": None},

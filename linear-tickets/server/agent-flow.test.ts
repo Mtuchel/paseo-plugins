@@ -61,7 +61,7 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
   const store = new SessionStore(join(directory, "sessions.json"));
   const router = new SessionRouter({
     api: { activity: async (_s: string, content: { type: string; body?: string }) => { calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); }, openSessions: async () => [], activities: async () => [] } as never,
-    linear: { viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, issueState: async () => { throw new Error("unused"); }, issueGroup: async () => { throw new Error("unused"); }, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {} },
+    linear: { viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, issueState: async () => { throw new Error("unused"); }, issueGroup: async () => { throw new Error("unused"); }, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {}, comment: async () => {}, hasComment: async () => false, userUrl: async () => "https://linear.app/owner" },
     starter: { start: async () => { throw new Error("unused"); }, admission: async () => ({ ok: true as const }) },
     handover: { resumeTarget: async () => null, handOff: async () => true },
     launcher: { gate: () => ({ release: () => {} }) },
@@ -140,7 +140,7 @@ test("the owner's Stop holds the ticket for the watchdog across a reload until t
   const directory = await mkdtemp(join(tmpdir(), "paseo-flow-watchdog-"));
   const watchdog = new WatchdogStore(join(directory, "watchdog.json"));
   const order: string[] = [];
-  const h = routerHarness([], { watchdog: { hold: async (issueId, agentId) => { order.push("hold"); await watchdog.hold(issueId, agentId); }, continued: (issueId) => watchdog.continued(issueId) }, stop: async () => { order.push("stop"); } });
+  const h = routerHarness([], { watchdog: { read: () => watchdog.read(), hold: async (issueId, agentId) => { order.push("hold"); await watchdog.hold(issueId, agentId); }, continued: (issueId) => watchdog.continued(issueId) }, stop: async () => { order.push("stop"); } });
   await h.store.put(link);
   await h.router.prompted("s1", { id: "p1", signal: "stop", content: { body: "stop" } });
   assert.deepEqual(order, ["hold", "stop"], "the hold is saved before the Stop goes out");

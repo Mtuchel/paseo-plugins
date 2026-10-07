@@ -414,6 +414,7 @@ function fakeBridge() {
   const bridge = {
     sessions: {
       sessionFor: async () => ({ sessionId: "s1" }), holdIfStopped: async () => false, follow: async () => {}, unfollow: async () => true, action: async () => {}, resumeNow: async () => false,
+      scheduleLimitResume: async () => false,
       say: async (_s: string, type: string, body: string) => { calls.push(`say ${type}: ${body}`); },
       link: async (_s: string, _title: string, url: string) => { calls.push(`session link ${url}`); },
       offerResume: async () => { calls.push("offer resume"); },

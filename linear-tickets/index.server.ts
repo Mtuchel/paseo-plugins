@@ -37,6 +37,7 @@ import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
 import { NeedsYouIssues } from "./server/needs-you";
 import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, ReviewDecisionAppliedError, SessionRouter, SessionStore, stopAgentTurn, type HostOwnership } from "./server/sessions";
+import { LimitResumeStore, UsageReader } from "./server/limit-resume";
 import { approveForLater, splitIntoSubIssues } from "./server/split";
 import { planSetup, TicketStarter } from "./server/starter";
 import { PLAN_TICKET_ENV } from "./server/plan-policy";
@@ -126,6 +127,7 @@ export default function contribute(server: PluginServerContext) {
   // ticketOwnership): assigned once the activation routers exist below.
   let ticketOwner: (issueId: string) => Promise<HostOwnership> = async () => "unknown";
   const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, needsYou, route, deletions, watchdog: watchdogStore,
+    limitResumes: new LimitResumeStore(), usage: new UsageReader(),
     owner: (issueId) => ticketOwner(issueId),
     decideReview,
     reviewOutcome: (review) => reviewOutcome(review),
