@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -12,7 +12,9 @@ import { fingerprint } from "./deputy";
 import { HealthMonitor } from "./health";
 import { reviewChange, type PullRequestView } from "./pr-watch";
 import { PermissionReplies } from "./permission-replies";
-import { decidePlannotatorReview, describeTool, questionPrompt, SessionRouter, SessionStore, type SessionLink } from "./sessions";
+import { PlannotatorBridge } from "./plannotator";
+import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
+import { APPROVE_LATER, decidePlannotatorReview, describeTool, questionPrompt, ReviewClosedError, SEND_BACK, SessionRouter, SessionStore, SPLIT_PLAN, type SessionLink } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { AWAY_REASON } from "./scheduler";
@@ -957,4 +959,419 @@ test("deleted tickets lose parked and queued sessions, archive every affected ag
       assert.equal(launches, 0);
     } finally { await restarted.cleanup(); }
   } finally { await h.cleanup(); await rm(directory, { recursive: true, force: true }); }
+});
+
+// --- Panel decisions and recovered outcomes through the journal (TUC-1288) -------------------
+
+// What the panel's bridge needs of the fake Linear service.
+type PanelLinearService = {
+  comment(issueId: string, body: string, id?: string): Promise<void>;
+  commentById(id: string): Promise<{ id: string } | null>;
+  issueById(id: string): Promise<{ id: string; identifier: string } | null>;
+  createIssue(input: { id?: string; title: string }): Promise<{ id: string; identifier: string }>;
+  addBlocker(blocker: string, blocked: string): Promise<void>;
+  delegate(issueId: string, appUserId: string): Promise<void>;
+  upsertIssueDocument(issueId: string, title: string): Promise<string>;
+  issueDocument(issueId: string, title: string): Promise<null>;
+  moveToStateNamed(issueId: string, name: string): Promise<{ changed: boolean }>;
+  moveToReady(issueId: string): Promise<{ changed: boolean }>;
+  addLabel(issueId: string, name: string): Promise<void>;
+  removeLabel(issueId: string, name: string): Promise<void>;
+  issueState(issueId: string): Promise<never>;
+  viewerId(): Promise<string>;
+  appUserId(): Promise<string>;
+};
+
+// How the fake Linear service fails a call: the message the call throws with, or `before`/`after`
+// for a sub-issue create (thrown before creating, or after creating with the answer lost).
+type LinearTrouble = {
+  document?: (call: number) => string | null;
+  ready?: (call: number) => string | null;
+  create?: (call: number) => "before" | "after" | null;
+};
+
+type PanelLinear = {
+  linear: PanelLinearService;
+  calls: string[];
+  issues: Map<string, { id: string; identifier: string }>;
+  counters: { documentTries: number; documents: number; readyTries: number; creates: number };
+};
+
+// The fake Linear service behind the panel's bridge: every effect is named in `calls`, sub-issues
+// stay under the id the worker reserved for them (a retry looks them up instead of creating
+// another), and `trouble` fails one call with the message it returns.
+function panelLinear(trouble: LinearTrouble = {}): PanelLinear {
+  const calls: string[] = [];
+  const issues = new Map<string, { id: string; identifier: string }>();
+  const counters = { documentTries: 0, documents: 0, readyTries: 0, creates: 0 };
+  const linear: PanelLinearService = {
+    async comment(issueId: string, _body: string, _id?: string) { calls.push(`comment ${issueId}`); },
+    async commentById(_id: string) { return null; },
+    async issueById(id: string) { return issues.get(id) ?? null; },
+    async createIssue(input: { id?: string; title: string }) {
+      counters.creates += 1;
+      const failure = trouble.create?.(counters.creates) ?? null;
+      if (failure === "before") throw new Error("Linear is down");
+      const issue = { id: input.id ?? `created-${counters.creates}`, identifier: `TUC-${900 + counters.creates}` };
+      issues.set(issue.id, issue);
+      calls.push(`create ${issue.identifier} ${input.title}`);
+      if (failure === "after") throw new Error("socket hang up");
+      return issue;
+    },
+    async addBlocker(blocker: string, blocked: string) { calls.push(`block ${blocker} ${blocked}`); },
+    async delegate(issueId: string, appUserId: string) { calls.push(`delegate ${issueId} ${appUserId}`); },
+    async upsertIssueDocument(issueId: string, title: string) {
+      counters.documentTries += 1;
+      const failure = trouble.document?.(counters.documentTries) ?? null;
+      if (failure) throw new Error(failure);
+      counters.documents += 1;
+      calls.push(`document ${issueId} ${title}`);
+      return `https://linear.app/doc/${issueId}`;
+    },
+    async issueDocument(_issueId: string, _title: string) { return null; },
+    async moveToStateNamed(issueId: string, name: string) { calls.push(`state ${name} ${issueId}`); return { changed: true }; },
+    async moveToReady(issueId: string) {
+      counters.readyTries += 1;
+      const failure = trouble.ready?.(counters.readyTries) ?? null;
+      if (failure) throw new Error(failure);
+      calls.push(`ready ${issueId}`);
+      return { changed: true };
+    },
+    async addLabel(issueId: string, name: string) { calls.push(`+${name} ${issueId}`); },
+    async removeLabel(issueId: string, name: string) { calls.push(`-${name} ${issueId}`); },
+    async issueState() { return { identifier: "TUC-1", teamId: "t1", projectId: "p1", labels: [], status: "Todo", statusType: "unstarted" } as never; },
+    async viewerId() { return OWNER; },
+    async appUserId() { return APP; },
+  };
+  return { linear, calls, issues, counters };
+}
+
+// The router with a real PlannotatorBridge (and its journal) behind the panel's decision deps:
+// a panel Approve / Send back goes through decideOwner, later/split through decidePanel, and a
+// saved outcome through recovered. `build()` makes a bridge on the same temp directories; after
+// stop(), building another one is a reload.
+async function panelHarness(plan: string, options: {
+  linear?: PanelLinear;
+  decide?: (localUrl: string, approve: boolean, feedback: string) => Promise<void>;
+  outcome?: (review: PendingReview) => Promise<ReviewOutcome>;
+  labels?: Record<string, string>;
+} = {}) {
+  const root = await mkdtemp(join(tmpdir(), "paseo-panel-"));
+  const store = new SessionStore(join(root, "sessions.json"));
+  const events = join(root, "events");
+  await mkdir(events, { recursive: true });
+  const linear = options.linear ?? panelLinear();
+  const decisions: { url: string; approve: boolean; feedback: string }[] = [];
+  const decide = async (url: string, approve: boolean, feedback: string) => {
+    decisions.push({ url, approve, feedback });
+    await options.decide?.(url, approve, feedback);
+  };
+  const holder: { bridge: PlannotatorBridge | null } = { bridge: null };
+  const h = routerHarness([], {
+    store,
+    decideReview: (url, approve, feedback, agentId, origin) => holder.bridge!.decideOwner(url, approve, feedback, agentId, origin),
+    decidePlan: (link, mode) => holder.bridge!.decidePanel(link, mode),
+    reviewOutcome: options.outcome ?? (async () => "open" as const),
+    recordOutcome: (agentId, outcome, review) => holder.bridge!.recovered(agentId, review, outcome),
+  });
+  // The agent's labels as the bridge sees them; without them it has no ticket and its decisions
+  // take the "none" route, without a session context.
+  if (options.labels) {
+    const labels = options.labels;
+    const ref = h.paseo.agents.ref.bind(h.paseo.agents);
+    Object.assign(h.paseo.agents as unknown as Record<string, unknown>, {
+      ref: (id: string) => ({ ...ref(id), refresh: async () => ({ agent: { id, labels } }) }),
+    });
+  }
+  const bridges: PlannotatorBridge[] = [];
+  const build = () => {
+    const bridge = new PlannotatorBridge(linear.linear as never, { read: async () => settings }, events, h.router, async () => plan, undefined, undefined, undefined, decide, () => {});
+    bridges.push(bridge);
+    holder.bridge = bridge;
+    return bridge;
+  };
+  // The journal's review generation and the session's stored review, as the hand-off leaves them.
+  const seed = async (bridge: PlannotatorBridge) => {
+    await h.store.put({ ...link, review: null });
+    const review = await bridge.decisionJournal.ensureReview({ agentId: "a1", localUrl: "http://localhost:4000/", openedAt: "2026-10-07T11:00:00.000Z", planHash: planHash(plan) });
+    await h.router.expectReview("s1", review.localUrl, plan, null, review.id);
+    return review;
+  };
+  const cleanup = async () => { for (const bridge of bridges) await bridge.stop().catch(() => {}); await h.cleanup(); };
+  return { h, store, events, linear, decisions, holder, build, seed, cleanup };
+}
+
+test("a panel approve is journaled before Plannotator is asked, and applied once", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-07T12:00:00Z") });
+  const plan = "# Plan\n\n1. Do the thing";
+  const panels = await panelHarness(plan, {
+    labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" },
+    decide: async () => {
+      const attempts = panels.holder.bridge!.decisionJournal.attempts();
+      assert.equal(attempts.length, 1, "the decision is journaled before Plannotator is asked");
+      assert.deepEqual(
+        { source: attempts[0].source, state: attempts[0].state, approved: attempts[0].approved, mode: attempts[0].mode, sessionId: attempts[0].sessionId, route: attempts[0].route },
+        { source: "linear-panel", state: "deciding", approved: true, mode: "approve", sessionId: "s1", route: "live" },
+      );
+    },
+  });
+  const { h, store } = panels;
+  try {
+    const bridge = panels.build();
+    bridge.attach(h.paseo);
+    await bridge.drain();
+    const review = await panels.seed(bridge);
+    await h.router.prompted("s1", { id: "p1", content: { body: "Approve plan" } });
+    assert.equal((await store.get("s1"))?.review, null, "the panel's approve clears the review");
+    assert.ok(h.calls.includes("thought:Plan approved."), JSON.stringify(h.calls));
+    const attempt = bridge.decisionJournal.attempts()[0];
+    assert.equal(attempt.reviewId, review.id, "the attempt is on the panel's review");
+    await bridge.drain();
+    assert.equal(bridge.decisionJournal.attempt(attempt.id)?.state, "applied", "the accepted decision is carried out");
+    assert.equal(h.calls.filter((call) => call === "thought:Plan approved — starting on it.").length, 1, "the panel note is posted once");
+    assert.equal(panels.linear.calls.filter((call) => call.startsWith("comment ")).length, 1, "the decision is carried out once");
+  } finally { await panels.cleanup(); }
+});
+
+test("a panel reply whose review already closed voids the attempt, clears the review and reaches the agent", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-07T12:00:00Z") });
+  const plan = "# Plan\n\n1. Do the thing";
+  let asked = 0;
+  const panels = await panelHarness(plan, {
+    decide: async () => {
+      const attempts = panels.holder.bridge!.decisionJournal.attempts();
+      assert.equal(attempts.length, 1);
+      assert.deepEqual({ source: attempts[0].source, approved: attempts[0].approved, mode: attempts[0].mode }, { source: "linear-panel", approved: false, mode: "send-back" });
+      asked += 1;
+      throw new ReviewClosedError("the review closed with its agent process", false);
+    },
+  });
+  const { h, store } = panels;
+  try {
+    const bridge = panels.build();
+    bridge.attach(h.paseo);
+    await bridge.drain();
+    await panels.seed(bridge);
+    await h.router.prompted("s1", { id: "p1", content: { body: SEND_BACK } });
+    assert.equal(asked, 1, "Plannotator was asked once");
+    const attempt = bridge.decisionJournal.attempts()[0];
+    assert.equal(attempt.state, "void", "a review Plannotator refused cannot be accepted later");
+    assert.ok(attempt.voidReason);
+    assert.equal((await store.get("s1"))?.review, null, "the closed review no longer holds the session");
+    assert.ok(h.calls.includes("thought:That plan review had already closed, so your reply goes to the agent, which submits the plan again."), JSON.stringify(h.calls));
+    assert.match(h.calls.at(-1) ?? "", /^send a1: Your Plannotator plan review closed[\s\S]*Sent back from Linear\./);
+  } finally { await panels.cleanup(); }
+});
+
+test("a panel 'approve, implement later' survives Linear failures and reloads, applies once, and its retire report confirms", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-07T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
+  const plan = "# Plan\n\n1. One\n2. Two";
+  let clears = 0;
+  let atRetire: string | null | undefined;
+  const linear = panelLinear({ document: (call) => call === 1 ? "Linear is down" : null, ready: (call) => call === 1 ? "Linear is down" : null });
+  const panels = await panelHarness(plan, { linear, decide: async (_url, approve) => { if (!approve) atRetire = (await panels.h.store.get("s1"))?.offer; } });
+  const { h, store } = panels;
+  try {
+    const bridge = panels.build();
+    bridge.attach(h.paseo);
+    await bridge.drain();
+    const review = await panels.seed(bridge);
+    const clear = h.router.clearReview.bind(h.router);
+    h.router.clearReview = async (sessionId: string) => { clears += 1; return clear(sessionId); };
+    await h.router.prompted("s1", { id: "p1", content: { body: APPROVE_LATER } });
+    assert.match(h.calls.at(-1) ?? "", /^response:Approved — being applied: Linear is down\./, JSON.stringify(h.calls));
+    assert.equal((await store.get("s1"))?.offer, "later", "the session is held before the planner is retired");
+    assert.equal((await store.get("s1"))?.review?.reviewId, review.id, "the review stays until the decision went through");
+    const attemptId = bridge.decisionJournal.attempts()[0].id;
+
+    // A reload between the hold and the retire: no Resume, no agent.
+    await bridge.stop();
+    let quiet = h.calls.length;
+    await h.router.offerResume("s1");
+    await h.router.startQueued();
+    assert.equal(h.calls.length, quiet, "a held session offers no Resume and starts nobody");
+    assert.equal(panels.decisions.length, 0, "the planner was not retired yet");
+
+    // The retry writes the document and retires the planner, then Linear fails at `ready`.
+    const second = panels.build();
+    t.mock.timers.tick(3_000);
+    second.attach(h.paseo);
+    await second.drain();
+    assert.equal(atRetire, "later", "the planner is retired only after the session is held");
+    assert.deepEqual(panels.decisions.map(({ approve }) => approve), [false], "the planner is retired once");
+    assert.equal((await store.get("s1"))?.review?.reviewId, review.id);
+    assert.equal(second.decisionJournal.attempt(attemptId)?.lastError, "Linear is down");
+
+    // A reload between the retire and the ready write: still no Resume and no agent.
+    await second.stop();
+    quiet = h.calls.length;
+    await h.router.offerResume("s1");
+    await h.router.startQueued();
+    assert.equal(h.calls.length, quiet, "the retired planner is not resumed");
+    assert.equal(panels.decisions.length, 1, "the retire is not repeated");
+
+    const third = panels.build();
+    t.mock.timers.tick(3_000);
+    third.attach(h.paseo);
+    await third.drain();
+    assert.equal(third.decisionJournal.attempt(attemptId)?.state, "applied");
+    assert.equal(clears, 1, "the review is cleared once");
+    assert.equal((await store.get("s1"))?.review, null);
+    assert.equal(h.calls.filter((call) => call.startsWith("response:Plan approved for later")).length, 1, "the workflow replies once");
+    assert.deepEqual(linear.calls.filter((call) => call.startsWith("ready ")), ["ready i1"]);
+    assert.equal(linear.counters.documents, 1, "the plan document is written once");
+    assert.ok(linear.calls.includes("+plan-ready i1"));
+
+    // The retired planner's report of the closed review arrives later: a confirmation, not a decision.
+    await writeFile(join(panels.events, "z-later-report.json"), JSON.stringify({ type: "decided", agentId: "a1", approved: false, planContent: plan, at: "2026-10-07T12:05:00.000Z" }));
+    quiet = h.calls.length;
+    await third.drain();
+    assert.deepEqual(third.decisionJournal.attempt(attemptId)?.reports, ["z-later-report.json"], "the report confirms the closing");
+    assert.equal(third.decisionJournal.attempt(attemptId)?.state, "applied");
+    assert.ok(!third.decisionJournal.all().some((entry) => entry.kind === "conflict"));
+    assert.equal(h.calls.length, quiet, "the confirmation reaches nobody");
+    assert.deepEqual(await readdir(panels.events), [], "the report file is consumed");
+  } finally { await panels.cleanup(); }
+});
+
+test("a panel split survives a lost sub-issue create and reloads: every sub-issue, blocker and delegation exactly once", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-07T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
+  const plan = "# Plan\n\n1. One\n2. Two\n3. Three";
+  let atRetire: string | null | undefined;
+  let groups = 0;
+  const linear = panelLinear({ create: (call) => call === 3 ? "before" : call === 4 ? "after" : null });
+  const panels = await panelHarness(plan, { linear, decide: async (_url, approve) => { if (!approve) atRetire = (await panels.h.store.get("s1"))?.offer; } });
+  const { h, store } = panels;
+  try {
+    const bridge = panels.build();
+    bridge.attach(h.paseo);
+    await bridge.drain();
+    const review = await panels.seed(bridge);
+    const group = h.router.groupSession.bind(h.router);
+    h.router.groupSession = async (sessionId: string) => { groups += 1; return group(sessionId); };
+
+    await h.router.prompted("s1", { id: "p1", content: { body: SPLIT_PLAN } });
+    assert.match(h.calls.at(-1) ?? "", /^response:Approved — being applied: Linear is down\./, JSON.stringify(h.calls));
+    assert.equal(atRetire, "split", "the planner is retired only after the session is held");
+    assert.equal(panels.decisions.length, 1, "the planner is retired once");
+    assert.equal(linear.issues.size, 2, "two sub-issues were created before the failure");
+    assert.equal((await store.get("s1"))?.review?.reviewId, review.id);
+
+    // A reload after the retire: no Resume, no parent agent.
+    await bridge.stop();
+    let quiet = h.calls.length;
+    await h.router.offerResume("s1");
+    await h.router.startQueued();
+    assert.equal(h.calls.length, quiet, "a held session offers no Resume and starts nobody");
+
+    // The retry creates the third sub-issue and loses its answer.
+    const second = panels.build();
+    t.mock.timers.tick(3_000);
+    second.attach(h.paseo);
+    await second.drain();
+    const attemptId = second.decisionJournal.attempts()[0].id;
+    assert.equal(linear.issues.size, 3, "the created sub-issue is kept under its reserved id");
+    assert.equal(linear.counters.creates, 4, "the third sub-issue was created once, after one failed try");
+
+    // Another reload after the retire, before the answer is recovered.
+    await second.stop();
+    quiet = h.calls.length;
+    await h.router.offerResume("s1");
+    await h.router.startQueued();
+    assert.equal(h.calls.length, quiet, "the retired planner is not resumed");
+
+    const third = panels.build();
+    t.mock.timers.tick(3_000);
+    third.attach(h.paseo);
+    await third.drain();
+    assert.equal(third.decisionJournal.attempt(attemptId)?.state, "applied");
+    assert.equal(linear.issues.size, 3, "exactly three sub-issues");
+    assert.equal(linear.counters.creates, 4, "the reserved id is looked up instead of creating a fourth");
+    assert.equal(linear.calls.filter((call) => call.startsWith("block ")).length, 2, "each later step is blocked by its predecessor once");
+    assert.equal(linear.calls.filter((call) => call.startsWith("delegate ")).length, 3, "every sub-issue is delegated once");
+    assert.equal(groups, 1, "the session is grouped once");
+    assert.deepEqual((await store.get("s1"))?.group, { delegated: false });
+    assert.equal((await store.get("s1"))?.review, null);
+    assert.equal(h.calls.filter((call) => call.startsWith("response:Split into 3 sub-issues")).length, 1);
+
+    // The retired planner's deny report is a confirmation.
+    await writeFile(join(panels.events, "z-split-report.json"), JSON.stringify({ type: "decided", agentId: "a1", approved: false, planContent: plan, at: "2026-10-07T12:05:00.000Z" }));
+    quiet = h.calls.length;
+    await third.drain();
+    assert.deepEqual(third.decisionJournal.attempt(attemptId)?.reports, ["z-split-report.json"]);
+    assert.equal(third.decisionJournal.attempt(attemptId)?.state, "applied");
+    assert.equal(h.calls.length, quiet, "the confirmation reaches nobody");
+  } finally { await panels.cleanup(); }
+});
+
+test("a recovered outcome whose journal write fails keeps the session's review for the next sweep", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-07T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
+  const plan = "# Plan\n\n1. Do the thing";
+  const panels = await panelHarness(plan, { labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" }, outcome: async () => ({ approved: true, planContent: plan }) });
+  const { h, store } = panels;
+  try {
+    const bridge = panels.build();
+    bridge.attach(h.paseo);
+    await bridge.drain();
+    const review = await panels.seed(bridge);
+    const report = bridge.decisionJournal.report.bind(bridge.decisionJournal);
+    let failOnce = true;
+    bridge.decisionJournal.report = async (input) => {
+      if (failOnce) { failOnce = false; throw new Error("disk full"); }
+      return report(input);
+    };
+
+    await h.router.settleReviews().catch(() => {});
+    assert.equal((await store.get("s1"))?.review?.reviewId, review.id, "the review waits for the next sweep");
+    assert.equal(bridge.decisionJournal.attempts().length, 0, "nothing was journaled");
+
+    await h.router.settleReviews();
+    const attempt = bridge.decisionJournal.attempts()[0];
+    assert.deepEqual(
+      { source: attempt.source, reviewId: attempt.reviewId, planContent: attempt.planContent, reports: attempt.reports },
+      { source: "recovered", reviewId: review.id, planContent: plan, reports: [`recovered-${review.id}`] },
+    );
+    assert.equal((await store.get("s1"))?.review, null, "the review lets go once the journal has it");
+    await bridge.drain();
+    assert.equal(bridge.decisionJournal.attempt(attempt.id)?.state, "applied");
+    assert.equal(bridge.decisionJournal.attempts(review.id).length, 1, "the outcome is applied once");
+    assert.equal(panels.linear.calls.filter((call) => call.startsWith("comment ")).length, 1, "the decision is carried out once");
+  } finally { await panels.cleanup(); }
+});
+
+test("a recovered outcome more than two minutes after the panel decision confirms it and is applied once", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-07T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
+  const plan = "# Plan\n\n1. Do the thing";
+  const panels = await panelHarness(plan, {
+    labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" },
+    outcome: async () => ({ approved: true, planContent: plan }),
+    decide: async () => { throw new ReviewClosedError("Plannotator did not answer in time", true); },
+  });
+  const { h, store } = panels;
+  try {
+    const bridge = panels.build();
+    bridge.attach(h.paseo);
+    await bridge.drain();
+    const review = await panels.seed(bridge);
+    await h.router.prompted("s1", { id: "p1", content: { body: "Approve plan" } });
+    const attempt = bridge.decisionJournal.attempts()[0];
+    assert.equal(attempt.state, "uncertain", "the lost answer leaves the attempt uncertain");
+    assert.match(h.calls.at(-1) ?? "", /^response:Plannotator did not answer/, JSON.stringify(h.calls));
+    assert.equal((await store.get("s1"))?.review?.reviewId, review.id, "the panel's review waits for its outcome");
+
+    // More than the old 120 s memory window: the saved outcome still binds to this review.
+    t.mock.timers.tick(130_000);
+    await h.router.settleReviews();
+    assert.equal(bridge.decisionJournal.attempts().length, 1, "the outcome confirms the panel's decision instead of recording a second one");
+    assert.deepEqual(bridge.decisionJournal.attempt(attempt.id)?.reports, [`recovered-${review.id}`]);
+    assert.equal((await store.get("s1"))?.review, null);
+    await bridge.drain();
+    assert.equal(bridge.decisionJournal.attempt(attempt.id)?.state, "applied");
+    assert.equal(h.calls.filter((call) => call === "thought:Plan approved — starting on it.").length, 1, "the decision is carried out once");
+    assert.equal(panels.linear.calls.filter((call) => call.startsWith("comment ")).length, 1, "the outcome is delivered once");
+  } finally { await panels.cleanup(); }
 });
