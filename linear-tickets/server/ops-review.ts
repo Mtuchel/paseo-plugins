@@ -751,7 +751,7 @@ export type FileReport = {
   created: { kind: string; ticket: string | null }[];
   nextWeek: string[];
   capLeft: number;
-  updated: { ticket: string; written: boolean }[];
+  updated: { ticket: string; comment: "written" | "due" | "present" }[];
   checks: { ticket: string; state: string; kinds: KindOutcome[]; due?: string }[];
   relapses: { ticket: string; state: string; kinds: { kind: string; count: number | null; baseline: number | null }[] }[];
   reopened: { ticket: string; marker: string; commented: boolean; moved: boolean }[];
@@ -834,9 +834,10 @@ async function fileReview(deps: FileDeps): Promise<FileReport> {
     if (!kinds.length) continue;
     const scoped = { ...ticket, kinds };
     if (!CLOSED_TYPES.includes(ticket.statusType)) {
-      const present = ticket.markers.has(week);
+      // A ticket filed this week already carries this week's numbers in its description.
+      const present = ticket.markers.has(week) || filedThisWeek.has(ticket.id);
       if (!present && !deps.dryRun) await deps.writer.comment(ticket.id, weeklyComment(scoped, rows, analysis, week));
-      report.updated.push({ ticket: ticket.identifier, written: !present && !deps.dryRun });
+      report.updated.push({ ticket: ticket.identifier, comment: present ? "present" : deps.dryRun ? "due" : "written" });
       continue;
     }
     if (ticket.statusType !== "completed" || !ticket.completedAt) continue;
@@ -919,7 +920,7 @@ export function renderFileReport(report: FileReport, dryRun: boolean): string {
   lines.push(`new tickets left this week: ${report.capLeft}`);
   for (const found of report.created) lines.push(`create: Recurring ops problem: ${found.kind}${found.ticket ? ` → ${found.ticket}` : ""}`);
   for (const kind of report.nextWeek) lines.push(`next week (cap reached): \`${kind}\``);
-  for (const found of report.updated) lines.push(`update: ${found.ticket} ${found.written ? "weekly comment written" : dryRun ? "weekly comment" : "weekly comment already there"}`);
+  for (const found of report.updated) lines.push(`update: ${found.ticket} ${found.comment === "present" ? "weekly comment already there" : found.comment === "due" ? "weekly comment to write" : "weekly comment written"}`);
   for (const found of report.checks) lines.push(`check: ${found.ticket} ${found.state}${found.due ? ` (from ${found.due})` : ""}${found.kinds.map((kind) => `\n  ${kind.kind}: ${kind.outcome}${kind.before === null ? "" : ` ${kind.before} → ${kind.after}`}`).join("")}`);
   for (const found of report.relapses) lines.push(`relapse look: ${found.ticket} ${found.state}${found.kinds.map((kind) => `\n  ${kind.kind}: ${kind.count === null ? "not enough data" : kind.count} (baseline ${kind.baseline === null ? "none" : kind.baseline})`).join("")}`);
   for (const found of report.reopened) lines.push(`reopen: ${found.ticket} (${found.marker})${dryRun ? "" : `: comment ${found.commented ? "written" : "already there"}, ${found.moved ? "moved to Todo" : "not moved (no longer Done)"}`}`);
