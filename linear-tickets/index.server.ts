@@ -45,6 +45,7 @@ import { PlanFollowUps } from "./server/plan-follow-ups";
 import { labelDaemon, StateLabels } from "./server/state-labels";
 import { LabelSync, PullRequestFiles } from "./server/label-sync";
 import { ProjectFlow, ProjectStore } from "./server/project-flow";
+import { ProjectIssueCache } from "./server/project-issues";
 import { LabelRepair } from "./server/label-repair";
 import { Presence } from "./server/presence";
 import { hostname } from "node:os";
@@ -172,7 +173,9 @@ export default function contribute(server: PluginServerContext) {
   // A planner without a live agent, and a ticket assigned to Paseo whose start failed, is started
   // again with a new agent and thread (README, "Projects").
   const projectStore = new ProjectStore();
-  const projects = new ProjectFlow({ linear, scheduler: starter.scheduler, capacity: starter.capacity, store: projectStore, retire: async (agentId, api) => {
+  // Project tickets are read in full every 30 minutes and only as changed in between (project-issues.ts).
+  const projectIssues = new ProjectIssueCache(linear);
+  const projects = new ProjectFlow({ linear, projectIssues: (projectId, full) => projectIssues.read(projectId, full), scheduler: starter.scheduler, capacity: starter.capacity, store: projectStore, retire: async (agentId, api) => {
     await stopAgentTurn(agentId).catch(() => {});
     await api.agents.ref(agentId).archive().catch(() => {});
   }, restart: async (issueId, identifier) => restartOrThrow(await sessions.restartFor(issueId, identifier)), accountedFor: async (issueId) => launcher.underWay(issueId) || await sessions.threadHolds(issueId) });

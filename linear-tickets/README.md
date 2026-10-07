@@ -982,7 +982,13 @@ as before.
 
 **Projects.** Adding the trigger label (`paseo`) to a Linear *project* lets Paseo work through
 the whole project without you assigning each ticket. Auto-dispatch must be on; projects are read
-every 2 minutes.
+with every dispatch poll, at most every 2 minutes. Reading every open ticket of a project with its
+labels and relations is expensive in Linear's hourly complexity budget (about 175 points a ticket;
+on 2026-10-07 the 518 open tickets of two projects cost 90,618 points a read, about 1.8M of the
+app's 2M points an hour), so a project is read in full every 30 minutes and right after Paseo
+writes a work order; in between only its tickets changed since the last read are read, plus the
+current state of the blockers its tickets wait on. A relation you add or remove in Linear without
+the ticket itself changing, or a deleted ticket, shows up with the next full read.
 
 - **Planning on its own.** Whenever a labelled project has new tickets and no open planner, the
   plugin files one. The Paseo Agents menu bar app uses two RPCs: `linear.projects-status` lists
