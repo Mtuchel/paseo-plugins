@@ -1603,7 +1603,8 @@ future-dated session, or a process table that cannot be read leave the agent alo
 
 Nothing is done while the agent waits for you (a question, a permission, a plan review, a
 waiting handover record, a "Needs you" sub-issue, the ticket in Needs input or carrying
-`<label>-needs-you` or `<label>-hold`), while the ticket is done or canceled, carries
+`<label>-needs-you` or `<label>-hold`; a closed or idle agent also while one of its ticket's
+manual tasks is open), while the ticket is done or canceled, carries
 `do-not-merge` (the ticket or any open pull request of it; pull requests that cannot be read
 count as a veto), is queued, forwarded to the peer, handing out sub-issues, parked or approved
 for later, paused for deletion, or has two live root agents. A quiet agent kept out this way is

@@ -546,6 +546,8 @@ export type WatchdogDeps = {
   settings: Pick<Settings, "read">;
   handover: { all(): Promise<HandoverRecord[]> };
   needsYou?: Pick<NeedsYouIssues, "all">;
+  // The owner's open manual tasks (manual-tasks.ts keeps one per task until it is done).
+  manualTasks?: { tasks(): Promise<{ parentId: string; identifier: string }[]> };
   activity?: (handle: unknown, now: number) => Promise<ActivityResult>;
   now?: () => number;
 };
@@ -721,6 +723,9 @@ export class Watchdog {
     const record = (await this.deps.handover.all()).find((item) => item.issueId === issueId) ?? null;
     if (record?.waiting) return "the agent waits for the owner";
     if ((await this.deps.needsYou?.all())?.some((entry) => entry.parentId === issueId)) return "a Needs you sub-issue waits for the owner";
+    // A stopped agent whose ticket waits for the owner's manual step has nothing to continue.
+    const manual = kind === "idle" ? (await this.deps.manualTasks?.tasks())?.find((task) => task.parentId === issueId) : undefined;
+    if (manual) return `the manual task ${manual.identifier} waits for the owner`;
     const pulls = await poll.pulls({ issueId, identifier, worktree: record?.worktreePath ?? agent?.cwd ?? null, link: record?.links["Pull request"] ?? null });
     if (!pulls) return "the ticket's open pull requests cannot be read";
     if (pulls.some((pull) => pull.labels.map((name) => name.toLowerCase()).includes(DO_NOT_MERGE))) return `an open pull request of ${identifier} carries ${DO_NOT_MERGE}`;
