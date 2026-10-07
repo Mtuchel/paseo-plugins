@@ -1,6 +1,7 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { DispatchStatus } from "../shared/contracts";
 import type { ActivationSink } from "./activation";
+import type { LabelRepair } from "./label-repair";
 import type { Launcher } from "./launch";
 import type { LabeledIssue, LinearService } from "./linear";
 import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
@@ -34,6 +35,9 @@ type Deps = {
   relay?: Pick<CommentRelay, "poll">;
   // Labelled projects (README, "Projects"), moved forward after the labelled tickets.
   projects?: { tick: (paseo: PaseoApi, settings: PluginSettings) => Promise<void> };
+  // Stale running and failed labels (README, "Repairing stale running and failed labels"), repaired
+  // after the projects; `ownerRetried` ends a ticket's incident before the owner's label starts it.
+  repairs?: Pick<LabelRepair, "tick" | "ownerRetried">;
   budget?: Pick<RateBudget, "pausedUntil">;
 };
 
@@ -43,7 +47,8 @@ type Deps = {
 // `manual`: a manual task an agent registered for the owner; `hold`: a project ticket the owner
 // releases before it is handed out; `planner`: a project's work-order ticket; `attended`: a ticket
 // that may need the owner while it runs, so it waits while they are away (presence.ts).
-export function dispatchLabels(trigger: string) {
+export type DispatchLabels = { running: string; failed: string; blocked: string; needsYou: string; manual: string; hold: string; planner: string; attended: string };
+export function dispatchLabels(trigger: string): DispatchLabels {
   return { running: `${trigger}-running`, failed: `${trigger}-failed`, blocked: `${trigger}-blocked`, needsYou: `${trigger}-needs-you`, manual: `${trigger}-manual`, hold: `${trigger}-hold`, planner: `${trigger}-planner`, attended: `${trigger}-attended` };
 }
 
@@ -158,10 +163,12 @@ export class Dispatcher {
       if (until !== null) throw new RateLimitedError("key", until, "reserve");
       await this.dispatch(issue, settings, paseo);
     }
-    if (this.stopped || !this.deps.projects) return;
-    const until = (this.deps.budget ?? rateBudget).pausedUntil("key", LAUNCH_ROOM);
-    if (until !== null) throw new RateLimitedError("key", until, "reserve");
-    await this.deps.projects.tick(paseo, settings);
+    for (const next of [this.deps.projects, this.deps.repairs]) {
+      if (this.stopped || !next) continue;
+      const until = (this.deps.budget ?? rateBudget).pausedUntil("key", LAUNCH_ROOM);
+      if (until !== null) throw new RateLimitedError("key", until, "reserve");
+      await next.tick(paseo, settings);
+    }
   }
 
   private record(identifier: string, outcome: DispatchStatus["recent"][number]["outcome"], detail: string): void {
@@ -218,6 +225,14 @@ export class Dispatcher {
     // Blocked tickets and a full agent limit wait with their label in place; the next poll retries.
     const admission = await this.deps.starter.admission(issue.id, paseo, settings);
     if (!admission.ok) return;
+    // The owner asked for this start: an incident of the label repair ends first, durably, so a
+    // failure of this start is a new incident with fresh retries. Without that, nothing starts.
+    try {
+      await this.deps.repairs?.ownerRetried(issue.id);
+    } catch (error) {
+      this.record(issue.identifier, "failed", `its label repair record could not be reset (${error instanceof Error ? error.message : error}); the label stays and the next poll retries`);
+      return;
+    }
     // Claim. If the trigger label cannot be removed, nothing else happens: the next poll retries.
     await linear.removeLabel(issue.id, trigger, issue.labels);
     try {

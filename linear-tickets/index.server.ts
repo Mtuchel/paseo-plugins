@@ -32,7 +32,7 @@ import { PullRequestBoard } from "./server/pull-requests";
 import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
 import { NeedsYouIssues } from "./server/needs-you";
-import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, ReviewDecisionAppliedError, SessionRouter, SessionStore, stopAgentTurn } from "./server/sessions";
+import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, ReviewDecisionAppliedError, SessionRouter, SessionStore, stopAgentTurn } from "./server/sessions";
 import { approveForLater, splitIntoSubIssues } from "./server/split";
 import { planSetup, TicketStarter } from "./server/starter";
 import { PLAN_TICKET_ENV } from "./server/plan-policy";
@@ -41,7 +41,8 @@ import { PlanRequests } from "./server/plan-requests";
 import { PlanFollowUps } from "./server/plan-follow-ups";
 import { labelDaemon, StateLabels } from "./server/state-labels";
 import { LabelSync, PullRequestFiles } from "./server/label-sync";
-import { ProjectFlow } from "./server/project-flow";
+import { ProjectFlow, ProjectStore } from "./server/project-flow";
+import { LabelRepair } from "./server/label-repair";
 import { Presence } from "./server/presence";
 import { hostname } from "node:os";
 import { readActivationSecret, type ActivationSink } from "./server/activation";
@@ -158,11 +159,15 @@ export default function contribute(server: PluginServerContext) {
   // Labelled projects: a planner ticket sets the work order, then tickets are handed out as slots free up.
   // A planner without a live agent, and a ticket assigned to Paseo whose start failed, is started
   // again with a new agent and thread (README, "Projects").
-  const projects = new ProjectFlow({ linear, scheduler: starter.scheduler, capacity: starter.capacity, retire: async (agentId, api) => {
+  const projectStore = new ProjectStore();
+  const projects = new ProjectFlow({ linear, scheduler: starter.scheduler, capacity: starter.capacity, store: projectStore, retire: async (agentId, api) => {
     await stopAgentTurn(agentId).catch(() => {});
     await api.agents.ref(agentId).archive().catch(() => {});
-  }, restart: (issueId, identifier) => sessions.restartFor(issueId, identifier), accountedFor: async (issueId) => launcher.underWay(issueId) || await sessions.threadHolds(issueId) });
-  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay: new CommentRelay(linear, undefined, needsYou, route), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects });
+  }, restart: async (issueId, identifier) => restartOrThrow(await sessions.restartFor(issueId, identifier)), accountedFor: async (issueId) => launcher.underWay(issueId) || await sessions.threadHolds(issueId) });
+  // Stale `-running` and `-failed` labels are reconciled, and their tickets started again (README,
+  // "Repairing stale running and failed labels"); its records share projects.json with the projects.
+  const labelRepair = new LabelRepair({ linear, store: projectStore, launcher, intake, deletions, restart: (issueId, identifier, options) => sessions.restartFor(issueId, identifier, options) });
+  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay: new CommentRelay(linear, undefined, needsYou, route), afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, repairs: labelRepair });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
   const decisions = new DecisionLog();
@@ -399,6 +404,9 @@ export default function contribute(server: PluginServerContext) {
     const model = tierModel(current, input.provider.split("/")[0], setup.tier?.tier ?? null, { provider: input.provider, ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}) });
     const launch = { ...input, ...model, modeId: setup.modeId, instructions: [...setup.notes, input.instructions.trim()].filter(Boolean).join("\n\n") };
     const markInProgress = input.markInProgress && setup.policy !== "required";
+    // The owner's own start ends any label-repair incident of the ticket first (README, "Repairing
+    // stale running and failed labels"), so a failure of it is a new incident with fresh retries.
+    await labelRepair.ownerRetried(input.id);
     const result = await launcher.start(launch, paseo, { promptTemplate: template ?? undefined, markInProgress, linearAccess: agentLinearAccess, labels: setup.labels, env: setup.env });
     await recordStart(tiers, { id: input.id, identifier: setup.identifier }, setup.tier, result.agentId, model.provider);
     await openSession(input.id, input.id, result.agentId);

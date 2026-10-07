@@ -2,7 +2,7 @@ import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { dispatchLabels } from "./dispatch";
 import type { Launcher } from "./launch";
 import type { LinearService } from "./linear";
-import { LIVE_AGENT } from "./project-flow";
+import { LIVE_AGENT } from "./process-liveness";
 import { deliverToAgent } from "./relay";
 import { ResumeUnavailableError, type TicketStarter, type Started } from "./starter";
 import type { Settings } from "./settings";
@@ -197,6 +197,19 @@ export class ActivationIntake implements ActivationSink {
   // answer from the draining host is not one.
   async claimFor(issueId: string): Promise<Claim | null> {
     return (await this.claimsFile.load()).claims[issueId] ?? null;
+  }
+
+  // Whether an activation for the ticket waits here (queued or handed off, not done): a start for
+  // it is under way, so nothing else may start one. Throws when the queue is unreadable.
+  async pendingFor(issueId: string): Promise<boolean> {
+    return Object.values((await this.pendingFile.load()).entries).some((entry) => entry.envelope.issueId === issueId && entry.state !== "done");
+  }
+
+  // Whether this host knows which tickets the peer keeps: no peer is configured, or its first
+  // claims snapshot arrived (the handshake). Throws when the claims are unreadable.
+  async claimsReady(): Promise<boolean> {
+    const claims = await this.claimsFile.load();
+    return Boolean(claims.appliedAt) || !(await this.deps.settings.read()).activation.peer;
   }
 
   // Applies one claims snapshot. The comparison and the replacement are one change to the file,

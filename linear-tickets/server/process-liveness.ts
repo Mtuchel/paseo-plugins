@@ -3,6 +3,7 @@ import { readlink, realpath } from "node:fs/promises";
 import { basename, isAbsolute } from "node:path";
 import { promisify } from "node:util";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
+import { issueAgents } from "./starter";
 
 const exec = promisify(execFile);
 const MAX_PAGES = 100;
@@ -174,4 +175,25 @@ export async function ghostAgents(agents: ProcessAgent[], now: number, inspect: 
   } catch {
     return new Set();
   }
+}
+
+// Agent states that still work on the ticket. A closed agent (idle too long) or one in error never
+// submits a plan, or takes the next step, on its own; nor does a ghost, idle or running without a
+// process (see ghostAgents).
+export const LIVE_AGENT: Record<string, true> = { initializing: true, idle: true, running: true };
+
+// The ticket's root agents on this host, from every page, by what they do: `live` work on it (see
+// LIVE_AGENT, ghosts excluded), `ghosts` show live without a process, `stopped` are closed or in
+// error but still exist. Archived agents and subagents are not listed.
+export type TicketAgents = { live: PaseoAgent[]; ghosts: PaseoAgent[]; stopped: PaseoAgent[] };
+
+export async function classifyTicketAgents(paseo: PaseoApi, issueId: string, now: number, inspect?: ProcessInspector): Promise<TicketAgents> {
+  const roots = (await issueAgents(paseo, issueId)).filter((agent) => !agent.labels?.["paseo.parent-agent-id"]);
+  const candidates = roots.filter((agent) => LIVE_AGENT[agent.status]);
+  const ghostIds = candidates.length ? await ghostAgents(candidates, now, inspect) : new Set<string>();
+  return {
+    live: candidates.filter((agent) => !ghostIds.has(agent.id)),
+    ghosts: candidates.filter((agent) => ghostIds.has(agent.id)),
+    stopped: roots.filter((agent) => !LIVE_AGENT[agent.status]),
+  };
 }

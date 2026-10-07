@@ -25,6 +25,15 @@ type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess
 // A held per-ticket start gate (see Launcher.gate); `release` is idempotent.
 export type Gate = { release(): void };
 export const LEAD_INTRO = "Paseo started you because the pull request needs this now:";
+// A start that cannot succeed until the owner fixes this host's setup: no Paseo project mapped, no
+// provider chosen, no usable base branch, branches for a project without Git. Retrying it changes
+// nothing, so the label repair stops at the first one (README, "Repairing stale running and failed labels").
+export class SetupError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SetupError";
+  }
+}
 
 // Linear computes the branch name with the workspace's branch-format setting, so it is
 // the name users expect — but a stored value is not guaranteed to be a safe git ref.
@@ -161,10 +170,10 @@ export class Launcher {
     if (project.projectKind === "git" && !options.resume) {
       const available = await this.branches(project.projectRootPath);
       if (!input.baseBranch || !available.branches.some((branch) => branch.id === input.baseBranch)) {
-        throw new Error("Select an available base branch for this project.");
+        throw new SetupError("Select an available base branch for this project.");
       }
     } else if (input.baseBranch && project.projectKind !== "git") {
-      throw new Error("This project does not support Git branches.");
+      throw new SetupError("This project does not support Git branches.");
     }
     const detail = await this.linear.detail(input.id);
     this.canonicalIds.set(input.id, detail.issue.id);
