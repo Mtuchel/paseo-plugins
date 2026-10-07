@@ -132,10 +132,27 @@ type PlannerLimitRestart = { runId: string; requestId: string; agentId: string; 
 const RESTART_HISTORY_MS = 8 * 24 * 60 * 60_000;
 // Same opaque-identity grammar as the ops digest's planner_id: an entry it rejects is malformed here too.
 const RESTART_ID = /^[A-Za-z0-9_.@-]{1,256}$/;
-const RESTART_TIME = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/;
+const RESTART_TIME = /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(?:Z|([+-])(\d\d):(\d\d))$/;
 
 function restartId(value: unknown): boolean {
   return typeof value === "string" && RESTART_ID.test(value);
+}
+
+// The epoch ms of a confirmation time, or null where the ops digest's planner_time
+// (Python `datetime.fromisoformat`) rejects it: a real calendar date from year 1, hours
+// 0-23, minutes and seconds 0-59, an offset under 24 hours. `Date.parse` alone is laxer
+// (it rolls `T24:00` over to the next day), so both sides would disagree on what is malformed.
+function restartTime(value: string): number | null {
+  const match = RESTART_TIME.exec(value);
+  if (!match) return null;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  const offset = match[8] ? (match[8] === "-" ? -1 : 1) * (Number(match[9]) * 60 + Number(match[10])) : 0;
+  if (year < 1 || hour > 23 || minute > 59 || second > 59 || Math.abs(offset) >= 24 * 60) return null;
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  date.setUTCHours(hour, minute, second, Number((match[7] ?? "0").slice(0, 3).padEnd(3, "0")));
+  return date.getTime() - offset * 60_000;
 }
 
 function validRestartHistory(value: unknown): value is PlannerLimitRestart[] {
@@ -144,9 +161,7 @@ function validRestartHistory(value: unknown): value is PlannerLimitRestart[] {
     && "runId" in entry && restartId(entry.runId)
     && "requestId" in entry && restartId(entry.requestId)
     && "agentId" in entry && restartId(entry.agentId)
-    && "confirmedAt" in entry && typeof entry.confirmedAt === "string"
-    && RESTART_TIME.test(entry.confirmedAt)
-    && Number.isFinite(Date.parse(entry.confirmedAt))
+    && "confirmedAt" in entry && typeof entry.confirmedAt === "string" && restartTime(entry.confirmedAt) !== null
     && (!("failedAgentId" in entry) || restartId(entry.failedAgentId)));
 }
 
@@ -231,7 +246,7 @@ export class ProjectStore {
       const file = await this.raw();
       const next = change(file[projectId] as ProjectRecord | undefined);
       if (next) {
-        if (validRestartHistory(next.plannerLimitRestarts)) next.plannerLimitRestarts = next.plannerLimitRestarts.filter((entry) => Date.parse(entry.confirmedAt) >= this.now() - RESTART_HISTORY_MS);
+        if (validRestartHistory(next.plannerLimitRestarts)) next.plannerLimitRestarts = next.plannerLimitRestarts.filter((entry) => restartTime(entry.confirmedAt)! >= this.now() - RESTART_HISTORY_MS);
         await this.save({ ...file, [projectId]: next });
       }
       return next;

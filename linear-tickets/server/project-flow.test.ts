@@ -1473,7 +1473,9 @@ test("project updates expire restart evidence after eight days while preserving 
 });
 
 test("malformed restart reporting evidence cannot block Skip or erase the unreadable evidence", async (t) => {
-  for (const bad of [{}, [null], [{ runId: "old", requestId: "old", agentId: "old", confirmedAt: "invalid" }], [{ runId: "old", requestId: "req:1", agentId: "old", confirmedAt: "2020-01-01T00:00:00Z" }]]) {
+  for (const bad of [{}, [null], [{ runId: "old", requestId: "old", agentId: "old", confirmedAt: "invalid" }], [{ runId: "old", requestId: "req:1", agentId: "old", confirmedAt: "2020-01-01T00:00:00Z" }],
+    // Date.parse rolls this over to the next day; the digest's fromisoformat rejects it.
+    [{ runId: "old", requestId: "old", agentId: "old", confirmedAt: "2020-01-01T24:00:00Z" }]]) {
     const r = await room(t, [issue(1)]);
     await writeFile(r.path, JSON.stringify({ erp: { planned: [], planner: runRecord({ ownerAsked: true }), plannerLimitRestarts: bad } }));
     await r.flow.skipPlan("erp", settings, paseoWith(() => []));
