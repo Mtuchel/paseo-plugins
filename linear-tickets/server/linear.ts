@@ -294,14 +294,16 @@ export const REPAIR_CANDIDATES_QUERY = `query repairCandidates($first: Int!, $af
 }`;
 export type RepairCandidate = { id: string; identifier: string; status: string; statusType: string; projectId: string | null; labels: { id: string; name: string }[]; openChildren: boolean };
 
-export function repairCandidateFilter(labels: string[], teamKeys: string[], ids: string[]): Record<string, unknown> {
-  const labelled = {
+// Two reads, merged by id: Linear's `or` around this multi-field filter matched every ticket of
+// the team (1210 of TUC, 2026-10-07), so the record ids are read on their own.
+export function repairCandidateFilter(labels: string[], teamKeys: string[]): Record<string, unknown> {
+  return {
     labels: { some: { or: labels.map((name) => ({ name: { eqIgnoreCase: name } })) } },
     team: { key: { in: [...new Set(teamKeys)].sort() } },
     state: { type: { nin: ["completed", "canceled"] } },
   };
-  return ids.length ? { or: [labelled, { id: { in: [...new Set(ids)].sort() } }] } : labelled;
 }
+const REPAIR_IDS_BATCH = 50;
 
 // The current state, team, labels and attachment links of one ticket: enough for
 // write-back decisions without the comment pagination that `detail` performs.
@@ -894,24 +896,30 @@ export class LinearService {
   }
 
   async repairCandidates(input: { labels: string[]; teamKeys: string[]; ids: string[] }): Promise<RepairCandidate[]> {
-    if (!input.teamKeys.length && !input.ids.length) return [];
     const found = new Map<string, RepairCandidate>();
-    let after: string | null = null;
-    do {
-      const data = record(await this.read(REPAIR_CANDIDATES_QUERY, { first: 100, after, filter: repairCandidateFilter(input.labels, input.teamKeys, input.ids) }));
-      const page = record(data.issues ?? {});
-      for (const node of connection(page).nodes.map((item) => record(item))) {
-        const state = record(node.state ?? {});
-        const id = label(node.id);
-        if (id) found.set(id, {
-          id, identifier: label(node.identifier), status: label(state.name), statusType: label(state.type),
-          projectId: label(record(node.project ?? {}).id) || null, labels: labelNodes(node.labels),
-          openChildren: connection(node.children ?? { nodes: [] }).nodes.length > 0,
-        });
-      }
-      const info = record(page.pageInfo ?? {});
-      after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
-    } while (after);
+    const ids = [...new Set(input.ids)].sort();
+    const filters = [
+      ...input.teamKeys.length ? [repairCandidateFilter(input.labels, input.teamKeys)] : [],
+      ...Array.from({ length: Math.ceil(ids.length / REPAIR_IDS_BATCH) }, (_, index) => ({ id: { in: ids.slice(index * REPAIR_IDS_BATCH, (index + 1) * REPAIR_IDS_BATCH) } })),
+    ];
+    for (const filter of filters) {
+      let after: string | null = null;
+      do {
+        const data = record(await this.read(REPAIR_CANDIDATES_QUERY, { first: 100, after, filter }));
+        const page = record(data.issues ?? {});
+        for (const node of connection(page).nodes.map((item) => record(item))) {
+          const state = record(node.state ?? {});
+          const id = label(node.id);
+          if (id) found.set(id, {
+            id, identifier: label(node.identifier), status: label(state.name), statusType: label(state.type),
+            projectId: label(record(node.project ?? {}).id) || null, labels: labelNodes(node.labels),
+            openChildren: connection(node.children ?? { nodes: [] }).nodes.length > 0,
+          });
+        }
+        const info = record(page.pageInfo ?? {});
+        after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
+      } while (after);
+    }
     return [...found.values()];
   }
 

@@ -1058,7 +1058,44 @@ every 2 minutes.
   counting), with a new agent and thread, as for the planner, one ticket per poll. After three
   restarts without a live agent Paseo comments on the ticket and stops: start an agent from the
   sidebar, or add the `paseo` label. Kept under `stalled` in `projects.json`; a ticket drops out
-  once an agent works on it.
+  once an agent works on it. Tickets carrying `paseo-running` or `paseo-failed` are left to
+  **Repairing stale running and failed labels** below.
+- **Repairing stale running and failed labels.** `paseo-running` says an agent works on the
+  ticket and `paseo-failed` that its start failed; with another trigger label the names change
+  with it. Nothing else removes them when the agent is deleted in the app, lost with its host's
+  records or left without its process (a ghost, see **Ghost agents**), and a failed start would
+  wait for you even after a passing glitch. So every two minutes the host that hands out tickets
+  (never a draining host, and only once the peer's claims arrived) reads the open tickets of the
+  dispatch teams with either label and applies one rule: each label is reconciled with what is
+  true, and a replacement agent starts only for a proven orphan in a work state.
+  - *An agent works on the ticket* when this host has one that is live (no ghost) or stopped but
+    still there (closed or in error: crash recovery and the pull request watch handle it), the
+    peer host claims the ticket, an activation for it is queued, or a start is under way. Then
+    `paseo-running` stays, and `paseo-failed` comes off with a comment.
+  - *`paseo-running` without one for 15 minutes:* the label (and `paseo-failed`, if it carries
+    both) comes off under the ticket's start lock, after a last look, with one comment. A ticket
+    in Triage, Backlog, Todo, Planning or In Progress without `paseo-hold`, `paseo-manual` or
+    `paseo-needs-you` is started again, continuing its recorded branch, 15 minutes apart, at most
+    three times; then Paseo comments once and stops. Other tickets only lose the label: in Needs
+    input your answer starts the next agent, in review the pull request watch does.
+  - *`paseo-failed` without one,* in the same states and without those labels: started again 10
+    minutes after the failure was first seen, then 30 and 90 minutes after each failed retry. A
+    retry that starts an agent removes `paseo-failed` and says so; after the third failure you are
+    mentioned once and the label stays.
+  - *A start that fails on this host's setup* (no Paseo project mapped, no provider chosen, no
+    usable base branch, a project without Git) is not retried: the ticket gets `paseo-failed` and
+    you are mentioned once.
+  - At most one ticket is restarted per pass. Before each restart the ticket is read again: one that closed, got `paseo-hold`, moved to
+    Needs input or review, or got an agent, a claim or a queued activation meanwhile is not
+    started. Tickets carrying the trigger label (the dispatch has them), planner tickets, groups
+    and tickets being deleted are left alone.
+  - Each incident is kept under `~repairs` in `projects.json` with its last ten steps. A restart
+    and a comment are claimed there before they happen, so a reload never doubles one and never
+    resets the count; an interrupted restart counts once 15 minutes passed without an agent. An
+    agent that vanishes again within a day of the repair continues the same incident. The
+    hand-out and **Restarting a failed start** leave tickets with an open incident alone. Adding
+    the trigger label or starting an agent from the sidebar ends the incident: a later failure
+    starts with fresh retries.
 - **New tickets.** A ticket is planned once a planner listed it (by ticket, not by creation
   time), so a ticket filed while the planner is being filed, or moved into the project from
   another one, is new too. Tickets that leave the project's open tickets (closed, moved out) drop
@@ -1579,7 +1616,9 @@ mode and reasoning level, the default prompt, the In Progress setting and agent 
 Linear. A short comment on the ticket names the provider and project. If the ticket already
 has an active Paseo agent, no second one starts. When a launch cannot proceed — no mapping,
 no remembered provider, an unavailable project — the ticket gets `<label>-failed` and a
-comment saying why; fix the cause and add the trigger label again.
+comment saying why; fix the cause and add the trigger label again. Stale `<label>-running` and
+`<label>-failed` labels are repaired on their own (see **Repairing stale running and failed
+labels** under Projects).
 
 Paseo gives plugin code its daemon connection only inside RPCs and lifecycle hooks, so
 polling starts at the first of these after the plugin loads: opening the ticket surface,
