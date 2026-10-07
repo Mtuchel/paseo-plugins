@@ -13,8 +13,19 @@ on the Mac). Each run:
      "Decision candidates" tickets still wait for the owner's answer (TUC-748; a count only,
      never an attention item or notification);
   3. merges both into the state in ~/.paseo/ops-digest/state.json and saves it BEFORE
-     publishing, so a failed publish never loses an observed problem;
-  4. rewrites the Linear document "Ops digest" (project Agent tooling) with the owner's key;
+     publishing, so a failed publish never loses an observed problem. The same save holds this
+     run's history lines in the state's outbox (`historyOutbox`): one `run` line with every unit
+     read and its outcome, and one line per item (`opened`, `open`, `cleared`) with its kind,
+     unit, ticket, host and whether the owner had to step in (`owner`) or automation acted
+     (`auto`), never free text. Right after, they are appended to ~/.paseo/ops-digest/history.jsonl
+     (lines of an earlier month to history-YYYY-MM.jsonl; at a month change history.jsonl is
+     moved into its month's file) and leave the outbox only once written, so a failed append is
+     retried next run (at most 72 runs wait; older ones become one `gap` line). The weekly
+     review (linear-tickets `ops-review`) reads these files. Changing `item_kind()` starts new
+     kinds in the history: earlier lines keep the old wording;
+  4. rewrites the Linear document "Ops digest" (project Agent tooling) with the owner's key,
+     including the week's trend from ~/.paseo/ops-digest/trend.json (written by the weekly
+     review);
   5. inside the notification window (Mon-Fri 08:00-19:00 Europe/Berlin) posts one comment on
      the document as the Paseo app, mentioning the owner, listing the problems not delivered
      yet (also those that came and went overnight). Pending items are acknowledged only after
@@ -28,8 +39,11 @@ A source that cannot be read keeps its previous items ("not refreshed since"). R
 log text never reaches Linear: errors are reduced to categories, each line names the local
 command that shows the details.
 
-Flags: --print (render to stdout; publishes nothing, writes no state), --dry-run (log what
-would be published and notified, write no state), --at <ISO time> (pretend "now"; testing).
+Flags: --print (render to stdout; publishes nothing, writes no state or history), --dry-run (log
+what would be published and notified, write no state or history), --at <ISO time> (pretend
+"now"; testing), --backfill-history (one-off migration: writes history-backfill.jsonl from the
+items, pending and cleared entries in state.json, after copying state.json to
+state.json.bak-<date>-backfill; refuses when history-backfill.jsonl exists).
 """
 import fcntl
 import glob
@@ -69,6 +83,13 @@ REVIEWS = f"{HOME}/linear-tickets/plannotator/reviews.json"
 # `mirko@45.154.33.85`). Each runs this script with --agents-json; its agents keep their host
 # in `_host` so the digest names the right `paseo --host` command.
 REMOTES = f"{DIR}/remotes"
+TREND = f"{DIR}/trend.json"
+PR_WATCH = f"{HOME}/linear-tickets/pr-watch.json"
+CRASHES = f"{HOME}/linear-tickets/crash-recovery.json"
+PULL_URL = "https://github.com/tuchel-sohn/tuchel-platform/pull/{}"
+HISTORY = "history.jsonl"
+HISTORY_BACKFILL = "history-backfill.jsonl"
+HISTORY_OUTBOX_RUNS = 72  # runs kept for a later append; older ones become one gap line
 LINEAR = "https://api.linear.app/graphql"
 PROJECT_ID = "0f1ef7f6-a8d6-4fd5-bb7a-549344761229"  # Agent tooling
 TITLE = "Ops digest"
@@ -269,7 +290,8 @@ def decision_candidates(issues):
 
 def empty_state():
     return {"items": {}, "pending": {}, "cleared": [], "desktopNotified": None, "document": None,
-            "publishedAt": None, "notifyFailedAt": None, "ownerUrl": None, "decisionCandidates": None}
+            "publishedAt": None, "notifyFailedAt": None, "ownerUrl": None, "decisionCandidates": None,
+            "historyOutbox": []}
 
 
 def merge_decisions(state, decisions, now):
@@ -352,7 +374,47 @@ SECTION_TITLES = [("queue", "Merge queue"), ("pulls", "Pull requests open > 5 h"
                   ("deploys", "Deploys (staging, production)"), ("agents", "Agents")]
 
 
-def render(state, units, now, *, new_keys=(), agent_notes=None, notify_failed=False):
+NOT_ENOUGH_DATA = " _(not enough data)_"
+TREND_KINDS = 5
+
+
+def trend_lines(trend):
+    """The "## Trend" block from trend.json (written weekly by the review); None: not computed yet.
+    Raises on a malformed trend, so load_trend() can reject it before rendering."""
+    if trend is None:
+        return ["## Trend", "", "- Trend: not computed yet", ""]
+
+    def num(value, fmt="{}"):
+        return "unknown" if value is None else fmt.format(value)
+
+    def mark(entry):
+        return "" if entry.get("complete") else NOT_ENOUGH_DATA
+
+    def owner(h):
+        return (f"{num(h.get('ownerPerMergedPr'), '{:.2f}')} ({num(h.get('ownerTrue'))} of "
+                f"{num(h.get('mergedPrs'))} merged PRs){mark(h)}")
+
+    def share(h):
+        value = h.get("shareClearedWithoutOwner")
+        return (f"{num(None if value is None else round(value * 100), '{} %')} ({num(h.get('clearedWithoutOwner'))} of "
+                f"{num(h.get('clearedKnownOwner'))} with known owner, {num(h.get('clearedUnknownOwner'))} unknown){mark(h)}")
+
+    def median(h):
+        return f"{num(h.get('medianHoursToClear'), '{:.1f} h')}{mark(h)}"
+
+    this, last = trend["headline"]["this"], trend["headline"]["last"]
+    out = [f"## Trend (week to {local(parse_iso(trend['window']['this']['to']), '%d.%m.%Y')})", "",
+           f"- Problems that needed you per merged PR (observed owner involvement): {owner(this)} — last week {owner(last)}",
+           f"- Share of problems cleared without you: {share(this)} — last week {share(last)}",
+           f"- Median time to clear: {median(this)} — last week {median(last)}",
+           "- Top kinds this week vs last week:"]
+    out += [f"  - {k['kind']}: {num(k.get('thisWeek'))} vs {num(k.get('lastWeek'))}{mark(k)}"
+            for k in (trend.get("kinds") or [])[:TREND_KINDS]] or ["  - none"]
+    out.append("")
+    return out
+
+
+def render(state, units, now, *, new_keys=(), agent_notes=None, notify_failed=False, trend=None):
     agent_notes = agent_notes or {}
     entries = state["items"]
 
@@ -413,6 +475,7 @@ def render(state, units, now, *, new_keys=(), agent_notes=None, notify_failed=Fa
     else:
         out.append("- Decision candidates waiting: not read yet")
     out.append("")
+    out += trend_lines(trend)
     if state.get("cleared"):
         out += ["## Cleared since last update", ""]
         out += [line(e["payload"]) for e in state["cleared"]]
@@ -431,12 +494,15 @@ NOTIFY_MAX_CHARS = 20000  # hard cap: a too-large comment fails, and then pendin
 
 
 def item_kind(payload):
-    """A coarse kind for summing items up: the section plus the detail with numbers, PR
-    references and parenthesised specifics removed."""
+    """A coarse kind for summing items up and for the history: the section plus the detail with
+    parenthesised specifics (nested ones too) removed, PR references as `#N` and every other
+    number as `N`. Changing it starts new kinds in the history (earlier lines keep theirs)."""
     detail = str(payload.get("detail") or "")
-    detail = re.sub(r"\([^)]*\)", "", detail)
+    while re.search(r"\([^()]*\)", detail):
+        detail = re.sub(r"\([^()]*\)", "", detail)
+    detail = detail.replace("(", "").replace(")", "")
     detail = re.sub(r"#\d+", "#N", detail)
-    detail = re.sub(r"\d+ (h|min)\b", r"N \1", detail)
+    detail = re.sub(r"\d+", "N", detail)
     detail = re.sub(r"\s+", " ", detail).strip(" ,;")
     return f"{payload.get('section')}: {detail[:90]}"
 
@@ -488,6 +554,133 @@ def notification_body(state, owner_url, doc_url, now):
 
 def pending_signature(state):
     return ",".join(sorted(state["pending"]))
+
+
+# ---------------------------------------------------------------------------- history (pure)
+
+PULL_KEY = re.compile(r"pr:(\d+):")
+AGENT_KEY = re.compile(r"agent-(?:error|silent|waiting):([^:]+)")
+
+
+def item_host(payload, host):
+    """The host an item belongs to: the part of its unit after the first `@` (another host's
+    agents), `host` (this one) for its own agents, None for repository items."""
+    unit = str(payload.get("unit") or "")
+    if "@" in unit:
+        return unit.split("@", 1)[1]
+    return host if payload.get("section") == "agents" else None
+
+
+def item_evidence(key, payload, at, host, evidence):
+    """(owner, auto) as observed at this run. owner: the item waits on the owner, or its pull
+    request watch / crash record escalated to the owner. auto: the watch nudged, handled a drop
+    or ran a queue action, or the agent was restarted. None: unknown (another host's item, an
+    unreadable record file, a kind without a record). Only these two flags leave the records."""
+    waiting = True if payload.get("group") == "waiting" else None
+    pull, agent = PULL_KEY.match(key), AGENT_KEY.match(key)
+    if (at is not None and at != host) or not (pull or agent):
+        return waiting, None
+    records = evidence.get("prWatch") if pull else evidence.get("crashes")
+    if records is None:
+        return waiting, None
+    record = records.get(PULL_URL.format(pull.group(1)) if pull else agent.group(1))
+    record = record if isinstance(record, dict) else {}
+    owner = waiting or bool(record.get("escalated"))
+    if pull:
+        nudges = record.get("nudges")
+        auto = (isinstance(nudges, dict) and any(isinstance(v, list) and v for v in nudges.values())
+                or bool(record.get("drops")) or bool(record.get("actions")))
+    else:
+        restarts = record.get("restarts")
+        auto = isinstance(restarts, (int, float)) and restarts > 0
+    return owner, bool(auto)
+
+
+def item_line(event, key, payload, first_seen, t, at, *, stale, owner, auto):
+    """One item's history line: fixed fields only, never title, detail, command or other text."""
+    return {"t": iso(t), "event": event, "key": key, "kind": item_kind(payload), "unit": payload.get("unit"),
+            "first": iso(first_seen), "attention": bool(payload.get("attention")), "section": payload.get("section"),
+            "group": payload.get("group"), "ticket": payload.get("ticket"), "host": at, "stale": bool(stale),
+            "owner": owner, "auto": auto}
+
+
+def hosts_read(units, host):
+    """`host` and every other host whose agents were read this run; [] when the agents were not."""
+    if not any(u["unit"] == "agents" and u.get("ok") for u in units):
+        return []
+    return [host] + [u["unit"].split("@", 1)[1] for u in units if u["unit"].startswith("agents@") and u.get("ok")]
+
+
+def history_events(previous_items, merged, units, now, *, host, read_hosts, evidence):
+    """This run's history lines: first the `run` line (every unit read and whether it was, plus
+    `pulls/<n>` for each pull request with a fresh item), then per item sorted by key `opened`
+    (new), `open` (still there; `stale` when its unit failed) or `cleared` (gone).
+    `evidence` = {"prWatch": dict|None, "crashes": dict|None} as read at this run."""
+    outcome = {}
+    for u in units:
+        outcome[u["unit"]] = outcome.get(u["unit"], True) and bool(u.get("ok"))
+    items = merged["items"]
+    for entry in items.values():
+        unit = str(entry["payload"].get("unit") or "")
+        if unit.startswith("pulls/") and not entry.get("stale"):
+            outcome.setdefault(unit, True)
+    lines = [{"t": iso(now), "event": "run", "host": host, "units": outcome, "hosts": sorted(read_hosts),
+              "items": len(items)}]
+    for key in sorted(set(items) | set(previous_items)):
+        if key in items:
+            entry, event, stale = items[key], "open" if key in previous_items else "opened", items[key].get("stale")
+        else:
+            entry, event, stale = previous_items[key], "cleared", False
+        payload = entry["payload"]
+        at = item_host(payload, host)
+        owner, auto = item_evidence(key, payload, at, host, evidence)
+        lines.append(item_line(event, key, payload, entry["firstSeen"], now, at, stale=stale, owner=owner, auto=auto))
+    return lines
+
+
+def run_time(run):
+    return next((line_["t"] for line_ in run if line_.get("event") == "run"), run[0]["t"])
+
+
+def cap_outbox(outbox, limit=HISTORY_OUTBOX_RUNS):
+    """At most `limit` runs wait for an append. Older ones are dropped and named by one `gap`
+    run first; a gap already there keeps its start and moves its end."""
+    gap = outbox[0] if outbox and outbox[0][0].get("event") == "gap" else None
+    runs = outbox[1:] if gap else outbox
+    if len(runs) <= limit:
+        return outbox
+    dropped, runs = runs[:-limit], runs[-limit:]
+    if gap:
+        gap = [{**gap[0], "to": run_time(dropped[-1])}]
+    else:
+        gap = [{"t": dropped[0][0]["t"], "event": "gap", "from": run_time(dropped[0]), "to": run_time(dropped[-1])}]
+    return [gap] + runs
+
+
+def backfill_events(state, host):
+    """History lines rebuilt from a state (one-off migration): one `opened` line per distinct
+    (key, firstSeen) of its items, cleared entries and pending items, and its `cleared` line
+    when the clearing time is known. Owner and automation are unknown then."""
+    found = {}
+    sources = [(k, e.get("payload"), e.get("firstSeen"), None) for k, e in (state.get("items") or {}).items()]
+    sources += [((e.get("payload") or {}).get("key"), e.get("payload"), e.get("firstSeen"), e.get("clearedAt"))
+                for e in state.get("cleared") or []]
+    sources += [(k, e.get("payload"), e.get("firstSeen"), e.get("clearedAt"))
+                for k, e in (state.get("pending") or {}).items()]
+    for key, payload, first, cleared in sources:
+        if not key or not payload or first is None:
+            continue
+        entry = found.setdefault((key, first), [payload, None])
+        if entry[1] is None:
+            entry[1] = cleared
+    lines = []
+    for (key, first), (payload, cleared) in found.items():
+        at = item_host(payload, host)
+        for event, t in [("opened", first)] + ([("cleared", cleared)] if cleared is not None else []):
+            lines.append({**item_line(event, key, payload, first, t, at, stale=False, owner=None, auto=None),
+                          "src": "backfill"})
+    lines.sort(key=lambda line_: (line_["t"], line_["key"]))
+    return lines
 
 
 # ---------------------------------------------------------------------------- side effects
@@ -547,20 +740,26 @@ class HostIO:
         self.sync_repo = sync_repo
         self._key = None
         self._remotes = None if remotes else []
+        self._targets = None if remotes else []
         self._unreachable = {}
+
+    def remote_targets(self):
+        """The SSH targets of the other hosts in REMOTES (read once per run)."""
+        if self._targets is None:
+            try:
+                with open(REMOTES) as f:
+                    self._targets = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+            except OSError:
+                self._targets = []
+        return list(self._targets)
 
     def remotes(self):
         """Agent snapshots of the other hosts (read once per run). A host that cannot be read
         (the Mac asleep or offline) is skipped and named by unreachable_hosts(): only its own
         items are kept stale, the other hosts' items still refresh."""
         if self._remotes is None:
-            try:
-                with open(REMOTES) as f:
-                    targets = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-            except OSError:
-                targets = []
             self._remotes = []
-            for target in targets:
+            for target in self.remote_targets():
                 try:
                     out = run_cmd(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", target,
                                    "bash -lc 'python3 .paseo/bin/paseo-ops-digest.py --agents-json'"])
@@ -577,6 +776,19 @@ class HostIO:
         """{ssh target: error category} of remotes that could not be read this run."""
         self.remotes()
         return dict(self._unreachable)
+
+    def evidence(self):
+        """The pull request watch and crash recovery records of the linear-tickets plugin, as
+        they are now (each None when unreadable); history lines keep only owner/auto flags."""
+        found = {}
+        for name, path in (("prWatch", PR_WATCH), ("crashes", CRASHES)):
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                data = None
+            found[name] = data if isinstance(data, dict) else None
+        return found
 
     def snapshot(self):
         """This host's agent data for another host's digest (--agents-json)."""
@@ -778,15 +990,196 @@ def save_state(state, path):
     os.replace(tmp, path)
 
 
+def load_trend(path):
+    """trend.json as the weekly review wrote it; None when missing, unreadable or malformed."""
+    try:
+        with open(path) as f:
+            trend = json.load(f)
+        trend_lines(trend)  # a trend that cannot be rendered counts as unreadable
+        return trend
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        log(f"WARN trend.json unreadable ({error_category(exc)})")
+        return None
+
+
+# ---------------------------------------------------------------------------- history files
+
+def utc_month(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m")
+
+
+def encode_line(line_):
+    return (json.dumps(line_, separators=(",", ":"), sort_keys=True) + "\n").encode()
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def read_back(f, size, n):
+    """The last n bytes (all when the file is smaller) of the binary file f of `size` bytes."""
+    start = max(0, size - n)
+    f.seek(start)
+    return f.read(size - start)
+
+
+def written_already(f, size, encoded):
+    """How many of the lines `encoded` (in order, from the first) the file already ends with:
+    an append that went through while its outbox was not emptied afterwards."""
+    if not size or not encoded:
+        return 0
+    tail = read_back(f, size, sum(map(len, encoded)) + 1)
+    whole = len(tail) == size
+    last_start = tail.rfind(b"\n", 0, len(tail) - 1) + 1
+    if last_start == 0 and not whole:
+        return 0  # the file's last line is longer than everything to write
+    last = tail[last_start:]
+    for k in range(len(encoded), 0, -1):
+        if encoded[k - 1] != last:
+            continue
+        joined = b"".join(encoded[:k])
+        before = len(tail) - len(joined)
+        if tail.endswith(joined) and (tail[before - 1:before] == b"\n" if before > 0 else whole):
+            return k
+    return 0
+
+
+def append_history(path, encoded):
+    """Appends the encoded lines exactly once, fsynced. A torn last line (an interrupted append;
+    its record is still in the outbox) is cut off first; lines the file already ends with are
+    not written again."""
+    with open(path, "a+b") as f:
+        size = f.seek(0, os.SEEK_END)
+        if size and read_back(f, size, 1) != b"\n":
+            end = size
+            while end > 0:
+                start = max(0, end - 65536)
+                f.seek(start)
+                found = f.read(end - start).rfind(b"\n")
+                if found >= 0:
+                    end = start + found + 1
+                    break
+                end = start
+            f.truncate(end)
+            size = end
+        f.write(b"".join(encoded[written_already(f, size, encoded):]))
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def rotate_history(history_dir, month):
+    """When history.jsonl starts before `month`, each of its lines is appended to the file of its
+    own month (history-YYYY-MM.jsonl, never overwritten); history.jsonl is removed only after
+    that. A torn last line is left out: its record is still in the outbox."""
+    path = os.path.join(history_dir, HISTORY)
+    try:
+        with open(path, "rb") as f:
+            raw = f.read().split(b"\n")[:-1]
+    except FileNotFoundError:
+        return
+    months = []
+    for r in raw:
+        try:
+            months.append(str(json.loads(r)["t"])[:7])
+        except (ValueError, KeyError, TypeError):
+            months.append(months[-1] if months else None)  # stays with the line before it
+    known = next((m for m in months if m), None)
+    if known is None or known >= month:
+        return
+    targets = {}
+    for r, m in zip(raw, months):
+        targets.setdefault(m or known, []).append(r + b"\n")
+    for m, encoded in targets.items():
+        append_history(os.path.join(history_dir, f"history-{m}.jsonl"), encoded)
+    os.remove(path)
+    fsync_dir(history_dir)
+
+
+def flush_history(state, history_dir, now):
+    """Appends every outbox line to its month's history file (history.jsonl for the month of
+    `now`, history-YYYY-MM.jsonl for earlier ones), then empties the outbox. Raises when a
+    file cannot be written; the outbox is then kept for the next run."""
+    outbox = state.get("historyOutbox") or []
+    if not outbox:
+        return
+    month = utc_month(now)
+    os.makedirs(history_dir, exist_ok=True)
+    rotate_history(history_dir, month)
+    targets = {}
+    for run_ in outbox:
+        for line_ in run_:
+            m = str(line_["t"])[:7]
+            name = HISTORY if m == month else f"history-{m}.jsonl"
+            targets.setdefault(os.path.join(history_dir, name), []).append(encode_line(line_))
+    for path, encoded in targets.items():
+        append_history(path, encoded)
+    fsync_dir(history_dir)
+    state["historyOutbox"] = []
+
+
+def backfill_history(state_path, history_dir, lock_path, now):
+    """One-off migration (--backfill-history): history-backfill.jsonl from the state's items,
+    pending and cleared entries, after copying state.json to state.json.bak-<date>-backfill.
+    state.json is never written. Returns an exit code (75: the lock is held, 1: refused)."""
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    lock = open(lock_path, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("ops digest: another run holds the lock; try again in a minute", file=sys.stderr)
+        lock.close()
+        return 75
+    try:
+        target = os.path.join(history_dir, HISTORY_BACKFILL)
+        if os.path.exists(target):
+            print(f"ops digest: {target} exists; the backfill ran already", file=sys.stderr)
+            return 1
+        try:
+            with open(state_path) as f:
+                state = json.load(f)
+        except (OSError, ValueError) as exc:
+            print(f"ops digest: {state_path} not readable ({error_category(exc)})", file=sys.stderr)
+            return 1
+        shutil.copy2(state_path, f"{state_path}.bak-{datetime.fromtimestamp(now, timezone.utc):%Y%m%d}-backfill")
+        lines = backfill_events(state, HOST_NAME)
+        os.makedirs(history_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=history_dir, prefix=".history-backfill-")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(b"".join(encode_line(line_) for line_ in lines))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+        fsync_dir(history_dir)
+        print(f"ops digest: wrote {len(lines)} lines to {target}")
+        return 0
+    finally:
+        lock.close()
+
+
 # ---------------------------------------------------------------------------- one run
 
 def collect(io, now, started):
-    """All items and unit outcomes of one run."""
+    """All items and unit outcomes of one run. Every unit attempted is listed, read or not (the
+    history's run line counts on it)."""
     items, units = [], []
     try:
         digest = io.repo_digest()
         items += digest["items"]
         units += digest["units"]
+        units.append({"unit": "repo", "ok": True})
     except Exception as exc:
         units.append({"unit": "repo", "ok": False, "category": error_category(exc)})
     agents, metas = [], {}
@@ -801,6 +1194,9 @@ def collect(io, now, started):
         units.append({"unit": "agents", "ok": False, "category": error_category(exc)})
         units.append({"unit": "silent", "ok": False, "category": "agents not read"})
         units.append({"unit": "locks", "ok": False, "category": "agents not read"})
+        for target in io.remote_targets():
+            units.append({"unit": f"agents@{target}", "ok": False, "category": "agents not read"})
+            units.append({"unit": f"silent@{target}", "ok": False, "category": "agents not read"})
         agents_ok = False
     teams = None
     if agents_ok:
@@ -817,10 +1213,15 @@ def collect(io, now, started):
             units.append({"unit": "silent", "ok": False, "category": error_category(exc)})
         items += agent_items(agents, metas, now=now, error_lines=error_lines, permissions=permissions,
                              open_reviews=reviews, teams=teams or {"TUC"}, ticket_states=states)
+        silent = units[-1]
         down = io.unreachable_hosts()
         for host, category in sorted(down.items()):
             units.append({"unit": f"agents@{host}", "ok": False, "category": category})
             units.append({"unit": f"silent@{host}", "ok": False, "category": category})
+        for target in io.remote_targets():
+            if target not in down:
+                units.append({"unit": f"agents@{target}", "ok": True})
+                units.append({**silent, "unit": f"silent@{target}"})
         try:
             if teams is None:
                 raise LinearError("teams not read")
@@ -862,8 +1263,10 @@ def dispatch_quarantine(io):
         log(f"WARN {QUARANTINE_WORKFLOW} not dispatched ({error_category(exc)})")
 
 
-def run(io, *, now, mode="publish", state_path=STATE, lock_path=LOCK, started=None):
-    """One digest run. mode: publish | print | dry-run. Returns an exit code."""
+def run(io, *, now, mode="publish", state_path=STATE, lock_path=LOCK, started=None, history_dir=DIR,
+        trend_path=TREND):
+    """One digest run. mode: publish | print | dry-run. Returns an exit code. Only publish
+    writes history (into `history_dir`); `trend_path` is the weekly review's trend.json."""
     started = started if started is not None else time.monotonic()
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     lock = open(lock_path, "w")
@@ -884,7 +1287,7 @@ def run(io, *, now, mode="publish", state_path=STATE, lock_path=LOCK, started=No
         merged, new_keys = merge_run(state, items, failed, now)
         merged = merge_decisions(merged, decisions, now)
         content = render(merged, units, now, new_keys=new_keys, agent_notes=agent_notes,
-                         notify_failed=bool(merged.get("notifyFailedAt")))
+                         notify_failed=bool(merged.get("notifyFailedAt")), trend=load_trend(trend_path))
         if mode == "print":
             print(content)
             return 0
@@ -892,7 +1295,16 @@ def run(io, *, now, mode="publish", state_path=STATE, lock_path=LOCK, started=No
             log(f"DRY RUN: {len(merged['items'])} items, {len(new_keys)} new, {len(merged['pending'])} pending, "
                 f"window={'open' if in_window(now) else 'closed'}, failed units={sorted(failed)}")
             return 0
+        # This run's history lines wait in the outbox, saved with the observations, until written.
+        events = history_events(state["items"], merged, units, now, host=HOST_NAME,
+                                read_hosts=hosts_read(units, HOST_NAME), evidence=io.evidence())
+        merged["historyOutbox"] = cap_outbox(list(merged.get("historyOutbox") or []) + [events])
         save_state(merged, state_path)  # observations are durable before anything is published
+        try:
+            flush_history(merged, history_dir, now)
+            save_state(merged, state_path)
+        except Exception as exc:
+            log(f"WARN history not written ({error_category(exc)})")  # the outbox keeps it for the next run
         try:
             merged["document"] = io.publish(merged.get("document"), content)
             merged["publishedAt"] = now
@@ -935,10 +1347,12 @@ def main(argv):
         # Read by another host's digest (REMOTES): this host's agents only, nothing published.
         print(json.dumps(HostIO(sync_repo=False, remotes=False).snapshot()))
         return 0
-    mode = "print" if "--print" in argv else "dry-run" if "--dry-run" in argv else "publish"
     now = time.time()
     if "--at" in argv:
         now = parse_iso(argv[argv.index("--at") + 1])
+    if "--backfill-history" in argv:
+        return backfill_history(STATE, DIR, LOCK, now)
+    mode = "print" if "--print" in argv else "dry-run" if "--dry-run" in argv else "publish"
     # Only the scheduled run moves the digest worktree to the latest origin/main.
     return run(HostIO(sync_repo=mode == "publish"), now=now, mode=mode)
 
