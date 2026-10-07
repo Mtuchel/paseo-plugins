@@ -45,7 +45,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   // Linear writes that fail (`update`: the next n project updates; one relation refused or never
   // reaching Linear); `start`: how a planner start fails (`setup`: a SetupError, `always`: a
   // timeout); `restart`: every stalled-ticket restart. `starts`: every planner start, in order.
-  const fail: { update?: number; relation?: string; unreached?: string; restart?: boolean; start?: "setup" | "always" } = {};
+  const fail: { update?: number; relation?: string; unreached?: string; restart?: boolean; start?: "setup" | "always"; startError?: string } = {};
   const starts: PlannerStart[] = [];
   const comments: string[] = [];
   const updates: string[] = [];
@@ -106,6 +106,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
       starting = true;
       await gate;
       if (fail.start === "always") throw new Error("Agent creation could not be confirmed (Timed out waiting for OMP to become ready).");
+      if (fail.startError) throw new Error(fail.startError);
       created++;
       return { agentId: `run-agent-${created}` };
     },
@@ -339,6 +340,27 @@ test("a start that keeps failing counts like a restart and reaches the owner the
   assert.equal(r.starts.length, 3, "three starts: the cap");
   assert.deepEqual(await poll(60), []);
   assert.equal((await r.store.all()).erp.planner?.ownerAsked, true);
+});
+
+test("a planner startup usage limit waits through the reset window without ordinary retries", async (t) => {
+  const r = await room(t, [issue(1)]);
+  const paseo = paseoWith(() => []);
+  r.fail.startError = "usage limit retry-after: 18000 model=anthropic/claude-opus-5-5";
+  await r.flow.planNow("erp", settings, paseo).catch(() => {});
+  const runId = (await r.store.all()).erp.planner!.id;
+  for (let poll = 0; poll < 12; poll++) {
+    r.advance(10 * MINUTE);
+    await r.flow.tick(paseo, settings);
+  }
+  assert.equal(r.starts.length, 1, "the provider is unavailable, not twelve new restart opportunities");
+  assert.equal((await r.store.all()).erp.planner?.restarts, 0);
+  assert.equal((await r.store.all()).erp.planner?.ownerAsked, undefined);
+  r.fail.startError = undefined;
+  r.advance(185 * MINUTE);
+  await r.flow.tick(paseo, settings);
+  assert.equal(r.starts.length, 2);
+  assert.equal(r.starts[1].runId, runId);
+  assert.notEqual(r.starts[1].requestId, r.starts[0].requestId);
 });
 
 test("a run agent that shows running without its process is started again (2026-10-05: a daemon crash left TUC-949's agent so)", async (t) => {
