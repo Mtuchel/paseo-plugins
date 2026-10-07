@@ -2,6 +2,8 @@
 // by `node`, so it is plain dependency-free ESM; it must not contain backticks or "${".
 export const TICKET_MCP_SOURCE = String.raw`
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { request } from "node:http";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -25,8 +27,8 @@ if (!readOnly && (!issueId || !/^[A-Za-z0-9-]{1,100}$/.test(issueId))) {
   process.stderr.write("linear-ticket MCP: --issue <id> must be 1 to 100 characters of letters, digits or dashes\n");
   process.exit(2);
 }
-const override = process.env.LINEAR_TICKET_MCP_ENDPOINT;
-const endpoint = override && /^http:\/\/127\.0\.0\.1:\d+\//.test(override) ? override : "https://api.linear.app/graphql";
+const socketPath = join(paseoHome, "linear-tickets", "linear-broker.sock");
+const toolContext = new AsyncLocalStorage();
 // Closing a ticket without its work needs a reason, posted on the ticket before the move.
 const REASON_TYPES = ["canceled", "duplicate"];
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -63,19 +65,32 @@ async function appToken() {
 }
 
 async function post(authorization, query, variables) {
-  let response;
-  try {
-    response = await fetch(endpoint, {
-      method: "POST", redirect: "error",
-      headers: { authorization, "content-type": "application/json" },
-      body: JSON.stringify({ query, variables }),
-      signal: AbortSignal.timeout(30000),
+  const reply = await new Promise((resolve, reject) => {
+    let connected = false;
+    const client = request({ socketPath, path: "/graphql", method: "POST" }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { body += chunk; });
+      response.on("error", () => reject(new Error("The Linear request may have completed; check the ticket before retrying a write.")));
+      response.on("end", () => {
+        try { resolve(JSON.parse(body)); }
+        catch { reject(new Error("The Linear request may have completed; check the ticket before retrying a write.")); }
+      });
     });
-  } catch { throw new Error("Could not reach the Linear API."); }
-  let payload = null;
-  try { payload = await response.json(); } catch {}
+    client.on("socket", (socket) => {
+      if (!socket.connecting) connected = true;
+      socket.once("connect", () => { connected = true; });
+    });
+    client.on("error", () => reject(new Error(connected
+      ? "The Linear request may have completed; check the ticket before retrying a write."
+      : "The host's Linear budget service is unavailable; no request was sent. Retry after the plugin is running.")));
+    client.setTimeout(35000, () => client.destroy());
+    client.end(JSON.stringify({ authorization, query, variables, tool: toolContext.getStore() }));
+  });
+  if (reply.kind !== "answer") throw new Error(reply.message || "The host's Linear budget service is unavailable; no request was sent. Retry after the plugin is running.");
+  const payload = reply.payload;
   const codes = payload && Array.isArray(payload.errors) ? payload.errors.map((e) => e && e.extensions && e.extensions.code) : [];
-  return { status: response.status, ok: response.ok, payload, codes };
+  return { status: reply.status, ok: reply.status >= 200 && reply.status < 300, payload, codes };
 }
 
 // Linear did not accept the credential, so it ran nothing.
@@ -529,7 +544,7 @@ async function handle(message) {
     if (inFlight >= MAX_IN_FLIGHT) return reply({ content: [{ type: "text", text: "Too many Linear calls at once; retry when the others finish." }], isError: true });
     inFlight++;
     try {
-      const result = await tool.run((params && params.arguments) || {});
+      const result = await toolContext.run(tool.name, () => tool.run((params && params.arguments) || {}));
       return reply({ content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
     } catch (error) {
       return reply({ content: [{ type: "text", text: error instanceof Error ? error.message : "The Linear request failed." }], isError: true });

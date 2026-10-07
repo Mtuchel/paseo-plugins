@@ -41,7 +41,8 @@ test("both reserves use the lower dimension, while unknown points do not restric
   assert.throws(() => budget.acquire("app", "background"), (error: unknown) => error instanceof RateLimitedError && error.reason === "reserve" && error.resumeAt === until);
   budget.acquire("app", "interactive").done(null, false);
   budget.acquire("app", "owner").done(null, false);
-  time.now = until;
+  assert.throws(() => budget.acquire("app", "background"), RateLimitedError);
+  time.now = budget.pausedUntil("app", "background")!;
   budget.acquire("app", "background").done(null, false);
   budget.acquire("key").done(headers(5000, 4500), false);
   budget.acquire("key", "background").done(null, false);
@@ -103,18 +104,15 @@ test("backoff precedes owner probe; lower tiers cannot steal it; network failure
   budget.acquire("app", "background").done(null, false);
 });
 
-test("missing dimension headers preserve the sample; EWMA estimates complexity in flight", () => {
-  const { time, budget } = clock();
-  const response = points(1_000_000);
-  response.set("x-complexity", "1000");
-  budget.acquire("app").done(response, false);
-  assert.equal(budget.averagePoints("app"), 280);
-  const ticket = budget.acquire("app");
-  assert.equal(budget.estimate("app", "points"), 1_000_000 - 280);
+test("a missing complexity header keeps a pessimistic debit rather than admitting another agent", () => {
+  const { budget } = clock();
+  budget.acquire("app").done(points(120_000), false);
+  const ticket = budget.acquire("app", "interactive", "mcp:get_issue", "ticket", { points: 10_000 });
   ticket.done(headers(5000, 4400), false);
-  assert.equal(budget.estimate("app", "points"), 1_000_000);
-  time.now += HOUR;
-  assert.equal(budget.estimate("app", "points"), 2_000_000);
+  assert.equal(budget.estimate("app", "points"), 110_000);
+  const second = budget.acquire("app", "interactive", "mcp:get_issue", "ticket", { points: 10_000 });
+  assert.throws(() => budget.acquire("app", "interactive", "mcp:get_issue", "ticket", { points: 10_000 }), RateLimitedError);
+  second.done(null, false);
 });
 
 test("a headerless refusal preserves the minute floor and doubles limited probes", () => {
@@ -152,6 +150,42 @@ test("concurrent already-sent refusals do not count as successively limited prob
   assert.equal(budget.blockedUntil("app"), time.now + 60_000);
 });
 
+
+test("changing daemon costs and reversed headers cannot resize captured MCP reservations", () => {
+  const { budget } = clock();
+  budget.acquire("app").done(points(130_100), false);
+  const a = budget.acquire("app", "interactive", "mcp:get_issue", "ticket", { points: 10_000 });
+  const b = budget.acquire("app", "interactive", "mcp:get_issue", "ticket", { points: 10_000 });
+  const daemon = budget.acquire("app", "owner");
+  const lower = points(108_000);
+  lower.set("x-complexity", "2000");
+  b.done(lower, false);
+  assert.ok(budget.estimate("app", "points") <= 97_900);
+  const stale = points(128_000);
+  stale.set("x-complexity", "2000");
+  a.done(stale, false);
+  assert.ok(budget.estimate("app", "points") <= 105_900);
+  assert.throws(() => budget.acquire("app", "interactive", "mcp:get_issue", "ticket", { points: 10_000 }), RateLimitedError);
+  daemon.done(null, false);
+});
+
+test("unsent cancellation releases its captured cost without counting traffic; settlement is idempotent", () => {
+  const now = () => 1_000_000;
+  const usage = new LinearUsage(now);
+  const budget = new RateBudget(now, usage);
+  budget.acquire("key", "owner").done(points(110_000), false);
+  const before = usage.snapshot();
+  const reserved = budget.acquire("key", "interactive", "mcp:add_comment", "comment", { points: 10_000, deferred: true });
+  reserved.cancel(); reserved.cancel(); reserved.done(null, false); reserved.start();
+  assert.deepEqual(usage.snapshot(), before);
+  assert.equal(budget.estimate("key", "points"), 110_000);
+  const sent = budget.acquire("key", "interactive", "mcp:add_comment", "comment", { points: 10_000, deferred: true });
+  sent.start(); sent.start(); sent.cancel(); sent.done(null, false, "uncertain"); sent.done(null, false, "uncertain");
+  assert.equal(usage.snapshot().rows.find((row) => row.caller === "mcp:add_comment")!.requests, 1);
+  assert.equal(budget.estimate("key", "points"), 100_000);
+  budget.acquire("key", "owner").done(points(110_000), false);
+  assert.equal(budget.estimate("key", "points"), 100_000);
+});
 function githubHeaders(remaining: number, resetAt: number, resource = "core"): Map<string, string> {
   return new Map([["x-ratelimit-limit", "5000"], ["x-ratelimit-remaining", String(remaining)], ["x-ratelimit-reset", String(resetAt / 1000)], ["x-ratelimit-resource", resource]]);
 }

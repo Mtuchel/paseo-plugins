@@ -402,7 +402,9 @@ export const setCapacityRpc = defineRpc({
   output: capacityStateSchema,
 });
 
-// Daemon-only Linear traffic; credential-wide headers also include other hosts and MCP servers.
+// Linear traffic through this daemon: the plugin's own callers and agent MCP calls through its
+// broker (`mcp:<tool>`). Credential-wide headers also include other hosts and host scripts.
+const sourceCountSchema = z.object({ requests: z.number().int().nonnegative(), points: z.number().nonnegative() });
 export const linearUsageSchema = z.object({
   since: z.string(),
   until: z.string(),
@@ -413,6 +415,10 @@ export const linearUsageSchema = z.object({
     pointsRemaining: z.number().nullable(), pointsLimit: z.number().nullable(),
     requests: z.number().int().nonnegative(), points: z.number().nonnegative(),
     unmetered: z.number().int().nonnegative(),
+    sources: z.object({
+      plugin: sourceCountSchema.extend({ unmetered: z.number().int().nonnegative() }),
+      mcp: sourceCountSchema.extend({ unmetered: z.number().int().nonnegative() }),
+    }),
   })),
   rows: z.array(z.object({
     pool: z.enum(["app", "key"]), caller: z.string(), operation: z.string(),
@@ -450,6 +456,7 @@ export const agentStatusRpc = defineRpc({
         pool: z.enum(["app", "key"]),
         start: z.string(),
         callers: z.array(z.object({ caller: z.string(), requests: z.number(), points: z.number() })),
+        sources: z.object({ plugin: sourceCountSchema, mcp: sourceCountSchema }),
         outside: z.object({
           requests: z.object({ spent: z.number(), observedShare: z.number() }),
           points: z.object({ spent: z.number(), observedShare: z.number() }),

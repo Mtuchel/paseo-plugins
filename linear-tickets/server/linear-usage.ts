@@ -5,9 +5,9 @@ import { dirname, join } from "node:path";
 import type { Pool, Priority } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
 
-// One accounting event feeds exact rolling daemon traffic and persistent hourly history.
-// MCP processes and host scripts share credentials but are not attributed; only isolated
-// header intervals contribute an explicitly partial estimate of outside spend.
+// One accounting event feeds exact rolling Linear traffic and persistent hourly history. Agent MCP
+// requests pass the daemon's broker under `mcp:<tool>` callers; host scripts and other hosts share
+// credentials unattributed, and only isolated header intervals estimate that outside spend.
 const HOUR_MS = 60 * 60 * 1000;
 const BUCKET_MS = 60 * 1000;
 const SAMPLE_MAX_AGE_MS = 5 * 60 * 1000;
@@ -36,7 +36,13 @@ export type PoolUsage = {
   requestsRemaining: number | null; requestsLimit: number | null;
   pointsRemaining: number | null; pointsLimit: number | null;
   requests: number; points: number; unmetered: number;
+  sources: Record<UsageSource, { requests: number; points: number; unmetered: number }>;
 };
+export type UsageSource = "plugin" | "mcp";
+// Broker-attributed agent tool traffic; every other caller is the plugin's own.
+export function usageSource(caller: string): UsageSource {
+  return caller.startsWith("mcp:") ? "mcp" : "plugin";
+}
 export type UsageSnapshot = { since: string; until: string; pools: PoolUsage[]; rows: UsageRow[] };
 type Bucket = { start: number; rows: Map<string, UsageRow> };
 type Last = { observedAt: string; requestsRemaining: number | null; requestsLimit: number | null; pointsRemaining: number | null; pointsLimit: number | null };
@@ -58,6 +64,7 @@ export type LinearUsageSummary = {
   pool: Pool;
   start: string;
   callers: Array<{ caller: string; requests: number; points: number }>;
+  sources: Record<UsageSource, { requests: number; points: number }>;
   outside: { requests: { spent: number; observedShare: number }; points: { spent: number; observedShare: number } };
 };
 export type LinearUsageOptions = {
@@ -228,6 +235,11 @@ export class LinearUsage {
   // Exactly one handle per sent request, including failed/limited responses; local budget
   // refusals do not reach this method. `done` records the answer once and never throws:
   // counting must not decide whether the request goes out or how its response is reported.
+  invalidateContinuity(pool: Pool): void {
+    this.previous[pool] = {};
+    for (const sample of this.inFlight[pool]) sample.clean = false;
+  }
+
   begin(pool: Pool, caller: string, operation: string): LinearUsageHandle {
     const active = this.inFlight[pool];
     const sample: RequestSample = { clean: active.size === 0 };
@@ -295,10 +307,15 @@ export class LinearUsage {
     const start = new Date(hourStart(at)).toISOString();
     return POOLS.map((pool) => {
       const bucket = this.bucket(pool, at);
+      const all = Object.entries(bucket.callers).map(([caller, counts]) => ({ caller, requests: counts.requests, points: counts.points }));
+      const sources = { plugin: { requests: 0, points: 0 }, mcp: { requests: 0, points: 0 } };
+      for (const row of all) {
+        sources[usageSource(row.caller)].requests += row.requests;
+        sources[usageSource(row.caller)].points += row.points;
+      }
       return {
-        pool, start,
-        callers: Object.entries(bucket.callers).map(([caller, counts]) => ({ caller, requests: counts.requests, points: counts.points }))
-          .sort((a, b) => b.points - a.points || b.requests - a.requests || a.caller.localeCompare(b.caller)).slice(0, 10),
+        pool, start, sources,
+        callers: all.sort((a, b) => b.points - a.points || b.requests - a.requests || a.caller.localeCompare(b.caller)).slice(0, 10),
         outside: {
           requests: { spent: Math.max(0, bucket.outside.requests.spent), observedShare: bucket.outside.requests.observedMs / HOUR_MS },
           points: { spent: Math.max(0, bucket.outside.points.spent), observedShare: bucket.outside.points.observedMs / HOUR_MS },
@@ -326,6 +343,13 @@ export class LinearUsage {
     const sorted = [...rows.values()].sort((a, b) => b.points - a.points || b.requests - a.requests);
     const pools = (["app", "key"] as const).map((pool): PoolUsage => {
       const own = sorted.filter((row) => row.pool === pool);
+      const sources = { plugin: { requests: 0, points: 0, unmetered: 0 }, mcp: { requests: 0, points: 0, unmetered: 0 } };
+      for (const row of own) {
+        const source = sources[usageSource(row.caller)];
+        source.requests += row.requests;
+        source.points += row.points;
+        source.unmetered += row.unmetered;
+      }
       const last = this.last[pool];
       return {
         pool, observedAt: last?.observedAt ?? null,
@@ -334,6 +358,7 @@ export class LinearUsage {
         requests: own.reduce((sum, row) => sum + row.requests, 0),
         points: own.reduce((sum, row) => sum + row.points, 0),
         unmetered: own.reduce((sum, row) => sum + row.unmetered, 0),
+        sources,
       };
     });
     return { since: new Date(Math.max(this.loadedAt, cutoff)).toISOString(), until: new Date(at).toISOString(), pools, rows: sorted };
@@ -470,7 +495,8 @@ export function usageLines(snapshot: UsageSnapshot, top = 12): string[] {
     const callers = snapshot.rows.filter((row) => row.pool === pool.pool).slice(0, top)
       .map((row) => `${row.caller}/${row.operation} ${row.points}/${row.requests} (${row.unmetered} unmetered)`).join(", ");
     return `[linear-tickets] Linear usage ${snapshot.since}..${snapshot.until} (${pool.pool}): `
-      + `daemon ${pool.points} points / ${pool.requests} requests (${pool.unmetered} unmetered); `
+      + `total ${pool.points} points / ${pool.requests} requests (${pool.unmetered} unmetered): `
+      + `plugin ${pool.sources.plugin.points}/${pool.sources.plugin.requests}, agent MCP ${pool.sources.mcp.points}/${pool.sources.mcp.requests}; `
       + `credential left ${pool.pointsRemaining ?? "?"}/${pool.pointsLimit ?? "?"} points, ${pool.requestsRemaining ?? "?"}/${pool.requestsLimit ?? "?"} requests at ${pool.observedAt ?? "unknown"}; `
       + `top (points/requests): ${callers}`;
   });

@@ -545,7 +545,9 @@ def decision_candidates(issues):
 HOUR_S = 3600
 BUDGET_DAYS_S = 7 * 24 * HOUR_S  # the section's "Limit reached (last 7 days)"
 BUDGET_ITEM_S = 24 * HOUR_S  # how long an hour that hit a limit stays an item
-OUTSIDE_SPENDER = "outside the plugin (agents' tools, scripts)"
+# Before TUC-1323 agents' tools sent outside the plugin too; old hours keep that estimate as it was.
+OUTSIDE_SPENDER = "outside shared admission (scripts, other hosts; agents' tools before the broker)"
+MCP_CALLER = "mcp:"  # the broker's caller prefix for agents' `linear_ticket` tools
 POOL_NAMES = {"app": "Paseo app", "key": "API key"}
 BUCKET_KINDS = ("points", "requests")  # what every hour measures; limits and outside hold both
 BUCKET_FIELDS = ("limits", "requests", "points", "estimatedPoints", "limited", "blockedMs", "refused",
@@ -855,6 +857,21 @@ def budget_callers(bucket):
                      for points, name in ranked[:CALLERS_SHOWN]) or "none"
 
 
+def budget_sources(bucket):
+    """The hour's own spend split into the plugin and agents' MCP tools (callers `mcp:<tool>`),
+    summed over every caller. An hour without MCP callers says `none recorded`, never a measured
+    zero: hours before the broker could not attribute agent tools."""
+    totals = {"plugin": {kind: 0 for kind in BUCKET_KINDS}, "mcp": {kind: 0 for kind in BUCKET_KINDS}}
+    seen = False
+    for name, caller in (bucket.get("callers") or {}).items():
+        source = "mcp" if name.startswith(MCP_CALLER) else "plugin"
+        seen = seen or source == "mcp"
+        for kind in BUCKET_KINDS:
+            totals[source][kind] += caller.get(kind) or 0
+    plugin, mcp = (f"{totals[source]['points']} points / {totals[source]['requests']} requests" for source in ("plugin", "mcp"))
+    return f"plugin {plugin}, agent MCP " + (mcp if seen else "none recorded")
+
+
 def budget_outside(bucket):
     """The outside estimate with an `≈`: what others spent per kind, its share of the hour, and
     how much of the hour was observed (the estimate covers only that part)."""
@@ -901,7 +918,8 @@ def budget_lines(usage, now):
                    f" {budget_use('points', bucket.get('points') or 0, limits.get('points'))}"
                    f" — last full hour {hour_text(last)} UTC")
         out.append(f"  - Top callers by points: {budget_callers(bucket)}")
-        out.append(f"  - Outside the plugin: {budget_outside(bucket)}")
+        out.append(f"  - Sources: {budget_sources(bucket)}")
+        out.append(f"  - Outside shared admission: {budget_outside(bucket)}")
     out += ["", "### Limit reached (last 7 days)", ""]
     out += [budget_limit_line(hour, pool, bucket) for hour, pool, bucket in budget_limited(buckets, now)] or ["- none"]
     out.append("")

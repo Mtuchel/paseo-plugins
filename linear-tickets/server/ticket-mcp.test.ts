@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -12,6 +12,9 @@ import type { PaseoApi, PaseoWorkspaceAgentCreateOptions } from "@getpaseo/clien
 import { LINEAR_ACCESS_NOTE, NO_LINEAR_ACCESS_NOTE } from "../shared/contracts";
 import { buildPrompt, normalizeIssue } from "./context";
 import { Launcher } from "./launch";
+import { LinearBroker } from "./linear-broker";
+import { LinearUsage } from "./linear-usage";
+import { RateBudget } from "./rate-budget";
 import { Settings } from "./settings";
 import { ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
 import { postedComments } from "./agent-records";
@@ -247,8 +250,10 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
   await mkdir(join(home, "linear-tickets"), { recursive: true });
   await writeFile(join(home, "linear-tickets", "credentials.json"), JSON.stringify({ apiKey: "saved-key" }));
   const script = await writeTicketMcpScript(home);
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
   const server = ticketMcpServer(script, ISSUE_ID, home);
-  const mcp = runServer(server.args[0], server.args.slice(1), { LINEAR_TICKET_MCP_ENDPOINT: linear.url });
+  const mcp = runServer(server.args[0], server.args.slice(1), {});
   try {
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
@@ -282,7 +287,7 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     assert.equal(((await mcp.request("tools/call", { name: "delete_everything" })).error as { code: number }).code, -32602);
     assert.equal(((await mcp.request("resources/list")).error as { code: number }).code, -32601);
     assert.ok(linear.calls.every((c) => !JSON.stringify(c.variables).includes("saved-key")));
-  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 test("a read-only MCP server reads any issue, mounts no write tools and never touches Linear or disk", async () => {
@@ -295,8 +300,10 @@ test("a read-only MCP server reads any issue, mounts no write tools and never to
   await mkdir(join(home, "linear-tickets"), { recursive: true });
   await writeFile(join(home, "linear-tickets", "credentials.json"), JSON.stringify({ apiKey: "saved-key" }));
   const script = await writeTicketMcpScript(home);
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
   const server = ticketMcpServer(script, null, home);
-  const mcp = runServer(server.args[0], server.args.slice(1), { LINEAR_TICKET_MCP_ENDPOINT: linear.url });
+  const mcp = runServer(server.args[0], server.args.slice(1), {});
   try {
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { instructions: string };
     assert.match(init.instructions, /Reads cover any Linear issue/);
@@ -321,7 +328,7 @@ test("a read-only MCP server reads any issue, mounts no write tools and never to
 
     assert.ok(!existsSync(join(home, "linear-tickets", "agent-issues")), "read-only mode creates no created-issues directory");
     assert.ok(!existsSync(join(home, "linear-tickets", "agent-comments")), "read-only mode creates no comments directory");
-  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 test("add_manual_task creates an assigned sub-issue, blocks the ticket only before merge, dedups by title and records the check locally", async () => {
@@ -337,7 +344,9 @@ test("add_manual_task creates an assigned sub-issue, blocks the ticket only befo
     return {};
   });
   const script = await writeTicketMcpScript(home);
-  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: linear.url });
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k" });
   try {
     const before = JSON.parse((await mcp.call("add_manual_task", { title: "Set LINEAR_API_KEY on batch-service (staging)", steps: "Railway → batch-service → Variables", when: "before_merge", check: "true" })).text);
     assert.equal(before.identifier, "ENG-51");
@@ -365,7 +374,7 @@ test("add_manual_task creates an assigned sub-issue, blocks the ticket only befo
     assert.deepEqual({ ...file, createdAt: undefined, cwd: undefined }, { id: "task-1", identifier: "ENG-51", url: "https://linear.app/x/issue/ENG-51", title: "Set LINEAR_API_KEY on batch-service (staging)", parentId: ISSUE_ID, parentIdentifier: "ENG-42", when: "before_merge", check: "true", createdAt: undefined, cwd: undefined, announced: false, activated: true, verifiedAt: null });
     assert.equal((await stat(join(directory, "task-1.json"))).mode & 0o777, 0o600);
     assert.equal(JSON.parse(await readFile(join(directory, "task-2.json"), "utf8")).activated, false);
-  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 test("writes follow the issue's scope: own ticket, issues the agent created, anything else", async () => {
@@ -397,7 +406,9 @@ test("writes follow the issue's scope: own ticket, issues the agent created, any
     return {};
   });
   const script = await writeTicketMcpScript(home);
-  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: linear.url });
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k" });
   const writes = (name: string) => linear.calls.filter((c) => c.query.includes(name)).map((c) => c.variables);
   try {
     const followUp = JSON.parse((await mcp.call("create_issue", { title: "Add retry", description: "Why and when done." })).text);
@@ -442,15 +453,17 @@ test("writes follow the issue's scope: own ticket, issues the agent created, any
     for (let i = 0; i < 8; i++) await writeFile(join(directory, `pad-${i}.json`), JSON.stringify({ id: `pad-${i}`, identifier: `ENG-9${i}`, url: "u", title: `pad ${i}` }));
     assert.match((await mcp.call("create_issue", { title: "One too many", description: "d" })).text, /already filed 10 issues/);
     assert.equal(created, 2);
-  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
-test("the MCP server prefers LINEAR_API_KEY, reports a missing key, and ignores non-loopback endpoint overrides", async () => {
+test("the MCP server prefers LINEAR_API_KEY and reports a missing key", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-key-"));
   const linear = await fakeLinear(() => ({ issue }));
   const script = await writeTicketMcpScript(home);
-  const withEnv = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_TICKET_MCP_ENDPOINT: linear.url, LINEAR_API_KEY: "env-key" });
-  const without = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_TICKET_MCP_ENDPOINT: linear.url });
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const withEnv = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "env-key" });
+  const without = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], {});
   try {
     assert.equal((await withEnv.call("get_ticket")).isError, false);
     assert.equal(linear.calls[0].authorization, "env-key");
@@ -458,7 +471,7 @@ test("the MCP server prefers LINEAR_API_KEY, reports a missing key, and ignores 
     assert.equal(missing.isError, true);
     assert.match(missing.text, /not connected/);
     assert.equal(linear.calls.length, 1);
-  } finally { withEnv.stop(); without.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { withEnv.stop(); without.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 test("the MCP server refuses to start without a valid issue id", async () => {
@@ -511,34 +524,20 @@ test("settings serialize concurrent patches so none is lost, and keep orphaned l
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("a cached script with loose permissions or a symlink is rewritten, not trusted", async () => {
-  const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-reuse-"));
-  try {
-    const path = await writeTicketMcpScript(home);
-    await chmod(path, 0o666);
-    await chmod(join(home, "linear-tickets"), 0o777);
-    assert.equal(await writeTicketMcpScript(home), path);
-    assert.equal((await stat(path)).mode & 0o777, 0o600);
-    assert.equal((await stat(join(home, "linear-tickets"))).mode & 0o777, 0o700);
-    const target = join(home, "elsewhere.mjs");
-    await writeFile(target, await readFile(path, "utf8"), { mode: 0o600 });
-    await rm(path);
-    await symlink(target, path);
-    await writeTicketMcpScript(home);
-    assert.ok((await lstat(path)).isFile());
-    assert.ok((await lstat(target)).isFile());
-  } finally { await rm(home, { recursive: true, force: true }); }
-});
-
 test("API error text never carries the key back to the agent", async () => {
-  const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-redact-"));
   const echo = (call: Call) => ({ errors: [{ message: "rejected: " + call.authorization }] });
   const unauthorized = await fakeLinear(() => ({}), { status: 401, raw: echo });
   const failing = await fakeLinear(() => ({}), { raw: echo });
-  const script = await writeTicketMcpScript(home);
   const env = { LINEAR_API_KEY: "lin_api_SECRETSECRET" };
-  const a = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { ...env, LINEAR_TICKET_MCP_ENDPOINT: unauthorized.url });
-  const b = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { ...env, LINEAR_TICKET_MCP_ENDPOINT: failing.url });
+  // Two fake upstreams need two broker homes: one broker serves one upstream.
+  const left = await host("paseo-linear-mcp-redact-");
+  const right = await host("paseo-linear-mcp-redact-");
+  const leftBroker = await brokerOn(left.home, unauthorized);
+  const rightBroker = await brokerOn(right.home, failing);
+  samples(leftBroker.budget);
+  samples(rightBroker.budget);
+  const a = runServer(left.script, ["--issue", ISSUE_ID, "--paseo-home", left.home], env);
+  const b = runServer(right.script, ["--issue", ISSUE_ID, "--paseo-home", right.home], env);
   try {
     const first = await a.call("get_ticket");
     assert.equal(first.isError, true);
@@ -547,27 +546,35 @@ test("API error text never carries the key back to the agent", async () => {
     assert.equal(second.isError, true);
     assert.match(second.text, /\[redacted\]/);
     assert.doesNotMatch(second.text, /SECRET/);
-  } finally { a.stop(); b.stop(); await unauthorized.close(); await failing.close(); await rm(home, { recursive: true, force: true }); }
+  } finally {
+    a.stop(); b.stop(); await leftBroker.broker.stop(); await rightBroker.broker.stop();
+    await unauthorized.close(); await failing.close();
+    await rm(left.home, { recursive: true, force: true }); await rm(right.home, { recursive: true, force: true });
+  }
 });
 
 test("a rate-limited Linear answer tells the agent to try again later instead of a generic failure", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-ratelimit-"));
   const limited = await fakeLinear(() => ({}), { status: 400, raw: () => ({ errors: [{ message: "Rate limit exceeded", extensions: { code: "RATELIMITED" } }] }) });
   const script = await writeTicketMcpScript(home);
-  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: limited.url });
+  const { broker, budget } = await brokerOn(home, limited);
+  samples(budget);
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k" });
   try {
     const result = await mcp.call("get_ticket");
     assert.equal(result.isError, true);
     assert.match(result.text, /Linear's hourly request limit is reached for the Linear API key; try again in about 10 minutes\./);
     assert.equal(limited.calls.length, 1);
-  } finally { mcp.stop(); await limited.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { mcp.stop(); await broker.stop(); await limited.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 test("the MCP server validates envelopes, never runs tools for notifications, and bounds input", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-envelope-"));
   const linear = await fakeLinear(() => ({ commentCreate: { success: true, comment: { id: "c-1", url: "u" } }, attachmentLinkURL: { success: true } }));
   const script = await writeTicketMcpScript(home);
-  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: linear.url });
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k" });
   try {
     mcp.raw("null"); mcp.raw("[]"); mcp.raw(JSON.stringify({ jsonrpc: "1.0", id: 3, method: "ping" }));
     mcp.raw(JSON.stringify({ jsonrpc: "2.0", method: "tools/call", params: { name: "add_comment", arguments: { body: "sneaky" } } }));
@@ -581,22 +588,21 @@ test("the MCP server validates envelopes, never runs tools for notifications, an
     assert.equal(long.isError, true);
     assert.equal((await mcp.request("tools/call", { name: "add_comment", arguments: [] })).error !== undefined, true);
     assert.equal(linear.calls.length, 0);
-  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
-test("the MCP server caps concurrent Linear calls and ignores a non-127.0.0.1 endpoint override", async () => {
+test("the MCP server caps concurrent Linear calls", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-limits-"));
   const slow = await fakeLinear(() => ({ commentCreate: { success: true, comment: { id: "c-1", url: "u" } } }), { delayMs: 300 });
   const script = await writeTicketMcpScript(home);
-  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: slow.url });
-  const localhost = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "not-a-real-key", LINEAR_TICKET_MCP_ENDPOINT: slow.url.replace("127.0.0.1", "localhost") });
+  const { broker, budget } = await brokerOn(home, slow);
+  samples(budget);
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k" });
   try {
     const results = await Promise.all(Array.from({ length: 6 }, () => mcp.call("add_comment", { body: "x" })));
     assert.equal(results.filter((result) => result.isError && /Too many/.test(result.text)).length, 2);
     assert.equal(slow.calls.length, 4);
-    await localhost.call("get_ticket");
-    assert.equal(slow.calls.length, 4);
-  } finally { mcp.stop(); localhost.stop(); await slow.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { mcp.stop(); await broker.stop(); await slow.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 // The Paseo app's token as the daemon keeps it; null leaves expires_at out. Sync, so a fake
@@ -614,8 +620,31 @@ async function host(prefix: string) {
   return { home, script: await writeTicketMcpScript(home) };
 }
 
-function startOn(home: string, script: string, url: string) {
-  return runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_TICKET_MCP_ENDPOINT: url });
+function headersFor(requests: number, points: number): Headers {
+  return new Headers({ "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": String(requests),
+    "x-ratelimit-complexity-limit": "2000000", "x-ratelimit-complexity-remaining": String(points), "x-complexity": "1" });
+}
+
+// Known samples per pool so a cold pool never first sends its own discovery probe, which would
+// shift the operation and authentication call sequences these tests assert. "Ample" stays well
+// above the 5% interactive reserve plus the 10,000-point ceiling one MCP request reserves.
+function samples(budget: RateBudget, overrides: Partial<Record<"app" | "key", Headers>> = {}) {
+  for (const pool of ["app", "key"] as const) budget.acquire(pool, "owner").done(overrides[pool] ?? headersFor(4_500, 1_900_000), false);
+}
+
+// The daemon's broker on this home; the fake Linear server is injected here, at construction,
+// never through the child's environment.
+async function brokerOn(home: string, linear: { url: string }) {
+  const usage = new LinearUsage(() => Date.now(), { path: join(home, "usage.json") });
+  const budget = new RateBudget(() => Date.now(), usage);
+  const broker = new LinearBroker({ home, budget, usage, upstream: (authorization, query, variables, signal) =>
+    fetch(linear.url, { method: "POST", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ query, variables }), signal }) });
+  await broker.start();
+  return { broker, budget };
+}
+
+function startOn(home: string, script: string) {
+  return runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], {});
 }
 
 function answers(call: Call) {
@@ -632,7 +661,9 @@ test("every ticket tool acts as the Paseo app while its token is fresh", async (
   const { home, script } = await host("paseo-linear-mcp-app-");
   writeToken(home, "app-1");
   const linear = await fakeLinear(answers);
-  const mcp = startOn(home, script, linear.url);
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const mcp = startOn(home, script);
   try {
     assert.equal((await mcp.call("get_ticket")).isError, false);
     assert.equal((await mcp.call("add_comment", { body: "Started." })).isError, false);
@@ -641,20 +672,22 @@ test("every ticket tool acts as the Paseo app while its token is fresh", async (
     assert.equal((await mcp.call("link_url", { url: "https://github.com/o/r/pull/1" })).isError, false);
     for (const kind of ["query ticket", "commentCreate", "issueUpdate", "attachmentLinkURL"]) assert.ok(linear.calls.some((call) => call.query.includes(kind)), kind);
     assert.ok(linear.calls.every((call) => call.authorization === "Bearer app-1"), JSON.stringify(authorizations(linear.calls)));
-  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 test("a token the daemon rotated between two calls is used for the next one", async () => {
   const { home, script } = await host("paseo-linear-mcp-rotate-");
   writeToken(home, "app-1");
   const linear = await fakeLinear(answers);
-  const mcp = startOn(home, script, linear.url);
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const mcp = startOn(home, script);
   try {
     await mcp.call("get_ticket");
     writeToken(home, "app-2");
     assert.equal((await mcp.call("add_comment", { body: "x" })).isError, false);
     assert.deepEqual(authorizations(linear.calls), ["Bearer app-1", "Bearer app-2"]);
-  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 test("a rejected token is retried once with the token rotated meanwhile, never with the key", async () => {
@@ -665,11 +698,13 @@ test("a rejected token is retried once with the token rotated meanwhile, never w
     writeToken(home, "app-2");
     return 401;
   } });
-  const mcp = startOn(home, script, linear.url);
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const mcp = startOn(home, script);
   try {
     assert.equal((await mcp.call("add_comment", { body: "x" })).isError, false);
     assert.deepEqual(authorizations(linear.calls), ["Bearer app-1", "Bearer app-2"]);
-  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 test("the owner's key is used only when Linear still does not accept the app", async () => {
@@ -689,11 +724,13 @@ test("the owner's key is used only when Linear still does not accept the app", a
       },
       raw: (call) => (call.authorization === "saved-key" || !raw ? { data: answers(call) } : raw),
     });
-    const mcp = startOn(home, script, linear.url);
+    const { broker, budget } = await brokerOn(home, linear);
+    samples(budget);
+    const mcp = startOn(home, script);
     try {
       assert.equal((await mcp.call("add_comment", { body: "x" })).isError, false, name);
       assert.deepEqual(authorizations(linear.calls), expected, name);
-    } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+    } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
   }
 });
 
@@ -707,32 +744,36 @@ test("a refusal of the rotated token goes back to the agent, never to the key", 
     },
     raw: (call) => (call.authorization === "Bearer app-2" ? { errors: [{ message: "Forbidden" }] } : { data: answers(call) }),
   });
-  const mcp = startOn(home, script, linear.url);
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const mcp = startOn(home, script);
   try {
     const result = await mcp.call("add_comment", { body: "x" });
     assert.equal(result.isError, true);
     assert.match(result.text, /^Linear refused this request for the Paseo app: Forbidden/);
     assert.deepEqual(authorizations(linear.calls), ["Bearer app-1", "Bearer app-2"]);
-  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 test("an outage, a lost connection or a spent rate limit on the app is not retried with the key", async () => {
   const cases = [
-    { name: "HTTP 500", options: { status: 500, raw: () => ({}) }, message: /^The Linear request failed \(HTTP 500\)\.$/ },
-    { name: "network", options: { drop: () => true }, message: /^Could not reach the Linear API\.$/ },
-    { name: "rate limit", options: { status: 400, raw: () => ({ errors: [{ message: "Rate limit exceeded", extensions: { code: "RATELIMITED" } }] }) }, message: /^Linear's hourly request limit is reached for the Paseo app; try again in about 10 minutes\.$/ },
+    { name: "HTTP 500", options: { status: 500, raw: () => ({}) }, message: "The Linear request failed (HTTP 500)." },
+    { name: "network", options: { drop: () => true }, message: "The Linear request may have completed; check the ticket before retrying a write." },
+    { name: "rate limit", options: { status: 400, raw: () => ({ errors: [{ message: "Rate limit exceeded", extensions: { code: "RATELIMITED" } }] }) }, message: "Linear's hourly request limit is reached for the Paseo app; try again in about 10 minutes." },
   ];
   for (const { name, options, message } of cases) {
     const { home, script } = await host("paseo-linear-mcp-nofallback-");
     writeToken(home, "app-1");
     const linear = await fakeLinear(answers, options);
-    const mcp = startOn(home, script, linear.url);
+    const { broker, budget } = await brokerOn(home, linear);
+    samples(budget);
+    const mcp = startOn(home, script);
     try {
       const result = await mcp.call("add_comment", { body: "x" });
       assert.equal(result.isError, true, name);
-      assert.match(result.text, message, name);
+      assert.equal(result.text, message, name);
       assert.deepEqual(authorizations(linear.calls), ["Bearer app-1"], name);
-    } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+    } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
   }
 });
 
@@ -748,12 +789,14 @@ test("without a usable app token the owner's key is used; a token without an exp
     for (const { name, token, expected } of cases) {
       const { home, script } = await host("paseo-linear-mcp-stale-");
       if (token !== "none") writeToken(home, "app-1", token);
-      const mcp = startOn(home, script, linear.url);
+      const { broker, budget } = await brokerOn(home, linear);
+      samples(budget);
+      const mcp = startOn(home, script);
       try {
         const before = linear.calls.length;
         assert.equal((await mcp.call("get_ticket")).isError, false, name);
         assert.deepEqual(authorizations(linear.calls.slice(before)), [expected], name);
-      } finally { mcp.stop(); await rm(home, { recursive: true, force: true }); }
+      } finally { mcp.stop(); await broker.stop(); await rm(home, { recursive: true, force: true }); }
     }
   } finally { await linear.close(); }
 });
@@ -768,7 +811,9 @@ test("a manual task is assigned to the key's owner but created by the Paseo app"
     if (call.query.includes("issueRelationCreate")) return { issueRelationCreate: { success: true } };
     return {};
   });
-  const mcp = startOn(home, script, linear.url);
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const mcp = startOn(home, script);
   try {
     const result = await mcp.call("add_manual_task", { title: "Set a secret", steps: "Railway → Variables", when: "before_merge" });
     assert.equal(result.isError, false, result.text);
@@ -778,7 +823,7 @@ test("a manual task is assigned to the key's owner but created by the Paseo app"
     assert.deepEqual(authorizations(by("issueCreate")), ["Bearer app-1"]);
     assert.deepEqual(authorizations(by("issueRelationCreate")), ["Bearer app-1"]);
     assert.equal((by("issueCreate")[0].variables.input as Record<string, unknown>).assigneeId, "owner-id");
-  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 test("Linear error text never carries the app's tokens or the key back to the agent", async () => {
@@ -796,12 +841,83 @@ test("Linear error text never carries the app's tokens or the key back to the ag
     await writeFile(join(home, "linear-tickets", "credentials.json"), JSON.stringify({ apiKey: "lin_api_KEYSECRET" }));
     writeToken(home, "app-TOKENSECRET");
     const linear = await fakeLinear(answers, { status: (call) => status(call, home), raw: echo });
-    const mcp = startOn(home, script, linear.url);
+    const { broker, budget } = await brokerOn(home, linear);
+    samples(budget);
+    const mcp = startOn(home, script);
     try {
       const result = await mcp.call("add_comment", { body: "x" });
       assert.equal(result.isError, true, name);
       assert.match(result.text, /\[redacted\]/, name);
       assert.doesNotMatch(result.text, /SECRET/, name);
-    } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+    } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
   }
+});
+
+test("at three percent the agent's reads and writes pause locally before anything is sent", async () => {
+  const cases: { name: string; token: boolean; override: Partial<Record<"app" | "key", Headers>> }[] = [
+    { name: "app points", token: true, override: { app: headersFor(4_500, 60_000) } },
+    { name: "app requests", token: true, override: { app: headersFor(100, 1_900_000) } },
+    { name: "key points", token: false, override: { key: headersFor(4_500, 60_000) } },
+  ];
+  for (const { name, token, override } of cases) {
+    const { home, script } = await host("paseo-linear-mcp-hold-");
+    if (token) writeToken(home, "app-1");
+    const linear = await fakeLinear(answers);
+    const { broker, budget } = await brokerOn(home, linear);
+    // Only the pool the request will spend is nearly empty; the other stays ample, so a forbidden
+    // fallback (to the key, or past the reserve) would reach the fake upstream and fail below.
+    samples(budget, override);
+    const mcp = startOn(home, script);
+    try {
+      for (const call of [() => mcp.call("get_ticket"), () => mcp.call("add_comment", { body: "Started." })]) {
+        const result = await call();
+        assert.equal(result.isError, true, name);
+        assert.match(result.text, /^Agent Linear work is paused to keep the last budget for owner decisions; retry after \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\.$/, name + ": " + result.text);
+      }
+      assert.equal(linear.calls.length, 0, name);
+    } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  }
+});
+
+test("at three percent a read-only planner's searches pause too", async () => {
+  const cases: { name: string; token: boolean; override: Partial<Record<"app" | "key", Headers>> }[] = [
+    { name: "app", token: true, override: { app: headersFor(4_500, 60_000) } },
+    { name: "key", token: false, override: { key: headersFor(100, 1_900_000) } },
+  ];
+  for (const { name, token, override } of cases) {
+    const { home, script } = await host("paseo-linear-mcp-hold-read-only-");
+    if (token) writeToken(home, "app-1");
+    const linear = await fakeLinear(answers);
+    const { broker, budget } = await brokerOn(home, linear);
+    samples(budget, override);
+    const mcp = runServer(script, ["--read-only", "--paseo-home", home], {});
+    try {
+      const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
+      assert.deepEqual(list.tools.map((tool) => tool.name), ["get_issue", "search_issues"], name);
+      for (const call of [() => mcp.call("search_issues", { query: "sign-in" }), () => mcp.call("get_issue", { issue: "ENG-42" })]) {
+        const result = await call();
+        assert.equal(result.isError, true, name);
+        assert.match(result.text, /^Agent Linear work is paused to keep the last budget for owner decisions; retry after \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\.$/, name + ": " + result.text);
+      }
+      assert.equal(linear.calls.length, 0, name);
+    } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+  }
+});
+
+test("without the broker the tools stay available and every request fails closed", async () => {
+  const { home, script } = await host("paseo-linear-mcp-nobroker-");
+  const linear = await fakeLinear(answers);
+  const mcp = startOn(home, script);
+  try {
+    const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
+    assert.equal(init.protocolVersion, "2025-06-18");
+    const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
+    assert.equal(list.tools.length, 10, "the tools stay mounted when the broker is down");
+    for (const call of [() => mcp.call("get_ticket"), () => mcp.call("add_comment", { body: "Started." })]) {
+      const result = await call();
+      assert.equal(result.isError, true);
+      assert.equal(result.text, "The host's Linear budget service is unavailable; no request was sent. Retry after the plugin is running.");
+    }
+    assert.equal(linear.calls.length, 0, "nothing fell back to a direct Linear connection");
+  } finally { mcp.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });

@@ -1272,11 +1272,13 @@ class LinearBudgetTest(RunCase):
             "## Linear budget\n\n"
             "- Paseo app: 124 requests (62 % of 200), 460 points (31 % of 1500) — last full hour 2026-09-30 07:00 UTC\n"
             "  - Top callers by points: ticket-agent 300 (65 %), review 100 (22 %), digest 56 (12 %)\n"
-            "  - Outside the plugin: ≈ 40 points (8 % of the hour), ≈ 5 requests (4 % of the hour)"
+            "  - Sources: plugin 460 points / 134 requests, agent MCP none recorded\n"
+            "  - Outside shared admission: ≈ 40 points (8 % of the hour), ≈ 5 requests (4 % of the hour)"
             " — observed 45 % of the hour\n"
             "- API key: 12 requests, 30 points — last full hour 2026-09-30 07:00 UTC\n"
             "  - Top callers by points: none\n"
-            "  - Outside the plugin: ≈ 0 points, ≈ 0 requests — observed 0 % of the hour\n"
+            "  - Sources: plugin 0 points / 0 requests, agent MCP none recorded\n"
+            "  - Outside shared admission: ≈ 0 points, ≈ 0 requests — observed 0 % of the hour\n"
             "\n"
             "### Limit reached (last 7 days)\n\n"
             "- 2026-09-29 22:00 UTC, Paseo app: blocked 13 min (3 rate-limited) — spender: ticket-agent\n"
@@ -1294,9 +1296,25 @@ class LinearBudgetTest(RunCase):
         doc = self.io.published[-1]
         self.assertIn("- Paseo app: nothing recorded in the last full hour (2026-09-30 07:00 UTC)", doc)
         self.assertIn("- 2026-09-29 22:00 UTC, Paseo app: blocked 30 min (5 rate-limited) — "
-                      "spender: outside the plugin (agents' tools, scripts)", doc)
+                      "spender: outside shared admission (scripts, other hosts; agents' tools before the broker)", doc)
         item = self.saved()["items"]["linear-limit:app:2026-09-29T22:00:00Z"]["payload"]
-        self.assertIn("spender: outside the plugin (agents' tools, scripts)", item["detail"])
+        self.assertIn("spender: outside shared admission", item["detail"])
+
+    def test_agent_mcp_is_measured_apart_from_the_plugin_and_outside(self):  # TUC-1323 AC-6
+        self.io.usage_data = usage_file({
+            "2026-09-30T07:00:00Z": {"app": usage_bucket(
+                requests=60, points=1300, limits=(200, 1500),
+                callers={"dispatch": usage_caller(40, 300), "mcp:get_issue": usage_caller(15, 900),
+                         "mcp:add_comment": usage_caller(5, 100)},
+                outside=usage_outside(points=50, requests=2, observedMs=3_600_000))},
+            "2026-09-30T06:00:00Z": {"app": usage_bucket(
+                requests=50, points=1400, limits=(200, 1500), limited=2, blockedMs=120_000,
+                callers={"dispatch": usage_caller(30, 200), "mcp:search_issues": usage_caller(20, 1200)})}})
+        self.run_at(WED_10_05)
+        doc = self.io.published[-1]
+        self.assertIn("  - Sources: plugin 300 points / 40 requests, agent MCP 1000 points / 20 requests\n"
+                      "  - Outside shared admission: ≈ 50 points (4 % of the hour), ≈ 2 requests (3 % of the hour)", doc)
+        self.assertIn("- 2026-09-30 06:00 UTC, Paseo app: blocked 2 min (2 rate-limited) — spender: mcp:search_issues", doc)
 
     def test_no_limited_hour_renders_none(self):  # AC-13
         self.io.usage_data = usage_file({"2026-09-30T07:00:00Z": {"app": usage_bucket(requests=5, points=5)}})

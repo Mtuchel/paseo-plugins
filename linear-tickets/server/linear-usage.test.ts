@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
-import { asCaller, LinearUsage, type LinearUsageHistory, type LinearUsageOptions } from "./linear-usage";
+import { asCaller, LinearUsage, usageLines, type LinearUsageHistory, type LinearUsageOptions } from "./linear-usage";
 import { currentCaller, RateBudget, RateLimitedError } from "./rate-budget";
 import { postGraphQL } from "./linear";
 
@@ -572,10 +572,27 @@ test("each credential reports its last observed budget, never extrapolated own u
   assert.deepEqual(usage.snapshot().pools[0], {
     pool: "app", observedAt: new Date(0).toISOString(), requestsRemaining: 123, requestsLimit: 5000,
     pointsRemaining: 456, pointsLimit: 2000000, requests: 2, points: 2, unmetered: 1,
+    sources: { plugin: { requests: 2, points: 2, unmetered: 1 }, mcp: { requests: 0, points: 0, unmetered: 0 } },
   });
   assert.equal(usage.snapshot().pools[1].points, 7);
   assert.equal(usage.snapshot().pools[1].pointsRemaining, null);
   assert.equal(usage.snapshot().since, new Date(0).toISOString());
+});
+
+test("agent MCP traffic is reported as its own source, summed over every caller beyond the top ten", () => {
+  const usage = new LinearUsage(() => START);
+  for (let index = 0; index < 11; index++) usage.begin("app", `plugin-${index}`, "sample").done(metered("100"), false, 100);
+  usage.begin("app", "mcp:get_issue", "issue").done(metered("3"), false, 100);
+  usage.begin("app", "mcp:add_comment", "commentCreate").done(null, false, 100);
+  const pool = usage.snapshot().pools[0];
+  assert.deepEqual(pool.sources, { plugin: { requests: 11, points: 1100, unmetered: 0 }, mcp: { requests: 2, points: 3, unmetered: 1 } });
+  assert.equal(pool.sources.plugin.requests + pool.sources.mcp.requests, pool.requests);
+  const hour = usage.summary().find((entry) => entry.pool === "app")!;
+  assert.equal(hour.callers.length, 10);
+  assert.ok(hour.callers.every((caller) => !caller.caller.startsWith("mcp:")), "the cheap MCP callers fall outside the top ten");
+  // Hourly history keeps its existing rule: a send without any answer has no measured cost.
+  assert.deepEqual(hour.sources, { plugin: { requests: 11, points: 1100 }, mcp: { requests: 1, points: 3 } });
+  assert.match(usageLines(usage.snapshot())[0], /plugin 1100\/11, agent MCP 3\/2;/);
 });
 
 test("real transport meters refused responses once, excludes local pauses, and counts failed sends", async (t) => {

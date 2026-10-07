@@ -11,6 +11,9 @@ import { promisify } from "node:util";
 // The bridge's hash: the extension's `advised` event must carry the same one.
 import { planHash } from "./review-outcome";
 import { ticketMcpServer, writeTicketMcpScript } from "./ticket-mcp";
+import { LinearBroker } from "./linear-broker";
+import { RateBudget } from "./rate-budget";
+import { LinearUsage } from "./linear-usage";
 
 // The omp extension reads its environment when it loads, so it is imported after this setup.
 const root = mkdtempSync(join(tmpdir(), "paseo-plan-advisor-"));
@@ -369,8 +372,19 @@ test("omp ticket agents get the linear_ticket tools, run through the plugin's se
     response.end(JSON.stringify({ data }));
   });
   await new Promise<void>((resolve) => linear.listen(0, "127.0.0.1", resolve));
+  const usage = new LinearUsage();
+  const budget = new RateBudget(Date.now, usage);
+  for (const pool of ["app", "key"] as const) budget.acquire(pool, "owner").done(new Headers({
+    "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": "4500",
+    "x-ratelimit-complexity-limit": "2000000", "x-ratelimit-complexity-remaining": "1800000",
+  }), false);
+  const broker = new LinearBroker({ home: root, budget, usage, upstream: (authorization, query, variables, signal) =>
+    fetch(`http://127.0.0.1:${(linear.address() as AddressInfo).port}/graphql`, {
+      method: "POST", headers: { authorization }, body: JSON.stringify({ query, variables }), signal,
+    }) });
+  await broker.start();
   const server = ticketMcpServer(await writeTicketMcpScript(root), "ticket-1", root);
-  process.env.LINEAR_TICKETS_MCP = JSON.stringify({ ...server, env: { LINEAR_API_KEY: "k", LINEAR_TICKET_MCP_ENDPOINT: `http://127.0.0.1:${(linear.address() as AddressInfo).port}/graphql` } });
+  process.env.LINEAR_TICKETS_MCP = JSON.stringify({ ...server, env: { LINEAR_API_KEY: "k" } });
   const tools: (Tool & { loadMode?: string })[] = [];
   const field = (): object => ({ describe: field, optional: () => ({}) });
   try {
@@ -385,6 +399,7 @@ test("omp ticket agents get the linear_ticket tools, run through the plugin's se
     await assert.rejects(mounted.linear_ticket_set_status.execute("c2", { issue: "ENG-7", status: "Todo" }), /ENG-7 is neither this agent's ticket nor an issue it created/);
   } finally {
     delete process.env.LINEAR_TICKETS_MCP;
+    await broker.stop();
     await new Promise<void>((resolve) => linear.close(() => resolve()));
   }
 });
