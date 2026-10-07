@@ -89,8 +89,6 @@ export type DecisionAttempt = {
   waitsForOwner?: boolean;
   appliedAt?: string;
   voidReason?: string;
-  // An unresolved conflict that holds this attempt.
-  pausedBy?: string;
 } & RouteSnapshot;
 
 // The plugin closing a review itself (retiring a planner, a tier send-back, a work order): its
@@ -153,6 +151,19 @@ export class DecisionPendingError extends Error {
 
 // An owner resolution on an entry whose state changed since the inbox listed it.
 export class StaleResolutionError extends Error {}
+
+// The attempt was paused by a conflict, or voided, while the worker was carrying it out: the
+// worker stops at the next step and never marks it applied.
+export class HaltedError extends Error {
+  constructor() { super("The decision was paused or dropped meanwhile."); }
+}
+
+// The attempt "Carry out the other" or "Carry it out" (an unbound report) creates: its id comes
+// from the entry it settles, so a retried or interrupted resolution finds it instead of creating
+// a second decision, and the entry counts as settled once it exists.
+function replacementId(entryId: string): string {
+  return `${entryId}-carried`;
+}
 
 const QUICK_ATTEMPTS = 20;
 const QUICK_RETRY_MS = 3_000;
@@ -233,6 +244,9 @@ export class DecisionJournal {
   private readonly files = new Map<string, string>();
   private unreadable: string[] = [];
   private loaded = false;
+  // The latest acceptance time handed out: strictly increasing, so a ticket's accepted decisions
+  // have one order even within a millisecond.
+  private lastAccepted = 0;
   private held = false;
   private stopping = false;
   private acquiring: Promise<boolean> | null = null;
@@ -360,8 +374,8 @@ export class DecisionJournal {
     const rows: ApplyingEntry[] = [];
     for (const entry of this.entries.values()) {
       if (entry.kind === "attempt" && (entry.state === "pending" || entry.state === "uncertain")) rows.push({ kind: "attempt", entry, review: this.review(entry.reviewId) });
-      if (entry.kind === "unbound" && entry.state === "open") rows.push({ kind: "unbound", entry, review: this.latestReview(entry.agentId) });
-      if (entry.kind === "conflict" && !entry.resolution) rows.push({ kind: "conflict", entry, attempt: entry.attemptId ? this.attempt(entry.attemptId) : null, review: this.review(entry.reviewId) });
+      if (entry.kind === "unbound" && this.unboundOpen(entry)) rows.push({ kind: "unbound", entry, review: this.latestReview(entry.agentId) });
+      if (entry.kind === "conflict" && this.conflictOpen(entry)) rows.push({ kind: "conflict", entry, attempt: entry.attemptId ? this.attempt(entry.attemptId) : null, review: this.review(entry.reviewId) });
     }
     for (const file of this.unreadable) rows.push({ kind: "unreadable", file });
     return rows;
@@ -371,8 +385,14 @@ export class DecisionJournal {
   busy(agentId: string): boolean {
     return this.all().some((entry) => entry.agentId === agentId && (
       entry.kind === "attempt" && (OPEN_STATES.has(entry.state) || entry.state === "pending")
-      || entry.kind === "unbound" && entry.state === "open"
-      || entry.kind === "conflict" && !entry.resolution));
+      || entry.kind === "unbound" && this.unboundOpen(entry)
+      || entry.kind === "conflict" && this.conflictOpen(entry)));
+  }
+
+  // An accepted attempt an unresolved conflict holds: the durable conflict record decides, so a
+  // crash between recording a conflict and anything after it never lets the attempt run.
+  paused(attemptId: string): boolean {
+    return this.all().some((entry) => entry.kind === "conflict" && entry.attemptId === attemptId && !entry.afterApply && this.conflictOpen(entry));
   }
 
   // Attempts for the worker: pending ones that are due and first in their ticket's order, and
@@ -385,7 +405,7 @@ export class DecisionJournal {
       const key = entry.issueId ?? `agent:${entry.agentId}`;
       if (!first.has(key)) first.set(key, entry);
     }
-    const pending = [...first.values()].filter((entry) => !entry.pausedBy && (!entry.nextAttemptAt || Date.parse(entry.nextAttemptAt) <= now));
+    const pending = [...first.values()].filter((entry) => !this.paused(entry.id) && (!entry.nextAttemptAt || Date.parse(entry.nextAttemptAt) <= now));
     const uncertain = this.attempts().filter((entry) => entry.state === "uncertain");
     return { pending, uncertain };
   }
@@ -430,19 +450,6 @@ export class DecisionJournal {
       if (answer === "unknown" && current.state === "deciding") return this.write({ ...current, state: "uncertain", lastError: detail ?? "Plannotator's answer was lost." });
       if (answer === "refused" && current.state === "uncertain") return this.write({ ...current, lastError: detail ?? "Plannotator was decided meanwhile; waiting for its report." });
       return current;
-    });
-  }
-
-  // A saved Plannotator outcome found for an uncertain attempt's generation (review-outcome.ts).
-  evidence(attemptId: string, approved: boolean, report: string): Promise<DecisionAttempt | null> {
-    const attempt = this.attempt(attemptId);
-    if (!attempt) return Promise.resolve(null);
-    return this.withReview(attempt.reviewId, async () => {
-      const current = this.attempt(attemptId)!;
-      if (!OPEN_STATES.has(current.state)) return current;
-      if (approved === current.transport) return this.accept({ ...current, reports: current.reports.includes(report) ? current.reports : [...current.reports, report] });
-      await this.write({ ...current, state: "void", voidReason: "Plannotator accepted the other decision." });
-      return null;
     });
   }
 
@@ -513,18 +520,18 @@ export class DecisionJournal {
         return;
       }
       if (current.kind === "unbound") {
-        if (current.state !== "open" || action !== "carry-out" && action !== "drop") throw new StaleResolutionError("That report changed meanwhile; reload the inbox.");
+        if (!this.unboundOpen(current) || action !== "carry-out" && action !== "drop") throw new StaleResolutionError("That report changed meanwhile; reload the inbox.");
         const resolvedAt = new Date(this.now()).toISOString();
         if (action === "drop") { await this.write({ ...current, state: "dropped", resolvedAt }); return; }
         const review = this.latestReview(current.agentId);
         if (!review) throw new StaleResolutionError("The agent has no review to carry this decision out on.");
         const busy = this.attempts(review.id).some((attempt) => OPEN_STATES.has(attempt.state) || ACCEPTED_STATES.has(attempt.state));
         if (busy || this.unresolvedConflict(review.id)) throw new StaleResolutionError("That review has a decision already; drop this report instead.");
-        const attempt = await this.createAttempt({ review, agentId: current.agentId, planContent: current.planContent, approved: current.approved, ...(current.feedback ? { feedback: current.feedback } : {}), source: "plannotator-page", state: "pending", snapshot: await snapshot(current.agentId, review), at: current.at });
+        const attempt = await this.createAttempt({ id: replacementId(current.id), review, agentId: current.agentId, planContent: current.planContent, approved: current.approved, ...(current.feedback ? { feedback: current.feedback } : {}), source: "plannotator-page", state: "pending", snapshot: await snapshot(current.agentId, review), at: current.at });
         await this.write({ ...current, state: "carried", attemptId: attempt.id, resolvedAt });
         return;
       }
-      if (current.kind !== "conflict" || current.resolution) throw new StaleResolutionError("That conflict was settled meanwhile; reload the inbox.");
+      if (current.kind !== "conflict" || !this.conflictOpen(current)) throw new StaleResolutionError("That conflict was settled meanwhile; reload the inbox.");
       const resolvedAt = new Date(this.now()).toISOString();
       if (current.afterApply) {
         if (action !== "dismiss") throw new StaleResolutionError("That decision was carried out already; only Dismiss remains.");
@@ -534,15 +541,18 @@ export class DecisionJournal {
       if (action !== "keep" && action !== "other") throw new StaleResolutionError("Choose which decision to keep.");
       const attempt = current.attemptId ? this.attempt(current.attemptId) : null;
       if (action === "keep") {
-        if (attempt && attempt.pausedBy === current.id) await this.write({ ...attempt, pausedBy: undefined });
+        // An interrupted "Carry out the other" already dropped this decision: only that remains.
+        if (attempt?.state === "void") throw new StaleResolutionError("That decision was dropped meanwhile; choose Carry out the other.");
         await this.write({ ...current, resolution: "keep", resolvedAt });
         return;
       }
       if (attempt && attempt.state === "applied") throw new StaleResolutionError("That decision was carried out meanwhile; reload the inbox.");
-      if (attempt) await this.write({ ...attempt, state: "void", voidReason: "The owner chose the other decision.", pausedBy: undefined });
+      // Dropped before the other one exists, so the two never both run; the other one's id is
+      // fixed, so a retry after a crash finds it.
+      if (attempt && attempt.state !== "void") await this.write({ ...attempt, state: "void", voidReason: "The owner chose the other decision." });
       const review = this.review(current.reviewId);
       if (review) {
-        await this.createAttempt({ review, agentId: current.agentId, planContent: current.report.planContent ?? attempt?.planContent ?? "", approved: current.reportOutcome, ...(current.report.feedback ? { feedback: current.report.feedback } : {}), source: review.parked ? "parked-page" : "plannotator-page", state: "pending", snapshot: await snapshot(current.agentId, review), at: current.report.at });
+        await this.createAttempt({ id: replacementId(current.id), review, agentId: current.agentId, planContent: current.report.planContent ?? attempt?.planContent ?? "", approved: current.reportOutcome, ...(current.report.feedback ? { feedback: current.report.feedback } : {}), source: review.parked ? "parked-page" : "plannotator-page", state: "pending", snapshot: await snapshot(current.agentId, review), at: current.report.at });
       }
       await this.write({ ...current, resolution: "other", resolvedAt });
     });
@@ -550,23 +560,32 @@ export class DecisionJournal {
 
   // --- The worker's bookkeeping -------------------------------------------------------------
 
-  // A step went through; `value` is what it produced (true when nothing).
-  async step(attempt: DecisionAttempt, name: string, value: unknown = true): Promise<DecisionAttempt> {
-    const current = this.attempt(attempt.id) ?? attempt;
-    return this.write({ ...current, steps: { ...current.steps, [name]: value } });
+  // Every update reads the current record under the review's lock, so a report or resolution
+  // written meanwhile is never overwritten by a stale copy (and the reverse).
+  private update(attempt: DecisionAttempt, change: (current: DecisionAttempt) => DecisionAttempt | null): Promise<DecisionAttempt> {
+    return this.withReview(attempt.reviewId, async () => {
+      const current = this.attempt(attempt.id) ?? attempt;
+      const next = change(current);
+      return next ? this.write(next) : current;
+    });
   }
 
-  async failed(attempt: DecisionAttempt, error: unknown, counted = true): Promise<DecisionAttempt> {
-    const current = this.attempt(attempt.id) ?? attempt;
-    const attempts = counted ? current.attempts + 1 : current.attempts;
+  // A step went through; `value` is what it produced (true when nothing).
+  step(attempt: DecisionAttempt, name: string, value: unknown = true): Promise<DecisionAttempt> {
+    return this.update(attempt, (current) => ({ ...current, steps: { ...current.steps, [name]: value } }));
+  }
+
+  failed(attempt: DecisionAttempt, error: unknown, counted = true): Promise<DecisionAttempt> {
     const message = (error instanceof Error ? error.message : String(error)).split("\n")[0].slice(0, 500);
-    return this.write({ ...current, attempts, lastError: message, nextAttemptAt: new Date(this.now() + retryDelay(attempts)).toISOString() });
+    return this.update(attempt, (current) => {
+      const attempts = counted ? current.attempts + 1 : current.attempts;
+      return { ...current, attempts, lastError: message, nextAttemptAt: new Date(this.now() + retryDelay(attempts)).toISOString() };
+    });
   }
 
   // Waits without counting a try (a deletion in progress, a rate-limit pause).
-  async later(attempt: DecisionAttempt, at: number, reason: string): Promise<DecisionAttempt> {
-    const current = this.attempt(attempt.id) ?? attempt;
-    return this.write({ ...current, lastError: reason, nextAttemptAt: new Date(at).toISOString() });
+  later(attempt: DecisionAttempt, at: number, reason: string): Promise<DecisionAttempt> {
+    return this.update(attempt, (current) => ({ ...current, lastError: reason, nextAttemptAt: new Date(at).toISOString() }));
   }
 
   // Whether an uncertain decision waits for the owner (Plannotator can no longer confirm it) or is
@@ -574,22 +593,29 @@ export class DecisionJournal {
   async awaitOwner(attemptId: string, waits: boolean, reason?: string): Promise<void> {
     const attempt = this.attempt(attemptId);
     if (!attempt) return;
-    await this.withReview(attempt.reviewId, async () => {
-      const current = this.attempt(attemptId)!;
-      if (current.state !== "uncertain") return;
-      if (Boolean(current.waitsForOwner) === waits && (!reason || current.lastError === reason)) return;
-      await this.write({ ...current, waitsForOwner: waits || undefined, ...(reason ? { lastError: reason } : {}) });
+    await this.update(attempt, (current) => {
+      if (current.state !== "uncertain") return null;
+      if (Boolean(current.waitsForOwner) === waits && (!reason || current.lastError === reason)) return null;
+      return { ...current, waitsForOwner: waits || undefined, ...(reason ? { lastError: reason } : {}) };
     });
   }
 
-  async applied(attempt: DecisionAttempt): Promise<DecisionAttempt> {
-    const current = this.attempt(attempt.id) ?? attempt;
-    return this.write({ ...current, state: "applied", appliedAt: new Date(this.now()).toISOString(), lastError: undefined, nextAttemptAt: undefined });
+  // Whether the worker may start its next step: still accepted, not paused by a conflict.
+  carryable(attemptId: string): boolean {
+    return this.attempt(attemptId)?.state === "pending" && !this.paused(attemptId);
   }
 
-  async abandon(attempt: DecisionAttempt, reason: string): Promise<DecisionAttempt> {
-    const current = this.attempt(attempt.id) ?? attempt;
-    return this.write({ ...current, state: "void", voidReason: reason });
+  // Every step went through. Refused (HaltedError) once a conflict paused the attempt or it was
+  // voided meanwhile: the owner's choice decides what happens to it.
+  applied(attempt: DecisionAttempt): Promise<DecisionAttempt> {
+    return this.update(attempt, (current) => {
+      if (current.state !== "pending" || this.paused(current.id)) throw new HaltedError();
+      return { ...current, state: "applied", appliedAt: new Date(this.now()).toISOString(), lastError: undefined, nextAttemptAt: undefined };
+    });
+  }
+
+  abandon(attempt: DecisionAttempt, reason: string): Promise<DecisionAttempt> {
+    return this.update(attempt, (current) => ({ ...current, state: "void", voidReason: reason }));
   }
 
   // Drops settled entries older than JOURNAL_KEEP_MS; never one still in progress or waiting for
@@ -604,10 +630,10 @@ export class DecisionJournal {
         if ((entry.state === "applied" || entry.state === "void") && old(entry.appliedAt ?? entry.at)) drop.push(entry);
         else keepReviews.add(entry.reviewId);
       } else if (entry.kind === "conflict") {
-        if (entry.resolution && old(entry.resolvedAt)) drop.push(entry);
+        if (!this.conflictOpen(entry) && old(entry.resolvedAt ?? entry.at)) drop.push(entry);
         else keepReviews.add(entry.reviewId);
       } else if (entry.kind === "unbound") {
-        if (entry.state !== "open" && old(entry.resolvedAt)) drop.push(entry);
+        if (!this.unboundOpen(entry) && old(entry.resolvedAt ?? entry.at)) drop.push(entry);
       } else if (entry.kind === "closing") {
         if (old(entry.at)) drop.push(entry);
         else keepReviews.add(entry.reviewId);
@@ -630,13 +656,23 @@ export class DecisionJournal {
       if (entry.kind === "attempt" && entry.reviewId === reviewId && (OPEN_STATES.has(entry.state) || ACCEPTED_STATES.has(entry.state))) {
         throw new DecisionPendingError(entry.state === "applied" ? "This review was decided already." : "Already decided; it is being applied.");
       }
-      if (entry.kind === "conflict" && entry.reviewId === reviewId && !entry.resolution) throw new DecisionPendingError("This review has conflicting decisions waiting for you under Being applied.");
+      if (entry.kind === "conflict" && entry.reviewId === reviewId && this.conflictOpen(entry)) throw new DecisionPendingError("This review has conflicting decisions waiting for you under Being applied.");
       if (options.closing !== false && entry.kind === "closing" && entry.reviewId === reviewId) throw new DecisionPendingError("Paseo closed this review itself; it takes no decision.");
     }
   }
 
   private unresolvedConflict(reviewId: string): DecisionConflict | null {
-    return this.all().find((entry): entry is DecisionConflict => entry.kind === "conflict" && entry.reviewId === reviewId && !entry.resolution) ?? null;
+    return this.all().find((entry): entry is DecisionConflict => entry.kind === "conflict" && entry.reviewId === reviewId && this.conflictOpen(entry)) ?? null;
+  }
+
+  // A conflict is settled by its resolution, or by the other decision's attempt existing (a
+  // "Carry out the other" interrupted before it recorded its resolution).
+  private conflictOpen(entry: DecisionConflict): boolean {
+    return !entry.resolution && !this.entries.has(replacementId(entry.id));
+  }
+
+  private unboundOpen(entry: UnboundReport): boolean {
+    return entry.state === "open" && !this.entries.has(replacementId(entry.id));
   }
 
   private knownReport(event: string): boolean {
@@ -648,9 +684,9 @@ export class DecisionJournal {
     return false;
   }
 
-  private async createAttempt(input: AttemptInput & { reports?: string[] }): Promise<DecisionAttempt> {
+  private async createAttempt(input: AttemptInput & { reports?: string[]; id?: string }): Promise<DecisionAttempt> {
     const at = input.at ?? new Date(this.now()).toISOString();
-    const id = randomUUID();
+    const id = input.id ?? randomUUID();
     const mode = input.mode ?? (input.approved ? "approve" : "send-back");
     const feedback = input.feedback?.trim();
     const attempt: DecisionAttempt = {
@@ -658,7 +694,7 @@ export class DecisionJournal {
       agentId: input.agentId, planHash: planHash(input.planContent), planContent: input.planContent,
       approved: input.approved, transport: input.transport ?? input.approved, mode,
       ...(feedback ? { feedback } : {}), source: input.source, state: input.state,
-      ...(input.state === "pending" ? { acceptedAt: new Date(this.now()).toISOString() } : {}),
+      ...(input.state === "pending" ? { acceptedAt: this.acceptStamp() } : {}),
       reports: input.reports ?? [], steps: {}, attempts: 0, ...input.snapshot,
     };
     return this.publish(attempt, `${compactTime(at)}-${id}.json`);
@@ -677,11 +713,15 @@ export class DecisionJournal {
       attemptId: attempt?.id ?? null, closingId: closing?.id ?? null, afterApply, reportOutcome: input.approved,
       report: { event: input.event, at: input.at, ...(input.feedback ? { feedback: input.feedback } : {}), ...(input.planContent ? { planContent: input.planContent } : {}) }, at,
     }, `${compactTime(at)}-${id}.json`);
-    if (attempt && !afterApply) await this.write({ ...attempt, pausedBy: id });
+  }
+
+  private acceptStamp(): string {
+    this.lastAccepted = Math.max(this.now(), this.lastAccepted + 1);
+    return new Date(this.lastAccepted).toISOString();
   }
 
   private accept(attempt: DecisionAttempt): Promise<DecisionAttempt> {
-    return this.write({ ...attempt, state: "pending", acceptedAt: attempt.acceptedAt ?? new Date(this.now()).toISOString(), lastError: undefined, nextAttemptAt: undefined, waitsForOwner: undefined });
+    return this.write({ ...attempt, state: "pending", acceptedAt: attempt.acceptedAt ?? this.acceptStamp(), lastError: undefined, nextAttemptAt: undefined, waitsForOwner: undefined });
   }
 
   private assertHeld(): void {
@@ -747,6 +787,7 @@ export class DecisionJournal {
         continue;
       }
       this.entries.set(entry.id, entry);
+      if (entry.kind === "attempt" && entry.acceptedAt) this.lastAccepted = Math.max(this.lastAccepted, Date.parse(entry.acceptedAt));
       this.files.set(entry.id, file);
     }
     this.unreadable = unreadable;

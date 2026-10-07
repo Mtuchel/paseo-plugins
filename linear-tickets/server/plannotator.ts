@@ -24,7 +24,7 @@ import { modelProblem, modelSteps, planTier, strongerTier, TIERS, type Tier } fr
 import { labelTier, onlyTierAdded, TIER_LABELS, tierModel, type TierStore } from "./model-tiers";
 import type { ReviewDeletions } from "./review-deletions";
 import { RateLimitedError, withPriority } from "./rate-budget";
-import { DecisionJournal, DecisionPendingError, FencedError, type DecisionAttempt, type ResolveAction, type ReviewGeneration, type RouteSnapshot } from "./decision-journal";
+import { DecisionJournal, DecisionPendingError, FencedError, HaltedError, type DecisionAttempt, type ResolveAction, type ReviewGeneration, type RouteSnapshot } from "./decision-journal";
 import { applyLater, applySplit, splitProblem, type PanelWork, type Steps } from "./split";
 
 // The plan text of a running review, from the same endpoint its page loads.
@@ -292,7 +292,13 @@ export class PlannotatorBridge {
     this.paseo = paseo;
     if (!first) return;
     // A cheap directory sweep; fs.watch proved unreliable for files renamed into place.
-    this.timer = setInterval(() => { void this.drain(); void this.followUps?.retryPending(); }, SWEEP_MS);
+    // Follow-up retries file tickets: like every effect, only while this instance holds the
+    // journal, and a reload waits for the running one.
+    this.timer = setInterval(() => {
+      void this.drain();
+      const followUps = this.followUps;
+      if (followUps && this.journal.active) void this.journal.run(() => followUps.retryPending()).catch((error: unknown) => { if (!(error instanceof FencedError)) console.error(`[linear-tickets] plan follow-up retries failed: ${message(error)}`); });
+    }, SWEEP_MS);
     this.timer.unref?.();
     void this.drain();
   }
@@ -933,17 +939,19 @@ export class PlannotatorBridge {
   // A ticket's decisions are applied in the order they were accepted, so an earlier decision's
   // state, label or document never lands after a later one's.
   private waitsForEarlier(attempt: DecisionAttempt): boolean {
-    const key = (entry: DecisionAttempt) => entry.issueId ?? `agent:${entry.agentId}`;
     const order = (entry: DecisionAttempt) => `${entry.acceptedAt ?? entry.at}\n${entry.id}`;
-    return this.journal.attempts().some((other) => other.id !== attempt.id && other.state === "pending" && key(other) === key(attempt) && order(other) < order(attempt));
+    return this.journal.attempts().some((other) => other.id !== attempt.id && other.state === "pending" && ticketKey(other) === ticketKey(attempt) && order(other) < order(attempt));
   }
 
-  // An attempt already being carried out is joined, not skipped: whoever asks returns once it is done.
+  // An attempt already being carried out is joined, not skipped: whoever asks returns once it is
+  // done. One worker per ticket at a time, so a later decision never overtakes a running one.
   private apply(id: string): Promise<void> {
     const running = this.applying.get(id);
     if (running) return running;
     const attempt = this.journal.attempt(id);
-    if (!attempt || attempt.state !== "pending" || attempt.pausedBy || this.waitsForEarlier(attempt)) return Promise.resolve();
+    if (!attempt || !this.journal.carryable(id) || this.waitsForEarlier(attempt)) return Promise.resolve();
+    const ticketBusy = [...this.applying.keys()].some((other) => { const entry = this.journal.attempt(other); return entry !== null && ticketKey(entry) === ticketKey(attempt); });
+    if (ticketBusy) return Promise.resolve();
     const work = this.carryOutRecorded(attempt).finally(() => this.applying.delete(id));
     this.applying.set(id, work);
     return work;
@@ -956,7 +964,7 @@ export class PlannotatorBridge {
           await withPriority("owner", "plan decision", () => this.carryOut(attempt));
           await this.journal.applied(attempt);
         } catch (error) {
-          if (error instanceof FencedError) return;
+          if (error instanceof FencedError || error instanceof HaltedError) return;
           if (error instanceof DeletedError) { await this.journal.abandon(attempt, "The ticket was deleted."); return; }
           if (error instanceof WaitError) { await this.journal.later(attempt, this.journal.now() + SWEEP_MS, error.message); return; }
           if (error instanceof RateLimitedError) { await this.journal.later(attempt, error.resumeAt, error.message); return; }
@@ -974,7 +982,12 @@ export class PlannotatorBridge {
   private steps(id: string): WorkerSteps {
     const journal = this.journal;
     const current = () => journal.attempt(id)!;
-    const starting = () => { if (journal.closing) throw new FencedError(); };
+    // No step starts once the plugin is stopping, or once a conflict paused the decision or it was
+    // dropped meanwhile (the owner's choice decides what happens to it).
+    const starting = () => {
+      if (journal.closing) throw new FencedError();
+      if (!journal.carryable(id)) throw new HaltedError();
+    };
     return {
       once: async <T>(name: string, work: () => Promise<T>): Promise<T> => {
         const done = current().steps;
@@ -1205,7 +1218,13 @@ export class PlannotatorBridge {
         // Plannotator reuses ports: a newer review on the address is not this one.
         const reused = this.journal.all().some((entry) => entry.kind === "review" && entry.localUrl === review.localUrl && entry.openedAt > review.openedAt);
         const outcome = await this.outcomes({ localUrl: review.localUrl, openedAt: review.openedAt, planHash: review.planHash ?? attempt.planHash }, !reused);
-        if (outcome && typeof outcome === "object") { await this.journal.evidence(attempt.id, outcome.approved, `saved-${review.id}`); return; }
+        // A saved outcome is Plannotator's report for this generation: a matching one confirms the
+        // decision, the opposite one voids it and becomes the review's decision (the same identity
+        // as the session's recovery, so the two never record it twice).
+        if (outcome && typeof outcome === "object") {
+          await this.journal.report({ event: `recovered-${review.id}`, agentId: attempt.agentId, approved: outcome.approved, ...(outcome.feedback ? { feedback: outcome.feedback } : {}), planContent: outcome.planContent, at: new Date(now).toISOString(), review, source: "recovered", exact: true, snapshot: () => this.snapshot(attempt.agentId, review) });
+          return;
+        }
         if (outcome !== "open") { await owner("Plannotator closed the review without a decision Paseo can find: carry it out or drop it."); return; }
         const shown = await this.fetchPlan(review.localUrl).catch(() => "");
         if (!shown.trim() || planHash(shown) !== attempt.planHash) { await owner("The review's address shows another plan now: carry it out or drop it."); return; }
@@ -1223,4 +1242,9 @@ export class PlannotatorBridge {
       if (!(error instanceof FencedError)) console.error(`[linear-tickets] checking the unconfirmed plan decision ${attempt.id} failed: ${message(error)}`);
     }
   }
+}
+
+// The order decisions are carried out in: per ticket, or per agent for agents without one.
+function ticketKey(attempt: DecisionAttempt): string {
+  return attempt.issueId ?? `agent:${attempt.agentId}`;
 }

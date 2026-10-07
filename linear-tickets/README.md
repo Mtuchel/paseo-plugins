@@ -862,7 +862,10 @@ request was sent): the decision then counts as not confirmed, is sent again whil
 still open, and is carried out once Plannotator confirms it; if the review is gone without a
 saved outcome, it waits for you (**Carry it out** / **Drop it** in the inbox). The same applies
 to a report the plugin cannot tie to one plan, and to Plannotator reporting the opposite of a
-decision not yet carried out (**Keep this one** / **Carry out the other**). Settled entries are
+decision not yet carried out (**Keep this one** / **Carry out the other**): from that moment no
+further step of the decision starts (one already on its way to Linear finishes) and it is not
+counted as carried out until you choose. A ticket's decisions are carried out one at a time, in
+the order they were accepted. Settled entries are
 kept for 60 days. Two limits: a decision on Plannotator's page is protected once Plannotator's omp
 extension has written its report, and the "Plan approved" chat row in Paseo can appear twice if
 the plugin dies right after posting it. To roll back the journal, revert the change only while

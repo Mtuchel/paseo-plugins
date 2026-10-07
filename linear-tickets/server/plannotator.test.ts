@@ -4,6 +4,7 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setImmediate as immediate } from "node:timers/promises";
 import { promisify } from "node:util";
 import type { PaseoApi } from "@getpaseo/client";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
@@ -2018,6 +2019,41 @@ test("the panel's immediate apply and the sweep together run one apply", async (
     assert.equal(f.calls.filter((call) => call.startsWith("document ")).length, 1);
     assert.equal(f.calls.filter((call) => call.startsWith("reply ")).length, 1);
     assert.equal(f.calls.filter((call) => call.startsWith("hold ")).length, 1);
+    await bridge.stop();
+  });
+});
+
+// A contradicting report recorded while the worker waits on a Linear call pauses the decision:
+// the step in flight finishes, no further step starts, and it is never marked applied.
+test("a conflict recorded while the worker is mid-step stops it before the next step", async () => {
+  const f = tracked({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let entered!: () => void;
+  const documentEntered = new Promise<void>((resolve) => { entered = resolve; });
+  const upsert = f.linear.upsertIssueDocument;
+  f.linear.upsertIssueDocument = async (issueId, title, content) => { entered(); await gate; return upsert(issueId, title, content); };
+  await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: null, at: "2026-01-01T10:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(f.linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, undefined, async () => {}, () => {});
+    bridge.attach(f.paseo);
+    await bridge.drain();
+    const decision = bridge.decideOwner("http://localhost:4000/", true, "", "agent-1", { source: "inbox" });
+    await documentEntered;
+    await writeFile(join(directory, "2.json"), JSON.stringify({ type: "decided", agentId: "agent-1", approved: false, feedback: "No, plan again.", planContent: RISKY(2), at: "2026-01-01T10:05:00Z" }));
+    const sweep = bridge.drain();
+    const journal = bridge.decisionJournal;
+    for (let turn = 0; turn < 1_000 && !journal.applying().some((row) => row.kind === "conflict"); turn++) await immediate();
+    assert.ok(journal.applying().some((row) => row.kind === "conflict"), "the report is a conflict");
+    release();
+    await decision;
+    await sweep;
+    const attempt = onlyAttempt(bridge);
+    assert.equal(attempt.state, "pending");
+    assert.equal(attempt.appliedAt, undefined, "a paused decision is never marked applied");
+    assert.ok(journal.paused(attempt.id));
+    assert.equal(f.commented.filter((body) => body.startsWith("✅")).length, 0, "no step after the one in flight");
+    await bridge.drain();
+    assert.equal(onlyAttempt(bridge).state, "pending", "the sweep does not carry it out either");
     await bridge.stop();
   });
 });

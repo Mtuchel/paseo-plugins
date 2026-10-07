@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { setImmediate as immediate } from "node:timers/promises";
 import {
-  DecisionJournal, DecisionPendingError, FencedError, StaleResolutionError, retryDelay, reviewEntryId,
+  DecisionJournal, DecisionPendingError, FencedError, HaltedError, StaleResolutionError, retryDelay, reviewEntryId,
   type AttemptInput, type DecisionConflict, type ReportInput, type ReviewGeneration, type RouteSnapshot, type UnboundReport,
 } from "./decision-journal";
 import { planHash } from "./review-outcome";
@@ -261,7 +261,7 @@ test("a decision is deciding until Plannotator takes it; a refusal voids it and 
   });
 });
 
-test("a lost answer turns the attempt uncertain; evidence settles it either way", async () => {
+test("a lost answer turns the attempt uncertain; a saved outcome settles it either way", async () => {
   await withJournal(async (journal) => {
     const review = await openReview(journal);
     const lost = await journal.begin(input(review, { state: "deciding" }));
@@ -270,18 +270,59 @@ test("a lost answer turns the attempt uncertain; evidence settles it either way"
     assert.equal(uncertain.lastError, "The request timed out.");
     assert.equal(journal.applying().filter((row) => row.kind === "attempt").length, 1);
 
-    const confirmed = await journal.evidence(lost.id, true, "saved-outcome-1");
-    assert.equal(confirmed?.state, "pending");
-    assert.deepEqual(confirmed?.reports, ["saved-outcome-1"]);
+    const saved = (approved: boolean, target: ReviewGeneration, agentId: string) => reportInput(target, { event: `recovered-${target.id}`, agentId, approved, source: "recovered", exact: true, ...(approved ? {} : { feedback: "Split it first." }) });
+    assert.equal(await journal.report(saved(true, review, "agent-1")), "confirmed");
+    const confirmed = journal.attempt(lost.id)!;
+    assert.equal(confirmed.state, "pending");
+    assert.deepEqual(confirmed.reports, [`recovered-${review.id}`]);
 
+    // The owner's page send-back won the race: it becomes the review's accepted decision.
     const otherReview = await openReview(journal, "agent-2", "2026-01-01T11:00:00Z");
     const lost2 = await journal.begin(input(otherReview, { agentId: "agent-2", state: "deciding" }));
     await journal.settle(lost2.id, "unknown");
-    const contradicted = await journal.evidence(lost2.id, false, "saved-outcome-2");
-    assert.equal(contradicted, null);
+    assert.equal(await journal.report(saved(false, otherReview, "agent-2")), "recorded");
     const voided = journal.attempt(lost2.id)!;
     assert.equal(voided.state, "void");
     assert.equal(voided.voidReason, "Plannotator accepted the other decision.");
+    const decision = accepted(journal, otherReview.id);
+    assert.equal(decision.length, 1);
+    assert.deepEqual([decision[0].approved, decision[0].feedback, decision[0].source], [false, "Split it first.", "recovered"]);
+  });
+});
+
+test("a worker checkpoint and a report written at the same time both survive", async () => {
+  await withJournal(async (journal) => {
+    const review = await openReview(journal);
+    const attempt = await journal.begin(input(review));
+    // The worker holds the copy it read before the report arrived.
+    await Promise.all([
+      journal.report(reportInput(review, { event: "305-1.json", exact: true })),
+      journal.step(attempt, "comment:id", "reserved-1"),
+    ]);
+    await journal.step(attempt, "document", "https://linear.app/doc/1");
+    const current = journal.attempt(attempt.id)!;
+    assert.deepEqual(current.reports, ["305-1.json"]);
+    assert.deepEqual(current.steps, { "comment:id": "reserved-1", document: "https://linear.app/doc/1" });
+  });
+});
+
+test("decisions accepted within one millisecond keep their acceptance order, across a restart too", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse(AT) });
+  await withJournal(async (journal, directory) => {
+    const stamps: string[] = [];
+    for (const [index, openedAt] of ["2026-01-01T10:00:00Z", "2026-01-01T10:01:00Z", "2026-01-01T10:02:00Z"].entries()) {
+      const review = await openReview(journal, `agent-${index}`, openedAt);
+      stamps.push((await journal.begin(input(review, { agentId: `agent-${index}` }))).acceptedAt!);
+    }
+    await journal.stop();
+    const restarted = new DecisionJournal(directory);
+    try {
+      assert.equal(await restarted.acquire(), true);
+      const review = await openReview(restarted, "agent-3", "2026-01-01T10:03:00Z");
+      stamps.push((await restarted.begin(input(review, { agentId: "agent-3" }))).acceptedAt!);
+    } finally { await restarted.stop(); }
+    assert.deepEqual(stamps, [...stamps].sort());
+    assert.equal(new Set(stamps).size, 4, "each one later than the one before");
   });
 });
 
@@ -414,7 +455,8 @@ test("a report contradicting an accepted decision pauses it as a conflict", asyn
     assert.equal(outcome, "conflict");
     const paused = journal.attempt(attempt.id)!;
     assert.equal(paused.state, "pending");
-    assert.ok(paused.pausedBy, "the attempt waits for the owner's choice");
+    assert.ok(journal.paused(attempt.id), "the attempt waits for the owner's choice");
+    await assert.rejects(journal.applied(paused), HaltedError, "a paused decision is never marked applied");
     const conflict = conflictOf(journal, review.id);
     assert.equal(conflict.attemptId, attempt.id);
     assert.equal(conflict.afterApply, false);
@@ -423,7 +465,26 @@ test("a report contradicting an accepted decision pauses it as a conflict", asyn
     const rows = journal.applying();
     assert.equal(rows.length, 2, "the paused decision and the conflict wait for the owner");
     assert.ok(rows.some((row) => row.kind === "conflict"));
-    assert.ok(rows.some((row) => row.kind === "attempt" && row.entry.id === attempt.id && row.entry.pausedBy === conflict.id));
+    assert.ok(rows.some((row) => row.kind === "attempt" && row.entry.id === attempt.id && row.entry.state === "pending"));
+  });
+});
+
+test("a conflict holds its decision from the conflict record alone, also after a restart", async () => {
+  await withJournal(async (journal, directory) => {
+    const review = await openReview(journal);
+    const attempt = await journal.begin(input(review));
+    await journal.report(reportInput(review, { event: "325-1.json", approved: false, exact: true }));
+    // The attempt's own record is untouched by the conflict: nothing between the two to lose.
+    assert.equal(JSON.parse(await readFile(join(directory, (await readdir(directory)).find((file) => file.endsWith(`${attempt.id}.json`))!), "utf8")).state, "pending");
+    await journal.stop();
+    const restarted = new DecisionJournal(directory);
+    try {
+      assert.equal(await restarted.acquire(), true);
+      assert.equal(restarted.paused(attempt.id), true);
+      assert.equal(restarted.carryable(attempt.id), false);
+      assert.deepEqual(restarted.due().pending, []);
+      await assert.rejects(restarted.applied(restarted.attempt(attempt.id)!), HaltedError);
+    } finally { await restarted.stop(); }
   });
 });
 
@@ -538,7 +599,7 @@ test("keep settles a conflict on the accepted decision; other voids it and accep
     const kept = await journal.begin(input(keptReview));
     await journal.report(reportInput(keptReview, { event: "360-1.json", approved: false, exact: true }));
     await journal.resolve(conflictOf(journal, keptReview.id).id, "keep", async () => SNAPSHOT);
-    assert.equal(journal.attempt(kept.id)!.pausedBy, undefined);
+    assert.equal(journal.paused(kept.id), false);
     assert.equal(journal.attempt(kept.id)!.state, "pending");
     assert.equal(conflictOf(journal, keptReview.id).resolution, "keep");
     assert.equal(accepted(journal, keptReview.id).length, 1);
@@ -555,6 +616,33 @@ test("keep settles a conflict on the accepted decision; other voids it and accep
     assert.equal(decision[0].approved, false);
     assert.equal(decision[0].transport, false);
     assert.equal(conflictOf(journal, otherReview.id).resolution, "other");
+  });
+});
+
+test("an interrupted Carry out the other is settled by its attempt, and a retry creates no second one", async () => {
+  await withJournal(async (journal, directory) => {
+    const review = await openReview(journal);
+    const original = await journal.begin(input(review));
+    await journal.report(reportInput(review, { event: "365-1.json", approved: false, exact: true }));
+    const conflict = conflictOf(journal, review.id);
+    await journal.resolve(conflict.id, "other", async () => SNAPSHOT);
+    // The process died after the other decision was published, before the resolution was written.
+    const file = (await readdir(directory)).find((name) => name.endsWith(`${conflict.id}.json`))!;
+    const { resolution: _resolution, resolvedAt: _resolvedAt, ...unresolved } = JSON.parse(await readFile(join(directory, file), "utf8")) as DecisionConflict;
+    await writeFile(join(directory, file), JSON.stringify(unresolved));
+    await journal.stop();
+    const restarted = new DecisionJournal(directory);
+    try {
+      assert.equal(await restarted.acquire(), true);
+      assert.equal(restarted.applying().some((row) => row.kind === "conflict"), false, "settled by the other decision's attempt");
+      await assert.rejects(restarted.resolve(conflict.id, "other", async () => SNAPSHOT), StaleResolutionError);
+      await assert.rejects(restarted.resolve(conflict.id, "keep", async () => SNAPSHOT), StaleResolutionError);
+      assert.equal(restarted.attempt(original.id)!.state, "void");
+      const decision = accepted(restarted, review.id);
+      assert.equal(decision.length, 1, "one accepted decision, the other one");
+      assert.equal(decision[0].approved, false);
+      assert.deepEqual(restarted.due().pending.map((attempt) => attempt.id), [decision[0].id]);
+    } finally { await restarted.stop(); }
   });
 });
 
