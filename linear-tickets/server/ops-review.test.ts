@@ -256,13 +256,15 @@ test("new tickets: at most 3 a week, ranked by hours open, with marker, numbers 
     assert.match(description, /^Marker: `ops-kind pulls: e`$/m);
     assert.match(description, /\| Problems \| 7 \| 0 \|/);
     assert.match(description, /Done when: the weekly count of `pulls: e` is at most half of the week before this ticket closes/);
-    // A second run the same week: the cap is used up, nothing is created twice.
+    // A second run the same week: the cap is used up, nothing is created twice, and the tickets
+    // filed this week get no weekly comment (their description holds this week's numbers).
     world.writes = [];
     const again = await runFile(deps(home, world));
     assert.equal(again.capLeft, 0);
     assert.deepEqual(again.created, []);
     assert.deepEqual(again.nextWeek, ["pulls: b", "pulls: a"]);
-    assert.equal(world.writes.filter((write) => write.startsWith("create")).length, 0);
+    assert.deepEqual(world.writes, []);
+    assert.deepEqual(new Set(again.updated.map((found) => found.comment)), new Set(["present"]));
     // Two filed this week leave room for one.
     const other = new World();
     other.issues.push(marker(1, { description: "Marker: `ops-kind pulls: x`", createdAt: at(NOW - HOUR) }), marker(2, { description: "Marker: `ops-kind pulls: y`", createdAt: at(NOW - 2 * HOUR) }));

@@ -2133,7 +2133,8 @@ ticket the review filed (created by the Paseo app), or in a comment of an **adop
    found by the next run instead of filed twice. Only `file` without `--dry-run` reconciles
    reservations.
 2. **Comments** once per Berlin ISO week on each open marker ticket with its kinds' numbers
-   (``Marker: `ops-review <year>-W<week>` ``).
+   (``Marker: `ops-review <year>-W<week>` ``), except tickets it filed that week (their
+   description holds the numbers). `file --dry-run` names each as "to write" or "already there".
 3. **Checks** a completed marker ticket 14 days after it closed: per kind, the week before the
    close against the second week after. At most half: verified; nothing in the week before: "no
    baseline" (neither verified nor failed); more than half: failed. Any failed kind reopens the
