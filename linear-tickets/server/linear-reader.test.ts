@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
-import { AuthenticationError, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, type App, type Post } from "./linear";
+import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, TEAM_STATES_QUERY, type App, type Post } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 
 const issue = { id: "i1", identifier: "TUC-1", state: { id: "s1", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] } };
@@ -19,6 +19,35 @@ function service(reader: Pick<App, "query"> | undefined, answers: (query: string
   const app: App | undefined = reader && { query: reader.query, mutate: () => Promise.reject(new Error("no writes here")), viewer: () => Promise.reject(new Error("no viewer here")) };
   return { keyCalls, linear: new LinearService(new Credentials("/unused", "env-key"), post, app) };
 }
+
+test("createIssue sends a client-chosen id with the assignee and priority, in Todo, and no project when none is given", async () => {  // TUC-1208 AC-9
+  const inputs: Record<string, unknown>[] = [];
+  const { linear } = service(undefined, (query, variables) => {
+    if (query === TEAM_STATES_QUERY) return { team: { states: { nodes: [{ id: "triage", name: "Triage", type: "triage", position: 0 }, { id: "todo", name: "Todo", type: "unstarted", position: 1 }] } } };
+    if (query === CREATE_ISSUE_QUERY) {
+      inputs.push(variables.input as Record<string, unknown>);
+      return { issueCreate: { success: true, issue: { id: ID_A, identifier: "TUC-9", url: "https://linear.app/t/issue/TUC-9" } } };
+    }
+    throw new Error(`unexpected query ${query}`);
+  });
+  const created = await linear.createIssue({ id: ID_A, teamId: "t1", projectId: null, title: "Greptile is not reviewing", description: "d", assigneeId: "owner", priority: 2, ready: true });
+  assert.equal(created.id, ID_A);
+  assert.deepEqual(inputs, [{ id: ID_A, teamId: "t1", title: "Greptile is not reviewing", description: "d", stateId: "todo", priority: 2, assigneeId: "owner" }]);
+  await linear.createIssue({ teamId: "t1", title: "plain", description: "d" });
+  assert.equal("id" in inputs[1], false);
+});
+
+test("issuesMentioning with openOnly filters on the description and leaves out finished tickets", async () => {  // TUC-1208 AC-9
+  const filters: unknown[] = [];
+  const { linear } = service(undefined, (query, variables) => {
+    assert.equal(query, MENTIONING_ISSUES_QUERY);
+    filters.push(variables.filter);
+    return { issues: { nodes: [{ id: "i1", identifier: "TUC-7", title: "Greptile is not reviewing", url: "u", state: { name: "Todo", type: "unstarted" }, description: "Marker: `greptile-outage`", comments: { nodes: [] } }], pageInfo: { hasNextPage: false, endCursor: null } } };
+  });
+  const found = await linear.issuesMentioning("t1", "greptile-outage", true);
+  assert.deepEqual(found.map((issue) => issue.identifier), ["TUC-7"]);
+  assert.deepEqual(filters, [{ team: { id: { eq: "t1" } }, description: { contains: "greptile-outage" }, state: { type: { nin: ["completed", "canceled", "duplicate"] } } }]);
+});
 
 test("poller reads go to the app's pool and never touch the key when the app can answer", async () => {
   const appCalls: string[] = [];

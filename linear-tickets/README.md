@@ -1262,6 +1262,9 @@ with the poll:
    queue-conflict and gate checks still apply.
 5. Open stacks stranded on an orphaned `graphite-base/<n>` branch are moved onto `main` (see
    "Stranded stacks" below), only when the checkout's `main` has `tools/ci/retarget-orphan.mjs`.
+6. On the dispatch host only, `complex-review` pull requests Greptile never reviewed get a review
+   request (see "Greptile re-request" below), only when the checkout's `main` has
+   `tools/ci/greptile-retrigger.mjs`.
 
 Every enqueue is an action (`drop:<drop key>:<top>`, since one queue draft can test several
 stacks, or `ready:<top>@<heads>`) saved in `pr-watch.json` before each step: the number and last
@@ -1334,6 +1337,38 @@ tickets (to the bottom ticket's agent) and a stack that changed while it was mov
 agent like a drop: a successor when it is gone, the ticket when none can start. A turn the owner
 starts directly is not serialized with a move; the leases keep the push safe, the final base
 change has no compare-and-swap.
+
+**Greptile re-request.** Greptile reviews only `complex-review` pull requests that are not drafts,
+and misses a label added after publish (or is down), so such a pull request can wait forever for
+its first review (the ops digest's "complex-review: no Greptile review yet"). Per repo and run,
+`node tools/ci/greptile-retrigger.mjs --trigger [--follow <pr>]…` decides and posts: every open,
+published `complex-review` pull request without a Greptile review gets one comment `@greptileai`
+(marked `<!-- greptile-retrigger:<head sha> -->`, from the bot) once 30 minutes have passed since
+it was published, labelled or last asked. The repo caps it from the markers on the pull request,
+so a restart or a lost state file never asks again: once per head, at most twice in any 24 hours,
+never after a Greptile review has been observed. Every request is also kept on the pull request's entry in
+`pr-watch.json` (`greptile`, evidence for the ops digest only, kept 14 days). **One writer:** only
+the host whose `dispatch.enabled` is on runs it (README "Several hosts" allows that on one host
+only), one backstop run at a time; every other host logs `greptile re-request: skipped, dispatch
+is off on this host` once and asks nobody. A script error, an undocumented exit or answer is that
+repo's failure, never a stop of the backstop.
+
+Once a request is 2 hours old without a review, the dispatch host files one Linear issue
+**"Greptile is not reviewing"** (`server/greptile-outage.ts`, state in
+`$PASEO_HOME/linear-tickets/greptile-outage.json`): in the first auto-dispatch team, no project
+(so no ticket agent starts on it), Todo, assigned to the owner, priority High, mentioning the
+owner. It lists every pull request that waits (with when Greptile was last asked, or "not asked
+yet") and keeps the ones that no longer wait with their outcome (reviewed, closed, back to draft,
+label removed); the backstop passes the listed ones as `--follow`, and the list is synced once per
+run after every repo, rewritten only when it changed. The issue is created under an id chosen and
+saved first, so a lost answer is looked up and retried under that id; with the state file lost,
+the open issue is found again by its `Marker: \`greptile-outage\`` line. Once a run read every
+repo without an error and every listed pull request has an outcome, the issue gets a closing
+comment with each outcome and completes itself. A repo whose run failed (or stopped at GitHub's
+budget) and a pull request that could not be read ("not read this run") keep it open. If you
+close it while pull requests still wait, it stays closed until a complete run finds none; a later
+outage files a new one. To switch it off, revert the plugin change (or the repo's script) and
+`paseo plugin reload linear-tickets`; comments already posted, and reviews already started, stay.
 
 The poll and backstop also recover a missing handover PR link before deciding the ticket's next
 step. They identify the repository from the recorded worktree's validated GitHub origin, or
@@ -2189,13 +2224,16 @@ host's digest (what the Mac runs for server087; its format is a contract with th
   URL. `owner` is `true` when the item waits on the owner or the plugin escalated it to the owner
   (`pr-watch.json`, `crash-recovery.json`), `false` when those records are readable and show
   neither, `null` (unknown) for another host's items or unreadable records. `auto` is `true` when
-  the plugin acted on it (pull request nudges, drop handling or queue actions; agent restarts),
-  `false` or `null` likewise. Both are read at that run, so later changes never rewrite old lines.
+  the plugin acted on it (pull request nudges, drop handling, queue actions or a Greptile
+  re-request; agent restarts), `false` or `null` likewise. Both are read at that run, so later
+  changes never rewrite old lines.
 
 `kind` is `item_kind()`: the section plus the detail without parenthesised parts, with `#N` for
 pull request references and `N` for every other number (`pulls: draft, not published`,
-`agents: running, no activity for N h`). Changing `item_kind()` starts new kinds; earlier lines
-keep their wording, and the review compares by the stored kind.
+`agents: running, no activity for N h`; the pulls line `complex-review: no Greptile review yet
+(Greptile re-requested 14:05)` stays `pulls: complex-review: no Greptile review yet`). Changing
+`item_kind()` starts new kinds; earlier lines keep their wording, and the review compares by the
+stored kind.
 
 The lines first go into the state's `historyOutbox` and are saved with the observations, then
 appended to the file of their UTC month (`history.jsonl` for the current one,

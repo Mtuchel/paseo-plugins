@@ -637,6 +637,11 @@ class ItemKindTest(unittest.TestCase):
                          "agents: waits for your permission: OMP select")
         self.assertEqual(self.kind("unbalanced ) and ( parens"), "pulls: unbalanced and parens")
 
+    def test_greptile_re_request_suffix_keeps_the_kind(self):  # TUC-1208 AC-6
+        self.assertEqual(self.kind("complex-review: no Greptile review yet (Greptile re-requested 14:05)"),
+                         "pulls: complex-review: no Greptile review yet")
+        self.assertEqual(self.kind("complex-review: no Greptile review yet"), "pulls: complex-review: no Greptile review yet")
+
 
 class BackfillTest(unittest.TestCase):
     NOW = at("2026-10-07T09:00:00Z")
@@ -793,6 +798,13 @@ class EvidenceTest(unittest.TestCase):
         lines = self.events({"prWatch": None, "crashes": None},
                             units=[{"unit": "pulls", "ok": True}, {"unit": "pulls", "ok": False, "category": "timeout"}])
         self.assertEqual(lines[0]["units"], {"pulls": False, "pulls/917": True, "pulls/918": True})
+
+    def test_a_greptile_re_request_counts_as_automation(self):  # TUC-1208 AC-7
+        lines = self.events({"prWatch": {digest.PULL_URL.format(917): {"greptile": [{"head": "a" * 40, "at": WED_09_05}]},
+                                         digest.PULL_URL.format(918): {"greptile": []}},
+                             "crashes": {}})
+        found = {line["key"]: (line["owner"], line["auto"]) for line in lines[1:]}
+        self.assertEqual((found["pr:917:draft"], found["pr:918:draft"]), ((False, True), (False, False)))
 
 
 if __name__ == "__main__":

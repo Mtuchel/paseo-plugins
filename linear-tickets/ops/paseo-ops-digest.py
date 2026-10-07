@@ -573,9 +573,10 @@ def item_host(payload, host):
 
 def item_evidence(key, payload, at, host, evidence):
     """(owner, auto) as observed at this run. owner: the item waits on the owner, or its pull
-    request watch / crash record escalated to the owner. auto: the watch nudged, handled a drop
-    or ran a queue action, or the agent was restarted. None: unknown (another host's item, an
-    unreadable record file, a kind without a record). Only these two flags leave the records."""
+    request watch / crash record escalated to the owner. auto: the watch nudged, handled a drop,
+    ran a queue action or re-requested a Greptile review, or the agent was restarted. None: unknown
+    (another host's item, an unreadable record file, a kind without a record). Only these two flags
+    leave the records."""
     waiting = True if payload.get("group") == "waiting" else None
     pull, agent = PULL_KEY.match(key), AGENT_KEY.match(key)
     if (at is not None and at != host) or not (pull or agent):
@@ -589,7 +590,7 @@ def item_evidence(key, payload, at, host, evidence):
     if pull:
         nudges = record.get("nudges")
         auto = (isinstance(nudges, dict) and any(isinstance(v, list) and v for v in nudges.values())
-                or bool(record.get("drops")) or bool(record.get("actions")))
+                or bool(record.get("drops")) or bool(record.get("actions")) or bool(record.get("greptile")))
     else:
         restarts = record.get("restarts")
         auto = isinstance(restarts, (int, float)) and restarts > 0

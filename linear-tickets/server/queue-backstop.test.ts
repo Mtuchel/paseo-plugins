@@ -16,6 +16,8 @@ import {
   parseReady,
   parseRetarget,
   parseRetargetList,
+  parseRetrigger,
+  retriggerArgs,
   readyArgs,
   reconcile,
   refusalKey,
@@ -113,6 +115,25 @@ test("enqueue-ready.mjs: stacks without their action, branch or heads are left o
   assert.throws(() => parseReady(out(0, { drops: [] })), BackstopScriptError);
   assert.throws(() => parseReady({ code: 0, stdout: "", stderr: "" }), BackstopScriptError);
   assert.deepEqual(readyArgs([419, 1501], ["ready:7@a1b2c3d"]), ["--ready-minutes", "10", "--exclude", "419", "--exclude", "1501", "--skip", "ready:7@a1b2c3d"]);
+});
+
+test("greptile-retrigger.mjs: exit 0 with all four lists; a wrong exit, a missing list, an unknown state or an entry without its number is an error", () => {  // TUC-1208 AC-4
+  const pull = { pr: 419, url: "https://github.com/o/r/pull/419", title: "Add TUC-1", head: "a".repeat(40), since: "2026-10-07T10:00:00Z", triggers: ["2026-10-07T10:30:00Z"], state: "triggered", overdue: false };
+  const answer = { pulls: [pull], followed: [{ pr: 12, state: "reviewed" }], triggered: [{ pr: 419, head: "a".repeat(40), at: "2026-10-07T10:30:00Z" }], errors: [{ pr: 13, error: "HTTP 502" }] };
+  assert.deepEqual(parseRetrigger(out(0, answer)), answer);
+  assert.throws(() => parseRetrigger(out(1, { error: "cannot list the open pull requests" })), BackstopScriptError);
+  assert.throws(() => parseRetrigger(out(64, { error: "usage" })), BackstopScriptError);
+  assert.throws(() => parseRetrigger({ code: 0, stdout: "not json", stderr: "" }), BackstopScriptError);
+  for (const field of ["pulls", "followed", "triggered", "errors"]) assert.throws(() => parseRetrigger(out(0, { ...answer, [field]: undefined })), BackstopScriptError, field);
+  assert.throws(() => parseRetrigger(out(0, { ...answer, pulls: [{ ...pull, state: "asked" }] })), BackstopScriptError);
+  assert.throws(() => parseRetrigger(out(0, { ...answer, pulls: [{ ...pull, pr: null }] })), BackstopScriptError);
+  for (const overdue of [undefined, "true", 1, null]) {
+    assert.throws(() => parseRetrigger(out(0, { ...answer, pulls: [{ ...pull, overdue }] })), BackstopScriptError);
+  }
+  assert.throws(() => parseRetrigger(out(0, { ...answer, followed: [{ pr: 12, state: "gone" }] })), BackstopScriptError);
+  assert.throws(() => parseRetrigger(out(0, { ...answer, triggered: [{ pr: 419, head: "a" }] })), BackstopScriptError);
+  assert.deepEqual(retriggerArgs([]), ["--trigger"]);
+  assert.deepEqual(retriggerArgs([12, 13]), ["--trigger", "--follow", "12", "--follow", "13"]);
 });
 
 test("refusals: keyed by action and kind, a queue-tip conflict also by its draft; each kind released by the change that can fix it", () => {

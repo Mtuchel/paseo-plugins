@@ -29,6 +29,7 @@ import { closeInternalDaemon, internalDaemon, modelSetter, ownConnection } from 
 import { ModelGuard } from "./server/model-guard";
 import { recordStart, TIER_AGENT_LABEL, tierModel, TierStore } from "./server/model-tiers";
 import { isTier } from "./shared/plan-model";
+import { GreptileOutage } from "./server/greptile-outage";
 import { HealthMonitor } from "./server/health";
 import { PullRequestWatch } from "./server/pr-watch";
 import { PullRequestBoard } from "./server/pull-requests";
@@ -260,7 +261,7 @@ export default function contribute(server: PluginServerContext) {
   plannotator.recordDecisions(decisions);
   const manualTasks = new ManualTasks({ linear, settings });
   const watchdog = new Watchdog({ store: watchdogStore, sessions, linear, settings, handover, needsYou });
-  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog });
+  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog, outage: new GreptileOutage(linear, settings) });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => sessions.receive(event));
   // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").

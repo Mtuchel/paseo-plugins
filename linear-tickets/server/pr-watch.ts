@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 import { githubCli } from "./github-cli";
+import type { GreptileOutage, RetriggerResult } from "./greptile-outage";
 import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
@@ -16,9 +17,9 @@ import { STAGE_STEP, stalledStage, type ReviewThread, type Stage } from "./pr-nu
 // `activityBullets` back from here) is resolved at call time, never at module load.
 import { ghGet, type RestGet, type RestResponse } from "./pull-requests";
 import {
-  activityBoundary, BACKSTOP_ENQUEUE, BackstopCheckout, CLASS_TEXT, commentOnce, dropWhy, ENQUEUE_READY, enqueueArgs, enqueuedComment, HELD_KINDS, openReplayText, parseEnqueue, parseExpect, parseJudgment,
-  parseReady, parseRetarget, parseRetargetList, READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, originRepo, RETARGET_ORPHAN, RETARGET_PER_RUN,
-  replayCommands, retargetedComment, retargetId, retargetKey, retargetNote, retargetPrepareArgs, runGit, runIsolatedEnqueue, runIsolatedRetarget, runNodeScript, ticketMarker, WAIT_QUEUE, waitQueueArgs, withRecordFile,
+  activityBoundary, BACKSTOP_ENQUEUE, BackstopCheckout, CLASS_TEXT, commentOnce, dropWhy, ENQUEUE_READY, enqueueArgs, enqueuedComment, GREPTILE_RETRIGGER, HELD_KINDS, openReplayText, parseEnqueue, parseExpect, parseJudgment,
+  parseReady, parseRetarget, parseRetargetList, parseRetrigger, READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, originRepo, RETARGET_ORPHAN, RETARGET_PER_RUN,
+  replayCommands, retargetedComment, retargetId, retargetKey, retargetNote, retargetPrepareArgs, retriggerArgs, runGit, runIsolatedEnqueue, runIsolatedRetarget, runNodeScript, ticketMarker, WAIT_QUEUE, waitQueueArgs, withRecordFile,
   type ActionRecord, type DropClass, type DropJudgment, type GitRunner, type PreparedRetarget, type Problem, type Refusal, type RetargetRecord, type ScriptRunner,
 } from "./queue-backstop";
 import { githubBudget, GitHubPausedError, RateLimitedError, withPriority, type GitHubBudget } from "./rate-budget";
@@ -109,6 +110,10 @@ type Seen = {
   // The move of the open stack whose bottom this is off its orphaned `graphite-base/<n>` base
   // (see retargets).
   retarget?: RetargetRecord;
+  // The Greptile reviews the backstop's `greptile-retrigger.mjs` requested on this pull request
+  // (TUC-1208): evidence for the ops digest only, the repo counts its own markers; kept as long
+  // as the backstop's actions.
+  greptile?: { head: string; at: string }[];
   // Since when the agent has waited for the owner's answer while the message `key` waited for it
   // (see waitFor): `stage:<stage>:<key>`, `drop:<key>` or `replay:<head>`.
   waits?: Record<string, string>;
@@ -734,6 +739,9 @@ export class PullRequestWatch {
       // Read-only worktree discovery; defaults to the queue backstop's git runner.
       git?: GitRunner;
       backstop?: BackstopDeps;
+      // The Greptile outage issue (greptile-outage.ts), synced once per backstop run on the
+      // dispatch host; without it the re-request still runs, unreported.
+      outage?: Pick<GreptileOutage, "follow" | "sync">;
       // The silent-agent watchdog (watchdog.ts): it runs first in every poll.
       watchdog?: Pick<Watchdog, "pass" | "stop">;
     },
@@ -824,6 +832,8 @@ export class PullRequestWatch {
   private githubThrottled = false;
   // The shared REST budget tripped its reserve: logged once per pause, like the throttle above.
   private githubPaused = false;
+  // A host whose dispatch is off never asks Greptile; logged once per process.
+  private greptileSkipLogged = false;
   // The poll and the backstop share pr-watch.json, so they take turns.
   private turn: Promise<unknown> = Promise.resolve();
 
@@ -1381,33 +1391,92 @@ export class PullRequestWatch {
   // move on (see advanceAction), the repo's `enqueue-ready.mjs` names the ready stacks and the
   // drops it saw, drops no record watches are claimed like the poll's, refused enqueues and
   // messages for pull requests without a record go out, and each ready stack is enqueued as an
-  // action. It shares pr-watch.json with the poll and runs in turn with it.
+  // action. On the dispatch host, each repo's `greptile-retrigger.mjs` re-requests missing
+  // Greptile reviews and, after the last repo, the outage issue is synced once with every repo's
+  // answer (see retrigger). It shares pr-watch.json with the poll and runs in turn with it.
   private async queueBackstop(): Promise<void> {
     const seenByUrl = await this.load();
     const records = await this.deps.handover.all();
     const context = this.context(records);
     const save = () => this.save(seenByUrl);
+    // Set once GitHub's budget stopped the run: the rest neither runs nor counts as read, and the
+    // outage issue still gets its one sync with those repos failed.
+    let stopped: string | null = null;
     for (const record of records) {
       try {
         await this.discover(record, context);
       } catch (error) {
-        console.error(`[linear-tickets] queue backstop discovery for ${record.identifier} stopped: ${error instanceof Error ? error.message : error}`);
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[linear-tickets] queue backstop discovery for ${record.identifier} stopped: ${message}`);
         if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) {
-          await save();
-          return;
+          stopped = message;
+          break;
         }
       }
     }
+    // Greptile request evidence expires like the other backstop memory, on every host and run.
+    for (const seen of Object.values(seenByUrl)) {
+      if (!seen.greptile) continue;
+      const kept = seen.greptile.filter((found) => context.now - Date.parse(found.at) < BACKSTOP_MEMORY_MS);
+      if (kept.length) seen.greptile = kept;
+      else delete seen.greptile;
+    }
     const repos = new Set([...records.map((record) => record.links["Pull request"] ?? ""), ...Object.keys(seenByUrl)].map((url) => PULL_URL.exec(url)?.[1] ?? "").filter(Boolean));
-    for (const repo of repos) {
+    // Only the dispatch host asks Greptile and files the outage issue: README allows dispatch on
+    // one host only, and its backstop runs one at a time, so every request has one writer.
+    const writer = (await this.deps.settings.read()).dispatch.enabled;
+    if (!writer && !this.greptileSkipLogged) {
+      this.greptileSkipLogged = true;
+      console.log("[linear-tickets] greptile re-request: skipped, dispatch is off on this host");
+    }
+    const follow = writer && this.deps.outage ? await this.deps.outage.follow() : new Map<string, number[]>();
+    const greptile: RetriggerResult[] = [];
+    for (const repo of new Set([...repos, ...follow.keys()])) {
+      if (writer) greptile.push(stopped ? { repo, result: "failed", error: stopped } : await this.retrigger(repo, follow.get(repo) ?? [], seenByUrl, context));
+      if (stopped || !repos.has(repo)) continue;
       try {
         await this.backstopRepo(repo, seenByUrl, context, save);
       } catch (error) {
-        console.error(`[linear-tickets] queue backstop for ${repo} stopped: ${error instanceof Error ? error.message : error}`);
-        if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) break;
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[linear-tickets] queue backstop for ${repo} stopped: ${message}`);
+        if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) stopped = message;
       }
     }
     await save();
+    if (writer && this.deps.outage) {
+      try {
+        await this.deps.outage.sync(greptile);
+      } catch (error) {
+        console.error(`[linear-tickets] greptile outage issue: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  private hasScript(checkout: string, script: string): boolean {
+    return (this.deps.backstop?.has ?? ((dir, name) => existsSync(join(dir, name))))(checkout, script);
+  }
+
+  // One repo's Greptile re-request (TUC-1208): the repo's script decides and posts (once per head,
+  // twice per 24 hours, never after a Greptile review); `follow` are the pull requests the outage
+  // issue lists. Each request it made is kept on the pull request's entry as evidence. Any failure
+  // is the repo's `failed` answer, never a stop of the backstop.
+  private async retrigger(repo: string, follow: number[], seenByUrl: Record<string, Seen>, context: RunContext): Promise<RetriggerResult> {
+    try {
+      const checkout = await context.checkout(repo);
+      if (!checkout || !this.hasScript(checkout, GREPTILE_RETRIGGER)) return { repo, result: "skipped" };
+      const run = parseRetrigger(await this.run(checkout, GREPTILE_RETRIGGER, retriggerArgs(follow), repo));
+      for (const found of run.triggered) {
+        const seen = entry(seenByUrl, pullUrl(repo, found.pr));
+        seen.greptile = [...(seen.greptile ?? []), { head: found.head, at: found.at }];
+        console.log(`[linear-tickets] greptile re-request: asked Greptile on ${repo}#${found.pr} at ${found.head.slice(0, 12)}`);
+      }
+      for (const found of run.errors) console.error(`[linear-tickets] greptile re-request ${repo}${found.pr ? `#${found.pr}` : ""}: ${found.error}`);
+      return { repo, result: "answer", run };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[linear-tickets] greptile re-request for ${repo} failed: ${message}`);
+      return { repo, result: "failed", error: message };
+    }
   }
 
   private async backstopRepo(repo: string, seenByUrl: Record<string, Seen>, context: RunContext, save: () => Promise<void>): Promise<void> {
@@ -1483,7 +1552,7 @@ export class PullRequestWatch {
     // The ready stacks, and the drops claimed above, are enqueued right away.
     await advance();
     await this.routeRefusals(repo, seenByUrl, context, save);
-    if ((this.deps.backstop?.has ?? ((dir, script) => existsSync(join(dir, script))))(checkout, RETARGET_ORPHAN)) await this.retargets(repo, checkout, seenByUrl, context, save);
+    if (this.hasScript(checkout, RETARGET_ORPHAN)) await this.retargets(repo, checkout, seenByUrl, context, save);
     // Unlinked messages still belong to the ticket's agent. A busy agent keeps its message pending.
     const reserved = new Set<string>();
     for (const [url, seen] of inRepo()) {
