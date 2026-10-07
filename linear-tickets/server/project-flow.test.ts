@@ -1471,3 +1471,31 @@ test("project updates expire restart evidence after eight days while preserving 
   assert.deepEqual((await store.all()).erp.plannerLimitRestarts, [boundary]);
   assert.deepEqual(await store.repairs(), { sentinel: { incident: "unchanged" } });
 });
+
+test("malformed restart reporting evidence cannot block Skip or erase the unreadable evidence", async (t) => {
+  for (const bad of [{}, [null], [{ runId: "old", requestId: "old", agentId: "old", confirmedAt: "invalid" }]]) {
+    const r = await room(t, [issue(1)]);
+    await writeFile(r.path, JSON.stringify({ erp: { planned: [], planner: runRecord({ ownerAsked: true }), plannerLimitRestarts: bad } }));
+    await r.flow.skipPlan("erp", settings, paseoWith(() => []));
+    const stored = (await r.store.all()).erp;
+    assert.equal(stored.planner, null);
+    assert.deepEqual(stored.planned, ["i1"]);
+    assert.deepEqual(stored.plannerLimitRestarts, bad);
+  }
+});
+
+test("malformed restart reporting evidence does not stop automatic recovery or invent usable history", async (t) => {
+  for (const bad of [{}, [null], [{ runId: "old", requestId: "old", agentId: "old", confirmedAt: "invalid" }]]) {
+    const r = await limitedRoom(t);
+    const file = JSON.parse(await readFile(r.path, "utf8"));
+    file.erp.plannerLimitRestarts = bad;
+    await writeFile(r.path, JSON.stringify(file));
+    r.usage.reports![0].limits = [{ amount: { usedFraction: 0 } }];
+    r.advance(2 * MINUTE);
+    await r.flow.tick(r.paseo, settings);
+    const stored = (await r.store.all()).erp;
+    assert.equal(stored.planner!.agentId, "run-agent-1");
+    assert.equal(stored.planner!.recovery!.pending, undefined);
+    assert.deepEqual(stored.plannerLimitRestarts, bad);
+  }
+});

@@ -2393,6 +2393,8 @@ confirmation that the plan finished. Run/request evidence is deduplicated and re
 eight days, pruned on project updates and filtered when read even for untouched closed projects.
 Counters, failed/uncertain claims, ordinary starts and old unlabeled agents earn no inferred
 success. There is no reconstruction of restarts before this evidence existed.
+Malformed confirmation evidence is preserved and marks recovery reporting unavailable; it
+cannot block automatic recovery or Plan/Skip. No usable success history is inferred from it.
 
 The additive `plannerRecovery` version-1 snapshot exports only project/run/request/root IDs,
 state and timestamps, never error text, plans, ticket lists, selectors or credentials. Local

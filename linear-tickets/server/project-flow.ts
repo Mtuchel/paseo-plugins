@@ -130,8 +130,28 @@ const projectRecordSchema = z.object({
 }).passthrough();
 type PlannerLimitRestart = { runId: string; requestId: string; agentId: string; confirmedAt: string; failedAgentId?: string };
 const RESTART_HISTORY_MS = 8 * 24 * 60 * 60_000;
+const RESTART_ID = /^[A-Za-z0-9_.@:-]{1,256}$/;
+const RESTART_TIME = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/;
+
+function restartId(value: unknown): boolean {
+  return typeof value === "string" && RESTART_ID.test(value);
+}
+
+function validRestartHistory(value: unknown): value is PlannerLimitRestart[] {
+  return Array.isArray(value) && value.every((entry: unknown) =>
+    entry !== null && typeof entry === "object"
+    && "runId" in entry && restartId(entry.runId)
+    && "requestId" in entry && restartId(entry.requestId)
+    && "agentId" in entry && restartId(entry.agentId)
+    && "confirmedAt" in entry && typeof entry.confirmedAt === "string"
+    && RESTART_TIME.test(entry.confirmedAt)
+    && Number.isFinite(Date.parse(entry.confirmedAt))
+    && (!("failedAgentId" in entry) || restartId(entry.failedAgentId)));
+}
 
 function confirmedRestart(record: ProjectRecord, run: PlannerRecord, requestId: string, agentId: string, now: number): ProjectRecord {
+  // Reporting corruption is unavailable evidence, never a reason to block recovery.
+  if (record.plannerLimitRestarts !== undefined && !validRestartHistory(record.plannerLimitRestarts)) return record;
   const entries = record.plannerLimitRestarts ?? [];
   if (entries.some((entry) => entry.runId === run.id && entry.requestId === requestId)) return record;
   return { ...record, plannerLimitRestarts: [...entries, {
@@ -210,7 +230,7 @@ export class ProjectStore {
       const file = await this.raw();
       const next = change(file[projectId] as ProjectRecord | undefined);
       if (next) {
-        if (next.plannerLimitRestarts) next.plannerLimitRestarts = next.plannerLimitRestarts.filter((entry) => Date.parse(entry.confirmedAt) >= this.now() - RESTART_HISTORY_MS);
+        if (validRestartHistory(next.plannerLimitRestarts)) next.plannerLimitRestarts = next.plannerLimitRestarts.filter((entry) => Date.parse(entry.confirmedAt) >= this.now() - RESTART_HISTORY_MS);
         await this.save({ ...file, [projectId]: next });
       }
       return next;
