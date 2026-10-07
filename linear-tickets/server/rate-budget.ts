@@ -34,7 +34,7 @@ export class RateLimitedError extends Error {
   }
 }
 
-type Dimension = { limit: number; remaining: number; at: number };
+type Dimension = { limit: number; remaining: number; at: number; observedAt: number };
 type PoolState = {
   requests: Dimension | null;
   points: Dimension | null;
@@ -87,14 +87,23 @@ export class RateBudget {
 
   averagePoints(pool: Pool): number { return this.pools[pool].avgPoints; }
 
-  hasSamples(pool: Pool): boolean { return this.pools[pool].requests !== null && this.pools[pool].points !== null; }
+  hasSamples(pool: Pool, since = 0): boolean {
+    const state = this.pools[pool];
+    return state.requests !== null && state.points !== null && state.requests.observedAt >= since && state.points.observedAt >= since;
+  }
 
   // Recovered/unknown sends are reservations, never fabricated usage measurements.
   retainDebt(pool: Pool, id: string, requests: number, points: number): void {
     this.pools[pool].debt.set(id, { requests, points });
   }
 
-  releaseDebt(pool: Pool, id: string): void { this.pools[pool].debt.delete(id); }
+  releaseDebt(pool: Pool, id: string, headers: Headers): void {
+    const state = this.pools[pool];
+    const debt = state.debt.get(id);
+    if (!debt) return;
+    this.record(pool, headers, false, debt.points);
+    state.debt.delete(id);
+  }
 
   private reserveUntil(pool: Pool, level: Priority, room: number, pointCost = this.pools[pool].avgPoints): number | null {
     const state = this.pools[pool];
@@ -208,7 +217,7 @@ export class RateBudget {
       const limit = Number(headers.get(`x-ratelimit-${name}-limit`) ?? previous?.limit);
       if (Number.isFinite(limit) && limit > 0 && Number.isFinite(remaining) && remaining >= 0 && remaining <= limit) {
         // A response which overlapped another request may be stale even if it arrives last.
-        state[dimension] = { limit, remaining: clean || pessimistic === null ? remaining : Math.min(remaining, pessimistic), at: this.now() };
+        state[dimension] = { limit, remaining: clean || pessimistic === null ? remaining : Math.min(remaining, pessimistic), at: this.now(), observedAt: this.now() };
       } else if (previous && pessimistic !== null) {
         state[dimension] = { ...previous, remaining: pessimistic, at: this.now() };
       }

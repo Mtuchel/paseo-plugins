@@ -64,9 +64,17 @@ import { PlanPipeline } from "./server/plan-pipeline";
 import { pipelineOwnerEvidence } from "./server/plan-pipeline-source";
 import { Watchdog, WatchdogStore } from "./server/watchdog";
 import { asCaller, linearUsage, usageLines } from "./server/linear-usage";
+import { LinearBroker } from "./server/linear-broker";
+import { upgradeTicketMcpScripts } from "./server/ticket-mcp";
 
 export default function contribute(server: PluginServerContext) {
   void linearUsage.start();
+  const broker = new LinearBroker();
+  const brokerReady = upgradeTicketMcpScripts().then(async (upgrade) => {
+    if (upgrade.unrecognized.length) console.error("[linear-tickets] Unrecognized saved MCP paths remain unprotected:", upgrade.unrecognized.join(", "));
+    if (upgrade.manifest) console.log("[linear-tickets] Saved MCP restoration manifest:", upgrade.manifest);
+    await broker.start();
+  }).catch(() => { console.error("[linear-tickets] Linear broker initialization failed; agent tools fail closed."); });
   const credentials = new Credentials();
   // The native Linear agent ("Paseo" app): sessions, webhooks through Tailscale Funnel, and the
   // handover record every agent keeps on its ticket. Without the app installed, only the
@@ -526,6 +534,8 @@ export default function contribute(server: PluginServerContext) {
     stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop();
     void closeInternalDaemon();
     await stoppedPullRequests;
+    await brokerReady;
+    await broker.stop();
     await linearUsage.stop();
   };
 }

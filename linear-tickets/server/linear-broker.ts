@@ -36,7 +36,7 @@ export class LinearBroker {
   private readonly intents = new Map<string, Intent>();
   private readonly active = new Set<Promise<unknown>>();
   private readonly reading = new Set<IncomingMessage>();
-  private readonly bootstrap: Partial<Record<Pool, Promise<BrokerReply | null>>> = {};
+  private readonly bootstrap: Partial<Record<Pool, { authorization: string; work: Promise<BrokerReply> }>> = {};
   private readonly retryAt: Record<Pool, number> = { app: 0, key: 0 };
   private writes = Promise.resolve();
   private server: Server | null = null;
@@ -166,20 +166,22 @@ export class LinearBroker {
       let fenceUntil = 0;
       for (const intent of this.intents.values()) if (intent.pool === pool) fenceUntil = Math.max(fenceUntil, intent.fenceUntil ?? 0);
       if (fenceUntil > this.now()) return this.reply(response, this.held(pool, "uncertain", fenceUntil));
-      if (!this.budget.hasSamples(pool)) {
+      if (!this.budget.hasSamples(pool, fenceUntil)) {
         let bootstrap = this.bootstrap[pool];
         if (!bootstrap) {
           if (this.retryAt[pool] > this.now()) return this.reply(response, this.held(pool, "samples", this.retryAt[pool]));
           this.retryAt[pool] = this.now() + 60_000;
-          bootstrap = this.send({ authorization: body.authorization, query: "query McpBudgetProbe { viewer { id } }", variables: {}, tool: "budget-probe" });
+          bootstrap = { authorization: body.authorization, work: this.send({ authorization: body.authorization, query: "query McpBudgetProbe { viewer { id } }", variables: {}, tool: "budget-probe" }) };
           this.bootstrap[pool] = bootstrap;
-          void bootstrap.finally(() => { delete this.bootstrap[pool]; });
+          void bootstrap.work.finally(() => { delete this.bootstrap[pool]; });
         }
-        const discovery = await bootstrap;
-        // Authentication failures remain available to MCP's existing auth-only fallback.
-        if (discovery && (discovery.kind !== "answer" || discovery.status >= 400
-          || (!!discovery.payload && typeof discovery.payload === "object" && "errors" in discovery.payload && Array.isArray(discovery.payload.errors) && discovery.payload.errors.length > 0))) return this.reply(response, discovery);
-        if (!this.budget.hasSamples(pool)) return this.reply(response, this.held(pool, "samples", this.retryAt[pool]));
+        const discovery = await bootstrap.work;
+        const authFailed = discovery.kind === "answer" && (discovery.status === 401 || hasCode(discovery.payload, "AUTHENTICATION_ERROR"));
+        // A different caller's rejected old token is not evidence that this credential failed.
+        if (!(authFailed && bootstrap.authorization !== body.authorization)
+          && (discovery.kind !== "answer" || discovery.status >= 400
+            || (!!discovery.payload && typeof discovery.payload === "object" && "errors" in discovery.payload && Array.isArray(discovery.payload.errors) && discovery.payload.errors.length > 0))) return this.reply(response, discovery);
+        if (!this.budget.hasSamples(pool, fenceUntil)) return this.reply(response, this.held(pool, "samples", this.retryAt[pool]));
       }
       if (response.destroyed) return;
       reply = await this.send(body, () => response.destroyed);
@@ -197,6 +199,10 @@ export class LinearBroker {
 
   private async send(body: BrokerRequest, disconnected: () => boolean = () => false): Promise<BrokerReply> {
     const pool = poolOf(body.authorization);
+    if (this.broken || this.stopped) return { kind: "unsent", message: UNAVAILABLE };
+    let pendingFence = 0;
+    for (const saved of this.intents.values()) if (saved.pool === pool) pendingFence = Math.max(pendingFence, saved.fenceUntil ?? 0);
+    if (pendingFence > this.now()) return this.held(pool, "uncertain", pendingFence);
     let ticket;
     try { ticket = this.budget.acquire(pool, "interactive", "mcp:" + body.tool, operationName(body.query), { points: MAX_POINTS, deferred: true }); }
     catch (error) {
@@ -212,11 +218,14 @@ export class LinearBroker {
       this.broken = true;
       return { kind: "unsent", message: UNAVAILABLE };
     }
-    if (disconnected() || this.stopped) {
+    // Journal persistence yields: another attempted request may have become uncertain meanwhile.
+    let fence = 0;
+    for (const saved of this.intents.values()) if (saved.pool === pool) fence = Math.max(fence, saved.fenceUntil ?? 0);
+    if (disconnected() || this.stopped || this.broken || fence > this.now()) {
       ticket.cancel();
       this.intents.delete(intent.id);
       try { await this.persist(); } catch { this.broken = true; }
-      return { kind: "unsent", message: UNAVAILABLE };
+      return fence > this.now() ? this.held(pool, "uncertain", fence) : { kind: "unsent", message: UNAVAILABLE };
     }
     const controller = new AbortController();
     let timeout: NodeJS.Timeout | undefined;
@@ -246,10 +255,10 @@ export class LinearBroker {
       this.usage.invalidateContinuity(pool);
       try { await this.persist(); } catch { this.broken = true; }
       // A transport ignoring abort can answer late. Release safety debt, never recount usage.
-      const late = attempt.then(async () => {
+      const late = attempt.then(async ({ response }) => {
         if (!this.intents.has(intent.id)) return;
         this.intents.delete(intent.id);
-        try { await this.persist(); this.budget.releaseDebt(pool, intent.id); } catch {
+        try { await this.persist(); this.budget.releaseDebt(pool, intent.id, response.headers); } catch {
           this.intents.set(intent.id, uncertain); this.broken = true;
         }
       }, () => {});

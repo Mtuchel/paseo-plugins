@@ -135,10 +135,10 @@ test("unknown outcomes retain debt and a definitive late answer releases it with
   // A read-only file condition observes the actual settlement, not a fixed timing assertion.
   for (let attempt = 0; attempt < 100; attempt++) {
     const journal = JSON.parse(await readFile(join(home, "linear-tickets", "linear-broker-journal.json"), "utf8"));
-    if (journal.intents.length === 0 && budget.estimate("app", "points") === 120_000) break;
+    if (journal.intents.length === 0 && budget.estimate("app", "points") === 119_999) break;
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
-  assert.equal(budget.estimate("app", "points"), 120_000);
+  assert.equal(budget.estimate("app", "points"), 119_999);
   assert.equal(usage.snapshot().rows.find((entry) => entry.caller === "mcp:get_issue")!.requests, 1);
 });
 

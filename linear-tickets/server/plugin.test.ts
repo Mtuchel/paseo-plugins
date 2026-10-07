@@ -13,6 +13,7 @@ import { Launcher, safeBranchName } from "./launch";
 import { Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_CHEAP_MODELS, DEFAULT_STANDARD_MODELS, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, DEFAULT_ACTIVATION } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { LinearService, postGraphQL, ADD_LABEL_QUERY, CREATE_LABEL_QUERY, LABEL_BY_NAME_QUERY, resolveReviewState, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
+import { LinearBroker } from "./linear-broker";
 import { rateBudget, RateBudget, RateLimitedError, withPriority } from "./rate-budget";
 import { linearUsage } from "./linear-usage";
 import { PlannotatorHost } from "./parked";
@@ -53,6 +54,7 @@ test("agent status reports each credential's dimensions, pause and hourly caller
   // No review listener or host process is needed to exercise the status RPC.
   t.mock.method(ReviewLinks.prototype, "start", async () => {});
   t.mock.method(PlannotatorHost.prototype, "start", async () => {});
+  t.mock.method(LinearBroker.prototype, "start", async () => {});
   await linearUsage.start();
   const headers = (requestLimit: number, pointLimit: number, pointsLeft: number) => new Headers({
     "x-ratelimit-requests-limit": String(requestLimit), "x-ratelimit-requests-remaining": String(requestLimit * 0.9),

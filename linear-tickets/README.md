@@ -229,7 +229,15 @@ forget them. Mappings are stored per host in `settings.json`.
 
 Agents started from a ticket get a `linear_ticket` MCP server (on by default, the Paseo Agents
 menu bar app's **Control panel → Agent access to Linear** turns it off). Agents read all of
-Linear; what they may write depends on how an issue relates to the ticket the agent started from:
+Linear; write scope depends on how an issue relates to the ticket the agent started from.
+
+Every managed ticket/planner tool request uses the host's private Linear broker and the same
+app/key request and complexity budget as the plugin. Agent work leaves the last **5%** for
+owner decisions. A hold never switches to the owner's key. `initialize` and `tools/list` stay
+local. With no broker, tools fail closed: no direct Linear access or endpoint override.
+An interrupted submitted request says it **may have completed**; check the ticket before retrying
+a write. Multi-request tools can still partly complete before a later hold.
+
 
 | Scope | Write (as Paseo) |
 | --- | --- |
@@ -2128,8 +2136,8 @@ No tokens, query bodies or ticket text appear in the report.
   state labels, the agent session sweep and the label rules' sweeps. The key reads them only when the app is not installed, its token cannot be
   refreshed, or it cannot see a ticket. An app rate limit never falls back to the key. Writes use
   the app's pool too; the key writes only in the cases listed under [Who Linear shows as the
-  author](#who-linear-shows-as-the-author). The agents' `linear_ticket` servers send their own
-  requests, which the daemon's estimate does not count.
+  author](#who-linear-shows-as-the-author). Managed `linear_ticket` requests share daemon
+  admission through the private broker; daemon and agent MCP traffic are attributed separately.
 - **The session sweep's per-session reads follow the webhooks.** It still lists Linear's open
   agent sessions every minute (one request, shared by the parts of a sweep that need it), because
   that is how a session whose `created` webhook was missed is found, but it reads a session's
@@ -2897,3 +2905,50 @@ activations, and the cutover's activation routing (claims, deferral, delivery ov
 between two host fixtures. It also runs the ops
 digest's Python tests (`python3 -m unittest discover -s ops -p 'test_*.py'`).
 Live account authentication and agent execution require your configured host and key.
+
+### Managed agent Linear cutover and recovery
+
+The broker listens only on `$PASEO_HOME/linear-tickets/linear-broker.sock` (0600, directory 0700).
+Each MCP attempt reserves one request and the upstream 10,000-point query ceiling; that is
+a safety reservation, not measured usage. Daemon average-cost estimates and other credential
+users can still consume more than predicted; the reserve is not an absolute external-spend guarantee.
+An unknown app/key pool singleflights one small `viewer { id }` discovery at interactive priority,
+counted as `mcp:budget-probe`, before tool queries. Known holds/probe ownership remain authoritative.
+Absent samples retry no more often than once a minute. This discovery can precede knowledge of
+the reserve; it never borrows owner priority.
+
+`linear-broker-journal.json` records only outstanding ids, pool, time and reserved costs.
+Intent is synced before dispatch. Unknown/recovered sends pause MCP on that pool for one hour;
+afterwards fresh dimension headers are required **and unresolved maximum-cost debt is still
+subtracted**. Repeated restarts preserve the original fence deadline and debt. Elapsed time/new
+headers do not prove that an unknown request finished. Corrupt/unreadable state fails closed until
+repaired from verified state; do not delete markers to unpause agents. Reconcile only when the
+specific outcome is established; otherwise retain debt or roll back the transport explicitly.
+Shutdown refuses new work and drains attempts within the 30-second upstream deadline.
+Usage counts settle once while the broker runs or drains; persistence remains best-effort across
+crashes, and unknown/recovered intervals invalidate outside-estimate continuity.
+
+For **each host** (laptop and server087), drain current agent turns/MCP calls, update the clean
+`~/dev/paseo-plugins` checkout with `git pull --ff-only`, run `npm ci` only if the lockfile changed,
+then `paseo plugin reload linear-tickets` — never restart the daemon to load source changes.
+Startup upgrades only verified private generated files, preserving saved command paths.
+Unrecognized paths are logged as **unprotected**, never overwritten. Correct their saved config
+or establish provenance before claiming host coverage. Restart already-loaded legacy MCP processes
+through the provider after the turn drains; use agent session reopen if no independent MCP restart
+exists. Inventory saved commands/live children, verify `paseo plugin ls`, the status schema and one
+read-only tool's `mcp:` counter delta. A successful reload alone is not proof. Inaccessible hosts
+need a registered after-merge manual task; do not race another rollout or recovery.
+
+Rollback: drain affected MCP processes, run the installed standalone helper with a selected
+rollout manifest, newest first:
+
+```sh
+node \"$PASEO_HOME/linear-tickets/ticket-mcp-restore.mjs\" \\
+  \"$PASEO_HOME/linear-tickets/mcp-upgrades/rollout-<timestamp>-<id>.json\"
+```
+
+It restores checksum-verified previous bytes for all affected saved paths, including commands
+created after cutover, and refuses modified/symlinked targets. Original sources stay in the private
+`mcp-upgrades/` archive. Then revert the merge in a new PR, run repository checks, merge/reload and
+restart affected MCP processes. Keep usage history and unresolved safety debt. A plain Git revert
+without saved-command restoration does not roll back those executable paths.
