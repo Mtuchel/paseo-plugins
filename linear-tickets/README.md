@@ -2116,7 +2116,8 @@ No tokens, query bodies or ticket text appear in the report.
   the backoff up to 15 minutes. Background still waits for its 20% share to refill.
   Rate-limit refusals of Plannotator events and plan follow-ups retry at the advertised resume
   time without consuming an attempt; already-created tickets and relations stay recorded.
-  This does not fix decisions lost halfway through delivery (tracked separately in TUC-1288).
+  Non-parked decisions are deduplicated only after delivery succeeds, so a refused hand-off
+  remains retryable. Crash-safe journaling of partially applied decisions remains TUC-1288.
 - **Hourly usage is persisted** in `$PASEO_HOME/linear-tickets/linear-usage.json` (version 1,
   mode 0600), atomically every minute and on unload, with eight days retained. It counts answered
   requests, complexity points (missing costs estimated separately), local reserve refusals,

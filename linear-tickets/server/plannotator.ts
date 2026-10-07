@@ -510,7 +510,11 @@ export class PlannotatorBridge {
   }
 
   private deliver(event: PlannotatorEvent, agentId: string, paseo: PaseoApi): Promise<void> {
-    if (event.type === "decided" || event.type === "opened") return withPriority("owner", event.type === "decided" ? "plan decision" : "plan review", () => this.deliverEvent(event, agentId, paseo));
+    if (event.type === "decided" || event.type === "opened") return withPriority("owner", event.type === "decided" ? "plan decision" : "plan review", async () => {
+      await this.deliverEvent(event, agentId, paseo);
+      // Deduplicate completed decisions, never a hand-off that still needs its event retried.
+      if (event.type === "decided") this.lastDecision.set(agentId, Date.parse(event.at) || Date.now());
+    });
     return this.deliverEvent(event, agentId, paseo);
   }
 
@@ -531,7 +535,6 @@ export class PlannotatorBridge {
       const previous = this.lastDecision.get(agentId);
       const at = Date.parse(event.at) || Date.now();
       if (previous !== undefined && Math.abs(at - previous) < 120_000) return;
-      this.lastDecision.set(agentId, at);
     }
     const handle = paseo.agents.ref(agentId);
     const refreshed = await handle.refresh();

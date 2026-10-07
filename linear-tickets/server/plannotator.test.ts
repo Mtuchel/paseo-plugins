@@ -525,6 +525,31 @@ test("a parked decision whose hand-off fails on a Linear error is delivered in f
   assert.equal(plans.size, 0);
 });
 
+test("a non-parked approval retries its Linear writes after a rate limit instead of being treated as delivered", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-07T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const upsert = linear.upsertIssueDocument;
+  let limited = true;
+  linear.upsertIssueDocument = async (issueId, title) => {
+    if (limited) throw new RateLimitedError("app", Date.now() + 60_000);
+    return upsert(issueId, title);
+  };
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, at: new Date().toISOString() }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+    Object.assign(bridge, { paseo });
+    await bridge.drain();
+    assert.deepEqual(await readdir(directory), ["0.json"]);
+    limited = false;
+    t.mock.timers.tick(60_000);
+    await bridge.drain();
+    await bridge.drain();
+    assert.deepEqual(await readdir(directory), []);
+    assert.deepEqual(calls.filter((call) => call.startsWith("document ")), ["document issue-1 Plan: TUC-25"]);
+    assert.deepEqual(calls.filter((call) => call.startsWith("comment ")), ["comment issue-1: ✅ **Plan approved** in Plannotator — [plan](https://linear.app/doc/1)"]);
+  });
+});
+
 test("parked rate-limited decisions keep their event and attempt count until resumeAt, however often Linear pauses", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-07T12:00:00Z") });
   const errors = t.mock.method(console, "error", () => {});
