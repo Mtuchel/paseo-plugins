@@ -1674,6 +1674,38 @@ test("a persisted refusal still reaches its agent when the handover link moves b
   assert.deepEqual(await h.backstop(), [], "persisted delivery is not repeated");
 });
 
+test("a persisted claimed message and the one queued behind it reach the agent once when the handover link disappears", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = harness(t);
+  h.github.view = READY;
+  h.scripts.ready = { stacks: [STACK], drops: [] };
+  h.scripts.enqueue = [{ code: 2, answer: { result: "refused", problems: [{ kind: "conflict-main", text: "conflicts with main" }] } }];
+  await h.backstop();
+  const state = JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"));
+  assert.ok(state[PR].pending, "the linked refusal waits for delivery");
+  state[PR].pending.sending = true;
+  state[PR].queued = [{ key: "refused:queued", reason: "Next refusal.", facts: "Another repair is waiting.", fix: "Repair the queued refusal." }];
+  await h.state(state);
+  h.records[0].links = {};
+  h.github.open = [listed(PR, READY)];
+  await h.restart();
+
+  const calls = await h.backstop();
+  assert.equal(count(calls, "prompt "), 1, "the claimed refusal is not sent again");
+  assert.equal(promptOf(calls), "Repair the queued refusal.");
+  assert.equal(count(calls, "comment "), 0, "the owner is not asked to repair either refusal");
+  assert.equal(count(calls, "pr comment "), 0, "the repair belongs to the ticket's agent");
+  await h.restart();
+  assert.deepEqual(await h.backstop(), [], "the queued refusal is not repeated after restart");
+
+  h.github.drafts = [draft(437, [419])];
+  h.scripts.ready = { stacks: [STACK], drops: [{ pr: 419, draft: 437, key: "#437", revision: null }] };
+  assert.equal(count(await h.backstop(), "enqueue "), 0, "a genuine drop of the unchanged head is not enqueued");
+  await h.restart();
+  assert.deepEqual(await h.backstop(), [], "the genuine drop is not delivered again");
+  assert.match(h.scripts.runs[0], /--exclude 419(?: |$)/, "the unchanged head remains excluded after restart");
+});
+
 test("a queue-tip conflict is routed once and retried once its queue draft is closed", async (t) => {
   const h = harness(t);
   h.github.view = READY;
