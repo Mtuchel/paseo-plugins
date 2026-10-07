@@ -137,7 +137,7 @@ function crashDaemon(calls: string[]) {
 const HEAD = "a1b2c3d4e5f6";
 const RUNNING_CI: CheckRun = { name: "Code validation / Core (core-web)", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/1/job/1", state: "pending", conclusion: "pending" };
 // An open, ready pull request whose CI still runs: no lifecycle stage applies to it.
-const OPEN_PR: PullRequestView = { state: "OPEN", isDraft: false, headSha: HEAD, headBranch: "mtuchel/tuc-1-fix", baseBranch: "main", updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, comments: [], reviews: [], lastCommitAt: null, checks: [RUNNING_CI] };
+const OPEN_PR: PullRequestView = { state: "OPEN", isDraft: false, headSha: HEAD, headBranch: "mtuchel/tuc-1-fix", baseBranch: "main", updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, comments: [], reviews: [], lastCommitAt: null, checks: [RUNNING_CI], mergeable: null };
 // A pull request as the repo's open listing shows it.
 const listed = (url: string, view: PullRequestView, title = "Fix TUC-1 [plugin] Retry the upload"): OpenPull => ({
   number: Number(url.split("/").at(-1)), url, title, headBranch: view.headBranch, headSha: view.headSha, baseBranch: view.baseBranch, trunk: "main", draft: view.isDraft, labels: view.labels,
@@ -162,13 +162,14 @@ const MAIN_BROKEN: Judgment = {
 // injected `view` is the whole read, as for the tests that predate it.
 function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean } = {}, probe?: PullViewSource) {
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
-  // `view`: the watched pull request, listed while open; `views`: other pull requests by URL, and
-  // `open` the listing's other entries; `deleted`: branches gone; `throttle`: pull requests whose
-  // read GitHub throttles; `listFailure`: what listing the open pull requests throws; `comments`:
+  // `view`: the watched pull request, listed while open under `title`; `views`: other pull requests
+  // by URL, and `open` the listing's other entries; `deleted`: branches gone; `throttle`: pull
+  // requests whose read GitHub throttles, `broken` ones whose read fails otherwise; `listFailure`:
+  // what listing the open pull requests throws; `comments`:
   // each pull request's conversation comments; `stall`: runs after a pull request comment went
   // out (a hanging one is a crash right after); `states`: pull request states as REST reads them
   // one by one (a draft's own state by default; `unreadable` ones fail).
-  const github = { view: OPEN_PR, views: {} as Record<string, PullRequestView>, drafts: [] as QueueDraft[], landed: [] as number[], threads: [] as ReviewThread[], open: [] as OpenPull[], deleted: [] as string[], reads: [] as string[], listings: [] as string[], threadReads: 0, throttled: false, throttle: [] as string[], missing: false, listFailure: null as Error | null, comments: {} as Record<number, string[]>, stall: async () => {}, states: {} as Record<number, string>, unreadable: [] as number[], stateReads: [] as number[] };
+  const github = { view: OPEN_PR, title: "Fix TUC-1 [plugin] Retry the upload", views: {} as Record<string, PullRequestView>, drafts: [] as QueueDraft[], landed: [] as number[], threads: [] as ReviewThread[], open: [] as OpenPull[], deleted: [] as string[], reads: [] as string[], listings: [] as string[], threadReads: 0, throttled: false, throttle: [] as string[], broken: [] as string[], missing: false, listFailure: null as Error | null, comments: {} as Record<number, string[]>, stall: async () => {}, states: {} as Record<number, string>, unreadable: [] as number[], stateReads: [] as number[] };
   // The repo's scripts the backstop runs from its checkout (`checkout` null: the repo has none).
   // `judgment`: what `wait-queue.mjs` answers for a dropped round (null: still running; `judgments`
   // per pull request override it), or
@@ -304,6 +305,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       github.reads.push(url);
       if (github.throttled || github.throttle.includes(url)) throw new GitHubRateLimitedError("GitHub is throttling gh: HTTP 403: API rate limit exceeded");
       if (github.missing) throw new PullRequestNotFoundError("GraphQL: Could not resolve to a PullRequest with the number of 419. (repository.pullRequest)");
+      if (github.broken.includes(url)) throw new Error("HTTP 502: Bad Gateway");
       return github.views[url] ?? github.view;
     },
     github: {
@@ -319,7 +321,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         github.listings.push(repo);
         if (github.listFailure) throw github.listFailure;
         const linked = records[0].links["Pull request"];
-        return [...(github.view.state === "OPEN" && linked ? [listed(linked, github.view)] : []), ...github.open]
+        return [...(github.view.state === "OPEN" && linked ? [listed(linked, github.view, github.title)] : []), ...github.open]
           .filter((pull) => pull.url.startsWith(`https://github.com/${repo}/pull/`));
       },
       branchExists: async (_repo, branch) => !github.deleted.includes(branch),
@@ -1259,6 +1261,8 @@ test("missing PR links recover the lowest open ticket remainder after #2000 land
   const top = { ...OPEN_PR, headBranch: "mtuchel/tuc-654-d", baseBranch: middle.headBranch };
   h.github.view = { ...OPEN_PR, state: "CLOSED", labels: ["externally-merged"] };
   h.github.views[prUrl(2001)] = bottom;
+  h.github.views[prUrl(2002)] = middle;
+  h.github.views[prUrl(2003)] = top;
   h.github.open = [
     listed(prUrl(1999), OPEN_PR, "Fix TUC-6540 [queue] Not this ticket"),
     listed(prUrl(2003), top, "Fix TUC-654 [queue] Top"),
@@ -1270,7 +1274,7 @@ test("missing PR links recover the lowest open ticket remainder after #2000 land
   await h.state({ [prUrl(2000)]: landed });
   const calls = await h.poll();
   assert.equal(h.records[0].links["Pull request"], prUrl(2001));
-  assert.deepEqual(h.github.reads, [prUrl(2001)]);
+  assert.deepEqual(h.github.reads, [prUrl(2001), prUrl(2002), prUrl(2003)], "the recovered PR, then its connected stack before any nudge");
   assert.match(promptOf(calls) ?? "", /Checks failed on the head of \[the pull request\]\(https:\/\/github\.com\/tuchel-sohn\/tuchel-platform\/pull\/2001\)/);
   assert.deepEqual(h.linear.issueReads, [], "a validated source origin wins without ticket reads");
   assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"))[prUrl(2000)], landed, "discovery leaves earlier lifecycle claims intact");
@@ -1285,15 +1289,17 @@ test("a removed worktree recovers its open remainder from the ticket's canonical
     h.records[0] = { ...h.records[0], identifier: "TUC-654", branch: "mtuchel/tuc-654-landed", worktreePath, links: {} };
     h.linear.attachments = [prUrl(2000), prUrl(2000), "https://linear.app/ws/issue/TUC-654"];
     const bottom = { ...OPEN_PR, headBranch: "mtuchel/tuc-654-b" };
+    const upper = { ...OPEN_PR, headBranch: "mtuchel/tuc-654-c", baseBranch: bottom.headBranch };
     h.github.open = [
-      listed(prUrl(2002), { ...OPEN_PR, headBranch: "mtuchel/tuc-654-c", baseBranch: bottom.headBranch }, "Fix TUC-654 [queue] Upper"),
+      listed(prUrl(2002), upper, "Fix TUC-654 [queue] Upper"),
       listed(prUrl(2001), bottom, "Fix TUC-654 [queue] Remainder"),
     ];
     h.github.views[prUrl(2001)] = bottom;
+    h.github.views[prUrl(2002)] = upper;
     h.github.view = { ...OPEN_PR, state: "CLOSED" };
     assert.ok((await h.poll()).includes(`handover link ${prUrl(2001)}`), String(worktreePath));
     assert.equal(h.records[0].links["Pull request"], prUrl(2001));
-    assert.deepEqual(h.github.reads, [prUrl(2001)], "the recovered PR is read immediately");
+    assert.deepEqual(h.github.reads, [prUrl(2001), prUrl(2002)], "the recovered PR is read immediately, then its connected stack");
     assert.deepEqual(h.github.listings, ["tuchel-sohn/tuchel-platform"]);
     await h.restart();
     assert.deepEqual(await h.poll(), [], "attachment fallback is not relinked on restart");
@@ -3077,4 +3083,255 @@ test("Greptile evidence expires even on non-writers and when the script is absen
     const saved = JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"));
     assert.equal(saved[PR].greptile, undefined);
   }
+});
+
+
+// TUC-1265: the ticket's connected stack #417 (on main) → #418 → #419, linked at `link`. Every
+// member is READY unless `parts` (bottom first) changes it; the listing shows what the views show.
+const CHAIN = [prUrl(417), prUrl(418), PR];
+const CHAIN_BRANCHES = ["mtuchel/tuc-1-a", "mtuchel/tuc-1-b", "mtuchel/tuc-1-fix"];
+function stackOf(h: ReturnType<typeof harness>, link: number, ...parts: Partial<PullRequestView>[]): PullRequestView[] {
+  const views = CHAIN.map((_, index) => ({ ...READY, headSha: `head${index}`, headBranch: CHAIN_BRANCHES[index], baseBranch: index ? CHAIN_BRANCHES[index - 1] : "main", ...parts[index] }));
+  h.records[0] = { ...h.records[0], links: { "Pull request": CHAIN[link] } };
+  CHAIN.forEach((url, index) => { h.github.views[url] = views[index]; });
+  h.github.view = views[link];
+  h.github.open = CHAIN.flatMap((url, index) => (index === link ? [] : [listed(url, views[index], `Fix TUC-1 [plugin] Part ${index + 1}`)]));
+  return views;
+}
+const RED = { checks: [failing("PR code")] };
+const saved = async (h: ReturnType<typeof harness>) => JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8")) as Record<string, { nudges?: Record<string, string[]> }>;
+const prompted = (calls: string[]) => calls.filter((call) => call.startsWith("prompt ")).map((call) => /\]\((https:\/\/github\.com\/[^)]+)\)/.exec(call)?.[1]);
+
+test("TUC-1265: a green linked pull request's connected red parent gets one repair; the link and its review mirror stay", async (t) => {
+  const h = harness(t);
+  const approval = { author: "ada", state: "APPROVED", submittedAt: "2026-10-07T08:00:00Z", body: "", commit: "head1" };
+  stackOf(h, 2, {}, { ...RED, reviews: [approval] });
+  const first = await h.poll();
+  assert.deepEqual(firstLines(first), ["prompt a1", "say thought The pull request is waiting for the agent to fix the failing checks; it was asked to."], "no review of the parent is mirrored into the ticket");
+  assert.ok(promptOf(first)?.startsWith(`Checks failed on the head of [the pull request](${prUrl(418)}) (\`head1\`):`), promptOf(first));
+  assert.equal(h.records[0].links["Pull request"], PR, "the link stays on the green child");
+  assert.deepEqual((await saved(h))[prUrl(418)].nudges, { red: ["head1"] });
+  assert.equal((await saved(h))[PR].nudges, undefined);
+  assert.deepEqual(await h.poll(), [], "claimed");
+  stackOf(h, 2, {}, { reviews: [approval] });
+  assert.deepEqual(await h.poll(), [], "the blocker cleared: nothing more, also not for the child");
+});
+
+test("TUC-1265: blocked members are repaired bottom first wherever the link sits, also above it", async (t) => {
+  for (const link of [0, 1, 2]) {
+    const h = harness(t);
+    stackOf(h, link, RED, RED, {});
+    assert.deepEqual(prompted(await h.poll()), [prUrl(417)], `linked #${417 + link}: the bottom first`);
+    assert.deepEqual(prompted(await h.poll()), [prUrl(418)], `linked #${417 + link}: then the middle`);
+    assert.deepEqual(await h.poll(), []);
+  }
+  const above = harness(t);
+  stackOf(above, 0, {}, {}, RED);
+  assert.deepEqual(prompted(await above.poll()), [PR], "a red member above the linked bottom is repaired too");
+  const middle = harness(t);
+  stackOf(middle, 0, {}, RED, {});
+  assert.deepEqual(prompted(await middle.poll()), [prUrl(418)], "the linked bottom's blocked middle");
+});
+
+test("TUC-1265: only the ticket's own connected chain counts; other tickets, trunk, and broken or forked topology leave the link to itself", async (t) => {
+  const log = t.mock.method(console, "error", () => {});
+  const disconnected = harness(t);
+  disconnected.github.view = READY;
+  disconnected.github.views[prUrl(500)] = { ...READY, ...RED, headBranch: "mtuchel/tuc-1-other" };
+  disconnected.github.open = [listed(prUrl(500), disconnected.github.views[prUrl(500)], "Fix TUC-1 [plugin] Elsewhere")];
+  assert.deepEqual(await disconnected.poll(), [], "a same-ticket pull request off the chain");
+  assert.ok(!disconnected.github.reads.includes(prUrl(500)), "and it is not even read");
+
+  const other = harness(t);
+  other.github.view = { ...READY, baseBranch: "mtuchel/tuc-10-x" };
+  other.github.views[prUrl(416)] = { ...READY, ...RED, headBranch: "mtuchel/tuc-10-x" };
+  other.github.open = [listed(prUrl(416), other.github.views[prUrl(416)], "Fix TUC-10 [plugin] Another ticket")];
+  assert.deepEqual(await other.poll(), [], "TUC-10 is another ticket: a boundary, never a target");
+
+  const broken: [string, (h: ReturnType<typeof harness>) => void][] = [
+    ["a parent branch without an open pull request", (h) => { stackOf(h, 2, {}, {}, RED); h.github.open = h.github.open.filter((pull) => pull.number !== 418); }],
+    ["two open pull requests on the parent's branch", (h) => { stackOf(h, 2, {}, RED); h.github.open.push(listed(prUrl(430), { ...READY, headBranch: CHAIN_BRANCHES[1] }, "Fix TUC-1 [plugin] Twin")); }],
+    ["a fork: two of the ticket's pull requests on the middle", (h) => { stackOf(h, 2, {}, RED); h.github.open.push(listed(prUrl(431), { ...READY, headBranch: "mtuchel/tuc-1-side", baseBranch: CHAIN_BRANCHES[1] }, "Fix TUC-1 [plugin] Side")); }],
+    ["a cycle", (h) => { stackOf(h, 2, {}, { ...RED, baseBranch: CHAIN_BRANCHES[2] }); h.github.open = h.github.open.filter((pull) => pull.number === 418); }],
+  ];
+  for (const [why, setup] of broken) {
+    const h = harness(t);
+    setup(h);
+    const linkedRed = h.github.view.checks.some((check) => check.state === "failed");
+    assert.deepEqual(prompted(await h.poll()), linkedRed ? [PR] : [], `${why}: only the link is nudged, as before`);
+    const state = await saved(h);
+    assert.deepEqual(Object.keys(state).filter((url) => url !== PR && state[url].nudges), [], `${why}: no member claimed`);
+  }
+  assert.ok(log.mock.calls.some((call) => /connected stack is deferred: the base mtuchel\/tuc-1-b of #419 has no open pull request/.test(String(call.arguments[0]))));
+});
+
+test("TUC-1265: a confirmed base conflict asks for an own-stack rebase after draft and failed checks; unknown or clean mergeability asks nothing", async (t) => {
+  const h = harness(t);
+  for (const mergeable of [null, "MERGEABLE"] as const) {
+    h.github.view = { ...READY, mergeable };
+    assert.deepEqual(await h.poll(), [], String(mergeable));
+  }
+  h.github.view = { ...READY, mergeable: "CONFLICTING" };
+  const calls = await h.poll();
+  assert.equal(promptOf(calls), [
+    `GitHub reports that [the pull request](${PR}) (\`mtuchel/tuc-1-fix\` at \`a1b2c3d\`) conflicts with its base \`main\`.`,
+    "Next step: rebase only your own stack onto the current `main`: this branch and your branches above it, resolving the conflicts. Run the checks your repository's AGENTS.md requires, then push and resubmit the rebased branches the way it prescribes (its review and publication rules still hold).",
+    "Do not run `gt sync` or `gt restack`, never rebase, restack or push another ticket's branches, and never enqueue around this pull request's parent.",
+    "",
+    "This is nudge 1 of 2 for this step; after that the owner takes over.",
+  ].join("\n"));
+  assert.equal(calls.at(-1), "say thought The pull request is waiting for the agent to resolve the base conflict; it was asked to.");
+  assert.deepEqual(await h.poll(), [], "claimed for this head");
+  await h.restart();
+  assert.deepEqual(await h.poll(), [], "also after a restart");
+  assert.deepEqual(h.scripts.runs, [], "no enqueue, retarget or other repo script");
+
+  const order = harness(t);
+  const changes = { author: "Mtuchel", state: "CHANGES_REQUESTED", submittedAt: "2026-10-07T09:00:00Z", body: "No.", commit: HEAD };
+  order.github.view = { ...READY, isDraft: true, updatedAt: ago(60 * MINUTE), ...RED, reviews: [changes], mergeable: "CONFLICTING" };
+  assert.match(promptOf(await order.poll()) ?? "", /still a draft/);
+  order.github.view = { ...order.github.view, isDraft: false };
+  assert.match(promptOf(await order.poll()) ?? "", /^Checks failed/);
+  order.github.view = { ...order.github.view, checks: READY.checks };
+  assert.match(promptOf(await order.poll()) ?? "", /conflicts with its base/, "before requested changes");
+  order.github.view = { ...order.github.view, mergeable: null };
+  assert.match(promptOf(await order.poll()) ?? "", /requested changes/);
+
+  const member = harness(t);
+  stackOf(member, 2, { mergeable: "CONFLICTING" });
+  const memberCalls = await member.poll();
+  assert.deepEqual(prompted(memberCalls), [prUrl(417)]);
+  assert.match(promptOf(memberCalls) ?? "", /\(`mtuchel\/tuc-1-a` at `head0`\) conflicts with its base `main`/);
+});
+
+test("TUC-1265: base conflicts on new heads use the stage's two nudges, then one owner mention with the blocked pull request, and a restart repeats none", async (t) => {
+  const log = t.mock.method(console, "error", () => {});
+  const h = harness(t);
+  const conflict = (head: string) => stackOf(h, 2, {}, { headSha: head, mergeable: "CONFLICTING" });
+  conflict("c1");
+  assert.match(promptOf(await h.poll()) ?? "", /pull\/418\)[^]*nudge 1 of 2/);
+  conflict("c2");
+  assert.match(promptOf(await h.poll()) ?? "", /pull\/418\)[^]*nudge 2 of 2/);
+  conflict("c3");
+  const third = await h.poll();
+  assert.equal(promptOf(third), undefined);
+  assert.ok(third[0].startsWith(`comment ${OWNER} Paseo asked the agent 2 times to resolve the base conflict on [the pull request](${prUrl(418)}), and it is stuck there again, so Paseo stops asking. Please take over.`), third[0]);
+  assert.equal(third[1], "say response The pull request is stuck again waiting for the agent to resolve the base conflict; the owner was asked to take over.");
+  await h.restart();
+  conflict("c4");
+  assert.deepEqual(await h.poll(), [], "after a restart a new head only reaches the log");
+  assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /pull\/418 is waiting for the agent to resolve the base conflict again; already escalated/);
+
+  t.mock.method(console, "log", () => {});
+  const waiting = harness(t);
+  const start = waiting.scripts.now;
+  stackOf(waiting, 2, {}, { headSha: "w1", mergeable: "CONFLICTING" });
+  waiting.paseo.answer = async () => "waiting";
+  assert.deepEqual(await waiting.poll(), []);
+  waiting.scripts.now = start + HOUR;
+  assert.deepEqual(await waiting.poll(), [`comment ${OWNER} The agent has waited over 60 minutes for your answer while [the pull request](${prUrl(418)}) waits for it to resolve the base conflict. Answer it in the ticket's thread, or take over.`]);
+  await waiting.restart();
+  waiting.paseo.answer = async () => "sent";
+  stackOf(waiting, 2, {}, { headSha: "w2", mergeable: "CONFLICTING" });
+  assert.deepEqual(await waiting.poll(), [], "the waited-out stage is exhausted; no second mention after the restart");
+});
+
+test("TUC-1265: a hold anywhere on the stack defers its connected repair without any claim, and one repair goes out once it clears", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const member = { reviewedAt: null, decision: null, merged: false };
+  const holds: [string, (h: ReturnType<typeof harness>) => Promise<void> | void][] = [
+    ["a veto on another member", (h) => { stackOf(h, 2, { labels: ["do-not-merge"] }, RED); }],
+    ["an explicit drop escalation", (h) => h.state({ [prUrl(417)]: { ...member, escalated: true } })],
+    ["a legacy third drop", (h) => h.state({ [prUrl(417)]: { ...member, drops: ["#1", "#2", "#3"] } })],
+    ["a pending drop message", (h) => h.state({ [prUrl(417)]: { ...member, pending: { key: "#9", reason: "conflict", facts: "", fix: "Restack." } } })],
+    ["a head held after a genuine drop", (h) => h.state({ [prUrl(417)]: { ...member, blockedAt: "head0" } })],
+    ["an unreadable member", (h) => { h.github.broken.push(prUrl(417)); }],
+    ["a head the listing does not show", (h) => { h.github.open = h.github.open.map((pull) => (pull.number === 417 ? { ...pull, headSha: "older" } : pull)); }],
+    ["a base the listing does not show", (h) => { h.github.views[prUrl(418)] = { ...h.github.views[prUrl(418)], baseBranch: "main" }; }],
+    ["another ticket's record linking a member", (h) => { h.records.push({ ...h.records[0], issueId: "i2", identifier: "TUC-2", agentId: "a2", links: { "Pull request": prUrl(417) } }); }],
+    ["an open manual task", (h) => { h.blockers.push("TUC-9"); }],
+    ["unreadable manual tasks", (h) => { h.gate.unreadable = true; }],
+    ["a busy agent", (h) => { h.paseo.answer = async () => "busy"; }],
+    ["the merge queue holding the blocked member", (h) => { stackOf(h, 2, {}, { ...RED, mergeActivity: activity(QUEUED) }); }],
+  ];
+  for (const [why, hold] of holds) {
+    const h = harness(t);
+    stackOf(h, 2, {}, RED);
+    await hold(h);
+    assert.deepEqual(await h.poll(), [], why);
+    assert.equal((await saved(h))[prUrl(418)]?.nudges, undefined, `${why}: nothing claimed`);
+    stackOf(h, 2, {}, RED);
+    h.records.splice(1);
+    h.blockers.length = 0;
+    h.gate.unreadable = false;
+    h.github.broken.length = 0;
+    h.paseo.answer = async () => "sent";
+    await h.state({});
+    assert.deepEqual(prompted(await h.poll()), [prUrl(418)], `${why} cleared: one repair`);
+    assert.deepEqual(await h.poll(), [], `${why} cleared: once`);
+  }
+  const gone = harness(t, { live: false });
+  stackOf(gone, 2, {}, RED);
+  const calls = await gone.poll();
+  assert.equal(calls[0], "move In Progress");
+  assert.ok(calls[1].includes(`Checks failed on the head of [the pull request](${prUrl(418)})`), "a gone agent's repair goes to the ticket");
+});
+
+test("TUC-1265: an exhausted stage stops only that member's stage; the rest of the stack is still repaired, also after a restart", async (t) => {
+  const log = t.mock.method(console, "error", () => {});
+  const h = harness(t);
+  await h.state({ [prUrl(418)]: { reviewedAt: null, decision: null, merged: false, nudges: { red: ["x1", "x2", "x3"] } } });
+  stackOf(h, 2, {}, { ...RED, headSha: "x4" }, RED);
+  assert.deepEqual(prompted(await h.poll()), [PR], "the escalated middle only logs; the red link gets its own first nudge");
+  assert.match(String(log.mock.calls.find((call) => /pull\/418 is waiting/.test(String(call.arguments[0])))?.arguments[0]), /already escalated to the owner/);
+  await h.restart();
+  stackOf(h, 2, {}, { ...RED, headSha: "x5" }, RED);
+  assert.deepEqual(await h.poll(), [], "no restart or other member resets the middle's budget");
+  assert.deepEqual((await saved(h))[prUrl(418)].nudges, { red: ["x1", "x2", "x3", "x4", "x5"] });
+});
+
+test("TUC-1265: green members sharing a blocked parent get one repair from one listing, and members never move the ticket's link or state", async (t) => {
+  const h = harness(t);
+  const approval = { author: "ada", state: "APPROVED", submittedAt: "2026-10-07T08:00:00Z", body: "", commit: "head0" };
+  stackOf(h, 2, { ...RED, reviews: [approval] });
+  h.records.push({ ...h.records[0], agentId: "a2", links: { "Pull request": prUrl(418) } });
+  const calls = await h.poll();
+  assert.deepEqual(prompted(calls), [prUrl(417)], "one repair for both green descendants");
+  assert.deepEqual(h.github.listings, ["tuchel-sohn/tuchel-platform"], "one open listing per repo and poll");
+  assert.ok(!calls.some((call) => call.startsWith("review ") || call.startsWith("move ")), "the parent's approval is not mirrored");
+  assert.deepEqual((await saved(h))[prUrl(417)].nudges, { red: ["head0"] });
+  assert.deepEqual(await h.poll(), []);
+  h.records.splice(1);
+  stackOf(h, 2);
+  h.github.open = h.github.open.filter((pull) => pull.number !== 417);
+  t.mock.method(console, "error", () => {});
+  assert.deepEqual(await h.poll(), [], "the parent closed: nothing merged, reviewed or relinked");
+  assert.equal(h.records[0].links["Pull request"], PR);
+});
+
+test("TUC-1265: a linked pull request whose title names no ticket keeps linked-only nudges and never targets a sibling", async (t) => {
+  const h = harness(t);
+  h.github.title = "The solver plans Aufbereitungen";
+  h.github.view = { ...READY, baseBranch: "aufbereitung-a" };
+  h.github.views[prUrl(417)] = { ...READY, ...RED, headBranch: "aufbereitung-a" };
+  h.github.open = [listed(prUrl(417), h.github.views[prUrl(417)], "The solver plans Aufbereitungen (part 1)")];
+  assert.deepEqual(await h.poll(), []);
+  assert.deepEqual(h.github.reads, [PR], "the sibling is not read");
+  h.github.view = { ...h.github.view, ...RED };
+  assert.deepEqual(prompted(await h.poll()), [PR], "the link itself is still nudged");
+});
+
+test("TUC-1265: an agent waiting for the owner holds the whole stack's repairs, and the owner is reminded of one wait", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t);
+  const start = h.scripts.now;
+  stackOf(h, 2, RED, RED);
+  h.paseo.answer = async () => "waiting";
+  assert.deepEqual(await h.poll(), []);
+  h.scripts.now = start + HOUR;
+  assert.deepEqual(await h.poll(), [`comment ${OWNER} The agent has waited over 60 minutes for your answer while [the pull request](${prUrl(417)}) waits for it to fix the failing checks. Answer it in the ticket's thread, or take over.`], "only the bottom's wait");
+  const state = await saved(h);
+  assert.equal(state[prUrl(418)]?.nudges, undefined, "the middle was not even tried");
+  h.paseo.answer = async () => "sent";
+  assert.deepEqual(prompted(await h.poll()), [prUrl(418)], "the bottom's stage is exhausted; the middle goes next");
 });

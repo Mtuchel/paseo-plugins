@@ -85,6 +85,10 @@ export type PullRequestView = {
   reviews: { author: string; state: string; submittedAt: string; body: string; commit: string | null }[];
   lastCommitAt: string | null;
   checks: CheckRun[];
+  // GitHub's merge check against the base: "CONFLICTING" only when GitHub confirmed a conflict,
+  // "MERGEABLE" when it confirmed none, null while it is still computing it (UNKNOWN) or did not
+  // say. Only a confirmed conflict is ever acted on.
+  mergeable: "MERGEABLE" | "CONFLICTING" | null;
 };
 // `held`: approved, but kept out of Ready to merge while manual tasks due before merge are open.
 // `closed`: closed without merging. Merge queue drops already claimed, by draft (`#123`) or, for
@@ -180,6 +184,52 @@ function lowestPull(open: OpenPull[]): OpenPull | undefined {
   return open.filter((pull) => !open.some((other) => other.headBranch === pull.baseBranch)).sort((a, b) => a.number - b.number)[0];
 }
 
+// The ticket's connected stack around its linked pull request, bottom first (README, "Stalled pull
+// requests"): the open pull requests of the repo whose titles name the ticket, joined by exact
+// `base → head` branch edges below and above the link. The repo's trunk and another ticket's pull
+// request end it, and are never part of it. Null when the link is not listed or its own title does
+// not name the ticket (repos whose titles carry no ticket keep linked-only nudges); `invalid` when
+// the branches are not one plain chain: a base branch without an open pull request, a branch two
+// open pull requests share, two of the ticket's pull requests on one branch, or a cycle.
+function connectedStack(identifier: string, repo: string, linked: number, listing: OpenPull[]): { stack: OpenPull[] } | { invalid: string } | null {
+  const names = namesTicket(identifier);
+  const open = listing.filter((pull) => pull.url.toLowerCase() === pullUrl(repo, pull.number).toLowerCase());
+  const link = open.find((pull) => pull.number === linked);
+  if (!link || !names.test(link.title)) return null;
+  // Every open pull request by its branch, and the ticket's by the branch they sit on.
+  const byHead = new Map<string, OpenPull[]>();
+  const onBase = new Map<string, OpenPull[]>();
+  for (const pull of open) {
+    byHead.set(pull.headBranch, [...(byHead.get(pull.headBranch) ?? []), pull]);
+    if (names.test(pull.title)) onBase.set(pull.baseBranch, [...(onBase.get(pull.baseBranch) ?? []), pull]);
+  }
+  const stack = [link];
+  for (let pull = link; pull.baseBranch !== pull.trunk;) {
+    const parents = byHead.get(pull.baseBranch) ?? [];
+    if (!parents.length) return { invalid: `the base ${pull.baseBranch} of #${pull.number} has no open pull request` };
+    if (parents.length > 1) return { invalid: `open pull requests ${parents.map((item) => `#${item.number}`).join(", ")} share the branch ${pull.baseBranch}` };
+    // Another ticket's pull request is a boundary: its branches are its agent's.
+    if (!names.test(parents[0].title)) break;
+    if (stack.includes(parents[0])) return { invalid: `the branches of #${parents[0].number} form a cycle` };
+    stack.unshift(parents[0]);
+    pull = parents[0];
+  }
+  for (let pull = link; ;) {
+    const next = onBase.get(pull.headBranch) ?? [];
+    if (next.length > 1) return { invalid: `#${next.map((item) => item.number).join(" and #")} both sit on #${pull.number}` };
+    if (!next.length) break;
+    if (stack.includes(next[0])) return { invalid: `the branches of #${next[0].number} form a cycle` };
+    stack.push(next[0]);
+    pull = next[0];
+  }
+  for (const [index, pull] of stack.entries()) {
+    if ((byHead.get(pull.headBranch) ?? []).length > 1) return { invalid: `open pull requests share the branch ${pull.headBranch} of #${pull.number}` };
+    const next = onBase.get(pull.headBranch) ?? [];
+    if (next.length > 1 || (next.length === 1 && next[0] !== stack[index + 1])) return { invalid: `#${pull.number} has more than one of the ticket's pull requests on it` };
+  }
+  return { stack };
+}
+
 // gh reports GitHub's throttling (HTTP 429, primary or secondary rate limit); the poll's GitHub
 // reads stop until the next one.
 export class GitHubRateLimitedError extends Error {
@@ -263,7 +313,8 @@ export async function viewPullRequest(url: string): Promise<PullRequestView> {
     reviews?: { author?: { login?: string }; state?: string; submittedAt?: string; body?: string; commit?: { oid?: string } | null }[];
     commits?: { committedDate?: string }[];
     statusCheckRollup?: RollupItem[];
-  }>(["pr", "view", url, "--json", "state,isDraft,headRefOid,headRefName,baseRefName,updatedAt,reviewDecision,labels,comments,reviews,commits,statusCheckRollup"]);
+    mergeable?: string | null;
+  }>(["pr", "view", url, "--json", "state,isDraft,headRefOid,headRefName,baseRefName,updatedAt,reviewDecision,labels,comments,reviews,commits,statusCheckRollup,mergeable"]);
   const activity = (data.comments ?? []).filter((comment) => /^graphite-app(\[bot\])?$/.test(comment.author?.login ?? "") && comment.body?.startsWith("### Merge activity")).at(-1);
   // A check re-run (or run again for another event) appears once per run; the latest one counts.
   const latest = new Map<string, { at: string; check: CheckRun }>();
@@ -291,6 +342,7 @@ export async function viewPullRequest(url: string): Promise<PullRequestView> {
     reviews: (data.reviews ?? []).map((review) => ({ author: review.author?.login ?? "someone", state: review.state ?? "", submittedAt: review.submittedAt ?? "", body: review.body ?? "", commit: review.commit?.oid ?? null })).filter((review) => review.submittedAt),
     lastCommitAt: data.commits?.at(-1)?.committedDate ?? null,
     checks: [...latest.values()].map((entry) => entry.check),
+    mergeable: data.mergeable === "CONFLICTING" || data.mergeable === "MERGEABLE" ? data.mergeable : null,
   };
 }
 
@@ -1012,6 +1064,8 @@ export class PullRequestWatch {
     // Agents that got a message this poll: one instruction per agent and poll, so the pull
     // requests of one stack do not each send it one.
     const reserved = new Set<string>();
+    // Detail views read this poll, shared by the connected stacks that list the same pull request.
+    const views = new Map<string, Promise<PullRequestView>>();
     const stopped: { paused: RateLimitedError | null; budget: GitHubPausedError | null; throttled: GitHubRateLimitedError | null } = { paused: null, budget: null, throttled: null };
     // A failure for one pull request is logged and the rest go on; a rate limit ends the poll.
     const step = async (record: HandoverRecord, url: string, work: () => Promise<void>): Promise<boolean> => {
@@ -1065,6 +1119,7 @@ export class PullRequestWatch {
           seenByUrl[url] = { ...(seenByUrl[url] ?? { reviewedAt: null, decision: null, merged: false }), missing: true, pending: null, queued: undefined };
           return;
         }
+        views.set(url, Promise.resolve(view));
         const result = reviewChange(view, seenByUrl[url] ?? { reviewedAt: null, decision: null, merged: false });
         const { change, seen } = manual ? await this.gate(record, result, manual) : result;
         if (change) await this.apply(record, change);
@@ -1103,7 +1158,7 @@ export class PullRequestWatch {
       if (!going) break;
     }
     for (const { record, url, view } of stopped.paused || stopped.budget || stopped.throttled ? [] : nudges) {
-      const next = view.state === "OPEN" ? () => this.nudge(record, url, view, seenByUrl, save, listDrafts, reserved)
+      const next = view.state === "OPEN" ? () => this.nudgeStack(record, url, view, seenByUrl, save, context, reserved, views)
         : seenByUrl[url].merged ? () => this.advance(record, url, seenByUrl, listPulls)
         : () => this.replace(record, url, view, seenByUrl, save, listPulls, reserved);
       if (!await step(record, url, next)) break;
@@ -2129,30 +2184,106 @@ export class PullRequestWatch {
     }
   }
 
+  // Why the connected stack of a linked pull request was last left to linked-only nudges, so the
+  // log names a deferral once per reason, not every poll.
+  private readonly deferredStacks = new Map<string, string>();
+
+  // The nudges of an open linked pull request. With a connected stack (see connectedStack) whose
+  // every member checked out (see stackMembers), each member is a candidate, bottom first, whatever
+  // the link's position: a blocked parent, or a blocked branch above the link, gets its step though
+  // the ticket links another pull request. The first member whose step went, or tried to go, to the
+  // agent ends the pass, so a busy or waiting agent is asked about one pull request per poll and
+  // the owner is reminded of one wait; a stage only escalated or logged lets the next member go.
+  // Otherwise only the link is nudged, as before. Members are only nudged: their reviews are not
+  // mirrored into the ticket, their drops not claimed, and the link stays where it is.
+  private async nudgeStack(record: HandoverRecord, url: string, view: PullRequestView, seenByUrl: Record<string, Seen>, save: () => Promise<void>, context: RunContext, reserved: Set<string>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
+    const members = await this.stackMembers(record, url, seenByUrl, context, views) ?? [{ url, view }];
+    for (const member of members) {
+      if (await this.nudge(record, member.url, member.view, seenByUrl, save, context.drafts, reserved)) return;
+    }
+  }
+
+  // The connected stack of the linked pull request, bottom first, each member with its detail view;
+  // null leaves the link to linked-only nudges. Discovery finishes before anything is sent, and the
+  // whole stack is deferred, never walked member by member, when the topology is not one plain
+  // chain, a member cannot be read or no longer matches the listing (state, head, branch, base), or
+  // a hold covers any member: `do-not-merge`, a drop escalated to the owner (also the legacy third
+  // drop), a merge queue message still pending or queued, the head a genuine drop left
+  // (`blockedAt`), or another ticket's record links it. A rate limit ends the poll as elsewhere.
+  private async stackMembers(record: HandoverRecord, url: string, seenByUrl: Record<string, Seen>, context: RunContext, views: Map<string, Promise<PullRequestView>>): Promise<{ url: string; view: PullRequestView }[] | null> {
+    const source = PULL_URL.exec(url);
+    if (!source) return null;
+    const repo = source[1];
+    const defer = (why: string | null) => {
+      if (why !== null && this.deferredStacks.get(url) !== why) console.error(`[linear-tickets] ${record.identifier}: only ${url} is nudged; its connected stack is deferred: ${why}`);
+      if (why === null) this.deferredStacks.delete(url);
+      else this.deferredStacks.set(url, why);
+      return null;
+    };
+    const members: { url: string; view: PullRequestView }[] = [];
+    try {
+      const found = connectedStack(record.identifier, repo, Number(source[2]), await context.pulls(repo));
+      if (!found) return defer(null);
+      if ("invalid" in found) return defer(found.invalid);
+      if (found.stack.length < 2) return defer(null);
+      for (const pull of found.stack) {
+        const memberUrl = pull.number === Number(source[2]) ? url : pullUrl(repo, pull.number);
+        if (!views.has(memberUrl)) views.set(memberUrl, this.view(memberUrl));
+        members.push({ url: memberUrl, view: await views.get(memberUrl)! });
+      }
+      for (const [index, pull] of found.stack.entries()) {
+        const member = members[index];
+        const seen = seenByUrl[member.url];
+        if (member.view.state !== "OPEN" || member.view.headSha !== pull.headSha || member.view.headBranch !== pull.headBranch || member.view.baseBranch !== pull.baseBranch) return defer(`#${pull.number} changed since the open pull requests were listed`);
+        if (member.view.labels.includes(DO_NOT_MERGE_LABEL) || pull.labels.includes(DO_NOT_MERGE_LABEL)) return defer(`#${pull.number} is labelled ${DO_NOT_MERGE_LABEL}`);
+        if (escalated(seen)) return defer(`a merge queue drop of #${pull.number} went to the owner`);
+        if (seen?.missing) return defer(`GitHub once had no pull request #${pull.number}`);
+        if (seen?.pending || seen?.queued?.length) return defer(`#${pull.number} still has a merge queue message to deliver`);
+        if (seen?.blockedAt === member.view.headSha) return defer(`#${pull.number}'s head is held after a genuine merge queue drop`);
+        const other = context.records.find((item) => item.issueId !== record.issueId && item.links["Pull request"] === member.url);
+        if (other) return defer(`#${pull.number} is the linked pull request of ${other.identifier}`);
+      }
+    } catch (error) {
+      if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) throw error;
+      return defer(`reading it failed: ${error instanceof Error ? error.message : error}`);
+    }
+    defer(null);
+    return members;
+  }
+
   // The next lifecycle step of a stalled ticket (see pr-nudge.ts), for its idle agent. Nothing
   // while manual tasks due before the merge are open or the agent already got a message this poll.
-  // The recorded pull request gets the steps before the merge (draft, failed checks, requested
-  // changes, findings) unless it may not be nudged (see nudgeable); a ready stack is the queue
+  // The pull request (the recorded one, or a member of its connected stack, see nudgeStack) gets
+  // the steps before the merge (draft, failed checks, base conflict, requested changes, findings)
+  // unless it may not be nudged (see nudgeable); a ready stack is the queue
   // backstop's (see queueBackstop). A step is claimed per head right before its message goes out:
   // at most STAGE_NUDGES per stage and pull request, then one escalation to the owner, then only
   // the log. A busy agent or a disconnected Paseo claims nothing; the next poll decides again. A
   // crashed agent got none of its nudges, so its stage is claimed again on the same head, up to
-  // the escalation: each claim restarts it and sends the step with its resume.
-  private async nudge(record: HandoverRecord, url: string, view: PullRequestView, seenByUrl: Record<string, Seen>, save: () => Promise<void>, drafts: (repo: string) => Promise<QueueDraft[]>, reserved: Set<string>): Promise<void> {
+  // the escalation: each claim restarts it and sends the step with its resume. True once the step
+  // went, or tried to go, to the agent, a successor or the ticket (whatever the agent answered): the
+  // rest of a connected stack waits for a later poll then (see nudgeStack).
+  private async nudge(record: HandoverRecord, url: string, view: PullRequestView, seenByUrl: Record<string, Seen>, save: () => Promise<void>, drafts: (repo: string) => Promise<QueueDraft[]>, reserved: Set<string>): Promise<boolean> {
     const source = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
-    if (!source || reserved.has(record.agentId)) return;
+    if (!source || reserved.has(record.agentId)) return false;
     const [, repo, number] = source;
     // A stage the agent is not nudged for now (open blockers, vetoed or queued) has nothing to be
     // reminded of: a later wait on it starts from zero.
-    if ((await this.deps.manualTasks?.openBlockers(record.issueId))?.length) return this.clearWaits(seenByUrl, url, "stage:");
+    if ((await this.deps.manualTasks?.openBlockers(record.issueId))?.length) {
+      this.clearWaits(seenByUrl, url, "stage:");
+      return false;
+    }
     const claimedOn = (stage: Stage) => seenByUrl[url]?.nudges?.[stage] ?? [];
-    if (!await this.nudgeable(repo, Number(number), view, drafts)) return this.clearWaits(seenByUrl, url, "stage:");
+    if (!await this.nudgeable(repo, Number(number), view, drafts)) {
+      this.clearWaits(seenByUrl, url, "stage:");
+      return false;
+    }
     const crashed = record.status !== "archived" && Boolean(await this.deps.sessions.crashed(record.agentId));
     const again = (stage: Stage) => crashed && claimedOn(stage).length <= STAGE_NUDGES;
     const found = await stalledStage(view, url, Date.now(), (stage, key) => !again(stage) && claimedOn(stage).some((entry) => entry.split(" ").includes(key)), () => this.github().reviewThreads(repo, Number(number)));
     // A stage that no longer stalls has nothing left for the owner to be reminded of.
     if (!found) this.clearWaits(seenByUrl, url, "stage:");
-    if (!found || (!again(found.stage) && claimedOn(found.stage).includes(found.key))) return;
+    if (!found || (!again(found.stage) && claimedOn(found.stage).includes(found.key))) return false;
     const { stage, text, key } = found;
     const before = seenByUrl[url]?.nudges ?? {};
     const heads = before[stage] ?? [];
@@ -2171,14 +2302,14 @@ export class PullRequestWatch {
       if (sent > STAGE_NUDGES) {
         console.error(`[linear-tickets] ${record.identifier}: ${url} is waiting for the agent to ${STAGE_STEP[stage]} again; already escalated to the owner`);
         await claim();
-        return;
+        return false;
       }
       if (sent === STAGE_NUDGES) {
         await claim();
         await this.dropResume(record.agentId);
         await this.mention(record.issueId, `Paseo asked the agent ${STAGE_NUDGES} times to ${STAGE_STEP[stage]} on [the pull request](${url}), and it is stuck there again, so Paseo stops asking. Please take over.\n\n${text}`);
         await this.tell(record, "response", `The pull request is stuck again waiting for the agent to ${STAGE_STEP[stage]}; the owner was asked to take over.`);
-        return;
+        return false;
       }
       const prompt = `${text}\n\nThis is nudge ${sent + 1} of ${STAGE_NUDGES} for this step; after that the owner takes over.`;
       if (record.status !== "archived") {
@@ -2188,22 +2319,23 @@ export class PullRequestWatch {
           seenByUrl[url] = { ...entry(seenByUrl, url), nudges: { ...before, [stage]: [...heads, ...Array<string>(Math.max(1, STAGE_NUDGES + 1 - sent)).fill(key)] }, waits: undefined, activeAt: new Date().toISOString() };
           await save();
           await this.waitedOut(record, url, STAGE_STEP[stage]);
-          return;
+          return true;
         }
         if (outcome === "sent") await this.tell(record, "thought", `The pull request is waiting for the agent to ${STAGE_STEP[stage]}; it was asked to.`);
         else await this.crashLine(record, outcome, STAGE_STEP[stage]);
-        if (outcome !== "gone") return;
+        if (outcome !== "gone") return true;
       }
       const next = await this.succession(record, view.labels, prompt, toAgent);
       if (next?.kind === "started") {
         // The claim stands: what follows the start is only logged when it fails.
         claimed = false;
         await this.succeeded(record, next.agent, seenByUrl, url, reserved, STAGE_STEP[stage]);
-        return;
+        return true;
       }
-      if (next && next.kind !== "impossible") return;
+      if (next && next.kind !== "impossible") return true;
       await this.handBack(record, prompt, toAgent);
       await this.tell(record, "response", `The pull request is waiting for the agent to ${STAGE_STEP[stage]}, and the agent is no longer running; the ticket is back in ${CODING_STATE}.`);
+      return true;
     } catch (error) {
       // A message that failed outright was not sent: the next poll sends it again.
       if (claimed) seenByUrl[url] = { ...seenByUrl[url], nudges: before };
