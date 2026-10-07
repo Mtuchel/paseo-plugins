@@ -130,7 +130,8 @@ const projectRecordSchema = z.object({
 }).passthrough();
 type PlannerLimitRestart = { runId: string; requestId: string; agentId: string; confirmedAt: string; failedAgentId?: string };
 const RESTART_HISTORY_MS = 8 * 24 * 60 * 60_000;
-const RESTART_ID = /^[A-Za-z0-9_.@:-]{1,256}$/;
+// Same opaque-identity grammar as the ops digest's planner_id: an entry it rejects is malformed here too.
+const RESTART_ID = /^[A-Za-z0-9_.@-]{1,256}$/;
 const RESTART_TIME = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/;
 
 function restartId(value: unknown): boolean {
