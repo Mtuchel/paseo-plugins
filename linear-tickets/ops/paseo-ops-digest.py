@@ -15,7 +15,9 @@ on the Mac). Each run:
      never an attention item or notification); and the linear-tickets plugin's own Linear API
      usage per UTC hour (TUC-1291, `~/.paseo/linear-tickets/linear-usage.json`) for the
      "Linear budget" section, where an hour that hit a limit in the last 24 h is a
-     non-attention item (never notified) and the section lists the last 7 days;
+     non-attention item (never notified) and the section lists the last 7 days; and, per host,
+     ticket-planning omp sessions of the last 24 h that started without Plannotator's planning
+     instructions and a failed planning smoke check (`linear-tickets/planning-smoke.json`);
   3. merges both into the state in ~/.paseo/ops-digest/state.json and saves it BEFORE
      publishing, so a failed publish never loses an observed problem. The same save holds this
      run's history lines in the state's outbox (`historyOutbox`): one `run` line with every unit
@@ -515,6 +517,213 @@ def project_planner_items(source, host):
     return items
 
 
+# ---------------------------------------------------------------------------- planning sessions (pure)
+
+# 2026-10-07: omp re-ran its before_agent_start handlers and dropped the first round's messages,
+# so Plannotator's planning instructions (its "framing") never reached planning agents launched
+# with LINEAR_TICKETS_PLAN=required, and their plans came out in the wrong layout. The digest reads
+# each host's omp session files to find such sessions, and the planning smoke check's result.
+OMP_SESSIONS = os.path.expanduser("~/.omp/agent/sessions")
+PLANNING_SMOKE = f"{HOME}/linear-tickets/planning-smoke.json"  # written by `npm run smoke:planning`
+PLANNING_WINDOW_S = 24 * 3600  # sessions started this long ago or less are judged
+SESSION_FILE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-\d{3}Z)_([A-Za-z0-9-]{1,128})\.jsonl")
+SESSION_ID = re.compile(r"[A-Za-z0-9-]{1,128}")
+LAUNCH_TICKET = re.compile(r"\b(?:Work on|continuing work on) (?:the )?Linear ticket ([A-Z][A-Z0-9]+-\d+)\b")
+SMOKE_CHECK = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+SMOKE_FINGERPRINT = re.compile(r"[0-9a-f]{64}")
+SMOKE_COMMAND = "cd ~/dev/paseo-plugins/linear-tickets && npm run smoke:planning"
+PLANNING_UNITS = ("planning_sessions", "planning_smoke")
+SOURCE_CATEGORIES = ("error", "unreadable response", "missing file", "timeout", "network", "rate limit")
+
+
+def source_category(source, exc):
+    """Why a host source was not read. Source outcomes and snapshot omissions are UNKNOWN, never
+    a successful empty read: the category the host reported when it is one this digest names,
+    else the category of the failed parse."""
+    if isinstance(source, dict) and source.get("ok") is False:
+        reported = source.get("category")
+        if reported in SOURCE_CATEGORIES or isinstance(reported, str) and re.fullmatch(r"(?:HTTP|exit) \d+", reported):
+            return reported
+    return "unreadable response" if isinstance(exc, ValueError) else error_category(exc)
+
+
+def session_start(name):
+    """(start epoch, session id) from an omp session file name, None for any other file."""
+    found = SESSION_FILE.fullmatch(name)
+    if not found:
+        return None
+    try:
+        start = datetime.strptime(found.group(1), "%Y-%m-%dT%H-%M-%S-%fZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return start.timestamp(), found.group(2)
+
+
+def message_text(message):
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(part["text"] for part in content if isinstance(part, dict) and isinstance(part.get("text"), str))
+    return ""
+
+
+def unframed_planning(path):
+    """One omp session file, read up to its first assistant message. {"cwd", "text"} (the first
+    user message) when it is a planning launch (a `linear-tickets.plan-first` launch marker) whose
+    first reply came without Plannotator's planning instructions (no `plannotator-framing` message
+    before it); None otherwise, also while no reply exists yet. Raises OSError."""
+    launch, cwd, text = False, None, None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                return None  # a line still being written: judged by a later run
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("type")
+            if kind == "session" and isinstance(entry.get("cwd"), str):
+                cwd = entry["cwd"]
+            elif kind == "custom" and entry.get("customType") == "linear-tickets.plan-first":
+                launch = launch or (isinstance(entry.get("data"), dict) and entry["data"].get("reason") == "launch")
+            elif kind == "custom_message" and entry.get("customType") == "plannotator-framing":
+                return None
+            elif kind == "message" and isinstance(entry.get("message"), dict):
+                role = entry["message"].get("role")
+                if role == "user" and text is None:
+                    text = message_text(entry["message"])
+                elif role == "assistant":
+                    return {"cwd": cwd, "text": text or ""} if launch else None
+    return None
+
+
+def planning_ticket(cwd, text):
+    """The ticket a planning session works on: from its launch prompt, else its worktree; None
+    for a project planner."""
+    found = LAUNCH_TICKET.search(text or "")
+    if found:
+        return found.group(1)
+    slug = WORKTREE_TICKET.search((cwd or "") + "/")
+    return f"{slug.group(1).upper()}-{slug.group(2)}" if slug else None
+
+
+def planning_sessions(root, now, window=PLANNING_WINDOW_S):
+    """Planning sessions of this host started within `window` before `now` without Plannotator's
+    planning instructions: [{"sessionId", "startedAt", "ticket"}]. Only `<root>/<cwd>/*.jsonl`
+    (subagent transcripts live deeper); files named outside the window or not modified within it
+    are not opened. A missing root is a host without omp sessions; an unreadable one raises."""
+    try:
+        folders = sorted(os.listdir(root))
+    except FileNotFoundError:
+        return []
+    found = []
+    for folder in folders:
+        directory = os.path.join(root, folder)
+        try:
+            names = sorted(os.listdir(directory)) if os.path.isdir(directory) else []
+        except FileNotFoundError:
+            continue
+        for name in names:
+            started = session_start(name)
+            if started is None or not now - window <= started[0] <= now:
+                continue
+            path = os.path.join(directory, name)
+            try:
+                if not os.path.isfile(path) or os.path.getmtime(path) < now - window:
+                    continue
+                missing = unframed_planning(path)
+            except FileNotFoundError:
+                continue  # removed since the listing
+            if missing:
+                found.append({"sessionId": started[1], "startedAt": iso(started[0]),
+                              "ticket": planning_ticket(missing["cwd"], missing["text"])})
+    return found
+
+
+def planning_session_items(source, host):
+    """One attention item per planning session without the planning instructions, keyed by host
+    and session id (reported once; it clears once the session leaves the window). Raises on an
+    unknown or malformed source, so only this host's previous items stay (stale)."""
+    if not isinstance(source, dict) or source.get("ok") is not True or not isinstance(source.get("sessions"), list):
+        raise TypeError("unknown planning sessions")
+    unit = "planning_sessions" if host == HOST_NAME else f"planning_sessions@{host}"
+    items = []
+    for session in source["sessions"]:
+        if not isinstance(session, dict) or not isinstance(session.get("sessionId"), str) \
+                or not SESSION_ID.fullmatch(session["sessionId"]):
+            raise TypeError("invalid planning session")
+        started = parse_iso(planner_time(session.get("startedAt")))
+        ticket = session.get("ticket")
+        if ticket is not None and not (isinstance(ticket, str) and TICKET.fullmatch(ticket)):
+            raise TypeError("invalid planning session ticket")
+        session_id = session["sessionId"]
+        items.append({"key": f"planning-missing:{host}:{session_id}", "unit": unit, "section": "planning",
+                      "attention": True, "ticket": ticket,
+                      "title": f"{'planning' if ticket else 'project planner'} session {session_id[:8]} on {host}",
+                      "detail": f"instructions missing (started {local(started, '%d.%m. %H:%M')} Berlin; the agent"
+                                " planned without Plannotator's planning instructions: check that plan's layout"
+                                " and send the plan back if it lacks their layout)",
+                      "command": None})
+    return items
+
+
+def smoke_text(value):
+    """A smoke failure's detail as short plain text; anything but plain words is dropped."""
+    text = re.sub(r"\s+", " ", re.sub(r"[^A-Za-z0-9 _.,:/'-]+", " ", value)).strip()
+    return text[:120] or "no detail"
+
+
+def parse_planning_smoke(data):
+    """planning-smoke.json (version 1, written by linear-tickets `npm run smoke:planning`) reduced
+    to its version, time, fingerprint, outcome and the failed checks with sanitized details.
+    Raises ValueError for anything else."""
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
+        raise ValueError("smoke version")
+    checked = planner_time(data.get("checkedAt"))
+    fingerprint, ok, failures = data.get("fingerprint"), data.get("ok"), data.get("failures")
+    if not isinstance(fingerprint, str) or not SMOKE_FINGERPRINT.fullmatch(fingerprint):
+        raise ValueError("smoke fingerprint")
+    if not isinstance(ok, bool) or not isinstance(failures, list) or (ok and failures):
+        raise ValueError("smoke outcome")
+    safe = []
+    for failure in failures:
+        if not isinstance(failure, dict) or not isinstance(failure.get("check"), str) \
+                or not SMOKE_CHECK.fullmatch(failure["check"]) or not isinstance(failure.get("detail"), str):
+            raise ValueError("smoke failure")
+        safe.append({"check": failure["check"], "detail": smoke_text(failure["detail"])})
+    return {"version": 1, "checkedAt": checked, "fingerprint": fingerprint, "ok": ok, "failures": safe}
+
+
+def read_planning_smoke(path):
+    """This host's planning smoke result; None when the smoke check has not run here yet."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    return parse_planning_smoke(data)
+
+
+def planning_smoke_items(source, host):
+    """One attention item per host whose last planning smoke check failed, keyed by host and the
+    checked setup's fingerprint. No result yet: nothing. Raises on an unknown or malformed source."""
+    if not isinstance(source, dict) or source.get("ok") is not True or "smoke" not in source:
+        raise TypeError("unknown planning smoke")
+    if source["smoke"] is None:
+        return []
+    smoke = parse_planning_smoke(source["smoke"])
+    if smoke["ok"]:
+        return []
+    named = "; ".join(f"{f['check']}: {f['detail']}" for f in smoke["failures"]) or "no check named"
+    return [{"key": f"planning-smoke:{host}:{smoke['fingerprint']}",
+             "unit": "planning_smoke" if host == HOST_NAME else f"planning_smoke@{host}",
+             "section": "planning", "attention": True, "ticket": None, "title": f"planning smoke check on {host}",
+             "detail": f"smoke check failed ({named}; checked {local(parse_iso(smoke['checkedAt']), '%d.%m. %H:%M')}"
+                       " Berlin; fix it, then run the smoke check again by hand)",
+             "command": SMOKE_COMMAND}]
+
+
 # ---------------------------------------------------------------------------- decision candidates (pure)
 
 def decision_candidates(issues):
@@ -727,8 +936,8 @@ def unit_failed(unit, failed_units):
     `pulls/917`), or the whole repository script — which covers every item of the repository
     part, but none of this host's own units, the plugin's `linear_budget` included."""
     unit = unit or ""
-    if unit.split("@", 1)[0] == "planners":
-        return unit in failed_units  # each project store is independent, including the local one
+    if unit.split("@", 1)[0] in ("planners",) + PLANNING_UNITS:
+        return unit in failed_units  # each host's store or files are independent, including the local ones
     if "repo" in failed_units and unit.split("@")[0] not in HOST_UNITS + ("linear_budget",):
         return True
     if unit.split("@")[0] == "planner_recovery":
@@ -794,7 +1003,8 @@ def line(payload, *, new=False, stale_since=None, agent_note=None):
 AGENT_GROUPS = [("error", "In error"), ("waiting", "Waiting on you"), ("silent", "Ticket agents silent > 2 h"),
                 ("locks", "Tickets marked running without an agent"), ("planners", "Project planners (usage-limit recovery)")]
 SECTION_TITLES = [("queue", "Merge queue"), ("pulls", "Pull requests open > 5 h"),
-                  ("deploys", "Deploys (staging, production)"), ("agents", "Agents")]
+                  ("deploys", "Deploys (staging, production)"), ("agents", "Agents"),
+                  ("planning", "Planning without Plannotator's instructions")]
 
 
 NOT_ENOUGH_DATA = " _(not enough data)_"
@@ -1077,11 +1287,11 @@ AGENT_KEY = re.compile(r"agent-(?:error|silent|waiting):([^:]+)")
 
 def item_host(payload, host):
     """The host an item belongs to: the part of its unit after the first `@` (another host's
-    agents), `host` (this one) for its own agents, None for repository items."""
+    agents or planning sessions), `host` (this one) for its own, None for repository items."""
     unit = str(payload.get("unit") or "")
     if "@" in unit:
         return unit.split("@", 1)[1]
-    return host if payload.get("section") == "agents" else None
+    return host if payload.get("section") in ("agents", "planning") else None
 
 
 def item_evidence(key, payload, at, host, evidence):
@@ -1376,6 +1586,36 @@ class HostIO:
             sources.setdefault(target, {"ok": False, "category": self._unreachable.get(target, "unreadable response")})
         return sources
 
+    def planning_sessions(self, now):
+        """This host's planning sessions without Plannotator's planning instructions, as a source
+        outcome: an unreadable sessions folder is UNKNOWN, never an empty read."""
+        try:
+            return {"ok": True, "sessions": planning_sessions(OMP_SESSIONS, now)}
+        except Exception as exc:
+            return {"ok": False, "category": error_category(exc)}
+
+    def planning_smoke(self):
+        """This host's planning smoke result (`smoke` None: not run here yet). An unreadable or
+        malformed file is UNKNOWN, never a passed check."""
+        try:
+            return {"ok": True, "smoke": read_planning_smoke(PLANNING_SMOKE)}
+        except (ValueError, TypeError):
+            return {"ok": False, "category": "unreadable response"}
+        except OSError as exc:
+            return {"ok": False, "category": error_category(exc)}
+
+    def planning_sources(self, now):
+        """{host: {unit: source}} for the planning units of this host and every remote. An older
+        remote without the snapshot fields gives None (not read); an unreachable one its category."""
+        sources = {HOST_NAME: {"planning_sessions": self.planning_sessions(now), "planning_smoke": self.planning_smoke()}}
+        for snapshot in self.remotes():
+            sources[snapshot["_host"]] = {"planning_sessions": snapshot.get("planningSessions"),
+                                          "planning_smoke": snapshot.get("planningSmoke")}
+        for target in self.remote_targets():
+            down = {"ok": False, "category": self._unreachable.get(target, "unreadable response")}
+            sources.setdefault(target, {unit: down for unit in PLANNING_UNITS})
+        return sources
+
     def evidence(self):
         """The pull request watch, crash recovery and limit-resume records of the linear-tickets
         plugin, as they are now (each None when unreadable); history lines keep only owner/auto
@@ -1416,6 +1656,7 @@ class HostIO:
     def snapshot(self):
         """Independent planner evidence survives failed agent/permission RPCs on this host."""
         snapshot = {"projectPlanners": self.project_planners(),
+                    "planningSessions": self.planning_sessions(time.time()), "planningSmoke": self.planning_smoke(),
                     "agents": [], "metas": {}, "permissions": {}, "reviews": {},
                     "errorLines": {}, "limitResumes": None}
         try:
@@ -1825,14 +2066,17 @@ def collect(io, now, started):
             items += project_planner_items(source, host)
             units.append({"unit": unit, "ok": True})
         except Exception as exc:
-            # Source outcomes and snapshot omissions are UNKNOWN, not a successful empty read.
-            category = error_category(exc)
-            if isinstance(source, dict) and source.get("ok") is False:
-                reported = source.get("category")
-                if (reported in ("error", "unreadable response", "missing file", "timeout", "network", "rate limit")
-                        or isinstance(reported, str) and re.fullmatch(r"(?:HTTP|exit) \d+", reported)):
-                    category = reported
-            units.append({"unit": unit, "ok": False, "category": category})
+            units.append({"unit": unit, "ok": False, "category": source_category(source, exc)})
+    readers = {"planning_sessions": planning_session_items, "planning_smoke": planning_smoke_items}
+    for host, sources in io.planning_sources(now).items():
+        for name, source in sources.items():
+            unit = name if host == HOST_NAME else f"{name}@{host}"
+            try:
+                items += readers[name](source, host)
+                units.append({"unit": unit, "ok": True})
+            except Exception as exc:
+                units.append({"unit": unit, "ok": False, "category": "not in host snapshot" if source is None
+                              else source_category(source, exc)})
     try:
         planners = io.planner_recovery(now)
     except Exception:
