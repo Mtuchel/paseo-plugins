@@ -2154,6 +2154,11 @@ No tokens, query bodies or ticket text appear in the report.
     is delivered before ordinary progress work, which still leaves the owner's reserve untouched.
     Nested work never lowers priority. Pending session links are only recorded after successful
     delivery; a reserve refusal leaves them for the next sweep.
+- **Reservations capture their cost at admission.** Pending requests do not resize when another
+  response changes the daemon's average complexity. Overlapping responses cannot restore capacity
+  from an older, higher remaining header. A missing dimension retains a pessimistic debit; an
+  unknown send retains its reserved debt even when later headers arrive. Owner work keeps its
+  priority and recovery probe. Reserved-but-unsent work can be cancelled without recording traffic.
 - **When Linear answers `RATELIMITED`**, every priority waits at least one minute. After that,
   reserve admission runs before the single probe slot: background or interactive work below
   its reserve cannot steal the owner's probe. Only one eligible request probes; a network

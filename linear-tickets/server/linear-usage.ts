@@ -228,6 +228,11 @@ export class LinearUsage {
   // Exactly one handle per sent request, including failed/limited responses; local budget
   // refusals do not reach this method. `done` records the answer once and never throws:
   // counting must not decide whether the request goes out or how its response is reported.
+  invalidateContinuity(pool: Pool): void {
+    this.previous[pool] = {};
+    for (const sample of this.inFlight[pool]) sample.clean = false;
+  }
+
   begin(pool: Pool, caller: string, operation: string): LinearUsageHandle {
     const active = this.inFlight[pool];
     const sample: RequestSample = { clean: active.size === 0 };

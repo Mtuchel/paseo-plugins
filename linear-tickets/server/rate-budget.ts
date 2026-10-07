@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { githubRouted } from "./github-cli";
-import { asCaller, currentCallerName, linearUsage, type LinearUsage } from "./linear-usage";
+import { asCaller, currentCallerName, linearUsage, type LinearUsage, type LinearUsageHandle } from "./linear-usage";
 
 // Linear's app and API-key pools each meter requests and complexity independently.
 export type Pool = "key" | "app";
@@ -39,13 +39,19 @@ type PoolState = {
   requests: Dimension | null;
   points: Dimension | null;
   avgPoints: number;
-  inFlight: number;
+  pending: Set<{ points: number; clean: boolean }>;
+  debt: Map<string, { requests: number; points: number }>;
   blockedUntil: number;
   backoffMs: number;
   probing: boolean;
 };
 
-export type Ticket = { done(headers: Headers | null, rateLimited: boolean): void };
+export type Ticket = {
+  start(): void;
+  cancel(): void;
+  done(headers: Headers | null, rateLimited: boolean, uncertaintyId?: string): void;
+};
+export type Reservation = { points?: number; deferred?: boolean };
 const priority = new AsyncLocalStorage<Priority>();
 export function currentPriority(): Priority { return priority.getStore() ?? "interactive"; }
 // The caller name carried by `asCaller` (linear-usage.ts); a request outside any such context is
@@ -63,8 +69,8 @@ export function withPriority<T>(level: Priority, caller: string, work: () => Pro
 
 export class RateBudget {
   private readonly pools: Record<Pool, PoolState> = {
-    key: { requests: null, points: null, avgPoints: 100, inFlight: 0, blockedUntil: 0, backoffMs: 0, probing: false },
-    app: { requests: null, points: null, avgPoints: 100, inFlight: 0, blockedUntil: 0, backoffMs: 0, probing: false },
+    key: { requests: null, points: null, avgPoints: 100, pending: new Set(), debt: new Map(), blockedUntil: 0, backoffMs: 0, probing: false },
+    app: { requests: null, points: null, avgPoints: 100, pending: new Set(), debt: new Map(), blockedUntil: 0, backoffMs: 0, probing: false },
   };
 
   constructor(private readonly now: () => number = () => Date.now(), private readonly usage?: LinearUsage) {}
@@ -73,19 +79,30 @@ export class RateBudget {
     const state = this.pools[pool];
     const known = state[dimension];
     if (!known) return Infinity;
-    return Math.min(known.limit, known.remaining + known.limit / PERIOD_MS * Math.max(0, this.now() - known.at))
-      - state.inFlight * (dimension === "points" ? state.avgPoints : 1);
+    let reserved = 0;
+    for (const ticket of state.pending) reserved += dimension === "points" ? ticket.points : 1;
+    for (const debt of state.debt.values()) reserved += debt[dimension];
+    return Math.min(known.limit, known.remaining + known.limit / PERIOD_MS * Math.max(0, this.now() - known.at)) - reserved;
   }
 
   averagePoints(pool: Pool): number { return this.pools[pool].avgPoints; }
 
-  private reserveUntil(pool: Pool, level: Priority, room: number): number | null {
+  hasSamples(pool: Pool): boolean { return this.pools[pool].requests !== null && this.pools[pool].points !== null; }
+
+  // Recovered/unknown sends are reservations, never fabricated usage measurements.
+  retainDebt(pool: Pool, id: string, requests: number, points: number): void {
+    this.pools[pool].debt.set(id, { requests, points });
+  }
+
+  releaseDebt(pool: Pool, id: string): void { this.pools[pool].debt.delete(id); }
+
+  private reserveUntil(pool: Pool, level: Priority, room: number, pointCost = this.pools[pool].avgPoints): number | null {
     const state = this.pools[pool];
     let until: number | null = null;
     for (const dimension of ["requests", "points"] as const) {
       const known = state[dimension];
       if (!known) continue;
-      const missing = Math.ceil(known.limit * RESERVES[level]) + room * (dimension === "points" ? state.avgPoints : 1) - this.estimate(pool, dimension);
+      const missing = Math.ceil(known.limit * RESERVES[level]) + room * (dimension === "points" ? pointCost : 1) - this.estimate(pool, dimension);
       if (missing > 0) until = Math.max(until ?? 0, this.now() + Math.ceil(missing * PERIOD_MS / known.limit));
     }
     return until;
@@ -109,13 +126,15 @@ export class RateBudget {
     });
   }
 
-  acquire(pool: Pool, level: Priority = currentPriority(), caller?: string, operation = "anonymous"): Ticket {
+  acquire(pool: Pool, level: Priority = currentPriority(), caller?: string, operation = "anonymous", options: Reservation = {}): Ticket {
     const named = caller ?? currentCaller(operation);
     const state = this.pools[pool];
+    const points = options.points ?? state.avgPoints;
+    if (!Number.isFinite(points) || points < 0) throw new Error("Invalid Linear reservation cost");
     const now = this.now();
     if (state.blockedUntil > now) throw new RateLimitedError(pool, state.blockedUntil);
     // Reserve admission precedes the probe slot: a poll cannot steal the owner's probe.
-    const until = this.reserveUntil(pool, level, 1);
+    const until = this.reserveUntil(pool, level, 1, points);
     if (until !== null) {
       if (level !== "owner") this.usage?.refused(pool, named, level);
       throw new RateLimitedError(pool, until, "reserve", level);
@@ -125,19 +144,35 @@ export class RateBudget {
       if (state.probing) throw new RateLimitedError(pool, now + PROBE_WAIT_MS);
       state.probing = probe = true;
     }
-    state.inFlight++;
-    // One handle per admitted request, settled exactly once by `done`; local refusals above
-    // never reach it, so the recorded traffic and the sent traffic agree.
-    const accounting = this.usage?.begin(pool, named, operation);
+    const captured = { points, clean: state.pending.size === 0 };
+    for (const pending of state.pending) pending.clean = false;
+    state.pending.add(captured);
+    let accounting: LinearUsageHandle | undefined;
+    let started = false;
     let settled = false;
-    return {
-      done: (headers, limited) => {
-        if (settled) return;
+    const release = () => { state.pending.delete(captured); if (probe) state.probing = false; };
+    const ticket: Ticket = {
+      start: () => {
+        if (settled || started) return;
+        started = true;
+        accounting = this.usage?.begin(pool, named, operation);
+      },
+      cancel: () => {
+        if (settled || started) return;
         settled = true;
-        state.inFlight--;
-        if (probe) state.probing = false;
-        accounting?.done(headers, limited, state.avgPoints);
-        this.record(pool, headers);
+        release();
+      },
+      done: (headers, limited, uncertaintyId) => {
+        if (settled) return;
+        if (!started) { ticket.cancel(); return; }
+        settled = true;
+        release();
+        accounting?.done(headers, limited, points);
+        if (headers === null) {
+          this.retainDebt(pool, uncertaintyId ?? `unknown:${++this.unknownSequence}`, 1, points);
+        } else {
+          this.record(pool, headers, captured.clean, points);
+        }
         if (limited) {
           if (!headers?.has("x-ratelimit-requests-remaining") && !headers?.has("x-ratelimit-complexity-remaining")) {
             const known = state.requests;
@@ -152,21 +187,33 @@ export class RateBudget {
         }
       },
     };
+    if (!options.deferred) ticket.start();
+    return ticket;
   }
 
-  private record(pool: Pool, headers: Headers | null): void {
-    if (!headers) return;
+  private unknownSequence = 0;
+
+  private record(pool: Pool, headers: Headers, clean: boolean, reservedPoints: number): void {
     const state = this.pools[pool];
+    const costHeader = headers.get("x-complexity");
+    const measured = costHeader === null ? NaN : Number(costHeader);
+    const cost = Number.isFinite(measured) && measured >= 0 ? measured : reservedPoints;
     for (const [dimension, name] of [["requests", "requests"], ["points", "complexity"]] as const) {
-      if (!headers.has(`x-ratelimit-${name}-remaining`)) continue;
-      const remaining = Number(headers.get(`x-ratelimit-${name}-remaining`));
-      const limit = Number(headers.get(`x-ratelimit-${name}-limit`) ?? state[dimension]?.limit);
-      if (Number.isFinite(limit) && limit > 0 && Number.isFinite(remaining) && remaining >= 0) state[dimension] = { limit, remaining, at: this.now() };
+      const previous = state[dimension];
+      const ownCost = dimension === "points" ? cost : 1;
+      const pessimistic = previous ? Math.max(0, Math.min(previous.limit,
+        previous.remaining + previous.limit / PERIOD_MS * Math.max(0, this.now() - previous.at)) - ownCost) : null;
+      const raw = headers.get(`x-ratelimit-${name}-remaining`);
+      const remaining = raw === null ? NaN : Number(raw);
+      const limit = Number(headers.get(`x-ratelimit-${name}-limit`) ?? previous?.limit);
+      if (Number.isFinite(limit) && limit > 0 && Number.isFinite(remaining) && remaining >= 0 && remaining <= limit) {
+        // A response which overlapped another request may be stale even if it arrives last.
+        state[dimension] = { limit, remaining: clean || pessimistic === null ? remaining : Math.min(remaining, pessimistic), at: this.now() };
+      } else if (previous && pessimistic !== null) {
+        state[dimension] = { ...previous, remaining: pessimistic, at: this.now() };
+      }
     }
-    if (headers.has("x-complexity")) {
-      const cost = Number(headers.get("x-complexity"));
-      if (Number.isFinite(cost) && cost >= 0) state.avgPoints = 0.2 * cost + 0.8 * state.avgPoints;
-    }
+    if (Number.isFinite(measured) && measured >= 0) state.avgPoints = 0.2 * measured + 0.8 * state.avgPoints;
   }
 }
 
