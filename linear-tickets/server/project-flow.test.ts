@@ -218,6 +218,24 @@ test("Skip waits for an in-flight order write and cannot claim its tickets went 
   assert.ok(!r.calls.includes("label i1 +paseo-hold"), "the obsolete report cannot apply another order");
 });
 
+test("Skip retires an unconfirmed creation, including an agent that appears only on a later poll", async (t) => {
+  const r = await room(t, [issue(1)]);
+  const agents: Agent[] = [];
+  const paseo = paseoWith(() => agents);
+  r.fail.start = "always";
+  await assert.rejects(r.flow.planNow("erp", settings, paseo), /creation could not be confirmed/);
+  const run = (await r.store.all()).erp.planner!.id;
+  agents.push({ id: "lost-response", status: "running", labels: { "linear.plannerRun": run, "linear.projectId": "erp" } });
+  await r.flow.skipPlan("erp", settings, paseo);
+  assert.ok(r.calls.includes("retire lost-response"));
+  agents.length = 0;
+  agents.push({ id: "late-creation", status: "running", labels: { "linear.plannerRun": run, "linear.projectId": "erp" } });
+  r.calls.length = 0;
+  r.advance(2 * MINUTE);
+  await r.flow.tick(paseo, settings);
+  assert.deepEqual(r.calls.slice(0, 2), ["retire late-creation", "delegate i1"], "obsolete roots are stopped before hand-out");
+});
+
 test("Skip stops the run without an order: its tickets count as planned and are handed out", async (t) => {
   const r = await room(t, [issue(1), issue(2)]);
   const paseo = paseoWith(() => []);

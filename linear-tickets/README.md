@@ -1039,8 +1039,9 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   the unreadable lines instead of closing as an empty order. Paseo then adds the blocking
   relations, links related tickets, puts `paseo-hold` on held tickets (removes it from released
   ones) and `paseo-attended` on attended ones (`unattended X` removes it), posts one update on the
-  *project* saying what it applied and skipped, and archives the run's agent. `A duplicates B` puts
-  `paseo-hold` on A, posts the reason on it and links it as a duplicate of B, which moves A to
+  *project* saying what it applied and skipped, and archives the run's agent. If that summary update
+  fails, the failure is logged; the applied order still closes. `A duplicates B` puts `paseo-hold`
+  on A, posts the reason on it and links it as a duplicate of B, which moves A to
   Linear's Duplicate status; B may be any ticket, in the project or not, open or done, while A
   must be a ticket of the project that is not started and not with an agent (others are listed
   as skipped). `A relates to B` needs A open in the project and B any ticket. Links that exist
@@ -1070,6 +1071,9 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   menu bar app to start again, or Skip to hand the tickets out without an order. Every start and
   restart is kept with the project's record in `projects.json`, and a late report of a run you
   skipped or replaced is ignored rather than written.
+  Skip and order application wait for any start or write already in flight. Each later project
+  poll also archives obsolete run agents, including one whose creation response was lost and
+  became visible only after Skip.
 - **Hand-out.** Planned tickets in Backlog or Todo that are unassigned or yours, not handed to
   Paseo yet, without `paseo-hold` (or other `paseo-` state labels) and with every blocker
   finished are assigned to Paseo in the *Who starts next* order, one per free slot. Tickets in

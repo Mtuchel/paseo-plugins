@@ -322,6 +322,7 @@ export class ProjectFlow {
       try {
         await this.exclusive(project.id, async () => {
           let read = await this.read(project, settings);
+          await this.retireObsolete(project.id, paseo);
           const planner = read.record.planner;
           if (planner?.approved) {
             const written = await this.write(project.id, planner, paseo, settings)
@@ -404,8 +405,8 @@ export class ProjectFlow {
       const open = read.record.planner;
       if (open && !open.ownerAsked) throw new Error("A planner is already planning the work order of this project.");
       if (open) {
-        if (open.agentId) await this.deps.retire(open.agentId, paseo).catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: archiving the stuck planner failed: ${message(error)}`));
         await this.store.update(project.id, (current) => current?.planner?.id === open.id ? { ...current, planner: null, closedPlanner: open.id } : null);
+        await this.retireObsolete(project.id, paseo, open.agentId);
         read = await this.read(project, settings);
       }
       if (!read.unplanned.length) throw new Error("No new tickets to plan.");
@@ -428,12 +429,29 @@ export class ProjectFlow {
       const stored = await this.store.update(project.id, (current) => current?.planner?.id === open.id
         ? { ...current, planned: plannedAfter(current, current.planner, read.work), planner: null, closedPlanner: current.planner.id }
         : null);
-      if (stored && open.agentId) await this.deps.retire(open.agentId, paseo).catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: archiving the planner failed: ${message(error)}`));
+      if (stored) await this.retireObsolete(project.id, paseo, open.agentId);
       if (stored) console.log(`[linear-tickets] project ${project.name}: the work order was skipped; its ${open.tickets} ticket${open.tickets === 1 ? "" : "s"} count as planned`);
       const after = await this.read(project, settings);
       this.statuses = [...this.statuses.filter((item) => item.id !== project.id), after.status];
       return after.status;
     });
+  }
+
+  // A creation whose response was lost can become visible after Skip/replacement. The project
+  // label lets every later poll retire all obsolete roots, even after another run closes.
+  private async retireObsolete(projectId: string, paseo: PaseoApi, recordedAgent?: string): Promise<void> {
+    const activeRun = (await this.store.all())[projectId]?.planner?.id;
+    const obsolete = new Set(recordedAgent ? [recordedAgent] : []);
+    let cursor: string | undefined;
+    do {
+      const page = await paseo.agents.list({ filter: { labels: { "linear.projectId": projectId }, includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
+      for (const { agent } of page.entries) {
+        const runId = agent.labels?.["linear.plannerRun"];
+        if (runId && runId !== activeRun && !agent.labels?.["paseo.parent-agent-id"]) obsolete.add(agent.id);
+      }
+      cursor = page.pageInfo?.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
+    } while (cursor);
+    for (const id of obsolete) await this.deps.retire(id, paseo);
   }
 
   // Starts a run for the project's unplanned tickets: the record first (the next read retries
