@@ -42,7 +42,7 @@ export function sectionSteps(): string {
     "- <place>: include — AC-N",
     "- <place>: follow-up — <title of the follow-up ticket>",
     "- <place>: n/a — <reason>",
-    `Go through every dimension: ${REACH_DIMENSIONS.join("; ")}. Every \`include\` names its own acceptance criterion (AC-N, defined in the plan's verification) that proves that place; no two places share one. Every \`follow-up\` is filed as a ticket in Todo, with that title and related to this ticket, when the plan is approved. When the right behaviour for a role is a business choice that no approved principle covers, ask the owner instead of guessing.`,
+    `Go through every dimension: ${REACH_DIMENSIONS.join("; ")}. Every \`include\` names its own acceptance criterion (AC-N, defined in the plan's verification) that proves that place; no two places share one. Repository records that describe the change (principles and decisions, glossary, process map, runbooks, env examples) are not places: they ship in the pull request of the code they describe, under its acceptance criterion, and are an \`include\` with their own only when no code changes (e.g. an owner decision). Every \`follow-up\` is filed as a ticket in Todo, with that title and related to this ticket, when the plan is approved. When the right behaviour for a role is a business choice that no approved principle covers, ask the owner instead of guessing.`,
     `\`## ${PRINCIPLES_SECTION}\`: which approved rules apply, and whether this change sets a new one.`,
     "- Applies: <IDs of the approved principles and ADRs that apply | none apply — reason>",
     "- Exceptions: <none | ID — why this change needs one>",

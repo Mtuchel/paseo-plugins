@@ -683,7 +683,11 @@ higher of planner and advisor) may answer each section in one line ("Only the me
 because …"). Every `include` and every new rule name their own acceptance criterion (`AC-N`,
 defined in the plan's verification), so the implementer cannot skip a place unnoticed: the omp gate
 checks that each named criterion exists outside these two sections and that no two share one,
-not that it really proves the place (that is the advisor's question and yours). Every
+not that it really proves the place (that is the advisor's question and yours). Repository records
+that describe the change (principles and decisions, glossary, process map, runbooks, env examples)
+are not places: they ship in the pull request of the code they describe, under its criterion, so a
+stack gets no records-only pull request. They are an `include` with a criterion of their own only
+when no code changes, e.g. an owner decision (TUC-1644). Every
 `follow-up` is filed as a ticket when the plan is approved (**Plan follow-ups** below). Every
 ticket agent, the one that plans and then implements as well as one that implements an approved
 plan later, is told to file a place the plan missed as a follow-up ticket (`create_issue`, related
