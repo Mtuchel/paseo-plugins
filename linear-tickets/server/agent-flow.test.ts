@@ -20,6 +20,7 @@ import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { AWAY_REASON } from "./scheduler";
 import { isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
 import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, planPolicy } from "./plan-policy";
+import type { ProcessInspector } from "./process-liveness";
 import { ReviewDeletions } from "./review-deletions";
 import { WatchdogStore } from "./watchdog";
 
@@ -694,8 +695,9 @@ test("the live feed shows completed commands and edits only", () => {
   assert.equal(describeTool({ type: "tool_call", status: "completed", detail: { type: "read", filePath: "a" } }), null);
 });
 
-// `appId`: the Paseo app's user, or null when the app is not usable on this host.
-function starterHarness(state: { creatorId: string | null; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number, appId: string | null = APP, away = false, planText = "# Plan\n1. Add the table") {
+// `appId`: the Paseo app's user, or null when the app is not usable on this host. `inspect`: the
+// process table ghost agents are checked against.
+function starterHarness(state: { creatorId: string | null; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number, appId: string | null = APP, away = false, planText = "# Plan\n1. Add the table", inspect?: ProcessInspector) {
   const launches: { provider?: string; thinkingOptionId?: string; modeId?: string; instructions: string; labels?: Record<string, string>; env?: Record<string, string>; markInProgress?: boolean }[] = [];
   const starter = new TicketStarter({
     linear: {
@@ -708,6 +710,7 @@ function starterHarness(state: { creatorId: string | null; labels: { id: string;
     launcher: { start: async (input, _paseo, options) => { launches.push({ provider: input.provider, thinkingOptionId: input.thinkingOptionId, modeId: input.modeId, instructions: input.instructions, labels: options?.labels, env: options?.env, markInProgress: options?.markInProgress }); return { agentId: "new", warnings: [] }; } },
     branches: async () => ({ branches: [{ id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }),
     presence: { away: async () => away },
+    ...(inspect ? { inspect } : {}),
   });
   const paseo = {
     agents: { list: async () => ({ entries: Array.from({ length: running }, (_, index) => ({ agent: { id: `r${index}`, status: "running", labels: { "linear.issueId": `x${index}` } } })), pageInfo: { hasMore: false } }) },
@@ -739,6 +742,28 @@ test("an agent waiting for the owner's answer or approval frees its slot; one at
   const working = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
   const busy = paseoWith([[], []]);
   assert.match((await working.starter.admission("i1", busy, settings) as { reason: string }).reason, /Queued: 2 of 2/);
+});
+
+test("an agent the daemon lists as running although its OMP process is gone frees its slot; a live one keeps it", async () => {
+  // As the daemon restart of 2026-10-08 left the agents it had loaded: their last status (running),
+  // quiet since the crash, native handle and worktree recorded (see process-liveness.test.ts).
+  const handle = "/home/mirko/.omp/agent/sessions/wt/2026-10-08T12-50-00-000Z_01a1b2c3.jsonl";
+  const crashed = { id: "r0", status: "running", provider: "omp", cwd: "/repo/wt", updatedAt: "2026-10-08T12:50:00Z", persistence: { nativeHandle: handle }, labels: { "linear.issueId": "x0" } };
+  const inspector = (processes: () => Promise<string>): ProcessInspector => ({ processes, cwd: async () => "/repo/wt", canonicalPath: async (path) => path });
+  const one = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 1 } };
+  const daemon = (paseo: PaseoApi) => ({ ...paseo, agents: { list: async () => ({ entries: [{ agent: { ...crashed } }], pageInfo: { hasMore: false } }) } }) as unknown as PaseoApi;
+
+  const gone = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0, APP, false, undefined, inspector(async () => ""));
+  assert.deepEqual(await gone.starter.admission("i1", daemon(gone.paseo), one), { ok: true }, "the ghost works on nothing: the waiting ticket gets the slot");
+  assert.equal((await gone.starter.scheduler.counts(daemon(gone.paseo))).running, 0);
+
+  const live = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0, APP, false, undefined, inspector(async () => `2100185 omp --mode rpc-ui --session ${handle}\n`));
+  assert.match((await live.starter.admission("i1", daemon(live.paseo), one) as { reason: string }).reason, /Queued: 1 of 1/, "its process works: the slot stays taken");
+  assert.equal((await live.starter.scheduler.counts(daemon(live.paseo))).running, 1);
+
+  const unreadable = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0, APP, false, undefined, inspector(async () => { throw new Error("ps failed"); }));
+  assert.match((await unreadable.starter.admission("i1", daemon(unreadable.paseo), one) as { reason: string }).reason, /Queued: 1 of 1/, "an inspection that fails counts the agent as today");
+  assert.equal((await unreadable.starter.scheduler.counts(daemon(unreadable.paseo))).running, 1);
 });
 
 test("while the owner is away, only the implementation of an attended ticket waits; planning never does, even with no agent limit", async () => {

@@ -1106,11 +1106,12 @@ line. While slots under *max agents* are short, a free slot goes to:
 4. then the ticket that unblocks the most open tickets;
 5. then the oldest ticket.
 
-An admitted ticket keeps its slot for 3 minutes while its agent starts. Tickets you start from
-the sidebar skip the line. So does a project's planner run (see **Projects**): it only orders
-tickets, and while it waits none of its project's new tickets can be handed out, so its agent starts
-even when every slot under *max agents* is taken and under any memory lease. It still counts as
-a working agent.
+The count is of agents that work: one the daemon still lists as running although its OMP process
+is gone (a ghost, see **Ghost agents**) holds no slot. An admitted ticket keeps its slot for 3
+minutes while its agent starts. Tickets you start from the sidebar skip the line. So does a
+project's planner run (see **Projects**): it only orders tickets, and while it waits none of its
+project's new tickets can be handed out, so its agent starts even when every slot under *max agents*
+is taken and under any memory lease. It still counts as a working agent.
 
 **Present and away.** Planning never waits: every ticket plans at any time, also at night. A plan
 that needs you is parked (see **Parked plans**) and takes no slot, so the plans are ready for your
@@ -1765,9 +1766,12 @@ its step to the ticket's agent by hand.
 status, idle or running, although no process works for them any more (2026-10-05: `spawn ps
 EAGAIN` crashed the daemon on server087, twenty agents stayed "running" for 16 hours, and the
 TUC-949 planner was never restarted). Such a ghost never takes the next step, so the planner
-restart, the restart of a failed start and the check for a live agent above do not count it: an
-OMP agent shown idle or running, not updated for five minutes, with no `--mode rpc-ui` process
-carrying its session and none running in its worktree, counts as stopped. The log names each
+restart, the restart of a failed start, the check for a live agent above and the slot count behind
+*max agents* do not count it: an OMP agent shown idle or running, not updated for five minutes,
+with no `--mode rpc-ui` process carrying its session and none running in its worktree, counts as
+stopped. Without that, the ghosts of the run before would fill the slots of the restarted daemon
+and refuse their own replacement starts (2026-10-08: 26 of 43 counted agents were ghosts, and a
+restart reported `Queued: RAM-limited, 43 of 40 slots used`). The log names each
 ghost (`agent … shows running but its OMP process is gone`). Only proven absence counts: an agent
 without a recorded session file or worktree, or a process table that cannot be read completely,
 keeps the agent live until the next poll.
