@@ -225,6 +225,59 @@ name equals the Linear project name is preselected when exactly one matches. A c
 by hand is never overridden. The Paseo Agents menu bar app's **Control panel → Project mappings** lists the saved mappings and can
 forget them. Mappings are stored per host in `settings.json`.
 
+## Worktree shards
+
+By default every ticket of a repository gets its worktree from the same git directory, and the
+Paseo daemon watches that directory: every filesystem event in it (git and Graphite rewrite
+`config`, take `packed-refs.lock`, drop temporary files) costs the daemon work proportional to the
+number of worktrees sharing it. On a repository with hundreds of live worktrees those events pile
+up and the daemon stalls, taking the app, the relay and the plugins with it.
+
+Worktree shards split a repository's ticket worktrees across independent clones, each with its own
+git directory (its own refs, config, hooks and remotes), dividing that cost by the number of
+shards. Every clone is registered as its own Paseo project, and the plugin assigns a new ticket to
+one of them instead of always using the mapped project:
+
+- A ticket whose work already exists in a clone keeps that clone: the worktree a follow-up
+  continues, its recorded worktree (the handover record), or its own branch as a local ref.
+- A ticket that stacks on, or is blocked by, another ticket's work goes to the clone that holds
+  that work: the parent sub-issue's or the blocker's recorded worktree, or the base branch when
+  only one clone has it as a local ref. Local branches and Graphite metadata exist in one clone
+  only, so a stack whose lower branches live elsewhere would find neither.
+- A launch that already names one of the clones (a project picked by hand) keeps it.
+- Everything else goes to the clone with the fewest registered worktrees, so new tickets build up
+  in the least loaded clone. Ties break on a stable hash of the ticket, so a retried launch lands
+  in the same clone.
+
+Tickets with worktrees in the original repository keep the original; nothing is migrated. Before a
+new ticket branches off a clone that has not fetched for ten minutes, the plugin fetches it, so the
+new branch starts from the current base branch. A clone that cannot be read or fetched is skipped
+with a warning on the launch, and a failed assignment keeps the mapped project: the setting never
+blocks a launch.
+
+Off by default, enabled per host through `linear.set-settings` (`worktreeShards`) or in
+`$PASEO_HOME/linear-tickets/settings.json`:
+
+```json
+"worktreeShards": {
+  "enabled": true,
+  "pools": {
+    "/home/mirko/paseo/tuchel-platform-git-source": [
+      "/home/mirko/paseo/tuchel-platform-2",
+      "/home/mirko/paseo/tuchel-platform-3",
+      "/home/mirko/paseo/tuchel-platform-4"
+    ]
+  }
+}
+```
+
+`pools` maps the root path of the Paseo project a Linear project's mapping points to (the
+original, as this host sees it) to its clones' root paths; each clone must be registered as a Paseo
+project on the same host. The clones are plain `git clone --reference` copies of the original's git
+directory: they borrow its objects and keep their own branches, remotes and Graphite stack
+metadata. Each clone is its own repository for its agents, so its `git config` (identity, rerere),
+its lefthook hooks and its Graphite trunk are set up like the original's.
+
 ## Agent access to Linear
 
 Agents started from a ticket get a `linear_ticket` MCP server (on by default, the Paseo Agents
@@ -352,6 +405,9 @@ list and the launch flow.
 - **Linear agent** — whether the native Linear agent is installed and receiving webhooks (see [Native Linear agent](#native-linear-agent)).
 - **Write back to Linear** — report ticket-linked agents' progress on the ticket, and start new agents automatically (off by default, except the silent-agent watchdog; see below).
 - **Deputy for agent questions** — off, shadow or live, its grace period, evaluator model and principles repository; set through `linear.set-settings` (`deputy`) for now (off by default; see [Deputy for agent questions](#deputy-for-agent-questions)).
+- **Worktree shards** — the repositories whose ticket worktrees are spread across independent
+  clones, and the clones themselves; set through `linear.set-settings` (`worktreeShards`) for now
+  (off by default; see [Worktree shards](#worktree-shards)).
 
 The last successful model, mode, and reasoning choices are stored in the same per-host
 settings file. They update automatically and do not need a separate settings toggle. The cheap

@@ -14,7 +14,7 @@ import { assessRisk, type Part } from "./deputy-risk";
 import { gatherSources, registerEntries, type Source, type SourceReaders } from "./deputy-sources";
 import type { IssueState } from "./linear";
 import { DecisionLog, type LogEntry } from "./owner-decisions";
-import { DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type DeputySettings, type PluginSettings } from "./settings";
+import { DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, DEFAULT_WORKTREE_SHARDS, type DeputySettings, type PluginSettings } from "./settings";
 
 const OWNER = "owner-1";
 const APP = "paseo-app";
@@ -207,6 +207,7 @@ async function harness(t: TestContext, deputy: Partial<DeputySettings> = {}, opt
     template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true,
     dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION,
     deputy: { ...DEFAULT_DEPUTY, model: "omp/test-model", principlesRepository: "/repo/platform", ...deputy },
+    worktreeShards: DEFAULT_WORKTREE_SHARDS,
   };
   const state: IssueState = { id: "i1", identifier: "TUC-1", status: "In Progress", statusId: "s", statusType: "started", teamId: "t", projectId: null, creatorId: OWNER, labels: [{ id: "l1", name: "plan-ready" }], attachmentUrls: [], blockedBy: [], priority: 0, createdAt: "2026-10-01T00:00:00Z", unblocks: 0 };
   const comments: string[] = [];
