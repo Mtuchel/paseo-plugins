@@ -1060,6 +1060,17 @@ and says so in the ticket's panel. To use another model for ticket work, change 
 or `cheapModels` / `standardModels` in the plugin, or the ticket's `model:` label; changing it on one agent in Paseo
 is undone.
 
+OMP's own fallback is left alone. When an account nears its usage reserve, omp switches the session
+to a model in the intended model's `retry.fallbackChains` (e.g. `anthropic/claude-opus-5-5` →
+`openai-codex/gpt-6.1-sol:high`). The guard treats a switch to such a model as omp's, not as drift:
+it neither restores nor announces anything. Restoring would only make omp fall back again — on
+2026-10-08 the two traded agents every 30 s to 8 min for a day, 276 restores over 69 agents.
+Whether and when omp returns the agent to its model is omp's (`retry.fallbackRevertPolicy`). A
+switch the guard cannot attribute is left alone the same way: with the chains unreadable (no `omp`,
+broken configuration) it keeps the model, logs the reason once, and still restores a drifted
+thinking level. A manual switch to one of the intended model's fallback targets therefore stays
+too.
+
 **Which model is working.** The progress comment, the final report, the plan review question and
 the plan document ("Planned with") show the model the agent runs, with its thinking level. When
 it changes between turns (you picked another model in Paseo, or Plannotator restored the model it

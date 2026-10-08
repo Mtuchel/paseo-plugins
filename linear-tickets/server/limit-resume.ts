@@ -101,6 +101,27 @@ export function limitSchedule(recovery: Availability["recovery"] | null | undefi
 const exec = promisify(execFile);
 const reportSchema = z.object({ provider: z.string(), fetchedAt: z.union([z.number(), z.string()]).optional(), limits: z.array(z.object({ scope: z.object({ tier: z.string().optional() }).optional(), amount: z.object({ usedFraction: z.number().optional(), remainingFraction: z.number().optional() }).optional(), status: z.string().optional(), window: z.object({ resetsAt: z.union([z.number(), z.string()]).optional() }).optional() })) });
 
+// `retry.fallbackChains` on its own: the models omp's own fallback may run instead of a model —
+// the usage-aware fallback before a hard limit, model fallback after repeated errors. An unset key
+// is `{}`, no fallback. Cached for five minutes because the model guard (model-guard.ts) asks
+// whenever its 20 s sweep finds a drifted model. null: the settings cannot be read; the guard then
+// leaves a switched model alone instead of restoring it, the side that cannot loop.
+let fallbackUntil = 0;
+let fallbackRead: Promise<FallbackChains | null> | null = null;
+export function ompFallbackChains(): Promise<FallbackChains | null> {
+  if (fallbackRead && Date.now() < fallbackUntil) return fallbackRead;
+  fallbackUntil = Date.now() + 5 * MINUTE;
+  fallbackRead = (async () => {
+    const binary = (process.env.PATH ?? "").split(delimiter).map((directory) => join(directory, "omp")).find(existsSync) ?? join(homedir(), ".local", "bin", "omp");
+    const { stdout } = await exec(binary, ["config", "get", "retry.fallbackChains", "--json"], { timeout: 10_000 });
+    // A key nobody set answers without `value`; anything that is not that JSON cannot be read.
+    const parsed = z.object({ value: z.record(z.string(), z.array(z.string())).optional() }).safeParse(JSON.parse(stdout));
+    if (!parsed.success) throw new Error("retry.fallbackChains has an unknown shape");
+    return parsed.data.value ?? {};
+  })().catch(() => null);
+  return fallbackRead;
+}
+
 // Only /v1/usage is read. /v1/snapshot carries credentials and must never be fetched here.
 export class UsageReader {
   private configUntil = 0;
