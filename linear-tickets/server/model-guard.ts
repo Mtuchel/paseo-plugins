@@ -1,5 +1,6 @@
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import type { Tier } from "../shared/plan-model";
+import { candidates, normalizeModel, ompFallbackChains, type FallbackChains } from "./limit-resume";
 import type { PluginSettings, Settings } from "./settings";
 
 // Ticket agents run the model of their tier (README, "Model tiers"): the launch model while they
@@ -7,6 +8,11 @@ import type { PluginSettings, Settings } from "./settings";
 // mode restores the model it saved when planning began once a plan is approved; an agent that
 // started on another model (or was switched during planning) then silently implements on that
 // one. Seen on TUC-9: approved at 11:51 UTC, merged a pull request on DeepSeek flash instead of Opus.
+//
+// omp's own fallback (`retry.fallbackChains`, README "Model tiers") also switches the model, when
+// an account nears its usage reserve. That switch is omp's, not this drift: restoring it only makes
+// omp fall back again. On 2026-10-08 the two traded agents every 30 s to 8 min for a day — 276
+// restores over 69 agents while the Claude account was inside its reserve margin.
 export type ModelSetter = {
   setModel: (agentId: string, modelId: string) => Promise<void>;
   setThinking: (agentId: string, thinkingOptionId: string) => Promise<void>;
@@ -16,6 +22,9 @@ type Snapshot = Pick<PaseoAgent, "id" | "provider" | "model" | "thinkingOptionId
 export type Drift = { agentId: string; from: string; to: string; model: string; thinking: string | null; tier: Tier | null };
 // The tier decided for this ticket agent, or null (index.server.ts: the tier store, then the launch label).
 export type TierOf = (agent: Snapshot) => Promise<Tier | null>;
+// omp's fallback targets (`retry.fallbackChains`; limit-resume.ts reads the same setting). null:
+// they cannot be read, and the guard then cannot tell omp's fallback from the drift it watches for.
+export type FallbackSource = () => Promise<FallbackChains | null>;
 
 const CHECK_MS = 20_000;
 const RESTORE_QUIET_MS = 30_000;
@@ -50,12 +59,15 @@ export class ModelGuard {
   private readonly checking = new Set<string>();
   // Snapshots taken before a restore can arrive after it; they must not restore (and announce) again.
   private readonly restoredAt = new Map<string, number>();
+  // Why the guard left an agent alone, once per message: the sweep runs every 20 s.
+  private readonly warned = new Set<string>();
 
   constructor(
     private readonly settings: Pick<Settings, "read">,
     private readonly setter: () => Promise<ModelSetter | null>,
     private readonly announce: (change: Drift) => Promise<void>,
     private readonly tierOf: TierOf = async () => null,
+    private readonly fallback: FallbackSource = ompFallbackChains,
   ) {}
 
   attach(paseo: PaseoApi): void {
@@ -103,9 +115,20 @@ export class ModelGuard {
       const tier = agent.labels?.["linear.issueId"] ? await this.tierOf(agent) : null;
       const change = drift(agent, await this.settings.read(), tier);
       if (!change) return null;
+      const running = change.from.split(" · ")[0];
+      // A model omp's own fallback would pick for the intended one is omp's to drive, not drift to
+      // restore: restoring it makes omp fall back again, and the two trade the agent (276 restores
+      // over 69 agents in one day). When the chains cannot be read, the guard cannot tell that
+      // fallback from the Plannotator drift above, and leaves the model alone too — the side that
+      // cannot loop (README, "Model tiers"; the thinking level is still restored either way).
+      if (running !== change.model) {
+        const chains = await this.fallback().catch(() => null);
+        if (!chains) this.warnOnce(`agent ${agent.id}: omp's fallback chains cannot be read; keeping ${running} instead of restoring ${change.model}`);
+        if (!chains || candidates(chains, change.model).includes(normalizeModel(running))) return null;
+      }
       const setter = await this.setter();
       if (!setter) { console.error(`[linear-tickets] agent ${agent.id} runs ${change.from} instead of ${change.to}, and the model cannot be changed from here.`); return null; }
-      if (change.from.split(" · ")[0] !== change.model) await setter.setModel(agent.id, change.model);
+      if (running !== change.model) await setter.setModel(agent.id, change.model);
       if (change.thinking) await setter.setThinking(agent.id, change.thinking);
       this.restoredAt.set(agent.id, Date.now());
       console.error(`[linear-tickets] agent ${agent.id}: restored ${change.to} (was ${change.from})`);
@@ -117,5 +140,11 @@ export class ModelGuard {
     } finally {
       this.checking.delete(agent.id);
     }
+  }
+
+  private warnOnce(message: string): void {
+    if (this.warned.has(message)) return;
+    this.warned.add(message);
+    console.error(`[linear-tickets] model check: ${message}`);
   }
 }
