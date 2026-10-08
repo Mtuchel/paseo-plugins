@@ -5,12 +5,13 @@ import { dispatchLabels, type DispatchLabels } from "./dispatch";
 import { SetupError, type Launcher } from "./launch";
 import type { LinearService, RepairCandidate } from "./linear";
 import { CODING_STATE, PLANNING_STATE } from "./plannotator";
-import { classifyTicketAgents, type ProcessInspector } from "./process-liveness";
+import { type ProcessInspector } from "./process-liveness";
 import type { ProjectStore } from "./project-flow";
 import { withPriority } from "./rate-budget";
 import type { ReviewDeletions } from "./review-deletions";
 import type { RestartOptions, RestartResult } from "./sessions";
 import type { PluginSettings } from "./settings";
+import { classifyTicketAgents } from "./starter";
 import { NEEDS_INPUT_STATE } from "./writeback";
 
 // Repairing stale running and failed labels (README, "Repairing stale running and failed labels").
