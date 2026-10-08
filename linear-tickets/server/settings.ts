@@ -53,6 +53,15 @@ export const DEFAULT_DEPUTY: DeputySettings = { mode: "off", graceMinutes: 5, mo
 export const MIN_DEPUTY_GRACE_MINUTES = 1;
 export const MAX_DEPUTY_GRACE_MINUTES = 120;
 const DEPUTY_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}$/;
+// Worktree shards (README, "Worktree shards"): one repository's ticket worktrees split across
+// independent clones, so a filesystem event in one clone's git directory costs work for fewer
+// worktrees. `pools` maps the root path of the Paseo project a Linear project is mapped to, as
+// this host sees it (the original), to its clones' root paths. Off on every host until its own
+// settings file turns it on.
+export type WorktreeShardSettings = { enabled: boolean; pools: Record<string, string[]> };
+export const DEFAULT_WORKTREE_SHARDS: WorktreeShardSettings = { enabled: false, pools: {} };
+export const MAX_SHARD_POOLS = 10;
+export const MAX_SHARD_ROOTS = 12;
 export type PluginSettings = {
   template: string | null;
   markInProgress: boolean;
@@ -75,6 +84,8 @@ export type PluginSettings = {
   // Activation routing (README, "Draining a host"); the secret is a separate host-local file.
   activation: ActivationSettings;
   deputy: DeputySettings;
+  // Splitting ticket worktrees across clones (README, "Worktree shards").
+  worktreeShards: WorktreeShardSettings;
 };
 
 type SettingsFile = {
@@ -94,6 +105,7 @@ type SettingsFile = {
   reviewPeers?: string[];
   activation?: { mode?: unknown; peer?: unknown };
   deputy?: Partial<DeputySettings>;
+  worktreeShards?: { enabled?: unknown; pools?: unknown };
 };
 
 function savedString(value: unknown): string | undefined {
@@ -280,6 +292,47 @@ function validDeputy(value: { mode?: unknown; graceMinutes?: unknown; model?: un
   return normalizeDeputy(value);
 }
 
+// An absolute directory path, without its trailing slashes (worktree shards key and list roots).
+function shardPath(value: unknown): string | null {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text.startsWith("/") || text.length > 500) return null;
+  return text.replace(/\/+$/, "") || "/";
+}
+
+// Malformed stored values fall back to that field's default rather than breaking the settings read:
+// a pool without a usable root, or a clone that is the original's own path, is dropped.
+export function normalizeWorktreeShards(value: unknown): WorktreeShardSettings {
+  const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const pools: Record<string, string[]> = {};
+  const raw = candidate.pools;
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [key, list] of Object.entries(raw).slice(0, MAX_SHARD_POOLS)) {
+      const mappedRoot = shardPath(key);
+      if (!mappedRoot || !Array.isArray(list)) continue;
+      const roots = [...new Set(list.flatMap((item) => shardPath(item) ?? []))].filter((root) => root !== mappedRoot).slice(0, MAX_SHARD_ROOTS);
+      if (roots.length) pools[mappedRoot] = roots;
+    }
+  }
+  return { enabled: candidate.enabled === true, pools };
+}
+
+// A user edit is rejected rather than silently repaired, so the settings form can say why.
+export function validWorktreeShards(value: { enabled?: unknown; pools?: unknown }): WorktreeShardSettings {
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") throw new Error("The worktree shards switch must be true or false.");
+  const raw = value.pools;
+  if (raw !== undefined) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Worktree shards take a pools object: the mapped project's root path to the clones' root paths.");
+    const entries = Object.entries(raw);
+    if (entries.length > MAX_SHARD_POOLS) throw new Error(`At most ${MAX_SHARD_POOLS} repositories can have their ticket worktrees sharded.`);
+    for (const [key, list] of entries) {
+      if (!shardPath(key)) throw new Error(`"${key}" is not an absolute project root path.`);
+      if (!Array.isArray(list) || !list.length || !list.every((item) => shardPath(item))) throw new Error(`The shard list of ${key} must be absolute root paths of its clones.`);
+      if (list.length > MAX_SHARD_ROOTS) throw new Error(`At most ${MAX_SHARD_ROOTS} clones can share one repository's ticket worktrees.`);
+    }
+  }
+  return normalizeWorktreeShards(value);
+}
+
 export type SettingsPatch = {
   template?: string;
   markInProgress?: boolean;
@@ -298,6 +351,8 @@ export type SettingsPatch = {
   // Activation routing; `secret` is write-only (the host-local file) and `null`/`""` removes it.
   activation?: { mode?: "local" | "remote"; peer?: string | null; secret?: string | null };
   deputy?: Partial<DeputySettings>;
+  // Worktree shards: `pools` replaces the whole map when given (README, "Worktree shards").
+  worktreeShards?: { enabled?: boolean; pools?: Record<string, string[]> };
 };
 
 // Returns null for an empty template (meaning: use the built-in default).
@@ -357,6 +412,7 @@ export class Settings {
       reviewPeers: normalizeReviewPeers(value.reviewPeers),
       activation: normalizeActivation(value.activation),
       deputy: normalizeDeputy(value.deputy),
+      worktreeShards: normalizeWorktreeShards(value.worktreeShards),
     };
   }
 
@@ -387,6 +443,9 @@ export class Settings {
       watchdog: patch.watchdog ? validWatchdog({ ...current.watchdog, ...patch.watchdog }) : current.watchdog,
       autoApprove: patch.autoApprove ? normalizeAutoApprove({ ...current.autoApprove, ...patch.autoApprove }) : current.autoApprove,
       deputy: patch.deputy ? validDeputy({ ...current.deputy, ...patch.deputy }) : current.deputy,
+      worktreeShards: patch.worktreeShards
+        ? validWorktreeShards({ enabled: patch.worktreeShards.enabled ?? current.worktreeShards.enabled, pools: patch.worktreeShards.pools ?? current.worktreeShards.pools })
+        : current.worktreeShards,
     };
     if (patch.launchPreference) {
       const { provider, model, modeId, thinkingOptionId } = patch.launchPreference;
@@ -431,7 +490,8 @@ export class Settings {
     const customStandardModels = JSON.stringify(value.standardModels) !== JSON.stringify(DEFAULT_STANDARD_MODELS);
     const customActivation = JSON.stringify(value.activation) !== JSON.stringify(DEFAULT_ACTIVATION);
     const customDeputy = JSON.stringify(value.deputy) !== JSON.stringify(DEFAULT_DEPUTY);
-    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customWatchdog && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length && !customActivation && !customDeputy) {
+    const customWorktreeShards = JSON.stringify(value.worktreeShards) !== JSON.stringify(DEFAULT_WORKTREE_SHARDS);
+    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customWatchdog && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length && !customActivation && !customDeputy && !customWorktreeShards) {
       await rm(this.path, { force: true });
       return value;
     }
@@ -455,6 +515,7 @@ export class Settings {
     if (value.reviewPeers.length) fileValue.reviewPeers = value.reviewPeers;
     if (customActivation) fileValue.activation = value.activation;
     if (customDeputy) fileValue.deputy = value.deputy;
+    if (customWorktreeShards) fileValue.worktreeShards = value.worktreeShards;
     const temporary = `${this.path}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, JSON.stringify(fileValue), { mode: 0o600, flag: "wx" });

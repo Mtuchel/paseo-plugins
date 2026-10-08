@@ -234,6 +234,12 @@ const deputyViewSchema = deputySettingsSchema.extend({
 export type DispatchSettingsValue = z.infer<typeof dispatchSettingsSchema>;
 export type WritebackSettingsValue = z.infer<typeof writebackSettingsSchema>;
 export type WatchdogSettingsValue = z.infer<typeof watchdogSettingsSchema>;
+// Worktree shards (server/settings.ts WorktreeShardSettings): the mapped project's root path to
+// the root paths of its clones. Server-side validation owns the exact rules.
+const worktreeShardsSchema = z.object({
+  enabled: z.boolean(),
+  pools: z.record(z.string().max(500), z.array(z.string().max(500)).max(12)),
+});
 const settingsOutputSchema = z.object({
   template: z.string().nullable(),
   builtin: z.string(),
@@ -254,6 +260,8 @@ const settingsOutputSchema = z.object({
   activation: activationSettingsSchema,
   // README, "Deputy for agent questions".
   deputy: deputyViewSchema,
+  // README, "Worktree shards".
+  worktreeShards: worktreeShardsSchema,
 });
 export const getSettingsRpc = defineRpc({
   name: "linear.get-settings",
@@ -290,6 +298,11 @@ export const setSettingsRpc = defineRpc({
     }).optional(),
     // README, "Deputy for agent questions"; `mode: "off"` stops it at once.
     deputy: deputySettingsSchema.partial().optional(),
+    // README, "Worktree shards"; `pools` replaces the whole map when given.
+    worktreeShards: z.object({
+      enabled: z.boolean().optional(),
+      pools: z.record(z.string().max(500), z.array(z.string().max(500)).max(12)).optional(),
+    }).optional(),
   }),
   output: settingsOutputSchema,
 });

@@ -14,6 +14,7 @@ import { findProject, ProjectUnavailableError, readBranches } from "./projects";
 import { repoOrientation } from "./repo-orientation";
 import type { PluginSettings } from "./settings";
 import { ompExtensionInstalled, paseoHome, TICKET_MCP_ENV, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript, type TicketMcpServer } from "./ticket-mcp";
+import { shardDependencies, type ShardAssignor } from "./worktree-shards";
 
 import type { ReviewDeletions } from "./review-deletions";
 type Start = RpcInput<typeof launchAgentRpc>;
@@ -97,6 +98,9 @@ export class Launcher {
     // backstop for every start path that did not route the activation first (the sidebar
     // included). Never consulted for a ticket an allowed local agent still owns.
     private readonly blocked?: (issueId: string) => Promise<string | null>,
+    // Which of a repository's clones a launch belongs to (README, "Worktree shards"); without it
+    // every launch uses the mapped project.
+    private readonly shards?: ShardAssignor,
   ) {}
 
   useDeletions(deletions: Pick<ReviewDeletions, "blocked">): void {
@@ -184,21 +188,57 @@ export class Launcher {
     return { release: () => { if (held) { held = false; this.gates.delete(issueId); } } };
   }
 
+  // The requested base branch must exist in the project that will create the worktree (which a
+  // shard assignment may have moved, README "Worktree shards"): a local read, before any Linear
+  // call or workspace creation.
+  private async requireBaseBranch(project: { projectKind: string; projectRootPath: string }, baseBranch: string | undefined, resuming: boolean): Promise<void> {
+    if (project.projectKind === "git" && !resuming) {
+      const available = await this.branches(project.projectRootPath);
+      if (!baseBranch || !available.branches.some((branch) => branch.id === baseBranch)) {
+        throw new SetupError("Select an available base branch for this project.");
+      }
+    } else if (baseBranch && project.projectKind !== "git") {
+      throw new SetupError("This project does not support Git branches.");
+    }
+  }
+
   private async launch(input: Start, paseo: PaseoApi, options: Options, onCreate: () => void): Promise<Result> {
     if (await this.deletions?.blocked(input.id)) throw new Error("This ticket is paused for deletion; no agent was started.");
     const blocked = await this.blocked?.(input.id);
     if (blocked) throw new Error(blocked);
-    const project = await findProject(paseo, input.projectId);
-    if (project.projectKind === "git" && !options.resume) {
-      const available = await this.branches(project.projectRootPath);
-      if (!input.baseBranch || !available.branches.some((branch) => branch.id === input.baseBranch)) {
-        throw new SetupError("Select an available base branch for this project.");
-      }
-    } else if (input.baseBranch && project.projectKind !== "git") {
-      throw new SetupError("This project does not support Git branches.");
-    }
+    const mapped = await findProject(paseo, input.projectId);
+    // Which of the repository's clones this launch belongs to (README, "Worktree shards"): a
+    // ticket's recorded work, the worktree a resume continues, its base branch and each clone's
+    // load are known without Linear, so they are assigned first — a launch whose base branch is
+    // gone still fails before any Linear read. The ticket's own branch and its parent/blockers need
+    // the ticket detail below and refine the choice. A failed assignment never blocks a launch.
+    const shards = this.shards;
+    const assign = (ticket: { id: string; branch: string | null; dependencies: string[] }) => shards!.assign({
+      requested: { projectId: mapped.projectId, rootPath: mapped.projectRootPath },
+      ticket,
+      resume: options.resume ? { worktreePath: options.resume.worktreePath, branch: options.resume.branch } : null,
+      baseBranch: input.baseBranch,
+    }, paseo);
+    const failSafe = (error: unknown) => {
+      console.error(`[linear-tickets] ${input.id}: worktree shard assignment failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      return null;
+    };
+    const first = shards ? await assign({ id: input.id, branch: null, dependencies: [] }).catch(failSafe) : null;
+    const firstProject = first ? await findProject(paseo, first.projectId) : mapped;
+    await this.requireBaseBranch(firstProject, input.baseBranch, Boolean(options.resume));
     const detail = await this.linear.detail(input.id);
     this.canonicalIds.set(input.id, detail.issue.id);
+    const shard = shards ? await assign({ id: detail.issue.id, branch: safeBranchName(detail.issue.branchName), dependencies: shardDependencies(detail.relations) }).catch(failSafe) : null;
+    const project = shard ? await findProject(paseo, shard.projectId) : firstProject;
+    if (shard && shard.rootPath !== firstProject.projectRootPath) await this.requireBaseBranch(project, input.baseBranch, Boolean(options.resume));
+    if (shard) console.log(`[linear-tickets] ${detail.issue.identifier} launches in ${shard.label} (${shard.reason}).`);
+    const warnings = [...detail.warnings, ...(first?.notes ?? []), ...(shard?.notes ?? [])];
+    // A clone that has not fetched for a while would branch off a stale base; refresh it before
+    // the worktree is created. Best effort and only for a fresh start (a resume keeps its worktree).
+    if (shard && !options.resume && shard.rootPath !== mapped.projectRootPath) {
+      const refreshNote = await this.shards?.refresh(shard.rootPath);
+      if (refreshNote) warnings.push(refreshNote);
+    }
     if (await this.deletions?.blocked(detail.issue.id)) throw new Error("This ticket is paused for deletion; no agent was started.");
     // Written before any creation so a failure here cannot leave a half-launched ticket.
     const mcpServers = options.linearAccess ? { [TICKET_MCP_NAME]: ticketMcpServer(await this.ticketScript(), detail.issue.id) } : undefined;
@@ -242,7 +282,6 @@ export class Launcher {
         }
       }
     }
-    const warnings = [...detail.warnings];
     // Before the agent exists, so its first prompt can point at the local copies.
     let instructions = input.instructions;
     const cwd = workspace.directory ?? (project.projectKind === "git" ? null : project.projectRootPath);

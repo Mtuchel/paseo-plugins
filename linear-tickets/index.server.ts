@@ -41,6 +41,7 @@ import { closeAnswered, NeedsYouIssues } from "./server/needs-you";
 import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, SessionRouter, SessionStore, stopAgentTurn, type HostOwnership } from "./server/sessions";
 import { LimitResumeStore, UsageReader } from "./server/limit-resume";
 import { planSetup, TicketStarter } from "./server/starter";
+import { ShardAssignor } from "./server/worktree-shards";
 import { PLAN_TICKET_ENV } from "./server/plan-policy";
 import { AgentEnvs, sessionEnv } from "./server/agent-env";
 import { PlanRequests } from "./server/plan-requests";
@@ -94,16 +95,19 @@ export default function contribute(server: PluginServerContext) {
   // not -- the sidebar included -- from falling back to a local start while this host drains or
   // while the peer still owns the ticket. Assigned once the routers exist.
   let activationGuard: (issueId: string) => Promise<string | null> = async () => null;
-  const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url), undefined, undefined, agentEnvs, (issueId) => activationGuard(issueId));
-  launcher.useDeletions(deletions);
   const settings = new Settings();
   const cache = new TicketCache();
   const handover = new Handover(linear, undefined, undefined, undefined, async (agentId) => { const serverId = await daemonServerId(); return serverId ? paseoAgentUrl(serverId, agentId) : null; });
+  // Which of a repository's clones a ticket's work belongs to (README, "Worktree shards"); off
+  // until this host's settings turn it on, so every launch keeps its mapped project.
+  const shards = new ShardAssignor({ settings: () => settings.read(), handover });
+  const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url), undefined, undefined, agentEnvs, (issueId) => activationGuard(issueId), shards);
+  launcher.useDeletions(deletions);
   // Present or away (README, "Present and away"): every start path asks the starter's scheduler.
   const presence = new Presence();
   // Model tiers (README, "Model tiers"): the tier each ticket implements on.
   const tiers = new TierStore();
-  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, deletions });
+  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, deletions, shards });
   // The decision journal (README, "Decision journal"): every owner decision on a plan is written
   // here first and carried out by the bridge's worker; the inbox lists what is being applied.
   const decisionJournal = new DecisionJournal();

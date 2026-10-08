@@ -11,7 +11,7 @@ import { SetupError, type PlannerStart } from "./launch";
 import type { ProcessInspector } from "./process-liveness";
 import { orderProblems, parseOrder, plannerBrief, ProjectFlow, ProjectStore, type PlannerRecord, type ProjectRecord } from "./project-flow";
 import { Scheduler } from "./scheduler";
-import { DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { type UsageReport } from "./limit-resume";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 
@@ -34,7 +34,7 @@ const settings: PluginSettings = {
   launchPreferences: { omp: { model: "anthropic/claude-opus-5-5", modeId: "full" } }, projectMappings: {}, agentLinearAccess: false,
   dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["TUC"], maxRunning: 2 }, writeback: DEFAULT_WRITEBACK,
   watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [],
-  activation: DEFAULT_ACTIVATION, deputy: DEFAULT_DEPUTY,
+  activation: DEFAULT_ACTIVATION, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
 };
 
 const issue = (n: number, change: Partial<ProjectIssue> = {}): ProjectIssue => ({
