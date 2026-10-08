@@ -9,6 +9,9 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { TicketDetail } from "../shared/contracts";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import type { ActivationEnvelope, ActivationResume, ActivationRoute, RequestLike } from "./activation";
+import { Credentials } from "./credentials";
+import { LinearService } from "./linear";
+import { PeerAppUser } from "./peer-identity";
 import { ACTIVATION_HEADER, activationEnvelopeSchema, recoverActivationId } from "./activation";
 import { activationEndpoints } from "./activation-endpoints";
 import { ActivationIntake } from "./activation-intake";
@@ -17,7 +20,7 @@ import { Handover } from "./handover";
 import { Launcher, type ResumeTarget } from "./launch";
 import { PermissionReplies } from "./permission-replies";
 import { SessionStore } from "./sessions";
-import { ResumeUnavailableError, TicketStarter } from "./starter";
+import { isUntrusted, ResumeUnavailableError, TicketStarter } from "./starter";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, Settings, type ActivationSettings, type PluginSettings } from "./settings";
 import { WATCHDOG_LABEL, WatchdogStore } from "./watchdog";
 
@@ -754,6 +757,75 @@ test("the activation routes require the shared secret; a draining host refuses t
   assert.equal(health.drain.seedSource, "daemon");
 });
 
+// The two hosts each install their own Paseo app ("Paseo" on the laptop, "Paseo Server" on the
+// server), so the tickets the peer's agents file carry the peer's app as creator.
+test("tickets the peer host's Paseo app wrote are trusted like this host's own, once the peer said who its app is", async (t) => {
+  const home = await withHome(t);
+  const daemon = fakeDaemon([]);
+  const idleDrain = { deliver: async () => ({ ok: false, reason: "no owner" }), status: async () => ({ mode: "local" as const, peer: null, host: "mac", seededAt: null, seedSource: null, seedRejected: 0, agents: 0, claims: 0, revision: 0, ackedRevision: 0, outbox: 0 }) };
+  const peerRoute = activationEndpoints({
+    settings: { read: async () => settingsFor({ mode: "remote", peer: PEER }) },
+    secret: async () => SECRET,
+    intake: new ActivationIntake({ settings: { read: async () => settingsFor({ mode: "remote", peer: PEER }) }, home, host: "mac", log: () => {}, paseo: () => daemon.paseo, linear: () => null, launcher: () => null, starter: () => null }),
+    drain: idleDrain,
+    appUserId: async () => "peer-app",
+  });
+  let reachable = true;
+  const asked: string[] = [];
+  const request: RequestLike = async (url, init) => {
+    asked.push(url);
+    if (!reachable) throw new Error("connect ECONNREFUSED");
+    const answer = await peerRoute({ method: init.method, path: new URL(url).pathname, headers: init.headers, body: init.body ?? "" });
+    return { ok: answer!.status < 300, status: answer!.status, text: async () => answer!.body };
+  };
+  let now = Date.parse("2026-10-09T00:00:00Z");
+  const settings = { read: async () => settingsFor({ mode: "local", peer: MAC }) };
+  const logs: string[] = [];
+  const peer = new PeerAppUser({ settings, home, secret: async () => SECRET, request, now: () => now, log: (line) => logs.push(line) });
+  const linear = new LinearService(new Credentials("/unused", "key"), async () => ({}), { query: () => Promise.reject(new Error("unused")), mutate: () => Promise.reject(new Error("unused")), viewer: async () => ({ id: "own-app", name: "Paseo Server" }) });
+  linear.peerAppUser = () => peer.id();
+
+  const ids = await linear.trustedAppIds();
+  assert.deepEqual(ids, ["own-app", "peer-app"]);
+  assert.deepEqual(asked, [`${MAC}/activation/health`]);
+  assert.equal(isUntrusted({ creatorId: "peer-app", labels: [] }, OWNER, ids), false);
+  assert.equal(isUntrusted({ creatorId: "peer-app", labels: [{ name: "feedback" }] }, OWNER, ids), true, "the feedback intake stays untrusted whoever filed it");
+  assert.equal(isUntrusted({ creatorId: "someone", labels: [] }, OWNER, ids), true);
+
+  // A restart while the peer is down keeps the id it gave; a refresh that fails keeps it too.
+  reachable = false;
+  const restarted = new PeerAppUser({ settings, home, secret: async () => SECRET, request, now: () => now, log: (line) => logs.push(line) });
+  assert.equal(await restarted.id(), "peer-app");
+  assert.equal(asked.length, 1, "a fresh id needs no question");
+  now += 7 * 60 * 60 * 1000;
+  assert.equal(await restarted.id(), "peer-app");
+  assert.equal(asked.length, 2);
+  assert.equal(logs.length, 1);
+
+  // Another peer is another app: the old answer no longer counts.
+  const moved = new PeerAppUser({ settings: { read: async () => settingsFor({ mode: "local", peer: "https://other.tail5efd6b.ts.net:8444" }) }, home, secret: async () => SECRET, request, now: () => now, log: () => {} });
+  assert.equal(await moved.id(), null);
+});
+
+test("a peer that never answered widens nothing, and is asked again only after ten minutes", async (t) => {
+  const home = await withHome(t);
+  const asked: string[] = [];
+  const request: RequestLike = async (url) => { asked.push(url); throw new Error("connect ECONNREFUSED"); };
+  let now = Date.parse("2026-10-09T00:00:00Z");
+  const peer = new PeerAppUser({ settings: { read: async () => settingsFor({ mode: "local", peer: MAC }) }, home, secret: async () => SECRET, request, now: () => now, log: () => {} });
+  const linear = new LinearService(new Credentials("/unused", "key"), async () => ({}), { query: () => Promise.reject(new Error("unused")), mutate: () => Promise.reject(new Error("unused")), viewer: async () => ({ id: "own-app", name: "Paseo Server" }) });
+  linear.peerAppUser = () => peer.id();
+  assert.deepEqual(await linear.trustedAppIds(), ["own-app"]);
+  assert.equal(isUntrusted({ creatorId: "peer-app", labels: [] }, OWNER, await linear.trustedAppIds()), true);
+  assert.equal(asked.length, 1);
+  now += 10 * 60 * 1000;
+  await peer.id();
+  assert.equal(asked.length, 2);
+  const alone = new PeerAppUser({ settings: { read: async () => settingsFor() }, home, secret: async () => SECRET, request, now: () => now, log: () => {} });
+  assert.equal(await alone.id(), null);
+  assert.equal(asked.length, 2, "a host without a peer asks nobody");
+});
+
 test("claims snapshots apply only a newer revision and a re-seed replaces the set", async (t) => {
   const home = await withHome(t);
   const daemon = fakeDaemon([]);
@@ -868,7 +940,7 @@ function resumeDestination(home: string, repo: string): { intake: ActivationInta
     } as unknown as TicketDetail),
     issueState: async () => ({ id: ISSUE, identifier: "TUC-1", projectId: "lp-1", creatorId: OWNER, blockedBy: [], status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", labels: [], attachmentUrls: [], priority: 0, createdAt: "2026-01-01T00:00:00Z", unblocks: 0 }),
     viewerId: async () => OWNER,
-    appUserId: async () => "app-1",
+    trustedAppIds: async () => ["app-1"],
     issueDocument: async () => null,
   };
   const starter = new TicketStarter({

@@ -70,7 +70,7 @@ type PlannotatorEvent = OpenedEvent | DecidedEvent | AdvisedEvent | EscalatedEve
 // Model tiers (README, "Model tiers"): where tier decisions are recorded, the model guard's
 // immediate switch of one agent, and sending a working agent back to planning (plan-requests.ts).
 export type Tiers = { store: Pick<TierStore, "record">; apply: (agentId: string) => Promise<unknown>; replan: (agent: { id: string; issueId: string; identifier: string }, message: string) => Promise<void> };
-type Linear = Pick<LinearService, "comment" | "commentById" | "upsertIssueDocument" | "issueDocument" | "moveToStateNamed" | "moveToReady" | "addLabel" | "removeLabel" | "issueState" | "viewerId" | "appUserId" | "createIssue" | "issueById" | "addBlocker" | "delegate">;
+type Linear = Pick<LinearService, "comment" | "commentById" | "upsertIssueDocument" | "issueDocument" | "moveToStateNamed" | "moveToReady" | "addLabel" | "removeLabel" | "issueState" | "viewerId" | "appUserId" | "trustedAppIds" | "createIssue" | "issueById" | "addBlocker" | "delegate">;
 type Sessions = Pick<SessionRouter, "sessionFor" | "plan" | "ask" | "say" | "said" | "expectReview" | "clearReview" | "parked" | "requeueSession" | "holdSession" | "groupSession">;
 // What the risk policy made of an opened review: `line` tells the owner, in the panel and on Linear;
 // `reasons` why it needs the owner (empty when approved).
@@ -532,7 +532,7 @@ export class PlannotatorBridge {
   private async reviewFacts(state: IssueState, verdict: string | null, settings: PluginSettings): Promise<ReviewFacts> {
     return {
       verdict,
-      untrusted: isUntrusted(state, await this.linear.viewerId(), await this.linear.appUserId()),
+      untrusted: isUntrusted(state, await this.linear.viewerId(), await this.linear.trustedAppIds()),
       attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()),
     };
   }

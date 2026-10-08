@@ -110,7 +110,7 @@ export async function readCandidates(directory: string): Promise<Record<string, 
 type Deps = {
   settings: Pick<Settings, "read">;
   log: Pick<DecisionLog, "append" | "entries">;
-  linear: Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "upsertComment">;
+  linear: Pick<LinearService, "issueState" | "viewerId" | "trustedAppIds" | "upsertComment">;
   sessions?: { sessionFor(agentId: string): Promise<{ sessionId: string } | null>; say(sessionId: string, type: "thought" | "response" | "error", body: string): Promise<void> };
   readers: SourceReaders;
   evaluate(input: EvaluationInput, model: string): Promise<Verdict>;
@@ -264,7 +264,7 @@ export class Deputy {
     } catch (error) {
       return { ok: false, reason: `the ticket could not be read (${message(error)})`, category: "source-unavailable" };
     }
-    const trusted = !isUntrusted(state, await this.deps.linear.viewerId(), await this.deps.linear.appUserId());
+    const trusted = !isUntrusted(state, await this.deps.linear.viewerId(), await this.deps.linear.trustedAppIds());
     // The ticket's plan is approved (plan-ready); before that a question decides the plan.
     const planApproved = planPolicy(state.labels) === null;
     const risk = assessRisk(candidate.request, { trusted, planning: !planApproved, attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()) });

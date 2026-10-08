@@ -541,6 +541,12 @@ runs on that app's host. The sweep takes only its own app's threads, since Linea
 app's sessions to each of them. Keep `dispatch.enabled` on one host only. Without activation
 routing, the label poll and project flow cannot see another host's agents.
 
+Tickets either host's app wrote count as yours: a host with an `activation.peer` asks the peer's
+authenticated `/activation/health` for its app user (`appUserId`) and trusts it like its own app,
+so tickets the other host's agents and planners file are not marked untrusted. The answer is kept
+in `$PASEO_HOME/linear-tickets/peer-app-user.json`, refreshed every 6 hours and kept while the
+peer is unreachable; until the peer has answered once, only this host's app is trusted.
+
 **Drain one host into another.** Activation routing lets the old host keep its Linear app and
 threads while sending new work to the destination. In the old host's
 `$PASEO_HOME/linear-tickets/settings.json`, set:
@@ -763,8 +769,9 @@ request.
 
 Claude starts in `plan` mode and Codex in `auto`; omp keeps your usual mode (its `write` mode asks
 before every shell command, reads included) and starts in Plannotator's planning phase instead.
-The prompt asks only for a plan and, for a ticket someone else wrote or labelled `feedback`, marks
-its text as untrusted input. With status write-back on, the ticket starts in **Planning** instead
+The prompt asks only for a plan and, for a ticket that neither you nor a Paseo app (this host's or
+the peer's) wrote, or one labelled `feedback`, marks its text as untrusted input. With status
+write-back on, the ticket starts in **Planning** instead
 of In Progress. Approving the plan switches the agent to your usual mode. A plan you sent back is
 planned again by the next agent, which gets the previous plan and your feedback from the ticket's
 plan document.

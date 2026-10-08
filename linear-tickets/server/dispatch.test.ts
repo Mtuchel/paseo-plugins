@@ -52,7 +52,7 @@ class FakeLinear {
 
   async viewerId() { return "owner"; }
 
-  async appUserId() { return "paseo-app"; }
+  async trustedAppIds() { return ["paseo-app"]; }
 
   async issueDocument() { return null; }
 

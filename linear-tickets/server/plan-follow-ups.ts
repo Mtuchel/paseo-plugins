@@ -12,7 +12,7 @@ export const RETRY_MS = 10 * 60_000;
 // How often the sweep looks for records with a retry due.
 const SCAN_MS = 60_000;
 
-type Linear = Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "createIssueAsApp" | "relateAsApp" | "comment" | "issueById" | "commentById">;
+type Linear = Pick<LinearService, "issueState" | "viewerId" | "trustedAppIds" | "createIssueAsApp" | "relateAsApp" | "comment" | "issueById" | "commentById">;
 type Item = {
   title: string;
   // The Linear id reserved before the create, saved first: a retry looks it up and only creates
@@ -157,7 +157,7 @@ export class PlanFollowUps {
       try {
         const state = await this.linear.issueState(record.issueId);
         // Checked before every creation, so a feedback label added while one waits stops it.
-        const untrusted = create.length > 0 && isUntrusted(state, await this.linear.viewerId(), await this.linear.appUserId());
+        const untrusted = create.length > 0 && isUntrusted(state, await this.linear.viewerId(), await this.linear.trustedAppIds());
         for (const item of create) {
           if (untrusted) { item.stopped = "untrusted"; continue; }
           if (!state.teamId) throw new Error("the ticket has no team");

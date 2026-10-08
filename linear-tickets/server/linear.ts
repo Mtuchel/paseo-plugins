@@ -832,6 +832,17 @@ export class LinearService {
     return this.appUser;
   }
 
+  // The peer host's app user (peer-identity.ts); unset on a host that has no peer.
+  peerAppUser?: () => Promise<string | null>;
+
+  // The app users whose tickets count as the owner's (starter.ts isUntrusted): this host's app and
+  // the peer host's, each only once known. A peer that cannot be asked adds nothing.
+  async trustedAppIds(): Promise<string[]> {
+    const own = await this.appUserId();
+    const peer = await (this.peerAppUser?.() ?? Promise.resolve(null)).catch(() => null);
+    return [own, peer].filter((id): id is string => Boolean(id));
+  }
+
   private readonly people = new Map<string, boolean>();
 
   // Whether the user is a person rather than an app or integration (read with the key, so it works

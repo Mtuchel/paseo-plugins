@@ -12,6 +12,8 @@ export type ActivationEndpointDeps = {
   secret?: () => Promise<string | null>;
   intake: Pick<ActivationIntake, "accept" | "applyClaims" | "status" | "deliverLocal">;
   drain: Pick<DrainRouter, "deliver" | "status">;
+  // This host's Paseo Linear app user, which the peer trusts like its own (peer-identity.ts).
+  appUserId?: () => Promise<string | null>;
 };
 
 function headerSecret(value: string | string[] | undefined): string | null {
@@ -32,9 +34,9 @@ export function activationEndpoints(deps: ActivationEndpointDeps): ActivationRou
     const role: "drain" | "intake" = mode === "remote" ? "drain" : "intake";
 
     if (path === "/activation/health" && (method === "GET" || method === "POST")) {
-      const [drain, intake] = await Promise.all([deps.drain.status(), deps.intake.status()]);
+      const [drain, intake, appUserId] = await Promise.all([deps.drain.status(), deps.intake.status(), (deps.appUserId?.() ?? Promise.resolve(null)).catch(() => null)]);
       return activationJson(200, {
-        role, host: drain.host, mode, peer: drain.peer, secretConfigured: true,
+        role, host: drain.host, mode, peer: drain.peer, secretConfigured: true, appUserId,
         drain: { seededAt: drain.seededAt, seedSource: drain.seedSource, seedRejected: drain.seedRejected, agents: drain.agents, claims: drain.claims, revision: drain.revision, ackedRevision: drain.ackedRevision, outbox: drain.outbox },
         intake: { claims: intake.claims, revision: intake.revision, appliedAt: intake.appliedAt, pending: intake.pending, handoffs: intake.handoffs, done: intake.done },
       });

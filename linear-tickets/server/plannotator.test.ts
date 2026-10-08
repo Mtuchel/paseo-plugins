@@ -102,6 +102,7 @@ function setup(labels: Record<string, string>, ticket: { creatorId: string; labe
     async issueState() { return { identifier: labels["linear.identifier"], creatorId: ticket.creatorId, labels: ticket.labels.map((name, index) => ({ id: `l${index}`, name })) } as never; },
     async viewerId() { return "owner"; },
     async appUserId() { return "paseo-app"; },
+    async trustedAppIds() { return ["paseo-app"]; },
   };
   const paseo = {
     agents: {
@@ -1076,6 +1077,7 @@ function tracked(agentLabels: Record<string, string> = {}, ticket: { creatorId: 
     async issueState() { return { identifier: agentLabels["linear.identifier"] ?? "TUC-25", creatorId: ticket.creatorId, labels: ticket.labels.map((name, index) => ({ id: `l${index}`, name })) } as never; },
     async viewerId() { return "owner"; },
     async appUserId() { return "paseo-app"; },
+    async trustedAppIds() { return ["paseo-app"]; },
   };
   const paseo = {
     agents: {

@@ -56,6 +56,7 @@ import { rateBudget, withPriority } from "./server/rate-budget";
 import { hostname } from "node:os";
 import { readActivationSecret, type ActivationSink } from "./server/activation";
 import { activationEndpoints } from "./server/activation-endpoints";
+import { PeerAppUser } from "./server/peer-identity";
 import { ActivationIntake } from "./server/activation-intake";
 import { DrainRouter } from "./server/drain";
 import { resumeGuard, ticketOwnership } from "./server/activation-guard";
@@ -96,6 +97,10 @@ export default function contribute(server: PluginServerContext) {
   // while the peer still owns the ticket. Assigned once the routers exist.
   let activationGuard: (issueId: string) => Promise<string | null> = async () => null;
   const settings = new Settings();
+  // The peer host's Paseo app wrote its agents' tickets; they are trusted like this host's app's
+  // (starter.ts isUntrusted, README "Several hosts").
+  const peerAppUser = new PeerAppUser({ settings });
+  linear.peerAppUser = () => peerAppUser.id();
   const cache = new TicketCache();
   const handover = new Handover(linear, undefined, undefined, undefined, async (agentId) => { const serverId = await daemonServerId(); return serverId ? paseoAgentUrl(serverId, agentId) : null; });
   // Which of a repository's clones a ticket's work belongs to (README, "Worktree shards"); off
@@ -238,7 +243,7 @@ export default function contribute(server: PluginServerContext) {
     },
     // Draining a host: /activation, /activation/claims, /activation/deliver and
     // /activation/health ride this tailnet service (activation-endpoints.ts).
-    routes: activationEndpoints({ settings, intake, drain }),
+    routes: activationEndpoints({ settings, intake, drain, appUserId: () => linear.appUserId() }),
     deletions,
     issueInfo: (identifier, options) => issueInfos.forIdentifier(identifier, options),
     issueLink: async (agentId) => {

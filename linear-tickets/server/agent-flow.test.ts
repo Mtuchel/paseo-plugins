@@ -704,7 +704,7 @@ function starterHarness(state: { creatorId: string | null; labels: { id: string;
       detail: async () => ({ issue: { identifier: "TUC-1", project: "", team: "Team" }, projectId: null, teamId: "t1" }) as never,
       issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, attachmentUrls: [], priority: 0, createdAt: "", unblocks: 0, ...state }),
       viewerId: async () => OWNER,
-      appUserId: async () => appId,
+      trustedAppIds: async () => appId ? [appId] : [],
       issueDocument: async (_id: string, title: string) => title === "Plan: TUC-1" ? { url: "https://linear.app/doc/plan", content: planText } : null,
     },
     launcher: { start: async (input, _paseo, options) => { launches.push({ provider: input.provider, thinkingOptionId: input.thinkingOptionId, modeId: input.modeId, instructions: input.instructions, labels: options?.labels, env: options?.env, markInProgress: options?.markInProgress }); return { agentId: "new", warnings: [] }; } },
@@ -784,9 +784,9 @@ test("while the owner is away, only the implementation of an attended ticket wai
 });
 
 test("every ticket starts plan-first; someone else's ticket is marked untrusted; omp keeps the usual mode so the planner never waits for approvals", async () => {
-  assert.equal(isUntrusted({ creatorId: OWNER, labels: [] }, OWNER, APP), false);
-  assert.equal(isUntrusted({ creatorId: "customer", labels: [] }, OWNER, APP), true);
-  assert.equal(isUntrusted({ creatorId: OWNER, labels: [{ name: "Feedback" }] }, OWNER, APP), true);
+  assert.equal(isUntrusted({ creatorId: OWNER, labels: [] }, OWNER, [APP]), false);
+  assert.equal(isUntrusted({ creatorId: "customer", labels: [] }, OWNER, [APP]), true);
+  assert.equal(isUntrusted({ creatorId: OWNER, labels: [{ name: "Feedback" }] }, OWNER, [APP]), true);
   const h = starterHarness({ creatorId: "customer", labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, settings, { retryHint: "retry" });
   assert.deepEqual({ untrusted: started.untrusted, plan: started.plan }, { untrusted: true, plan: "required" });
@@ -798,12 +798,12 @@ test("every ticket starts plan-first; someone else's ticket is marked untrusted;
 });
 
 test("tickets the Paseo app wrote are trusted like the owner's, unless they came from the feedback intake or the app is unknown here", async () => {
-  assert.equal(isUntrusted({ creatorId: APP, labels: [] }, OWNER, APP), false);
-  assert.equal(isUntrusted({ creatorId: APP, labels: [{ name: "feedback" }] }, OWNER, APP), true);
-  assert.equal(isUntrusted({ creatorId: "customer", labels: [] }, OWNER, APP), true);
-  assert.equal(isUntrusted({ creatorId: null, labels: [] }, OWNER, APP), true);
-  assert.equal(isUntrusted({ creatorId: null, labels: [] }, OWNER, null), true, "an unknown creator never matches an unknown app");
-  assert.equal(isUntrusted({ creatorId: APP, labels: [] }, OWNER, null), true);
+  assert.equal(isUntrusted({ creatorId: APP, labels: [] }, OWNER, [APP]), false);
+  assert.equal(isUntrusted({ creatorId: APP, labels: [{ name: "feedback" }] }, OWNER, [APP]), true);
+  assert.equal(isUntrusted({ creatorId: "customer", labels: [] }, OWNER, [APP]), true);
+  assert.equal(isUntrusted({ creatorId: null, labels: [] }, OWNER, [APP]), true);
+  assert.equal(isUntrusted({ creatorId: null, labels: [] }, OWNER, []), true, "an unknown creator never matches an unknown app");
+  assert.equal(isUntrusted({ creatorId: APP, labels: [] }, OWNER, []), true);
   const byApp = starterHarness({ creatorId: APP, labels: [], blockedBy: [] }, 0);
   const trusted = await byApp.starter.start("i1", byApp.paseo, settings, { retryHint: "retry" });
   assert.deepEqual({ untrusted: trusted.untrusted, plan: trusted.plan }, { untrusted: false, plan: "required" });
