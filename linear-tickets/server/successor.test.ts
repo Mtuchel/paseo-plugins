@@ -144,6 +144,7 @@ class FakeLinear {
   async comment(id: string, body: string) { this.writes.push(`comment ${id}: ${body}`); }
   async viewerId() { return OWNER; }
   async appUserId() { return APP; }
+  async trustedAppIds() { return [APP]; }
   async issueDocument() { return null; }
   async upsertComment() { return "comment-1"; }
   async moveToStateNamed() { return { changed: false }; }

@@ -13,7 +13,7 @@ const PLAN = "# Plan\n\n## Reach\n\n- Changes: the delivery date\n- Help page: f
 const ORIGIN = { issueId: "origin-1", identifier: "TUC-50", plan: PLAN, documentUrl: "https://linear.app/doc/plan" };
 type Mode = "ok" | "null" | "throw" | "lost" | RateLimitedError;
 type Ticket = { teamId: string; projectId: string; creatorId: string; labels: { id: string; name: string }[] };
-type FollowUpLinear = Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "createIssueAsApp" | "relateAsApp" | "comment" | "issueById" | "commentById">;
+type FollowUpLinear = Pick<LinearService, "issueState" | "viewerId" | "trustedAppIds" | "createIssueAsApp" | "relateAsApp" | "comment" | "issueById" | "commentById">;
 type Ref = { id: string; identifier: string; url: string };
 type Harness = {
   calls: string[];
@@ -46,7 +46,7 @@ function fakeLinear() {
   const linear = {
     async issueState() { return { ...ticket } as never; },
     async viewerId() { return "owner"; },
-    async appUserId() { return "paseo-app"; },
+    async trustedAppIds() { return ["paseo-app"]; },
     async createIssueAsApp(input: { id?: string; teamId: string; projectId?: string | null; ready?: boolean; title: string; description: string }) {
       calls.push(`create "${input.title}" ${input.teamId} ${input.projectId} ready=${input.ready}`);
       const value: Ref = { id: `new-${created + 1}`, identifier: `TUC-${101 + created}`, url: `https://linear.app/TUC-${101 + created}` };

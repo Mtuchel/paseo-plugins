@@ -232,7 +232,7 @@ async function harness(t: TestContext, deputy: Partial<DeputySettings> = {}, opt
     linear: {
       issueState: async () => state,
       viewerId: async () => OWNER,
-      appUserId: async () => APP,
+      trustedAppIds: async () => [APP],
       upsertComment: async (_issueId: string, body: string) => { comments.push(body); return `notice-${comments.length}`; },
     },
     sessions: { sessionFor: async () => ({ sessionId: "s1" }), say: async (_sessionId, _type, body) => { said.push(body); } },
@@ -455,7 +455,7 @@ test("an answer interrupted by a reload is never submitted again", async (t) => 
   store[key] = { ...store[key], status: "dispatching", intentId: "intent-1" };
   await writeFile(join(h.directory, "candidates.json"), JSON.stringify(store));
   const fake = arbiter();
-  const reloaded = new Deputy({ settings: { read: async () => h.settings }, log: h.log, linear: { issueState: async () => h.state, viewerId: async () => OWNER, appUserId: async () => APP, upsertComment: async () => "n" }, readers: readers(), evaluate: async () => ({ ok: false, reason: "unused" }), arbiter: async () => fake.value, directory: h.directory });
+  const reloaded = new Deputy({ settings: { read: async () => h.settings }, log: h.log, linear: { issueState: async () => h.state, viewerId: async () => OWNER, trustedAppIds: async () => [APP], upsertComment: async () => "n" }, readers: readers(), evaluate: async () => ({ ok: false, reason: "unused" }), arbiter: async () => fake.value, directory: h.directory });
   reloaded.attach(h.paseo);
   await reloaded.idle();
   assert.deepEqual(fake.calls, []);

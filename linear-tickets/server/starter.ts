@@ -22,7 +22,7 @@ import { shardDependencies, type ShardAssignor } from "./worktree-shards";
 
 export type Started = { agentId: string; warnings: string[]; provider: string; target: string; resumed: boolean; untrusted: boolean; plan: PlanPolicy | null };
 type Deps = {
-  linear: Pick<LinearService, "detail" | "issueState" | "viewerId" | "appUserId" | "issueDocument">;
+  linear: Pick<LinearService, "detail" | "issueState" | "viewerId" | "trustedAppIds" | "issueDocument">;
   launcher: Pick<Launcher, "start">;
   handover?: Pick<Handover, "resumeTarget">;
   branches?: typeof readBranches;
@@ -91,11 +91,12 @@ export function sentBackPlanNote(identifier: string, plan: { url: string; conten
   ].join("\n\n");
 }
 
-// Tickets the owner wrote, or the Paseo app wrote in a flow the owner started (split sub-issues,
-// needs-you sub-issues, manual tasks), are trusted unless they carry the feedback label. `appId` is
-// null when the app cannot be used here; an unknown app never widens trust.
-export function isUntrusted(state: { creatorId: string | null; labels: { name: string }[] }, ownerId: string, appId: string | null): boolean {
-  return !state.creatorId || (state.creatorId !== ownerId && state.creatorId !== appId) || hasLabel(state.labels, "feedback");
+// Tickets the owner wrote, or a Paseo app wrote in a flow the owner started (split sub-issues,
+// needs-you sub-issues, manual tasks, follow-ups, tickets agents file), are trusted unless they
+// carry the feedback label. `appIds` are this host's app user and the peer host's (README, "Several
+// hosts"); an app that is unknown here is simply not in the list, so it never widens trust.
+export function isUntrusted(state: { creatorId: string | null; labels: { name: string }[] }, ownerId: string, appIds: readonly string[]): boolean {
+  return !state.creatorId || (state.creatorId !== ownerId && !appIds.includes(state.creatorId)) || hasLabel(state.labels, "feedback");
 }
 
 // `tier`: the model tier an implementing launch runs on (null while the ticket plans), and why.
@@ -103,9 +104,9 @@ export type PlanSetup = { identifier: string; untrusted: boolean; policy: PlanPo
 
 // What a ticket's launch looks like under its plan policy: mode, instructions, model tier, and the
 // agent label and environment the omp extension and write-back read. Shared by every launch path.
-export async function planSetup(linear: Pick<LinearService, "issueState" | "viewerId" | "appUserId" | "issueDocument">, issueId: string, provider: string, usualModeId: string | undefined, tiers?: Pick<TierStore, "get">): Promise<PlanSetup> {
+export async function planSetup(linear: Pick<LinearService, "issueState" | "viewerId" | "trustedAppIds" | "issueDocument">, issueId: string, provider: string, usualModeId: string | undefined, tiers?: Pick<TierStore, "get">): Promise<PlanSetup> {
   const state = await linear.issueState(issueId);
-  const untrusted = isUntrusted(state, await linear.viewerId(), await linear.appUserId());
+  const untrusted = isUntrusted(state, await linear.viewerId(), await linear.trustedAppIds());
   const plan = await linear.issueDocument(issueId, `Plan: ${state.identifier}`).catch(() => null);
   const providerKey = provider.split("/")[0];
   // Implementing an approved plan: the strongest of the ticket's label, its recorded tier and the plan's.
