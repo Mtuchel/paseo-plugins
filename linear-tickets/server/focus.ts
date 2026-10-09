@@ -94,33 +94,42 @@ export class Focus {
   // Turns focus on, fixing the roots: every ticket with work under way -- a root ticket agent on
   // this host, a dispatch status label (`-running`, `-needs-you`, `-blocked`, `-failed`), or a
   // started ticket of the dispatch teams that Paseo has (delegated to this host's or the peer's
-  // app, or carrying a Paseo agent link). An approved plan that no agent implements yet (Todo or
-  // Backlog with `plan-ready`, no live agent) is new work and waits. Already on: unchanged.
+  // app, carrying a Paseo agent link, or carrying `plan-ready`: an approved plan being implemented,
+  // also once its agent was archived). An approved plan that no agent implements yet (Todo or
+  // Backlog with `plan-ready`, no live agent) is new work and waits. Already on: the tickets in
+  // flight now that are not roots yet join them, and none leaves, so it never lets new work start.
   async enable(paseo: PaseoApi): Promise<FocusStatus> {
-    if (!(await this.file.load()).active) {
-      const settings = await this.deps.settings.read();
-      const labels = dispatchLabels(settings.dispatch.label);
-      const agents = await agentsByTicket(paseo);
-      const appIds = new Set(await this.deps.linear.trustedAppIds());
-      const seed = await this.deps.linear.focusSeed(settings.dispatch.teamKeys, [labels.running, labels.needsYou, labels.blocked, labels.failed]);
-      const candidates = new Map<string, FocusNode>();
-      for (const node of seed.labelled) candidates.set(node.id, node);
-      for (const node of seed.started) {
-        if ((node.delegateId && appIds.has(node.delegateId)) || node.agentLinked || agents.has(node.id)) candidates.set(node.id, node);
-      }
-      for (const node of await this.deps.linear.focusTickets([...agents.keys()].filter((id) => !candidates.has(id)))) candidates.set(node.id, node);
-      const roots = Object.fromEntries([...candidates.values()]
-        .filter((node) => !(["unstarted", "backlog", "triage"].includes(node.statusType) && node.labels.some((name) => name.toLowerCase() === PLAN_READY_LABEL) && !agents.get(node.id)?.live))
-        .map((node) => [node.id, node.identifier]));
-      const since = new Date(this.now()).toISOString();
-      await this.file.update((file) => {
-        if (file.active) return;
-        Object.assign(file, { active: true, since, roots });
-      });
-      this.snapshot = null;
-      this.error = null;
-      console.log(`[linear-tickets] focus mode on: ${Object.keys(roots).length} ticket${Object.keys(roots).length === 1 ? "" : "s"} in flight`);
+    const settings = await this.deps.settings.read();
+    const labels = dispatchLabels(settings.dispatch.label);
+    const agents = await agentsByTicket(paseo);
+    const appIds = new Set(await this.deps.linear.trustedAppIds());
+    const seed = await this.deps.linear.focusSeed(settings.dispatch.teamKeys, [labels.running, labels.needsYou, labels.blocked, labels.failed]);
+    const planReady = (node: FocusNode) => node.labels.some((name) => name.toLowerCase() === PLAN_READY_LABEL);
+    const candidates = new Map<string, FocusNode>();
+    for (const node of seed.labelled) candidates.set(node.id, node);
+    for (const node of seed.started) {
+      if ((node.delegateId && appIds.has(node.delegateId)) || node.agentLinked || planReady(node) || agents.has(node.id)) candidates.set(node.id, node);
     }
+    for (const node of await this.deps.linear.focusTickets([...agents.keys()].filter((id) => !candidates.has(id)))) candidates.set(node.id, node);
+    const roots = Object.fromEntries([...candidates.values()]
+      .filter((node) => !(["unstarted", "backlog", "triage"].includes(node.statusType) && planReady(node) && !agents.get(node.id)?.live))
+      .map((node) => [node.id, node.identifier]));
+    const since = new Date(this.now()).toISOString();
+    // -1: focus was off and starts now; otherwise how many tickets in flight joined it.
+    let joined = -1;
+    await this.file.update((file) => {
+      if (!file.active) {
+        Object.assign(file, { active: true, since, roots });
+        return;
+      }
+      const missing = Object.entries(roots).filter(([id]) => !file.roots[id]);
+      Object.assign(file.roots, Object.fromEntries(missing));
+      joined = missing.length;
+    });
+    this.snapshot = null;
+    this.error = null;
+    const count = (value: number) => `${value} ticket${value === 1 ? "" : "s"}`;
+    console.log(joined < 0 ? `[linear-tickets] focus mode on: ${count(Object.keys(roots).length)} in flight` : `[linear-tickets] focus mode already on: ${count(joined)} in flight joined it`);
     return this.status(paseo);
   }
 
