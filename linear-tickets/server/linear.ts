@@ -379,6 +379,46 @@ export const ADMISSION_STATES_QUERY = `query admissionStates($ids: [ID!]!, $firs
     relations(first: 50) { nodes { type relatedIssue { state { type } } } }
   } }
 }`;
+// Focus mode (focus.ts): one ticket with what its focus walk needs -- workflow state, who has it,
+// labels, pull requests and the Paseo agent link, open sub-issues and the tickets blocking it. The
+// same node for the walk by id and the seed read by team, 50 per request like the admission read.
+const FOCUS_NODE = `id identifier title url state { name type } delegate { id } labels(first: 50) { nodes { id name } }
+    attachments(first: 25) { nodes { url title sourceType metadata } }
+    children(first: 50, filter: { state: { type: { nin: ["completed", "canceled"] } } }) { nodes { id } }
+    inverseRelations(first: 50) { nodes { type issue { id identifier state { type } } } }`;
+export const FOCUS_TICKETS_BATCH = 50;
+export const FOCUS_TICKETS_QUERY = `query focusTickets($ids: [ID!]!, $first: Int!) {
+  issues(first: $first, filter: { id: { in: $ids } }) { nodes { ${FOCUS_NODE} } }
+}`;
+export const FOCUS_SEED_QUERY = `query focusSeed($first: Int!, $after: String, $filter: IssueFilter) {
+  issues(first: $first, after: $after, includeArchived: false, filter: $filter) {
+    nodes { ${FOCUS_NODE} }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+// `finished` as a blocker counts it (Done, Canceled, or in review with its pull requests merged).
+// `children`: open sub-issues. `blockers`: tickets blocking this one that are not closed.
+// `agentLinked`: it carries the "Paseo agent" link a ticket agent leaves (handover.ts).
+export type FocusNode = {
+  id: string; identifier: string; title: string; url: string; status: string; statusType: string; delegateId: string | null;
+  labels: string[]; finished: boolean; agentLinked: boolean; children: string[]; blockers: { id: string; identifier: string }[];
+};
+function focusNode(node: Record<string, unknown>): FocusNode {
+  const state = record(node.state ?? {});
+  return {
+    id: label(node.id), identifier: label(node.identifier), title: label(node.title), url: label(node.url),
+    status: label(state.name), statusType: label(state.type), delegateId: label(record(node.delegate ?? {}).id) || null,
+    labels: labelNodes(node.labels).map((item) => item.name),
+    finished: finishedIssue(node),
+    agentLinked: connection(node.attachments ?? { nodes: [] }).nodes.some((item) => label(record(item).title).startsWith("Paseo agent")),
+    children: connection(node.children ?? { nodes: [] }).nodes.map((item) => label(record(item).id)).filter(Boolean),
+    blockers: connection(node.inverseRelations ?? { nodes: [] }).nodes.map((item) => record(item))
+      .filter((relation) => label(relation.type) === "blocks")
+      .map((relation) => record(relation.issue ?? {}))
+      .filter((blocker) => label(blocker.id) && !["completed", "canceled", "duplicate"].includes(label(record(blocker.state ?? {}).type)))
+      .map((blocker) => ({ id: label(blocker.id), identifier: label(blocker.identifier) })),
+  };
+}
 // A state the plugin itself just moved a ticket into, from the mutation's own answer.
 export type WrittenState = { name: string; type: string };
 
@@ -1230,6 +1270,50 @@ export class LinearService {
       }
     }
     return result;
+  }
+
+  // Focus mode's walk (focus.ts): the given tickets, 50 per request. Tickets Linear does not
+  // return (deleted, no access) are missing.
+  async focusTickets(ids: string[]): Promise<FocusNode[]> {
+    const result: FocusNode[] = [];
+    const unique = [...new Set(ids)];
+    for (let start = 0; start < unique.length; start += FOCUS_TICKETS_BATCH) {
+      const chunk = unique.slice(start, start + FOCUS_TICKETS_BATCH);
+      const data = record(await this.read(FOCUS_TICKETS_QUERY, { ids: chunk, first: chunk.length }, (found) => connection(record(found.issues ?? {})).nodes.length === chunk.length));
+      result.push(...connection(record(data.issues ?? {})).nodes.map((item) => focusNode(record(item))).filter((node) => node.id));
+    }
+    return result;
+  }
+
+  // Focus mode's seed (focus.ts), open tickets of the dispatch teams, all pages: those carrying one
+  // of `labels` (the dispatch status labels) and the started ones (In Progress, In Review, ...),
+  // in two reads: Linear's `or` around multi-field filters matched every ticket of the team (see
+  // repairCandidateFilter).
+  async focusSeed(teamKeys: string[], labels: string[]): Promise<{ labelled: FocusNode[]; started: FocusNode[] }> {
+    return {
+      labelled: labels.length ? await this.focusPages(teamKeys, { labels: { some: { or: labels.map((name) => ({ name: { eqIgnoreCase: name } })) } } }) : [],
+      started: await this.focusPages(teamKeys, { state: { type: { eq: "started" } } }),
+    };
+  }
+
+  // The open queue blockers of the dispatch teams (README, "Auto-dispatch"): always in focus.
+  async focusQueueBlockers(teamKeys: string[]): Promise<FocusNode[]> {
+    return this.focusPages(teamKeys, queueBlockerFilter());
+  }
+
+  private async focusPages(teamKeys: string[], filter: Record<string, unknown>): Promise<FocusNode[]> {
+    if (!teamKeys.length) return [];
+    const scoped = { team: { key: { in: [...new Set(teamKeys)].sort() } }, state: { type: { nin: ["completed", "canceled", "duplicate"] } }, ...filter };
+    const found: FocusNode[] = [];
+    let after: string | null = null;
+    do {
+      const data = record(await this.read(FOCUS_SEED_QUERY, { first: FOCUS_TICKETS_BATCH, after, filter: scoped }));
+      const page = record(data.issues ?? {});
+      found.push(...connection(page).nodes.map((item) => focusNode(record(item))).filter((node) => node.id));
+      const info = record(page.pageInfo ?? {});
+      after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
+    } while (after);
+    return found;
   }
 
   async issueMetadata(id: string): Promise<IssueMetadata> {

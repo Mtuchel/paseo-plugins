@@ -392,6 +392,49 @@ export const setPresenceRpc = defineRpc({
   output: presenceSchema,
 });
 
+// Focus mode (README, "Focus mode"): no new ticket work starts; the tickets in flight when it was
+// turned on, their sub-issues and their unfinished blockers run to the end. `phase` per ticket:
+// `working` (an agent works on it), `needs-you` (it waits for your answer or a fix),
+// `waiting` (blockers, a free slot or a start), `review` (in review, no agent working), `done`.
+// `complete`: every ticket is in review or done, so their pull requests can be merged.
+export const focusPhaseSchema = z.enum(["working", "needs-you", "waiting", "review", "done"]);
+export type FocusPhase = z.infer<typeof focusPhaseSchema>;
+export const focusTicketSchema = z.object({
+  id: z.string(),
+  identifier: z.string(),
+  title: z.string(),
+  url: z.string(),
+  status: z.string(),
+  phase: focusPhaseSchema,
+  // Why it is in focus: in flight when focus began, a sub-issue, a blocker, or a queue blocker.
+  reason: z.enum(["in-flight", "sub-issue", "blocker", "queue-blocker"]),
+  // Unfinished blockers' identifiers.
+  waitingOn: z.array(z.string()),
+});
+export type FocusTicket = z.infer<typeof focusTicketSchema>;
+export const focusStatusSchema = z.object({
+  active: z.boolean(),
+  since: z.string().nullable(),
+  // When the ticket set was last read from Linear; null before the first read.
+  readAt: z.string().nullable(),
+  // Why the last read failed; admission keeps the last set read (refusing everything before one).
+  error: z.string().nullable(),
+  tickets: z.array(focusTicketSchema),
+  left: z.number().int(),
+  complete: z.boolean(),
+});
+export type FocusStatus = z.infer<typeof focusStatusSchema>;
+export const focusRpc = defineRpc({
+  name: "linear.focus",
+  input: z.object({}),
+  output: focusStatusSchema,
+});
+export const setFocusRpc = defineRpc({
+  name: "linear.set-focus",
+  input: z.object({ active: z.boolean() }),
+  output: focusStatusSchema,
+});
+
 // RAM lease (README, "Memory lease"): the Paseo Agents menu bar app caps new ticket-agent starts
 // by free memory for a short while. `limit` is the cap in effect now (null: no limit); `source`
 // is "ram" while the lease is what applies. Server-side validation (capacity.ts) owns the exact

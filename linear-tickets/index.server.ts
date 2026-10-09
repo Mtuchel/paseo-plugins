@@ -1,6 +1,6 @@
 import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setPresenceRpc, setSettingsRpc, skipPlanRpc, statusRpc, answerAskRpc, ownerAsksRpc, type CapacityState } from "./shared/contracts";
+import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, focusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setFocusRpc, setPresenceRpc, setSettingsRpc, skipPlanRpc, statusRpc, answerAskRpc, ownerAsksRpc, type CapacityState } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -55,6 +55,7 @@ import { ProjectFlow, ProjectStore } from "./server/project-flow";
 import { ProjectIssueCache } from "./server/project-issues";
 import { LabelRepair } from "./server/label-repair";
 import { Presence } from "./server/presence";
+import { Focus } from "./server/focus";
 import { rateBudget, withPriority } from "./server/rate-budget";
 import { hostname } from "node:os";
 import { readActivationSecret, type ActivationSink } from "./server/activation";
@@ -115,7 +116,9 @@ export default function contribute(server: PluginServerContext) {
   const presence = new Presence();
   // Model tiers (README, "Model tiers"): the tier each ticket implements on.
   const tiers = new TierStore();
-  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, deletions, shards });
+  // Focus mode (README, "Focus mode"): while on, every start path admits only the tickets in focus.
+  const focus = new Focus({ linear, settings });
+  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, deletions, shards, focus });
   // The decision journal (README, "Decision journal"): every owner decision on a plan is written
   // here first and carried out by the bridge's worker; the inbox lists what is being applied.
   const decisionJournal = new DecisionJournal();
@@ -194,7 +197,7 @@ export default function contribute(server: PluginServerContext) {
   const projectStore = new ProjectStore();
   // Project tickets are read in full every 30 minutes and only as changed in between (project-issues.ts).
   const projectIssues = new ProjectIssueCache(linear);
-  const projects = new ProjectFlow({ linear, settings, projectIssues: (projectId, full) => projectIssues.read(projectId, full), scheduler: starter.scheduler, capacity: starter.capacity, store: projectStore, usage, tiers,
+  const projects = new ProjectFlow({ linear, settings, projectIssues: (projectId, full) => projectIssues.read(projectId, full), scheduler: starter.scheduler, capacity: starter.capacity, store: projectStore, usage, tiers, focus,
     startPlanner: (input, paseo, current) => launcher.startPlanner(input, paseo, current),
     retire: async (agentId, api) => {
       await stopAgentTurn(agentId).catch(() => {});
@@ -204,7 +207,7 @@ export default function contribute(server: PluginServerContext) {
   // "Repairing stale running and failed labels"); its records share projects.json with the projects.
   const labelRepair = new LabelRepair({ linear, store: projectStore, launcher, intake, deletions, restart: (issueId, identifier, options) => sessions.restartFor(issueId, identifier, options) });
   const relay = new CommentRelay(linear, undefined, needsYou, route, replies);
-  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, repairs: labelRepair });
+  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, repairs: labelRepair, focus });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
   const decisions = new DecisionLog();
@@ -467,6 +470,15 @@ export default function contribute(server: PluginServerContext) {
   server.handle(skipPlanRpc, async ({ projectId }, { paseo }) => { attach(paseo); return asCaller("project-flow", async () => projects.skipPlan(projectId, await settings.read(), paseo)); });
   server.handle(presenceRpc, () => presence.state());
   server.handle(setPresenceRpc, (change) => presence.update(change));
+  server.handle(focusRpc, (_input, { paseo }) => { attach(paseo); return asCaller("focus", () => focus.status(paseo)); });
+  server.handle(setFocusRpc, async ({ active }, { paseo }) => {
+    attach(paseo);
+    if (active) return asCaller("focus", () => focus.enable(paseo));
+    const status = await focus.disable();
+    // What waited for focus starts at this poll, not the next one.
+    dispatcher.wake();
+    return status;
+  });
   // Memory lease (README, "Memory lease"): the menu bar app's RAM cap on new starts.
   const capacityState = async (paseo: PaseoApi): Promise<CapacityState> => {
     const { maxRunning } = (await settings.read()).dispatch;
@@ -544,6 +556,8 @@ export default function contribute(server: PluginServerContext) {
     await labelRepair.ownerRetried(input.id);
     const result = await launcher.start(launch, paseo, { promptTemplate: template ?? undefined, markInProgress, linearAccess: agentLinearAccess, labels: setup.labels, env: setup.env });
     await recordStart(tiers, { id: input.id, identifier: setup.identifier }, setup.tier, result.agentId, model.provider);
+    // Started by hand while focus is on: in flight now, so its successors start too.
+    await focus.include(input.id, setup.identifier);
     await openSession(input.id, input.id, result.agentId);
     return result;
   });

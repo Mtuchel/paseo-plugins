@@ -43,8 +43,8 @@ const issue = (n: number, change: Partial<ProjectIssue> = {}): ProjectIssue => (
   teamId: "t1", teamKey: "TUC", creatorId: OWNER, assigneeId: null, delegateId: null, labels: [], parentId: null, blockers: [], blocks: [], linked: [], ...change,
 });
 
-// `inspect`: the provider process table ghost agents are checked against.
-async function room(t: TestContext, issues: ProjectIssue[], running: string[] = [], inspect?: ProcessInspector, readSettings?: () => Promise<PluginSettings>) {
+// `inspect`: the provider process table ghost agents are checked against. `focus`: focus mode.
+async function room(t: TestContext, issues: ProjectIssue[], running: string[] = [], inspect?: ProcessInspector, readSettings?: () => Promise<PluginSettings>, focus?: { active: () => Promise<boolean>; admits: (issueId: string) => Promise<string | null> }) {
   const directory = await mkdtemp(join(tmpdir(), "project-flow-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const calls: string[] = [];
@@ -140,7 +140,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
     },
     accountedFor: async (id: string) => held.has(id),
     usage: { chains: async () => usage.chains, read: async () => usage.refresh ? usage.reports?.map((report) => ({ ...report, fetchedAt: now })) ?? null : usage.reports },
-    jitter: () => MINUTE };
+    jitter: () => MINUTE, focus };
   const makeFlow = () => new ProjectFlow({ ...deps, store: new ProjectStore(path, () => now) });
   const flow = makeFlow();
   return {
@@ -899,6 +899,31 @@ test("tickets nobody may hand out stay put: started, someone else's, already wit
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);
   assert.deepEqual(r.calls, ["delegate i4", "delegate i6"]);
+});
+
+test("in focus mode no planner run starts, and only tickets in focus are handed out or restarted", async (t) => {
+  const focus = { active: async () => true, admits: async (id: string) => ["i2", "i4"].includes(id) ? null : "Focus mode is on." };
+  const paseo = paseoWith(() => []);
+
+  const waiting = await room(t, [issue(1), issue(2)], [], undefined, undefined, focus);
+  await waiting.flow.tick(paseo, settings);
+  waiting.advance(HOUR);
+  await waiting.flow.tick(paseo, settings);
+  assert.deepEqual(waiting.calls, [], "the tickets waited past the quiet time, but no run starts");
+
+  const planned = await room(t, [issue(1), issue(2)], [], undefined, undefined, focus);
+  const run = (await planned.flow.planNow("erp", settings, paseo)).planner!.runId;
+  await planned.flow.applyPlan(run, "run-agent-1", "```project-order\n```", paseo, settings);
+  planned.calls.length = 0;
+  planned.advance(HOUR);
+  await planned.flow.tick(paseo, settings);
+  assert.deepEqual(planned.calls, ["delegate i2"], "Plan by hand still plans; the hand-out takes only the ticket in focus");
+
+  const stalled = await room(t, [issue(3, { delegateId: APP }), issue(4, { delegateId: APP })], [], undefined, undefined, focus);
+  await stalled.flow.tick(paseo, settings);
+  stalled.advance(11 * MINUTE);
+  await stalled.flow.tick(paseo, settings);
+  assert.deepEqual(stalled.calls.filter((call) => call.startsWith("restart")), ["restart i4"]);
 });
 
 test("only new tickets the project could hand out get a run", async (t) => {

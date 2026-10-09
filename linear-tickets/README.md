@@ -1172,6 +1172,39 @@ slots used (…)`. The lease lives in the plugin's memory only: when it runs out
 `lease: null`, or the daemon restarts, *max agents* applies again. It only gates new starts and
 never stops or touches agents already working.
 
+**Focus mode.** Focus mode finishes the work that is under way before anything new starts, so
+that at the end every pull request of that work can be merged. Turn it on with the Focus button
+of the Paseo Agents menu bar app (the `linear.set-focus` RPC). The host that hands out tickets
+then fixes the tickets *in flight* in `~/.paseo/linear-tickets/focus.json`: every ticket with a
+root ticket agent on this host that is not archived, every open ticket of the dispatch teams
+carrying `paseo-running`, `paseo-needs-you`, `paseo-blocked` or `paseo-failed`, and every started
+ticket of those teams (In Progress, In Review, …) that is delegated to this host's or the peer's
+Paseo app or carries a Paseo agent link. An approved plan that no agent implements yet (Todo or
+Backlog with `plan-ready`, no live agent) is new work and is not in flight.
+
+While focus is on, a ticket starts only when it is in focus: a ticket in flight, its open
+sub-issues (a split approved meanwhile included) and its unfinished blockers, followed down the
+chain, and the open queue blockers. That set below the tickets in flight is read from Linear again
+at most every 5 minutes (about one request per 50 tickets), so a blocker or sub-issue added
+meanwhile joins it within 5 minutes; while Linear cannot be
+read, the last set read decides, and before the first read only the tickets in flight start. The
+check is part of admission, so it applies to every automatic start path: the label dispatch, a
+group's hand-out, assignments and their threads, a successor for pull-request reviews or
+failing checks, the watchdog's recoveries, the label repair, activations forwarded by a draining
+host, and the projects. A project starts no new planner run (Plan by hand still does; a run
+already planning finishes) and hands out or restarts only tickets in focus. Everything else waits
+exactly like a blocked ticket, with its label, thread or assignment kept and the reason
+`Focus mode is on: …`, and starts at the first poll after focus is turned off. A ticket you start
+from the sidebar while focus is on joins the tickets in flight, so its successors start too.
+
+`linear.focus` reports each ticket in focus with why it is there (`in-flight`, `sub-issue`,
+`blocker`, `queue-blocker`), its unfinished blockers, and its phase: `working` (an agent works on
+it), `needs-you` (it waits for your answer, or carries `paseo-needs-you`, `-blocked` or `-failed`,
+or is in Needs input or Plan review), `waiting` (blockers, a free slot or its start), `review` (in review, no
+agent working) or `done` (closed, or in review with its pull requests merged). Focus is
+*complete* when every ticket in it is in review or done: their pull requests can be merged. Focus
+stays on until you turn it off; turning it off forgets the tickets in flight.
+
 **Split into sub-issues.** A plan with 2–12 steps also offers **Approve & split into N
 sub-issues**. The plan becomes the parent's plan document and the planning agent is closed.
 Each step becomes a sub-issue in Todo, assigned to Paseo, blocked by the step before, and the
