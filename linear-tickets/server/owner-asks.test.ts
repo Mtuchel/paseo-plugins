@@ -48,6 +48,8 @@ async function setup(options: {
     records: options.records ?? new Map<string, HandoverRecord | null>(),
     now: NOW,
     extraction: options.extraction ?? (async () => ({ ok: false as const, reason: "extraction not configured" })),
+    // Tickets with a menu-bar answer waiting in line (the router's queued threads).
+    queued: new Set<string>(),
   };
   const delivered: { agentId: string; message: string; origin: DeliveryOrigin }[] = [];
   const continued: { issueId: string; identifier: string; lead: string }[] = [];
@@ -74,7 +76,9 @@ async function setup(options: {
     queueAnswer: async (issueId, identifier, text, from, reason) => {
       if (options.queueError) throw new Error(options.queueError);
       events.push(`queue ${issueId} ${identifier} from ${from.userId}: ${text} (${reason})`);
+      state.queued.add(issueId);
     },
+    queuedAnswers: async () => state.queued,
     directory,
     now: () => state.now,
   };
@@ -301,6 +305,26 @@ test("an answer that can neither start an agent nor join the wait line fails and
   await h.ownerAsks.snapshot(h.paseo);
   await assert.rejects(() => h.ownerAsks.answer({ issueId: "i1", answers: { q1: "Agent does it" }, note: "" }, h.paseo), /TUC-1453 cannot start an agent now \(Queued: 1 of 1.*could not join the wait line: Linear did not create/);
   assert.deepEqual(h.events, [], "no comment, no closed sub-issue");
+  h.ownerAsks.stop();
+});
+
+test("an ask whose answer waits in line stays answered when Linear's updatedAt moves (the wait line label); a manual task of the ticket stays", async () => {
+  const record: HandoverRecord = { issueId: "i3", identifier: "TUC-1015", agentId: "a3", agentTitle: "agent", branch: null, worktreePath: null, lastCommit: null, summaries: [], links: {}, status: "waiting", progressCommentId: null, resumedFrom: null, updatedAt: at };
+  const h = await setup({
+    issues: [
+      issue({ id: "i3", identifier: "TUC-1015", title: "Post-Sale C2", parentId: "p3", parentIdentifier: "TUC-33", labels: [] }),
+      issue({ id: "i4", identifier: "TUC-1900", title: "Rotate the token", parentId: "i3", parentIdentifier: "TUC-1015", labels: ["paseo-manual"] }),
+    ],
+    comments: new Map([["i3", [comment("c1", waitComment)]]]),
+    records: new Map([["i3", record]]),
+    agents: [{ id: "a3", status: "closed", createdAt: "2026-10-01T00:00:00.000Z", issueId: "i3" }],
+    continueOutcome: { kind: "deferred", reason: "Queued: 2 of 2 ticket agents are working." },
+  });
+  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).asks.map((ask) => ask.identifier).sort(), ["TUC-1015", "TUC-1900"]);
+  assert.equal((await h.ownerAsks.answer({ issueId: "i3", answers: { q1: "Yes" }, note: "" }, h.paseo)).delivered, "queued");
+  h.state.now = NOW + 5 * 60_000;
+  h.state.issues[0] = { ...h.state.issues[0], updatedAt: new Date(NOW + 2 * 60_000).toISOString() };
+  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).asks.map((ask) => ask.identifier), ["TUC-1900"]);
   h.ownerAsks.stop();
 });
 

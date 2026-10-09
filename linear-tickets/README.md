@@ -1117,14 +1117,17 @@ none open or draft, as Linear's GitHub integration reports them. Links added by 
 an open pull request still holds the ticket back.
 
 **Wait line label.** Every ticket waiting in a host's line carries `paseo-queued`
-(`<trigger>-queued`): one the scheduler was asked to start in the last 3 minutes and did not
-admit, and one with a queued thread that has no agent yet. It comes off within a minute of the
-ticket starting or leaving the line, so a Linear view filtered on the label is the wait line;
-each waiting thread's panel says why it waits. The label is only shown: nothing reads it to decide
-anything, and adding or removing it by hand changes nothing. Each host labels and unlabels only
-the tickets it labelled itself (kept in `$PASEO_HOME/linear-tickets/queued-labels.json`), so a
-ticket waiting on the other host keeps its label. The line lives in memory, so for 3 minutes after
-a reload labels only go on, not off, while the start paths ask again.
+(`<trigger>-queued`): one the scheduler was asked to start and did not admit, and one with a
+queued thread that has no agent yet. It comes off within a minute of the ticket being admitted,
+or 20 minutes after it was last seen waiting (a ticket closed or unassigned meanwhile): some start
+paths ask only every 15 minutes, and a shorter memory made those labels flap. A Linear view
+filtered on the label is the wait line; each waiting thread's panel says why it waits. The label is
+only shown: nothing reads it to decide anything, and adding or removing it by hand changes nothing.
+Each host labels and unlabels only the tickets it labelled itself (kept in
+`$PASEO_HOME/linear-tickets/queued-labels.json`), so a ticket waiting on the other host keeps its
+label; after a reload its labels count as seen at the first pass. A removal reads the ticket's
+labels first (about 500 points on the owner's key), so a reload that dropped a burst of labels at
+once cost about 40k points on 2026-10-09; the 20-minute memory avoids that.
 
 **Who starts next.** Every way a ticket starts (label, assignment, group, project) waits in one
 line. While slots under *max agents* are short, a free slot goes to:
@@ -3560,7 +3563,10 @@ parent ticket it only records the comment and leaves the state to the agent, who
 the wait. Every answer records "Answered from the menu bar: …" on the issue. An answer is idempotent
 per issue and answer text for 10 minutes (a double click is one answer), and an answered ask stays
 out of the read until Linear's `updatedAt` moves past the answer by a minute, so the answer's own
-comment and state move do not resurrect it. Failures throw with a sentence the menu bar shows.
+comment and state move do not resurrect it. An ask whose ticket holds a menu-bar answer in the wait
+line stays out of the read until that thread has its agent, since the wait line label moves
+`updatedAt` too (a manual task of the ticket is still shown). Failures throw with a sentence the
+menu bar shows.
 
 **Host choice.** The menu bar calls `linear.owner-asks` on its tickets host (server087 by default)
 and `linear.answer-ask` on the Mac daemon instead when a live agent there carries the ticket, so the
