@@ -896,11 +896,13 @@ export class LinearService {
     return work(key);
   }
 
-  // Background reads (pollers, sweeps) go to the API key's pool first: the Paseo app's pool keeps
-  // its requests for the writes the owner sees as Paseo's and for interactive reads. The app reads
-  // one only when the key cannot see everything asked for (`complete` false, or "Entity not found").
-  // While the key is at its background reserve, or none is connected, a background read takes the
-  // interactive path. A key rate limit on a key-first read propagates; the app does not repeat it.
+  // Background reads (pollers, sweeps) go to whichever pool has more of its hourly allowance left
+  // above the background reserve (RateBudget.headroom), the key on a tie: the API key is shared by
+  // every host, so a host whose own app pool has room keeps its background reads off it. Read with
+  // the key, the app reads only when the key cannot see everything asked for (`complete` false, or
+  // "Entity not found") or refused the read at its reserve before sending it. While the key is at
+  // its background reserve, or none is connected, a background read takes the interactive path.
+  // A Linear rate limit on a key-first read propagates; the app does not repeat it.
   // Interactive and owner reads go to the app first; the key reads instead when the app cannot be
   // used (`app.query` returns null) or cannot see everything asked for. An app rate limit is not a
   // reason: it propagates, so the work pauses instead of draining the key (README, "Rate limits").
@@ -909,13 +911,14 @@ export class LinearService {
       if (error instanceof Error && /Entity not found/i.test(error.message)) return null;
       throw error;
     };
-    if (this.app && currentPriority() === "background" && this.budget.pausedUntil("key", "background") === null) {
+    if (this.app && currentPriority() === "background" && this.budget.pausedUntil("key", "background") === null
+      && this.budget.headroom("key") >= this.budget.headroom("app")) {
       const { key } = await this.credentials.read();
       if (key) {
         let missing: unknown = null;
         const data = await this.post(key, query, variables).catch((error: unknown) => {
           missing = error;
-          return notFound(error);
+          return error instanceof RateLimitedError && error.reason === "reserve" ? null : notFound(error);
         });
         if (data && complete(data)) return data;
         const fromApp = await this.app.query(query, variables).catch(notFound);

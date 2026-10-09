@@ -95,9 +95,9 @@ function fixture(t: TestContext, reply: (call: Call, variables: Record<string, u
   }), false);
   return { clock, now, calls, refusals, budget, linear, post, sample };
 }
-// Both pools at 19% (`LOW_POINTS`) or 21% (`HIGH_POINTS`) of their points: a background read goes
-// to the key first (LinearService.read), so a poller pauses only when both are at their reserve,
-// and then on the app's.
+// Both pools at 19% (`LOW_POINTS`) or 21% (`HIGH_POINTS`) of their points: with equal room a
+// background read goes to the key first (LinearService.read), so a poller pauses only when both are
+// at their reserve, and then on the app's.
 function bothAt(f: Fixture, points: number): void {
   f.sample("app", PLENTY_REQUESTS, points);
   f.sample("key", PLENTY_REQUESTS, points);
@@ -203,6 +203,58 @@ test("with the key at its reserve the dispatch poll still reads on the app and s
   await dispatch.tick();
   assert.deepEqual(f.calls, [{ pool: "app", operation: "labeledIssues" }, { pool: "app", operation: "labeledIssues" }]);
   assert.match(dispatch.snapshot().lastError ?? "", /^paused:/);
+});
+
+// The launch's writes go to the app: with the app at its reserve a labelled ticket waits with its
+// label, instead of losing it to a claim whose next write is refused (and being marked failed).
+test("with the app at its reserve and the key free, a labelled ticket waits and nothing is written", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const f = fixture(t, () => ({ issues: { nodes: [{ id: ID_A, identifier: "ENG-1", priority: 0, team: { key: "ENG" }, labels: { nodes: [{ id: "l1", name: "paseo" }] } }] } }));
+  f.sample("app", 4_500, 60_000);
+  f.sample("key", PLENTY_REQUESTS, HIGH_POINTS);
+  const dispatch = dispatcher(f);
+  await dispatch.tick();
+  assert.deepEqual(f.calls, [{ pool: "key", operation: "labeledIssues" }]);
+  assert.deepEqual(dispatch.snapshot().recent, [], "no launch was attempted");
+  assert.match(dispatch.snapshot().lastError ?? "", /^paused: .*Paseo Linear app/);
+});
+
+// The API key is shared by every host: one whose own app pool has more room left above the
+// background reserve keeps its background reads on the app, although the key is above its reserve.
+test("with the app further above its reserve than the key, background reads go to the app", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture(t, () => ({ issues: { nodes: [] } }));
+  f.sample("app", PLENTY_REQUESTS, Math.ceil(POINTS_LIMIT * 0.9));
+  f.sample("key", Math.ceil(REQUESTS_LIMIT * 0.25), Math.ceil(POINTS_LIMIT * 0.9));
+  await dispatcher(f).tick();
+  assert.deepEqual(f.calls, [{ pool: "app", operation: "labeledIssues" }]);
+  assert.deepEqual(f.refusals, []);
+});
+
+// A refusal at the key's reserve sent nothing (two pollers can pass the pool choice before the
+// first's request is counted), so the app answers; a rate limit Linear itself answered still
+// propagates without the app repeating the read.
+test("a key-first read refused at the key's reserve is answered by the app; a Linear rate limit is not repeated", async () => {
+  for (const [reason, answered] of [["reserve", true], ["limited", false]] as const) {
+    const budget = new RateBudget(() => 0);
+    const pools: Pool[] = [];
+    const post: Post = async (key) => {
+      const pool = /^Bearer\s/i.test(key) ? "app" : "key";
+      pools.push(pool);
+      if (pool === "key") throw new RateLimitedError("key", 60_000, reason);
+      return { issues: { nodes: [] } };
+    };
+    const linear = new LinearService(new Credentials("/unused", "env-key"), post, new AgentApi({ accessToken: async () => APP_TOKEN }, post), budget);
+    const reading = withPriority("background", "dispatch", () => linear.labeledIssues("paseo", ["ENG"]));
+    if (answered) {
+      assert.deepEqual(await reading, []);
+      assert.deepEqual(pools, ["key", "app"]);
+    } else {
+      await assert.rejects(reading, (error: unknown) => error instanceof RateLimitedError && error.reason === "limited");
+      assert.deepEqual(pools, ["key"]);
+    }
+  }
 });
 
 // AC-2: the comment relay owns its caller context, so a direct poll is admitted as background work.

@@ -124,6 +124,18 @@ export class RateBudget {
     return reserve === null ? blocked : blocked === null ? reserve : Math.max(reserve, blocked);
   }
 
+  // The share of the pool's hourly allowance left above `level`'s reserve: the smaller of its
+  // two dimensions, negative below the reserve, Infinity while neither has been observed.
+  headroom(pool: Pool, level: Priority = "background"): number {
+    const state = this.pools[pool];
+    let share = Infinity;
+    for (const dimension of ["requests", "points"] as const) {
+      const known = state[dimension];
+      if (known) share = Math.min(share, (this.estimate(pool, dimension) - known.limit * RESERVES[level]) / known.limit);
+    }
+    return share;
+  }
+
   blockedUntil(pool: Pool): number { return this.pools[pool].blockedUntil; }
 
   snapshot() {
