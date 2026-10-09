@@ -54,6 +54,9 @@ export type OwnerAsksDeps = {
   continueTicket: (issueId: string, identifier: string, lead: string) => Promise<ContinueOutcome>;
   // A new thread on the ticket that waits in line with the answer (SessionRouter.queueAnswer).
   queueAnswer: (issueId: string, identifier: string, text: string, from: { activityId: string; userId: string }, reason: string) => Promise<void>;
+  // Tickets whose menu-bar answer waits in line (a queued thread carrying it): their asks are
+  // answered, whatever Linear's `updatedAt` does meanwhile (the wait line label moves it).
+  queuedAnswers: () => Promise<Set<string>>;
   directory?: string;
   now?: () => number;
 };
@@ -164,7 +167,8 @@ export class OwnerAsks {
   async snapshot(paseo: PaseoApi | null): Promise<{ asks: OwnerAsk[]; updatedAt: string }> {
     const at = new Date(this.now()).toISOString();
     await this.loadLedger();
-    const drafts = (await this.collect(paseo)).filter((draft) => !this.hidden(draft.issue));
+    const queued = await this.deps.queuedAnswers();
+    const drafts = (await this.collect(paseo)).filter((draft) => !this.hidden(draft.issue) && (draft.manual || !queued.has(draft.ticketId)));
     const asks: OwnerAsk[] = [];
     for (const draft of drafts) {
       const hash = askHash(`${EXTRACTION_VERSION}\n${draft.text}`);

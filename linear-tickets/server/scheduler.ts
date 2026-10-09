@@ -155,7 +155,15 @@ export class Scheduler {
   // Tickets asked for within the last WAITING_MS and not admitted: the wait line as it stands.
   waitingIds(): string[] {
     const now = (this.deps.now ?? Date.now)();
-    return [...this.waiting.values()].filter((item) => now - item.seenAt <= WAITING_MS && !this.reserved.has(item.issueId)).map((item) => item.issueId);
+    const admitted = new Set(this.admittedIds());
+    return [...this.waiting.values()].filter((item) => now - item.seenAt <= WAITING_MS && !admitted.has(item.issueId)).map((item) => item.issueId);
+  }
+
+  // Tickets out of the line: admitted (a reservation not run out) or with a working agent, as last read.
+  admittedIds(): string[] {
+    const now = (this.deps.now ?? Date.now)();
+    const reserved = [...this.reserved].filter(([, reservation]) => reservation.until >= now).map(([issueId]) => issueId);
+    return [...new Set([...reserved, ...(this.runningCache?.ids ?? [])])];
   }
 
   // The working agents (read once per burst), with stale reservations and waiting tickets dropped.

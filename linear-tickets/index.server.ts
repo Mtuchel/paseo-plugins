@@ -263,6 +263,9 @@ export default function contribute(server: PluginServerContext) {
       }
     },
     queueAnswer: async (issueId, identifier, text, from, reason) => { await sessions.queueAnswer(issueId, identifier, text, from, reason); },
+    queuedAnswers: async () => new Set((await sessionStore.all())
+      .filter((link) => link.queued && !link.agentId && !link.closed && link.pendingFrom?.activityId.startsWith("owner-ask:"))
+      .map((link) => link.issueId)),
   });
   // The wait line in Linear (README, "Wait line label"): tickets waiting here for an agent slot,
   // and queued threads waiting to start (their answer or comment included), carry `<trigger>-queued`.
@@ -273,6 +276,7 @@ export default function contribute(server: PluginServerContext) {
       const threads = (await sessionStore.all()).filter((link) => link.queued && !link.agentId && !link.closed && !link.remote);
       return [...new Set([...starter.scheduler.waitingIds(), ...threads.map((link) => link.issueId)])];
     },
+    admitted: () => starter.scheduler.admittedIds(),
   });
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   // Its root is the review inbox, listing the peer hosts' reviews too (README, "Review inbox").
