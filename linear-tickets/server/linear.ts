@@ -276,11 +276,24 @@ export const LABELED_ISSUES_QUERY = `query labeledIssues($first: Int!, $filter: 
   }
 }`;
 
-export function labeledIssueFilter(label: string, teamKeys: string[]): Record<string, unknown> {
+// Queue-blocker tickets (README, "Auto-dispatch"): tuchel-platform's tools/ci/queue-blocker-alert.mjs
+// opens one per failing merge-queue check, as a sub-issue of TUC-538 titled "Queue blocker: <…>"
+// with "Queue blocker id: <…>" as its description's first line. Either marker identifies one, so a
+// re-titled or re-parented ticket is still found.
+export const QUEUE_BLOCKER_TITLE_PREFIX = "Queue blocker:";
+export const QUEUE_BLOCKER_DESCRIPTION_MARKER = "Queue blocker id:";
+// The filter both queue-blocker reads share: the title the alert tool writes, or the description
+// marker for one whose title changed.
+export function queueBlockerFilter(): Record<string, unknown> {
+  return { or: [{ title: { startsWith: QUEUE_BLOCKER_TITLE_PREFIX } }, { description: { contains: QUEUE_BLOCKER_DESCRIPTION_MARKER } }] };
+}
+
+export function labeledIssueFilter(label: string, teamKeys: string[], options: { queueBlockers?: boolean } = {}): Record<string, unknown> {
   return {
     labels: { some: { name: { eqIgnoreCase: label } } },
     team: { key: { in: [...new Set(teamKeys)].sort() } },
     state: { type: { nin: ["completed", "canceled"] } },
+    ...(options.queueBlockers ? queueBlockerFilter() : {}),
   };
 }
 
@@ -300,19 +313,24 @@ export type LabeledIssue = { id: string; identifier: string; teamKey: string; pr
 // label, and the tickets of its open records whatever their labels or state, all pages.
 export const REPAIR_CANDIDATES_QUERY = `query repairCandidates($first: Int!, $after: String, $filter: IssueFilter) {
   issues(first: $first, after: $after, includeArchived: false, filter: $filter) {
-    nodes { id identifier state { name type } project { id } labels(first: 50) { nodes { id name } } children(first: 1, filter: { state: { type: { nin: ["completed", "canceled"] } } }) { nodes { id } } }
+    nodes { id identifier title state { name type } project { id } labels(first: 50) { nodes { id name } } children(first: 1, filter: { state: { type: { nin: ["completed", "canceled"] } } }) { nodes { id } } }
     pageInfo { hasNextPage endCursor }
   }
 }`;
-export type RepairCandidate = { id: string; identifier: string; status: string; statusType: string; projectId: string | null; labels: { id: string; name: string }[]; openChildren: boolean };
+// `queueBlocker`: the ticket is a queue blocker (README, "Auto-dispatch"): a read filtered to the
+// markers marks every candidate, the unfiltered read recognizes the title prefix.
+export type RepairCandidate = { id: string; identifier: string; status: string; statusType: string; projectId: string | null; labels: { id: string; name: string }[]; openChildren: boolean; queueBlocker: boolean };
 
 // Two reads, merged by id: Linear's `or` around this multi-field filter matched every ticket of
-// the team (1210 of TUC, 2026-10-07), so the record ids are read on their own.
-export function repairCandidateFilter(labels: string[], teamKeys: string[]): Record<string, unknown> {
+// the team (1210 of TUC, 2026-10-07), so the record ids are read on their own. `queueBlockers`
+// adds the marker filter, so only queue-blocker tickets are returned (the dispatch fallback's
+// read while the background share is paused).
+export function repairCandidateFilter(labels: string[], teamKeys: string[], options: { queueBlockers?: boolean } = {}): Record<string, unknown> {
   return {
     labels: { some: { or: labels.map((name) => ({ name: { eqIgnoreCase: name } })) } },
     team: { key: { in: [...new Set(teamKeys)].sort() } },
     state: { type: { nin: ["completed", "canceled"] } },
+    ...(options.queueBlockers ? queueBlockerFilter() : {}),
   };
 }
 const REPAIR_IDS_BATCH = 50;
@@ -1073,9 +1091,9 @@ export class LinearService {
     });
   }
 
-  async labeledIssues(labelName: string, teamKeys: string[]): Promise<LabeledIssue[]> {
+  async labeledIssues(labelName: string, teamKeys: string[], options: { queueBlockers?: boolean } = {}): Promise<LabeledIssue[]> {
     if (!teamKeys.length) return [];
-    const data = record(await this.read(LABELED_ISSUES_QUERY, { first: 50, filter: labeledIssueFilter(labelName, teamKeys) }));
+    const data = record(await this.read(LABELED_ISSUES_QUERY, { first: 50, filter: labeledIssueFilter(labelName, teamKeys, options) }));
     return connection(record(data.issues)).nodes.map((node) => record(node)).map((node) => ({
       id: label(node.id),
       identifier: label(node.identifier),
@@ -1088,12 +1106,14 @@ export class LinearService {
       .sort((a, b) => (a.priority || 5) - (b.priority || 5));
   }
 
-  async repairCandidates(input: { labels: string[]; teamKeys: string[]; ids: string[] }): Promise<RepairCandidate[]> {
+  async repairCandidates(input: { labels: string[]; teamKeys: string[]; ids: string[]; queueBlockers?: boolean }): Promise<RepairCandidate[]> {
     const found = new Map<string, RepairCandidate>();
     const ids = [...new Set(input.ids)].sort();
     const filters = [
-      ...input.teamKeys.length ? [repairCandidateFilter(input.labels, input.teamKeys)] : [],
-      ...Array.from({ length: Math.ceil(ids.length / REPAIR_IDS_BATCH) }, (_, index) => ({ id: { in: ids.slice(index * REPAIR_IDS_BATCH, (index + 1) * REPAIR_IDS_BATCH) } })),
+      ...input.teamKeys.length ? [repairCandidateFilter(input.labels, input.teamKeys, { queueBlockers: input.queueBlockers })] : [],
+      // A queue-blocker read names the tickets it means: the record-id read would return the other
+      // records' tickets too.
+      ...(input.queueBlockers ? [] : Array.from({ length: Math.ceil(ids.length / REPAIR_IDS_BATCH) }, (_, index) => ({ id: { in: ids.slice(index * REPAIR_IDS_BATCH, (index + 1) * REPAIR_IDS_BATCH) } }))),
     ];
     for (const filter of filters) {
       let after: string | null = null;
@@ -1107,6 +1127,7 @@ export class LinearService {
             id, identifier: label(node.identifier), status: label(state.name), statusType: label(state.type),
             projectId: label(record(node.project ?? {}).id) || null, labels: labelNodes(node.labels),
             openChildren: connection(node.children ?? { nodes: [] }).nodes.length > 0,
+            queueBlocker: input.queueBlockers === true || label(node.title).startsWith(QUEUE_BLOCKER_TITLE_PREFIX),
           });
         }
         const info = record(page.pageInfo ?? {});

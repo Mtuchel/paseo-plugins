@@ -7,9 +7,10 @@ import type { PaseoApi } from "@getpaseo/client";
 import { Dispatcher } from "./dispatch";
 import { LabelRepair, type RepairRecord } from "./label-repair";
 import { Launcher, SetupError } from "./launch";
-import type { IssueState, LabeledIssue, RepairCandidate } from "./linear";
+import { LinearApiError, type IssueState, type LabeledIssue, type RepairCandidate } from "./linear";
 import type { ProcessInspector } from "./process-liveness";
 import { ProjectStore } from "./project-flow";
+import { RateLimitedError } from "./rate-budget";
 import { restartOrThrow, type RestartOptions, type RestartResult } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 
@@ -59,8 +60,8 @@ async function world(t: TestContext, options: { label?: string; pageSize?: numbe
   let created = 0;
   const byId = (id: string) => tickets.get(id)!;
   const linear = {
-    repairCandidates: async ({ labels, ids }: { labels: string[]; teamKeys: string[]; ids: string[] }) => [...tickets.values()]
-      .filter((ticket) => ids.includes(ticket.id) || (!["completed", "canceled"].includes(ticket.statusType) && ticket.labels.some((item) => labels.some((name) => name.toLowerCase() === item.name.toLowerCase()))))
+    repairCandidates: async ({ labels, ids, queueBlockers }: { labels: string[]; teamKeys: string[]; ids: string[]; queueBlockers?: boolean }) => [...tickets.values()]
+      .filter((ticket) => ids.includes(ticket.id) || (!["completed", "canceled"].includes(ticket.statusType) && (!queueBlockers || ticket.queueBlocker) && ticket.labels.some((item) => labels.some((name) => name.toLowerCase() === item.name.toLowerCase()))))
       .map((ticket) => ({ ...ticket, labels: [...ticket.labels] })),
     addLabel: async (id: string, name: string) => {
       calls.push(`${byId(id).identifier} +${name}`);
@@ -119,12 +120,14 @@ async function world(t: TestContext, options: { label?: string; pageSize?: numbe
     setSettings: (next: PluginSettings) => { settings = next; },
     now: () => now,
     at: async (minutes: number) => { now = T0 + minutes * MINUTE; await repair.tick(paseo, settings); },
+    // The paused poll's blocker-only pass (the dispatcher's fallback): m minutes after T0.
+    blockers: async (minutes: number) => { now = T0 + minutes * MINUTE; await repair.tickQueueBlockers(paseo, settings); },
     // A reload of the plugin: the same projects.json, a new repair.
     reload: () => { repair = make(); },
     record: async (id = "i1"): Promise<RepairRecord | undefined> => (await store.repairs())[id],
     labels: (id = "i1") => byId(id).labels.map((item) => item.name).sort(),
     add: (n: number, labels: string[], change: Partial<RepairCandidate> = {}) => {
-      tickets.set(`i${n}`, { id: `i${n}`, identifier: `TUC-${n}`, status: "Todo", statusType: "unstarted", projectId: null, openChildren: false, labels: labels.map((name) => ({ id: name, name })), ...change });
+      tickets.set(`i${n}`, { id: `i${n}`, identifier: `TUC-${n}`, status: "Todo", statusType: "unstarted", projectId: null, openChildren: false, queueBlocker: false, labels: labels.map((name) => ({ id: name, name })), ...change });
     },
   };
 }
@@ -305,6 +308,60 @@ test("a failed start is retried 10, 30 and 90 minutes after each failure, then t
   for (const minutes of [200, 3000]) await w.at(minutes);
   assert.equal(w.restarts.length, 3);
   assert.equal(w.comments.length, 1);
+});
+
+test("a queue blocker's failed start is retried while the background share is paused: a pause, a 5xx and an unreachable API give the attempt back, and the owner is never mentioned", async (t) => {
+  const w = await world(t);
+  w.add(1, ["paseo-failed"], { queueBlocker: true });
+  w.outcomes.push(
+    { kind: "failed", error: new RateLimitedError("app", T0 + 10 * MINUTE, "reserve") },
+    { kind: "failed", error: new LinearApiError("The Linear API request failed (HTTP 500). Try again.", 500) },
+    { kind: "failed", error: new Error("Could not reach the Linear API. Check the host's network connection and try again.") },
+    "start",
+  );
+  await w.blockers(0);
+  assert.deepEqual(w.restarts, [], "the first pass only opens the incident");
+  await w.blockers(10);
+  assert.deepEqual(w.restarts, ["TUC-1"]);
+  assert.deepEqual([(await w.record())?.state, (await w.record())?.attempts], ["watching", 0], "the pause did not count against its restarts");
+  await w.blockers(15);
+  assert.equal(w.restarts.length, 1, "the retry waits the failed backoff");
+  await w.blockers(20);
+  await w.blockers(30);
+  assert.deepEqual((await w.record())?.state, "watching", "a 5xx and an unreachable API did not count either");
+  assert.equal((await w.record())?.attempts, 0);
+  await w.blockers(40);
+  assert.deepEqual(w.restarts.length, 4);
+  assert.deepEqual(w.labels(), ["paseo-running"]);
+  assert.equal(w.comments.length, 1);
+  assert.ok(!w.comments.some((comment) => comment.includes(OWNER_URL)), "no owner mention");
+});
+
+test("a queue blocker whose retries ended in a setup error is not retried: today's mention-once and stop", async (t) => {
+  const w = await world(t);
+  w.add(1, ["paseo-failed"], { queueBlocker: true });
+  const setup = new SetupError("No Paseo project is mapped to the TUC team. Start one agent for it from the Linear tickets sidebar (that saves the mapping), then add the \"paseo\" label again.");
+  w.outcomes.push({ kind: "failed", error: setup });
+  await w.blockers(0);
+  await w.blockers(10);
+  assert.deepEqual(w.restarts, ["TUC-1"]);
+  assert.deepEqual([(await w.record())?.state, (await w.record())?.setup], ["exhausted", true]);
+  assert.deepEqual(w.labels(), ["paseo-failed"]);
+  assert.equal(w.comments.filter((comment) => comment.includes(OWNER_URL)).length, 1);
+  for (const minutes of [60, 2000]) await w.blockers(minutes);
+  assert.equal(w.restarts.length, 1, "it does not retry");
+});
+
+test("the blocker pass reads only the marker-filtered tickets: non-blockers are left to the full pass", async (t) => {
+  const w = await world(t);
+  w.add(1, ["paseo-failed"], { queueBlocker: true });
+  w.add(2, ["paseo-failed"]);
+  w.outcomes.push("start", "start");
+  await w.blockers(0);
+  assert.deepEqual(Object.keys(await w.store.repairs()), ["i1"], "only the blocker opened an incident");
+  await w.blockers(10);
+  assert.deepEqual(w.restarts, ["TUC-1"]);
+  assert.equal(await w.record("i2"), undefined, "the non-blocker was not read or repaired");
 });
 
 test("a retry that starts an agent removes the failed label and says so", async (t) => {

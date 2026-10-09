@@ -38,7 +38,8 @@ type Deps = {
   projects?: { tick: (paseo: PaseoApi, settings: PluginSettings) => Promise<void> };
   // Stale running and failed labels (README, "Repairing stale running and failed labels"), repaired
   // after the projects; `ownerRetried` ends a ticket's incident before the owner's label starts it.
-  repairs?: Pick<LabelRepair, "tick" | "ownerRetried">;
+  // `tickQueueBlockers` is the paused poll's queue-blocker-only pass (README, "Auto-dispatch").
+  repairs?: Pick<LabelRepair, "tick" | "ownerRetried" | "tickQueueBlockers">;
   budget?: Pick<RateBudget, "pausedUntil">;
 };
 
@@ -71,6 +72,7 @@ export class Dispatcher {
 
   private relayError: string | null = null;
   private pausedPool: RateLimitedError["pool"] | null = null;
+  private blockerError: string | null = null;
 
   // Relay failures are logged, once per distinct error (a rate limit once per pool), and never stop dispatch.
   private async relayComments(relay: Pick<CommentRelay, "poll">, paseo: PaseoApi): Promise<void> {
@@ -125,8 +127,9 @@ export class Dispatcher {
     let intervalSeconds = IDLE_POLL_SECONDS;
     // Background priority: every request stops at its pool's reserve (see rate-budget.ts).
     this.polling = withPriority("background", "dispatch", async () => {
+      let settings: PluginSettings | null = null;
       try {
-        const settings = await this.deps.settings.read();
+        settings = await this.deps.settings.read();
         intervalSeconds = settings.dispatch.intervalSeconds;
         if (settings.writeback.mentions && this.deps.relay && this.paseo) await asCaller("comment-relay", () => this.relayComments(this.deps.relay!, this.paseo!));
         this.status.active = settings.dispatch.enabled && settings.dispatch.teamKeys.length > 0;
@@ -135,6 +138,7 @@ export class Dispatcher {
         this.status.lastPollAt = new Date().toISOString();
         this.status.lastError = null;
         this.pausedPool = null;
+        this.blockerError = null;
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
         // Logged once per distinct error (a pause once per pool) so a persistent failure does not flood the plugin log.
@@ -143,6 +147,9 @@ export class Dispatcher {
         this.pausedPool = pool;
         this.status.lastPollAt = new Date().toISOString();
         this.status.lastError = pool ? `paused: ${message}` : message;
+        // A queue blocker is not skipped by the pause (README, "Auto-dispatch"); anything else
+        // keeps waiting for the background share.
+        if (pool && settings && this.paseo && this.status.active) await this.blockers(settings, this.paseo);
       }
     });
     try {
@@ -153,6 +160,32 @@ export class Dispatcher {
       this.rerun = false;
       if (!this.stopped) this.schedule(again ? 0 : intervalSeconds * 1000);
     }
+  }
+
+  // The queue-blocker exception to a background pause (README, "Auto-dispatch"): a ticket created
+  // by the merge queue's alert (a "Queue blocker:" title or a "Queue blocker id:" description)
+  // unblocks every stack, so its poll and start run at interactive priority — the class agents'
+  // own Linear work uses — while every other ticket keeps waiting for the background share. The
+  // read is the same small labeledIssues query with the marker filter added: at most one request
+  // per paused poll, about 100 complexity points at the pool's starting average (with the blocker
+  // repair pass below that is roughly 90 requests and 9,000 points an hour at the default 60 s
+  // interval while the pause lasts), and its failures are logged once per message. The `-failed`
+  // label repair gets the same exception through `tickQueueBlockers`.
+  private async blockers(settings: PluginSettings, paseo: PaseoApi): Promise<void> {
+    await withPriority("interactive", "queue-blocker", async () => {
+      try {
+        const issues = await this.deps.linear.labeledIssues(settings.dispatch.label, settings.dispatch.teamKeys, { queueBlockers: true });
+        for (const issue of issues) {
+          if (this.stopped) return;
+          await this.dispatch(issue, settings, paseo);
+        }
+        await this.deps.repairs?.tickQueueBlockers(paseo, settings);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        if (message !== this.blockerError) console.error(`[linear-tickets] queue-blocker dispatch failed: ${message}`);
+        this.blockerError = message;
+      }
+    });
   }
 
   private async poll(settings: PluginSettings, paseo: PaseoApi): Promise<void> {

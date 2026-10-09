@@ -3,11 +3,11 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { ActivationIntake } from "./activation-intake";
 import { dispatchLabels, type DispatchLabels } from "./dispatch";
 import { SetupError, type Launcher } from "./launch";
-import type { LinearService, RepairCandidate } from "./linear";
+import { LinearApiError, type LinearService, type RepairCandidate } from "./linear";
 import { CODING_STATE, PLANNING_STATE } from "./plannotator";
 import { type ProcessInspector } from "./process-liveness";
 import type { ProjectStore } from "./project-flow";
-import { withPriority } from "./rate-budget";
+import { RateLimitedError, withPriority } from "./rate-budget";
 import type { ReviewDeletions } from "./review-deletions";
 import type { RestartOptions, RestartResult } from "./sessions";
 import type { PluginSettings } from "./settings";
@@ -112,7 +112,9 @@ function sentence(reason: string): string {
 
 export class LabelRepair {
   private lastPoll = 0;
+  private lastBlockerPoll = 0;
   private lastError: string | null = null;
+  private lastBlockerError: string | null = null;
 
   constructor(private readonly deps: Deps) {}
 
@@ -152,6 +154,38 @@ export class LabelRepair {
       } catch (error) {
         if (message(error) !== this.lastError) console.error(`[linear-tickets] the label repair pass failed: ${message(error)}`);
         this.lastError = message(error);
+      }
+    });
+  }
+
+  // The queue-blocker exception to a background pause (README, "Auto-dispatch"): the dispatcher
+  // calls this from its paused poll, so blocker tickets with a failed start are still retried
+  // while the background share waits. One filtered read — the teams' open tickets carrying
+  // `-failed` and a queue-blocker marker — at most every REPAIR_POLL_MS (the failed backoffs are
+  // minutes long anyway), and each attempt runs at interactive priority, where the budget is
+  // admitted above the 5% owner reserve. The read is filtered, so a record whose ticket is not in
+  // it is not "gone": nothing is pruned here, and a full pass does that.
+  async tickQueueBlockers(paseo: PaseoApi, settings: PluginSettings): Promise<void> {
+    if (settings.activation.mode === "remote") return;
+    await withPriority("interactive", "queue-blocker repair", async () => {
+      if (this.now() - this.lastBlockerPoll < REPAIR_POLL_MS) return;
+      this.lastBlockerPoll = this.now();
+      try {
+        if (!await this.deps.intake.claimsReady()) return;
+        const names = { ...dispatchLabels(settings.dispatch.label), trigger: settings.dispatch.label };
+        const records = await this.deps.store.repairs();
+        const tickets = await this.deps.linear.repairCandidates({ labels: [names.failed], teamKeys: settings.dispatch.teamKeys, ids: [], queueBlockers: true });
+        // One restart per pass, like the full pass: a start takes a minute or two.
+        const pass = { restarted: false };
+        for (const ticket of tickets) {
+          if (CLOSED_TYPES.has(ticket.statusType.trim().toLowerCase())) continue;
+          await this.repair(paseo, names, ticket, records[ticket.id] ?? null, pass)
+            .catch((error: unknown) => console.error(`[linear-tickets] ${ticket.identifier}: repairing its labels failed, the next pass retries: ${message(error)}`));
+        }
+        this.lastBlockerError = null;
+      } catch (error) {
+        if (message(error) !== this.lastBlockerError) console.error(`[linear-tickets] the queue-blocker repair pass failed: ${message(error)}`);
+        this.lastBlockerError = message(error);
       }
     });
   }
@@ -387,8 +421,17 @@ export class LabelRepair {
       if (!claimed.comments?.includes("setup")) await this.post(ticket, `**Paseo cannot start an agent for this ticket until its setup is fixed:** ${sentence(reason)}. It does not retry; the ticket is marked \`${names.failed}\`.`, true);
       return;
     }
+    // A queue blocker whose start failed only for something the next poll can pass — Linear refused
+    // the request (a budget pause or its hourly rate limit), answered a 5xx, or could not be reached
+    // — gives the attempt back (README, "Auto-dispatch"): it is retried after the current backoff
+    // instead of counting toward the cap, so a paused budget or a Linear hiccup never exhausts the
+    // restarts nor mentions the owner. A setup error above keeps today's behavior.
+    const passing = result.error instanceof RateLimitedError
+      || (result.error instanceof LinearApiError && result.error.status >= 500)
+      || /^Could not reach the Linear API/.test(reason);
     const after = { ...claimed, lastReason: reason };
-    if (n >= RESTART_CAP) await this.exhaust(ticket, after, names, at, reason);
+    if (ticket.queueBlocker && passing) await this.commit(ticket.id, claimed.incident, logged(timed({ ...after, attempts: watching.attempts, state: "watching", attemptAt: undefined }, at), at, `restart ${n} did not start: ${reason}`));
+    else if (n >= RESTART_CAP) await this.exhaust(ticket, after, names, at, reason);
     else await this.commit(ticket.id, claimed.incident, logged(timed({ ...after, state: "watching", attemptAt: undefined }, at), at, `restart ${n} failed: ${reason}`));
   }
 
