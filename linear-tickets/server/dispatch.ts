@@ -54,10 +54,11 @@ type Deps = {
 // `blocked`: the agent stopped with an error; `needsYou`: it waits for the owner's answer or approval;
 // `manual`: a manual task an agent registered for the owner; `hold`: a project ticket the owner
 // releases before it is handed out; `attended`: a ticket
-// that may need the owner while it runs, so it waits while they are away (presence.ts).
-export type DispatchLabels = { running: string; failed: string; blocked: string; needsYou: string; manual: string; hold: string; attended: string };
+// that may need the owner while it runs, so it waits while they are away (presence.ts);
+// `queued`: a ticket waiting in this host's line for an agent slot (queued-labels.ts), shown only.
+export type DispatchLabels = { running: string; failed: string; blocked: string; needsYou: string; manual: string; hold: string; attended: string; queued: string };
 export function dispatchLabels(trigger: string): DispatchLabels {
-  return { running: `${trigger}-running`, failed: `${trigger}-failed`, blocked: `${trigger}-blocked`, needsYou: `${trigger}-needs-you`, manual: `${trigger}-manual`, hold: `${trigger}-hold`, attended: `${trigger}-attended` };
+  return { running: `${trigger}-running`, failed: `${trigger}-failed`, blocked: `${trigger}-blocked`, needsYou: `${trigger}-needs-you`, manual: `${trigger}-manual`, hold: `${trigger}-hold`, attended: `${trigger}-attended`, queued: `${trigger}-queued` };
 }
 
 // Polls Linear for tickets carrying the trigger label and starts one agent per ticket

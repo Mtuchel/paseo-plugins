@@ -52,12 +52,14 @@ export type OwnerAsksDeps = {
   extract: (input: ExtractInput, model: string) => Promise<Extraction>;
   deliver: (paseo: PaseoApi, agentId: string, message: string, origin: DeliveryOrigin) => Promise<DeliveryResult>;
   continueTicket: (issueId: string, identifier: string, lead: string) => Promise<ContinueOutcome>;
+  // A new thread on the ticket that waits in line with the answer (SessionRouter.queueAnswer).
+  queueAnswer: (issueId: string, identifier: string, text: string, from: { activityId: string; userId: string }, reason: string) => Promise<void>;
   directory?: string;
   now?: () => number;
 };
 
 export type AnswerAskInput = { issueId: string; answers: Record<string, string>; note?: string; done?: boolean };
-export type AnswerAskResult = { delivered: "agent" | "continued" | "comment" | "closed"; message: string };
+export type AnswerAskResult = { delivered: "agent" | "continued" | "queued" | "comment" | "closed"; message: string };
 
 // The ask text of one issue and what the extraction made of it. `questions` are the extraction's
 // (empty while it is pending or failed). `ticketId`/`ticketIdentifier` name the ticket the ask
@@ -244,7 +246,21 @@ export class OwnerAsks {
       // A live agent took the ticket meanwhile: the answer goes to it, exactly as a comment would.
       if (outcome.kind === "live" && draft.ticketAgentId) return this.tellAgent(draft, input, ask, paseo, draft.ticketAgentId);
       if (outcome.kind === "failed") throw new Error(`Could not start an agent on ${draft.ticketIdentifier}: ${outcome.reason ?? "unknown error"}.`);
-      if (outcome.kind === "deferred" || outcome.kind === "skipped" || outcome.kind === "live") throw new Error(`No continuation agent was started: ${outcome.reason ?? "the ticket cannot start right now"}.`);
+      if (outcome.kind === "skipped") throw new Error(`No agent was started: ${draft.ticketIdentifier} is paused for deletion.`);
+      // No slot yet, a start under way, a process still exiting, a hand-over held, or an agent this
+      // host does not know yet: the answer waits in line like an "@paseo" thread would.
+      if (outcome.kind === "deferred" || outcome.kind === "live") {
+        const reason = outcome.kind === "live" ? "Another agent took the ticket meanwhile; the answer is passed to it." : outcome.reason ?? "The ticket cannot start an agent right now.";
+        const userId = await this.deps.linear.viewerId().catch(() => "");
+        try {
+          await this.deps.queueAnswer(ticketId, draft.ticketIdentifier, text, { activityId: `owner-ask:${draft.issue.id}:${answerSignature(input)}`, userId }, reason);
+        } catch (error) {
+          throw new Error(`${draft.ticketIdentifier} cannot start an agent now (${reason}), and the answer could not join the wait line: ${error instanceof Error ? error.message : error}`);
+        }
+        if (draft.needsYou) await closeAnswered(this.deps.needsYou, this.deps.linear, draft.issue.id);
+        await this.deps.linear.comment(ticketId, this.record(text));
+        return { delivered: "queued", message: `${draft.ticketIdentifier} is in the wait line with your answer. ${reason}` };
+      }
       if (draft.needsYou) await closeAnswered(this.deps.needsYou, this.deps.linear, draft.issue.id);
       await this.deps.linear.comment(ticketId, this.record(text));
       return { delivered: "continued", message: outcome.kind === "forwarded" ? `The answer is handed to ${outcome.peer ?? "the other host"}, which continues the ticket.` : `Started a continuation agent on ${draft.ticketIdentifier}.` };

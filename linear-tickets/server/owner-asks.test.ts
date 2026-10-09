@@ -6,7 +6,7 @@ import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { HandoverRecord } from "./handover";
 import type { OwnerAskComment, OwnerAskIssue } from "./linear";
-import { ANSWER_HIDE_MS, answerText, asksOwner, askRoute, deliveryText, OwnerAsks, selectAskText, type OwnerAsksDeps } from "./owner-asks";
+import { ANSWER_HIDE_MS, answerText, asksOwner, askRoute, deliveryText, OwnerAsks, selectAskText, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
 import type { OwnerAsk } from "../shared/contracts";
 import type { Extraction } from "./owner-ask-extract";
 import type { DeliveryOrigin, DeliveryResult } from "./permission-replies";
@@ -35,6 +35,8 @@ async function setup(options: {
   records?: Map<string, HandoverRecord | null>;
   agents?: { id: string; status: string; createdAt: string; issueId?: string }[];
   extraction?: () => Promise<Extraction>;
+  continueOutcome?: ContinueOutcome;
+  queueError?: string;
 } = { issues: [] }) {
   const directory = await mkdtemp(join(tmpdir(), "owner-asks-"));
   const events: string[] = [];
@@ -68,7 +70,11 @@ async function setup(options: {
       delivered.push({ agentId, message, origin });
       return { status: "applied", reply: null, delivered: true, at } as DeliveryResult;
     },
-    continueTicket: async (issueId, identifier, lead) => { continued.push({ issueId, identifier, lead }); return { kind: "started", agentId: "new-agent" }; },
+    continueTicket: async (issueId, identifier, lead) => { continued.push({ issueId, identifier, lead }); return options.continueOutcome ?? { kind: "started", agentId: "new-agent" }; },
+    queueAnswer: async (issueId, identifier, text, from, reason) => {
+      if (options.queueError) throw new Error(options.queueError);
+      events.push(`queue ${issueId} ${identifier} from ${from.userId}: ${text} (${reason})`);
+    },
     directory,
     now: () => state.now,
   };
@@ -261,6 +267,40 @@ test("answering a Needs-you sub-issue whose agent is gone continues the ticket w
   assert.ok(h.events.includes("needsYou.remove i1"));
   assert.ok(h.events.includes("complete i1"));
   assert.ok(h.events.some((event) => event.startsWith("comment p1: Answered from the menu bar: Agent does it")));
+  h.ownerAsks.stop();
+});
+
+test("an answer whose ticket has no free agent slot joins the wait line with the answer instead of failing", async () => {
+  const reason = "Queued: 2 of 2 ticket agents are working. It starts when one finishes.";
+  const h = await setup({
+    issues: [issue()],
+    needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }],
+    records: new Map([["p1", null]]),
+    agents: [{ id: "a1", status: "closed", createdAt: "2026-10-01T00:00:00.000Z", issueId: "p1" }],
+    continueOutcome: { kind: "deferred", reason },
+  });
+  await h.ownerAsks.snapshot(h.paseo);
+  const result = await h.ownerAsks.answer({ issueId: "i1", answers: { q1: "Agent does it" }, note: "" }, h.paseo);
+  assert.equal(result.delivered, "queued");
+  assert.match(result.message, /TUC-1453 is in the wait line with your answer\. Queued: 2 of 2/);
+  assert.ok(h.events.includes(`queue p1 TUC-1453 from owner-1: Agent does it (${reason})`), "the parent ticket waits, with the owner's answer as its lead");
+  assert.ok(h.events.includes("needsYou.remove i1"), "the sub-issue is answered");
+  assert.ok(h.events.some((event) => event.startsWith("comment p1: Answered from the menu bar: Agent does it")));
+  h.ownerAsks.stop();
+});
+
+test("an answer that can neither start an agent nor join the wait line fails and changes nothing in Linear", async () => {
+  const h = await setup({
+    issues: [issue()],
+    needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }],
+    records: new Map([["p1", null]]),
+    agents: [{ id: "a1", status: "closed", createdAt: "2026-10-01T00:00:00.000Z", issueId: "p1" }],
+    continueOutcome: { kind: "deferred", reason: "Queued: 1 of 1 ticket agents are working." },
+    queueError: "Linear did not create an agent session on the ticket.",
+  });
+  await h.ownerAsks.snapshot(h.paseo);
+  await assert.rejects(() => h.ownerAsks.answer({ issueId: "i1", answers: { q1: "Agent does it" }, note: "" }, h.paseo), /TUC-1453 cannot start an agent now \(Queued: 1 of 1.*could not join the wait line: Linear did not create/);
+  assert.deepEqual(h.events, [], "no comment, no closed sub-issue");
   h.ownerAsks.stop();
 });
 

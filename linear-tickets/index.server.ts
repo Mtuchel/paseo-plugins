@@ -40,6 +40,7 @@ import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
 import { closeAnswered, NeedsYouIssues } from "./server/needs-you";
 import { OWNER_ASK_DIRECTORY, OwnerAsks } from "./server/owner-asks";
+import { QueuedLabels } from "./server/queued-labels";
 import { extractWithOmp } from "./server/owner-ask-extract";
 import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, SessionRouter, SessionStore, stopAgentTurn, type HostOwnership } from "./server/sessions";
 import { LimitResumeStore, UsageReader } from "./server/limit-resume";
@@ -261,6 +262,17 @@ export default function contribute(server: PluginServerContext) {
         case "skipped": return { kind: "skipped" };
       }
     },
+    queueAnswer: async (issueId, identifier, text, from, reason) => { await sessions.queueAnswer(issueId, identifier, text, from, reason); },
+  });
+  // The wait line in Linear (README, "Wait line label"): tickets waiting here for an agent slot,
+  // and queued threads waiting to start (their answer or comment included), carry `<trigger>-queued`.
+  const queuedLabels = new QueuedLabels({
+    linear,
+    label: async () => dispatchLabels((await settings.read()).dispatch.label).queued,
+    waiting: async () => {
+      const threads = (await sessionStore.all()).filter((link) => link.queued && !link.agentId && !link.closed && !link.remote);
+      return [...new Set([...starter.scheduler.waitingIds(), ...threads.map((link) => link.issueId)])];
+    },
   });
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   // Its root is the review inbox, listing the peer hosts' reviews too (README, "Review inbox").
@@ -375,6 +387,7 @@ export default function contribute(server: PluginServerContext) {
     asCaller("manual-tasks", () => manualTasks.start());
     asCaller("state-labels", () => stateLabels.start());
     asCaller("label-sync", () => labelSync.start());
+    asCaller("queued-labels", () => queuedLabels.start());
     if (!app) return false;
     stopKeepingFresh = auth.keepFresh();
     await webhook.start();
@@ -601,7 +614,7 @@ export default function contribute(server: PluginServerContext) {
     const stoppedPullRequests = pullRequests.stop();
     pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop();
     stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop();
-    ownerAsks.stop();
+    ownerAsks.stop(); queuedLabels.stop();
     void closeInternalDaemon();
     await stoppedPullRequests;
     await brokerReady;

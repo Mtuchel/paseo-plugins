@@ -643,7 +643,7 @@ export const answerAskRpc = defineRpc({
     note: z.string().max(4000).default(""),
     done: z.boolean().default(false),
   }),
-  output: z.object({ delivered: z.enum(["agent", "continued", "comment", "closed"]), message: z.string() }),
+  output: z.object({ delivered: z.enum(["agent", "continued", "queued", "comment", "closed"]), message: z.string() }),
 });
 
 export const pullRequestsRpc = defineRpc({

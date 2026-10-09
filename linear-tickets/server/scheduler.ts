@@ -152,6 +152,12 @@ export class Scheduler {
     return { running: running.length, reserved: this.reserved.size, waiting: this.waiting.size };
   }
 
+  // Tickets asked for within the last WAITING_MS and not admitted: the wait line as it stands.
+  waitingIds(): string[] {
+    const now = (this.deps.now ?? Date.now)();
+    return [...this.waiting.values()].filter((item) => now - item.seenAt <= WAITING_MS && !this.reserved.has(item.issueId)).map((item) => item.issueId);
+  }
+
   // The working agents (read once per burst), with stale reservations and waiting tickets dropped.
   private async refresh(paseo: PaseoApi, now: number): Promise<string[]> {
     if (!this.runningCache || now - this.runningCache.at > RUNNING_CACHE_MS) this.runningCache = { at: now, ids: await this.deps.running(paseo) };
