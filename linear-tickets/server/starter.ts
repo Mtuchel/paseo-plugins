@@ -14,7 +14,7 @@ import { findProject, readBranches } from "./projects";
 import { advisorNote, hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, planPolicy, SAFE_MODES, type PlanPolicy } from "./plan-policy";
 import { needsOwner, type Presence } from "./presence";
 import { ghostAgents, LIVE_AGENT, type ProcessInspector } from "./process-liveness";
-import { Scheduler, type Admission } from "./scheduler";
+import { nightInput, Scheduler, type Admission } from "./scheduler";
 import type { PluginSettings } from "./settings";
 import { launchTier, recordStart, TIER_AGENT_LABEL, tierModel, tierNote, type TierStore } from "./model-tiers";
 import type { ReviewDeletions } from "./review-deletions";
@@ -247,8 +247,12 @@ export class TicketStarter {
     if (await this.deps.deletions?.blocked(issueId)) return { ok: false, reason: "This ticket is paused for deletion." };
     const state = await this.deps.linear.issueState(issueId);
     if (state.blockedBy.length) return { ok: false, reason: `Waiting for ${state.blockedBy.join(", ")} to finish.` };
-    const attended = needsOwner(state.labels.map((item) => item.name), settings.dispatch.label);
-    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended }, paseo, this.capacity.limit(settings.dispatch.maxRunning));
+    const labels = state.labels.map((item) => item.name);
+    const attended = needsOwner(labels, settings.dispatch.label);
+    // The night order's tier comes from what is already here (README, "Who starts next"): the
+    // ticket's labels and its recorded tier, never from reading its plan document.
+    const night = nightInput(labels, (await this.deps.tiers?.get(issueId)) ?? null);
+    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended, night }, paseo, this.capacity.limit(settings.dispatch.maxRunning));
   }
 
   // `resumeOnly`: continue the recorded branch and worktree or throw ResumeUnavailableError, never

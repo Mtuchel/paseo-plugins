@@ -1116,13 +1116,18 @@ an open pull request still holds the ticket back.
 **Who starts next.** Every way a ticket starts (label, assignment, group, project) waits in one
 line. While slots under *max agents* are short, a free slot goes to:
 
-1. the project with the fewest agents working, so one project gets every slot while nothing
+1. while you are away, the night order first: a ticket whose approved plan implements on the cheap
+   model tier, then one on the standard tier, then everything else — a strong implementation, a
+   ticket whose tier the plugin does not know before it starts, and one that still plans (see
+   *Model tiers* and *Present and away*). The class only orders the line: nothing waits because of
+   it, so with nothing cheaper waiting a slot goes to the rest;
+2. the project with the fewest agents working, so one project gets every slot while nothing
    else waits, and a ticket of another project gets the next free slot;
-2. then tickets that may need you (see *Present and away*), so the time you are around is used
+3. then tickets that may need you (see *Present and away*), so the time you are around is used
    for them;
-3. then the higher priority (Urgent first, no priority last);
-4. then the ticket that unblocks the most open tickets;
-5. then the oldest ticket.
+4. then the higher priority (Urgent first, no priority last);
+5. then the ticket that unblocks the most open tickets;
+6. then the oldest ticket.
 
 The count is of agents that work: one the daemon still lists as running although its OMP process
 is gone (a ghost, see **Ghost agents**) holds no slot. An admitted ticket keeps its slot for 3
@@ -1133,10 +1138,16 @@ is taken and under any memory lease. It still counts as a working agent.
 
 **Present and away.** Planning never waits: every ticket plans at any time, also at night. A plan
 that needs you is parked (see **Parked plans**) and takes no slot, so the plans are ready for your
-review when you are back. While you are away, only the implementation of a ticket that may need
-you during the run waits: one that carries `paseo-attended` (a planner run marks these, and
-you can add or remove the label yourself) and has an approved plan (`plan-ready`). Its plan always
-goes to you (the risk policy never approves an attended ticket), so an attended ticket you approve
+review when you are back. While you are away, the line also starts what can finish without you
+first: a ticket whose approved plan implements on the cheap model tier, then one on the standard
+tier, and only then a ticket that still plans, a strong implementation or one whose tier the plugin
+does not know before the start (see *Who starts next*). That tier is the ticket's `model:` label or
+the tier store's record of it (see *Model tiers*), never the plan document, which is only read when
+the agent starts; so a plan that is the first to name the tier ranks with the rest. While you are
+away, only the implementation of a ticket that may need you during the run waits: one that carries
+`paseo-attended` (a planner run marks these, and you can add or remove the label yourself) and has
+an approved plan (`plan-ready`). Its plan always goes to you (the risk policy never approves an
+attended ticket), so an attended ticket you approve
 while away starts once you are present again. Waiting tickets keep their place and start within a
 few minutes of you being present again; agents already working continue. A ticket that asks you
 something anyway stops in Needs input and frees its slot.

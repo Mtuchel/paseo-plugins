@@ -7,7 +7,8 @@ import type { ProjectStatus } from "../shared/contracts";
 import type { Capacity } from "./capacity";
 import { dispatchLabels } from "./dispatch";
 import { refusedByLinear, type LinearService, type ProjectIssue, type TeamIssue } from "./linear";
-import type { Scheduler } from "./scheduler";
+import { nightInput, type Candidate, type Scheduler } from "./scheduler";
+import type { TierStore } from "./model-tiers";
 import { needsOwner } from "./presence";
 import { classifyRunAgents, classifyTicketAgents, type TicketAgents } from "./starter";
 import { type ProcessInspector } from "./process-liveness";
@@ -341,6 +342,9 @@ type Deps = {
   // bypass it: they only order tickets, and while one waits none of its project's new tickets can
   // be handed out (README, "Who starts next").
   capacity: Pick<Capacity, "limit">;
+  // Where the night order reads a ticket's recorded model tier (README, "Who starts next"); a host
+  // without the store ranks those tickets by their labels alone.
+  tiers?: Pick<TierStore, "get">;
   store?: ProjectStore;
   // Queued operations and launch preparation must not retain ownership after this host drains.
   settings?: Pick<Settings, "read">;
@@ -905,10 +909,13 @@ export class ProjectFlow {
       console.log(`[linear-tickets] project hand-out ${group.identifier}: group`);
     }
     const singles = ready.filter((issue) => !parents.has(issue.id));
-    const candidates = singles.map((issue) => ({
+    // The night order's tier comes from what is already here (labels and the tier store); the plan
+    // document is not read during a poll.
+    const candidates = await Promise.all(singles.map(async (issue): Promise<Candidate> => ({
       issueId: issue.id, identifier: issue.identifier, projectId, priority: issue.priority, unblocks: issue.blocks.length, createdAt: issue.createdAt,
       attended: needsOwner(issue.labels, settings.dispatch.label),
-    }));
+      night: nightInput(issue.labels, (await this.deps.tiers?.get(issue.id)) ?? null),
+    })));
     this.deps.scheduler.note(candidates);
     for (const candidate of candidates) {
       const admission = await this.deps.scheduler.admit(candidate, paseo, this.deps.capacity.limit(settings.dispatch.maxRunning));
@@ -968,6 +975,7 @@ export class ProjectFlow {
       const admission = await this.deps.scheduler.admit({
         issueId: issue.id, identifier: issue.identifier, projectId, priority: issue.priority, unblocks: issue.blocks.length, createdAt: issue.createdAt,
         attended: needsOwner(issue.labels, settings.dispatch.label),
+        night: nightInput(issue.labels, (await this.deps.tiers?.get(issue.id)) ?? null),
       }, paseo, this.deps.capacity.limit(settings.dispatch.maxRunning));
       if (!admission.ok) continue;
       // Counted before the start, so a start that keeps failing still reaches the cap, and the
