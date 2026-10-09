@@ -30,14 +30,19 @@ import {
 
 const out = (code: number | null, value: unknown, stderr = ""): ScriptOutput => ({ code, stdout: `progress line\n${JSON.stringify(value)}\n`, stderr });
 const REVISION = { state: "same", draft: 437, branch: "mtuchel/tuc-1-fix", expect: "419@a1b2c3d,1501@b2c3d4e", reason: "the draft tested these heads" };
-const DROPPED = { pr: 419, result: "dropped", reason: "a check failed", class: "flaky", requeue: true, evidence: ["a known flaky test"], revision: REVISION, queueDraft: 437, failures: [{ check: "Core", conclusion: "failure", url: "https://x" }] };
+const DROPPED = { pr: 419, result: "dropped", reason: "a check failed", class: "flaky", requeue: true, evidence: ["a known flaky test"], revision: REVISION, queueDraft: 437, failures: [{ check: "Core", conclusion: "failure", url: "https://x", tests: ["core > uploads a file: timed out"], testIds: ["core > uploads a file"] }] };
 
 test("wait-queue.mjs: a dropped round carries its class, requeue, evidence and revision; merged and still-running rounds are no drop", () => {
   assert.deepEqual(parseJudgment(out(2, DROPPED)), {
     result: "dropped", reason: "a check failed", class: "flaky", requeue: true, evidence: ["a known flaky test"],
     revision: { state: "same", draft: 437, branch: "mtuchel/tuc-1-fix", expect: "419@a1b2c3d,1501@b2c3d4e", reason: "the draft tested these heads" },
-    queueDraft: 437, failures: [{ check: "Core", conclusion: "failure", url: "https://x" }],
+    queueDraft: 437, failures: [{ check: "Core", conclusion: "failure", url: "https://x", tests: ["core > uploads a file: timed out"], testIds: ["core > uploads a file"] }],
   });
+  assert.deepEqual(parseJudgment(out(2, { ...DROPPED, failures: [{ check: "Core", conclusion: "failure", url: "https://x" }] })), {
+    result: "dropped", reason: "a check failed", class: "flaky", requeue: true, evidence: ["a known flaky test"],
+    revision: { state: "same", draft: 437, branch: "mtuchel/tuc-1-fix", expect: "419@a1b2c3d,1501@b2c3d4e", reason: "the draft tested these heads" },
+    queueDraft: 437, failures: [{ check: "Core", conclusion: "failure", url: "https://x", tests: [], testIds: [] }],
+  }, "a run without failing tests carries none");
   assert.deepEqual(parseJudgment(out(0, { result: "merged" })), { result: "merged" });
   assert.deepEqual(parseJudgment(out(3, { result: "running" })), { result: "pending" });
   const genuine = parseJudgment(out(2, { ...DROPPED, class: "genuine" }));

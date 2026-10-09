@@ -145,7 +145,7 @@ const listed = (url: string, view: PullRequestView, title = "Fix TUC-1 [plugin] 
 
 // The repo's `wait-queue.mjs` judgment of a dropped round (see queue-backstop.ts): genuine, and
 // its code could not be compared, unless a test says otherwise.
-type Judgment = { class: string; requeue: boolean; evidence: string[]; revision: { state: string; draft?: number | null; branch?: string | null; expect?: string | null; reason: string }; failures: { check: string; conclusion: string; url: string }[] };
+type Judgment = { class: string; requeue: boolean; evidence: string[]; revision: { state: string; draft?: number | null; branch?: string | null; expect?: string | null; reason: string }; failures: { check: string; conclusion: string; url: string; tests?: string[]; testIds?: string[] }[] };
 const GENUINE: Judgment = { class: "genuine", requeue: false, evidence: [], revision: { state: "unknown", reason: "no queue draft" }, failures: [] };
 // Graphite named a conflict that is still there: a restack, no automatic re-enqueue.
 const CONFLICT_ONLY: Judgment = { class: "conflictOnly", requeue: false, evidence: [], revision: { state: "unknown", reason: "no queue draft" }, failures: [] };
@@ -617,9 +617,14 @@ test("an archived agent's open pull request stops being watched after the escala
     h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
     const calls = await h.poll();
     assert.ok(!calls.some((call) => call.startsWith("prompt")), "an archived agent is never prompted");
-    assert.match(calls.find((call) => call.startsWith("comment")) ?? "", drop === 2 ? /dropped this stack again/ : /no longer running/);
+    const comment = calls.find((call) => call.startsWith("comment")) ?? "";
+    assert.match(comment, /no longer running/);
+    assert.ok(!/take over|took over/.test(comment), `${drop}: an archived agent's drop never hands the ticket to the owner`);
     events.push(QUEUED, REMOVED);
   }
+  // An escalation of the pull request — here the owner's answer was waited out — still ends the
+  // watch: no further reads.
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, escalated: true } });
   h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
   await h.poll();
   assert.deepEqual(h.github.reads, [], "escalated: no longer read");
@@ -880,7 +885,7 @@ test("a conflict-only drop, before any queue draft or with nothing failed on it,
   assert.match(prompt, /regenerate them; never merge them by hand\. Run the focused checks/);
   assert.match(prompt, /then right away `git switch mtuchel\/tuc-1-fix && node tools\/ci\/enqueue\.mjs` \(the top branch of the dropped queue range, not the stack's top branch; never a bare `gt merge`[^\n]*\) and `node tools\/ci\/wait-queue\.mjs 419`\. Do not wait for the pull request's checks[^\n]*wait with `node tools\/ci\/wait-checks\.mjs 419` and run `node tools\/ci\/enqueue\.mjs` once more\./);
   assert.doesNotMatch(prompt, /Fix the cause/);
-  assert.match(prompt, /This is automatic restack 1 of 5 for this pull request/);
+  assert.match(prompt, /This is conflict-only drop 1 of this range; every one gets this restack request\./);
 
   const green = harness(t);
   green.github.view = { ...green.github.view, mergeActivity: activity(QUEUED, running(437), CONFLICT) };
@@ -888,7 +893,7 @@ test("a conflict-only drop, before any queue draft or with nothing failed on it,
   green.scripts.judgment = CONFLICT_ONLY;
   const restack = promptOf(await green.poll()) ?? "";
   assert.match(restack, /No check failed on the queue's draft \[#437\]/);
-  assert.match(restack, /restack 1 of 5/);
+  assert.match(restack, /This is conflict-only drop 1 of this range/);
 });
 
 test("a drop re-enqueues the dropped queue range from its top branch, never from the stack's top above it", async (t) => {
@@ -935,15 +940,16 @@ test("the repo's wait-queue.mjs decides the kind of a drop, for the round's draf
     assert.deepEqual(h.scripts.runs, [`${WAIT_QUEUE} ${args}`]);
     if (judgment === GENUINE) {
       assert.match(prompt, /2\. Fix the cause\./, "Graphite naming a conflict does not make it conflict-only");
-      assert.match(prompt, /This is automatic fix request 1 of 1 for this pull request; the next plain drop goes to the owner\./);
+      assert.match(prompt, /This is genuine drop 1 of this range; every genuine drop gets this fix request\./);
       assert.doesNotMatch(prompt, /Conflict only/);
-    } else assert.match(prompt, /Conflict only[^]*restack 1 of 5/);
+    } else assert.match(prompt, /Conflict only[^]*This is conflict-only drop 1 of this range/);
   }
 });
 
-test("conflict-only and plain drops count separately: five restacks, one fix request, then the owner; after that no drop prompts again", async (t) => {
+test("no count of conflict-only or plain drops escalates a range: the restacks and fix requests keep coming, and only every fifth consecutive conflict asks for the hotspot (AC-1, AC-3)", async (t) => {
   const h = harness(t);
-  const log = t.mock.method(console, "error", () => {});
+  t.mock.method(console, "error", () => {});
+  const calls: string[] = [];
   const events: string[] = [];
   const drop = (...more: string[]) => {
     events.push(...more);
@@ -951,32 +957,35 @@ test("conflict-only and plain drops count separately: five restacks, one fix req
     h.scripts.judgment = more.at(-1) === CONFLICT ? CONFLICT_ONLY : GENUINE;
     return h.poll();
   };
-  for (let restack = 1; restack <= 5; restack++) assert.match(promptOf(await drop(QUEUED, CONFLICT)) ?? "", new RegExp(`restack ${restack} of 5`));
+  // Six conflict-only drops in a row: every one asks for a restack, and only the fifth (the fifth
+  // consecutive one) also asks for the hotspot. Nothing reaches the owner, nothing stops.
+  for (let restack = 1; restack <= 6; restack++) {
+    const prompt = promptOf(await drop(QUEUED, CONFLICT)) ?? "";
+    calls.push(prompt);
+    assert.match(prompt, new RegExp(`This is conflict-only drop ${restack} of this range; every one gets this restack request\\.`));
+    if (restack === 5) assert.match(prompt, /5 conflict-only drops of this range in a row: besides the restack, find out why it keeps conflicting and fix that cause/);
+    else assert.doesNotMatch(prompt, /in a row: besides the restack/, `restack ${restack}`);
+    assert.match(prompt, /Ask the owner only for a decision that can break something[^]*never because of a drop count\./);
+  }
+  // A plain drop resets the streak and gets its own fix request; the next conflict starts a new one.
   h.github.drafts = [draft(440, [419])];
-  assert.match(promptOf(await drop(QUEUED, running(440), REMOVED)) ?? "", /fix request 1 of 1/, "restacks leave the plain budget alone");
-  const sixth = await drop(QUEUED, CONFLICT);
-  assert.equal(promptOf(sixth), undefined);
-  assert.match(sixth[0], new RegExp(`^comment ${OWNER} The merge queue dropped this stack again after Paseo's automatic requests`));
-  assert.match(sixth[0], /Drops of this pull request so far: 1 plain, 6 conflict-only\./);
-  assert.match(sixth[1], /^say response The merge queue dropped the pull request again; the owner was asked to take over\./);
+  const plain = promptOf(await drop(QUEUED, running(440), REMOVED)) ?? "";
+  calls.push(plain);
+  assert.match(plain, /This is genuine drop 1 of this range; every genuine drop gets this fix request\./);
   h.github.drafts = [draft(441, [419])];
-  assert.deepEqual(await drop(QUEUED, running(441), REMOVED), [], "after the escalation a plain drop only reaches the log");
-  assert.deepEqual(await drop(QUEUED, CONFLICT), [], "and so does a conflict-only one");
-  assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /dropped .*pull\/419 again; already escalated to the owner/);
-
-  const plain = harness(t);
-  plain.github.view = { ...plain.github.view, mergeActivity: activity(QUEUED, REMOVED) };
-  assert.match(promptOf(await plain.poll()) ?? "", /fix request 1 of 1/);
-  plain.github.view = { ...plain.github.view, mergeActivity: activity(QUEUED, REMOVED, QUEUED, REMOVED) };
-  const second = await plain.poll();
-  assert.equal(promptOf(second), undefined);
-  assert.match(second[0], /dropped this stack again[^]*so far: 2 plain, 0 conflict-only\./, "the second plain drop goes to the owner");
-  plain.github.view = { ...plain.github.view, mergeActivity: activity(QUEUED, REMOVED, QUEUED, REMOVED, QUEUED, CONFLICT) };
-  plain.scripts.judgment = CONFLICT_ONLY;
-  assert.deepEqual(await plain.poll(), [], "a conflict-only drop after the escalation is not restacked");
+  const after = promptOf(await drop(QUEUED, running(441), REMOVED)) ?? "";
+  calls.push(after);
+  assert.match(after, /This is genuine drop 2 of this range/);
+  h.github.drafts = [draft(442, [419])];
+  const restarted = promptOf(await drop(QUEUED, CONFLICT)) ?? "";
+  calls.push(restarted);
+  assert.match(restarted, /This is conflict-only drop 7 of this range/);
+  assert.doesNotMatch(restarted, /in a row: besides the restack/, "the plain drops reset the conflict streak");
+  assert.ok(!calls.some((call) => /Please take over|owner was asked/.test(call)), "no drop ever hands the stack to the owner");
+  assert.ok(!(await h.poll()).some((call) => /^comment /.test(call)), "nor on a later poll");
 });
 
-test("a main-broken drop the backstop cannot re-enqueue counts toward neither limit and asks to re-enqueue with --wait-main once main is green", async (t) => {
+test("a main-broken drop the backstop cannot re-enqueue counts toward nothing and asks to re-enqueue with --wait-main once main is green", async (t) => {
   const h = harness(t);
   h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(437)) };
   h.github.drafts = [draft(437, [419])];
@@ -985,10 +994,11 @@ test("a main-broken drop the backstop cannot re-enqueue counts toward neither li
   assert.match(prompt, /- \[Code validation \/ Migration replay\]\(https:\/\/github\.com\/[^)]+\) — failure/);
   assert.match(prompt, /Kind \(tools\/ci\/wait-queue\.mjs\): main-broken[^\n]*\n- Migration replay was red on main at 07:30/);
   assert.match(prompt, /Paseo did not re-enqueue it: it could not prove that the range is still the code that dropped \(no queue draft\)/);
-  assert.match(prompt, /Main broken: the merge queue dropped the range because `main` was already red on the same jobs at that time \(tools\/ci\/wait-queue\.mjs\)\. This drop does not count toward the stack's limits, and no restack or fix of your own is needed unless `enqueue\.mjs` refuses the range\./);
+  assert.match(prompt, /Main broken: the merge queue dropped the range because `main` was already red on the same jobs at that time \(tools\/ci\/wait-queue\.mjs\)\. No restack or fix of your own is needed unless `enqueue\.mjs` refuses the range\./);
   assert.match(prompt, /Re-enqueue the dropped queue range from its top branch once `main` is green: `git switch mtuchel\/tuc-1-fix && node tools\/ci\/enqueue\.mjs --wait-main` \(it waits until `main` is green, then checks and enqueues\), then `node tools\/ci\/wait-queue\.mjs 419`\./);
-  assert.match(prompt, /Drops of this pull request so far: 0 plain, 0 conflict-only, 1 main-broken \(not counted\)\.$/);
-  assert.doesNotMatch(prompt, /Fix the cause|git rebase|automatic fix request/);
+  assert.match(prompt, /Drops of this range so far: 0 plain, 0 conflict-only, 1 main-broken\./);
+  assert.match(prompt, /Ask the owner only for a decision that can break something[^]*never because of a drop count\./);
+  assert.doesNotMatch(prompt, /Fix the cause|git rebase|Please take over/);
   assert.deepEqual(await h.poll(), [], "not claimed again on the next poll");
   await h.restart();
   assert.deepEqual(await h.poll(), [], "nor after a restart");
@@ -1003,7 +1013,7 @@ test("a main-broken drop the backstop cannot re-enqueue counts toward neither li
   assert.match(calls[1], new RegExp(`^comment ${OWNER} The agent that worked on this ticket is no longer running[^]*enqueue\\.mjs --wait-main`));
 });
 
-test("three main-broken drops leave the plain budget alone: the next genuine failure gets fix request 1 of 1", async (t) => {
+test("three main-broken drops leave the plain drops alone: the next genuine failure gets its fix request", async (t) => {
   const h = harness(t);
   const events: string[] = [];
   const drop = (number: number) => {
@@ -1013,12 +1023,39 @@ test("three main-broken drops leave the plain budget alone: the next genuine fai
     return h.poll();
   };
   h.scripts.judgment = MAIN_BROKEN;
-  for (const [index, number] of [440, 441, 442].entries()) assert.match(promptOf(await drop(number)) ?? "", new RegExp(`so far: 0 plain, 0 conflict-only, ${index + 1} main-broken \\(not counted\\)\\.$`));
+  for (const [index, number] of [440, 441, 442].entries()) assert.match(promptOf(await drop(number)) ?? "", new RegExp(`Drops of this range so far: 0 plain, 0 conflict-only, ${index + 1} main-broken\\.`));
   h.scripts.judgment = GENUINE;
   const genuine = promptOf(await drop(443)) ?? "";
   assert.match(genuine, /2\. Fix the cause\./);
-  assert.match(genuine, /This is automatic fix request 1 of 1 for this pull request; the next plain drop goes to the owner\./);
+  assert.match(genuine, /This is genuine drop 1 of this range; every genuine drop gets this fix request\./);
   assert.doesNotMatch(genuine, /Main broken/);
+});
+
+test("a genuine drop's fix request carries the range's drop history, and a repeated failing signature also asks for the reproduction on main and the queue incident (AC-4)", async (t) => {
+  const h = harness(t);
+  t.mock.method(console, "error", () => {});
+  const failures = [{ check: "Code validation / Core (core-web) (2/4)", conclusion: "failure", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/9/job/2", tests: ["core > uploads a file: timed out"], testIds: ["core > uploads a file"] }];
+  const events: string[] = [];
+  const round = async (number: number) => {
+    events.push(QUEUED, running(number), REMOVED);
+    h.github.view = { ...h.github.view, mergeActivity: activity(...events) };
+    h.github.drafts = [...h.github.drafts, draft(number, [419])];
+    h.scripts.judgment = { ...GENUINE, failures };
+    return promptOf(await h.poll()) ?? "";
+  };
+  // The first genuine drop has no history yet: the request names the failing check and test.
+  const first = await round(437);
+  assert.doesNotMatch(first, /The range's drops \(newest last/, "the first drop's own entry is not yet history");
+  assert.doesNotMatch(first, /The failing signature repeats/);
+  // The second drop repeats the first's signature: its request adds the history, the reproduction
+  // on current `origin/main` and the queue incident.
+  const second = await round(438);
+  assert.match(second, /- \d{4}-\d{2}-\d{2}T[0-9:.]+Z — genuine failure \(#437\) — failed checks: Code validation \/ Core \(core-web\) — failing tests: core > uploads a file: timed out/);
+  assert.match(second, /The failing signature repeats the range's genuine drop #437 of \d{4}-\d{2}-\d{2}T[0-9:.]+Z: Code validation \/ Core \(core-web\) — core > uploads a file: timed out\./);
+  assert.match(second, /Before you enqueue the range again, reproduce it on the range merged onto current `origin\/main`: in the stack's worktree `git fetch origin main`, then from the range's top branch `git switch -c queue-repro mtuchel\/tuc-1-fix && git merge --no-edit origin\/main`, and run the failing tests above there/);
+  assert.match(second, /attach that evidence to its queue incident — the `TUC-538` queue-blocker ticket whose `Queue blocker id` is `core > uploads a file` — opening one if none exists/);
+  assert.match(second, /This is genuine drop 2 of this range; every genuine drop gets this fix request\./);
+  assert.match(second, /Ask the owner only for a decision that can break something[^]*never because of a drop count\./);
 });
 
 test("a wait-queue.mjs run that fails, or a round it does not call dropped yet, claims nothing; a later poll claims the drop", async (t) => {
@@ -1034,42 +1071,93 @@ test("a wait-queue.mjs run that fails, or a round it does not call dropped yet, 
   h.scripts.judgment = null;
   assert.deepEqual(await h.poll(), [], "still running as far as the repo can tell");
   h.scripts.judgment = MAIN_BROKEN;
-  assert.match(promptOf(await h.poll()) ?? "", /Main broken[^]*so far: 0 plain, 0 conflict-only, 1 main-broken \(not counted\)\.$/);
+  assert.match(promptOf(await h.poll()) ?? "", /Main broken[^]*Drops of this range so far: 0 plain, 0 conflict-only, 1 main-broken\./);
 });
 
-test("an escalated pull request stays with the owner after a main-broken drop, and wait-queue.mjs is not run", async (t) => {
+test("the cutover un-escalates a range the old drop limits handed to the owner and gives its newest drop back once (AC-6)", async (t) => {
+  const h = harness(t);
+  t.mock.method(console, "error", () => {});
+  // State the old plugin left: escalated at the second plain drop, its escalation to the owner
+  // still unsent.
+  await h.state({ [PR]: {
+    reviewedAt: null, decision: null, merged: false, drops: ["#436", "#437"], escalated: true,
+    pending: { key: "#437", reason: "a check failed", facts: "the old escalation to the owner", fix: null },
+    activeAt: new Date().toISOString(),
+  } });
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(437)) };
+  h.github.drafts = [draft(437, [419])];
+  h.scripts.judgment = { ...GENUINE, failures: [{ check: "Code validation / Core (core-web)", conclusion: "failure", url: "https://github.com/tuchel-sohn/tuchel-platform/actions/runs/9/job/2", tests: ["core > uploads a file: timed out"], testIds: ["core > uploads a file"] }] };
+  const calls = await h.poll();
+  assert.deepEqual(h.scripts.runs, [`${WAIT_QUEUE} 419 --draft 437`], "the newest drop is judged and claimed again");
+  const prompt = promptOf(calls) ?? "";
+  assert.match(prompt, /This is genuine drop 2 of this range; every genuine drop gets this fix request\./, "the agent gets the fix request the escalation had withheld");
+  assert.ok(!calls.some((call) => /take over|took over/.test(call)), "the unsent escalation to the owner never goes out");
+  const state = JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"));
+  assert.equal(state[PR].escalated, undefined, "un-escalated");
+  assert.equal(state[PR].cutover, true, "marked, so a later load never hands the same drop back");
+  assert.equal(state[PR].pending, null, "the owner message is gone");
+  assert.deepEqual(await h.poll(), [], "never handed back twice");
+  // A drop after the cutover is an ordinary drop.
+  h.github.drafts = [draft(438, [419])];
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(437), REMOVED, QUEUED, running(438)) };
+  assert.match(promptOf(await h.poll()) ?? "", /This is genuine drop 3 of this range/);
+});
+
+test("a stage or permission escalation stays as it is: the cutover reads no drop-count handover into it (AC-6)", async (t) => {
   const h = harness(t);
   const log = t.mock.method(console, "error", () => {});
-  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#437", "#438"], escalated: true, activeAt: new Date().toISOString() } });
-  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(439)) };
-  h.github.drafts = [draft(439, [419])];
-  h.scripts.judgment = MAIN_BROKEN;
-  assert.deepEqual(await h.poll(), []);
-  assert.deepEqual(h.scripts.runs, []);
+  // Two plain drops, but the escalation a stage's own (its nudges went past their budget).
+  await h.state({ [PR]: {
+    reviewedAt: null, decision: null, merged: false, drops: ["#436", "#437"], escalated: true,
+    nudges: { checks: ["h1", "h1", "h1"] }, activeAt: new Date().toISOString(),
+  } });
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, running(438)) };
+  h.github.drafts = [draft(438, [419])];
+  h.scripts.judgment = GENUINE;
+  assert.deepEqual(await h.poll(), [], "held: the drop only reaches the log");
+  assert.deepEqual(h.scripts.runs, [], "and wait-queue.mjs is not run for it");
   assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /dropped .*pull\/419 again; already escalated to the owner/);
+  const state = JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"));
+  assert.equal(state[PR].escalated, true, "the stage escalation stays");
+  assert.equal(state[PR].cutover, undefined, "no cutover mark on it");
+
+  // A message of a pull request whose agent waited out the owner's answer (the surviving
+  // escalation) stays, too: no count evidence is read into it.
+  const waited = harness(t);
+  await waited.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#437"], escalated: true, activeAt: new Date().toISOString() } });
+  waited.github.view = { ...waited.github.view, mergeActivity: activity(QUEUED, running(438)) };
+  waited.github.drafts = [draft(438, [419])];
+  assert.deepEqual(await waited.poll(), [], "held");
+  const kept = JSON.parse(await readFile(join(await waited.home(), "pr-watch.json"), "utf8"));
+  assert.equal(kept[PR].escalated, true, "the wait escalation stays");
+  assert.equal(kept[PR].cutover, undefined);
 });
 
-test("drops claimed before drops had kinds count as plain ones", async (t) => {
+test("drops claimed before drops had kinds count as plain ones and escalate nothing (AC-1, AC-6)", async (t) => {
   const conflict = { ...OPEN_PR, mergeActivity: activity(QUEUED, CONFLICT) };
-  const plainDrop = { ...OPEN_PR, mergeActivity: activity(QUEUED, REMOVED) };
-  const oneFix = harness(t);
-  await oneFix.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#437"], activeAt: new Date().toISOString() } });
-  oneFix.github.view = plainDrop;
-  const escalation = await oneFix.poll();
-  assert.equal(promptOf(escalation), undefined);
-  assert.match(escalation[0], /dropped this stack again[^]*so far: 2 plain, 0 conflict-only\./, "the earlier fix request used up the plain budget");
+  // One old plain drop, then a plain drop: the removed 2nd-drop limit handed the range to the
+  // owner; now the agent gets the fix request.
+  const two = harness(t);
+  await two.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#436"], activeAt: new Date().toISOString() } });
+  two.github.view = { ...two.github.view, mergeActivity: activity(QUEUED, REMOVED, QUEUED, REMOVED) };
+  const prompt = promptOf(await two.poll()) ?? "";
+  assert.match(prompt, /This is genuine drop 2 of this range; every genuine drop gets this fix request\./);
+  assert.match(prompt, /Drops of this range so far: 2 plain, 0 conflict-only, 0 main-broken\./);
+  assert.doesNotMatch(prompt, /take over|next plain drop goes to the owner/);
 
-  const twoFixes = harness(t);
-  await twoFixes.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#437", "#438"] } });
-  twoFixes.github.view = conflict;
-  twoFixes.scripts.judgment = CONFLICT_ONLY;
-  assert.match(promptOf(await twoFixes.poll()) ?? "", /restack 1 of 5/, "not escalated yet: a conflict-only drop is restacked");
+  // Two old plain drops, then a conflict-only drop: restacked, not escalated.
+  const restacked = harness(t);
+  await restacked.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#437", "#438"] } });
+  restacked.github.view = conflict;
+  restacked.scripts.judgment = CONFLICT_ONLY;
+  assert.match(promptOf(await restacked.poll()) ?? "", /This is conflict-only drop 1 of this range/);
 
-  const escalated = harness(t);
-  t.mock.method(console, "error", () => {});
-  await escalated.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#437", "#438", "#439"] } });
-  escalated.github.view = conflict;
-  assert.deepEqual(await escalated.poll(), [], "the third drop escalated under the old rule");
+  // Three old plain drops: the removed legacy third-drop rule escalated them; nothing does now.
+  const legacy = harness(t);
+  await legacy.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#437", "#438", "#439"] } });
+  legacy.github.view = conflict;
+  legacy.scripts.judgment = CONFLICT_ONLY;
+  assert.match(promptOf(await legacy.poll()) ?? "", /This is conflict-only drop 1 of this range/, "the third drop escalates nothing");
 });
 
 const PARENT = "mtuchel/tuc-0-parent";
@@ -1507,7 +1595,7 @@ test("a genuine drop goes to the agent, and the backstop never enqueues the rang
   assert.deepEqual(h.scripts.runs, [READY_RUN, enqueueRun(`ready:419@${fixed}`, `419@${fixed}`)], "the fix is enqueued");
 });
 
-test("a flaky drop of unchanged code is re-enqueued by the backstop without the agent, and counts as a plain drop", async (t) => {
+test("a flaky drop of unchanged code is re-enqueued by the backstop without the agent, whatever the count (AC-2)", async (t) => {
   const h = harness(t);
   const bullets = bulletsOf(h, {}, QUEUED, running(437), REMOVED);
   h.github.drafts = [draft(437, [419])];
@@ -1517,17 +1605,16 @@ test("a flaky drop of unchanged code is re-enqueued by the backstop without the 
   const calls = await h.backstop();
   assert.deepEqual(h.scripts.runs, [enqueueRun("drop:#437:419"), READY_RUN]);
   assert.deepEqual(firstLines(calls), [`enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#437:419`, `pr comment #419 ${ENQUEUED}`, `comment ${ENQUEUED}`, "prompt a1"]);
-  assert.match(h.github.comments[419][0], /\[queue run #437\]\([^)]+\)\), and it was not the stack's fault: flaky[^]*- `server\/upload\.test\.ts > retries`[^]*The code is unchanged since the drop \(the queue's draft tested these heads\)\. It counts as plain drop 1 of 1; the next plain drop goes to the owner\./);
+  assert.match(h.github.comments[419][0], /\[queue run #437\]\([^)]+\)\), and it was not the stack's fault: flaky[^]*- `server\/upload\.test\.ts > retries`[^]*The code is unchanged since the drop \(the queue's draft tested these heads\)\. Nothing of the range's own needs a fix; no drop count hands anything to the owner\./);
   assert.deepEqual(await h.backstop(), [], "once");
+  // The next drop of the range is claimed like any first drop: the flaky round counted toward nothing.
   bullets.add(running(438), REMOVED);
   h.github.drafts = [draft(438, [419])];
   h.scripts.judgment = GENUINE;
-  const next = await h.poll();
-  assert.equal(promptOf(next), undefined);
-  assert.match(next[0], /dropped this stack again[^]*so far: 2 plain, 0 conflict-only\./, "the re-enqueued drop used up the plain budget");
+  assert.match(promptOf(await h.poll()) ?? "", /This is genuine drop 2 of this range; every genuine drop gets this fix request\./);
 });
 
-test("a main-broken drop of unchanged code is re-enqueued once main is green: held until then, counted toward no limit", async (t) => {
+test("a main-broken drop of unchanged code is re-enqueued once main is green: held until then, counted toward nothing", async (t) => {
   const h = harness(t);
   const bullets = bulletsOf(h, {}, QUEUED, running(437), REMOVED);
   h.github.drafts = [draft(437, [419])];
@@ -1539,7 +1626,7 @@ test("a main-broken drop of unchanged code is re-enqueued once main is green: he
   assert.deepEqual(firstLines(await h.backstop()), [`enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#437:419`], "held: no comment yet");
   const enqueued = await h.backstop();
   assert.equal(count(enqueued, "enqueue "), 1);
-  assert.match(h.github.comments[419][0], /main-broken[^]*Main-broken drops count toward no limit; the enqueue waits until `main` is green\./);
+  assert.match(h.github.comments[419][0], /main-broken[^]*The code is unchanged since the drop \(the queue's draft tested these heads\)\. The drop was `main`'s; the enqueue waits until `main` is green\./);
 });
 
 test("the same heads dropped in two rounds are two re-enqueues, and each drop is counted once", async (t) => {
@@ -1562,24 +1649,22 @@ test("the same heads dropped in two rounds are two re-enqueues, and each drop is
   // The backstop's own enqueue of these heads came right before this round, so only a drop the
   // repo does not clear for a re-enqueue reaches the agent.
   h.scripts.judgment = { ...MAIN_BROKEN, requeue: false };
-  assert.match(promptOf(await h.poll()) ?? "", /so far: 0 plain, 0 conflict-only, 3 main-broken \(not counted\)\.$/);
+  assert.match(promptOf(await h.poll()) ?? "", /Drops of this range so far: 0 plain, 0 conflict-only, 3 main-broken\./);
 });
 
-test("an escalated stack stays out of every automatic enqueue, also after its top pull request gets a new head", async (t) => {
+test("a genuine drop of a range member goes to the agent and holds the whole range for the backstop until its heads change", async (t) => {
   const h = harness(t);
-  t.mock.method(console, "error", () => {});
   const step2 = { ...READY, headSha: "5e5e5e5", headBranch: "mtuchel/tuc-1-b", baseBranch: "mtuchel/tuc-1-fix" };
   h.github.open = [listed(prUrl(1501), step2, "Add TUC-1 [plugin] Step two")];
-  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#436"] } });
   h.github.view = { ...READY, mergeActivity: activity(QUEUED, running(437), REMOVED) };
   h.github.drafts = [draft(437, [419, 1501])];
-  assert.match((await h.poll())[0], /dropped this stack again[^]*so far: 2 plain/, "the second plain drop escalates");
-  for (const head of ["5e5e5e5", "6f6f6f6"]) {
-    h.github.open = [listed(prUrl(1501), { ...step2, headSha: head }, "Add TUC-1 [plugin] Step two")];
-    h.scripts.ready = { stacks: [{ action: `ready:1501@${HEAD},${head}`, top: 1501, branch: "mtuchel/tuc-1-b", prs: [419, 1501], expect: `419@${HEAD},1501@${head}`, tickets: ["TUC-1"], result: "candidate" }], drops: [] };
-    assert.deepEqual(await h.backstop(), [], head);
-    assert.deepEqual(h.scripts.runs, [`${READY_RUN} --exclude 419 --exclude 1501`], head);
-  }
+  assert.match(promptOf(await h.poll()) ?? "", /This is genuine drop 1 of this range; every genuine drop gets this fix request\./, "the drop of the range goes to the agent");
+  h.scripts.ready = { stacks: [{ action: `ready:1501@${HEAD},5e5e5e5`, top: 1501, branch: "mtuchel/tuc-1-b", prs: [419, 1501], expect: `419@${HEAD},1501@5e5e5e5`, tickets: ["TUC-1"], result: "candidate" }], drops: [] };
+  assert.deepEqual(await h.backstop(), [], "held at the heads the drop left");
+  assert.deepEqual(h.scripts.runs, [`${READY_RUN} --exclude 419 --exclude 1501`]);
+  h.github.open = [listed(prUrl(1501), { ...step2, headSha: "6f6f6f6" }, "Add TUC-1 [plugin] Step two")];
+  await h.backstop();
+  assert.deepEqual(h.scripts.runs, [`${READY_RUN} --exclude 419`], "the member's new head releases it; the dropped head still holds");
 });
 
 test("a refused enqueue goes to the agent once per refusal, and is skipped until the change that fixes it", async (t) => {
@@ -1842,7 +1927,7 @@ test("a drop whose code could not be compared stays out of both enqueue paths an
   h.scripts.judgment = { ...FLAKY, revision: { state: "unknown", reason: "the queue's draft could not be read" } };
   const prompt = promptOf(await h.poll()) ?? "";
   assert.match(prompt, /Paseo did not re-enqueue it: it could not prove that the range is still the code that dropped \(the queue's draft could not be read\), and it leaves the range alone until one of its heads changes\./);
-  assert.match(prompt, /Not the stack's fault \(flaky: [^)]*\)[^]*This drop counts as plain drop 1 of 1/);
+  assert.match(prompt, /Not the stack's fault \(flaky: [^)]*\)[^]*Drops of this range so far: 1 plain, 0 conflict-only, 0 main-broken\./);
   h.scripts.ready = { stacks: [STACK], drops: [] };
   for (const step of ["backstop", "restart"]) {
     if (step === "restart") await h.restart();
@@ -1909,7 +1994,7 @@ test("after a restart the enqueue bullet, also stamped in the same minute, and a
     bullets.add(running(437), REMOVED);
     h.github.drafts = [draft(437, [419])];
     await h.restart();
-    assert.match(promptOf(await h.poll()) ?? "", /This is automatic fix request 1 of 1/, String(stamp));
+    assert.match(promptOf(await h.poll()) ?? "", /This is genuine drop 1 of this range/, String(stamp));
     const calls = await h.backstop();
     assert.equal(count(calls, "enqueue "), 0, `${stamp}: reconciled as enqueued`);
     assert.equal(count(calls, `comment ${ENQUEUED}`), 1, `${stamp}: its ticket comment`);
@@ -2066,41 +2151,46 @@ test("one queue draft that tested two independent stacks gives each its own re-e
   assert.match(h.github.comments[1600][0], /<!-- queue-backstop:drop:#450:1600 -->$/);
 });
 
-test("a range counts as its most-dropped pull request: a plain drop or an escalation of another member keeps the re-enqueue away", async (t) => {
+test("a range member's plain drop escalates nothing: the next drop is handled like any other, and an escalated member still holds the range (AC-1, AC-6)", async (t) => {
   const log = t.mock.method(console, "error", () => {});
-  for (const before of [{ drops: ["#436"] }, { escalated: true }]) {
-    const h = harness(t);
-    const step2 = { ...READY, headSha: "5e5e5e5", headBranch: "mtuchel/tuc-1-b", baseBranch: "mtuchel/tuc-1-fix", mergeActivity: activity(QUEUED, running(437), REMOVED) };
-    h.github.open = [listed(prUrl(1501), step2, "Add TUC-1 [plugin] Step two")];
-    h.github.views[prUrl(1501)] = step2;
-    await h.state({ [prUrl(1501)]: { reviewedAt: null, decision: null, merged: false, ...before } });
-    h.github.view = { ...READY, mergeActivity: activity(QUEUED, running(437), REMOVED) };
-    h.github.drafts = [draft(437, [419, 1501])];
-    h.scripts.judgment = { ...FLAKY, revision: { ...SAME, branch: "mtuchel/tuc-1-b", expect: `419@${HEAD},1501@5e5e5e5` } };
-    const calls = await h.poll();
-    if ("drops" in before) assert.match(calls[0], /dropped this stack again[^]*so far: 2 plain, 0 conflict-only\./, "the second plain drop of the range goes to the owner");
-    else {
-      assert.deepEqual(calls, []);
-      assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /whose range already escalated to the owner/);
-    }
-    assert.equal(count(await h.backstop(), "enqueue "), 0, JSON.stringify(before));
-    assert.deepEqual(h.scripts.runs, [`${READY_RUN} --exclude 419 --exclude 1501`], `${JSON.stringify(before)}: the whole range escalated`);
-  }
+  const step2 = { ...READY, headSha: "5e5e5e5", headBranch: "mtuchel/tuc-1-b", baseBranch: "mtuchel/tuc-1-fix", mergeActivity: activity(QUEUED, running(437), REMOVED) };
+  // One earlier plain drop of another member: the range's flaky drop is re-enqueued like the first.
+  const counted = harness(t);
+  counted.github.open = [listed(prUrl(1501), step2, "Add TUC-1 [plugin] Step two")];
+  counted.github.views[prUrl(1501)] = step2;
+  await counted.state({ [prUrl(1501)]: { reviewedAt: null, decision: null, merged: false, drops: ["#436"] } });
+  counted.github.view = { ...READY, mergeActivity: activity(QUEUED, running(437), REMOVED) };
+  counted.github.drafts = [draft(437, [419, 1501])];
+  counted.scripts.judgment = { ...FLAKY, revision: { ...SAME, branch: "mtuchel/tuc-1-b", expect: `419@${HEAD},1501@5e5e5e5` } };
+  assert.deepEqual(await counted.poll(), [], "nothing for the agent: the drop was not the stack's fault");
+  assert.equal(count(await counted.backstop(), "enqueue "), 1, "the range is enqueued again, whatever the member's count");
+  // A member escalated after it waited out the owner's answer holds the whole range, as before.
+  const escalated = harness(t);
+  escalated.github.open = [listed(prUrl(1501), step2, "Add TUC-1 [plugin] Step two")];
+  escalated.github.views[prUrl(1501)] = step2;
+  await escalated.state({ [prUrl(1501)]: { reviewedAt: null, decision: null, merged: false, escalated: true } });
+  escalated.github.view = { ...READY, mergeActivity: activity(QUEUED, running(437), REMOVED) };
+  escalated.github.drafts = [draft(437, [419, 1501])];
+  escalated.scripts.judgment = { ...FLAKY, revision: { ...SAME, branch: "mtuchel/tuc-1-b", expect: `419@${HEAD},1501@5e5e5e5` } };
+  assert.deepEqual(await escalated.poll(), []);
+  assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /whose range escalated to the owner already/);
+  assert.equal(count(await escalated.backstop(), "enqueue "), 0);
+  assert.deepEqual(escalated.scripts.runs, [`${READY_RUN} --exclude 419 --exclude 1501`], "the whole range stays out");
 });
 
-test("a range member's two plain drops from before drops had kinds, without the escalation flag, route the range's next plain drop to the owner", async (t) => {
+test("two plain drops from before drops had kinds, without the escalation flag, escalate nothing: the next drop goes to the agent (AC-1, AC-6)", async (t) => {
   const h = harness(t);
-  const step2 = { ...READY, headSha: "5e5e5e5", headBranch: "mtuchel/tuc-1-b", baseBranch: "mtuchel/tuc-1-fix", mergeActivity: activity(QUEUED, running(437), REMOVED) };
+  const step2 = { ...READY, headSha: "5e5e5e5", headBranch: "mtuchel/tuc-1-b", baseBranch: "mtuchel/tuc-1-fix" };
   h.github.open = [listed(prUrl(1501), step2, "Add TUC-1 [plugin] Step two")];
   h.github.views[prUrl(1501)] = step2;
-  await h.state({ [prUrl(1501)]: { reviewedAt: null, decision: null, merged: false, drops: ["#435", "#436"] } });
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#435", "#436"] } });
   h.github.view = { ...READY, mergeActivity: activity(QUEUED, running(437), REMOVED) };
   h.github.drafts = [draft(437, [419, 1501])];
-  const calls = await h.poll();
-  assert.equal(promptOf(calls), undefined);
-  assert.match(calls[0] ?? "", /dropped this stack again[^]*so far: 3 plain, 0 conflict-only\./, "the owner is asked to take over");
-  assert.equal(count(await h.backstop(), "enqueue "), 0);
-  assert.deepEqual(h.scripts.runs, [`${READY_RUN} --exclude 419 --exclude 1501`], "the whole range escalated");
+  h.scripts.judgment = { ...FLAKY, revision: { state: "unknown", reason: "no queue draft" } };
+  const prompt = promptOf(await h.poll()) ?? "";
+  assert.match(prompt, /Drops of this range so far: 3 plain, 0 conflict-only, 0 main-broken\./);
+  assert.match(prompt, /Re-enqueue the dropped queue range from its top branch/);
+  assert.doesNotMatch(prompt, /take over|next plain drop goes to the owner/);
 });
 
 test("the ticket comment of an enqueue is looked up by its mark before it goes out: a lost answer never doubles it, and one that never went out is posted after a restart", async (t) => {
@@ -3386,7 +3476,6 @@ test("TUC-1265: a hold anywhere on the stack defers its connected repair without
   const holds: [string, (h: ReturnType<typeof harness>) => Promise<void> | void][] = [
     ["a veto on another member", (h) => { stackOf(h, 2, { labels: ["do-not-merge"] }, RED); }],
     ["an explicit drop escalation", (h) => h.state({ [prUrl(417)]: { ...member, escalated: true } })],
-    ["a legacy third drop", (h) => h.state({ [prUrl(417)]: { ...member, drops: ["#1", "#2", "#3"] } })],
     ["a pending drop message", (h) => h.state({ [prUrl(417)]: { ...member, pending: { key: "#9", reason: "conflict", facts: "", fix: "Restack." } } })],
     ["a head held after a genuine drop", (h) => h.state({ [prUrl(417)]: { ...member, blockedAt: "head0" } })],
     ["an unreadable member", (h) => { h.github.broken.push(prUrl(417)); }],

@@ -226,8 +226,11 @@ export type DropClass = (typeof DROP_CLASSES)[number];
 // range's current heads, lowest first (`<pr>@<sha>,…`), set for `same` and `changed`; `branch`: the
 // head branch of its highest pull request.
 export type Revision = { state: "same" | "changed" | "unknown"; draft: number | null; branch: string | null; expect: string | null; reason: string };
-// A failed check on the queue's draft.
-export type DropFailure = { check: string; conclusion: string; url: string };
+// A failed check on the queue's draft: its job name, the conclusion, its run and the failing tests
+// the script read (the title annotations' display lines, else the log digest) with their test ids
+// (the annotation titles, empty when the tests came from the log); both name the drop's signature
+// and the queue blocker (`Queue blocker id: <test id, else job family>`).
+export type DropFailure = { check: string; conclusion: string; url: string; tests: string[]; testIds: string[] };
 export type DropJudgment = {
   result: "dropped";
   reason: string;
@@ -281,7 +284,7 @@ export function parseJudgment(output: ScriptOutput): RoundJudgment {
   const revision = parseRevision(found.revision);
   if (!DROP_CLASSES.includes(kind as DropClass) || typeof found.requeue !== "boolean" || !revision) throw new BackstopScriptError(`${WAIT_QUEUE} answered a drop without a class, requeue or revision`);
   const failures = (Array.isArray(found.failures) ? found.failures : []).map(record).filter((item): item is Record<string, unknown> => item !== null)
-    .map((item) => ({ check: text(item.check) || "check", conclusion: text(item.conclusion) || "failure", url: text(item.url) }));
+    .map((item) => ({ check: text(item.check) || "check", conclusion: text(item.conclusion) || "failure", url: text(item.url), tests: texts(item.tests), testIds: texts(item.testIds) }));
   return {
     result: "dropped",
     reason: text(found.reason),
@@ -482,13 +485,13 @@ export const CLASS_TEXT: Record<DropClass, string> = {
 const pullList = (repo: string, prs: number[]) => prs.map((pr) => `[#${pr}](https://github.com/${repo}/pull/${pr})`).join(", ");
 
 // The opening line of a drop re-enqueue's comments: the kind, the evidence, the queue run, why the
-// code is the code that dropped (`unchanged`) and how the drop counts (`count`).
-export function dropWhy(repo: string, judgment: DropJudgment, unchanged: string, count: string): string {
+// code is the code that dropped (`unchanged`) and what the drop asks for (`note`).
+export function dropWhy(repo: string, judgment: DropJudgment, unchanged: string, note: string): string {
   const run = judgment.queueDraft === null ? "" : ` ([queue run #${judgment.queueDraft}](https://github.com/${repo}/pull/${judgment.queueDraft}))`;
   return [
     `The merge queue dropped this range${run}, and it was not the stack's fault: ${CLASS_TEXT[judgment.class]}.`,
     ...judgment.evidence.map((line) => `- ${line}`),
-    `The code is unchanged since the drop (${unchanged}). ${count}`,
+    `The code is unchanged since the drop (${unchanged}). ${note}`,
   ].join("\n");
 }
 
