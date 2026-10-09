@@ -235,7 +235,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // the agent (see `started`). A start or a live agent moves the record to it, as
   // SessionRouter.succeed does. `idle`: what SessionRouter.whileIdle finds for the ticket (its
   // work runs only when `ran`).
-  const paseo: { answer: () => Promise<Outcome>; send: () => Promise<void>; session: () => Promise<unknown>; succeed: (claim: () => Promise<void>) => Promise<Succession>; idle: (issueId: string) => Promise<IdleRun<unknown>["outcome"]> } = {
+  const paseo: { answer: (agentId?: string) => Promise<Outcome>; send: () => Promise<void>; session: () => Promise<unknown>; succeed: (claim: () => Promise<void>) => Promise<Succession>; idle: (issueId: string) => Promise<IdleRun<unknown>["outcome"]> } = {
     answer: async () => (agent.live ?? true) ? "sent" : "gone",
     send: async () => {},
     session: async () => ({ sessionId: "s" }),
@@ -261,7 +261,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       say: async (_id, kind, text) => { calls.push(`say ${kind} ${text.split("\n")[0]}`); },
       link: async (_id, label, url) => { calls.push(`session link ${label} ${url}`); },
       prompt: daemon ? (agentId, text, onDispatch, recovery) => daemon.router.prompt(agentId, text, onDispatch, recovery) : async (agentId, text, onDispatch) => {
-        const outcome = await paseo.answer();
+        const outcome = await paseo.answer(agentId);
         if (outcome !== "sent") return outcome;
         await onDispatch?.();
         await paseo.send();
@@ -4076,6 +4076,40 @@ test("at most three Done tickets are reopened per poll", async (t) => {
   const rest = await h.poll();
   assert.equal(count(rest, "reopen"), 1, "the fourth follows on the next poll");
   assert.deepEqual(await h.poll(), [], "then nothing");
+});
+
+// Seen live on 2026-10-09: three reopened tickets whose agents were busy held their notices, and
+// counting those undelivered notices used up every later poll, so no other ticket was reopened or
+// asked again. A notice that did not go out keeps waiting without holding the others back.
+test("busy agents' undelivered policy messages do not use up the poll for the other tickets", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const build = (state: { status: string; statusType: string }) => {
+    const h = harness(t);
+    const [first] = h.records;
+    h.records.length = 0;
+    for (const index of [0, 1, 2, 3]) {
+      const urls = [0, 1, 2, 3].map((part) => prUrl(500 + index * 10 + part));
+      const now = new Date().toISOString();
+      urls.forEach((url, part) => {
+        h.github.views[url] = { ...OPEN_PR, isDraft: true, updatedAt: now, lastCommitAt: now, headBranch: `mtuchel/tuc-${index + 1}-${part}`, headSha: `head${index}${part}` };
+        h.github.open.push(listed(url, h.github.views[url], `Fix TUC-${index + 1} [plugin] Part ${part + 1}`));
+      });
+      h.records.push({ ...first, issueId: `i${index}`, identifier: `TUC-${index + 1}`, agentId: `a${index + 1}`, branch: `mtuchel/tuc-${index + 1}-3`, links: { "Pull request": urls[3] } });
+      h.linear.byIssue[`i${index}`] = { ...state };
+    }
+    h.github.view = { ...OPEN_PR, state: "CLOSED" };
+    h.linear.completedAt = "2026-10-09T08:00:00.000Z";
+    // The first three agents are busy; the fourth takes messages.
+    h.paseo.answer = async (agentId?: string) => (agentId === "a4" ? "sent" : "busy");
+    return h;
+  };
+  const reopen = build({ status: "Done", statusType: "completed" });
+  assert.equal(count(await reopen.poll(), "reopen"), 3, "the moves of the first three count");
+  const next = await reopen.poll();
+  assert.equal(count(next, "reopen"), 1, "the busy agents' pending notices do not hold the fourth ticket back");
+  assert.equal(count(next, "prompt a4"), 1, "and the fourth ticket's agent gets its notice");
+  const cap = build({ status: "In Progress", statusType: "started" });
+  assert.equal(count(await cap.poll(), "prompt a4"), 1, "an over-cap stack behind three busy agents is asked in the same poll");
 });
 
 test("a Done ticket's reopen reaches an archived agent as a successor and a crashed one with its restart", async (t) => {

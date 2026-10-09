@@ -3139,7 +3139,10 @@ export class PullRequestWatch {
       }
       const claim = async () => { reopen.sending = true; await save(); };
       await this.policySend(record, reopen.message, "land the pull requests of its stack that are still open", claim, async () => { reopen.message = undefined; reopen.sending = undefined; await save(); }, reserved, seenByUrl);
-      acted = true;
+      // Only a notice that went out (or is with a restart, successor or the ticket) counts toward
+      // POLICY_PER_POLL: a busy or reserved agent keeps its notice for a later poll without holding
+      // the other Done tickets back.
+      if (reopen.message === undefined || reopen.sending) acted = true;
     }
     return acted;
   }
@@ -3179,7 +3182,8 @@ export class PullRequestWatch {
           await writeState(this.policyPath, this.policy).catch(() => {});
           throw error;
         }
-        asked++;
+        // Counted only once claimed: a busy or reserved agent does not use up the poll's budget.
+        if (ticket.cap === signature) asked++;
       } catch (error) {
         console.error(`[linear-tickets] ${record.identifier}: the stack cap message failed: ${error instanceof Error ? error.message : error}`);
       }
