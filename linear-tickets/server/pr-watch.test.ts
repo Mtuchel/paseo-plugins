@@ -168,6 +168,7 @@ const MAIN_BROKEN: Judgment = {
 // `probe`: the cheap first look the poll goes through (see ConditionalPullView); without one the
 // injected `view` is the whole read, as for the tests that predate it.
 function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean } = {}, probe?: PullViewSource) {
+  const waits = { runs: 0, failure: null as Error | null };
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open under `title`; `views`: other pull requests
   // by URL, and `open` the listing's other entries; `deleted`: branches gone; `throttle`: pull
@@ -419,6 +420,9 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         return answer(next.code, next.answer);
       },
     },
+    // The waits the plugin recorded for the owner (writeback.ts, reconcileWaiting): every poll
+    // checks them; `waitsFailing` makes that check fail.
+    ownerWaits: { reconcileWaiting: async () => { waits.runs++; if (waits.failure) throw waits.failure; } },
   }, join(home, "pr-watch.json")));
   let watch = create();
   const poll = async () => {
@@ -449,7 +453,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     await writeFile(path, value);
     return value;
   };
-  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, home: () => directory, watch: () => watch };
+  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, waits, home: () => directory, watch: () => watch };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -3740,4 +3744,17 @@ test("TUC-1265: members compare by repo and number whatever the URL's spelling, 
   orphan.github.open = [listed(prUrl(417), orphan.github.views[prUrl(417)], "Fix TUC-1 [plugin] Part 1"), listed(prUrl(440), { ...READY, ...RED, headBranch: CHAIN_BRANCHES[1], baseBranch: CHAIN_BRANCHES[0] }, "Fix TUC-1 [plugin] From a fork", "someone/tuchel-platform")];
   assert.deepEqual(await orphan.poll(), [], "with the repo's own parent gone, a fork's same-named branch is no parent");
   assert.ok(!orphan.github.reads.includes(prUrl(440)));
+});
+
+test("every poll checks the waits the plugin recorded for the owner; a failure there is logged and never ends the poll", async (t) => {
+  const errors = t.mock.method(console, "error", () => {});
+  const h = harness(t);
+  await h.poll();
+  assert.equal(h.waits.runs, 1);
+  await h.poll();
+  assert.equal(h.waits.runs, 2);
+  h.waits.failure = new Error("Linear is unreachable");
+  await h.poll();
+  assert.equal(h.waits.runs, 3);
+  assert.ok(errors.mock.calls.some((call) => /closing left-behind owner waits failed: Linear is unreachable/.test(String(call.arguments[0]))));
 });

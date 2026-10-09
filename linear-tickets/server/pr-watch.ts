@@ -980,6 +980,10 @@ export class PullRequestWatch {
       outage?: Pick<GreptileOutage, "follow" | "sync">;
       // The silent-agent watchdog (watchdog.ts): it runs first in every poll.
       watchdog?: Pick<Watchdog, "pass" | "stop">;
+      // The waits the plugin recorded for the owner whose ending event was lost (writeback.ts,
+      // reconcileWaiting): checked every poll, after the watchdog, so a ticket the plugin parked in
+      // Needs input is never left there once no live agent can end the wait.
+      ownerWaits?: { reconcileWaiting: () => Promise<void> };
       // The ticket states crash recovery last saw (known-states.ts); the daemon passes the one the
       // plugin's own state writes feed. Absent: known-states.json next to pr-watch.json.
       knownStates?: KnownStates;
@@ -1326,6 +1330,19 @@ export class PullRequestWatch {
         } catch (error) {
           if (error instanceof RateLimitedError) throw error;
           console.error(`[linear-tickets] watchdog: ${error instanceof Error ? error.message : error}`);
+        }
+      });
+    }
+    // Waits the plugin recorded for the owner, whose ending event was lost (writeback.ts): the
+    // ticket would stay in Needs input under its label with nothing waiting, so each poll closes
+    // the ones no live agent can end. Its own failures are logged; they never end the poll.
+    if (this.deps.ownerWaits) {
+      await pass(async () => {
+        try {
+          await this.deps.ownerWaits!.reconcileWaiting();
+        } catch (error) {
+          if (error instanceof RateLimitedError) throw error;
+          console.error(`[linear-tickets] closing left-behind owner waits failed: ${error instanceof Error ? error.message : error}`);
         }
       });
     }

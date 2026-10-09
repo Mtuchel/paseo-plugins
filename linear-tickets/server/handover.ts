@@ -12,10 +12,18 @@ const exec = promisify(execFile);
 const MAX_SUMMARY = 1_500;
 const KEPT_SUMMARIES = 3;
 
+// What opened a waiting period: a question or permission request ("request"), which ends when
+// nothing is pending any more, or a turn that ended by asking the owner ("turn-end"), which ends
+// when the agent's next turn starts or the agent itself is gone.
+export type WaitingKind = "request" | "turn-end";
+
 // While an agent waits for an answer or approval: the state the ticket left for "Needs input"
 // (restored afterwards) and the mention comment edited for each further question. A ticket already
 // closed stays closed: the wait lives in a "Needs you" sub-issue (`subIssueId`), which holds the comment.
-export type WaitingPeriod = { previousStateId: string | null; commentId: string | null; subIssueId?: string | null };
+// `kind` and `at` describe what opened the period and when it last opened, so writeback can tell a
+// wait whose ending event was lost (a question killed with its agent's process, a reload in
+// between) from a live one.
+export type WaitingPeriod = { previousStateId: string | null; commentId: string | null; subIssueId?: string | null; kind?: WaitingKind; at?: string };
 export type HandoverStatus = "working" | "waiting" | "finished" | "failed" | "archived";
 export type HandoverRecord = {
   issueId: string;

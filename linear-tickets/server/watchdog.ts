@@ -222,6 +222,14 @@ export class WatchdogStore {
     return historyOf(ticket, now);
   }
 
+  // The tickets this host forwarded to the peer (with the time of the hand-over): their local
+  // records are no longer this host's to recover, and a wait recorded here for one of them is the
+  // peer's plugin's to end (writeback.ts, the left-behind waits).
+  async handedOver(): Promise<Map<string, string>> {
+    const tickets = (await this.read()).tickets;
+    return new Map(Object.entries(tickets).flatMap(([issueId, ticket]) => ticket.transferredAt ? [[issueId, ticket.transferredAt] as const] : []));
+  }
+
   // A ticket handed over from the peer: its history is taken over before anything starts here.
   adopt(issueId: string, identifier: string, value: unknown, timings: WatchdogTimings, now = Date.now()): Promise<"imported" | "quarantined"> {
     return this.update((file) => importHistory(file, issueId, identifier, value, now, timings));
