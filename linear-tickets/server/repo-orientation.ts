@@ -30,6 +30,11 @@ export function scoutNote(provider: string): string {
   return `If your harness offers read-only exploration subagents, then after brief inline scoping delegate broad exploration of unfamiliar code to them ${SCOUT_RULES}`;
 }
 
+// TUC-665: a sample of first package lookups showed behavior questions answered from installed
+// package files where the repository's instructions already point at documentation first. This
+// restates that existing rule at the decision point; it adds no obligation and enforces nothing.
+const LIBRARY_LOOKUP = "Library behavior lookup: where this repository's applicable instructions already require documentation-first, distinguish behavior questions from exact installed signature/version checks before inspecting installed package files. Follow those instructions' documentation pointer for behavior; where `docs/libraries.md` is the registry, use its Docs entry. Documentation-first means returned content relevant to the question, not merely an ID resolution, registry/skill read or bundled-doc filename listing. Use version-matched bundled docs when the repository directs you there. Exact installed signatures/options/versions may use `.d.ts` or `package.json` directly where the applicable instructions allow it. Preserve the repository's no-pointer exceptions and failure/refusal fallbacks; do not import another repository's registry or invent an obligation. When relying on earlier parent documentation for a delegated lookup, pass the relevant content and provenance; otherwise the helper performs whatever lookup its own applicable instructions require. Unrelated, later or unpassed parent docs are not evidence of documentation-first.";
+
 // Only the ticket's own words: title, description, labels and comments (not related tickets).
 export function ticketWords(detail: Pick<TicketDetail, "issue" | "context">): Ticket {
   let comments: string[] = [];
@@ -109,7 +114,7 @@ export async function guidePaths(cwd: string): Promise<string[]> {
 // Never throws: a launch without the guide list is still a launch. Emits only repository paths
 // and headings, never ticket text.
 export async function repoOrientation(input: { cwd: string | null; git: boolean; provider: string; detail: Pick<TicketDetail, "issue" | "context"> }): Promise<{ note: string; warnings: string[] }> {
-  const scout = scoutNote(input.provider);
+  const scout = [scoutNote(input.provider), LIBRARY_LOOKUP].join("\n\n");
   if (!input.git || !input.cwd) return { note: scout, warnings: [] };
   let paths: string[];
   try {

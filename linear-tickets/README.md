@@ -471,8 +471,9 @@ in total are downloaded; a failed or skipped file becomes a launch warning, neve
 
 ## Repository orientation
 
-Every launch adds two things to the instructions, so the agent neither hunts for the
-repository's area guides nor fills its own context with exploration:
+Every launch adds three things to the instructions, so the agent neither hunts for the
+repository's area guides nor fills its own context with exploration, and meets the library lookup
+rule where it decides:
 
 - **Domain guides.** In a Git project, the plugin lists the checkout's tracked `AGENTS.md`
   files (all but the root one) with each guide's first `# ` heading. Guides the ticket names are
@@ -488,10 +489,21 @@ repository's area guides nor fills its own context with exploration:
   Explore subagent; others: whatever their harness offers), asks them to cite the file and line
   behind each claim, checks every claim it acts on in that file, and reads the files it changes
   itself.
+- **Library behavior lookup.** A reminder that applies only where the repository's own
+  instructions already require documentation first (for example a `docs/libraries.md` registry
+  with a Docs entry per library): behavior questions go to that documentation, and only returned
+  content relevant to the question counts, not an ID resolution, a registry read or a bundled-doc
+  file listing. Exact installed signatures, options and versions may still come from `.d.ts` or
+  `package.json` where those instructions allow it, and the repository's no-pointer exceptions and
+  failure fallbacks stay. A helper reuses its parent's documentation lookup only when the parent
+  passes the relevant content and its source. The reminder restates the existing rule (TUC-665);
+  no read is intercepted or refused, and nothing checks compliance.
 
 A guide that cannot be read is listed without its heading, and a failed `git ls-files` drops
-the list; both become a launch warning, never a failure. Non-Git projects get the scout
-sentence only.
+the list; both become a launch warning, never a failure. Non-Git projects get the scout and
+library-lookup notes only. The notes reach new ticket agents (including a new agent continuing a
+ticket) under the default and any custom prompt template, since both always carry the
+instructions; already-running agents and their helpers do not receive them.
 
 ## Native Linear agent
 
