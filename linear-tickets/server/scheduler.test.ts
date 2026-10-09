@@ -51,6 +51,25 @@ test("the project with fewer agents working gets the next slot, then priority, u
   assert.equal((await noneLast.admit(none, paseo, max(1))).ok, false);
 });
 
+// Seen live on 2026-10-09: two queue blockers in the busiest project waited behind every lighter
+// project while main was red and the queue held every stack.
+test("a queue blocker takes the next free slot ahead of a lighter project, urgency, age and the night order, but still waits for one", async () => {
+  const blocker = ticket("TUC-1832", { queueBlocker: true, priority: 4, createdAt: "2026-10-09T13:19:00Z" });
+  const lighter = ticket("TUC-2", { projectId: "web", priority: 1, createdAt: "2025-01-01T00:00:00Z", attended: true });
+  const { instance } = scheduler([{ issueId: "r1", projectId: "erp" }, { issueId: "r2", projectId: "erp" }]);
+  instance.note([lighter, blocker]);
+  assert.equal((await instance.admit(lighter, paseo, max(3))).ok, false, "the lighter project's urgent, older ticket waits");
+  assert.deepEqual(await instance.admit(blocker, paseo, max(3)), { ok: true });
+
+  const { instance: away } = scheduler([], true);
+  const cheap = impl("TUC-3", "cheap", { createdAt: "2025-01-01T00:00:00Z" });
+  away.note([cheap, blocker]);
+  assert.deepEqual(await away.admit(blocker, paseo, max(1)), { ok: true }, "ahead of the night order too");
+
+  const { instance: full } = scheduler([{ issueId: "r1", projectId: "erp" }]);
+  assert.deepEqual(await full.admit(blocker, paseo, max(1)), { ok: false, reason: "Queued: 1 of 1 ticket agents are working. It starts when one finishes." }, "a full limit holds it");
+});
+
 test("while the owner is away a cheap implementation goes first, then a standard one, then the rest", async () => {
   const strong = impl("TUC-1", "strong", { priority: 1, createdAt: "2025-01-01T00:00:00Z" });
   const planning = ticket("TUC-2", { priority: 1, createdAt: "2024-01-01T00:00:00Z", night: { planReady: false, tier: null } });

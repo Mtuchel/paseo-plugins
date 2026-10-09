@@ -8,6 +8,9 @@ import { planPolicy } from "./plan-policy";
 // ticket asks here: threads waiting their turn, labelled tickets and project tickets. Each ask
 // registers the ticket as waiting; while slots are short, the waiting tickets are ranked and only
 // the first ones are admitted:
+// 0. a queue blocker (tuchel-platform's `queue-blocker-alert.mjs` ticket, `queueBlocker`) first:
+//    while it waits, every stack's merge-queue run waits with it, so it takes the next free slot
+//    ahead of every other ticket, whatever its project's load or the night order;
 // 1. while the owner is away, the night class first (see Night): a ticket whose approved plan
 //    implements on the cheap tier, then one on the standard tier, then the rest — so the work that
 //    can finish without the owner starts first. The class only orders the line; nothing waits
@@ -38,6 +41,8 @@ export function nightInput(labelNames: readonly string[], record: TierRecord | n
 // `blocked` tickets never ask: their blockers are checked before.
 export type Candidate = {
   issueId: string; identifier: string; projectId: string | null; priority: number; unblocks: number; createdAt: string; attended?: boolean;
+  // A queue blocker (IssueState.queueBlocker) ranks ahead of everything (rankWaiting); absent: not one.
+  queueBlocker?: boolean;
   // While the owner is away this ticket's night class decides first (see rankWaiting); absent:
   // class 2.
   night?: Night;
@@ -75,7 +80,8 @@ export function rankWaiting(waiting: Candidate[], load: Map<string | null, numbe
   const left = [...waiting];
   const picked: Candidate[] = [];
   while (picked.length < slots && left.length) {
-    left.sort((a, b) => (away ? nightClass(a) - nightClass(b) : 0)
+    left.sort((a, b) => Number(Boolean(b.queueBlocker)) - Number(Boolean(a.queueBlocker))
+      || (away ? nightClass(a) - nightClass(b) : 0)
       || (loads.get(a.projectId) ?? 0) - (loads.get(b.projectId) ?? 0)
       || Number(Boolean(b.attended)) - Number(Boolean(a.attended))
       || (a.priority || 5) - (b.priority || 5)

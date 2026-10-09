@@ -128,7 +128,7 @@ test("the status batch asks for exactly the rows of its chunk (AC-11): two ids s
 // TUC-1684: the queue's batch decides admission on the same parsed fields as a single read.
 test("the admission batch parses a ticket exactly as issueState does, once per id, and leaves out tickets Linear does not return", async () => {
   const node = {
-    id: "i1", identifier: "TUC-1", priority: 2, createdAt: "2026-10-01T00:00:00Z", state: { id: "s1", name: "Todo", type: "unstarted" }, project: { id: "p1" }, labels: { nodes: [{ id: "l1", name: "paseo" }] },
+    id: "i1", identifier: "TUC-1", title: "Queue blocker: PostgreSQL integration", priority: 2, createdAt: "2026-10-01T00:00:00Z", state: { id: "s1", name: "Todo", type: "unstarted" }, project: { id: "p1" }, labels: { nodes: [{ id: "l1", name: "paseo" }] },
     inverseRelations: { nodes: [
       { type: "blocks", issue: { id: "b1", identifier: "TUC-8", state: { name: "In Progress", type: "started" }, attachments: { nodes: [] } } },
       { type: "blocks", issue: { id: "b2", identifier: "TUC-9", state: { name: "Done", type: "completed" }, attachments: { nodes: [] } } },
@@ -146,7 +146,8 @@ test("the admission batch parses a ticket exactly as issueState does, once per i
   const batch = await linear.admissionStates(["i1", "gone", "i1"]);
   assert.deepEqual(asked, [["i1", "gone"]]);
   const read = batch.get("i1")!;
-  for (const field of ["id", "identifier", "status", "statusType", "projectId", "labels", "blockedBy", "priority", "createdAt", "unblocks"] as const) assert.deepEqual(read[field], single[field], field);
+  for (const field of ["id", "identifier", "status", "statusType", "projectId", "labels", "blockedBy", "priority", "createdAt", "unblocks", "queueBlocker"] as const) assert.deepEqual(read[field], single[field], field);
+  assert.equal(read.queueBlocker, true, "the alert's title prefix marks a queue blocker");
   assert.deepEqual(read.blockedBy, ["TUC-8"]);
   assert.equal(batch.has("gone"), false);
 });
