@@ -2246,6 +2246,29 @@ comment saying why; fix the cause and add the trigger label again. Stale `<label
 `<label>-failed` labels are repaired on their own (see **Repairing stale running and failed
 labels** under Projects).
 
+**Queue blockers are not skipped by a Linear budget pause.** A queue blocker is a ticket the
+merge queue's alert opens under `TUC-538` (tuchel-platform's `tools/ci/queue-blocker-alert.mjs`):
+titled `Queue blocker: …`, with `Queue blocker id: …` as its description's first line. Either
+marker identifies one, so a ticket whose title changed is still found. While background Linear
+work is paused (see [Rate limits](#rate-limits)), every poll still runs one small read filtered
+to tickets carrying the trigger label **and** a blocker marker, and starts one on sight — a
+blocker holds the merge queue for every stack until it is fixed. A blocker whose launch then
+failed on the pause (it carries `<label>-failed`) is picked up by a blocker-only pass of the
+label repair (see **Repairing stale running and failed labels** under Projects). Both run at
+**interactive** priority, the class ticket agents' own Linear work uses: they are admitted above
+the 5% kept for owner decisions and never spend it, and every other ticket keeps waiting for the
+background share. The filtered read is the poll's own `labeledIssues` query with the marker
+filter added, so a paused poll costs one extra request, and the blocker repair pass one more every
+two minutes (about 100 complexity points each at the pool's starting average — roughly 9,000
+points an hour between them at the default 60 s interval while the pause lasts).
+
+A failed start a later poll can pass — Linear refused the request (the budget pause or its
+hourly rate limit), answered a 5xx, or could not be reached — is not held against a blocker:
+the attempt is given back, so it does not count toward the failed start's three retries, and
+the ticket is retried after the current failed-start backoff without ever mentioning the owner.
+Only a start that fails on this host's setup stops the retries and mentions the owner once, as
+for any other ticket.
+
 Paseo gives plugin code its daemon connection only inside RPCs and lifecycle hooks, so
 polling starts at the first of these after the plugin loads: opening the ticket surface,
 saving a setting, or any agent or workspace activity on the host (agents resumed after a

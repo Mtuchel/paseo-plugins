@@ -26,6 +26,7 @@ import { Writeback } from "./writeback";
 
 const APP_TOKEN = "app-token";
 const ID_A = "3b241101-e2bb-4255-8caf-4136c566a962";
+const ID_B = "c7d3f6b0-6a41-4f2e-9b8d-2f5c1a0e77c4";
 const REQUESTS_LIMIT = 5_000;
 const POINTS_LIMIT = 2_000_000;
 // The budget every background fixture runs against: 19% of the points budget is below the 20%
@@ -145,13 +146,16 @@ function assertSent(f: Fixture, pool: Pool = "app"): void {
 
 // AC-2: the dispatch poll pauses with both pools at 19% of the points budget, and sends at 21%.
 // The mock clock keeps the timer `attach` arms from polling a second time behind the explicit tick.
-test("the dispatch poll pauses at 19% of the points budget and sends nothing; at 21% it reads", async (t) => {
+// A paused poll's one outgoing request is the queue-blocker read (README, "Auto-dispatch"): it is
+// admitted at interactive priority and its empty reply starts nothing.
+test("the dispatch poll pauses at 19% of the points budget and sends only the queue-blocker read; at 21% it reads the full one", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const low = fixture(t);
+  const low = fixture(t, () => ({ issues: { nodes: [] } }));
   bothAt(low, LOW_POINTS);
   const paused = dispatcher(low);
   await paused.tick();
-  assertPaused(low, "dispatch");
+  assert.deepEqual(low.calls, [{ pool: "app", operation: "labeledIssues" }], "the queue-blocker read is admitted at interactive priority");
+  assert.deepEqual(low.refusals, [["app", "dispatch", "background"]]);
   assert.match(paused.snapshot().lastError ?? "", /^paused:/);
 
   const high = fixture(t, () => ({ issues: { nodes: [] } }));
@@ -168,7 +172,8 @@ test("AC-1: at 3% of the points budget (4,500/5,000 requests) the dispatch poll 
   f.sample("key", 4_500, 60_000);
   const paused = dispatcher(f);
   await paused.tick();
-  assertPaused(f, "dispatch");
+  assert.deepEqual(f.calls, [], "no request reaches Linear");
+  assert.deepEqual(f.refusals, [["app", "dispatch", "background"], ["app", "queue-blocker", "interactive"]], "the queue-blocker read is admitted only above the 5% owner reserve");
   assert.match(paused.snapshot().lastError ?? "", /^paused: /);
 });
 
@@ -187,14 +192,15 @@ test("with the app at its reserve and the key free, the dispatch poll reads with
 
 // AC-4's no-fallback rule on the launch path: the read on one pool never spends the other's reserve.
 // The key at its reserve sends the background read back to the app (TUC-1684), and the launch
-// that would spend the key's last budget waits.
+// that would spend the key's last budget waits. The paused poll's queue-blocker read repeats the
+// app read at interactive priority; the key stays untouched.
 test("with the key at its reserve the dispatch poll still reads on the app and sends nothing with the key", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const f = fixture(t, () => ({ issues: { nodes: [{ id: ID_A, identifier: "ENG-1", priority: 0, team: { key: "ENG" }, labels: { nodes: [{ id: "l1", name: "paseo" }] } }] } }));
   f.sample("key", 100, HIGH_POINTS);
   const dispatch = dispatcher(f);
   await dispatch.tick();
-  assert.deepEqual(f.calls, [{ pool: "app", operation: "labeledIssues" }]);
+  assert.deepEqual(f.calls, [{ pool: "app", operation: "labeledIssues" }, { pool: "app", operation: "labeledIssues" }]);
   assert.match(dispatch.snapshot().lastError ?? "", /^paused:/);
 });
 
@@ -603,4 +609,114 @@ test("the crash check reads with the key when the app is at its reserve and is r
   f.sample("key", 100, HIGH_POINTS);
   await assert.rejects(withPriority("interactive", "crash-recovery", () => f.linear.issueStatusAnyPool(ID_A)), RateLimitedError);
   assert.deepEqual(f.calls, [], "nothing is sent past either reserve");
+});
+
+// The queue-blocker exception (README, "Auto-dispatch"): a queue-blocker ticket blocks the merge
+// queue for everyone, so a paused background poll still reads and starts it, at interactive
+// priority; every other labelled ticket keeps waiting for the background share.
+test("while background is paused, a queue blocker is polled and started at interactive priority and a ticket that is not one waits", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const started: string[] = [];
+  const blocker = { id: ID_A, identifier: "TUC-538-1", priority: 1, team: { key: "ENG" }, labels: { nodes: [{ id: "l1", name: "paseo" }] } };
+  const elsewhere = { id: ID_B, identifier: "ENG-2", priority: 0, team: { key: "ENG" }, labels: { nodes: [{ id: "l1", name: "paseo" }] } };
+  const filters: Record<string, unknown>[] = [];
+  const writes: string[] = [];
+  const f = fixture(t, (call, variables) => {
+    const issueId = String((variables.id ?? (variables.input as { issueId?: string } | undefined)?.issueId) ?? "");
+    if (call.operation === "addLabel" || call.operation === "removeLabel" || call.operation === "comment") writes.push(`${call.operation} ${issueId}`);
+    if (call.operation === "labeledIssues") {
+      const filter = variables.filter as Record<string, unknown>;
+      filters.push(filter);
+      return { issues: { nodes: filter.or ? [blocker] : [blocker, elsewhere] } };
+    }
+    if (call.operation === "labelByName") return { issueLabels: { nodes: [{ id: "l-running", name: "paseo-running" }] } };
+    if (call.operation === "addLabel") return { issueAddLabel: { success: true } };
+    if (call.operation === "removeLabel") return { issueRemoveLabel: { success: true } };
+    if (call.operation === "comment") return { commentCreate: { success: true, comment: { id: "c1" } } };
+    return {};
+  });
+  f.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  f.sample("key", PLENTY_REQUESTS, LOW_POINTS);
+  const dispatch = new Dispatcher({
+    linear: f.linear,
+    starter: { admission: async () => ({ ok: true as const }), start: async (issueId: string) => { started.push(issueId); return { agentId: "agent-1", warnings: [], provider: "claude", target: "repo", resumed: false, untrusted: false, plan: null }; } },
+    launcher: { gate: () => ({ release: () => {} }) },
+    settings: { read: async () => settings },
+    budget: f.budget,
+  });
+  dispatch.attach({ agents: { list: async () => ({ entries: [] }) } } as unknown as PaseoApi);
+  await dispatch.tick();
+  assert.deepEqual(started, [ID_A], "only the queue blocker started");
+  assert.ok(!writes.some((write) => write.endsWith(` ${ID_B}`)), `nothing touched the ticket that is not a blocker: ${writes.join(", ")}`);
+  assert.deepEqual(f.refusals, [["app", "dispatch", "background"]], "the normal poll paused at the background reserve");
+  assert.deepEqual(f.calls[0], { pool: "app", operation: "labeledIssues" }, "the blocker read ran at interactive priority, not on the paused path");
+  assert.deepEqual(filters, [{ labels: { some: { name: { eqIgnoreCase: "paseo" } } }, team: { key: { in: ["ENG"] } }, state: { type: { nin: ["completed", "canceled"] } }, or: [{ title: { startsWith: "Queue blocker:" } }, { description: { contains: "Queue blocker id:" } }] }], "the read is filtered to the queue-blocker markers");
+});
+
+// The retry side of the exception: a blocker whose launch lost the pause race carries
+// `paseo-failed`; the paused poll's blocker pass retries it at interactive priority instead of
+// waiting for the owner.
+test("while background is paused, a paseo-failed queue blocker is retried by the blocker repair pass at interactive priority", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const dir = await directory(t, "paseo-blocker-repair-");
+  const comments: string[] = [];
+  const restarts: string[] = [];
+  const f = fixture(t, (call, variables) => {
+    if (call.operation === "labeledIssues") return { issues: { nodes: [] } };
+    if (call.operation === "repairCandidates") return { issues: { nodes: [{ id: ID_A, identifier: "TUC-1", title: "Queue blocker: Image scan", state: { name: "Todo", type: "unstarted" }, project: null, labels: { nodes: [{ id: "l-failed", name: "paseo-failed" }] }, children: { nodes: [] } }], pageInfo: { hasNextPage: false, endCursor: null } } };
+    if (call.operation === "issueState") return ISSUE_STATE_REPLY;
+    if (call.operation === "labelByName") return { issueLabels: { nodes: [{ id: "l-running", name: "paseo-running" }] } };
+    if (call.operation === "addLabel") return { issueAddLabel: { success: true } };
+    if (call.operation === "removeLabel") return { issueRemoveLabel: { success: true } };
+    if (call.operation === "comment") { comments.push(String((variables.input as { body?: string } | undefined)?.body ?? "")); return { commentCreate: { success: true, comment: { id: "c1" } } }; }
+    return {};
+  });
+  f.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  f.sample("key", PLENTY_REQUESTS, LOW_POINTS);
+  const store = new ProjectStore(join(dir, "projects.json"));
+  // The failed launch's incident, due for its first retry.
+  await store.updateRepairs(() => ({ [ID_A]: { incident: "pause-1", identifier: "TUC-1", kind: "failed", state: "watching", attempts: 0, failedSince: new Date(f.clock.now - 11 * 60_000).toISOString(), log: [] } }));
+  const repairs = new LabelRepair({
+    linear: f.linear, store, launcher: { gate: () => ({ release: () => {} }), underWay: () => false },
+    restart: async (_issueId: string, identifier: string) => { restarts.push(identifier); return { kind: "started" as const, agentId: "agent-9", marked: false }; },
+    intake: { claimsReady: async () => true, claimFor: async () => null, pendingFor: async () => false },
+    now: f.now,
+  } as never);
+  const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }) } } as unknown as PaseoApi;
+  const dispatch = new Dispatcher({
+    linear: f.linear,
+    starter: { admission: async () => ({ ok: true as const }), start: async () => { throw new Error("nothing carries the trigger label"); } },
+    launcher: { gate: () => ({ release: () => {} }) },
+    settings: { read: async () => settings },
+    budget: f.budget,
+    repairs,
+  });
+  dispatch.attach(paseo);
+  await dispatch.tick();
+  assert.deepEqual(restarts, ["TUC-1"], "the retry ran while the background share stayed paused");
+  assert.deepEqual(f.refusals, [["app", "dispatch", "background"]]);
+  assert.deepEqual(f.calls[0], { pool: "app", operation: "labeledIssues" }, "the blocker poll's read is admitted at interactive priority; the same pool's background share is paused");
+  assert.ok(comments.some((body) => body.startsWith("Paseo started an agent for this ticket on retry 1 of 3")), comments.join(" | "));
+  assert.ok(!comments.some((body) => body.includes("profiles/")), "no owner mention");
+});
+
+// The blocker reads are filtered server-side, and a marker-filtered read marks every candidate,
+// so the retry rules apply without a further read.
+test("the queue-blocker repair reads filter on the markers and mark their candidates", async (t) => {
+  const filters: Record<string, unknown>[] = [];
+  const nodes = [
+    { id: ID_A, identifier: "TUC-1", title: "Queue blocker: Image scan", state: { name: "Todo", type: "unstarted" }, project: null, labels: { nodes: [{ id: "l1", name: "paseo-failed" }] }, children: { nodes: [] } },
+    { id: ID_B, identifier: "ENG-2", title: "Unrelated work", state: { name: "Todo", type: "unstarted" }, project: null, labels: { nodes: [{ id: "l2", name: "paseo-failed" }] }, children: { nodes: [] } },
+  ];
+  const f = fixture(t, (call, variables) => {
+    if (call.operation !== "repairCandidates") return {};
+    filters.push(variables.filter as Record<string, unknown>);
+    return { issues: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } };
+  });
+  const open = await f.linear.repairCandidates({ labels: ["paseo-failed"], teamKeys: ["ENG"], ids: [] });
+  assert.deepEqual(open.map((ticket) => [ticket.identifier, ticket.queueBlocker]), [["TUC-1", true], ["ENG-2", false]], "the title prefix marks a blocker on the unfiltered read");
+  const blockers = await f.linear.repairCandidates({ labels: ["paseo-failed"], teamKeys: ["ENG"], ids: [], queueBlockers: true });
+  assert.deepEqual(filters[1]?.or, [{ title: { startsWith: "Queue blocker:" } }, { description: { contains: "Queue blocker id:" } }], "the read is filtered to the markers");
+  assert.deepEqual(blockers.map((ticket) => [ticket.identifier, ticket.queueBlocker]), [["TUC-1", true], ["ENG-2", true]], "a marker-filtered read marks every candidate it returns");
 });
