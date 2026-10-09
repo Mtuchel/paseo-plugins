@@ -8,6 +8,7 @@ import { z } from "zod";
 import { githubCli } from "./github-cli";
 import type { GreptileOutage, RetriggerResult } from "./greptile-outage";
 import type { Handover, HandoverRecord } from "./handover";
+import { KnownStates, type KnownState } from "./known-states";
 import type { LinearService } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
 import { CODING_STATE } from "./plannotator";
@@ -23,7 +24,7 @@ import {
   type ActionRecord, type DropClass, type DropJudgment, type GitRunner, type PreparedRetarget, type Problem, type Refusal, type RetargetRecord, type ScriptRunner,
 } from "./queue-backstop";
 import { githubBudget, GitHubPausedError, RateLimitedError, withPriority, type GitHubBudget } from "./rate-budget";
-import type { PromptOutcome, Recovery, SessionRouter, Succession } from "./sessions";
+import { unverifiedResume, type PromptOutcome, type Recovery, type SessionRouter, type Succession } from "./sessions";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 import type { Watchdog } from "./watchdog";
@@ -758,9 +759,9 @@ async function writeState(path: string, value: unknown): Promise<void> {
   } finally { await rm(temporary, { force: true }); }
 }
 
-// Crash recovery per agent, in crash-recovery.json next to pr-watch.json. `restarts`: restarts
-// while none of the ticket's pull requests was open (nudges count theirs per stage); `escalated`:
-// the next crash after those went to the owner, so the agent is not restarted again then.
+// Crash recovery per agent, in crash-recovery.json next to pr-watch.json. `restarts`: every restart
+// of the agent so far, by the crash pass or with a pull request's message; `escalated`: the next
+// crash after STAGE_NUDGES of them went to the owner, so the agent is not restarted again then.
 // `resume`: what a restart has still to send, kept until it went out (at least once) or no
 // longer applies; `error`: the crash of the last restart.
 type Crash = { restarts?: number; escalated?: boolean; resume?: { text: string; issueId: string } | null; error?: string };
@@ -784,9 +785,10 @@ export class PullRequestWatch {
     private readonly deps: {
       handover: Pick<Handover, "all" | "update">;
       sessions: Pick<SessionRouter, "sessionFor" | "say" | "prompt" | "link" | "crashed" | "succeed" | "whileIdle">;
-      // `issueState` finds a ticket that has no handover record by its identifier, and tells
-      // whether a crashed agent's ticket is still started.
-      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "hasComment" | "viewerId" | "userUrl" | "linkUrl" | "issueState" | "issueAttachments">;
+      // `issueState` finds a ticket that has no handover record by its identifier. Crash recovery
+      // checks a crashed agent's ticket with `issueStatusAnyPool`, and keeps the states of all
+      // running agents' tickets known with one `issueStatuses` read per poll (see crashPass).
+      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "hasComment" | "viewerId" | "userUrl" | "linkUrl" | "issueState" | "issueAttachments" | "issueStatusAnyPool" | "issueStatuses">;
       // `tasks` finds the before-merge tasks of tickets that have no handover record.
       manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge"> & Partial<Pick<ManualTasks, "tasks">>;
       settings: Pick<Settings, "read">;
@@ -804,9 +806,16 @@ export class PullRequestWatch {
       outage?: Pick<GreptileOutage, "follow" | "sync">;
       // The silent-agent watchdog (watchdog.ts): it runs first in every poll.
       watchdog?: Pick<Watchdog, "pass" | "stop">;
+      // The ticket states crash recovery last saw (known-states.ts); the daemon passes the one the
+      // plugin's own state writes feed. Absent: known-states.json next to pr-watch.json.
+      knownStates?: KnownStates;
     },
     private readonly path = join(paseoHome(), "linear-tickets", "pr-watch.json"),
-  ) {}
+  ) {
+    this.knownStates = deps.knownStates ?? new KnownStates(join(dirname(path), "known-states.json"));
+  }
+
+  private readonly knownStates: KnownStates;
 
   start(): void {
     if (this.timer) return;
@@ -864,14 +873,18 @@ export class PullRequestWatch {
   }
 
   // How a message's send recovers a crashed agent: right before the reload the agent is reserved,
-  // `claim` records the attempt, and the resume is kept until it went out.
-  private recovery(record: HandoverRecord, reserved: Set<string>, claim: () => Promise<void>): Recovery {
+  // `claim` records the attempt, the restart is counted (see Crash) and the resume is kept until it
+  // went out. None for an agent whose crashes went to the owner: its send then comes to `crashed`.
+  // `unverified`: the ticket state the restart goes by could not be read just now (see crashPass).
+  private recovery(record: HandoverRecord, reserved: Set<string>, claim: () => Promise<void>, unverified?: KnownState): Recovery | undefined {
+    if (this.crashes[record.agentId]?.escalated) return undefined;
     return {
       issueId: record.issueId,
+      ...(unverified ? { unverified: { name: unverified.name, at: unverified.at } } : {}),
       before: async (resume, error) => {
         reserved.add(record.agentId);
         await claim();
-        await this.saveCrash(record.agentId, { resume: { text: resume, issueId: record.issueId }, error });
+        await this.saveCrash(record.agentId, { resume: { text: resume, issueId: record.issueId }, error, restarts: (this.crashes[record.agentId]?.restarts ?? 0) + 1 });
       },
     };
   }
@@ -1087,7 +1100,7 @@ export class PullRequestWatch {
       }
       return !stopped.paused && !stopped.budget && !stopped.throttled;
     };
-    // A rate limit in the crash passes ends the poll too; other failures are logged per agent.
+    // A rate limit in the watchdog's pass ends the poll's pull request work; other failures are logged.
     const pass = async (work: () => Promise<void>) => {
       try {
         await work();
@@ -1108,8 +1121,8 @@ export class PullRequestWatch {
         }
       });
     }
-    // Resumes left by an earlier restart go out first.
-    await pass(() => this.pendingResumes(all, reserved));
+    // Crash recovery comes next, whatever the watchdog's Linear budget came to (see crashPass).
+    await this.crashPass(all, reserved);
     // Stalled pull requests are nudged, and closed ones followed to their replacement, after every
     // drop was handled: a drop's fix request comes first when both are for the same agent.
     const nudges: { record: HandoverRecord; url: string; view: PullRequestView }[] = [];
@@ -1171,8 +1184,6 @@ export class PullRequestWatch {
         : () => this.replace(record, url, view, seenByUrl, save, listPulls, reserved);
       if (!await step(record, url, next)) break;
     }
-    // Tickets without an open pull request, once the pull requests relinked theirs.
-    if (!stopped.paused && !stopped.budget && !stopped.throttled) await pass(() => this.crashedWithoutPull(seenByUrl, reserved));
     const { paused, budget, throttled } = stopped;
     if (paused && paused.pool !== this.pausedPool) console.error(`[linear-tickets] pull request watch paused: ${paused.message}`);
     this.pausedPool = paused?.pool ?? null;
@@ -2465,10 +2476,68 @@ export class PullRequestWatch {
     }
   }
 
+  // Crash recovery (README, "Crashed agents"), right after the watchdog in every poll and whatever
+  // the background budget says: first the resumes a restart left pending, then every crashed agent
+  // of a running ticket. Its ticket checks and the owner's comment go at interactive priority as
+  // `crash-recovery`; the reload and the resume need no Linear call. A failure for one agent, a
+  // refused Linear request included, is logged and the pass goes on with the next agent.
+  private async crashPass(all: HandoverRecord[], reserved: Set<string>): Promise<void> {
+    await this.observeStates(all);
+    await withPriority("interactive", "crash-recovery", async () => {
+      await this.pendingResumes(all, reserved);
+      await this.crashedAgents(all, reserved);
+    });
+  }
+
+  // Keeps the states of the running agents' tickets known (see KnownStates) with one background read
+  // per poll, on the API key's pool first (LinearService.read); skipped while both pools refuse it.
+  // Tickets without a running agent's record are forgotten.
+  private async observeStates(all: HandoverRecord[]): Promise<void> {
+    const ids = [...new Set(all.filter((record) => record.status !== "archived").map((record) => record.issueId))];
+    await this.knownStates.retain(new Set(ids));
+    if (!ids.length) return;
+    const sent = Date.now();
+    try {
+      const states = await withPriority("background", "crash-recovery", () => this.deps.linear.issueStatuses(ids));
+      for (const [id, state] of states) await this.knownStates.observe(id, { name: state.status, type: state.statusType }, sent);
+    } catch (error) {
+      if (error instanceof RateLimitedError) return;
+      console.error(`[linear-tickets] reading the running tickets' Linear states failed: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+
+  // Agents whose ticket state is unknown while Linear refuses, each logged once per refusal.
+  private readonly unknownLogged = new Set<string>();
+
+  // The ticket state a crash recovery goes by: read on the app's pool, on the key's when the app's
+  // refuses (LinearService.issueStatusAnyPool), and the later of that read and a state the plugin
+  // wrote meanwhile. When both pools refuse, the state Paseo last saw (`unverified`). Null when none
+  // is known: the agent waits for the next poll rather than being restarted on a guess.
+  private async ticketState(record: HandoverRecord): Promise<{ status: string; statusType: string; unverified?: KnownState } | null> {
+    const sent = Date.now();
+    try {
+      const read = await this.deps.linear.issueStatusAnyPool(record.issueId);
+      this.unknownLogged.clear();
+      await this.knownStates.observe(record.issueId, { name: read.status, type: read.statusType }, sent);
+      const known = await this.knownStates.get(record.issueId);
+      return known ? { status: known.name, statusType: known.type } : read;
+    } catch (error) {
+      if (!(error instanceof RateLimitedError)) throw error;
+      const known = await this.knownStates.get(record.issueId);
+      if (known) return { status: known.name, statusType: known.type, unverified: known };
+      if (!this.unknownLogged.has(record.agentId)) {
+        this.unknownLogged.add(record.agentId);
+        console.error(`[linear-tickets] ${record.identifier}: Linear refuses the ticket check and its state is not known yet, so agent ${record.agentId.slice(0, 8)} is not restarted before the next poll: ${error.message}`);
+      }
+      return null;
+    }
+  }
+
   // Resumes a restart left pending (see Crash), before anything else is sent: once the agent takes
   // a message, the resume goes out and is cleared after the send (a resume can arrive twice). It is
   // dropped unsent once it no longer applies: the ticket's record names another agent or is
-  // archived, the agent is gone, its crashes went to the owner, or the ticket is not started.
+  // archived, the agent is gone, its crashes went to the owner, or the ticket is not started. Sent
+  // on a state Paseo last saw, it starts with the line to check the ticket first (unverifiedResume).
   private async pendingResumes(all: HandoverRecord[], reserved: Set<string>): Promise<void> {
     for (const [agentId, crash] of Object.entries(this.crashes)) {
       const resume = crash.resume;
@@ -2476,44 +2545,40 @@ export class PullRequestWatch {
       const record = all.find((item) => item.issueId === resume.issueId && item.agentId === agentId && item.status !== "archived");
       const label = record?.identifier ?? resume.issueId;
       try {
-        if (!record || crash.escalated || (await this.deps.linear.issueState(resume.issueId)).statusType !== "started") {
+        const state = record && !crash.escalated ? await this.ticketState(record) : null;
+        if (record && !crash.escalated && !state) continue;
+        if (!record || !state || state.statusType !== "started") {
           console.error(`[linear-tickets] ${label}: the resume for restarted agent ${agentId.slice(0, 8)} no longer applies; it is not sent`);
           await this.dropResume(agentId);
           continue;
         }
-        const outcome = await this.deps.sessions.prompt(agentId, resume.text, async () => { reserved.add(agentId); });
+        const outcome = await this.deps.sessions.prompt(agentId, unverifiedResume(resume.text, state.unverified), async () => { reserved.add(agentId); });
         if (outcome === "sent" || outcome === "gone") await this.dropResume(agentId);
         if (outcome === "sent") await this.tell(record, "thought", "Paseo sent the restarted agent its resume.");
         if (outcome === "crashed" || outcome === "unavailable") console.error(`[linear-tickets] ${label}: the resume for restarted agent ${agentId.slice(0, 8)} waits (${outcome})`);
       } catch (error) {
-        if (error instanceof RateLimitedError) throw error;
         console.error(`[linear-tickets] ${label}: the resume for restarted agent ${agentId.slice(0, 8)} failed: ${error instanceof Error ? error.message : error}`);
       }
     }
   }
 
-  // A crashed agent whose ticket has no open pull request (none linked yet, or the linked one was
-  // merged, closed or deleted with nothing open after it) is restarted while its ticket is
-  // started: up to STAGE_NUDGES restarts, then one comment to the owner, then nothing.
-  private async crashedWithoutPull(seenByUrl: Record<string, Seen>, reserved: Set<string>): Promise<void> {
-    for (const record of await this.deps.handover.all()) {
-      const url = record.links["Pull request"];
-      const seen = url ? seenByUrl[url] : undefined;
-      if (record.status === "archived" || reserved.has(record.agentId) || (url && !seen?.merged && !seen?.closed && !seen?.missing)) continue;
-      const entry = this.crashes[record.agentId] ?? {};
-      if (entry.escalated) continue;
+  // Every crashed agent of a running ticket, with an open pull request or not, is restarted while
+  // its ticket is started: up to STAGE_NUDGES restarts in all (see Crash), then one comment to the
+  // owner, then nothing.
+  private async crashedAgents(all: HandoverRecord[], reserved: Set<string>): Promise<void> {
+    for (const record of all) {
+      if (record.status === "archived" || reserved.has(record.agentId) || this.crashes[record.agentId]?.escalated) continue;
       try {
         const error = await this.deps.sessions.crashed(record.agentId);
         if (!error) continue;
-        const state = await this.deps.linear.issueState(record.issueId);
-        if (state.statusType !== "started") continue;
-        const restarts = entry.restarts ?? 0;
-        if (restarts >= STAGE_NUDGES) {
+        const state = await this.ticketState(record);
+        if (!state || state.statusType !== "started") continue;
+        if ((this.crashes[record.agentId]?.restarts ?? 0) >= STAGE_NUDGES) {
           // Claimed before the comment; a comment that failed is retried on the next poll, as for
           // a stage's escalation.
           await this.saveCrash(record.agentId, { escalated: true, resume: null });
           try {
-            await this.mention(record.issueId, `The agent crashed again after Paseo restarted it ${STAGE_NUDGES} times while no pull request was open, so Paseo stops restarting it. Please take over.\n\n\`${error}\``);
+            await this.mention(record.issueId, `The agent crashed again after Paseo restarted it ${STAGE_NUDGES} times, so Paseo stops restarting it. Please take over.\n\n\`${error}\``);
           } catch (failure) {
             await this.saveCrash(record.agentId, { escalated: false });
             throw failure;
@@ -2522,10 +2587,9 @@ export class PullRequestWatch {
           continue;
         }
         const text = `Your ticket ${record.identifier} is in ${state.status}. Continue the lifecycle step you were on.`;
-        const outcome = await this.deps.sessions.prompt(record.agentId, text, async () => { reserved.add(record.agentId); }, this.recovery(record, reserved, () => this.saveCrash(record.agentId, { restarts: restarts + 1 })));
+        const outcome = await this.deps.sessions.prompt(record.agentId, text, async () => { reserved.add(record.agentId); }, this.recovery(record, reserved, async () => {}, state.unverified));
         await this.crashLine(record, outcome, "continue the step it was on");
       } catch (error) {
-        if (error instanceof RateLimitedError) throw error;
         console.error(`[linear-tickets] ${record.identifier}: restarting the crashed agent failed: ${error instanceof Error ? error.message : error}`);
       }
     }

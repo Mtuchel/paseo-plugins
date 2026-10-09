@@ -85,7 +85,7 @@ function fixture(t: TestContext, reply: (call: Call, variables: Record<string, u
   };
   const budget = new RateBudget(now, usage);
   const post: Post = (key, query, variables) => postGraphQL(key, query, variables, budget);
-  const linear = new LinearService(new Credentials("/unused", "env-key"), post, new AgentApi({ accessToken: async () => APP_TOKEN }, post));
+  const linear = new LinearService(new Credentials("/unused", "env-key"), post, new AgentApi({ accessToken: async () => APP_TOKEN }, post), budget);
   const sample = (pool: Pool, requests: number, points: number) => budget.acquire(pool, "owner").done(new Headers({
     "x-ratelimit-requests-limit": String(REQUESTS_LIMIT),
     "x-ratelimit-requests-remaining": String(requests),
@@ -93,6 +93,13 @@ function fixture(t: TestContext, reply: (call: Call, variables: Record<string, u
     "x-ratelimit-complexity-remaining": String(points),
   }), false);
   return { clock, now, calls, refusals, budget, linear, post, sample };
+}
+// Both pools at 19% (`LOW_POINTS`) or 21% (`HIGH_POINTS`) of their points: a background read goes
+// to the key first (LinearService.read), so a poller pauses only when both are at their reserve,
+// and then on the app's.
+function bothAt(f: Fixture, points: number): void {
+  f.sample("app", PLENTY_REQUESTS, points);
+  f.sample("key", PLENTY_REQUESTS, points);
 }
 
 const settings = {
@@ -136,35 +143,51 @@ function assertSent(f: Fixture, pool: Pool = "app"): void {
   assert.equal(f.calls[0]?.pool, pool, `first request is on the ${pool} pool`);
 }
 
-// AC-2: the dispatch poll pauses at 19% of the points budget, and sends at 21%.
+// AC-2: the dispatch poll pauses with both pools at 19% of the points budget, and sends at 21%.
 // The mock clock keeps the timer `attach` arms from polling a second time behind the explicit tick.
 test("the dispatch poll pauses at 19% of the points budget and sends nothing; at 21% it reads", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const low = fixture(t);
-  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  bothAt(low, LOW_POINTS);
   const paused = dispatcher(low);
   await paused.tick();
   assertPaused(low, "dispatch");
   assert.match(paused.snapshot().lastError ?? "", /^paused:/);
 
   const high = fixture(t, () => ({ issues: { nodes: [] } }));
-  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  bothAt(high, HIGH_POINTS);
   await dispatcher(high).tick();
-  assertSent(high);
+  assertSent(high, "key");
 });
 
-// AC-1: the ticket's fixture, the poller side: plenty of requests, 3% of the points budget.
+// AC-1: the ticket's fixture, the poller side: plenty of requests, 3% of the points budget on both pools.
 test("AC-1: at 3% of the points budget (4,500/5,000 requests) the dispatch poll reports paused and sends nothing", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const f = fixture(t);
   f.sample("app", 4_500, 60_000);
+  f.sample("key", 4_500, 60_000);
   const paused = dispatcher(f);
   await paused.tick();
   assertPaused(f, "dispatch");
   assert.match(paused.snapshot().lastError ?? "", /^paused: /);
 });
 
+// TUC-1684: the app's allowance at its reserve no longer pauses background reads while the key has room.
+test("with the app at its reserve and the key free, the dispatch poll reads with the key and nothing goes to the app", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture(t, () => ({ issues: { nodes: [] } }));
+  f.sample("app", 4_500, 60_000);
+  f.sample("key", PLENTY_REQUESTS, HIGH_POINTS);
+  const dispatch = dispatcher(f);
+  await dispatch.tick();
+  assert.deepEqual(f.calls, [{ pool: "key", operation: "labeledIssues" }]);
+  assert.deepEqual(f.refusals, []);
+  assert.equal(dispatch.snapshot().lastError, null);
+});
+
 // AC-4's no-fallback rule on the launch path: the read on one pool never spends the other's reserve.
+// The key at its reserve sends the background read back to the app (TUC-1684), and the launch
+// that would spend the key's last budget waits.
 test("with the key at its reserve the dispatch poll still reads on the app and sends nothing with the key", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const f = fixture(t, () => ({ issues: { nodes: [{ id: ID_A, identifier: "ENG-1", priority: 0, team: { key: "ENG" }, labels: { nodes: [{ id: "l1", name: "paseo" }] } }] } }));
@@ -231,14 +254,14 @@ test("the label repair pauses at 19% of the points budget and sends at 21%", asy
   } as never);
 
   const low = fixture(t);
-  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  bothAt(low, LOW_POINTS);
   await repair(low).tick({} as PaseoApi, settings);
   assertPaused(low, "label-repair");
 
   const high = fixture(t, () => ({ issues: { nodes: [], pageInfo: { hasNextPage: false } } }));
-  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  bothAt(high, HIGH_POINTS);
   await repair(high).tick({} as PaseoApi, settings);
-  assertSent(high);
+  assertSent(high, "key");
 });
 
 // AC-2: health's public check, which is where its caller context lives.
@@ -281,14 +304,14 @@ test("the manual task poll pauses at 19% of the points budget and sends at 21%",
   await writeFile(join(dir, "a.json"), JSON.stringify(MANUAL_TASK("a", "p1")));
 
   const low = fixture(t);
-  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  bothAt(low, LOW_POINTS);
   await new ManualTasks({ linear: low.linear, settings: { read: async () => settings } }, dir).poll();
   assertPaused(low, "manual-tasks");
 
   const high = fixture(t, (_call, variables) => ({ issues: { nodes: ((variables.ids ?? []) as string[]).map((id) => ({ id, state: { name: "Todo", type: "unstarted" }, completedAt: null })) } }));
-  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  bothAt(high, HIGH_POINTS);
   await new ManualTasks({ linear: high.linear, settings: { read: async () => settings } }, dir).poll();
-  assertSent(high);
+  assertSent(high, "key");
 });
 
 // AC-2: the plan-request poll reads the agents' tickets through the real pool admission.
@@ -299,7 +322,7 @@ test("the plan request poll pauses at 19% of the points budget and sends at 21%"
   const poller = (f: Fixture) => new PlanRequests({ linear: f.linear, prompt: async () => "sent", directory: join(dir, "requests") } as never);
 
   const low = fixture(t);
-  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  bothAt(low, LOW_POINTS);
   const paused = poller(low);
   paused.attach(paseo);
   await paused.poll();
@@ -307,27 +330,56 @@ test("the plan request poll pauses at 19% of the points budget and sends at 21%"
   assertPaused(low, "plan-requests");
 
   const high = fixture(t, () => ({ issues: { nodes: [{ id: ID_A, labels: { nodes: [] } }] } }));
-  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  bothAt(high, HIGH_POINTS);
   const running = poller(high);
   running.attach(paseo);
   await running.poll();
   running.stop();
-  assertSent(high);
+  assertSent(high, "key");
 });
 
-// AC-2: the pull request watch's own poll.
+// AC-2: the pull request watch's own poll. The crash pass runs first whatever the budget says;
+// with no crashed agent, its only Linear read is the background batch of the running tickets'
+// states, which pauses like the poll's own reads.
 test("the pull request watch pauses at 19% of the points budget and sends at 21%", async (t) => {
   const dir = await directory(t, "paseo-prwatch-");
   t.mock.method(console, "error", () => {});
   const low = fixture(t);
-  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  bothAt(low, LOW_POINTS);
   await watcher(low, dir).poll();
-  assertPaused(low, "pr-watch");
+  assert.deepEqual(low.calls, [], "no request reaches Linear");
+  assert.deepEqual(low.refusals, [["app", "crash-recovery", "background"], ["app", "pr-watch", "background"]]);
 
   const high = fixture(t, () => ISSUE_STATE_REPLY);
-  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  bothAt(high, HIGH_POINTS);
   await watcher(high, dir).poll();
-  assertSent(high);
+  assertSent(high, "key");
+});
+
+// TUC-1684 AC-3: while background Linear work is paused, a crashed agent is still restarted in the
+// same poll: its ticket check goes at interactive priority as `crash-recovery`.
+test("with background work paused on both pools, the pull request watch still restarts a crashed agent", async (t) => {
+  const dir = await directory(t, "paseo-crash-");
+  t.mock.method(console, "error", () => {});
+  // Every answer keeps both pools at 19%: background work stays paused through the whole poll.
+  const f = fixture(t, () => ({ issue: { state: { name: "In Progress", type: "started" } } }), () => ({ requests: PLENTY_REQUESTS, points: LOW_POINTS }));
+  bothAt(f, LOW_POINTS);
+  const prompts: string[] = [];
+  const sessions = {
+    crashed: async () => "OMP RPC process is closed",
+    prompt: async (agentId: string, text: string, onDispatch?: () => Promise<void>, recovery?: { before: (resume: string, error: string) => Promise<void> }) => {
+      await recovery?.before(`resume: ${text}`, "OMP RPC process is closed");
+      await onDispatch?.();
+      prompts.push(`${agentId}: ${text}`);
+      return "restarted";
+    },
+    say: async () => {},
+    sessionFor: async () => null,
+  };
+  await new PullRequestWatch({ handover: { all: async () => [HANDOVER_RECORD], update: async () => {} }, sessions, linear: f.linear, settings: { read: async () => settings } } as never, join(dir, "pr-watch.json")).poll();
+  assert.deepEqual(prompts, ["agent-1: Your ticket TUC-1 is in In Progress. Continue the lifecycle step you were on."]);
+  assert.deepEqual(f.calls, [{ pool: "app", operation: "issueStatus" }], "only the crash check went out");
+  assert.deepEqual(f.refusals, [["app", "crash-recovery", "background"], ["app", "pr-watch", "background"]], "the running tickets' batch and the pull request work wait");
 });
 
 // AC-2: the queue backstop's own run.
@@ -335,14 +387,14 @@ test("the queue backstop pauses at 19% of the points budget and sends at 21%", a
   const dir = await directory(t, "paseo-backstop-");
   t.mock.method(console, "error", () => {});
   const low = fixture(t);
-  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  bothAt(low, LOW_POINTS);
   await watcher(low, dir).backstop();
   assertPaused(low, "queue backstop");
 
   const high = fixture(t, () => ISSUE_STATE_REPLY);
-  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  bothAt(high, HIGH_POINTS);
   await watcher(high, dir).backstop();
-  assertSent(high);
+  assertSent(high, "key");
 });
 
 // AC-2: the workspace state labels' batched ticket read.
@@ -359,14 +411,14 @@ test("the state labels pause at 19% of the points budget and send at 21%", async
   const labels = (f: Fixture) => new StateLabels({ linear: f.linear, daemon: async () => daemon(), now: f.now } as never);
 
   const low = fixture(t);
-  low.sample("app", PLENTY_REQUESTS, LOW_POINTS);
+  bothAt(low, LOW_POINTS);
   await labels(low).sync();
   assertPaused(low, "state-labels");
 
   const high = fixture(t, () => ({ issues: { nodes: [{ id: ID_A, state: { name: "Todo", type: "unstarted" }, completedAt: null }] } }));
-  high.sample("app", PLENTY_REQUESTS, HIGH_POINTS);
+  bothAt(high, HIGH_POINTS);
   await labels(high).sync();
-  assertSent(high);
+  assertSent(high, "key");
 });
 
 // AC-4: at 4% of either dimension the interactive work is refused and the owner's share passes.
@@ -427,13 +479,14 @@ test("AC-4: at 6% interactive work passes while the same work at background prio
   }
 });
 
-// AC-4/AC-2: with the app at its reserve a poll stops on the app and never falls back to the key.
+// AC-4/AC-2: with the app at its reserve a poll stops on the app and never moves a write to the key.
 test("the app reaching its reserve during a poll stops the remaining writes without falling back to the key; the pause is logged once", async (t) => {
   const dir = await directory(t, "paseo-tasks-");
   for (const item of [MANUAL_TASK("a", "p1"), MANUAL_TASK("bb", "p2")]) await writeFile(join(dir, `${item.id}.json`), JSON.stringify(item));
   // The plugin's writes go out as the app, which starts one request above its 20% reserve
-  // (1,001 of 5,000) plus room and loses one per answered request; the key reads stay plentiful.
-  let appRemaining = 1_003;
+  // (1,001 of 5,000) plus room and loses one per answered request; the key reads stay plentiful
+  // and take the poll's background reads (TUC-1684).
+  let appRemaining = 1_002;
   const f = fixture(t, (call, variables) => {
     const data: Record<string, Record<string, unknown>> = {
       issueStatuses: { issues: { nodes: ((variables.ids ?? []) as string[]).map((id) => ({ id, state: { type: "unstarted" }, completedAt: null })) } },
@@ -445,7 +498,7 @@ test("the app reaching its reserve during a poll stops the remaining writes with
     };
     return data[call.operation] ?? {};
   }, (call) => ({ requests: call.pool === "app" ? appRemaining-- : PLENTY_REQUESTS, points: HIGH_POINTS }));
-  f.sample("app", 1_003, HIGH_POINTS);
+  f.sample("app", 1_002, HIGH_POINTS);
   f.sample("key", PLENTY_REQUESTS, HIGH_POINTS);
   const errors: string[] = [];
   t.mock.method(console, "error", (...args: unknown[]) => { errors.push(args.join(" ")); });
@@ -453,7 +506,7 @@ test("the app reaching its reserve during a poll stops the remaining writes with
 
   await manual.poll();
   assert.deepEqual(f.calls.map((call) => `${call.pool} ${call.operation}`), [
-    "app issueStatuses",
+    "key issueStatuses",
     "key labelByName", "app addLabel", "key viewerCheck", "key userUrl", "app comment",
     // The second ticket's label goes out; its mention would dip into the app's reserve and waits
     // instead of going out with the key.
@@ -464,7 +517,7 @@ test("the app reaching its reserve during a poll stops the remaining writes with
 
   f.calls.length = 0;
   await manual.poll();
-  assert.deepEqual(f.calls, [], "the app stays paused; nothing moves to the key");
+  assert.deepEqual(f.calls.map((call) => `${call.pool} ${call.operation}`), ["key issueStatuses"], "the read goes on with the key; the app stays paused and no write moves to the key");
   assert.equal(errors.filter((line) => line.includes("manual tasks paused")).length, 1);
 });
 
@@ -510,4 +563,41 @@ test("AC-7: markInProgress keeps its best-effort warning note, also in a paused 
 
   const teamless = await withPriority("background", "dispatch poll", () => f.linear.markInProgress({ id: ID_A, status: "Todo", statusType: "unstarted" }, null));
   assert.deepEqual(teamless, { changed: false, note: "The ticket has no team, so it could not be marked in progress." });
+});
+
+// TUC-1684: background reads go to the key first; the app answers only what the key cannot see.
+test("a background read the key cannot see, or sees in part, is read again with the app; interactive reads stay on the app", async (t) => {
+  const notFound = { status: 200, errors: [{ message: "Entity not found: Issue" }] };
+  const f = fixture(t, (call, variables) => {
+    if (call.operation === "issueStatus") return call.pool === "key" ? notFound : { issue: { state: { name: "Todo", type: "unstarted" } } };
+    if (call.operation === "issueStatuses") return { issues: { nodes: ((variables.ids ?? []) as string[]).filter((id) => call.pool === "app" || id === ID_A).map((id) => ({ id, state: { name: "Todo", type: "unstarted" }, completedAt: null })) } };
+    return {};
+  });
+  bothAt(f, HIGH_POINTS);
+  await withPriority("background", "test", () => f.linear.issueStatus(ID_A));
+  await withPriority("background", "test", () => f.linear.issueStatuses([ID_A, "other"]));
+  await withPriority("interactive", "test", () => f.linear.issueStatus(ID_A));
+  assert.deepEqual(f.calls.map((call) => `${call.pool} ${call.operation}`), ["key issueStatus", "app issueStatus", "key issueStatuses", "app issueStatuses", "app issueStatus"]);
+});
+
+test("a Linear rate limit on a key-first background read propagates without asking the app", async (t) => {
+  const f = fixture(t, (call) => call.pool === "key" ? { status: 400, errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] as never } : { issue: { state: { name: "Todo", type: "unstarted" } } });
+  bothAt(f, HIGH_POINTS);
+  await assert.rejects(withPriority("background", "test", () => f.linear.issueStatus(ID_A)), (error: unknown) => error instanceof RateLimitedError && error.pool === "key");
+  assert.deepEqual(f.calls, [{ pool: "key", operation: "issueStatus" }]);
+});
+
+// Crash recovery's ticket check (pr-watch.ts) at interactive priority: the key answers when the
+// app's pool refuses, and only both refusing stops it.
+test("the crash check reads with the key when the app is at its reserve and is refused only when both are", async (t) => {
+  const f = fixture(t, () => ({ issue: { state: { name: "In Progress", type: "started" } } }));
+  f.sample("app", 100, HIGH_POINTS);
+  f.sample("key", PLENTY_REQUESTS, HIGH_POINTS);
+  assert.deepEqual(await withPriority("interactive", "crash-recovery", () => f.linear.issueStatusAnyPool(ID_A)), { status: "In Progress", statusType: "started" });
+  assert.deepEqual(f.calls, [{ pool: "key", operation: "issueStatus" }]);
+
+  f.calls.length = 0;
+  f.sample("key", 100, HIGH_POINTS);
+  await assert.rejects(withPriority("interactive", "crash-recovery", () => f.linear.issueStatusAnyPool(ID_A)), RateLimitedError);
+  assert.deepEqual(f.calls, [], "nothing is sent past either reserve");
 });

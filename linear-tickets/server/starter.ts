@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import type { Handover } from "./handover";
 import type { ActivationResume } from "./activation";
 import { SetupError, safeBranchName, type Launcher, type ResumeTarget } from "./launch";
-import type { LinearService } from "./linear";
+import type { AdmissionState, LinearService } from "./linear";
 import { findProject, readBranches } from "./projects";
 import { advisorNote, hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, planPolicy, SAFE_MODES, type PlanPolicy } from "./plan-policy";
 import { needsOwner, type Presence } from "./presence";
@@ -242,10 +242,11 @@ export class TicketStarter {
   }
 
   // Whether the ticket may start now: its blockers are finished, and the scheduler gives it a slot
-  // (none while the owner is away for an approved plan that may need them).
-  async admission(issueId: string, paseo: PaseoApi, settings: PluginSettings): Promise<Admission> {
+  // (none while the owner is away for an approved plan that may need them). `read`: the ticket's
+  // state the caller read in this same pass (the queue's batched read); without it, read fresh.
+  async admission(issueId: string, paseo: PaseoApi, settings: PluginSettings, read?: AdmissionState): Promise<Admission> {
     if (await this.deps.deletions?.blocked(issueId)) return { ok: false, reason: "This ticket is paused for deletion." };
-    const state = await this.deps.linear.issueState(issueId);
+    const state = read ?? await this.deps.linear.issueState(issueId);
     if (state.blockedBy.length) return { ok: false, reason: `Waiting for ${state.blockedBy.join(", ")} to finish.` };
     const labels = state.labels.map((item) => item.name);
     const attended = needsOwner(labels, settings.dispatch.label);

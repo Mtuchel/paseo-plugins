@@ -3,7 +3,7 @@ import type { Issue, TicketDetail } from "../shared/contracts";
 import { buildContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations, type FinishedBlocker } from "./context";
 import { Credentials } from "./credentials";
 import type { LabelEvent, SweptIssue } from "./label-rules";
-import { currentCaller, poolOf, rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
+import { currentCaller, currentPriority, poolOf, rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
 import { operationName } from "./linear-usage";
 
 const endpoint = "https://api.linear.app/graphql";
@@ -348,6 +348,17 @@ export const ISSUE_STATUSES_BATCH = 250;
 export const ISSUE_STATUSES_QUERY = `query issueStatuses($ids: [ID!]!, $first: Int!) {
   issues(first: $first, filter: { id: { in: $ids } }) { nodes { id state { name type } completedAt } }
 }`;
+// Everything the queue's admission decides on (TicketStarter.admission), for up to 50 waiting
+// tickets in one request: measured 2026-10-09 on 50 live tickets, 502 points against 498 for one
+// `issueState` read (README, "Rate limits"). Parsed by the same function as `issueState`.
+export const ADMISSION_STATES_BATCH = 50;
+export const ADMISSION_STATES_QUERY = `query admissionStates($ids: [ID!]!, $first: Int!) {
+  issues(first: $first, filter: { id: { in: $ids } }) { nodes {
+    id identifier priority createdAt state { id name type } project { id } labels(first: 50) { nodes { id name } }
+    inverseRelations(first: 50) { nodes { type issue { id identifier state { name type } attachments(first: 25) { nodes { url sourceType metadata } } } } }
+    relations(first: 50) { nodes { type relatedIssue { state { type } } } }
+  } }
+}`;
 // A state the plugin itself just moved a ticket into, from the mutation's own answer.
 export type WrittenState = { name: string; type: string };
 
@@ -398,6 +409,36 @@ export type IssueState = {
   id: string; identifier: string; status: string; statusId: string; statusType: string; teamId: string | null; projectId: string | null; creatorId: string | null;
   labels: { id: string; name: string }[]; attachmentUrls: string[]; blockedBy: string[]; priority: number; createdAt: string; unblocks: number;
 };
+// The part of IssueState that ADMISSION_STATES_QUERY reads: what TicketStarter.admission decides on.
+export type AdmissionState = Pick<IssueState, "id" | "identifier" | "status" | "statusType" | "projectId" | "labels" | "blockedBy" | "priority" | "createdAt" | "unblocks">;
+
+// An ISSUE_STATUS_QUERY answer's workflow state, whichever pool sent it.
+function issueStatusOf(data: Record<string, unknown>): Pick<IssueState, "status" | "statusType"> {
+  if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
+  const state = record(record(data.issue).state ?? {});
+  return { status: label(state.name), statusType: label(state.type) };
+}
+
+// One ticket node of ISSUE_STATE_QUERY or ADMISSION_STATES_QUERY; fields a query does not ask for
+// come out empty. Both reads decide blockers and `unblocks` here, so the queue's batched read and a
+// single read give the same admission.
+function parseIssueState(issue: Record<string, unknown>): IssueState {
+  const state = record(issue.state ?? {});
+  const attachmentUrls = connection(issue.attachments ?? { nodes: [] }).nodes.map((node) => label(record(node).url)).filter(Boolean);
+  const blockedBy = connection(issue.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
+    .filter((relation) => label(relation.type) === "blocks")
+    .map((relation) => record(relation.issue ?? {}))
+    .filter((blocker) => !finishedIssue(blocker))
+    .map((blocker) => label(blocker.identifier)).filter(Boolean);
+  const unblocks = connection(issue.relations ?? { nodes: [] }).nodes.map((node) => record(node))
+    .filter((relation) => label(relation.type) === "blocks" && !["completed", "canceled", "duplicate"].includes(label(record(record(relation.relatedIssue ?? {}).state ?? {}).type))).length;
+  return {
+    id: label(issue.id), identifier: label(issue.identifier), status: label(state.name), statusId: label(state.id), statusType: label(state.type),
+    teamId: label(record(issue.team ?? {}).id) || null, projectId: label(record(issue.project ?? {}).id) || null, creatorId: label(record(issue.creator ?? {}).id) || null,
+    labels: labelNodes(issue.labels), attachmentUrls, blockedBy,
+    priority: typeof issue.priority === "number" ? issue.priority : 0, createdAt: label(issue.createdAt), unblocks,
+  };
+}
 export type IssueMetadata = Pick<IssueState, "id" | "identifier" | "labels">;
 
 // Projects carrying the trigger label (README, "Projects"), and their open tickets with what the
@@ -739,21 +780,21 @@ function issueLink(value: unknown): IssueLink | null {
 }
 
 export class LinearService {
-  private stateWritten: ((issueId: string, state: WrittenState) => void) | null = null;
+  private readonly stateWritten: ((issueId: string, state: WrittenState) => void)[] = [];
 
-  constructor(readonly credentials = new Credentials(), private readonly post: Post = postGraphQL, private readonly app?: App) {}
+  constructor(readonly credentials = new Credentials(), private readonly post: Post = postGraphQL, private readonly app?: App, private readonly budget: RateBudget = rateBudget) {}
 
   // Told about every state change the plugin makes (launch, write-back, review, PR watch), so
   // views of the ticket's state can follow at once instead of at the next poll.
   onStateWritten(listener: (issueId: string, state: WrittenState) => void): void {
-    this.stateWritten = listener;
+    this.stateWritten.push(listener);
   }
 
   private async writeState(issueId: string, stateId: string): Promise<Record<string, unknown>> {
     const data = record(await this.write(UPDATE_ISSUE_STATE_QUERY, { id: issueId, stateId }));
     const result = record(data.issueUpdate ?? {});
     const state = record(record(result.issue ?? {}).state ?? {});
-    if (result.success !== false && label(state.name)) this.stateWritten?.(issueId, { name: label(state.name), type: label(state.type) });
+    if (result.success !== false && label(state.name)) for (const listener of this.stateWritten) listener(issueId, { name: label(state.name), type: label(state.type) });
     return data;
   }
 
@@ -783,15 +824,35 @@ export class LinearService {
     return work(key);
   }
 
-  // The reads pollers repeat go to the Paseo app's own request pool. The key reads instead when the
-  // app cannot be used (`app.query` returns null) or cannot see everything asked for (`complete` is
-  // false); an app rate limit is not a reason: it propagates, so background work pauses instead of
-  // draining the key.
+  // Background reads (pollers, sweeps) go to the API key's pool first: the Paseo app's pool keeps
+  // its requests for the writes the owner sees as Paseo's and for interactive reads. The app reads
+  // one only when the key cannot see everything asked for (`complete` false, or "Entity not found").
+  // While the key is at its background reserve, or none is connected, a background read takes the
+  // interactive path. A key rate limit on a key-first read propagates; the app does not repeat it.
+  // Interactive and owner reads go to the app first; the key reads instead when the app cannot be
+  // used (`app.query` returns null) or cannot see everything asked for. An app rate limit is not a
+  // reason: it propagates, so the work pauses instead of draining the key (README, "Rate limits").
   private async read(query: string, variables: Record<string, unknown>, complete: (data: Record<string, unknown>) => boolean = () => true): Promise<Record<string, unknown>> {
-    const data = this.app ? await this.app.query(query, variables).catch((error: unknown) => {
+    const notFound = (error: unknown) => {
       if (error instanceof Error && /Entity not found/i.test(error.message)) return null;
       throw error;
-    }) : null;
+    };
+    if (this.app && currentPriority() === "background" && this.budget.pausedUntil("key", "background") === null) {
+      const { key } = await this.credentials.read();
+      if (key) {
+        let missing: unknown = null;
+        const data = await this.post(key, query, variables).catch((error: unknown) => {
+          missing = error;
+          return notFound(error);
+        });
+        if (data && complete(data)) return data;
+        const fromApp = await this.app.query(query, variables).catch(notFound);
+        if (fromApp) return fromApp;
+        if (data) return data;
+        throw missing;
+      }
+    }
+    const data = this.app ? await this.app.query(query, variables).catch(notFound) : null;
     return data && complete(data) ? data : this.withKey((key) => this.post(key, query, variables));
   }
 
@@ -1070,22 +1131,23 @@ export class LinearService {
   async issueState(id: string): Promise<IssueState> {
     const data = record(await this.read(ISSUE_STATE_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object")));
     if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
-    const issue = record(data.issue);
-    const state = record(issue.state ?? {});
-    const attachmentUrls = connection(issue.attachments ?? { nodes: [] }).nodes.map((node) => label(record(node).url)).filter(Boolean);
-    const blockedBy = connection(issue.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
-      .filter((relation) => label(relation.type) === "blocks")
-      .map((relation) => record(relation.issue ?? {}))
-      .filter((blocker) => !finishedIssue(blocker))
-      .map((blocker) => label(blocker.identifier)).filter(Boolean);
-    const unblocks = connection(issue.relations ?? { nodes: [] }).nodes.map((node) => record(node))
-      .filter((relation) => label(relation.type) === "blocks" && !["completed", "canceled", "duplicate"].includes(label(record(record(relation.relatedIssue ?? {}).state ?? {}).type))).length;
-    return {
-      id: label(issue.id), identifier: label(issue.identifier), status: label(state.name), statusId: label(state.id), statusType: label(state.type),
-      teamId: label(record(issue.team ?? {}).id) || null, projectId: label(record(issue.project ?? {}).id) || null, creatorId: label(record(issue.creator ?? {}).id) || null,
-      labels: labelNodes(issue.labels), attachmentUrls, blockedBy,
-      priority: typeof issue.priority === "number" ? issue.priority : 0, createdAt: label(issue.createdAt), unblocks,
-    };
+    return parseIssueState(record(data.issue));
+  }
+
+  // What admission decides on, for many tickets in requests of 50 (ADMISSION_STATES_QUERY), parsed
+  // exactly as `issueState`. Each id is asked for once; tickets Linear does not return are missing.
+  async admissionStates(ids: string[]): Promise<Map<string, AdmissionState>> {
+    const result = new Map<string, AdmissionState>();
+    const unique = [...new Set(ids)];
+    for (let start = 0; start < unique.length; start += ADMISSION_STATES_BATCH) {
+      const chunk = unique.slice(start, start + ADMISSION_STATES_BATCH);
+      const data = record(await this.read(ADMISSION_STATES_QUERY, { ids: chunk, first: chunk.length }, (found) => connection(record(found.issues ?? {})).nodes.length === chunk.length));
+      for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) {
+        const { id, identifier, status, statusType, projectId, labels, blockedBy, priority, createdAt, unblocks } = parseIssueState(node);
+        if (id) result.set(id, { id, identifier, status, statusType, projectId, labels, blockedBy, priority, createdAt, unblocks });
+      }
+    }
+    return result;
   }
 
   async issueMetadata(id: string): Promise<IssueMetadata> {
@@ -1096,10 +1158,21 @@ export class LinearService {
   }
 
   async issueStatus(id: string): Promise<Pick<IssueState, "status" | "statusType">> {
-    const data = await this.read(ISSUE_STATUS_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object"));
-    if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
-    const state = record(record(data.issue).state ?? {});
-    return { status: label(state.name), statusType: label(state.type) };
+    return issueStatusOf(await this.read(ISSUE_STATUS_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object")));
+  }
+
+  // `issueStatus` on whichever pool can answer: the app's as usual, the key's when the app's refuses
+  // (its reserve or a Linear rate limit). Crash recovery's ticket check (pr-watch.ts) must not wait
+  // for one exhausted pool; when no key is connected, the app's refusal propagates.
+  async issueStatusAnyPool(id: string): Promise<Pick<IssueState, "status" | "statusType">> {
+    try {
+      return await this.issueStatus(id);
+    } catch (error) {
+      if (!(error instanceof RateLimitedError) || error.pool !== "app") throw error;
+      const { key } = await this.credentials.read();
+      if (!key) throw error;
+      return issueStatusOf(await this.post(key, ISSUE_STATUS_QUERY, { id }));
+    }
   }
 
   async issueAttachments(id: string): Promise<string[]> {

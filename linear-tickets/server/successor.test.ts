@@ -11,7 +11,7 @@ import type { ActivationResume } from "./activation";
 import { Dispatcher } from "./dispatch";
 import { Handover } from "./handover";
 import { Launcher, LEAD_INTRO, type ResumeTarget } from "./launch";
-import type { IssueState, IssueStatus, LabeledIssue } from "./linear";
+import type { AdmissionState, IssueState, LabeledIssue } from "./linear";
 import { SessionRouter, SessionStore, type HostOwnership, type SessionLink, type Succession } from "./sessions";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { ResumeUnavailableError, TicketStarter, type Started } from "./starter";
@@ -157,12 +157,8 @@ class FakeLinear {
     };
   }
 
-  async issueStatus(_id: string) {
-    return { status: this.status, statusType: this.statusType };
-  }
-
-  // Returns nothing, so each ticket is read alone through `issueStatus` (the batch's fallback).
-  async issueStatuses(_ids: string[]): Promise<Map<string, IssueStatus>> {
+  // Returns nothing, so each ticket is read alone through `issueState` (the batch's fallback).
+  async admissionStates(_ids: string[]): Promise<Map<string, AdmissionState>> {
     return new Map();
   }
 
@@ -1004,8 +1000,8 @@ test("retirement after the agent directory read cannot send queued text to the n
   const owner = ticketAgent("owner", "2026-01-02T00:00:00Z", { labels: { "linear.issueId": ISSUE.id, "linear.sessionId": "s1" } });
   const h = routerHarness({ agents: [owner] });
   t.after(h.cleanup);
-  const issueStatus = h.linear.issueStatus.bind(h.linear);
-  h.linear.issueStatus = async (id) => { owner.status = "closed"; return issueStatus(id); };
+  const issueState = h.linear.issueState.bind(h.linear);
+  h.linear.issueState = async (id) => { owner.status = "closed"; return issueState(id); };
   await h.store.put(thread({ queued: true, pendingText: "Keep this instruction queued." }));
   await h.router.startQueued();
   await h.router.startQueued();
