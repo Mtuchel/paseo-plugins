@@ -3428,8 +3428,9 @@ Agents menu bar app as multiple-choice cards, without opening the ticket. `linea
 reads the asks and `linear.answer-ask` answers one the way an owner's `@paseo <answer>` comment
 would. Both are read-only in Linear until an answer is sent.
 
-**What is read.** The owner's issues in the "Needs input" state (pages of 50, up to 250 issues a
-refresh; newest 12 comments each, ten issues per read), their descriptions, this host's "Needs you"
+**What is read.** The owner's issues in the "Needs input" state, always with the owner's key (through
+the Paseo app "assigned to me" would mean the app; pages of 50, up to 250 issues a refresh; newest
+12 comments each, ten issues per read), their descriptions, this host's "Needs you"
 records (`$PASEO_HOME/linear-tickets/needs-you/`) and handover records. The ask text per issue,
 first match wins: the description of a "Needs you" sub-issue or a `paseo-manual` issue; the plugin's
 own wait comment (`… is waiting for you: …`, read by id when it is older than those comments); the

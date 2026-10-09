@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
-import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, TEAM_STATES_QUERY, type App, type Post } from "./linear";
+import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_PAGES, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type Post } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 
 const issue = { id: "i1", identifier: "TUC-1", state: { id: "s1", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] } };
@@ -250,4 +250,20 @@ test("relay comments: an app rate limit fails the read without falling back to t
   const { linear, keyCalls } = service({ query: () => Promise.reject(new RateLimitedError("app", Date.now() + 60_000)) }, () => ({}));
   await assert.rejects(linear.relayComments("me", [{ issueId: ID_A, since: "2026-01-01T00:00:00Z" }]), RateLimitedError);
   assert.deepEqual(keyCalls, []);
+});
+
+// Through the app's token `isMe` is the Paseo app, which is assigned nothing: the server returned
+// no asks at all while the owner had 38 in Needs input.
+test("the owner's asks are read with the owner's key, never the app, page by page up to the cap", async () => {
+  const appQueries: string[] = [];
+  const node = (n: number) => ({ id: `i${n}`, identifier: `TUC-${n}`, title: "t", url: "u", updatedAt: "2026-10-09T00:00:00Z", description: "", state: { name: "Needs input", type: "started" }, parent: null, labels: { nodes: [] } });
+  let page = 0;
+  const { linear, keyCalls } = service({ query: (query) => { appQueries.push(query); return Promise.resolve({ issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } }); } }, () => {
+    page++;
+    return { issues: { nodes: [node(page)], pageInfo: { hasNextPage: true, endCursor: `c${page}` } } };
+  });
+  const asks = await linear.ownerAskIssues();
+  assert.deepEqual(appQueries, []);
+  assert.deepEqual(keyCalls, Array(OWNER_ASKS_PAGES).fill(OWNER_ASKS_QUERY));
+  assert.deepEqual(asks.map((issue) => issue.identifier), Array.from({ length: OWNER_ASKS_PAGES }, (_, index) => `TUC-${index + 1}`));
 });
