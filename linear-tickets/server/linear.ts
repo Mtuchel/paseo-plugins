@@ -1784,13 +1784,14 @@ export class LinearService {
   }
 
   // The owner's asks (README, "Owner asks"): the issues in "Needs input", newest change first,
-  // OWNER_ASKS_PAGE a read, at most OWNER_ASKS_PAGES reads.
+  // OWNER_ASKS_PAGE a read, at most OWNER_ASKS_PAGES reads. Always with the owner's key, as
+  // `issues()`: the filter's `isMe` would name the Paseo app through the app's token.
   async ownerAskIssues(): Promise<OwnerAskIssue[]> {
     const issues: OwnerAskIssue[] = [];
     let after: string | null = null;
     let pages = 0;
     do {
-      const page = record(record(await this.read(OWNER_ASKS_QUERY, { first: OWNER_ASKS_PAGE, after, filter: listIssueFilter([NEEDS_INPUT_STATE]) })).issues ?? {});
+      const page = record(record(await this.withKey((key) => this.post(key, OWNER_ASKS_QUERY, { first: OWNER_ASKS_PAGE, after, filter: listIssueFilter([NEEDS_INPUT_STATE]) }))).issues ?? {});
       for (const node of connection(page).nodes) {
         const issue = ownerAskIssue(record(node));
         if (issue.id) issues.push(issue);
