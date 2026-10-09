@@ -17,7 +17,8 @@ import { planHash, type PendingReview, type ReviewOutcome } from "./review-outco
 import { APPROVE_LATER, decidePlannotatorReview, describeTool, questionPrompt, ReviewClosedError, SEND_BACK, SessionRouter, SessionStore, SPLIT_PLAN, type SessionLink } from "./sessions";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
-import { AWAY_REASON } from "./scheduler";
+import { AWAY_REASON, type Candidate } from "./scheduler";
+import { TierStore } from "./model-tiers";
 import { isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
 import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, planPolicy } from "./plan-policy";
 import type { ProcessInspector } from "./process-liveness";
@@ -696,8 +697,9 @@ test("the live feed shows completed commands and edits only", () => {
 });
 
 // `appId`: the Paseo app's user, or null when the app is not usable on this host. `inspect`: the
-// process table ghost agents are checked against.
-function starterHarness(state: { creatorId: string | null; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number, appId: string | null = APP, away = false, planText = "# Plan\n1. Add the table", inspect?: ProcessInspector) {
+// process table ghost agents are checked against. `tiers`: the model tier store the night order
+// reads (README, "Who starts next").
+function starterHarness(state: { creatorId: string | null; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number, appId: string | null = APP, away = false, planText = "# Plan\n1. Add the table", inspect?: ProcessInspector, tiers?: Pick<TierStore, "get" | "record">) {
   const launches: { provider?: string; thinkingOptionId?: string; modeId?: string; instructions: string; labels?: Record<string, string>; env?: Record<string, string>; markInProgress?: boolean }[] = [];
   const starter = new TicketStarter({
     linear: {
@@ -711,6 +713,7 @@ function starterHarness(state: { creatorId: string | null; labels: { id: string;
     branches: async () => ({ branches: [{ id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }),
     presence: { away: async () => away },
     ...(inspect ? { inspect } : {}),
+    ...(tiers ? { tiers } : {}),
   });
   const paseo = {
     agents: { list: async () => ({ entries: Array.from({ length: running }, (_, index) => ({ agent: { id: `r${index}`, status: "running", labels: { "linear.issueId": `x${index}` } } })), pageInfo: { hasMore: false } }) },
@@ -781,6 +784,29 @@ test("while the owner is away, only the implementation of an attended ticket wai
     const away = starterHarness({ ...state, labels: [...state.labels], blockedBy: [] }, 0, APP, true);
     assert.deepEqual(await away.starter.admission("i1", away.paseo, unlimited), { ok: true }, why);
   }
+});
+
+test("while the owner is away the starter ranks by the ticket's model: its label or its recorded tier", async (t) => {
+  // One running agent of two slots: one free. The rival ranks before every ticket here on today's
+  // order (Urgent, older), so only the night class lets a ticket pass it.
+  const rival: Candidate = { issueId: "rival", identifier: "TUC-9", projectId: null, priority: 1, unblocks: 0, createdAt: "2025-01-01T00:00:00Z", night: { planReady: true, tier: "strong" } };
+  const directory = await mkdtemp(join(tmpdir(), "night-tiers-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const tiers = new TierStore(directory, () => "2026-01-01T00:00:00Z");
+  await tiers.record({ id: "i1", identifier: "TUC-1" }, { tier: "cheap", source: "plan", reason: "every step is spelled out", agentId: null, model: null });
+
+  const labelled = starterHarness({ creatorId: OWNER, labels: [{ id: "r", name: "plan-ready" }, { id: "m", name: "model:cheap" }], blockedBy: [] }, 1, APP, true);
+  labelled.starter.scheduler.note([rival]);
+  assert.deepEqual(await labelled.starter.admission("i1", labelled.paseo, settings), { ok: true }, "the model:cheap label decides");
+
+  const recorded = starterHarness({ creatorId: OWNER, labels: [{ id: "r", name: "plan-ready" }], blockedBy: [] }, 1, APP, true, undefined, undefined, tiers);
+  recorded.starter.scheduler.note([rival]);
+  assert.deepEqual(await recorded.starter.admission("i1", recorded.paseo, settings), { ok: true }, "the recorded cheap tier decides");
+
+  const strong = starterHarness({ creatorId: OWNER, labels: [{ id: "r", name: "plan-ready" }, { id: "m", name: "model:strong" }], blockedBy: [] }, 1, APP, true);
+  strong.starter.scheduler.note([rival]);
+  const refused = await strong.starter.admission("i1", strong.paseo, settings);
+  assert.match(refused.ok ? "" : refused.reason, /1 ticket ahead/, "on strong the ticket ranks as before, behind the urgent one");
 });
 
 test("every ticket starts plan-first; someone else's ticket is marked untrusted; omp keeps the usual mode so the planner never waits for approvals", async () => {

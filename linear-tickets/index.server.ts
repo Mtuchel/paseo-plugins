@@ -191,7 +191,7 @@ export default function contribute(server: PluginServerContext) {
   const projectStore = new ProjectStore();
   // Project tickets are read in full every 30 minutes and only as changed in between (project-issues.ts).
   const projectIssues = new ProjectIssueCache(linear);
-  const projects = new ProjectFlow({ linear, settings, projectIssues: (projectId, full) => projectIssues.read(projectId, full), scheduler: starter.scheduler, capacity: starter.capacity, store: projectStore, usage,
+  const projects = new ProjectFlow({ linear, settings, projectIssues: (projectId, full) => projectIssues.read(projectId, full), scheduler: starter.scheduler, capacity: starter.capacity, store: projectStore, usage, tiers,
     startPlanner: (input, paseo, current) => launcher.startPlanner(input, paseo, current),
     retire: async (agentId, api) => {
       await stopAgentTurn(agentId).catch(() => {});

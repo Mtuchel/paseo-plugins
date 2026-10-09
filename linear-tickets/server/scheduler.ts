@@ -1,20 +1,47 @@
 import type { PaseoApi } from "@getpaseo/client";
+import type { Tier } from "../shared/plan-model";
 import type { EffectiveLimit } from "./capacity";
+import { launchTier, type TierRecord } from "./model-tiers";
+import { planPolicy } from "./plan-policy";
 
 // Who gets the next free agent slot (README, "Who starts next"). Every path that wants to start a
 // ticket asks here: threads waiting their turn, labelled tickets and project tickets. Each ask
 // registers the ticket as waiting; while slots are short, the waiting tickets are ranked and only
 // the first ones are admitted:
-// 1. the project with the fewest agents working first, so one project takes every slot only
+// 1. while the owner is away, the night class first (see Night): a ticket whose approved plan
+//    implements on the cheap tier, then one on the standard tier, then the rest — so the work that
+//    can finish without the owner starts first. The class only orders the line; nothing waits
+//    because of it;
+// 2. the project with the fewest agents working first, so one project takes every slot only
 //    while nothing else waits, and a project that waits gets the next free slot;
-// 2. then tickets that may need the owner (`attended`), so the time they are present is used for those;
-// 3. then priority (urgent first, none last), then the ticket that unblocks the most open tickets,
+// 3. then tickets that may need the owner (`attended`), so the time they are present is used for those;
+// 4. then priority (urgent first, none last), then the ticket that unblocks the most open tickets,
 //    then the oldest.
 // While the owner is away, `attended` tickets are not admitted and take no place in the line.
 // An admitted ticket keeps its slot (a reservation) until its agent shows up or a few minutes pass.
 
+// The night order's input (README, "Who starts next"): `planReady`, the ticket implements an
+// approved plan (`plan-ready`) rather than planning, and `tier`, the tier that implementation runs
+// on. A build site that cannot tell leaves it out: the ticket ranks in class 2 like everything the
+// night order does not place.
+export type Night = { planReady: boolean; tier: Tier | null };
+
+// The night input of a ticket, from data the plugin already has when it builds a candidate: the
+// label names the ticket carries and its tier store record (null where a site has no record). The
+// tier is the strongest of the ticket's `model:` label and its recorded decision, as launchTier
+// does; the plan document is not read before a start.
+export function nightInput(labelNames: readonly string[], record: TierRecord | null): Night {
+  const labels = labelNames.map((name) => ({ name }));
+  return { planReady: planPolicy(labels) === null, tier: launchTier(labels, record, null) };
+}
+
 // `blocked` tickets never ask: their blockers are checked before.
-export type Candidate = { issueId: string; identifier: string; projectId: string | null; priority: number; unblocks: number; createdAt: string; attended?: boolean };
+export type Candidate = {
+  issueId: string; identifier: string; projectId: string | null; priority: number; unblocks: number; createdAt: string; attended?: boolean;
+  // While the owner is away this ticket's night class decides first (see rankWaiting); absent:
+  // class 2.
+  night?: Night;
+};
 
 export const AWAY_REASON = "Waits until you are present: it may need you while it runs.";
 export type Admission = { ok: true } | { ok: false; reason: string };
@@ -35,12 +62,21 @@ type Deps = {
   now?: () => number;
 };
 
-export function rankWaiting(waiting: Candidate[], load: Map<string | null, number>, slots: number): Candidate[] {
+// The class a waiting ticket ranks in while the owner is away (README, "Who starts next"): 0 a
+// cheap implementation, 1 a standard one, 2 everything else — a strong implementation, one whose
+// tier is not known here, a ticket that still plans, one whose site passed no input.
+function nightClass(candidate: Candidate): number {
+  if (!candidate.night?.planReady) return 2;
+  return candidate.night.tier === "cheap" ? 0 : candidate.night.tier === "standard" ? 1 : 2;
+}
+
+export function rankWaiting(waiting: Candidate[], load: Map<string | null, number>, slots: number, away = false): Candidate[] {
   const loads = new Map(load);
   const left = [...waiting];
   const picked: Candidate[] = [];
   while (picked.length < slots && left.length) {
-    left.sort((a, b) => (loads.get(a.projectId) ?? 0) - (loads.get(b.projectId) ?? 0)
+    left.sort((a, b) => (away ? nightClass(a) - nightClass(b) : 0)
+      || (loads.get(a.projectId) ?? 0) - (loads.get(b.projectId) ?? 0)
       || Number(Boolean(b.attended)) - Number(Boolean(a.attended))
       || (a.priority || 5) - (b.priority || 5)
       || b.unblocks - a.unblocks
@@ -104,9 +140,9 @@ export class Scheduler {
     }
     for (const { projectId } of this.reserved.values()) load.set(projectId, (load.get(projectId) ?? 0) + 1);
     const line = [...this.waiting.values()].filter((item) => !(away && item.attended));
-    const picked = rankWaiting(line, load, limit - used);
+    const picked = rankWaiting(line, load, limit - used, away);
     if (picked.some((item) => item.issueId === candidate.issueId)) return this.reserve(candidate, now);
-    const ahead = rankWaiting(line, load, line.length).findIndex((item) => item.issueId === candidate.issueId);
+    const ahead = rankWaiting(line, load, line.length, away).findIndex((item) => item.issueId === candidate.issueId);
     return { ok: false, reason: `Queued: ${limit - used} free agent slot${limit - used === 1 ? "" : "s"}, ${ahead} ticket${ahead === 1 ? "" : "s"} ahead. It starts when its turn comes.` };
   }
 

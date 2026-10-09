@@ -11,6 +11,7 @@ import { SetupError, type PlannerStart } from "./launch";
 import type { ProcessInspector } from "./process-liveness";
 import { orderProblems, parseOrder, plannerBrief, ProjectFlow, ProjectStore, type PlannerRecord, type ProjectRecord } from "./project-flow";
 import { Scheduler } from "./scheduler";
+import { TierStore } from "./model-tiers";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { type UsageReport } from "./limit-resume";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
@@ -109,12 +110,14 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   };
   const path = join(directory, "projects.json");
   const store = new ProjectStore(path, () => now);
+  // The model tier store the hand-out's night order reads (README, "Who starts next").
+  const tiers = new TierStore(join(directory, "model-tiers"), () => new Date(now).toISOString());
   const scheduler = new Scheduler({ running: async () => running, projectOf: async () => "erp", away: async () => away, now: () => now });
   // Tickets a start under way, or their newest thread, accounts for.
   const held = new Set<string>();
   const usage = { reports: null as UsageReport[] | null, chains: {} as Record<string, string[]>, refresh: true };
   const launchedSelectors: string[] = [];
-  const deps = { linear, projectIssues, scheduler, capacity: new Capacity(() => now), store,
+  const deps = { linear, projectIssues, scheduler, capacity: new Capacity(() => now), store, tiers,
     settings: readSettings ? { read: readSettings } : undefined,
     startPlanner: async (input: PlannerStart, _paseo: PaseoApi, current: PluginSettings) => {
       launchedSelectors.push(current.launchPreferences[current.lastProvider!].model);
@@ -141,7 +144,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   const makeFlow = () => new ProjectFlow({ ...deps, store: new ProjectStore(path, () => now) });
   const flow = makeFlow();
   return {
-    flow, makeFlow, calls, reads, path, store, issues, fail, comments, updates, starts, descriptions, team, elsewhere, held, usage, launchedSelectors,
+    flow, makeFlow, calls, reads, path, store, tiers, issues, fail, comments, updates, starts, descriptions, team, elsewhere, held, usage, launchedSelectors,
     now: () => now,
     notificationAttempts,
     setLabelled: (value: boolean) => { labelled = value; },
@@ -859,6 +862,24 @@ test("while the owner is away only an attended ticket with an approved plan wait
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);
   assert.deepEqual(r.calls, ["delegate i1", "delegate i3"], "present: the attended ticket goes before higher-priority ones, so TUC-4 waits");
+});
+
+test("while the owner is away the hand-out starts a cheap implementation before an urgent strong one; present, priority decides as before", async (t) => {
+  // TUC-1's recorded tier is strong, TUC-2's label makes it cheap; TUC-1 is the urgent, older one.
+  const tickets = () => [issue(1, { labels: ["plan-ready"], priority: 1, createdAt: "2025-01-01T00:00:00Z" }), issue(2, { labels: ["plan-ready", "model:cheap"], priority: 4 })];
+  const oneSlot = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 1 } };
+  const paseo = paseoWith(() => []);
+  for (const [isAway, expected, why] of [
+    [true, "delegate i2", "away: the one slot goes to the cheap implementation, not the urgent strong one"],
+    [false, "delegate i1", "present: the night class is ignored and the urgent ticket wins"],
+  ] as const) {
+    const r = await room(t, tickets());
+    await r.seed({ planned: ["i1", "i2"], planner: null });
+    await r.tiers.record({ id: "i1", identifier: "TUC-1" }, { tier: "strong", source: "plan", reason: "spans four layers", agentId: null, model: null });
+    r.setAway(isAway);
+    await r.flow.tick(paseo, oneSlot);
+    assert.deepEqual(r.calls, [expected], why);
+  }
 });
 
 test("tickets nobody may hand out stay put: started, someone else's, already with Paseo, sub-issues; a parent goes as a group", async (t) => {
