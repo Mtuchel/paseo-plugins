@@ -754,6 +754,7 @@ test("a permission shows in the agent panel only while still pending, and the ti
       moveToStateNamed: async (_i: string, name: string) => { calls.push(`move ${name}`); return { changed: true }; },
       comment: async (_i: string, body: string) => { calls.push(`comment ${body.slice(0, 30)}`); },
       upsertComment: async (_i: string, body: string, id: string | null) => { calls.push(`app comment ${id ?? "new"} ${body.split("\n")[0]}`); return "c1"; },
+      commentBody: async (_id: string) => null,
       // In a session the session's owner is asked; the ticket's creator is never looked at.
       isPerson: async (): Promise<boolean> => { throw new Error("the creator is not consulted in a session"); },
       viewerId: async () => OWNER, userUrl: async (id: string) => `https://linear.app/ws/profiles/${id}`,
@@ -765,7 +766,7 @@ test("a permission shows in the agent panel only while still pending, and the ti
       scheduleLimitResume: async () => false,
       ask: async (_s: string, body: string, options: { value: string }[]) => { calls.push(`ask ${body.split("\n")[0]} [${options.map((o) => o.value).join("|")}]`); },
     };
-    const handover = { read: async () => null, update: async () => ({}) as never, finish: async () => ({}) as never, handOff: async () => true, waiting: async () => null, setWaiting: async () => {} };
+    const handover = { read: async () => null, all: async () => [], update: async () => ({}) as never, finish: async () => ({}) as never, handOff: async () => true, waiting: async () => null, setWaiting: async () => {} };
     const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" }, pendingPermissions: pending } }) }) } } as unknown as PaseoApi;
     const writeback = new Writeback(linear, { read: async () => ({ ...settings, writeback: { ...DEFAULT_WRITEBACK, blocked: true } }) }, { sessions: sessions as never, handover }, 0, join(tmpdir(), `paseo-writeback-outbox-${process.pid}.json`));
     await writeback.permissionRequested({ agent: { id: "a1", workspaceId: "w", parentAgentId: null, provider: "omp", cwd: "/x", title: "T" }, request }, paseo);

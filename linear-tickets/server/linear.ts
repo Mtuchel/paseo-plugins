@@ -611,9 +611,9 @@ export const CREATE_COMMENT_QUERY = `mutation comment($input: CommentCreateInput
   commentCreate(input: $input) { success comment { id } }
 }`;
 // `comment(id:)` is a lookup, not the issue's comment list: an id Linear has no comment for comes
-// back as an "Entity not found" error, which `commentById` maps to null.
+// back as an "Entity not found" error, which `commentById` and `commentBody` map to null.
 export const COMMENT_BY_ID_QUERY = `query commentById($id: String!) {
-  comment(id: $id) { id }
+  comment(id: $id) { id body }
 }`;
 export const UPDATE_COMMENT_QUERY = `mutation commentUpdate($id: String!, $input: CommentUpdateInput!) {
   commentUpdate(id: $id, input: $input) { success }
@@ -1039,11 +1039,15 @@ export class LinearService {
   }
 
   // Best-effort by design: callers surface `note` as a warning,
-  // and a failure here must never turn into a launch failure.
-  async markInProgress(issue: Pick<Issue, "id" | "status" | "statusType">, teamId: string | null): Promise<{ changed: boolean; note?: string }> {
+  // and a failure here must never turn into a launch failure. `fromStarted`: move even out of a
+  // started state that is not work (writeback.ts sends a ticket whose wait ended back to work when
+  // nothing recorded the state the wait left); a closed ticket is still left alone.
+  async markInProgress(issue: Pick<Issue, "id" | "status" | "statusType">, teamId: string | null, options: { fromStarted?: boolean } = {}): Promise<{ changed: boolean; note?: string }> {
     return withPriority("owner", "status change", async () => {
       // Already started: avoid a repeat write and needless audit noise.
-      if (issue.statusType.trim().toLowerCase() === "started") return { changed: false };
+      const type = issue.statusType.trim().toLowerCase();
+      if (!options.fromStarted && type === "started") return { changed: false };
+      if (options.fromStarted && (type === "completed" || type === "canceled" || type === "duplicate")) return { changed: false };
       if (!teamId) return { changed: false, note: "The ticket has no team, so it could not be marked in progress." };
       let states: TeamState[];
       try {
@@ -1528,6 +1532,19 @@ export class LinearService {
     try {
       const comment = record(record(await this.withKey((key) => this.post(key, COMMENT_BY_ID_QUERY, { id }))).comment ?? {});
       return label(comment.id) ? { id: label(comment.id) } : null;
+    } catch (error) {
+      if (entityNotFound(error)) return null;
+      throw error;
+    }
+  }
+
+  // One comment's body by its id, with the key like `commentById`; null when Linear has no comment
+  // with that id. A recorded waiting period's own comment says what opened it, so writeback can
+  // classify waits from before it recorded that. Any other failure propagates.
+  async commentBody(id: string): Promise<string | null> {
+    try {
+      const comment = record(record(await this.withKey((key) => this.post(key, COMMENT_BY_ID_QUERY, { id }))).comment ?? {});
+      return label(comment.id) ? label(comment.body) : null;
     } catch (error) {
       if (entityNotFound(error)) return null;
       throw error;

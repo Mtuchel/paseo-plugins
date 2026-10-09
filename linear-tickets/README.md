@@ -2244,11 +2244,23 @@ independently of the agent's own `linear_ticket` tools:
     opened the agent's Linear session, else the ticket's creator when a person wrote it, else you.
   Further questions in the same wait edit that comment. Once nothing is pending (a follow-up
   question arriving within seconds keeps the wait open), and when the turn ends or the agent
-  is archived, the label comes off and the ticket returns to its previous state, unless
-  someone moved it out of Needs input meanwhile. The next wait gets a fresh comment. A
+  is archived, the label comes off and the ticket returns to its previous state — or to its
+  team's In Progress state when the plugin has no record of it, which happens when the wait
+  opened while the ticket already waited for you (an earlier wait, the other host, a wait
+  whose end was lost) — unless someone moved it out of Needs input meanwhile. A ticket whose
+  team has no In Progress state, or that is closed, is left where it is. The next wait gets a fresh comment. A
   failed turn adds `<label>-blocked`, which marks errors only; the next completed turn
   removes it. Started agents are asked to put everything they need from you (answers,
   decisions, approvals, secrets, manual steps) into one question request.
+  Those ending events can get lost — a host or daemon restart kills the process a question
+  belonged to, an agent is closed or archived while the plugin is down, the plugin is
+  reloaded in between — which would leave the ticket in Needs input under its label with
+  nothing waiting. So every pull request poll also checks the waits this host recorded, a
+  couple of minutes apart, against the ticket's live agents: a wait whose agent is gone
+  (archived, closed, or a ghost), or a question wait whose agent holds no pending request any
+  more, ends like a normal one. A wait that just opened is left alone until the daemon has
+  listed its agents again, and a ticket this host handed to the other host keeps its wait,
+  which the other host's plugin ends.
   As a fallback, a completed turn whose final reply ends by asking you (a question, or a
   phrase such as "needs your OK", "once you decide" or "reply "yes" and I'll") opens a
   wait too; the comment quotes that part of the reply. It lasts until the agent's next turn

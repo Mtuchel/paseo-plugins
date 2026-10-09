@@ -294,7 +294,11 @@ export default function contribute(server: PluginServerContext) {
   // The ticket states crash recovery last saw, fed by every state the plugin writes (README, "Crashed agents").
   const knownStates = new KnownStates();
   linear.onStateWritten((issueId, state) => { void knownStates.observe(issueId, state, Date.now()); });
-  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog, knownStates, outage: new GreptileOutage(linear, settings) });
+  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog, knownStates, outage: new GreptileOutage(linear, settings),
+    // The waits the plugin recorded for the owner, checked in every poll: a wait whose ending event
+    // was lost would hold its ticket in Needs input forever. The tickets this host handed to the
+    // peer keep their waits (the peer's plugin ends them).
+    ownerWaits: { reconcileWaiting: async () => { if (attachedPaseo) await writeback.reconcileWaiting(attachedPaseo, { handedOver: () => watchdogStore.handedOver() }); } } });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => asCaller("session-webhook", () => sessions.receive(event)));
   // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").
