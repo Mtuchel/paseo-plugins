@@ -1793,6 +1793,27 @@ sent again. A busy or disconnected agent is asked on a later poll; a gone or arc
 agent's nudge starts a successor or goes to the ticket like a drop's fix request.
 Review threads are read (GraphQL, every page) only when a stage needs them.
 
+**Stack cap.** The owner's policy allows a ticket at most three open (unlanded) pull requests at
+a time; before stacking a 4th, the agent lands the reviewed bottom range. So every poll counts
+the open pull requests of each ticket this host owns whose title names it as a whole word (the
+connected-stack sense above, without `do-not-merge` ones, forks' branches and the merge queue's
+own drafts) for its **started** tickets, from the listings and Graphite's drafts the poll already
+read: no pull request is read for this alone. A ticket over the cap whose bottom is still
+unpublished (a draft no open queue draft lists) gets one message, claimed under the stack's
+signature — its pull requests with their heads — so it is asked once, and again only once the
+stack changed (a new branch, a new head). The message names the stack and what the policy asks:
+land the reviewed bottom range before stacking more, bottom first from the top branch of the
+reviewed range (`node tools/ci/publish.mjs`), review the range, then `node tools/ci/enqueue.mjs`
+and `wait-queue.mjs`; never close or split a pull request for the cap, add no new branch until it
+lands, and review is never waived. Nothing mentions you, and no count hands anything to you. A
+published bottom, or one an open queue draft already tests, is left alone: its own lifecycle
+steps and the [queue backstop](#queue-backstop)'s ready rule own it. The message goes to the
+ticket's agent like a nudge (**Stalled pull requests**): a busy or disconnected agent is asked on
+a later poll, a gone or archived one's message starts a successor or goes to the ticket. At most
+three tickets are asked per poll, so the first poll after this was rolled out asks the over-cap
+stacks of the day a few at a time. The cap is a policy message, never enforcement: nothing is
+closed, split or blocked, and an existing over-cap stack is not touched beyond the message.
+
 **Gone agents.** A nudge, merge queue fix request (the queue backstop's refused enqueues
 included) or replacement request for an agent that is archived or no longer exists starts a
 successor: a new agent on the ticket's recorded branch and worktree, which gets the handover of
@@ -1926,6 +1947,27 @@ limit: those runs get their own message, see above). The restarts live in
 (`escalated`) is cleared when that file loads, so the agent is restarted again, or succeeded,
 while its ticket is started. A plan request (see `plan` label) waits until
 the watch restarted the agent.
+
+**Done tickets with open pull requests.** A ticket is done only once its stack has landed (the
+owner switched Linear's "pull request merged → Done" automation off for TUC on 2026-10-09). A
+ticket this host owns that Linear shows completed while its own open pull requests remain
+(never only `do-not-merge` ones, forks' branches or the merge queue's drafts) goes back to work
+instead: Paseo moves it to its team's started "In Progress" state — the same resolution **Marking
+tickets In Progress** uses, so a team without one is left alone — posts one comment on the ticket
+naming the pull requests and why, and sends its agent the notice a stalled pull request gets: a
+crashed agent is restarted with it, a gone one starts a successor (see **Gone agents**), and when
+neither can start, it goes to the ticket. From then on the ticket is a started ticket like any
+other: crash restarts, resumes a restart left pending and successor starts apply to it, and its
+open pull requests are nudged on their stages. Canceled and duplicate tickets are never reopened.
+The decision is made once per completion — Linear's `completedAt` is kept in
+`$PASEO_HOME/linear-tickets/stack-policy.json` — so a ticket you moved back to Done after a
+reopen stays Done and the log names it once (respecting it is deliberate: Paseo does not fight
+you for the state). A reopen is finished step by step, so an interrupted one (a plugin stop
+between the move, the comment and the notice) resumes where it stopped: the state move changes
+nothing when it already went through, the comment is found by its mark, and the notice is claimed
+before it goes out. At most three tickets are reopened per poll, so the first poll after this was
+rolled out works through the Done tickets with open pull requests (~16 in tuchel-platform on
+2026-10-09) without waking every agent at once; the rest follow on the next polls.
 
 **Silent and stuck agents.** A ticket agent that stops making progress is recovered by the
 watchdog ([`server/watchdog.ts`](server/watchdog.ts)), which runs first in every two-minute poll
@@ -3518,7 +3560,8 @@ calls, the session sweep's webhook-driven activity reads (skipped while a webhoo
 5-minute fallback, the minute sweep without webhooks), the waiting threads' batched status reads
 (120 threads in four requests; a session Linear no longer has is dropped and read alone), and the pull request view (CI summaries,
 merge queue parsing, polling cadence, the GitHub budget's reserve and its routed bypass,
-labelling) against a fake GitHub, the decision candidates (the log, the collector's sources
+labelling, the stack policy's cap message once per changed stack and its reopen of Done tickets
+once per completion, both bounded per poll) against a fake GitHub, the decision candidates (the log, the collector's sources
 and exclusions, window limits, candidate identity, one ticket per project, app-only filing)
 and the weekly ops review (history reading, coverage, per-kind numbers, dedupe, the cap, checks
 and reopens, the review lock, create reservations) against a fake Linear, the checked answer path
