@@ -37,7 +37,7 @@ export class NeedsYouIssues {
 
 // The owner answered on the sub-issue (a relayed comment or an @mention of the Paseo app): it is
 // done, and later comments there stay put.
-export async function closeAnswered(needsYou: NeedsYouIssues, linear: Pick<LinearService, "complete">, id: string): Promise<void> {
+export async function closeAnswered(needsYou: Pick<NeedsYouIssues, "remove">, linear: Pick<LinearService, "complete">, id: string): Promise<void> {
   await needsYou.remove(id);
   await linear.complete(id).catch((error: unknown) => console.error(`[linear-tickets] closing answered sub-issue ${id} failed: ${error instanceof Error ? error.message : error}`));
 }

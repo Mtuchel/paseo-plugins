@@ -71,7 +71,9 @@ export type Candidate = {
   notice?: { comment: boolean; session: boolean; commentId: string | null };
 };
 
-export type CorrectionActivity = { via: "linear-comment" | "linear-session"; activityId: string; userId: string };
+// Where an owner's answer came from: a Linear comment, an agent session, or the Paseo Agents
+// menu bar's ask cards (owner-asks.ts).
+export type CorrectionActivity = { via: "linear-comment" | "linear-session" | "menu-bar"; activityId: string; userId: string };
 export type Correction = { delivered: boolean; reply: string };
 
 const OVERRIDE = /^\s*override\s+(D-[0-9a-f]{8})\b[:,.]?\s*([\s\S]*)$/i;

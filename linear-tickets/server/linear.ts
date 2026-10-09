@@ -5,6 +5,7 @@ import { Credentials } from "./credentials";
 import type { LabelEvent, SweptIssue } from "./label-rules";
 import { currentCaller, currentPriority, poolOf, rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
 import { operationName } from "./linear-usage";
+import { NEEDS_INPUT_STATE } from "./writeback";
 
 const endpoint = "https://api.linear.app/graphql";
 export type Post = (key: string, query: string, variables: Record<string, unknown>) => Promise<Record<string, unknown>>;
@@ -687,6 +688,58 @@ export const REACTION_QUERY = `mutation react($commentId: String!, $emoji: Strin
 // those reach the agent through the session webhook, not the relay. `parent`: the thread's first
 // comment when this one is a reply (its `sessionId` set when the thread is an agent session's).
 export type RelayComment = { id: string; body: string; createdAt: string; userId: string; reactions: { emoji: string; userId: string }[]; sessionId: string | null; parent: { id: string; userId: string; sessionId: string | null } | null };
+
+// The owner's asks (README, "Owner asks"): the issues in the "Needs input" state the menu bar
+// shows as cards. One batched read lists them (same scope as `linear.list-issues` with
+// stateNames ["Needs input"]); the comments a changed ask is chosen from come in one read per
+// OWNER_ASK_COMMENT_BATCH issues (`comments(last:)`, so the newest ones).
+export type OwnerAskIssue = {
+  id: string; identifier: string; title: string; url: string; updatedAt: string; description: string;
+  status: string; statusType: string; parentId: string | null; parentIdentifier: string | null; labels: string[];
+};
+export type OwnerAskComment = { id: string; body: string; createdAt: string };
+export const OWNER_ASKS_PAGE = 50;
+export const OWNER_ASKS_PAGES = 5;
+const OWNER_ASK_FIELDS = `id identifier title url updatedAt description state { name type } parent { id identifier } labels(first: 50) { nodes { name } }`;
+export const OWNER_ASKS_QUERY = `query ownerAskIssues($first: Int!, $after: String, $filter: IssueFilter) {
+  issues(first: $first, after: $after, includeArchived: false, orderBy: updatedAt, filter: $filter) {
+    nodes { ${OWNER_ASK_FIELDS} }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export const OWNER_ASKS_BY_ID_QUERY = `query ownerAskIssuesById($ids: [ID!]!, $first: Int!) {
+  issues(first: $first, includeArchived: true, filter: { id: { in: $ids } }) {
+    nodes { ${OWNER_ASK_FIELDS} }
+  }
+}`;
+// The newest OWNER_ASK_COMMENTS comments of one issue. Linear's `comments(first:)` returns the
+// newest first (its `last:` returns the oldest), so a single page is the recent history.
+export const OWNER_ASK_COMMENT_BATCH = 10;
+export const OWNER_ASK_COMMENTS = 12;
+export function ownerAskCommentsQuery(count: number): string {
+  const indexes = Array.from({ length: count }, (_, index) => index);
+  const declarations = indexes.map((index) => `$i${index}: ID!`).join(", ");
+  const fields = indexes.map((index) => `t${index}: issues(first: 1, filter: { id: { eq: $i${index} } }) {
+    nodes { comments(first: ${OWNER_ASK_COMMENTS}) { nodes { id body createdAt } } }
+  }`).join("\n  ");
+  return `query ownerAskComments(${declarations}) {\n  ${fields}\n}`;
+}
+function ownerAskIssue(node: Record<string, unknown>): OwnerAskIssue {
+  const parent = record(node.parent ?? {});
+  return {
+    id: label(node.id),
+    identifier: label(node.identifier),
+    title: label(node.title),
+    url: label(node.url),
+    updatedAt: label(node.updatedAt),
+    description: label(node.description),
+    status: label(record(node.state ?? {}).name),
+    statusType: label(record(node.state ?? {}).type),
+    parentId: label(parent.id) || null,
+    parentIdentifier: label(parent.identifier) || null,
+    labels: connection(node.labels).nodes.map((entry) => label(record(entry).name)).filter(Boolean),
+  };
+}
 
 export const ISSUE_DOCUMENTS_QUERY = `query issueDocuments($id: String!) {
   issue(id: $id) { id documents(first: 50) { nodes { id title url content } } }
@@ -1728,6 +1781,53 @@ export class LinearService {
       round = next;
     }
     return empty;
+  }
+
+  // The owner's asks (README, "Owner asks"): the issues in "Needs input", newest change first,
+  // OWNER_ASKS_PAGE a read, at most OWNER_ASKS_PAGES reads.
+  async ownerAskIssues(): Promise<OwnerAskIssue[]> {
+    const issues: OwnerAskIssue[] = [];
+    let after: string | null = null;
+    let pages = 0;
+    do {
+      const page = record(record(await this.read(OWNER_ASKS_QUERY, { first: OWNER_ASKS_PAGE, after, filter: listIssueFilter([NEEDS_INPUT_STATE]) })).issues ?? {});
+      for (const node of connection(page).nodes) {
+        const issue = ownerAskIssue(record(node));
+        if (issue.id) issues.push(issue);
+      }
+      const info = record(page.pageInfo ?? {});
+      after = ++pages < OWNER_ASKS_PAGES && info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
+    } while (after);
+    return issues;
+  }
+
+  // Named issues (the acceptance smoke test): read by id, closed ones included.
+  async ownerAskIssuesByIds(ids: string[]): Promise<OwnerAskIssue[]> {
+    if (!ids.length) return [];
+    const data = await this.read(OWNER_ASKS_BY_ID_QUERY, { ids, first: ids.length }, (result) => connection(record(result.issues)).nodes.length === ids.length);
+    return connection(record(data.issues)).nodes.map((node) => ownerAskIssue(record(node))).filter((issue) => issue.id);
+  }
+
+  // The newest OWNER_ASK_COMMENTS comments of each issue, in one read per OWNER_ASK_COMMENT_BATCH
+  // issues. An issue neither credential returns is left out (deleted, or not visible).
+  async ownerAskComments(ids: string[]): Promise<Map<string, OwnerAskComment[]>> {
+    const comments = new Map<string, OwnerAskComment[]>();
+    for (let start = 0; start < ids.length; start += OWNER_ASK_COMMENT_BATCH) {
+      const batch = ids.slice(start, start + OWNER_ASK_COMMENT_BATCH);
+      const variables: Record<string, unknown> = {};
+      batch.forEach((id, index) => Object.assign(variables, { [`i${index}`]: id }));
+      const data = await this.read(ownerAskCommentsQuery(batch.length), variables, (result) =>
+        batch.every((_, index) => Boolean(connection(record(result[`t${index}`] ?? {})).nodes[0])));
+      batch.forEach((id, index) => {
+        const issue = connection(record(data[`t${index}`] ?? {})).nodes[0];
+        if (!issue) return;
+        comments.set(id, connection(record(record(issue).comments ?? {})).nodes.map((node) => {
+          const entry = record(node);
+          return { id: label(entry.id), body: label(entry.body), createdAt: label(entry.createdAt) };
+        }).filter((comment) => comment.id));
+      });
+    }
+    return comments;
   }
 
   // Every page of a connection read with the key (at most WINDOW_PAGES), for the windowed reads below.

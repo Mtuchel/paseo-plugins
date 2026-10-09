@@ -3421,6 +3421,54 @@ default.
 for their grace period at once; `shadow` ends waiting live candidates too. Neither undoes an
 answer already given or work an agent did after it; override those.
 
+## Owner asks
+
+Everything waiting for the owner in Linear's "Needs input" state is answerable from the Paseo
+Agents menu bar app as multiple-choice cards, without opening the ticket. `linear.owner-asks`
+reads the asks and `linear.answer-ask` answers one the way an owner's `@paseo <answer>` comment
+would. Both are read-only in Linear until an answer is sent.
+
+**What is read.** The owner's issues in the "Needs input" state (pages of 50, up to 250 issues a
+refresh; newest 12 comments each, ten issues per read), their descriptions, this host's "Needs you"
+records (`$PASEO_HOME/linear-tickets/needs-you/`) and handover records. The ask text per issue,
+first match wins: the description of a "Needs you" sub-issue or a `paseo-manual` issue; the plugin's
+own wait comment (`… is waiting for you: …`, read by id when it is older than those comments); the
+newest comment that hands the next step to the owner; else the description. An issue whose
+`updatedAt` has not moved is cached, so a refresh reads only what changed. An ask's ticket is the
+parent of a "Needs you" sub-issue or manual task, else the issue itself (a ticket under an epic is
+still its own ticket). Each ask carries its route from this host's view: `agent` (the live asking
+agent), `continue` (the ticket's agent is gone: an answer starts a continuation agent through the
+starter's handover path), or `comment`.
+
+**The extraction.** `linear.owner-asks` never waits for a model. An ask whose ask text is new (or
+whose earlier extraction failed) is returned right away with `extracted: false` (kind `info`,
+summary = title) and extracted in the background: one isolated, tool-less OMP call per ask text
+(no MCP servers, extensions, skills, rules or memory; the ask is data, never instructions), thinking
+`low`, on `deputy.model` when set, else the cheap tier's `cheapModels.omp` model. Strict JSON is
+accepted: kind `decision` (with questions and options), `manual` (the owner does something outside
+Linear) or `info`; anything else, an unreadable or oversized answer, or a tool event leaves the ask
+unextracted and the call is retried after 15 s, 60 s and 5 minutes, then given up. Two calls run at
+a time. Results are cached in `$PASEO_HOME/linear-tickets/owner-asks/extract/<issueId>.json`
+(directory `0700`, file `0600`, keyed by the ask text and the extraction version), so a restart or a
+second refresh re-runs nothing.
+
+**Where an answer goes.** `linear.answer-ask` takes `{ issueId, answers, note?, done? }`, where
+`answers` maps each question key to the chosen option label or free text, and answers like an
+`@paseo` reply: to the live agent that asked through the checked relay path (its pending question is
+answered, else the text is a prompt), else a continuation agent on the ticket (the answer is its
+lead, as an owner comment on a waiting ticket would start), else a comment on the issue. `done:
+true` completes a `paseo-manual` issue and a "Needs you" sub-issue and moves them to Done; on a
+parent ticket it only records the comment and leaves the state to the agent, whose next turn settles
+the wait. Every answer records "Answered from the menu bar: …" on the issue. An answer is idempotent
+per issue and answer text for 10 minutes (a double click is one answer), and an answered ask stays
+out of the read until Linear's `updatedAt` moves past the answer by a minute, so the answer's own
+comment and state move do not resurrect it. Failures throw with a sentence the menu bar shows.
+
+**Host choice.** The menu bar calls `linear.owner-asks` on its tickets host (server087 by default)
+and `linear.answer-ask` on the Mac daemon instead when a live agent there carries the ticket, so the
+answer reaches the agent's session; otherwise the tickets host answers, which starts the
+continuation when the asking agent is gone.
+
 ## Connection storage
 
 The API-key form stores the key on the daemon host in

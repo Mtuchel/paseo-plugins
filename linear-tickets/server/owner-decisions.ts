@@ -83,12 +83,12 @@ export type LogEntry =
   | { kind: "plan-feedback"; id: string; at: string; identifier: string; issueId: string; approved: boolean; text: string }
   | { kind: "question"; id: string; at: string; identifier: string; issueId: string; questions: LoggedQuestion[] }
   | { kind: "answer"; id: string; at: string; answers?: Record<string, string>; denyMessage?: string }
-  | { kind: "owner-answer"; id: string; at: string; key: string; via: "linear-comment" | "linear-session"; userId: string; answers: Record<string, string> }
+  | { kind: "owner-answer"; id: string; at: string; key: string; via: "linear-comment" | "linear-session" | "menu-bar"; userId: string; answers: Record<string, string> }
   | { kind: "deputy-prediction"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; selections: Record<string, string>; citations: Citation[] }
   | { kind: "deputy-refusal"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; reason: string; category?: string }
   | { kind: "deputy-answer"; id: string; at: string; identifier: string; issueId: string; version: string; key: string; answers: Record<string, string>; citations: Citation[] }
   | { kind: "deputy-outcome"; id: string; at: string; key: "blocked" | "canceled" | "owner-won" | "unknown"; reason: string }
-  | { kind: "deputy-override"; id: string; at: string; key: string; via: "linear-comment" | "linear-session"; userId: string; text: string; disposition: "delivered" | "failed"; detail?: string };
+  | { kind: "deputy-override"; id: string; at: string; key: string; via: "linear-comment" | "linear-session" | "menu-bar"; userId: string; text: string; disposition: "delivered" | "failed"; detail?: string };
 
 const KINDS: LogEntry["kind"][] = ["plan-feedback", "question", "answer", "owner-answer", "deputy-prediction", "deputy-refusal", "deputy-answer", "deputy-outcome", "deputy-override"];
 const entryKey = (entry: LogEntry) => `${entry.kind}\n${entry.id}\n${"key" in entry ? entry.key : ""}`;
