@@ -12,7 +12,7 @@ import { AgentApi, AppAuth } from "./agent-app";
 import { verifyWebhook } from "./agent-webhook";
 import { fingerprint, type Candidate, type CorrectionActivity } from "./deputy";
 import { Handover, handoverPrompt, progressBody, type HandoverRecord } from "./handover";
-import { AuthenticationError, LinearApiError, LinearService, postGraphQL, type GroupChild, type IssueGroup, type IssueState } from "./linear";
+import { AuthenticationError, LinearApiError, LinearService, postGraphQL, type AdmissionState, type GroupChild, type IssueGroup, type IssueState } from "./linear";
 import { closeAnswered, NeedsYouIssues } from "./needs-you";
 import { PermissionReplies } from "./permission-replies";
 import { planSteps, SessionRouter, SessionStore, type SessionLink } from "./sessions";
@@ -205,10 +205,10 @@ test("plan checklists come from checkboxes, or numbered steps under a Steps head
 });
 
 type Call = string;
-type RouterLinear = Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "issueStatuses" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
+type RouterLinear = Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "admissionStates" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
 // `reload`: the daemon's agent reload (null: the plugin has no daemon connection); `send`: runs
 // before each send is recorded.
-function harness(options: { now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; processLiveness?: typeof ticketProcessLiveness; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; admission?: (issueId: string) => Promise<{ ok: true } | { ok: false; reason: string }>; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null> } = {}) {
+function harness(options: { now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; processLiveness?: typeof ticketProcessLiveness; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; admission?: (issueId: string, paseo: PaseoApi, settings: PluginSettings, read?: AdmissionState) => Promise<{ ok: true } | { ok: false; reason: string }>; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null> } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -266,8 +266,7 @@ function harness(options: { now?: () => number; pending?: AgentPermissionRequest
       addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); },
       complete: async (id: string) => { calls.push(`complete ${id}`); }, cancel: async (id: string, reason: string) => { calls.push(`cancel ${id}: ${reason.split("\n")[0]}`); },
       issueState: async (id: string) => ({ id, status: "Todo", statusType: "unstarted", blockedBy: options.blockedBy?.[id] ?? [] }) as IssueState,
-      issueStatus: async () => ({ status: "Todo", statusType: "unstarted" }),
-      issueStatuses: async (ids: string[]) => new Map(ids.map((id) => [id, { status: "Todo", statusType: "unstarted", completedAt: null }])),
+      admissionStates: async (ids: string[]) => new Map(ids.map((id) => [id, { id, status: "Todo", statusType: "unstarted", blockedBy: options.blockedBy?.[id] ?? [] } as AdmissionState])),
       issueGroup: async (id: string) => options.groups?.[id] ?? { id, identifier: "TUC-1", status: "Todo", statusType: "unstarted", delegateId: "paseo-app", finished: false, children: [] },
       moveToStateNamed: async (id: string, name: string) => { calls.push(`move ${id} to ${name}`); return { changed: true }; },
       delegate: options.delegate ?? (async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); }),
@@ -995,7 +994,7 @@ function routerAdmission(t: TestContext, points = 60_000, limitedOperation?: str
   });
   const post = (key: string, query: string, variables: Record<string, unknown>) => postGraphQL(key, query, variables, budget);
   const api = new AgentApi({ accessToken: async () => "app-token" }, post);
-  const linear = new LinearService(new Credentials("/unused", "owner-key"), post, api);
+  const linear = new LinearService(new Credentials("/unused", "owner-key"), post, api, budget);
   return { budget, headers, api, linear, sent, now: () => 0 };
 }
 
@@ -1081,25 +1080,66 @@ test("a queued-thread rate limit stops its loop and logs once across the remaini
 test("a queue pass reads 120 waiting threads' Linear states in four requests, not one per thread", async (t) => {
   const admission = routerAdmission(t, 1_000_000, undefined, (operation, variables) => {
     if (operation === "sessionStatuses") return { data: Object.fromEntries(Object.keys(variables).map((alias) => [alias, { status: "active" }])) };
-    if (operation === "issueStatuses") return { data: { issues: { nodes: (variables.ids as string[]).map((id) => ({ id, state: { name: "Todo", type: "unstarted" }, completedAt: null })) } } };
+    if (operation === "admissionStates") return { data: { issues: { nodes: (variables.ids as string[]).map((id) => ({ id, identifier: `TUC-${id.slice(1)}`, state: { id: "todo", name: "Todo", type: "unstarted" }, labels: { nodes: [] } })) } } };
     return undefined;
   });
+  const reads: string[] = [];
   const h = harness({
     ...admission,
     manual: true,
     processLiveness: async (_paseo, issueId) => Number(issueId.slice(1)) < 100 ? "alive" : "absent",
-    admission: async () => ({ ok: false, reason: "Waiting for TUC-9 to finish." }),
+    admission: async (issueId, _paseo, _settings, read) => { reads.push(`${issueId} ${read?.id} ${read?.status}`); return { ok: false, reason: "Waiting for TUC-9 to finish." }; },
   });
   try {
     for (let n = 0; n < 120; n += 1) await h.store.put(link({ sessionId: `s${n}`, issueId: `i${n}`, identifier: `TUC-${n}`, agentId: null, queued: true }));
     await h.router.startQueued();
-    assert.deepEqual(admission.sent.map((call) => call.operation), ["sessionStatuses", "sessionStatuses", "sessionStatuses", "issueStatuses"]);
+    assert.deepEqual(admission.sent.map((call) => call.operation), ["sessionStatuses", "sessionStatuses", "sessionStatuses", "admissionStates"]);
     assert.deepEqual(admission.sent.slice(0, 3).map((call) => Object.keys(call.variables).length), [50, 50, 20]);
     assert.deepEqual(admission.sent[3].variables.ids, Array.from({ length: 20 }, (_, n) => `i${100 + n}`), "the tickets from the first thread that needs a state on");
+    assert.deepEqual(reads, Array.from({ length: 20 }, (_, n) => `i${100 + n} i${100 + n} Todo`), "each admission decides on its ticket's state from the batch");
     assert.equal((await h.store.get("s0"))?.queueReason, "an OMP worker for this ticket is still alive");
     assert.equal((await h.store.get("s119"))?.queueReason, "Waiting for TUC-9 to finish.");
     assert.equal((await h.store.get("s119"))?.queued, true);
   } finally { await h.cleanup(); }
+});
+
+// TUC-1684: 51 waiting threads, two of them on one ticket, need the states of 50 tickets: one
+// admission request. A ticket the batch leaves out is read alone; a failed batch keeps every thread queued.
+test("51 waiting threads on 50 tickets take one admission request; a missing ticket is read alone, a failed batch keeps them queued", async (t) => {
+  for (const failing of [false, true]) {
+    const errors = t.mock.method(console, "error", () => {});
+    const admission = routerAdmission(t, 1_000_000, undefined, (operation, variables) => {
+      if (operation === "sessionStatuses") return { data: Object.fromEntries(Object.keys(variables).map((alias) => [alias, { status: "active" }])) };
+      if (operation === "admissionStates" && failing) return { errors: [{ message: "Internal server error" }] };
+      if (operation === "admissionStates") return { data: { issues: { nodes: (variables.ids as string[]).filter((id) => id !== "i7").map((id) => ({ id, identifier: `TUC-${id.slice(1)}`, state: { id: "todo", name: "Todo", type: "unstarted" }, labels: { nodes: [] } })) } } };
+      if (operation === "issueState") return { data: { issue: { id: variables.id, identifier: "TUC-7", state: { id: "todo", name: "Todo", type: "unstarted" }, labels: { nodes: [] } } } };
+      return undefined;
+    });
+    const reads: string[] = [];
+    const h = harness({
+      ...admission,
+      manual: true,
+      processLiveness: async () => "absent",
+      admission: async (issueId, _paseo, _settings, read) => { reads.push(`${issueId} ${read ? "batch" : "alone"}`); return { ok: false, reason: "Waiting for TUC-9 to finish." }; },
+    });
+    try {
+      for (let n = 0; n < 51; n += 1) await h.store.put(link({ sessionId: `s${n}`, issueId: `i${n === 50 ? 3 : n}`, identifier: `TUC-${n === 50 ? 3 : n}`, agentId: null, queued: true }));
+      await h.router.startQueued();
+      // An answer missing a ticket is asked once more on the other pool (LinearService.read).
+      const states = admission.sent.filter((call) => call.operation === "admissionStates");
+      assert.deepEqual(states.map((call) => (call.variables.ids as string[]).length), failing ? [50] : [50, 50], "50 distinct tickets in one request");
+      if (failing) {
+        assert.deepEqual(reads, []);
+        for (const n of [0, 3, 50]) assert.equal((await h.store.get(`s${n}`))?.queued, true);
+        assert.ok(errors.mock.calls.some((call) => /checking the queued thread failed/.test(String(call.arguments[0]))));
+      } else {
+        assert.deepEqual(admission.sent.filter((call) => call.operation === "issueState").map((call) => call.variables.id), ["i7"], "only the ticket the batch left out is read alone");
+        assert.equal(reads.length, 51);
+        assert.ok(reads.every((entry) => entry.endsWith("batch")), "every admission decides on a state read in this pass");
+        assert.equal((await h.store.get("s50"))?.queueReason, "Waiting for TUC-9 to finish.", "both threads of one ticket share its state");
+      }
+    } finally { errors.mock.restore(); await h.cleanup(); }
+  }
 });
 
 test("a waiting thread Linear has no session for leaves the batch and is read alone; the batch still ends a completed thread", async (t) => {

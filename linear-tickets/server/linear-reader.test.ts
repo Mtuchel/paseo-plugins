@@ -49,7 +49,9 @@ test("issuesMentioning with openOnly filters on the description and leaves out f
   assert.deepEqual(filters, [{ team: { id: { eq: "t1" } }, description: { contains: "greptile-outage" }, state: { type: { nin: ["completed", "canceled", "duplicate"] } } }]);
 });
 
-test("poller reads go to the app's pool and never touch the key when the app can answer", async () => {
+// Outside a background context (owner-triggered and interactive reads); background reads go to the
+// key first (background-pause.test.ts).
+test("interactive reads go to the app's pool and never touch the key when the app can answer", async () => {
   const appCalls: string[] = [];
   const reader: Pick<App, "query"> = {
     query: (query, variables) => {
@@ -123,6 +125,32 @@ test("the status batch asks for exactly the rows of its chunk (AC-11): two ids s
   assert.deepEqual(keyCalls, []);
 });
 
+// TUC-1684: the queue's batch decides admission on the same parsed fields as a single read.
+test("the admission batch parses a ticket exactly as issueState does, once per id, and leaves out tickets Linear does not return", async () => {
+  const node = {
+    id: "i1", identifier: "TUC-1", priority: 2, createdAt: "2026-10-01T00:00:00Z", state: { id: "s1", name: "Todo", type: "unstarted" }, project: { id: "p1" }, labels: { nodes: [{ id: "l1", name: "paseo" }] },
+    inverseRelations: { nodes: [
+      { type: "blocks", issue: { id: "b1", identifier: "TUC-8", state: { name: "In Progress", type: "started" }, attachments: { nodes: [] } } },
+      { type: "blocks", issue: { id: "b2", identifier: "TUC-9", state: { name: "Done", type: "completed" }, attachments: { nodes: [] } } },
+      { type: "related", issue: { id: "r1", identifier: "TUC-10", state: { name: "Todo", type: "unstarted" }, attachments: { nodes: [] } } },
+    ] },
+    relations: { nodes: [{ type: "blocks", relatedIssue: { state: { type: "unstarted" } } }, { type: "blocks", relatedIssue: { state: { type: "completed" } } }] },
+  };
+  const asked: string[][] = [];
+  const { linear } = service({ query: (query, variables) => {
+    if (query === ISSUE_STATE_QUERY) return Promise.resolve({ issue: node });
+    asked.push(variables.ids as string[]);
+    return Promise.resolve({ issues: { nodes: [node] } });
+  } }, () => ({ issues: { nodes: [node] } }));
+  const single = await linear.issueState("i1");
+  const batch = await linear.admissionStates(["i1", "gone", "i1"]);
+  assert.deepEqual(asked, [["i1", "gone"]]);
+  const read = batch.get("i1")!;
+  for (const field of ["id", "identifier", "status", "statusType", "projectId", "labels", "blockedBy", "priority", "createdAt", "unblocks"] as const) assert.deepEqual(read[field], single[field], field);
+  assert.deepEqual(read.blockedBy, ["TUC-8"]);
+  assert.equal(batch.has("gone"), false);
+});
+
 test("hasComment looks a marker up among the ticket's comments, counts only a body that carries it whole, and fails rather than answer for a ticket Linear does not return", async () => {
   const asked: Record<string, unknown>[] = [];
   const mark = "`queue-backstop:drop:#437:419`";
@@ -142,7 +170,7 @@ test("hasComment looks a marker up among the ticket's comments, counts only a bo
   assert.deepEqual(missing.keyCalls, [MARKED_COMMENT_QUERY], "a ticket the app cannot see is read with the key first");
 });
 
-test("an app rate limit pauses the read instead of spending the key", async () => {
+test("an app rate limit pauses an interactive read instead of spending the key", async () => {
   const limited = new RateLimitedError("app", Date.now() + 60_000);
   const { linear, keyCalls } = service({ query: () => Promise.reject(limited) }, () => ({ issue }));
   await assert.rejects(linear.issueState("i1"), (error: unknown) => error === limited);

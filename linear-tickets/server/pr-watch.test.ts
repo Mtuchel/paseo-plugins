@@ -10,7 +10,7 @@ import type { HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
 import { activityBullets, ConditionalPullView, githubReader, GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft } from "./pr-watch";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, GREPTILE_RETRIGGER, marker, RETARGET_ORPHAN, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
-import { GitHubBudget, GitHubPausedError, withPriority } from "./rate-budget";
+import { GitHubBudget, GitHubPausedError, RateLimitedError, withPriority } from "./rate-budget";
 import { PermissionReplies } from "./permission-replies";
 import { SessionRouter, type IdleRun, type Succession } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
@@ -205,8 +205,9 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // `failure`: what linking a URL on the ticket throws; `arrive`: runs before a ticket comment
   // reaches Linear (a hanging one is a crash before it went out), `stall` after it did (a crash
   // right after); `lost`: the request fails although the comment reached Linear. `comments`:
-  // each ticket's comments; `state`: the ticket's workflow state.
-  const linear = { failure: null as Error | null, issueFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" } };
+  // each ticket's comments; `state`: the ticket's workflow state. `issueFailure` fails the ticket
+  // reads (`issueReads`), `statesFailure` the per-poll batch of the running tickets (`stateReads`).
+  const linear = { failure: null as Error | null, issueFailure: null as Error | null, statesFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], stateReads: [] as string[][], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" } };
   // No test worktree exists unless its git source is explicitly provided.
   const git = { origin: null as string | null, root: null as string | null, reads: [] as string[][] };
   // Open before-merge manual tasks of the ticket; `unreadable`: reading them fails.
@@ -288,6 +289,16 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         linear.issueReads.push(id);
         if (linear.issueFailure) throw linear.issueFailure;
         return linear.attachments;
+      },
+      issueStatusAnyPool: async (id) => {
+        linear.issueReads.push(id);
+        if (linear.issueFailure) throw linear.issueFailure;
+        return { ...linear.state, sentAt: Date.now() };
+      },
+      issueStatuses: async (ids) => {
+        linear.stateReads.push(ids);
+        if (linear.statesFailure) throw linear.statesFailure;
+        return new Map(ids.map((id) => [id, { ...linear.state, completedAt: null }]));
       },
     },
     manualTasks: {
@@ -2164,7 +2175,7 @@ test("a drop claimed while its pull request still holds an earlier message is qu
   assert.deepEqual(await h.backstop(), [], "each once");
 });
 
-test("a crashed agent is restarted and resumed with its nudge, also on an unchanged head; repeated crashes still reach the owner after two attempts, then nothing", async (t) => {
+test("a crashed agent with an open pull request is restarted by the crash pass at once, also on an unchanged head; repeated crashes reach the owner after two restarts, then nothing", async (t) => {
   const h = harness(t, { crash: true });
   h.github.view = { ...READY, checks: [failing("PR code")] };
   h.daemon.agent = RESTARTED;
@@ -2174,20 +2185,23 @@ test("a crashed agent is restarted and resumed with its nudge, also on an unchan
   assert.deepEqual(await h.poll(), [], "a healthy agent is not nudged twice on one head");
   h.daemon.agent = CRASHED;
   const restarted = await h.poll();
-  assert.deepEqual(restarted.filter((call) => !call.startsWith("prompt")), ["reload a1", `say thought The agent had crashed (${CRASH}); Paseo restarted it and asked it to resume and fix the failing checks.`]);
+  assert.deepEqual(restarted.filter((call) => !call.startsWith("prompt")), ["reload a1", `say thought The agent had crashed (${CRASH}); Paseo restarted it and asked it to resume and continue the step it was on.`]);
   const resume = promptOf(restarted) ?? "";
   assert.match(resume, /^Your previous run crashed \(`OMP RPC process is closed`\), and Paseo restarted you\./);
   assert.match(resume, /run `git status`/);
-  assert.match(resume, /nudge 2 of 2 for this step/);
+  assert.match(resume, /\n\nYour ticket TUC-1 is in In Progress\. Continue the lifecycle step you were on\.$/);
+  assert.equal(restarted.filter((call) => call.startsWith("prompt")).length, 1, "the nudge does not follow in the same poll");
+  h.daemon.agent = CRASHED;
+  assert.ok((await h.poll()).includes("reload a1"), "the second restart");
   h.daemon.agent = CRASHED;
   const escalated = await h.poll();
   assert.ok(!escalated.includes("reload a1"), "the escalation restarts nothing");
-  assert.match(escalated[0], /^comment https:\/\/linear\.app\/ws\/profiles\/me Paseo asked the agent 2 times to fix the failing checks/);
-  assert.deepEqual(await h.poll(), [], "after the escalation, nothing");
+  assert.ok(escalated.some((call) => call.startsWith(`comment ${OWNER} The agent crashed again after Paseo restarted it 2 times, so Paseo stops restarting it.`)), JSON.stringify(escalated));
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("reload") || call.startsWith("comment") || call.startsWith("prompt")), "after the escalation, nothing");
   // Reloaded by hand: no automatic resume reaches it.
   h.daemon.agent = RESTARTED;
   await h.restart();
-  assert.deepEqual(await h.poll(), []);
+  assert.ok(!(await h.poll()).some((call) => call.includes("Your previous run crashed")));
 });
 
 test("a crashed agent whose restart fails is sent nothing, and the attempt counts", async (t) => {
@@ -2199,7 +2213,8 @@ test("a crashed agent whose restart fails is sent nothing, and the attempt count
   h.daemon.reloaded = RESTARTED;
   const second = await h.poll();
   assert.equal(second[0], "reload a1");
-  assert.match(promptOf(second) ?? "", /nudge 2 of 2/);
+  assert.match(promptOf(second) ?? "", /Continue the lifecycle step you were on\.$/);
+  assert.equal(JSON.parse(await h.crashFile()).a1.restarts, 2);
 });
 
 test("a resume that did not go out after the restart is sent on a later poll, also after a plugin restart, and cleared only once sent", async (t) => {
@@ -2215,22 +2230,24 @@ test("a resume that did not go out after the restart is sent on a later poll, al
   h.daemon.send = async () => {};
   const saved = await h.crashFile();
   const sent = await h.poll();
-  assert.match(promptOf(sent) ?? "", /^Your previous run crashed[\s\S]*nudge 1 of 2/);
-  assert.equal(sent.at(-1), "say thought Paseo sent the restarted agent its resume.");
-  assert.deepEqual(await h.poll(), [], "sent once");
+  assert.match(promptOf(sent) ?? "", /^Your previous run crashed[\s\S]*Continue the lifecycle step you were on\.$/);
+  assert.ok(sent.includes("say thought Paseo sent the restarted agent its resume."));
+  assert.ok(!(await h.poll()).some((call) => call.includes("Your previous run crashed")), "sent once");
   // The plugin stopped after the send, before the resume was cleared: it goes out once more.
   await h.crashFile(saved);
   await h.restart();
   assert.match(promptOf(await h.poll()) ?? "", /^Your previous run crashed/);
 });
 
-test("a drop's fix request for an agent whose restart fails goes to the ticket, and its resume is never sent later", async (t) => {
+test("a drop's fix request for an agent the crash pass could not restart goes to the ticket once its crashes went to the owner, and its resume is never sent later", async (t) => {
   const h = harness(t, { crash: true });
   t.mock.method(console, "error", () => {});
   h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
   h.daemon.reloaded = CRASHED;
-  const calls = await h.poll();
-  assert.equal(calls[0], "reload a1");
+  const calls: string[] = [];
+  for (let poll = 0; poll < 3; poll++) calls.push(...await h.poll());
+  assert.equal(calls.filter((call) => call === "reload a1").length, 2, "two restarts, then the owner");
+  assert.ok(calls.some((call) => call.startsWith(`comment ${OWNER} The agent crashed again after Paseo restarted it 2 times`)));
   assert.ok(calls.includes("move In Progress"));
   assert.ok(calls.some((call) => call.startsWith(`comment ${OWNER} The agent that worked on this ticket is no longer running`)));
   // Reloaded by hand.
@@ -2267,7 +2284,7 @@ test("a crashed agent without an open pull request is restarted while its ticket
     h.daemon.agent = CRASHED;
     const third = await h.poll();
     assert.ok(!third.includes("reload a1"), pull);
-    assert.ok(third.some((call) => call.startsWith(`comment ${OWNER} The agent crashed again after Paseo restarted it 2 times while no pull request was open`)), pull);
+    assert.ok(third.some((call) => call.startsWith(`comment ${OWNER} The agent crashed again after Paseo restarted it 2 times, so Paseo stops restarting it.`)), pull);
     await h.restart();
     assert.deepEqual(await h.poll(), [], `${pull}: then nothing`);
   }
@@ -2297,6 +2314,101 @@ test("without an open pull request, a healthy agent or a ticket that is not star
     h.linear.state = { status: statusType === "started" ? "In Progress" : "Done", statusType };
     assert.deepEqual(await h.poll(), [], statusType);
   }
+});
+
+// TUC-1684: the crash pass's ticket check falls back from a fresh read (either pool) to the state
+// Paseo last saw (known-states.json), and only with neither does the agent wait for the next poll.
+const REFUSED = () => new RateLimitedError("key", Date.now() + 60_000, "reserve");
+
+test("with Linear refusing both pools, a crashed agent is restarted on the stored state, also after a plugin restart, and told to check its ticket first", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = harness(t, { crash: true });
+  h.records[0] = { ...h.records[0], links: {} };
+  h.daemon.agent = RESTARTED;
+  assert.deepEqual(await h.poll(), [], "a healthy agent is left alone");
+  assert.deepEqual(h.linear.stateReads, [["i1"]], "one batch per poll keeps the running tickets' states known");
+  await h.restart();
+  h.linear.issueFailure = REFUSED();
+  h.linear.statesFailure = REFUSED();
+  h.daemon.agent = CRASHED;
+  const calls = await h.poll();
+  assert.ok(calls.includes("reload a1"));
+  const resume = promptOf(calls) ?? "";
+  assert.match(resume, /^Paseo could not read this ticket's Linear state just now and restarted you on the state it last saw \(In Progress, \d{4}-\d\d-\d\d \d\d:\d\d UTC\)\. First check the ticket's state with the linear_ticket tool get_ticket\. If it is Done or Canceled \(or marked a duplicate\), stop\./);
+  assert.match(resume, /\n\nYour previous run crashed \(`OMP RPC process is closed`\)[\s\S]*Your ticket TUC-1 is in In Progress\. Continue the lifecycle step you were on\.$/);
+  assert.doesNotMatch(JSON.parse(await h.crashFile()).a1.resume?.text ?? "", /could not read this ticket/, "the line is added at send time, never stored");
+});
+
+test("a stored Done is not restarted while Linear refuses both pools, and a ticket with no stored state waits, logged once, until a check succeeds", async (t) => {
+  const errors = t.mock.method(console, "error", () => {});
+  const done = harness(t, { crash: true });
+  done.records[0] = { ...done.records[0], links: {} };
+  done.daemon.agent = RESTARTED;
+  done.linear.state = { status: "Done", statusType: "completed" };
+  await done.poll();
+  done.linear.issueFailure = REFUSED();
+  done.linear.statesFailure = REFUSED();
+  done.daemon.agent = CRASHED;
+  assert.ok(!(await done.poll()).includes("reload a1"), "the stored Done holds");
+
+  const unknown = harness(t, { crash: true });
+  unknown.records[0] = { ...unknown.records[0], links: {} };
+  unknown.linear.issueFailure = REFUSED();
+  unknown.linear.statesFailure = REFUSED();
+  assert.ok(!(await unknown.poll()).includes("reload a1"));
+  assert.ok(!(await unknown.poll()).includes("reload a1"));
+  assert.equal(errors.mock.calls.filter((call) => /TUC-1: Linear refuses the ticket check and its state is not known yet, so agent a1 is not restarted/.test(String(call.arguments[0]))).length, 1);
+  unknown.linear.issueFailure = null;
+  const restarted = await unknown.poll();
+  assert.ok(restarted.includes("reload a1"));
+  assert.doesNotMatch(promptOf(restarted) ?? "", /could not read this ticket/, "a fresh read needs no check-first line");
+});
+
+test("a saved resume, also one saved before this line existed, is sent with the check-first line when only the stored state is known", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = harness(t, { crash: true });
+  h.records[0] = { ...h.records[0], links: {} };
+  await writeFile(join(await h.home(), "known-states.json"), JSON.stringify({ i1: { name: "In Review", type: "started", at: Date.parse("2026-10-09T05:00:00Z") } }));
+  await h.crashFile(JSON.stringify({ a1: { restarts: 1, resume: { text: "Your previous run crashed (`boom`), and Paseo restarted you.\n\nOld step.", issueId: "i1" } } }));
+  await h.restart();
+  h.linear.issueFailure = REFUSED();
+  h.linear.statesFailure = REFUSED();
+  h.daemon.agent = RESTARTED;
+  const sent = promptOf(await h.poll()) ?? "";
+  assert.match(sent, /^Paseo could not read this ticket's Linear state just now and restarted you on the state it last saw \(In Review, 2026-10-09 05:00 UTC\)\./);
+  assert.match(sent, /\n\nYour previous run crashed \(`boom`\), and Paseo restarted you\.\n\nOld step\.$/);
+  assert.equal(JSON.parse(await h.crashFile()).a1.resume, null, "cleared once sent");
+});
+
+test("a refused Linear call for one crashed agent does not stop the crash pass for the next", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = harness(t, { crash: true });
+  h.records[0] = { ...h.records[0], links: {} };
+  h.records.push({ ...h.records[0], issueId: "i2", identifier: "TUC-2", agentId: "a2", worktreePath: "/wt/tuc-2" });
+  await h.crashFile(JSON.stringify({ a1: { restarts: 2 } }));
+  await h.restart();
+  h.linear.arrive = async () => { throw REFUSED(); };
+  const calls = await h.poll();
+  assert.ok(!calls.includes("reload a1"), "a1's crashes go to the owner");
+  assert.ok(calls.includes("reload a2"), "a2 is restarted although a1's comment was refused");
+  assert.equal(JSON.parse(await h.crashFile()).a1.escalated, false, "a1's refused comment is retried on the next poll");
+});
+
+test("a crashed agent with a stalled pull request that the ticket check or the restart limit held back is not reloaded by its nudge in the same poll", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const unknown = harness(t, { crash: true });
+  unknown.github.view = { ...READY, checks: [failing("PR code")] };
+  unknown.linear.issueFailure = REFUSED();
+  unknown.linear.statesFailure = REFUSED();
+  assert.ok(!(await unknown.poll()).includes("reload a1"), "no known state: the nudge waits with the crash pass");
+
+  const capped = harness(t, { crash: true });
+  capped.github.view = { ...READY, checks: [failing("PR code")] };
+  await capped.crashFile(JSON.stringify({ a1: { restarts: 2 } }));
+  await capped.restart();
+  capped.linear.arrive = async () => { throw REFUSED(); };
+  assert.ok(!(await capped.poll()).includes("reload a1"), "a refused owner comment does not let the nudge restart it a third time");
+  assert.equal(JSON.parse(await capped.crashFile()).a1.restarts, 2);
 });
 
 // ---- The cheap first look (ConditionalPullView): conditional REST requests per pull request (read

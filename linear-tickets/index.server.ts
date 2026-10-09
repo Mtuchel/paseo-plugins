@@ -33,6 +33,7 @@ import { recordStart, TIER_AGENT_LABEL, tierModel, TierStore } from "./server/mo
 import { isTier } from "./shared/plan-model";
 import { GreptileOutage } from "./server/greptile-outage";
 import { HealthMonitor } from "./server/health";
+import { KnownStates } from "./server/known-states";
 import { PullRequestWatch } from "./server/pr-watch";
 import { PullRequestBoard } from "./server/pull-requests";
 import { ManualTasks } from "./server/manual-tasks";
@@ -290,7 +291,10 @@ export default function contribute(server: PluginServerContext) {
   plannotator.recordDecisions(decisions);
   const manualTasks = new ManualTasks({ linear, settings });
   const watchdog = new Watchdog({ store: watchdogStore, sessions, linear, settings, handover, needsYou, manualTasks });
-  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog, outage: new GreptileOutage(linear, settings) });
+  // The ticket states crash recovery last saw, fed by every state the plugin writes (README, "Crashed agents").
+  const knownStates = new KnownStates();
+  linear.onStateWritten((issueId, state) => { void knownStates.observe(issueId, state, Date.now()); });
+  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog, knownStates, outage: new GreptileOutage(linear, settings) });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => asCaller("session-webhook", () => sessions.receive(event)));
   // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").

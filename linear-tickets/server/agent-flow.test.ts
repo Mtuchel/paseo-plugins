@@ -11,6 +11,7 @@ import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/
 import { fingerprint } from "./deputy";
 import { HealthMonitor } from "./health";
 import { reviewChange, type PullRequestView } from "./pr-watch";
+import { currentCallerName } from "./linear-usage";
 import { PermissionReplies } from "./permission-replies";
 import { PlannotatorBridge } from "./plannotator";
 import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
@@ -77,7 +78,7 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
   });
   const router = new SessionRouter({
     api: { activity: async (_s: string, content: { type: string; body?: string }) => { calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); }, openSessions: async () => [], activities: async () => [] } as never,
-    linear: { viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, issueState: async () => { throw new Error("unused"); }, issueStatus: async () => { throw new Error("unused"); }, issueStatuses: async () => { throw new Error("unused"); }, issueGroup: async () => { throw new Error("unused"); }, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {}, comment: async () => {}, hasComment: async () => false, userUrl: async () => "https://linear.app/owner" },
+    linear: { viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, issueState: async () => { throw new Error("unused"); }, admissionStates: async () => { throw new Error("unused"); }, issueGroup: async () => { throw new Error("unused"); }, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {}, comment: async () => {}, hasComment: async () => false, userUrl: async () => "https://linear.app/owner" },
     starter: { start: async () => { throw new Error("unused"); }, admission: async () => ({ ok: true as const }) },
     handover: { resumeTarget: async () => null, handOff: async () => true },
     launcher: { gate: () => ({ release: () => {} }) },
@@ -364,6 +365,27 @@ test("while a question is open the live feed holds its actions, so Linear keeps 
   await h.cleanup();
 });
 
+// TUC-1684: the live feed's posts are counted as `session-live-feed`, not as an unnamed
+// `op:agentActivity`, and go out at most every 15 seconds per agent.
+test("the live feed posts a running agent's commands once per 15 seconds under its own caller name", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const posts: string[] = [];
+  const h = routerHarness([], { api: { activity: async (_s: string, content: { type: string; body?: string }) => { posts.push(`${currentCallerName()} ${content.type}:${content.body ?? ""}`); }, openSessions: async () => [], activities: async () => [] } as never });
+  t.after(h.cleanup);
+  await h.store.put(link);
+  await h.router.follow("a1");
+  const ran = (command: string) => h.feeds[0]({ event: { type: "timeline", item: { type: "tool_call", status: "completed", detail: { type: "shell", command } } } });
+  ran("ls");
+  ran("pwd");
+  t.mock.timers.tick(14_999);
+  await setImmediate();
+  assert.deepEqual(posts, [], "nothing before 15 seconds");
+  t.mock.timers.tick(1);
+  while (!posts.length) await setImmediate();
+  assert.equal(posts.length, 1, "both commands in one post");
+  assert.match(posts[0], /^session-live-feed action:/);
+});
+
 test("feedback for a review whose Plannotator server is gone reaches the agent instead of failing", async () => {
   // A port nothing listens on any more: the connection is refused, so the decision never reached Plannotator.
   const server = createServer();
@@ -543,9 +565,9 @@ test("a queued thread starts once its blockers finish, even after it dropped out
   const sessionStatus: Record<string, string | null> = { q1: "stale", q2: "complete", q3: "stale", q4: "stale", q5: "awaitingInput" };
   const h = routerHarness([], {
     // Linear's session list no longer contains any of the waiting threads.
-    // The batched reads return nothing, so each thread is read alone (the batch's fallback).
+    // The batched session reads return nothing, so each thread's session is read alone; the ticket states come in one batch.
     api: { activity: async (sessionId: string, content: { type: string; body?: string }) => { if (content.type !== "thought") events.push(`${sessionId} ${content.type}`); }, openSessions: async () => [], activities: async () => [], sessionStatus: async (id: string) => sessionStatus[id], sessionStatuses: async () => new Map() } as never,
-    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueStatus: async (id: string) => ({ statusType: id === "i3" ? "canceled" : "unstarted", status: id === "i3" ? "Canceled" : "Todo" }), issueStatuses: async () => new Map() } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, admissionStates: async (ids: string[]) => new Map(ids.map((id) => [id, { id, statusType: id === "i3" ? "canceled" : "unstarted", status: id === "i3" ? "Canceled" : "Todo" }])) } as never,
     starter: {
       admission: async (id: string) => (blocked.has(id) ? { ok: false as const, reason: "Waiting for TUC-9 to finish." } : { ok: true as const }),
       start: async (id: string) => {
@@ -600,8 +622,7 @@ test("a thread Linear marked stale while this host was down starts its agent, un
     } as never,
     linear: {
       viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {},
-      issueStatus: async () => ({ statusType: "unstarted", status: "Todo" }),
-      issueStatuses: async () => new Map(),
+      admissionStates: async (ids: string[]) => new Map(ids.map((id) => [id, { id, statusType: "unstarted", status: "Todo" }])),
       issueGroup: async (id: string) => ({ id, identifier: `TUC-${id}`, status: "Todo", statusType: "unstarted", delegateId: APP, finished: false, children: [] }),
     } as never,
     starter: {
@@ -625,7 +646,7 @@ test("a queued thread whose ticket already has a running agent is linked to it i
   const starts: string[] = [];
   const h = routerHarness([], {
     api: { activity: async () => {}, openSessions: async () => [], activities: async () => [], sessionStatus: async () => "stale", sessionStatuses: async () => new Map() } as never,
-    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueStatus: async () => ({ statusType: "unstarted", status: "Todo" }), issueStatuses: async () => new Map() } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, admissionStates: async (ids: string[]) => new Map(ids.map((id) => [id, { id, statusType: "unstarted", status: "Todo" }])) } as never,
     starter: { admission: async () => ({ ok: true as const }), start: async (id: string) => { starts.push(id); throw new Error("unused"); } },
   }, [{ id: "labelled", title: "Started by the paseo label" }]);
   await h.store.put({ ...link, sessionId: "q1", agentId: null, queued: true });
@@ -639,7 +660,7 @@ test("a parked plan's thread offers no resume when its agent is retired, and sta
   const starts: string[] = [];
   const h = routerHarness([], {
     api: { activity: async (_s: string, content: { type: string; body?: string }) => { h.calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); }, openSessions: async () => [], activities: async () => [], sessionStatus: async () => "stale", sessionStatuses: async () => new Map() } as never,
-    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, issueStatus: async () => ({ statusType: "unstarted", status: "Todo" }), issueStatuses: async () => new Map() } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, admissionStates: async (ids: string[]) => new Map(ids.map((id) => [id, { id, statusType: "unstarted", status: "Todo" }])) } as never,
     starter: {
       admission: async () => ({ ok: true as const }),
       start: async (id: string) => { starts.push(id); return { agentId: "fresh", warnings: [], provider: "omp", target: "repo", resumed: false, untrusted: false, plan: null }; },
@@ -730,6 +751,15 @@ test("admission waits for unfinished blockers and for a free agent slot", async 
   const room = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 1);
   assert.deepEqual(await room.starter.admission("i1", room.paseo, settings), { ok: true });
   assert.deepEqual(await room.starter.admission("i1", room.paseo, { ...settings, dispatch: { ...settings.dispatch, maxRunning: 0 } }), { ok: true });
+});
+
+// TUC-1684: the queue's batched read hands admission the state it read in the same pass; every other
+// caller (dispatch, activation, session paths) passes none and admission reads the ticket fresh.
+test("admission decides on a state read in the same pass when given one, and reads the ticket itself otherwise", async () => {
+  const h = starterHarness({ creatorId: OWNER, labels: [], blockedBy: ["TUC-9"] }, 0);
+  const read = { id: "i1", identifier: "TUC-1", status: "Todo", statusType: "unstarted", projectId: null, labels: [], blockedBy: [], priority: 0, createdAt: "", unblocks: 0 };
+  assert.deepEqual(await h.starter.admission("i1", h.paseo, settings, read), { ok: true }, "the batch's state: no blockers left");
+  assert.deepEqual(await h.starter.admission("i1", h.paseo, settings), { ok: false, reason: "Waiting for TUC-9 to finish." }, "a fresh read");
 });
 
 test("an agent waiting for the owner's answer or approval frees its slot; one at work keeps it", async () => {

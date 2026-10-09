@@ -633,7 +633,7 @@ Pending source activations are never evicted.
 
 
 **In the panel.**
-- The agent's commands and file edits show up while it works, merged at most every 4 seconds.
+- The agent's commands and file edits show up while it works, merged at most every 15 seconds.
 - Each session links **Open in Paseo** (the web app at app.paseo.sh opens the agent when that browser is paired with this host).
 - Questions with several parts are asked one part at a time, and are answered together once all parts are in. "Other" options are not buttons: type your own answer instead.
 - **Stop** interrupts the turn and keeps the agent stopped (a turn the provider starts by itself within 5 minutes is stopped again) until you reply.
@@ -1806,24 +1806,46 @@ without a recorded session file or worktree, or a process table that cannot be r
 keeps the agent live until the next poll.
 
 **Crashed agents.** An agent whose provider process exited or closed (Paseo shows it in error,
-for example "OMP RPC process is closed") receives no message. Before a nudge, a merge queue fix
-request or a replacement request goes out, the watch reads the agent: a crashed one is restarted
-the way `paseo agent reload` does it, keeping its conversation and worktree, and then gets one
-message that names the crash, tells it to run `git status` and finish or abort an interrupted
-rebase, and repeats the step it was about to be asked for. The agent panel shows "The agent had
-crashed (…); Paseo restarted it …". A restart counts as a nudge for its stage even on an
-unchanged head, so an agent that crashes on every turn still reaches the owner after two. When
-the restart fails, the attempt still counts; a fix or replacement request then goes to the ticket
-(no successor: the agent still exists). A busy agent, an agent waiting for an answer, and an agent whose ticket has
-another live agent (for example a successor the automatic resume just started) are never
-restarted. If the message does not go out after the restart (the agent is busy right away, the
-send fails, or the plugin stops), it is sent on a later poll, at least once: a duplicate is
-possible, so the message asks the agent to check its state first. It is dropped unsent once the
-ticket is no longer started, another agent took it over, or the step went to the owner.
-An agent whose ticket has no open pull request (none yet, or the last one merged or closed) is
-restarted the same way while its ticket is in a started state: up to two restarts, then one
-comment to the owner, then nothing. The state lives in `$PASEO_HOME/linear-tickets/crash-recovery.json`.
-A plan request (see `plan` label) waits until the watch restarted the agent.
+for example "OMP RPC process is closed") receives no message. Crash recovery runs in every
+two-minute poll of the pull request watch, right after the watchdog and before any pull request
+work, whatever the background Linear budget says: background work being paused does not hold it
+back. It covers every crashed agent of a ticket with a running record, open pull request or not.
+A crashed agent is restarted the way `paseo agent reload` does it, keeping its conversation and
+worktree, and then gets one message that names the crash, tells it to run `git status` and finish
+or abort an interrupted rebase, and says "Your ticket … is in …. Continue the lifecycle step you
+were on." The agent panel shows "The agent had crashed (…); Paseo restarted it …". Every restart
+counts, so an agent that crashes on every turn reaches the owner after two: then one comment to
+the owner, then nothing. When the restart fails, the attempt still counts. A busy agent, an agent
+waiting for an answer, and an agent whose ticket has another live agent (for example a successor
+the automatic resume just started) are never restarted. A crashed agent the crash pass looked at
+gets no nudge, merge queue fix request or replacement request in that poll, restarted or not: the
+ticket check and the restart limit hold for those too. They still restart an agent that crashed
+after the crash pass ran, within the same limit. For an agent whose crashes went to the owner, a
+fix or replacement request goes to the ticket instead (no successor: the agent still exists).
+
+An agent is restarted only while its ticket is in a started state (a ticket in review whose pull
+requests merged is still started: it may have steps left). The check reads the ticket's state on
+the Paseo app's pool, at interactive priority (`crash-recovery`, 4 points), and on the API key's
+when the app's refuses it. When Linear refuses both, the plugin goes by the state it last saw,
+kept in `$PASEO_HOME/linear-tickets/known-states.json` for every ticket with a running record:
+every state the plugin writes, the crash check's own reads, and one background read per poll of
+all running agents' tickets (about 30 requests an hour) fill it, and of two observations the
+later one wins (a read by when it was sent, a write by when Linear confirmed it). The restarted
+agent's message then starts with "Paseo could not read this ticket's Linear state just now and
+restarted you on the state it last saw (…). First check the ticket's state … If it is Done or
+Canceled (or marked a duplicate), stop. … If you cannot check it, wait …": an instruction to the
+agent, not a guarantee. With no stored state either (right after this was rolled out, or a lost
+file), the agent is not restarted before the next poll, and the log names it once. A refused or
+failed Linear call for one agent is logged and the pass goes on with the next one; a refused
+owner comment is retried on the next poll.
+
+If the message does not go out after the restart (the agent is busy right away, the send fails,
+or the plugin stops), it is sent on a later poll, at least once: a duplicate is possible, so the
+message asks the agent to check its state first. Sent on a stored state, it gets the check-first
+line too. It is dropped unsent once the ticket is no longer started, another agent took it over,
+or the agent's crashes went to the owner. The restarts live in
+`$PASEO_HOME/linear-tickets/crash-recovery.json`. A plan request (see `plan` label) waits until
+the watch restarted the agent.
 
 **Silent and stuck agents.** A ticket agent that stops making progress is recovered by the
 watchdog ([`server/watchdog.ts`](server/watchdog.ts)), which runs first in every two-minute poll
@@ -2374,8 +2396,9 @@ Calls are counted when their fetch settles. Caller context follows awaited work 
 nested callers override it. Unscoped requests are labelled `op:<operation>`.
 
 The caller names distinguish dispatch, project flow, comment relay, label repair, PR watch,
-session-sweep parts, session webhooks, lifecycle write-backs, sidebar reads, health, manual
-tasks, state labels, label rules and plan handling. Each pool also includes the most recently
+crash recovery (`crash-recovery`), session-sweep parts, session webhooks, the agent panel's live
+feed (`session-live-feed`), lifecycle write-backs, sidebar reads, health, manual tasks, state
+labels, label rules and plan handling. Each pool also includes the most recently
 observed request/complexity limits and remaining budget, with `observedAt` (not an extrapolation).
 Once an hour the plugin logs totals split into plugin and agent MCP sources, and its twelve most
 expensive caller/operation rows. Counters cover this daemon's GraphQL transport, including
@@ -2386,13 +2409,29 @@ hold within a running broker and its graceful drain; a crash can lose the last m
 which is never reconstructed from reservations.
 No tokens, query bodies or ticket text appear in the report.
 
-- **Reads that pollers repeat use the app's pool** when the Paseo app is installed: the relay's
-  comment read, the auto-dispatch label query, ticket state, manual-task status, the sidebar
-  state labels, the agent session sweep and the label rules' sweeps. The key reads them only when the app is not installed, its token cannot be
-  refreshed, or it cannot see a ticket. An app rate limit never falls back to the key. Writes use
-  the app's pool too; the key writes only in the cases listed under [Who Linear shows as the
-  author](#who-linear-shows-as-the-author). Managed `linear_ticket` requests share daemon
-  admission through the private broker; daemon and agent MCP traffic are attributed separately.
+- **Background reads use the API key's pool first** (TUC-1684): the relay's comment read, the
+  auto-dispatch label query, ticket states, manual-task status, the state labels, the queue's
+  admission read, the PR watch's reads and the label rules' sweeps. The app reads one only when the
+  key cannot see everything asked for (an incomplete answer or "Entity not found"). While the key
+  is at its own background reserve, or no key is connected, a background read takes the app path
+  below, so it pauses only when both pools are at their reserve. A key rate limit on a key-first
+  read propagates; the app does not repeat it. Since 2026-10-08 14:00 UTC the app had used its
+  whole hourly allowance every hour while the key used 25–190 of its 2,500 requests; with the
+  background reads the key carries about 1,000–1,900 an hour. Everything using the owner's key
+  shares that allowance, and each pool keeps its own reserves.
+- **Interactive and owner reads use the app's pool** when the Paseo app is installed: the
+  sidebar, the review page and ticket agents' `linear_ticket` reads. The key reads them only when
+  the app is not installed, its token cannot be refreshed, or it cannot see a ticket. An app rate
+  limit on them never falls back to the key. The agent session API (the session sweep's session
+  reads, the panel's activities) works only with the app. Writes use the app's pool too, whatever
+  the priority, so Linear shows Paseo as their author; the key writes only in the cases listed
+  under [Who Linear shows as the author](#who-linear-shows-as-the-author). Managed `linear_ticket`
+  requests share daemon admission through the private broker; daemon and agent MCP traffic are
+  attributed separately.
+- **The live feed posts every 15 seconds.** The agent panel's commands and file edits go out as
+  one `agentActivity` per running agent at most every 15 s (`session-live-feed`). Before, it ran
+  every 4 s outside any caller and showed as `op:agentActivity`: 200–1,150 app requests an hour
+  on server087 (2026-10-08). While a question waits in the panel, the feed holds its actions.
 - **The session sweep's per-session reads follow the webhooks.** It still lists Linear's open
   agent sessions every minute (one request, shared by the parts of a sweep that need it), because
   that is how a session whose `created` webhook was missed is found, but it reads a session's
@@ -2411,19 +2450,25 @@ No tokens, query bodies or ticket text appear in the report.
   worker) made `session-sweep.queued threads` 1,678–1,951 requests an hour, 34–39% of the app's
   5,000. Now the sweep reads all waiting threads' session states up front, 50 aliased
   `agentSession` lookups per request (`sessionStatuses`, about 2 points each), and the first
-  thread that needs its ticket's state reads it for every later thread in one `issueStatuses`
-  request. Those 62 threads cost 2 + 1 requests a sweep instead of 62 + 7, plus the unchanged
-  dependency read of `starter.admission` for each of the 7 that reached it. A session Linear no
-  longer has makes Linear refuse the whole batch; its alias is dropped, the rest are read again,
-  and that thread is read alone as before. Anything a batch does not return is read alone, and a
-  failed batch fails each thread's check as its own read did. The per-thread order, gates and
-  outcomes are unchanged; the states are read up to one sweep pass earlier than before.
+  thread that needs its ticket reads, for every later thread, everything `starter.admission`
+  decides on (state, project, labels, priority, blockers with their pull requests, and what the
+  ticket blocks) in one `admissionStates` request per 50 tickets. Admission then reads nothing
+  itself. Until 2026-10-09 it read each waiting ticket alone (498 points): with about 50 waiting
+  tickets, `session-sweep.queued threads/issueState` cost 1,286–2,771 requests and 0.64–1.38M
+  points an hour on server087. A read-only probe on the 50 live waiting tickets measured the batch
+  at 502 points, so a pass now costs about one fiftieth. Several threads of one ticket share its
+  entry. A session Linear no longer has makes Linear refuse the whole batch; its alias is dropped,
+  the rest are read again, and that thread is read alone as before. A ticket the batch does not
+  return is read alone, and a failed batch fails each thread's check as its own read did. The
+  per-thread order, gates and outcomes are unchanged, and the states are as fresh as before: read
+  in the same pass. Dispatch, activation and the session paths still read the ticket themselves.
 - **Three priorities reserve room for owner intent on both dimensions.**
   - Background work leaves **20%**: auto-dispatch, comment relay, project flow, label repair,
     health, label rules, manual tasks, plan requests, PR watch, queue backstop, state labels
     and the session sweep. Polls resume as the budget refills; the sweep skips its whole round
     while paused. Auto-dispatch shows `paused: …`, and persistent pauses are logged once per pool/cause.
-  - Interactive agent work leaves **5%**: progress write-backs, session replies and sidebar reads.
+  - Interactive agent work leaves **5%**: progress write-backs, session replies, sidebar reads and
+    crash recovery's ticket check and owner comment (see **Crashed agents**).
   - Owner work may use the final **5%**: plan approval/send-back (review page, inbox and Linear
     panel, including split and approve-later), plan follow-up filing and its retry worker,
     ticket status changes, and owner questions (panel prompt, Needs input, label and comment).
@@ -2473,13 +2518,12 @@ No tokens, query bodies or ticket text appear in the report.
   agents' tools; it is not relabelled as measured agent MCP use.
   The laptop's digest aggregation, menu-bar budget view, comment webhooks and one-week budget
   review are separate follow-ups. Status batches request only the number of IDs in each chunk.
-  Review inbox metadata reads only issue id, identifier and labels; queued threads read only
-  the workflow state before capacity admission. `starter.admission` still checks dependencies
-  and merged-review blockers using the full state query. On 2026-10-07 the old full state read
+  Review inbox metadata reads only issue id, identifier and labels; the queue reads its waiting
+  tickets with `admissionStates` (see above). On 2026-10-07 the old full state read
   measured 498 points, while `issueStatuses` measured 4: declared page size is not measured cost.
   PR discovery reads only attachment URLs (the same first 50 as before); watchdog exclusions
-  read only workflow state and labels. Both retain app-first reads, access fallback to the key
-  and propagation of app rate limits without key fallback. Discovery's repository/title matching,
+  read only workflow state and labels. Both are background reads: key first, then the app (see
+  above). Discovery's repository/title matching,
   ambiguous-repository refusal and watchdog owner/hold/veto exclusions are unchanged.
   A read-only production probe on this ticket measured the new attachment-URL query at
   4 points and the watchdog state/label query at 5 points (2026-10-07); costs vary with data.

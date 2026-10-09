@@ -15,7 +15,7 @@ import { groupProgress, groupStatus, isGroup } from "./groups";
 import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
 import { dispatchLabels } from "./dispatch";
 import type { Handover } from "./handover";
-import type { IssueGroup, IssueState, IssueStatus, LinearService } from "./linear";
+import type { AdmissionState, IssueGroup, LinearService } from "./linear";
 import type { Launcher } from "./launch";
 import { CODING_STATE } from "./plannotator";
 import type { NeedsYouIssues } from "./needs-you";
@@ -70,6 +70,22 @@ export function crashResume(error: string, next: string): string {
   ].join("\n");
 }
 
+// The ticket state a crash restart went by when Linear refused even the small ticket check on both
+// pools (README, "Crashed agents"): the state Paseo last saw, and when (milliseconds since the epoch).
+export type UnverifiedState = { name: string; at: number };
+
+// A resume sent on such a state starts by asking the agent to check its ticket first. Added when the
+// resume is sent, never stored with it: a pending resume sent later on a fresh read goes without it.
+export function unverifiedResume(resume: string, seen: UnverifiedState | undefined): string {
+  if (!seen) return resume;
+  const at = `${new Date(seen.at).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+  return [
+    `Paseo could not read this ticket's Linear state just now and restarted you on the state it last saw (${seen.name}, ${at}). First check the ticket's state with the linear_ticket tool get_ticket. If it is Done or Canceled (or marked a duplicate), stop. Otherwise check where your pull requests and lifecycle step stand and continue the steps that are not finished, without repeating finished ones. If you cannot check it, wait and do nothing else until you can.`,
+    "",
+    resume,
+  ].join("\n");
+}
+
 // `restarted`: the agent had crashed, was reloaded and got the resume. `reloaded`: it was reloaded,
 // but the resume did not go out (busy right after, or the send failed). `crashed`: it is crashed and
 // was not (or could not be) reloaded; nothing was sent. `waiting`: it waits for the owner's answer
@@ -108,7 +124,8 @@ export function restartOrThrow(result: RestartResult): void {
 }
 // How a crashed agent is recovered: `before` runs with the resume text and the crash right before
 // the reload, so the caller can claim the attempt and keep the resume until it went out.
-export type Recovery = { issueId: string; before: (resume: string, error: string) => Promise<void> };
+// `unverified`: the ticket state the restart went by could not be read just now (see unverifiedResume).
+export type Recovery = { issueId: string; before: (resume: string, error: string) => Promise<void>; unverified?: UnverifiedState };
 type Snapshot = ProcessAgent & { activeTurn?: unknown; pendingPermissions?: unknown[] | null };
 
 // Running, starting, in a turn or waiting for an answer: a message would interrupt the turn or drop
@@ -310,7 +327,9 @@ export function daemonServerId(): Promise<string | null> {
   return serverIdCache;
 }
 
-const LIVE_FLUSH_MS = 4_000;
+// The live feed's cadence: one agentActivity per running agent at most this often (README, "Rate
+// limits"). At 4 s it cost the app up to 1,150 requests an hour on server087 (2026-10-08).
+const LIVE_FLUSH_MS = 15_000;
 const HOLD_MS = 5 * 60 * 1000;
 
 // Checklist entries from a plan's markdown: "- [ ] step", "1. step" or "- step" under a
@@ -334,7 +353,7 @@ export function planSteps(markdown: string): string[] {
 
 type Deps = {
   api: AgentApi;
-  linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "issueStatuses" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
+  linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "admissionStates" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
   starter: Pick<TicketStarter, "start" | "admission">;
   // The ticket's handover record: a successor resumes from it and takes it over (succeed).
   handover: Pick<Handover, "resumeTarget" | "handOff">;
@@ -381,8 +400,8 @@ type Deps = {
 };
 
 // One queue pass's Linear reads (see startQueued): the waiting threads' session states, or the
-// error their batched read failed with, and each ticket's workflow state on demand.
-type QueuedReads = { sessions: Map<string, string> | Error; ticket: (issueId: string) => Promise<Pick<IssueState, "status" | "statusType">> };
+// error their batched read failed with, and each ticket's admission state on demand.
+type QueuedReads = { sessions: Map<string, string> | Error; ticket: (issueId: string) => Promise<AdmissionState> };
 
 // How long a watchdog Stop waits for the turn to end before it counts as failed.
 const STOP_WAIT_MS = 60_000;
@@ -788,7 +807,7 @@ export class SessionRouter {
     for (const [agentId, state] of this.live) {
       if (state.sessionId !== sessionId || !state.asking) continue;
       state.asking = false;
-      state.timer ??= setTimeout(() => { void this.flush(agentId); }, LIVE_FLUSH_MS);
+      state.timer ??= setTimeout(() => { void asCaller("session-live-feed", () => this.flush(agentId)); }, LIVE_FLUSH_MS);
     }
     const activityId = String(activity.id ?? "");
     const content = (activity.content ?? {}) as { body?: string };
@@ -982,8 +1001,8 @@ export class SessionRouter {
   // wait with an error in the thread (as for a ticket that was never queued). A ticket that has an
   // agent meanwhile is linked to it without waiting for a slot: linking starts nothing.
   // Linear counts requests, not threads: the waiting threads' session states are read in batches
-  // up front, and their tickets' workflow states in one batch once a thread first needs one
-  // (README, "Rate limits").
+  // up front, and their tickets' states, with everything admission decides on, in batches of 50
+  // once a thread first needs one (README, "Rate limits").
   async startQueued(): Promise<void> {
     const waiting = (await this.deps.store.all()).filter((link) => link.queued && !link.agentId && !link.closed);
     if (!waiting.length) return;
@@ -994,7 +1013,7 @@ export class SessionRouter {
       if (error instanceof RateLimitedError) throw error;
       sessions = error instanceof Error ? error : new Error(String(error));
     }
-    const reads: QueuedReads = { sessions, ticket: this.ticketStatuses(waiting.map((link) => link.issueId)) };
+    const reads: QueuedReads = { sessions, ticket: this.ticketStates(waiting.map((link) => link.issueId)) };
     for (const link of waiting) {
       if (await this.deps.deletions?.blocked(link.issueId)) continue;
       const gate = this.deps.launcher.gate(link.issueId);
@@ -1010,15 +1029,16 @@ export class SessionRouter {
     }
   }
 
-  // A ticket's workflow state for this queue pass. The first thread that needs one reads it for
-  // itself and every ticket after it in one batch; a ticket the batch does not return is read alone,
-  // as before batching. A failed batch fails each thread that needs it, as its own read would.
-  private ticketStatuses(issueIds: string[]): (issueId: string) => Promise<Pick<IssueState, "status" | "statusType">> {
-    let batch: Promise<Map<string, IssueStatus>> | null = null;
+  // A ticket's admission state for this queue pass. The first thread that needs one reads it for
+  // itself and every ticket after it in one batch; threads of one ticket share its entry. A ticket
+  // the batch does not return is read alone, as before batching. A failed batch fails each thread
+  // that needs it, as its own read would. Read in the same pass as admission, so no fresher read
+  // exists: nothing is cached across passes.
+  private ticketStates(issueIds: string[]): (issueId: string) => Promise<AdmissionState> {
+    let batch: Promise<Map<string, AdmissionState>> | null = null;
     return async (issueId) => {
-      batch ??= this.deps.linear.issueStatuses([...new Set(issueIds.slice(issueIds.indexOf(issueId)))]);
-      const found = (await batch).get(issueId);
-      return found ?? this.deps.linear.issueStatus(issueId);
+      batch ??= this.deps.linear.admissionStates(issueIds.slice(issueIds.indexOf(issueId)));
+      return (await batch).get(issueId) ?? this.deps.linear.issueState(issueId);
     };
   }
 
@@ -1093,7 +1113,7 @@ export class SessionRouter {
         await this.say(link.sessionId, "thought", `${link.identifier} is handled on ${routed.peer}${link.pendingText ? "; your message was passed on" : ""}.`);
         return;
       }
-      const admission = await this.deps.starter.admission(link.issueId, this.paseo!, await this.deps.settings.read());
+      const admission = await this.deps.starter.admission(link.issueId, this.paseo!, await this.deps.settings.read(), ticket);
       if (!admission.ok) {
         if (link.queueReason !== admission.reason) await this.deps.store.patch(link.sessionId, { queueReason: admission.reason });
         return;
@@ -1460,7 +1480,7 @@ export class SessionRouter {
     if (reloaded.agent.status === "error") return "crashed";
     if (busy(reloaded.agent)) return "reloaded";
     try {
-      await reloaded.handle.send(resume);
+      await reloaded.handle.send(unverifiedResume(resume, recovery.unverified));
     } catch (failure) {
       console.error(`[linear-tickets] the resume for restarted agent ${agentId} failed: ${failure instanceof Error ? failure.message : failure}`);
       return "reloaded";
@@ -1584,7 +1604,8 @@ export class SessionRouter {
     return true;
   }
 
-  // Posts the agent's completed commands and edits while the turn runs, merged at most every 4 s.
+  // Posts the agent's completed commands and edits while the turn runs, merged at most every 15 s,
+  // accounted as `session-live-feed` (the timer runs outside any caller context).
   async follow(agentId: string): Promise<void> {
     if (!this.paseo || this.live.has(agentId)) return;
     const link = await this.deps.store.forAgent(agentId);
@@ -1596,7 +1617,7 @@ export class SessionRouter {
       const description = describeTool(event.event.item);
       if (!description) return;
       state.pending.push(description);
-      state.timer ??= setTimeout(() => { void this.flush(agentId); }, LIVE_FLUSH_MS);
+      state.timer ??= setTimeout(() => { void asCaller("session-live-feed", () => this.flush(agentId)); }, LIVE_FLUSH_MS);
     });
     state.stop = () => unsubscribe();
   }
