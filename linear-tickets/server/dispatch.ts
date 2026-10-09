@@ -12,8 +12,10 @@ import { asCaller } from "./linear-usage";
 
 const RECENT_LIMIT = 10;
 const IDLE_POLL_SECONDS = 60;
-// A launch sends about a dozen requests with the key (claim, ticket, comments, state); it only
-// starts when the key has that much room above its reserve, so it does not stop half-way.
+// A launch sends about a dozen requests (claim, ticket, comments, state): its writes go to the
+// Paseo app (LinearService.write) and some reads to the key (label and team lookups), so it only
+// starts when both pools have that much room above their background reserve, and does not stop
+// half-way with the trigger label already gone.
 const LAUNCH_ROOM = 20;
 
 type Linear = Pick<LinearService, "labeledIssues" | "addLabel" | "removeLabel" | "comment">;
@@ -193,15 +195,21 @@ export class Dispatcher {
     // Sequential on purpose: each launch creates a worktree, and Linear rate-limits writes.
     for (const issue of issues) {
       if (this.stopped) return;
-      const until = (this.deps.budget ?? rateBudget).pausedUntil("key", "background", LAUNCH_ROOM);
-      if (until !== null) throw new RateLimitedError("key", until, "reserve");
+      this.launchRoom();
       await this.dispatch(issue, settings, paseo);
     }
     for (const next of [this.deps.projects, this.deps.repairs]) {
       if (this.stopped || !next) continue;
-      const until = (this.deps.budget ?? rateBudget).pausedUntil("key", "background", LAUNCH_ROOM);
-      if (until !== null) throw new RateLimitedError("key", until, "reserve");
+      this.launchRoom();
       await asCaller(next === this.deps.projects ? "project-flow" : "label-repair", () => next.tick(paseo, settings));
+    }
+  }
+
+  private launchRoom(): void {
+    const budget = this.deps.budget ?? rateBudget;
+    for (const pool of ["app", "key"] as const) {
+      const until = budget.pausedUntil(pool, "background", LAUNCH_ROOM);
+      if (until !== null) throw new RateLimitedError(pool, until, "reserve");
     }
   }
 
@@ -290,7 +298,7 @@ export class Dispatcher {
       const message = error instanceof Error ? error.message : "Unknown error";
       this.record(issue.identifier, "failed", message);
       // Best-effort: surface the failure on the ticket; `<trigger>-failed` keeps it out of the next poll.
-      // Reported at interactive priority: a launch that ran into the key's reserve must still say so.
+      // Reported at interactive priority: a launch that ran into the background reserve must still say so.
       await withPriority("interactive", "dispatch failure report", async () => {
         for (const step of [
           () => linear.removeLabel(issue.id, labels.running),

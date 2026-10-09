@@ -2524,16 +2524,21 @@ hold within a running broker and its graceful drain; a crash can lose the last m
 which is never reconstructed from reservations.
 No tokens, query bodies or ticket text appear in the report.
 
-- **Background reads use the API key's pool first** (TUC-1684): the relay's comment read, the
+- **Background reads use the pool with more room** (TUC-1684): the relay's comment read, the
   auto-dispatch label query, ticket states, manual-task status, the state labels, the queue's
-  admission read, the PR watch's reads and the label rules' sweeps. The app reads one only when the
-  key cannot see everything asked for (an incomplete answer or "Entity not found"). While the key
-  is at its own background reserve, or no key is connected, a background read takes the app path
-  below, so it pauses only when both pools are at their reserve. A key rate limit on a key-first
-  read propagates; the app does not repeat it. Since 2026-10-08 14:00 UTC the app had used its
-  whole hourly allowance every hour while the key used 25–190 of its 2,500 requests; with the
-  background reads the key carries about 1,000–1,900 an hour. Everything using the owner's key
-  shares that allowance, and each pool keeps its own reserves.
+  admission read, the PR watch's reads and the label rules' sweeps go to whichever pool has the
+  larger share of its hourly allowance left above the background reserve (the smaller of its
+  requests and points shares), the key on a tie. Read with the key, the app reads one only when
+  the key cannot see everything asked for (an incomplete answer or "Entity not found") or refused
+  it at its reserve before sending it. While the key is at its own background reserve, or no key
+  is connected, a background read takes the app path below, so it pauses only when both pools are
+  at their reserve. A Linear rate limit on a key-first read propagates; the app does not repeat it.
+  The key is the owner's, so every host shares its 2,500 requests: from 2026-10-09 08:00 UTC, when
+  both hosts sent background reads to the key first whatever their app had left, server087
+  (1,300–1,900 an hour) and the Mac (1,800–2,200) held it at its reserve, which paused
+  auto-dispatch, the comment relay and the state labels while server087's app had 70–96% of its
+  5,000 left. Choosing by room keeps a host's background reads on its own app while that has more
+  left, and each pool keeps its own reserves.
 - **Interactive and owner reads use the app's pool** when the Paseo app is installed: the
   sidebar, the review page and ticket agents' `linear_ticket` reads. The key reads them only when
   the app is not installed, its token cannot be refreshed, or it cannot see a ticket. An app rate
@@ -2637,7 +2642,7 @@ No tokens, query bodies or ticket text appear in the report.
   tickets with `admissionStates` (see above). On 2026-10-07 the old full state read
   measured 498 points, while `issueStatuses` measured 4: declared page size is not measured cost.
   PR discovery reads only attachment URLs (the same first 50 as before); watchdog exclusions
-  read only workflow state and labels. Both are background reads: key first, then the app (see
+  read only workflow state and labels. Both are background reads on the pool with more room (see
   above). Discovery's repository/title matching,
   ambiguous-repository refusal and watchdog owner/hold/veto exclusions are unchanged.
   A read-only production probe on this ticket measured the new attachment-URL query at
