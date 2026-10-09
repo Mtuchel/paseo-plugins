@@ -341,7 +341,7 @@ const REPAIR_IDS_BATCH = 50;
 // write-back decisions without the comment pagination that `detail` performs.
 export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
   issue(id: $id) {
-    id identifier priority createdAt state { id name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
+    id identifier title priority createdAt state { id name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
     inverseRelations(first: 50) { nodes { type issue { identifier state { name type } attachments(first: 25) { nodes { url sourceType metadata } } } } }
     relations(first: 50) { nodes { type relatedIssue { state { type } } } }
   }
@@ -374,7 +374,7 @@ export const ISSUE_STATUSES_QUERY = `query issueStatuses($ids: [ID!]!, $first: I
 export const ADMISSION_STATES_BATCH = 50;
 export const ADMISSION_STATES_QUERY = `query admissionStates($ids: [ID!]!, $first: Int!) {
   issues(first: $first, filter: { id: { in: $ids } }) { nodes {
-    id identifier priority createdAt state { id name type } project { id } labels(first: 50) { nodes { id name } }
+    id identifier title priority createdAt state { id name type } project { id } labels(first: 50) { nodes { id name } }
     inverseRelations(first: 50) { nodes { type issue { id identifier state { name type } attachments(first: 25) { nodes { url sourceType metadata } } } } }
     relations(first: 50) { nodes { type relatedIssue { state { type } } } }
   } }
@@ -465,12 +465,14 @@ function groupIssue(node: Record<string, unknown>): GroupIssue {
 
 // `blockedBy`: identifiers of unfinished tickets that block this one (merged reviews count as finished).
 // `unblocks`: how many open tickets this one blocks. `priority`: Linear's 1 (urgent) … 4 (low), 0 none.
+// `queueBlocker`: the title carries QUEUE_BLOCKER_TITLE_PREFIX (the title the alert tool writes);
+// the scheduler gives such a ticket the next free slot (README, "Who starts next"). Absent: not one.
 export type IssueState = {
   id: string; identifier: string; status: string; statusId: string; statusType: string; teamId: string | null; projectId: string | null; creatorId: string | null;
-  labels: { id: string; name: string }[]; attachmentUrls: string[]; blockedBy: string[]; priority: number; createdAt: string; unblocks: number;
+  labels: { id: string; name: string }[]; attachmentUrls: string[]; blockedBy: string[]; priority: number; createdAt: string; unblocks: number; queueBlocker?: boolean;
 };
 // The part of IssueState that ADMISSION_STATES_QUERY reads: what TicketStarter.admission decides on.
-export type AdmissionState = Pick<IssueState, "id" | "identifier" | "status" | "statusType" | "projectId" | "labels" | "blockedBy" | "priority" | "createdAt" | "unblocks">;
+export type AdmissionState = Pick<IssueState, "id" | "identifier" | "status" | "statusType" | "projectId" | "labels" | "blockedBy" | "priority" | "createdAt" | "unblocks" | "queueBlocker">;
 
 // An ISSUE_STATUS_QUERY answer's workflow state, whichever pool sent it.
 function issueStatusOf(data: Record<string, unknown>): Pick<IssueState, "status" | "statusType"> {
@@ -497,6 +499,7 @@ function parseIssueState(issue: Record<string, unknown>): IssueState {
     teamId: label(record(issue.team ?? {}).id) || null, projectId: label(record(issue.project ?? {}).id) || null, creatorId: label(record(issue.creator ?? {}).id) || null,
     labels: labelNodes(issue.labels), attachmentUrls, blockedBy,
     priority: typeof issue.priority === "number" ? issue.priority : 0, createdAt: label(issue.createdAt), unblocks,
+    queueBlocker: label(issue.title).startsWith(QUEUE_BLOCKER_TITLE_PREFIX),
   };
 }
 export type IssueMetadata = Pick<IssueState, "id" | "identifier" | "labels">;
@@ -1265,8 +1268,8 @@ export class LinearService {
       const chunk = unique.slice(start, start + ADMISSION_STATES_BATCH);
       const data = record(await this.read(ADMISSION_STATES_QUERY, { ids: chunk, first: chunk.length }, (found) => connection(record(found.issues ?? {})).nodes.length === chunk.length));
       for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) {
-        const { id, identifier, status, statusType, projectId, labels, blockedBy, priority, createdAt, unblocks } = parseIssueState(node);
-        if (id) result.set(id, { id, identifier, status, statusType, projectId, labels, blockedBy, priority, createdAt, unblocks });
+        const { id, identifier, status, statusType, projectId, labels, blockedBy, priority, createdAt, unblocks, queueBlocker } = parseIssueState(node);
+        if (id) result.set(id, { id, identifier, status, statusType, projectId, labels, blockedBy, priority, createdAt, unblocks, queueBlocker });
       }
     }
     return result;

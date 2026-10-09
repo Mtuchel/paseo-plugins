@@ -259,7 +259,7 @@ export class TicketStarter {
     // The night order's tier comes from what is already here (README, "Who starts next"): the
     // ticket's labels and its recorded tier, never from reading its plan document.
     const night = nightInput(labels, (await this.deps.tiers?.get(issueId)) ?? null);
-    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended, night }, paseo, this.capacity.limit(settings.dispatch.maxRunning));
+    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended, night, queueBlocker: state.queueBlocker === true }, paseo, this.capacity.limit(settings.dispatch.maxRunning));
   }
 
   // `resumeOnly`: continue the recorded branch and worktree or throw ResumeUnavailableError, never

@@ -1132,6 +1132,10 @@ once cost about 40k points on 2026-10-09; the 20-minute memory avoids that.
 **Who starts next.** Every way a ticket starts (label, assignment, group, project) waits in one
 line. While slots under *max agents* are short, a free slot goes to:
 
+0. a queue blocker first (a ticket titled `Queue blocker: …`, opened by the merge queue's alert,
+   see *Auto-dispatch*): while it waits, every stack's queue run waits with it, so it takes the next
+   free slot ahead of every other ticket, whatever its project's load or the night order. It still
+   waits for a free slot: a full *max agents* or memory lease holds it like any ticket;
 1. while you are away, the night order first: a ticket whose approved plan implements on the cheap
    model tier, then one on the standard tier, then everything else — a strong implementation, a
    ticket whose tier the plugin does not know before it starts, and one that still plans (see
