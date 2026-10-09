@@ -68,6 +68,8 @@ test("turning focus on takes the tickets with work under way, but not an approve
     node("agent", { status: "Todo" }),
     node("parked", { labels: ["plan-ready"] }),
     node("implementing", { labels: ["plan-ready"] }),
+    // In Progress on an approved plan whose agent was archived and whose agent link is gone.
+    node("orphaned", { statusType: "started", status: "In Progress", labels: ["plan-ready"] }),
     node("fresh"),
   ], [
     { id: "a1", status: "idle", issueId: "agent" },
@@ -77,10 +79,28 @@ test("turning focus on takes the tickets with work under way, but not an approve
   ]);
   const status = await w.focus.enable(w.paseo);
   assert.equal(status.active, true);
-  assert.deepEqual(status.tickets.map((ticket) => ticket.id).sort(), ["agent", "delegated", "implementing", "labelled", "linked"]);
+  assert.deepEqual(status.tickets.map((ticket) => ticket.id).sort(), ["agent", "delegated", "implementing", "labelled", "linked", "orphaned"]);
   assert.ok(status.tickets.every((ticket) => ticket.reason === "in-flight"));
   for (const id of ["human", "parked", "fresh"]) assert.equal(await w.focus.admits(id, w.paseo), FOCUS_REASON, id);
   assert.equal(await w.focus.admits("implementing", w.paseo), null);
+});
+
+test("turning focus on again while it is on adds the tickets in flight it missed, and nothing leaves or starts anew", async (t) => {
+  const w = await world(t, [
+    node("root", { statusType: "started", status: "In Progress", delegateId: "app" }),
+    node("later", { statusType: "started", status: "In Progress", delegateId: "someone" }),
+    node("new"),
+  ], []);
+  const first = await w.focus.enable(w.paseo);
+  assert.deepEqual(first.tickets.map((ticket) => ticket.id), ["root"]);
+  // The root's agent finished and Paseo let go of it; `later` became Paseo's meanwhile.
+  w.nodes.set("root", { ...w.nodes.get("root")!, delegateId: null });
+  w.nodes.set("later", { ...w.nodes.get("later")!, labels: ["plan-ready"] });
+  w.advance(60_000);
+  const again = await w.focus.enable(w.paseo);
+  assert.equal(again.since, first.since, "focus did not start over");
+  assert.deepEqual(again.tickets.map((ticket) => ticket.id).sort(), ["later", "root"]);
+  assert.equal(await w.focus.admits("new", w.paseo), FOCUS_REASON);
 });
 
 test("sub-issues and blockers of tickets in focus start, down the chain and as they appear; nothing else does", async (t) => {

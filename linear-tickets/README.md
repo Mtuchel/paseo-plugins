@@ -1189,8 +1189,11 @@ then fixes the tickets *in flight* in `~/.paseo/linear-tickets/focus.json`: ever
 root ticket agent on this host that is not archived, every open ticket of the dispatch teams
 carrying `paseo-running`, `paseo-needs-you`, `paseo-blocked` or `paseo-failed`, and every started
 ticket of those teams (In Progress, In Review, …) that is delegated to this host's or the peer's
-Paseo app or carries a Paseo agent link. An approved plan that no agent implements yet (Todo or
-Backlog with `plan-ready`, no live agent) is new work and is not in flight.
+Paseo app, carries a Paseo agent link, or carries `plan-ready` (an approved plan being implemented,
+also after its agent was archived). An approved plan that no agent implements yet (Todo or
+Backlog with `plan-ready`, no live agent) is new work and is not in flight. Turning focus on
+while it is on reads the tickets in flight again: the ones it did not have join, none leaves, and
+focus does not start over.
 
 While focus is on, a ticket starts only when it is in focus: a ticket in flight, its open
 sub-issues (a split approved meanwhile included) and its unfinished blockers, followed down the
