@@ -43,14 +43,16 @@ const READY_STATE = "Ready to merge";
 // the base branch and closes them instead of merging them.
 export const QUEUE_MERGED_LABEL = "externally-merged";
 const QUEUE_DRAFT_TITLE = "[Graphite MQ] Draft PR";
-// Automatic prompts per pull request and drop kind (docs/automation/merge-queue.md in the repo):
-// one fix request after a plain drop, up to five restacks after conflict-only drops. The next drop
-// of a kind goes to the owner instead, and after that escalation no drop prompts the agent again.
-// Main-broken drops have no budget: they count toward neither limit. An automatic re-enqueue after
-// a flaky or infra drop counts as a plain drop.
-const DROP_PROMPTS: Record<Exclude<DropKind, "main">, number> = { plain: 1, conflict: 5 };
-// How the repo's drop class counts (see claimDrop).
+// The drop counts the removed owner handovers escalated at (the old "2nd plain drop" and "6th
+// conflict-only drop", TUC-1777). Stored state never recorded a drop escalation's cause, so a load
+// reads these counts back to tell one from a stage or wait escalation when it un-escalates the old
+// handovers (see cutOver). No drop count escalates, mentions the owner or stops the automation now.
+const OLD_DROP_HANDOVER = { plain: 2, conflict: 6 };
+// How the repo's drop class counts (see claimDrop): which of the entry's drop lists its key joins.
 const DROP_KIND: Record<DropClass, DropKind> = { conflictOnly: "conflict", mainBroken: "main", infra: "plain", flaky: "plain", genuine: "plain" };
+// How many of a range's drops its drop history keeps (see DropHistoryEntry); the fix request carries
+// them, and without a limit a range can drop for a long time.
+const DROP_HISTORY = 10;
 // Nudges per pull request and lifecycle stage; the next time that stage stalls goes to the owner.
 const STAGE_NUDGES = 2;
 // How long an agent may wait for the owner's answer while a message of its pull request waits for
@@ -95,9 +97,13 @@ export type PullRequestView = {
 // `closed`: closed without merging. Merge queue drops already claimed, by draft (`#123`) or, for
 // drops before any draft, by the Merge activity bullet, on every pull request of the dropped range:
 // `drops` the plain ones (and every drop claimed before drops had kinds), `conflicts` the
-// conflict-only ones, `mainBroken` the main-broken ones (counted toward neither limit).
-// `escalated`: a drop went to the owner (every pull request of the range is marked); before drops
-// had kinds that was the third drop. `pending`: the claimed drop (or refused enqueue) still to be
+// conflict-only ones, `mainBroken` the main-broken ones. `dropHistory`: the range's last
+// DROP_HISTORY drops (time, class, key, failed job families, failing tests), which a fix request
+// carries; `conflictStreak`: the range's consecutive conflict-only drops, which asks for the
+// hotspot every fifth one. `escalated`: a message of the pull request waited out the owner's
+// permission wait (every pull request of the range is marked, see claimDrop); `cutover`: the
+// TUC-1777 cutover cleared an old drop-count handover here and gave the newest drop back once, so a
+// later load never does so again. `pending`: the claimed drop (or refused enqueue) still to be
 // delivered, `queued` the messages routed to the same pull request while it was, delivered in turn
 // after it (see route). `replay`: closed without merging, `due` until the closure was looked at once,
 // `asked` once the agent was told to open a replacement pull request (see replace). `nudges`: per
@@ -110,7 +116,7 @@ export type PullRequestView = {
 // whose code could not be compared) left, which no automatic enqueue touches until a new head;
 // `actions`, its enqueues of ranges whose top this is; `refusals`, their refused enqueues.
 type Seen = {
-  reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; conflicts?: string[]; mainBroken?: string[]; escalated?: boolean; pending?: PendingDrop | null; queued?: PendingDrop[]; replay?: "due" | "asked"; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean; advance?: "due";
+  reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; conflicts?: string[]; mainBroken?: string[]; dropHistory?: DropHistoryEntry[]; conflictStreak?: number; escalated?: boolean; cutover?: true; pending?: PendingDrop | null; queued?: PendingDrop[]; replay?: "due" | "asked"; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean; advance?: "due";
   blockedAt?: string; actions?: ActionRecord[]; refusals?: Refusal[];
   // The move of the open stack whose bottom this is off its orphaned `graphite-base/<n>` base
   // (see retargets).
@@ -123,13 +129,18 @@ type Seen = {
   // (see waitFor): `stage:<stage>:<key>`, `drop:<key>` or `replay:<head>`.
   waits?: Record<string, string>;
 };
+// One claimed drop of a range, for the history a fix request carries (TUC-1777): when it was
+// claimed, its class, its claim key and the failing signature the judgment read — the failed check
+// rows as job families (the name without its shard) and their failing tests, both sorted; empty
+// when the run named none. `families` equal on two genuine drops means the same jobs failed.
+type DropHistoryEntry = { at: string; class: DropClass; key: string; families: string[]; tests: string[] };
 // A claimed drop or refused enqueue, saved before anything is sent. `fix` goes to the agent (or,
-// when it is gone, to the ticket); without it, `facts` escalate to the owner. `sending`: a message
-// went out and its result was not recorded (a restart or a failed save), so it is not sent again.
-// `subject` names it in the agent panel ("The merge queue dropped the pull request" by default).
-// `orphan`: the pull request has no handover record, so it goes to its tickets, or without one as
-// a pull request comment (see deliverOrphan).
-type PendingDrop = { key: string; reason: string; facts: string; fix: string | null; sending?: boolean; subject?: string; orphan?: { tickets: string[] } };
+// when it is gone, to a successor or the ticket). `sending`: a message went out and its result was
+// not recorded (a restart or a failed save), so it is not sent again. `subject` names it in the
+// agent panel ("The merge queue dropped the pull request" by default). `orphan`: the pull request
+// has no handover record, so it goes to its tickets, or without one as a pull request comment (see
+// deliverOrphan).
+type PendingDrop = { key: string; reason: string; facts: string; fix: string; sending?: boolean; subject?: string; orphan?: { tickets: string[] } };
 type Change = { thought: string; review: string; state?: string };
 
 // A draft pull request the merge queue tests a stack on; `base` is the branch it lands on.
@@ -628,14 +639,79 @@ export function activityBullets(body: string | null): Bullet[] {
   });
 }
 
-// A drop went to the owner. Before drops had kinds, the third drop did.
+// A message of the pull request waited out the owner's permission wait (see waitFor): the range is
+// held until the owner answers. Drop counts never escalate anything (TUC-1777), so only that mark
+// and the cutover's `cutover` marker can be in the state.
 function escalated(seen: Seen | undefined): boolean {
-  return Boolean(seen?.escalated) || (seen?.drops?.length ?? 0) > 2;
+  return Boolean(seen?.escalated);
 }
 
 // Every drop key claimed on the pull request, of any kind.
 function handledDrops(seen: Seen | undefined): string[] {
   return [...(seen?.drops ?? []), ...(seen?.conflicts ?? []), ...(seen?.mainBroken ?? [])];
+}
+
+// A failed check's job family: its row name without the shard suffix, as the repo reads it
+// (tools/ci/job-families.mjs). The signature and the queue blocker's id are per family, not shard.
+function jobFamily(check: string): string {
+  return check.replace(/ \((?:\d+\/\d+|\$\{\{ *matrix\.shard *\}\})\)$/, "").trim();
+}
+
+// The failing signature of a judgment: the failed check rows as job families and their failing
+// tests, both sorted and unique. Empty families mean the run named no failed job (no signature).
+function dropSignature(judgment: DropJudgment): { families: string[]; tests: string[] } {
+  const unique = (items: string[]) => [...new Set(items)].sort();
+  return {
+    families: unique(judgment.failures.map((failure) => jobFamily(failure.check)).filter(Boolean)),
+    tests: unique(judgment.failures.flatMap((failure) => failure.tests)),
+  };
+}
+
+// Whether two signatures name the same failure: the same job families and the same failing tests.
+function sameSignature(one: { families: string[]; tests: string[] }, other: { families: string[]; tests: string[] }): boolean {
+  const same = (left: string[], right: string[]) => left.length === right.length && left.every((item, index) => item === right[index]);
+  return same(one.families, other.families) && same(one.tests, other.tests);
+}
+
+// The range's newest earlier genuine drop with this failing signature: its fix request asks to
+// reproduce the failure on the range merged onto `origin/main` and to use the queue incident, not to
+// retry (TUC-1777). A drop that named no failed job has no signature and never matches.
+function repeatedDrop(history: DropHistoryEntry[] | undefined, signature: { families: string[]; tests: string[] }): DropHistoryEntry | null {
+  if (!signature.families.length) return null;
+  return (history ?? []).findLast((entry) => entry.class === "genuine" && entry.families.length > 0 && sameSignature(entry, signature)) ?? null;
+}
+
+// The range's drop history as message lines: each drop's time, class, key, failed checks and
+// failing tests (TUC-1777).
+function historyLines(history: DropHistoryEntry[]): string[] {
+  return [
+    "The range's drops (newest last; time, kind, failed checks, failing tests):",
+    ...history.map((entry) => [
+      `- ${entry.at} — ${CLASS_TEXT[entry.class]}${entry.key ? ` (${entry.key})` : ""}`,
+      entry.families.length ? ` — failed checks: ${entry.families.join(", ")}` : "",
+      entry.tests.length ? ` — failing tests: ${entry.tests.join("; ")}` : "",
+    ].join("")),
+  ];
+}
+
+// The requirement a fix request adds when its failing signature repeats an earlier genuine drop of
+// the range (TUC-1777): reproduce it on the range merged onto current `origin/main` before the next
+// enqueue, and, when the cause is outside the change, attach it to the queue incident instead of
+// retrying.
+function repetitionLines(repeated: DropHistoryEntry, signature: { families: string[]; tests: string[] }, branch: string, judgment: DropJudgment): string[] {
+  const ids = blockerIds(judgment);
+  return [
+    `The failing signature repeats the range's genuine drop${repeated.key ? ` ${repeated.key}` : ""} of ${repeated.at}: ${signature.families.join(", ")}${signature.tests.length ? ` — ${signature.tests.join("; ")}` : ""}.`,
+    `Before you enqueue the range again, reproduce it on the range merged onto current \`origin/main\`: in the stack's worktree \`git fetch origin main\`, then from the range's top branch \`git switch -c queue-repro ${branch} && git merge --no-edit origin/main\`, and run the failing tests above there (the merge is only for the reproduction: \`git switch -\` and \`git branch -D queue-repro\` afterwards).`,
+    `If they pass on the merged tree, the cause is outside your change: instead of enqueueing the range again, attach that evidence to its queue incident — the \`TUC-538\` queue-blocker ticket whose \`Queue blocker id\` is ${ids.length ? ids.map((id) => `\`${id}\``).join(" or ") : "the failing test or the job family"} — opening one if none exists (docs/automation/merge-queue.md#queue-blocker-who-fixes-it).`,
+  ];
+}
+
+// The queue-blocker ids of a drop's failures, as the repo's `tools/ci/queue-blocker-alert.mjs`
+// names them: the failing test's id, else its job family. They name the queue incident a fix
+// request points at when the cause is outside the range's change (TUC-1777).
+function blockerIds(judgment: DropJudgment): string[] {
+  return [...new Set(judgment.failures.map((failure) => failure.testIds[0] ?? jobFamily(failure.check)).filter(Boolean))];
 }
 
 // The pull request's message slot once its pending message went out: the next message routed to
@@ -749,6 +825,45 @@ export function reviewChange(view: PullRequestView, seen: Seen): { change: Chang
   return { change: null, seen };
 }
 
+// A message the removed drop path had routed to the owner instead of the agent: it carries the
+// escalation's facts but no fix request, so it never goes out (TUC-1777). `fix` is typed as text;
+// state saved before the cutover may carry null or nothing there, which this reads.
+function toOwner(message: PendingDrop | null | undefined): boolean {
+  return message != null && !message.fix;
+}
+
+// The TUC-1777 cutover, run on every load: the removed fixed limits ("2nd plain drop", "6th
+// conflict-only drop") handed a range to the owner and stopped its drop prompts. Stored state never
+// recorded an escalation's cause, so a load reads the old drop counts back: an entry whose plain or
+// conflict-only drops reach one of the removed limits, and no stage of which shows an escalation of
+// its own (a stage or crash escalation stays as it was), was escalated by a drop count — the flag
+// goes, `cutover` marks it (so a later load never hands the same drop back twice), and the range's
+// newest drop, whose claim key is forgotten here, is claimed again by the next poll or backstop run
+// like any drop.
+function cutOver(state: Record<string, Seen>): Record<string, Seen> {
+  for (const seen of Object.values(state)) {
+    if (toOwner(seen.pending)) seen.pending = null;
+    const queued = (seen.queued ?? []).filter((message) => !toOwner(message));
+    if (queued.length) seen.queued = queued;
+    else delete seen.queued;
+    const counted = (seen.drops?.length ?? 0) >= OLD_DROP_HANDOVER.plain || (seen.conflicts?.length ?? 0) >= OLD_DROP_HANDOVER.conflict;
+    const staged = Object.values(seen.nudges ?? {}).some((keys) => (keys?.length ?? 0) > STAGE_NUDGES);
+    if (!seen.escalated || seen.cutover || !counted || staged) continue;
+    delete seen.escalated;
+    seen.cutover = true;
+    const drafts = handledDrops(seen).map((key) => /^#(\d+)$/.exec(key)).filter((found): found is RegExpExecArray => found !== null).map((found) => Number(found[1]));
+    // Without keys that name a draft the claim order is not stored: the last recorded one is the
+    // load's best read of the range's newest drop.
+    const newest = drafts.length ? `#${Math.max(...drafts)}` : seen.drops?.at(-1) ?? seen.conflicts?.at(-1) ?? seen.mainBroken?.at(-1) ?? null;
+    for (const field of ["drops", "conflicts", "mainBroken"] as const) {
+      const kept = seen[field]?.filter((key) => key !== newest);
+      if (kept?.length) seen[field] = kept;
+      else delete seen[field];
+    }
+  }
+  return state;
+}
+
 // Writes a JSON state file atomically (a temporary file renamed over it), owner-only.
 async function writeState(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -844,7 +959,9 @@ export class PullRequestWatch {
   }
 
   private async load(): Promise<Record<string, Seen>> {
-    try { return JSON.parse(await readFile(this.path, "utf8")); } catch { return {}; }
+    // The cutover (see cutOver) runs on every load; it leaves its marks in the state every run
+    // saves, so it does its work once.
+    try { return cutOver(JSON.parse(await readFile(this.path, "utf8"))); } catch { return {}; }
   }
 
   private async save(value: Record<string, Seen>): Promise<void> {
@@ -1072,7 +1189,7 @@ export class PullRequestWatch {
       const seen = seenByUrl[url];
       if (seen?.missing) continue;
       // An archived agent's open pull request stays watched, so a merge queue drop still reaches
-      // the ticket: until a drop escalated to the owner, or 14 days without activity. After-merge
+      // the ticket: until an escalation of it to the owner, or 14 days without activity. After-merge
       // tasks keep it watched until the merge, a closure until it was looked at, and a landing until
       // the ticket's next open pull request was looked for; once the agent was asked to open a
       // replacement, until the replacement is linked or 14 days pass.
@@ -1235,12 +1352,13 @@ export class PullRequestWatch {
   }
 
   // A drop as the repo's `wait-queue.mjs` judges it (class, requeue, revision; see
-  // queue-backstop.ts), claimed on every pull request of the dropped range and counted by class:
-  // conflict-only toward the restack limit, main-broken toward none, every other class toward the
-  // plain limit. The range counts as its most-dropped pull request: the next drop of a counted kind
-  // past its limit on any of them escalates to the owner, and so does a drop of a range one of
-  // whose pull requests escalated already (every pull request of the range is marked); after the
-  // escalation drops of any kind only reach the log. A newer round retires the range's automatic
+  // queue-backstop.ts), claimed on every pull request of the dropped range and recorded there: the
+  // drop's key by class, its time, class and failing signature in the range's drop history, and the
+  // range's consecutive conflict-only count. No drop count hands a range to the owner or stops its
+  // requests (TUC-1777): every genuine drop asks the agent to fix it (and to reproduce a repeated
+  // failing signature on the range merged onto `main`, see repetitionLines), every conflict-only
+  // drop gets its restack, and a drop of a range one of whose pull requests is escalated already
+  // claims nothing for it (see escalated). A newer round retires the range's automatic
   // enqueues that had not gone through yet (see supersede), unless the range changed since the
   // drop. Otherwise:
   // - not the stack's fault, the code provably the code that dropped (`same`, or the backstop's
@@ -1272,14 +1390,26 @@ export class PullRequestWatch {
     const kind = DROP_KIND[judgment.class];
     const list = kind === "conflict" ? "conflicts" : kind === "main" ? "mainBroken" : "drops";
     const members = range.prs.map((pr) => entry(seenByUrl, pullUrl(drop.repo, pr)));
-    // Decided before this drop is added: a member's legacy plain drops reaching the old limit with
-    // this one is a new escalation, routed below, not an earlier one.
+    // Decided before this drop is added: a range one of whose members is escalated claims nothing
+    // for this drop.
     const already = members.some((member) => escalated(member));
-    for (const member of members) if (!handledDrops(member).includes(drop.key)) member[list] = [...(member[list] ?? []), drop.key];
+    // The range's drop history and consecutive conflict-only drops (TUC-1777): the fix request and
+    // every fifth restack carry what the history and the streak make of them.
+    const signature = dropSignature(judgment);
+    const earlier = seen.dropHistory ?? [];
+    const repeated = judgment.class === "genuine" ? repeatedDrop(earlier, signature) : null;
+    const history: DropHistoryEntry = { at: new Date(context.now).toISOString(), class: judgment.class, key: drop.key, ...signature };
+    const streak = judgment.class === "conflictOnly" ? Math.max(...members.map((member) => member.conflictStreak ?? 0)) + 1 : 0;
+    for (const member of members) {
+      if (handledDrops(member).includes(drop.key)) continue;
+      member[list] = [...(member[list] ?? []), drop.key];
+      member.dropHistory = [...(member.dropHistory ?? []), history].slice(-DROP_HISTORY);
+      member.conflictStreak = streak;
+    }
     if (judgment.revision.state !== "changed") this.supersede(drop.repo, range.prs, drop.key, seenByUrl);
     if (already) {
       for (const member of members) member.escalated = true;
-      console.error(`[linear-tickets] ${record?.identifier ?? drop.repo}: the merge queue dropped ${url}, whose range already escalated to the owner`);
+      console.error(`[linear-tickets] ${record?.identifier ?? drop.repo}: the merge queue dropped ${url}, whose range escalated to the owner already`);
       return true;
     }
     const most = (field: "drops" | "conflicts" | "mainBroken") => Math.max(...members.map((member) => member[field]?.length ?? 0));
@@ -1298,26 +1428,20 @@ export class PullRequestWatch {
     ].join("\n");
     const tickets = ticketsOf(drop.repo, range.prs, open, context.records, record);
     const target = { record, url, tickets };
-    const count = kind === "plain" ? plain : conflicts;
-    if (kind !== "main" && count > DROP_PROMPTS[kind]) {
-      for (const member of members) member.escalated = true;
-      this.route(seenByUrl, target, { key: drop.key, reason, facts: `${facts}\nDrops of this pull request so far: ${plain} plain, ${conflicts} conflict-only.`, fix: null });
-      return true;
-    }
     const own = ownRound(drop, seenByUrl, open);
     const same = judgment.revision.state === "same" && judgment.revision.expect ? { expect: judgment.revision.expect, branch: judgment.revision.branch } : null;
     const proof = same ?? own;
     const unchanged = same ? judgment.revision.reason || "checked against the queue's draft" : "Paseo's queue backstop enqueued these very heads right before this round";
     const gated = (await this.gatedTickets(context.records, tickets)).size > 0;
-    const counted = kind === "main" ? "Main-broken drops count toward no limit; the enqueue waits until `main` is green."
-      : kind === "conflict" ? `This is conflict-only drop ${conflicts} of ${DROP_PROMPTS.conflict} before the owner takes over.`
-      : `It counts as plain drop ${plain} of ${DROP_PROMPTS.plain}; the next plain drop goes to the owner.`;
+    const note = kind === "main" ? "The drop was `main`'s; the enqueue waits until `main` is green."
+      : kind === "conflict" ? "Every conflict-only drop of the range gets this automatic restack request; no drop count hands it to the owner."
+      : "Nothing of the range's own needs a fix; no drop count hands anything to the owner.";
     if (judgment.requeue && proof && !gated) {
       const heads = parseExpect(proof.expect) ?? [];
       const top = heads.at(-1)?.pr ?? range.top;
       const action: ActionRecord = {
         id: `drop:${drop.key}:${top}`, repo: drop.repo, branch: proof.branch ?? range.branch, expect: proof.expect, prs: heads.map((head) => head.pr), top, tickets,
-        why: dropWhy(drop.repo, judgment, unchanged, counted), at: new Date(context.now).toISOString(), activityBoundary: null,
+        why: dropWhy(drop.repo, judgment, unchanged, note), at: new Date(context.now).toISOString(), activityBoundary: null,
         steps: { enqueue: "due", prComment: "none", linearComment: "none", note: "none" },
       };
       const holder = entry(seenByUrl, pullUrl(drop.repo, top));
@@ -1346,14 +1470,20 @@ export class PullRequestWatch {
       : !proof ? `it could not prove that the range is still the code that dropped (${judgment.revision.reason || "no comparison"}), and it leaves the range alone until one of its heads changes. Check that nothing changed, then follow the steps below.`
       : "a manual task due before the merge is open. Re-enqueue once it is done.";
     const held = judgment.class === "genuine" ? [] : [`Paseo did not re-enqueue it: ${notRequeued}`, ""];
+    // The owner policy every drop message states (TUC-1777; docs/automation/merge-queue.md): owner
+    // involvement only through the agent's question path, and never because of a drop count.
+    const ownerAsk = "Ask the owner only for a decision that can break something (data, production or staging, migrations, security, reverting someone else's landed work) or that changes how CI works in general (required checks, CI selection, quarantine, queue settings), through the ticket's normal question path (the deputy answers first); never because of a drop count.";
+    const counts = `Drops of this range so far: ${plain} plain, ${conflicts} conflict-only, ${main} main-broken.`;
     const fix = judgment.class === "mainBroken" ? [
       facts,
       "",
       ...held,
-      "Main broken: the merge queue dropped the range because `main` was already red on the same jobs at that time (tools/ci/wait-queue.mjs). This drop does not count toward the stack's limits, and no restack or fix of your own is needed unless `enqueue.mjs` refuses the range.",
+      "Main broken: the merge queue dropped the range because `main` was already red on the same jobs at that time (tools/ci/wait-queue.mjs). No restack or fix of your own is needed unless `enqueue.mjs` refuses the range.",
       `Re-enqueue the dropped queue range from its top branch once \`main\` is green: \`git switch ${branch} && node tools/ci/enqueue.mjs --wait-main\` (it waits until \`main\` is green, then checks and enqueues), then \`node tools/ci/wait-queue.mjs ${pr}\`.`,
       "",
-      `Drops of this pull request so far: ${plain} plain, ${conflicts} conflict-only, ${main} main-broken (not counted).`,
+      counts,
+      "",
+      ownerAsk,
     ] : judgment.class === "conflictOnly" ? [
       facts,
       "",
@@ -1363,7 +1493,10 @@ export class PullRequestWatch {
       "2. Keep `main`'s version of generated files and regenerate them; never merge them by hand. Run the focused checks for the files the restack touched.",
       `3. Run \`gt submit --stack --ignore-out-of-sync-trunk\`, then right away ${enqueue} and \`node tools/ci/wait-queue.mjs ${pr}\`. Do not wait for the pull request's checks first: the queue's draft runs the full suite. Only when \`enqueue.mjs\` reports that \`gt merge\` refused because checks are still running, wait with \`node tools/ci/wait-checks.mjs ${pr}\` and run \`node tools/ci/enqueue.mjs\` once more.`,
       "",
-      `This is automatic restack ${count} of ${DROP_PROMPTS.conflict} for this pull request; after that the owner takes over.`,
+      `${counts} This is conflict-only drop ${conflicts} of this range; every one gets this restack request.`,
+      ...(streak % 5 ? [] : ["", `${streak} conflict-only drops of this range in a row: besides the restack, find out why it keeps conflicting and fix that cause — the hotspot file every round conflicts in (the paths the last rounds named), or another stack that keeps moving the same lines. Coordinate with that stack's agent, or wait until it lands; restacking alone drops the range again.`]),
+      "",
+      ownerAsk,
     ] : judgment.class !== "genuine" ? [
       facts,
       "",
@@ -1371,7 +1504,9 @@ export class PullRequestWatch {
       `Not the stack's fault (${CLASS_TEXT[judgment.class]}): no fix of your own is needed unless \`enqueue.mjs\` refuses the range.`,
       `Re-enqueue the dropped queue range from its top branch: ${enqueue}, then \`node tools/ci/wait-queue.mjs ${pr}\`.`,
       "",
-      `This drop counts as plain drop ${count} of ${DROP_PROMPTS.plain} for this pull request; the next plain drop goes to the owner.`,
+      counts,
+      "",
+      ownerAsk,
     ] : [
       facts,
       "",
@@ -1380,8 +1515,14 @@ export class PullRequestWatch {
       "2. Fix the cause.",
       `3. Run \`gt submit --stack --ignore-out-of-sync-trunk\`, then ${enqueue} and \`node tools/ci/wait-queue.mjs ${pr}\`.`,
       "",
+      counts,
+      `This is genuine drop ${plain} of this range; every genuine drop gets this fix request.`,
+      ...(earlier.length ? ["", ...historyLines(earlier)] : []),
+      ...(repeated ? ["", ...repetitionLines(repeated, signature, branch, judgment)] : []),
+      "",
       `An obviously flaky failure (unrelated to the change) gets one plain \`git switch ${branch} && node tools/ci/enqueue.mjs\` retry instead.`,
-      `This is automatic fix request ${count} of ${DROP_PROMPTS.plain} for this pull request; the next plain drop goes to the owner.`,
+      "",
+      ownerAsk,
     ];
     this.route(seenByUrl, target, { key: drop.key, reason, facts, fix: fix.join("\n") });
     return true;
@@ -2101,14 +2242,14 @@ export class PullRequestWatch {
   }
 
   // A missing/moved PR link does not make the owner the repair worker. Reuse normal agent delivery
-  // and crash/successor recovery whenever a ticket record exists; only genuine escalations or a
-  // ticket with no recoverable agent record use the ticket/PR fallback.
+  // and crash/successor recovery whenever a ticket record exists; only a ticket with no recoverable
+  // agent record uses the ticket/PR fallback.
   private async deliverOrphan(url: string, seen: Seen, seenByUrl: Record<string, Seen>, context: RunContext, save: () => Promise<void>, reserved: Set<string>): Promise<boolean> {
     const pending = seen.pending;
     const source = PULL_URL.exec(url);
     if (!pending?.orphan || !source) return false;
     const record = recordFor(pending.orphan.tickets, context.records);
-    if (record && pending.fix !== null) {
+    if (record) {
       const pull = (await context.pulls(source[1])).find((pull) => pull.url === url);
       if (!pull) return false;
       await this.deliver(record, url, pull.labels, pending, seenByUrl, save, reserved, async () => {
@@ -2119,7 +2260,7 @@ export class PullRequestWatch {
       });
       return seen.pending !== pending;
     }
-    const text = pending.fix ?? `The merge queue dropped this stack again after Paseo's automatic requests (one fix request after a plain drop, ${DROP_PROMPTS.conflict} restacks after conflict-only drops), so Paseo stops asking. Please take over.\n\n${pending.facts}`;
+    const text = pending.fix;
     const issues = await this.issueIds(pending.orphan.tickets, context.records);
     if (!issues.length) await commentOnce(this.github(), source[1], Number(source[2]), `route:${pending.key}`, text);
     else if (pending.sending) console.error(`[linear-tickets] queue backstop: the message about ${url} may already have gone out; it is not sent again`);
@@ -2139,8 +2280,8 @@ export class PullRequestWatch {
   }
 
   // Delivers a claimed drop: the fix request to the agent while it exists; for a gone agent, to a
-  // successor (see succession), else to the ticket, which goes back to coding for the next agent;
-  // an escalation to the owner. It waits for a later poll while the agent is in a turn or waits for
+  // successor (see succession), else to the ticket, which goes back to coding for the next agent.
+  // It waits for a later poll while the agent is in a turn or waits for
   // the owner (who is reminded once after PERMISSION_WAIT_MS, see waitFor), Paseo is not connected,
   // a successor cannot start yet, or the agent already got a message this poll (`reserved`).
   // `sending` is saved right before a message goes out (or a successor starts with it), so one
@@ -2164,19 +2305,13 @@ export class PullRequestWatch {
     const { fix } = pending;
     const step = "fix the merge queue drop";
     try {
-      if (fix === null) {
-        await dispatch();
-        await this.mention(record.issueId, `The merge queue dropped this stack again after Paseo's automatic requests (one fix request after a plain drop, ${DROP_PROMPTS.conflict} restacks after conflict-only drops), so Paseo stops asking the agent to fix it. Please take over.\n\n${pending.facts}`);
-        await delivered();
-        await this.tell(record, "response", `The merge queue dropped the pull request again; the owner was asked to take over.\n\n${pending.facts}`);
-        return;
-      }
       if (reserved.has(record.agentId)) return;
       let gone = record.status === "archived";
       if (!gone) {
         const outcome = await this.deps.sessions.prompt(record.agentId, fix, toAgent, this.recovery(record, reserved, dispatch));
         if (this.waitFor(seenByUrl, url, `drop:${pending.key}`, outcome)) {
-          // Escalated like an exhausted drop, claimed before the reminder goes out.
+          // The agent waited out the owner's answer: the message is claimed as escalated, which
+          // holds the range until the owner answers, before the reminder goes out.
           seenByUrl[url] = { ...seenByUrl[url], escalated: true, waits: undefined };
           await dispatch();
           await this.waitedOut(record, url, step);
@@ -2228,8 +2363,8 @@ export class PullRequestWatch {
   // null leaves the link to linked-only nudges. Discovery finishes before anything is sent, and the
   // whole stack is deferred, never walked member by member, when the topology is not one plain
   // chain, a member cannot be read or no longer matches the listing (state, head, branch, base), or
-  // a hold covers any member: `do-not-merge`, a drop escalated to the owner (also the legacy third
-  // drop), a merge queue message still pending or queued, the head a genuine drop left
+  // a hold covers any member: `do-not-merge`, an escalation of the pull request to the owner, a
+  // merge queue message still pending or queued, the head a genuine drop left
   // (`blockedAt`), or another ticket's record links it. While it is deferred, the ticket's other
   // pull requests are not nudged, so a permission wait of theirs starts from zero later, as for a
   // vetoed link (see nudge). A pull request's state and links compare by repo and number, whatever
@@ -2271,7 +2406,7 @@ export class PullRequestWatch {
         const seen = seenByUrl[member.url];
         if (member.view.state !== "OPEN" || member.view.headSha !== pull.headSha || member.view.headBranch !== pull.headBranch || member.view.baseBranch !== pull.baseBranch) return defer(`#${pull.number} changed since the open pull requests were listed`);
         if (member.view.labels.includes(DO_NOT_MERGE_LABEL) || pull.labels.includes(DO_NOT_MERGE_LABEL)) return defer(`#${pull.number} is labelled ${DO_NOT_MERGE_LABEL}`);
-        if (escalated(seen)) return defer(`a merge queue drop of #${pull.number} went to the owner`);
+        if (escalated(seen)) return defer(`an escalation of #${pull.number} went to the owner`);
         if (seen?.missing) return defer(`GitHub once had no pull request #${pull.number}`);
         if (seen?.pending || seen?.queued?.length) return defer(`#${pull.number} still has a merge queue message to deliver`);
         if (seen?.blockedAt === member.view.headSha) return defer(`#${pull.number}'s head is held after a genuine merge queue drop`);

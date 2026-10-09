@@ -1449,14 +1449,13 @@ what kind of drop it is: the plugin runs `tools/ci/wait-queue.mjs <pr> --draft <
 without a draft) from the [queue backstop's checkout](#queue-backstop) and reads its `class`,
 `requeue`, `evidence`, `revision` and failed checks (`docs/automation/merge-queue.md`). A repo
 without that checkout has no classes: its drops are genuine. A run that fails or prints no JSON
-claims nothing, and the next poll decides again. The class counts on every pull request of the
-dropped range: `conflictOnly` toward up to five restacks, `mainBroken` toward nothing (it never
-escalates), every other class (`infra`, `flaky`, `genuine`) toward one fix request. A range
-counts as its most-dropped pull request: the next drop past a limit on any of them only mentions
-you ("the merge queue dropped this stack again", with both counts), every pull request of the
-range is marked escalated, and after that drops of any kind are only logged; a drop of a range
-one of whose pull requests escalated already escalates the whole range, too. Drops claimed
-before the kinds existed count as plain, and three of them as escalated. A newer round of a range
+claims nothing, and the next poll decides again. The class decides what happens; no number of
+drops of any class ever hands a stack to the owner, mentions the owner or stops the automation
+(TUC-1777). Every claimed drop is recorded on each pull request of the dropped range: its key
+by class, and its time, class and failing signature — the failed check rows as job families and
+the failing tests the judgment read — in the range's drop history, of which the newest ten are
+kept. A drop of a range one of whose pull requests is escalated already (see **Stalled pull
+requests**) is only logged. A newer round of a range
 retires the backstop's enqueues of it that had not gone through yet (unless the range changed
 since the drop). Then, by class and revision:
 
@@ -1464,14 +1463,21 @@ since the drop). Then, by class and revision:
   `same`, or the backstop's own enqueue of these very heads came right before this round) and no
   [manual task](#manual-tasks) due before the merge open (one that cannot be read counts as
   open): the [queue backstop](#queue-backstop) re-enqueues the range, nothing goes to the agent.
-  A main-broken range waits there until `main` is green;
+  A main-broken range waits there until `main` is green. A `flaky` or `infra` drop of provably
+  unchanged code takes exactly this path, however often the range dropped before;
+- `conflictOnly` always asks the agent for the restack
+  ([Conflict-only drops](#conflict-only-drops)), never the backstop: a conflict with `main` is
+  the stack's own to fix. Every fifth consecutive conflict-only drop of a range, the request
+  also asks to find out why the range keeps conflicting — the hotspot file every round conflicts
+  in, or another stack that keeps moving the same lines — and to fix that cause, not only the
+  conflict at hand;
 - not genuine, but the range changed since the drop (`changed`): nothing is sent; the new heads
   go through the ready rule;
 - not genuine, but the code could not be compared (`unknown`), or a manual task is open: the
   kind's request goes to the agent, saying why Paseo did not re-enqueue it. An `unknown` range is
   blocked like a genuine one;
-- genuine: today's fix request. The range is blocked at its heads: the backstop leaves it alone
-  until one of them changes.
+- genuine: the fix request, every time. The range is blocked at its heads: the backstop leaves
+  it alone until one of them changes.
 
 The ticket's agent gets the reason, the checks that did not pass on the draft, the kind with its
 evidence and the runbook for it. All re-enqueue the dropped queue range from its top branch, the
@@ -1492,7 +1498,18 @@ draft runs the full suite (only when `gt merge` refuses because checks still run
 tools/ci/wait-checks.mjs <its PR>`, then `enqueue.mjs` once more). A main-broken drop needs no
 restack or fix of its own, and asks for `git switch <range top> && node tools/ci/enqueue.mjs
 --wait-main` (it waits until `main` is green, then checks and enqueues) and `node
-tools/ci/wait-queue.mjs <its PR>`; its message carries all three counts. The message goes out
+tools/ci/wait-queue.mjs <its PR>`; its message carries the counts, as every drop message does.
+Every drop message also carries the range's drop history (each earlier drop's time, class, failed
+checks and failing tests) and the owner policy: ask the owner only for a decision that can break
+something (data, production or staging, migrations, security, reverting someone else's landed
+work) or that changes how CI works in general (required checks, CI selection, quarantine policy,
+queue settings), through the ticket's usual question path (the deputy answers first) — never
+because of a drop count. When the failing signature (the job families and failing tests) repeats
+an earlier genuine drop of the range, the fix request also requires reproducing the failing tests
+on the range merged onto current `origin/main` before the next enqueue, and, when they pass there
+(the cause is outside the change), attaching that evidence to the queue incident — the `TUC-538`
+queue-blocker ticket whose `Queue blocker id` is the failing test, else its job family — instead
+of retrying. The message goes out
 once the agent is idle; Paseo resumes it if it has stopped. While the agent is in a turn or
 waiting for an answer, or Paseo is not connected, the message waits for a later poll. When the
 agent is gone or archived, a successor starts with the same text (see **Gone agents** below);
@@ -1500,9 +1517,14 @@ when none can start, it becomes a
 ticket comment mentioning you, and the ticket moves back to In Progress (when status write-back
 is on). Each drop is claimed in
 `$PASEO_HOME/linear-tickets/pr-watch.json` (by its draft, or by the bullet when there is none)
-before anything is sent, so it is delivered at most once, also across restarts. A message for a
+before anything is sent, so it is delivered at most once, also across restarts. A range the
+removed limits had handed to the owner is un-escalated when the plugin loads that file, and its
+newest drop is handed back once — the poll claims it again like any drop, so it gets the request
+its class needs. The entry keeps a `cutover` mark, so a later load never hands the same drop back
+twice; a message the old path had routed to the owner and never sent is dropped, and escalations
+of a stage or a crash restart stay as they are. A message for a
 pull request that still holds an undelivered one waits behind it and goes out after it. An
-archived agent's open pull request stays watched until that escalation or 14 days without
+archived agent's open pull request stays watched until it is escalated to you or 14 days without
 activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
 
 **Queue backstop.** Every 10 minutes, and right after a poll claimed a drop to re-enqueue, the
@@ -1581,7 +1603,8 @@ plugin change and `paseo plugin reload linear-tickets`; ranges already in the qu
 If a handover record has no pull-request link, or its link moved or disappeared after routing,
 the backstop still delivers the repair to that ticket's agent through the same crash/successor
 recovery path. Busy agents keep their requests pending across restarts; in-flight claims prevent
-duplicate sends. Owner fallback is reserved for escalation or a missing/unrecoverable agent record.
+duplicate sends. The ticket (or, without one, a marked pull request comment) is the fallback only
+when no agent record can be recovered at all; drops never fall back to the owner.
 
 **Stranded stacks.** When the bottom of a stack lands, Graphite sometimes leaves the pull request
 above it based on a helper branch `graphite-base/<n>` that no open pull request owns; it cannot
@@ -1713,8 +1736,9 @@ sent the whole stack is read and checked; it falls back to the recorded pull req
 the log says why once, when the branches are not one plain chain (a base branch without an open
 pull request, a branch two open pull requests share, two of the ticket's pull requests on one
 branch, a cycle), when a member cannot be read or no longer matches the listing (state, head,
-branch, base), or when a hold covers any member: `do-not-merge`, a drop escalated to you (also
-the third drop from before drops had kinds), a merge queue message still to deliver, the head a
+branch, base), or when a hold covers any member: `do-not-merge`, an escalation of a member to you
+after it waited out your answer (see **Stalled pull requests**), a merge queue message still to
+deliver, the head a
 genuine drop left, or another ticket's record linking it (compared by repository and number,
 whatever the URL's spelling). While the stack is deferred its other pull requests are not
 nudged, so a permission wait of theirs starts from zero once they are again. In a repository
@@ -1735,8 +1759,7 @@ claimed per review instead: a change request is sent once, however many commits 
 keeps holding the merge until the reviewer settles it), and a new request is sent again. The next time that
 stage stalls, you get one comment instead ("Paseo asked the agent 2 times to …"), and after
 that only the log. A busy or disconnected agent is asked on a later poll; a gone or archived
-agent's nudge starts a successor or goes to the ticket like a drop's fix request (it counts toward
-the same two).
+agent's nudge starts a successor or goes to the ticket like a drop's fix request.
 Review threads are read (GraphQL, every page) only when a stage needs them.
 
 **Gone agents.** A nudge, merge queue fix request (the queue backstop's refused enqueues
@@ -1744,7 +1767,7 @@ included) or replacement request for an agent that is archived or no longer exis
 successor: a new agent on the ticket's recorded branch and worktree, which gets the handover of
 the previous agent's reports and, as the last part of its first prompt, "Paseo started you
 because the pull request needs this now:" with the message. It is claimed right before the start
-and counts like a message sent (the two nudges per stage, the drop limits), so a pull request
+and counts like a message sent (the two nudges per stage), so a pull request
 that keeps stalling still reaches you. The ticket's panel shows "The agent was gone; Paseo
 started a successor (agent 1a2b3c4d) on `<branch>` and asked it to …"; it gets its own thread,
 the gone agent is archived and the handover record names the successor. When no slot is free
