@@ -84,6 +84,22 @@ const PASSING_CONCLUSIONS = ["success", "skipped", "neutral"];
 // An archived agent's open pull request stops being watched after this long without activity.
 const ARCHIVED_WATCH_MS = 14 * 24 * 60 * 60 * 1000;
 
+// The `Paseo agent` attachment (handover.ts) names the ticket's newest agent and, in its URL, the
+// host that ran it (`app.paseo.sh/h/<serverId>/agent/<id>`; the id is in `~/.paseo/server-id`).
+const AGENT_ATTACHMENT = /^https:\/\/app\.paseo\.sh\/h\/([^/]+)\/agent\/[^/?#]+$/;
+// How long the agent-host evidence of one ticket is kept (see ownership): the ticket's newest agent
+// moves with a handover, which the peer claims already show (they are read with every run), and
+// every re-read is a Linear request.
+const AGENT_HOST_MS = 6 * 60 * 60 * 1000;
+
+// This host's Paseo server id, cached for the process: the daemon writes it next to its state and
+// it changes only with a new daemon identity.
+let localServerId: Promise<string | null> | null = null;
+function hostServerId(): Promise<string | null> {
+  localServerId ??= readFile(join(paseoHome(), "server-id"), "utf8").then((text) => text.trim() || null, () => null);
+  return localServerId;
+}
+
 // A check on the pull request's head: the latest run of each check, pending until it completes.
 export type CheckRun = { name: string; url: string; state: "pending" | "passed" | "failed"; conclusion: string };
 export type PullRequestView = {
@@ -966,6 +982,17 @@ export class PullRequestWatch {
       // `tasks` finds the before-merge tasks of tickets that have no handover record.
       manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge"> & Partial<Pick<ManualTasks, "tasks">>;
       settings: Pick<Settings, "read">;
+      // Which of these tickets this host owns (README, "Several hosts"), read once per poll and
+      // backstop run from the peer mechanism (activation.ts claims, read only; index.server.ts
+      // passes activation-guard.ts ticketOwners). A ticket it does not name belongs to another
+      // host: its pull requests are not read, routed, nudged or succeeded here at all. `null`: it
+      // cannot be told, and the ticket's own `Paseo agent` attachment decides (see ownership).
+      // Absent: this host owns every ticket, as on a host without a peer.
+      owner?: (issueIds: string[]) => Promise<Set<string> | null>;
+      // This host's Paseo server id (`~/.paseo/server-id`, which the daemon writes next to its
+      // state): the agent links on the tickets name their host with it (see ownership). Absent:
+      // the file is read.
+      serverId?: () => Promise<string | null>;
       view?: (url: string) => Promise<PullRequestView>;
       // The cheap first look that decides whether `view` (the detail read) is needed at all. The
       // daemon leaves both out and gets the real one (ConditionalPullView); an injected `view`
@@ -1206,6 +1233,77 @@ export class PullRequestWatch {
       && (record.status !== "archived" || now - (Date.parse(record.updatedAt) || 0) <= ARCHIVED_WATCH_MS);
   }
 
+  // The tickets this run owns (see the `owner` dep). Null: it could not be read, so each ticket is
+  // judged on its own evidence.
+  private ownedIds: Set<string> | null = null;
+  private ownerRead = 0;
+  // The agent-host evidence per ticket, kept for AGENT_HOST_MS; `null` is "nothing to decide from".
+  private readonly agentHosts = new Map<string, { at: number; here: boolean | null }>();
+  // Tickets whose ownership could not be told at all, logged once each.
+  private readonly ownershipUnknown = new Set<string>();
+  // The records this host stopped watching because their tickets belong to another host: counted on
+  // every run, logged once with the first count.
+  private ownershipSkipped = false;
+
+  private async readOwner(issueIds: string[]): Promise<void> {
+    this.ownerRead = this.clock();
+    if (!this.deps.owner) {
+      this.ownedIds = new Set(issueIds);
+      return;
+    }
+    this.ownedIds = await this.deps.owner(issueIds).catch((error: unknown) => {
+      console.error(`[linear-tickets] reading which tickets this host owns failed: ${error instanceof Error ? error.message : error}; every ticket stays watched here`);
+      return null;
+    });
+  }
+
+  // Whether this host watches the ticket's pull requests (README, "Several hosts"): one host owns
+  // a ticket's work at a time. The peer mechanism decides when it can tell (see the `owner` dep): a
+  // ticket it does not name is another host's, and its pull requests are not read, routed, nudged
+  // or succeeded here at all. When it cannot tell, the ticket's own evidence decides: its
+  // `Paseo agent` attachment (handover.ts) names the host of its newest agent, and one of another
+  // host means the work moved there. Nothing readable: the ticket keeps being watched (fail open),
+  // logged once.
+  private async ownership(issueId: string, identifier: string): Promise<boolean> {
+    if (this.ownedIds) return this.ownedIds.has(issueId);
+    const cached = this.agentHosts.get(issueId);
+    if (cached && this.clock() - cached.at < AGENT_HOST_MS) return cached.here ?? true;
+    let here: boolean | null;
+    try {
+      const hosts = (await this.deps.linear.issueAttachments(issueId)).flatMap((url) => AGENT_ATTACHMENT.exec(url)?.[1] ?? []);
+      const mine = hosts.length ? await (this.deps.serverId ?? hostServerId)() : null;
+      here = hosts.length && mine ? hosts.includes(mine) : null;
+    } catch (error) {
+      // A failed read is not evidence that the ticket moved: it stays watched and is read again.
+      console.error(`[linear-tickets] ${identifier}: reading which host runs the ticket's agent failed (${error instanceof Error ? error.message : error}); its pull requests stay watched here`);
+      return true;
+    }
+    this.agentHosts.set(issueId, { at: this.clock(), here });
+    if (here === null && !this.ownershipUnknown.has(issueId)) {
+      this.ownershipUnknown.add(issueId);
+      console.log(`[linear-tickets] ${identifier}: which host owns the ticket could not be told; its pull requests stay watched here`);
+    }
+    return here ?? true;
+  }
+
+  // The records this run may work on: the tickets whose work is this host's. Polls and backstop
+  // runs log the first count of the ones they leave alone, so the migration of a host's records is
+  // visible once and never again.
+  private async ownedRecords(records: HandoverRecord[]): Promise<HandoverRecord[]> {
+    await this.readOwner(records.map((record) => record.issueId));
+    const mine: HandoverRecord[] = [];
+    let skipped = 0;
+    for (const record of records) {
+      if (await this.ownership(record.issueId, record.identifier)) mine.push(record);
+      else skipped++;
+    }
+    if (skipped && !this.ownershipSkipped) {
+      this.ownershipSkipped = true;
+      console.log(`[linear-tickets] pull request watch: ${skipped} ticket${skipped === 1 ? "" : "s"} of this host's records belong to another host; their pull requests are not polled here (the records are kept)`);
+    }
+    return mine;
+  }
+
   private async discover(record: HandoverRecord, context: RunContext): Promise<void> {
     if (!this.discoverable(record, context.now)) return;
     let repo = record.worktreePath ? await context.repo(record.worktreePath) : null;
@@ -1271,9 +1369,12 @@ export class PullRequestWatch {
     }
     const manual = this.deps.manualTasks;
     const all = await this.deps.handover.all();
-    const context = this.context(all);
+    // One poll watches one host's tickets (see ownership): another host's records stay here
+    // untouched, so their pull requests are not read, routed, nudged or succeeded from this host.
+    const mine = await this.ownedRecords(all);
+    const context = this.context(mine);
     const records: HandoverRecord[] = [];
-    for (const record of all) {
+    for (const record of mine) {
       const url = record.links["Pull request"];
       if (!url) {
         if (this.discoverable(record, context.now)) records.push(record);
@@ -1326,7 +1427,7 @@ export class PullRequestWatch {
     if (this.deps.watchdog) {
       await pass(async () => {
         try {
-          await this.deps.watchdog!.pass({ records: all, reserved, pulls: (ticket) => this.ticketPulls(ticket, context) });
+          await this.deps.watchdog!.pass({ records: mine, reserved, pulls: (ticket) => this.ticketPulls(ticket, context) });
         } catch (error) {
           if (error instanceof RateLimitedError) throw error;
           console.error(`[linear-tickets] watchdog: ${error instanceof Error ? error.message : error}`);
@@ -1347,7 +1448,7 @@ export class PullRequestWatch {
       });
     }
     // Crash recovery comes next, whatever the watchdog's Linear budget came to (see crashPass).
-    await this.crashPass(all, reserved, seenByUrl, views);
+    await this.crashPass(mine, reserved, seenByUrl, views);
     // Stalled pull requests are nudged, and closed ones followed to their replacement, after every
     // drop was handled: a drop's fix request comes first when both are for the same agent.
     const nudges: { record: HandoverRecord; url: string; view: PullRequestView }[] = [];
@@ -1720,11 +1821,22 @@ export class PullRequestWatch {
   // action. On the dispatch host, each repo's `greptile-retrigger.mjs` re-requests missing
   // Greptile reviews and, after the last repo, the outage issue is synced once with every repo's
   // answer (see retrigger). It shares pr-watch.json with the poll and runs in turn with it.
+  //
+  // Only one host may drive a repo's queue (the `backstop.run` setting, see backstopHost): the
+  // repo-wide half (the `enqueue-ready.mjs` listing, the drops and ready stacks it names, and the
+  // stranded-stack moves) runs there and nowhere else, so two hosts never read the same repository
+  // for the same answer or claim the same drop twice. Every host still follows up the actions it
+  // claimed for its own tickets (see advanceAction) and delivers its own pending messages.
   private async queueBackstop(): Promise<void> {
     const seenByUrl = await this.load();
-    const records = await this.deps.handover.all();
+    const all = await this.deps.handover.all();
+    // Discovery links a ticket's open pull requests to its record, so it is this host's tickets'
+    // work: another host's records keep their state here untouched.
+    const records = await this.ownedRecords(all);
     const context = this.context(records);
     const save = () => this.save(seenByUrl);
+    // Whether this host runs the repo-wide half of the backstop (see backstopHost).
+    const repoWide = await this.backstopHost();
     // Set once GitHub's budget stopped the run: the rest neither runs nor counts as read, and the
     // outage issue still gets its one sync with those repos failed.
     let stopped: string | null = null;
@@ -1761,7 +1873,7 @@ export class PullRequestWatch {
       if (writer) greptile.push(stopped ? { repo, result: "failed", error: stopped } : await this.retrigger(repo, follow.get(repo) ?? [], seenByUrl, context));
       if (stopped || !repos.has(repo)) continue;
       try {
-        await this.backstopRepo(repo, seenByUrl, context, save);
+        await this.backstopRepo(repo, seenByUrl, context, save, repoWide);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[linear-tickets] queue backstop for ${repo} stopped: ${message}`);
@@ -1781,6 +1893,23 @@ export class PullRequestWatch {
   private hasScript(checkout: string, script: string): boolean {
     return (this.deps.backstop?.has ?? ((dir, name) => existsSync(join(dir, name))))(checkout, script);
   }
+
+  // Whether this host runs the repo-wide half of the queue backstop (README, "Queue backstop").
+  // `auto` (the default) is the host with auto-dispatch enabled, which already drives the repo's
+  // ticket work, so one host per repo drives its queue without a hostname in the code; the setting
+  // pins it where dispatch is off or on both hosts. Logged once per process when it is off here.
+  private async backstopHost(): Promise<boolean> {
+    const { backstop, dispatch } = await this.deps.settings.read();
+    const runs = backstop.run === "always" ? true : backstop.run === "never" ? false : dispatch.enabled;
+    if (!runs && !this.backstopSkipLogged) {
+      this.backstopSkipLogged = true;
+      console.log(`[linear-tickets] queue backstop: the repo-wide half runs on the backstop host only (backstop.run is ${backstop.run}${backstop.run === "auto" ? " and auto-dispatch is off here" : ""}); this host follows up its own enqueues`);
+    }
+    return runs;
+  }
+
+  // The repo-wide half is off here: logged once per process (see backstopHost).
+  private backstopSkipLogged = false;
 
   // One repo's Greptile re-request (TUC-1208): the repo's script decides and posts (once per head,
   // twice per 24 hours, never after a Greptile review); `follow` are the pull requests the outage
@@ -1805,7 +1934,12 @@ export class PullRequestWatch {
     }
   }
 
-  private async backstopRepo(repo: string, seenByUrl: Record<string, Seen>, context: RunContext, save: () => Promise<void>): Promise<void> {
+  // One repo's backstop steps. The actions this host claimed for its own tickets -- and the
+  // messages they left -- are followed up on every host (see advanceAction); the repo-wide half
+  // (`repoWide`: the `enqueue-ready.mjs` listing with the drops and ready stacks it names, and the
+  // stranded-stack moves) runs only on the backstop host (see backstopHost), so one host reads the
+  // repository for those answers.
+  private async backstopRepo(repo: string, seenByUrl: Record<string, Seen>, context: RunContext, save: () => Promise<void>, repoWide: boolean): Promise<void> {
     const checkout = await context.checkout(repo);
     if (!checkout) return;
     const inRepo = () => Object.entries(seenByUrl).filter(([url]) => PULL_URL.exec(url)?.[1] === repo);
@@ -1813,19 +1947,28 @@ export class PullRequestWatch {
       seen.actions = seen.actions?.filter((action) => context.now - Date.parse(action.at) < BACKSTOP_MEMORY_MS || ["due", "started", "held"].includes(action.steps.enqueue));
       seen.refusals = seen.refusals?.filter((refusal) => context.now - Date.parse(refusal.at) < BACKSTOP_MEMORY_MS);
     }
+    // An action is this host's when it names one of this host's tickets: the enqueues the poll
+    // claimed for its pull requests stay with the host the tickets belong to. An action that names
+    // no ticket at all (the repo's own, claimed for a pull request no record watches) stays where
+    // it was claimed, which only the backstop host does.
+    const mine = new Set(context.records.map((record) => record.identifier));
+    const own = (action: ActionRecord) => !action.tickets.length || action.tickets.some((ticket) => mine.has(ticket));
     // Each action moves at most once per run: a held one is retried on the next run, not twice.
     const advanced = new Set<string>();
     const advance = async () => {
       for (const [, seen] of inRepo()) {
         for (const action of seen.actions ?? []) {
-          if (advanced.has(action.id)) continue;
+          if (advanced.has(action.id) || !own(action)) continue;
           advanced.add(action.id);
           await this.advanceAction(action, seenByUrl, context, checkout, save);
         }
       }
     };
     await advance();
-    const open = await context.pulls(repo);
+    // The repo's open pull requests: the repo-wide half needs them, and so does following up an
+    // action or a message this host still holds (the retry checks the heads and the veto).
+    const held = inRepo().some(([, seen]) => (seen.actions ?? []).some(own) || Boolean(seen.pending));
+    const open = repoWide || held ? await context.pulls(repo) : [];
     const watched = new Set(context.records.map((record) => record.links["Pull request"]));
     // Recover messages whose record lost or moved its link after routing.
     // Only open PRs need a repair request; preserve any in-flight delivery claim.
@@ -1838,47 +1981,51 @@ export class PullRequestWatch {
         pending.orphan ??= { tickets };
       }
     }
-    const gated = await this.gatedTickets(context.records);
-    const excluded = this.excluded(repo, seenByUrl, open, gated, context.records);
-    const skips = await this.skips(repo, seenByUrl, open, context.now);
-    // A refused drop re-enqueue whose refusals are all released runs again: `enqueue-ready.mjs`
-    // never lists a dropped range as ready, so nothing else would retry it.
-    for (const [, seen] of inRepo()) {
-      for (const action of seen.actions ?? []) {
-        if (!action.id.startsWith("drop:") || action.steps.enqueue !== "refused" || skips.includes(action.id)) continue;
-        if (action.prs.some((pr) => excluded.has(pr)) || action.tickets.some((ticket) => gated.has(ticket))) continue;
-        action.steps.enqueue = "due";
-        advanced.delete(action.id);
+    if (repoWide || open.length) {
+      const gated = await this.gatedTickets(context.records);
+      const excluded = this.excluded(repo, seenByUrl, open, gated, context.records);
+      const skips = await this.skips(repo, seenByUrl, open, context.now);
+      // A refused drop re-enqueue whose refusals are all released runs again: `enqueue-ready.mjs`
+      // never lists a dropped range as ready, so nothing else would retry it.
+      for (const [, seen] of inRepo()) {
+        for (const action of seen.actions ?? []) {
+          if (!own(action) || !action.id.startsWith("drop:") || action.steps.enqueue !== "refused" || skips.includes(action.id)) continue;
+          if (action.prs.some((pr) => excluded.has(pr)) || action.tickets.some((ticket) => gated.has(ticket))) continue;
+          action.steps.enqueue = "due";
+          advanced.delete(action.id);
+        }
+      }
+      if (repoWide) {
+        const ready = parseReady(await this.run(checkout, ENQUEUE_READY, readyArgs([...excluded].sort((a, b) => a - b), skips), repo));
+        for (const found of ready.drops) {
+          const url = pullUrl(repo, found.pr);
+          if (watched.has(url) || handledDrops(seenByUrl[url]).includes(found.key)) continue;
+          const drop: Drop = { key: found.key, reason: "", repo, number: found.pr, draft: found.draft === null ? null : { number: found.draft, url: pullUrl(repo, found.draft), headSha: null, pulls: [] } };
+          if (await this.claimDrop(drop, recordFor(ticketsOf(repo, [found.pr], open, context.records, null), context.records), seenByUrl, context)) await save();
+        }
+        // The drops claimed above may have started re-enqueues of their own.
+        const busy = this.excluded(repo, seenByUrl, open, gated, context.records);
+        for (const stack of ready.stacks) {
+          if (stack.result !== "candidate" || stack.prs.some((pr) => busy.has(pr)) || stack.tickets.some((ticket) => gated.has(ticket)) || skips.includes(stack.action)) continue;
+          const holder = entry(seenByUrl, pullUrl(repo, stack.top));
+          const existing = holder.actions?.find((action) => action.id === stack.action);
+          // A stack already enqueued under this action is followed by the drop path from now on.
+          if (existing && existing.steps.enqueue !== "refused") continue;
+          if (existing) {
+            existing.steps.enqueue = "due";
+            advanced.delete(existing.id);
+          } else holder.actions = [...(holder.actions ?? []), {
+            id: stack.action, repo, branch: stack.branch, expect: stack.expect, prs: stack.prs, top: stack.top, tickets: stack.tickets, why: READY_WHY,
+            at: new Date(context.now).toISOString(), activityBoundary: null, steps: { enqueue: "due", prComment: "none", linearComment: "none", note: "none" },
+          }];
+          await save();
+        }
+        // The ready stacks, and the drops claimed above, are enqueued right away.
+        await advance();
+        if (this.hasScript(checkout, RETARGET_ORPHAN)) await this.retargets(repo, checkout, seenByUrl, context, save);
       }
     }
-    const ready = parseReady(await this.run(checkout, ENQUEUE_READY, readyArgs([...excluded].sort((a, b) => a - b), skips), repo));
-    for (const found of ready.drops) {
-      const url = pullUrl(repo, found.pr);
-      if (watched.has(url) || handledDrops(seenByUrl[url]).includes(found.key)) continue;
-      const drop: Drop = { key: found.key, reason: "", repo, number: found.pr, draft: found.draft === null ? null : { number: found.draft, url: pullUrl(repo, found.draft), headSha: null, pulls: [] } };
-      if (await this.claimDrop(drop, recordFor(ticketsOf(repo, [found.pr], open, context.records, null), context.records), seenByUrl, context)) await save();
-    }
-    // The drops claimed above may have started re-enqueues of their own.
-    const busy = this.excluded(repo, seenByUrl, open, gated, context.records);
-    for (const stack of ready.stacks) {
-      if (stack.result !== "candidate" || stack.prs.some((pr) => busy.has(pr)) || stack.tickets.some((ticket) => gated.has(ticket)) || skips.includes(stack.action)) continue;
-      const holder = entry(seenByUrl, pullUrl(repo, stack.top));
-      const existing = holder.actions?.find((action) => action.id === stack.action);
-      // A stack already enqueued under this action is followed by the drop path from now on.
-      if (existing && existing.steps.enqueue !== "refused") continue;
-      if (existing) {
-        existing.steps.enqueue = "due";
-        advanced.delete(existing.id);
-      } else holder.actions = [...(holder.actions ?? []), {
-        id: stack.action, repo, branch: stack.branch, expect: stack.expect, prs: stack.prs, top: stack.top, tickets: stack.tickets, why: READY_WHY,
-        at: new Date(context.now).toISOString(), activityBoundary: null, steps: { enqueue: "due", prComment: "none", linearComment: "none", note: "none" },
-      }];
-      await save();
-    }
-    // The ready stacks, and the drops claimed above, are enqueued right away.
-    await advance();
     await this.routeRefusals(repo, seenByUrl, context, save);
-    if (this.hasScript(checkout, RETARGET_ORPHAN)) await this.retargets(repo, checkout, seenByUrl, context, save);
     // Unlinked messages still belong to the ticket's agent. A busy agent keeps its message pending.
     const reserved = new Set<string>();
     for (const [url, seen] of inRepo()) {

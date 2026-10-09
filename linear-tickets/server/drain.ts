@@ -304,6 +304,18 @@ export class DrainRouter implements ActivationSink {
     return live.find((entry) => entry.issueId === issueId) ?? null;
   }
 
+  // The tickets the live allowlisted agents above own, for a caller that decides a whole run at
+  // once (pr-watch.ts ownership, README "Several hosts"): the same set, read once instead of once
+  // per ticket, because each read lists this host's agents and checks their tickets' states. Null:
+  // this host cannot tell (its daemon is not connected, or its allowlist has not been seeded), and
+  // the caller keeps its tickets instead of handing them to the peer.
+  async ownedTickets(): Promise<Set<string> | null> {
+    const paseo = this.deps.paseo();
+    const allowlist = await this.allowlist.load();
+    if (!paseo || !allowlist.seededAt) return null;
+    return new Set((await this.liveAllowlisted(paseo)).map((entry) => entry.issueId));
+  }
+
   // Forwards one new automatic activation. Null keeps it local (not draining, or an allowed agent
   // still owns the ticket); `{ peer }` hands it over; `{ held }` starts nothing anywhere -- the
   // prompt is durably queued and the sweep retries it. Nothing is ever decided on an unreadable

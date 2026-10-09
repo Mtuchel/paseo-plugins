@@ -21,7 +21,7 @@ import { Launcher, type ResumeTarget } from "./launch";
 import { PermissionReplies } from "./permission-replies";
 import { SessionStore } from "./sessions";
 import { isUntrusted, ResumeUnavailableError, TicketStarter } from "./starter";
-import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, Settings, type ActivationSettings, type PluginSettings } from "./settings";
+import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, Settings, type ActivationSettings, type PluginSettings } from "./settings";
 import { WATCHDOG_LABEL, WatchdogStore } from "./watchdog";
 
 const exec = promisify(execFile);
@@ -37,7 +37,7 @@ process.env.PASEO_ACTIVATION_SECRET = SECRET;
 function settingsFor(activation: ActivationSettings = DEFAULT_ACTIVATION): PluginSettings {
   return {
     template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: false,
-    dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
+    dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
   };
 }
 

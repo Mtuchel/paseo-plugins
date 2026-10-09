@@ -408,6 +408,9 @@ list and the launch flow.
 - **Worktree shards** — the repositories whose ticket worktrees are spread across independent
   clones, and the clones themselves; set through `linear.set-settings` (`worktreeShards`) for now
   (off by default; see [Worktree shards](#worktree-shards)).
+- **Queue backstop host** — which host runs the repo-wide half of the merge queue automation;
+  set through `linear.set-settings` (`backstop.run`) for now (`auto`, the host with auto-dispatch
+  enabled; see [Queue backstop](#queue-backstop)).
 
 The last successful model, mode, and reasoning choices are stored in the same per-host
 settings file. They update automatically and do not need a separate settings toggle. The cheap
@@ -1415,6 +1418,18 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
 
 What has been planned is kept in `~/.paseo/linear-tickets/projects.json`.
 
+**One host per ticket.** A ticket's pull requests are watched by the host that owns the ticket's
+work. The activation routing decides which host that is (see **Drain one host into another**): the
+peer's claims name the tickets its live agents still hold, and only when they cannot tell, the
+ticket's `Paseo agent` attachment decides — its URL names the host
+(`app.paseo.sh/h/<server id>/agent/<agent id>`) that ran the ticket's newest agent, read from
+Linear at most every 6 hours per ticket. A ticket of which neither source names another host stays
+watched here, and an unreadable source is never evidence that the work moved: a failed read keeps
+watching and is logged once, and a host without a peer watches every ticket as before. The host
+that no longer owns a ticket stops reading its pull requests, routing drops and refusals into
+them, nudging them and recovering agents for them; its records and the history in `pr-watch.json`
+are kept, not deleted or moved, and the count of the records left alone is logged once.
+
 **Pull request reviews.** Every 2 minutes the plugin looks at each ticket's pull request, but reads
 it in full — one `gh pr view` GraphQL query — only when something actually changed. The first look is
 REST and conditional: the pull request read as an issue (`repos/…/issues/<n>`; the single-pull
@@ -1533,8 +1548,16 @@ plugin enqueues on its own what nobody else did. It runs the repo's scripts, nev
 judgment, from a detached worktree per repo at
 `$PASEO_HOME/linear-tickets/queue-backstop/<owner>-<repo>`, made from the git common dir of any
 recorded worktree of the repo and reset to `origin/main` (fetched first) before every run; a repo
-whose `main` has no `tools/ci/enqueue-ready.mjs` gets no backstop. One run at a time, taking turns
-with the poll:
+whose `main` has no `tools/ci/enqueue-ready.mjs` gets no backstop. One host per repository drives
+its repo-wide half — the `enqueue-ready.mjs` listing (step 2) with the drops and ready stacks it
+names, and the stranded-stack moves (step 5) — so two hosts never read the same repository for the
+same answer or claim the same drop twice. That host is the one with auto-dispatch enabled
+(`backstop.run: "auto"`, the default; see [Settings](#settings)); `"always"` and `"never"` pin it
+where auto-dispatch is off or on both hosts. Every other host still follows up the enqueues it
+claimed for its own tickets (step 1 and the refusals) and delivers their messages, and it reads a
+repository's open pull requests only while it still holds one of those; it logs once that it left
+the repo-wide half alone. With `"never"` on every host the repo-wide half does not run at all. One
+run at a time, taking turns with the poll:
 
 1. Re-enqueues claimed above, and earlier enqueues that are still due or held, move on. Right
    before each enqueue the range is checked again as it is now: a round on any pull request of

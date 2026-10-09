@@ -165,9 +165,13 @@ const MAIN_BROKEN: Judgment = {
 // `crash`: the agent runs on crashDaemon (`daemon`) instead of the fake router (`paseo`).
 // `autoResume`: the setting *Start a new agent automatically* (`writeback.autoResume`) is on, so a
 // gone agent's message starts a successor (`paseo.succeed`).
+// `owner`: what the peer mechanism (README, "Several hosts") names as this host's tickets: `all`
+// (the default: a host without a peer) keeps every record, `none` names none of them, `unknown`
+// cannot tell, and `throws` fails the read. `backstop`: the queue backstop's `run` setting; the
+// harness host is the backstop host unless a test says otherwise.
 // `probe`: the cheap first look the poll goes through (see ConditionalPullView); without one the
 // injected `view` is the whole read, as for the tests that predate it.
-function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean } = {}, probe?: PullViewSource) {
+function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean; owner?: "all" | "none" | "unknown" | "throws"; backstop?: "auto" | "always" | "never" } = {}, probe?: PullViewSource) {
   const waits = { runs: 0, failure: null as Error | null };
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open under `title`; `views`: other pull requests
@@ -237,6 +241,8 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   };
   const calls: string[] = [];
   const daemon = agent.crash ? crashDaemon(calls) : null;
+  // This host's Paseo server id, as the tickets' `Paseo agent` attachments name it (see ownership).
+  const server = { id: "srv_test" };
   const directory = mkdtemp(join(tmpdir(), "paseo-pr-watch-"));
   t.after(async () => rm(await directory, { recursive: true, force: true }));
   const create = () => directory.then((home) => new PullRequestWatch({
@@ -317,7 +323,13 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       awaitingMerge: async () => false,
       merged: async (issueId) => { calls.push(`merged ${issueId}`); },
     },
-    settings: { read: async () => ({ ...settings, dispatch: { ...settings.dispatch, enabled: agent.dispatch ?? false }, writeback: { ...settings.writeback, autoResume: agent.autoResume ?? settings.writeback.autoResume } }) },
+    settings: { read: async () => ({ ...settings, dispatch: { ...settings.dispatch, enabled: agent.dispatch ?? false }, writeback: { ...settings.writeback, autoResume: agent.autoResume ?? settings.writeback.autoResume }, backstop: { run: agent.backstop ?? "always" } }) },
+    owner: async (issueIds) => {
+      if (agent.owner === "throws") throw new Error("Linear is unavailable");
+      if (agent.owner === "unknown") return null;
+      return agent.owner === "none" ? new Set<string>() : new Set(issueIds);
+    },
+    serverId: async () => server.id,
     outage: { follow: async () => scripts.outage.follow, sync: async (results) => { scripts.outage.syncs.push(results); } },
     ...(probe ? { probe } : {}),
     view: async (url) => {
@@ -453,7 +465,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     await writeFile(path, value);
     return value;
   };
-  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, waits, home: () => directory, watch: () => watch };
+  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, waits, server, home: () => directory, watch: () => watch };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -3757,4 +3769,106 @@ test("every poll checks the waits the plugin recorded for the owner; a failure t
   await h.poll();
   assert.equal(h.waits.runs, 3);
   assert.ok(errors.mock.calls.some((call) => /closing left-behind owner waits failed: Linear is unreachable/.test(String(call.arguments[0]))));
+});
+// --- One host per ticket and one per repo (TUC-538) ----------------------------------------------
+
+const AGENT_URL = (server: string, agent = "a9") => `https://app.paseo.sh/h/${server}/agent/${agent}`;
+const countLogs = (logs: { mock: { calls: { arguments: unknown[] }[] } }, pattern: RegExp) =>
+  logs.mock.calls.filter((call) => pattern.test(String(call.arguments[0]))).length;
+const readState = async (home: string) => JSON.parse(await readFile(join(home, "pr-watch.json"), "utf8")) as Record<string, { drops?: string[]; blockedAt?: string }>;
+
+test("a ticket another host owns is not polled, routed, nudged or succeeded here; its record and its history stay (TUC-538)", async (t) => {
+  const logs = t.mock.method(console, "log", () => {});
+  // The laptop's settings: the tickets moved to server087, and the repo-wide queue half too.
+  const h = harness(t, { owner: "none", backstop: "auto", dispatch: false });
+  // A drop of its pull request, and a second record with no link for the backstop to discover.
+  h.github.view = { ...READY, mergeActivity: activity(QUEUED, running(437), REMOVED) };
+  h.github.drafts = [draft(437, [419])];
+  h.records.push({ ...h.records[0], issueId: "i2", identifier: "TUC-2", agentId: "a2", links: {}, branch: "mtuchel/tuc-2" });
+  // The state an earlier host left: kept as it is, never read, routed or cleared.
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, drops: ["#437"], blockedAt: HEAD } });
+  const skipped = /tickets? of this host's records belong to another host; their pull requests are not polled here/;
+  assert.deepEqual(await h.poll(), [], "no drop request, no nudge, no ticket message");
+  assert.deepEqual(h.github.reads, [], "its pull request is not read");
+  assert.deepEqual(h.github.listings, [], "not even the repository is listed");
+  assert.deepEqual(await h.backstop(), [], "and the backstop neither discovers it nor scans for it");
+  assert.deepEqual(h.github.listings, []);
+  assert.deepEqual(h.scripts.runs, []);
+  assert.equal(countLogs(logs, skipped), 1);
+  assert.equal(countLogs(logs, /which host owns the ticket could not be told/), 0, "the ownership was told, it was not unknown");
+  await h.poll();
+  assert.equal(countLogs(logs, skipped), 1, "the count is logged once");
+  assert.deepEqual(h.records.map((record) => record.identifier), ["TUC-1", "TUC-2"], "the records are kept, not deleted");
+  assert.deepEqual((await readState(await h.home()))[PR], { reviewedAt: null, decision: null, merged: false, drops: ["#437"], blockedAt: HEAD }, "so is the history of its pull request");
+  // The same poll on the host that owns the ticket is unchanged.
+  const owned = harness(t);
+  owned.github.view = { ...READY, mergeActivity: activity(QUEUED, running(437), REMOVED) };
+  owned.github.drafts = [draft(437, [419])];
+  assert.match(promptOf(await owned.poll()) ?? "", /Fix the cause/, "the ticket's own host still routes the drop to its agent");
+  assert.deepEqual(owned.github.reads, [PR]);
+});
+
+test("an unknowable owner keeps watching (fail open), once logged; the ticket's agent link decides when it can (TUC-538)", async (t) => {
+  const logs = t.mock.method(console, "log", () => {});
+  const open = harness(t, { owner: "unknown" });
+  await open.poll();
+  assert.deepEqual(open.github.reads, [PR], "nothing readable: the ticket stays watched");
+  assert.equal(countLogs(logs, /which host owns the ticket could not be told; its pull requests stay watched here/), 1);
+  await open.poll();
+  assert.equal(countLogs(logs, /which host owns the ticket could not be told/), 1, "logged once");
+  // The fallback evidence: the ticket's `Paseo agent` attachment names the host of its newest agent.
+  const foreign = harness(t, { owner: "unknown" });
+  foreign.linear.attachments = [AGENT_URL("srv_other")];
+  assert.deepEqual(await foreign.poll(), []);
+  assert.deepEqual(foreign.github.reads, [], "another host's agent runs the ticket: not watched here");
+  assert.deepEqual(foreign.linear.issueReads, ["i1"], "read once");
+  const mine = harness(t, { owner: "unknown" });
+  mine.linear.attachments = [AGENT_URL(mine.server.id, "a1")];
+  await mine.poll();
+  assert.deepEqual(mine.github.reads, [PR], "this host's own agent: watched as before");
+  const broken = harness(t, { owner: "throws" });
+  await broken.poll();
+  assert.deepEqual(broken.github.reads, [PR], "a failed ownership read keeps watching");
+  const unreadable = harness(t, { owner: "unknown" });
+  unreadable.linear.issueFailure = new Error("Linear is unavailable");
+  await unreadable.poll();
+  assert.deepEqual(unreadable.github.reads, [PR], "an unreadable agent link keeps watching");
+});
+
+test("the repo-wide half of the queue backstop runs on one host per repo; each host still enqueues what its own tickets claimed (AC-3)", async (t) => {
+  const logs = t.mock.method(console, "log", () => {});
+  // The laptop's settings: auto-dispatch off, so `auto` leaves the repo-wide half to server087.
+  const laptop = harness(t, { backstop: "auto", dispatch: false });
+  laptop.scripts.ready = { stacks: [STACK], drops: [] };
+  assert.deepEqual(await laptop.backstop(), [], "no ready stack is enqueued");
+  assert.deepEqual(laptop.scripts.runs, [], "not even the repository's own listing runs");
+  assert.deepEqual(laptop.github.listings, [], "and the repository is not read for it");
+  assert.equal(countLogs(logs, /queue backstop: the repo-wide half runs on the backstop host only \(backstop.run is auto and auto-dispatch is off here\); this host follows up its own enqueues/), 1);
+  await laptop.backstop();
+  assert.equal(countLogs(logs, /queue backstop: the repo-wide half runs on the backstop host only/), 1, "logged once");
+  // A drop the poll claimed for this host's own ticket is still enqueued here: only the repo-wide
+  // half moved to the backstop host.
+  const h = harness(t, { backstop: "never" });
+  const bullets = bulletsOf(h, {}, QUEUED, running(437), REMOVED);
+  h.github.drafts = [draft(437, [419])];
+  h.scripts.judgment = FLAKY;
+  h.scripts.onEnqueue = async () => bullets.add(QUEUED);
+  assert.deepEqual(await h.poll(), [], "the flaky drop needs nothing from the agent");
+  assert.deepEqual(firstLines(await h.backstop()), [`enqueue mtuchel/tuc-1-fix --expect 419@${HEAD} --action drop:#437:419`, `pr comment #419 ${ENQUEUED}`, `${"comment"} ${ENQUEUED}`, "prompt a1"]);
+  assert.deepEqual(h.scripts.runs, [enqueueRun("drop:#437:419")], "its own range, and no repository listing");
+  // `always` pins the repo-wide half to a host whose dispatch is off.
+  const server = harness(t, { backstop: "always", dispatch: false });
+  server.scripts.ready = { stacks: [STACK], drops: [] };
+  await server.backstop();
+  assert.deepEqual(server.scripts.runs, [READY_RUN, enqueueRun(STACK.action)]);
+  // And a host that owns none of the repo's tickets does not discover their pull requests; the
+  // repo-wide half it drives is the backstop host's own work.
+  const foreign = harness(t, { owner: "none" });
+  foreign.scripts.ready = { stacks: [], drops: [] };
+  foreign.records.push({ ...foreign.records[0], issueId: "i2", identifier: "TUC-2", links: {}, branch: "mtuchel/tuc-2" });
+  foreign.linear.attachments = [prUrl(2000)];
+  await foreign.state({ [prUrl(2000)]: { reviewedAt: null, decision: null, merged: false } });
+  await foreign.backstop();
+  assert.deepEqual(foreign.linear.issueReads, [], "no discovery of another host's ticket");
+  assert.deepEqual(foreign.scripts.runs, [READY_RUN], "while the repo-wide half it drives still runs");
 });

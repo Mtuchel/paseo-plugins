@@ -8,10 +8,10 @@ import test, { type TestContext } from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { activationEndpoints } from "./activation-endpoints";
-import { ticketOwnership } from "./activation-guard";
+import { ticketOwnership, ticketOwners } from "./activation-guard";
 import { ActivationIntake } from "./activation-intake";
 import { DrainRouter } from "./drain";
-import { DEFAULT_WORKTREE_SHARDS, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type ActivationSettings, type PluginSettings } from "./settings";
+import { DEFAULT_WORKTREE_SHARDS, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type ActivationSettings, type PluginSettings } from "./settings";
 
 // The two hosts over real HTTP (the review service's :8444 listener, activation-endpoints.ts):
 // the Mac drains, the server answers, and both talk to each other exactly as they do in the
@@ -22,7 +22,7 @@ process.env.PASEO_ACTIVATION_SECRET = SECRET;
 function settingsFor(activation: ActivationSettings): PluginSettings {
   return {
     template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: false,
-    dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
+    dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
   };
 }
 
@@ -255,4 +255,38 @@ test("ticket ownership for the queue backstop's moves follows the two hosts' rea
 
   const alone = ticketOwnership({ settings: { read: async () => settingsFor({ mode: "local", peer: null }) }, drain: server.drain, intake: server.intake });
   assert.equal(await alone("i1"), "here", "a host without a peer owns every ticket");
+});
+
+// TUC-538: the pull request watch reads the same claims once for a whole poll (ticketOwners). The
+// set must agree with ticketOwnership ticket by ticket, and an unreadable state is `null` (the
+// caller fails open), never a set that drops a ticket this host still runs.
+test("the watch's bulk ownership read follows the two hosts' real claims, and every unreadable one is null", async (t) => {
+  let macUrl = "";
+  const server = await hostOverHttp(t, { name: "server087", activation: () => ({ mode: "local", peer: macUrl }) });
+  const mac = await hostOverHttp(t, {
+    name: "mac",
+    activation: () => ({ mode: "remote", peer: server.url }),
+    agents: [{ id: "a-run", issueId: "i1", identifier: "TUC-1", status: "running" }],
+  });
+  macUrl = mac.url;
+  const ids = ["i1", "i2"];
+  const owns = (set: Set<string> | null) => [...set ?? []].sort();
+  const serverOwns = ticketOwners({ settings: { read: async () => settingsFor({ mode: "local", peer: macUrl }) }, drain: server.drain, intake: server.intake });
+  const macOwns = ticketOwners({ settings: { read: async () => settingsFor({ mode: "remote", peer: server.url }) }, drain: mac.drain, intake: mac.intake });
+  assert.equal(await serverOwns(ids), null, "before the claims handshake the receiving host decides nothing");
+
+  await mac.drain.readyNow();
+  assert.deepEqual([owns(await macOwns(ids)), owns(await serverOwns(ids))], [["i1"], ["i2"]], "the ticket the Mac still runs is the Mac's alone");
+
+  mac.daemon.agents[0].status = "error";
+  await mac.drain.sweep();
+  assert.deepEqual([owns(await macOwns(ids)), owns(await serverOwns(ids))], [[], ["i1", "i2"]], "a released ticket moves to the server");
+
+  const alone = ticketOwners({ settings: { read: async () => settingsFor({ mode: "local", peer: null }) }, drain: server.drain, intake: server.intake });
+  assert.deepEqual(owns(await alone(ids)), ids, "a host without a peer owns every ticket");
+  // A draining host that cannot read its own agents decides nothing (its allowlist is not seeded).
+  const unseeded = await hostOverHttp(t, { name: "cold-mac", activation: () => ({ mode: "remote", peer: server.url }) });
+  const coldOwns = ticketOwners({ settings: { read: async () => settingsFor({ mode: "remote", peer: server.url }) }, drain: unseeded.drain, intake: unseeded.intake });
+  assert.equal(await coldOwns(ids), null, "a host that cannot read its agents keeps its tickets instead of handing them over");
+  assert.deepEqual([server.starts, mac.daemon.sent], [[], []], "reading ownership started and sent nothing");
 });

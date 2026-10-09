@@ -60,7 +60,7 @@ import { activationEndpoints } from "./server/activation-endpoints";
 import { PeerAppUser } from "./server/peer-identity";
 import { ActivationIntake } from "./server/activation-intake";
 import { DrainRouter } from "./server/drain";
-import { resumeGuard, ticketOwnership } from "./server/activation-guard";
+import { resumeGuard, ticketOwnership, ticketOwners } from "./server/activation-guard";
 import { ReviewDeletions } from "./server/review-deletions";
 import { ReviewIssueInfos } from "./server/review-issue-info";
 import { PlanPipeline } from "./server/plan-pipeline";
@@ -295,6 +295,9 @@ export default function contribute(server: PluginServerContext) {
   const knownStates = new KnownStates();
   linear.onStateWritten((issueId, state) => { void knownStates.observe(issueId, state, Date.now()); });
   const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog, knownStates, outage: new GreptileOutage(linear, settings),
+    // Which tickets this host's pull request watch may work on (README, "Several hosts"): the same
+    // claims rule SessionRouter reads per ticket, once for a whole poll (activation-guard.ts).
+    owner: ticketOwners({ settings, drain, intake }),
     // The waits the plugin recorded for the owner, checked in every poll: a wait whose ending event
     // was lost would hold its ticket in Needs input forever. The tickets this host handed to the
     // peer keep their waits (the peer's plugin ends them).

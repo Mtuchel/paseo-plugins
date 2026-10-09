@@ -6,7 +6,7 @@ import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import { availability, candidates, LIMIT_DAY, LimitResumeStore, limitError, type UsageReport, UsageReader } from "./limit-resume";
 import { SessionRouter, SessionStore, type SessionLink } from "./sessions";
-import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { WatchdogStore } from "./watchdog";
 import { Writeback } from "./writeback";
@@ -27,7 +27,7 @@ async function harness() {
     pauseStart: null as null | (() => Promise<void>), commentFailure: "none" as "none" | "before" | "after",
     pauseRecipient: null as null | (() => Promise<void>), onUsage: null as null | (() => void),
     starts: [] as { id: string; fresh: boolean | undefined }[], messages: [] as string[], comments: [] as string[], stopped: [] as string[], sent: [] as string[],
-    settings: { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: false, dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, autoResume: true }, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS } as PluginSettings,
+    settings: { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: false, dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, autoResume: true }, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS } as PluginSettings,
     agents: [{ id: "a0", status: "error", createdAt: iso(T0), cwd: "/repo/wt", labels: { "linear.issueId": "i1" }, archivedAt: null as string | null }],
   };
   const sessions = new SessionStore(join(directory, "sessions.json"));
