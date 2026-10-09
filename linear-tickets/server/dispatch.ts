@@ -3,6 +3,7 @@ import type { DispatchStatus } from "../shared/contracts";
 import type { ActivationSink } from "./activation";
 import type { LabelRepair } from "./label-repair";
 import type { Launcher } from "./launch";
+import type { Focus } from "./focus";
 import type { LabeledIssue, LinearService } from "./linear";
 import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
 import type { CommentRelay } from "./relay";
@@ -43,6 +44,9 @@ type Deps = {
   // `tickQueueBlockers` is the paused poll's queue-blocker-only pass (README, "Auto-dispatch").
   repairs?: Pick<LabelRepair, "tick" | "ownerRetried" | "tickQueueBlockers">;
   budget?: Pick<RateBudget, "pausedUntil">;
+  // Focus mode (README, "Focus mode"): a labelled ticket outside focus keeps its label and waits,
+  // a group included (its hand-out would start new work).
+  focus?: Pick<Focus, "admits">;
 };
 
 // The labels a dispatched ticket moves through, derived from the trigger label so a
@@ -223,6 +227,8 @@ export class Dispatcher {
     const { linear } = this.deps;
     const trigger = settings.dispatch.label;
     const labels = dispatchLabels(trigger);
+    // A ticket outside focus waits with its label (README, "Focus mode"), before anything is read.
+    if (await this.deps.focus?.admits(issue.id, paseo)) return;
     // A ticket with open sub-issues goes to Paseo as a group (README, "Groups"): its thread hands
     // out the sub-issues, so the label comes off and no agent starts here. A failed check keeps the
     // label for the next poll.

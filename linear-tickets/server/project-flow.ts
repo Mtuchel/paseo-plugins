@@ -11,6 +11,7 @@ import { nightInput, type Candidate, type Scheduler } from "./scheduler";
 import type { TierStore } from "./model-tiers";
 import { needsOwner } from "./presence";
 import { classifyRunAgents, classifyTicketAgents, type TicketAgents } from "./starter";
+import type { Focus } from "./focus";
 import { type ProcessInspector } from "./process-liveness";
 import { SetupError, type PlannerStart } from "./launch";
 import type { RepairRecord } from "./label-repair";
@@ -368,6 +369,9 @@ type Deps = {
   inspect?: ProcessInspector;
   usage?: Pick<UsageReader, "read" | "chains">;
   jitter?: () => number;
+  // Focus mode (README, "Focus mode"): no new planner run starts and only tickets in focus are
+  // handed out or restarted; a run already planning keeps going.
+  focus?: Pick<Focus, "active" | "admits">;
 };
 
 export class ProjectFlow {
@@ -480,13 +484,14 @@ export class ProjectFlow {
             }
             const open = read.record.planner;
             let status = read.status;
-            if (settings.dispatch.enabled && open && !open.startedAt && !open.approved && !open.ownerAsked) {
+            const focused = await this.deps.focus?.active() ?? false;
+            if (settings.dispatch.enabled && !focused && open && !open.startedAt && !open.approved && !open.ownerAsked) {
               status = await this.launchRun(project, open, read, settings, paseo)
                 .catch((error: unknown) => { console.error(`[linear-tickets] project ${project.name}: starting the planner failed: ${message(error)}`); return read.status; });
-            } else if (settings.dispatch.enabled && open && !open.approved && !open.ownerAsked) {
+            } else if (settings.dispatch.enabled && open && open.startedAt && !open.approved && !open.ownerAsked) {
               await this.revive(project, open, read, settings, paseo)
                 .catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: restarting the planner failed, the first read after ${RESTART_GRACE_MS / 60_000} minutes retries: ${message(error)}`));
-            } else if (settings.dispatch.enabled && !open && read.unplanned.length && this.settled(read.record.waiting ?? {}, read.unplanned)) {
+            } else if (settings.dispatch.enabled && !focused && !open && read.unplanned.length && this.settled(read.record.waiting ?? {}, read.unplanned)) {
               // The tickets have waited for their plan (none newer than the quiet time, or the oldest
               // at the max wait): start the run.
               status = await this.startRun(project, read, settings, paseo)
@@ -902,8 +907,8 @@ export class ProjectFlow {
     const pending = (await this.store.all())[projectId]?.planner?.approved;
     const ordered = new Set(pending ? parseOrder(pending.plan).flatMap((step) => step.kind === "blocks" ? [step.blocked] : step.kind === "hold" || step.kind === "attended" ? [step.ticket] : []) : []);
     const parents = new Set(read.work.map((issue) => issue.parentId).filter(Boolean));
-    const ready = read.work.filter((issue) => read.planned(issue) && !withheld.has(issue.id) && !repairing.has(issue.id) && !ordered.has(issue.identifier) && HAND_OUT_TYPES.has(issue.statusType) && !issue.delegateId && (!issue.assigneeId || issue.assigneeId === read.owner)
-      && !issue.parentId && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished));
+    const ready = await this.inFocus(read.work.filter((issue) => read.planned(issue) && !withheld.has(issue.id) && !repairing.has(issue.id) && !ordered.has(issue.identifier) && HAND_OUT_TYPES.has(issue.statusType) && !issue.delegateId && (!issue.assigneeId || issue.assigneeId === read.owner)
+      && !issue.parentId && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished)), paseo);
     for (const group of ready.filter((issue) => parents.has(issue.id))) {
       await this.deps.linear.delegate(group.id, appId);
       console.log(`[linear-tickets] project hand-out ${group.identifier}: group`);
@@ -930,6 +935,14 @@ export class ProjectFlow {
     }
   }
 
+  // The tickets focus mode lets start (README, "Focus mode"): all of them while it is off.
+  private async inFocus(issues: ProjectIssue[], paseo: PaseoApi): Promise<ProjectIssue[]> {
+    if (!this.deps.focus) return issues;
+    const kept: ProjectIssue[] = [];
+    for (const issue of issues) if (!(await this.deps.focus.admits(issue.id, paseo))) kept.push(issue);
+    return kept;
+  }
+
   // Tickets assigned to Paseo that never got an agent: the launch failed (TUC-53: "Daemon client
   // closed", TUC-534: OMP did not come up) or Linear's webhook never arrived (TUC-290). The ticket
   // stays assigned to Paseo, so the hand-out never takes it again, and assigning Paseo once more
@@ -946,8 +959,8 @@ export class ProjectFlow {
     const skip = new Set([labels.hold, labels.manual, labels.needsYou, labels.running, labels.failed, settings.dispatch.label].map((name) => name.toLowerCase()));
     const parents = new Set(read.work.map((issue) => issue.parentId).filter(Boolean));
     const repairing = await this.repairing();
-    const suspects = read.work.filter((issue) => issue.delegateId === appId && HAND_OUT_TYPES.has(issue.statusType) && !parents.has(issue.id) && !repairing.has(issue.id)
-      && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished));
+    const suspects = await this.inFocus(read.work.filter((issue) => issue.delegateId === appId && HAND_OUT_TYPES.has(issue.statusType) && !parents.has(issue.id) && !repairing.has(issue.id)
+      && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished)), paseo);
     const stalled: ProjectIssue[] = [];
     for (const issue of suspects) {
       if (await this.working(paseo, issue.id, issue.identifier)) continue;
