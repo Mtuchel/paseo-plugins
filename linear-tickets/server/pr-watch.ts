@@ -9,6 +9,7 @@ import { githubCli } from "./github-cli";
 import type { GreptileOutage, RetriggerResult } from "./greptile-outage";
 import type { Handover, HandoverRecord } from "./handover";
 import { KnownStates, type KnownState } from "./known-states";
+import { limitError } from "./limit-resume";
 import type { LinearService } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
 import { CODING_STATE } from "./plannotator";
@@ -24,7 +25,7 @@ import {
   type ActionRecord, type DropClass, type DropJudgment, type GitRunner, type PreparedRetarget, type Problem, type Refusal, type RetargetRecord, type ScriptRunner,
 } from "./queue-backstop";
 import { githubBudget, GitHubPausedError, RateLimitedError, withPriority, type GitHubBudget } from "./rate-budget";
-import { unverifiedResume, type PromptOutcome, type Recovery, type SessionRouter, type Succession } from "./sessions";
+import { crashResume, unverifiedResume, type PromptOutcome, type Recovery, type SessionRouter, type Succession } from "./sessions";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 import type { Watchdog } from "./watchdog";
@@ -53,8 +54,26 @@ const DROP_KIND: Record<DropClass, DropKind> = { conflictOnly: "conflict", mainB
 // How many of a range's drops its drop history keeps (see DropHistoryEntry); the fix request carries
 // them, and without a limit a range can drop for a long time.
 const DROP_HISTORY = 10;
-// Nudges per pull request and lifecycle stage; the next time that stage stalls goes to the owner.
-const STAGE_NUDGES = 2;
+// The old stage cap (the removed "2 nudges per stage and pull request, then the owner" rule,
+// TUC-1777), read back by the cutover to tell an old stage escalation from an old drop-count one
+// (see cutOver). No count stops a stage's nudges or mentions the owner now.
+const OLD_STAGE_HANDOVER = 2;
+// Every STAGE_NUDGES-th nudge of the same stage and pull request (the 3rd, 6th, …) carries the
+// approach-change line, and a crash after STAGE_NUDGES restarts of an agent starts a successor for
+// its ticket (TUC-1777). No count mentions the owner, stops a nudge or stops a restart.
+const STAGE_NUDGES = 3;
+// The backoff between the restarts of one crashed agent (TUC-1777): the 1st restart is immediate,
+// the 2nd waits this long after the 1st (2 minutes) and the 3rd twice that (4 minutes). It doubles
+// per restart up to CRASH_BACKOFF_MAX_MS; a crash after the 3rd restart starts a successor instead
+// (see succeedCrashed), so the cap only bounds the formula. The crash pass runs every two minutes,
+// so a due restart waits for the next poll at most.
+const CRASH_BACKOFF_MS = 2 * 60 * 1000;
+const CRASH_BACKOFF_MAX_MS = 60 * 60 * 1000;
+// The owner policy every agent message of the watch ends with (TUC-1777, #136): the agent decides
+// itself unless a real decision blocks it, and asks the owner then through the ticket's question
+// path. The drop fix requests close it with "; never because of a drop count", the stage nudges
+// with "; never just wait".
+const OWNER_POLICY = "Ask the owner only for a decision that can break something (data, production or staging, migrations, security, reverting someone else's landed work) or that changes how CI works in general (required checks, CI selection, quarantine, queue settings), through the ticket's normal question path (the deputy answers first)";
 // How long an agent may wait for the owner's answer while a message of its pull request waits for
 // it, before the owner is reminded once (README, "Stalled pull requests").
 const PERMISSION_WAIT_MS = 60 * 60 * 1000;
@@ -107,8 +126,10 @@ export type PullRequestView = {
 // delivered, `queued` the messages routed to the same pull request while it was, delivered in turn
 // after it (see route). `replay`: closed without merging, `due` until the closure was looked at once,
 // `asked` once the agent was told to open a replacement pull request (see replace). `nudges`: per
-// stage, one key per nudge (or the escalation after them): the head, or for requested changes the
-// reviews it covered, space-separated (see stalledStage). `activeAt`: the last change, drop or
+// stage, one key per nudge, the head, or for requested changes the reviews it covered,
+// space-separated (see stalledStage); a message the agent waited out the owner's permission wait on
+// is claimed with its key too, so that key is not nudged again while the answer is pending (no
+// count stops the stage's other stalls, TUC-1777). `activeAt`: the last change, drop or
 // nudge seen. `missing`: GitHub has no pull request at the link (a made-up or mistyped URL); it is
 // never read again, so a later pull request that takes the number is not mistaken for the ticket's.
 // `advance`: landed, `due` until the ticket's next open pull request was looked for (see advance).
@@ -835,11 +856,12 @@ function toOwner(message: PendingDrop | null | undefined): boolean {
 // The TUC-1777 cutover, run on every load: the removed fixed limits ("2nd plain drop", "6th
 // conflict-only drop") handed a range to the owner and stopped its drop prompts. Stored state never
 // recorded an escalation's cause, so a load reads the old drop counts back: an entry whose plain or
-// conflict-only drops reach one of the removed limits, and no stage of which shows an escalation of
-// its own (a stage or crash escalation stays as it was), was escalated by a drop count — the flag
-// goes, `cutover` marks it (so a later load never hands the same drop back twice), and the range's
-// newest drop, whose claim key is forgotten here, is claimed again by the next poll or backstop run
-// like any drop.
+// conflict-only drops reach one of the removed limits, and no stage of which was nudged past the
+// old stage cap of its own (an old stage escalation stays as it was; the removed drop rule left the
+// stage's nudges alone, so a stage past OLD_STAGE_HANDOVER reads as a stage escalation), was
+// escalated by a drop count — the flag goes, `cutover` marks it (so a later load never hands the
+// same drop back twice), and the range's newest drop, whose claim key is forgotten here, is claimed
+// again by the next poll or backstop run like any drop.
 function cutOver(state: Record<string, Seen>): Record<string, Seen> {
   for (const seen of Object.values(state)) {
     if (toOwner(seen.pending)) seen.pending = null;
@@ -847,7 +869,7 @@ function cutOver(state: Record<string, Seen>): Record<string, Seen> {
     if (queued.length) seen.queued = queued;
     else delete seen.queued;
     const counted = (seen.drops?.length ?? 0) >= OLD_DROP_HANDOVER.plain || (seen.conflicts?.length ?? 0) >= OLD_DROP_HANDOVER.conflict;
-    const staged = Object.values(seen.nudges ?? {}).some((keys) => (keys?.length ?? 0) > STAGE_NUDGES);
+    const staged = Object.values(seen.nudges ?? {}).some((keys) => (keys?.length ?? 0) > OLD_STAGE_HANDOVER);
     if (!seen.escalated || seen.cutover || !counted || staged) continue;
     delete seen.escalated;
     seen.cutover = true;
@@ -874,12 +896,49 @@ async function writeState(path: string, value: unknown): Promise<void> {
   } finally { await rm(temporary, { force: true }); }
 }
 
+// A crash no restart can clear (TUC-1777): "limit" for a usage or rate limit, which the existing
+// limit-resume handling resumes at the reset and which never counts as a restart, and "setup" for
+// an error that says the agent cannot run until a person fixes the host — its provider
+// credentials or authentication, credit or quota, or a full disk. Checked in this order (a limit
+// names its own handling) and narrow on purpose: a false "setup" mentions the owner and leaves a
+// recoverable agent stopped, so generic denials (permission denied, forbidden, EACCES, EPERM),
+// which a tool or file error also produces, go through the restart and successor path instead.
+// `SetupError` (launch.ts) is thrown by launches and never carried by a crash error, and no
+// permanent-failure classifier from TUC-569 exists in this repo.
+const SETUP_FAILURE = /\b(?:not authenticated|authentication failed|invalid (?:api[- ]?key|credentials|x-api-key)|api[- ]?key (?:is )?(?:missing|invalid|expired|rejected)|payment required|credit balance (?:is )?too low|insufficient[_ ]quota|exceeded your current quota|subscription (?:expired|lapsed|canceled|cancelled)|no space left on device|ENOSPC)\b/i;
+
+function crashKind(error: string): "limit" | "setup" | null {
+  if (limitError(error)) return "limit";
+  return SETUP_FAILURE.test(error) ? "setup" : null;
+}
+
 // Crash recovery per agent, in crash-recovery.json next to pr-watch.json. `restarts`: every restart
-// of the agent so far, by the crash pass or with a pull request's message; `escalated`: the next
-// crash after STAGE_NUDGES of them went to the owner, so the agent is not restarted again then.
-// `resume`: what a restart has still to send, kept until it went out (at least once) or no
-// longer applies; `error`: the crash of the last restart.
-type Crash = { restarts?: number; escalated?: boolean; resume?: { text: string; issueId: string } | null; error?: string };
+// of the agent so far, by the crash pass or with a pull request's message; `restartedAt`: when the
+// last one went through, the backoff between restarts counting from it (see recovery). After
+// STAGE_NUDGES restarts of the agent the next crash starts a successor for the ticket instead of
+// reloading the agent again — its session itself may be broken — which `successor` marks, so the
+// pass never touches it again. `setup`/`limit`: the crash error no restart loop can clear (see
+// crashKind), kept with the error it was seen on until a different crash clears it. `resume`: what
+// a restart has still to send, kept until it went out (at least once) or no longer applies;
+// `error`: the crash of the last restart. `escalated`: written by the removed rule only (the next
+// crash after STAGE_NUDGES restarts was handed to the owner); the load clears it (see
+// cutOverCrashes).
+type Crash = { restarts?: number; restartedAt?: string; successor?: boolean; setup?: string; limit?: string; escalated?: boolean; resume?: { text: string; issueId: string } | null; error?: string };
+
+// The TUC-1777 crash cutover, run on every load: the removed rule handed an agent to the owner
+// after STAGE_NUDGES restarts and stopped restarting it (`escalated: true`). The flag goes; its
+// restarts stay, so the next crash pass of a started ticket restarts the agent (and a crash after
+// STAGE_NUDGES starts a successor, as for any other agent). True once something changed, so the
+// load writes the file back once.
+function cutOverCrashes(crashes: Record<string, Crash>): boolean {
+  let changed = false;
+  for (const crash of Object.values(crashes)) {
+    if (!crash.escalated) continue;
+    delete crash.escalated;
+    changed = true;
+  }
+  return changed;
+}
 
 // The cheap first look at a pull request; `ConditionalPullView` is the real one, and the tests
 // inject a fake (see the deps of PullRequestWatch).
@@ -990,22 +1049,36 @@ export class PullRequestWatch {
   }
 
   // How a message's send recovers a crashed agent: right before the reload the agent is reserved,
-  // `claim` records the attempt, the restart is counted (see Crash) and the resume is kept until it
-  // went out. None for an agent whose crashes went to the owner, or that used up its STAGE_NUDGES
-  // restarts and waits for the crash pass's owner comment: its send then comes to `crashed`.
+  // `claim` records the attempt, the restart is counted and holds the next one back until its
+  // backoff passed (see Crash), and the resume is kept until it went out. None while no restart
+  // will come (`Crash.successor`, `setup`, `limit` — see their comments) or while that backoff
+  // still runs (the crash pass restarts the agent when it is due): the send then comes to
+  // `crashed`, and the message waits.
   // `unverified`: the ticket state the restart goes by could not be read just now (see crashPass).
   private recovery(record: HandoverRecord, reserved: Set<string>, claim: () => Promise<void>, unverified?: KnownState): Recovery | undefined {
     const crash = this.crashes[record.agentId];
-    if (crash?.escalated || (crash?.restarts ?? 0) >= STAGE_NUDGES) return undefined;
+    if (crash?.successor || crash?.setup || crash?.limit || !this.restartDue(crash)) return undefined;
     return {
       issueId: record.issueId,
       ...(unverified ? { unverified: { name: unverified.name, at: unverified.at } } : {}),
       before: async (resume, error) => {
         reserved.add(record.agentId);
         await claim();
-        await this.saveCrash(record.agentId, { resume: { text: resume, issueId: record.issueId }, error, restarts: (this.crashes[record.agentId]?.restarts ?? 0) + 1 });
+        await this.saveCrash(record.agentId, {
+          resume: { text: resume, issueId: record.issueId }, error,
+          restarts: (this.crashes[record.agentId]?.restarts ?? 0) + 1, restartedAt: new Date(this.clock()).toISOString(),
+        });
       },
     };
+  }
+
+  // Whether the next restart of this crashed agent is due (see CRASH_BACKOFF_MS): the 1st is
+  // immediate, every one after it waits its backoff after the last restart. State from before the
+  // backoff existed (no `restartedAt`) is due at once.
+  private restartDue(crash: Crash | undefined): boolean {
+    const restarts = crash?.restarts ?? 0;
+    if (!restarts || !crash?.restartedAt) return true;
+    return this.clock() - Date.parse(crash.restartedAt) >= Math.min(CRASH_BACKOFF_MS * 2 ** (restarts - 1), CRASH_BACKOFF_MAX_MS);
   }
 
   // The panel line after a crash recovery; a delivered resume is no longer pending.
@@ -1018,7 +1091,17 @@ export class PullRequestWatch {
     } else if (outcome === "reloaded") {
       await this.tell(record, "thought", `The agent had crashed${cause}; Paseo restarted it, and asks it to resume once it takes a message.`);
     } else if (outcome === "crashed") {
-      await this.tell(record, "thought", `The agent had crashed${cause}, and Paseo's restart failed.`);
+      const crash = this.crashes[record.agentId];
+      // The restart attempted a moment ago (its count and time are from this poll) failed: the
+      // next one waits for its backoff. Any other crash here waits for a backoff already running,
+      // or for the successor path, the host's setup or the limit's reset.
+      const attempted = crash?.restartedAt !== undefined && Date.parse(crash.restartedAt) === this.clock();
+      const why = crash?.successor ? "the successor path is under way"
+        : crash?.setup ? "the host's setup must be fixed first"
+        : crash?.limit ? "the usage limit's reset comes first"
+        : attempted ? "Paseo's restart failed; the next one waits for its backoff"
+        : "Paseo's restart waits for the backoff after the last one";
+      await this.tell(record, "thought", `The agent had crashed${cause}, and ${why}.`);
     }
   }
 
@@ -1176,6 +1259,12 @@ export class PullRequestWatch {
   private async watch(): Promise<void> {
     const seenByUrl = await this.load();
     this.crashes = await readFile(this.crashPath, "utf8").then((text) => JSON.parse(text) as Record<string, Crash>, () => ({}));
+    // The crash cutover (see cutOverCrashes) runs on every load and writes its one change back.
+    if (cutOverCrashes(this.crashes)) {
+      await writeState(this.crashPath, this.crashes).catch((error: unknown) => {
+        console.error(`[linear-tickets] clearing the old crash escalations failed: ${error instanceof Error ? error.message : error}`);
+      });
+    }
     const manual = this.deps.manualTasks;
     const all = await this.deps.handover.all();
     const context = this.context(all);
@@ -1241,7 +1330,7 @@ export class PullRequestWatch {
       });
     }
     // Crash recovery comes next, whatever the watchdog's Linear budget came to (see crashPass).
-    await this.crashPass(all, reserved);
+    await this.crashPass(all, reserved, seenByUrl, views);
     // Stalled pull requests are nudged, and closed ones followed to their replacement, after every
     // drop was handled: a drop's fix request comes first when both are for the same agent.
     const nudges: { record: HandoverRecord; url: string; view: PullRequestView }[] = [];
@@ -1470,9 +1559,9 @@ export class PullRequestWatch {
       : !proof ? `it could not prove that the range is still the code that dropped (${judgment.revision.reason || "no comparison"}), and it leaves the range alone until one of its heads changes. Check that nothing changed, then follow the steps below.`
       : "a manual task due before the merge is open. Re-enqueue once it is done.";
     const held = judgment.class === "genuine" ? [] : [`Paseo did not re-enqueue it: ${notRequeued}`, ""];
-    // The owner policy every drop message states (TUC-1777; docs/automation/merge-queue.md): owner
-    // involvement only through the agent's question path, and never because of a drop count.
-    const ownerAsk = "Ask the owner only for a decision that can break something (data, production or staging, migrations, security, reverting someone else's landed work) or that changes how CI works in general (required checks, CI selection, quarantine, queue settings), through the ticket's normal question path (the deputy answers first); never because of a drop count.";
+    // The drop message closes with the shared owner policy (TUC-1777; docs/automation/merge-queue.md):
+    // owner involvement only through the agent's question path, and never because of a drop count.
+    const ownerAsk = `${OWNER_POLICY}; never because of a drop count.`;
     const counts = `Drops of this range so far: ${plain} plain, ${conflicts} conflict-only, ${main} main-broken.`;
     const fix = judgment.class === "mainBroken" ? [
       facts,
@@ -2320,8 +2409,12 @@ export class PullRequestWatch {
         }
         if (outcome === "sent" || outcome === "restarted" || outcome === "reloaded") await delivered();
         if (outcome === "sent") await this.tell(record, "thought", `${pending.subject ?? `The merge queue dropped the pull request (${pending.reason})`}. The agent was asked to fix it.`);
-        else await this.crashLine(record, outcome, step);
+        else if (outcome !== "crashed") await this.crashLine(record, outcome, step);
         if (outcome !== "gone" && outcome !== "crashed") return;
+        // A crashed agent waits for its restart (the backoff, or the crash pass's next pass): the
+        // message is judged again then. Only one whose crash already went through the successor
+        // path (Crash.successor) goes on as for a gone agent.
+        if (outcome === "crashed" && !this.crashes[record.agentId]?.successor) return;
         gone = outcome === "gone";
       }
       const next = gone ? await this.succession(record, labels, fix, toAgent) : null;
@@ -2349,7 +2442,8 @@ export class PullRequestWatch {
   // the link's position: a blocked parent, or a blocked branch above the link, gets its step though
   // the ticket links another pull request. The first member whose step went, or tried to go, to the
   // agent ends the pass, so a busy or waiting agent is asked about one pull request per poll and
-  // the owner is reminded of one wait; a stage only escalated or logged lets the next member go.
+  // the owner is reminded of one wait; a member whose step claimed nothing (no stall, a hold, a
+  // crashed agent waiting for its restart) lets the next member go.
   // Otherwise only the link is nudged, as before. Members are only nudged: their reviews are not
   // mirrored into the ticket, their drops not claimed, and the link stays where it is.
   private async nudgeStack(record: HandoverRecord, url: string, view: PullRequestView, seenByUrl: Record<string, Seen>, save: () => Promise<void>, context: RunContext, reserved: Set<string>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
@@ -2426,13 +2520,16 @@ export class PullRequestWatch {
   // The pull request (the recorded one, or a member of its connected stack, see nudgeStack) gets
   // the steps before the merge (draft, failed checks, base conflict, requested changes, findings)
   // unless it may not be nudged (see nudgeable); a ready stack is the queue
-  // backstop's (see queueBackstop). A step is claimed per head right before its message goes out:
-  // at most STAGE_NUDGES per stage and pull request, then one escalation to the owner, then only
-  // the log. A busy agent or a disconnected Paseo claims nothing; the next poll decides again. A
-  // crashed agent got none of its nudges, so its stage is claimed again on the same head, up to
-  // the escalation: each claim restarts it and sends the step with its resume. True once the step
-  // went, or tried to go, to the agent, a successor or the ticket (whatever the agent answered): the
-  // rest of a connected stack waits for a later poll then (see nudgeStack).
+  // backstop's (see queueBackstop). A step is claimed per head right before its message goes out,
+  // and no count ever stops the nudges or mentions the owner (TUC-1777): every new stall of a
+  // stage gets its message, and every STAGE_NUDGES-th nudge of the same stage and pull request
+  // (the 3rd, 6th, …) adds the approach-change line (see approachLine). Every prompt ends with the
+  // owner policy (OWNER_POLICY). A busy agent or a disconnected Paseo claims nothing; the next
+  // poll decides again. A crashed agent got none of its nudges, so its stage is claimed again on
+  // the same head, and each claim restarts it (with the backoff between restarts, see recovery)
+  // and sends the step with its resume. True once the step went, or tried to go, to the agent, a
+  // successor or the ticket (whatever the agent answered): the rest of a connected stack waits for
+  // a later poll then (see nudgeStack).
   private async nudge(record: HandoverRecord, url: string, view: PullRequestView, seenByUrl: Record<string, Seen>, save: () => Promise<void>, drafts: (repo: string) => Promise<QueueDraft[]>, reserved: Set<string>): Promise<boolean> {
     const source = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
     if (!source || reserved.has(record.agentId)) return false;
@@ -2448,12 +2545,12 @@ export class PullRequestWatch {
       this.clearWaits(seenByUrl, url, "stage:");
       return false;
     }
+    // A crashed agent got none of its nudges: its stage is claimed again on the same head.
     const crashed = record.status !== "archived" && Boolean(await this.deps.sessions.crashed(record.agentId));
-    const again = (stage: Stage) => crashed && claimedOn(stage).length <= STAGE_NUDGES;
-    const found = await stalledStage(view, url, Date.now(), (stage, key) => !again(stage) && claimedOn(stage).some((entry) => entry.split(" ").includes(key)), () => this.github().reviewThreads(repo, Number(number)));
+    const found = await stalledStage(view, url, Date.now(), (stage, key) => !crashed && claimedOn(stage).some((entry) => entry.split(" ").includes(key)), () => this.github().reviewThreads(repo, Number(number)));
     // A stage that no longer stalls has nothing left for the owner to be reminded of.
     if (!found) this.clearWaits(seenByUrl, url, "stage:");
-    if (!found || (!again(found.stage) && claimedOn(found.stage).includes(found.key))) return false;
+    if (!found || (!crashed && claimedOn(found.stage).includes(found.key))) return false;
     const { stage, text, key } = found;
     const before = seenByUrl[url]?.nudges ?? {};
     const heads = before[stage] ?? [];
@@ -2469,30 +2566,30 @@ export class PullRequestWatch {
       await claim();
     };
     try {
-      if (sent > STAGE_NUDGES) {
-        console.error(`[linear-tickets] ${record.identifier}: ${url} is waiting for the agent to ${STAGE_STEP[stage]} again; already escalated to the owner`);
-        await claim();
-        return false;
-      }
-      if (sent === STAGE_NUDGES) {
-        await claim();
-        await this.dropResume(record.agentId);
-        await this.mention(record.issueId, `Paseo asked the agent ${STAGE_NUDGES} times to ${STAGE_STEP[stage]} on [the pull request](${url}), and it is stuck there again, so Paseo stops asking. Please take over.\n\n${text}`);
-        await this.tell(record, "response", `The pull request is stuck again waiting for the agent to ${STAGE_STEP[stage]}; the owner was asked to take over.`);
-        return false;
-      }
-      const prompt = `${text}\n\nThis is nudge ${sent + 1} of ${STAGE_NUDGES} for this step; after that the owner takes over.`;
+      // Every STAGE_NUDGES-th nudge of this stage and pull request (the 3rd, 6th, …) adds the
+      // approach-change line; every prompt ends with the owner policy (TUC-1777).
+      const count = sent + 1;
+      const prompt = [
+        text,
+        ...(count % STAGE_NUDGES === 0 ? [`The pull request keeps stalling at this step (nudge ${count}); change your approach. If a decision only the owner can make blocks it, ask the owner now through the ticket's normal question path (the deputy answers first) instead of waiting.`] : []),
+        "",
+        `${OWNER_POLICY}; never just wait.`,
+      ].join("\n");
       if (record.status !== "archived") {
         const outcome = await this.deps.sessions.prompt(record.agentId, prompt, toAgent, this.recovery(record, reserved, claim));
         if (this.waitFor(seenByUrl, url, `stage:${stage}:${key}`, outcome)) {
-          // The stage is exhausted, as after its last nudge: later stalls of it only reach the log.
-          seenByUrl[url] = { ...entry(seenByUrl, url), nudges: { ...before, [stage]: [...heads, ...Array<string>(Math.max(1, STAGE_NUDGES + 1 - sent)).fill(key)] }, waits: undefined, activeAt: new Date().toISOString() };
+          // The agent waits for the owner's answer, so the step is claimed here — a later stall
+          // under this key is not nudged again — and the owner is reminded once. No count holds
+          // the stage's other stalls back (TUC-1777).
+          seenByUrl[url] = { ...entry(seenByUrl, url), nudges: { ...before, [stage]: [...heads, key] }, waits: undefined, activeAt: new Date().toISOString() };
           await save();
           await this.waitedOut(record, url, STAGE_STEP[stage]);
           return true;
         }
         if (outcome === "sent") await this.tell(record, "thought", `The pull request is waiting for the agent to ${STAGE_STEP[stage]}; it was asked to.`);
-        else await this.crashLine(record, outcome, STAGE_STEP[stage]);
+        // A crash the message itself could not restart is the crash pass's line to report (see
+        // crashLine): nothing repeats here while the agent waits for its restart.
+        else if (outcome !== "crashed") await this.crashLine(record, outcome, STAGE_STEP[stage]);
         if (outcome !== "gone") return true;
       }
       const next = await this.succession(record, view.labels, prompt, toAgent);
@@ -2592,8 +2689,11 @@ export class PullRequestWatch {
           return;
         }
         if (outcome === "sent") await this.tell(record, "thought", "The pull request was closed because the branch below it landed; the agent was asked to open its replacement.");
-        else await this.crashLine(record, outcome, step);
+        else if (outcome !== "crashed") await this.crashLine(record, outcome, step);
         if (outcome !== "gone" && outcome !== "crashed") return;
+        // A crashed agent waits for its restart (see deliver); only one whose crash already went
+        // through the successor path goes on as for a gone agent.
+        if (outcome === "crashed" && !this.crashes[record.agentId]?.successor) return;
         gone = outcome === "gone";
       }
       const next = gone ? await this.succession(record, view.labels, text, toAgent) : null;
@@ -2615,14 +2715,14 @@ export class PullRequestWatch {
 
   // Crash recovery (README, "Crashed agents"), right after the watchdog in every poll and whatever
   // the background budget says: first the resumes a restart left pending, then every crashed agent
-  // of a running ticket. Its ticket checks and the owner's comment go at interactive priority as
-  // `crash-recovery`; the reload and the resume need no Linear call. A failure for one agent, a
+  // of a running ticket. Its ticket checks and the owner's one comment go at interactive priority
+  // as `crash-recovery`; the reload and the resume need no Linear call. A failure for one agent, a
   // refused Linear request included, is logged and the pass goes on with the next agent.
-  private async crashPass(all: HandoverRecord[], reserved: Set<string>): Promise<void> {
+  private async crashPass(all: HandoverRecord[], reserved: Set<string>, seenByUrl: Record<string, Seen>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
     await this.observeStates(all);
     await withPriority("interactive", "crash-recovery", async () => {
       await this.pendingResumes(all, reserved);
-      await this.crashedAgents(all, reserved);
+      await this.crashedAgents(all, reserved, seenByUrl, views);
     });
   }
 
@@ -2672,8 +2772,8 @@ export class PullRequestWatch {
   // Resumes a restart left pending (see Crash), before anything else is sent: once the agent takes
   // a message, the resume goes out and is cleared after the send (a resume can arrive twice). It is
   // dropped unsent once it no longer applies: the ticket's record names another agent or is
-  // archived, the agent is gone, its crashes went to the owner, or the ticket is not started. Sent
-  // on a state Paseo last saw, it starts with the line to check the ticket first (unverifiedResume).
+  // archived, the agent is gone, or the ticket is not started. Sent on a state Paseo last saw, it
+  // starts with the line to check the ticket first (unverifiedResume).
   private async pendingResumes(all: HandoverRecord[], reserved: Set<string>): Promise<void> {
     for (const [agentId, crash] of Object.entries(this.crashes)) {
       const resume = crash.resume;
@@ -2681,8 +2781,8 @@ export class PullRequestWatch {
       const record = all.find((item) => item.issueId === resume.issueId && item.agentId === agentId && item.status !== "archived");
       const label = record?.identifier ?? resume.issueId;
       try {
-        const state = record && !crash.escalated ? await this.ticketState(record) : null;
-        if (record && !crash.escalated && !state) continue;
+        const state = record ? await this.ticketState(record) : null;
+        if (record && !state) continue;
         if (!record || !state || state.statusType !== "started") {
           console.error(`[linear-tickets] ${label}: the resume for restarted agent ${agentId.slice(0, 8)} no longer applies; it is not sent`);
           await this.dropResume(agentId);
@@ -2699,32 +2799,59 @@ export class PullRequestWatch {
   }
 
   // Every crashed agent of a running ticket, with an open pull request or not, is restarted while
-  // its ticket is started: up to STAGE_NUDGES restarts in all (see Crash), then one comment to the
-  // owner, then nothing. Every crashed agent this pass looked at is reserved for the poll, restarted
-  // or not: a nudge, drop fix or replacement must not reload one the ticket check or the restart
-  // limit held back.
-  private async crashedAgents(all: HandoverRecord[], reserved: Set<string>): Promise<void> {
+  // its ticket is started, and no count ever stops that (TUC-1777): the 1st restart is immediate,
+  // every one after it waits its backoff (see CRASH_BACKOFF_MS), and after STAGE_NUDGES restarts
+  // the next crash starts a successor for the ticket instead of reloading the agent again (see
+  // succeedCrashed). A crash no restart can clear is left to the owner once (`setup`) or to the
+  // limit-resume handling (`limit`), and neither counts as a restart (see crashKind). Every crashed
+  // agent this pass looked at is reserved for the poll, restarted or not: a nudge, drop fix or
+  // replacement must not reload one the ticket check, the backoff or a successor held back.
+  private async crashedAgents(all: HandoverRecord[], reserved: Set<string>, seenByUrl: Record<string, Seen>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
     for (const record of all) {
-      if (record.status === "archived" || reserved.has(record.agentId) || this.crashes[record.agentId]?.escalated) continue;
+      if (record.status === "archived" || reserved.has(record.agentId) || this.crashes[record.agentId]?.successor) continue;
       try {
         const error = await this.deps.sessions.crashed(record.agentId);
         if (!error) continue;
         reserved.add(record.agentId);
         const state = await this.ticketState(record);
         if (!state || state.statusType !== "started") continue;
-        if ((this.crashes[record.agentId]?.restarts ?? 0) >= STAGE_NUDGES) {
-          // Claimed before the comment; a comment that failed is retried on the next poll, as for
-          // a stage's escalation.
-          await this.saveCrash(record.agentId, { escalated: true, resume: null });
+        const kind = crashKind(error);
+        if (kind === "limit") {
+          // The existing limit-resume handling (writeback schedules it in limit-resumes.json)
+          // starts a new agent at the reset: no restart here, and none counts.
+          if (this.crashes[record.agentId]?.limit !== error) {
+            console.log(`[linear-tickets] ${record.identifier}: the crash of agent ${record.agentId.slice(0, 8)} names a usage limit; the limit resume starts a new agent at the reset, so Paseo does not restart it`);
+            await this.saveCrash(record.agentId, { limit: error, resume: null });
+          }
+          continue;
+        }
+        if (kind === "setup") {
+          // No restart loop can clear this: the owner gets one message with the error, and the
+          // agent waits until the crash changes (see Crash.setup). Claimed before the comment; a
+          // comment that failed is retried on the next poll.
+          if (this.crashes[record.agentId]?.setup === error) continue;
+          await this.saveCrash(record.agentId, { setup: error, resume: null });
           try {
-            await this.mention(record.issueId, `The agent crashed again after Paseo restarted it ${STAGE_NUDGES} times, so Paseo stops restarting it. Please take over.\n\n\`${error}\``);
+            await this.mention(record.issueId, `The agent cannot run until the host's setup is fixed, and every restart would fail the same way, so Paseo stops restarting it. Fix this on this host, then start the agent again from the ticket:\n\n\`${error}\``);
           } catch (failure) {
-            await this.saveCrash(record.agentId, { escalated: false });
+            await this.saveCrash(record.agentId, { setup: undefined });
             throw failure;
           }
-          await this.tell(record, "response", "The agent crashed again; the owner was asked to take over.");
-          // Its crashes are the owner's now: a drop fix or replacement goes to the ticket this poll.
-          reserved.delete(record.agentId);
+          await this.tell(record, "response", "The agent cannot run until the host's setup is fixed; the owner was asked to fix it.");
+          continue;
+        }
+        if (this.crashes[record.agentId]?.setup) await this.saveCrash(record.agentId, { setup: undefined });
+        if (this.crashes[record.agentId]?.limit) await this.saveCrash(record.agentId, { limit: undefined });
+        if ((this.crashes[record.agentId]?.restarts ?? 0) >= STAGE_NUDGES) {
+          await this.succeedCrashed(record, state.status, error, reserved, seenByUrl, views);
+          continue;
+        }
+        if (!this.restartDue(this.crashes[record.agentId])) {
+          const restartedAt = this.crashes[record.agentId]?.restartedAt ?? "";
+          if (this.backoffLogged.get(record.agentId) !== restartedAt) {
+            this.backoffLogged.set(record.agentId, restartedAt);
+            console.log(`[linear-tickets] ${record.identifier}: the restart of agent ${record.agentId.slice(0, 8)} waits for its backoff after the last one`);
+          }
           continue;
         }
         const text = `Your ticket ${record.identifier} is in ${state.status}. Continue the lifecycle step you were on.`;
@@ -2735,6 +2862,54 @@ export class PullRequestWatch {
       }
     }
   }
+
+  // A crashed agent that reached STAGE_NUDGES restarts is not reloaded again — its session itself
+  // may be broken — so a successor takes its ticket over (TUC-1777), with the pending resume as
+  // its lead (else the resume the restart would have sent). The crash is marked before the start
+  // (so no later pass restarts or succeeds this agent again) and the ticket's waits are cleared.
+  // No successor possible — a `do-not-merge` pull request or one whose veto cannot be checked,
+  // automatic starts switched off, no recorded branch, a refused start — hands the ticket back as
+  // for a gone agent (one comment to the owner); one that waits is decided again on the next poll.
+  private async succeedCrashed(record: HandoverRecord, status: string, error: string, reserved: Set<string>, seenByUrl: Record<string, Seen>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
+    const crash = this.crashes[record.agentId];
+    const lead = crash?.resume?.text ?? crashResume(error, `Your ticket ${record.identifier} is in ${status}. Continue the lifecycle step you were on.`);
+    const url = record.links["Pull request"];
+    let labels: string[] = [];
+    if (url) {
+      try {
+        if (!views.has(url)) views.set(url, this.view(url));
+        labels = (await views.get(url)!).labels;
+      } catch (failure) {
+        if (failure instanceof RateLimitedError || failure instanceof GitHubPausedError || failure instanceof GitHubRateLimitedError) throw failure;
+        console.error(`[linear-tickets] ${record.identifier}: reading ${url} before the successor failed: ${failure instanceof Error ? failure.message : failure}`);
+        labels = [DO_NOT_MERGE_LABEL];
+      }
+    }
+    const claim = async () => {
+      reserved.add(record.agentId);
+      await this.saveCrash(record.agentId, { successor: true, resume: null });
+    };
+    const next = await this.succession(record, labels, lead, claim);
+    if (next?.kind === "started") {
+      reserved.add(next.agent.id);
+      if (url) this.clearWaits(seenByUrl, url);
+      await this.tell({ ...record, agentId: next.agent.id }, "thought", `The agent crashed ${crash?.restarts ?? STAGE_NUDGES} times in all; Paseo started a successor (agent ${next.agent.id.slice(0, 8)}) and asked it to resume and continue the step it was on.`);
+      return;
+    }
+    if (next && next.kind !== "impossible") return;
+    try {
+      await this.handBack(record, lead, claim);
+    } catch (failure) {
+      // The comment failed: the mark goes, so the next pass tries the successor (and the comment)
+      // again instead of losing the hand-back.
+      await this.saveCrash(record.agentId, { successor: undefined });
+      throw failure;
+    }
+  }
+
+  // A crash restart logged once per wait (see crashedAgents): the agent and the restartedAt it was
+  // logged for.
+  private readonly backoffLogged = new Map<string, string>();
 
   // The record's pull request link moves: the ticket, the handover record and, best effort, the
   // agent's session.
