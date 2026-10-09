@@ -651,7 +651,7 @@ test("while background is paused, a queue blocker is polled and started at inter
   assert.ok(!writes.some((write) => write.endsWith(` ${ID_B}`)), `nothing touched the ticket that is not a blocker: ${writes.join(", ")}`);
   assert.deepEqual(f.refusals, [["app", "dispatch", "background"]], "the normal poll paused at the background reserve");
   assert.deepEqual(f.calls[0], { pool: "app", operation: "labeledIssues" }, "the blocker read ran at interactive priority, not on the paused path");
-  assert.deepEqual(filters, [{ labels: { some: { name: { eqIgnoreCase: "paseo" } } }, team: { key: { in: ["ENG"] } }, state: { type: { nin: ["completed", "canceled"] } }, or: [{ title: { startsWith: "Queue blocker:" } }, { description: { contains: "Queue blocker id:" } }] }], "the read is filtered to the queue-blocker markers");
+  assert.deepEqual(filters, [{ labels: { some: { name: { eqIgnoreCase: "paseo" } } }, team: { key: { in: ["ENG"] } }, state: { type: { nin: ["completed", "canceled"] } }, or: [{ title: { startsWith: "Queue blocker:" } }, { description: { startsWith: "Queue blocker id:" } }] }], "the read is filtered to the queue-blocker markers");
 });
 
 // The retry side of the exception: a blocker whose launch lost the pause race carries
@@ -718,6 +718,6 @@ test("the queue-blocker repair reads filter on the markers and mark their candid
   const open = await f.linear.repairCandidates({ labels: ["paseo-failed"], teamKeys: ["ENG"], ids: [] });
   assert.deepEqual(open.map((ticket) => [ticket.identifier, ticket.queueBlocker]), [["TUC-1", true], ["ENG-2", false]], "the title prefix marks a blocker on the unfiltered read");
   const blockers = await f.linear.repairCandidates({ labels: ["paseo-failed"], teamKeys: ["ENG"], ids: [], queueBlockers: true });
-  assert.deepEqual(filters[1]?.or, [{ title: { startsWith: "Queue blocker:" } }, { description: { contains: "Queue blocker id:" } }], "the read is filtered to the markers");
+  assert.deepEqual(filters[1]?.or, [{ title: { startsWith: "Queue blocker:" } }, { description: { startsWith: "Queue blocker id:" } }], "the read is filtered to the markers");
   assert.deepEqual(blockers.map((ticket) => [ticket.identifier, ticket.queueBlocker]), [["TUC-1", true], ["ENG-2", true]], "a marker-filtered read marks every candidate it returns");
 });

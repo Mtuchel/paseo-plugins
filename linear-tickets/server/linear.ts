@@ -283,9 +283,10 @@ export const LABELED_ISSUES_QUERY = `query labeledIssues($first: Int!, $filter: 
 export const QUEUE_BLOCKER_TITLE_PREFIX = "Queue blocker:";
 export const QUEUE_BLOCKER_DESCRIPTION_MARKER = "Queue blocker id:";
 // The filter both queue-blocker reads share: the title the alert tool writes, or the description
-// marker for one whose title changed.
+// marker for one whose title changed. The marker must start the description: a ticket that only
+// quotes it (an issue about the alert itself, e.g. TUC-1813) is not a blocker.
 export function queueBlockerFilter(): Record<string, unknown> {
-  return { or: [{ title: { startsWith: QUEUE_BLOCKER_TITLE_PREFIX } }, { description: { contains: QUEUE_BLOCKER_DESCRIPTION_MARKER } }] };
+  return { or: [{ title: { startsWith: QUEUE_BLOCKER_TITLE_PREFIX } }, { description: { startsWith: QUEUE_BLOCKER_DESCRIPTION_MARKER } }] };
 }
 
 export function labeledIssueFilter(label: string, teamKeys: string[], options: { queueBlockers?: boolean } = {}): Record<string, unknown> {
