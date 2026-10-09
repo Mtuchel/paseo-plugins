@@ -436,6 +436,9 @@ export class SessionRouter {
   private sessionList: Promise<OpenSession[]> | null = null;
   // Reads webhooks started (`receive` is fire-and-forget), awaited by `settled`.
   private readonly inflightReads = new Set<Promise<unknown>>();
+  // Tickets this host is opening a thread on itself (queueAnswer): a `created` webhook for that
+  // thread can arrive before its link is stored and must not be taken for someone else's.
+  private readonly opening = new Set<string>();
 
   // Explicit overrides retain their existing path; confirmed answer evidence is owned by replies.
   private deputy: Pick<Deputy, "byRef" | "correct"> | null = null;
@@ -519,9 +522,22 @@ export class SessionRouter {
     const due = readAt === undefined || now - readAt >= WEBHOOK_FALLBACK_MS;
     this.webhookedAt.set(sessionId, now);
     if (event.action !== "created" && due) this.track(this.readSession(sessionId, "webhook"));
-    if (event.action === "created") void this.say(event.agentSession.id, "thought", "Paseo received this — preparing an agent…").catch(() => {});
+    if (event.action === "created") void this.acknowledge(event.agentSession);
     if (!this.paseo) { this.waiting.push(event); return; }
     this.track(this.handle(event));
+  }
+
+  // Linear marks a thread without an activity within 10 s as unresponsive. A thread this host
+  // opened itself (queueAnswer) already says why it waits, so it is not told "preparing" over that.
+  private async acknowledge(session: AgentSessionWebhook["agentSession"]): Promise<void> {
+    try {
+      const issue = (session.issue ?? {}) as { id?: string };
+      if (this.opening.has(String(session.issueId ?? issue.id ?? ""))) return;
+      if ((await this.deps.store.get(session.id))?.queued) return;
+      await this.say(session.id, "thought", "Paseo received this — preparing an agent…");
+    } catch {
+      // Best effort, as before: the thread is handled either way.
+    }
   }
 
   // What the event-driven reads did, for `linear.agent-status` (README, "Rate limits").
@@ -638,8 +654,11 @@ export class SessionRouter {
     const identifier = String(issue.identifier ?? "this ticket");
     if (!issueId) throw new Error("The session has no ticket.");
     if (await this.deps.deletions?.blocked(issueId)) return;
+    // A thread this host opened itself is already handled by its opener (queueAnswer); a real
+    // owner thread skipped here is adopted by the sweep (catchUp).
+    if (this.opening.has(issueId)) return;
     const known = await this.deps.store.get(session.id);
-    if (known?.agentId || known?.group) return;
+    if (known?.agentId || known?.group || known?.queued) return;
     const link: SessionLink = { sessionId: session.id, agentId: null, issueId, identifier, createdAt: new Date().toISOString(), handled: [], review: null, offer: null };
     // One-person workspace: other integrations acting in Linear must not start agents here. Kept
     // as closed, so the ticket left assigned to Paseo is not taken for a failed start either.
@@ -2358,6 +2377,22 @@ export class SessionRouter {
       console.error(`[linear-tickets] ${identifier}: could not delegate the ticket to Paseo: ${error instanceof Error ? error.message : error}`);
     }
     return sessionId;
+  }
+
+  // An owner's answer whose ticket cannot start an agent right now (README, "Owner asks"): a new
+  // thread on the ticket joins the wait line with the answer as its message, exactly as an
+  // "@paseo" thread that could not start does. The minute sweep (startQueued) starts the agent
+  // with it once the ticket is admitted, or passes it to an agent that took the ticket meanwhile.
+  async queueAnswer(issueId: string, identifier: string, text: string, from: { activityId: string; userId: string }, reason: string): Promise<string> {
+    this.opening.add(issueId);
+    try {
+      const sessionId = await this.deps.api.createSessionOnIssue(issueId);
+      await this.deps.store.put({ sessionId, agentId: null, issueId, identifier, createdAt: new Date().toISOString(), handled: [], review: null, offer: null, queued: true, queueReason: reason, pendingText: text, pendingFrom: from });
+      await this.say(sessionId, "thought", `Waiting in line with your answer from the menu bar: ${reason}`).catch(() => {});
+      return sessionId;
+    } finally {
+      this.opening.delete(issueId);
+    }
   }
 }
 

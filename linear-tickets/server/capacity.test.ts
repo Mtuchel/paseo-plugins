@@ -77,7 +77,7 @@ test("leases out of range are refused and leave the current one in place", () =>
   assert.equal(capacity.set(lease(50, 600))?.limit, 50);
 });
 
-test("the capacity counts working, reserved and waiting tickets", async () => {
+test("the capacity counts working, reserved and waiting tickets; the wait line lists the waiting ones until they go stale", async () => {
   const { capacity, scheduler, advance } = room(["r1"]);
   capacity.set(lease(2));
   const cap = capacity.limit(0);
@@ -85,6 +85,8 @@ test("the capacity counts working, reserved and waiting tickets", async () => {
   await scheduler.admit(ticket("TUC-2"), paseo, cap);
   await scheduler.admit(ticket("TUC-3"), paseo, cap);
   assert.deepEqual(await scheduler.counts(paseo), { running: 1, reserved: 1, waiting: 2 });
+  assert.deepEqual(scheduler.waitingIds(), [ticket("TUC-2").issueId, ticket("TUC-3").issueId], "the admitted TUC-1 is not in line");
   advance(4 * 60_000);
+  assert.deepEqual(scheduler.waitingIds(), [], "not asked for in 3 minutes: out of the line");
   assert.deepEqual(await scheduler.counts(paseo), { running: 1, reserved: 0, waiting: 0 });
 });

@@ -583,6 +583,24 @@ test("an unconfirmed queued message replay reports the original uncertainty and 
   assert.equal((await restarted.store.get("queued"))?.queued, true, "uncertainty remains visible rather than silently declaring delivery");
 });
 
+test("an answer queued from the menu bar opens its own waiting thread, which its created webhook leaves alone, and starts the agent when admitted", async (t) => {
+  let admitted = false;
+  const h = harness({ manual: true, agents: [], admission: async () => admitted ? { ok: true as const } : { ok: false as const, reason: "Queued: 1 of 1 ticket agents are working." } });
+  t.after(h.cleanup);
+  const sessionId = await h.router.queueAnswer("i1", "TUC-1", "Agent does it", { activityId: "owner-ask:i1:abc", userId: OWNER }, "Queued: 1 of 1 ticket agents are working.");
+  assert.equal(sessionId, "s-new");
+  h.router.receive({ type: "AgentSessionEvent", action: "created", agentSession: { id: "s-new", issueId: "i1", issue: { id: "i1", identifier: "TUC-1" }, creatorId: "paseo-app" } });
+  await h.router.settled();
+  assert.deepEqual(h.calls.filter((call) => call.startsWith("thought:")), ["thought:Waiting in line with your answer from the menu bar: Queued: 1 of 1 ticket agents are working."], "no \"preparing\" over the reason, no refusal");
+  await h.router.startQueued();
+  assert.ok(!h.calls.some((call) => call.startsWith("start ")), "no slot: it keeps waiting");
+  assert.equal((await h.store.get("s-new"))?.pendingText, "Agent does it");
+  admitted = true;
+  await h.router.startQueued();
+  assert.equal(h.calls.filter((call) => call.startsWith("start ")).length, 1);
+  assert.equal((await h.store.get("s-new"))?.agentId, "agent-new");
+});
+
 test("needs-you completion follows confirmed session outcomes, including a delivered late correction, not rejected or unconfirmed answers", async (t) => {
   const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Format?", header: "Response", options: [{ label: "CSV" }] }] } };
   for (const error of [null, "No pending permission request with id 'q'", "Timed out waiting for agent_permission_resolved"]) {

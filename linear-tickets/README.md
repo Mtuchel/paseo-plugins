@@ -1116,6 +1116,16 @@ none open or draft, as Linear's GitHub integration reports them. Links added by 
 `link_url` carry no status and do not count. A blocker In Progress, Needs input or In Review with
 an open pull request still holds the ticket back.
 
+**Wait line label.** Every ticket waiting in a host's line carries `paseo-queued`
+(`<trigger>-queued`): one the scheduler was asked to start in the last 3 minutes and did not
+admit, and one with a queued thread that has no agent yet. It comes off within a minute of the
+ticket starting or leaving the line, so a Linear view filtered on the label is the wait line;
+each waiting thread's panel says why it waits. The label is only shown: nothing reads it to decide
+anything, and adding or removing it by hand changes nothing. Each host labels and unlabels only
+the tickets it labelled itself (kept in `$PASEO_HOME/linear-tickets/queued-labels.json`), so a
+ticket waiting on the other host keeps its label. The line lives in memory, so for 3 minutes after
+a reload labels only go on, not off, while the start paths ask again.
+
 **Who starts next.** Every way a ticket starts (label, assignment, group, project) waits in one
 line. While slots under *max agents* are short, a free slot goes to:
 
@@ -3537,7 +3547,11 @@ second refresh re-runs nothing.
 `answers` maps each question key to the chosen option label or free text, and answers like an
 `@paseo` reply: to the live agent that asked through the checked relay path (its pending question is
 answered, else the text is a prompt), else a continuation agent on the ticket (the answer is its
-lead, as an owner comment on a waiting ticket would start), else a comment on the issue. `done:
+lead, as an owner comment on a waiting ticket would start), else a comment on the issue. When the
+continuation cannot start now (no free agent slot, blockers, a start or a process exit under way, a
+hand-over held), the answer joins the wait line instead of failing: the plugin opens a thread on
+the ticket that waits with the answer as its message, exactly like an `@paseo` thread that could
+not start (see *Waiting their turn*), and the menu bar shows `queued` with the reason. `done:
 true` completes a `paseo-manual` issue and a "Needs you" sub-issue and moves them to Done; on a
 parent ticket it only records the comment and leaves the state to the agent, whose next turn settles
 the wait. Every answer records "Answered from the menu bar: …" on the issue. An answer is idempotent
