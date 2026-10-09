@@ -258,6 +258,8 @@ const settingsOutputSchema = z.object({
   standardModels: tierModelsSchema,
   // README, "Draining a host".
   activation: activationSettingsSchema,
+  // README, "Queue backstop": which host runs its repo-wide half.
+  backstop: z.object({ run: z.enum(["auto", "always", "never"]) }),
   // README, "Deputy for agent questions".
   deputy: deputyViewSchema,
   // README, "Worktree shards".
@@ -298,6 +300,8 @@ export const setSettingsRpc = defineRpc({
     }).optional(),
     // README, "Deputy for agent questions"; `mode: "off"` stops it at once.
     deputy: deputySettingsSchema.partial().optional(),
+    // README, "Queue backstop": which host runs the repo-wide half of the merge queue automation.
+    backstop: z.object({ run: z.enum(["auto", "always", "never"]).optional() }).optional(),
     // README, "Worktree shards"; `pools` replaces the whole map when given.
     worktreeShards: z.object({
       enabled: z.boolean().optional(),

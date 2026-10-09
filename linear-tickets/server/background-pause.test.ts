@@ -20,7 +20,7 @@ import { PullRequestWatch } from "./pr-watch";
 import { RateBudget, RateLimitedError, withPriority, type Pool } from "./rate-budget";
 import { CommentRelay } from "./relay";
 import { SessionRouter, SessionStore } from "./sessions";
-import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { StateLabels } from "./state-labels";
 import { Writeback } from "./writeback";
 
@@ -107,6 +107,7 @@ const settings = {
   dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["ENG"] },
   writeback: DEFAULT_WRITEBACK,
   activation: DEFAULT_ACTIVATION,
+  backstop: DEFAULT_BACKSTOP,
 } as unknown as PluginSettings;
 // The write-back settings that make an agent's failed turn post its one Linear error comment.
 const summaryWriteback = { ...settings, writeback: { ...DEFAULT_WRITEBACK, summaries: true } } as unknown as PluginSettings;

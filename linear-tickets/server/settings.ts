@@ -39,6 +39,14 @@ export const MAX_WATCHDOG_MINUTES = 1440;
 // The shared secret is not part of this: it lives in the host-local `activation-secret` file.
 export type ActivationSettings = { mode: "local" | "remote"; peer: string | null };
 export const DEFAULT_ACTIVATION: ActivationSettings = { mode: "local", peer: null };
+// The queue backstop (README, "Queue backstop"): its repo-wide half (the repo's
+// `enqueue-ready.mjs` listing, the enqueues it starts, and the stranded-stack moves) may drive one
+// repo from one host only, so `run` says which one: `auto` (the default) is the host with
+// auto-dispatch enabled, which already drives the repo's ticket work, and `always`/`never` pin it.
+// Every host still follows up the enqueues it claimed for its own tickets.
+export type BackstopSettings = { run: "auto" | "always" | "never" };
+export const DEFAULT_BACKSTOP: BackstopSettings = { run: "auto" };
+const BACKSTOP_RUN = ["auto", "always", "never"] as const;
 export const MIN_DISPATCH_INTERVAL_SECONDS = 30;
 export const MAX_DISPATCH_INTERVAL_SECONDS = 3_600;
 export const MAX_DISPATCH_TEAMS = 20;
@@ -83,6 +91,8 @@ export type PluginSettings = {
   reviewPeers: string[];
   // Activation routing (README, "Draining a host"); the secret is a separate host-local file.
   activation: ActivationSettings;
+  // Which host runs the repo-wide half of the queue backstop (README, "Queue backstop").
+  backstop: BackstopSettings;
   deputy: DeputySettings;
   // Splitting ticket worktrees across clones (README, "Worktree shards").
   worktreeShards: WorktreeShardSettings;
@@ -104,6 +114,7 @@ type SettingsFile = {
   standardModels?: Record<string, TierModel>;
   reviewPeers?: string[];
   activation?: { mode?: unknown; peer?: unknown };
+  backstop?: { run?: unknown };
   deputy?: Partial<DeputySettings>;
   worktreeShards?: { enabled?: unknown; pools?: unknown };
 };
@@ -258,6 +269,20 @@ function validActivation(value: ActivationSettings): ActivationSettings {
   return normalizeActivation(value);
 }
 
+// Malformed stored values fall back to that field's default rather than breaking the settings read.
+export function normalizeBackstop(value: unknown): BackstopSettings {
+  const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const run = BACKSTOP_RUN.find((mode) => mode === candidate.run);
+  return { run: run ?? DEFAULT_BACKSTOP.run };
+}
+
+// A user edit is rejected rather than silently repaired, so the settings form can say why.
+function validBackstop(value: { run?: unknown }): BackstopSettings {
+  const run = BACKSTOP_RUN.find((mode) => mode === value.run);
+  if (!run) throw new Error(`The queue backstop can run "auto", "always" or "never", not ${JSON.stringify(value.run)}.`);
+  return { run };
+}
+
 export function normalizeAutoApprove(value: unknown): AutoApprovePolicy {
   const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const [maxImpact, maxImpactWithFlag] = (["maxImpact", "maxImpactWithFlag"] as const).map((key) => {
@@ -350,6 +375,8 @@ export type SettingsPatch = {
   tierModel?: { tier: "cheap" | "standard"; provider: string; model: string | null; thinkingOptionId?: string };
   // Activation routing; `secret` is write-only (the host-local file) and `null`/`""` removes it.
   activation?: { mode?: "local" | "remote"; peer?: string | null; secret?: string | null };
+  // Queue backstop: which host runs its repo-wide half (README, "Queue backstop").
+  backstop?: { run?: "auto" | "always" | "never" };
   deputy?: Partial<DeputySettings>;
   // Worktree shards: `pools` replaces the whole map when given (README, "Worktree shards").
   worktreeShards?: { enabled?: boolean; pools?: Record<string, string[]> };
@@ -411,6 +438,7 @@ export class Settings {
       standardModels: normalizeTierModels(value.standardModels, DEFAULT_STANDARD_MODELS),
       reviewPeers: normalizeReviewPeers(value.reviewPeers),
       activation: normalizeActivation(value.activation),
+      backstop: normalizeBackstop(value.backstop),
       deputy: normalizeDeputy(value.deputy),
       worktreeShards: normalizeWorktreeShards(value.worktreeShards),
     };
@@ -443,6 +471,7 @@ export class Settings {
       watchdog: patch.watchdog ? validWatchdog({ ...current.watchdog, ...patch.watchdog }) : current.watchdog,
       autoApprove: patch.autoApprove ? normalizeAutoApprove({ ...current.autoApprove, ...patch.autoApprove }) : current.autoApprove,
       deputy: patch.deputy ? validDeputy({ ...current.deputy, ...patch.deputy }) : current.deputy,
+      backstop: patch.backstop ? validBackstop({ run: patch.backstop.run ?? current.backstop.run }) : current.backstop,
       worktreeShards: patch.worktreeShards
         ? validWorktreeShards({ enabled: patch.worktreeShards.enabled ?? current.worktreeShards.enabled, pools: patch.worktreeShards.pools ?? current.worktreeShards.pools })
         : current.worktreeShards,
@@ -490,8 +519,9 @@ export class Settings {
     const customStandardModels = JSON.stringify(value.standardModels) !== JSON.stringify(DEFAULT_STANDARD_MODELS);
     const customActivation = JSON.stringify(value.activation) !== JSON.stringify(DEFAULT_ACTIVATION);
     const customDeputy = JSON.stringify(value.deputy) !== JSON.stringify(DEFAULT_DEPUTY);
+    const customBackstop = JSON.stringify(value.backstop) !== JSON.stringify(DEFAULT_BACKSTOP);
     const customWorktreeShards = JSON.stringify(value.worktreeShards) !== JSON.stringify(DEFAULT_WORKTREE_SHARDS);
-    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customWatchdog && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length && !customActivation && !customDeputy && !customWorktreeShards) {
+    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customWatchdog && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length && !customActivation && !customDeputy && !customBackstop && !customWorktreeShards) {
       await rm(this.path, { force: true });
       return value;
     }
@@ -514,6 +544,7 @@ export class Settings {
     if (customStandardModels) fileValue.standardModels = value.standardModels;
     if (value.reviewPeers.length) fileValue.reviewPeers = value.reviewPeers;
     if (customActivation) fileValue.activation = value.activation;
+    if (customBackstop) fileValue.backstop = value.backstop;
     if (customDeputy) fileValue.deputy = value.deputy;
     if (customWorktreeShards) fileValue.worktreeShards = value.worktreeShards;
     const temporary = `${this.path}.${randomUUID()}.tmp`;

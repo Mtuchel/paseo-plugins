@@ -72,3 +72,23 @@ export function ticketOwnership(deps: {
     return (await deps.intake.claimFor(issueId)) ? "elsewhere" : "here";
   };
 }
+
+// The same rule for a caller that decides a whole run at once (the pull request watch, TUC-538):
+// which of the given tickets this host owns, read in one call instead of one per ticket. A
+// draining host owns the tickets of its live allowlisted agents; a receiving host owns every
+// ticket the peer does not claim; a host without a peer owns every ticket. Null: it cannot be told
+// right now (this host's agents cannot be read, or the peer's first claims snapshot has not
+// arrived), and the caller decides on each ticket's own evidence instead of dropping it.
+export function ticketOwners(deps: {
+  settings: Pick<Settings, "read">;
+  drain: Pick<DrainRouter, "ownedTickets">;
+  intake: Pick<ActivationIntake, "claimedTickets">;
+}): (issueIds: string[]) => Promise<Set<string> | null> {
+  return async (issueIds) => {
+    const { mode, peer } = (await deps.settings.read()).activation;
+    if (mode === "remote") return deps.drain.ownedTickets();
+    if (!peer) return new Set(issueIds);
+    const claimed = await deps.intake.claimedTickets();
+    return claimed ? new Set(issueIds.filter((issueId) => !claimed.has(issueId))) : null;
+  };
+}

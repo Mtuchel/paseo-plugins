@@ -229,6 +229,14 @@ export class ActivationIntake implements ActivationSink {
     return (await this.claimsFile.load()).claims[issueId] ?? null;
   }
 
+  // The tickets the peer still works (its claims), for a caller that decides a whole run at once
+  // (pr-watch.ts ownership, README "Several hosts"). Null until the handshake: no snapshot has
+  // been applied, so an empty set would say the peer works nothing, which its silence does not.
+  async claimedTickets(): Promise<Set<string> | null> {
+    const claims = await this.claimsFile.load();
+    return claims.appliedAt ? new Set(Object.keys(claims.claims)) : null;
+  }
+
   // Whether an activation for the ticket waits here (queued or handed off, not done): a start for
   // it is under way, so nothing else may start one. Throws when the queue is unreadable.
   async pendingFor(issueId: string): Promise<boolean> {
