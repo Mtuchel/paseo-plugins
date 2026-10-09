@@ -10,7 +10,7 @@ import type { GreptileOutage, RetriggerResult } from "./greptile-outage";
 import type { Handover, HandoverRecord } from "./handover";
 import { KnownStates, type KnownState } from "./known-states";
 import { limitError } from "./limit-resume";
-import type { LinearService } from "./linear";
+import type { IssueState, IssueStatus, LinearService } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
 import { CODING_STATE } from "./plannotator";
 import { STAGE_STEP, stalledStage, type ReviewThread, type Stage } from "./pr-nudge";
@@ -69,10 +69,20 @@ const STAGE_NUDGES = 3;
 // so a due restart waits for the next poll at most.
 const CRASH_BACKOFF_MS = 2 * 60 * 1000;
 const CRASH_BACKOFF_MAX_MS = 60 * 60 * 1000;
+// The owner's stack policy (decision, 2026-10-09): a ticket holds at most this many open
+// (unlanded) pull requests at a time, and a ticket is Done only once its stack has landed. Before
+// stacking a 4th the agent lands the reviewed bottom range; a Done ticket with open pull requests
+// goes back to work. See "Stack cap" and "Done tickets with open pull requests" in the README.
+const STACK_CAP = 3;
+// How many stack-policy actions one poll takes on (a Done ticket's reopen, a stack-cap message).
+// The first poll after the plugin loads finds every Done ticket with open pull requests at once
+// (2026-10-09: ~16 in tuchel-platform), and a few per poll reopen and wake them without swamping
+// the host or Linear.
+const POLICY_PER_POLL = 3;
 // The owner policy every agent message of the watch ends with (TUC-1777, #136): the agent decides
 // itself unless a real decision blocks it, and asks the owner then through the ticket's question
 // path. The drop fix requests close it with "; never because of a drop count", the stage nudges
-// with "; never just wait".
+// with "; never just wait", the stack-cap message with "; never because of the count".
 const OWNER_POLICY = "Ask the owner only for a decision that can break something (data, production or staging, migrations, security, reverting someone else's landed work) or that changes how CI works in general (required checks, CI selection, quarantine, queue settings), through the ticket's normal question path (the deputy answers first)";
 // How long an agent may wait for the owner's answer while a message of its pull request waits for
 // it, before the owner is reminded once (README, "Stalled pull requests").
@@ -180,6 +190,24 @@ type DropHistoryEntry = { at: string; class: DropClass; key: string; families: s
 type PendingDrop = { key: string; reason: string; facts: string; fix: string; sending?: boolean; subject?: string; orphan?: { tickets: string[] } };
 type Change = { thought: string; review: string; state?: string };
 
+// The stack policy's per-ticket memory, in stack-policy.json next to pr-watch.json (README, "Stack
+// cap" and "Done tickets with open pull requests").
+// `cap`: the signature of the stack (its pull requests and their heads) the cap message was last
+// sent for, claimed right before the message goes out: the ticket is asked once per stack, and
+// again only once the stack changed.
+// `reopen`: the completion a reopen was decided for — Linear's `completedAt`, empty when the read
+// named none — so the decision is made once per completion. `moved` and `commented` record its two
+// first steps (the state move and the ticket comment), so an interrupted reopen is finished on the
+// next poll without repeating them, and `message` is the notice still to deliver to the ticket's
+// agent (`sending`: it is on its way; a crash never sends it twice). `respected`: after the reopen
+// the owner moved the ticket to Done again, so it stays Done and the key is logged as respected
+// once. Canceled and duplicate tickets are never reopened.
+type PolicyTicket = {
+  cap?: string;
+  reopen?: { completedAt: string; at: string; moved?: boolean; commented?: boolean; respected?: boolean; comment?: string; message?: string; sending?: boolean };
+};
+type PolicyState = Record<string, PolicyTicket>;
+
 // A draft pull request the merge queue tests a stack on; `base` is the branch it lands on.
 export type QueueDraft = { number: number; title: string; body: string; state: string; headSha: string; base: string };
 // An open pull request of the repo, from one listing per repo and poll; `trunk` is the repo's
@@ -214,6 +242,9 @@ type Drop = { key: string; reason: string; repo: string; number: number; draft: 
 type DropKind = "plain" | "conflict" | "main";
 // What one poll or backstop run reads at most once per repo.
 type RunContext = { records: HandoverRecord[]; repo(worktree: string): Promise<string | null>; pulls(repo: string): Promise<OpenPull[]>; drafts(repo: string): Promise<QueueDraft[]>; checkout(repo: string): Promise<string | null>; now: number };
+// A poll's stopped state (see the `stopped` flags in watch): a rate limit or a burnt budget ends
+// the poll's GitHub reads.
+type StopFlags = { paused: RateLimitedError | null; budget: GitHubPausedError | null; throttled: GitHubRateLimitedError | null };
 
 const pullUrl = (repo: string, number: number) => `https://github.com/${repo}/pull/${number}`;
 const PULL_URL = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/;
@@ -237,6 +268,37 @@ export function namesTicket(identifier: string): RegExp {
 // Lowest remaining ticket PR: no other open ticket branch below it, then stable PR number.
 function lowestPull(open: OpenPull[]): OpenPull | undefined {
   return open.filter((pull) => !open.some((other) => other.headBranch === pull.baseBranch)).sort((a, b) => a.number - b.number)[0];
+}
+
+// The message an over-cap ticket's agent gets (see PullRequestWatch.capPass): its stack, the step
+// the owner's stack policy asks for before another branch is stacked, and what is never done for
+// the count. No count reaches the owner (see OWNER_POLICY).
+function capNotice(open: OpenPull[], bottom: OpenPull): string {
+  const list = open.map((pull) => `[#${pull.number}](${pull.url}) \`${pull.headBranch}\``).join(", ");
+  return [
+    `The ticket's stack has ${open.length} open pull requests (bottom first: ${list}); the owner's policy allows at most ${STACK_CAP} unlanded at a time.`,
+    `Land the reviewed bottom range before stacking more: publish it bottom first from the top branch of the reviewed range (\`git switch <that branch> && node tools/ci/publish.mjs\`, the only way to publish), review the range, then \`node tools/ci/enqueue.mjs\` and \`wait-queue.mjs\`. The bottom of the stack is \`${bottom.headBranch}\` (#${bottom.number}).`,
+    "Never close or split a pull request for the cap, and add no new branch until the bottom range lands; review is never waived.",
+    "",
+    `${OWNER_POLICY}; never because of the count.`,
+  ].join("\n");
+}
+
+// The comment on the ticket and the notice to its agent after a reopen (see
+// PullRequestWatch.reopenDone): why the ticket is back in work, and what its agent does about the
+// pull requests that are still open.
+function reopenNotice(open: OpenPull[]): { comment: string; message: string } {
+  const list = open.map((pull) => `[#${pull.number}](${pull.url})`).join(", ");
+  const one = open.length === 1;
+  return {
+    comment: `This ticket was in Done while ${open.length} pull request${one ? "" : "s"} of its stack ${one ? "was" : "were"} still open and unlanded: ${list}. Paseo moved it back to its working state, so the agent lands them or closes the ones that should not land; a ticket is Done only once its stack has landed.`,
+    message: [
+      `This ticket was in Done, but its stack has not landed: ${list} ${one ? "is" : "are"} still open. Paseo moved the ticket back to ${CODING_STATE} for you to continue.`,
+      "Next step: land the reviewed bottom range (publish it bottom first from the top branch of the reviewed range, review the range, `node tools/ci/enqueue.mjs`, `wait-queue.mjs`), or close deliberately, with a reason on the pull request, what should not land.",
+      "",
+      `${OWNER_POLICY}; never just wait.`,
+    ].join("\n"),
+  };
 }
 
 // The ticket's connected stack around its linked pull request, bottom first (README, "Stalled pull
@@ -978,7 +1040,9 @@ export class PullRequestWatch {
       // `issueState` finds a ticket that has no handover record by its identifier. Crash recovery
       // checks a crashed agent's ticket with `issueStatusAnyPool`, and keeps the states of all
       // running agents' tickets known with one `issueStatuses` read per poll (see crashPass).
-      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "hasComment" | "viewerId" | "userUrl" | "linkUrl" | "issueState" | "issueAttachments" | "issueStatusAnyPool" | "issueStatuses">;
+      // `reopenToCoding` moves a Done ticket whose stack has not landed back to its coding state
+      // (see reopenDone).
+      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "hasComment" | "viewerId" | "userUrl" | "linkUrl" | "issueState" | "issueAttachments" | "issueStatusAnyPool" | "issueStatuses" | "reopenToCoding">;
       // `tasks` finds the before-merge tasks of tickets that have no handover record.
       manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge"> & Partial<Pick<ManualTasks, "tasks">>;
       settings: Pick<Settings, "read">;
@@ -1056,6 +1120,25 @@ export class PullRequestWatch {
 
   private async save(value: Record<string, Seen>): Promise<void> {
     await writeState(this.path, value);
+  }
+
+  // The stack policy's memory (see PolicyTicket), loaded with each poll and written back whenever
+  // a message is claimed or a reopen moves on. A missing or unreadable file is empty: the first
+  // poll after load then reopens the Done tickets with open pull requests a few at a time (see
+  // reopenDone) and asks every over-cap stack once.
+  private policy: PolicyState = {};
+
+  private get policyPath(): string {
+    return join(dirname(this.path), "stack-policy.json");
+  }
+
+  private async loadPolicy(): Promise<PolicyState> {
+    try {
+      const parsed: unknown = JSON.parse(await readFile(this.policyPath, "utf8"));
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as PolicyState : {};
+    } catch {
+      return {};
+    }
   }
 
   // Crash recovery per agent (see Crash), loaded with each poll; one poll runs at a time.
@@ -1361,6 +1444,7 @@ export class PullRequestWatch {
   private async watch(): Promise<void> {
     const seenByUrl = await this.load();
     this.crashes = await readFile(this.crashPath, "utf8").then((text) => JSON.parse(text) as Record<string, Crash>, () => ({}));
+    this.policy = await this.loadPolicy();
     // The crash cutover (see cutOverCrashes) runs on every load and writes its one change back.
     if (cutOverCrashes(this.crashes)) {
       await writeState(this.crashPath, this.crashes).catch((error: unknown) => {
@@ -1400,7 +1484,7 @@ export class PullRequestWatch {
     const reserved = new Set<string>();
     // Detail views read this poll, shared by the connected stacks that list the same pull request.
     const views = new Map<string, Promise<PullRequestView>>();
-    const stopped: { paused: RateLimitedError | null; budget: GitHubPausedError | null; throttled: GitHubRateLimitedError | null } = { paused: null, budget: null, throttled: null };
+    const stopped: StopFlags = { paused: null, budget: null, throttled: null };
     // A failure for one pull request is logged and the rest go on; a rate limit ends the poll.
     const step = async (record: HandoverRecord, url: string, work: () => Promise<void>): Promise<boolean> => {
       try {
@@ -1448,7 +1532,11 @@ export class PullRequestWatch {
       });
     }
     // Crash recovery comes next, whatever the watchdog's Linear budget came to (see crashPass).
-    await this.crashPass(mine, reserved, seenByUrl, views);
+    const states = await this.observeStates(mine);
+    // A Done ticket whose stack has not landed goes back to work first, so its agent's crash is
+    // restarted like any started ticket's in the same poll (see reopenDone).
+    await this.reopenDone(mine, states, reserved, context, seenByUrl, stopped);
+    await this.crashPass(mine, states, reserved, seenByUrl, views);
     // Stalled pull requests are nudged, and closed ones followed to their replacement, after every
     // drop was handled: a drop's fix request comes first when both are for the same agent.
     const nudges: { record: HandoverRecord; url: string; view: PullRequestView }[] = [];
@@ -1510,6 +1598,9 @@ export class PullRequestWatch {
         : () => this.replace(record, url, view, seenByUrl, save, listPulls, reserved);
       if (!await step(record, url, next)) break;
     }
+    // The stack cap's message comes last: a drop's fix request and a stalled pull request's step
+    // are about one pull request and more specific, and one agent gets one message per poll.
+    await this.capPass(mine, states, reserved, context, seenByUrl, stopped);
     const { paused, budget, throttled } = stopped;
     if (paused && paused.pool !== this.pausedPool) console.error(`[linear-tickets] pull request watch paused: ${paused.message}`);
     this.pausedPool = paused?.pool ?? null;
@@ -2882,8 +2973,9 @@ export class PullRequestWatch {
   // of a running ticket. Its ticket checks and the owner's one comment go at interactive priority
   // as `crash-recovery`; the reload and the resume need no Linear call. A failure for one agent, a
   // refused Linear request included, is logged and the pass goes on with the next agent.
-  private async crashPass(all: HandoverRecord[], reserved: Set<string>, seenByUrl: Record<string, Seen>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
-    await this.observeStates(all);
+  // `states`: the poll's one batch read of the tickets' states (see observeStates), shared with the
+  // stack policy's pass.
+  private async crashPass(all: HandoverRecord[], states: Map<string, IssueStatus> | null, reserved: Set<string>, seenByUrl: Record<string, Seen>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
     await withPriority("interactive", "crash-recovery", async () => {
       await this.pendingResumes(all, reserved);
       await this.crashedAgents(all, reserved, seenByUrl, views);
@@ -2892,19 +2984,254 @@ export class PullRequestWatch {
 
   // Keeps the states of the running agents' tickets known (see KnownStates) with one background read
   // per poll, on the API key's pool first (LinearService.read); skipped while both pools refuse it.
-  // Tickets without a running agent's record are forgotten.
-  private async observeStates(all: HandoverRecord[]): Promise<void> {
-    const ids = [...new Set(all.filter((record) => record.status !== "archived").map((record) => record.issueId))];
-    await this.knownStates.retain(new Set(ids));
-    if (!ids.length) return;
+  // The read covers every record of the poll, the stack policy's Done tickets included (see
+  // reopenDone), while only tickets with a running agent's record are kept. Tickets without a
+  // running agent's record are forgotten. Null: the read did not come back.
+  private async observeStates(all: HandoverRecord[]): Promise<Map<string, IssueStatus> | null> {
+    const running = all.filter((record) => record.status !== "archived").map((record) => record.issueId);
+    await this.knownStates.retain(new Set(running));
+    const ids = [...new Set(all.map((record) => record.issueId))];
+    if (!ids.length) return null;
     const sent = Date.now();
     try {
       const states = await withPriority("background", "crash-recovery", () => this.deps.linear.issueStatuses(ids));
-      for (const [id, state] of states) await this.knownStates.observe(id, { name: state.status, type: state.statusType }, sent);
+      for (const id of running) {
+        const state = states.get(id);
+        if (state) await this.knownStates.observe(id, { name: state.status, type: state.statusType }, sent);
+      }
+      return states;
     } catch (error) {
-      if (error instanceof RateLimitedError) return;
-      console.error(`[linear-tickets] reading the running tickets' Linear states failed: ${error instanceof Error ? error.message : error}`);
+      if (!(error instanceof RateLimitedError)) console.error(`[linear-tickets] reading the tickets' Linear states failed: ${error instanceof Error ? error.message : error}`);
+      return null;
     }
+  }
+
+  // The ticket's open pull requests that count for the stack policy: the open pull requests of its
+  // own repositories whose title names the ticket as a whole word (or whose branch is the recorded
+  // one), whose branch lives in the repository itself (never a fork's), that are not vetoed
+  // (`do-not-merge`, the owner said no) and not the merge queue's own draft, one per pull request,
+  // by number. The repositories are the recorded branch's worktree and the linked pull request;
+  // without either, the one repository the ticket's attachments name (never a guess between
+  // several, as in discover). Null when they cannot be read, which is not "none".
+  private async policyPulls(record: HandoverRecord, context: RunContext, stopped: StopFlags): Promise<OpenPull[] | null> {
+    try {
+      const repos = new Set<string>();
+      const linked = PULL_URL.exec(record.links["Pull request"] ?? "")?.[1];
+      if (linked) repos.add(linked.toLowerCase());
+      const worktree = record.worktreePath ? await context.repo(record.worktreePath) : null;
+      if (worktree) repos.add(worktree.toLowerCase());
+      if (!repos.size) {
+        const attached = new Set((await this.deps.linear.issueAttachments(record.issueId)).flatMap((url) => {
+          const source = /^https:\/\/github\.com\/([A-Za-z0-9-]+\/[A-Za-z0-9_.-]+)\/pull\/[1-9]\d*\/?$/.exec(url);
+          return source ? [source[1].toLowerCase()] : [];
+        }));
+        if (attached.size !== 1) return null;
+        repos.add([...attached][0]);
+      }
+      const names = namesTicket(record.identifier);
+      const open: OpenPull[] = [];
+      for (const repo of repos) open.push(...(await context.pulls(repo)).filter((pull) => names.test(pull.title) || (record.branch && pull.headBranch === record.branch)));
+      const own = open.filter((pull) => {
+        const repo = PULL_URL.exec(pull.url)?.[1];
+        if (!repo) return false;
+        return !pull.title.startsWith(QUEUE_DRAFT_TITLE) && !pull.labels.includes(DO_NOT_MERGE_LABEL) && pull.headRepo?.toLowerCase() === repo.toLowerCase();
+      });
+      return [...new Map(own.map((pull) => [pullKey(pull.url), pull])).values()].sort((one, other) => one.number - other.number);
+    } catch (error) {
+      if (error instanceof RateLimitedError) stopped.paused = error;
+      else if (error instanceof GitHubPausedError) stopped.budget = error;
+      else if (error instanceof GitHubRateLimitedError) stopped.throttled = error;
+      else console.error(`[linear-tickets] ${record.identifier}: reading its open pull requests for the stack policy failed: ${error instanceof Error ? error.message : error}`);
+      return null;
+    }
+  }
+
+  // A Done ticket whose stack has not landed goes back to work (README, "Done tickets with open
+  // pull requests"). Its coding state comes back, one comment on the ticket names the open pull
+  // requests, and its agent gets the notice a stalled pull request gets — restarted with a crashed
+  // agent, started as a successor for a gone one, else handed back to the ticket. Canceled and
+  // duplicate tickets are never reopened, and the decision is made once per completion: one the
+  // owner closed again after a reopen is respected and the log says so once (see PolicyTicket).
+  // A few tickets per poll (POLICY_PER_POLL): the first poll after load works through the Done
+  // tickets of the census (2026-10-09: ~16 in tuchel-platform) without waking every agent at once.
+  private async reopenDone(all: HandoverRecord[], states: Map<string, IssueStatus> | null, reserved: Set<string>, context: RunContext, seenByUrl: Record<string, Seen>, stopped: StopFlags): Promise<void> {
+    if (!states) return;
+    let acts = 0;
+    for (const record of all) {
+      if (acts >= POLICY_PER_POLL || stopped.paused || stopped.budget || stopped.throttled) break;
+      const state = states.get(record.issueId);
+      const type = state?.statusType.trim().toLowerCase();
+      if (!state || type === "canceled" || type === "duplicate") continue;
+      const ticket = this.policy[record.issueId] ?? {};
+      const key = state.completedAt ?? "";
+      try {
+        if (ticket.reopen) {
+          if (ticket.reopen.respected) continue;
+          // The owner moved the ticket to Done again after the reopen: it stays Done, logged once.
+          if (type === "completed" && ticket.reopen.completedAt !== key) {
+            ticket.reopen = { completedAt: key, at: ticket.reopen.at, respected: true };
+            this.policy[record.issueId] = ticket;
+            console.log(`[linear-tickets] ${record.identifier}: it was moved to Done again after Paseo reopened it; it stays there and is not reopened again`);
+            await writeState(this.policyPath, this.policy);
+            continue;
+          }
+        } else {
+          if (type !== "completed") continue;
+          const open = await this.policyPulls(record, context, stopped);
+          if (!open?.length) continue;
+          ticket.reopen = { completedAt: key, at: new Date(this.clock()).toISOString(), ...reopenNotice(open) };
+          this.policy[record.issueId] = ticket;
+          await writeState(this.policyPath, this.policy);
+        }
+        if (await this.finishReopen(record, ticket, seenByUrl, reserved)) acts++;
+      } catch (error) {
+        console.error(`[linear-tickets] ${record.identifier}: reopening it (its stack has not landed) failed: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  // The remaining steps of a decided reopen, in order: the state move (skipped once it went
+  // through), the comment on the ticket (found by its mark, so it goes out once), and the notice
+  // to the agent (claimed right before it goes out, so it never goes twice). A step that fails
+  // (Linear refuses, the agent is busy) leaves the ones after it to the next poll. True once this
+  // poll did one of them.
+  private async finishReopen(record: HandoverRecord, ticket: PolicyTicket, seenByUrl: Record<string, Seen>, reserved: Set<string>): Promise<boolean> {
+    const reopen = ticket.reopen;
+    if (!reopen || reopen.respected) return false;
+    const save = () => writeState(this.policyPath, this.policy);
+    let acted = false;
+    if (!reopen.moved) {
+      const current = await this.deps.linear.issueState(record.issueId);
+      const type = current.statusType.trim().toLowerCase();
+      if (type === "canceled" || type === "duplicate") {
+        // Finished by hand while the reopen waited: it stays finished, and the decision goes.
+        delete ticket.reopen;
+        await save();
+        console.log(`[linear-tickets] ${record.identifier}: it is ${current.status} now, so it is not reopened`);
+        return false;
+      }
+      if (type === "completed") {
+        const moved = await this.deps.linear.reopenToCoding(record.issueId, current);
+        if (!moved.changed) {
+          console.error(`[linear-tickets] ${record.identifier}: moving it back to work failed${moved.note ? `: ${moved.note}` : ""}; the next poll tries again`);
+          return false;
+        }
+      }
+      reopen.moved = true;
+      await save();
+      acted = true;
+    }
+    if (!reopen.commented) {
+      const mark = `\`stack-policy:reopen:${record.identifier}:${reopen.completedAt || "none"}\``;
+      if (!await this.deps.linear.hasComment(record.issueId, mark)) await this.deps.linear.comment(record.issueId, `${reopen.comment}\n\n${mark}`);
+      reopen.commented = true;
+      await save();
+      acted = true;
+    }
+    if (reopen.message) {
+      if (reopen.sending) {
+        // The send was interrupted (a restart, a lost save) and may have gone out: never twice.
+        console.error(`[linear-tickets] ${record.identifier}: the reopen notice may already have gone out; it is not sent again`);
+        reopen.message = undefined;
+        reopen.sending = undefined;
+        await save();
+        return acted;
+      }
+      const claim = async () => { reopen.sending = true; await save(); };
+      await this.policySend(record, reopen.message, "land the pull requests of its stack that are still open", claim, async () => { reopen.message = undefined; reopen.sending = undefined; await save(); }, reserved, seenByUrl);
+      acted = true;
+    }
+    return acted;
+  }
+
+  // The stack cap (README, "Stack cap"): a ticket holds at most STACK_CAP open (unlanded) pull
+  // requests. Before stacking a 4th, its agent lands the reviewed bottom range. An over-cap ticket
+  // whose bottom is still unpublished (a draft no open queue draft lists, see landing) gets one
+  // message per stack — claimed under the stack's signature (its pull requests with their heads),
+  // so it repeats only once the stack changed — that names the policy: land the reviewed bottom
+  // range before stacking more, never close or split pull requests for the cap, and review is
+  // never waived. Nothing mentions the owner and no count hands anything over. Only started
+  // tickets: a Done ticket's stack is the reopen's business (see reopenDone). A few messages per
+  // poll (POLICY_PER_POLL), and the poll's own listing and drafts answer everything, so the cap
+  // costs no GitHub read of its own.
+  private async capPass(all: HandoverRecord[], states: Map<string, IssueStatus> | null, reserved: Set<string>, context: RunContext, seenByUrl: Record<string, Seen>, stopped: StopFlags): Promise<void> {
+    if (!states) return;
+    let asked = 0;
+    for (const record of all) {
+      if (asked >= POLICY_PER_POLL || stopped.paused || stopped.budget || stopped.throttled) break;
+      const state = states.get(record.issueId);
+      if (!state || state.statusType.trim().toLowerCase() !== "started" || reserved.has(record.agentId)) continue;
+      try {
+        const open = await this.policyPulls(record, context, stopped);
+        if (!open || open.length <= STACK_CAP) continue;
+        const bottom = lowestPull(open);
+        if (!bottom || await this.landing(bottom, context)) continue;
+        const signature = open.map((pull) => `${pull.number}@${pull.headSha}`).join(",");
+        const ticket = this.policy[record.issueId] ?? {};
+        if (ticket.cap === signature) continue;
+        const claim = async () => { ticket.cap = signature; this.policy[record.issueId] = ticket; await writeState(this.policyPath, this.policy); };
+        try {
+          await this.policySend(record, capNotice(open, bottom), "land the reviewed bottom range before stacking more", claim, claim, reserved, seenByUrl);
+        } catch (error) {
+          // A message that failed outright was not sent: the next poll asks again.
+          delete ticket.cap;
+          this.policy[record.issueId] = ticket;
+          await writeState(this.policyPath, this.policy).catch(() => {});
+          throw error;
+        }
+        asked++;
+      } catch (error) {
+        console.error(`[linear-tickets] ${record.identifier}: the stack cap message failed: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  // Whether the bottom of an over-cap stack is already on its way to main: it is published (not a
+  // draft), which the queue backstop's ready rule and the pull request's own lifecycle steps own,
+  // or an open queue draft already tests it. Both answer from the poll's listing and Graphite's
+  // drafts, so the cap costs no GitHub read of its own (see capPass).
+  private async landing(bottom: OpenPull, context: RunContext): Promise<boolean> {
+    if (!bottom.draft) return true;
+    const source = PULL_URL.exec(bottom.url);
+    if (!source) return false;
+    const listed = `](https://app.graphite.com/github/pr/${source[1]}/${source[2]})`;
+    return (await context.drafts(source[1])).some((draft) => draft.state === "OPEN" && draft.title.startsWith(QUEUE_DRAFT_TITLE) && draft.body.includes(listed));
+  }
+
+  // One stack-policy message for the ticket's agent, delivered like a nudge (README, "Stalled pull
+  // requests"): `claim` runs right before it goes to the agent (its send, a restart, a successor
+  // start), `done` right after it went anywhere, so a claimed message never goes twice. A busy or
+  // waiting agent claims nothing (the next poll decides again), a crashed one waits for its restart
+  // with the message as its resume, a gone one starts a successor with it, and when neither can it
+  // goes to the ticket as before.
+  private async policySend(record: HandoverRecord, text: string, step: string, claim: () => Promise<void>, done: () => Promise<void>, reserved: Set<string>, seenByUrl: Record<string, Seen>): Promise<void> {
+    if (reserved.has(record.agentId)) return;
+    const toAgent = async () => { reserved.add(record.agentId); await claim(); };
+    if (record.status !== "archived") {
+      const outcome = await this.deps.sessions.prompt(record.agentId, text, toAgent, this.recovery(record, reserved, toAgent));
+      if (outcome === "sent") {
+        await done();
+        await this.tell(record, "thought", `The agent was asked to ${step}.`);
+        return;
+      }
+      if (outcome === "restarted" || outcome === "reloaded" || outcome === "crashed") {
+        // The claim stands: the message went with the restart's resume (see recovery), and what
+        // follows it is only logged.
+        await done();
+        await this.crashLine(record, outcome, step);
+        if (outcome !== "crashed" || !this.crashes[record.agentId]?.successor) return;
+      } else if (outcome !== "gone") return;
+    }
+    const next = await this.succession(record, [], text, toAgent);
+    if (next?.kind === "started") {
+      await done();
+      await this.succeeded(record, next.agent, seenByUrl, record.links["Pull request"] ?? "", reserved, step);
+      return;
+    }
+    if (next && next.kind !== "impossible") return;
+    await this.handBack(record, text, toAgent);
+    await done();
+    await this.tell(record, "response", `The stack policy was sent to the ticket, and the agent is no longer running; the ticket is back in ${CODING_STATE}.`);
   }
 
   // Agents whose ticket state is unknown while Linear refuses, each logged once per refusal.

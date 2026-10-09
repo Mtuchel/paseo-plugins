@@ -2022,6 +2022,28 @@ export class LinearService {
     });
   }
 
+  // Moves a Done ticket back to its coding state (README, "Done tickets with open pull requests"):
+  // the started state marking tickets In Progress resolves, the same one `markInProgress` writes
+  // (resolveStartedState). A completed ticket passes here — that is the point, unlike
+  // `moveToStateNamed`, which leaves finished tickets to people — while canceled and duplicate
+  // tickets stay finished and a ticket already in the target state is left alone (a repeated call
+  // changes nothing, so a reopen interrupted between the move and its bookkeeping can repeat it).
+  // Teams without a started state are left alone, with the note. `current`: the ticket's state when
+  // the caller already read it.
+  async reopenToCoding(issueId: string, current?: IssueState): Promise<{ changed: boolean; note?: string }> {
+    return withPriority("owner", "status change", async () => {
+      const state = current ?? await this.issueState(issueId);
+      const type = state.statusType.trim().toLowerCase();
+      if (type === "canceled" || type === "duplicate") return { changed: false };
+      if (!state.teamId) return { changed: false, note: "The ticket has no team." };
+      const target = resolveStartedState(await this.teamStates(state.teamId));
+      if (!target) return { changed: false, note: `The ticket's team has no "In Progress" state.` };
+      if (target.id === state.statusId) return { changed: false };
+      succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
+      return { changed: true };
+    });
+  }
+
   // State name, type and completion time of up to 250 issues per request. Deleted, archived or
   // invisible issues are absent from the result. Issues the app cannot see are read again with the key.
   async issueStatuses(ids: string[]): Promise<Map<string, IssueStatus>> {

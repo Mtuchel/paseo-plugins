@@ -217,9 +217,12 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // `failure`: what linking a URL on the ticket throws; `arrive`: runs before a ticket comment
   // reaches Linear (a hanging one is a crash before it went out), `stall` after it did (a crash
   // right after); `lost`: the request fails although the comment reached Linear. `comments`:
-  // each ticket's comments; `state`: the ticket's workflow state. `issueFailure` fails the ticket
-  // reads (`issueReads`), `statesFailure` the per-poll batch of the running tickets (`stateReads`).
-  const linear = { failure: null as Error | null, issueFailure: null as Error | null, statesFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], stateReads: [] as string[][], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" } };
+  // each ticket's comments; `state`: the ticket's workflow state, `completedAt` its Linear
+  // completion stamp (drives the stack policy's once-per-completion reopen), and `byIssue` the
+  // states of tickets a run has several of (`state` is every other ticket's). `issueFailure` fails
+  // the ticket reads (`issueReads`), `statesFailure` the per-poll batch of the running tickets
+  // (`stateReads`).
+  const linear = { failure: null as Error | null, issueFailure: null as Error | null, statesFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], stateReads: [] as string[][], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" }, completedAt: null as string | null, byIssue: {} as Record<string, { status: string; statusType: string }> };
   // No test worktree exists unless its git source is explicitly provided.
   const git = { origin: null as string | null, root: null as string | null, reads: [] as string[][] };
   // Open before-merge manual tasks of the ticket; `unreadable`: reading them fails.
@@ -280,6 +283,17 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     },
     linear: {
       moveToStateNamed: async (_id, name) => { calls.push(`move ${name}`); return { changed: true }; },
+      // A Done ticket's reopen (see reopenDone): the fake moves the state like Linear does, so the
+      // once-per-completion decision and the owner's re-close are exercised the way they run.
+      reopenToCoding: async (id) => {
+        const before = linear.byIssue[id] ?? linear.state;
+        if (before.statusType !== "completed") return { changed: false };
+        calls.push("reopen");
+        const moved = { status: "In Progress", statusType: "started" };
+        if (linear.byIssue[id]) linear.byIssue[id] = moved;
+        else linear.state = moved;
+        return { changed: true };
+      },
       comment: async (id, body) => {
         await linear.arrive();
         linear.comments[id] = [...(linear.comments[id] ?? []), body];
@@ -297,7 +311,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       issueState: async (id) => {
         linear.issueReads.push(id);
         if (linear.issueFailure) throw linear.issueFailure;
-        return { ...linear.state, attachmentUrls: linear.attachments } as never;
+        return { ...(linear.byIssue[id] ?? linear.state), attachmentUrls: linear.attachments } as never;
       },
       issueAttachments: async (id) => {
         linear.issueReads.push(id);
@@ -307,12 +321,12 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       issueStatusAnyPool: async (id) => {
         linear.issueReads.push(id);
         if (linear.issueFailure) throw linear.issueFailure;
-        return { ...linear.state, sentAt: Date.now() };
+        return { ...(linear.byIssue[id] ?? linear.state), sentAt: Date.now() };
       },
       issueStatuses: async (ids) => {
         linear.stateReads.push(ids);
         if (linear.statesFailure) throw linear.statesFailure;
-        return new Map(ids.map((id) => [id, { ...linear.state, completedAt: null }]));
+        return new Map(ids.map((id) => [id, { ...(linear.byIssue[id] ?? linear.state), completedAt: linear.completedAt }]));
       },
     },
     manualTasks: {
@@ -465,7 +479,9 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     await writeFile(path, value);
     return value;
   };
-  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, waits, server, home: () => directory, watch: () => watch };
+  // The stack policy's state file (caps and reopens), read as is (empty before the first write).
+  const policyFile = async () => readFile(join(await directory, "stack-policy.json"), "utf8").catch(() => "");
+  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, policyFile, waits, server, home: () => directory, watch: () => watch };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -2463,8 +2479,13 @@ test("a pending resume is dropped unsent once its ticket is no longer started or
     h.github.view = { ...READY, checks: [failing("PR code")] };
     h.daemon.reloaded = { ...RESTARTED, status: "running" };
     await h.poll();
-    if (change === "completed") h.linear.state = { status: "Done", statusType: "completed" };
-    else h.records[0] = { ...h.records[0], agentId: "a2" };
+    if (change === "completed") {
+      // Done and its stack landed (no open pull request): the ticket stays Done, so the resume no
+      // longer applies. Done with open pull requests is reopened instead (see the stack policy
+      // tests), which is what keeps a resume for such a ticket pending.
+      h.linear.state = { status: "Done", statusType: "completed" };
+      h.records[0] = { ...h.records[0], links: {} };
+    } else h.records[0] = { ...h.records[0], agentId: "a2" };
     h.daemon.agent = RESTARTED;
     assert.ok(!(await h.poll()).some((call) => call.includes("Your previous run crashed")), change);
     assert.equal(JSON.parse(await h.crashFile()).a1.resume, null, change);
@@ -3871,4 +3892,248 @@ test("the repo-wide half of the queue backstop runs on one host per repo; each h
   await foreign.backstop();
   assert.deepEqual(foreign.linear.issueReads, [], "no discovery of another host's ticket");
   assert.deepEqual(foreign.scripts.runs, [READY_RUN], "while the repo-wide half it drives still runs");
+});
+
+// --- The owner's stack policy (2026-10-09): the cap and the reopen of Done tickets ----------------
+
+// The harness fakes a stack of test pull requests is built from.
+type StackFixture = {
+  github: { view: PullRequestView; views: Record<string, PullRequestView>; open: OpenPull[] };
+  records: HandoverRecord[];
+};
+
+// A chain of `count` draft pull requests naming TUC-1, bottom first, its lowest branch based on
+// main, with the ticket's link on the top one. `updatedAt` is now, so no draft stage is stalled.
+function draftStack(h: StackFixture, count: number) {
+  const branches = Array.from({ length: count }, (_, index) => `mtuchel/tuc-1-${String.fromCharCode(97 + index)}`);
+  const now = new Date().toISOString();
+  const views = branches.map((headBranch, index) => ({
+    ...OPEN_PR, isDraft: true, updatedAt: now, lastCommitAt: now, headSha: `head${index}`, headBranch, baseBranch: index ? branches[index - 1] : "main",
+  }));
+  const urls = views.map((_, index) => prUrl(420 + index));
+  views.forEach((view, index) => { h.github.views[urls[index]] = view; });
+  h.records[0] = { ...h.records[0], branch: branches[count - 1], links: { "Pull request": urls[count - 1] } };
+  h.github.view = views[count - 1];
+  h.github.open = views.slice(0, -1).map((view, index) => listed(urls[index], view, `Fix TUC-1 [plugin] Part ${index + 1}`));
+  return { urls, views };
+}
+
+test("the stack cap asks an over-cap ticket's agent once per stack to land the bottom range", async (t) => {
+  const h = harness(t);
+  const { urls } = draftStack(h, 4);
+  const calls = await h.poll();
+  const prompt = promptOf(calls) ?? "";
+  assert.ok(prompt.startsWith(`The ticket's stack has 4 open pull requests (bottom first: [#420](${urls[0]}) \`mtuchel/tuc-1-a\`, [#421](${urls[1]}) \`mtuchel/tuc-1-b\`, [#422](${urls[2]}) \`mtuchel/tuc-1-c\`, [#423](${urls[3]}) \`mtuchel/tuc-1-d\`); the owner's policy allows at most 3 unlanded at a time.`), prompt);
+  assert.match(prompt, /Land the reviewed bottom range before stacking more: publish it bottom first from the top branch of the reviewed range \(`git switch <that branch> && node tools\/ci\/publish\.mjs`/);
+  assert.match(prompt, /`node tools\/ci\/enqueue\.mjs` and `wait-queue\.mjs`/);
+  assert.match(prompt, /Never close or split a pull request for the cap, and add no new branch until the bottom range lands; review is never waived\./);
+  assert.ok(prompt.endsWith(`${OWNER_POLICY}; never because of the count.`), "the owner policy closes it, with no count handover");
+  assert.ok(!prompt.includes(OWNER), "no owner mention");
+  assert.ok(calls.includes("say thought The agent was asked to land the reviewed bottom range before stacking more."));
+  assert.deepEqual(await h.poll(), [], "the same stack is not asked twice");
+  // The claim is the stack's signature: a new head is a changed stack and is asked again.
+  h.github.open[0] = { ...h.github.open[0], headSha: "moved-on" };
+  assert.match(promptOf(await h.poll()) ?? "", /^The ticket's stack has 4 open pull requests/);
+  // A stack of three is allowed: nothing is sent.
+  const atCap = harness(t);
+  draftStack(atCap, 3);
+  assert.deepEqual(await atCap.poll(), [], "three open pull requests are allowed");
+});
+
+test("the stack cap leaves a bottom that is published or already in the queue alone, reading no pull request of its own", async (t) => {
+  // Four same-ticket pull requests off one chain, so this poll reads only its link: the cap decides
+  // on the listing and Graphite's drafts, never with a pull request read.
+  const shaped = (h: StackFixture) => {
+    const urls = [0, 1, 2, 3].map((index) => prUrl(420 + index));
+    const now = new Date().toISOString();
+    urls.forEach((url, index) => { h.github.views[url] = { ...OPEN_PR, isDraft: true, updatedAt: now, lastCommitAt: now, headBranch: `mtuchel/tuc-1-${index}`, headSha: `head${index}` }; });
+    h.records[0] = { ...h.records[0], branch: null, links: { "Pull request": urls[3] } };
+    h.github.view = h.github.views[urls[3]];
+    h.github.open = urls.slice(0, 3).map((url, index) => listed(url, h.github.views[url], `Fix TUC-1 [plugin] Part ${index + 1}`));
+    return urls;
+  };
+  const published = harness(t);
+  const urls = shaped(published);
+  // The bottom is published (not a draft): its own lifecycle steps and the queue backstop's ready
+  // rule own it, so the cap says nothing.
+  published.github.open[0] = { ...published.github.open[0], draft: false };
+  assert.deepEqual(await published.poll(), [], "a published bottom needs no message");
+  assert.deepEqual(published.github.reads, [urls[3]], "and the cap read no pull request of its own");
+  const draftBottom = harness(t);
+  const drafts = shaped(draftBottom);
+  assert.match(promptOf(await draftBottom.poll()) ?? "", /^The ticket's stack has 4 open pull requests/, "a draft bottom is asked");
+  assert.deepEqual(draftBottom.github.reads, [drafts[3]], "still no read of its own");
+  const queued = harness(t);
+  const held = shaped(queued);
+  queued.github.drafts = [draft(437, [420], "OPEN")];
+  assert.deepEqual(await queued.poll(), [], "the queue holds the bottom already");
+  assert.deepEqual(queued.github.reads, [held[3]]);
+});
+
+test("the cap message is a nudge: a gone agent's message starts a successor, a busy one waits", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const gone = harness(t, { live: false, autoResume: true });
+  draftStack(gone, 4);
+  gone.paseo.succeed = startSuccessor;
+  const calls = await gone.poll();
+  assert.match(calls[0], /^succeed a1\nThe ticket's stack has 4 open pull requests/);
+  assert.equal(calls[1], "say thought The agent was gone; Paseo started a successor (agent s2a2b3c4) on mtuchel/tuc-1-d and asked it to land the reviewed bottom range before stacking more.");
+  assert.deepEqual(await gone.poll(), [], "claimed once");
+  const busy = harness(t);
+  draftStack(busy, 4);
+  busy.paseo.answer = async () => "busy";
+  assert.deepEqual(await busy.poll(), [], "a busy agent claims nothing");
+  busy.paseo.answer = async () => "sent";
+  assert.match(promptOf(await busy.poll()) ?? "", /^The ticket's stack has 4 open pull requests/, "asked on the next poll");
+});
+
+test("a Done ticket with open pull requests goes back to work once per completion, and its gone agent starts a successor", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { live: false, autoResume: true });
+  h.linear.state = { status: "Done", statusType: "completed" };
+  h.linear.completedAt = "2026-10-09T08:49:39.000Z";
+  const { urls } = draftStack(h, 2);
+  h.paseo.succeed = startSuccessor;
+  const calls = await h.poll();
+  assert.ok(calls.includes("reopen"), "the ticket is moved back to its coding state");
+  assert.equal(h.linear.state.statusType, "started");
+  const comment = calls.find((call) => call.startsWith("comment This ticket was in Done"));
+  assert.ok(comment?.includes(`2 pull requests of its stack were still open and unlanded: [#420](${urls[0]}), [#421](${urls[1]}).`), comment);
+  assert.match(comment ?? "", /`stack-policy:reopen:TUC-1:2026-10-09T08:49:39\.000Z`$/, "found by its mark on a retry");
+  assert.match(calls.find((call) => call.startsWith("succeed a1")) ?? "", /^succeed a1\nThis ticket was in Done, but its stack has not landed: \[#420\]/);
+  assert.equal(calls.find((call) => call.startsWith("say thought The agent was gone;"))?.includes("land the pull requests of its stack that are still open"), true);
+  assert.deepEqual(await h.poll(), [], "decided once per completion: nothing on the next poll");
+  // The three steps are recorded, so an interrupted reopen is finished without repeating them.
+  const saved = JSON.parse(await h.policyFile()).i1.reopen;
+  assert.equal(saved.completedAt, "2026-10-09T08:49:39.000Z");
+  assert.equal(saved.moved, true);
+  assert.equal(saved.commented, true);
+  assert.equal(saved.message, undefined, "the notice went out");
+  assert.equal(saved.sending, undefined);
+  // Only the host that owns the ticket reopens it (README, "Several hosts").
+  const foreign = harness(t, { owner: "none" });
+  foreign.linear.state = { status: "Done", statusType: "completed" };
+  draftStack(foreign, 1);
+  assert.deepEqual(await foreign.poll(), [], "another host's ticket");
+  assert.equal(await foreign.policyFile(), "", "and nothing is recorded for it");
+});
+
+test("a ticket moved to Done again after a reopen stays Done, logged once", async (t) => {
+  const logs = t.mock.method(console, "log", () => {});
+  const h = harness(t, { live: false, autoResume: true });
+  h.linear.state = { status: "Done", statusType: "completed" };
+  h.linear.completedAt = "2026-10-09T08:49:39.000Z";
+  draftStack(h, 1);
+  h.paseo.succeed = startSuccessor;
+  await h.poll();
+  assert.equal(h.linear.state.statusType, "started", "reopened");
+  // The owner moves it to Done again: respected, and the log says so once.
+  h.linear.state = { status: "Done", statusType: "completed" };
+  h.linear.completedAt = "2026-10-09T09:30:00.000Z";
+  assert.deepEqual(await h.poll(), [], "respected: the ticket stays Done");
+  assert.equal(countLogs(logs, /TUC-1: it was moved to Done again after Paseo reopened it; it stays there and is not reopened again/), 1);
+  const before = logs.mock.calls.length;
+  assert.deepEqual(await h.poll(), [], "nothing new");
+  assert.deepEqual(await h.poll(), [], "also with a plugin restart");
+  await h.restart();
+  assert.deepEqual(await h.poll(), []);
+  assert.equal(logs.mock.calls.length, before, "logged once");
+  assert.deepEqual(JSON.parse(await h.policyFile()).i1.reopen.respected, true);
+});
+
+test("a canceled or duplicate ticket is never reopened, and neither is one whose open pull requests are all vetoed", async (t) => {
+  for (const [status, statusType] of [["Canceled", "canceled"], ["Duplicate", "duplicate"]] as const) {
+    const h = harness(t);
+    h.linear.state = { status, statusType };
+    draftStack(h, 1);
+    assert.deepEqual(await h.poll(), [], status);
+  }
+  const vetoed = harness(t);
+  vetoed.linear.state = { status: "Done", statusType: "completed" };
+  draftStack(vetoed, 1);
+  vetoed.github.view = { ...vetoed.github.view, labels: ["do-not-merge"] };
+  vetoed.github.open = vetoed.github.open.map((pull) => ({ ...pull, labels: ["do-not-merge"] }));
+  assert.deepEqual(await vetoed.poll(), [], "do-not-merge only: nothing to land");
+});
+
+test("at most three Done tickets are reopened per poll", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t);
+  const [first] = h.records;
+  h.records.length = 0;
+  for (const index of [0, 1, 2, 3]) {
+    const url = prUrl(430 + index);
+    h.github.views[url] = { ...OPEN_PR, isDraft: true, updatedAt: new Date().toISOString(), lastCommitAt: new Date().toISOString(), headBranch: `mtuchel/tuc-${index + 1}`, headSha: `head${index}` };
+    h.github.open.push(listed(url, h.github.views[url], `Fix TUC-${index + 1} [plugin] Work`));
+    h.records.push({ ...first, issueId: `i${index}`, identifier: `TUC-${index + 1}`, agentId: `a${index + 1}`, branch: `mtuchel/tuc-${index + 1}`, links: { "Pull request": url } });
+    h.linear.byIssue[`i${index}`] = { status: "Done", statusType: "completed" };
+  }
+  h.github.view = { ...OPEN_PR, state: "CLOSED" };
+  h.linear.completedAt = "2026-10-09T08:00:00.000Z";
+  const reopened = await h.poll();
+  assert.equal(count(reopened, "reopen"), 3, "three of the four Done tickets, no more");
+  assert.equal(count(reopened, "prompt a1"), 1, "each gets its own agent, one message per agent");
+  const rest = await h.poll();
+  assert.equal(count(rest, "reopen"), 1, "the fourth follows on the next poll");
+  assert.deepEqual(await h.poll(), [], "then nothing");
+});
+
+test("a Done ticket's reopen reaches an archived agent as a successor and a crashed one with its restart", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const archived = harness(t, { status: "archived", autoResume: true });
+  archived.linear.state = { status: "Done", statusType: "completed" };
+  draftStack(archived, 1);
+  archived.paseo.succeed = startSuccessor;
+  const archivedCalls = await archived.poll();
+  assert.ok(archivedCalls.includes("reopen"));
+  assert.ok(archivedCalls.some((call) => call.startsWith("succeed a1\nThis ticket was in Done")), "no prompt: an archived agent is gone by definition");
+  assert.ok(!archivedCalls.some((call) => call.startsWith("prompt a1")), "never sent to the archived agent's session");
+
+  const crashed = harness(t, { crash: true });
+  crashed.linear.state = { status: "Done", statusType: "completed" };
+  draftStack(crashed, 1);
+  const crashedCalls = await crashed.poll();
+  assert.ok(crashedCalls.includes("reopen"));
+  assert.ok(crashedCalls.includes("reload a1"), "the crashed agent is restarted with the notice as its resume");
+  assert.match(promptOf(crashedCalls) ?? "", /Your previous run crashed[\s\S]*This ticket was in Done, but its stack has not landed/);
+  assert.equal(JSON.parse(await crashed.crashFile()).a1.resume, null, "the notice went out, so the resume is cleared");
+});
+
+test("a Done ticket whose only open pull request is the merge queue's own draft is not reopened", async (t) => {
+  const h = harness(t);
+  h.linear.state = { status: "Done", statusType: "completed" };
+  draftStack(h, 1);
+  // The queue's draft is open in the repository, but it is Graphite's, not the ticket's: it never
+  // counts as an unlanded pull request of the stack.
+  h.github.open = [{ ...h.github.open[0], title: "[Graphite MQ] Draft PR GROUP:spec_437 (PRs 420)" }];
+  assert.deepEqual(await h.poll(), [], "nothing to land: the queue manages its own draft");
+});
+
+test("an interrupted reopen finishes its remaining steps on the next poll", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { live: false, autoResume: true });
+  draftStack(h, 1);
+  h.paseo.succeed = startSuccessor;
+  // The plugin stopped after the move: the comment and the notice are still due, the move is not.
+  await writeFile(join(await h.home(), "stack-policy.json"), JSON.stringify({
+    i1: { reopen: { completedAt: "2026-10-09T08:49:39.000Z", at: new Date().toISOString(), moved: true, comment: "This ticket was in Done while its stack was open.", message: "This ticket was in Done, but its stack has not landed." } },
+  }));
+  const calls = await h.poll();
+  assert.ok(!calls.includes("reopen"), "the move already went through");
+  assert.ok(calls.some((call) => call === "comment This ticket was in Done while its stack was open.\n\n`stack-policy:reopen:TUC-1:2026-10-09T08:49:39.000Z`"), "the comment goes out once, found by its mark");
+  assert.match(calls.find((call) => call.startsWith("succeed a1")) ?? "", /^succeed a1\nThis ticket was in Done, but its stack has not landed\./);
+  assert.deepEqual(await h.poll(), [], "finished");
+  // Its save may be lost right after Linear took the comment: the mark on the ticket finds it and
+  // the notice still goes out.
+  const lost = harness(t, { live: false, autoResume: true });
+  draftStack(lost, 1);
+  lost.paseo.succeed = startSuccessor;
+  const comment = "This ticket was in Done while its stack was open.";
+  await writeFile(join(await lost.home(), "stack-policy.json"), JSON.stringify({
+    i1: { reopen: { completedAt: "2026-10-09T08:49:39.000Z", at: new Date().toISOString(), moved: true, comment, message: "This ticket was in Done, but its stack has not landed." } },
+  }));
+  lost.linear.comments.i1 = [`${comment}\n\n\`stack-policy:reopen:TUC-1:2026-10-09T08:49:39.000Z\``];
+  const again = await lost.poll();
+  assert.ok(!again.some((call) => call.startsWith("comment")), "the comment is found by its mark, not repeated");
+  assert.match(again.find((call) => call.startsWith("succeed a1")) ?? "", /^succeed a1\nThis ticket was in Done, but its stack has not landed\./);
 });
