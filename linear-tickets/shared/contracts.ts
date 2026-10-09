@@ -549,6 +549,60 @@ export const pullRequestsSnapshotSchema = z.object({
   landedRecently: z.array(landedCommitSchema),
 });
 export type PullRequestsSnapshot = z.infer<typeof pullRequestsSnapshotSchema>;
+// The owner's asks in Linear's "Needs input" state (README, "Owner asks"), read for the Paseo
+// Agents menu bar app as multiple-choice cards. One RPC answers from cache at once; the model
+// extraction of each ask runs in the background (server/owner-asks.ts), so an ask arrives with
+// `extracted: false` (kind "info", summary = title) until it is done.
+export const askOptionSchema = z.object({ label: z.string().min(1), description: z.string().default("") });
+export const askQuestionSchema = z.object({
+  // Stable within one ask ("q1", "q2", …); keys the menu bar's answers by.
+  key: z.string().min(1),
+  question: z.string().min(1),
+  // Empty: free text only.
+  options: z.array(askOptionSchema),
+  multiSelect: z.boolean().default(false),
+});
+export const ownerAskSchema = z.object({
+  issueId: z.string().min(1),
+  identifier: z.string(),
+  title: z.string(),
+  url: z.string(),
+  // The ticket an answer is about: the parent for a "Needs you" sub-issue, else the issue itself.
+  parentIdentifier: z.string().nullable(),
+  ticketIdentifier: z.string(),
+  // decision = choose/answer; manual = the owner must do something outside (button "Done");
+  // info = nothing extractable, read and reply.
+  kind: z.enum(["decision", "manual", "info"]),
+  summary: z.string(),
+  questions: z.array(askQuestionSchema),
+  // The ask markdown the extraction read (shown expandable), capped at 4000 characters.
+  source: z.string(),
+  // Where an answer goes from this host's view (server/owner-asks.ts).
+  route: z.enum(["agent", "continue", "comment"]),
+  agentId: z.string().nullable(),
+  extracted: z.boolean(),
+  updatedAt: z.string(),
+});
+export type OwnerAsk = z.infer<typeof ownerAskSchema>;
+
+export const ownerAsksRpc = defineRpc({
+  name: "linear.owner-asks",
+  input: z.object({}),
+  output: z.object({ asks: z.array(ownerAskSchema), updatedAt: z.string() }),
+});
+
+export const answerAskRpc = defineRpc({
+  name: "linear.answer-ask",
+  input: z.object({
+    issueId: z.string().min(1),
+    // Question key → chosen option label(s) (multi-select joined with ", ") or free text.
+    answers: z.record(z.string(), z.string()),
+    note: z.string().max(4000).default(""),
+    done: z.boolean().default(false),
+  }),
+  output: z.object({ delivered: z.enum(["agent", "continued", "comment", "closed"]), message: z.string() }),
+});
+
 export const pullRequestsRpc = defineRpc({
   name: "linear.pull-requests",
   input: z.object({ repository: repositorySchema }),

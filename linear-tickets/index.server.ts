@@ -1,15 +1,15 @@
 import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setPresenceRpc, setSettingsRpc, skipPlanRpc, statusRpc, type CapacityState } from "./shared/contracts";
+import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setPresenceRpc, setSettingsRpc, skipPlanRpc, statusRpc, answerAskRpc, ownerAsksRpc, type CapacityState } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
-import { Settings, type PluginSettings } from "./server/settings";
+import { Settings, DEFAULT_CHEAP_MODELS, type PluginSettings } from "./server/settings";
 import { DEFAULT_PROMPT_TEMPLATE } from "./shared/contracts";
 import { cacheScope, TicketCache } from "./server/cache";
 import { Credentials } from "./server/credentials";
-import { Dispatcher } from "./server/dispatch";
-import { CommentRelay } from "./server/relay";
+import { Dispatcher, dispatchLabels } from "./server/dispatch";
+import { CommentRelay, deliverToAgent } from "./server/relay";
 import { recordPluginComment } from "./server/agent-records";
 import { paseoHome } from "./server/ticket-mcp";
 import { join } from "node:path";
@@ -39,6 +39,8 @@ import { PullRequestBoard } from "./server/pull-requests";
 import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
 import { closeAnswered, NeedsYouIssues } from "./server/needs-you";
+import { OWNER_ASK_DIRECTORY, OwnerAsks } from "./server/owner-asks";
+import { extractWithOmp } from "./server/owner-ask-extract";
 import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, SessionRouter, SessionStore, stopAgentTurn, type HostOwnership } from "./server/sessions";
 import { LimitResumeStore, UsageReader } from "./server/limit-resume";
 import { planSetup, TicketStarter } from "./server/starter";
@@ -225,6 +227,35 @@ export default function contribute(server: PluginServerContext) {
     needsYou: async (agentId, issueId) => {
       for (const entry of await needsYou.all()) {
         if (entry.agentId === agentId && (!issueId || entry.id === issueId)) await closeAnswered(needsYou, linear, entry.id);
+      }
+    },
+  });
+  // The owner's asks (README, "Owner asks"): the Paseo Agents menu bar app's cards for everything
+  // waiting in Linear's "Needs input" state, extracted by one isolated model call each and
+  // answered through the same paths an owner's "@paseo" reply takes.
+  const ownerAsks = new OwnerAsks({
+    linear,
+    needsYou,
+    handover,
+    labels: async () => dispatchLabels((await settings.read()).dispatch.label),
+    // The contract's model: the deputy's when set, else the cheap tier's omp model. Settings hold
+    // Paseo provider ids ("omp/deepseek/deepseek-flash"); the isolated OMP call takes omp's own
+    // "provider/model" form.
+    resolveModel: async () => {
+      const saved = await settings.read();
+      return (saved.deputy.model ?? saved.cheapModels.omp?.model ?? DEFAULT_CHEAP_MODELS.omp.model).replace(/^omp\//, "");
+    },
+    extract: (input, model) => extractWithOmp(input, model, OWNER_ASK_DIRECTORY()),
+    deliver: (paseo, agentId, message, origin) => deliverToAgent(paseo, agentId, message, origin, replies),
+    continueTicket: async (issueId, identifier, lead) => {
+      const result = await sessions.restartFor(issueId, identifier, { lead, retryHint: "answer from the menu bar or assign Paseo again" });
+      switch (result.kind) {
+        case "started": return { kind: "started", agentId: result.agentId };
+        case "failed": return { kind: "failed", reason: result.error.message };
+        case "deferred": return { kind: "deferred", reason: result.reason };
+        case "forwarded": return { kind: "forwarded", peer: result.peer };
+        case "live": return { kind: "live" };
+        case "skipped": return { kind: "skipped" };
       }
     },
   });
@@ -448,6 +479,10 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(pullRequestsRpc, ({ repository }) => pullBoard.read(repository));
   server.handle(labelPullsRpc, ({ repository, label, numbers }) => pullBoard.label(repository, label, numbers));
+  // The owner's asks (README, "Owner asks"): read from cache at once (never waiting for the
+  // model), answered through the same paths an "@paseo" reply takes.
+  server.handle(ownerAsksRpc, async (_input, { paseo }) => { attach(paseo); return ownerAsks.snapshot(paseo); });
+  server.handle(answerAskRpc, async (input, { paseo }) => { attach(paseo); return asCaller("owner-asks", () => ownerAsks.answer(input, paseo)); });
   server.handle(connectRpc, ({ apiKey }) => asCaller("sidebar", () => linear.authenticate(apiKey)));
   server.handle(disconnectRpc, () => linear.disconnect());
   server.handle(listIssuesRpc, async ({ cursor, stateNames, relation }) => {
@@ -552,6 +587,7 @@ export default function contribute(server: PluginServerContext) {
     const stoppedPullRequests = pullRequests.stop();
     pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop();
     stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop();
+    ownerAsks.stop();
     void closeInternalDaemon();
     await stoppedPullRequests;
     await brokerReady;

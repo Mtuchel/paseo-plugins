@@ -114,8 +114,9 @@ export type RestartResult =
   | { kind: "live" } | { kind: "forwarded"; peer: string } | { kind: "skipped" }
   | { kind: "deferred"; reason: string } | { kind: "failed"; error: Error };
 // `retryHint`: how the owner tries again, for a start that fails on setup. `eligible`: why the
-// ticket may not start any more (null: it may), checked last before the start.
-export type RestartOptions = { retryHint?: string; eligible?: () => Promise<string | null> };
+// ticket may not start any more (null: it may), checked last before the start. `lead`: the last
+// part of the new agent's first prompt (the owner's answer, for the menu bar's asks).
+export type RestartOptions = { retryHint?: string; eligible?: () => Promise<string | null>; lead?: string };
 // The project flow's restarts: a deferred or failed restart throws, as before restartFor had a
 // result, so the caller's catch releases its scheduler reservation and logs why.
 export function restartOrThrow(result: RestartResult): void {
@@ -1958,7 +1959,7 @@ export class SessionRouter {
       const marked = await this.deps.linear.addLabel(issueId, running).then(() => true, () => false);
       let agentId: string;
       try {
-        agentId = (await this.deps.starter.start(issueId, paseo, settings, { retryHint: options.retryHint ?? "the project's next read starts it again" })).agentId;
+        agentId = (await this.deps.starter.start(issueId, paseo, settings, { retryHint: options.retryHint ?? "the project's next read starts it again", ...(options.lead ? { lead: options.lead } : {}) })).agentId;
       } catch (error) {
         await this.deps.linear.removeLabel(issueId, running).catch(() => {});
         return { kind: "failed", error: error instanceof Error ? error : new Error(String(error)) };
