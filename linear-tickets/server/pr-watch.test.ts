@@ -20,6 +20,13 @@ import { ghGet } from "./pull-requests";
 const settings = { dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true } } as unknown as PluginSettings;
 const OWNER = "https://linear.app/ws/profiles/me";
 const PR = "https://github.com/tuchel-sohn/tuchel-platform/pull/419";
+// The owner policy every nudge prompt ends with (TUC-1777); the drop fix requests close it with
+// "; never because of a drop count".
+const OWNER_POLICY = "Ask the owner only for a decision that can break something (data, production or staging, migrations, security, reverting someone else's landed work) or that changes how CI works in general (required checks, CI selection, quarantine, queue settings), through the ticket's normal question path (the deputy answers first)";
+const NUDGE_CLOSE = `${OWNER_POLICY}; never just wait.`;
+// Mirrors STAGE_NUDGES (module-private in server/pr-watch.ts): every third nudge of a stage adds the
+// approach line, and a crash after three restarts of an agent starts a successor.
+const STAGE_NUDGES = 3;
 const graphiteLink = (number: number) => `[#${number}](https://app.graphite.com/github/pr/tuchel-sohn/tuchel-platform/${number})`;
 
 async function failingGh(t: TestContext, source: string): Promise<void> {
@@ -684,7 +691,8 @@ test("a draft with no commit or activity for 30 minutes is told to run the Sol r
   const calls = await h.poll();
   const prompt = promptOf(calls) ?? "";
   assert.ok(prompt.startsWith(`[The pull request](${PR}) is still a draft, with no new commit or pull request activity for 30 minutes.\nNext step: `), prompt);
-  assert.ok(prompt.endsWith("\n\nThis is nudge 1 of 2 for this step; after that the owner takes over."), prompt);
+  assert.ok(prompt.endsWith(`\n\n${NUDGE_CLOSE}`), prompt);
+  assert.doesNotMatch(prompt, /owner takes over|takes over/, "no nudge hands the step to the owner");
   const order = ["- CI is the proof: <killed | timed out | failed twice on unrelated tests> — <evidence>", "none of the ticket's questions to the owner is still unanswered", "node tools/ci/publish.mjs --ci-proof"].map((part) => prompt.indexOf(part));
   assert.ok(order.every((at, i) => at !== -1 && (i === 0 || at > order[i - 1])), `evidence line, then the owner-question check, then --ci-proof: ${order}`);
   assert.ok(!prompt.includes("gt submit --publish") && !prompt.includes("gh pr ready"), "publish.mjs is the only publish route");
@@ -698,7 +706,7 @@ test("failed checks on a ready pull request are listed with links, ignoring pend
   h.github.view = { ...READY, checks: [GREEN, RUNNING_CI, failing("Graphite / mergeability_check")] };
   assert.deepEqual(await h.poll(), [], "only the queue's own check failed");
   h.github.view = { ...READY, checks: [GREEN, RUNNING_CI, failing("Graphite / mergeability_check"), failing("Code validation / Platform gate")] };
-  assert.equal(promptOf(await h.poll()), `Checks failed on the head of [the pull request](${PR}) (\`a1b2c3d\`):\n- [Code validation / Platform gate](https://github.com/tuchel-sohn/tuchel-platform/actions/runs/2/job/31) — failure\nNext step: fix them, then \`gt submit --stack\`.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+  assert.equal(promptOf(await h.poll()), `Checks failed on the head of [the pull request](${PR}) (\`a1b2c3d\`):\n- [Code validation / Platform gate](https://github.com/tuchel-sohn/tuchel-platform/actions/runs/2/job/31) — failure\nNext step: fix them, then \`gt submit --stack\`.\n\n${NUDGE_CLOSE}`);
   assert.equal(h.github.threadReads, 0);
 });
 
@@ -717,7 +725,7 @@ test("each reviewer's outstanding change request is sent once with the open thre
   ] };
   const calls = await h.poll();
   assert.equal(calls.length, 2);
-  assert.equal(promptOf(calls), `@Mtuchel requested changes on [the pull request](${PR}):\n> Two things before this can land.\n\nUnresolved review threads:\n- [db/migrate.sql](${PR}#discussion_r2) @Mtuchel: Split this migration. (1 reply)\n\nNext step: address them, then \`gt submit --stack\`.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`, "ada approved since, bob's review was dismissed");
+  assert.equal(promptOf(calls), `@Mtuchel requested changes on [the pull request](${PR}):\n> Two things before this can land.\n\nUnresolved review threads:\n- [db/migrate.sql](${PR}#discussion_r2) @Mtuchel: Split this migration. (1 reply)\n\nNext step: address them, then \`gt submit --stack\`.\n\n${NUDGE_CLOSE}`, "ada approved since, bob's review was dismissed");
   assert.equal(calls.at(-1), "say thought The pull request is waiting for the agent to address the requested changes; it was asked to.");
   h.github.threads = [];
   assert.deepEqual(await h.poll(), [], "sent once");
@@ -727,7 +735,7 @@ test("a change request is sent once however many heads follow it; a new request 
   const h = harness(t);
   const mtuchel = { author: "Mtuchel", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T08:00:00Z", body: "Two things before this can land.", commit: HEAD };
   h.github.view = { ...READY, reviews: [mtuchel] };
-  assert.match(promptOf(await h.poll()) ?? "", /^@Mtuchel requested changes[^]*nudge 1 of 2/);
+  assert.match(promptOf(await h.poll()) ?? "", new RegExp(`^@Mtuchel requested changes[^]*never just wait\\.$`));
   for (const head of ["h2", "h3", "h4"]) {
     h.github.view = { ...h.github.view, headSha: head };
     assert.deepEqual(await h.poll(), [], `pushed ${head} without a new review: no prompt, no escalation`);
@@ -735,17 +743,20 @@ test("a change request is sent once however many heads follow it; a new request 
   h.github.view = { ...h.github.view, reviews: [mtuchel, { author: "ada", state: "CHANGES_REQUESTED", submittedAt: "2026-09-29T09:00:00Z", body: "Nit.", commit: "h4" }] };
   const later = promptOf(await h.poll()) ?? "";
   assert.match(later, /^@Mtuchel requested changes on \[the pull request\]\([^)]*\) at `a1b2c3d`, before the latest commits:\n> Two things before this can land\.\n@ada requested changes on \[the pull request\]\([^)]*\):\n> Nit\.\n/);
-  assert.match(later, /Where the new commits already address a review, reply on its threads and re-request a review from @Mtuchel\.\n\nThis is nudge 2 of 2/);
+  assert.match(later, /Where the new commits already address a review, reply on its threads and re-request a review from @Mtuchel\./);
+  assert.doesNotMatch(later, /keeps stalling/, "the second nudge of the stage is an ordinary one");
+  assert.ok(later.endsWith(`\n\n${NUDGE_CLOSE}`), later);
   h.github.view = { ...h.github.view, headSha: "h5", reviews: [...h.github.view.reviews, { ...mtuchel, submittedAt: "2026-09-29T10:00:00Z", commit: "h5" }] };
-  const third = await h.poll();
-  assert.equal(promptOf(third), undefined);
-  assert.match(third.find((call) => call.startsWith("comment")) ?? "", new RegExp(`^comment ${OWNER} Paseo asked the agent 2 times to address the requested changes`), "a third request goes to the owner");
+  const third = promptOf(await h.poll()) ?? "";
+  assert.match(third, /^@Mtuchel requested changes/);
+  assert.match(third, /keeps stalling at this step \(nudge 3\); change your approach\./, "the third nudge asks for a new approach instead of mentioning the owner");
+  assert.ok(third.endsWith(`\n\n${NUDGE_CLOSE}`), third);
 });
 
 test("GitHub's changes-requested decision alone is a change request, sent once, and holds the merge", async (t) => {
   const h = harness(t);
   h.github.view = { ...READY, reviewDecision: "CHANGES_REQUESTED" };
-  assert.equal(promptOf(await h.poll()), `GitHub reports changes requested on [the pull request](${PR}).\n\nNext step: address them, then \`gt submit --stack\`.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+  assert.equal(promptOf(await h.poll()), `GitHub reports changes requested on [the pull request](${PR}).\n\nNext step: address them, then \`gt submit --stack\`.\n\n${NUDGE_CLOSE}`);
   h.github.view = { ...h.github.view, headSha: "h2" };
   assert.deepEqual(await h.poll(), [], "once per pull request, not per head");
 });
@@ -775,7 +786,7 @@ test("unresolved bot review findings are sent for the review loop", async (t) =>
   const h = harness(t);
   h.github.view = READY;
   h.github.threads = [FINDING];
-  assert.equal(promptOf(await h.poll()), `Reviewers left unresolved findings on [the pull request](${PR}):\n- [server/upload.ts:42](${PR}#discussion_r1) @greptile-apps: P2 The retry loop never gives up.\n\nNext step: run the AGENTS.md review loop on them.\n\nThis is nudge 1 of 2 for this step; after that the owner takes over.`);
+  assert.equal(promptOf(await h.poll()), `Reviewers left unresolved findings on [the pull request](${PR}):\n- [server/upload.ts:42](${PR}#discussion_r1) @greptile-apps: P2 The retry loop never gives up.\n\nNext step: run the AGENTS.md review loop on them.\n\n${NUDGE_CLOSE}`);
 });
 
 test("a ready, green, reviewed pull request outside the queue gets no merge nudge: the queue backstop enqueues it", async (t) => {
@@ -821,7 +832,7 @@ test("do-not-merge and open manual tasks keep every nudge and escalation away", 
   }
   h.github.view = { ...READY, checks: [failing("PR code")] };
   h.blockers.length = 0;
-  assert.match(promptOf(await h.poll()) ?? "", /nudge 1 of 2/, "the veto and the task claimed nothing");
+  assert.ok((promptOf(await h.poll()) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`), "the veto and the task claimed nothing");
 });
 
 test("a busy agent or a failed send is nudged on a later poll; a gone agent's nudge goes to the ticket", async (t) => {
@@ -836,43 +847,57 @@ test("a busy agent or a failed send is nudged on a later poll; a gone agent's nu
   t.mock.method(console, "error", () => {});
   assert.deepEqual(await h.poll(), [], "the send failed");
   h.paseo.send = async () => {};
-  assert.match(promptOf(await h.poll()) ?? "", /nudge 1 of 2/, "still the first nudge");
+  assert.ok((promptOf(await h.poll()) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`), "still the first nudge");
 
   const gone = harness(t, { live: false });
   gone.github.view = { ...READY, checks: [failing("PR code")] };
   const calls = await gone.poll();
   assert.equal(calls[0], "move In Progress");
   assert.match(calls[1], new RegExp(`^comment ${OWNER} The agent that worked on this ticket is no longer running, so the ticket is back in In Progress for the next one\\.\n\nChecks failed on the head`));
-  assert.match(calls[1], /This is nudge 1 of 2 for this step/);
+  assert.ok(calls[1].endsWith(`\n\n${NUDGE_CLOSE}`), "the hand-back carries the nudge's prompt");
   assert.equal(calls[2], "say response The pull request is waiting for the agent to fix the failing checks, and the agent is no longer running; the ticket is back in In Progress.");
   assert.equal(calls.length, 3);
   assert.deepEqual(await gone.poll(), []);
 });
 
-test("two nudges per stage across heads, then one owner escalation, then only the log; other stages keep their own budget", async (t) => {
+test("every new stall of a stage is nudged, no count ever hands it to the owner, and every third nudge asks for a new approach", async (t) => {
   const h = harness(t, { live: false });
-  const log = t.mock.method(console, "error", () => {});
   const red = (head: string) => ({ ...READY, headSha: head, checks: [failing("PR code")] });
   h.github.view = red("h1");
-  assert.match((await h.poll())[1], /nudge 1 of 2/, "a gone agent's hand-back counts as a nudge");
+  const handedBack = await h.poll();
+  assert.ok(handedBack[1].endsWith(`\n\n${NUDGE_CLOSE}`), "a gone agent's hand-back counts as a nudge and carries the prompt");
   assert.deepEqual(await h.poll(), [], "same head");
   h.paseo.answer = async () => "sent";
-  h.github.view = red("h2");
-  assert.match(promptOf(await h.poll()) ?? "", /nudge 2 of 2/, "a new head re-nudges within the budget");
-  h.github.view = red("h3");
-  const third = await h.poll();
-  assert.equal(promptOf(third), undefined);
-  assert.match(third[0], new RegExp(`^comment ${OWNER} Paseo asked the agent 2 times to fix the failing checks on \\[the pull request\\]\\(${PR.replace(/[/.]/g, "\\$&")}\\), and it is stuck there again, so Paseo stops asking\\. Please take over\\.\n\nChecks failed`));
-  assert.equal(third[1], "say response The pull request is stuck again waiting for the agent to fix the failing checks; the owner was asked to take over.");
-  h.github.view = red("h4");
-  assert.deepEqual(await h.poll(), []);
-  assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /waiting for the agent to fix the failing checks again; already escalated to the owner/);
-  const logged = log.mock.callCount();
-  assert.deepEqual(await h.poll(), []);
-  assert.equal(log.mock.callCount(), logged, "logged once per head");
-  h.github.view = { ...READY, headSha: "h4" };
+  for (const head of ["h2", "h3", "h4", "h5", "h6"]) {
+    h.github.view = red(head);
+    const calls = await h.poll();
+    const prompt = promptOf(calls) ?? "";
+    assert.match(prompt, /^Checks failed on the head/, head);
+    assert.ok(prompt.endsWith(`\n\n${NUDGE_CLOSE}`), head);
+    // h1 was nudge 1, so head hN is the stage's nudge N: the third and sixth ask for a new approach.
+    const count = Number(head.slice(1));
+    if (count % 3 === 0) assert.match(prompt, new RegExp(`keeps stalling at this step \\(nudge ${count}\\); change your approach`), head);
+    else assert.doesNotMatch(prompt, /keeps stalling/, head);
+    assert.ok(!calls.some((call) => call.startsWith("comment")), `${head}: no count mentions the owner`);
+  }
+  // A stage of its own starts from its own count, not from the checks stage's.
+  h.github.view = { ...READY, headSha: "h6" };
   h.github.threads = [FINDING];
-  assert.match(promptOf(await h.poll()) ?? "", /unresolved findings[^]*nudge 1 of 2/, "the findings stage starts its own budget");
+  const findings = promptOf(await h.poll()) ?? "";
+  assert.match(findings, /unresolved findings[^]*never just wait\.$/, "the findings stage nudges with the owner policy");
+  assert.doesNotMatch(findings, /keeps stalling/, "and without the approach line");
+});
+
+test("a stage escalated under the old cap resumes nudging on its next new stall; nothing mentions the owner for it", async (t) => {
+  const h = harness(t);
+  h.paseo.answer = async () => "sent";
+  // The old plugin escalated the stage at its two nudges; its flag stays in the entry (state
+  // cannot tell it from a waited-out question), but no count stops the nudges anymore.
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, escalated: true, nudges: { red: ["h1", "h1", "h1"] } } });
+  h.github.view = { ...READY, headSha: "h2", checks: [failing("PR code")] };
+  const calls = await h.poll();
+  assert.ok((promptOf(calls) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`), "the stage is nudged again");
+  assert.ok(!calls.some((call) => call.startsWith("comment")), "and no count mentions the owner");
 });
 
 test("a conflict-only drop, before any queue draft or with nothing failed on it, asks for a restack and an immediate re-enqueue", async (t) => {
@@ -2265,12 +2290,15 @@ test("a drop claimed while its pull request still holds an earlier message is qu
   assert.deepEqual(await h.backstop(), [], "each once");
 });
 
-test("a crashed agent with an open pull request is restarted by the crash pass at once, also on an unchanged head; repeated crashes reach the owner after two restarts, then nothing", async (t) => {
-  const h = harness(t, { crash: true });
+test("a crashed agent is restarted at once, then after its backoff, and the crash after three restarts starts a successor", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { crash: true, autoResume: true });
+  h.paseo.succeed = startSuccessor;
+  h.records[0] = { ...h.records[0], branch: "mtuchel/tuc-1-fix" };
   h.github.view = { ...READY, checks: [failing("PR code")] };
   h.daemon.agent = RESTARTED;
   const first = await h.poll();
-  assert.match(promptOf(first) ?? "", /nudge 1 of 2/);
+  assert.ok((promptOf(first) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`));
   assert.ok(!first.includes("reload a1"), "a healthy agent is nudged as before");
   assert.deepEqual(await h.poll(), [], "a healthy agent is not nudged twice on one head");
   h.daemon.agent = CRASHED;
@@ -2281,17 +2309,33 @@ test("a crashed agent with an open pull request is restarted by the crash pass a
   assert.match(resume, /run `git status`/);
   assert.match(resume, /\n\nYour ticket TUC-1 is in In Progress\. Continue the lifecycle step you were on\.$/);
   assert.equal(restarted.filter((call) => call.startsWith("prompt")).length, 1, "the nudge does not follow in the same poll");
+  assert.equal(JSON.parse(await h.crashFile()).a1.restarts, 1);
+
+  // The second restart waits its backoff (2 minutes), with no message and no owner mention.
   h.daemon.agent = CRASHED;
-  assert.ok((await h.poll()).includes("reload a1"), "the second restart");
+  const waited = await h.poll();
+  assert.ok(!waited.includes("reload a1"), "the second restart waits for the backoff");
+  assert.ok(!waited.some((call) => call.startsWith("comment")), "no restart count mentions the owner");
+  h.scripts.now += 2 * MINUTE;
+  assert.ok((await h.poll()).includes("reload a1"), "the second restart after its backoff");
+  assert.equal(JSON.parse(await h.crashFile()).a1.restarts, 2);
+  // The third waits longer (4 minutes after the second), then goes the same way.
   h.daemon.agent = CRASHED;
-  const escalated = await h.poll();
-  assert.ok(!escalated.includes("reload a1"), "the escalation restarts nothing");
-  assert.ok(escalated.some((call) => call.startsWith(`comment ${OWNER} The agent crashed again after Paseo restarted it 2 times, so Paseo stops restarting it.`)), JSON.stringify(escalated));
-  assert.ok(!(await h.poll()).some((call) => call.startsWith("reload") || call.startsWith("comment") || call.startsWith("prompt")), "after the escalation, nothing");
-  // Reloaded by hand: no automatic resume reaches it.
+  h.scripts.now += 2 * MINUTE;
+  assert.ok(!(await h.poll()).includes("reload a1"), "the third restart waits its longer backoff");
+  h.scripts.now += 2 * MINUTE;
+  assert.ok((await h.poll()).includes("reload a1"), "the third restart after its backoff");
+  assert.equal(JSON.parse(await h.crashFile()).a1.restarts, 3);
+
+  // The crash after three restarts starts a successor whose lead is the pending resume.
+  h.daemon.agent = CRASHED;
+  const succeeded = await h.poll();
+  assert.match(succeeded[0], /^succeed a1\nYour previous run crashed \(`OMP RPC process is closed`\), and Paseo restarted you\.[\s\S]*Continue the lifecycle step you were on\.$/);
+  assert.equal(succeeded[1], `say thought The agent crashed 3 times in all; Paseo started a successor (agent s2a2b3c4) and asked it to resume and continue the step it was on.`);
+  assert.equal(h.records[0].agentId, SUCCESSOR.id, "the record names the successor");
+  assert.ok(JSON.parse(await h.crashFile()).a1.successor, "marked: this session is never restarted again");
   h.daemon.agent = RESTARTED;
-  await h.restart();
-  assert.ok(!(await h.poll()).some((call) => call.includes("Your previous run crashed")));
+  assert.deepEqual(await h.poll(), [], "no restart, no owner comment, no further message");
 });
 
 test("a crashed agent whose restart fails is sent nothing, and the attempt counts", async (t) => {
@@ -2299,12 +2343,60 @@ test("a crashed agent whose restart fails is sent nothing, and the attempt count
   t.mock.method(console, "error", () => {});
   h.github.view = { ...READY, checks: [failing("PR code")] };
   h.daemon.reloaded = CRASHED;
-  assert.deepEqual(await h.poll(), ["reload a1", `say thought The agent had crashed (${CRASH}), and Paseo's restart failed.`]);
+  assert.deepEqual(await h.poll(), ["reload a1", `say thought The agent had crashed (${CRASH}), and Paseo's restart failed; the next one waits for its backoff.`]);
+  assert.equal(JSON.parse(await h.crashFile()).a1.restarts, 1);
   h.daemon.reloaded = RESTARTED;
+  h.scripts.now += 2 * MINUTE;
   const second = await h.poll();
-  assert.equal(second[0], "reload a1");
+  assert.equal(second[0], "reload a1", "the second restart, after its backoff");
   assert.match(promptOf(second) ?? "", /Continue the lifecycle step you were on\.$/);
   assert.equal(JSON.parse(await h.crashFile()).a1.restarts, 2);
+});
+
+test("a crash only a person can fix gets one owner mention naming it and no restart loop", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { crash: true });
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.daemon.agent = { status: "error", lastError: "OMP RPC process exited with code 1: invalid API key for provider anthropic", pendingPermissions: [] };
+  const calls = await h.poll();
+  assert.ok(!calls.includes("reload a1"), "no restart clears this");
+  const comments = calls.filter((call) => call.startsWith("comment "));
+  assert.equal(comments.length, 1);
+  assert.match(comments[0], /cannot run until the host's setup is fixed/);
+  assert.match(comments[0], /invalid API key for provider anthropic/, "the comment names exactly what to fix");
+  assert.equal(JSON.parse(await h.crashFile()).a1.restarts, undefined, "it never counts as a restart");
+  assert.ok(JSON.parse(await h.crashFile()).a1.setup, "the crash is held until it changes");
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("reload") || call.startsWith("comment")), "told once: no restart loop");
+  await h.restart();
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("reload") || call.startsWith("comment")), "also after a plugin restart");
+  // The agent crashes differently now: handled like any other crash.
+  h.daemon.agent = CRASHED;
+  assert.ok((await h.poll()).includes("reload a1"), "a new crash is restarted as usual");
+});
+
+test("a crash with a generic denial a tool or file also raises is restarted, not handed to the owner", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { crash: true });
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.daemon.agent = { status: "error", lastError: "OMP RPC process exited with code 1: EACCES: permission denied, open '/repo/.git/index.lock' (403 Forbidden)", pendingPermissions: [] };
+  const calls = await h.poll();
+  assert.ok(calls.includes("reload a1"), "a restart can clear it");
+  assert.ok(!calls.some((call) => call.startsWith("comment")), "no owner mention");
+  assert.equal(JSON.parse(await h.crashFile()).a1.setup, undefined);
+});
+
+test("a crash that names a usage limit is never restarted and never counts: the limit resume owns it", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { crash: true });
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  h.daemon.agent = { status: "error", lastError: "OMP RPC process exited with code 1 (usage limit retry-after: 3600 model=anthropic/claude-opus-5-5)", pendingPermissions: [] };
+  const calls = await h.poll();
+  assert.ok(!calls.includes("reload a1"), "the limit-resume handling starts a new agent at the reset");
+  assert.ok(!calls.some((call) => call.startsWith("comment")), "no owner mention");
+  const saved = JSON.parse(await h.crashFile());
+  assert.equal(saved.a1.restarts, undefined, "a usage limit never counts as a restart");
+  assert.match(saved.a1.limit, /usage limit/);
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("reload") || call.startsWith("comment")), "left to the limit resume");
 });
 
 test("a resume that did not go out after the restart is sent on a later poll, also after a plugin restart, and cleared only once sent", async (t) => {
@@ -2329,20 +2421,23 @@ test("a resume that did not go out after the restart is sent on a later poll, al
   assert.match(promptOf(await h.poll()) ?? "", /^Your previous run crashed/);
 });
 
-test("a drop's fix request for an agent the crash pass could not restart goes to the ticket once its crashes went to the owner, and its resume is never sent later", async (t) => {
+test("a drop's fix request for an agent whose crash reached the successor path goes to the ticket, and its resume is never sent later", async (t) => {
   const h = harness(t, { crash: true });
   t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
   h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
-  h.daemon.reloaded = CRASHED;
-  const calls: string[] = [];
-  for (let poll = 0; poll < 3; poll++) calls.push(...await h.poll());
-  assert.equal(calls.filter((call) => call === "reload a1").length, 2, "two restarts, then the owner");
-  assert.ok(calls.some((call) => call.startsWith(`comment ${OWNER} The agent crashed again after Paseo restarted it 2 times`)));
-  assert.ok(calls.includes("move In Progress"));
-  assert.ok(calls.some((call) => call.startsWith(`comment ${OWNER} The agent that worked on this ticket is no longer running`)));
-  // Reloaded by hand.
-  h.daemon.agent = RESTARTED;
-  assert.ok(!(await h.poll()).some((call) => call.startsWith("prompt")));
+  await h.crashFile(JSON.stringify({ a1: { restarts: STAGE_NUDGES, restartedAt: new Date(h.scripts.now).toISOString() } }));
+  await h.restart();
+  const first = await h.poll();
+  assert.ok(!first.includes("reload a1"), "three restarts in all: the session is not reloaded again");
+  assert.ok(first.includes("move In Progress"));
+  assert.ok(first.some((call) => call.startsWith(`comment ${OWNER} The agent that worked on this ticket is no longer running`)), "no successor can start: the ticket is handed back");
+  assert.ok(JSON.parse(await h.crashFile()).a1.successor, "marked: it is never restarted again");
+  // The drop fix follows on the next poll, to the ticket.
+  const next = await h.poll();
+  assert.ok(next.includes("move In Progress"));
+  assert.ok(next.some((call) => call.startsWith(`comment ${OWNER} The agent that worked on this ticket is no longer running`)));
+  assert.ok(!next.some((call) => call.startsWith("prompt")), "never sent to the crashed agent's session");
 });
 
 test("a pending resume is dropped unsent once its ticket is no longer started or another agent took the ticket over", async (t) => {
@@ -2360,8 +2455,9 @@ test("a pending resume is dropped unsent once its ticket is no longer started or
   }
 });
 
-test("a crashed agent without an open pull request is restarted while its ticket is started: twice, then the owner once, then nothing", async (t) => {
+test("a crashed agent without an open pull request is restarted while its ticket is started, and after three restarts a successor takes over or the ticket goes back", async (t) => {
   t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
   for (const pull of ["never linked", "closed"] as const) {
     const h = harness(t, { crash: true });
     if (pull === "never linked") h.records[0] = { ...h.records[0], links: {} };
@@ -2369,31 +2465,48 @@ test("a crashed agent without an open pull request is restarted while its ticket
     const first = await h.poll();
     assert.ok(first.includes("reload a1"), pull);
     assert.match(promptOf(first) ?? "", /\n\nYour ticket TUC-1 is in In Progress\. Continue the lifecycle step you were on\.$/, pull);
+    assert.equal(JSON.parse(await h.crashFile()).a1.restarts, 1, pull);
+    // Three restarts in all: the crash after them is the successor path's (no branch is recorded
+    // here, so no successor can start and the ticket goes back).
+    await h.crashFile(JSON.stringify({ a1: { ...JSON.parse(await h.crashFile()).a1, restarts: STAGE_NUDGES } }));
     h.daemon.agent = CRASHED;
-    assert.ok((await h.poll()).includes("reload a1"), `${pull}: the second restart`);
-    h.daemon.agent = CRASHED;
-    const third = await h.poll();
-    assert.ok(!third.includes("reload a1"), pull);
-    assert.ok(third.some((call) => call.startsWith(`comment ${OWNER} The agent crashed again after Paseo restarted it 2 times, so Paseo stops restarting it.`)), pull);
+    await h.restart();
+    const handed = await h.poll();
+    assert.ok(!handed.includes("reload a1"), `${pull}: the session is not reloaded again`);
+    assert.ok(handed.includes("move In Progress"), pull);
+    assert.ok(handed.some((call) => call.startsWith(`comment ${OWNER} The agent that worked on this ticket is no longer running`)), pull);
     await h.restart();
     assert.deepEqual(await h.poll(), [], `${pull}: then nothing`);
   }
 });
 
-test("an owner comment that failed after the restarts without an open pull request is posted on the next poll", async (t) => {
+test("a hand-back whose owner comment failed is tried again on the next poll", async (t) => {
   t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
   const h = harness(t, { crash: true });
   h.records[0] = { ...h.records[0], links: {} };
-  for (let restart = 0; restart < 2; restart++) {
-    h.daemon.agent = CRASHED;
-    assert.ok((await h.poll()).includes("reload a1"));
-  }
-  h.daemon.agent = CRASHED;
+  await h.crashFile(JSON.stringify({ a1: { restarts: STAGE_NUDGES } }));
+  await h.restart();
   h.linear.arrive = async () => { throw new Error("Linear is unavailable"); };
-  assert.deepEqual(await h.poll(), [], "the comment failed");
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("comment")), "the comment failed");
+  assert.ok(!JSON.parse(await h.crashFile()).a1.successor, "the mark goes, so the pass tries again");
   h.linear.arrive = async () => {};
-  assert.ok((await h.poll()).some((call) => call.startsWith(`comment ${OWNER} The agent crashed again`)), "retried");
+  assert.ok((await h.poll()).some((call) => call.startsWith(`comment ${OWNER} The agent that worked on this ticket is no longer running`)), "retried");
   assert.deepEqual(await h.poll(), [], "then nothing");
+});
+
+test("the crash cutover clears an old owner escalation, so the agent is restarted again under the new rule", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { crash: true });
+  h.github.view = { ...READY, checks: [failing("PR code")] };
+  await h.crashFile(JSON.stringify({ a1: { restarts: 2, escalated: true, resume: null, error: CRASH } }));
+  await h.restart();
+  const calls = await h.poll();
+  assert.ok(calls.includes("reload a1"), "the old cap's hand-over is cleared: the agent is restarted");
+  assert.ok(!calls.some((call) => call.startsWith("comment")), "no owner mention");
+  const saved = JSON.parse(await h.crashFile());
+  assert.equal(saved.a1.escalated, undefined, "the flag is gone from the state file");
+  assert.equal(saved.a1.restarts, 3, "the restarts stay, so the next crash starts a successor");
 });
 
 test("without an open pull request, a healthy agent or a ticket that is not started is left alone", async (t) => {
@@ -2472,19 +2585,20 @@ test("a saved resume, also one saved before this line existed, is sent with the 
 
 test("a refused Linear call for one crashed agent does not stop the crash pass for the next", async (t) => {
   t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
   const h = harness(t, { crash: true });
   h.records[0] = { ...h.records[0], links: {} };
   h.records.push({ ...h.records[0], issueId: "i2", identifier: "TUC-2", agentId: "a2", worktreePath: "/wt/tuc-2" });
-  await h.crashFile(JSON.stringify({ a1: { restarts: 2 } }));
+  await h.crashFile(JSON.stringify({ a1: { restarts: STAGE_NUDGES } }));
   await h.restart();
   h.linear.arrive = async () => { throw REFUSED(); };
   const calls = await h.poll();
-  assert.ok(!calls.includes("reload a1"), "a1's crashes go to the owner");
-  assert.ok(calls.includes("reload a2"), "a2 is restarted although a1's comment was refused");
-  assert.equal(JSON.parse(await h.crashFile()).a1.escalated, false, "a1's refused comment is retried on the next poll");
+  assert.ok(!calls.includes("reload a1"), "a1's three restarts went to the successor path");
+  assert.ok(calls.includes("reload a2"), "a2 is restarted although a1's hand-back comment was refused");
+  assert.ok(!JSON.parse(await h.crashFile()).a1.successor, "a1's mark goes, so the hand-back is retried on the next poll");
 });
 
-test("a crashed agent with a stalled pull request that the ticket check or the restart limit held back is not reloaded by its nudge in the same poll", async (t) => {
+test("a crashed agent with a stalled pull request that the ticket check or the successor path held back is not reloaded by its nudge in the same poll", async (t) => {
   t.mock.method(console, "error", () => {});
   const unknown = harness(t, { crash: true });
   unknown.github.view = { ...READY, checks: [failing("PR code")] };
@@ -2492,13 +2606,13 @@ test("a crashed agent with a stalled pull request that the ticket check or the r
   unknown.linear.statesFailure = REFUSED();
   assert.ok(!(await unknown.poll()).includes("reload a1"), "no known state: the nudge waits with the crash pass");
 
-  const capped = harness(t, { crash: true });
-  capped.github.view = { ...READY, checks: [failing("PR code")] };
-  await capped.crashFile(JSON.stringify({ a1: { restarts: 2 } }));
-  await capped.restart();
-  capped.linear.arrive = async () => { throw REFUSED(); };
-  assert.ok(!(await capped.poll()).includes("reload a1"), "a refused owner comment does not let the nudge restart it a third time");
-  assert.equal(JSON.parse(await capped.crashFile()).a1.restarts, 2);
+  const succeeded = harness(t, { crash: true });
+  succeeded.github.view = { ...READY, checks: [failing("PR code")] };
+  await succeeded.crashFile(JSON.stringify({ a1: { restarts: STAGE_NUDGES } }));
+  await succeeded.restart();
+  succeeded.linear.arrive = async () => { throw REFUSED(); };
+  assert.ok(!(await succeeded.poll()).includes("reload a1"), "a refused hand-back comment does not let the nudge reload it again");
+  assert.equal(JSON.parse(await succeeded.crashFile()).a1.restarts, STAGE_NUDGES, "and no restart is counted");
 });
 
 // ---- The cheap first look (ConditionalPullView): conditional REST requests per pull request (read
@@ -2702,7 +2816,8 @@ test("a gone agent's stalled stage starts one successor with the nudge as its le
     assert.deepEqual(await h.poll(), [], "judged again on the next poll");
     h.paseo.succeed = startSuccessor;
     const calls = await h.poll();
-    assert.match(calls[0], /^succeed a1\nChecks failed on the head[^]*This is nudge 1 of 2 for this step; after that the owner takes over\.$/);
+    assert.ok(calls[0].startsWith("succeed a1\nChecks failed on the head"), calls[0]);
+    assert.ok(calls[0].endsWith(`\n\n${NUDGE_CLOSE}`), calls[0]);
     assert.equal(calls[1], STARTED_LINE("fix the failing checks"));
     assert.equal(calls.length, 2, JSON.stringify(agent));
     assert.equal(h.records[0].agentId, SUCCESSOR.id, "the record names the successor");
@@ -2712,7 +2827,7 @@ test("a gone agent's stalled stage starts one successor with the nudge as its le
   }
 });
 
-test("a successor start counts as a nudge: a gone agent's stage still reaches the owner after two", async (t) => {
+test("a successor start counts as a nudge: a gone agent's stage keeps stalling without limit and asks for a new approach every third", async (t) => {
   t.mock.method(console, "log", () => {});
   const h = harness(t, { status: "archived", autoResume: true });
   h.paseo.succeed = async (claim) => {
@@ -2720,15 +2835,16 @@ test("a successor start counts as a nudge: a gone agent's stage still reaches th
     h.records[0] = { ...h.records[0], status: "archived" };
     return { kind: "started", agent: { ...SUCCESSOR, id: h.records[0].agentId } };
   };
-  for (const head of ["h1", "h2"]) {
+  for (const head of ["h1", "h2", "h3", "h4"]) {
     h.github.view = { ...READY, headSha: head, checks: [failing("PR code")] };
-    assert.match((await h.poll())[0], /^succeed a1\n/, head);
+    const calls = await h.poll();
+    assert.match(calls[0], /^succeed a1\n/, head);
+    if (head === "h3") assert.match(calls[0], /keeps stalling at this step \(nudge 3\); change your approach/, head);
+    else assert.doesNotMatch(calls[0], /keeps stalling/, head);
+    assert.ok(calls[0].endsWith(`\n\n${NUDGE_CLOSE}`), head);
+    assert.ok(!calls.some((call) => call.startsWith("comment")), `${head}: no count hands the stage to the owner`);
     h.records[0] = { ...h.records[0], status: "archived" };
   }
-  h.github.view = { ...READY, headSha: "h3", checks: [failing("PR code")] };
-  const calls = await h.poll();
-  assert.match(calls[0], new RegExp(`^comment ${OWNER} Paseo asked the agent 2 times to fix the failing checks`));
-  assert.ok(!calls.some((call) => call.startsWith("succeed")));
 });
 
 test("a gone agent's message goes to the ticket when no successor can start, the switch is off, or the pull request is vetoed", async (t) => {
@@ -2859,7 +2975,8 @@ test("a live agent of the ticket takes the gone agent's record and gets the mess
   assert.deepEqual(await h.poll(), [], "nothing claimed yet");
   h.paseo.succeed = async () => { throw new Error("the live agent takes it"); };
   const calls = await h.poll();
-  assert.match(calls[0], /^prompt a2\nChecks failed on the head[^]*nudge 1 of 2/);
+  assert.ok(calls[0].startsWith("prompt a2\nChecks failed on the head"), calls[0]);
+  assert.ok(calls[0].endsWith(`\n\n${NUDGE_CLOSE}`), calls[0]);
   assert.deepEqual(await h.poll(), []);
 });
 
@@ -2888,7 +3005,10 @@ test("a stage waiting 60 minutes for the owner's answer reminds the owner once; 
   assert.deepEqual(await h.poll(), [], "once");
   h.paseo.answer = async () => "sent";
   h.github.view = { ...READY, headSha: "h2", checks: [failing("PR code")] };
-  assert.deepEqual(await h.poll(), [], "the stage is exhausted: a new head of it only reaches the log");
+  const nudged = await h.poll();
+  assert.ok((promptOf(nudged) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`), "a new stall of the stage is nudged again: no count stops it");
+  assert.equal(nudged.at(-1), "say thought The pull request is waiting for the agent to fix the failing checks; it was asked to.");
+  assert.deepEqual(await h.poll(), [], "and the same head is not nudged twice while the answer is pending");
 });
 
 test("a message that went out, a new head or another stage starts the permission wait again from zero", async (t) => {
@@ -2900,7 +3020,7 @@ test("a message that went out, a new head or another stage starts the permission
   await h.poll();
   h.scripts.now = start + 50 * MINUTE;
   h.paseo.answer = async () => "sent";
-  assert.match(promptOf(await h.poll()) ?? "", /nudge 1 of 2/, "answered before the hour: sent");
+  assert.ok((promptOf(await h.poll()) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`), "answered before the hour: sent");
   h.github.view = { ...READY, headSha: "h2", checks: [failing("PR code")] };
   h.paseo.answer = async () => "waiting";
   assert.deepEqual(await h.poll(), [], "a new head waits from now");
@@ -3412,7 +3532,7 @@ test("TUC-1265: a confirmed base conflict asks for an own-stack rebase after dra
     "Next step: rebase only your own stack onto the current `main`: this branch and your branches above it, resolving the conflicts. Run the checks your repository's AGENTS.md requires, then push and resubmit the rebased branches the way it prescribes (its review and publication rules still hold).",
     "Do not run `gt sync` or `gt restack`, never rebase, restack or push another ticket's branches, and never enqueue around this pull request's parent.",
     "",
-    "This is nudge 1 of 2 for this step; after that the owner takes over.",
+    `${NUDGE_CLOSE}`,
   ].join("\n"));
   assert.equal(calls.at(-1), "say thought The pull request is waiting for the agent to resolve the base conflict; it was asked to.");
   assert.deepEqual(await h.poll(), [], "claimed for this head");
@@ -3438,23 +3558,22 @@ test("TUC-1265: a confirmed base conflict asks for an own-stack rebase after dra
   assert.match(promptOf(memberCalls) ?? "", /\(`mtuchel\/tuc-1-a` at `head0`\) conflicts with its base `main`/);
 });
 
-test("TUC-1265: base conflicts on new heads use the stage's two nudges, then one owner mention with the blocked pull request, and a restart repeats none", async (t) => {
-  const log = t.mock.method(console, "error", () => {});
+test("TUC-1265: base conflicts on new heads keep being nudged, every third asks for a new approach, and no count mentions the owner", async (t) => {
   const h = harness(t);
   const conflict = (head: string) => stackOf(h, 2, {}, { headSha: head, mergeable: "CONFLICTING" });
+  h.paseo.answer = async () => "sent";
   conflict("c1");
-  assert.match(promptOf(await h.poll()) ?? "", /pull\/418\)[^]*nudge 1 of 2/);
+  assert.match(promptOf(await h.poll()) ?? "", /pull\/418\)[^]*never just wait\.$/);
   conflict("c2");
-  assert.match(promptOf(await h.poll()) ?? "", /pull\/418\)[^]*nudge 2 of 2/);
+  assert.match(promptOf(await h.poll()) ?? "", /pull\/418\)[^]*never just wait\.$/);
   conflict("c3");
   const third = await h.poll();
-  assert.equal(promptOf(third), undefined);
-  assert.ok(third[0].startsWith(`comment ${OWNER} Paseo asked the agent 2 times to resolve the base conflict on [the pull request](${prUrl(418)}), and it is stuck there again, so Paseo stops asking. Please take over.`), third[0]);
-  assert.equal(third[1], "say response The pull request is stuck again waiting for the agent to resolve the base conflict; the owner was asked to take over.");
+  assert.match(promptOf(third) ?? "", /pull\/418\)[^]*keeps stalling at this step \(nudge 3\); change your approach[^]*never just wait\.$/, "the third nudge asks for a new approach");
   await h.restart();
   conflict("c4");
-  assert.deepEqual(await h.poll(), [], "after a restart a new head only reaches the log");
-  assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /pull\/418 is waiting for the agent to resolve the base conflict again; already escalated/);
+  const fourth = await h.poll();
+  assert.match(promptOf(fourth) ?? "", /pull\/418\)[^]*never just wait\.$/, "also after a restart");
+  assert.ok(!fourth.some((call) => call.startsWith("comment")), "no restart count or nudge count mentions the owner");
 
   t.mock.method(console, "log", () => {});
   const waiting = harness(t);
@@ -3467,7 +3586,9 @@ test("TUC-1265: base conflicts on new heads use the stage's two nudges, then one
   await waiting.restart();
   waiting.paseo.answer = async () => "sent";
   stackOf(waiting, 2, {}, { headSha: "w2", mergeable: "CONFLICTING" });
-  assert.deepEqual(await waiting.poll(), [], "the waited-out stage is exhausted; no second mention after the restart");
+  const nudged = await waiting.poll();
+  assert.ok((promptOf(nudged) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`), "a new head of the stage is nudged again; no second mention for it");
+  assert.equal(nudged.at(-1), "say thought The pull request is waiting for the agent to resolve the base conflict; it was asked to.");
 });
 
 test("TUC-1265: a hold anywhere on the stack defers its connected repair without any claim, and one repair goes out once it clears", async (t) => {
@@ -3510,16 +3631,17 @@ test("TUC-1265: a hold anywhere on the stack defers its connected repair without
   assert.ok(calls[1].includes(`Checks failed on the head of [the pull request](${prUrl(418)})`), "a gone agent's repair goes to the ticket");
 });
 
-test("TUC-1265: an exhausted stage stops only that member's stage; the rest of the stack is still repaired, also after a restart", async (t) => {
-  const log = t.mock.method(console, "error", () => {});
+test("TUC-1265: an old stage's nudges never exhaust it: its next new head is nudged, and the stack's other members follow on the next poll", async (t) => {
   const h = harness(t);
+  h.paseo.answer = async () => "sent";
+  // State the old plugin left: three nudges of the middle's red stage (its whole budget then).
   await h.state({ [prUrl(418)]: { reviewedAt: null, decision: null, merged: false, nudges: { red: ["x1", "x2", "x3"] } } });
   stackOf(h, 2, {}, { ...RED, headSha: "x4" }, RED);
-  assert.deepEqual(prompted(await h.poll()), [PR], "the escalated middle only logs; the red link gets its own first nudge");
-  assert.match(String(log.mock.calls.find((call) => /pull\/418 is waiting/.test(String(call.arguments[0])))?.arguments[0]), /already escalated to the owner/);
+  assert.deepEqual(prompted(await h.poll()), [prUrl(418)], "the old cap does not stop the next new head's nudge");
+  assert.deepEqual(prompted(await h.poll()), [PR], "and the other members are reached on the next poll");
   await h.restart();
   stackOf(h, 2, {}, { ...RED, headSha: "x5" }, RED);
-  assert.deepEqual(await h.poll(), [], "no restart or other member resets the middle's budget");
+  assert.deepEqual(prompted(await h.poll()), [prUrl(418)], "also after a restart, on the stage's next new head");
   assert.deepEqual((await saved(h))[prUrl(418)].nudges, { red: ["x1", "x2", "x3", "x4", "x5"] });
 });
 
@@ -3566,7 +3688,7 @@ test("TUC-1265: an agent waiting for the owner holds the whole stack's repairs, 
   const state = await saved(h);
   assert.equal(state[prUrl(418)]?.nudges, undefined, "the middle was not even tried");
   h.paseo.answer = async () => "sent";
-  assert.deepEqual(prompted(await h.poll()), [prUrl(418)], "the bottom's stage is exhausted; the middle goes next");
+  assert.deepEqual(prompted(await h.poll()), [prUrl(418)], "the bottom's waited-out stall is claimed; the middle goes next");
 });
 
 test("TUC-1265: a member the stack held back starts its permission wait from zero once the hold lifts", async (t) => {

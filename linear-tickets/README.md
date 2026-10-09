@@ -1521,8 +1521,9 @@ before anything is sent, so it is delivered at most once, also across restarts. 
 removed limits had handed to the owner is un-escalated when the plugin loads that file, and its
 newest drop is handed back once — the poll claims it again like any drop, so it gets the request
 its class needs. The entry keeps a `cutover` mark, so a later load never hands the same drop back
-twice; a message the old path had routed to the owner and never sent is dropped, and escalations
-of a stage or a crash restart stay as they are. A message for a
+twice; a message the old path had routed to the owner and never sent is dropped, and an old stage
+escalation stays in the entry (the stage simply resumes nudging on its next new stall key, see
+**Stalled pull requests**). A message for a
 pull request that still holds an undelivered one waits behind it and goes out after it. An
 archived agent's open pull request stays watched until it is escalated to you or 14 days without
 activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
@@ -1754,11 +1755,18 @@ one message per poll: merge queue drops of all its pull requests come first, the
 pull requests of one stack take turns; within a connected stack, the first member whose step went
 (or tried to go) to the agent ends the poll's pass, so a busy or waiting agent is asked about one
 pull request at a time. Each stage is claimed per head right before it goes out:
-a new head can be nudged again, at most twice per stage and pull request. Requested changes are
-claimed per review instead: a change request is sent once, however many commits follow it (it
-keeps holding the merge until the reviewer settles it), and a new request is sent again. The next time that
-stage stalls, you get one comment instead ("Paseo asked the agent 2 times to …"), and after
-that only the log. A busy or disconnected agent is asked on a later poll; a gone or archived
+a new head can be nudged again; no count stops the nudges or mentions you (TUC-1777). Every new
+stall of a stage gets its message, and every third nudge of the same stage and pull request (the
+3rd, 6th, …) adds the approach-change line: the step keeps stalling, change the approach, and if
+a decision only you can make blocks it, ask through the ticket's normal question path (the
+deputy answers first) now instead of waiting. Every nudge prompt ends with the same owner policy
+a drop's fix request states: involve you only for a decision that can break something (data,
+production or staging, migrations, security, reverting someone else's landed work) or that
+changes how CI works in general (required checks, CI selection, quarantine, queue settings),
+through the ticket's normal question path (the deputy answers first); never just wait.
+Requested changes are claimed per review instead: a change request is sent once, however many
+commits follow it (it keeps holding the merge until the reviewer settles it), and a new request is
+sent again. A busy or disconnected agent is asked on a later poll; a gone or archived
 agent's nudge starts a successor or goes to the ticket like a drop's fix request.
 Review threads are read (GraphQL, every page) only when a stage needs them.
 
@@ -1767,8 +1775,8 @@ included) or replacement request for an agent that is archived or no longer exis
 successor: a new agent on the ticket's recorded branch and worktree, which gets the handover of
 the previous agent's reports and, as the last part of its first prompt, "Paseo started you
 because the pull request needs this now:" with the message. It is claimed right before the start
-and counts like a message sent (the two nudges per stage), so a pull request
-that keeps stalling still reaches you. The ticket's panel shows "The agent was gone; Paseo
+and counts like a message sent, so a pull request
+that keeps stalling keeps getting its step. The ticket's panel shows "The agent was gone; Paseo
 started a successor (agent 1a2b3c4d) on `<branch>` and asked it to …"; it gets its own thread,
 the gone agent is archived and the handover record names the successor. When no slot is free
 (blockers, the agent limit, memory, away mode) or another start of the ticket is under way, the
@@ -1793,8 +1801,10 @@ removes a worktree or changes a branch.
 **Waiting for your answer.** An agent waiting for your answer or approval takes no message, so
 the pull request waits with it. When a nudge, fix request or replacement request has waited 60
 minutes for such an agent, you get one comment, "The agent has waited over 60 minutes for your
-answer while the pull request waits for it to …", and the message counts as escalated (the
-stage's nudges, the drop, the replacement request then only reach the log). The wait is kept in
+answer while the pull request waits for it to …", and the message counts as claimed: that stall
+key is not nudged again while the answer is pending (a new stall of the same stage is a new
+step and is nudged like any other), and the drop's range and the replacement request then only
+reach the log. The wait is kept in
 `pr-watch.json` across polls, restarts and a busy or disconnected agent, and starts again for a
 new head, review or stage, or once a message went out.
 
@@ -1836,15 +1846,36 @@ back. It covers every crashed agent of a ticket with a running record, open pull
 A crashed agent is restarted the way `paseo agent reload` does it, keeping its conversation and
 worktree, and then gets one message that names the crash, tells it to run `git status` and finish
 or abort an interrupted rebase, and says "Your ticket … is in …. Continue the lifecycle step you
-were on." The agent panel shows "The agent had crashed (…); Paseo restarted it …". Every restart
-counts, so an agent that crashes on every turn reaches the owner after two: then one comment to
-the owner, then nothing. When the restart fails, the attempt still counts. A busy agent, an agent
+were on." The agent panel shows "The agent had crashed (…); Paseo restarted it …". No restart
+count hands an agent to you (TUC-1777): the first restart of an agent is immediate, the second
+waits two minutes after the first and the third four minutes after the second (the wait doubles
+per restart, capped at an hour, and the pass runs every two minutes, so a due restart goes out
+with the next poll) — and after three restarts of the same agent the next crash starts a successor
+for the ticket instead of reloading the broken session again: a new agent on the recorded branch
+and worktree, with the pending resume (or the restart's message) as its lead, started exactly like
+a gone agent's successor (see **Gone agents**, `do-not-merge` and the automatic-start switch
+included). When no successor can start, the ticket goes back to In Progress with one comment
+mentioning you, as a gone agent's message does. When the restart fails, the attempt still counts,
+and its backoff starts with the next one. A busy agent, an agent
 waiting for an answer, and an agent whose ticket has another live agent (for example a successor
 the automatic resume just started) are never restarted. A crashed agent the crash pass looked at
 gets no nudge, merge queue fix request or replacement request in that poll, restarted or not: the
-ticket check and the restart limit hold for those too. They still restart an agent that crashed
-after the crash pass ran, within the same limit. For an agent whose crashes went to the owner, a
-fix or replacement request goes to the ticket instead (no successor: the agent still exists).
+ticket check and the backoff hold for those too. They still restart an agent that crashed
+after the crash pass ran, within the same schedule. A nudge, fix or replacement request for a
+crashed agent is sent by its restart, with the resume; one whose crash already went through the
+successor path goes to the ticket instead, as before.
+
+Two crashes no restart loop clears, checked by `server/pr-watch.ts` (`crashKind`) in this order:
+
+- **Usage and rate limits** (the existing classifier `limitError` of `server/limit-resume.ts`):
+  the agent is never restarted and the crash never counts. The limit-resume handling starts a new
+  agent at the reset instead (see **Usage-limit resumes**), and the message names that.
+- **Owner-only setup failures** (`SETUP_FAILURE`): the error says the agent cannot run until a
+  person fixes the host — provider credentials or authentication (a missing, invalid or rejected
+  API key), credit or quota, or a full disk. Generic denials (permission denied, forbidden) take
+  the restart and successor path instead. You get one comment naming the
+  error; Paseo starts no restart loop until that crash changes (a reloaded agent that crashes
+  with a different error is handled normally again).
 
 An agent is restarted only while its ticket is in a started state (a ticket in review whose pull
 requests merged is still started: it may have steps left). The check reads the ticket's state on
@@ -1866,8 +1897,11 @@ If the message does not go out after the restart (the agent is busy right away, 
 or the plugin stops), it is sent on a later poll, at least once: a duplicate is possible, so the
 message asks the agent to check its state first. Sent on a stored state, it gets the check-first
 line too. It is dropped unsent once the ticket is no longer started, another agent took it over,
-or the agent's crashes went to the owner. The restarts live in
-`$PASEO_HOME/linear-tickets/crash-recovery.json`. A plan request (see `plan` label) waits until
+or its crash is one the pass never restarts (a successor, an owner-only setup failure, or a usage
+limit: those runs get their own message, see above). The restarts live in
+`$PASEO_HOME/linear-tickets/crash-recovery.json`; a crash the old plugin had handed to you
+(`escalated`) is cleared when that file loads, so the agent is restarted again, or succeeded,
+while its ticket is started. A plan request (see `plan` label) waits until
 the watch restarted the agent.
 
 **Silent and stuck agents.** A ticket agent that stops making progress is recovered by the
