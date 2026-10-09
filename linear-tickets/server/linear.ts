@@ -1163,15 +1163,18 @@ export class LinearService {
 
   // `issueStatus` on whichever pool can answer: the app's as usual, the key's when the app's refuses
   // (its reserve or a Linear rate limit). Crash recovery's ticket check (pr-watch.ts) must not wait
-  // for one exhausted pool; when no key is connected, the app's refusal propagates.
-  async issueStatusAnyPool(id: string): Promise<Pick<IssueState, "status" | "statusType">> {
+  // for one exhausted pool; when no key is connected, the app's refusal propagates. `sentAt`: when
+  // the request that answered was sent (milliseconds since the epoch), for KnownStates' precedence.
+  async issueStatusAnyPool(id: string): Promise<Pick<IssueState, "status" | "statusType"> & { sentAt: number }> {
+    const sentAt = Date.now();
     try {
-      return await this.issueStatus(id);
+      return { ...await this.issueStatus(id), sentAt };
     } catch (error) {
       if (!(error instanceof RateLimitedError) || error.pool !== "app") throw error;
       const { key } = await this.credentials.read();
       if (!key) throw error;
-      return issueStatusOf(await this.post(key, ISSUE_STATUS_QUERY, { id }));
+      const keySentAt = Date.now();
+      return { ...issueStatusOf(await this.post(key, ISSUE_STATUS_QUERY, { id })), sentAt: keySentAt };
     }
   }
 

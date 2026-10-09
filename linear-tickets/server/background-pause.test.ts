@@ -593,7 +593,10 @@ test("the crash check reads with the key when the app is at its reserve and is r
   const f = fixture(t, () => ({ issue: { state: { name: "In Progress", type: "started" } } }));
   f.sample("app", 100, HIGH_POINTS);
   f.sample("key", PLENTY_REQUESTS, HIGH_POINTS);
-  assert.deepEqual(await withPriority("interactive", "crash-recovery", () => f.linear.issueStatusAnyPool(ID_A)), { status: "In Progress", statusType: "started" });
+  const before = Date.now();
+  const { sentAt, ...read } = await withPriority("interactive", "crash-recovery", () => f.linear.issueStatusAnyPool(ID_A));
+  assert.deepEqual(read, { status: "In Progress", statusType: "started" });
+  assert.ok(sentAt >= before && sentAt <= Date.now(), "stamped when the key's request was sent");
   assert.deepEqual(f.calls, [{ pool: "key", operation: "issueStatus" }]);
 
   f.calls.length = 0;

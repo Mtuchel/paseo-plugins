@@ -293,7 +293,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       issueStatusAnyPool: async (id) => {
         linear.issueReads.push(id);
         if (linear.issueFailure) throw linear.issueFailure;
-        return { ...linear.state };
+        return { ...linear.state, sentAt: Date.now() };
       },
       issueStatuses: async (ids) => {
         linear.stateReads.push(ids);
@@ -2392,6 +2392,23 @@ test("a refused Linear call for one crashed agent does not stop the crash pass f
   assert.ok(!calls.includes("reload a1"), "a1's crashes go to the owner");
   assert.ok(calls.includes("reload a2"), "a2 is restarted although a1's comment was refused");
   assert.equal(JSON.parse(await h.crashFile()).a1.escalated, false, "a1's refused comment is retried on the next poll");
+});
+
+test("a crashed agent with a stalled pull request that the ticket check or the restart limit held back is not reloaded by its nudge in the same poll", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const unknown = harness(t, { crash: true });
+  unknown.github.view = { ...READY, checks: [failing("PR code")] };
+  unknown.linear.issueFailure = REFUSED();
+  unknown.linear.statesFailure = REFUSED();
+  assert.ok(!(await unknown.poll()).includes("reload a1"), "no known state: the nudge waits with the crash pass");
+
+  const capped = harness(t, { crash: true });
+  capped.github.view = { ...READY, checks: [failing("PR code")] };
+  await capped.crashFile(JSON.stringify({ a1: { restarts: 2 } }));
+  await capped.restart();
+  capped.linear.arrive = async () => { throw REFUSED(); };
+  assert.ok(!(await capped.poll()).includes("reload a1"), "a refused owner comment does not let the nudge restart it a third time");
+  assert.equal(JSON.parse(await capped.crashFile()).a1.restarts, 2);
 });
 
 // ---- The cheap first look (ConditionalPullView): conditional REST requests per pull request (read

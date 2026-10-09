@@ -874,10 +874,12 @@ export class PullRequestWatch {
 
   // How a message's send recovers a crashed agent: right before the reload the agent is reserved,
   // `claim` records the attempt, the restart is counted (see Crash) and the resume is kept until it
-  // went out. None for an agent whose crashes went to the owner: its send then comes to `crashed`.
+  // went out. None for an agent whose crashes went to the owner, or that used up its STAGE_NUDGES
+  // restarts and waits for the crash pass's owner comment: its send then comes to `crashed`.
   // `unverified`: the ticket state the restart goes by could not be read just now (see crashPass).
   private recovery(record: HandoverRecord, reserved: Set<string>, claim: () => Promise<void>, unverified?: KnownState): Recovery | undefined {
-    if (this.crashes[record.agentId]?.escalated) return undefined;
+    const crash = this.crashes[record.agentId];
+    if (crash?.escalated || (crash?.restarts ?? 0) >= STAGE_NUDGES) return undefined;
     return {
       issueId: record.issueId,
       ...(unverified ? { unverified: { name: unverified.name, at: unverified.at } } : {}),
@@ -2514,13 +2516,12 @@ export class PullRequestWatch {
   // wrote meanwhile. When both pools refuse, the state Paseo last saw (`unverified`). Null when none
   // is known: the agent waits for the next poll rather than being restarted on a guess.
   private async ticketState(record: HandoverRecord): Promise<{ status: string; statusType: string; unverified?: KnownState } | null> {
-    const sent = Date.now();
     try {
       const read = await this.deps.linear.issueStatusAnyPool(record.issueId);
       this.unknownLogged.clear();
-      await this.knownStates.observe(record.issueId, { name: read.status, type: read.statusType }, sent);
+      await this.knownStates.observe(record.issueId, { name: read.status, type: read.statusType }, read.sentAt);
       const known = await this.knownStates.get(record.issueId);
-      return known ? { status: known.name, statusType: known.type } : read;
+      return known ? { status: known.name, statusType: known.type } : { status: read.status, statusType: read.statusType };
     } catch (error) {
       if (!(error instanceof RateLimitedError)) throw error;
       const known = await this.knownStates.get(record.issueId);
@@ -2564,13 +2565,16 @@ export class PullRequestWatch {
 
   // Every crashed agent of a running ticket, with an open pull request or not, is restarted while
   // its ticket is started: up to STAGE_NUDGES restarts in all (see Crash), then one comment to the
-  // owner, then nothing.
+  // owner, then nothing. Every crashed agent this pass looked at is reserved for the poll, restarted
+  // or not: a nudge, drop fix or replacement must not reload one the ticket check or the restart
+  // limit held back.
   private async crashedAgents(all: HandoverRecord[], reserved: Set<string>): Promise<void> {
     for (const record of all) {
       if (record.status === "archived" || reserved.has(record.agentId) || this.crashes[record.agentId]?.escalated) continue;
       try {
         const error = await this.deps.sessions.crashed(record.agentId);
         if (!error) continue;
+        reserved.add(record.agentId);
         const state = await this.ticketState(record);
         if (!state || state.statusType !== "started") continue;
         if ((this.crashes[record.agentId]?.restarts ?? 0) >= STAGE_NUDGES) {
@@ -2584,6 +2588,8 @@ export class PullRequestWatch {
             throw failure;
           }
           await this.tell(record, "response", "The agent crashed again; the owner was asked to take over.");
+          // Its crashes are the owner's now: a drop fix or replacement goes to the ticket this poll.
+          reserved.delete(record.agentId);
           continue;
         }
         const text = `Your ticket ${record.identifier} is in ${state.status}. Continue the lifecycle step you were on.`;

@@ -1817,10 +1817,11 @@ were on." The agent panel shows "The agent had crashed (…); Paseo restarted it
 counts, so an agent that crashes on every turn reaches the owner after two: then one comment to
 the owner, then nothing. When the restart fails, the attempt still counts. A busy agent, an agent
 waiting for an answer, and an agent whose ticket has another live agent (for example a successor
-the automatic resume just started) are never restarted. A nudge, a merge queue fix request or a
-replacement request still restarts a crashed agent the crash pass did not reach in that poll; for
-an agent whose crashes went to the owner it is not restarted, and a fix or replacement request
-goes to the ticket instead (no successor: the agent still exists).
+the automatic resume just started) are never restarted. A crashed agent the crash pass looked at
+gets no nudge, merge queue fix request or replacement request in that poll, restarted or not: the
+ticket check and the restart limit hold for those too. They still restart an agent that crashed
+after the crash pass ran, within the same limit. For an agent whose crashes went to the owner, a
+fix or replacement request goes to the ticket instead (no successor: the agent still exists).
 
 An agent is restarted only while its ticket is in a started state (a ticket in review whose pull
 requests merged is still started: it may have steps left). The check reads the ticket's state on
