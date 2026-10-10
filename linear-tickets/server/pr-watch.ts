@@ -6,6 +6,7 @@ import { z } from "zod";
 import { githubCli } from "./github-cli";
 import { githubUsage } from "./github-usage";
 import type { GreptileOutage, RetriggerResult } from "./greptile-outage";
+import { CONTEXT_TOO_LARGE } from "./context";
 import type { Handover, HandoverRecord } from "./handover";
 import { KnownStates, type KnownState } from "./known-states";
 import { limitError } from "./limit-resume";
@@ -1034,6 +1035,15 @@ function crashKind(error: string): "limit" | "setup" | null {
 // crash after STAGE_NUDGES restarts was handed to the owner); the load clears it (see
 // cutOverCrashes).
 type Crash = { restarts?: number; restartedAt?: string; successor?: boolean; setup?: string; limit?: string; escalated?: boolean; resume?: { text: string; issueId: string } | null; error?: string };
+
+// One owner ask about a ticket too large to start any agent (see PullRequestWatch.oversizeHandBack).
+type OversizeAsk = { state: "pending" | "confirmed"; issueId: string; at: string };
+
+// An oversized ticket's ask is keyed by the ticket and the gone agent its messages were for, so a
+// new agent's later failure is a new ask.
+function oversizeKey(record: HandoverRecord): string {
+  return `${record.issueId}:${record.agentId}`;
+}
 
 // The TUC-1777 crash cutover, run on every load: the removed rule handed an agent to the owner
 // after STAGE_NUDGES restarts and stopped restarting it (`escalated: true`). The flag goes; its
@@ -2799,7 +2809,7 @@ export class PullRequestWatch {
         return;
       }
       if (next && next.kind !== "impossible") return;
-      await this.handBack(record, fix, toAgent);
+      await this.handBack(record, fix, toAgent, next);
       await delivered();
       await this.tell(record, "response", `${pending.subject ?? "The merge queue dropped the pull request"} and the agent is no longer running; the ticket is back in ${CODING_STATE}.\n\n${pending.facts}`);
     } finally {
@@ -2975,7 +2985,7 @@ export class PullRequestWatch {
         return true;
       }
       if (next && next.kind !== "impossible") return true;
-      await this.handBack(record, prompt, toAgent);
+      await this.handBack(record, prompt, toAgent, next);
       await this.tell(record, "response", `The pull request is waiting for the agent to ${STAGE_STEP[stage]}, and the agent is no longer running; the ticket is back in ${CODING_STATE}.`);
       return true;
     } catch (error) {
@@ -3079,7 +3089,7 @@ export class PullRequestWatch {
         return;
       }
       if (next && next.kind !== "impossible") return;
-      await this.handBack(record, text, toAgent);
+      await this.handBack(record, text, toAgent, next);
       await this.tell(record, "response", `The pull request was closed because the branch below it landed, and the agent is no longer running; the ticket is back in ${CODING_STATE}.`);
     } catch (error) {
       // A message that failed outright was not sent: the next poll sends it again.
@@ -3353,7 +3363,7 @@ export class PullRequestWatch {
       return;
     }
     if (next && next.kind !== "impossible") return;
-    await this.handBack(record, text, toAgent);
+    await this.handBack(record, text, toAgent, next);
     await done();
     await this.tell(record, "response", `The stack policy was sent to the ticket, and the agent is no longer running; the ticket is back in ${CODING_STATE}.`);
   }
@@ -3513,7 +3523,7 @@ export class PullRequestWatch {
     }
     if (next && next.kind !== "impossible") return;
     try {
-      await this.handBack(record, lead, claim);
+      await this.handBack(record, lead, claim, next);
     } catch (failure) {
       // The comment failed: the mark goes, so the next pass tries the successor (and the comment)
       // again instead of losing the hand-back.
@@ -3541,12 +3551,73 @@ export class PullRequestWatch {
 
   // A message for an agent that is gone goes to the ticket: back to coding (when status write-back
   // is on) and a comment mentioning the owner. `dispatch` records it right before the comment. A
-  // resume a restart left pending no longer goes out.
-  private async handBack(record: HandoverRecord, text: string, dispatch: () => Promise<void>): Promise<void> {
+  // resume a restart left pending no longer goes out. A successor that failed because the ticket is
+  // too large for any prompt (`next.tooLarge`) asks the owner once (see oversizeHandBack).
+  private async handBack(record: HandoverRecord, text: string, dispatch: () => Promise<void>, next: Succession | null): Promise<void> {
+    if (next?.kind === "impossible" && next.tooLarge) return this.oversizeHandBack(record, text, dispatch);
     await this.dropResume(record.agentId);
     if ((await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(record.issueId, CODING_STATE);
     await dispatch();
     await this.mention(record.issueId, `The agent that worked on this ticket is no longer running, so the ticket is back in ${CODING_STATE} for the next one.\n\n${text}`);
+  }
+
+  // The owner asks recorded for tickets too large to start any agent (README, "Long tickets"), one
+  // per ticket and gone agent (see oversizeKey), in oversize-asks.json next to pr-watch.json. Read
+  // and written whole on each use: the poll and the backstop take turns, so nothing races.
+  private get oversizePath(): string {
+    return join(dirname(this.path), "oversize-asks.json");
+  }
+
+  private async oversizeAsks(): Promise<Record<string, OversizeAsk>> {
+    try {
+      const parsed: unknown = JSON.parse(await readFile(this.oversizePath, "utf8"));
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, OversizeAsk> : {};
+    } catch {
+      return {};
+    }
+  }
+
+  // A ticket too large for any prompt cannot start a successor, whatever the event (a drop, a stalled
+  // stage, a replay, the stack cap, a crash), so the owner is asked once, not on every later one.
+  // `pending` is saved before the ask and `confirmed` after it; an ask still pending (its comment may
+  // have been posted before a failure or a restart) is looked up by its marker first, never posted
+  // blind. Only the host that owns the ticket asks: while the peer mechanism cannot tell, the message
+  // waits (it throws, so the caller retries it on the next poll). A confirmed ask still claims later
+  // messages, without a comment or a state change. A successor or live agent taking the ticket over
+  // clears it (see succession).
+  private async oversizeHandBack(record: HandoverRecord, text: string, dispatch: () => Promise<void>): Promise<void> {
+    const key = oversizeKey(record);
+    const marker = `<!-- paseo:oversize-start:${key} -->`;
+    const asks = await this.oversizeAsks();
+    const save = async (state: OversizeAsk["state"]) => {
+      asks[key] = { state, issueId: record.issueId, at: new Date(this.clock()).toISOString() };
+      await writeState(this.oversizePath, asks);
+    };
+    if (asks[key]?.state === "confirmed") {
+      await this.dropResume(record.agentId);
+      await dispatch();
+      console.log(`[linear-tickets] ${record.identifier}: the ticket is still too large to start an agent; the owner was already asked, so the message is not posted again`);
+      return;
+    }
+    const owned = async () => {
+      const owners = this.deps.owner ? await this.deps.owner([record.issueId]).catch(() => null) : new Set([record.issueId]);
+      if (!owners?.has(record.issueId)) throw new Error("the ticket is too large to start an agent, and whether this host owns it cannot be told; the owner is asked once it can");
+    };
+    await owned();
+    if (asks[key]?.state === "pending" && await this.deps.linear.hasComment(record.issueId, marker)) {
+      await save("confirmed");
+      await this.dropResume(record.agentId);
+      await dispatch();
+      console.log(`[linear-tickets] ${record.identifier}: the owner's ask about the oversized ticket was already posted; it is recorded now`);
+      return;
+    }
+    await save("pending");
+    await this.dropResume(record.agentId);
+    if ((await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(record.issueId, CODING_STATE);
+    await dispatch();
+    await owned();
+    await this.mention(record.issueId, `The agent that worked on this ticket is no longer running, and no successor can start: ${CONTEXT_TOO_LARGE} The ticket is back in ${CODING_STATE}. Paseo asks only once: later messages for its pull requests are not posted here until an agent works on the ticket again. To go on, move the pull requests to another ticket by naming only that ticket in their titles and descriptions (README, "Moving a pull request to another ticket").\n\n${text}\n\n${marker}`);
+    await save("confirmed");
   }
 
   // A message for an agent that is gone starts a successor on the ticket's recorded branch and
@@ -3563,6 +3634,13 @@ export class PullRequestWatch {
     if (next.kind === "wait") console.log(`[linear-tickets] ${record.identifier}: the message for ${gone} waits for a successor: ${next.reason}`);
     else if (next.kind === "live") console.log(`[linear-tickets] ${record.identifier}: live agent ${next.agent.id.slice(0, 8)} took over the record of ${gone}; it gets the message on the next poll`);
     else if (next.kind === "impossible") console.error(`[linear-tickets] ${record.identifier}: no successor can start for ${gone} (${next.reason}); the message goes to the ticket`);
+    if (next.kind === "started" || next.kind === "live") {
+      // An agent works on the ticket again: a later oversized start asks the owner again.
+      const asks = await this.oversizeAsks();
+      const cleared = Object.keys(asks).filter((key) => asks[key].issueId === record.issueId);
+      for (const key of cleared) delete asks[key];
+      if (cleared.length) await writeState(this.oversizePath, asks).catch((error: unknown) => console.error(`[linear-tickets] ${record.identifier}: clearing the oversized-ticket ask failed: ${error instanceof Error ? error.message : error}`));
+    }
     return next;
   }
 

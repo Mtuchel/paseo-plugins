@@ -199,7 +199,15 @@ carries the same facts in `omittedComments`, including the Linear uploads of the
 comments, so the attachment download still saves them. Nothing is deleted in Linear. A ticket
 that cannot fit even then (a description over the limit, or a newest comment that alone is too
 long) fails as before: "This ticket and its comments are too large to send in one prompt
-(200,000 characters maximum)."
+(200,000 characters maximum)." Dispatch still comments that and adds the `-failed` label. When
+the pull request watch starts a successor for a gone agent (a queue drop, a stalled stage, a
+replay, the stack cap, a crash) and the start fails this way, the owner is asked once per ticket
+and gone agent (the comment carries the mark `<!-- paseo:oversize-start:<issue>:<agent> -->`, and
+`oversize-asks.json` next to `pr-watch.json` records it): later messages for its pull requests
+are claimed without another comment or state change, across restarts. Only the host that owns
+the ticket asks; while that cannot be told, the message waits. An ask whose comment may have
+been posted before a failure is looked up by its mark first, never posted twice. A successor or
+live agent taking the ticket over clears it.
 
 **Finished blockers.** When a ticket starts after blockers that are finished (see *Waiting their turn*), its prompt gets a
 **Finished blockers** section after the instructions: for each one, its links (pull requests,

@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
+import { CONTEXT_TOO_LARGE } from "./context";
 import type { RetriggerResult } from "./greptile-outage";
 import type { HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
@@ -4286,4 +4287,78 @@ test("the watchdog resumes an idle agent whose ticket names no repository and no
   // A known repository whose listing fails, or attachments that cannot be read, still veto.
   assert.deepEqual(await judge({ origin: "https://github.com/tuchel-sohn/tuchel-platform.git", listing: new Error("HTTP 502: Bad Gateway") }), []);
   assert.deepEqual(await judge({ attachments: new Error("Linear is unavailable") }), []);
+});
+
+// A successor start that fails because the ticket cannot fit in any prompt (sessions.ts `tooLarge`).
+const TOO_LARGE = async (claim: () => Promise<void>): Promise<Succession> => {
+  await claim();
+  return { kind: "impossible", reason: CONTEXT_TOO_LARGE, tooLarge: true };
+};
+const OVERSIZE_MARK = "<!-- paseo:oversize-start:i1:a1 -->";
+
+test("an oversized ticket asks the owner once: later drops and nudges, and a restart, claim their messages silently", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const h = harness(t, { live: false, autoResume: true });
+  h.paseo.succeed = TOO_LARGE;
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  const first = await h.poll();
+  assert.equal(first[0], "move In Progress");
+  assert.match(first[1], new RegExp(`^comment ${OWNER} The agent that worked on this ticket is no longer running, and no successor can start: This ticket and its comments are too large to send in one prompt \\(200,000 characters maximum\\)\\.`));
+  assert.ok(first[1].endsWith(OVERSIZE_MARK));
+  assert.equal(first.filter((call) => call.startsWith("comment")).length, 1);
+  // A stalled stage on the same pull request, then a new head after a restart: no new ask, no state change.
+  h.github.view = { ...READY, mergeActivity: activity(QUEUED, CONFLICT), checks: [failing("PR code")] };
+  const nudged = await h.poll();
+  assert.ok(!nudged.some((call) => call.startsWith("comment") || call.startsWith("move")), nudged.join("\n"));
+  await h.restart();
+  h.github.view = { ...h.github.view, headSha: "f00dfeedbeef" };
+  const restarted = await h.poll();
+  assert.ok(!restarted.some((call) => call.startsWith("comment") || call.startsWith("move")), restarted.join("\n"));
+  assert.deepEqual(await h.poll(), [], "each message was claimed");
+  assert.equal(h.linear.comments.i1.length, 1);
+  // A successor that starts clears the ask: the next agent's oversized failure is a new one.
+  h.paseo.succeed = async (claim) => { await claim(); return { kind: "started", agent: { id: "s2", title: "S2", cwd: "/wt/tuc-1" } }; };
+  h.github.view = { ...h.github.view, headSha: "0123456789ab" };
+  assert.ok((await h.poll()).some((call) => call.startsWith("succeed a1")));
+  const asks = JSON.parse(await readFile(join(await h.home(), "oversize-asks.json"), "utf8"));
+  assert.deepEqual(asks, {});
+});
+
+test("an oversized ticket's ask survives a lost response, a failed comment and an unknown owner without a second comment", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const owner: { owner?: "all" | "unknown" } = { owner: "unknown" };
+  const h = harness(t, Object.assign(owner, { live: false, autoResume: true }));
+  h.paseo.succeed = TOO_LARGE;
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  // Whether this host owns the ticket cannot be told: nobody asks, the drop stays pending.
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("comment")));
+  owner.owner = "all";
+  // The comment never reaches Linear: retried on the next poll.
+  h.linear.arrive = async () => { throw new Error("Linear is unavailable"); };
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("comment")));
+  // The comment reaches Linear, but its response is lost: the next poll finds it by its mark.
+  h.linear.arrive = async () => {};
+  h.linear.lost = true;
+  await h.poll();
+  h.linear.lost = false;
+  assert.equal(h.linear.comments.i1.length, 1);
+  const again = await h.poll();
+  assert.ok(!again.some((call) => call.startsWith("comment")), again.join("\n"));
+  assert.equal(h.linear.comments.i1.length, 1);
+  assert.ok(h.linear.comments.i1[0].endsWith(OVERSIZE_MARK));
+  assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "oversize-asks.json"), "utf8"))["i1:a1"].state, "confirmed");
+  assert.deepEqual(await h.poll(), [], "the drop was claimed once confirmed");
+});
+
+test("an unrelated successor failure still hands every message back as before", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const h = harness(t, { live: false, autoResume: true });
+  h.paseo.succeed = async (claim) => { await claim(); return { kind: "impossible", reason: "Paseo is not connected yet." }; };
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  assert.match((await h.poll())[1], HANDED_BACK);
+  h.github.view = { ...READY, mergeActivity: activity(QUEUED, CONFLICT), checks: [failing("PR code")] };
+  assert.match((await h.poll()).find((call) => call.startsWith("comment")) ?? "", HANDED_BACK);
 });

@@ -13,6 +13,7 @@ import { recoverActivationId, type ActivationSink } from "./activation";
 import type { AgentSessionWebhook } from "./agent-webhook";
 import { groupProgress, groupStatus, isGroup } from "./groups";
 import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
+import { ContextTooLargeError } from "./context";
 import { dispatchLabels } from "./dispatch";
 import type { Handover } from "./handover";
 import type { AdmissionState, IssueGroup, LinearService } from "./linear";
@@ -99,10 +100,13 @@ export type IdleRun<T> = { outcome: "ran"; value: T } | { outcome: "busy" | "wai
 // What a successor start for a gone agent (SessionRouter.succeed) came to. `started`: a new agent
 // runs with the message as the last part of its first prompt. `live`: another live agent of the
 // ticket now owns its record and takes the message from the next poll. `wait`: nothing claimed, try
-// again later. `impossible`: no successor can start (the caller tells the owner).
+// again later. `impossible`: no successor can start (the caller tells the owner); `tooLarge`: the
+// start failed because the ticket cannot fit in any prompt (context.ts ContextTooLargeError), which
+// no later attempt changes.
 export type Succession =
   | { kind: "started" | "live"; agent: { id: string; title: string | null; cwd: string } }
-  | { kind: "wait" | "impossible"; reason: string };
+  | { kind: "wait"; reason: string }
+  | { kind: "impossible"; reason: string; tooLarge?: true };
 // What a restart (SessionRouter.restartFor) came to. `started`: a new agent runs (`marked`: the
 // running label was written). `live`: a live agent already works on the ticket. `forwarded`: the
 // peer host owns the start. `skipped`: the ticket is deleted or paused for deletion. `deferred`:
@@ -2082,7 +2086,7 @@ export class SessionRouter {
         agentId = (await this.deps.starter.start(issue.id, paseo, settings, { retryHint: "assign Paseo again", resumeOnly: true, lead })).agentId;
       } catch (error) {
         await this.deps.linear.removeLabel(issue.id, running).catch(() => {});
-        return { kind: "impossible", reason: error instanceof Error ? error.message : String(error) };
+        return { kind: "impossible", reason: error instanceof Error ? error.message : String(error), ...(error instanceof ContextTooLargeError ? { tooLarge: true as const } : {}) };
       }
       console.log(`[linear-tickets] ${issue.identifier}: started a successor (agent ${agentId.slice(0, 8)}) for gone agent ${predecessorId.slice(0, 8)}`);
       const snapshot = (await paseo.agents.ref(agentId).refresh().catch(() => null))?.agent;

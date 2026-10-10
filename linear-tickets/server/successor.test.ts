@@ -7,6 +7,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import type { PaseoApi, PaseoWorkspaceAgentCreateOptions, PaseoWorkspaceCreateOptions } from "@getpaseo/client";
 import type { TicketDetail } from "../shared/contracts";
+import { ContextTooLargeError } from "./context";
 import type { ActivationResume } from "./activation";
 import { Dispatcher } from "./dispatch";
 import { Handover } from "./handover";
@@ -197,7 +198,7 @@ function routerHarness(options: {
   sessionStatus?: () => Promise<string | null>;
   route?: ConstructorParameters<typeof SessionRouter>[0]["route"];
   processLiveness?: typeof ticketProcessLiveness;
-  failStart?: boolean;
+  failStart?: boolean | Error;
   // Called inside the start, before the agent exists; the start goes on once it settles.
   pauseStart?: () => Promise<void>;
   openFails?: boolean;
@@ -234,7 +235,7 @@ function routerHarness(options: {
       calls.push("start");
       starts.push({ issueId, options: startOptions });
       if (options.pauseStart) await options.pauseStart();
-      if (options.failStart) throw new Error("Paseo is not connected yet.");
+      if (options.failStart) throw options.failStart === true ? new Error("Paseo is not connected yet.") : options.failStart;
       daemon.add(ticketAgent("agent-new", "2026-02-01T00:00:09Z"));
       return { agentId: "agent-new", warnings: [], provider: "claude/opus", target: "repo", resumed: true, untrusted: false, plan: null };
     },
@@ -358,6 +359,19 @@ test("a start that throws leaves the ticket unclaimed by a successor and says im
   assert.ok(h.calls.includes("+paseo-running") && h.calls.includes("-paseo-running"), "the running label is taken back");
   assertGateFree(h.gates);
   await h.cleanup();
+});
+
+test("a start that fails because the ticket cannot fit in a prompt says so, typed, with today's message", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = routerHarness({ failStart: new ContextTooLargeError(), agents: [ticketAgent("agent-gone", "2026-01-01T00:00:00Z", { status: "closed" })] });
+  assert.deepEqual(await succeed(h), { kind: "impossible", reason: "This ticket and its comments are too large to send in one prompt (200,000 characters maximum).", tooLarge: true });
+  assert.ok(h.calls.includes("-paseo-running"), "the running label is taken back");
+  assertGateFree(h.gates);
+  await h.cleanup();
+  // Any other error with the same text is not the typed failure.
+  const lookalike = routerHarness({ failStart: new Error("This ticket and its comments are too large to send in one prompt (200,000 characters maximum).") });
+  assert.equal("tooLarge" in await succeed(lookalike), false);
+  await lookalike.cleanup();
 });
 
 // --- TicketStarter: resume-only never falls back to a fresh agent ------------------------------
