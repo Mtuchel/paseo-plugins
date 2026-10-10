@@ -10,11 +10,12 @@
 //     <plugin-dir> and enabled;
 //  2. waits until no plugin loaded from this checkout is loading (never pulls during a load);
 //  3. resolves the receipt a killed rollout left `pending`;
-//  4. classifies the running code: known (the receipt's tree), down (its last load failed) or
-//     unknown;
-//  5. refuses a dirty checkout, `git pull --ff-only`;
-//  6. `npm ci` when the lockfile differs from the last successful install or node_modules is gone;
-//  7. Paseo's own plugin build (tools/paseo-build.mjs): a refused build reloads nothing;
+//  4. refuses a dirty checkout, `git pull --ff-only`;
+//  5. `npm ci` when the lockfile differs from the last successful install or node_modules is gone;
+//  6. Paseo's own plugin build (tools/paseo-build.mjs): a refused build reloads nothing;
+//  7. settles again and classifies the running code on that fresh state: known (the receipt's
+//     tree), down (its last load failed) or unknown (no receipt, a Paseo restart, a load
+//     outside this tool);
 //  8. decides: known and unchanged → "already loaded"; changed, down or --force → reload;
 //     unknown → exit 2 ("cannot tell which code <id> runs"), rerun with --force to reload;
 //  9. reloads once and waits through the CLI's 60 s timeout for "Plugin ready" or
@@ -236,7 +237,14 @@ function runner(lockFd, deadline, env) {
   };
   // `bounded: false` (read-only status calls): only the call's own timeout, so the step that hits
   // the deadline can still read the state and say why it stops.
-  const run = (command, args, { cwd, timeoutMs, bounded = true }) =>
+  const running = new Set();
+  const run = (command, args, options) => {
+    const result = start(command, args, options);
+    running.add(result);
+    result.finally(() => running.delete(result));
+    return result;
+  };
+  const start = (command, args, { cwd, timeoutMs, bounded = true }) =>
     new Promise((done) => {
       let child;
       try {
@@ -270,7 +278,13 @@ function runner(lockFd, deadline, env) {
       });
     });
   const killAll = () => children.forEach(killGroup);
-  return { run, killAll };
+  // Every exit path: kill what still runs and wait for it, so no child outlives the tool holding
+  // the lock without its timeout.
+  const stopAll = async () => {
+    killAll();
+    await Promise.all([...running]);
+  };
+  return { run, killAll, stopAll };
 }
 
 function describeRun(result) {
@@ -299,18 +313,26 @@ function lockfileOf(pluginDir) {
   return null;
 }
 
-async function rollout({ pluginArg, force, lockFd, deadline, env }) {
+async function rollout(options) {
+  const children = runner(options.lockFd, options.deadline, options.env);
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, () => {
+      children.killAll();
+      process.exit(1);
+    });
+  }
+  try {
+    return await steps(options, children);
+  } finally {
+    await children.stopAll();
+  }
+}
+
+async function steps({ pluginArg, force, deadline, env }, { run }) {
   const settings = settingsFrom(env);
   const pluginDir = realpathOr(pluginArg);
   const id = pluginId(pluginDir);
   const say = (line) => console.log(`${id}: ${line}`);
-  const { run, killAll } = runner(lockFd, deadline, env);
-  for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.on(signal, () => {
-      killAll();
-      process.exit(1);
-    });
-  }
 
   const paseo = async (args) => {
     const result = await run(settings.paseoBin, args, { timeoutMs: TIMEOUTS.paseo, bounded: false });
@@ -362,24 +384,23 @@ async function rollout({ pluginArg, force, lockFd, deadline, env }) {
     return entry.enabled && (path === repoRoot || path.startsWith(repoRoot + sep));
   };
   const snapshot = async () => {
-    const entries = (await listPlugins()).filter(fromCheckout);
-    return Promise.all(entries.map(async (entry) => ({ entry, logs: await readLogs(entry.id) })));
+    const plugins = [];
+    for (const entry of (await listPlugins()).filter(fromCheckout)) plugins.push({ entry, logs: await readLogs(entry.id) });
+    return plugins;
   };
   const settleAll = () => settle({ snapshot, deadline, pollMs: settings.pollMs, say });
   let plugins = await settleAll();
   let own = plugins.find(({ entry }) => entry.id === id);
   if (!own) throw new Fail(`${id} disappeared from Paseo's plugin list; nothing done`);
 
-  // 3. Resolve a pending receipt; 4. classify before the pull.
+  // 3. Resolve a pending receipt (under the lock nothing else writes it).
   const stateDir = join(settings.home, "plugin-rollout");
   const receiptFile = join(stateDir, `${id}.json`);
-  const current = await daemonStatus();
   const stored = readReceipt(receiptFile);
-  const receipt = resolvePending(stored, current, own.logs);
+  const receipt = resolvePending(stored, await daemonStatus(), own.logs);
   if (receipt !== stored) writeAtomically(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`);
-  const classification = classify(receipt, current, own.entry, own.logs);
 
-  // 5. Checkout. Dirty: any tracked change, or an untracked file inside the plugin directory (the
+  // 4. Checkout. Dirty: any tracked change, or an untracked file inside the plugin directory (the
   // build could pick it up although the tree does not have it). Untracked files elsewhere (planner
   // notes at the root) change neither the pull nor this plugin's code.
   const status = await run("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: repoRoot, timeoutMs: TIMEOUTS.git });
@@ -395,7 +416,7 @@ async function rollout({ pluginArg, force, lockFd, deadline, env }) {
   const tree = await git(["rev-parse", treeSpec]);
   say(before === revision ? `checkout at ${revision.slice(0, 7)}` : `pulled ${before.slice(0, 7)}..${revision.slice(0, 7)}`);
 
-  // 6. Dependencies.
+  // 5. Dependencies.
   if (existsSync(join(pluginDir, "package.json"))) {
     const lockfile = lockfileOf(pluginDir);
     if (!lockfile) throw new Fail(`${pluginDir} has a package.json but no lockfile; nothing reloaded`);
@@ -414,14 +435,21 @@ async function rollout({ pluginArg, force, lockFd, deadline, env }) {
     }
   }
 
-  // 7. Paseo's own plugin build.
+  // 6. Paseo's own plugin build.
   const build = await run(process.execPath, [join(TOOLS, "paseo-build.mjs"), pluginDir], { timeoutMs: TIMEOUTS.build });
   if (build.code !== 0) {
     throw new Fail(`${(build.stderr || build.stdout).trim() || describeRun(build)}\nnot reloading; the running plugin keeps its code`);
   }
   say(build.stdout.trim());
 
-  // 8. Decide.
+  // 7. Classify, on a fresh state: every plugin of the checkout settled again (no reload into a
+  // load that started meanwhile) and the daemon read again (a restart during the pull, install or
+  // build makes the running code unknown). 8. Decide.
+  plugins = await settleAll();
+  own = plugins.find(({ entry }) => entry.id === id);
+  if (!own) throw new Fail(`${id} disappeared from Paseo's plugin list; nothing reloaded`);
+  const daemonNow = await daemonStatus();
+  const classification = classify(receipt, daemonNow, own.entry, own.logs);
   const decision = decide(classification, tree, force);
   if (decision.action === "skip") {
     say(`already loaded ${revision.slice(0, 7)}`);
@@ -432,10 +460,6 @@ async function rollout({ pluginArg, force, lockFd, deadline, env }) {
   }
 
   // 9. Reload once, never into a running load.
-  plugins = await settleAll();
-  own = plugins.find(({ entry }) => entry.id === id);
-  if (!own) throw new Fail(`${id} disappeared from Paseo's plugin list; nothing reloaded`);
-  const daemonNow = await daemonStatus();
   const afterSequence = newestSequence(own.logs);
   const pending = {
     revision,
@@ -454,13 +478,14 @@ async function rollout({ pluginArg, force, lockFd, deadline, env }) {
     if (!started) throw new Fail(`paseo plugin reload ${id} failed (${describeRun(reload)}); no load started`);
   }
   if (cliTimeout) say("the CLI stopped waiting after 60 s; the load goes on, waiting for Plugin ready");
+  // The load's `Loading plugin` line may leave the 500-entry window before its outcome is logged:
+  // once seen, its sequence alone correlates the outcome.
   let loadSequence = null;
   for (;;) {
     const events = lifecycle(await readLogs(id));
-    const load = events.find((event) => event.kind === "loading" && event.sequence > afterSequence);
-    if (load) {
-      loadSequence = load.sequence;
-      const outcome = events.find((event) => event.sequence > load.sequence && (event.kind === "ready" || event.kind === "failed"));
+    loadSequence ??= events.find((event) => event.kind === "loading" && event.sequence > afterSequence)?.sequence ?? null;
+    if (loadSequence !== null) {
+      const outcome = events.find((event) => event.sequence > loadSequence && (event.kind === "ready" || event.kind === "failed"));
       if (outcome) {
         writeAtomically(
           receiptFile,

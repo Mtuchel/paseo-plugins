@@ -69,18 +69,28 @@ if (a === "daemon" && b === "status") {
     plugin(s, c).status = "failed";
     return s.behavior[c] ?? { outcome: "ready", loadMs: 400 };
   });
-  spawn(process.execPath, [process.argv[1], "__finish", c, behavior.outcome, String(behavior.loadMs)], { detached: true, stdio: "ignore" }).unref();
+  spawn(process.execPath, [process.argv[1], "__finish", c, behavior.outcome, String(behavior.loadMs), String(behavior.burst ?? 0)], { detached: true, stdio: "ignore" }).unref();
   if (behavior.cliMs) sleep(behavior.cliMs);
   console.error("Error: Timeout waiting for message (60000ms)");
   process.exit(1);
 } else if (a === "__finish") {
   sleep(Number(process.argv[5]));
   locked((s) => {
+    // A startup burst can push the load's own lines out of the 500-entry window.
+    for (let i = 0; i < Number(process.argv[6]); i += 1) log(s, b, "[" + b + "] starting up");
     if (process.argv[4] === "ready") { log(s, b, "[paseo] Plugin ready"); plugin(s, b).status = "running"; }
     else if (process.argv[4] === "failed") log(s, b, "[paseo] Plugin failed to load: Build failed with 1 error: boom");
   });
 } else if (a === "__event") {
   locked((s) => { s.events.push(b); });
+} else if (a === "__restart") {
+  // A daemon restart: new identity, and it loads every plugin from the checkout as it is.
+  locked((s) => {
+    s.daemon.pid += 1;
+    s.daemon.startedAt = new Date().toISOString();
+    s.restartOnBuild = false;
+    for (const p of s.plugins) { log(s, p.id, "[paseo] Loading plugin"); log(s, p.id, "[paseo] Plugin ready"); p.status = "running"; }
+  });
 } else {
   console.error("fake paseo: unknown command " + process.argv.slice(2).join(" "));
   process.exit(64);
@@ -94,11 +104,14 @@ if (existsSync(process.env.FAKE_NPM_CALLS + ".fail")) { console.error("npm error
 mkdirSync("node_modules", { recursive: true });
 `;
 
-// The stub build refuses a plugin directory that contains BUILD_FAIL.
-const STUB_RUNTIME = `import { existsSync } from "node:fs";
+// The stub build refuses a plugin directory that contains BUILD_FAIL, and restarts the fake daemon
+// while it builds when the state asks for it.
+const STUB_RUNTIME = `import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 export class PluginRuntime {
   async validatePlugin(directory) {
+    if (JSON.parse(readFileSync(process.env.FAKE_PASEO_STATE, "utf8")).restartOnBuild) execFileSync(process.env.PASEO_BIN, ["__restart"]);
     if (existsSync(join(directory, "BUILD_FAIL"))) throw new Error("Build failed with 1 error: stub refusal");
   }
 }
@@ -574,6 +587,30 @@ test("a malformed receipt counts as none", async (t) => {
   const run = await ctx.rollout("alpha");
   assert.equal(run.code, 2, run.out);
   assert.match(run.out, /no receipt/);
+  assert.equal(reloads(ctx), 1);
+});
+
+test("Paseo restarting during the pull or build makes the running code unknown, not already loaded", async (t) => {
+  const ctx = setup(t);
+  await ctx.prime();
+  ctx.update((s) => (s.restartOnBuild = true));
+  const run = await ctx.rollout("alpha");
+  assert.equal(run.code, 2, run.out);
+  assert.match(run.out, /cannot tell which code alpha runs \(Paseo restarted since its last rollout\)/);
+  assert.doesNotMatch(run.out, /already loaded/);
+  assert.equal(reloads(ctx), 1);
+});
+
+test("a load whose Loading line left the log window before its outcome still ends at Plugin ready", async (t) => {
+  const ctx = setup(t);
+  ctx.update((s) => (s.behavior.alpha = { outcome: "ready", loadMs: 600, burst: 600 }));
+  const run = await ctx.rollout("alpha", "--force");
+  assert.equal(run.code, 0, run.out);
+  assert.match(run.out, /ready [0-9a-f]{7}/);
+  assert.equal(ctx.receipt("alpha").state, "loaded");
+  const next = await ctx.rollout("alpha");
+  assert.equal(next.code, 0, next.out);
+  assert.match(next.out, /already loaded/);
   assert.equal(reloads(ctx), 1);
 });
 
