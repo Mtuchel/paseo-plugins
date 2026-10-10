@@ -2141,19 +2141,23 @@ waiting handover record, a "Needs you" sub-issue, the ticket in Needs input or c
 manual tasks is open), while the ticket is done or canceled, carries
 `do-not-merge` (the ticket or any open pull request of it; pull requests that cannot be read
 count as a veto), is queued, forwarded to the peer, handing out sub-issues, parked or approved
-for later, paused for deletion, or has two live root agents. A quiet agent kept out this way is
-judged again 15 minutes later, not every poll (each judgement reads Linear and GitHub), so its
-recovery can start up to 15 minutes after the reason ends. Your Stop in Linear holds the ticket
-until you reply, resume or open a new thread: it is saved before the Stop goes out and survives
-reloads. Every step is re-checked inside the ticket's turn and start gate right before it, and
-claimed in `$PASEO_HOME/linear-tickets/watchdog.json` before its effect. A claim whose outcome a
-restart lost is never repeated: the next step follows after its window, and an unproven
-replacement is awaited by its label (`linear-tickets.watchdog`) or ends with the mention. A turn,
-message or session the watchdog did not cause (yours, another nudge's) ends the cycle; new
-progress ends it too. At most two cycles start per ticket in any 24 hours; a third silence gets
-the mention once and nothing more until the agent makes progress or you continue. A corrupt or
-unreadable `watchdog.json` stops all recovery (it is never reset). Unloading the plugin stops new
-steps; a step in flight finishes under a host-local lease the next instance waits for.
+for later, paused for deletion, or has two live root agents. A ticket whose repository is not
+known (no linked pull request, a worktree without a GitHub origin Git can read, such as a main
+checkout configured `core.bare`) and whose attachments name no pull request has no open pull
+request; only a failed read of the attachments or of a repository's pull requests vetoes. A
+quiet agent kept out this way is judged again 15 minutes later, not every poll (each judgement
+reads Linear and GitHub), so its recovery can start up to 15 minutes after the reason ends. Your
+Stop in Linear holds the ticket until you reply, resume or open a new thread: it is saved before
+the Stop goes out and survives reloads. Every step is re-checked inside the ticket's turn and
+start gate right before it, and claimed in `$PASEO_HOME/linear-tickets/watchdog.json` before its
+effect. A claim whose outcome a restart lost is never repeated: the next step follows after its
+window, and an unproven replacement is awaited by its label (`linear-tickets.watchdog`) or ends
+with the mention. A turn, message or session the watchdog did not cause (yours, another nudge's)
+ends the cycle; new progress ends it too. At most two cycles start per ticket in any 24 hours; a
+third silence gets the mention once and nothing more until the agent makes progress or you
+continue. A corrupt or unreadable `watchdog.json` stops all recovery (it is never reset).
+Unloading the plugin stops new steps; a step in flight finishes under a host-local lease the next
+instance waits for.
 
 The ticket's watchdog history (cycle starts of the last 24 hours, an exhausted budget, a
 forwarded replacement's cycle) travels with every activation a draining host forwards (see

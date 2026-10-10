@@ -1496,7 +1496,10 @@ export class PullRequestWatch {
 
   // The open pull requests of a ticket, for the watchdog: those of its worktree's repo (else the one
   // repo its attachments name) whose title names the ticket or whose branch is the recorded one.
-  // Null: they cannot be read, which is not "none" (a missing link proves nothing).
+  // A ticket with no repository known (no linked pull request, a worktree without a GitHub origin
+  // Git can read, e.g. a main checkout configured `core.bare`) and no pull request among its
+  // attachments has none: its work never reached GitHub. Null: the attachments or a repo's listing
+  // cannot be read, which is not "none".
   private async ticketPulls(ticket: { issueId: string; identifier: string; worktree: string | null; link: string | null }, context: RunContext): Promise<OpenPull[] | null> {
     try {
       const repos = new Set<string>();
@@ -1511,7 +1514,7 @@ export class PullRequestWatch {
           if (source) repos.add(source[1].toLowerCase());
         }
       }
-      if (!repos.size) return null;
+      if (!repos.size) return [];
       const record = context.records.find((item) => item.issueId === ticket.issueId);
       const names = namesTicket(ticket.identifier);
       const open: OpenPull[] = [];

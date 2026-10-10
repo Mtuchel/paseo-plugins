@@ -13,7 +13,8 @@ import { BACKSTOP_ENQUEUE, ENQUEUE_READY, GREPTILE_RETRIGGER, marker, RETARGET_O
 import { GitHubBudget, GitHubPausedError, GitHubRateLimitedError, RateLimitedError, withPriority } from "./rate-budget";
 import { PermissionReplies } from "./permission-replies";
 import { SessionRouter, type IdleRun, type Succession } from "./sessions";
-import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { Watchdog, WatchdogStore, type WatchedAgent } from "./watchdog";
 import { githubRouted } from "./github-cli";
 import { ghGet } from "./pull-requests";
 
@@ -171,7 +172,7 @@ const MAIN_BROKEN: Judgment = {
 // harness host is the backstop host unless a test says otherwise.
 // `probe`: the cheap first look the poll goes through (see ConditionalPullView); without one the
 // injected `view` is the whole read, as for the tests that predate it.
-function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean; owner?: "all" | "none" | "unknown" | "throws"; backstop?: "auto" | "always" | "never" } = {}, probe?: PullViewSource) {
+function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean; owner?: "all" | "none" | "unknown" | "throws"; backstop?: "auto" | "always" | "never"; watchdog?: Pick<Watchdog, "pass" | "stop"> } = {}, probe?: PullViewSource) {
   const waits = { runs: 0, failure: null as Error | null };
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open under `title`; `views`: other pull requests
@@ -352,6 +353,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     serverId: async () => server.id,
     outage: { follow: async () => scripts.outage.follow, sync: async (results) => { scripts.outage.syncs.push(results); } },
     ...(probe ? { probe } : {}),
+    ...(agent.watchdog ? { watchdog: agent.watchdog } : {}),
     view: async (url) => {
       github.reads.push(url);
       if (github.throttled || github.throttle.includes(url)) throw new GitHubRateLimitedError("GitHub is throttling gh: HTTP 403: API rate limit exceeded");
@@ -4225,4 +4227,63 @@ test("an interrupted reopen finishes its remaining steps on the next poll", asyn
   const again = await lost.poll();
   assert.ok(!again.some((call) => call.startsWith("comment")), "the comment is found by its mark, not repeated");
   assert.match(again.find((call) => call.startsWith("succeed a1")) ?? "", /^succeed a1\nThis ticket was in Done, but its stack has not landed\./);
+});
+
+// TUC-999/728/1322 on server087: planners idle since 2026-10-07 in the main checkout (configured
+// `core.bare`, so Git cannot name its repository), no linked pull request, no pull request
+// attachments. Their open pull requests were "cannot be read" on every judgement, so the watchdog
+// never resumed them.
+test("the watchdog resumes an idle agent whose ticket names no repository and no pull request; a failed pull request read still vetoes", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const quietSince = Date.now() - 3 * 60 * 60_000;
+  const root = {
+    id: "a1", provider: "omp", cwd: "/home/mirko/paseo/tuchel-platform", status: "idle", activeTurn: null,
+    createdAt: new Date(quietSince).toISOString(), updatedAt: new Date(quietSince).toISOString(), lastUserMessageAt: null,
+    pendingPermissions: [], title: "TUC-1: plan", labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" },
+    persistence: { provider: "omp", sessionId: "native-a1", nativeHandle: "/sessions/a1.jsonl" },
+  } as unknown as WatchedAgent;
+  // `origin`: the worktree's GitHub origin (none: Git cannot name it); `listing`, `attachments`:
+  // what reading the repository's open pull requests or the ticket's attachments throws.
+  const judge = async (read: { origin?: string; listing?: Error; attachments?: Error } = {}) => {
+    const directory = await mkdtemp(join(tmpdir(), "paseo-pr-watch-watchdog-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const acts: string[] = [];
+    let watchdog: Watchdog | null = null;
+    const h = harness(t, { watchdog: { pass: (poll) => watchdog!.pass(poll), stop: () => watchdog!.stop() } });
+    h.records[0] = { ...h.records[0], worktreePath: root.cwd, links: {} };
+    watchdog = new Watchdog({
+      store: new WatchdogStore(join(directory, "watchdog.json")),
+      sessions: {
+        watchdogRoots: async () => new Map([["i1", { issueId: "i1", identifier: "TUC-1", roots: [root], ghosts: new Set<string>() }]]),
+        watchdogAct: async (request) => {
+          const reason = await request.check(root, true);
+          if (reason) return { kind: "skipped", reason, end: true };
+          await request.claim();
+          acts.push(request.action);
+          return { kind: "done" };
+        },
+        watchdogThread: async () => null,
+        sessionFor: async () => null,
+        say: async () => {},
+      },
+      linear: {
+        issueWatchState: async () => ({ status: "Planning", statusType: "started", labels: [] }),
+        comment: async () => {}, hasComment: async () => false, viewerId: async () => "me", userUrl: async () => OWNER,
+      },
+      settings: { read: async () => ({ ...settings, watchdog: DEFAULT_WATCHDOG }) },
+      handover: { all: async () => h.records },
+      activity: async () => ({ ok: true, activity: { progressAt: quietSince, touchedAt: quietSince, head: "h1", awaitingChild: false } }),
+    });
+    h.git.origin = read.origin ?? null;
+    h.github.listFailure = read.listing ?? null;
+    h.linear.issueFailure = read.attachments ?? null;
+    await h.poll();
+    return acts;
+  };
+  // Git cannot name the worktree's repository and Linear lists no attachments: no pull requests.
+  assert.deepEqual(await judge(), ["resume"]);
+  // A known repository whose listing fails, or attachments that cannot be read, still veto.
+  assert.deepEqual(await judge({ origin: "https://github.com/tuchel-sohn/tuchel-platform.git", listing: new Error("HTTP 502: Bad Gateway") }), []);
+  assert.deepEqual(await judge({ attachments: new Error("Linear is unavailable") }), []);
 });
