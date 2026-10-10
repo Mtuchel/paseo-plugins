@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync, utimesSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync, existsSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 import { GitHubUsage } from "./github-usage";
 import { asCaller } from "./linear-usage";
@@ -93,13 +95,25 @@ test("a script's environment sends its gh through the meter, tagged with the cal
   assert.equal(env.LINEAR_TICKETS_GH_NEXT, fake);
   assert.equal(env.LINEAR_TICKETS_GH_BASIS, "guard rule");
   assert.equal(env.LINEAR_TICKETS_GH_METER_DIR, join(dir, "meter"));
-  meter.install();
-  const wrapper = readFileSync(join(dir, "meter", "gh"), "utf8");
-  assert.match(wrapper, /^#!\/bin\/sh\n/);
-  assert.match(wrapper, /scripts\/gh-meter\.mjs' "\$@"\n$/);
+});
+
+test("the wrapper runs the gh behind it even without the script environment, and is removed without a meter script", () => {
+  const dir = join(root, "wrapper");
+  const plain = join(dir, "plain");
+  mkdirSync(plain, { recursive: true });
+  symlinkSync(fake, join(plain, "gh"));
+  const script = fileURLToPath(new URL("../scripts/gh-meter.mjs", import.meta.url));
+  const meter = new GitHubUsage({ dir: join(dir, "usage"), meterDir: join(dir, "meter"), script });
+  assert.equal(meter.install(), true);
+  // gt or git's credential helper: no LINEAR_TICKETS_GH_* variables, the wrapper first on PATH.
+  const env = { PATH: `${join(dir, "meter")}:${plain}:/usr/bin:/bin`, FAKE_RESPONSE: JSON.stringify({ body: "ok" }), LINEAR_TICKETS_USAGE_DIR: join(dir, "usage") };
+  assert.equal(execFileSync(join(dir, "meter", "gh"), ["pr", "view", "1"], { env, timeout: 10_000 }).toString(), "ok");
   rmSync(join(dir, "meter", "gh"));
-  meter.install();
+  assert.equal(meter.install(), true);
   assert.equal(existsSync(join(dir, "meter", "gh")), true);
+  const missing = new GitHubUsage({ dir: join(dir, "usage"), meterDir: join(dir, "meter"), script: join(dir, "nowhere.mjs") });
+  assert.equal(missing.install(), false);
+  assert.equal(existsSync(join(dir, "meter", "gh")), false);
 });
 
 test("day files older than 14 days are pruned", async () => {
