@@ -6,6 +6,7 @@ import { PLAN_LABEL } from "./plan-policy";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
 import type { PromptOutcome } from "./sessions";
+import type { SmallRoutes } from "./small-route";
 
 const POLL_MS = 60_000;
 const STATE_FILE = "state.json";
@@ -17,7 +18,8 @@ export function planRequestsDirectory(home = paseoHome()): string {
 }
 
 type Prompt = (agentId: string, text: string) => Promise<PromptOutcome>;
-type Deps = { linear: Pick<LinearService, "issueLabels">; prompt: Prompt; directory?: string };
+// `routes`: the small-ticket route, cancelled by the owner's request (small-route.ts).
+type Deps = { linear: Pick<LinearService, "issueLabels">; prompt: Prompt; directory?: string; routes?: Pick<SmallRoutes, "ownerRequested"> };
 // Per agent: whether its ticket carried the `plan` label at the last poll, and whether the agent
 // still has to be told (it was busy, crashed, or Paseo was unavailable).
 type Entry = { plan: boolean; pending: boolean };
@@ -83,6 +85,7 @@ export class PlanRequests {
       const plan = names.includes(PLAN_LABEL);
       const entry: Entry = { plan, pending: plan && (before?.pending ?? false) };
       if (plan && before && !before.plan) {
+        await this.deps.routes?.ownerRequested(agent.issueId);
         await this.writeRequest(agent);
         entry.pending = true;
       }

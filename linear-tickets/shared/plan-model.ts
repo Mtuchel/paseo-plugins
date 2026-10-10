@@ -44,6 +44,12 @@ export function strongRequired(risk: PlanRisk): string | null {
   return reasons.length ? reasons.join(", ") : null;
 }
 
+// A small-ticket route's rating (shared/small-route.ts) as a plan rating, so the same rule decides
+// whether its tier may be below strong (`strongRequired`). There is no advisor and no plan text.
+export function routeRisk(rating: { impact: PlanRisk["impact"]; reversibility: PlanRisk["reversibility"]; migration: boolean; auth: boolean; newRule: boolean }): PlanRisk {
+  return { impact: rating.impact, reversibility: rating.reversibility, featureFlag: false, migration: rating.migration, auth: rating.auth, newRule: rating.newRule, advisor: null, recommendation: "auto" };
+}
+
 // Shared by planning and every implementation tier, including strong ticket owners.
 export function workerDelegationNote(): string {
   return "Worker allocation is slice-specific, not inherited from the ticket's tier or risk rating. Keep the ticket owner responsible for framing, integration and verification. For useful independent slices whose interfaces, invariants and expected behavior the approved plan already settles, use the cheap worker (OMP: `task` without a model override, currently DeepSeek); examples: prescribed predicate/validator replacements, established-pattern caller updates, settled behavioral fixtures, exact review fixes and specified smoke checks. Do not use `@slow` merely because the ticket is strong, touches several files or requires careful execution. Use the strong model only for unresolved design or diagnosis, authorization/identity/financial/solver decisions, concurrency/recovery/external-effect boundaries, or substantial rescue; state that slice-specific reason in the brief. Give workers exact writable scope, rules and an observable verification scenario. A worker returns new decisions or an unresolved failure after two honest fix attempts to the owner rather than improvising. Do not force delegation for a trivial or tightly coupled edit. This applies to implementation workers only: Opus planning/ownership, Astra plan advice and independent Sol review routing stay unchanged.";

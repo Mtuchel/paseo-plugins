@@ -12,12 +12,14 @@ import type { ActivationResume } from "./activation";
 import { SetupError, safeBranchName, type Launcher, type ResumeTarget } from "./launch";
 import type { AdmissionState, LinearService } from "./linear";
 import { findProject, readBranches } from "./projects";
-import { advisorNote, hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, planPolicy, SAFE_MODES, type PlanPolicy } from "./plan-policy";
+import { advisorNote, hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE, planPolicy, SAFE_MODES, type PlanPolicy } from "./plan-policy";
 import { needsOwner, type Presence } from "./presence";
 import { ghostAgents, LIVE_AGENT, type ProcessInspector } from "./process-liveness";
 import { nightInput, Scheduler, type Admission } from "./scheduler";
 import type { PluginSettings } from "./settings";
 import { launchTier, recordStart, TIER_AGENT_LABEL, tierModel, tierNote, type TierStore } from "./model-tiers";
+import { eligibilityProblems, SMALL_ROUTE_POLICY, type RouteRecord, type SmallRoutes } from "./small-route";
+import { NO_PLAN_LABEL, SMALL_ROUTE_ENV, smallRouteNote } from "../shared/small-route";
 import type { ReviewDeletions } from "./review-deletions";
 import { shardDependencies, type ShardAssignor } from "./worktree-shards";
 
@@ -31,6 +33,8 @@ type Deps = {
   capacity?: Capacity;
   presence?: Pick<Presence, "away">;
   tiers?: Pick<TierStore, "get" | "record">;
+  // The small-ticket route's records (README, "Small-ticket route").
+  routes?: Pick<SmallRoutes, "get">;
   deletions?: Pick<ReviewDeletions, "blocked">;
   // Which of a repository's clones a ticket's work belongs to (README, "Worktree shards").
   shards?: ShardAssignor;
@@ -107,19 +111,36 @@ export type PlanSetup = { identifier: string; untrusted: boolean; policy: PlanPo
 
 // What a ticket's launch looks like under its plan policy: mode, instructions, model tier, and the
 // agent label and environment the omp extension and write-back read. Shared by every launch path.
-export async function planSetup(linear: Pick<LinearService, "issueState" | "viewerId" | "trustedAppIds" | "issueDocument">, issueId: string, provider: string, usualModeId: string | undefined, tiers?: Pick<TierStore, "get">): Promise<PlanSetup> {
+// `routes` and `settings`: the small-ticket route (README, "Small-ticket route"), offered to an
+// omp planner of an eligible ticket, and taken again on a relaunch of a ticket that took it.
+export async function planSetup(
+  linear: Pick<LinearService, "issueState" | "viewerId" | "trustedAppIds" | "issueDocument">,
+  issueId: string,
+  provider: string,
+  usualModeId: string | undefined,
+  context: { tiers?: Pick<TierStore, "get">; routes?: Pick<SmallRoutes, "get">; settings?: Pick<PluginSettings, "autoApprove" | "dispatch"> } = {},
+): Promise<PlanSetup> {
+  const { tiers, routes, settings } = context;
   const state = await linear.issueState(issueId);
   const untrusted = isUntrusted(state, await linear.viewerId(), await linear.trustedAppIds());
   const plan = await linear.issueDocument(issueId, `Plan: ${state.identifier}`).catch(() => null);
   const providerKey = provider.split("/")[0];
   // Implementing an approved plan: the strongest of the ticket's label, its recorded tier and the plan's.
   const approved = planPolicy(state.labels) === null;
+  // The `plan` label wins over `no-plan`, `plan-ready` over both; a `no-plan` without the route's
+  // record (added by hand, or left from before) plans, and so does one the owner's settings or the
+  // ticket no longer allow.
+  const route = !approved && routes && settings && hasLabel(state.labels, NO_PLAN_LABEL) ? await routes.get(issueId) : null;
+  const small = route && settings && !eligibilityProblems(state, untrusted, route.facts.impact, settings).length ? route : null;
+  if (small) return smallRouteSetup(state.identifier, small, launchTier(state.labels, await tiers?.get(issueId) ?? null, small.tier) ?? small.tier, usualModeId);
   const planned = approved ? planTier(plan?.content ?? "") : null;
   const decided = approved ? launchTier(state.labels, await tiers?.get(issueId) ?? null, planned?.tier ?? null) : null;
   // None of them names a tier: the plan goes back to planning for it, never to a default tier.
   const tierMissing = approved && !decided;
   const policy: PlanPolicy | null = approved && !tierMissing ? null : "required";
   const tier = tierMissing ? null : decided;
+  // Offered to omp planners only: the tool that checks the conditions is the omp extension's.
+  const offer = policy && !tierMissing && providerKey === "omp" && settings && !eligibilityProblems(state, untrusted, 0, settings).length;
   return {
     identifier: state.identifier,
     untrusted,
@@ -131,6 +152,8 @@ export async function planSetup(linear: Pick<LinearService, "issueState" | "view
       tierMissing ? tierMissingNote(state.identifier, plan) : "",
       policy && !tierMissing ? OVERLAP_NOTE : "",
       policy ? PLAN_SECTIONS_NOTE : "",
+      policy ? PLAN_SLICING_NOTE : "",
+      offer ? smallRouteNote() : "",
       policy ? MODEL_NOTE : "",
       policy ? advisorNote(providerKey) : approvedPlanNote(state.identifier, plan),
       policy && !tierMissing ? sentBackPlanNote(state.identifier, plan) : "",
@@ -138,8 +161,27 @@ export async function planSetup(linear: Pick<LinearService, "issueState" | "view
       MISSED_REACH_NOTE,
     ].filter(Boolean),
     labels: { ...(policy ? { [PLAN_POLICY_LABEL]: policy } : {}), ...(tier ? { [TIER_AGENT_LABEL]: tier } : {}) },
-    env: policy ? { [PLAN_POLICY_ENV]: policy } : {},
+    env: { ...(policy ? { [PLAN_POLICY_ENV]: policy } : {}), ...(offer ? { [SMALL_ROUTE_ENV]: "1" } : {}) },
     tier: tier ? { tier, reason: tier === planned?.tier ? planned.reason || "the approved plan" : "raised by the ticket's model label or an earlier escalation" } : null,
+  };
+}
+
+// A relaunch of a ticket that took the small-ticket route: no plan, implementing on the route's
+// tier (or a stronger one its label or an escalation recorded), in the provider's usual mode.
+function smallRouteSetup(identifier: string, route: RouteRecord, tier: Tier, usualModeId: string | undefined): PlanSetup {
+  return {
+    identifier,
+    untrusted: false,
+    policy: null,
+    modeId: usualModeId,
+    notes: [
+      `${identifier} took the small-ticket route on ${route.at.slice(0, 10)}: there is no plan and no plan review. Implement it. Your pull request body's \`Reach:\` and \`Principles and rules:\` bullets are the plan (the route recorded Reach: ${route.facts.reach}). The route comment on the ticket lists why it qualified. If the work turns out bigger or riskier than that, stop and ask the owner for a plan.`,
+      tierNote(tier, null),
+      MISSED_REACH_NOTE,
+    ],
+    labels: { [PLAN_POLICY_LABEL]: SMALL_ROUTE_POLICY, [TIER_AGENT_LABEL]: tier },
+    env: {},
+    tier: { tier, reason: tier === route.tier ? route.facts.tierReason : "raised by the ticket's model label or an earlier escalation" },
   };
 }
 
@@ -308,7 +350,7 @@ export class TicketStarter {
       : recordedResume;
     if (options.resumeOnly && !resume) throw new ResumeUnavailableError(`${detail.issue.identifier} has no recorded branch to continue on.`);
     if (options.resumeOnly && project.projectKind !== "git") throw new ResumeUnavailableError(`${target} is not a Git project, so ${detail.issue.identifier}'s branch cannot be continued.`);
-    const setup = await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, this.deps.tiers);
+    const setup = await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, { tiers: this.deps.tiers, routes: this.deps.routes, settings });
     const model = tierModel(settings, preference.model.split("/")[0], setup.tier?.tier ?? null, { provider: preference.model, ...(preference.thinkingOptionId ? { thinkingOptionId: preference.thinkingOptionId } : {}) });
     const base = {
       id: issueId,

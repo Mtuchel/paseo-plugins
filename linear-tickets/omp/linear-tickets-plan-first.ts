@@ -4,7 +4,14 @@
 // delivers the planning framing on the same prompt.
 //
 // - LINEAR_TICKETS_PLAN=required (set by the plugin for every ticket agent without an approved
-//   plan): a fresh session starts in Plannotator's planning phase. There is no way to skip it.
+//   plan): a fresh session starts in Plannotator's planning phase.
+// - LINEAR_TICKETS_SMALL_ROUTE=1 (set by the plugin next to it when the ticket may take the
+//   small-ticket route, README "Small-ticket route"): `take_small_ticket_route` checks the
+//   ticket's facts (shared/small-route.ts), drops a `route` event and waits up to a minute for the
+//   plugin's decision file `<PASEO_HOME>/linear-tickets/small-route/decisions/<route id>.decision`.
+//   Whichever side writes that file first decides; it is created once with link(2), so a late
+//   answer never replaces it. Only an `accepted` decision leaves planning; without an answer the
+//   tool writes `cancelled` itself and the agent plans. Not after an owner `plan` request.
 // - <PASEO_HOME>/linear-tickets/plan-requests/<agent id> (written by the plugin when the owner adds
 //   the `plan` label while the agent works, or when an approved plan names no model tier): the
 //   agent enters planning at its next tool call, which is blocked and followed by a message with
@@ -45,15 +52,17 @@
 //   refuses every xd:// write.
 import { execFileSync, execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { ADVISOR_MODEL, ADVISOR_SECTION, ADVISOR_THINKING, advisorSteps, RECORD_ADVICE_TOOL } from "../shared/plan-advisor";
 import { combinedRating, parsePlanRisk, sectionBody } from "../shared/plan-risk";
 import { parsePlanSections, ruleMismatch, sectionSteps } from "../shared/plan-sections";
 import { ESCALATE_TOOL, parsePlanModel } from "../shared/plan-model";
 import { layoutProblem, requiredParts } from "../shared/plan-layout";
+import { decisionText, parseDecision, parseRouteFacts, routeRefusals, SMALL_ROUTE_ENV, SMALL_ROUTE_TOOL, SMALL_ROUTE_WAIT_MS, smallRouteNote, type RouteDecision } from "../shared/small-route";
 
 type Phase = "idle" | "planning" | "executing";
 type Entry = { type: string; customType?: string; data?: { reason?: string; path?: string; hash?: string }; message?: { role?: string } };
@@ -85,11 +94,17 @@ const AGENT_ID = process.env.PASEO_AGENT_ID;
 const PASEO_CLI = process.env.PASEO_CLI || "paseo";
 const HOME = process.env.PASEO_HOME?.replace(/^~(?=\/|$)/, homedir()) || join(homedir(), ".paseo");
 const EVENTS = join(HOME, "linear-tickets", "plannotator", "events");
+// The plugin's decisions on small-ticket route attempts (server/small-route.ts, same directory).
+const ROUTE_DECISIONS = join(HOME, "linear-tickets", "small-route", "decisions");
+const SMALL_ROUTE = process.env[SMALL_ROUTE_ENV] === "1";
 // Plannotator's global config, resolved as Plannotator resolves it (its config.ts): the owner's
 // planning instructions, whose plan layout the record gate checks (shared/plan-layout.ts).
 const PLANNOTATOR_CONFIG = join(process.env.PI_CODING_AGENT_DIR || join(process.env.HOME || process.env.USERPROFILE || homedir(), ".pi", "agent"), "plannotator.json");
 const MARKER = "linear-tickets.plan-first";
 const ADVICE_MARKER = "linear-tickets.plan-advice";
+// The session left planning by the small-ticket route (server/plan-pipeline-source.ts reads it).
+const ROUTE_MARKER = "linear-tickets.small-route";
+const ROUTE_POLL_MS = 500;
 const SUBMIT_TOOL = "plannotator_submit_plan";
 const VERDICTS = ["agreed", "disagreements", "unavailable"] as const;
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -101,17 +116,44 @@ function text(message: string, details: Record<string, unknown> = {}): ToolResul
   return { content: [{ type: "text", text: message }], details };
 }
 
-// Hands an event to the plugin's Plannotator bridge; best-effort, the bridge treats a missing one
-// as "ask the owner".
+// Hands an event to the plugin's Plannotator bridge. Throws when it cannot be written.
+function writeEvent(event: Record<string, unknown>): void {
+  mkdirSync(EVENTS, { recursive: true, mode: 0o700 });
+  const name = `${Date.now()}-${randomUUID()}.json`;
+  writeFileSync(join(EVENTS, `.${name}.tmp`), JSON.stringify({ ...event, agentId: AGENT_ID, at: new Date().toISOString() }), { mode: 0o600 });
+  renameSync(join(EVENTS, `.${name}.tmp`), join(EVENTS, name));
+}
+
+// Best-effort: the bridge treats a missing event as "ask the owner".
 function dropEvent(event: Record<string, unknown>): void {
+  try { writeEvent(event); } catch { /* see above */ }
+}
+
+// Publishes a route attempt's decision unless one exists, and returns the one that stands: a
+// complete file linked into place, never replaced (server/small-route.ts writes the same way).
+// null: unreadable, which never counts as accepted.
+function publishDecision(routeId: string, decision: RouteDecision): RouteDecision | null {
+  mkdirSync(ROUTE_DECISIONS, { recursive: true, mode: 0o700 });
+  const target = join(ROUTE_DECISIONS, `${routeId}.decision`);
+  const temporary = join(ROUTE_DECISIONS, `.${routeId}.${randomUUID()}.tmp`);
   try {
-    mkdirSync(EVENTS, { recursive: true, mode: 0o700 });
-    const name = `${Date.now()}-${randomUUID()}.json`;
-    writeFileSync(join(EVENTS, `.${name}.tmp`), JSON.stringify({ ...event, agentId: AGENT_ID, at: new Date().toISOString() }), { mode: 0o600 });
-    renameSync(join(EVENTS, `.${name}.tmp`), join(EVENTS, name));
-  } catch {
-    // See above.
+    const fd = openSync(temporary, "wx", 0o600);
+    try { writeSync(fd, decisionText(decision, "tool")); fsyncSync(fd); } finally { closeSync(fd); }
+    linkSync(temporary, target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") return null;
+  } finally {
+    rmSync(temporary, { force: true });
   }
+  try { return parseDecision(readFileSync(target, "utf8")); } catch { return null; }
+}
+
+// The decision on a route attempt: the plugin's, or once the wait ends without one, the tool's own
+// `cancelled` (publishing returns whichever decision came first).
+async function awaitDecision(routeId: string, expiresAt: number, signal: AbortSignal | undefined): Promise<RouteDecision | null> {
+  const target = join(ROUTE_DECISIONS, `${routeId}.decision`);
+  while (Date.now() < expiresAt && !signal?.aborted && !existsSync(target)) await sleep(ROUTE_POLL_MS);
+  return publishDecision(routeId, { decision: "cancelled", reason: signal?.aborted ? "the tool call was aborted" : "the plugin did not answer in time" });
 }
 
 // The plan file a submission names, as given: a path relative to the working directory, or omp's
@@ -515,6 +557,60 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       if (!reason) return text("Give the reason your model is not enough.");
       dropEvent({ type: "escalated", reason: reason.slice(0, 1_000) });
       return text("Escalation requested: the plugin switches you to the strong model within seconds and records the reason on the ticket. Carry on with the work.");
+    },
+  });
+
+  // The small-ticket route (README, "Small-ticket route"): only when the plugin offered it at launch.
+  const yesNo = () => pi.zod.enum(["yes", "no"]);
+  if (TICKET && SMALL_ROUTE) pi.registerTool({
+    name: SMALL_ROUTE_TOOL,
+    label: "Take Small-Ticket Route",
+    description: `Skip the plan review for a small, low-risk ticket and implement it now. ${smallRouteNote()}`,
+    parameters: pi.zod.object({
+      acceptanceCriteria: pi.zod.number().describe("How many acceptance criteria the ticket has."),
+      expectedChangedLines: pi.zod.number().describe("Changed lines (added + deleted) you expect in total."),
+      impact: pi.zod.number().describe("Impact 0-4, as in a plan's `## Risk and impact`."),
+      reversibility: pi.zod.enum(["revert", "data-fix", "irreversible"]),
+      migration: yesNo(),
+      auth: yesNo(),
+      moneyOrErp: yesNo(),
+      crossPackageContract: yesNo(),
+      newRule: yesNo(),
+      ownerDecisionNeeded: yesNo(),
+      tier: pi.zod.enum(["cheap", "standard", "strong"]),
+      tierReason: pi.zod.string(),
+      reach: pi.zod.string().describe("The `Reach:` bullet your pull request body will carry: where else what you change is used, or why nowhere."),
+      reason: pi.zod.string().describe("Why this ticket is small and low-risk, in one or two sentences."),
+    }),
+    // A direct tool: Plannotator's planning phase blocks xd:// writes to discoverable tools.
+    loadMode: "essential",
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const plan = "Write the plan and submit it for review as usual.";
+      if (ctx?.agent?.kind === "sub") return text("Only the ticket agent itself can take the small-ticket route.");
+      const ownerAsked = existsSync(request) || (ctx?.sessionManager.getBranch() ?? []).some((entry) => entry.type === "custom" && entry.customType === MARKER && entry.data?.reason === "owner");
+      if (ownerAsked) return text(`The owner asked for a plan on this ticket, so the small-ticket route is closed. ${plan}`);
+      const parsed = parseRouteFacts(params);
+      if ("problem" in parsed) return text(`${parsed.problem} Call the tool again with every field, or plan.`);
+      const refusals = routeRefusals(parsed.facts);
+      if (refusals.length) return text(`This ticket does not qualify for the small-ticket route: ${refusals.join("; ")}. ${plan}`);
+      const phase = await planMode("status");
+      if (phase !== "planning") return text(`Not in plan mode (${phase ?? "Plannotator did not answer"}): the small-ticket route only replaces a plan review.`);
+      const routeId = randomUUID();
+      const expiresAt = Date.now() + SMALL_ROUTE_WAIT_MS;
+      try {
+        writeEvent({ type: "route", routeId, expiresAt: new Date(expiresAt).toISOString(), facts: parsed.facts });
+      } catch (error) {
+        return text(`The route request could not be handed to the plugin (${error instanceof Error ? error.message : String(error)}). ${plan}`);
+      }
+      const decision = await awaitDecision(routeId, expiresAt, signal);
+      if (decision?.decision !== "accepted") {
+        const why = decision ? decision.reason : "its decision could not be read";
+        return text(`The plugin did not accept the small-ticket route (${why}). ${plan}`, { routeId, decision: decision?.decision ?? "unreadable" });
+      }
+      // Before leaving: the plan pipeline reads planning that ends after it as the route, not a cancellation.
+      pi.appendEntry(ROUTE_MARKER, { routeId, tier: parsed.facts.tier, at: new Date().toISOString() });
+      if (await planMode("exit") !== "idle") return text(`The plugin accepted the small-ticket route, but Plannotator did not leave plan mode. ${plan} An approved plan replaces the route.`, { routeId, decision: "accepted" });
+      return text(`Small-ticket route taken: the plugin records why on the ticket and moves you to the ${parsed.facts.tier} tier. Implement the ticket now; there is no plan document. Your pull request body's \`Reach:\` and \`Principles and rules:\` bullets are the plan (Reach: ${parsed.facts.reach}). If the work turns out bigger or riskier than you rated it, stop and ask the owner for a plan.`, { routeId, decision: "accepted" });
     },
   });
 

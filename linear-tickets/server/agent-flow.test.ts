@@ -21,10 +21,12 @@ import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { AWAY_REASON, type Candidate } from "./scheduler";
 import { TierStore } from "./model-tiers";
 import { isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
-import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, planPolicy } from "./plan-policy";
+import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE, planPolicy } from "./plan-policy";
 import type { ProcessInspector } from "./process-liveness";
 import { ReviewDeletions } from "./review-deletions";
 import { WatchdogStore } from "./watchdog";
+import type { RouteRecord, SmallRoutes } from "./small-route";
+import { smallRouteNote } from "../shared/small-route";
 
 const OWNER = "owner-1";
 const APP = "paseo-app";
@@ -720,7 +722,7 @@ test("the live feed shows completed commands and edits only", () => {
 // `appId`: the Paseo app's user, or null when the app is not usable on this host. `inspect`: the
 // process table ghost agents are checked against. `tiers`: the model tier store the night order
 // reads (README, "Who starts next").
-function starterHarness(state: { creatorId: string | null; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number, appId: string | null = APP, away = false, planText = "# Plan\n1. Add the table", inspect?: ProcessInspector, tiers?: Pick<TierStore, "get" | "record">) {
+function starterHarness(state: { creatorId: string | null; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number, appId: string | null = APP, away = false, planText = "# Plan\n1. Add the table", inspect?: ProcessInspector, tiers?: Pick<TierStore, "get" | "record">, routes?: Pick<SmallRoutes, "get">) {
   const launches: { provider?: string; thinkingOptionId?: string; modeId?: string; instructions: string; labels?: Record<string, string>; env?: Record<string, string>; markInProgress?: boolean }[] = [];
   const starter = new TicketStarter({
     linear: {
@@ -735,6 +737,7 @@ function starterHarness(state: { creatorId: string | null; labels: { id: string;
     presence: { away: async () => away },
     ...(inspect ? { inspect } : {}),
     ...(tiers ? { tiers } : {}),
+    ...(routes ? { routes } : {}),
   });
   const paseo = {
     agents: { list: async () => ({ entries: Array.from({ length: running }, (_, index) => ({ agent: { id: `r${index}`, status: "running", labels: { "linear.issueId": `x${index}` } } })), pageInfo: { hasMore: false } }) },
@@ -846,11 +849,45 @@ test("every ticket starts plan-first; someone else's ticket is marked untrusted;
   const h = starterHarness({ creatorId: "customer", labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, settings, { retryHint: "retry" });
   assert.deepEqual({ untrusted: started.untrusted, plan: started.plan }, { untrusted: true, plan: "required" });
-  assert.deepEqual(h.launches[0], { provider: "omp/opus", thinkingOptionId: undefined, modeId: "full", instructions: `${UNTRUSTED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
+  assert.deepEqual(h.launches[0], { provider: "omp/opus", thinkingOptionId: undefined, modeId: "full", instructions: `${UNTRUSTED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
   const mine = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
   const own = await mine.starter.start("i1", mine.paseo, settings, { retryHint: "retry" });
   assert.deepEqual({ untrusted: own.untrusted, plan: own.plan }, { untrusted: false, plan: "required" });
-  assert.deepEqual(mine.launches[0], { provider: "omp/opus", thinkingOptionId: undefined, modeId: "full", instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
+  // The owner's own ticket is offered the small-ticket route (README, "Small-ticket route").
+  assert.deepEqual(mine.launches[0], { provider: "omp/opus", thinkingOptionId: undefined, modeId: "full", instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${smallRouteNote()}\n\n${MODEL_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_SMALL_ROUTE: "1" }, markInProgress: false });
+});
+
+test("AC-3: only an omp planner of an eligible ticket is offered the small-ticket route", async () => {
+  const offered = async (labels: string[], options: { settings?: PluginSettings; creatorId?: string } = {}) => {
+    const h = starterHarness({ creatorId: options.creatorId ?? OWNER, labels: labels.map((name) => ({ id: name, name })), blockedBy: [] }, 0);
+    await h.starter.start("i1", h.paseo, options.settings ?? settings, { retryHint: "retry" });
+    return { env: h.launches[0].env?.LINEAR_TICKETS_SMALL_ROUTE ?? null, note: h.launches[0].instructions.includes(smallRouteNote()) };
+  };
+  assert.deepEqual(await offered([]), { env: "1", note: true });
+  assert.deepEqual(await offered(["paseo-attended"]), { env: null, note: false }, "attended");
+  assert.deepEqual(await offered(["plan"]), { env: null, note: false }, "the owner's plan label");
+  assert.deepEqual(await offered([], { creatorId: "customer" }), { env: null, note: false }, "someone else's ticket");
+  assert.deepEqual(await offered([], { settings: { ...settings, autoApprove: { ...settings.autoApprove, enabled: false } } }), { env: null, note: false }, "auto-approval off");
+  assert.deepEqual(await offered([], { settings: { ...settings, lastProvider: "claude", launchPreferences: { claude: { model: "claude/opus", modeId: "default" } } } }), { env: null, note: false }, "a Claude planner");
+});
+
+test("AC-3: a relaunch implements on the recorded small route only while the ticket and settings still allow it", async () => {
+  const record = (impact: 0 | 1 | 2): RouteRecord => ({ routeId: "r1", agentId: "old", tier: "cheap", facts: { acceptanceCriteria: 1, expectedChangedLines: 40, impact, reversibility: "revert", migration: false, auth: false, moneyOrErp: false, crossPackageContract: false, newRule: false, ownerDecisionNeeded: false, tier: "cheap", tierReason: "a copy change", reach: "Only the settings page.", reason: "One label." }, at: "2026-10-10T08:00:00.000Z" });
+  const launch = async (labels: string[], recorded: RouteRecord | null) => {
+    const h = starterHarness({ creatorId: OWNER, labels: labels.map((name) => ({ id: name, name })), blockedBy: [] }, 0, APP, false, "# Plan\n1. Add the table", undefined, undefined, { get: async () => recorded });
+    const started = await h.starter.start("i1", h.paseo, settings, { retryHint: "retry" });
+    return { plan: started.plan, ...h.launches[0] };
+  };
+  const small = await launch(["no-plan"], record(1));
+  assert.equal(small.plan, null);
+  assert.deepEqual(small.labels, { "linear.plan": "small-route", "linear.tier": "cheap" });
+  assert.equal(small.env?.LINEAR_TICKETS_PLAN, undefined);
+  assert.match(small.instructions, /took the small-ticket route on 2026-10-10: there is no plan/);
+  assert.match(small.instructions, /Reach: Only the settings page\./);
+  assert.equal((await launch(["no-plan"], null)).plan, "required", "a no-plan label without the route's record plans");
+  assert.equal((await launch(["no-plan"], record(2))).plan, "required", "an impact above today's threshold plans");
+  assert.equal((await launch(["no-plan", "plan"], record(1))).plan, "required", "the owner's plan label wins");
+  assert.equal((await launch(["no-plan", "model:strong"], record(1))).labels?.["linear.tier"], "strong", "a stronger label is never downgraded");
 });
 
 test("tickets the Paseo app wrote are trusted like the owner's, unless they came from the feedback intake or the app is unknown here", async () => {
@@ -880,7 +917,7 @@ test("a plan starts in the provider's safe mode, and not in progress", async () 
   const h = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, { ...settings, markInProgress: true, lastProvider: "claude", launchPreferences: { claude: { model: "claude/opus", modeId: "default" } } }, { retryHint: "retry" });
   assert.deepEqual({ untrusted: started.untrusted, plan: started.plan }, { untrusted: false, plan: "required" });
-  assert.deepEqual(h.launches[0], { provider: "claude/opus", thinkingOptionId: undefined, modeId: "plan", instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("claude")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
+  assert.deepEqual(h.launches[0], { provider: "claude/opus", thinkingOptionId: undefined, modeId: "plan", instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("claude")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
 });
 
 test("a plan-first ticket is not marked in progress; once its plan is approved (plan-ready) the next agent implements it in the usual mode", async () => {

@@ -16,6 +16,7 @@ import type { ReviewLinks } from "./review-links";
 import { autoApproval, parsePlanRisk, ratingText, type ReviewFacts } from "../shared/plan-risk";
 import { planHash, reviewOutcome, type PendingReview, type ReviewOutcome } from "./review-outcome";
 import { isUntrusted } from "./starter";
+import type { RouteEvent, SmallRoutes } from "./small-route";
 import { dispatchLabels } from "./dispatch";
 import { orderProblems, type ProjectFlow } from "./project-flow";
 import type { PlanFollowUps } from "./plan-follow-ups";
@@ -66,7 +67,8 @@ export type DecidedEvent = { type: "decided"; agentId: string | null; approved: 
 export type AdvisedEvent = { type: "advised"; agentId: string | null; verdict: string; hash: string; at: string };
 // The ticket agent asked for the strong model tier (the omp extension's escalate_model tool).
 export type EscalatedEvent = { type: "escalated"; agentId: string | null; reason: string; at: string };
-type PlannotatorEvent = OpenedEvent | DecidedEvent | AdvisedEvent | EscalatedEvent;
+// The ticket agent asked to take the small-ticket route (README, "Small-ticket route"; small-route.ts).
+type PlannotatorEvent = OpenedEvent | DecidedEvent | AdvisedEvent | EscalatedEvent | RouteEvent;
 // Model tiers (README, "Model tiers"): where tier decisions are recorded, the model guard's
 // immediate switch of one agent, and sending a working agent back to planning (plan-requests.ts).
 export type Tiers = { store: Pick<TierStore, "record">; apply: (agentId: string) => Promise<unknown>; replan: (agent: { id: string; issueId: string; identifier: string }, message: string) => Promise<void> };
@@ -150,6 +152,9 @@ export function parseEvent(raw: string): PlannotatorEvent | null {
   if (event.type === "escalated" && typeof event.reason === "string" && event.reason.trim()) {
     return { type: "escalated", agentId, reason: event.reason.trim().slice(0, 1_000), at };
   }
+  if (event.type === "route" && typeof event.routeId === "string" && /^[0-9a-f-]{36}$/.test(event.routeId) && typeof event.expiresAt === "string") {
+    return { type: "route", agentId, routeId: event.routeId, expiresAt: event.expiresAt, facts: event.facts, at };
+  }
   return null;
 }
 
@@ -209,6 +214,7 @@ export class PlannotatorBridge {
   private decisions: Pick<DecisionLog, "append"> | null = null;
   // Model tiers (README, "Model tiers"): approved plans and escalations set the agent's tier.
   private tiers: Tiers | null = null;
+  private smallRoutes: Pick<SmallRoutes, "handle" | "sweep" | "planApproved"> | null = null;
   private deletions: Pick<ReviewDeletions, "get" | "forAgent"> | null = null;
   private deliveryFailure: ((event: OpenedEvent, error: unknown, attempts: number) => Promise<void>) | null = null;
   // What became of a review whose decision Plannotator did not confirm (review-outcome.ts);
@@ -327,6 +333,10 @@ export class PlannotatorBridge {
 
   useTiers(tiers: Tiers): void {
     this.tiers = tiers;
+  }
+
+  useSmallRoutes(routes: Pick<SmallRoutes, "handle" | "sweep" | "planApproved">): void {
+    this.smallRoutes = routes;
   }
 
   // --- Producers: the journal first --------------------------------------------------------
@@ -496,6 +506,18 @@ export class PlannotatorBridge {
     console.log(`[linear-tickets] ${issue.identifier}: ${note}`);
   }
 
+  // A small-ticket route attempt (small-route.ts decides it). An agent whose plan decision is still
+  // being carried out is refused: the approved plan's tier must not race the route's.
+  private async route(event: RouteEvent, agentId: string, paseo: PaseoApi): Promise<void> {
+    const routes = this.smallRoutes;
+    if (!routes) return;
+    const agent = (await paseo.agents.ref(agentId).refresh())?.agent;
+    const labels = agent?.labels ?? {};
+    const issueId = labels["paseo.parent-agent-id"] ? null : labels["linear.issueId"] ?? null;
+    const planDecisionOpen = this.journal.attempts().some((attempt) => attempt.agentId === agentId && attempt.state !== "applied" && attempt.state !== "void");
+    await routes.handle(event, { id: agentId, issueId, identifier: labels["linear.identifier"] || issueId || "this ticket", provider: agent?.provider ?? "", planPolicy: labels[PLAN_POLICY_LABEL] ?? null, planDecisionOpen });
+  }
+
   // The plan document is replaced every round, so the log is where each round's feedback stays.
   // One entry per decision (its time is its id), however often the step is tried.
   private async logFeedback(agentId: string, event: DecidedEvent, issue: { id: string; identifier: string }): Promise<void> {
@@ -630,6 +652,11 @@ export class PlannotatorBridge {
         }
       } while (this.again);
       await this.applyDue();
+      // Small-ticket route attempts: expired ones, accepted ones still being carried out, the owner's cancellations.
+      const routes = this.smallRoutes;
+      if (routes) await this.journal.run(() => routes.sweep()).catch((error: unknown) => {
+        if (!(error instanceof FencedError)) console.error(`[linear-tickets] the small-ticket route sweep failed: ${message(error)}`);
+      });
       // Escalations held back behind a decision of their agent that was still being applied.
       if (this.heldBack) {
         this.heldBack = false;
@@ -730,6 +757,7 @@ export class PlannotatorBridge {
       if (parked && planHash(parked.plan) === event.hash) await this.rejudgeParked(parked, event.verdict, paseo);
       return;
     }
+    if (event.type === "route") return this.route(event, agentId, paseo);
     return this.escalate(event, agentId, paseo);
   }
 
@@ -1064,6 +1092,7 @@ export class PlannotatorBridge {
     if (attempt.approved) {
       await steps.once("follow-ups", async () => { await this.followUps?.file({ issueId: issue.id, identifier: issue.identifier, plan: event.planContent ?? parked.plan, documentUrl: documentUrl || null }); });
       await steps.once("plan-ready", () => this.linear.addLabel(issue.id, PLAN_READY_LABEL));
+      await steps.once("small-route", async () => { await this.smallRoutes?.planApproved(issue.id); });
       await steps.once("ready", async () => {
         const moved = await this.linear.moveToReady(issue.id);
         if (moved.note) console.error(`[linear-tickets] ${issue.identifier}: ${moved.note}`);
@@ -1113,6 +1142,8 @@ export class PlannotatorBridge {
       });
     }
     if (attempt.approved) await this.applyPlanTier(attempt, steps, settings);
+    // An approved plan replaces a small-ticket route (README, "Small-ticket route").
+    if (attempt.approved) await steps.once("small-route", async () => { await this.smallRoutes?.planApproved(issueId); });
     // Planning after a send-back; coding once approved.
     if (settings.writeback.status) {
       await steps.once("state", async () => {

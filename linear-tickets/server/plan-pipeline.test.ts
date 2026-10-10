@@ -263,6 +263,19 @@ test("supersession is per revision; explicit idle exit cancels current planning,
   });
 });
 
+test("AC-3: planning left by the small-ticket route reads as auto-approved, not as a cancellation", async () => {
+  await harness(async (h) => {
+    await h.append([
+      { type: "custom", timestamp: "2026-10-06T12:04:00.000Z", customType: "linear-tickets.small-route", data: { routeId: "r1", tier: "cheap" } },
+      { type: "custom", timestamp: "2026-10-06T12:04:01.000Z", customType: "plannotator", data: { phase: "idle" } },
+    ]);
+    await h.refresh();
+    const rows = (await h.snapshot()).rows;
+    assert.equal(rows.some((entry) => entry.stage === "auto-approved"), true);
+    assert.equal(rows.some((entry) => entry.stage === "cancelled"), false);
+  });
+});
+
 test("source failures preserve successful checkedAt and evidence; unsupported native provider stays unknown", async () => {
   await harness(async (h) => {
     const good = (await h.snapshot()).checkedAt;
