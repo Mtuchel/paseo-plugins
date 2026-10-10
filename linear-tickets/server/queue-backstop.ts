@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { githubShimDir } from "./github-cli";
+import { githubUsage, nodeBinary } from "./github-usage";
 import { paseoHome } from "./ticket-mcp";
 
 const exec = promisify(execFile);
@@ -51,17 +52,12 @@ export class BackstopScriptError extends Error {
   }
 }
 
-// Tools such as node, gh and gt live in Homebrew, which a daemon's PATH often lacks. The account
-// router's shims (~/.local/bin/{gh,git,gt}, see github-cli.ts) come first, so the repo scripts
-// below and `gt` run the routed CLI, never an unguarded one (README, "GitHub automation
-// identity").
-const TOOL_PATH = [githubShimDir(), "/opt/homebrew/bin", "/usr/local/bin", process.env.PATH ?? "/usr/bin:/bin"].join(":");
-
-function nodeBinary(): string {
-  if (basename(process.execPath) === "node") return process.execPath;
-  for (const candidate of ["/opt/homebrew/bin/node", "/usr/local/bin/node"]) if (existsSync(candidate)) return candidate;
-  return "node";
-}
+// Tools such as node, gh and gt live in Homebrew, which a daemon's PATH often lacks. The GitHub
+// usage meter's wrapper (github-usage.ts) comes first, so every `gh` a repo script runs is
+// recorded; behind it, the account router's shims (~/.local/bin/{gh,git,gt}, see github-cli.ts),
+// so the repo scripts below and `gt` run the routed CLI, never an unguarded one (README, "GitHub
+// automation identity").
+const TOOL_PATH = [githubUsage.meterDir, githubShimDir(), "/opt/homebrew/bin", "/usr/local/bin", process.env.PATH ?? "/usr/bin:/bin"].join(":");
 
 // A failed run's exit code and output come with execFile's error.
 function failedRun(error: unknown): ScriptOutput {
@@ -71,6 +67,7 @@ function failedRun(error: unknown): ScriptOutput {
 
 export const runNodeScript: ScriptRunner = async (cwd, script, args, env) => {
   try {
+    githubUsage.install();
     const { stdout, stderr } = await exec(nodeBinary(), [script, ...args], { cwd, timeout: SCRIPT_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, PATH: TOOL_PATH, ...env } });
     return { code: 0, stdout, stderr };
   } catch (error) {

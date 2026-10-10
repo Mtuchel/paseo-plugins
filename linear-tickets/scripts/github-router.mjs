@@ -334,11 +334,14 @@ export function botGitEnvironment(home, realGh, env) {
   return botGitInvocation(findBinary("git", env), realGh, home, [], accountEnvironment("bot", home, env), guardedHelper()).env;
 }
 
-function record(home, agent, account, mode, operation) {
+// `call`: the linear-tickets GitHub usage meter's id for the call ($LINEAR_TICKETS_GH_CALL), so
+// its record takes the account from this line (README, "GitHub usage").
+function record(home, agent, account, mode, operation, env = process.env) {
   const directory = join(home, "github-router");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const call = env.LINEAR_TICKETS_GH_CALL;
   // No arguments/bodies/tokens: enough to attribute traffic without collecting secrets.
-  appendFileSync(join(directory, "calls.jsonl"), JSON.stringify({ at: new Date().toISOString(), agent, account, command: mode, operation }) + "\n", { mode: 0o600 });
+  appendFileSync(join(directory, "calls.jsonl"), JSON.stringify({ at: new Date().toISOString(), agent, account, command: mode, operation, ...(call ? { call } : {}) }) + "\n", { mode: 0o600 });
 }
 
 export async function route(mode, args, env = process.env) {
@@ -377,7 +380,7 @@ export async function route(mode, args, env = process.env) {
         save(join(directory, "identity.json"), { login: BOT, digest, at: Date.now() });
       }
     }
-    record(home, who.agent, "bot", mode, args[0]);
+    record(home, who.agent, "bot", mode, args[0], env);
     return { real, args, env: next };
   }
   if (who.agent && !["daemon", "plugin"].includes(who.agent)) {
@@ -398,7 +401,7 @@ export async function route(mode, args, env = process.env) {
     routedArgs = [...args.slice(0, index + 1), "--cache", "30s", ...args.slice(index + 1)];
     if (operation.actionIndex >= 0) operation.actionIndex += 2;
   }
-  record(home, who.agent, account, mode, `${operation.command ?? "unknown"} ${operation.action ?? ""}`.trim().replace(/\?.*$/, ""));
+  record(home, who.agent, account, mode, `${operation.command ?? "unknown"} ${operation.action ?? ""}`.trim().replace(/\?.*$/, ""), env);
   return { real, args: routedArgs, env: next, account, operation, who, home, write };
 }
 
@@ -438,7 +441,7 @@ async function main() {
       environment: (account) => accountEnvironment(account, invocation.home, invocation.env),
       observe: (account, resource, headers) => observe(invocation.home, account, resource, headers),
       complete: (account, resource) => finishRead(invocation.home, account, resource),
-      record: (account, resource) => record(invocation.home, invocation.who.agent, account, "gh-api", resource),
+      record: (account, resource) => record(invocation.home, invocation.who.agent, account, "gh-api", resource, invocation.env),
     };
     try {
       const result = invocation.operation.command === "api" ? await runNativeApi(invocation, deps) : { code: await watchRun(args, deps) };

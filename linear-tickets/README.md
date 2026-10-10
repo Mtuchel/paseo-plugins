@@ -2770,6 +2770,56 @@ No tokens, query bodies or ticket text appear in the report.
   before this check existed and now rejected gets `; already attached on Linear; remove it by
   hand` in that line.
 
+### GitHub usage
+
+The bot account's GitHub budget is shared by every host and caller that reads with it, and
+GitHub's `GET /rate_limit` does not show its REST window (on server087 it reported `used 0` while
+real answers carried `X-Ratelimit-Used: 2849`). So the plugin counts its own GitHub requests by
+caller, from GitHub's answers, in day files that a report merges across hosts (TUC-1880):
+
+- **What is metered.** Every `gh` call the plugin makes in-process (`ghJson`: PR watch, the pull
+  request view, label sync, the queue backstop's reads) and every `gh` call of the repo scripts
+  it starts (`tools/ci/*.mjs` from the queue backstop: the plugin writes the wrapper
+  `$PASEO_HOME/linear-tickets/gh-meter/gh` at start and puts its directory first on the scripts'
+  `PATH`; it runs `scripts/gh-meter.mjs`, which runs the real `gh`, the gh guard or the account
+  router behind it, with the same arguments, stdin, stderr, exit code and signals). Agents' own
+  `gh` calls are not metered.
+- **Responses are read only where gh prints them untransformed:** `gh api` without `--jq`,
+  `--template`, `--slurp`, `--silent`, `--paginate` (gh joins the pages differently with
+  `--include`) or a non-JSON `Accept`. The meter adds `--include`, reads the status line and the
+  `X-Ratelimit-*`, `Retry-After` and `Date` headers, and cuts the block off again, so the caller
+  gets the bytes gh prints without it. A caller's own `--include` passes untouched and is read.
+  Every other call (`gh pr view`, `--jq` reads, paginated listings) is one **invocation, pages
+  unknown**: counted as a call, never as requests.
+- **Each response is classed:** `free` (304, which GitHub does not meter), `refused` (403/429 with
+  GitHub's rate-limit wording or `remaining: 0`), `charged` (no cache can have answered),
+  `uncertain` (a cache may have: the router adds `--cache 30s` to core reads, or the caller asked
+  for one) and `cached` (uncertain, and GitHub's `Date` is more than 2 s older than the call: a
+  suspected cache hit).
+- **Account, from the routing:** with the gh guard (server087) its rule decides: the plugin's
+  reads run on the bot once its login is set up, writes on the owner. With the account router
+  (the laptop) the meter passes its call id as `LINEAR_TICKETS_GH_CALL`, the router writes it as
+  `call` on that call's `calls.jsonl` line, and the report takes the account from that line;
+  without one the account stays `unknown`. Never from timing.
+- **Files:** one JSON line per call in `$PASEO_HOME/linear-tickets/github-usage/<UTC date>.jsonl`
+  (`at`, `host`, `call`, `caller`, `run`, `command`, `method`, `write`, `responses`, `pages`,
+  `account`, `basis`, `exit`; no arguments, bodies or tokens), plus one `kind: "run"` line per PR
+  watch poll and backstop run with its size (`watched`, `actions`, `repos`, `candidates`), so cost
+  per unit of work compares across days. Script calls are named `<caller>: <script>`. A line that
+  cannot be written is skipped; the call is unchanged. Day files older than 14 days are removed.
+- **Report:** `node scripts/github-usage-report.mjs --from <ISO> [--to <ISO>] [--input <file or
+  dir>]… [--guard <dir>] [--guard-host <host>] [--json]`. By default it reads this host's day
+  files, their `laptop/` subdirectory (where the laptop's day files and `calls.jsonl` are copied
+  for a merged report) and the local router log and guard counters. It prints per UTC hour, host,
+  caller and account the responses by class, the invocations with unknown pages, GraphQL requests
+  and writes; the runs and their size; per GitHub reset window (not a calendar hour) the highest
+  `used` seen on any host — a lower bound — against the responses counted in it, the rest as
+  unattributed, or `inconsistent`/`incomplete` instead of a number; GraphQL points per caller as
+  an **allocation assuming equal cost per request**, never a measurement; on the guard host, per
+  complete hour, the guard's `bot.<hour>` counter minus the meter's bot reads as **unattributed
+  daemon bot-read invocations** (Paseo's own PR poller, another daemon child, or missing records);
+  on a router host its agent sessions' invocations beside the table, never added to it.
+
 ## Pull request view
 
 The Paseo Agents menu bar app shows a repository's open pull requests, the Graphite merge queue

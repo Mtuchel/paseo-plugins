@@ -71,12 +71,15 @@ import { PlanPipeline } from "./server/plan-pipeline";
 import { pipelineOwnerEvidence } from "./server/plan-pipeline-source";
 import { Watchdog, WatchdogStore } from "./server/watchdog";
 import { asCaller, linearUsage, usageLines } from "./server/linear-usage";
+import { githubUsage } from "./server/github-usage";
 import { LinearBroker } from "./server/linear-broker";
 import { upgradeTicketMcpScripts } from "./server/ticket-mcp";
 import { PlanningSmoke } from "./server/planning-smoke";
 
 export default function contribute(server: PluginServerContext) {
   void linearUsage.start();
+  // README "GitHub usage": the gh wrapper for the repo scripts, and the day files' retention.
+  githubUsage.start();
   const broker = new LinearBroker();
   const brokerReady = upgradeTicketMcpScripts().then(async (upgrade) => {
     if (upgrade.unrecognized.length) console.error("[linear-tickets] Unrecognized saved MCP paths remain unprotected:", upgrade.unrecognized.join(", "));
@@ -624,5 +627,6 @@ export default function contribute(server: PluginServerContext) {
     await brokerReady;
     await broker.stop();
     await linearUsage.stop();
+    githubUsage.stop();
   };
 }

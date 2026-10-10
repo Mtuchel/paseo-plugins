@@ -95,6 +95,28 @@ test("missing bot credentials block automated writes instead of falling back", a
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
+test("the usage meter's call id lands on the read's calls.jsonl line, without changing the route", async () => {
+  const home = mkdtempSync(join(tmpdir(), "github-call-id-"));
+  try {
+    mkdirSync(join(home, "gh-bot")); writeFileSync(join(home, "gh-bot", "hosts.yml"), "github.com:\n  user: bot112112121\n  oauth_token: fixture\n");
+    mkdirSync(join(home, "github-router"));
+    const now = Date.now();
+    writeFileSync(join(home, "github-router", "budgets.json"), JSON.stringify({ botTokenDigest: createHash("sha256").update("fixture").digest("hex"), core: {
+      bot: { remaining: 4_000, resetAt: now + 600_000, at: now, identity: "bot112112121" },
+      owner: { remaining: 4_000, resetAt: now + 600_000, at: now },
+    } }));
+    const env = { ...process.env, PASEO_HOME: home, PASEO_AGENT_ID: "call-agent" };
+    const plain = await route("gh", ["api", "repos/o/r/issues/42"], env);
+    const metered = await route("gh", ["api", "repos/o/r/issues/42"], { ...env, LINEAR_TICKETS_GH_CALL: "abc123" });
+    assert.deepEqual([metered.account, metered.args], [plain.account, plain.args]);
+    assert.ok(metered.args.includes("--cache"));
+    const lines = readFileSync(join(home, "github-router", "calls.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal("call" in lines[0], false);
+    assert.equal(lines[1].call, "abc123");
+    assert.equal(lines[1].account, metered.account);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
 test("a refreshed budget cannot re-admit capacity held by an outstanding read", async () => {
   const home = mkdtempSync(join(tmpdir(), "github-refresh-"));
   try {
