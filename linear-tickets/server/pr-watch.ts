@@ -946,6 +946,33 @@ function ownRound(drop: Drop, seenByUrl: Record<string, Seen>, open: OpenPull[])
 
 const TICKET_ID = /(?<![A-Za-z0-9-])([A-Z][A-Z0-9]*-\d+)(?![A-Za-z0-9])/g;
 
+// The identifiers of `teams`' tickets a text names, upper case, once each, in order of mention.
+export function namedTickets(text: string, teams: ReadonlySet<string>): string[] {
+  return [...new Set([...text.matchAll(TICKET_ID)].map((match) => match[1].toUpperCase()))].filter((id) => teams.has(id.split("-")[0]));
+}
+
+// The tickets a pull request description's `Linear:` lines name (tuchel-platform's template:
+// `Linear: Part of TUC-12 …`), or null when it has no such line. Mentions anywhere else in the
+// description (decision records, related work) do not count.
+export function linearLineTickets(body: string, teams: ReadonlySet<string>): string[] | null {
+  const lines = body.split(/\r?\n/).filter((line) => /^\s*Linear:/.test(line));
+  return lines.length ? namedTickets(lines.join("\n"), teams) : null;
+}
+
+// The other ticket a pull request names as its own, or null: its title or its `Linear:` line
+// names tickets of `identifier`'s team, but not `identifier`. Such a pull request is never linked
+// to `identifier`'s record, whatever else names it (README, "Moving a pull request to another
+// ticket"). An unread description (`body` absent) is judged by the title alone.
+export function othersPullRequest(identifier: string, title: string, body: string | null | undefined): { ticket: string; place: "title" | "`Linear:` line" } | null {
+  const own = identifier.toUpperCase();
+  const teams = new Set([own.split("-")[0]]);
+  const titled = namedTickets(title, teams);
+  if (titled.length && !titled.includes(own)) return { ticket: titled[0], place: "title" };
+  const line = typeof body === "string" ? linearLineTickets(body, teams) : null;
+  if (line?.length && !line.includes(own)) return { ticket: line[0], place: "`Linear:` line" };
+  return null;
+}
+
 // The tickets of a repo's pull requests: the record's, those whose records link one of them, and
 // those their open pull requests' titles name (an identifier Linear does not know is dropped later).
 function ticketsOf(repo: string, prs: number[], open: OpenPull[], records: HandoverRecord[], record: HandoverRecord | null): string[] {
@@ -1558,8 +1585,10 @@ export class PullRequestWatch {
     return mine;
   }
 
-  private async discover(record: HandoverRecord, context: RunContext): Promise<void> {
-    if (!this.discoverable(record, context.now)) return;
+  // Links the ticket's lowest open pull request to a record that has none (see nextOwnPull).
+  // Returns its view, which the poll goes on with instead of reading it again.
+  private async discover(record: HandoverRecord, context: RunContext): Promise<PullRequestView | null> {
+    if (!this.discoverable(record, context.now)) return null;
     let repo = record.worktreePath ? await context.repo(record.worktreePath) : null;
     if (!repo) {
       // Removed worker folders can still have a landed PR attached to the ticket. It supplies
@@ -1570,17 +1599,35 @@ export class PullRequestWatch {
         return source ? [source[1].toLowerCase()] : [];
       }));
       // Conflicting attachment repos do not identify a safe source.
-      if (repos.size !== 1) return;
+      if (repos.size !== 1) return null;
       repo = [...repos][0];
     }
     const identifier = namesTicket(record.identifier);
     const open = (await context.pulls(repo)).filter((pull) => pull.url.toLowerCase() === pullUrl(repo, pull.number) && identifier.test(pull.title));
-    const next = lowestPull(open);
-    if (!next) return;
-    const url = pullUrl(repo, next.number);
+    const next = await this.nextOwnPull(record, open);
+    if (!next) return null;
+    const url = pullUrl(repo, next.pull.number);
     await this.relink(record, url);
     // Handover.update can replace its stored object; the run keeps this snapshot too.
     record.links = { ...record.links, "Pull request": url };
+    return next.view;
+  }
+
+  // The ticket's lowest open pull request (see lowestPull) among `open`, those whose title names
+  // it, with its view; one that names another ticket as its own (othersPullRequest) is left out,
+  // logged once, so a title copied from this ticket's pull request never links another ticket's
+  // work to it. Only the candidates looked at are read.
+  private async nextOwnPull(record: HandoverRecord, open: OpenPull[]): Promise<{ pull: OpenPull; view: PullRequestView } | null> {
+    let left = open;
+    for (let pull = lowestPull(left); pull; pull = lowestPull(left)) {
+      const view = await this.view(pull.url);
+      const other = othersPullRequest(record.identifier, view.title ?? pull.title, view.body);
+      if (!other) return { pull, view };
+      this.transferNote(pull.url, `${record.identifier}: ${pull.url} is not followed: its ${other.place} names ${other.ticket}`);
+      const skipped = pull;
+      left = left.filter((item) => item !== skipped);
+    }
+    return null;
   }
 
   // The open pull requests of a ticket, for the watchdog: those of its worktree's repo (else the one
@@ -1627,23 +1674,24 @@ export class PullRequestWatch {
     });
   }
 
-  // A pull request's saved ownership follows its title and body (README, "Moving a pull request to
-  // another ticket"): an open pull request whose title names exactly one ticket other than the
-  // record's, and whose title and description together name only that ticket, moves to that
-  // ticket's record (Handover.transfer) before this poll routes anything. A branch name never
-  // moves one. Every saved link is looked at, those of tickets another host owns too: only the
-  // records move here, and the owner filter then decides who acts for the destination. Counted
-  // as ticket identifiers: those of the teams the records name (so `AC-1` or `UTF-8` count as
-  // nothing). `held`: pull requests whose move is due but could not be made (the destination or
-  // the move failed); none of their messages is routed this poll, and the next poll tries again.
-  // Once a rate limit or GitHub's budget stops the checks, every pull request not checked yet
-  // whose listed title names another ticket (or whose listing cannot be read) is held too.
+  // A pull request's saved ownership follows its title and `Linear:` line (README, "Moving a pull
+  // request to another ticket"): an open pull request whose title names exactly one ticket other
+  // than the record's, and whose description's `Linear:` line names that ticket and no other,
+  // moves to that ticket's record (Handover.transfer) before this poll routes anything. Tickets
+  // named anywhere else in the description do not count; no `Linear:` line, or one that names
+  // another ticket, keeps it where it is. A branch name never moves one. Every saved link is
+  // looked at, those of tickets another host owns too: only the records move here, and the owner
+  // filter then decides who acts for the destination. Counted as ticket identifiers: those of the
+  // teams the records name (so `AC-1` or `UTF-8` count as nothing). `held`: pull requests whose
+  // move is due but could not be made (the destination or the move failed); none of their
+  // messages is routed this poll, and the next poll tries again. Once a rate limit or GitHub's
+  // budget stops the checks, every pull request not checked yet whose listed title names another
+  // ticket (or whose listing cannot be read) is held too.
   private async reconcile(all: HandoverRecord[], context: RunContext, seenByUrl: Record<string, Seen>): Promise<{ records: HandoverRecord[]; held: Set<string> }> {
     const held = new Set<string>();
     const transfer = this.deps.handover.transfer;
     if (!transfer) return { records: all, held };
     const teams = new Set(all.map((record) => record.identifier.split("-")[0].toUpperCase()));
-    const named = (text: string) => [...new Set([...text.matchAll(TICKET_ID)].map((match) => match[1].toUpperCase()))].filter((id) => teams.has(id.split("-")[0]));
     let moved = false;
     let stopped = false;
     for (const record of all) {
@@ -1653,7 +1701,7 @@ export class PullRequestWatch {
         if (!source || seen?.merged || seen?.closed || seen?.missing) continue;
         try {
           const pull = (await context.pulls(source[1])).find((item) => pullKey(item.url) === pullKey(url));
-          const titled = pull ? named(pull.title) : [];
+          const titled = pull ? namedTickets(pull.title, teams) : [];
           if (titled.length !== 1 || titled[0] === record.identifier.toUpperCase()) continue;
           if (stopped) {
             held.add(pullKey(url));
@@ -1662,9 +1710,10 @@ export class PullRequestWatch {
           const view = await this.view(url);
           // An unread description never moves a pull request; nor does a closed one.
           if (view.state !== "OPEN" || typeof view.body !== "string") continue;
-          const names = new Set([...named(view.title ?? pull!.title), ...named(view.body)]);
-          if (names.size !== 1 || !names.has(titled[0])) {
-            this.transferNote(url, `${record.identifier}: ${url} stays: its title names ${titled[0]}, but its title and description name ${[...names].join(", ")}`);
+          const retitled = namedTickets(view.title ?? pull!.title, teams);
+          const line = linearLineTickets(view.body, teams);
+          if (retitled.length !== 1 || retitled[0] !== titled[0] || line?.length !== 1 || line[0] !== titled[0]) {
+            this.transferNote(url, `${record.identifier}: ${url} stays: its title names ${retitled.join(", ") || "no ticket"}, but its \`Linear:\` line ${line === null ? "is missing" : `names ${line.join(", ") || "no ticket"}`}`);
             continue;
           }
           let target: IssueCore;
@@ -1686,7 +1735,7 @@ export class PullRequestWatch {
           moved = true;
           this.transferNotes.delete(url);
           await this.deps.linear.linkUrl(target.id, url, "Pull request").catch((error: unknown) => console.error(`[linear-tickets] ${target.identifier}: linking ${url} failed: ${error instanceof Error ? error.message : error}`));
-          console.log(`[linear-tickets] ${url} (${pullKey(url)}) moved from ${record.identifier} to ${target.identifier}: its title and description name only ${target.identifier}`);
+          console.log(`[linear-tickets] ${url} (${pullKey(url)}) moved from ${record.identifier} to ${target.identifier}: its title and \`Linear:\` line name only ${target.identifier}`);
         } catch (error) {
           if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) {
             stopped = true;
@@ -1836,12 +1885,12 @@ export class PullRequestWatch {
     const nudges: { record: HandoverRecord; url: string; view: PullRequestView }[] = [];
     for (const record of stopped.paused || stopped.budget || stopped.throttled ? [] : records) {
       const going = await step(record, record.links["Pull request"] ?? "the worktree's open pull requests", async () => {
-        await this.discover(record, context);
+        const discovered = await this.discover(record, context);
         const url = record.links["Pull request"];
         if (!url || seenByUrl[url]?.missing) return;
         let view: PullRequestView;
         try {
-          view = await this.view(url);
+          view = discovered ?? await this.view(url);
         } catch (error) {
           if (!(error instanceof PullRequestNotFoundError)) throw error;
           console.error(`[linear-tickets] ${record.identifier}: ${url} does not exist (${error.message}); it is no longer watched`);
@@ -3209,14 +3258,15 @@ export class PullRequestWatch {
   // stays open (the queue landed only the range below it), or the agent replayed it onto main as
   // new pull requests. While the ticket has an open pull request, the record's link moves to the
   // lowest one (the one no other open pull request of the ticket sits below; ties go to the lower
-  // number), as for a replacement, and the watch and its nudges follow
-  // it from the next poll. `advance: due` is cleared only once the lookup and the move succeeded,
-  // so a failure, or a poll that ended before it, is retried on the next poll.
+  // number; never one whose title or `Linear:` line names another ticket, see nextOwnPull), as
+  // for a replacement, and the watch and its nudges follow it from the next poll. `advance: due`
+  // is cleared only once the lookup and the move succeeded, so a failure, or a poll that ended
+  // before it, is retried on the next poll.
   private async advance(record: HandoverRecord, url: string, seenByUrl: Record<string, Seen>, pulls: (repo: string) => Promise<OpenPull[]>): Promise<void> {
     const source = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
     const identifier = namesTicket(record.identifier);
     const open = source ? (await pulls(source[1])).filter((pull) => pull.url !== url && identifier.test(pull.title)) : [];
-    const next = lowestPull(open);
+    const next = (await this.nextOwnPull(record, open))?.pull;
     if (next) await this.relink(record, next.url);
     seenByUrl[url] = { ...seenByUrl[url], advance: undefined };
     if (next) await this.tell(record, "thought", `The pull request landed; Paseo now follows the ticket's next open pull request #${next.number}.`);
