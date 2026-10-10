@@ -1014,6 +1014,12 @@ Your decision there, or **Approve plan** / **Send back** in the panel:
   Paseo again);
 - send back: the plan document with your feedback, and a fresh agent that plans again from it.
 
+While a plan waits for you, nothing else starts an agent on its ticket: every automatic start
+path (a queued thread, a restart, a forwarded activation) is refused with "A plan for this ticket
+waits for your decision", and auto-dispatch takes the trigger label off instead of starting a
+second planner, even while focus mode would only hold it. Only your decision starts the next
+agent, so your feedback always reaches it.
+
 Plans stay parked across plugin and host restarts, and until your decision has been carried out
 (see **Decision journal** below): when Linear fails (an outage, the hourly request limit), the
 decision is retried every few seconds for about a minute, then once a minute until it goes
@@ -2592,7 +2598,8 @@ then launches exactly as the sidebar would: the saved project mapping (never a n
 guess) and its base branch (or the repository default), your last-used provider, model,
 mode and reasoning level, the default prompt, the In Progress setting and agent access to
 Linear. A short comment on the ticket names the provider and project. If the ticket already
-has an active Paseo agent, no second one starts. When a launch cannot proceed — no mapping,
+has an active Paseo agent, no second one starts; if a plan for it waits for your decision (see
+**Parked plans**), the trigger label comes off and nothing starts. When a launch cannot proceed — no mapping,
 no remembered provider, an unavailable project — the ticket gets `<label>-failed` and a
 comment saying why; fix the cause and add the trigger label again. Stale `<label>-running` and
 `<label>-failed` labels are repaired on their own (see **Repairing stale running and failed

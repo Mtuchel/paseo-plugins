@@ -136,7 +136,9 @@ export default function contribute(server: PluginServerContext) {
       return found === null || Boolean(found?.agent.archivedAt);
     },
   });
-  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, routes: smallRoutes, deletions, shards, focus });
+  // Parked plans are built below with the Plannotator host; read only once the plugin runs.
+  const waitingPlans = { has: (issueId: string) => parking.plans.has(issueId) };
+  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, routes: smallRoutes, deletions, shards, focus, parked: waitingPlans });
   // The decision journal (README, "Decision journal"): every owner decision on a plan is written
   // here first and carried out by the bridge's worker; the inbox lists what is being applied.
   const decisionJournal = new DecisionJournal();
@@ -228,7 +230,7 @@ export default function contribute(server: PluginServerContext) {
     waiting: async (issueId, inTurn) => await parking.plans.has(issueId) || await sessions.threadQueued(issueId, inTurn),
     restart: (issueId, identifier, options) => sessions.restartFor(issueId, identifier, options) });
   const relay = new CommentRelay(linear, undefined, needsYou, route, replies);
-  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, repairs: labelRepair, focus });
+  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, repairs: labelRepair, focus, parked: waitingPlans });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
   const decisions = new DecisionLog();
