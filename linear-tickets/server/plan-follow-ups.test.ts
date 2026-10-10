@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -47,8 +47,8 @@ function fakeLinear() {
     async issueState() { return { ...ticket } as never; },
     async viewerId() { return "owner"; },
     async trustedAppIds() { return ["paseo-app"]; },
-    async createIssueAsApp(input: { id?: string; teamId: string; projectId?: string | null; ready?: boolean; title: string; description: string }) {
-      calls.push(`create "${input.title}" ${input.teamId} ${input.projectId} ready=${input.ready}`);
+    async createIssueAsApp(input: { id?: string; teamId: string; projectId?: string | null; backlog?: boolean; title: string; description: string }) {
+      calls.push(`create "${input.title}" ${input.teamId} ${input.projectId} backlog=${input.backlog}`);
       const value: Ref = { id: `new-${created + 1}`, identifier: `TUC-${101 + created}`, url: `https://linear.app/TUC-${101 + created}` };
       if (mode.create === "lost") {
         if (input.id) landed.set(input.id, value);
@@ -114,24 +114,33 @@ test("the create and relate of a follow-up go only through the Paseo app, never 
     viewer: async () => ({ id: "paseo-app", name: "Paseo" }),
   };
   const linear = new LinearService(new Credentials("/unused", "owner-key"), post, app);
-  assert.deepEqual(await linear.createIssueAsApp({ teamId: "t1", projectId: "p1", ready: true, title: "Follow-up", description: "d" }), { id: "i9", identifier: "TUC-9", url: "https://linear.app/TUC-9" });
+  assert.deepEqual(await linear.createIssueAsApp({ teamId: "t1", projectId: "p1", backlog: true, title: "Follow-up", description: "d" }), { id: "i9", identifier: "TUC-9", url: "https://linear.app/TUC-9" });
   assert.equal(await linear.relateAsApp("i9", "origin", "related"), true);
   assert.deepEqual(mutations.map((mutation) => mutation.variables.input), [
-    { teamId: "t1", title: "Follow-up", description: "d", stateId: "todo", projectId: "p1" },
+    { teamId: "t1", title: "Follow-up", description: "d", stateId: "backlog", projectId: "p1" },
     { issueId: "i9", relatedIssueId: "origin", type: "related" },
   ]);
   usable = false;
-  assert.equal(await linear.createIssueAsApp({ teamId: "t1", ready: true, title: "Follow-up", description: "d" }), null);
+  assert.equal(await linear.createIssueAsApp({ teamId: "t1", backlog: true, title: "Follow-up", description: "d" }), null);
   assert.equal(await linear.relateAsApp("i9", "origin", "related"), null);
   assert.deepEqual(keyed, ["states"], "the key only read the team's states; no write reached it");
+
+  // A team without a Backlog state: the create carries no stateId and Linear files it in its
+  // default state.
+  const statesOnly = { team: { states: { nodes: [{ id: "todo", name: "Todo", type: "unstarted", position: 1 }] } } };
+  const withoutBacklog = new LinearService(new Credentials("/unused", "owner-key"), async (_key: string, query: string) => query === TEAM_STATES_QUERY ? statesOnly : { issueCreate: { success: true, issue: { id: "x2", identifier: "X-2", url: "u2" } } }, app);
+  mutations.length = 0;
+  usable = true;
+  await withoutBacklog.createIssueAsApp({ teamId: "t1", backlog: true, title: "Follow-up", description: "d" });
+  assert.deepEqual(mutations, [{ query: CREATE_ISSUE_QUERY, variables: { input: { teamId: "t1", title: "Follow-up", description: "d" } } }]);
 });
 
 test("two follow-ups become two tickets in the origin's team and project, related to it, with one comment; a repeated approval files nothing again", async () => {
   await withFollowUps(async ({ calls, followUps, directory }) => {
     await followUps.file(ORIGIN);
     assert.deepEqual(calls, [
-      `create "Document the delivery date" team-1 project-1 ready=true`,
-      `create "Show the delivery date on mobile" team-1 project-1 ready=true`,
+      `create "Document the delivery date" team-1 project-1 backlog=true`,
+      `create "Show the delivery date on mobile" team-1 project-1 backlog=true`,
       "relate new-1 origin-1 related",
       "relate new-2 origin-1 related",
       "comment origin-1: 📌 Follow-ups filed from the approved plan ([plan](https://linear.app/doc/plan)):\n- [TUC-101](https://linear.app/TUC-101) Document the delivery date\n- [TUC-102](https://linear.app/TUC-102) Show the delivery date on mobile",
@@ -150,6 +159,78 @@ test("a plan without follow-ups files and says nothing", async () => {
     await followUps.file({ ...ORIGIN, plan: "# Plan\n\n## Reach\n\nOnly the menu bar.\n" });
     assert.deepEqual(calls, []);
     assert.deepEqual(await readdir(directory).catch(() => []), []);
+  });
+});
+
+test("a plan files its first three follow-ups in Backlog; the rest are recorded over-cap and listed as not filed", async () => {
+  const plan = [
+    "# Plan\n\n## Reach\n\n- Changes: the delivery date\n",
+    "- One: follow-up — First finding\n",
+    "- Two: follow-up — Second finding\n",
+    "- Three: follow-up — Third finding\n",
+    "- Four: follow-up — Fourth finding\n",
+    "- Five: follow-up — Fifth finding\n",
+    "\n## Principles and rules\n\nNone apply; no new rule.\n",
+  ].join("\n");
+  await withFollowUps(async ({ calls, followUps, directory }) => {
+    await followUps.file({ ...ORIGIN, plan });
+    assert.deepEqual(calls, [
+      `create "First finding" team-1 project-1 backlog=true`,
+      `create "Second finding" team-1 project-1 backlog=true`,
+      `create "Third finding" team-1 project-1 backlog=true`,
+      "relate new-1 origin-1 related",
+      "relate new-2 origin-1 related",
+      "relate new-3 origin-1 related",
+      "comment origin-1: 📌 Follow-ups filed from the approved plan ([plan](https://linear.app/doc/plan)):\n- [TUC-101](https://linear.app/TUC-101) First finding\n- [TUC-102](https://linear.app/TUC-102) Second finding\n- [TUC-103](https://linear.app/TUC-103) Third finding\n\nNot filed (a plan files at most 3 follow-ups; file one by hand if it matters):\n- Fourth finding\n- Fifth finding",
+    ]);
+    const record = JSON.parse(await readFile(join(directory, "origin-1.json"), "utf8")) as FollowUpRecord;
+    assert.deepEqual(Object.values(record.items).filter((item) => item.stopped === "over-cap").map((item) => item.title), ["Fourth finding", "Fifth finding"]);
+    calls.length = 0;
+    await followUps.file({ ...ORIGIN, plan });
+    assert.deepEqual(calls, [], "a repeated approval does not file the capped items either");
+  });
+});
+
+test("a place the plan leaves to an open ticket is listed in the notice, never filed", async () => {
+  const plan = "# Plan\n\n## Reach\n\n- Changes: the delivery date\n- Help page: follow-up — Document the delivery date\n- Seed data: existing — TUC-12 (the backfill covers it)\n\n## Principles and rules\n\nNone apply; no new rule.\n";
+  await withFollowUps(async ({ calls, followUps }) => {
+    await followUps.file({ ...ORIGIN, plan });
+    assert.equal(calls.filter((call) => call.startsWith("create")).length, 1);
+    assert.match(comments(calls)[0], /Already covered by open tickets, so nothing was filed \(\[plan\]\(https:\/\/linear\.app\/doc\/plan\)\):\n- TUC-12/);
+  });
+});
+
+test("a legacy stop on the item past the cap does not wedge the filing: an already created ticket is still linked", async () => {
+  const plan = [
+    "# Plan\n\n## Reach\n\n- Changes: the delivery date\n",
+    "- One: follow-up — First finding\n",
+    "- Two: follow-up — Second finding\n",
+    "- Three: follow-up — Third finding\n",
+    "- Four: follow-up — Fourth finding\n",
+    "\n## Principles and rules\n\nNone apply; no new rule.\n",
+  ].join("\n");
+  await withFollowUps(async ({ calls, followUps, directory }) => {
+    // A record an earlier version wrote: four items, the fourth already created but never linked
+    // and stopped as `gave-up` — now past the cap.
+    await writeFile(join(directory, "origin-1.json"), JSON.stringify({
+      issueId: "origin-1", identifier: "TUC-50", documentUrl: "https://linear.app/doc/plan",
+      titles: ["first finding", "second finding", "third finding", "fourth finding"],
+      items: {
+        "first finding": { title: "First finding", id: "old-1", identifier: "TUC-101", url: "https://linear.app/TUC-101", related: true },
+        "second finding": { title: "Second finding", id: "old-2", identifier: "TUC-102", url: "https://linear.app/TUC-102", related: true },
+        "third finding": { title: "Third finding", id: "old-3", identifier: "TUC-103", url: "https://linear.app/TUC-103", related: true },
+        "fourth finding": { title: "Fourth finding", id: "old-4", identifier: "TUC-104", url: "https://linear.app/TUC-104", related: false, stopped: "gave-up" },
+      },
+      notice: null, attempts: 2, retryAt: Date.parse("2026-10-04T12:10:00Z"),
+    }));
+    await followUps.file({ ...ORIGIN, plan });
+    assert.deepEqual(calls, [
+      "relate old-4 origin-1 related",
+      "comment origin-1: 📌 Follow-ups filed from the approved plan ([plan](https://linear.app/doc/plan)):\n- [TUC-101](https://linear.app/TUC-101) First finding\n- [TUC-102](https://linear.app/TUC-102) Second finding\n- [TUC-103](https://linear.app/TUC-103) Third finding\n- [TUC-104](https://linear.app/TUC-104) Fourth finding",
+    ], "the created item past the cap is linked, not left stopped");
+    const record = JSON.parse(await readFile(join(directory, "origin-1.json"), "utf8")) as FollowUpRecord;
+    assert.equal(record.retryAt, null);
+    assert.ok(Object.values(record.items).every((item) => item.id && item.related && !item.stopped), "the legacy stop is gone and the step settles");
   });
 });
 

@@ -359,10 +359,16 @@ agent's own ticket):
 - `add_relation` — relate the ticket (or an issue the agent created) to any issue: related,
   blocks, blocked by or duplicate of;
 - `create_issue` — file a follow-up, related to the ticket (or blocking it, or blocked by it), or a
-  sub-issue of it. It is created in the team's Todo state and the ticket's project, so the usual
-  pickup applies: a project that carries the dispatch label plans it, otherwise it waits in Todo.
-  A repeated title returns the issue already filed, and an agent files at most 10 issues per
-  ticket. Created issues are recorded under `$PASEO_HOME/linear-tickets/agent-issues/<ticket>/`;
+  sub-issue of it. A follow-up is only for a substantial finding the owner should see on its own
+  (a defect, a data, security or money risk, or a missing guarantee); it is created in the team's
+  **Backlog** state and the ticket's project, where it waits for the owner — no planner run counts
+  it as new work and no hand-out takes it (see **Projects**); an agent files at most 3 follow-ups
+  per ticket. A sub-issue goes to the team's Todo state and the
+  usual pickup applies: a project that carries the dispatch label plans it, otherwise it waits in
+  Todo; an agent files at most 10 sub-issues per ticket. A repeated title returns the issue already
+  filed. A record written before the split counts against both limits (it carries no kind, so it
+  cannot be told apart). Created issues are recorded under
+  `$PASEO_HOME/linear-tickets/agent-issues/<ticket>/`;
 - `update_issue` — change the title or description of an issue the agent created;
 - `add_manual_task` — register a step only a person can do; see [Manual tasks](#manual-tasks).
 
@@ -777,7 +783,8 @@ a fixed format ([`shared/plan-sections.ts`](shared/plan-sections.ts)):
 - Changes: <the concept the ticket changes, not the page it names>
 - <place>: include — AC-N
 - <place>: follow-up — <title of the follow-up ticket>
-- <place>: n/a — <reason>
+- <place>: existing — <TICKET-ID> [note]
+- <place>: n/a — <reason | minor: <what>>
 
 ## Principles and rules
 
@@ -804,11 +811,18 @@ not that it really proves the place (that is the advisor's question and yours). 
 that describe the change (principles and decisions, glossary, process map, runbooks, env examples)
 are not places: they ship in the pull request of the code they describe, under its criterion, so a
 stack gets no records-only pull request. They are an `include` with a criterion of their own only
-when no code changes, e.g. an owner decision (TUC-1644). Every
-`follow-up` is filed as a ticket when the plan is approved (**Plan follow-ups** below). Every
-ticket agent, the one that plans and then implements as well as one that implements an approved
-plan later, is told to file a place the plan missed as a follow-up ticket (`create_issue`, related
-to the ticket) instead of quietly doing more.
+when no code changes, e.g. an owner decision (TUC-1644). A `follow-up` is only for a substantial
+finding outside this ticket — a defect, a data, security or money risk, or a missing guarantee a
+user or another system relies on — and is filed in **Backlog**, at most three per plan, when the
+plan is approved (**Plan follow-ups** below), where it waits for the owner rather than being
+planned or handed out (see **Projects**); small work on code the ticket already touches is an
+`include`, and polish, docs, naming, refactors, ideas and "could consider" are `n/a — minor:
+<what>`, never a ticket. `existing — <TICKET-ID>` says an open ticket already covers the place:
+nothing is filed for it. The gate refuses a fourth follow-up, a follow-up that only names the
+ticket already covering it, and an `existing` without an identifier. Every ticket agent, the one
+that plans and then implements as well as one that implements an approved plan later, is told to
+fix a small missed place in the ticket and to file a substantial one as a follow-up (`create_issue`)
+instead of quietly doing more; minor findings go into its final comment.
 
 ### Model tiers
 
@@ -1064,20 +1078,31 @@ the inbox's **Being applied** is empty.
 
 **Plan follow-ups.** When a ticket plan is approved, by you on Plannotator's page, by **Approve
 plan**, **Approve, implement later** or **Approve & split** in the panel, as a parked plan or by
-the risk policy, every `follow-up — <title>` line of its `## Reach` and `## Principles and rules`
-sections becomes a ticket: in Todo, without assignee or labels, in the original ticket's team and
-project, related to it, with a description pointing at the plan. One comment on the original
-ticket lists them ("Follow-ups filed from the approved plan: …"). They are written only by the
-Paseo app, never under your name: when the app cannot write at that moment, nothing is filed and
-the comment says so ("file them by hand or approve again later"). For a ticket someone else wrote,
-or one labelled `feedback`, nothing is filed; the comment lists the titles for you instead. Paseo
-keeps what it filed per ticket in `$PASEO_HOME/linear-tickets/plan-follow-ups/<issue>.json`, so a
-repeated approval files nothing twice, and a ticket filed but not yet linked is only linked on the
-next try. Linear failures are retried every 10 minutes until every item is filed (the trust check
-is repeated before each pending creation); the approval counts as carried out only once they are.
-Each ticket and the comment get their Linear id before they are sent, so a retry whose first
-answer was lost finds them instead of filing a second one. A planner run's work order files
-nothing.
+the risk policy, the plan's `follow-up — <title>` lines of its `## Reach` and `## Principles and
+rules` sections become tickets: at most three per plan, in plan order, without assignee or labels,
+in the team's **Backlog** state and the original ticket's project, related to it, with a description
+pointing at the plan ("promote it to Todo to have it planned"). They wait for you: no planner run
+counts one as new work and no hand-out or failed-start restart takes it while it is in Backlog and
+Paseo wrote it (see **Projects**). A team without a Backlog state
+leaves the state to Linear. One comment on the original ticket lists them ("Follow-ups filed from
+the approved plan: …"); further follow-ups are listed under "Not filed (a plan files at most 3
+follow-ups; file one by hand if it matters):", and the identifiers a plan's `existing — <TICKET-ID>`
+items name under "Already covered by open tickets, so nothing was filed:". A plan with no follow-up
+to file says nothing. The reader skips a
+`follow-up` whose title only names a ticket (or names one together with a word like "already",
+"existing" or "same comment") on the plans the gate never saw too, so a reference to an existing
+ticket is never filed again; a title that merely mentions a related ticket is still filed. The
+tickets are written only by the Paseo app, never under your name: when the app cannot write at that
+moment, nothing is filed and the comment says so ("file them by hand or approve again later"). For
+a ticket someone else wrote, or one labelled `feedback`, nothing is filed; the comment lists the
+titles for you instead. Paseo keeps what it filed per ticket in
+`$PASEO_HOME/linear-tickets/plan-follow-ups/<issue>.json`, so a repeated approval files nothing
+twice (the cap counts from the latest plan's titles; an item filed earlier is never touched), and a
+ticket filed but not yet linked is only linked on the next try. Linear failures are retried every 10
+minutes until every item is filed or stopped (the trust check is repeated before each pending
+creation); the approval counts as carried out only once they are. Each ticket and the comment get
+their Linear id before they are sent, so a retry whose first answer was lost finds them instead of
+filing a second one. A planner run's work order files nothing.
 
 **The omp extension.** The planning phase and the plan advisor gate come from
 [`omp/linear-tickets-plan-first.ts`](omp/linear-tickets-plan-first.ts), which omp loads from its
@@ -1403,7 +1428,8 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   first prompt is the brief: every open ticket of the project (In Progress and In Review included)
   in one line with its state, priority, labels, open blockers and links, the new ones marked and
   also given in full (up to 4,000 characters each and 30,000 in all; past that the agent reads
-  them in Linear), and the 300 most recently updated open tickets of the same team outside the
+  them in Linear) — a follow-up Paseo filed in Backlog is listed but never marked new (see
+  **Plan follow-ups**) — and the 300 most recently updated open tickets of the same team outside the
   project by title. The brief stays within 120,000 characters, so it fits any project size (the
   ticket planners before it rode Linear's 200,000-character agent context, and ERP's 409 open
   tickets went past it: TUC-1094 never started); every new ticket is always listed, and when the
@@ -1514,13 +1540,18 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   finished are assigned to Paseo in the *Who starts next* order, one per free slot. Tickets in
   Triage or already started, someone else's, and sub-issues (their parent's group hands them
   out) are left alone. A ticket with open sub-issues in the project is assigned as a group and
-  takes no slot itself. Removing `paseo-hold` releases a ticket.
+  takes no slot itself. Removing `paseo-hold` releases a ticket. A follow-up Paseo filed in
+  **Backlog** (see **Plan follow-ups**) waits for you: it is not new work for a planner run and
+  the hand-out leaves it alone even once a run listed it; your own Backlog tickets are planned
+  and handed out as before. Moving the follow-up to Todo invites it.
 - **Restarting a failed start.** A ticket stays assigned to Paseo when its start fails (the
   launch timed out, the daemon connection dropped) or Linear's webhook never arrives, so the
   hand-out never takes it again. So every project read also checks each ticket assigned to Paseo
   that is still in Backlog or Todo (a started agent moves it on), is not a group, carries none of
   the `paseo`, `paseo-running`, `paseo-failed`, `paseo-hold`, `paseo-manual` or `paseo-needs-you`
-  labels and has every blocker finished. When it has no live agent and no start under way, and its
+  labels, has every blocker finished and was not created by Paseo (a follow-up it filed in
+  Backlog waits for you: nothing restarts it and no failed start is reported for it). When it has
+  no live agent and no start under way, and its
   newest thread neither waits for its turn, ever had an agent nor was closed on purpose (a plan
   approved for later is back in Todo on purpose; a ticket someone else handed to Paseo was
   refused; a waiting thread you completed is left alone), it is started again ten minutes after
@@ -2407,8 +2438,10 @@ still answers; each row opens the agent's stable link. Each waiting row shows th
 (its `# ` heading without the ticket number), its opening paragraph, the
 risk rating (see *Plan risk and auto-approval*) as a coloured badge (green impact 0–1, amber 2, red
 3–4; planner and advisor combined, as the policy reads it) and why the risk policy left it to
-you. Next to the badge, `2 follow-ups` counts the plan's `follow-up` items (filed as tickets on
-approval) and **Rule change** marks a plan whose risk section says it introduces a new rule.
+you. Next to the badge, `2 follow-ups` counts the plan's `follow-up` items that would be filed
+(in Backlog, at most three, when the plan is approved; a title that only points at the ticket
+already covering the place is not counted) and
+**Rule change** marks a plan whose risk section says it introduces a new rule.
 Each ticket-backed row also shows its actual Linear **Area** labels, not an area inferred from
 the plan's wording. Below it: **Linear ↗** (the ticket), the model that wrote the plan, and the
 host it runs on when the inbox lists several. Decided rows keep the title and the chips, and say

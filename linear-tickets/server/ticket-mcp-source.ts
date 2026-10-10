@@ -189,8 +189,13 @@ async function recordedManualTasks() {
 // it may edit them. The directory name is the launch's issue ID, checked above; null in read-only
 // mode, where no ticket exists and it is neither created nor read.
 const CREATED_DIRECTORY = issueId === null ? null : join(paseoHome, "linear-tickets", "agent-issues", issueId);
-// Follow-ups land in Todo and may start agents of their own; the cap stops a runaway chain.
-const MAX_CREATED = 10;
+// Follow-ups are for substantial findings only and land in Backlog, where nothing plans them until
+// the owner promotes one: at most 3 per ticket, so a runaway chain of plans cannot start itself.
+// Sub-issues land in Todo and plan again like the ticket, so they keep the wider cap. A record
+// written before the split carries no kind and cannot be told apart: it counts against both
+// limits, the one shared limit it was filed under.
+const MAX_FOLLOW_UPS = 3;
+const MAX_SUB_ISSUES = 10;
 
 async function createdIssues() {
   if (CREATED_DIRECTORY === null) return [];
@@ -403,13 +408,13 @@ const tools = [
   },
   {
     name: "create_issue",
-    description: "File a new issue as Paseo: a follow-up related to this agent's ticket (default) or a sub-issue of it. It is created in the team's Todo state and the ticket's project, so it can be picked up like any other ticket; check with search_issues that it does not exist yet. Not for steps only a person can do: use add_manual_task for those.",
+    description: "File a new issue as Paseo. kind=follow_up (default): a substantial finding of your work that the owner should see on its own — a defect, a data, security or money risk, or a missing guarantee a user or another system relies on — with the evidence in the description; fix small things this ticket already touches here, and mention minor ones (polish, docs, naming, refactors, ideas) in your final comment or the pull request body instead. It is created in the team's Backlog state and the ticket's project, related to your ticket, and nothing plans it until the owner promotes it; at most 3 follow-ups per ticket. kind=sub_issue: a sub-issue of this ticket in Todo, at most 10. Check with search_issues that the work is not filed yet. Not for steps only a person can do: use add_manual_task for those.",
     inputSchema: {
       type: "object",
       properties: {
         title: { type: "string", minLength: 1, maxLength: 200 },
         description: { type: "string", minLength: 1, maxLength: 20000, description: "Markdown: the problem, evidence, goal and when it is done, readable without this conversation." },
-        kind: { type: "string", enum: ["follow_up", "sub_issue"], description: "Default follow_up." },
+        kind: { type: "string", enum: ["follow_up", "sub_issue"], description: "Default follow_up (Backlog, related to this ticket); sub_issue makes it a child of this ticket in Todo." },
         relation: { type: "string", enum: ["related", "blocks", "blocked_by"], description: "Follow-ups only, read as \"<new issue> blocks <this ticket>\". Default related." },
       },
       required: ["title", "description"],
@@ -429,10 +434,15 @@ const tools = [
       // A retried call returns the issue it already made instead of filing a duplicate.
       const existing = created.find((record) => record.title.trim().toLowerCase() === title.toLowerCase());
       if (existing) return { identifier: existing.identifier, url: existing.url, deduped: true };
-      if (created.length >= MAX_CREATED) throw new Error("This agent already filed " + MAX_CREATED + " issues for " + origin.identifier + ", the limit. Ask the owner before filing more.");
-      const todo = states(origin).find((s) => s.type === "unstarted");
+      const limit = kind === "follow_up" ? MAX_FOLLOW_UPS : MAX_SUB_ISSUES;
+      const filed = created.filter((record) => record.kind === kind || record.kind === undefined).length;
+      if (filed >= limit) throw new Error("This agent already filed " + limit + " " + (kind === "follow_up" ? "follow-ups" : "sub-issues") + " for " + origin.identifier + ", the limit." + (kind === "follow_up" ? " Only substantial findings become follow-ups; mention the rest in your final comment." : " Ask the owner before filing more."));
+      // A follow-up waits in Backlog: nothing plans it until the owner promotes it. A team without
+      // a backlog state gets no stateId, so Linear files it in the team's default state.
+      const all = states(origin);
+      const target = kind === "follow_up" ? all.find((s) => s.type === "backlog") : all.find((s) => s.type === "unstarted");
       const payload = { teamId: origin.team.id, title, description: body + "\n\n---\nFiled by the Paseo agent working on " + origin.identifier + "." };
-      if (todo) payload.stateId = todo.id;
+      if (target) payload.stateId = target.id;
       if (origin.project) payload.projectId = origin.project.id;
       if (kind === "sub_issue") payload.parentId = origin.id;
       const data = await linear("mutation createIssue($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier url } } }", { input: payload });
@@ -448,7 +458,7 @@ const tools = [
           throw new Error("Created " + issue.identifier + " but could not relate it to " + origin.identifier + " (retry with add_relation): " + (error instanceof Error ? error.message : String(error)));
         }
       }
-      return { identifier: issue.identifier, url: issue.url, kind, status: todo ? todo.name : null, deduped: false };
+      return { identifier: issue.identifier, url: issue.url, kind, status: target ? target.name : null, deduped: false };
     },
   },
   {

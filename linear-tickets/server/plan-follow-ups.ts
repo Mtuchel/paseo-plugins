@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { planFollowUps } from "../shared/plan-sections";
+import { MAX_PLAN_FOLLOW_UPS, planExistingRefs, planFollowUps } from "../shared/plan-sections";
 import type { LinearService } from "./linear";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import { isUntrusted } from "./starter";
@@ -22,10 +22,11 @@ type Item = {
   identifier?: string;
   url?: string;
   related: boolean;
-  // Why the item is no longer worked on: the Paseo app could not be used, the ticket is not
-  // trusted, or (records written before the step stopped giving up) Linear kept failing. A new
-  // approval clears it and tries again.
-  stopped?: "no-app" | "gave-up" | "untrusted";
+  // Why the item is no longer worked on: the latest plan carried more follow-ups than it may file
+  // and this one was never created (`over-cap`), the Paseo app could not be used, the ticket is
+  // not trusted, or (records written before the step stopped giving up) Linear kept failing. A new
+  // approval clears it and tries again; only an uncreated over-cap item is decided anew.
+  stopped?: "over-cap" | "no-app" | "gave-up" | "untrusted";
 };
 export type FollowUpRecord = {
   issueId: string;
@@ -35,6 +36,9 @@ export type FollowUpRecord = {
   titles: string[];
   // Every follow-up of this ticket's approved plans, so one filed earlier is never filed again.
   items: Record<string, Item>;
+  // The ticket identifiers the latest plan's `existing` items name: covered by open tickets, so
+  // nothing is filed for them and the notice lists them.
+  existing?: string[];
   // sha256 of the last comment posted about them.
   notice: string | null;
   // A comment reserved before it was posted: its id and the sha256 of the body it carries, so a
@@ -46,18 +50,19 @@ export type FollowUpRecord = {
   retryAt: number | null;
 };
 
-// Follow-ups of an approved plan (README, "Plan follow-ups"): every `follow-up — <title>` of its
-// `## Reach` and `## Principles and rules` sections becomes a ticket in Todo, written by the Paseo
-// app (never the owner's key), in the origin's project and related to it, and one comment on the
-// origin lists them. A ticket not written by the owner or Paseo, or labelled feedback, gets the
-// list only. One private record per origin under $PASEO_HOME/linear-tickets/plan-follow-ups,
-// written after every Linear write, so a repeated approval files nothing twice and only retries
-// what failed. Work for one origin runs one call at a time (the plugin is one process). `file()`
-// runs one round and rejects until every follow-up of the latest approved plan is filed and
-// related (or stopped for `no-app`/`untrusted`, which an approval cannot fix) and the notice about
-// them is posted; the decision worker calls it again on its own retry schedule. The ids of tickets
-// and of the notice are reserved before their creates, so an answer lost on the way back is
-// recovered by lookup instead of writing twice.
+// Follow-ups of an approved plan (README, "Plan follow-ups"): the plan's `follow-up — <title>`
+// items, at most MAX_PLAN_FOLLOW_UPS per plan, become tickets in Backlog, written by the Paseo app
+// (never the owner's key), in the origin's project and related to it, and one comment on the
+// origin lists them and what was left out. A ticket not written by the owner or Paseo, or labelled
+// feedback, gets the list only. One private record per origin under
+// $PASEO_HOME/linear-tickets/plan-follow-ups, written after every Linear write, so a repeated
+// approval files nothing twice and only retries what failed. Work for one origin runs one call at
+// a time (the plugin is one process). `file()` runs one round and rejects until every follow-up of
+// the latest approved plan is filed and related (or stopped for a reason the plan cannot fix:
+// `over-cap`, `no-app`/`untrusted`) and the notice about them is posted; the decision worker calls
+// it again on its own retry schedule. The ids of tickets and of the notice are reserved before
+// their creates, so an answer lost on the way back is recovered by lookup instead of writing
+// twice.
 export class PlanFollowUps {
   private readonly chains = new Map<string, Promise<void>>();
   private lastScan = Number.NEGATIVE_INFINITY;
@@ -80,12 +85,17 @@ export class PlanFollowUps {
       const record: FollowUpRecord = await this.load(origin.issueId) ?? { issueId: origin.issueId, identifier: origin.identifier, documentUrl: null, titles: [], items: {}, notice: null, attempts: 0, retryAt: null };
       record.identifier = origin.identifier;
       record.documentUrl = origin.documentUrl ?? record.documentUrl;
+      record.existing = planExistingRefs(origin.plan);
       record.titles = titles.map((title) => title.toLowerCase());
-      for (const title of titles) {
-        const item = record.items[title.toLowerCase()];
-        if (item) delete item.stopped;
-        else record.items[title.toLowerCase()] = { title, related: false };
-      }
+      titles.forEach((title, index) => {
+        const item = record.items[title.toLowerCase()] ??= { title, related: false };
+        // Over the cap, counted from this plan's titles in order: an item that was never created is
+        // recorded so no round files it and a repeated approval does not either. An item that
+        // exists keeps its link work — clearing a stop a legacy record left on it — so an over-cap
+        // position can never wedge the step.
+        if (index >= MAX_PLAN_FOLLOW_UPS && !item.id) item.stopped = "over-cap";
+        else delete item.stopped;
+      });
       record.attempts = 0;
       record.retryAt = null;
       await this.save(record);
@@ -181,9 +191,9 @@ export class PlanFollowUps {
               id: item.reservedId,
               teamId: state.teamId,
               projectId: state.projectId,
-              ready: true,
+              backlog: true,
               title: item.title,
-              description: `Follow-up from ${record.identifier}'s approved plan${record.documentUrl ? ` ([plan](${record.documentUrl}))` : ""}: ${item.title}. Filed by Paseo when the plan was approved.`,
+              description: `Follow-up from ${record.identifier}'s approved plan${record.documentUrl ? ` ([plan](${record.documentUrl}))` : ""}: ${item.title}. Filed by Paseo in Backlog when the plan was approved; promote it to Todo to have it planned.`,
             });
             if (!created) item.stopped = "no-app";
             else Object.assign(item, { id: created.id, identifier: created.identifier, url: created.url, related: false });
@@ -222,9 +232,10 @@ export class PlanFollowUps {
   }
 
   // The step is complete only when every item of the latest approved plan is filed and related, or
-  // stopped for a reason a new approval cannot fix, and the notice about them is posted.
+  // stopped for a reason the plan cannot fix (`over-cap`, `no-app`, `untrusted`), and the notice
+  // about them is posted.
   private settled(record: FollowUpRecord, items: Item[]): boolean {
-    const terminal = (item: Item) => Boolean(item.id && item.related) || item.stopped === "no-app" || item.stopped === "untrusted";
+    const terminal = (item: Item) => Boolean(item.id && item.related) || item.stopped === "over-cap" || item.stopped === "no-app" || item.stopped === "untrusted";
     if (!items.length || !items.every(terminal)) return false;
     const body = noticeText(record, items);
     return body !== null && createHash("sha256").update(body).digest("hex") === record.notice;
@@ -292,7 +303,7 @@ export class PlanFollowUps {
 
 // What the origin's comment says about the latest approved plan's follow-ups; null while a
 // creation still waits for its retry.
-export function noticeText(record: Pick<FollowUpRecord, "documentUrl">, items: Item[]): string | null {
+export function noticeText(record: Pick<FollowUpRecord, "documentUrl" | "existing">, items: Item[]): string | null {
   if (!items.length || items.some((item) => !item.id && !item.stopped)) return null;
   const plan = record.documentUrl ? ` ([plan](${record.documentUrl}))` : "";
   const groups: [string, Item[]][] = [
@@ -301,6 +312,10 @@ export function noticeText(record: Pick<FollowUpRecord, "documentUrl">, items: I
     ["Created, but Paseo could not link them to this ticket; link them by hand:", items.filter((item) => item.id && !item.related && item.stopped)],
     [`📌 Follow-ups in the approved plan${plan}, not filed because this ticket was not written by you or Paseo:`, items.filter((item) => !item.id && item.stopped === "untrusted")],
     ["Not filed: Paseo could not write to Linear as itself; file them by hand or approve again later:", items.filter((item) => !item.id && item.stopped === "no-app")],
+    [`Not filed (a plan files at most ${MAX_PLAN_FOLLOW_UPS} follow-ups; file one by hand if it matters):`, items.filter((item) => !item.id && item.stopped === "over-cap")],
   ];
-  return groups.filter(([, list]) => list.length).map(([head, list]) => `${head}\n${list.map((item) => `- ${item.id ? `${item.url ? `[${item.identifier}](${item.url})` : item.identifier} ` : ""}${item.title}`).join("\n")}`).join("\n\n");
+  const sections = groups.filter(([, list]) => list.length).map(([head, list]) => `${head}\n${list.map((item) => `- ${item.id ? `${item.url ? `[${item.identifier}](${item.url})` : item.identifier} ` : ""}${item.title}`).join("\n")}`);
+  const existing = record.existing ?? [];
+  if (existing.length) sections.push(`Already covered by open tickets, so nothing was filed${plan}:\n${existing.map((identifier) => `- ${identifier}`).join("\n")}`);
+  return sections.join("\n\n");
 }
