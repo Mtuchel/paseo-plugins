@@ -131,6 +131,18 @@ test("only a thread waiting for its turn keeps a ticket whose agent is gone from
   await h.cleanup();
 });
 
+test("a restart's own turn is no queued thread to the check it runs before the start", async () => {
+  const h = routerHarness([], { starter: { admission: async () => ({ ok: true as const }), start: () => Promise.reject(new Error("not reached")) } });
+  const seen: boolean[] = [];
+  const result = await h.router.restartFor("i9", "TUC-9", { eligible: async () => {
+    seen.push(await h.router.threadQueued("i9"), await h.router.threadQueued("i9", true));
+    return "checked";
+  } });
+  assert.deepEqual(result, { kind: "deferred", reason: "checked" });
+  assert.deepEqual(seen, [true, false], "from outside the turn is a start under way; from inside it is the caller itself");
+  await h.cleanup();
+});
+
 test("a start under way accounts for the ticket until it ends", async () => {
   const gate: { fail?: (error: Error) => void } = {};
   const h = routerHarness([], {

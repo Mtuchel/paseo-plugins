@@ -1023,9 +1023,10 @@ export class SessionRouter {
   // Whether a start or crash recovery of the ticket is under way (its turn) or one of its threads
   // waits for blockers or a slot (`startQueued` starts it). Unlike `threadHolds`, an agent that ran
   // once does not count: the label repair's orphan rule (label-repair.ts) restarts a ticket whose
-  // agent is gone, unless something is about to start it anyway.
-  async threadQueued(issueId: string): Promise<boolean> {
-    if (this.turns.has(issueId)) return true;
+  // agent is gone, unless something is about to start it anyway. `inTurn`: the caller runs inside
+  // the ticket's turn (a restart's `eligible` check), so that turn is its own and counts for nothing.
+  async threadQueued(issueId: string, inTurn = false): Promise<boolean> {
+    if (!inTurn && this.turns.has(issueId)) return true;
     return (await this.deps.store.all()).some((link) => link.issueId === issueId && link.queued && !link.agentId && !link.closed);
   }
 
