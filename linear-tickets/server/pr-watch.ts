@@ -947,8 +947,9 @@ function ownRound(drop: Drop, seenByUrl: Record<string, Seen>, open: OpenPull[])
 const TICKET_ID = /(?<![A-Za-z0-9-])([A-Z][A-Z0-9]*-\d+)(?![A-Za-z0-9])/g;
 
 // The identifiers of `teams`' tickets a text names, upper case, once each, in order of mention.
+// Case-insensitive like namesTicket, so `eng-1` names ENG-1.
 export function namedTickets(text: string, teams: ReadonlySet<string>): string[] {
-  return [...new Set([...text.matchAll(TICKET_ID)].map((match) => match[1].toUpperCase()))].filter((id) => teams.has(id.split("-")[0]));
+  return [...new Set([...text.matchAll(/(?<![A-Za-z0-9-])([A-Za-z][A-Za-z0-9]*-\d+)(?![A-Za-z0-9])/g)].map((match) => match[1].toUpperCase()))].filter((id) => teams.has(id.split("-")[0]));
 }
 
 // The tickets a pull request description's `Linear:` lines name (tuchel-platform's template:

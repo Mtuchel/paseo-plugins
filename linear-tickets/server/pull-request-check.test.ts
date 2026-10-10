@@ -37,6 +37,9 @@ test("a pull request whose title or `Linear:` line names another ticket is that 
   // Its own pull request still links when it also names other tickets, and identifiers of other teams never count.
   assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "Add ENG-1 [repo] Fix sign-in", body: "Linear: Closes ENG-1\n\nAfter ENG-2 and ENG-3." })), { link: true });
   assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "Fix UTF-8 sign-in (AC-1)", body: "Linear: Part of ENG-1" })), { link: true });
+  // Identifiers count in any case, as in namesTicket.
+  assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "Fix eng-1 after ENG-2", body: "Linear: Part of eng-1" })), { link: true });
+  assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "Add ENG-1 [repo] Fix sign-in", body: "Linear: Part of eng-2" })), { link: false, reason: "the pull request is ENG-2's: its `Linear:` line names ENG-2, not ENG-1" });
 });
 
 test("throttling and any other gh failure throw a message the write-back retries, so the pull request is kept", async () => {
