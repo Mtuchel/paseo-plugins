@@ -125,3 +125,26 @@ test("day files older than 14 days are pruned", async () => {
   await new GitHubUsage({ dir, now: () => Date.parse("2026-10-10T12:00:00Z") }).prune();
   assert.deepEqual(readdirSync(dir).sort(), ["2026-09-26.jsonl", "2026-10-10.jsonl", "notes.txt"]);
 });
+
+test("only the meter the plugin started records and wraps: a test run of the plugin's code leaves the day files alone", async () => {
+  const home = join(root, "shared-home");
+  const saved = process.env.PASEO_HOME;
+  process.env.PASEO_HOME = home;
+  process.env.FAKE_RESPONSE = JSON.stringify({ status: 200, headers, body: "{}" });
+  const usageFiles = () => existsSync(join(home, "linear-tickets", "github-usage")) ? readdirSync(join(home, "linear-tickets", "github-usage")) : [];
+  try {
+    const meter = new GitHubUsage({ cli: () => fake, routed: () => false, script: fileURLToPath(new URL("../scripts/gh-meter.mjs", import.meta.url)) });
+    await meter.run("queue backstop", () => meter.exec(fake, ["api", "user"], { timeout: 5000, maxBuffer: 1 << 20 }));
+    assert.equal(meter.install(), false, "no wrapper for the scripts either");
+    assert.deepEqual(usageFiles(), []);
+    meter.start();
+    await meter.run("queue backstop", () => meter.exec(fake, ["api", "user"], { timeout: 5000, maxBuffer: 1 << 20 }));
+    meter.stop();
+    const lines = usageFiles().flatMap((name) => readFileSync(join(home, "linear-tickets", "github-usage", name), "utf8").split("\n").filter(Boolean));
+    assert.equal(lines.length, 2, "the started meter writes the call and its run");
+    assert.equal(existsSync(join(home, "linear-tickets", "gh-meter", "gh")), true);
+  } finally {
+    if (saved === undefined) delete process.env.PASEO_HOME;
+    else process.env.PASEO_HOME = saved;
+  }
+});
