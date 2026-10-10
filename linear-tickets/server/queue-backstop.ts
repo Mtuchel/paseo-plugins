@@ -6,6 +6,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { githubShimDir } from "./github-cli";
 import { githubUsage, nodeBinary } from "./github-usage";
+import { GitHubRateLimitedError } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
 
 const exec = promisify(execFile);
@@ -248,13 +249,31 @@ const text = (value: unknown): string => (typeof value === "string" ? value : ""
 const count = (value: unknown): number | null => (typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null);
 const texts = (value: unknown): string[] => (Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []);
 
+// GitHub's refusal as a repo script reports it: gh's stderr (`gh: API rate limit exceeded for user
+// ID …`) or the JSON answer's `error`. Scripts print no reset time; the backstop probes for it.
+const REFUSAL = /API rate limit (?:already )?exceeded|rate limit already exceeded|secondary rate limit|\bHTTP 429\b|\bRATE_LIMITED\b/i;
+
+export function isRefusal(message: string): boolean {
+  return REFUSAL.test(message);
+}
+
+function refusal(script: string, output: ScriptOutput, found: Record<string, unknown> | null): GitHubRateLimitedError | null {
+  const line = `${output.stderr}\n${text(found?.error)}`.split("\n").find(isRefusal);
+  return line ? new GitHubRateLimitedError(`GitHub refused ${script}'s requests: ${line.trim().slice(0, 300)}`) : null;
+}
+
+// A script that failed: GitHub's refusal when it says so, else `fallback`.
+function failed(script: string, output: ScriptOutput, found: Record<string, unknown> | null, fallback: string): never {
+  throw refusal(script, output, found) ?? new BackstopScriptError(fallback);
+}
+
 // The single JSON line a script printed (its last non-empty stdout line).
 function answer(script: string, output: ScriptOutput): Record<string, unknown> {
   const line = output.stdout.split("\n").map((item) => item.trim()).filter(Boolean).at(-1) ?? "";
   let parsed: unknown;
   try { parsed = JSON.parse(line); } catch { parsed = null; }
   const found = record(parsed);
-  if (!found) throw new BackstopScriptError(`${script} printed no JSON answer (exit ${output.code}): ${(output.stderr.trim().split("\n").at(-1) ?? "").slice(0, 300)}`);
+  if (!found) failed(script, output, null, `${script} printed no JSON answer (exit ${output.code}): ${(output.stderr.trim().split("\n").at(-1) ?? "").slice(0, 300)}`);
   return found;
 }
 
@@ -276,7 +295,7 @@ export function parseJudgment(output: ScriptOutput): RoundJudgment {
   const result = text(found.result);
   if (output.code === 0 && result === "merged") return { result: "merged" };
   if (output.code === 3) return { result: "pending" };
-  if (output.code !== 2 || result !== "dropped") throw new BackstopScriptError(`${WAIT_QUEUE} answered ${result || "nothing"} with exit ${output.code}`);
+  if (output.code !== 2 || result !== "dropped") failed(WAIT_QUEUE, output, found, `${WAIT_QUEUE} answered ${result || "nothing"} with exit ${output.code}`);
   const kind = text(found.class);
   const revision = parseRevision(found.revision);
   if (!DROP_CLASSES.includes(kind as DropClass) || typeof found.requeue !== "boolean" || !revision) throw new BackstopScriptError(`${WAIT_QUEUE} answered a drop without a class, requeue or revision`);
@@ -320,15 +339,20 @@ function problems(value: unknown): Problem[] {
 // Exit 0 enqueued, 1 error, 2 refused, 3 held; the JSON's `result` has to say the same. An error
 // whose `enqueue.mjs` answered `not-enqueued` (exit 1: `gt merge` ran and enqueued nothing) is
 // final: a refusal of kind `not-enqueued`, so the Merge activity never decides it, and an enqueue
-// someone else made meanwhile is never taken for the backstop's. Anything else is an error (the
-// caller then reconciles from the Merge activity instead of assuming).
+// someone else made meanwhile is never taken for the backstop's. GitHub's refusal of the
+// script's requests throws GitHubRateLimitedError: the action stays `started`, and the run stops
+// and waits for the reset (pr-watch.ts). Anything else is an error (the caller then reconciles
+// from the Merge activity instead of assuming).
 export function parseEnqueue(output: ScriptOutput): EnqueueOutcome {
   let found: Record<string, unknown>;
   try { found = answer(BACKSTOP_ENQUEUE, output); } catch (error) {
+    if (error instanceof GitHubRateLimitedError) throw error;
     return { result: "error", problems: [], comment: "none", error: error instanceof Error ? error.message : String(error) };
   }
   const expected = output.code === null ? undefined : ENQUEUE_EXITS[output.code];
   const result = text(found.result);
+  const refused = !expected || expected === "error" ? refusal(BACKSTOP_ENQUEUE, output, found) : null;
+  if (refused) throw refused;
   if (!expected || expected !== result) return { result: "error", problems: problems(found.problems), comment: "none", error: `${BACKSTOP_ENQUEUE} answered ${result || "nothing"} with exit ${output.code}${text(found.error) ? `: ${text(found.error)}` : ""}` };
   const enqueue = record(found.enqueue);
   if (expected === "error" && enqueue && text(enqueue.result) === "not-enqueued") {
@@ -357,7 +381,7 @@ export type ReadyRun = { stacks: ReadyStack[]; drops: ReadyDrop[] };
 // or heads is left out.
 export function parseReady(output: ScriptOutput): ReadyRun {
   const found = answer(ENQUEUE_READY, output);
-  if (output.code !== 0 || !Array.isArray(found.stacks)) throw new BackstopScriptError(`${ENQUEUE_READY} exited ${output.code} without its stacks`);
+  if (output.code !== 0 || !Array.isArray(found.stacks)) failed(ENQUEUE_READY, output, found, `${ENQUEUE_READY} exited ${output.code} without its stacks`);
   const stacks = found.stacks.map(record).filter((item): item is Record<string, unknown> => item !== null).flatMap((item) => {
     const action = text(item.action);
     const top = count(item.top);
@@ -574,7 +598,7 @@ export function parseRetargetList(output: ScriptOutput): RetargetCandidate[] {
   if (output.code !== 0 || text(found.result) !== "listed" || !Array.isArray(found.candidates)) {
     const last = (value: string) => value.split("\n").map((line) => line.trim()).filter(Boolean).at(-1) ?? "";
     const reason = last(text(found.error)) || last(output.stderr);
-    throw new BackstopScriptError(`${RETARGET_ORPHAN} --list exited ${output.code} without its candidates${reason ? `: ${reason.slice(0, 300)}` : ""}`);
+    failed(RETARGET_ORPHAN, output, found, `${RETARGET_ORPHAN} --list exited ${output.code} without its candidates${reason ? `: ${reason.slice(0, 300)}` : ""}`);
   }
   return found.candidates.map(record).filter((item): item is Record<string, unknown> => item !== null).flatMap((item) => {
     const pr = count(item.pr);
@@ -597,14 +621,19 @@ const RETARGET_EXITS: Record<number, RetargetOutcome["result"][]> = { 0: ["prepa
 
 // `--prepare` / `--apply`: exit 0 prepared or retargeted, 2 conflict or refused, 1 error; the JSON's
 // `result` has to agree. A prepared answer without its full record is an error: nothing may be
-// written for a move whose new SHAs are not saved.
+// written for a move whose new SHAs are not saved. GitHub's refusal throws GitHubRateLimitedError:
+// the move keeps its step, and the run stops and waits for the reset.
 export function parseRetarget(output: ScriptOutput): RetargetOutcome {
   let found: Record<string, unknown>;
   try { found = answer(RETARGET_ORPHAN, output); } catch (error) {
+    if (error instanceof GitHubRateLimitedError) throw error;
     return { result: "error", prepared: null, problems: [], error: error instanceof Error ? error.message : String(error) };
   }
   const result = text(found.result) as RetargetOutcome["result"];
-  if (output.code === null || !(RETARGET_EXITS[output.code] ?? []).includes(result)) return { result: "error", prepared: null, problems: problems(found.problems), error: `${RETARGET_ORPHAN} answered ${result || "nothing"} with exit ${output.code}${text(found.error) ? `: ${text(found.error)}` : ""}` };
+  const valid = output.code !== null && (RETARGET_EXITS[output.code] ?? []).includes(result);
+  const refused = !valid || result === "error" ? refusal(RETARGET_ORPHAN, output, found) : null;
+  if (refused) throw refused;
+  if (!valid) return { result: "error", prepared: null, problems: problems(found.problems), error: `${RETARGET_ORPHAN} answered ${result || "nothing"} with exit ${output.code}${text(found.error) ? `: ${text(found.error)}` : ""}` };
   const prepared = result === "prepared" ? preparedOf(found) : null;
   if (result === "prepared" && !prepared) return { result: "error", prepared: null, problems: [], error: `${RETARGET_ORPHAN} prepared a move without its full record` };
   return { result, prepared, problems: problems(found.problems), error: text(found.error) || null };
@@ -713,10 +742,12 @@ const entries = (found: Record<string, unknown>, field: string): Record<string, 
 
 // Exit 0 with all four lists; anything else (exit 1: the open pull requests could not be read) is
 // an error, and so is an entry without its number or with a state the script does not document:
-// the outage issue must never take a misread run for a recovery.
+// the outage issue must never take a misread run for a recovery. GitHub's refusal, of the run or of
+// one of its requests (an `errors` entry), throws GitHubRateLimitedError once the requests already
+// made are known (`partial`): the backstop records them and stops.
 export function parseRetrigger(output: ScriptOutput): RetriggerRun {
   const found = answer(GREPTILE_RETRIGGER, output);
-  if (output.code !== 0) throw new BackstopScriptError(`${GREPTILE_RETRIGGER} exited ${output.code}: ${text(found.error).slice(0, 300)}`);
+  if (output.code !== 0) failed(GREPTILE_RETRIGGER, output, found, `${GREPTILE_RETRIGGER} exited ${output.code}: ${text(found.error).slice(0, 300)}`);
   const malformed = (field: string): never => { throw new BackstopScriptError(`${GREPTILE_RETRIGGER} printed a malformed ${field} entry`); };
   const pulls = entries(found, "pulls").map((item): RetriggerPull => {
     const pr = count(item.pr);
@@ -734,7 +765,18 @@ export function parseRetrigger(output: ScriptOutput): RetriggerRun {
     return pr === null || !text(item.at) ? malformed("triggered") : { pr, head: text(item.head), at: text(item.at) };
   });
   const errors = entries(found, "errors").map((item) => ({ pr: count(item.pr), error: text(item.error) || "unknown error" }));
-  return { pulls, followed, triggered, errors };
+  const run = { pulls, followed, triggered, errors };
+  const refused = errors.find((item) => isRefusal(item.error));
+  if (refused) throw new RetriggerRefusedError(`GitHub refused ${GREPTILE_RETRIGGER}'s requests${refused.pr ? ` (#${refused.pr})` : ""}: ${refused.error.slice(0, 300)}`, run);
+  return run;
+}
+
+// GitHub refused some of a Greptile re-request run's requests; `partial` is what the run did.
+export class RetriggerRefusedError extends GitHubRateLimitedError {
+  constructor(message: string, readonly partial: RetriggerRun) {
+    super(message);
+    this.name = "RetriggerRefusedError";
+  }
 }
 
 export function retriggerArgs(follow: number[]): string[] {

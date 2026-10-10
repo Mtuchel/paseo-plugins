@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { GitHubRateLimitedError } from "./pr-watch";
-import { GitHubBudget, GitHubPausedError, RateBudget, RateLimitedError, withPriority } from "./rate-budget";
+import { GitHubBudget, GitHubPausedError, GitHubRateLimitedError, RateBudget, RateLimitedError, withPriority } from "./rate-budget";
 import { LinearUsage } from "./linear-usage";
 import { postGraphQL } from "./linear";
 
@@ -209,14 +208,38 @@ test("GitHub: background requests stop below the 300-request reserve until the w
   budget.admit("background");
 });
 
-test("GitHub: after a refusal nothing is sent for two minutes, interactive requests included", async () => {
+test("GitHub: after a refusal that names no reset, nothing is sent for two minutes, interactive requests included", async () => {
   const time = { now: 1_000_000_000 };
   const budget = new GitHubBudget(() => time.now);
-  const pause = budget.throttled();
+  const pause = budget.refused(new GitHubRateLimitedError("GitHub is throttling gh"));
+  assert.ok(pause instanceof GitHubPausedError);
   assert.equal(pause.resumeAt, time.now + 120_000);
   await withPriority("interactive", "test GitHub", async () => assert.throws(() => budget.admit(), (error: unknown) => error instanceof GitHubPausedError && error.reason === "throttled"));
   time.now += 120_000;
   budget.admit("interactive");
+});
+
+test("GitHub: a refused response's own headers set the pause: its resource's reset when spent, else retry-after; times read UTC", () => {
+  const time = { now: Date.parse("2026-10-09T16:22:56Z") };
+  const budget = new GitHubBudget(() => time.now);
+  const reset = Date.parse("2026-10-09T17:05:00Z");
+  const spent = Object.assign(new GitHubRateLimitedError("GitHub is throttling gh"), { headers: githubHeaders(0, reset) });
+  const pause = budget.refused(spent);
+  assert.ok(pause instanceof GitHubPausedError);
+  assert.deepEqual([pause.resumeAt, pause.resource, pause.kind], [reset, "core", "primary"]);
+  assert.equal(pause.message, "GitHub refused the shared gh login: its core budget is spent; paused until 17:05 UTC");
+  time.now = reset - 1;
+  assert.throws(() => budget.admit("owner"), GitHubPausedError, "an hour-long reset is not capped");
+  time.now = reset;
+  budget.admit("background");
+
+  const secondary = Object.assign(new GitHubRateLimitedError("GitHub is throttling gh"), { headers: new Map([["retry-after", "60"], ["x-ratelimit-remaining", "4000"]]) });
+  const later = budget.refused(secondary) as GitHubPausedError;
+  assert.deepEqual([later.resumeAt, later.kind], [time.now + 60_000, "secondary"]);
+  // A shorter refusal never shortens a longer pause already set.
+  budget.throttled({ resumeAt: time.now + 1_000, resource: "core", kind: "secondary" });
+  assert.throws(() => budget.admit("owner"), (error: unknown) => error instanceof GitHubPausedError && error.resumeAt === time.now + 60_000);
+  assert.equal(new GitHubPausedError(reset, "budget", 295).message, "Paused until 17:05 UTC: the shared GitHub budget is low (295 left)");
 });
 
 test("GitHub: a routed budget records nothing from one account's headers and passes the router's refusal through", () => {

@@ -3,8 +3,8 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { LinearService } from "./linear";
 import { chosenByHand, planLabelChanges, readLabelRules, type LabelRules, type ResolvedGroup, type SweptIssue } from "./label-rules";
-import { ghJson, GitHubRateLimitedError, PullRequestNotFoundError } from "./pr-watch";
-import { RateLimitedError, withPriority } from "./rate-budget";
+import { ghJson, PullRequestNotFoundError } from "./pr-watch";
+import { GitHubRateLimitedError, RateLimitedError, withPriority } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
 
 const SYNC_MS = 2 * 60 * 1000;

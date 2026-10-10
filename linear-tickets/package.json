@@ -24,7 +24,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "generate:icons": "node scripts/generate-provider-icons.mjs",
-    "test": "node --import tsx --test server/*.test.ts client/*.test.ts scripts/*.test.mjs && python3 -m unittest discover -s ops -p 'test_*.py'",
+    "test": "LINEAR_TICKETS_USAGE_DIR=\"${TMPDIR:-/tmp}/linear-tickets-test-usage\" node --import tsx --test server/*.test.ts client/*.test.ts scripts/*.test.mjs && python3 -m unittest discover -s ops -p 'test_*.py'",
     "tier-report": "node scripts/tier-report.mjs",
     "smoke:planning": "node scripts/planning-smoke.mjs"
   },
