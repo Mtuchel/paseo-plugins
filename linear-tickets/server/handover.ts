@@ -75,7 +75,8 @@ export function ownedPullRequests(record: HandoverRecord): string[] {
 // One pull request's move from one ticket's record to another's (see Handover.transfer), journaled
 // per pull request. Writing it `pending` is the move: from then on the pull request is the
 // destination's, and reads wait until both records say so (`completed`). A later move of the same
-// pull request has a higher `generation`.
+// pull request has a higher `generation` and keeps the earlier ones (`earlier`, oldest first, the
+// last MAX_EARLIER_MOVES), so saved work that still names a ticket two moves back follows too.
 export type PullTransfer = {
   generation: number;
   url: string;
@@ -85,7 +86,10 @@ export type PullTransfer = {
   headBranch: string | null;
   state: "pending" | "completed";
   at: string;
+  earlier?: PullMove[];
 };
+export type PullMove = Pick<PullTransfer, "from" | "to" | "at">;
+const MAX_EARLIER_MOVES = 20;
 type TransferJournal = Record<string, PullTransfer>;
 export type GitState = { branch: string | null; lastCommit: string | null };
 type Linear = Pick<LinearService, "upsertComment" | "comment" | "upsertAttachment" | "removeAttachments">;
@@ -229,7 +233,8 @@ export class Handover {
       if (destination && ownedPullRequests(destination).some((owned) => pullKey(owned) === key)) return "already";
       const source = await this.raw(from.issueId);
       if (!source || !ownedPullRequests(source).some((owned) => pullKey(owned) === key)) return "not-owned";
-      const entry: PullTransfer = { generation: (last?.generation ?? 0) + 1, url, from, to, headBranch, state: "pending", at: this.now() };
+      const earlier = last ? [...(last.earlier ?? []), { from: last.from, to: last.to, at: last.at }].slice(-MAX_EARLIER_MOVES) : [];
+      const entry: PullTransfer = { generation: (last?.generation ?? 0) + 1, url, from, to, headBranch, state: "pending", at: this.now(), ...(earlier.length ? { earlier } : {}) };
       await this.saveJournal({ ...journal, [key]: entry });
       await this.materialize(entry);
       console.log(`[linear-tickets] ${key} moved from ${from.identifier} to ${to.identifier} (generation ${entry.generation})`);

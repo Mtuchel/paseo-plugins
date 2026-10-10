@@ -2268,8 +2268,9 @@ stops the checks, if its title names another ticket. Each move is journaled firs
 finished before any other read or write of the records, after a restart too, so a pull request
 is never on two tickets or on none; a late link from the old ticket's agent does not take it back,
 and the old ticket's branch no longer counts it (its stack policy and watchdog look past it).
-What the old ticket had pending for it follows it, on every poll from the journal (so also after
-a restart before that was saved): messages addressed to the ticket by name and not sent yet, and
+What the old ticket had pending for it follows it, on every poll from the journal (which keeps a
+pull request's last 20 earlier moves too, so also after a restart before that was saved and
+across a second move): messages addressed to the ticket by name and not sent yet, and
 the queue backstop's saved enqueues and stack moves that name the old ticket (the old one stays
 named while it still owns another pull request of the range). A restarted agent's resume about
 that pull request, restarted before the move, is not sent any more; one about a stack member no

@@ -1710,18 +1710,21 @@ export class PullRequestWatch {
     console.log(`[linear-tickets] ${note}`);
   }
 
-  // Every journaled move (Handover.moves) rebinds what this host saved for the old ticket (see
-  // rebind), with the source's ownership as it is now, so several moves of one range in one poll
-  // and a restart before the state was saved both end the same way. `all`: the records as they
-  // are now. A failed journal read is logged; the next run rebinds. Returns the moves.
+  // Every journaled move (Handover.moves), the earlier moves of the same pull request first, rebinds
+  // what this host saved for the old ticket (see rebind), with the source's ownership as it is now,
+  // so several moves of one range in one poll, a restart before the state was saved and a second
+  // move before the first was rebound all end the same way. `all`: the records as they are now. A
+  // failed journal read is logged; the next run rebinds. Returns the moves.
   private async rebindMoved(seenByUrl: Record<string, Seen>, all: HandoverRecord[]): Promise<PullTransfer[]> {
     const moves = await this.deps.handover.moves?.().catch((error: unknown) => {
       console.error(`[linear-tickets] reading the moved pull requests failed: ${error instanceof Error ? error.message : error}`);
       return [];
     }) ?? [];
-    for (const move of moves) {
-      const source = all.find((record) => record.issueId === move.from.issueId);
-      rebind(seenByUrl, { url: move.url, from: move.from.identifier, to: move.to.identifier, at: move.at }, source ? ownedPullRequests(source) : []);
+    for (const last of moves) {
+      for (const move of [...(last.earlier ?? []), last]) {
+        const source = all.find((record) => record.issueId === move.from.issueId);
+        rebind(seenByUrl, { url: last.url, from: move.from.identifier, to: move.to.identifier, at: move.at }, source ? ownedPullRequests(source) : []);
+      }
     }
     return moves;
   }
@@ -3852,7 +3855,11 @@ export class PullRequestWatch {
       if (!owners?.has(ask.issueId)) continue;
       try {
         const marker = oversizeMarker(key);
-        if (!ask.moved && (await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(ask.issueId, CODING_STATE);
+        if (!ask.moved) {
+          if ((await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(ask.issueId, CODING_STATE);
+          asks[key] = { ...ask, moved: true };
+          await writeState(this.oversizePath, asks);
+        }
         if (!(await this.deps.linear.hasComment(ask.issueId, marker))) await this.mention(ask.issueId, `${ask.body}\n\n${marker}`);
         asks[key] = { state: "confirmed", issueId: ask.issueId, at: new Date(this.clock()).toISOString() };
         await writeState(this.oversizePath, asks);

@@ -4516,6 +4516,24 @@ test("a pending oversized-ticket ask whose event was already claimed is finished
   assert.equal(JSON.parse(await readFile(asks, "utf8"))["i1:a1"].state, "confirmed");
 });
 
+test("a pending oversized-ticket ask whose comment fails after the ticket moved back does not move it again on the next poll", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const h = harness(t);
+  const asks = join(await h.home(), "oversize-asks.json");
+  await writeFile(asks, JSON.stringify({ "i1:a1": { state: "pending", issueId: "i1", at: "2026-10-10T00:00:00.000Z", body: "No successor can start." } }));
+  h.linear.arrive = async () => { throw new Error("Linear is unavailable"); };
+  const first = await h.poll();
+  assert.ok(first.includes("move In Progress"));
+  assert.equal(JSON.parse(await readFile(asks, "utf8"))["i1:a1"].moved, true, "the move is recorded before the comment");
+  h.linear.arrive = async () => {};
+  // The owner moved the ticket on in between: recovery of the same ask leaves that alone.
+  const second = await h.poll();
+  assert.ok(!second.some((call) => call.startsWith("move")), second.join("\n"));
+  assert.equal(h.linear.comments.i1?.length, 1);
+  assert.equal(JSON.parse(await readFile(asks, "utf8"))["i1:a1"].state, "confirmed");
+});
+
 test("a rate limit while checking a renamed pull request holds its events: the old ticket's agent is not asked", async (t) => {
   t.mock.method(console, "log", () => {});
   t.mock.method(console, "error", () => {});
@@ -4589,4 +4607,21 @@ test("the backstop's saved work on moved pull requests names the ticket that own
   await h.restart();
   await h.poll();
   assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"))[PR].actions[0].tickets, ["TUC-2"]);
+});
+
+test("saved work that names a ticket two moves back follows the pull request to its owner now", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const store = await transferStore(t);
+  // Two moves before any poll rebound the first (a restart in between).
+  assert.equal(await store.transfer(PR, { issueId: "i1", identifier: "TUC-1" }, { issueId: "i2", identifier: "TUC-2" }, READY.headBranch), "moved");
+  assert.equal(await store.transfer(PR, { issueId: "i2", identifier: "TUC-2" }, { issueId: "i3", identifier: "TUC-3" }, READY.headBranch), "moved");
+  const h = harness(t, { store });
+  const title = "Fix TUC-3 [plugin] Retry the upload";
+  h.github.title = title;
+  h.github.view = { ...READY, title, body: "Part of TUC-3.", checks: [failing("PR code")] };
+  h.linear.byIssue["TUC-3"] = { id: "i3", identifier: "TUC-3", status: "In Progress", statusType: "started" };
+  const action = { id: "x", repo: "tuchel-sohn/tuchel-platform", branch: READY.headBranch, expect: "h", prs: [419], top: 419, tickets: ["TUC-1"], why: "", at: "2026-01-01T00:00:00.000Z", activityBoundary: null, steps: { enqueue: "refused", prComment: "done", linearComment: "done", note: "done" } };
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, actions: [action] } });
+  await h.poll();
+  assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"))[PR].actions[0].tickets, ["TUC-3"]);
 });
