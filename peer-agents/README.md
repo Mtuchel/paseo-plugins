@@ -52,4 +52,7 @@ cd peer-agents
 npm ci
 npm run typecheck
 npm test
+node ../tools/paseo-build.mjs .
 ```
+
+peer-agents declares Paseo >=0.9.1 <0.10.0, so on a 0.10 host this check refuses it with Paseo's own message; check it against a supported Paseo with `PASEO_SERVER_DIR` (see AGENTS.md, "Checks"). Roll out with `node ~/dev/paseo-plugins/tools/plugin-rollout.mjs ~/dev/paseo-plugins/peer-agents`.

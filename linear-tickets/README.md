@@ -30,11 +30,31 @@ paseo plugin install /absolute/path/to/linear-tickets
 ```
 
 Enable plugins in Paseo Settings → Plugins if needed. Open **Linear tickets** in
-the sidebar or **Open Linear tickets** in the command center. After source changes:
+the sidebar or **Open Linear tickets** in the command center. Roll out source
+changes on each host with the rollout tool, and nothing else (see `AGENTS.md`):
 
 ```sh
-paseo plugin reload linear-tickets
+node ~/dev/paseo-plugins/tools/plugin-rollout.mjs ~/dev/paseo-plugins/linear-tickets
 ```
+
+It waits for any load still running from the checkout, pulls, runs `npm ci` when the
+lockfile changed, runs Paseo's own plugin build (a refused build reloads nothing),
+and reloads only when the plugin's code differs from what it last loaded, then waits
+for `ready` or prints the load error. Exit 2 (`cannot tell which code linear-tickets
+runs`) means it was loaded outside the tool, Paseo restarted, or this is the host's
+first rollout: read the reason and rerun with `--force` to reload it once. Use
+`--force` too after a config-only change.
+
+**Waiting for a reload.** A load takes about 2.5 minutes. A 60 s CLI timeout
+(`Timeout waiting for message (60000ms)`) and a `failed` status in `paseo plugin ls`
+during the first ~3 minutes are not failures: wait for `[paseo] Plugin ready` in
+`paseo plugin logs linear-tickets` (or `running` in `paseo plugin ls`), act only on a
+`[paseo] Plugin failed to load` line, and never reload again while a load runs —
+each reload starts the load over. Reload only through the tool: a reload from Paseo
+Settings (or a bare `paseo plugin reload`) whose log line has already scrolled out of
+the 500-line plugin log goes unnoticed, normally causing one unnecessary reload
+later, and in one rare case (plugin code changed, reloaded from Settings, then
+reverted to the exact earlier code) it reports old code as current.
 
 ## GitHub automation identity
 
@@ -71,7 +91,7 @@ change billing without the account owner's approval.
 
 ```sh
 node scripts/install-github-router.mjs
-paseo plugin reload linear-tickets
+node ~/dev/paseo-plugins/tools/plugin-rollout.mjs ~/dev/paseo-plugins/linear-tickets --force
 ```
 
 The installer verifies both bot identities before changing any command path.
@@ -989,7 +1009,7 @@ Bun (`~/.bun/bin/bun`, Homebrew or `LINEAR_TICKETS_BUN`) and the Plannotator omp
 (`~/.omp/plugins/node_modules/@plannotator/pi-extension`, or `LINEAR_TICKETS_PLANNOTATOR_PACKAGE`);
 without them plans are not parked and their agents wait for you as before.
 
-The host outlives plugin reloads (a deploy runs `paseo plugin reload`): the next plugin run adopts
+The host outlives plugin reloads (a deploy runs `tools/plugin-rollout.mjs`): the next plugin run adopts
 it through its heartbeat (`plannotator/host.json`), so a review you have open keeps its server and
 your annotations. During the reload itself (about a minute on the server) the page cannot reach
 its server, because the tailnet route goes through the plugin's compressing proxy: a note saved
@@ -1805,7 +1825,7 @@ the saved bullets means it went through, none means it is retried while the pull
 and a comment that no longer starts with the saved bullets means nothing can be told: it is not
 retried, the range is blocked and the agent is asked to check. Comments owed for an enqueue still
 go out once after the pull request closed or landed. To switch the backstop off, revert the
-plugin change and `paseo plugin reload linear-tickets`; ranges already in the queue stay there.
+plugin change and roll it out with `tools/plugin-rollout.mjs`; ranges already in the queue stay there.
 
 If a handover record has no pull-request link, or its link moved or disappeared after routing,
 the backstop still delivers the repair to that ticket's agent through the same crash/successor
@@ -1880,7 +1900,7 @@ comment with each outcome and completes itself. A repo whose run failed (or stop
 budget) and a pull request that could not be read ("not read this run") keep it open. If you
 close it while pull requests still wait, it stays closed until a complete run finds none; a later
 outage files a new one. To switch it off, revert the plugin change (or the repo's script) and
-`paseo plugin reload linear-tickets`; comments already posted, and reviews already started, stay.
+roll it out with `tools/plugin-rollout.mjs`; comments already posted, and reviews already started, stay.
 
 The poll and backstop also recover a missing handover PR link before deciding the ticket's next
 step. They identify the repository from the recorded worktree's validated GitHub origin, or
@@ -3883,9 +3903,10 @@ Shutdown refuses new work and drains attempts within the 30-second upstream dead
 Usage counts settle once while the broker runs or drains; persistence remains best-effort across
 crashes, and unknown/recovered intervals invalidate outside-estimate continuity.
 
-For **each host** (laptop and server087), drain current agent turns/MCP calls, update the clean
-`~/dev/paseo-plugins` checkout with `git pull --ff-only`, run `npm ci` only if the lockfile changed,
-then `paseo plugin reload linear-tickets` — never restart the daemon to load source changes.
+For **each host** (laptop and server087), drain current agent turns/MCP calls, then run
+`node ~/dev/paseo-plugins/tools/plugin-rollout.mjs ~/dev/paseo-plugins/linear-tickets` — it pulls,
+installs when the lockfile changed, runs Paseo's build, and reloads once. Never restart the daemon
+to load source changes.
 Startup upgrades only verified private generated files, preserving saved command paths.
 Unrecognized paths are logged as **unprotected**, never overwritten. Correct their saved config
 or establish provenance before claiming host coverage. Restart already-loaded legacy MCP processes

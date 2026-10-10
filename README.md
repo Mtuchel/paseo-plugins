@@ -20,26 +20,36 @@ cd linear-tickets
 npm ci
 npm run typecheck
 npm test
+node ../tools/paseo-build.mjs .
 paseo plugin install "$PWD"
 ```
 
-Enable plugins in Paseo Settings → Plugins if needed, then reload after source
-changes:
+Enable plugins in Paseo Settings → Plugins if needed, then roll out source
+changes from the checkout root:
 
 ```sh
-paseo plugin reload linear-tickets
+node tools/plugin-rollout.mjs linear-tickets
 ```
+
+After a config change, add `--force`. The tool pulls, installs, runs the build
+check, and reloads only when needed; see AGENTS.md for the wait rules (a load
+takes about 2.5 minutes).
 
 Each plugin's README covers its own setup, permissions and behavior.
 
 ## Development
 
-Every plugin is checked with the same two commands before installing:
+Every plugin is checked with the same three commands before installing:
 
 ```sh
 npm run typecheck   # tsc --noEmit against the Paseo SDK
 npm test            # node --test with the plugin's own test files
+node ../tools/paseo-build.mjs .   # Paseo's own plugin build (the daemon's load check)
 ```
+
+A plugin that excludes the installed Paseo (`peer-agents` today) is checked
+against a supported Paseo with `PASEO_SERVER_DIR` (see AGENTS.md, "Checks").
+A change under `tools/` also runs `node --test tools/` at the repository root.
 
 ## Adding a plugin
 
