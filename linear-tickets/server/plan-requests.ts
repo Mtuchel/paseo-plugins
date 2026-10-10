@@ -88,8 +88,10 @@ export class PlanRequests {
       // ticket taking the small route, which refuses a `plan` label, so it came afterwards.
       const added = plan && (before ? !before.plan : await this.deps.routes?.active(agent.issueId) ?? false);
       if (added) {
-        await this.deps.routes?.ownerRequested(agent.issueId);
+        // The request file first: it alone reaches the running agent, and the route's fence reads it
+        // too. A failure before the owner record leaves no baseline saved, so the next poll retries.
         await this.writeRequest(agent);
+        await this.deps.routes?.ownerRequested(agent.issueId);
         entry.pending = true;
       }
       if (!plan && before?.pending) await rm(join(this.directory, agent.id), { force: true });
