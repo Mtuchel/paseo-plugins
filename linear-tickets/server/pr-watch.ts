@@ -281,8 +281,42 @@ export async function probeRates(): Promise<RateProbe[]> {
 type Drop = { key: string; reason: string; repo: string; number: number; draft: { number: number; url: string; headSha: string | null; pulls: number[] } | null };
 // `conflict`: the repo's class is conflictOnly; `main`: mainBroken; `plain`: any other class.
 type DropKind = "plain" | "conflict" | "main";
-// What one poll or backstop run reads at most once per repo.
-type RunContext = { records: HandoverRecord[]; repo(worktree: string): Promise<string | null>; pulls(repo: string): Promise<OpenPull[]>; drafts(repo: string): Promise<QueueDraft[]>; checkout(repo: string): Promise<string | null>; now: number };
+// What one poll or backstop run reads at most once per repo. `owner`: the ticket (issue id) whose
+// record owns a pull request, over every record of this host's files, another host's tickets too.
+type RunContext = { records: HandoverRecord[]; owner(url: string): string | undefined; repo(worktree: string): Promise<string | null>; pulls(repo: string): Promise<OpenPull[]>; drafts(repo: string): Promise<QueueDraft[]>; checkout(repo: string): Promise<string | null>; now: number };
+
+// An open pull request found on a ticket's recorded branch counts for the ticket unless another
+// ticket's record owns it (it moved there, see PullRequestWatch.reconcile): a branch never keeps a
+// pull request on the ticket it moved away from.
+function onBranch(record: { issueId: string; branch: string | null } | undefined, pull: OpenPull, context: RunContext): boolean {
+  return Boolean(record?.branch && pull.headBranch === record.branch && (context.owner(pull.url) ?? record.issueId) === record.issueId);
+}
+
+// The queue backstop's saved enqueues (`actions`) and stack moves (`retarget`) name their tickets
+// by identifier. When a pull request of their range moves from ticket `from` to `to` (see
+// PullRequestWatch.reconcile), `to` joins them, and `from` leaves unless the source still owns
+// another pull request of the range (`kept`, the URLs it still owns): their comments, refusals and
+// instructions then go to the ticket that owns the pull request now.
+function rebind(seenByUrl: Record<string, Seen>, url: string, from: string, to: string, kept: string[]): void {
+  const source = PULL_URL.exec(url);
+  if (!source) return;
+  const repo = source[1].toLowerCase();
+  const moved = Number(source[2]);
+  const still = new Set(kept.flatMap((owned) => {
+    const found = PULL_URL.exec(owned);
+    return found && found[1].toLowerCase() === repo ? [Number(found[2])] : [];
+  }));
+  const swap = (tickets: string[], prs: number[]): string[] => {
+    if (!prs.includes(moved)) return tickets;
+    const rest = prs.some((pr) => pr !== moved && still.has(pr)) ? tickets : tickets.filter((ticket) => ticket.toUpperCase() !== from.toUpperCase());
+    return rest.some((ticket) => ticket.toUpperCase() === to.toUpperCase()) ? rest : [...rest, to];
+  };
+  for (const [key, seen] of Object.entries(seenByUrl)) {
+    if (PULL_URL.exec(key)?.[1].toLowerCase() !== repo) continue;
+    for (const action of seen.actions ?? []) action.tickets = swap(action.tickets, action.prs);
+    if (seen.retarget) seen.retarget.tickets = swap(seen.retarget.tickets, [seen.retarget.pr, ...seen.retarget.range.map((member) => member.pr)]);
+  }
+}
 // A poll's stopped state (see the `stopped` flags in watch): a rate limit or a burnt budget ends
 // the poll's GitHub reads.
 type StopFlags = { paused: RateLimitedError | null; budget: GitHubPausedError | null; throttled: GitHubRateLimitedError | null };
@@ -1033,14 +1067,20 @@ function crashKind(error: string): "limit" | "setup" | null {
 // reloading the agent again — its session itself may be broken — which `successor` marks, so the
 // pass never touches it again. `setup`/`limit`: the crash error no restart loop can clear (see
 // crashKind), kept with the error it was seen on until a different crash clears it. `resume`: what
-// a restart has still to send, kept until it went out (at least once) or no longer applies;
+// a restart has still to send, kept until it went out (at least once) or no longer applies; `url`:
+// the pull request a drop fix, nudge or replay in it is about, so the resume no longer applies once
+// that pull request moved to another ticket (see PullRequestWatch.reconcile).
 // `error`: the crash of the last restart. `escalated`: written by the removed rule only (the next
 // crash after STAGE_NUDGES restarts was handed to the owner); the load clears it (see
 // cutOverCrashes).
-type Crash = { restarts?: number; restartedAt?: string; successor?: boolean; setup?: string; limit?: string; escalated?: boolean; resume?: { text: string; issueId: string } | null; error?: string };
+type Crash = { restarts?: number; restartedAt?: string; successor?: boolean; setup?: string; limit?: string; escalated?: boolean; resume?: { text: string; issueId: string; url?: string } | null; error?: string };
 
 // One owner ask about a ticket too large to start any agent (see PullRequestWatch.oversizeHandBack).
-type OversizeAsk = { state: "pending" | "confirmed"; issueId: string; at: string };
+// `body`: the comment of a pending ask, so a poll can finish it once its event was claimed (see
+// finishOversizeAsks); a confirmed ask keeps none.
+type OversizeAsk = { state: "pending" | "confirmed"; issueId: string; at: string; body?: string };
+
+const oversizeMarker = (key: string) => `<!-- paseo:oversize-start:${key} -->`;
 
 // An oversized ticket's ask is keyed by the ticket and the gone agent its messages were for, so a
 // new agent's later failure is a new ask.
@@ -1087,8 +1127,9 @@ export class PullRequestWatch {
   constructor(
     private readonly deps: {
       // `transfer` moves a pull request to the ticket its title and body name (see reconcile);
-      // `annotate` records a link or review on a record without an agent. Absent: neither happens.
-      handover: Pick<Handover, "all" | "update"> & Partial<Pick<Handover, "transfer" | "annotate">>;
+      // `annotate` records a link or review on a record without an agent; `swapPullRequest`
+      // replaces one pull request a record owns besides its primary one. Absent: none happens.
+      handover: Pick<Handover, "all" | "update"> & Partial<Pick<Handover, "transfer" | "annotate" | "swapPullRequest">>;
       sessions: Pick<SessionRouter, "sessionFor" | "say" | "prompt" | "link" | "crashed" | "succeed" | "whileIdle">;
       // `issueState` finds a ticket that has no handover record by its identifier. Crash recovery
       // checks a crashed agent's ticket with `issueStatusAnyPool`, and keeps the states of all
@@ -1283,7 +1324,8 @@ export class PullRequestWatch {
   // still runs (the crash pass restarts the agent when it is due): the send then comes to
   // `crashed`, and the message waits.
   // `unverified`: the ticket state the restart goes by could not be read just now (see crashPass).
-  private recovery(record: HandoverRecord, reserved: Set<string>, claim: () => Promise<void>, unverified?: KnownState): Recovery | undefined {
+  // `url`: the pull request the message is about (see Crash.resume), absent for ticket-wide ones.
+  private recovery(record: HandoverRecord, reserved: Set<string>, claim: () => Promise<void>, unverified?: KnownState, url?: string): Recovery | undefined {
     const agentId = record.agentId;
     const crash = this.crashOf(record);
     if (agentId === null || crash?.successor || crash?.setup || crash?.limit || !this.restartDue(crash)) return undefined;
@@ -1294,7 +1336,7 @@ export class PullRequestWatch {
         reserved.add(agentId);
         await claim();
         await this.saveCrash(agentId, {
-          resume: { text: resume, issueId: record.issueId }, error,
+          resume: { text: resume, issueId: record.issueId, ...(url ? { url } : {}) }, error,
           restarts: (this.crashes[agentId]?.restarts ?? 0) + 1, restartedAt: new Date(this.clock()).toISOString(),
         });
       },
@@ -1380,8 +1422,9 @@ export class PullRequestWatch {
 
   // The poll's and the backstop's reads, once per repo: the open pull requests, Graphite's drafts
   // and the backstop checkout (made from the worktree of any record of the repo). `pulls`: the
-  // open pull requests already listed this poll (see reconcile).
-  private context(records: HandoverRecord[], pulls = new Map<string, Promise<OpenPull[]>>()): RunContext {
+  // open pull requests already listed this poll (see reconcile). `all`: every record, for `owner`.
+  private context(records: HandoverRecord[], pulls = new Map<string, Promise<OpenPull[]>>(), all: HandoverRecord[] = records): RunContext {
+    const owners = new Map(all.flatMap((record) => ownedPullRequests(record).map((url) => [pullKey(url), record.issueId] as const)));
     const drafts = new Map<string, Promise<QueueDraft[]>>();
     const checkouts = new Map<string, Promise<string | null>>();
     const repos = new Map<string, Promise<string | null>>();
@@ -1399,6 +1442,7 @@ export class PullRequestWatch {
     const checkout = this.deps.backstop?.checkout ?? new BackstopCheckout();
     return {
       records,
+      owner: (url) => owners.get(pullKey(url)),
       now: this.deps.backstop?.now?.() ?? Date.now(),
       repo: (worktree) => {
         const source = repos.get(worktree) ?? repo(worktree);
@@ -1551,7 +1595,7 @@ export class PullRequestWatch {
       const record = context.records.find((item) => item.issueId === ticket.issueId);
       const names = namesTicket(ticket.identifier);
       const open: OpenPull[] = [];
-      for (const repo of repos) open.push(...(await context.pulls(repo)).filter((pull) => names.test(pull.title) || (record?.branch && pull.headBranch === record.branch)));
+      for (const repo of repos) open.push(...(await context.pulls(repo)).filter((pull) => names.test(pull.title) || onBranch(record, pull, context)));
       return open;
     } catch (error) {
       if (error instanceof RateLimitedError) throw error;
@@ -1580,6 +1624,8 @@ export class PullRequestWatch {
   // as ticket identifiers: those of the teams the records name (so `AC-1` or `UTF-8` count as
   // nothing). `held`: pull requests whose move is due but could not be made (the destination or
   // the move failed); none of their messages is routed this poll, and the next poll tries again.
+  // Once a rate limit or GitHub's budget stops the checks, every pull request not checked yet
+  // whose listed title names another ticket (or whose listing cannot be read) is held too.
   private async reconcile(all: HandoverRecord[], context: RunContext, seenByUrl: Record<string, Seen>): Promise<{ records: HandoverRecord[]; held: Set<string> }> {
     const held = new Set<string>();
     const transfer = this.deps.handover.transfer;
@@ -1587,6 +1633,7 @@ export class PullRequestWatch {
     const teams = new Set(all.map((record) => record.identifier.split("-")[0].toUpperCase()));
     const named = (text: string) => [...new Set([...text.matchAll(TICKET_ID)].map((match) => match[1].toUpperCase()))].filter((id) => teams.has(id.split("-")[0]));
     let moved = false;
+    let stopped = false;
     for (const record of all) {
       for (const url of ownedPullRequests(record)) {
         const seen = seenByUrl[url];
@@ -1596,6 +1643,10 @@ export class PullRequestWatch {
           const pull = (await context.pulls(source[1])).find((item) => pullKey(item.url) === pullKey(url));
           const titled = pull ? named(pull.title) : [];
           if (titled.length !== 1 || titled[0] === record.identifier.toUpperCase()) continue;
+          if (stopped) {
+            held.add(pullKey(url));
+            continue;
+          }
           const view = await this.view(url);
           // An unread description never moves a pull request; nor does a closed one.
           if (view.state !== "OPEN" || typeof view.body !== "string") continue;
@@ -1624,10 +1675,17 @@ export class PullRequestWatch {
           this.transferNotes.delete(url);
           // Messages routed to the old ticket by name and not sent yet go to the new one.
           for (const message of [seen?.pending, ...(seen?.queued ?? [])]) if (message?.orphan && !message.sending) message.orphan = { tickets: [target.identifier] };
+          // So do the backstop's saved enqueues and stack moves that name it (see rebind).
+          rebind(seenByUrl, url, record.identifier, target.identifier, ownedPullRequests(record).filter((owned) => pullKey(owned) !== pullKey(url)));
           await this.deps.linear.linkUrl(target.id, url, "Pull request").catch((error: unknown) => console.error(`[linear-tickets] ${target.identifier}: linking ${url} failed: ${error instanceof Error ? error.message : error}`));
           console.log(`[linear-tickets] ${url} (${pullKey(url)}) moved from ${record.identifier} to ${target.identifier}: its title and description name only ${target.identifier}`);
         } catch (error) {
-          if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) return { records: moved ? await this.deps.handover.all() : all, held };
+          if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) {
+            stopped = true;
+            held.add(pullKey(url));
+            this.transferNote(url, `${record.identifier}: checking whether ${url} moved to another ticket stopped (${error.message}); its messages wait`);
+            continue;
+          }
           held.add(pullKey(url));
           this.transferNote(url, `${record.identifier}: checking whether ${url} moved to another ticket failed (${error instanceof Error ? error.message : error}); its messages wait`);
         }
@@ -1654,6 +1712,7 @@ export class PullRequestWatch {
         console.error(`[linear-tickets] clearing the old crash escalations failed: ${error instanceof Error ? error.message : error}`);
       });
     }
+    await this.finishOversizeAsks();
     const manual = this.deps.manualTasks;
     const listed = new Map<string, Promise<OpenPull[]>>();
     // Pull requests move to the ticket their title and body name before anything is routed.
@@ -1661,7 +1720,7 @@ export class PullRequestWatch {
     // One poll watches one host's tickets (see ownership): another host's records stay here
     // untouched, so their pull requests are not read, routed, nudged or succeeded from this host.
     const mine = await this.ownedRecords(all);
-    const context = this.context(this.perPullRequest(mine, held), listed);
+    const context = this.context(this.perPullRequest(mine, held), listed, all);
     const records: HandoverRecord[] = [];
     for (const record of context.records) {
       const url = record.links["Pull request"];
@@ -2131,7 +2190,7 @@ export class PullRequestWatch {
     // work: another host's records keep their state here untouched.
     const records = await this.ownedRecords(all);
     // Routing, stack ownership and pending messages see every pull request a record owns.
-    const context = this.context(this.perPullRequest(records, new Set()));
+    const context = this.context(this.perPullRequest(records, new Set()), undefined, all);
     const save = () => this.save(seenByUrl);
     // Whether this host runs the repo-wide half of the backstop (see backstopHost).
     const repoWide = await this.backstopHost();
@@ -2893,7 +2952,7 @@ export class PullRequestWatch {
       if (reserved.has(this.slot(record))) return;
       let gone = record.status === "archived";
       if (!gone) {
-        const outcome = await this.deps.sessions.prompt(record.agentId, fix, toAgent, this.recovery(record, reserved, dispatch));
+        const outcome = await this.deps.sessions.prompt(record.agentId, fix, toAgent, this.recovery(record, reserved, dispatch, undefined, url));
         if (this.waitFor(seenByUrl, url, `drop:${pending.key}`, outcome)) {
           // The agent waited out the owner's answer: the message is claimed as escalated, which
           // holds the range until the owner answers, before the reminder goes out.
@@ -3072,7 +3131,7 @@ export class PullRequestWatch {
         `${OWNER_POLICY}; never just wait.`,
       ].join("\n");
       if (record.status !== "archived") {
-        const outcome = await this.deps.sessions.prompt(record.agentId, prompt, toAgent, this.recovery(record, reserved, claim));
+        const outcome = await this.deps.sessions.prompt(record.agentId, prompt, toAgent, this.recovery(record, reserved, claim, undefined, url));
         if (this.waitFor(seenByUrl, url, `stage:${stage}:${key}`, outcome)) {
           // The agent waits for the owner's answer, so the step is claimed here — a later stall
           // under this key is not nudged again — and the owner is reminded once. No count holds
@@ -3176,7 +3235,7 @@ export class PullRequestWatch {
     try {
       let gone = record.status === "archived";
       if (!gone) {
-        const outcome = await this.deps.sessions.prompt(record.agentId, text, toAgent, this.recovery(record, reserved, toAgent));
+        const outcome = await this.deps.sessions.prompt(record.agentId, text, toAgent, this.recovery(record, reserved, toAgent, undefined, url));
         if (this.waitFor(seenByUrl, url, `replay:${view.headSha}`, outcome)) {
           // Claimed as asked before the reminder goes out, so it never goes out twice.
           seenByUrl[url] = { ...seenByUrl[url], replay: "asked", waits: undefined, activeAt: new Date().toISOString() };
@@ -3271,7 +3330,7 @@ export class PullRequestWatch {
       }
       const names = namesTicket(record.identifier);
       const open: OpenPull[] = [];
-      for (const repo of repos) open.push(...(await context.pulls(repo)).filter((pull) => names.test(pull.title) || (record.branch && pull.headBranch === record.branch)));
+      for (const repo of repos) open.push(...(await context.pulls(repo)).filter((pull) => names.test(pull.title) || onBranch(record, pull, context)));
       const own = open.filter((pull) => {
         const repo = PULL_URL.exec(pull.url)?.[1];
         if (!repo) return false;
@@ -3519,8 +3578,10 @@ export class PullRequestWatch {
       try {
         const state = record ? await this.ticketState(record) : null;
         if (record && !state) continue;
-        if (!record || !state || state.statusType !== "started") {
-          console.error(`[linear-tickets] ${label}: the resume for restarted agent ${agentId.slice(0, 8)} no longer applies; it is not sent`);
+        const moved = record && resume.url && !ownedPullRequests(record).some((owned) => pullKey(owned) === pullKey(resume.url!));
+        if (!record || !state || state.statusType !== "started" || moved) {
+          if (moved) console.log(`[linear-tickets] ${label}: the resume for restarted agent ${agentId.slice(0, 8)} is about ${resume.url}, which moved to another ticket; it is not sent`);
+          else console.error(`[linear-tickets] ${label}: the resume for restarted agent ${agentId.slice(0, 8)} no longer applies; it is not sent`);
           await this.dropResume(agentId);
           continue;
         }
@@ -3649,9 +3710,16 @@ export class PullRequestWatch {
   private readonly backoffLogged = new Map<string, string>();
 
   // The record's pull request link moves: the ticket, the handover record and, best effort, the
-  // agent's session. A record without an agent (Handover.transfer) only records the link.
+  // agent's session. A record without an agent (Handover.transfer) only records the link. For a
+  // pull request the record owns besides its primary one (see perPullRequest), only that one gives
+  // way (Handover.swapPullRequest): the primary one and the session's link stay.
   private async relink(record: HandoverRecord, url: string): Promise<void> {
     await this.deps.linear.linkUrl(record.issueId, url, "Pull request");
+    const previous = record.links["Pull request"];
+    if (previous && (record.pullRequests ?? []).some((other) => pullKey(other) === pullKey(previous))) {
+      await this.deps.handover.swapPullRequest?.(record.issueId, previous, url);
+      return;
+    }
     if (record.agentId === null) {
       await this.deps.handover.annotate?.(record.issueId, { link: ["Pull request", url] });
       return;
@@ -3695,18 +3763,19 @@ export class PullRequestWatch {
 
   // A ticket too large for any prompt cannot start a successor, whatever the event (a drop, a stalled
   // stage, a replay, the stack cap, a crash), so the owner is asked once, not on every later one.
-  // `pending` is saved before the ask and `confirmed` after it; an ask still pending (its comment may
-  // have been posted before a failure or a restart) is looked up by its marker first, never posted
-  // blind. Only the host that owns the ticket asks: while the peer mechanism cannot tell, the message
-  // waits (it throws, so the caller retries it on the next poll). A confirmed ask still claims later
-  // messages, without a comment or a state change. A successor or live agent taking the ticket over
-  // clears it (see succession).
+  // `pending` (with the comment) is saved before the ask and `confirmed` after it; an ask still
+  // pending (its comment may have been posted before a failure or a restart) is looked up by its
+  // marker first, never posted blind, and finished by the next poll even when no later event comes
+  // (see finishOversizeAsks). Only the host that owns the ticket asks: while the peer mechanism
+  // cannot tell, the message waits (it throws, so the caller retries it on the next poll). A
+  // confirmed ask still claims later messages, without a comment or a state change. A successor or
+  // live agent taking the ticket over clears it (see succession).
   private async oversizeHandBack(record: HandoverRecord, text: string, dispatch: () => Promise<void>): Promise<void> {
     const key = oversizeKey(record);
-    const marker = `<!-- paseo:oversize-start:${key} -->`;
+    const marker = oversizeMarker(key);
     const asks = await this.oversizeAsks();
-    const save = async (state: OversizeAsk["state"]) => {
-      asks[key] = { state, issueId: record.issueId, at: new Date(this.clock()).toISOString() };
+    const save = async (state: OversizeAsk["state"], body?: string) => {
+      asks[key] = { state, issueId: record.issueId, at: new Date(this.clock()).toISOString(), ...(body ? { body } : {}) };
       await writeState(this.oversizePath, asks);
     };
     if (asks[key]?.state === "confirmed") {
@@ -3727,13 +3796,38 @@ export class PullRequestWatch {
       console.log(`[linear-tickets] ${record.identifier}: the owner's ask about the oversized ticket was already posted; it is recorded now`);
       return;
     }
-    await save("pending");
+    const body = `The agent that worked on this ticket is no longer running, and no successor can start: ${CONTEXT_TOO_LARGE} The ticket is back in ${CODING_STATE}. Paseo asks only once: later messages for its pull requests are not posted here until an agent works on the ticket again. To go on, move the pull requests to another ticket by naming only that ticket in their titles and descriptions (README, "Moving a pull request to another ticket").\n\n${text}`;
+    await save("pending", body);
     await this.dropResume(record.agentId);
     if ((await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(record.issueId, CODING_STATE);
     await dispatch();
     await owned();
-    await this.mention(record.issueId, `The agent that worked on this ticket is no longer running, and no successor can start: ${CONTEXT_TOO_LARGE} The ticket is back in ${CODING_STATE}. Paseo asks only once: later messages for its pull requests are not posted here until an agent works on the ticket again. To go on, move the pull requests to another ticket by naming only that ticket in their titles and descriptions (README, "Moving a pull request to another ticket").\n\n${text}\n\n${marker}`);
+    await this.mention(record.issueId, `${body}\n\n${marker}`);
     await save("confirmed");
+  }
+
+  // Pending asks whose event was already claimed (a restart, or a failure, between the claim and
+  // the comment) are finished on every poll, by this host only for the tickets it owns (none while
+  // that cannot be told): found by their marker, else posted, then confirmed. A failure is logged
+  // and the next poll tries again.
+  private async finishOversizeAsks(): Promise<void> {
+    const asks = await this.oversizeAsks();
+    const pending = Object.entries(asks).filter(([, ask]) => ask.state === "pending" && typeof ask.body === "string");
+    if (!pending.length) return;
+    const ids = [...new Set(pending.map(([, ask]) => ask.issueId))];
+    const owners = this.deps.owner ? await this.deps.owner(ids).catch(() => null) : new Set(ids);
+    for (const [key, ask] of pending) {
+      if (!owners?.has(ask.issueId)) continue;
+      try {
+        const marker = oversizeMarker(key);
+        if (!(await this.deps.linear.hasComment(ask.issueId, marker))) await this.mention(ask.issueId, `${ask.body}\n\n${marker}`);
+        asks[key] = { state: "confirmed", issueId: ask.issueId, at: new Date(this.clock()).toISOString() };
+        await writeState(this.oversizePath, asks);
+        console.log(`[linear-tickets] ${ask.issueId}: the owner's ask about the oversized ticket, left pending, is posted and recorded now`);
+      } catch (error) {
+        console.error(`[linear-tickets] ${ask.issueId}: finishing the owner's ask about the oversized ticket failed: ${error instanceof Error ? error.message : error}`);
+      }
+    }
   }
 
   // A message for an agent that is gone starts a successor on the ticket's recorded branch and

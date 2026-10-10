@@ -206,8 +206,9 @@ and gone agent (the comment carries the mark `<!-- paseo:oversize-start:<issue>:
 `oversize-asks.json` next to `pr-watch.json` records it): later messages for its pull requests
 are claimed without another comment or state change, across restarts. Only the host that owns
 the ticket asks; while that cannot be told, the message waits. An ask whose comment may have
-been posted before a failure is looked up by its mark first, never posted twice. A successor or
-live agent taking the ticket over clears it.
+been posted before a failure is looked up by its mark first, never posted twice; one left pending
+after its message was claimed (a restart in between) is finished by the next poll of the owning
+host. A successor or live agent taking the ticket over clears it.
 
 **Finished blockers.** When a ticket starts after blockers that are finished (see *Waiting their turn*), its prompt gets a
 **Finished blockers** section after the instructions: for each one, its links (pull requests,
@@ -2260,11 +2261,19 @@ and uncommitted-change evidence") rather than starting on a guessed branch. Ever
 own records the same way from the pull request alone, also when the old ticket belongs to the
 peer; which host then acts on the destination is decided as for any ticket (**Several hosts**).
 When the destination cannot be read, that pull request's messages wait and the next poll tries
-again. Each move is journaled first (`handover/transfers/journal.json`, one entry per pull
-request with a generation number) and finished on the next read after a restart, so a pull
-request is never on two tickets or on none; a late link from the old ticket's agent does not take
-it back. Moving it back is a new move (rename it again). Reverting the plugin does not move pull
-requests back: rename them.
+again; so do those of every pull request not checked yet once a rate limit or GitHub's budget
+stops the checks, if its title names another ticket. Each move is journaled first
+(`handover/transfers/journal.json`, one entry per pull request with a generation number) and
+finished before any other read or write of the records, after a restart too, so a pull request
+is never on two tickets or on none; a late link from the old ticket's agent does not take it back,
+and the old ticket's branch no longer counts it (its stack policy and watchdog look past it).
+What the old ticket had pending for it follows it: messages addressed to the ticket by name and
+not sent yet, and the queue backstop's saved enqueues and stack moves that name the old ticket
+(the old one stays named while it still owns another pull request of the range). A restarted
+agent's resume about that pull request is not sent any more. A pull request owned besides the
+primary one that is replaced (same branch) or lands is swapped alone for the next one; the
+primary one stays. Moving it back is a new move (rename it again). Reverting the plugin does not
+move pull requests back: rename them.
 
 **Usage-limit resumes.** With the automatic-start switch on, a failed turn whose error says
 429, rate limit or usage limit is checked against the OMP broker's `/v1/usage` reports. A fresh,

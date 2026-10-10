@@ -4491,3 +4491,84 @@ test("a ticket that already owns a pull request keeps it primary and gets the mo
   assert.match(asked, /pull\/419/, "the moved pull request's stall reaches the destination's agent");
   assert.match(asked, /pull\/420/, "and so does its own pull request's");
 });
+
+test("a pending oversized-ticket ask whose event was already claimed is finished on the next poll, never posted twice", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t);
+  const asks = join(await h.home(), "oversize-asks.json");
+  const body = "The agent that worked on this ticket is no longer running, and no successor can start.";
+  await writeFile(asks, JSON.stringify({ "i1:a1": { state: "pending", issueId: "i1", at: "2026-10-10T00:00:00.000Z", body } }));
+  const calls = await h.poll();
+  assert.equal(calls.filter((call) => call.startsWith("comment")).length, 1, calls.join("\n"));
+  assert.equal(h.linear.comments.i1.length, 1);
+  assert.ok(h.linear.comments.i1[0].startsWith(OWNER) && h.linear.comments.i1[0].includes(body) && h.linear.comments.i1[0].endsWith(OVERSIZE_MARK));
+  const confirmed = JSON.parse(await readFile(asks, "utf8"))["i1:a1"];
+  assert.equal(confirmed.state, "confirmed");
+  assert.equal(confirmed.body, undefined, "a confirmed ask keeps no comment");
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("comment")), "confirmed: not posted again");
+  // Posted before a restart lost the confirmation: found by its mark, not posted again.
+  await writeFile(asks, JSON.stringify({ "i1:a1": { state: "pending", issueId: "i1", at: "2026-10-10T00:00:00.000Z", body } }));
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("comment")));
+  assert.equal(h.linear.comments.i1.length, 1);
+  assert.equal(JSON.parse(await readFile(asks, "utf8"))["i1:a1"].state, "confirmed");
+});
+
+test("a rate limit while checking a renamed pull request holds its events: the old ticket's agent is not asked", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const store = await transferStore(t);
+  const h = harness(t, { store });
+  renamed(h);
+  h.linear.issueFailure = new RateLimitedError("key", Date.now() + 60_000);
+  assert.deepEqual(prompts(await h.poll(), "a1"), []);
+  assert.equal((await store.read("i1"))?.links["Pull request"], PR);
+  h.linear.issueFailure = null;
+  await h.poll();
+  assert.equal((await store.read("i2"))?.links["Pull request"], PR);
+});
+
+test("a moved pull request no longer counts for the old ticket's branch: its Done ticket is not reopened for it", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const directory = await mkdtemp(join(tmpdir(), "paseo-pr-transfer-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const linear = { upsertComment: async () => "c1", comment: async () => {}, upsertAttachment: async () => {}, removeAttachments: async () => {} };
+  // The old ticket's record is on the pull request's own branch.
+  const store = new Handover(linear as never, directory, async () => ({ branch: READY.headBranch, lastCommit: "abc" }), () => new Date().toISOString());
+  await store.update({ id: "i1", identifier: "TUC-1" }, { id: "a1", title: "T", cwd: "/wt/tuc-1" }, { link: ["Pull request", PR] });
+  const h = harness(t, { store, autoResume: true });
+  renamed(h);
+  h.linear.state = { status: "Done", statusType: "completed" };
+  h.linear.completedAt = "2026-10-09T08:49:39.000Z";
+  // The destination works (its state read by id as well as by identifier); only TUC-1 is Done.
+  h.linear.byIssue.i2 = { status: "In Progress", statusType: "started" };
+  // Its repository is known from the ticket's attachments (the old link stays there as history).
+  h.linear.attachments = [PR];
+  h.paseo.succeed = async (claim) => { await claim(); return { kind: "started", agent: { id: "a2", title: "TUC-2", cwd: "/wt/tuc-2" } }; };
+  const calls = await h.poll();
+  assert.equal((await store.read("i2"))?.links["Pull request"], PR);
+  assert.ok(!calls.includes("reopen"), calls.join("\n"));
+  assert.deepEqual(prompts(calls, "a1"), []);
+});
+
+test("a restart's resume about a pull request that moved away is not sent to the old ticket's agent", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const store = await transferStore(t);
+  const h = harness(t, { store });
+  renamed(h);
+  await h.crashFile(JSON.stringify({ a1: { restarts: 1, restartedAt: "2026-10-10T00:00:00.000Z", resume: { text: "Fix the merge queue drop of pull/419.", issueId: "i1", url: PR } } }));
+  const calls = await h.poll();
+  assert.ok(!calls.some((call) => call.startsWith("prompt a1") && call.includes("Fix the merge queue drop")), calls.join("\n"));
+  assert.equal(JSON.parse(await h.crashFile()).a1.resume, null);
+});
+
+test("the backstop's saved enqueue of a moved pull request names the ticket that owns it now", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const store = await transferStore(t);
+  const h = harness(t, { store });
+  renamed(h);
+  const action = { id: "x", repo: "tuchel-sohn/tuchel-platform", branch: READY.headBranch, expect: "h", prs: [419], top: 419, tickets: ["TUC-1"], why: "", at: new Date().toISOString(), activityBoundary: null, steps: { enqueue: "refused", prComment: "done", linearComment: "done", note: "done" } };
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, actions: [action] } });
+  await h.poll();
+  const saved = JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"));
+  assert.deepEqual(saved[PR].actions[0].tickets, ["TUC-2"]);
+});

@@ -175,17 +175,18 @@ export class Handover {
 
   constructor(private readonly linear: Linear, private readonly directory = join(paseoHome(), "linear-tickets", "handover"), private readonly git = readGitState, private readonly now = () => new Date().toISOString(), private readonly agentUrl?: AgentUrl) {}
 
+  // Every read and write runs in one queue, after any move journaled but not applied to both
+  // records yet (a restart in between): nothing ever sees a pull request on both tickets or on
+  // neither. Inside the queue, use `raw`.
   private serialize<T>(work: () => Promise<T>): Promise<T> {
-    const result = this.queue.then(work, work);
+    const locked = async () => { await this.recover(); return work(); };
+    const result = this.queue.then(locked, locked);
     this.queue = result.catch(() => undefined);
     return result;
   }
 
-  // The record as the last move of a pull request left it: a move journaled but not applied to
-  // both records yet (a restart in between) is applied first. Inside `serialize`, use `raw`.
-  async read(issueId: string): Promise<HandoverRecord | null> {
-    await this.settle();
-    return this.raw(issueId);
+  read(issueId: string): Promise<HandoverRecord | null> {
+    return this.serialize(() => this.raw(issueId));
   }
 
   private async raw(issueId: string): Promise<HandoverRecord | null> {
@@ -209,12 +210,6 @@ export class Handover {
     } finally { await rm(temporary, { force: true }); }
   }
 
-  // Reads go through the queue only while a move is unfinished, so they never see a pull request
-  // on both tickets or on neither.
-  private async settle(): Promise<void> {
-    if (Object.values(await this.journal()).some((entry) => entry.state === "pending")) await this.serialize(() => this.recover());
-  }
-
   private async recover(): Promise<void> {
     for (const entry of Object.values(await this.journal())) if (entry.state === "pending") await this.materialize(entry);
   }
@@ -227,7 +222,6 @@ export class Handover {
   // request (any more), nothing changed. Each step is idempotent, so a restart anywhere resumes.
   transfer(url: string, from: { issueId: string; identifier: string }, to: { issueId: string; identifier: string }, headBranch: string | null): Promise<"moved" | "already" | "not-owned"> {
     return this.serialize(async () => {
-      await this.recover();
       const key = pullKey(url);
       const journal = await this.journal();
       const last = journal[key];
@@ -289,6 +283,23 @@ export class Handover {
       if (!previous || previous.agentId !== null) return;
       if (change.link?.[0] === "Pull request" && await this.movedAway(issueId, change.link[1])) return;
       await this.save({ ...previous, links: change.link ? { ...previous.links, [change.link[0]]: change.link[1] } : previous.links, review: change.review ?? previous.review ?? null, updatedAt: this.now() });
+    });
+  }
+
+  // One pull request the record owns gives way to another (a replacement from the same branch, the
+  // next one after a landing), wherever it stands: the primary link or the others. The others the
+  // record owns stay. Nothing changes when the record does not own `previous`; a pull request that
+  // moved away from this ticket is not taken back (only `previous` goes).
+  swapPullRequest(issueId: string, previous: string, url: string): Promise<void> {
+    return this.serialize(async () => {
+      const record = await this.raw(issueId);
+      const owned = record ? ownedPullRequests(record) : [];
+      if (!record || !owned.some((item) => pullKey(item) === pullKey(previous))) return;
+      const away = await this.movedAway(issueId, url);
+      const list = owned.flatMap((item) => (pullKey(item) === pullKey(previous) ? (away ? [] : [url]) : [item]));
+      const kept = list.filter((item, index) => list.findIndex((other) => pullKey(other) === pullKey(item)) === index);
+      const { "Pull request": _old, ...links } = record.links;
+      await this.save({ ...record, links: kept[0] ? { ...links, "Pull request": kept[0] } : links, pullRequests: kept.length > 1 ? kept.slice(1) : undefined, updatedAt: this.now() });
     });
   }
 
@@ -403,11 +414,12 @@ export class Handover {
     });
   }
 
-  async all(): Promise<HandoverRecord[]> {
-    await this.settle();
-    const names = await readdir(this.directory).catch(() => [] as string[]);
-    const records = await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readFile(join(this.directory, name), "utf8").then((text) => JSON.parse(text) as HandoverRecord, () => null)));
-    return records.filter((record): record is HandoverRecord => Boolean(record));
+  all(): Promise<HandoverRecord[]> {
+    return this.serialize(async () => {
+      const names = await readdir(this.directory).catch(() => [] as string[]);
+      const records = await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readFile(join(this.directory, name), "utf8").then((text) => JSON.parse(text) as HandoverRecord, () => null)));
+      return records.filter((record): record is HandoverRecord => Boolean(record));
+    });
   }
 
   async resumeTarget(issueId: string): Promise<ResumeTarget | null> {

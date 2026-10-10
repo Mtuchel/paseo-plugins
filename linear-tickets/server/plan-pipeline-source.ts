@@ -61,6 +61,9 @@ export async function pipelineOwnerEvidence(home: string, issueIds: readonly str
       const value = readOwner ? await readOwner(issueId) : await sourceJson(join(home, "linear-tickets", "handover", `${issueId.replace(/[^A-Za-z0-9-]/g, "_")}.json`), 64 * 1024);
       if (value === null) continue;
       const record = object(value), waiting = record.waiting == null ? null : object(record.waiting);
+      // A record without an agent (a ticket that took a pull request over, Handover.transfer) is
+      // no agent's: it gives no owner evidence.
+      if (record.issueId === issueId && record.agentId === null && timestamp(record.updatedAt)) continue;
       if (record.issueId !== issueId || typeof record.agentId !== "string" || !timestamp(record.updatedAt)) throw new Error("Owner evidence malformed");
       if (waiting && ((waiting.previousStateId !== null && typeof waiting.previousStateId !== "string")
         || (waiting.commentId !== null && typeof waiting.commentId !== "string"))) throw new Error("Owner wait evidence malformed");

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { Handover, type GitState, type HandoverStatus } from "./handover";
+import { Handover, ownedPullRequests, type GitState, type HandoverStatus } from "./handover";
 
 const exec = promisify(execFile);
 
@@ -313,5 +313,42 @@ test("a move back is a newer generation, and an agent taking over the agentless 
     assert.equal(record?.agentId, successor.id);
     assert.equal(record?.links["Pull request"], PR);
     assert.equal(record?.resumedFrom, null);
+  });
+});
+
+test("a replaced pull request the ticket owns besides its primary one gives way alone: the primary one and the others stay", async () => {
+  await withHandover(async (handover) => {
+    await handover.update(ISSUE, PREDECESSOR, { link: ["Pull request", OTHER_PR] });
+    await handover.update({ id: TARGET.issueId, identifier: TARGET.identifier }, { id: "agent-9", title: "ENG-2", cwd: "/wt/eng-2" }, { link: ["Pull request", PR] });
+    const third = "https://github.com/o/r/pull/9";
+    await handover.update({ id: "issue-3", identifier: "ENG-3" }, { id: "agent-3", title: "ENG-3", cwd: "/wt/eng-3" }, { link: ["Pull request", third] });
+    assert.equal(await handover.transfer(third, { issueId: "issue-3", identifier: "ENG-3" }, SOURCE, "eng-3"), "moved");
+    assert.deepEqual((await handover.read(ISSUE.id))?.pullRequests, [third]);
+    const replacement = "https://github.com/o/r/pull/10";
+    await handover.swapPullRequest(ISSUE.id, third, replacement);
+    const record = await handover.read(ISSUE.id);
+    assert.equal(record?.links["Pull request"], OTHER_PR, "the primary pull request stays");
+    assert.deepEqual(record?.pullRequests, [replacement]);
+    // The next pull request after a landing that the ticket already owns: the landed one just goes.
+    await handover.swapPullRequest(ISSUE.id, replacement, OTHER_PR);
+    assert.deepEqual(ownedPullRequests((await handover.read(ISSUE.id))!), [OTHER_PR]);
+    // One whose last move took it to another ticket is not taken (only the old one goes).
+    assert.equal(await handover.transfer(PR, TARGET, { issueId: "issue-3", identifier: "ENG-3" }, "eng-2"), "moved");
+    await handover.swapPullRequest(ISSUE.id, OTHER_PR, PR);
+    assert.deepEqual(ownedPullRequests((await handover.read(ISSUE.id))!), []);
+    assert.deepEqual(ownedPullRequests((await handover.read("issue-3"))!), [PR]);
+    // A pull request the ticket does not own changes nothing.
+    await handover.swapPullRequest("issue-3", OTHER_PR, replacement);
+    assert.deepEqual(ownedPullRequests((await handover.read("issue-3"))!), [PR]);
+  });
+});
+
+test("a list or read issued while a move runs sees the pull request on exactly one ticket", async () => {
+  await withHandover(async (handover) => {
+    await handover.update(ISSUE, PREDECESSOR, { link: ["Pull request", PR] });
+    const [moved, all, target] = await Promise.all([handover.transfer(PR, SOURCE, TARGET, "eng-2"), handover.all(), handover.read(TARGET.issueId)]);
+    assert.equal(moved, "moved");
+    assert.deepEqual(all.filter((record) => ownedPullRequests(record).includes(PR)).map((record) => record.identifier), ["ENG-2"]);
+    assert.equal(target?.links["Pull request"], PR);
   });
 });
