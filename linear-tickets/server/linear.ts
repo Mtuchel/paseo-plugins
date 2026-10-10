@@ -824,7 +824,7 @@ function succeeded(data: Record<string, unknown>, field: string, what: string): 
 
 // `id`: a client-chosen UUID, so a create whose answer was lost can be looked up and retried
 // under the same id without filing a second ticket (see greptile-outage.ts).
-type CreateIssueInput = { id?: string; teamId: string; title: string; description: string; parentId?: string; projectId?: string | null; assigneeId?: string; priority?: number; ready?: boolean; startedState?: string };
+type CreateIssueInput = { id?: string; teamId: string; title: string; description: string; parentId?: string; projectId?: string | null; assigneeId?: string; priority?: number; ready?: boolean; backlog?: boolean; startedState?: string };
 
 function createdIssue(data: Record<string, unknown>): { id: string; identifier: string; url: string } {
   succeeded(data, "issueCreate", "create the ticket");
@@ -1501,7 +1501,9 @@ export class LinearService {
   }
 
   // `ready` puts the ticket into the team's first unstarted state (Todo) instead of Triage, for
-  // tickets the plugin creates as planned work; `startedState` into the started state of that name.
+  // tickets the plugin creates as planned work; `backlog` into its lowest-position backlog state
+  // (Backlog), so a follow-up is filed without being picked up; `startedState` into the started
+  // state of that name. A team without the wanted state gets no `stateId`: Linear's default.
   async createIssue(input: CreateIssueInput): Promise<{ id: string; identifier: string; url: string }> {
     return createdIssue(record(await this.write(CREATE_ISSUE_QUERY, { input: await this.issuePayload(input) })));
   }
@@ -1526,11 +1528,12 @@ export class LinearService {
   private async issuePayload(input: CreateIssueInput): Promise<Record<string, unknown>> {
     const payload: Record<string, unknown> = { teamId: input.teamId, title: input.title, description: input.description };
     if (input.id) payload.id = input.id;
-    if (input.ready || input.startedState) {
+    if (input.ready || input.startedState || input.backlog) {
       const states = await this.teamStates(input.teamId);
       const wanted = input.startedState?.trim().toLowerCase();
       const target = (wanted ? states.find((state) => state.type === "started" && state.name.trim().toLowerCase() === wanted) : undefined)
-        ?? (input.ready ? states.filter((state) => state.type === "unstarted").sort((a, b) => a.position - b.position)[0] : undefined);
+        ?? (input.ready ? states.filter((state) => state.type === "unstarted").sort((a, b) => a.position - b.position)[0] : undefined)
+        ?? (input.backlog ? states.filter((state) => state.type === "backlog").sort((a, b) => a.position - b.position)[0] : undefined);
       if (target) payload.stateId = target.id;
     }
     if (input.priority) payload.priority = input.priority;

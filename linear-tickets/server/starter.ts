@@ -56,7 +56,7 @@ export const OVERLAP_NOTE = "Before you plan, look for overlapping work. Search 
 export const MODEL_NOTE = modelSteps();
 // Every ticket agent, whether it planned and continues or implements a plan approved earlier: a
 // place the plan missed is filed, not quietly added to the ticket (README, "Plan-first").
-export const MISSED_REACH_NOTE = "A place the plan missed that you find while implementing (another page, role, record, export or repository that uses what this ticket changes) becomes a follow-up ticket (the linear_ticket tool `create_issue`, related to this ticket; without it, list it for the owner in your final comment), not extra scope in this ticket.";
+export const MISSED_REACH_NOTE = "A place the plan missed that you find while implementing (another page, role, record, export or repository that uses what this ticket changes): when the work is small and its code is already in this ticket's scope, fix it here — that is not extra scope. A substantial finding — a defect, a data, security or money risk, or a missing guarantee a user or another system relies on — becomes a follow-up ticket (the linear_ticket tool `create_issue`, related to this ticket; at most 3 per ticket, filed in Backlog; without the tool, list it for the owner in your final comment). Minor findings (polish, docs, naming, refactors, ideas) go into your final comment, not a ticket.";
 const MAX_PLAN_NOTE_CHARS = 20_000;
 // A question request moves the ticket to "Needs input" and notifies the owner, so one ask beats
 // five, and an ask only written into the final reply is easy to miss.

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parsePlanSections, planFollowUps, ruleMismatch, type PlanSections } from "../shared/plan-sections";
+import { parsePlanSections, planExistingRefs, planFollowUps, ruleMismatch, type PlanSections } from "../shared/plan-sections";
 
 const VERIFICATION = "## Verification\n\n- AC-1: the order page shows the date\n- AC-2: the CSV export carries it\n- AC-3: the check fails on a page without the date\n";
 const REACH = "## Reach\n\n- Changes: the order's delivery date\n- Order page (sales, warehouse): include — AC-1\n- CSV export: include — AC-2\n- Help page: follow-up — Document the delivery date\n- Seed data: n/a — no new data\n";
@@ -80,4 +80,39 @@ test("follow-ups are read leniently from both sections only: bold labels, number
   ].join("\n");
   assert.deepEqual(planFollowUps(text), ["Document the date", "Show it on mobile", "Fix the returns page"]);
   assert.deepEqual(planFollowUps("# Plan\n\n- Help page: n/a — no follow-up needed\n"), []);
+});
+
+test("a plan carries at most three follow-ups across both sections", () => {
+  const three = "## Reach\n\n- Changes: the order's delivery date\n- Order page: include — AC-1\n- CSV export: include — AC-2\n- Help page: follow-up — Document the delivery date\n- Mobile app: follow-up — Warn on mobile too\n- Returns page: follow-up — Show the date on returns\n";
+  assert.equal(parsed(plan(VERIFICATION, three, NO_RULE)).followUps.length, 3, "three follow-ups pass");
+  const four = three.replace("- Returns page: follow-up — Show the date on returns\n", "- Returns page: follow-up — Show the date on returns\n- Seed data: follow-up — Seed the dates\n");
+  assert.match(problem(plan(VERIFICATION, four, NO_RULE)), /The plan has 4 follow-ups; a plan files at most 3\. Keep the 3 that matter most and turn the rest into "include" \(fixed now\) or "n\/a — minor: <what>"\./);
+  // The principles section counts too: its "Existing violations" follow-ups file the same way.
+  assert.match(problem(plan(VERIFICATION, three, RULE)), /The plan has 4 follow-ups/);
+});
+
+test("a follow-up that only points at an open ticket is refused; existing names the ticket it defers to", () => {
+  const ref = (line: string) => plan(VERIFICATION, REACH.replace("- Seed data: n/a — no new data", line), NO_RULE);
+  assert.match(problem(ref("- Seed data: follow-up — TUC-935")), /"Seed data" is a follow-up for TUC-935, which already covers that place; write "- Seed data: existing — TUC-935"/);
+  assert.match(problem(ref("- Seed data: follow-up — Backfill the seed dates (TUC-935, already Todo)")), /"Seed data" is a follow-up for TUC-935/);
+  assert.match(problem(ref("- Seed data: existing — the backfill is planned elsewhere")), /"Seed data" is existing without a ticket identifier; write "- Seed data: existing — <TICKET-ID>"/);
+  const ok = ref("- Seed data: existing — TUC-12 (the backfill covers it)");
+  assert.deepEqual(parsed(ok), { followUps: ["Document the delivery date"], newRule: false }, "an existing place files nothing");
+  assert.deepEqual(planExistingRefs(ok), ["TUC-12"]);
+});
+
+test("the reader files only titles that state a finding: bare identifiers and 'already filed' references stay with their tickets", () => {
+  const text = [
+    "# Plan\n\n## Reach\n\n- Changes: the delivery date\n",
+    "- Help page: follow-up — Document the delivery date\n",
+    "- Mobile app: follow-up — TUC-935\n",
+    "- CSV export: follow-up — Carry the date into the export (TUC-827, already Todo)\n",
+    "- Delivery notes: follow-up — Print the date on notes (existing TUC-583; same comment)\n",
+    "- Returns page: follow-up — Menu stops pulling texts (related to TUC-971)\n",
+    "- Seed data: existing — TUC-12 (the backfill covers it)\n",
+    "## Principles and rules\n\nNone apply; no new rule.\n",
+  ].join("\n");
+  assert.deepEqual(planFollowUps(text), ["Document the delivery date", "Menu stops pulling texts (related to TUC-971)"]);
+  assert.deepEqual(planExistingRefs(text), ["TUC-12"]);
+  assert.deepEqual(planExistingRefs("# Plan\n\n## Reach\n\n- Changes: x\n- Order page: include — AC-1\n"), []);
 });

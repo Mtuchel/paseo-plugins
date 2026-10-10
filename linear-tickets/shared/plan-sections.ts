@@ -1,7 +1,9 @@
 // Where else a change applies and which rules it follows or sets (README, "Plan-first"). Every
 // ticket plan carries a `## Reach` and a `## Principles and rules` section in a fixed format; the
-// omp extension refuses to record the advisor review without them, and approving a plan files its
-// `follow-up` items as tickets (server/plan-follow-ups.ts).
+// omp extension refuses to record the advisor review without them, and approving a plan files the
+// plan's substantial `follow-up` items as tickets in Backlog, at most MAX_PLAN_FOLLOW_UPS
+// (server/plan-follow-ups.ts). A place an open ticket already covers is `existing — <TICKET-ID>`
+// there: nothing is filed for it.
 // No imports beyond ./plan-risk: Paseo's shared bundle refuses Node modules, and the omp extension
 // imports it from outside the plugin's build.
 
@@ -9,6 +11,10 @@ import { field, type Impact } from "./plan-risk";
 
 export const REACH_SECTION = "Reach";
 export const PRINCIPLES_SECTION = "Principles and rules";
+// A plan files at most this many follow-ups (in Backlog, when the plan is approved); everything
+// past it becomes an `include` or an `n/a — minor`. The filer enforces it too, on the plans the
+// gate never saw, and records the items it stopped as `over-cap` (server/plan-follow-ups.ts).
+export const MAX_PLAN_FOLLOW_UPS = 3;
 // Every place a change can reach; the planner goes through each.
 export const REACH_DIMENSIONS = [
   "workspaces/pages and roles",
@@ -41,8 +47,9 @@ export function sectionSteps(): string {
     "- Changes: <the concept the ticket changes, not the page it names>",
     "- <place>: include — AC-N",
     "- <place>: follow-up — <title of the follow-up ticket>",
-    "- <place>: n/a — <reason>",
-    `Go through every dimension: ${REACH_DIMENSIONS.join("; ")}. Every \`include\` names its own acceptance criterion (AC-N, defined in the plan's verification) that proves that place; no two places share one. Repository records that describe the change (principles and decisions, glossary, process map, runbooks, env examples) are not places: they ship in the pull request of the code they describe, under its acceptance criterion, and are an \`include\` with their own only when no code changes (e.g. an owner decision). Every \`follow-up\` is filed as a ticket in Todo, with that title and related to this ticket, when the plan is approved. When the right behaviour for a role is a business choice that no approved principle covers, ask the owner instead of guessing.`,
+    "- <place>: existing — <TICKET-ID> [note]",
+    "- <place>: n/a — <reason | minor: <what>>",
+    `Go through every dimension: ${REACH_DIMENSIONS.join("; ")}. Every \`include\` names its own acceptance criterion (AC-N, defined in the plan's verification) that proves that place; no two places share one. Repository records that describe the change (principles and decisions, glossary, process map, runbooks, env examples) are not places: they ship in the pull request of the code they describe, under its acceptance criterion, and are an \`include\` with their own only when no code changes (e.g. an owner decision). A \`follow-up\` is only for a substantial finding outside this ticket — a defect, a data, security or money risk, or a missing guarantee a user or another system relies on — and becomes a ticket in Backlog, with that title and related to this ticket, when the plan is approved: search Linear's open tickets (\`search_issues\`) before writing one, and keep at most ${MAX_PLAN_FOLLOW_UPS} per plan. Small work on code this ticket already touches is an \`include\` (fixed now); polish, docs, naming, refactors, ideas and "could consider" are \`n/a — minor: <what>\`, never a ticket. \`existing — <TICKET-ID>\` says an open ticket already covers the place: nothing is filed. When the right behaviour for a role is a business choice that no approved principle covers, ask the owner instead of guessing.`,
     `\`## ${PRINCIPLES_SECTION}\`: which approved rules apply, and whether this change sets a new one.`,
     "- Applies: <IDs of the approved principles and ADRs that apply | none apply — reason>",
     "- Exceptions: <none | ID — why this change needs one>",
@@ -51,7 +58,7 @@ export function sectionSteps(): string {
     "- Replaces: <the rule it replaces, or nothing>",
     "- Lives in: <where it is written down, following the repository's routing (e.g. tuchel-platform's CONTRIBUTING.md decision tree)>",
     "- Enforced by: <a check with a known-exceptions baseline, a test, or review>",
-    "- Existing violations: <none | fixed now | follow-up — <title>, one line each>",
+    "- Existing violations: <none | fixed now | follow-up — <title> (counts toward the three), one line each>",
     "A new rule names its own acceptance criterion that proves it, and `## Risk and impact` then says `- New rule: yes`: such a plan always goes to the owner. In tuchel-platform a new rule is a `Q-N` proposal in `docs/principles/decision-queue.md`, never an approved principle.",
     `At impact 0–1 each section may be one line, e.g. "Only the menu bar app, because …" under \`## ${REACH_SECTION}\` and "None apply; no new rule." under \`## ${PRINCIPLES_SECTION}\`.`,
   ].join("\n");
@@ -66,11 +73,16 @@ function sectionText(plan: string, name: string): { body: string; text: string }
 }
 
 const ITEM = String.raw`^\s*(?:[-*+]|\d+[.)])\s+`;
-// `- <place>: include | follow-up | n/a <rest>`
-const DECISION = new RegExp(`${ITEM}(?:\\*\\*)?(.+?)(?:\\*\\*)?\\s*:(?:\\*\\*)?\\s*(include|follow-up|n/a)\\b(?:\\*\\*)?\\s*(?:[—–:-]+\\s*)?(.*)$`, "i");
+// `- <place>: include | follow-up | existing | n/a <rest>`
+const DECISION = new RegExp(`${ITEM}(?:\\*\\*)?(.+?)(?:\\*\\*)?\\s*:(?:\\*\\*)?\\s*(include|follow-up|existing|n/a)\\b(?:\\*\\*)?\\s*(?:[—–:-]+\\s*)?(.*)$`, "i");
 // A follow-up item: at the start of a list item or right after its label's colon.
 const FOLLOW_UP = new RegExp(`${ITEM}(?:[^\\n]*?:\\s*)?(?:\\*\\*)?follow-up\\b(?:\\*\\*)?\\s*(?:[—–:-]+\\s*)?(.*)$`, "i");
 const MAX_TITLE = 200;
+// A ticket a plan's text names: an uppercase team key and a number ("TUC-935"). AC-N is a plan
+// criterion, never a ticket.
+const TICKET_ID = /\b(?!AC-)[A-Z][A-Z0-9]+-\d+\b/g;
+// A word saying that the work a follow-up points at exists already.
+const COVERED = /\b(already|existing|exists|filed|covered|tracked|duplicate|reopened)\b|same comment/i;
 
 function cleanTitle(raw: string): string {
   const title = raw.replace(/\*\*/g, "").replace(/\s+/g, " ").trim().replace(/^[`"'“„]+|[`"'”“]+$/g, "").trim();
@@ -78,27 +90,58 @@ function cleanTitle(raw: string): string {
   return title.length <= MAX_TITLE ? title : `${title.slice(0, MAX_TITLE - 1).trimEnd()}…`;
 }
 
-function decisions(body: string): { place: string; kind: "include" | "follow-up" | "n/a"; rest: string }[] {
+// The identifiers a line names, in order, without AC-N.
+const ticketRefs = (text: string): string[] => [...text.matchAll(TICKET_ID)].map((match) => match[0]);
+
+// The identifier a follow-up title defers to when it carries no finding of its own: the title is
+// nothing but ticket identifiers and punctuation, or names a ticket together with a word saying
+// its work exists (README, "Reach and principles"). null: the title states its own finding and is
+// filed — a title that merely mentions a related ticket ("Menu stops pulling texts (related to
+// TUC-971)") is filed too.
+function coveredFollowUp(title: string): string | null {
+  const ids = ticketRefs(title);
+  if (!ids.length) return null;
+  if (COVERED.test(title)) return ids[0];
+  return title.replace(TICKET_ID, "").replace(/[^A-Za-z0-9]+/g, "") ? null : ids[0];
+}
+
+function decisions(body: string): { place: string; kind: "include" | "follow-up" | "existing" | "n/a"; rest: string }[] {
   return body.split("\n").flatMap((line) => {
     const match = DECISION.exec(line);
-    return match ? [{ place: match[1].trim(), kind: match[2].toLowerCase() as "include" | "follow-up" | "n/a", rest: match[3].trim() }] : [];
+    return match ? [{ place: match[1].trim(), kind: match[2].toLowerCase() as "include" | "follow-up" | "existing" | "n/a", rest: match[3].trim() }] : [];
   });
 }
 
 // The `follow-up — <title>` items of both sections, read leniently (the inbox and the filing use
-// it on plans the gate never saw): trimmed, case-insensitively deduplicated, in plan order.
+// it on plans the gate never saw): trimmed, case-insensitively deduplicated, in plan order. Items
+// without a finding of their own — a bare ticket identifier, or one with a word saying the work
+// exists — are left out; the ticket they name already covers the place.
 export function planFollowUps(plan: string): string[] {
   const seen = new Set<string>();
   const titles: string[] = [];
   for (const name of [REACH_SECTION, PRINCIPLES_SECTION]) {
     for (const line of (sectionText(plan, name)?.text ?? "").split("\n")) {
       const title = cleanTitle(FOLLOW_UP.exec(line)?.[1] ?? "");
-      if (!title || seen.has(title.toLowerCase())) continue;
+      if (!title || coveredFollowUp(title) || seen.has(title.toLowerCase())) continue;
       seen.add(title.toLowerCase());
       titles.push(title);
     }
   }
   return titles;
+}
+
+// The identifiers a plan's `existing — <TICKET-ID>` items name: those places are covered by open
+// tickets and nothing is filed for them. The origin's notice lists them next to what was filed.
+// Deduplicated, in plan order.
+export function planExistingRefs(plan: string): string[] {
+  const refs: string[] = [];
+  for (const name of [REACH_SECTION, PRINCIPLES_SECTION]) {
+    for (const place of decisions(sectionText(plan, name)?.text ?? "")) {
+      if (place.kind !== "existing") continue;
+      for (const id of ticketRefs(place.rest)) if (!refs.includes(id)) refs.push(id);
+    }
+  }
+  return refs;
 }
 
 const criteria = (text: string): string[] => [...new Set([...text.matchAll(/\bAC-(\d+)\b/g)].map((match) => `AC-${match[1]}`))];
@@ -107,7 +150,9 @@ const criteria = (text: string): string[] => [...new Set([...text.matchAll(/\bAC
 // `impact`: the plan's rating (the higher of planner and advisor); 0–1 allows one-line sections,
 // null (unknown) does not. At any impact, every `include` and a new rule name an acceptance
 // criterion defined elsewhere in the plan, and no two share one: a reference check only, whether
-// the criterion proves the place is the advisor's and the owner's call.
+// the criterion proves the place is the advisor's and the owner's call. A plan carries at most
+// MAX_PLAN_FOLLOW_UPS follow-ups across both sections, each a finding of its own (not a ticket
+// that already covers the place) and each `existing` names the ticket it defers to.
 export function parsePlanSections(plan: string, impact: Impact | null): { sections: PlanSections } | { problem: string } {
   const reach = sectionText(plan, REACH_SECTION);
   const principles = sectionText(plan, PRINCIPLES_SECTION);
@@ -122,10 +167,18 @@ export function parsePlanSections(plan: string, impact: Impact | null): { sectio
   const newRule = rule === null ? null : !/^\W*(?:none|no)\b/i.test(rule);
   if (!brief) {
     if (!field(reach!.text, "Changes")) problems.push(`"## ${REACH_SECTION}" has no "- Changes: <the concept the ticket changes>" line.`);
-    if (!places.length) problems.push(`"## ${REACH_SECTION}" has no place with a decision ("- <place>: include — AC-N", "follow-up — <title>" or "n/a — <reason>").`);
+    if (!places.length) problems.push(`"## ${REACH_SECTION}" has no place with a decision ("- <place>: include — AC-N", "follow-up — <title>", "existing — <TICKET-ID>" or "n/a — <reason>").`);
     for (const place of places) {
       if (place.kind === "follow-up" && !cleanTitle(place.rest)) problems.push(`"${place.place}" is a follow-up without a title.`);
       if (place.kind === "n/a" && !place.rest) problems.push(`"${place.place}" is n/a without a reason.`);
+      if (place.kind === "existing" && !ticketRefs(place.rest).length) problems.push(`"${place.place}" is existing without a ticket identifier; write "- ${place.place}: existing — <TICKET-ID>".`);
+    }
+    const followUps = [...places, ...decisions(principles!.text)].filter((place) => place.kind === "follow-up");
+    if (followUps.length > MAX_PLAN_FOLLOW_UPS) problems.push(`The plan has ${followUps.length} follow-ups; a plan files at most ${MAX_PLAN_FOLLOW_UPS}. Keep the ${MAX_PLAN_FOLLOW_UPS} that matter most and turn the rest into "include" (fixed now) or "n/a — minor: <what>".`);
+    for (const place of followUps) {
+      const title = cleanTitle(place.rest);
+      const covered = title ? coveredFollowUp(title) : null;
+      if (covered) problems.push(`"${place.place}" is a follow-up for ${covered}, which already covers that place; write "- ${place.place}: existing — ${covered}".`);
     }
     for (const name of ["Applies", "New rule"]) if (!field(principles!.text, name)) problems.push(`"## ${PRINCIPLES_SECTION}" has no "- ${name}:" line.`);
     if (newRule) for (const name of RULE_FIELDS) if (!field(principles!.text, name)) problems.push(`The new rule has no "- ${name}:" line.`);

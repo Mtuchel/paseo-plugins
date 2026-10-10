@@ -423,7 +423,7 @@ test("add_manual_task creates an assigned sub-issue, blocks the ticket only befo
 
 test("writes follow the issue's scope: own ticket, issues the agent created, anything else", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-scope-"));
-  const own = { ...issue, project: { id: "lp-1", name: "Tooling" } };
+  const own = { ...issue, project: { id: "lp-1", name: "Tooling" }, team: { ...issue.team, states: { nodes: [{ id: "s-backlog", name: "Backlog", type: "backlog", position: 0 }, ...states] } } };
   const other = { ...issue, id: "other-1", identifier: "ENG-7", title: "Someone else's" };
   let created = 0;
   const filed = new Map<string, typeof issue>();
@@ -456,9 +456,9 @@ test("writes follow the issue's scope: own ticket, issues the agent created, any
   const writes = (name: string) => linear.calls.filter((c) => c.query.includes(name)).map((c) => c.variables);
   try {
     const followUp = JSON.parse((await mcp.call("create_issue", { title: "Add retry", description: "Why and when done." })).text);
-    assert.deepEqual(followUp, { identifier: "ENG-61", url: "https://linear.app/x/issue/ENG-61", kind: "follow_up", status: "Todo", deduped: false });
+    assert.deepEqual(followUp, { identifier: "ENG-61", url: "https://linear.app/x/issue/ENG-61", kind: "follow_up", status: "Backlog", deduped: false });
     const input = writes("issueCreate")[0].input as Record<string, unknown>;
-    assert.deepEqual({ ...input, description: undefined }, { teamId: "team-1", title: "Add retry", description: undefined, stateId: "s-todo", projectId: "lp-1" });
+    assert.deepEqual({ ...input, description: undefined }, { teamId: "team-1", title: "Add retry", description: undefined, stateId: "s-backlog", projectId: "lp-1" });
     assert.match(String(input.description), /^Why and when done\.[\s\S]*ENG-42\.$/);
     assert.deepEqual(writes("issueRelationCreate"), [{ input: { issueId: "new-1", relatedIssueId: ISSUE_ID, type: "related" } }]);
     assert.equal(JSON.parse((await mcp.call("create_issue", { title: "add RETRY", description: "again" })).text).deduped, true);
@@ -487,16 +487,22 @@ test("writes follow the issue's scope: own ticket, issues the agent created, any
     assert.deepEqual(writes("issueUpdate").at(-1), { id: "new-1", stateId: "s-review" });
     assert.match((await mcp.call("update_issue", { issue: "ENG-42", title: "x" })).text, /own ticket/);
 
+    // A follow-up is capped on its own at 3; sub-issues keep their own cap of 10.
+    for (const title of ["Second follow-up", "Third follow-up"]) assert.equal((await mcp.call("create_issue", { title, description: "d" })).isError, false);
+    assert.match((await mcp.call("create_issue", { title: "Fourth follow-up", description: "d" })).text, /already filed 3 follow-ups for ENG-42, the limit\. Only substantial findings become follow-ups; mention the rest in your final comment\./);
     const sub = JSON.parse((await mcp.call("create_issue", { title: "Split part", description: "d", kind: "sub_issue" })).text);
     assert.equal(sub.kind, "sub_issue");
-    assert.equal((writes("issueCreate")[1].input as Record<string, unknown>).parentId, ISSUE_ID);
-    assert.equal(writes("issueRelationCreate").length, 2, "a sub-issue gets no extra relation");
+    assert.equal((writes("issueCreate")[3].input as Record<string, unknown>).parentId, ISSUE_ID);
+    assert.equal(writes("issueRelationCreate").length, 4, "a sub-issue gets no extra relation");
 
-    // The cap counts every recorded issue of this ticket.
+    // A record written before the split carries no kind: it cannot be told apart, so it counts
+    // against both limits, the one shared limit it was filed under.
     const directory = join(home, "linear-tickets", "agent-issues", ISSUE_ID);
     for (let i = 0; i < 8; i++) await writeFile(join(directory, `pad-${i}.json`), JSON.stringify({ id: `pad-${i}`, identifier: `ENG-9${i}`, url: "u", title: `pad ${i}` }));
-    assert.match((await mcp.call("create_issue", { title: "One too many", description: "d" })).text, /already filed 10 issues/);
-    assert.equal(created, 2);
+    assert.match((await mcp.call("create_issue", { title: "One too many", description: "d" })).text, /already filed 3 follow-ups/);
+    assert.equal((await mcp.call("create_issue", { title: "Tenth", description: "d", kind: "sub_issue" })).isError, false, "the created and unknown records count 9 of 10 sub-issues");
+    assert.match((await mcp.call("create_issue", { title: "Eleventh", description: "d", kind: "sub_issue" })).text, /already filed 10 sub-issues/);
+    assert.equal(created, 5);
   } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
