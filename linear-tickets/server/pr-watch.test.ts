@@ -8,9 +8,9 @@ import { test, type TestContext } from "node:test";
 import type { RetriggerResult } from "./greptile-outage";
 import type { HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
-import { activityBullets, ConditionalPullView, githubReader, GitHubRateLimitedError, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft } from "./pr-watch";
+import { activityBullets, ConditionalPullView, githubReader, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft, type RateProbe } from "./pr-watch";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, GREPTILE_RETRIGGER, marker, RETARGET_ORPHAN, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
-import { GitHubBudget, GitHubPausedError, RateLimitedError, withPriority } from "./rate-budget";
+import { GitHubBudget, GitHubPausedError, GitHubRateLimitedError, RateLimitedError, withPriority } from "./rate-budget";
 import { PermissionReplies } from "./permission-replies";
 import { SessionRouter, type IdleRun, type Succession } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
@@ -196,6 +196,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // `beforeApply` runs before its answer (a hanging one is a crash during the write). `greptile`:
   // `greptile-retrigger.mjs`, present in the checkout while `present`, answering per repo (an
   // empty run by default); `outage` the outage issue's `follow` list and every `sync`'s results.
+  const clock = { now: Date.now() };
   const scripts = {
     checkout: "/backstop" as string | null,
     judgment: GENUINE as Judgment | null,
@@ -208,11 +209,16 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     beforeEnqueue: async () => {},
     files: {} as Record<string, string>,
     runs: [] as string[],
-    now: Date.now(),
+    get now(): number { return clock.now; },
+    set now(at: number) { clock.now = at; },
     checkouts: [] as { repo: string; sources: string[] }[],
     retarget: { present: false, list: [] as unknown[], prepare: [] as { code: number; answer: Record<string, unknown> }[], apply: [] as { code: number; answer: Record<string, unknown> }[], records: [] as unknown[], beforePrepare: async () => {}, beforeApply: async () => {} },
     greptile: { present: true, answers: {} as Record<string, { code: number; answer: unknown }> },
     outage: { follow: new Map<string, number[]>(), syncs: [] as RetriggerResult[][] },
+    // The backstop's own GitHub budget and what the reset probe finds (probeRates).
+    budget: new GitHubBudget(() => clock.now),
+    rates: [] as RateProbe[],
+    probes: 0,
   };
   // `failure`: what linking a URL on the ticket throws; `arrive`: runs before a ticket comment
   // reaches Linear (a hanging one is a crash before it went out), `stall` after it did (a crash
@@ -385,6 +391,8 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     },
     backstop: {
       now: () => scripts.now,
+      budget: scripts.budget,
+      rates: async () => { scripts.probes++; return scripts.rates; },
       has: (_checkout, script) => (script === RETARGET_ORPHAN ? scripts.retarget.present : script === GREPTILE_RETRIGGER ? scripts.greptile.present : true),
       checkout: {
         prepare: async (repo, sources) => {
@@ -3462,6 +3470,53 @@ test("a discovery rate limit still synchronizes the incident once without runnin
   await h.backstop();
   assert.deepEqual(h.scripts.runs, []);
   assert.deepEqual(h.scripts.outage.syncs.map((run) => run.map((found) => [found.repo, found.result])), [[[PLATFORM, "failed"], ["o/other", "failed"]]]);
+});
+
+test("GitHub refusing a repo script stops the backstop, which waits until the probed reset, logged in UTC, and then runs again by itself (AC-3)", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const logs: string[] = [];
+  t.mock.method(console, "log", (...args: unknown[]) => { logs.push(args.join(" ")); });
+  const h = harness(t, { dispatch: true });
+  h.scripts.now = Date.parse("2026-10-09T19:16:55Z");
+  h.scripts.greptile.answers = { [PLATFORM]: { code: 1, answer: { error: "gh: API rate limit exceeded for user ID 333775540. (HTTP 403)" } } };
+  h.scripts.rates = [{ resource: "graphql", remaining: 4800, resetAt: Date.parse("2026-10-09T19:50:00Z") }, { resource: "core", remaining: 0, resetAt: Date.parse("2026-10-09T19:23:10Z") }];
+  await h.backstop();
+  assert.deepEqual(h.scripts.runs, [`${GREPTILE_RETRIGGER} --trigger`], "the repo's backstop steps do not run into the refusal");
+  assert.equal(h.scripts.probes, 1);
+  assert.deepEqual(h.scripts.outage.syncs[0].map((found) => [found.repo, found.result]), [[PLATFORM, "failed"]]);
+  assert.ok(logs.some((line) => line.startsWith("[linear-tickets] queue backstop waits until 19:23 UTC for GitHub's core budget reset (GitHub refused tools/ci/greptile-retrigger.mjs's requests: gh: API rate limit exceeded")), "the budget with room (graphql) is not the one waited for");
+
+  h.scripts.greptile.answers = {};
+  h.scripts.runs.length = 0;
+  t.mock.timers.tick(Date.parse("2026-10-09T19:23:10Z") - h.scripts.now + 4_999);
+  assert.deepEqual(h.scripts.runs, [], "nothing runs before the reset");
+  t.mock.timers.tick(1);
+  await (await h.watch()).backstop();
+  assert.deepEqual(h.scripts.runs, [`${GREPTILE_RETRIGGER} --trigger`, READY_RUN], "after the reset the backstop ran again on its own");
+  assert.ok(logs.some((line) => line === "[linear-tickets] queue backstop resumes after GitHub's reset at 19:23 UTC"));
+});
+
+test("the backstop's own low-budget pause stops it before its first GitHub request and resumes at the reset (AC-3)", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "error", () => {});
+  const logs: string[] = [];
+  t.mock.method(console, "log", (...args: unknown[]) => { logs.push(args.join(" ")); });
+  const h = harness(t);
+  h.records[0] = { ...h.records[0], branch: OPEN_PR.headBranch, links: {} };
+  h.git.origin = "git@github.com:tuchel-sohn/tuchel-platform.git";
+  const reset = Math.floor(h.scripts.now / 1000) + 600;
+  h.scripts.budget.record(new Map([["x-ratelimit-resource", "core"], ["x-ratelimit-remaining", "260"], ["x-ratelimit-limit", "5000"], ["x-ratelimit-reset", String(reset)]]));
+  await h.backstop();
+  assert.deepEqual(h.scripts.runs, [], "no repo script runs");
+  assert.deepEqual(h.github.listings, [], "discovery does not list the repository either");
+  assert.equal(h.scripts.probes, 0, "the pause names its own reset");
+  const at = new Date(reset * 1000).toISOString().slice(11, 16);
+  assert.ok(logs.some((line) => line === `[linear-tickets] queue backstop waits until ${at} UTC for GitHub's core budget reset (Paused until ${at} UTC: the shared GitHub budget is low (260 left))`));
+  h.scripts.now = reset * 1000 + 5_000;
+  t.mock.timers.tick(605_000);
+  await (await h.watch()).backstop();
+  assert.ok(h.github.listings.length > 0, "once the window reset, discovery reads again");
 });
 
 test("Greptile evidence expires even on non-writers and when the script is absent (AC-4)", async (t) => {

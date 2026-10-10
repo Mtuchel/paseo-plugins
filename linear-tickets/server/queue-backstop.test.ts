@@ -3,6 +3,7 @@ import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { GitHubRateLimitedError } from "./rate-budget";
 import {
   BackstopCheckout,
   BackstopScriptError,
@@ -102,8 +103,10 @@ test("retarget-orphan.mjs: a move counts as prepared only with its full record, 
 
   const candidate = { pr: 419, branch: "mtuchel/tuc-1-fix", base: "graphite-base/418", baseSha: sha("b"), expect: `419@${sha("1")}`, range, tickets: ["TUC-1"], eligible: true, reason: null };
   assert.deepEqual(parseRetargetList(out(0, { result: "listed", candidates: [candidate, { ...candidate, pr: 420 }, { ...candidate, baseSha: "b" }] })), [candidate], "a candidate whose stack does not start at it, or without its base head, is left out");
-  const failed = `Command failed: gh api --paginate repos/o/r/pulls?state=open --jq ${"x".repeat(400)}\ngh: API rate limit exceeded (HTTP 403)\n`;
-  assert.throws(() => parseRetargetList(out(1, { result: "error", error: failed })), (error: unknown) => error instanceof BackstopScriptError && error.message.includes("API rate limit exceeded (HTTP 403)"), "a failed command logs its own error line, not its long command line");
+  const failed = `Command failed: gh api --paginate repos/o/r/pulls?state=open --jq ${"x".repeat(400)}\ngh: Not Found (HTTP 404)\n`;
+  assert.throws(() => parseRetargetList(out(1, { result: "error", error: failed })), (error: unknown) => error instanceof BackstopScriptError && error.message.includes("Not Found (HTTP 404)") && !error.message.includes("xxx"), "a failed command logs its own error line, not its long command line");
+  const refused = failed.replace("Not Found (HTTP 404)", "API rate limit exceeded for user ID 333775540. (HTTP 403)");
+  assert.throws(() => parseRetargetList(out(1, { result: "error", error: refused })), (error: unknown) => error instanceof GitHubRateLimitedError && error.message.includes("API rate limit exceeded for user ID 333775540") && !error.message.includes("xxx"), "GitHub's refusal stops the run instead of failing the step (2026-10-09 21:24)");
 });
 
 test("enqueue-ready.mjs: stacks without their action, branch or heads are left out; a run without stacks is an error", () => {

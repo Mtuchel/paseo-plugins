@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { CheckSummary, LandedCommit, PullRequestEntry, PullRequestsSnapshot, QueueActivity } from "../shared/contracts";
-import { activityBullets, ghJson, GitHubRateLimitedError, QUEUE_MERGED_LABEL } from "./pr-watch";
-import { githubBudget, GitHubPausedError, withPriority, type GitHubBudget } from "./rate-budget";
+import { activityBullets, ghJson, QUEUE_MERGED_LABEL } from "./pr-watch";
+import { githubBudget, GitHubPausedError, GitHubRateLimitedError, refusalHeaders, withPriority, type GitHubBudget } from "./rate-budget";
 
 // The Paseo Agents menu bar's pull request view (README, "Pull request view"), read from GitHub
 // REST through the routed gh CLI (github-cli.ts): the account router decides which read account
@@ -173,6 +173,8 @@ export const ghGet: RestGet = async (path, etag) => {
     // gh exits with an error on 304 Not Modified; its output still holds the headers.
     const stdout = error && typeof error === "object" && "stdout" in error ? String(error.stdout) : "";
     if (/^HTTP\/\S+ 304\b/.test(stdout)) return parseIncluded(stdout);
+    // A refusal's own headers say until when (GitHubBudget.refused), also without the usage meter.
+    if (error instanceof GitHubRateLimitedError && !refusalHeaders(error) && /^HTTP\/\S+ (?:403|429)\b/.test(stdout)) Object.assign(error, { headers: parseIncluded(stdout).headers });
     throw error;
   }
 };

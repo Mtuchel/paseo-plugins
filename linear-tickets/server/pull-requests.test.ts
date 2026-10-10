@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { GitHubRateLimitedError } from "./pr-watch";
 import { checkSummary, pullEntry, PullRequestBoard, queueActivity, supersededSuites, type CheckRunRecord, type RestGet } from "./pull-requests";
-import { GitHubBudget } from "./rate-budget";
+import { GitHubBudget, GitHubRateLimitedError } from "./rate-budget";
 
 const NOW = Date.UTC(2026, 9, 3, 8, 30);
 const at = (hour: number, minute = 0) => new Date(Date.UTC(2026, 9, 3, hour, minute)).toISOString().replace(/\.\d{3}Z$/, "Z");

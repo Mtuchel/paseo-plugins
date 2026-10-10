@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { GitHubRateLimitedError, PullRequestNotFoundError } from "./pr-watch";
+import { PullRequestNotFoundError } from "./pr-watch";
+import { GitHubRateLimitedError } from "./rate-budget";
 import { ticketPullRequest, type PullRequestText } from "./pull-request-check";
 
 const URL = "https://github.com/o/r/pull/1";

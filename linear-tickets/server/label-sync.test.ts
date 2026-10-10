@@ -6,7 +6,8 @@ import test from "node:test";
 import { parseLabelRules, SETTLE_MS, type LabelEvent, type LabelRules, type SweptIssue } from "./label-rules";
 import { LabelSync, PullRequestFiles, type PullRequestRead } from "./label-sync";
 import type { CatalogLabel } from "./linear";
-import { GitHubRateLimitedError, PullRequestNotFoundError } from "./pr-watch";
+import { PullRequestNotFoundError } from "./pr-watch";
+import { GitHubRateLimitedError } from "./rate-budget";
 
 const NOW = Date.parse("2026-10-02T12:00:00.000Z");
 const OLD = new Date(NOW - SETTLE_MS - 1).toISOString();

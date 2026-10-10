@@ -20,10 +20,10 @@ import { ghGet, type RestGet, type RestResponse } from "./pull-requests";
 import {
   activityBoundary, BACKSTOP_ENQUEUE, BackstopCheckout, CLASS_TEXT, commentOnce, dropWhy, ENQUEUE_READY, enqueueArgs, enqueuedComment, GREPTILE_RETRIGGER, HELD_KINDS, openReplayText, parseEnqueue, parseExpect, parseJudgment,
   parseReady, parseRetarget, parseRetargetList, parseRetrigger, READY_WHY, readyArgs, reconcile, refusalKey, refusalText, released, REPAIR_RETRY_MS, REPAIRABLE_KINDS, originRepo, RETARGET_ORPHAN, RETARGET_PER_RUN,
-  replayCommands, retargetedComment, retargetId, retargetKey, retargetNote, retargetPrepareArgs, retriggerArgs, runGit, runIsolatedEnqueue, runIsolatedRetarget, runNodeScript, ticketMarker, WAIT_QUEUE, waitQueueArgs, withRecordFile,
-  type ActionRecord, type DropClass, type DropJudgment, type GitRunner, type PreparedRetarget, type Problem, type Refusal, type RetargetRecord, type ScriptRunner,
+  replayCommands, retargetedComment, retargetId, retargetKey, retargetNote, retargetPrepareArgs, retriggerArgs, RetriggerRefusedError, runGit, runIsolatedEnqueue, runIsolatedRetarget, runNodeScript, ticketMarker, WAIT_QUEUE, waitQueueArgs, withRecordFile,
+  type ActionRecord, type DropClass, type DropJudgment, type GitRunner, type PreparedRetarget, type Problem, type Refusal, type RetargetRecord, type RetriggerRun, type ScriptRunner,
 } from "./queue-backstop";
-import { githubBudget, GitHubPausedError, RateLimitedError, withPriority, type GitHubBudget } from "./rate-budget";
+import { githubBudget, GitHubPausedError, GitHubRateLimitedError, RateLimitedError, refusalHeaders, refusalOf, utcClock, withPriority, type GitHubBudget } from "./rate-budget";
 import { crashResume, unverifiedResume, type PromptOutcome, type Recovery, type SessionRouter, type Succession } from "./sessions";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
@@ -33,6 +33,12 @@ const INTERVAL_MS = 2 * 60 * 1000;
 // The queue backstop (see queueBackstop) runs this often, and right after a poll claimed a drop
 // it re-enqueues.
 const BACKSTOP_INTERVAL_MS = 10 * 60 * 1000;
+// After GitHub's budget stopped a run, the backstop runs again this long after GitHub's reset;
+// ticks are skipped until this long past it (a lost timer costs at most that and one tick); with no
+// reset known it waits the fallback.
+const RESUME_DELAY_MS = 5 * 1000;
+const RESUME_GRACE_MS = 60 * 1000;
+const RESUME_FALLBACK_MS = 2 * 60 * 1000;
 // Finished actions and refusals are kept this long, so a round is never acted on twice.
 const BACKSTOP_MEMORY_MS = 14 * 24 * 60 * 60 * 1000;
 const REVIEW_STATE = "In Review";
@@ -231,8 +237,40 @@ export type GitHubReader = {
 };
 // The queue backstop's runners (see queueBackstop): the repo's scripts, the checkout they run in,
 // the clock its hourly retries use, and whether the checkout has a script (`retarget-orphan.mjs`
-// runs only where it exists).
-export type BackstopDeps = { run?: ScriptRunner; checkout?: Pick<BackstopCheckout, "prepare" | "commentFile">; now?: () => number; has?: (checkout: string, script: string) => boolean };
+// runs only where it exists). `budget`: the single-login GitHub budget a run is admitted by;
+// `rates`: the probe for when GitHub's budgets reset after a script was refused (probeRates).
+export type BackstopDeps = { run?: ScriptRunner; checkout?: Pick<BackstopCheckout, "prepare" | "commentFile">; now?: () => number; has?: (checkout: string, script: string) => boolean; budget?: Pick<GitHubBudget, "admit" | "reserve">; rates?: () => Promise<RateProbe[]> };
+
+// One GitHub budget as the probe read it: `resetAt` in ms.
+export type RateProbe = { resource: string; remaining: number; resetAt: number };
+
+// When the budgets the backstop's scripts spend reset (a script prints no reset time): a
+// conditional `GET user` (its 304 or its refusal carries the core headers and costs nothing) and
+// GraphQL's `rateLimit` (1 point), through the same routing the scripts use.
+let userEtag: string | null = null;
+export async function probeRates(): Promise<RateProbe[]> {
+  const found: RateProbe[] = [];
+  const core = (headers: ReadonlyMap<string, string> | null) => {
+    const remaining = Number(headers?.get("x-ratelimit-remaining"));
+    const reset = Number(headers?.get("x-ratelimit-reset"));
+    if (headers?.has("x-ratelimit-remaining") && Number.isFinite(remaining) && Number.isFinite(reset)) found.push({ resource: headers.get("x-ratelimit-resource") || "core", remaining, resetAt: reset * 1000 });
+  };
+  try {
+    const response = await ghGet("user", userEtag);
+    userEtag = response.headers.get("etag") ?? userEtag;
+    core(response.headers);
+  } catch (error) {
+    core(refusalHeaders(error));
+  }
+  try {
+    const rate = await ghJson<{ remaining?: unknown; resetAt?: unknown }>(["api", "graphql", "-f", "query={ rateLimit { remaining resetAt } }", "--jq", ".data.rateLimit"]);
+    const resetAt = Date.parse(String(rate.resetAt));
+    if (typeof rate.remaining === "number" && Number.isFinite(resetAt)) found.push({ resource: "graphql", remaining: rate.remaining, resetAt });
+  } catch {
+    // Unreadable: the core answer, or the fallback, decides.
+  }
+  return found;
+}
 // `repo` is the pull request's `owner/name` and `number` its number; `draft.headSha` is null when
 // the draft is no longer listed, and `draft.pulls` are the pull requests its body lists (none then).
 type Drop = { key: string; reason: string; repo: string; number: number; draft: { number: number; url: string; headSha: string | null; pulls: number[] } | null };
@@ -347,14 +385,8 @@ function connectedStack(identifier: string, repo: string, linked: number, listin
   return { stack };
 }
 
-// gh reports GitHub's throttling (HTTP 429, primary or secondary rate limit); the poll's GitHub
-// reads stop until the next one.
-export class GitHubRateLimitedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "GitHubRateLimitedError";
-  }
-}
+// GitHubRateLimitedError (rate-budget.ts): gh reports GitHub's throttling; the poll's GitHub reads
+// stop until the next one.
 // gh found the repository but no pull request with that number.
 export class PullRequestNotFoundError extends Error {
   constructor(message: string) {
@@ -390,8 +422,7 @@ export async function ghJson<T>(args: string[], parse: (stdout: string) => T = (
     // A CLI can echo the body escaped, reformatted, or split across lines. For writes carrying
     // a body, retain only safe diagnostics in stderr rather than trying substring redaction.
     // `headers`: the response's, when the usage meter read them (see github-usage.ts).
-    const headers = error && typeof error === "object" && "headers" in error && error.headers instanceof Map ? error.headers as ReadonlyMap<string, string> : null;
-    const metadata = { stdout, stderr: hasBody ? message : stderr, code, signal, headers };
+    const metadata = { stdout, stderr: hasBody ? message : stderr, code, signal, headers: refusalHeaders(error) };
     // The router's exit 75 and GitHub's throttling both stop this round. Preserve the router's
     // retry time when no request body could have supplied it.
     if (code === 75 || /HTTP 429|rate limit|budgets? exhausted/i.test(stderr)) {
@@ -1089,28 +1120,78 @@ export class PullRequestWatch {
 
   start(): void {
     if (this.timer) return;
+    this.halted = false;
     this.timer = setInterval(() => {
       void this.poll().then(() => {
         if (!this.timer || !this.kicked) return;
         this.kicked = false;
-        void this.backstop();
+        if (!this.waitingForReset()) void this.backstop();
       });
     }, INTERVAL_MS);
     this.timer.unref?.();
-    this.backstopTimer = setInterval(() => { void this.backstop(); }, BACKSTOP_INTERVAL_MS);
+    this.backstopTimer = setInterval(() => { if (!this.waitingForReset()) void this.backstop(); }, BACKSTOP_INTERVAL_MS);
     this.backstopTimer.unref?.();
   }
 
   async stop(): Promise<void> {
+    this.halted = true;
     if (this.timer) clearInterval(this.timer);
     clearInterval(this.backstopTimer ?? undefined);
+    clearTimeout(this.resumeTimer ?? undefined);
     this.timer = null;
     this.backstopTimer = null;
+    this.resumeTimer = null;
     // No watchdog effect starts after the unload; one in flight drains under its lease.
     this.deps.watchdog?.stop();
     // These runs may be awaiting GitHub before their next Linear write. Finish them
     // before the plugin's final hourly-usage flush and replacement instance start.
     await Promise.allSettled([this.running, this.backstopping]);
+  }
+
+  // The queue backstop's wait for GitHub's reset (see armResume): while it is armed and not more
+  // than a minute past its time, the 10-minute tick and the poll's kick leave the backstop alone;
+  // the poll keeps running.
+  private halted = false;
+  private resumeTimer: NodeJS.Timeout | null = null;
+  private resumeAt = 0;
+
+  private waitingForReset(): boolean {
+    return this.resumeTimer !== null && this.clock() < this.resumeAt + RESUME_GRACE_MS;
+  }
+
+  // After GitHub's budget stopped a backstop run: one timer for GitHub's reset, 5 s after it, that
+  // runs the backstop again (rearming replaces it). The time is the pause's own, else the router's
+  // `try again after`, else the refused response's headers, else the probe (probeRates), else
+  // the 2-minute fallback.
+  private async armResume(stop: Error): Promise<void> {
+    if (this.halted) return;
+    const now = this.clock();
+    let wait: { resumeAt: number; resource: string } | null = null;
+    if (stop instanceof GitHubPausedError) wait = { resumeAt: stop.resumeAt, resource: stop.resource };
+    else {
+      const router = /\btry again after (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/.exec(stop.message)?.[1];
+      const refusal = refusalOf(refusalHeaders(stop), now);
+      if (router && Date.parse(router) > now) wait = { resumeAt: Date.parse(router), resource: "read" };
+      else if (refusal.kind !== "unknown") wait = refusal;
+      else {
+        const reserve = this.deps.backstop?.budget?.reserve ?? githubBudget.reserve;
+        const low = (await (this.deps.backstop?.rates ?? probeRates)().catch(() => [])).filter((rate) => rate.remaining < reserve && rate.resetAt > now);
+        const latest = low.sort((a, b) => b.resetAt - a.resetAt)[0];
+        wait = latest ? { resumeAt: latest.resetAt, resource: latest.resource } : null;
+      }
+    }
+    const resumeAt = wait?.resumeAt ?? now + RESUME_FALLBACK_MS;
+    const resource = wait ? `${wait.resource} budget reset` : "rate limit to pass (GitHub named no reset)";
+    console.log(`[linear-tickets] queue backstop waits until ${utcClock(resumeAt)} for GitHub's ${resource} (${stop.message})`);
+    if (this.halted) return;
+    clearTimeout(this.resumeTimer ?? undefined);
+    this.resumeAt = resumeAt;
+    this.resumeTimer = setTimeout(() => {
+      this.resumeTimer = null;
+      console.log(`[linear-tickets] queue backstop resumes after GitHub's reset at ${utcClock(resumeAt)}`);
+      void this.backstop();
+    }, Math.max(0, resumeAt + RESUME_DELAY_MS - now));
+    this.resumeTimer.unref?.();
   }
 
   private async load(): Promise<Record<string, Seen>> {
@@ -1931,16 +2012,26 @@ export class PullRequestWatch {
     // Whether this host runs the repo-wide half of the backstop (see backstopHost).
     const repoWide = await this.backstopHost();
     // Set once GitHub's budget stopped the run: the rest neither runs nor counts as read, and the
-    // outage issue still gets its one sync with those repos failed.
-    let stopped: string | null = null;
-    for (const record of records) {
+    // outage issue still gets its one sync with those repos failed. A GitHub stop then waits for
+    // GitHub's reset (armResume); Linear's limit keeps the next tick. A budget already paused when
+    // the run starts stops it before its first request.
+    let stopped: Error | null = null;
+    const stops = (error: unknown): error is Error => error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError;
+    try {
+      (this.deps.backstop?.budget ?? githubBudget).admit("background");
+    } catch (error) {
+      if (!(error instanceof GitHubPausedError)) throw error;
+      console.error(`[linear-tickets] queue backstop stopped before its first GitHub request: ${error.message}`);
+      stopped = error;
+    }
+    for (const record of stopped ? [] : records) {
       try {
         await this.discover(record, context);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[linear-tickets] queue backstop discovery for ${record.identifier} stopped: ${message}`);
-        if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) {
-          stopped = message;
+        if (stops(error)) {
+          stopped = error;
           break;
         }
       }
@@ -1964,14 +2055,25 @@ export class PullRequestWatch {
     const follow = writer && this.deps.outage ? await this.deps.outage.follow() : new Map<string, number[]>();
     const greptile: RetriggerResult[] = [];
     for (const repo of new Set([...repos, ...follow.keys()])) {
-      if (writer) greptile.push(stopped ? { repo, result: "failed", error: stopped } : await this.retrigger(repo, follow.get(repo) ?? [], seenByUrl, context));
+      if (writer) {
+        if (stopped) greptile.push({ repo, result: "failed", error: stopped.message });
+        else {
+          try {
+            greptile.push(await this.retrigger(repo, follow.get(repo) ?? [], seenByUrl, context));
+          } catch (error) {
+            // Only GitHub's refusal escapes retrigger: the repo failed, and the run stops.
+            stopped = error as Error;
+            greptile.push({ repo, result: "failed", error: stopped.message });
+          }
+        }
+      }
       if (stopped || !repos.has(repo)) continue;
       try {
         await this.backstopRepo(repo, seenByUrl, context, save, repoWide);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[linear-tickets] queue backstop for ${repo} stopped: ${message}`);
-        if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) stopped = message;
+        if (stops(error)) stopped = error;
       }
     }
     await save();
@@ -1982,6 +2084,7 @@ export class PullRequestWatch {
         console.error(`[linear-tickets] greptile outage issue: ${error instanceof Error ? error.message : error}`);
       }
     }
+    if (stopped && !(stopped instanceof RateLimitedError)) await this.armResume(stopped);
   }
 
   private hasScript(checkout: string, script: string): boolean {
@@ -2007,23 +2110,31 @@ export class PullRequestWatch {
 
   // One repo's Greptile re-request (TUC-1208): the repo's script decides and posts (once per head,
   // twice per 24 hours, never after a Greptile review); `follow` are the pull requests the outage
-  // issue lists. Each request it made is kept on the pull request's entry as evidence. Any failure
-  // is the repo's `failed` answer, never a stop of the backstop.
+  // issue lists. Each request it made is kept on the pull request's entry as evidence. A failure is
+  // the repo's `failed` answer, except GitHub's refusal (of the run, or of one of its requests,
+  // after the requests it made are kept): that stops the backstop run, which waits for the reset.
   private async retrigger(repo: string, follow: number[], seenByUrl: Record<string, Seen>, context: RunContext): Promise<RetriggerResult> {
-    try {
-      const checkout = await context.checkout(repo);
-      if (!checkout || !this.hasScript(checkout, GREPTILE_RETRIGGER)) return { repo, result: "skipped" };
-      const run = parseRetrigger(await this.run(checkout, GREPTILE_RETRIGGER, retriggerArgs(follow), repo));
+    const keep = (run: RetriggerRun) => {
       for (const found of run.triggered) {
         const seen = entry(seenByUrl, pullUrl(repo, found.pr));
         seen.greptile = [...(seen.greptile ?? []), { head: found.head, at: found.at }];
         console.log(`[linear-tickets] greptile re-request: asked Greptile on ${repo}#${found.pr} at ${found.head.slice(0, 12)}`);
       }
       for (const found of run.errors) console.error(`[linear-tickets] greptile re-request ${repo}${found.pr ? `#${found.pr}` : ""}: ${found.error}`);
+    };
+    try {
+      const checkout = await context.checkout(repo);
+      if (!checkout || !this.hasScript(checkout, GREPTILE_RETRIGGER)) return { repo, result: "skipped" };
+      const run = parseRetrigger(await this.run(checkout, GREPTILE_RETRIGGER, retriggerArgs(follow), repo));
+      keep(run);
       return { repo, result: "answer", run };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`[linear-tickets] greptile re-request for ${repo} failed: ${message}`);
+      if (error instanceof GitHubRateLimitedError || error instanceof GitHubPausedError) {
+        if (error instanceof RetriggerRefusedError) keep(error.partial);
+        throw error;
+      }
       return { repo, result: "failed", error: message };
     }
   }

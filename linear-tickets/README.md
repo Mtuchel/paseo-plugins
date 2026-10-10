@@ -1606,7 +1606,8 @@ escalation stays in the entry (the stage simply resumes nudging on its next new 
 **Stalled pull requests**). A message for a
 pull request that still holds an undelivered one waits behind it and goes out after it. An
 archived agent's open pull request stays watched until it is escalated to you or 14 days without
-activity. When GitHub throttles `gh`, the rest of the poll waits for the next one.
+activity. When GitHub throttles `gh`, the rest of the poll waits for the next one; with one `gh`
+login it sends nothing until GitHub's own reset (see [Pull request view](#pull-request-view)).
 
 **Queue backstop.** Every 10 minutes, and right after a poll claimed a drop to re-enqueue, the
 plugin enqueues on its own what nobody else did. It runs the repo's scripts, never its own
@@ -1657,6 +1658,24 @@ run at a time, taking turns with the poll:
 6. On the dispatch host only, `complex-review` pull requests Greptile never reviewed get a review
    request (see "Greptile re-request" below), only when the checkout's `main` has
    `tools/ci/greptile-retrigger.mjs`.
+
+**When GitHub's budget runs out** (TUC-1880). A run stops at the first GitHub refusal or budget
+pause: the steps, repos and Greptile re-requests after it do not run (those repos count as failed
+for the outage issue), and the actions keep their saved step. An enqueue whose answer the refusal
+cut off stays `started` and is reconciled from the Merge activity on the next run, so nothing is
+enqueued twice. A refusal is GitHub's answer to the plugin's own read, or a repo script whose
+stderr or JSON `error` says `API rate limit exceeded`, `secondary rate limit`, `HTTP 429` or
+`RATE_LIMITED` (for `greptile-retrigger.mjs` also one pull request's error; the requests it made
+before are recorded). With one `gh` login, a budget already below the 300-request reserve stops
+the run before its first request, discovery's listing included. The backstop then waits for the
+reset and starts again 5 seconds after it, by itself, instead of on the next 10-minute tick; the
+ticks and the poll's kicks leave it alone until then. The time is, in order: the pause's own reset,
+the router's `try again after`, the refused response's headers, else — scripts print no reset — a
+probe through the same routing (a conditional `GET user`, free as a `304`, and GraphQL's
+`rateLimit`, 1 point) that takes the latest reset of a budget below the reserve, else 2 minutes.
+It logs `queue backstop waits until 17:23 UTC for GitHub's core budget reset (<the refusal>)` and
+`queue backstop resumes after GitHub's reset at 17:23 UTC`. Linear's rate limit keeps stopping a
+run until the next tick.
 
 Every enqueue is an action (`drop:<drop key>:<top>`, since one queue draft can test several
 stacks, or `ready:<top>@<heads>`) saved in `pr-watch.json` before each step: the number and last
@@ -1744,7 +1763,8 @@ never after a Greptile review has been observed. Every request is also kept on t
 the host whose `dispatch.enabled` is on runs it (README "Several hosts" allows that on one host
 only), one backstop run at a time; every other host logs `greptile re-request: skipped, dispatch
 is off on this host` once and asks nobody. A script error, an undocumented exit or answer is that
-repo's failure, never a stop of the backstop.
+repo's failure, never a stop of the backstop; only GitHub's refusal stops it (see **When GitHub's
+budget runs out**).
 
 Once a request is 2 hours old without a review, the dispatch host files one Linear issue
 **"Greptile is not reviewing"** (`server/greptile-outage.ts`, state in
@@ -2850,8 +2870,13 @@ instead of two:
   its own, and a refusal says which budgets are spent and when they resume. Without the router
   (a host with one `gh` login) polling runs at background priority instead: while fewer than 300
   REST requests are left before the login's hourly reset, it pauses until the reset and keeps the
-  last data (`rateLimited` in the snapshot), and after GitHub refuses a request for its rate
-  limit nothing is sent for 2 minutes. Labelling is not held back by the reserve.
+  last data (`rateLimited` in the snapshot). After GitHub refuses a request for its rate limit,
+  nothing is sent until the time the refused response names: its resource's
+  `x-ratelimit-reset` when `x-ratelimit-remaining` is 0 (the primary limit, up to an hour, never
+  capped), else its `retry-after` (a secondary limit), else 2 minutes. The pause is shared with
+  the pull request watch and the queue backstop, and its log line names the time in UTC
+  (`paused until 17:23 UTC`), as every GitHub pause message does. Labelling is not held back by
+  the reserve.
 - The [pull request watch](#pull-request-reviews) reads the same way: through the router's read
   account where it is installed, under the single-login reserve where it is not; its conditional
   first look (the issue resource, its comments and reviews, the head's checks) keeps a quiet pull
