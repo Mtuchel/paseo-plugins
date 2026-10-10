@@ -1395,6 +1395,36 @@ test("after a partial landing the ticket's lowest open pull request is linked, w
   }
 });
 
+// TUC-1815's #4241 carried a title copied from TUC-1562's pull request: after TUC-1562's last pull
+// request landed, the landing-follow linked it to TUC-1562 by its title alone.
+test("a landing or a missing link never follows a pull request whose `Linear:` line names another ticket, though its title names this one; the ticket's own one is followed", async (t) => {
+  const logs = t.mock.method(console, "log", () => {});
+  const copied = { ...READY, headSha: "c1", headBranch: "mtuchel/tuc-2-ac8", baseBranch: "main", title: "Add TUC-1 [plugin] Retry the upload (AC-1)", body: "Linear: Part of TUC-2\n\nFollows TUC-1's upload." };
+  const own = { ...READY, headSha: "o1", headBranch: "mtuchel/tuc-1-b", baseBranch: "main", title: "Add TUC-1 [plugin] Step two", body: "Linear: Part of TUC-1", checks: [failing("PR code")] };
+  const arrange = (h: ReturnType<typeof harness>) => {
+    h.github.views = { [prUrl(1501)]: copied, [prUrl(1502)]: own };
+    h.github.open = [listed(prUrl(1501), copied, copied.title), listed(prUrl(1502), own, own.title)];
+  };
+  const skipped = `[linear-tickets] TUC-1: ${prUrl(1501)} is not followed: its \`Linear:\` line names TUC-2`;
+
+  const landed = harness(t);
+  arrange(landed);
+  landed.github.view = { ...READY, state: "CLOSED", labels: ["externally-merged"] };
+  const calls = await landed.poll();
+  assert.ok(calls.includes(`handover link ${prUrl(1502)}`), "the ticket's own next pull request is followed");
+  assert.ok(calls.includes("say thought The pull request landed; Paseo now follows the ticket's next open pull request #1502."));
+  assert.ok(!calls.some((call) => call.includes(prUrl(1501))), "the copied title links nothing");
+
+  const linkless = harness(t);
+  arrange(linkless);
+  linkless.records[0] = { ...linkless.records[0], branch: "mtuchel/tuc-1-b", links: {} };
+  linkless.git.origin = "git@github.com:tuchel-sohn/tuchel-platform.git";
+  await linkless.poll();
+  assert.equal(linkless.records[0].links["Pull request"], prUrl(1502));
+  assert.deepEqual(linkless.github.reads, [prUrl(1501), prUrl(1502)], "each candidate is read once; the linked one is not read again");
+  assert.equal(logs.mock.calls.filter((call) => call.arguments[0] === skipped).length, 2, "logged once per watch");
+});
+
 test("an archived agent's landing is followed to the ticket's next pull request after the lookup or the move failed, or a rate limit ended the poll first", async (t) => {
   const pull = (number: number) => `https://github.com/tuchel-sohn/tuchel-platform/pull/${number}`;
   const step2 = { ...READY, headSha: "s2", headBranch: "mtuchel/tuc-1-b", baseBranch: "main", checks: [failing("PR code")] };
@@ -4426,8 +4456,8 @@ async function transferStore(t: TestContext): Promise<Handover> {
   return store;
 }
 
-// The watched pull request renamed to TUC-2 (title and body), with failing checks to report.
-function renamed(h: ReturnType<typeof harness>, body = "Part of TUC-2."): void {
+// The watched pull request renamed to TUC-2 (title and `Linear:` line), with failing checks to report.
+function renamed(h: ReturnType<typeof harness>, body = "Linear: Part of TUC-2."): void {
   h.github.title = MOVED_TITLE;
   h.github.view = { ...READY, title: MOVED_TITLE, body, checks: [failing("PR code")] };
   h.linear.byIssue["TUC-2"] = { id: "i2", identifier: "TUC-2", status: "In Progress", statusType: "started" };
@@ -4435,11 +4465,11 @@ function renamed(h: ReturnType<typeof harness>, body = "Part of TUC-2."): void {
 
 const prompts = (calls: string[], agentId: string) => calls.filter((call) => call.startsWith(`prompt ${agentId}\n`));
 
-test("a pull request whose title and body name only another ticket moves to it on the next poll, and its events go there, never to the old ticket's agent", async (t) => {
+test("a pull request whose title and `Linear:` line name only another ticket moves to it on the next poll, whatever else its description names, and its events go there, never to the old ticket's agent", async (t) => {
   t.mock.method(console, "log", () => {});
   const store = await transferStore(t);
   const h = harness(t, { store, autoResume: true });
-  renamed(h, "Part of TUC-2. Covers AC-1 and AC-3 over UTF-8 input.");
+  renamed(h, "## Summary\n\nLinear: Part of TUC-2 https://linear.app/ws/issue/TUC-2 — Retry the upload.\n\nRebased onto TUC-1's work; the decision record is TUC-3's. Covers AC-1 and AC-3 over UTF-8 input.");
   h.paseo.succeed = async (claim) => {
     await claim();
     return { kind: "started", agent: { id: "a2", title: "TUC-2", cwd: "/wt/tuc-2" } };
@@ -4457,11 +4487,14 @@ test("a pull request whose title and body name only another ticket moves to it o
   assert.deepEqual(await h.poll(), [], "moved once; the claimed stage is not sent again");
 });
 
-test("a pull request stays when its title names no other ticket, its body names more than one, its body was not read, or it is closed", async (t) => {
+test("a pull request stays when its title names no other ticket, its `Linear:` line is missing or names another ticket too, its body was not read, or it is closed", async (t) => {
   t.mock.method(console, "log", () => {});
   const cases: [string, (h: ReturnType<typeof harness>) => void][] = [
     ["the title names its own ticket", (h) => { renamed(h); h.github.title = "Fix TUC-1 [plugin] Retry the upload"; h.github.view = { ...h.github.view, title: h.github.title }; }],
-    ["the body still names the old ticket", (h) => renamed(h, "Part of TUC-2, continues TUC-1.")],
+    ["there is no `Linear:` line", (h) => renamed(h, "Part of TUC-2.")],
+    ["the `Linear:` line still names the old ticket", (h) => renamed(h, "Linear: Part of TUC-1.")],
+    ["the `Linear:` line names both tickets", (h) => renamed(h, "Linear: Part of TUC-2, continues TUC-1.")],
+    ["the title is renamed back to the old ticket after the listing", (h) => { renamed(h); h.github.view = { ...h.github.view, title: "Fix TUC-1 [plugin] Retry the upload" }; }],
     ["the body was not read", (h) => { renamed(h); const { body: _body, ...view } = h.github.view; h.github.view = view; }],
     ["the pull request is closed", (h) => { renamed(h); h.github.view = { ...h.github.view, state: "CLOSED" }; }],
     ["only the branch names the other ticket", (h) => { h.github.view = { ...READY, headBranch: "mtuchel/tuc-2-fix", body: "Retry the upload.", title: "Retry the upload", checks: [failing("PR code")] }; h.github.title = "Retry the upload"; h.linear.byIssue["TUC-2"] = { id: "i2", identifier: "TUC-2", status: "In Progress", statusType: "started" }; }],
@@ -4635,7 +4668,7 @@ test("the backstop's saved work on moved pull requests names the ticket that own
   assert.equal(await store.transfer(OTHER, { issueId: "i9", identifier: "TUC-9" }, { issueId: "i1", identifier: "TUC-1" }, "mtuchel/tuc-1-other"), "moved");
   const h = harness(t, { store });
   renamed(h);
-  h.github.views[OTHER] = { ...READY, headSha: "other-head", headBranch: "mtuchel/tuc-1-other", title: MOVED_TITLE, body: "Part of TUC-2.", checks: [failing("PR code")] };
+  h.github.views[OTHER] = { ...READY, headSha: "other-head", headBranch: "mtuchel/tuc-1-other", title: MOVED_TITLE, body: "Linear: Part of TUC-2.", checks: [failing("PR code")] };
   h.github.open.push(listed(OTHER, h.github.views[OTHER], MOVED_TITLE));
   const action = (prs: number[]) => ({ id: `x${prs.join("-")}`, repo: "tuchel-sohn/tuchel-platform", branch: READY.headBranch, expect: "h", prs, top: prs.at(-1), tickets: ["TUC-1"], why: "", at: "2026-01-01T00:00:00.000Z", activityBoundary: null, steps: { enqueue: "refused", prComment: "done", linearComment: "done", note: "done" } });
   await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, actions: [action([419])] }, [OTHER]: { reviewedAt: null, decision: null, merged: false, actions: [action([419, 420])] } });
@@ -4659,7 +4692,7 @@ test("saved work that names a ticket two moves back follows the pull request to 
   const h = harness(t, { store });
   const title = "Fix TUC-3 [plugin] Retry the upload";
   h.github.title = title;
-  h.github.view = { ...READY, title, body: "Part of TUC-3.", checks: [failing("PR code")] };
+  h.github.view = { ...READY, title, body: "Linear: Part of TUC-3.", checks: [failing("PR code")] };
   h.linear.byIssue["TUC-3"] = { id: "i3", identifier: "TUC-3", status: "In Progress", statusType: "started" };
   const action = { id: "x", repo: "tuchel-sohn/tuchel-platform", branch: READY.headBranch, expect: "h", prs: [419], top: 419, tickets: ["TUC-1"], why: "", at: "2026-01-01T00:00:00.000Z", activityBoundary: null, steps: { enqueue: "refused", prComment: "done", linearComment: "done", note: "done" } };
   await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, actions: [action] } });

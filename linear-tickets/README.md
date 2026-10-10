@@ -1906,7 +1906,8 @@ The poll and backstop also recover a missing handover PR link before deciding th
 step. They identify the repository from the recorded worktree's validated GitHub origin, or
 from canonical PR attachments on the ticket when that source is unavailable. Conflicting
 attachment repositories are skipped. The lowest open PR whose title names the whole ticket
-is relinked in Linear, the handover, and its agent session, then handled in the same poll.
+(and that is not another ticket's, see **Partial landings**) is relinked in Linear, the
+handover, and its agent session, then handled in the same poll.
 Archived linkless records use the same 14-day relevance window; no worker branch is changed
 by discovery.
 
@@ -1917,8 +1918,11 @@ other open pull request of the ticket sits on; ties go to the lower number), the
 and the handover record point at it, and the plugin watches and nudges it from the next poll,
 also for an archived agent. This repeats with each landing until none of the ticket's pull
 requests is open. The ticket's pull requests are the ones whose title names it as a whole word
-(`Add TUC-34 [area] …` is TUC-34's, never TUC-343's). A lookup or link move that fails, or a poll
-that ends before it (a rate limit), is retried on the next poll, also across restarts.
+(`Add TUC-34 [area] …` is TUC-34's, never TUC-343's), except one whose `Linear:` line names
+another ticket and not this one (a title copied from another pull request): it is skipped with
+one log line ``[linear-tickets] TUC-34: <url> is not followed: its `Linear:` line names TUC-35``.
+A lookup or link move that fails, or a poll that ends before it (a rate limit), is retried on
+the next poll, also across restarts.
 
 **Replacement pull requests.** When the queue lands part of a stack, Graphite deletes the
 landed branch, and GitHub closes the pull request based on it for good (it cannot be reopened
@@ -2264,12 +2268,17 @@ report then only says who took over. A third agent's record is never touched.
 
 **Moving a pull request to another ticket.** A pull request belongs to the ticket whose record
 links it. To move it, rename it: once an open pull request's title names exactly one other
-ticket, and its title and description together name only that ticket, the next poll moves it to
-that ticket's record and links it on that ticket in Linear. Nobody edits the handover files. Only
-identifiers of the teams this host's records belong to count, so `AC-1` or `UTF-8` in a
-description change nothing; a description that still names the old ticket ("Part of TUC-594"),
-a title that names the ticket the pull request already belongs to, a branch name, a closed pull
-request, an unread description, or a Done or canceled ticket moves nothing. Only the pull request
+ticket, and its description's `Linear:` line (tuchel-platform's pull request template:
+`Linear: Part of TUC-2` or `Linear: Closes TUC-2`) names that ticket and no other, the next poll
+moves it to that ticket's record and links it on that ticket in Linear. Tickets the description
+names anywhere else (decision records, rebases, related work) do not count. Nobody edits the
+handover files. Only identifiers of the teams this host's records belong to count, so `AC-1` or
+`UTF-8` change nothing; no `Linear:` line, a `Linear:` line that still names the old ticket
+("Linear: Part of TUC-594") or names both, a title that names the ticket the pull request
+already belongs to, a branch name, a closed pull request, an unread description, or a Done or
+canceled ticket moves nothing (logged once, e.g. ``<url> stays: its title names TUC-2, but its
+`Linear:` line is missing``). A move is logged as `<url> (<repo>#<n>) moved from TUC-1 to
+TUC-2`. Only the pull request
 moves: the old ticket keeps its agent, branch, plan and reports, and any other pull requests it
 owns (the next becomes its primary one). A ticket that already has an agent or a pull request
 keeps both and owns the moved one too, so its pull request watch follows both. A ticket without a
@@ -2646,8 +2655,10 @@ independently of the agent's own `linear_ticket` tools:
   commands during a turn (for example `gh pr create`) are attached to the ticket, the agent
   panel and the handover record, and the ticket then moves to its team's started state named
   like *In Review*, but only for a pull request of that ticket: `gh pr view` on this host
-  finds it, and its title, description or head branch names the ticket identifier as a whole
-  word (`Part of TUC-123`; `TUC-12` does not name `TUC-123`). Test fixtures, which
+  finds it, its title, description or head branch names the ticket identifier as a whole
+  word (`Part of TUC-123`; `TUC-12` does not name `TUC-123`), and neither its title nor its
+  `Linear:` line names another ticket instead (a TUC-630 pull request whose description lists
+  TUC-935 as related work is not TUC-935's). Test fixtures, which
   `gh` cannot resolve ("no such pull request", or a repository that does not exist or this
   host's `gh` cannot see), and real pull requests of other tickets are skipped, each with a
   plugin log line `[linear-tickets] not linking <url> to <identifier>: <reason>`, and a turn

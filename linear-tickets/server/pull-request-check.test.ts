@@ -21,9 +21,25 @@ test("an existing pull request is the ticket's when its title, description or he
   assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "Fix sign-in", body: "Part of ENG-1" })), linked);
   assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "Fix sign-in", headRefName: "mtuchel/eng-1-fix" })), linked);
   assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "eng-1 fix sign-in" })), linked);
-  assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "ENG-10: other work", body: "Part of ENG-10", headRefName: "mtuchel/eng-10-other" })), { link: false, reason: "the pull request does not name ENG-1 in its title, description or branch" });
+  assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "Other work", body: "Part of ENG-10", headRefName: "mtuchel/eng-10-other" })), { link: false, reason: "the pull request does not name ENG-1 in its title, description or branch" });
   // The agent's own branch is no proof: branch names repeat across repositories.
   assert.equal((await ticketPullRequest(URL, "ENG-1", shows({ title: "Fix sign-in", body: null, headRefName: "fix-sign-in" }))).link, false);
+});
+
+test("a pull request whose title or `Linear:` line names another ticket is that ticket's, however its description or branch names this one", async () => {
+  // TUC-630's #3011 listed TUC-935 as related work: TUC-935's agent printed its URL, and it was linked there.
+  const related = shows({ title: "Add ENG-630 [repo] Admins control proposals (AC-13)", body: "Linear: Part of ENG-630\n\nRelated to ENG-935, ENG-936.", headRefName: "mtuchel/eng-630-ac-13" });
+  assert.deepEqual(await ticketPullRequest(URL, "ENG-935", related), { link: false, reason: "the pull request is ENG-630's: its title names ENG-630, not ENG-935" });
+  // TUC-1815's #4241 carried a title copied from TUC-1562's pull request.
+  const copied = shows({ title: "Add ENG-1562 [repo] Archived design Markdown proves its AC (AC-1)", body: "Linear: `Part of ENG-1815` `Heavy build steps`", headRefName: "mtuchel/eng-1815-ac8" });
+  assert.deepEqual(await ticketPullRequest(URL, "ENG-1562", copied), { link: false, reason: "the pull request is ENG-1815's: its `Linear:` line names ENG-1815, not ENG-1562" });
+  assert.deepEqual(await ticketPullRequest(URL, "ENG-1815", copied), { link: false, reason: "the pull request is ENG-1562's: its title names ENG-1562, not ENG-1815" }, "disagreeing title and `Linear:` line link it to neither ticket");
+  // Its own pull request still links when it also names other tickets, and identifiers of other teams never count.
+  assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "Add ENG-1 [repo] Fix sign-in", body: "Linear: Closes ENG-1\n\nAfter ENG-2 and ENG-3." })), { link: true });
+  assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "Fix UTF-8 sign-in (AC-1)", body: "Linear: Part of ENG-1" })), { link: true });
+  // Identifiers count in any case, as in namesTicket.
+  assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "Fix eng-1 after ENG-2", body: "Linear: Part of eng-1" })), { link: true });
+  assert.deepEqual(await ticketPullRequest(URL, "ENG-1", shows({ title: "Add ENG-1 [repo] Fix sign-in", body: "Linear: Part of eng-2" })), { link: false, reason: "the pull request is ENG-2's: its `Linear:` line names ENG-2, not ENG-1" });
 });
 
 test("throttling and any other gh failure throw a message the write-back retries, so the pull request is kept", async () => {
