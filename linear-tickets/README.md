@@ -1483,8 +1483,8 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   counting), with a new agent and thread, as for a planner run, one ticket per poll. After three
   restarts without a live agent Paseo comments on the ticket and stops: start an agent from the
   sidebar, or add the `paseo` label. Kept under `stalled` in `projects.json`; a ticket drops out
-  once an agent works on it. Tickets carrying `paseo-running` or `paseo-failed` are left to
-  **Repairing stale running and failed labels** below.
+  once an agent works on it. Tickets carrying `paseo-running` or `paseo-failed`, and orphaned
+  tickets in Planning, are left to **Repairing stale running and failed labels** below.
 - **Repairing stale running and failed labels.** `paseo-running` says an agent works on the
   ticket and `paseo-failed` that its start failed; with another trigger label the names change
   with it. Nothing else removes them when the agent is deleted in the app, lost with its host's
@@ -1507,10 +1507,23 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
     minutes after the failure was first seen, then 30 and 90 minutes after each failed retry. A
     retry that starts an agent removes `paseo-failed` and says so; after the third failure you are
     mentioned once and the label stays.
+  - *An orphan:* a ticket in Planning that is assigned to this host's Paseo app (not the peer's,
+    not nobody's) and carries none of the `paseo`, `paseo-running`, `paseo-failed`, `paseo-hold`,
+    `paseo-manual` and `paseo-needs-you` labels, without an agent (as above), a parked plan or a
+    thread waiting for its turn. Its agent was archived or stopped while planning, its review was
+    never delivered, or a send-back's fresh agent failed, and neither the hand-out nor
+    **Restarting a failed start** (Backlog and Todo only) would ever start it. The same pass reads
+    the dispatch teams' Planning tickets for it, and 15 minutes after an orphan was first seen it
+    is started again like a vanished agent: continuing its recorded branch, 15 minutes apart, at
+    most three times, then Paseo comments once and stops. A ticket that stops being an orphan
+    (an agent, a label, a parked plan, another state) ends the incident; once restarted it is kept
+    a day, so its restarts count on if it is orphaned again.
   - *A start that fails on this host's setup* (no Paseo project mapped, no provider chosen, no
     usable base branch, a project without Git) is not retried: the ticket gets `paseo-failed` and
     you are mentioned once.
-  - At most one ticket is restarted per pass. Before each restart the ticket is read again: one that closed, got `paseo-hold`, moved to
+  - At most one ticket is restarted per pass. A restart refused at admission (focus mode, the agent
+    limit, blockers) is a wait: it uses no attempt, and the next pass tries the other tickets first,
+    so one waiting ticket never holds the others up. Before each restart the ticket is read again: one that closed, got `paseo-hold`, moved to
     Needs input or review, or got an agent, a claim or a queued activation meanwhile is not
     started. Tickets carrying the trigger label (the dispatch has them), groups
     and tickets being deleted are left alone.

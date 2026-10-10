@@ -1020,6 +1020,15 @@ export class SessionRouter {
     return Boolean(newest && (newest.queued || newest.agentId || newest.offer || newest.group || newest.closed));
   }
 
+  // Whether a start or crash recovery of the ticket is under way (its turn) or one of its threads
+  // waits for blockers or a slot (`startQueued` starts it). Unlike `threadHolds`, an agent that ran
+  // once does not count: the label repair's orphan rule (label-repair.ts) restarts a ticket whose
+  // agent is gone, unless something is about to start it anyway.
+  async threadQueued(issueId: string): Promise<boolean> {
+    if (this.turns.has(issueId)) return true;
+    return (await this.deps.store.all()).some((link) => link.issueId === issueId && link.queued && !link.agentId && !link.closed);
+  }
+
   // Threads waiting for blockers, an agent slot or another start of their ticket. Read from the
   // store, not from `openSessions`: that is Linear's 50 most recently updated sessions in the whole
   // workspace, and a waiting thread posts nothing, so it drops out of that list hours before a slow

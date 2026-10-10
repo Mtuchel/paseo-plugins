@@ -312,18 +312,21 @@ const ISSUE_LABELS_BATCH = 50;
 export type LabeledIssue = { id: string; identifier: string; teamKey: string; priority: number; labels: { id: string; name: string }[]; openChildren: boolean };
 
 // The label repair (label-repair.ts): open tickets of the dispatch teams carrying a stale-able
-// label, and the tickets of its open records whatever their labels or state, all pages.
+// label, the teams' tickets in one started state whatever their labels (orphans, see
+// orphanCandidateFilter), and the tickets of its open records whatever their labels or state, all
+// pages.
 export const REPAIR_CANDIDATES_QUERY = `query repairCandidates($first: Int!, $after: String, $filter: IssueFilter) {
   issues(first: $first, after: $after, includeArchived: false, filter: $filter) {
-    nodes { id identifier title state { name type } project { id } labels(first: 50) { nodes { id name } } children(first: 1, filter: { state: { type: { nin: ["completed", "canceled"] } } }) { nodes { id } } }
+    nodes { id identifier title state { name type } project { id } delegate { id } labels(first: 50) { nodes { id name } } children(first: 1, filter: { state: { type: { nin: ["completed", "canceled"] } } }) { nodes { id } } }
     pageInfo { hasNextPage endCursor }
   }
 }`;
 // `queueBlocker`: the ticket is a queue blocker (README, "Auto-dispatch"): a read filtered to the
-// markers marks every candidate, the unfiltered read recognizes the title prefix.
-export type RepairCandidate = { id: string; identifier: string; status: string; statusType: string; projectId: string | null; labels: { id: string; name: string }[]; openChildren: boolean; queueBlocker: boolean };
+// markers marks every candidate, the unfiltered read recognizes the title prefix. `delegateId`: the
+// app the ticket is assigned to (the orphan rule restarts only this host's).
+export type RepairCandidate = { id: string; identifier: string; status: string; statusType: string; projectId: string | null; delegateId: string | null; labels: { id: string; name: string }[]; openChildren: boolean; queueBlocker: boolean };
 
-// Two reads, merged by id: Linear's `or` around this multi-field filter matched every ticket of
+// Separate reads, merged by id: Linear's `or` around this multi-field filter matched every ticket of
 // the team (1210 of TUC, 2026-10-07), so the record ids are read on their own. `queueBlockers`
 // adds the marker filter, so only queue-blocker tickets are returned (the dispatch fallback's
 // read while the background share is paused).
@@ -333,6 +336,14 @@ export function repairCandidateFilter(labels: string[], teamKeys: string[], opti
     team: { key: { in: [...new Set(teamKeys)].sort() } },
     state: { type: { nin: ["completed", "canceled"] } },
     ...(options.queueBlockers ? queueBlockerFilter() : {}),
+  };
+}
+// The teams' tickets in the started state `state` (Planning), whatever their labels and delegate:
+// the label repair keeps those assigned to this host's app without any Paseo state label.
+export function orphanCandidateFilter(state: string, teamKeys: string[]): Record<string, unknown> {
+  return {
+    team: { key: { in: [...new Set(teamKeys)].sort() } },
+    state: { type: { eq: "started" }, name: { eqIgnoreCase: state } },
   };
 }
 const REPAIR_IDS_BATCH = 50;
@@ -1206,11 +1217,13 @@ export class LinearService {
       .sort((a, b) => (a.priority || 5) - (b.priority || 5));
   }
 
-  async repairCandidates(input: { labels: string[]; teamKeys: string[]; ids: string[]; queueBlockers?: boolean }): Promise<RepairCandidate[]> {
+  // `state`: also read the teams' tickets in this started state (orphanCandidateFilter).
+  async repairCandidates(input: { labels: string[]; teamKeys: string[]; ids: string[]; queueBlockers?: boolean; state?: string }): Promise<RepairCandidate[]> {
     const found = new Map<string, RepairCandidate>();
     const ids = [...new Set(input.ids)].sort();
     const filters = [
       ...input.teamKeys.length ? [repairCandidateFilter(input.labels, input.teamKeys, { queueBlockers: input.queueBlockers })] : [],
+      ...input.teamKeys.length && input.state && !input.queueBlockers ? [orphanCandidateFilter(input.state, input.teamKeys)] : [],
       // A queue-blocker read names the tickets it means: the record-id read would return the other
       // records' tickets too.
       ...(input.queueBlockers ? [] : Array.from({ length: Math.ceil(ids.length / REPAIR_IDS_BATCH) }, (_, index) => ({ id: { in: ids.slice(index * REPAIR_IDS_BATCH, (index + 1) * REPAIR_IDS_BATCH) } }))),
@@ -1225,7 +1238,7 @@ export class LinearService {
           const id = label(node.id);
           if (id) found.set(id, {
             id, identifier: label(node.identifier), status: label(state.name), statusType: label(state.type),
-            projectId: label(record(node.project ?? {}).id) || null, labels: labelNodes(node.labels),
+            projectId: label(record(node.project ?? {}).id) || null, delegateId: label(record(node.delegate ?? {}).id) || null, labels: labelNodes(node.labels),
             openChildren: connection(node.children ?? { nodes: [] }).nodes.length > 0,
             queueBlocker: input.queueBlockers === true || label(node.title).startsWith(QUEUE_BLOCKER_TITLE_PREFIX),
           });

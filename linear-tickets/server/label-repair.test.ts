@@ -10,6 +10,7 @@ import { LabelRepair, type RepairRecord } from "./label-repair";
 import { Launcher, SetupError } from "./launch";
 import { LinearApiError, type IssueState, type LabeledIssue, type RepairCandidate } from "./linear";
 import type { ProcessInspector } from "./process-liveness";
+import { ParkedPlans } from "./parked";
 import { ProjectStore } from "./project-flow";
 import { RateLimitedError } from "./rate-budget";
 import { restartOrThrow, type RestartOptions, type RestartResult } from "./sessions";
@@ -18,6 +19,8 @@ import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSet
 const MINUTE = 60_000;
 const T0 = Date.parse("2026-10-07T10:00:00Z");
 const OWNER_URL = "https://linear.app/acme/profiles/owner";
+// This host's Paseo app; tickets assigned to it may be orphans.
+const APP = "paseo-app";
 
 type Agent = { id: string; status: string; provider: string; cwd: string; createdAt: string; updatedAt: string; labels: Record<string, string>; persistence?: { nativeHandle: string } };
 // `outcome` of the next restart: "start" brings up a live agent, as restartFor would.
@@ -56,6 +59,9 @@ async function world(t: TestContext, options: { label?: string; pageSize?: numbe
   const outcomes: Outcome[] = [];
   const claims = new Set<string>();
   const pending = new Set<string>();
+  // Threads waiting for their turn (SessionRouter.threadQueued); parked plans are real files.
+  const queued = new Set<string>();
+  const parked = new ParkedPlans(join(directory, "parked"));
   const intakeState = { ready: true as boolean | Error };
   // Tickets focus mode refuses; restartFor's admission refuses them too.
   const unfocused = new Set<string>();
@@ -64,8 +70,9 @@ async function world(t: TestContext, options: { label?: string; pageSize?: numbe
   let created = 0;
   const byId = (id: string) => tickets.get(id)!;
   const linear = {
-    repairCandidates: async ({ labels, ids, queueBlockers }: { labels: string[]; teamKeys: string[]; ids: string[]; queueBlockers?: boolean }) => [...tickets.values()]
-      .filter((ticket) => ids.includes(ticket.id) || (!["completed", "canceled"].includes(ticket.statusType) && (!queueBlockers || ticket.queueBlocker) && ticket.labels.some((item) => labels.some((name) => name.toLowerCase() === item.name.toLowerCase()))))
+    repairCandidates: async ({ labels, ids, queueBlockers, state }: { labels: string[]; teamKeys: string[]; ids: string[]; queueBlockers?: boolean; state?: string }) => [...tickets.values()]
+      .filter((ticket) => ids.includes(ticket.id) || (!["completed", "canceled"].includes(ticket.statusType) && (!queueBlockers || ticket.queueBlocker)
+        && (ticket.labels.some((item) => labels.some((name) => name.toLowerCase() === item.name.toLowerCase())) || (!queueBlockers && state !== undefined && ticket.statusType === "started" && ticket.status.toLowerCase() === state.toLowerCase()))))
       .map((ticket) => ({ ...ticket, labels: [...ticket.labels] })),
     addLabel: async (id: string, name: string) => {
       calls.push(`${byId(id).identifier} +${name}`);
@@ -83,6 +90,7 @@ async function world(t: TestContext, options: { label?: string; pageSize?: numbe
     issueState: async (id: string) => ({ ...byId(id), labels: [...byId(id).labels] }) as unknown as IssueState,
     userUrl: async () => OWNER_URL,
     viewerId: async () => "owner",
+    appUserId: async () => APP as string | null,
   };
   const paseo = { agents: { list: async ({ filter, page }: { filter: { labels: Record<string, string> }; page?: { limit?: number; cursor?: string } }) => {
     const mine = agents.filter((agent) => agent.labels["linear.issueId"] === filter.labels["linear.issueId"]);
@@ -116,10 +124,10 @@ async function world(t: TestContext, options: { label?: string; pageSize?: numbe
       gate.release();
     }
   };
-  const make = () => new LabelRepair({ linear, store, launcher, intake, restart, focus, now: () => now, inspect: options.inspect });
+  const make = () => new LabelRepair({ linear, store, launcher, intake, restart, focus, waiting: async (id) => await parked.has(id) || queued.has(id), now: () => now, inspect: options.inspect });
   let repair = make();
   return {
-    tickets, agents, calls, comments, restarts, outcomes, claims, pending, intakeState, unfocused, fail, store, launcher, linear, paseo,
+    tickets, agents, calls, comments, restarts, outcomes, claims, pending, queued, parked, intakeState, unfocused, fail, store, launcher, linear, paseo,
     get repair() { return repair; },
     settings: () => settings,
     setSettings: (next: PluginSettings) => { settings = next; },
@@ -132,7 +140,7 @@ async function world(t: TestContext, options: { label?: string; pageSize?: numbe
     record: async (id = "i1"): Promise<RepairRecord | undefined> => (await store.repairs())[id],
     labels: (id = "i1") => byId(id).labels.map((item) => item.name).sort(),
     add: (n: number, labels: string[], change: Partial<RepairCandidate> = {}) => {
-      tickets.set(`i${n}`, { id: `i${n}`, identifier: `TUC-${n}`, status: "Todo", statusType: "unstarted", projectId: null, openChildren: false, queueBlocker: false, labels: labels.map((name) => ({ id: name, name })), ...change });
+      tickets.set(`i${n}`, { id: `i${n}`, identifier: `TUC-${n}`, status: "Todo", statusType: "unstarted", projectId: null, delegateId: null, openChildren: false, queueBlocker: false, labels: labels.map((name) => ({ id: name, name })), ...change });
     },
   };
 }
@@ -285,6 +293,94 @@ test("a ticket focus mode refuses waits unclaimed and silent, leaves the pass's 
   const restarted = await w.record();
   assert.deepEqual([restarted?.state, restarted?.attempts], ["resolved", 1]);
   assert.ok(restarted?.log.some((step) => step.action === "restart 1 of 3"));
+});
+
+// In Planning and assigned to this host's Paseo app, without any Paseo label: an orphan once its
+// agent is gone.
+const ORPHAN: Partial<RepairCandidate> = { status: "Planning", statusType: "started", delegateId: APP };
+
+test("an orphaned Planning ticket starts again after 15 minutes; three failed restarts end in one comment", async (t) => {
+  const started = await world(t);
+  started.add(1, [], ORPHAN);
+  await started.at(0);
+  await started.at(14);
+  assert.deepEqual(started.restarts, [], "nothing within the grace");
+  assert.equal((await started.record())?.kind, "orphan");
+  await started.at(16);
+  assert.deepEqual(started.restarts, ["TUC-1"]);
+  assert.deepEqual(started.labels(), ["paseo-running"], "the new agent's start marks it");
+  assert.deepEqual([(await started.record())?.state, (await started.record())?.attempts], ["resolved", 1]);
+  for (const minutes of [20, 60]) await started.at(minutes);
+  assert.deepEqual([started.restarts, started.comments], [["TUC-1"], []], "the new agent works on it");
+
+  const w = await world(t);
+  w.add(1, [], ORPHAN);
+  w.outcomes.push(...[1, 2, 3].map((n): RestartResult => ({ kind: "failed", error: new Error(`Workspace creation could not be confirmed (${n})`) })));
+  await w.at(0);
+  await w.at(16);
+  assert.equal((await w.record())?.attempts, 1);
+  w.reload();
+  await w.at(30);
+  assert.equal(w.restarts.length, 1, "the next one 15 minutes after the failure, also after a reload");
+  await w.at(32);
+  await w.at(48);
+  assert.equal(w.restarts.length, 3);
+  assert.equal((await w.record())?.state, "exhausted");
+  assert.equal(w.comments.length, 1);
+  assert.match(w.comments[0], /^TUC-1: \*\*Paseo could not start an agent for this ticket\.\*\* It is assigned to Paseo, .*3 times.*Last failure: Workspace creation could not be confirmed \(3\)\. Start an agent for it from the Linear tickets sidebar, or add the `paseo` label to try again\.$/);
+  w.reload();
+  for (const minutes of [70, 200, 2000]) await w.at(minutes);
+  assert.deepEqual([w.restarts.length, w.comments.length], [3, 1], "no fourth restart, no second comment");
+});
+
+test("no orphan: a parked plan, a held ticket, a queued thread, no or another delegate, an agent anywhere, a group, another state", async (t) => {
+  const w = await world(t);
+  w.add(1, [], ORPHAN);
+  await w.parked.put({ issueId: "i1", identifier: "TUC-1", agentId: "retired", plan: "# Plan", line: "Owner review", reasons: [], model: null, parkedAt: new Date(T0).toISOString(), announced: true });
+  w.add(2, ["paseo-hold"], ORPHAN);
+  w.add(3, [], ORPHAN);
+  w.queued.add("i3");
+  w.add(4, [], { ...ORPHAN, delegateId: null });
+  w.add(5, [], { ...ORPHAN, delegateId: "peer-app" });
+  w.add(6, ["paseo-manual"], ORPHAN);
+  w.add(7, ["paseo-needs-you"], ORPHAN);
+  w.add(8, [], ORPHAN);
+  w.agents.push(agent("live", "i8", "running"));
+  w.add(9, [], ORPHAN);
+  w.claims.add("i9");
+  w.add(10, [], ORPHAN);
+  w.pending.add("i10");
+  w.add(11, [], { ...ORPHAN, openChildren: true });
+  w.add(12, [], { ...ORPHAN, status: "Needs input" });
+  w.add(13, ["paseo"], ORPHAN);
+  for (const minutes of [0, 20, 40, 200]) await w.at(minutes);
+  assert.deepEqual([w.restarts, w.calls, w.comments], [[], [], []]);
+  assert.deepEqual(await w.store.repairs(), {});
+  // The owner decided the parked plan and its file went, but nothing started: an orphan now.
+  await w.parked.remove("i1");
+  await w.at(202);
+  await w.at(218);
+  assert.deepEqual(w.restarts, ["TUC-1"]);
+});
+
+test("a focus refusal is a wait: it uses no attempt, and the next pass tries another orphan first", async (t) => {
+  const w = await world(t);
+  w.add(1, [], ORPHAN);
+  w.add(2, [], ORPHAN);
+  const focus: RestartResult = { kind: "deferred", reason: "Focus mode is on: TUC-1 is outside the focused tickets." };
+  w.outcomes.push(focus, "start", focus, focus, "start");
+  await w.at(0);
+  await w.at(16);
+  assert.deepEqual(w.restarts, ["TUC-1"]);
+  assert.deepEqual([(await w.record("i1"))?.state, (await w.record("i1"))?.attempts], ["watching", 0], "the refusal gave the attempt back");
+  await w.at(18);
+  assert.deepEqual(w.restarts, ["TUC-1", "TUC-2"], "the waiting orphan does not take every pass's restart");
+  await w.at(20);
+  await w.at(22);
+  assert.equal((await w.record("i1"))?.attempts, 0, "still no attempt used");
+  await w.at(24);
+  assert.deepEqual([(await w.record("i1"))?.state, (await w.record("i1"))?.attempts], ["resolved", 1]);
+  assert.deepEqual(w.comments, []);
 });
 
 test("a vanished agent is restarted at most three times, 15 minutes apart; a no-start gives the attempt back; a reload keeps the count", async (t) => {
