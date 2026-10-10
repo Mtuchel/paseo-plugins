@@ -1466,3 +1466,18 @@ test("an unreadable owner record leaves the planner wait unconfirmed until the r
     assert.equal(restored.detail, scheduled(RESUME, NOW));
   });
 });
+
+test("a ticket record without an agent (a moved pull request's) gives no owner evidence and spoils no other ticket's", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-owner-evidence-"));
+  try {
+    const records: Record<string, unknown> = {
+      moved: { issueId: "moved", identifier: "ENG-2", agentId: null, agentTitle: "Paseo on ENG-2", branch: "eng-2", worktreePath: null, lastCommit: null, summaries: [], links: { "Pull request": "https://github.com/o/r/pull/7" }, status: "archived", progressCommentId: null, resumedFrom: null, updatedAt: SUBMIT },
+      worked: { issueId: "worked", identifier: "ENG-1", agentId: "agent-1", agentTitle: "ENG-1", branch: "eng-1", worktreePath: "/wt/eng-1", lastCommit: null, summaries: [], links: {}, status: "failed", progressCommentId: null, resumedFrom: null, updatedAt: SUBMIT },
+    };
+    const evidence = await pipelineOwnerEvidence(home, ["moved", "worked"], async (issueId) => (records[issueId] ?? null) as HandoverRecord | null);
+    assert.deepEqual(evidence.map((owner) => [owner.issueId, owner.agentId]), [["worked", "agent-1"]]);
+    // A malformed agent id still fails the read.
+    records.moved = { ...(records.moved as object), agentId: 7 };
+    await assert.rejects(pipelineOwnerEvidence(home, ["moved", "worked"], async (issueId) => (records[issueId] ?? null) as HandoverRecord | null), /Owner evidence malformed/);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});

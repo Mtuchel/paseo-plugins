@@ -258,7 +258,7 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "get_issue", "search_issues", "add_comment", "set_status", "link_url", "add_relation", "create_issue", "update_issue", "add_manual_task"]);
+    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "get_issue", "get_comments", "search_issues", "add_comment", "set_status", "link_url", "add_relation", "create_issue", "update_issue", "add_manual_task"]);
 
     const ticket = JSON.parse((await mcp.call("get_ticket")).text);
     assert.equal(ticket.identifier, "ENG-42");
@@ -287,6 +287,50 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     assert.equal(((await mcp.request("tools/call", { name: "delete_everything" })).error as { code: number }).code, -32602);
     assert.equal(((await mcp.request("resources/list")).error as { code: number }).code, -32601);
     assert.ok(linear.calls.every((c) => !JSON.stringify(c.variables).includes("saved-key")));
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("get_comments pages through the whole comment history, past what get_ticket shows", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-comments-"));
+  // 120 comments, newest first as Linear lists them; the oldest is on the third page.
+  const history = Array.from({ length: 120 }, (_, index) => ({ id: `c-${index}`, body: `Comment ${index}`, createdAt: new Date(Date.UTC(2026, 0, 1, 0, 120 - index)).toISOString(), url: `https://linear.app/x/issue/ENG-42#comment-${index}`, user: { name: "Teo" } }));
+  const linear = await fakeLinear((call) => {
+    if (call.query.includes("query ticket")) return { issue: { ...issue, comments: { nodes: history.slice(0, 50) } } };
+    if (call.query.includes("query comments")) {
+      const start = call.variables.after === null ? 0 : Number(String(call.variables.after).slice(1));
+      const end = start + Number(call.variables.first);
+      return { issue: { identifier: "ENG-42", comments: { nodes: history.slice(start, end), pageInfo: { hasNextPage: end < history.length, endCursor: `p${end}` } } } };
+    }
+    return {};
+  });
+  await mkdir(join(home, "linear-tickets"), { recursive: true });
+  await writeFile(join(home, "linear-tickets", "credentials.json"), JSON.stringify({ apiKey: "saved-key" }));
+  const script = await writeTicketMcpScript(home);
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const server = ticketMcpServer(script, ISSUE_ID, home);
+  const mcp = runServer(server.args[0], server.args.slice(1), {});
+  try {
+    await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } });
+    assert.equal(JSON.parse((await mcp.call("get_ticket")).text).comments.length, 20, "get_ticket keeps its recent comments");
+    const seen: { id: string; body: string; createdAt: string; url: string }[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 5; page++) {
+      const result = JSON.parse((await mcp.call("get_comments", cursor ? { cursor } : {})).text);
+      assert.equal(result.issue, "ENG-42");
+      seen.push(...result.comments);
+      cursor = result.nextCursor;
+      if (!cursor) break;
+    }
+    assert.equal(seen.length, 120);
+    assert.deepEqual(seen.at(-1), { id: "c-119", author: "Teo", createdAt: history[119].createdAt, url: history[119].url, body: "Comment 119" });
+    assert.deepEqual(linear.calls.filter((c) => c.query.includes("query comments")).map((c) => c.variables), [
+      { id: ISSUE_ID, first: 50, after: null }, { id: ISSUE_ID, first: 50, after: "p50" }, { id: ISSUE_ID, first: 50, after: "p100" },
+    ]);
+    const other = JSON.parse((await mcp.call("get_comments", { issue: "ENG-7" })).text);
+    assert.equal(other.comments.length, 50);
+    assert.equal(linear.calls.at(-1)!.variables.id, "ENG-7");
+    assert.equal((await mcp.call("get_comments", { cursor: "" })).isError, true);
   } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
@@ -912,7 +956,7 @@ test("without the broker the tools stay available and every request fails closed
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.equal(list.tools.length, 10, "the tools stay mounted when the broker is down");
+    assert.equal(list.tools.length, 11, "the tools stay mounted when the broker is down");
     for (const call of [() => mcp.call("get_ticket"), () => mcp.call("add_comment", { body: "Started." })]) {
       const result = await call();
       assert.equal(result.isError, true);

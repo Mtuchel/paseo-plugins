@@ -89,8 +89,8 @@ export function secretsMatch(given: string | null, expected: string | null): boo
 // on the peer and forwarded by the draining host is started once. A label has no immutable source
 // id, so the draining host adds the occurrence it saw (`occurrenceFor` in drain.ts) and only a
 // label that is added again after the previous occurrence was acknowledged is a new activation.
-export function recoverActivationId(issueId: string, predecessorId: string, lead: string): string {
-  return `recover:${issueId}:${predecessorId}:${createHash("sha256").update(lead).digest("hex").slice(0, 16)}`;
+export function recoverActivationId(issueId: string, predecessorId: string | null, lead: string): string {
+  return `recover:${issueId}:${predecessorId ?? "none"}:${createHash("sha256").update(lead).digest("hex").slice(0, 16)}`;
 }
 
 export const activationKindSchema = z.enum(["session", "reply", "ticket", "recover"]);

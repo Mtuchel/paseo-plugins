@@ -5,8 +5,9 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
+import { CONTEXT_TOO_LARGE } from "./context";
 import type { RetriggerResult } from "./greptile-outage";
-import type { HandoverRecord } from "./handover";
+import { Handover, type HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
 import { activityBullets, ConditionalPullView, githubReader, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft, type RateProbe } from "./pr-watch";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, GREPTILE_RETRIGGER, marker, RETARGET_ORPHAN, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
@@ -172,7 +173,9 @@ const MAIN_BROKEN: Judgment = {
 // harness host is the backstop host unless a test says otherwise.
 // `probe`: the cheap first look the poll goes through (see ConditionalPullView); without one the
 // injected `view` is the whole read, as for the tests that predate it.
-function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean; owner?: "all" | "none" | "unknown" | "throws"; backstop?: "auto" | "always" | "never"; watchdog?: Pick<Watchdog, "pass" | "stop"> } = {}, probe?: PullViewSource) {
+// `store`: a real Handover on temporary files instead of the in-memory records (the transfer
+// tests); `owns`: the only tickets the peer mechanism names as this host's.
+function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean; owner?: "all" | "none" | "unknown" | "throws"; backstop?: "auto" | "always" | "never"; watchdog?: Pick<Watchdog, "pass" | "stop">; store?: Handover; owns?: string[] } = {}, probe?: PullViewSource) {
   const waits = { runs: 0, failure: null as Error | null };
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open under `title`; `views`: other pull requests
@@ -229,7 +232,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // states of tickets a run has several of (`state` is every other ticket's). `issueFailure` fails
   // the ticket reads (`issueReads`), `statesFailure` the per-poll batch of the running tickets
   // (`stateReads`).
-  const linear = { failure: null as Error | null, issueFailure: null as Error | null, statesFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], stateReads: [] as string[][], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" }, completedAt: null as string | null, byIssue: {} as Record<string, { status: string; statusType: string }> };
+  const linear = { failure: null as Error | null, issueFailure: null as Error | null, statesFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], stateReads: [] as string[][], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" }, completedAt: null as string | null, byIssue: {} as Record<string, { status: string; statusType: string; id?: string; identifier?: string }> };
   // No test worktree exists unless its git source is explicitly provided.
   const git = { origin: null as string | null, root: null as string | null, reads: [] as string[][] };
   // Open before-merge manual tasks of the ticket; `unreadable`: reading them fails.
@@ -250,13 +253,15 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     idle: async () => "ran",
   };
   const calls: string[] = [];
+  // Every successor start asked for, as `<issue id> <predecessor>`.
+  const successions: string[] = [];
   const daemon = agent.crash ? crashDaemon(calls) : null;
   // This host's Paseo server id, as the tickets' `Paseo agent` attachments name it (see ownership).
   const server = { id: "srv_test" };
   const directory = mkdtemp(join(tmpdir(), "paseo-pr-watch-"));
   t.after(async () => rm(await directory, { recursive: true, force: true }));
   const create = () => directory.then((home) => new PullRequestWatch({
-    handover: { all: async () => records, update: async (issue, _agent, patch) => {
+    handover: agent.store ?? { all: async () => records, update: async (issue, _agent, patch) => {
       if (!patch.link) { calls.push(`review ${patch.review}`); return null as never; }
       calls.push(`handover link ${patch.link[1]}`);
       const index = records.findIndex((record) => record.issueId === issue.id);
@@ -268,7 +273,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       say: async (_id, kind, text) => { calls.push(`say ${kind} ${text.split("\n")[0]}`); },
       link: async (_id, label, url) => { calls.push(`session link ${label} ${url}`); },
       prompt: daemon ? (agentId, text, onDispatch, recovery) => daemon.router.prompt(agentId, text, onDispatch, recovery) : async (agentId, text, onDispatch) => {
-        const outcome = await paseo.answer(agentId);
+        const outcome = agentId === null ? "gone" : await paseo.answer(agentId);
         if (outcome !== "sent") return outcome;
         await onDispatch?.();
         await paseo.send();
@@ -277,6 +282,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       },
       crashed: async (agentId) => daemon ? daemon.router.crashed(agentId) : null,
       succeed: async (_issueId, _identifier, predecessor, lead, onDispatch) => {
+        successions.push(`${_issueId} ${predecessor}`);
         const next = await paseo.succeed(onDispatch);
         if (next.kind === "started") calls.push(`succeed ${predecessor}\n${lead}`);
         if (next.kind === "started" || next.kind === "live") records[0] = { ...records[0], agentId: next.agent.id, agentTitle: next.agent.title ?? "", status: "working" };
@@ -348,6 +354,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     owner: async (issueIds) => {
       if (agent.owner === "throws") throw new Error("Linear is unavailable");
       if (agent.owner === "unknown") return null;
+      if (agent.owns) return new Set(issueIds.filter((id) => agent.owns!.includes(id)));
       return agent.owner === "none" ? new Set<string>() : new Set(issueIds);
     },
     serverId: async () => server.id,
@@ -491,7 +498,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   };
   // The stack policy's state file (caps and reopens), read as is (empty before the first write).
   const policyFile = async () => readFile(join(await directory, "stack-policy.json"), "utf8").catch(() => "");
-  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, policyFile, waits, server, home: () => directory, watch: () => watch };
+  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, successions, scripts, poll, backstop, restart, state, crashFile, policyFile, waits, server, home: () => directory, watch: () => watch };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -2880,7 +2887,7 @@ test("a successor start counts as a nudge: a gone agent's stage keeps stalling w
   h.paseo.succeed = async (claim) => {
     await claim();
     h.records[0] = { ...h.records[0], status: "archived" };
-    return { kind: "started", agent: { ...SUCCESSOR, id: h.records[0].agentId } };
+    return { kind: "started", agent: { ...SUCCESSOR, id: h.records[0].agentId ?? "a1" } };
   };
   for (const head of ["h1", "h2", "h3", "h4"]) {
     h.github.view = { ...READY, headSha: head, checks: [failing("PR code")] };
@@ -4286,4 +4293,335 @@ test("the watchdog resumes an idle agent whose ticket names no repository and no
   // A known repository whose listing fails, or attachments that cannot be read, still veto.
   assert.deepEqual(await judge({ origin: "https://github.com/tuchel-sohn/tuchel-platform.git", listing: new Error("HTTP 502: Bad Gateway") }), []);
   assert.deepEqual(await judge({ attachments: new Error("Linear is unavailable") }), []);
+});
+
+// A successor start that fails because the ticket cannot fit in any prompt (sessions.ts `tooLarge`).
+const TOO_LARGE = async (claim: () => Promise<void>): Promise<Succession> => {
+  await claim();
+  return { kind: "impossible", reason: CONTEXT_TOO_LARGE, tooLarge: true };
+};
+const OVERSIZE_MARK = "<!-- paseo:oversize-start:i1:a1 -->";
+
+test("an oversized ticket asks the owner once: later drops and nudges, and a restart, claim their messages silently", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const h = harness(t, { live: false, autoResume: true });
+  h.paseo.succeed = TOO_LARGE;
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  const first = await h.poll();
+  assert.equal(first[0], "move In Progress");
+  assert.match(first[1], new RegExp(`^comment ${OWNER} The agent that worked on this ticket is no longer running, and no successor can start: This ticket and its comments are too large to send in one prompt \\(200,000 characters maximum\\)\\.`));
+  assert.ok(first[1].endsWith(OVERSIZE_MARK));
+  assert.equal(first.filter((call) => call.startsWith("comment")).length, 1);
+  // A stalled stage on the same pull request, then a new head after a restart: no new ask, no state change.
+  h.github.view = { ...READY, mergeActivity: activity(QUEUED, CONFLICT), checks: [failing("PR code")] };
+  const nudged = await h.poll();
+  assert.ok(!nudged.some((call) => call.startsWith("comment") || call.startsWith("move")), nudged.join("\n"));
+  await h.restart();
+  h.github.view = { ...h.github.view, headSha: "f00dfeedbeef" };
+  const restarted = await h.poll();
+  assert.ok(!restarted.some((call) => call.startsWith("comment") || call.startsWith("move")), restarted.join("\n"));
+  assert.deepEqual(await h.poll(), [], "each message was claimed");
+  assert.equal(h.linear.comments.i1.length, 1);
+  // A successor that starts clears the ask: the next agent's oversized failure is a new one.
+  h.paseo.succeed = async (claim) => { await claim(); return { kind: "started", agent: { id: "s2", title: "S2", cwd: "/wt/tuc-1" } }; };
+  h.github.view = { ...h.github.view, headSha: "0123456789ab" };
+  assert.ok((await h.poll()).some((call) => call.startsWith("succeed a1")));
+  const asks = JSON.parse(await readFile(join(await h.home(), "oversize-asks.json"), "utf8"));
+  assert.deepEqual(asks, {});
+});
+
+test("an oversized ticket's ask survives a lost response, a failed comment and an unknown owner without a second comment", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const owner: { owner?: "all" | "unknown" } = { owner: "unknown" };
+  const h = harness(t, Object.assign(owner, { live: false, autoResume: true }));
+  h.paseo.succeed = TOO_LARGE;
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  // Whether this host owns the ticket cannot be told: nobody asks, the drop stays pending.
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("comment")));
+  owner.owner = "all";
+  // The comment never reaches Linear: retried on the next poll.
+  h.linear.arrive = async () => { throw new Error("Linear is unavailable"); };
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("comment")));
+  // The comment reaches Linear, but its response is lost: the next poll finds it by its mark.
+  h.linear.arrive = async () => {};
+  h.linear.lost = true;
+  await h.poll();
+  h.linear.lost = false;
+  assert.equal(h.linear.comments.i1.length, 1);
+  const again = await h.poll();
+  assert.ok(!again.some((call) => call.startsWith("comment")), again.join("\n"));
+  assert.equal(h.linear.comments.i1.length, 1);
+  assert.ok(h.linear.comments.i1[0].endsWith(OVERSIZE_MARK));
+  assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "oversize-asks.json"), "utf8"))["i1:a1"].state, "confirmed");
+  assert.deepEqual(await h.poll(), [], "the drop was claimed once confirmed");
+});
+
+test("an unrelated successor failure still hands every message back as before", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const h = harness(t, { live: false, autoResume: true });
+  h.paseo.succeed = async (claim) => { await claim(); return { kind: "impossible", reason: "Paseo is not connected yet." }; };
+  h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+  assert.match((await h.poll())[1], HANDED_BACK);
+  h.github.view = { ...READY, mergeActivity: activity(QUEUED, CONFLICT), checks: [failing("PR code")] };
+  assert.match((await h.poll()).find((call) => call.startsWith("comment")) ?? "", HANDED_BACK);
+});
+
+
+// --- A pull request moves to the ticket its title and body name (TUC-1890) ----------------------
+
+const MOVED_TITLE = "Fix TUC-2 [plugin] Retry the upload";
+const OTHER = "https://github.com/tuchel-sohn/tuchel-platform/pull/420";
+
+// A real Handover on temporary files whose TUC-1 record (agent a1) links PR.
+async function transferStore(t: TestContext): Promise<Handover> {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-pr-transfer-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const linear = { upsertComment: async () => "c1", comment: async () => {}, upsertAttachment: async () => {}, removeAttachments: async () => {} };
+  const store = new Handover(linear as never, directory, async (cwd: string) => ({ branch: `branch-of-${cwd}`, lastCommit: "abc" }), () => new Date().toISOString());
+  await store.update({ id: "i1", identifier: "TUC-1" }, { id: "a1", title: "T", cwd: "/wt/tuc-1" }, { link: ["Pull request", PR] });
+  return store;
+}
+
+// The watched pull request renamed to TUC-2 (title and body), with failing checks to report.
+function renamed(h: ReturnType<typeof harness>, body = "Part of TUC-2."): void {
+  h.github.title = MOVED_TITLE;
+  h.github.view = { ...READY, title: MOVED_TITLE, body, checks: [failing("PR code")] };
+  h.linear.byIssue["TUC-2"] = { id: "i2", identifier: "TUC-2", status: "In Progress", statusType: "started" };
+}
+
+const prompts = (calls: string[], agentId: string) => calls.filter((call) => call.startsWith(`prompt ${agentId}\n`));
+
+test("a pull request whose title and body name only another ticket moves to it on the next poll, and its events go there, never to the old ticket's agent", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const store = await transferStore(t);
+  const h = harness(t, { store, autoResume: true });
+  renamed(h, "Part of TUC-2. Covers AC-1 and AC-3 over UTF-8 input.");
+  h.paseo.succeed = async (claim) => {
+    await claim();
+    return { kind: "started", agent: { id: "a2", title: "TUC-2", cwd: "/wt/tuc-2" } };
+  };
+  const calls = await h.poll();
+  const moved = await store.read("i2");
+  assert.equal(moved?.agentId, null, "a destination without a record gets one without an agent");
+  assert.equal(moved?.links["Pull request"], PR);
+  assert.equal(moved?.branch, READY.headBranch, "on the pull request's branch");
+  assert.equal((await store.read("i1"))?.links["Pull request"], undefined);
+  assert.equal((await store.read("i1"))?.agentId, "a1", "the source keeps its agent");
+  assert.ok(calls.includes(`link Pull request ${PR}`), "the destination ticket links the pull request");
+  assert.deepEqual(prompts(calls, "a1"), [], "the old ticket's agent hears nothing");
+  assert.deepEqual(h.successions, ["i2 null"], "the destination's successor starts, with no predecessor agent");
+  assert.deepEqual(await h.poll(), [], "moved once; the claimed stage is not sent again");
+});
+
+test("a pull request stays when its title names no other ticket, its body names more than one, its body was not read, or it is closed", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const cases: [string, (h: ReturnType<typeof harness>) => void][] = [
+    ["the title names its own ticket", (h) => { renamed(h); h.github.title = "Fix TUC-1 [plugin] Retry the upload"; h.github.view = { ...h.github.view, title: h.github.title }; }],
+    ["the body still names the old ticket", (h) => renamed(h, "Part of TUC-2, continues TUC-1.")],
+    ["the body was not read", (h) => { renamed(h); const { body: _body, ...view } = h.github.view; h.github.view = view; }],
+    ["the pull request is closed", (h) => { renamed(h); h.github.view = { ...h.github.view, state: "CLOSED" }; }],
+    ["only the branch names the other ticket", (h) => { h.github.view = { ...READY, headBranch: "mtuchel/tuc-2-fix", body: "Retry the upload.", title: "Retry the upload", checks: [failing("PR code")] }; h.github.title = "Retry the upload"; h.linear.byIssue["TUC-2"] = { id: "i2", identifier: "TUC-2", status: "In Progress", statusType: "started" }; }],
+    ["the named ticket is done", (h) => { renamed(h); h.linear.byIssue["TUC-2"] = { id: "i2", identifier: "TUC-2", status: "Done", statusType: "completed" }; }],
+  ];
+  for (const [name, arrange] of cases) {
+    const store = await transferStore(t);
+    const h = harness(t, { store });
+    arrange(h);
+    const calls = await h.poll();
+    assert.equal((await store.read("i1"))?.links["Pull request"], PR, name);
+    assert.equal(await store.read("i2"), null, name);
+    if (name !== "the pull request is closed") assert.equal(prompts(calls, "a1").length, 1, `${name}: the ticket's own agent gets the event as before`);
+  }
+});
+
+test("a move whose destination cannot be read holds that pull request's events, then moves on a later poll", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const store = await transferStore(t);
+  const h = harness(t, { store });
+  renamed(h);
+  h.linear.issueFailure = new Error("Linear is unavailable");
+  const held = await h.poll();
+  assert.deepEqual(prompts(held, "a1"), [], "held: the old ticket's agent is not asked either");
+  assert.equal((await store.read("i1"))?.links["Pull request"], PR);
+  h.linear.issueFailure = null;
+  await h.poll();
+  assert.equal((await store.read("i2"))?.links["Pull request"], PR);
+  assert.equal((await store.read("i1"))?.links["Pull request"], undefined);
+});
+
+test("a host that no longer owns the old ticket still moves the pull request, and only the destination's owner acts on it", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const owner = await transferStore(t);
+  const here = harness(t, { store: owner, owns: ["i2"], autoResume: true });
+  renamed(here);
+  here.paseo.succeed = async (claim) => { await claim(); return { kind: "started", agent: { id: "a2", title: "TUC-2", cwd: "/wt/tuc-2" } }; };
+  const calls = await here.poll();
+  assert.equal((await owner.read("i2"))?.links["Pull request"], PR, "learned from the pull request, not from the peer's files");
+  assert.deepEqual(prompts(calls, "a1"), []);
+  assert.deepEqual(here.successions, ["i2 null"]);
+
+  const peer = await transferStore(t);
+  const there = harness(t, { store: peer, owns: ["i1"], autoResume: true });
+  renamed(there);
+  const quiet = await there.poll();
+  assert.equal((await peer.read("i2"))?.links["Pull request"], PR, "the records move on every host");
+  assert.deepEqual(prompts(quiet, "a1"), [], "the old ticket's host does not act for the destination");
+  assert.deepEqual(there.successions, []);
+});
+
+test("a ticket that already owns a pull request keeps it primary and gets the moved one too; both route to its agent", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const store = await transferStore(t);
+  await store.update({ id: "i2", identifier: "TUC-2" }, { id: "a2", title: "TUC-2", cwd: "/wt/tuc-2" }, { link: ["Pull request", OTHER] });
+  const h = harness(t, { store });
+  renamed(h);
+  h.github.views[OTHER] = { ...READY, headSha: "other-head", headBranch: "mtuchel/tuc-2-other", title: "Fix TUC-2 other", body: "Part of TUC-2", checks: [failing("PR code")] };
+  h.github.open.push(listed(OTHER, h.github.views[OTHER], "Fix TUC-2 other"));
+  const first = await h.poll();
+  const target = await store.read("i2");
+  assert.equal(target?.links["Pull request"], OTHER, "its own pull request stays primary");
+  assert.deepEqual(target?.pullRequests, [PR]);
+  assert.equal(target?.agentId, "a2");
+  const second = await h.poll();
+  const asked = [...prompts(first, "a2"), ...prompts(second, "a2")].join("\n");
+  assert.deepEqual(prompts([...first, ...second], "a1"), []);
+  assert.match(asked, /pull\/419/, "the moved pull request's stall reaches the destination's agent");
+  assert.match(asked, /pull\/420/, "and so does its own pull request's");
+});
+
+test("a pending oversized-ticket ask whose event was already claimed is finished on the next poll, never posted twice", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const h = harness(t);
+  const asks = join(await h.home(), "oversize-asks.json");
+  const body = "The agent that worked on this ticket is no longer running, and no successor can start.";
+  await writeFile(asks, JSON.stringify({ "i1:a1": { state: "pending", issueId: "i1", at: "2026-10-10T00:00:00.000Z", body } }));
+  const calls = await h.poll();
+  assert.ok(calls.includes("move In Progress"), "the ticket goes back to coding, which the claimed event did not get to");
+  assert.equal(calls.filter((call) => call.startsWith("comment")).length, 1, calls.join("\n"));
+  assert.equal(h.linear.comments.i1.length, 1);
+  assert.ok(h.linear.comments.i1[0].startsWith(OWNER) && h.linear.comments.i1[0].includes(body) && h.linear.comments.i1[0].endsWith(OVERSIZE_MARK));
+  const confirmed = JSON.parse(await readFile(asks, "utf8"))["i1:a1"];
+  assert.equal(confirmed.state, "confirmed");
+  assert.equal(confirmed.body, undefined, "a confirmed ask keeps no comment");
+  assert.ok(!(await h.poll()).some((call) => call.startsWith("comment")), "confirmed: not posted again");
+  // Posted before a restart lost the confirmation: found by its mark, not posted again, and the
+  // ticket, already moved, is not moved again.
+  await writeFile(asks, JSON.stringify({ "i1:a1": { state: "pending", issueId: "i1", at: "2026-10-10T00:00:00.000Z", body, moved: true } }));
+  const again = await h.poll();
+  assert.ok(!again.some((call) => call.startsWith("comment") || call.startsWith("move")), again.join("\n"));
+  assert.equal(h.linear.comments.i1.length, 1);
+  assert.equal(JSON.parse(await readFile(asks, "utf8"))["i1:a1"].state, "confirmed");
+});
+
+test("a pending oversized-ticket ask whose comment fails after the ticket moved back does not move it again on the next poll", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const h = harness(t);
+  const asks = join(await h.home(), "oversize-asks.json");
+  await writeFile(asks, JSON.stringify({ "i1:a1": { state: "pending", issueId: "i1", at: "2026-10-10T00:00:00.000Z", body: "No successor can start." } }));
+  h.linear.arrive = async () => { throw new Error("Linear is unavailable"); };
+  const first = await h.poll();
+  assert.ok(first.includes("move In Progress"));
+  assert.equal(JSON.parse(await readFile(asks, "utf8"))["i1:a1"].moved, true, "the move is recorded before the comment");
+  h.linear.arrive = async () => {};
+  // The owner moved the ticket on in between: recovery of the same ask leaves that alone.
+  const second = await h.poll();
+  assert.ok(!second.some((call) => call.startsWith("move")), second.join("\n"));
+  assert.equal(h.linear.comments.i1?.length, 1);
+  assert.equal(JSON.parse(await readFile(asks, "utf8"))["i1:a1"].state, "confirmed");
+});
+
+test("a rate limit while checking a renamed pull request holds its events: the old ticket's agent is not asked", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const store = await transferStore(t);
+  const h = harness(t, { store });
+  renamed(h);
+  h.linear.issueFailure = new RateLimitedError("key", Date.now() + 60_000);
+  assert.deepEqual(prompts(await h.poll(), "a1"), []);
+  assert.equal((await store.read("i1"))?.links["Pull request"], PR);
+  h.linear.issueFailure = null;
+  await h.poll();
+  assert.equal((await store.read("i2"))?.links["Pull request"], PR);
+});
+
+test("a moved pull request no longer counts for the old ticket's branch: its Done ticket is not reopened for it", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const directory = await mkdtemp(join(tmpdir(), "paseo-pr-transfer-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const linear = { upsertComment: async () => "c1", comment: async () => {}, upsertAttachment: async () => {}, removeAttachments: async () => {} };
+  // The old ticket's record is on the pull request's own branch.
+  const store = new Handover(linear as never, directory, async () => ({ branch: READY.headBranch, lastCommit: "abc" }), () => new Date().toISOString());
+  await store.update({ id: "i1", identifier: "TUC-1" }, { id: "a1", title: "T", cwd: "/wt/tuc-1" }, { link: ["Pull request", PR] });
+  const h = harness(t, { store, autoResume: true });
+  renamed(h);
+  h.linear.state = { status: "Done", statusType: "completed" };
+  h.linear.completedAt = "2026-10-09T08:49:39.000Z";
+  // The destination works (its state read by id as well as by identifier); only TUC-1 is Done.
+  h.linear.byIssue.i2 = { status: "In Progress", statusType: "started" };
+  // Its repository is known from the ticket's attachments (the old link stays there as history).
+  h.linear.attachments = [PR];
+  h.paseo.succeed = async (claim) => { await claim(); return { kind: "started", agent: { id: "a2", title: "TUC-2", cwd: "/wt/tuc-2" } }; };
+  const calls = await h.poll();
+  assert.equal((await store.read("i2"))?.links["Pull request"], PR);
+  assert.ok(!calls.includes("reopen"), calls.join("\n"));
+  assert.deepEqual(prompts(calls, "a1"), []);
+});
+
+test("a restart's resume about a pull request that moved away later is not sent to the old ticket's agent; one about a stack member that never moved is", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const store = await transferStore(t);
+  const h = harness(t, { store });
+  renamed(h);
+  await h.crashFile(JSON.stringify({ a1: { restarts: 1, restartedAt: "2026-01-01T00:00:00.000Z", resume: { text: "Fix the merge queue drop of pull/419.", issueId: "i1", url: PR } } }));
+  const calls = await h.poll();
+  assert.ok(!calls.some((call) => call.startsWith("prompt a1") && call.includes("Fix the merge queue drop")), calls.join("\n"));
+  assert.equal(JSON.parse(await h.crashFile()).a1.resume, null);
+
+  const kept = harness(t);
+  await kept.crashFile(JSON.stringify({ a1: { restarts: 1, restartedAt: "2026-01-01T00:00:00.000Z", resume: { text: "Land the stack member pull/420.", issueId: "i1", url: OTHER } } }));
+  assert.ok((await kept.poll()).some((call) => call.startsWith("prompt a1") && call.includes("Land the stack member")), "a member no record owns is still the agent's");
+});
+
+test("the backstop's saved work on moved pull requests names the ticket that owns them now, after a restart and when a whole range moves", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const store = await transferStore(t);
+  // TUC-1 owns 420 too (moved to it earlier from ENG-9), besides its primary 419.
+  await store.update({ id: "i9", identifier: "TUC-9" }, { id: "a9", title: "T9", cwd: "/wt/tuc-9" }, { link: ["Pull request", OTHER] });
+  assert.equal(await store.transfer(OTHER, { issueId: "i9", identifier: "TUC-9" }, { issueId: "i1", identifier: "TUC-1" }, "mtuchel/tuc-1-other"), "moved");
+  const h = harness(t, { store });
+  renamed(h);
+  h.github.views[OTHER] = { ...READY, headSha: "other-head", headBranch: "mtuchel/tuc-1-other", title: MOVED_TITLE, body: "Part of TUC-2.", checks: [failing("PR code")] };
+  h.github.open.push(listed(OTHER, h.github.views[OTHER], MOVED_TITLE));
+  const action = (prs: number[]) => ({ id: `x${prs.join("-")}`, repo: "tuchel-sohn/tuchel-platform", branch: READY.headBranch, expect: "h", prs, top: prs.at(-1), tickets: ["TUC-1"], why: "", at: "2026-01-01T00:00:00.000Z", activityBoundary: null, steps: { enqueue: "refused", prComment: "done", linearComment: "done", note: "done" } });
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, actions: [action([419])] }, [OTHER]: { reviewedAt: null, decision: null, merged: false, actions: [action([419, 420])] } });
+  await h.poll();
+  const saved = JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"));
+  assert.deepEqual(saved[PR].actions[0].tickets, ["TUC-2"]);
+  assert.deepEqual(saved[OTHER].actions[0].tickets, ["TUC-2"], "the old ticket owns neither pull request of the range any more");
+  // A move whose rebind was never saved (a restart right after it) is rebound on the next run.
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, actions: [action([419])] } });
+  await h.restart();
+  await h.poll();
+  assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"))[PR].actions[0].tickets, ["TUC-2"]);
+});
+
+test("saved work that names a ticket two moves back follows the pull request to its owner now", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const store = await transferStore(t);
+  // Two moves before any poll rebound the first (a restart in between).
+  assert.equal(await store.transfer(PR, { issueId: "i1", identifier: "TUC-1" }, { issueId: "i2", identifier: "TUC-2" }, READY.headBranch), "moved");
+  assert.equal(await store.transfer(PR, { issueId: "i2", identifier: "TUC-2" }, { issueId: "i3", identifier: "TUC-3" }, READY.headBranch), "moved");
+  const h = harness(t, { store });
+  const title = "Fix TUC-3 [plugin] Retry the upload";
+  h.github.title = title;
+  h.github.view = { ...READY, title, body: "Part of TUC-3.", checks: [failing("PR code")] };
+  h.linear.byIssue["TUC-3"] = { id: "i3", identifier: "TUC-3", status: "In Progress", statusType: "started" };
+  const action = { id: "x", repo: "tuchel-sohn/tuchel-platform", branch: READY.headBranch, expect: "h", prs: [419], top: 419, tickets: ["TUC-1"], why: "", at: "2026-01-01T00:00:00.000Z", activityBoundary: null, steps: { enqueue: "refused", prComment: "done", linearComment: "done", note: "done" } };
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, actions: [action] } });
+  await h.poll();
+  assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"))[PR].actions[0].tickets, ["TUC-3"]);
 });

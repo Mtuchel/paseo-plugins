@@ -470,7 +470,8 @@ export class Writeback {
   // One recorded wait against this host's agents for its ticket: closes it when nothing can end it.
   private async reconcileWait(paseo: PaseoApi, record: HandoverRecord, settings: PluginSettings, deps: ReconcileDeps, handedOver: () => Promise<Map<string, string> | null>): Promise<void> {
     const waiting = record.waiting;
-    if (!waiting) return;
+    // A record without an agent (Handover.transfer) never opened a wait.
+    if (!waiting || record.agentId === null) return;
     const issue = { id: record.issueId, identifier: record.identifier };
     const agent: WaitingAgent = { id: record.agentId, title: record.agentTitle, cwd: record.worktreePath ?? "" };
     const now = Date.now();

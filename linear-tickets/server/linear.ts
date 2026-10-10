@@ -1,6 +1,6 @@
 import { MAX_ATTACHMENT_BYTES } from "./attachments";
 import type { Issue, TicketDetail } from "../shared/contracts";
-import { buildContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations, type FinishedBlocker } from "./context";
+import { boundedContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations, type FinishedBlocker } from "./context";
 import { Credentials } from "./credentials";
 import type { LabelEvent, SweptIssue } from "./label-rules";
 import { currentCaller, currentPriority, poolOf, rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
@@ -1112,7 +1112,9 @@ export class LinearService {
         comments = [];
         warnings.push("Comments could not be loaded; only the ticket details are included.");
       }
-      return { issue, teamId, projectId, warnings, relations: ticketRelations(issueData, viewerId), context: buildContext(issueData, comments, stateHistorySpans(issueData)) };
+      const { context, notice } = boundedContext(issueData, comments, stateHistorySpans(issueData));
+      if (notice) warnings.push(notice);
+      return { issue, teamId, projectId, warnings, relations: ticketRelations(issueData, viewerId), context };
     });
   }
 

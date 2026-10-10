@@ -7,6 +7,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import type { PaseoApi, PaseoWorkspaceAgentCreateOptions, PaseoWorkspaceCreateOptions } from "@getpaseo/client";
 import type { TicketDetail } from "../shared/contracts";
+import { ContextTooLargeError } from "./context";
 import type { ActivationResume } from "./activation";
 import { Dispatcher } from "./dispatch";
 import { Handover } from "./handover";
@@ -197,7 +198,7 @@ function routerHarness(options: {
   sessionStatus?: () => Promise<string | null>;
   route?: ConstructorParameters<typeof SessionRouter>[0]["route"];
   processLiveness?: typeof ticketProcessLiveness;
-  failStart?: boolean;
+  failStart?: boolean | Error;
   // Called inside the start, before the agent exists; the start goes on once it settles.
   pauseStart?: () => Promise<void>;
   openFails?: boolean;
@@ -234,7 +235,7 @@ function routerHarness(options: {
       calls.push("start");
       starts.push({ issueId, options: startOptions });
       if (options.pauseStart) await options.pauseStart();
-      if (options.failStart) throw new Error("Paseo is not connected yet.");
+      if (options.failStart) throw options.failStart === true ? new Error("Paseo is not connected yet.") : options.failStart;
       daemon.add(ticketAgent("agent-new", "2026-02-01T00:00:09Z"));
       return { agentId: "agent-new", warnings: [], provider: "claude/opus", target: "repo", resumed: true, untrusted: false, plan: null };
     },
@@ -318,6 +319,22 @@ test("a live agent of the ticket takes the record over instead of a new start, b
   await failing.cleanup();
 });
 
+// A ticket that took a pull request over without an agent (Handover.transfer): no predecessor.
+test("a ticket without an agent: its live agent takes the record over, and a peer that cannot verify the branch holds the start instead of a fresh one", async () => {
+  const live = routerHarness({ resumeTarget: null, agents: [ticketAgent("agent-live", "2026-01-02T00:00:00Z")] });
+  const succession = await live.router.succeed(ISSUE.id, ISSUE.identifier, null, "Fix the failing check.", async () => { live.calls.push("claim"); });
+  assert.equal(succession.kind, "live");
+  assert.deepEqual(live.calls, ["handOff null -> agent-live"], "the live agent is chosen without any source agent's identity");
+  await live.cleanup();
+
+  const held = routerHarness({ processLiveness: async () => "absent", route: { take: async () => ({ held: "no verified branch, commit and uncommitted-change evidence" }) } });
+  const waiting = await held.router.succeed(ISSUE.id, ISSUE.identifier, null, "Fix the failing check.", async () => { held.calls.push("claim"); });
+  assert.deepEqual(waiting, { kind: "wait", reason: `Pull request ownership moved to ${ISSUE.identifier}; recovery is waiting for verified branch, commit and uncommitted-change evidence (no verified branch, commit and uncommitted-change evidence)` });
+  assert.equal(held.starts.length, 0, "never a local start on a guessed branch");
+  assert.deepEqual(held.calls, [], "nothing claimed: a later poll tries again once the evidence is there");
+  await held.cleanup();
+});
+
 test("succession waits on admission without claiming the message or starting anything", async () => {
   const h = routerHarness({ admission: { ok: false, reason: "Queued: 1 of 1 ticket agents are working. It starts when one finishes." } });
   assert.deepEqual(await succeed(h), { kind: "wait", reason: "Queued: 1 of 1 ticket agents are working. It starts when one finishes." });
@@ -358,6 +375,19 @@ test("a start that throws leaves the ticket unclaimed by a successor and says im
   assert.ok(h.calls.includes("+paseo-running") && h.calls.includes("-paseo-running"), "the running label is taken back");
   assertGateFree(h.gates);
   await h.cleanup();
+});
+
+test("a start that fails because the ticket cannot fit in a prompt says so, typed, with today's message", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = routerHarness({ failStart: new ContextTooLargeError(), agents: [ticketAgent("agent-gone", "2026-01-01T00:00:00Z", { status: "closed" })] });
+  assert.deepEqual(await succeed(h), { kind: "impossible", reason: "This ticket and its comments are too large to send in one prompt (200,000 characters maximum).", tooLarge: true });
+  assert.ok(h.calls.includes("-paseo-running"), "the running label is taken back");
+  assertGateFree(h.gates);
+  await h.cleanup();
+  // Any other error with the same text is not the typed failure.
+  const lookalike = routerHarness({ failStart: new Error("This ticket and its comments are too large to send in one prompt (200,000 characters maximum).") });
+  assert.equal("tooLarge" in await succeed(lookalike), false);
+  await lookalike.cleanup();
 });
 
 // --- TicketStarter: resume-only never falls back to a fresh agent ------------------------------

@@ -185,8 +185,31 @@ work. Status changes arrive the same way: a compact **Status changes** line (for
 "Todo → In Progress → Done (currently Done)") and the raw state-history spans in the JSON
 snapshot. The JSON response is preserved in the prompt, including the description and any
 returned links. Linked documents and attachments are not downloaded. If comments
-are unavailable, the preview and agent prompt say so. Context over 200,000 characters
-is rejected rather than silently truncated.
+are unavailable, the preview and agent prompt say so.
+
+**Long tickets.** The snapshot holds 200,000 characters. A ticket over that still starts: the
+plugin's own status cards (Paseo progress, final reports, "Please reply with an option" stubs,
+the agent-thread stub) are left out first, oldest first; if it is still over, the oldest real
+comments follow, one whole comment at a time, until the snapshot and its notice fit. The
+description, labels, links, relations, state history and the newest real comment always stay,
+and no comment is ever cut in the middle. The preview and the prompt then say under **Context
+limitations** how many comments were left out (status cards and real ones), from which period
+("date unavailable" without dates), and that `get_comments` reads them; the JSON snapshot
+carries the same facts in `omittedComments`, including the Linear uploads of the omitted
+comments, so the attachment download still saves them. Nothing is deleted in Linear. A ticket
+that cannot fit even then (a description over the limit, or a newest comment that alone is too
+long) fails as before: "This ticket and its comments are too large to send in one prompt
+(200,000 characters maximum)." Dispatch still comments that and adds the `-failed` label. When
+the pull request watch starts a successor for a gone agent (a queue drop, a stalled stage, a
+replay, the stack cap, a crash) and the start fails this way, the owner is asked once per ticket
+and gone agent (the comment carries the mark `<!-- paseo:oversize-start:<issue>:<agent> -->`, and
+`oversize-asks.json` next to `pr-watch.json` records it): later messages for its pull requests
+are claimed without another comment or state change, across restarts. Only the host that owns
+the ticket asks; while that cannot be told, the message waits. An ask whose comment may have
+been posted before a failure is looked up by its mark first, never posted twice; one left pending
+after its message was claimed (a restart in between) is finished by the next poll of the owning
+host, including the move back to In Progress if that had not happened yet. A successor or live
+agent taking the ticket over clears it.
 
 **Finished blockers.** When a ticket starts after blockers that are finished (see *Waiting their turn*), its prompt gets a
 **Finished blockers** section after the instructions: for each one, its links (pull requests,
@@ -307,6 +330,8 @@ agent's own ticket):
 - `get_issue` — any issue: text, status, project, labels, parent, sub-issues, relations,
   comments, links, and what the agent may change on it;
 - `search_issues` — full-text search over all issues;
+- `get_comments` — an issue's full comment history, 50 per page (pass the returned `nextCursor`
+  as `cursor`), including the comments a long ticket's snapshot left out;
 - `add_comment` — post a Markdown comment, on any issue;
 - `set_status` — move the ticket (or an issue the agent created) to another state of its team by
   name; a canceled or duplicate state needs a `reason`, posted on the issue before the move;
@@ -2216,6 +2241,43 @@ record, so the pull request watch keeps following them; only "Open in Paseo" mov
 agent. The record changes owner at a takeover only while it still names the old agent (or none):
 once the new agent wrote to it, the old agent's archive leaves it alone, and the old agent's final
 report then only says who took over. A third agent's record is never touched.
+
+**Moving a pull request to another ticket.** A pull request belongs to the ticket whose record
+links it. To move it, rename it: once an open pull request's title names exactly one other
+ticket, and its title and description together name only that ticket, the next poll moves it to
+that ticket's record and links it on that ticket in Linear. Nobody edits the handover files. Only
+identifiers of the teams this host's records belong to count, so `AC-1` or `UTF-8` in a
+description change nothing; a description that still names the old ticket ("Part of TUC-594"),
+a title that names the ticket the pull request already belongs to, a branch name, a closed pull
+request, an unread description, or a Done or canceled ticket moves nothing. Only the pull request
+moves: the old ticket keeps its agent, branch, plan and reports, and any other pull requests it
+owns (the next becomes its primary one). A ticket that already has an agent or a pull request
+keeps both and owns the moved one too, so its pull request watch follows both. A ticket without a
+record gets a record without an agent, on the pull request's branch: its next pull request event
+goes to a live agent of the ticket if there is one, else starts a successor on that branch, and
+nothing goes back to the old ticket's agent. When the destination ticket belongs to the other host
+and the branch, commit and uncommitted changes cannot be verified for the move there, the start
+waits ("Pull request ownership moved to TUC-2; recovery is waiting for verified branch, commit
+and uncommitted-change evidence") rather than starting on a guessed branch. Every host moves its
+own records the same way from the pull request alone, also when the old ticket belongs to the
+peer; which host then acts on the destination is decided as for any ticket (**Several hosts**).
+When the destination cannot be read, that pull request's messages wait and the next poll tries
+again; so do those of every pull request not checked yet once a rate limit or GitHub's budget
+stops the checks, if its title names another ticket. Each move is journaled first
+(`handover/transfers/journal.json`, one entry per pull request with a generation number) and
+finished before any other read or write of the records, after a restart too, so a pull request
+is never on two tickets or on none; a late link from the old ticket's agent does not take it back,
+and the old ticket's branch no longer counts it (its stack policy and watchdog look past it).
+What the old ticket had pending for it follows it, on every poll from the journal (which keeps a
+pull request's last 20 earlier moves too, so also after a restart before that was saved and
+across a second move): messages addressed to the ticket by name and not sent yet, and
+the queue backstop's saved enqueues and stack moves that name the old ticket (the old one stays
+named while it still owns another pull request of the range). A restarted agent's resume about
+that pull request, restarted before the move, is not sent any more; one about a stack member no
+record owns still is. A pull request owned besides the
+primary one that is replaced (same branch) or lands is swapped alone for the next one; the
+primary one stays. Moving it back is a new move (rename it again). Reverting the plugin does not
+move pull requests back: rename them.
 
 **Usage-limit resumes.** With the automatic-start switch on, a failed turn whose error says
 429, rate limit or usage limit is checked against the OMP broker's `/v1/usage` reports. A fresh,
