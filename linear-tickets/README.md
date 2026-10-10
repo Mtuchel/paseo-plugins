@@ -2240,6 +2240,32 @@ agent. The record changes owner at a takeover only while it still names the old 
 once the new agent wrote to it, the old agent's archive leaves it alone, and the old agent's final
 report then only says who took over. A third agent's record is never touched.
 
+**Moving a pull request to another ticket.** A pull request belongs to the ticket whose record
+links it. To move it, rename it: once an open pull request's title names exactly one other
+ticket, and its title and description together name only that ticket, the next poll moves it to
+that ticket's record and links it on that ticket in Linear. Nobody edits the handover files. Only
+identifiers of the teams this host's records belong to count, so `AC-1` or `UTF-8` in a
+description change nothing; a description that still names the old ticket ("Part of TUC-594"),
+a title that names the ticket the pull request already belongs to, a branch name, a closed pull
+request, an unread description, or a Done or canceled ticket moves nothing. Only the pull request
+moves: the old ticket keeps its agent, branch, plan and reports, and any other pull requests it
+owns (the next becomes its primary one). A ticket that already has an agent or a pull request
+keeps both and owns the moved one too, so its pull request watch follows both. A ticket without a
+record gets a record without an agent, on the pull request's branch: its next pull request event
+goes to a live agent of the ticket if there is one, else starts a successor on that branch, and
+nothing goes back to the old ticket's agent. When the destination ticket belongs to the other host
+and the branch, commit and uncommitted changes cannot be verified for the move there, the start
+waits ("Pull request ownership moved to TUC-2; recovery is waiting for verified branch, commit
+and uncommitted-change evidence") rather than starting on a guessed branch. Every host moves its
+own records the same way from the pull request alone, also when the old ticket belongs to the
+peer; which host then acts on the destination is decided as for any ticket (**Several hosts**).
+When the destination cannot be read, that pull request's messages wait and the next poll tries
+again. Each move is journaled first (`handover/transfers/journal.json`, one entry per pull
+request with a generation number) and finished on the next read after a restart, so a pull
+request is never on two tickets or on none; a late link from the old ticket's agent does not take
+it back. Moving it back is a new move (rename it again). Reverting the plugin does not move pull
+requests back: rename them.
+
 **Usage-limit resumes.** With the automatic-start switch on, a failed turn whose error says
 429, rate limit or usage limit is checked against the OMP broker's `/v1/usage` reports. A fresh,
 measurable shared window is required: stale (>30 min), empty, tier-only or unknown readings

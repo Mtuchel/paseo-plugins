@@ -1428,8 +1428,9 @@ export class SessionRouter {
 
   // ---- outbound -------------------------------------------------------------------------
 
-  async sessionFor(agentId: string): Promise<SessionLink | null> {
-    return this.deps.store.forAgent(agentId);
+  // A null agent is a ticket record without one (Handover.transfer): no session, process or crash.
+  async sessionFor(agentId: string | null): Promise<SessionLink | null> {
+    return agentId === null ? null : this.deps.store.forAgent(agentId);
   }
 
   // Sends an idle agent a new message; a stopped one is loaded only after its ticket's terminal
@@ -1440,7 +1441,8 @@ export class SessionRouter {
   // `onDispatch` runs once the agent is known to take it, right before the message is sent.
   // A crashed agent (see crashedProcess) takes no message: `crashed`, unless `recovery` asks to
   // reload it and send it the resume (see recover).
-  async prompt(agentId: string, text: string, onDispatch?: () => Promise<void>, recovery?: Recovery): Promise<PromptOutcome> {
+  async prompt(agentId: string | null, text: string, onDispatch?: () => Promise<void>, recovery?: Recovery): Promise<PromptOutcome> {
+    if (agentId === null) return "gone";
     if (!this.paseo) return "unavailable";
     const found = await this.agent(agentId);
     if (!found) return "gone";
@@ -1477,8 +1479,8 @@ export class SessionRouter {
   }
 
   // The crashed process of an existing, unarchived agent (its last error), else null.
-  async crashed(agentId: string): Promise<string | null> {
-    if (!this.paseo) return null;
+  async crashed(agentId: string | null): Promise<string | null> {
+    if (!this.paseo || agentId === null) return null;
     const found = await this.agent(agentId);
     return found ? crashedProcess(found.agent) : null;
   }
@@ -2031,12 +2033,15 @@ export class SessionRouter {
   // a recorded branch nothing can continue (`impossible`); without admission (blockers, the agent
   // limit, memory, away) it waits. Then `onDispatch` claims the message, right before the start:
   // a failed start is `impossible`, and a claimed message never starts a second successor. What
-  // follows the start (thread, archive, record) is best effort and never undoes it.
-  succeed(issueId: string, identifier: string, predecessorId: string, lead: string, onDispatch: () => Promise<void>): Promise<Succession> {
+  // follows the start (thread, archive, record) is best effort and never undoes it. A null
+  // `predecessorId` is a ticket that took a pull request over without an agent of its own
+  // (Handover.transfer): there is no gone agent to exclude, archive or name.
+  succeed(issueId: string, identifier: string, predecessorId: string | null, lead: string, onDispatch: () => Promise<void>): Promise<Succession> {
     return this.exclusive(issueId, () => this.succeedNow({ id: issueId, identifier }, predecessorId, lead, onDispatch));
   }
 
-  private async succeedNow(issue: { id: string; identifier: string }, predecessorId: string, lead: string, onDispatch: () => Promise<void>): Promise<Succession> {
+  private async succeedNow(issue: { id: string; identifier: string }, predecessorId: string | null, lead: string, onDispatch: () => Promise<void>): Promise<Succession> {
+    const gone = predecessorId ? `gone agent ${predecessorId.slice(0, 8)}` : "the ticket without an agent";
     if (await this.deps.deletions?.blocked(issue.id)) return { kind: "impossible", reason: "the ticket was deleted or is paused for deletion" };
     if (!this.paseo) return { kind: "wait", reason: "Paseo is not connected yet" };
     const paseo = this.paseo;
@@ -2050,7 +2055,7 @@ export class SessionRouter {
     try {
       const wait = await this.processWait(issue.id);
       if (wait) return { kind: "wait", reason: wait };
-      const live = await this.liveSuccessorFor(issue.id, [predecessorId]);
+      const live = await this.liveSuccessorFor(issue.id, predecessorId ? [predecessorId] : []);
       if (live) {
         // Nothing is claimed: a failed hand-off is tried again with the message on the next poll.
         await later("handing the record to the live agent", () => this.deps.handover.handOff(issue, predecessorId, live));
@@ -2067,10 +2072,12 @@ export class SessionRouter {
       });
       // Held: nothing was started here and nothing was forwarded; the message stays unclaimed so
       // the next poll tries again.
-      if (routed && "held" in routed) return { kind: "wait", reason: `the pull request's message is not routed yet: ${routed.held}` };
+      if (routed && "held" in routed) {
+        return { kind: "wait", reason: predecessorId ? `the pull request's message is not routed yet: ${routed.held}` : `Pull request ownership moved to ${issue.identifier}; recovery is waiting for verified branch, commit and uncommitted-change evidence (${routed.held})` };
+      }
       if (routed) {
         await onDispatch();
-        console.log(`[linear-tickets] ${issue.identifier}: the pull request's message for gone agent ${predecessorId.slice(0, 8)} is handed to ${routed.peer}`);
+        console.log(`[linear-tickets] ${issue.identifier}: the pull request's message for ${gone} is handed to ${routed.peer}`);
         return { kind: "started", agent: { id: `peer:${routed.peer}`, title: `an agent on ${routed.peer}`, cwd: "" } };
       }
       if (!await this.deps.handover.resumeTarget(issue.id)) return { kind: "impossible", reason: "no branch is recorded for the ticket" };
@@ -2078,7 +2085,7 @@ export class SessionRouter {
       const admission = await this.deps.starter.admission(issue.id, paseo, settings);
       if (!admission.ok) return { kind: "wait", reason: admission.reason };
       await onDispatch();
-      console.log(`[linear-tickets] ${issue.identifier}: the pull request's message for gone agent ${predecessorId.slice(0, 8)} is claimed; starting a successor`);
+      console.log(`[linear-tickets] ${issue.identifier}: the pull request's message for ${gone} is claimed; starting a successor`);
       const running = dispatchLabels(settings.dispatch.label).running;
       await this.deps.linear.addLabel(issue.id, running).catch(() => {});
       let agentId: string;
@@ -2088,11 +2095,11 @@ export class SessionRouter {
         await this.deps.linear.removeLabel(issue.id, running).catch(() => {});
         return { kind: "impossible", reason: error instanceof Error ? error.message : String(error), ...(error instanceof ContextTooLargeError ? { tooLarge: true as const } : {}) };
       }
-      console.log(`[linear-tickets] ${issue.identifier}: started a successor (agent ${agentId.slice(0, 8)}) for gone agent ${predecessorId.slice(0, 8)}`);
+      console.log(`[linear-tickets] ${issue.identifier}: started a successor (agent ${agentId.slice(0, 8)}) for ${gone}`);
       const snapshot = (await paseo.agents.ref(agentId).refresh().catch(() => null))?.agent;
       const agent = { id: agentId, title: snapshot?.title ?? null, cwd: snapshot?.cwd ?? "" };
       await later("opening the successor's thread", () => this.openFor(issue.id, issue.identifier, agentId));
-      await later("archiving the gone agent", async () => { if (await this.agent(predecessorId)) await paseo.agents.ref(predecessorId).archive(); });
+      if (predecessorId) await later("archiving the gone agent", async () => { if (await this.agent(predecessorId)) await paseo.agents.ref(predecessorId).archive(); });
       await later("closing superseded threads", () => this.closeSuperseded());
       // Without the successor's worktree the record would lose its branch: the hand-off waits for
       // the next poll, which finds the successor live (see above), or for its first write-back.

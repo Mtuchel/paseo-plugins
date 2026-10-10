@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -206,4 +206,112 @@ test("no resume snapshot is offered without a record, a recorded branch or a rea
     await worktree.done();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+// --- Handover.transfer: a pull request's ownership moves between tickets' records (TUC-1890) ------
+
+const PR = "https://github.com/o/r/pull/7";
+const OTHER_PR = "https://github.com/o/r/pull/8";
+const SOURCE = { issueId: ISSUE.id, identifier: ISSUE.identifier };
+const TARGET = { issueId: "issue-2", identifier: "ENG-2" };
+
+test("a pull request moves to a ticket without a record: an agentless record on its branch owns it, the source keeps everything else, and a late source link cannot take it back", async () => {
+  await withHandover(async (handover, writes) => {
+    await handover.update(ISSUE, PREDECESSOR, { summary: "Opened the pull request.", link: ["Pull request", PR], plan: "approved" });
+    writes.length = 0;
+    assert.equal(await handover.transfer(PR, SOURCE, TARGET, "mtuchel/eng-2-work"), "moved");
+    const target = await handover.read(TARGET.issueId);
+    assert.equal(target?.agentId, null);
+    assert.equal(target?.status, "archived");
+    assert.equal(target?.branch, "mtuchel/eng-2-work");
+    assert.deepEqual(target?.links, { "Pull request": PR });
+    assert.deepEqual(target?.summaries, [], "no report, plan or agent of the source is copied");
+    assert.equal(target?.plan, undefined);
+    const source = await handover.read(ISSUE.id);
+    assert.equal(source?.agentId, PREDECESSOR.id);
+    assert.equal(source?.plan, "approved");
+    assert.equal(source?.links["Pull request"], undefined, "only the pull request left the source");
+    assert.deepEqual(writes, [], "a move posts nothing on Linear");
+    assert.match((await handover.resumeTarget(TARGET.issueId))?.handover ?? "", /moved here from another ticket; no Paseo agent has worked on this ticket yet/);
+
+    // The source agent's write-back links the pull request again: the move stands.
+    await handover.update(ISSUE, PREDECESSOR, { link: ["Pull request", PR], summary: "Pushed again." });
+    assert.equal((await handover.read(ISSUE.id))?.links["Pull request"], undefined);
+    assert.equal(await handover.transfer(PR, SOURCE, TARGET, null), "already");
+    assert.equal(await handover.transfer(PR, { issueId: "issue-9", identifier: "ENG-9" }, TARGET, null), "already");
+    assert.equal(await handover.transfer(OTHER_PR, SOURCE, TARGET, null), "not-owned", "a pull request the source does not own never moves");
+  });
+});
+
+test("a destination with its own pull request keeps it as primary and owns the moved one too, its concurrent update survives, and the source's next pull request becomes its primary", async () => {
+  await withHandover(async (handover) => {
+    await handover.update(ISSUE, PREDECESSOR, { link: ["Pull request", PR] });
+    const destination = { id: "agent-9", title: "ENG-2: Other", cwd: "/wt/eng-2" };
+    await handover.update({ id: TARGET.issueId, identifier: TARGET.identifier }, destination, { link: ["Pull request", OTHER_PR] });
+    // The source owns a second pull request besides its primary one (an earlier move to it).
+    const third = "https://github.com/o/r/pull/9";
+    await handover.update({ id: "issue-3", identifier: "ENG-3" }, { id: "agent-3", title: "ENG-3", cwd: "/wt/eng-3" }, { link: ["Pull request", third] });
+    assert.equal(await handover.transfer(third, { issueId: "issue-3", identifier: "ENG-3" }, SOURCE, "b"), "moved");
+    assert.deepEqual((await handover.read(ISSUE.id))?.pullRequests, [third], "the source already had a primary: the moved one is added");
+
+    const [moved] = await Promise.all([
+      handover.transfer(PR, SOURCE, TARGET, "ignored"),
+      handover.update({ id: TARGET.issueId, identifier: TARGET.identifier }, destination, { summary: "The destination's own work." }),
+    ]);
+    assert.equal(moved, "moved");
+    const target = await handover.read(TARGET.issueId);
+    assert.equal(target?.agentId, "agent-9");
+    assert.equal(target?.links["Pull request"], OTHER_PR, "the destination's primary pull request stays primary");
+    assert.deepEqual(target?.pullRequests, [PR]);
+    assert.equal(target?.branch, GIT.branch, "a destination with an agent keeps its own branch");
+    assert.deepEqual(target?.summaries, ["The destination's own work."]);
+    const source = await handover.read(ISSUE.id);
+    assert.equal(source?.links["Pull request"], third, "the source's remaining pull request is now its primary one");
+    assert.equal(source?.pullRequests, undefined);
+  });
+});
+
+test("a move interrupted after any durable step finishes on the next read, with one owner and nothing written twice", async () => {
+  for (const stage of ["journal", "destination", "both"] as const) {
+    const directory = await mkdtemp(join(tmpdir(), "paseo-handover-transfer-"));
+    try {
+      const { linear } = fakeLinear();
+      const before = new Handover(linear, directory, async () => GIT, () => "2026-01-01T10:00:00.000Z");
+      await before.update(ISSUE, PREDECESSOR, { link: ["Pull request", PR], summary: "Opened it." });
+      const source = (await before.read(ISSUE.id))!;
+      await mkdir(join(directory, "transfers"), { recursive: true });
+      await writeFile(join(directory, "transfers", "journal.json"), JSON.stringify({ "o/r#7": { generation: 1, url: PR, from: SOURCE, to: TARGET, headBranch: "eng-2", state: "pending", at: "2026-01-01T10:00:00.000Z" } }));
+      if (stage !== "journal") await writeFile(join(directory, "issue-2.json"), JSON.stringify({ issueId: TARGET.issueId, identifier: TARGET.identifier, agentId: null, agentTitle: "Paseo on ENG-2", branch: "eng-2", worktreePath: null, lastCommit: null, summaries: [], links: { "Pull request": PR }, status: "archived", progressCommentId: null, resumedFrom: null, updatedAt: "2026-01-01T10:00:00.000Z" }));
+      if (stage === "both") await writeFile(join(directory, "issue-1.json"), JSON.stringify({ ...source, links: {} }));
+
+      const after = new Handover(linear, directory, async () => GIT, () => "2026-01-01T11:00:00.000Z");
+      const owners = (await after.all()).filter((record) => record.links["Pull request"] === PR || record.pullRequests?.includes(PR)).map((record) => record.identifier);
+      assert.deepEqual(owners, ["ENG-2"], stage);
+      assert.deepEqual((await after.read(ISSUE.id))?.summaries, ["Opened it."], stage);
+      const journal = JSON.parse(await readFile(join(directory, "transfers", "journal.json"), "utf8"));
+      assert.equal(journal["o/r#7"].state, "completed", stage);
+      assert.equal(journal["o/r#7"].generation, 1, stage);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  }
+});
+
+test("a move back is a newer generation, and an agent taking over the agentless record keeps the moved pull request", async () => {
+  await withHandover(async (handover) => {
+    await handover.update(ISSUE, PREDECESSOR, { link: ["Pull request", PR] });
+    assert.equal(await handover.transfer(PR, SOURCE, TARGET, "eng-2"), "moved");
+    assert.equal(await handover.transfer(PR, TARGET, SOURCE, "eng-2"), "moved");
+    assert.equal((await handover.read(ISSUE.id))?.links["Pull request"], PR);
+    assert.equal((await handover.read(TARGET.issueId))?.links["Pull request"], undefined);
+    // The newer generation decides: the source may link it again, the old destination not.
+    await handover.update(ISSUE, PREDECESSOR, { link: ["Pull request", PR] });
+    assert.equal((await handover.read(ISSUE.id))?.links["Pull request"], PR);
+
+    assert.equal(await handover.transfer(PR, SOURCE, TARGET, "eng-2"), "moved");
+    const successor = { id: "agent-7", title: "ENG-2: Continue", cwd: "/wt/eng-2" };
+    assert.equal(await handover.handOff({ id: TARGET.issueId, identifier: TARGET.identifier }, null, successor), true, "the agentless record is the null predecessor's");
+    const record = await handover.read(TARGET.issueId);
+    assert.equal(record?.agentId, successor.id);
+    assert.equal(record?.links["Pull request"], PR);
+    assert.equal(record?.resumedFrom, null);
+  });
 });

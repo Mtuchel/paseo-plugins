@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { CONTEXT_TOO_LARGE } from "./context";
 import type { RetriggerResult } from "./greptile-outage";
-import type { HandoverRecord } from "./handover";
+import { Handover, type HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
 import { activityBullets, ConditionalPullView, githubReader, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft, type RateProbe } from "./pr-watch";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, GREPTILE_RETRIGGER, marker, RETARGET_ORPHAN, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
@@ -173,7 +173,9 @@ const MAIN_BROKEN: Judgment = {
 // harness host is the backstop host unless a test says otherwise.
 // `probe`: the cheap first look the poll goes through (see ConditionalPullView); without one the
 // injected `view` is the whole read, as for the tests that predate it.
-function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean; owner?: "all" | "none" | "unknown" | "throws"; backstop?: "auto" | "always" | "never"; watchdog?: Pick<Watchdog, "pass" | "stop"> } = {}, probe?: PullViewSource) {
+// `store`: a real Handover on temporary files instead of the in-memory records (the transfer
+// tests); `owns`: the only tickets the peer mechanism names as this host's.
+function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean; owner?: "all" | "none" | "unknown" | "throws"; backstop?: "auto" | "always" | "never"; watchdog?: Pick<Watchdog, "pass" | "stop">; store?: Handover; owns?: string[] } = {}, probe?: PullViewSource) {
   const waits = { runs: 0, failure: null as Error | null };
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open under `title`; `views`: other pull requests
@@ -230,7 +232,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // states of tickets a run has several of (`state` is every other ticket's). `issueFailure` fails
   // the ticket reads (`issueReads`), `statesFailure` the per-poll batch of the running tickets
   // (`stateReads`).
-  const linear = { failure: null as Error | null, issueFailure: null as Error | null, statesFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], stateReads: [] as string[][], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" }, completedAt: null as string | null, byIssue: {} as Record<string, { status: string; statusType: string }> };
+  const linear = { failure: null as Error | null, issueFailure: null as Error | null, statesFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], stateReads: [] as string[][], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" }, completedAt: null as string | null, byIssue: {} as Record<string, { status: string; statusType: string; id?: string; identifier?: string }> };
   // No test worktree exists unless its git source is explicitly provided.
   const git = { origin: null as string | null, root: null as string | null, reads: [] as string[][] };
   // Open before-merge manual tasks of the ticket; `unreadable`: reading them fails.
@@ -251,13 +253,15 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     idle: async () => "ran",
   };
   const calls: string[] = [];
+  // Every successor start asked for, as `<issue id> <predecessor>`.
+  const successions: string[] = [];
   const daemon = agent.crash ? crashDaemon(calls) : null;
   // This host's Paseo server id, as the tickets' `Paseo agent` attachments name it (see ownership).
   const server = { id: "srv_test" };
   const directory = mkdtemp(join(tmpdir(), "paseo-pr-watch-"));
   t.after(async () => rm(await directory, { recursive: true, force: true }));
   const create = () => directory.then((home) => new PullRequestWatch({
-    handover: { all: async () => records, update: async (issue, _agent, patch) => {
+    handover: agent.store ?? { all: async () => records, update: async (issue, _agent, patch) => {
       if (!patch.link) { calls.push(`review ${patch.review}`); return null as never; }
       calls.push(`handover link ${patch.link[1]}`);
       const index = records.findIndex((record) => record.issueId === issue.id);
@@ -269,7 +273,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       say: async (_id, kind, text) => { calls.push(`say ${kind} ${text.split("\n")[0]}`); },
       link: async (_id, label, url) => { calls.push(`session link ${label} ${url}`); },
       prompt: daemon ? (agentId, text, onDispatch, recovery) => daemon.router.prompt(agentId, text, onDispatch, recovery) : async (agentId, text, onDispatch) => {
-        const outcome = await paseo.answer(agentId);
+        const outcome = agentId === null ? "gone" : await paseo.answer(agentId);
         if (outcome !== "sent") return outcome;
         await onDispatch?.();
         await paseo.send();
@@ -278,6 +282,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       },
       crashed: async (agentId) => daemon ? daemon.router.crashed(agentId) : null,
       succeed: async (_issueId, _identifier, predecessor, lead, onDispatch) => {
+        successions.push(`${_issueId} ${predecessor}`);
         const next = await paseo.succeed(onDispatch);
         if (next.kind === "started") calls.push(`succeed ${predecessor}\n${lead}`);
         if (next.kind === "started" || next.kind === "live") records[0] = { ...records[0], agentId: next.agent.id, agentTitle: next.agent.title ?? "", status: "working" };
@@ -349,6 +354,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     owner: async (issueIds) => {
       if (agent.owner === "throws") throw new Error("Linear is unavailable");
       if (agent.owner === "unknown") return null;
+      if (agent.owns) return new Set(issueIds.filter((id) => agent.owns!.includes(id)));
       return agent.owner === "none" ? new Set<string>() : new Set(issueIds);
     },
     serverId: async () => server.id,
@@ -492,7 +498,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   };
   // The stack policy's state file (caps and reopens), read as is (empty before the first write).
   const policyFile = async () => readFile(join(await directory, "stack-policy.json"), "utf8").catch(() => "");
-  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, scripts, poll, backstop, restart, state, crashFile, policyFile, waits, server, home: () => directory, watch: () => watch };
+  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, successions, scripts, poll, backstop, restart, state, crashFile, policyFile, waits, server, home: () => directory, watch: () => watch };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -2881,7 +2887,7 @@ test("a successor start counts as a nudge: a gone agent's stage keeps stalling w
   h.paseo.succeed = async (claim) => {
     await claim();
     h.records[0] = { ...h.records[0], status: "archived" };
-    return { kind: "started", agent: { ...SUCCESSOR, id: h.records[0].agentId } };
+    return { kind: "started", agent: { ...SUCCESSOR, id: h.records[0].agentId ?? "a1" } };
   };
   for (const head of ["h1", "h2", "h3", "h4"]) {
     h.github.view = { ...READY, headSha: head, checks: [failing("PR code")] };
@@ -4361,4 +4367,127 @@ test("an unrelated successor failure still hands every message back as before", 
   assert.match((await h.poll())[1], HANDED_BACK);
   h.github.view = { ...READY, mergeActivity: activity(QUEUED, CONFLICT), checks: [failing("PR code")] };
   assert.match((await h.poll()).find((call) => call.startsWith("comment")) ?? "", HANDED_BACK);
+});
+
+
+// --- A pull request moves to the ticket its title and body name (TUC-1890) ----------------------
+
+const MOVED_TITLE = "Fix TUC-2 [plugin] Retry the upload";
+const OTHER = "https://github.com/tuchel-sohn/tuchel-platform/pull/420";
+
+// A real Handover on temporary files whose TUC-1 record (agent a1) links PR.
+async function transferStore(t: TestContext): Promise<Handover> {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-pr-transfer-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const linear = { upsertComment: async () => "c1", comment: async () => {}, upsertAttachment: async () => {}, removeAttachments: async () => {} };
+  const store = new Handover(linear as never, directory, async (cwd: string) => ({ branch: `branch-of-${cwd}`, lastCommit: "abc" }), () => new Date().toISOString());
+  await store.update({ id: "i1", identifier: "TUC-1" }, { id: "a1", title: "T", cwd: "/wt/tuc-1" }, { link: ["Pull request", PR] });
+  return store;
+}
+
+// The watched pull request renamed to TUC-2 (title and body), with failing checks to report.
+function renamed(h: ReturnType<typeof harness>, body = "Part of TUC-2."): void {
+  h.github.title = MOVED_TITLE;
+  h.github.view = { ...READY, title: MOVED_TITLE, body, checks: [failing("PR code")] };
+  h.linear.byIssue["TUC-2"] = { id: "i2", identifier: "TUC-2", status: "In Progress", statusType: "started" };
+}
+
+const prompts = (calls: string[], agentId: string) => calls.filter((call) => call.startsWith(`prompt ${agentId}\n`));
+
+test("a pull request whose title and body name only another ticket moves to it on the next poll, and its events go there, never to the old ticket's agent", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const store = await transferStore(t);
+  const h = harness(t, { store, autoResume: true });
+  renamed(h, "Part of TUC-2. Covers AC-1 and AC-3 over UTF-8 input.");
+  h.paseo.succeed = async (claim) => {
+    await claim();
+    return { kind: "started", agent: { id: "a2", title: "TUC-2", cwd: "/wt/tuc-2" } };
+  };
+  const calls = await h.poll();
+  const moved = await store.read("i2");
+  assert.equal(moved?.agentId, null, "a destination without a record gets one without an agent");
+  assert.equal(moved?.links["Pull request"], PR);
+  assert.equal(moved?.branch, READY.headBranch, "on the pull request's branch");
+  assert.equal((await store.read("i1"))?.links["Pull request"], undefined);
+  assert.equal((await store.read("i1"))?.agentId, "a1", "the source keeps its agent");
+  assert.ok(calls.includes(`link Pull request ${PR}`), "the destination ticket links the pull request");
+  assert.deepEqual(prompts(calls, "a1"), [], "the old ticket's agent hears nothing");
+  assert.deepEqual(h.successions, ["i2 null"], "the destination's successor starts, with no predecessor agent");
+  assert.deepEqual(await h.poll(), [], "moved once; the claimed stage is not sent again");
+});
+
+test("a pull request stays when its title names no other ticket, its body names more than one, its body was not read, or it is closed", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const cases: [string, (h: ReturnType<typeof harness>) => void][] = [
+    ["the title names its own ticket", (h) => { renamed(h); h.github.title = "Fix TUC-1 [plugin] Retry the upload"; h.github.view = { ...h.github.view, title: h.github.title }; }],
+    ["the body still names the old ticket", (h) => renamed(h, "Part of TUC-2, continues TUC-1.")],
+    ["the body was not read", (h) => { renamed(h); const { body: _body, ...view } = h.github.view; h.github.view = view; }],
+    ["the pull request is closed", (h) => { renamed(h); h.github.view = { ...h.github.view, state: "CLOSED" }; }],
+    ["only the branch names the other ticket", (h) => { h.github.view = { ...READY, headBranch: "mtuchel/tuc-2-fix", body: "Retry the upload.", title: "Retry the upload", checks: [failing("PR code")] }; h.github.title = "Retry the upload"; h.linear.byIssue["TUC-2"] = { id: "i2", identifier: "TUC-2", status: "In Progress", statusType: "started" }; }],
+    ["the named ticket is done", (h) => { renamed(h); h.linear.byIssue["TUC-2"] = { id: "i2", identifier: "TUC-2", status: "Done", statusType: "completed" }; }],
+  ];
+  for (const [name, arrange] of cases) {
+    const store = await transferStore(t);
+    const h = harness(t, { store });
+    arrange(h);
+    const calls = await h.poll();
+    assert.equal((await store.read("i1"))?.links["Pull request"], PR, name);
+    assert.equal(await store.read("i2"), null, name);
+    if (name !== "the pull request is closed") assert.equal(prompts(calls, "a1").length, 1, `${name}: the ticket's own agent gets the event as before`);
+  }
+});
+
+test("a move whose destination cannot be read holds that pull request's events, then moves on a later poll", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const store = await transferStore(t);
+  const h = harness(t, { store });
+  renamed(h);
+  h.linear.issueFailure = new Error("Linear is unavailable");
+  const held = await h.poll();
+  assert.deepEqual(prompts(held, "a1"), [], "held: the old ticket's agent is not asked either");
+  assert.equal((await store.read("i1"))?.links["Pull request"], PR);
+  h.linear.issueFailure = null;
+  await h.poll();
+  assert.equal((await store.read("i2"))?.links["Pull request"], PR);
+  assert.equal((await store.read("i1"))?.links["Pull request"], undefined);
+});
+
+test("a host that no longer owns the old ticket still moves the pull request, and only the destination's owner acts on it", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const owner = await transferStore(t);
+  const here = harness(t, { store: owner, owns: ["i2"], autoResume: true });
+  renamed(here);
+  here.paseo.succeed = async (claim) => { await claim(); return { kind: "started", agent: { id: "a2", title: "TUC-2", cwd: "/wt/tuc-2" } }; };
+  const calls = await here.poll();
+  assert.equal((await owner.read("i2"))?.links["Pull request"], PR, "learned from the pull request, not from the peer's files");
+  assert.deepEqual(prompts(calls, "a1"), []);
+  assert.deepEqual(here.successions, ["i2 null"]);
+
+  const peer = await transferStore(t);
+  const there = harness(t, { store: peer, owns: ["i1"], autoResume: true });
+  renamed(there);
+  const quiet = await there.poll();
+  assert.equal((await peer.read("i2"))?.links["Pull request"], PR, "the records move on every host");
+  assert.deepEqual(prompts(quiet, "a1"), [], "the old ticket's host does not act for the destination");
+  assert.deepEqual(there.successions, []);
+});
+
+test("a ticket that already owns a pull request keeps it primary and gets the moved one too; both route to its agent", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const store = await transferStore(t);
+  await store.update({ id: "i2", identifier: "TUC-2" }, { id: "a2", title: "TUC-2", cwd: "/wt/tuc-2" }, { link: ["Pull request", OTHER] });
+  const h = harness(t, { store });
+  renamed(h);
+  h.github.views[OTHER] = { ...READY, headSha: "other-head", headBranch: "mtuchel/tuc-2-other", title: "Fix TUC-2 other", body: "Part of TUC-2", checks: [failing("PR code")] };
+  h.github.open.push(listed(OTHER, h.github.views[OTHER], "Fix TUC-2 other"));
+  const first = await h.poll();
+  const target = await store.read("i2");
+  assert.equal(target?.links["Pull request"], OTHER, "its own pull request stays primary");
+  assert.deepEqual(target?.pullRequests, [PR]);
+  assert.equal(target?.agentId, "a2");
+  const second = await h.poll();
+  const asked = [...prompts(first, "a2"), ...prompts(second, "a2")].join("\n");
+  assert.deepEqual(prompts([...first, ...second], "a1"), []);
+  assert.match(asked, /pull\/419/, "the moved pull request's stall reaches the destination's agent");
+  assert.match(asked, /pull\/420/, "and so does its own pull request's");
 });

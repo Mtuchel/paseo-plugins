@@ -319,6 +319,22 @@ test("a live agent of the ticket takes the record over instead of a new start, b
   await failing.cleanup();
 });
 
+// A ticket that took a pull request over without an agent (Handover.transfer): no predecessor.
+test("a ticket without an agent: its live agent takes the record over, and a peer that cannot verify the branch holds the start instead of a fresh one", async () => {
+  const live = routerHarness({ resumeTarget: null, agents: [ticketAgent("agent-live", "2026-01-02T00:00:00Z")] });
+  const succession = await live.router.succeed(ISSUE.id, ISSUE.identifier, null, "Fix the failing check.", async () => { live.calls.push("claim"); });
+  assert.equal(succession.kind, "live");
+  assert.deepEqual(live.calls, ["handOff null -> agent-live"], "the live agent is chosen without any source agent's identity");
+  await live.cleanup();
+
+  const held = routerHarness({ processLiveness: async () => "absent", route: { take: async () => ({ held: "no verified branch, commit and uncommitted-change evidence" }) } });
+  const waiting = await held.router.succeed(ISSUE.id, ISSUE.identifier, null, "Fix the failing check.", async () => { held.calls.push("claim"); });
+  assert.deepEqual(waiting, { kind: "wait", reason: `Pull request ownership moved to ${ISSUE.identifier}; recovery is waiting for verified branch, commit and uncommitted-change evidence (no verified branch, commit and uncommitted-change evidence)` });
+  assert.equal(held.starts.length, 0, "never a local start on a guessed branch");
+  assert.deepEqual(held.calls, [], "nothing claimed: a later poll tries again once the evidence is there");
+  await held.cleanup();
+});
+
 test("succession waits on admission without claiming the message or starting anything", async () => {
   const h = routerHarness({ admission: { ok: false, reason: "Queued: 1 of 1 ticket agents are working. It starts when one finishes." } });
   assert.deepEqual(await succeed(h), { kind: "wait", reason: "Queued: 1 of 1 ticket agents are working. It starts when one finishes." });

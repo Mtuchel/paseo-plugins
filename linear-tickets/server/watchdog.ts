@@ -619,7 +619,7 @@ export class Watchdog {
         // A ticket in a cycle belongs to the watchdog this poll: its root, its recorded agent and
         // every other root of it are reserved.
         if (ticket.cycle.rootId) poll.reserved.add(ticket.cycle.rootId);
-        for (const record of poll.records) if (record.issueId === issueId) poll.reserved.add(record.agentId);
+        for (const record of poll.records) if (record.issueId === issueId && record.agentId) poll.reserved.add(record.agentId);
         for (const agent of roots.get(issueId)?.roots ?? []) poll.reserved.add(agent.id);
       }
       const issues = [...new Set([...Object.keys(file.tickets), ...roots.keys()])];
