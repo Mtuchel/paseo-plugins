@@ -10,7 +10,7 @@ import { CONTEXT_TOO_LARGE } from "./context";
 import { ownedPullRequests, pullKey, type Handover, type HandoverRecord, type PullTransfer } from "./handover";
 import { KnownStates, type KnownState } from "./known-states";
 import { limitError } from "./limit-resume";
-import type { IssueState, IssueStatus, LinearService } from "./linear";
+import type { IssueCore, IssueStatus, LinearService } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
 import { CODING_STATE } from "./plannotator";
 import { STAGE_STEP, stalledStage, type ReviewThread, type Stage } from "./pr-nudge";
@@ -1143,12 +1143,12 @@ export class PullRequestWatch {
       // (see rebindMoved). Absent: none happens.
       handover: Pick<Handover, "all" | "update"> & Partial<Pick<Handover, "transfer" | "annotate" | "swapPullRequest" | "moves">>;
       sessions: Pick<SessionRouter, "sessionFor" | "say" | "prompt" | "link" | "crashed" | "succeed" | "whileIdle">;
-      // `issueState` finds a ticket that has no handover record by its identifier. Crash recovery
+      // `issueCore` finds a ticket that has no handover record by its identifier. Crash recovery
       // checks a crashed agent's ticket with `issueStatusAnyPool`, and keeps the states of all
       // running agents' tickets known with one `issueStatuses` read per poll (see crashPass).
       // `reopenToCoding` moves a Done ticket whose stack has not landed back to its coding state
       // (see reopenDone).
-      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "hasComment" | "viewerId" | "userUrl" | "linkUrl" | "issueState" | "issueAttachments" | "issueStatusAnyPool" | "issueStatuses" | "reopenToCoding">;
+      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "hasComment" | "viewerId" | "userUrl" | "linkUrl" | "issueCore" | "issueAttachments" | "issueStatusAnyPool" | "issueStatuses" | "reopenToCoding">;
       // `tasks` finds the before-merge tasks of tickets that have no handover record.
       manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge"> & Partial<Pick<ManualTasks, "tasks">>;
       settings: Pick<Settings, "read">;
@@ -1667,9 +1667,9 @@ export class PullRequestWatch {
             this.transferNote(url, `${record.identifier}: ${url} stays: its title names ${titled[0]}, but its title and description name ${[...names].join(", ")}`);
             continue;
           }
-          let target: IssueState;
+          let target: IssueCore;
           try {
-            target = await this.deps.linear.issueState(titled[0]);
+            target = await this.deps.linear.issueCore(titled[0]);
           } catch (error) {
             if (error instanceof RateLimitedError) throw error;
             held.add(pullKey(url));
@@ -2192,7 +2192,7 @@ export class PullRequestWatch {
     const found: { identifier: string; issueId: string }[] = [];
     for (const identifier of tickets) {
       let issueId = records.find((record) => record.identifier === identifier)?.issueId ?? tasks.find((task) => task.parentIdentifier === identifier)?.parentId;
-      if (!issueId && this.deps.linear.issueState) issueId = await this.deps.linear.issueState(identifier).then((state) => state.id, () => undefined);
+      if (!issueId && this.deps.linear.issueCore) issueId = await this.deps.linear.issueCore(identifier).then((state) => state.id, () => undefined);
       if (issueId) found.push({ identifier, issueId });
     }
     return found;
@@ -3431,7 +3431,7 @@ export class PullRequestWatch {
     const save = () => writeState(this.policyPath, this.policy);
     let acted = false;
     if (!reopen.moved) {
-      const current = await this.deps.linear.issueState(record.issueId);
+      const current = await this.deps.linear.issueCore(record.issueId);
       const type = current.statusType.trim().toLowerCase();
       if (type === "canceled" || type === "duplicate") {
         // Finished by hand while the reopen waited: it stays finished, and the decision goes.

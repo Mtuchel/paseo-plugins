@@ -218,6 +218,7 @@ test("ticket admission refuses a ticket outside focus before it reads Linear", a
     linear: {
       detail: async () => { throw new Error("not used"); },
       issueState: async (id: string) => { reads += 1; return { id, identifier: "TUC-1", status: "Todo", statusId: "todo", statusType: "unstarted", teamId: null, projectId: null, creatorId: null, labels: [], attachmentUrls: [], blockedBy: [], priority: 0, createdAt: "", unblocks: 0 }; },
+      issueCore: async () => { throw new Error("not used"); },
       viewerId: async () => "owner",
       trustedAppIds: async () => [],
       issueDocument: async () => null,

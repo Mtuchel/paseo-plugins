@@ -62,6 +62,8 @@ class FakeLinear {
     return { id, identifier: id.toUpperCase(), status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, creatorId: "owner", labels: [], attachmentUrls: [], blockedBy: this.blocked[id] ?? [], priority: 0, createdAt: "", unblocks: 0 };
   }
 
+  async issueCore(id: string) { return this.issueState(id); }
+
   async detail(id: string): Promise<TicketDetail> {
     // Only the fields dispatch reads; the fixture is not a full Linear snapshot.
     const detail = { issue: { id, identifier: id.toUpperCase(), project: "App", team: "Engineering" }, projectId: id === "unmapped" ? "lp-2" : "lp-1", teamId: "t1" };

@@ -348,8 +348,8 @@ export function orphanCandidateFilter(state: string, teamKeys: string[]): Record
 }
 const REPAIR_IDS_BATCH = 50;
 
-// The current state, team, labels and attachment links of one ticket: enough for
-// write-back decisions without the comment pagination that `detail` performs.
+// One ticket with its blockers and what it blocks (each blocker's state and pull requests), for
+// decisions on dependencies; everything else reads ISSUE_CORE_QUERY (498 against 8 points).
 export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
   issue(id: $id) {
     id identifier title priority createdAt state { id name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
@@ -372,6 +372,11 @@ export const ISSUE_WATCH_STATE_QUERY = `query issueWatchState($id: String!) {
 // Queued threads check terminal state before capacity; admission separately reads dependencies.
 export const ISSUE_STATUS_QUERY = `query issueStatus($id: String!) {
   issue(id: $id) { state { name type } }
+}`;
+// A ticket without its relations (TUC-1324): what status moves, labels, owner waits and starts
+// decide on. Measured 8 points against 498 for ISSUE_STATE_QUERY (README, "Rate limits").
+export const ISSUE_CORE_QUERY = `query issueCore($id: String!) {
+  issue(id: $id) { id identifier state { id name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } } }
 }`;
 // `status`: the workflow state's name ("In Review"); `statusType` its kind ("started").
 export type IssueStatus = { status: string; statusType: string; completedAt: string | null };
@@ -484,6 +489,9 @@ export type IssueState = {
 };
 // The part of IssueState that ADMISSION_STATES_QUERY reads: what TicketStarter.admission decides on.
 export type AdmissionState = Pick<IssueState, "id" | "identifier" | "status" | "statusType" | "projectId" | "labels" | "blockedBy" | "priority" | "createdAt" | "unblocks" | "queueBlocker">;
+// The part of IssueState that ISSUE_CORE_QUERY reads: no blockers, priority, age or title, so
+// code that decides on those cannot be handed this read (tsc rejects it).
+export type IssueCore = Pick<IssueState, "id" | "identifier" | "status" | "statusId" | "statusType" | "teamId" | "projectId" | "creatorId" | "labels" | "attachmentUrls">;
 
 // An ISSUE_STATUS_QUERY answer's workflow state, whichever pool sent it.
 function issueStatusOf(data: Record<string, unknown>): Pick<IssueState, "status" | "statusType"> {
@@ -1274,6 +1282,14 @@ export class LinearService {
     return parseIssueState(record(data.issue));
   }
 
+  // `issueState` without the relations (ISSUE_CORE_QUERY), with the same pools and missing-ticket error.
+  async issueCore(id: string): Promise<IssueCore> {
+    const data = record(await this.read(ISSUE_CORE_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object")));
+    if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
+    const { id: issueId, identifier, status, statusId, statusType, teamId, projectId, creatorId, labels, attachmentUrls } = parseIssueState(record(data.issue));
+    return { id: issueId, identifier, status, statusId, statusType, teamId, projectId, creatorId, labels, attachmentUrls };
+  }
+
   // What admission decides on, for many tickets in requests of 50 (ADMISSION_STATES_QUERY), parsed
   // exactly as `issueState`. Each id is asked for once; tickets Linear does not return are missing.
   async admissionStates(ids: string[]): Promise<Map<string, AdmissionState>> {
@@ -1561,7 +1577,7 @@ export class LinearService {
   // Moves the ticket to its team's first completed state (Done).
   async complete(issueId: string): Promise<void> {
     return withPriority("owner", "status change", async () => {
-      const state = await this.issueState(issueId);
+      const state = await this.issueCore(issueId);
       if (!state.teamId || state.statusType === "completed") return;
       const done = (await this.teamStates(state.teamId)).filter((item) => item.type === "completed").sort((a, b) => a.position - b.position)[0];
       if (!done) return;
@@ -1572,7 +1588,7 @@ export class LinearService {
   // Moves the ticket to its team's first canceled state, with the reason posted first.
   async cancel(issueId: string, reason: string): Promise<void> {
     return withPriority("owner", "status change", async () => {
-      const state = await this.issueState(issueId);
+      const state = await this.issueCore(issueId);
       if (!state.teamId || ["completed", "canceled", "duplicate"].includes(state.statusType)) return;
       const canceled = (await this.teamStates(state.teamId)).filter((item) => item.type === "canceled").sort((a, b) => a.position - b.position)[0];
       if (!canceled) return;
@@ -1618,7 +1634,7 @@ export class LinearService {
   // Removes every label on the ticket with this name (case-insensitive); a team label and
   // a workspace label can share a name. Missing labels are not an error.
   async removeLabel(issueId: string, name: string, current?: { id: string; name: string }[]): Promise<void> {
-    const labels = current ?? (await this.issueState(issueId)).labels;
+    const labels = current ?? (await this.issueCore(issueId)).labels;
     const wanted = name.trim().toLowerCase();
     for (const { id } of labels.filter((item) => item.name.trim().toLowerCase() === wanted)) {
       try {
@@ -2077,9 +2093,9 @@ export class LinearService {
   // Moves the ticket into its team's "started" state with this name (for example Planning or
   // In Progress), unless it is already there or finished. Teams without it are left alone.
   // `current`: the ticket's state when the caller already read it.
-  async moveToStateNamed(issueId: string, name: string, current?: IssueState): Promise<{ changed: boolean; note?: string }> {
+  async moveToStateNamed(issueId: string, name: string, current?: IssueCore): Promise<{ changed: boolean; note?: string }> {
     return withPriority("owner", "status change", async () => {
-      const state = current ?? await this.issueState(issueId);
+      const state = current ?? await this.issueCore(issueId);
       const type = state.statusType.trim().toLowerCase();
       if (type === "completed" || type === "canceled" || type === "duplicate") return { changed: false };
       if (state.status.trim().toLowerCase() === name.toLowerCase()) return { changed: false };
@@ -2101,7 +2117,7 @@ export class LinearService {
   // Moves the ticket back to its team's first unstarted state (Todo): planned, not being worked on.
   async moveToReady(issueId: string): Promise<{ changed: boolean; note?: string }> {
     return withPriority("owner", "status change", async () => {
-      const state = await this.issueState(issueId);
+      const state = await this.issueCore(issueId);
       const type = state.statusType.trim().toLowerCase();
       if (type === "completed" || type === "canceled" || type === "duplicate" || type === "unstarted") return { changed: false };
       if (!state.teamId) return { changed: false, note: "The ticket has no team." };
@@ -2116,7 +2132,7 @@ export class LinearService {
   // task whose check failed after it was marked done.
   async reopen(issueId: string): Promise<void> {
     return withPriority("owner", "status change", async () => {
-      const state = await this.issueState(issueId);
+      const state = await this.issueCore(issueId);
       if (!state.teamId) return;
       const target = (await this.teamStates(state.teamId)).filter((item) => item.type === "unstarted").sort((a, b) => a.position - b.position)[0];
       if (!target || target.id === state.statusId) return;
@@ -2132,9 +2148,9 @@ export class LinearService {
   // changes nothing, so a reopen interrupted between the move and its bookkeeping can repeat it).
   // Teams without a started state are left alone, with the note. `current`: the ticket's state when
   // the caller already read it.
-  async reopenToCoding(issueId: string, current?: IssueState): Promise<{ changed: boolean; note?: string }> {
+  async reopenToCoding(issueId: string, current?: IssueCore): Promise<{ changed: boolean; note?: string }> {
     return withPriority("owner", "status change", async () => {
-      const state = current ?? await this.issueState(issueId);
+      const state = current ?? await this.issueCore(issueId);
       const type = state.statusType.trim().toLowerCase();
       if (type === "canceled" || type === "duplicate") return { changed: false };
       if (!state.teamId) return { changed: false, note: "The ticket has no team." };
@@ -2197,7 +2213,7 @@ export class LinearService {
   // started work (completed or canceled tickets are left to people and integrations).
   async moveToReview(issueId: string): Promise<{ changed: boolean; note?: string }> {
     return withPriority("owner", "status change", async () => {
-      const state = await this.issueState(issueId);
+      const state = await this.issueCore(issueId);
       const type = state.statusType.trim().toLowerCase();
       if (type === "completed" || type === "canceled") return { changed: false };
       if (/review/i.test(state.status) && type === "started") return { changed: false };

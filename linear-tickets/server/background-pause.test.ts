@@ -585,7 +585,7 @@ test("the app reaching its reserve during a poll stops the remaining writes with
 // AC-7: every public state mover runs at owner priority inside a background context.
 test("AC-7: moveToStateNamed reads and writes inside a background context at 3% of the points budget", async (t) => {
   const f = fixture(t, (call) => {
-    if (call.operation === "issueState") return ISSUE_STATE_REPLY;
+    if (call.operation === "issueCore") return ISSUE_STATE_REPLY;
     if (call.operation === "teamStates") return { team: { states: { nodes: [{ id: "s-wip", name: "In Progress", type: "started", position: 2 }, { id: "s-review", name: "In Review", type: "started", position: 3 }] } } };
     if (call.operation === "issueUpdateState") return { issueUpdate: { success: true, issue: { id: ID_A, state: { name: "In Progress", type: "started" } } } };
     return {};
@@ -595,7 +595,7 @@ test("AC-7: moveToStateNamed reads and writes inside a background context at 3% 
 
   const result = await withPriority("background", "dispatch poll", () => f.linear.moveToStateNamed(ID_A, "In Progress"));
   assert.deepEqual(result, { changed: true });
-  assert.deepEqual(f.calls.map((call) => `${call.pool} ${call.operation}`), ["app issueState", "key teamStates", "app issueUpdateState"]);
+  assert.deepEqual(f.calls.map((call) => `${call.pool} ${call.operation}`), ["app issueCore", "key teamStates", "app issueUpdateState"]);
   assert.deepEqual(f.refusals, [], "the owner tier never touches the reserve");
 });
 
@@ -631,6 +631,7 @@ test("a background read the key cannot see, or sees in part, is read again with 
   const notFound = { status: 200, errors: [{ message: "Entity not found: Issue" }] };
   const f = fixture(t, (call, variables) => {
     if (call.operation === "issueStatus") return call.pool === "key" ? notFound : { issue: { state: { name: "Todo", type: "unstarted" } } };
+    if (call.operation === "issueCore") return call.pool === "key" ? notFound : ISSUE_STATE_REPLY;
     if (call.operation === "issueStatuses") return { issues: { nodes: ((variables.ids ?? []) as string[]).filter((id) => call.pool === "app" || id === ID_A).map((id) => ({ id, state: { name: "Todo", type: "unstarted" }, completedAt: null })) } };
     return {};
   });
@@ -638,7 +639,9 @@ test("a background read the key cannot see, or sees in part, is read again with 
   await withPriority("background", "test", () => f.linear.issueStatus(ID_A));
   await withPriority("background", "test", () => f.linear.issueStatuses([ID_A, "other"]));
   await withPriority("interactive", "test", () => f.linear.issueStatus(ID_A));
-  assert.deepEqual(f.calls.map((call) => `${call.pool} ${call.operation}`), ["key issueStatus", "app issueStatus", "key issueStatuses", "app issueStatuses", "app issueStatus"]);
+  await withPriority("background", "test", () => f.linear.issueCore(ID_A));
+  await withPriority("interactive", "test", () => f.linear.issueCore(ID_A));
+  assert.deepEqual(f.calls.map((call) => `${call.pool} ${call.operation}`), ["key issueStatus", "app issueStatus", "key issueStatuses", "app issueStatuses", "app issueStatus", "key issueCore", "app issueCore", "app issueCore"]);
 });
 
 test("a Linear rate limit on a key-first background read propagates without asking the app", async (t) => {

@@ -8,7 +8,7 @@ import { activeModel } from "./model";
 import { limitError } from "./limit-resume";
 import { questionsOf } from "./relay";
 import type { Handover, HandoverRecord, WaitingKind, WaitingPeriod } from "./handover";
-import type { IssueState, LinearService } from "./linear";
+import type { IssueCore, LinearService } from "./linear";
 import type { NeedsYouIssues } from "./needs-you";
 import { PLANNING_STATE } from "./plannotator";
 import { PLAN_POLICY_LABEL } from "./plan-policy";
@@ -58,7 +58,7 @@ export type AgentBridge = {
   sessions: Pick<SessionRouter, "sessionFor" | "say" | "action" | "ask" | "askQuestion" | "link" | "offerResume" | "resumeNow" | "scheduleLimitResume" | "holdIfStopped" | "follow" | "unfollow">;
   handover: Pick<Handover, "read" | "all" | "update" | "finish" | "handOff" | "waiting" | "setWaiting">;
 };
-type Linear = Pick<LinearService, "issueState" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "upsertComment" | "commentBody" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "isPerson" | "userUrl" | "createIssue" | "complete">;
+type Linear = Pick<LinearService, "issueCore" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "upsertComment" | "commentBody" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "isPerson" | "userUrl" | "createIssue" | "complete">;
 // What a waiting period needs of its agent: enough to write the record back without a hook event.
 type WaitingAgent = { id: string; title: string | null; cwd: string };
 // What the reconcile below gets from the host: the tickets this host forwarded to the peer host
@@ -347,7 +347,7 @@ export class Writeback {
       // When the current kind was opened: a new question on the same wait keeps the first one's
       // time, so a wait that keeps asking is not treated as brand new forever.
       const at = waiting?.kind === kind ? waiting.at ?? new Date().toISOString() : new Date().toISOString();
-      const state = await this.linear.issueState(issue.id);
+      const state = await this.linear.issueCore(issue.id);
       const needsYou = dispatchLabels(settings.dispatch.label).needsYou;
       // Only the owner opens Linear sessions; without one, whoever wrote the ticket is asked, unless
       // the Paseo app or another integration wrote it.
@@ -360,7 +360,7 @@ export class Writeback {
         // The agent's sub-issue from an earlier wait, while still open, takes the new one too.
         for (const known of (await this.needsYou.all()).filter((entry) => entry.parentId === issue.id && entry.agentId === agent.id)) {
           // A deleted sub-issue is gone; outages and rate limits retry the whole write-back.
-          const found = subIssueId ? null : await this.linear.issueState(known.id).catch((error: unknown) => {
+          const found = subIssueId ? null : await this.linear.issueCore(known.id).catch((error: unknown) => {
             if (error instanceof RateLimitedError || (error instanceof Error && TRANSIENT.test(error.message))) throw error;
             return null;
           });
@@ -407,10 +407,10 @@ export class Writeback {
   // input meanwhile. The next period gets a fresh comment. A "Needs you" sub-issue is closed only
   // when `answered` (the question or approval was resolved); a wait that ended otherwise may be a
   // manual step, which the owner closes.
-  private clearWaiting(issue: { id: string; identifier: string }, agent: WaitingAgent, settings: PluginSettings, current?: IssueState, answered = false): Promise<void> {
+  private clearWaiting(issue: { id: string; identifier: string }, agent: WaitingAgent, settings: PluginSettings, current?: IssueCore, answered = false): Promise<void> {
     return this.serialize(issue.id, async () => {
       const waiting = await this.waitingFor(issue.id);
-      const state = current ?? await this.linear.issueState(issue.id);
+      const state = current ?? await this.linear.issueCore(issue.id);
       await this.linear.removeLabel(issue.id, dispatchLabels(settings.dispatch.label).needsYou, state.labels);
       if (state.status.trim().toLowerCase() === NEEDS_INPUT_STATE.toLowerCase()) {
         if (waiting?.previousStateId) await this.linear.moveToState(issue.id, waiting.previousStateId);
@@ -626,7 +626,7 @@ export class Writeback {
       await withPriority("owner", "status change", async () => {
         if (settings.writeback.blocked && await this.waitingFor(issueId)) await this.clearWaiting({ id: issueId, identifier }, agent, settings);
         if (!settings.writeback.status || this.started.has(agent.id)) return;
-        const state = await this.linear.issueState(issueId);
+        const state = await this.linear.issueCore(issueId);
         // Work after merge (for example a deploy watch) never reopens a closed ticket.
         if (!CLOSED_TYPES.includes(state.statusType.trim().toLowerCase())) {
           const outcome = !planFirst ? await this.linear.markInProgress(state, state.teamId)
@@ -676,7 +676,7 @@ export class Writeback {
         await once("owner-question", () => this.markWaiting(issue, agent, settings, request, `**${title}** (Paseo) finished its turn and is waiting for you:\n\n${truncateSummary(request)}${hint}`, inSession, "turn-end", context));
       }
       const blocked = dispatchLabels(settings.dispatch.label).blocked;
-      const state = writeback.blocked ? await this.linear.issueState(issueId) : null;
+      const state = writeback.blocked ? await this.linear.issueCore(issueId) : null;
       // Without a new question the turn is over; `paseo-blocked` marks errors only.
       if (state && !request) await this.clearWaiting(issue, agent, settings, state);
       if (outcome.kind === "completed") {
@@ -784,7 +784,7 @@ export class Writeback {
       // stay open for the owner.
       if (this.needsYou) for (const entry of (await this.needsYou.all()).filter((known) => known.agentId === agent.id)) await this.needsYou.remove(entry.id);
       const labels = dispatchLabels(settings.dispatch.label);
-      const state = await this.linear.issueState(issueId);
+      const state = await this.linear.issueCore(issueId);
       // A successor already working on the ticket (a resume) keeps the running marker and the session,
       // and the record: the newest other ticket agent (subagents are not one) takes it over unless it
       // or a third agent already owns it (Handover.handOff), whichever event comes first.

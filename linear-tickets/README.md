@@ -2869,6 +2869,28 @@ No tokens, query bodies or ticket text appear in the report.
   return is read alone, and a failed batch fails each thread's check as its own read did. The
   per-thread order, gates and outcomes are unchanged, and the states are as fresh as before: read
   in the same pass. Dispatch, activation and the session paths still read the ticket themselves.
+- **Status moves, turn write-backs and the PR watch read the ticket without its relations**
+  (TUC-1324). The full `issueState` read (every blocker with its pull requests and what the
+  ticket blocks) is kept for decisions on dependencies: queue admission and the other readers
+  TUC-1939 covers. Everything else reads `issueCore` (state, team, project, author, labels,
+  attachment links) or, for a successor's closed-ticket check before admission, `issueStatus`:
+  - `issueCore`: agent turn start, turn end, archive, owner questions and their end (including the
+    wait reconcile and the "Needs you" sub-issue check); the shared status moves `complete`,
+    `cancel`, `moveToStateNamed`, `moveToReady`, `reopen`, `reopenToCoding`, `moveToReview` and
+    `removeLabel` without the caller's labels; the PR watch's move of a pull request to the
+    ticket it names, its reopen of a Done ticket and its identifier lookup for queue comments;
+    the plan setup of every start and the scheduler's project of a working ticket.
+  - `issueStatus`: `SessionRouter.succeed` (the PR watch's successor for a gone agent); the
+    successor's admission still reads the blockers.
+
+  Each helper keeps its own rule for closed tickets, the pools and the app-to-key fallback for a
+  ticket the app cannot see are those of every read, and an app rate limit never moves to the
+  key. A read-only probe with the committed queries on TUC-1324, TUC-1291 and TUC-1939
+  (2026-10-10) measured 498 points for `issueState`, 8 for `issueCore` and 3 for `issueStatus`
+  on each. Baseline on server087, 12 UTC hours 2026-10-09 18:00 – 2026-10-10 06:00: the hourly
+  top rows put at least 706,000 points in 1,427 full reads on these paths (`pr-watch` 306,768 in
+  619, `writeback.turn-ended` 262,944 in 534, `status change` 129,978 in 261,
+  `writeback.archived` 6,474 in 13).
 - **Three priorities reserve room for owner intent on both dimensions.**
   - Background work leaves **20%**: auto-dispatch, comment relay, project flow, label repair,
     health, label rules, manual tasks, plan requests, PR watch, queue backstop, state labels

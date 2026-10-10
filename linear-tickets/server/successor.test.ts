@@ -12,7 +12,7 @@ import type { ActivationResume } from "./activation";
 import { Dispatcher } from "./dispatch";
 import { Handover } from "./handover";
 import { Launcher, LEAD_INTRO, type ResumeTarget } from "./launch";
-import type { AdmissionState, IssueState, LabeledIssue } from "./linear";
+import type { AdmissionState, IssueCore, IssueState, LabeledIssue } from "./linear";
 import { SessionRouter, SessionStore, type HostOwnership, type SessionLink, type Succession } from "./sessions";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { ResumeUnavailableError, TicketStarter, type Started } from "./starter";
@@ -150,12 +150,29 @@ class FakeLinear {
   async upsertComment() { return "comment-1"; }
   async moveToStateNamed() { return { changed: false }; }
 
+  // Which single-ticket reads ran, in order: `state` (with relations), `core`, `status`.
+  readonly reads: string[] = [];
+
   async issueState(id: string): Promise<IssueState> {
+    this.reads.push(`state ${id}`);
     return {
       id, identifier: identifierOf(id), projectId: "lp-1", creatorId: OWNER, blockedBy: [], status: this.status, statusId: "todo",
       statusType: this.statusType, teamId: "t1", labels: [...(this.labels.get(id) ?? [])].map((name) => ({ id: `l-${name}`, name })),
       attachmentUrls: [], priority: 0, createdAt: "2026-01-01T00:00:00Z", unblocks: 0,
     };
+  }
+
+  async issueCore(id: string): Promise<IssueCore> {
+    this.reads.push(`core ${id}`);
+    return {
+      id, identifier: identifierOf(id), projectId: "lp-1", creatorId: OWNER, status: this.status, statusId: "todo",
+      statusType: this.statusType, teamId: "t1", labels: [...(this.labels.get(id) ?? [])].map((name) => ({ id: `l-${name}`, name })), attachmentUrls: [],
+    };
+  }
+
+  async issueStatus(id: string) {
+    this.reads.push(`status ${id}`);
+    return { status: this.status, statusType: this.statusType };
   }
 
   // Returns nothing, so each ticket is read alone through `issueState` (the batch's fallback).
@@ -294,6 +311,24 @@ test("succession is impossible for a closed ticket and for one without a recorde
   assert.deepEqual(noBranch.calls, []);
   assertGateFree(noBranch.gates);
   await noBranch.cleanup();
+});
+
+test("a successor's closed check reads only the ticket's status; an open ticket goes on to admission", async () => {
+  for (const statusType of ["completed", "canceled", "duplicate"]) {
+    const closed = routerHarness({ statusType, admission: async () => { throw new Error(`${statusType}: admission must not run`); } });
+    assert.equal((await succeed(closed)).kind, "impossible", statusType);
+    assert.deepEqual(closed.linear.reads, [`status ${ISSUE.id}`], `${statusType}: only the status read, never the read with relations`);
+    assert.deepEqual(closed.calls, [], `${statusType}: not claimed`);
+    assertGateFree(closed.gates);
+    await closed.cleanup();
+  }
+  let admitted = 0;
+  const open = routerHarness({ admission: async () => { admitted += 1; return { ok: false, reason: "Waiting for TUC-9 to finish." }; } });
+  await succeed(open);
+  assert.equal(admitted, 1, "an open ticket reaches admission");
+  assert.equal(open.linear.reads[0], `status ${ISSUE.id}`);
+  assert.ok(!open.linear.reads.includes(`state ${ISSUE.id}`), "the router reads no relations before admission");
+  await open.cleanup();
 });
 
 test("a live agent of the ticket takes the record over instead of a new start, branch or not", async (t) => {

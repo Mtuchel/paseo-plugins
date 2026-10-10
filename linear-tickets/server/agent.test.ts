@@ -205,7 +205,7 @@ test("plan checklists come from checkboxes, or numbered steps under a Steps head
 });
 
 type Call = string;
-type RouterLinear = Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "admissionStates" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
+type RouterLinear = Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "admissionStates" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
 // `reload`: the daemon's agent reload (null: the plugin has no daemon connection); `send`: runs
 // before each send is recorded.
 function harness(options: { now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; processLiveness?: typeof ticketProcessLiveness; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; admission?: (issueId: string, paseo: PaseoApi, settings: PluginSettings, read?: AdmissionState) => Promise<{ ok: true } | { ok: false; reason: string }>; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null> } = {}) {
@@ -266,6 +266,7 @@ function harness(options: { now?: () => number; pending?: AgentPermissionRequest
       addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); },
       complete: async (id: string) => { calls.push(`complete ${id}`); }, cancel: async (id: string, reason: string) => { calls.push(`cancel ${id}: ${reason.split("\n")[0]}`); },
       issueState: async (id: string) => ({ id, status: "Todo", statusType: "unstarted", blockedBy: options.blockedBy?.[id] ?? [] }) as IssueState,
+      issueStatus: async () => ({ status: "Todo", statusType: "unstarted" }),
       admissionStates: async (ids: string[]) => new Map(ids.map((id) => [id, { id, status: "Todo", statusType: "unstarted", blockedBy: options.blockedBy?.[id] ?? [] } as AdmissionState])),
       issueGroup: async (id: string) => options.groups?.[id] ?? { id, identifier: "TUC-1", status: "Todo", statusType: "unstarted", delegateId: "paseo-app", finished: false, children: [] },
       moveToStateNamed: async (id: string, name: string) => { calls.push(`move ${id} to ${name}`); return { changed: true }; },
@@ -767,7 +768,7 @@ test("a permission shows in the agent panel only while still pending, and the ti
   for (const pending of [[], [request]]) {
     const calls: string[] = [];
     const linear = {
-      issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "In Progress", statusId: "ip", statusType: "started", teamId: "t", projectId: null, creatorId: "customer", labels: [], attachmentUrls: [], blockedBy: [], priority: 0, createdAt: "", unblocks: 0 }),
+      issueCore: async () => ({ id: "i1", identifier: "TUC-1", status: "In Progress", statusId: "ip", statusType: "started", teamId: "t", projectId: null, creatorId: "customer", labels: [], attachmentUrls: [] }),
       markInProgress: async () => ({ changed: false }), moveToReview: async () => ({ changed: false }), linkUrl: async () => {}, moveToState: async () => {},
       moveToStateNamed: async (_i: string, name: string) => { calls.push(`move ${name}`); return { changed: true }; },
       comment: async (_i: string, body: string) => { calls.push(`comment ${body.slice(0, 30)}`); },
@@ -992,6 +993,7 @@ function routerAdmission(t: TestContext, points = 60_000, limitedOperation?: str
   const data: Record<string, object> = {
     viewerCheck: { viewer: { id: OWNER } },
     issueState: { issue: { id: "i1", identifier: "TUC-1", state: { id: "todo", name: "Todo", type: "unstarted" }, team: { id: "team-1" }, labels: { nodes: [] } } },
+    issueCore: { issue: { id: "i1", identifier: "TUC-1", state: { id: "todo", name: "Todo", type: "unstarted" }, team: { id: "team-1" }, labels: { nodes: [] } } },
     issueStatus: { issue: { state: { name: "Todo", type: "unstarted" } } },
     teamStates: { team: { states: { nodes: [{ id: "coding", name: "In Progress", type: "started", position: 1 }] } } },
     issueUpdateState: { issueUpdate: { success: true, issue: { id: "i1", state: { id: "coding", name: "In Progress", type: "started" } } } },

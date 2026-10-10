@@ -32,6 +32,10 @@ const ANSWERS: Record<string, Answer> = {
     id: "i1", identifier: "TUC-1", state: { id: "s-ip", name: "In Progress", type: "started" }, team: { id: "t1" }, project: null, creator: { id: "u1" },
     labels: { nodes: [{ id: "l-needs-you", name: "paseo-needs-you" }] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] },
   } }),
+  issueCore: () => ({ issue: {
+    id: "i1", identifier: "TUC-1", state: { id: "s-ip", name: "In Progress", type: "started" }, team: { id: "t1" }, project: null, creator: { id: "u1" },
+    labels: { nodes: [{ id: "l-needs-you", name: "paseo-needs-you" }] }, attachments: { nodes: [] },
+  } }),
   teamStates: () => ({ team: { states } }),
   issueUpdateState: ({ variables }) => {
     const state = states.nodes.find((item) => item.id === variables.stateId)!;

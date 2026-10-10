@@ -626,7 +626,7 @@ test("a Plannotator decision reaches its cold-cache reads and writes through rea
   for (const pool of ["app", "key"] as const) budget.acquire(pool, "owner").done(new Headers(headers), false);
   const sent: string[] = [];
   const data: Record<string, object> = {
-    issueState: { issue: { id: "issue-1", identifier: "TUC-25", state: { id: "todo", name: "Todo", type: "unstarted" }, team: { id: "team-1" }, labels: { nodes: [] } } },
+    issueCore: { issue: { id: "issue-1", identifier: "TUC-25", state: { id: "todo", name: "Todo", type: "unstarted" }, team: { id: "team-1" }, labels: { nodes: [] } } },
     teamStates: { team: { states: { nodes: [{ id: "coding", name: "In Progress", type: "started", position: 1 }] } } },
     issueUpdateState: { issueUpdate: { success: true, issue: { id: "issue-1", state: { id: "coding", name: "In Progress", type: "started" } } } },
     labelByName: { issueLabels: { nodes: [{ id: "ready", name: "plan-ready" }] } },
@@ -652,7 +652,7 @@ test("a Plannotator decision reaches its cold-cache reads and writes through rea
     await withPriority("background", "decision ingress test", () => bridge.drain());
     assert.deepEqual(await readdir(directory), []);
   });
-  assert.deepEqual(sent, ["issueState", "teamStates", "issueUpdateState", "labelByName", "addLabel", "issueDocuments", "documentCreate", "comment"]);
+  assert.deepEqual(sent, ["issueCore", "teamStates", "issueUpdateState", "labelByName", "addLabel", "issueDocuments", "documentCreate", "comment"]);
   await assert.rejects(linear.comment("issue-1", "ordinary agent progress"), RateLimitedError);
   assert.equal(sent.length, 8, "ordinary interactive comments cannot consume the owner's last share");
 });
