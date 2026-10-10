@@ -208,7 +208,8 @@ are claimed without another comment or state change, across restarts. Only the h
 the ticket asks; while that cannot be told, the message waits. An ask whose comment may have
 been posted before a failure is looked up by its mark first, never posted twice; one left pending
 after its message was claimed (a restart in between) is finished by the next poll of the owning
-host. A successor or live agent taking the ticket over clears it.
+host, including the move back to In Progress if that had not happened yet. A successor or live
+agent taking the ticket over clears it.
 
 **Finished blockers.** When a ticket starts after blockers that are finished (see *Waiting their turn*), its prompt gets a
 **Finished blockers** section after the instructions: for each one, its links (pull requests,
@@ -2267,10 +2268,12 @@ stops the checks, if its title names another ticket. Each move is journaled firs
 finished before any other read or write of the records, after a restart too, so a pull request
 is never on two tickets or on none; a late link from the old ticket's agent does not take it back,
 and the old ticket's branch no longer counts it (its stack policy and watchdog look past it).
-What the old ticket had pending for it follows it: messages addressed to the ticket by name and
-not sent yet, and the queue backstop's saved enqueues and stack moves that name the old ticket
-(the old one stays named while it still owns another pull request of the range). A restarted
-agent's resume about that pull request is not sent any more. A pull request owned besides the
+What the old ticket had pending for it follows it, on every poll from the journal (so also after
+a restart before that was saved): messages addressed to the ticket by name and not sent yet, and
+the queue backstop's saved enqueues and stack moves that name the old ticket (the old one stays
+named while it still owns another pull request of the range). A restarted agent's resume about
+that pull request, restarted before the move, is not sent any more; one about a stack member no
+record owns still is. A pull request owned besides the
 primary one that is replaced (same branch) or lands is swapped alone for the next one; the
 primary one stays. Moving it back is a new move (rename it again). Reverting the plugin does not
 move pull requests back: rename them.

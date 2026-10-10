@@ -4499,6 +4499,7 @@ test("a pending oversized-ticket ask whose event was already claimed is finished
   const body = "The agent that worked on this ticket is no longer running, and no successor can start.";
   await writeFile(asks, JSON.stringify({ "i1:a1": { state: "pending", issueId: "i1", at: "2026-10-10T00:00:00.000Z", body } }));
   const calls = await h.poll();
+  assert.ok(calls.includes("move In Progress"), "the ticket goes back to coding, which the claimed event did not get to");
   assert.equal(calls.filter((call) => call.startsWith("comment")).length, 1, calls.join("\n"));
   assert.equal(h.linear.comments.i1.length, 1);
   assert.ok(h.linear.comments.i1[0].startsWith(OWNER) && h.linear.comments.i1[0].includes(body) && h.linear.comments.i1[0].endsWith(OVERSIZE_MARK));
@@ -4506,9 +4507,11 @@ test("a pending oversized-ticket ask whose event was already claimed is finished
   assert.equal(confirmed.state, "confirmed");
   assert.equal(confirmed.body, undefined, "a confirmed ask keeps no comment");
   assert.ok(!(await h.poll()).some((call) => call.startsWith("comment")), "confirmed: not posted again");
-  // Posted before a restart lost the confirmation: found by its mark, not posted again.
-  await writeFile(asks, JSON.stringify({ "i1:a1": { state: "pending", issueId: "i1", at: "2026-10-10T00:00:00.000Z", body } }));
-  assert.ok(!(await h.poll()).some((call) => call.startsWith("comment")));
+  // Posted before a restart lost the confirmation: found by its mark, not posted again, and the
+  // ticket, already moved, is not moved again.
+  await writeFile(asks, JSON.stringify({ "i1:a1": { state: "pending", issueId: "i1", at: "2026-10-10T00:00:00.000Z", body, moved: true } }));
+  const again = await h.poll();
+  assert.ok(!again.some((call) => call.startsWith("comment") || call.startsWith("move")), again.join("\n"));
   assert.equal(h.linear.comments.i1.length, 1);
   assert.equal(JSON.parse(await readFile(asks, "utf8"))["i1:a1"].state, "confirmed");
 });
@@ -4550,25 +4553,40 @@ test("a moved pull request no longer counts for the old ticket's branch: its Don
   assert.deepEqual(prompts(calls, "a1"), []);
 });
 
-test("a restart's resume about a pull request that moved away is not sent to the old ticket's agent", async (t) => {
+test("a restart's resume about a pull request that moved away later is not sent to the old ticket's agent; one about a stack member that never moved is", async (t) => {
   t.mock.method(console, "log", () => {});
   const store = await transferStore(t);
   const h = harness(t, { store });
   renamed(h);
-  await h.crashFile(JSON.stringify({ a1: { restarts: 1, restartedAt: "2026-10-10T00:00:00.000Z", resume: { text: "Fix the merge queue drop of pull/419.", issueId: "i1", url: PR } } }));
+  await h.crashFile(JSON.stringify({ a1: { restarts: 1, restartedAt: "2026-01-01T00:00:00.000Z", resume: { text: "Fix the merge queue drop of pull/419.", issueId: "i1", url: PR } } }));
   const calls = await h.poll();
   assert.ok(!calls.some((call) => call.startsWith("prompt a1") && call.includes("Fix the merge queue drop")), calls.join("\n"));
   assert.equal(JSON.parse(await h.crashFile()).a1.resume, null);
+
+  const kept = harness(t);
+  await kept.crashFile(JSON.stringify({ a1: { restarts: 1, restartedAt: "2026-01-01T00:00:00.000Z", resume: { text: "Land the stack member pull/420.", issueId: "i1", url: OTHER } } }));
+  assert.ok((await kept.poll()).some((call) => call.startsWith("prompt a1") && call.includes("Land the stack member")), "a member no record owns is still the agent's");
 });
 
-test("the backstop's saved enqueue of a moved pull request names the ticket that owns it now", async (t) => {
+test("the backstop's saved work on moved pull requests names the ticket that owns them now, after a restart and when a whole range moves", async (t) => {
   t.mock.method(console, "log", () => {});
   const store = await transferStore(t);
+  // TUC-1 owns 420 too (moved to it earlier from ENG-9), besides its primary 419.
+  await store.update({ id: "i9", identifier: "TUC-9" }, { id: "a9", title: "T9", cwd: "/wt/tuc-9" }, { link: ["Pull request", OTHER] });
+  assert.equal(await store.transfer(OTHER, { issueId: "i9", identifier: "TUC-9" }, { issueId: "i1", identifier: "TUC-1" }, "mtuchel/tuc-1-other"), "moved");
   const h = harness(t, { store });
   renamed(h);
-  const action = { id: "x", repo: "tuchel-sohn/tuchel-platform", branch: READY.headBranch, expect: "h", prs: [419], top: 419, tickets: ["TUC-1"], why: "", at: new Date().toISOString(), activityBoundary: null, steps: { enqueue: "refused", prComment: "done", linearComment: "done", note: "done" } };
-  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, actions: [action] } });
+  h.github.views[OTHER] = { ...READY, headSha: "other-head", headBranch: "mtuchel/tuc-1-other", title: MOVED_TITLE, body: "Part of TUC-2.", checks: [failing("PR code")] };
+  h.github.open.push(listed(OTHER, h.github.views[OTHER], MOVED_TITLE));
+  const action = (prs: number[]) => ({ id: `x${prs.join("-")}`, repo: "tuchel-sohn/tuchel-platform", branch: READY.headBranch, expect: "h", prs, top: prs.at(-1), tickets: ["TUC-1"], why: "", at: "2026-01-01T00:00:00.000Z", activityBoundary: null, steps: { enqueue: "refused", prComment: "done", linearComment: "done", note: "done" } });
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, actions: [action([419])] }, [OTHER]: { reviewedAt: null, decision: null, merged: false, actions: [action([419, 420])] } });
   await h.poll();
   const saved = JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"));
   assert.deepEqual(saved[PR].actions[0].tickets, ["TUC-2"]);
+  assert.deepEqual(saved[OTHER].actions[0].tickets, ["TUC-2"], "the old ticket owns neither pull request of the range any more");
+  // A move whose rebind was never saved (a restart right after it) is rebound on the next run.
+  await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, actions: [action([419])] } });
+  await h.restart();
+  await h.poll();
+  assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"))[PR].actions[0].tickets, ["TUC-2"]);
 });

@@ -7,7 +7,7 @@ import { githubCli } from "./github-cli";
 import { githubUsage } from "./github-usage";
 import type { GreptileOutage, RetriggerResult } from "./greptile-outage";
 import { CONTEXT_TOO_LARGE } from "./context";
-import { ownedPullRequests, pullKey, type Handover, type HandoverRecord } from "./handover";
+import { ownedPullRequests, pullKey, type Handover, type HandoverRecord, type PullTransfer } from "./handover";
 import { KnownStates, type KnownState } from "./known-states";
 import { limitError } from "./limit-resume";
 import type { IssueState, IssueStatus, LinearService } from "./linear";
@@ -293,30 +293,40 @@ function onBranch(record: { issueId: string; branch: string | null } | undefined
 }
 
 // The queue backstop's saved enqueues (`actions`) and stack moves (`retarget`) name their tickets
-// by identifier. When a pull request of their range moves from ticket `from` to `to` (see
-// PullRequestWatch.reconcile), `to` joins them, and `from` leaves unless the source still owns
-// another pull request of the range (`kept`, the URLs it still owns): their comments, refusals and
-// instructions then go to the ticket that owns the pull request now.
-function rebind(seenByUrl: Record<string, Seen>, url: string, from: string, to: string, kept: string[]): void {
-  const source = PULL_URL.exec(url);
+// by identifier. Once a pull request of their range moved from ticket `from` to `to` (see
+// PullRequestWatch.reconcile), those saved before the move (`at`) name `to`, and no longer `from`
+// unless the source still owns another pull request of the range (`kept`, the URLs it owns now):
+// their comments, refusals and instructions then go to the ticket that owns the pull request.
+// Applied from the journal on every run (see rebindMoved), so a restart before the state was saved
+// loses nothing, and applying it again changes nothing.
+function rebind(seenByUrl: Record<string, Seen>, move: { url: string; from: string; to: string; at: string }, kept: string[]): void {
+  const source = PULL_URL.exec(move.url);
   if (!source) return;
   const repo = source[1].toLowerCase();
   const moved = Number(source[2]);
+  const before = (at: string) => (Date.parse(at) || 0) <= (Date.parse(move.at) || 0);
   const still = new Set(kept.flatMap((owned) => {
     const found = PULL_URL.exec(owned);
     return found && found[1].toLowerCase() === repo ? [Number(found[2])] : [];
   }));
   const swap = (tickets: string[], prs: number[]): string[] => {
     if (!prs.includes(moved)) return tickets;
-    const rest = prs.some((pr) => pr !== moved && still.has(pr)) ? tickets : tickets.filter((ticket) => ticket.toUpperCase() !== from.toUpperCase());
-    return rest.some((ticket) => ticket.toUpperCase() === to.toUpperCase()) ? rest : [...rest, to];
+    const rest = prs.some((pr) => pr !== moved && still.has(pr)) ? tickets : tickets.filter((ticket) => ticket.toUpperCase() !== move.from.toUpperCase());
+    return rest.some((ticket) => ticket.toUpperCase() === move.to.toUpperCase()) ? rest : [...rest, move.to];
   };
   for (const [key, seen] of Object.entries(seenByUrl)) {
     if (PULL_URL.exec(key)?.[1].toLowerCase() !== repo) continue;
-    for (const action of seen.actions ?? []) action.tickets = swap(action.tickets, action.prs);
-    if (seen.retarget) seen.retarget.tickets = swap(seen.retarget.tickets, [seen.retarget.pr, ...seen.retarget.range.map((member) => member.pr)]);
+    // Messages for the moved pull request routed to the old ticket by name and not sent yet.
+    if (pullKey(key) === pullKey(move.url)) {
+      for (const message of [seen.pending, ...(seen.queued ?? [])]) {
+        if (message?.orphan && !message.sending && message.orphan.tickets.some((ticket) => ticket.toUpperCase() === move.from.toUpperCase())) message.orphan = { tickets: [move.to] };
+      }
+    }
+    for (const action of seen.actions ?? []) if (before(action.at)) action.tickets = swap(action.tickets, action.prs);
+    if (seen.retarget && before(seen.retarget.since)) seen.retarget.tickets = swap(seen.retarget.tickets, [seen.retarget.pr, ...seen.retarget.range.map((member) => member.pr)]);
   }
 }
+
 // A poll's stopped state (see the `stopped` flags in watch): a rate limit or a burnt budget ends
 // the poll's GitHub reads.
 type StopFlags = { paused: RateLimitedError | null; budget: GitHubPausedError | null; throttled: GitHubRateLimitedError | null };
@@ -1077,8 +1087,9 @@ type Crash = { restarts?: number; restartedAt?: string; successor?: boolean; set
 
 // One owner ask about a ticket too large to start any agent (see PullRequestWatch.oversizeHandBack).
 // `body`: the comment of a pending ask, so a poll can finish it once its event was claimed (see
-// finishOversizeAsks); a confirmed ask keeps none.
-type OversizeAsk = { state: "pending" | "confirmed"; issueId: string; at: string; body?: string };
+// finishOversizeAsks); `moved`: the ticket went back to its coding state (or status write-back is
+// off), so finishing it does not move it again. A confirmed ask keeps neither.
+type OversizeAsk = { state: "pending" | "confirmed"; issueId: string; at: string; body?: string; moved?: true };
 
 const oversizeMarker = (key: string) => `<!-- paseo:oversize-start:${key} -->`;
 
@@ -1128,8 +1139,9 @@ export class PullRequestWatch {
     private readonly deps: {
       // `transfer` moves a pull request to the ticket its title and body name (see reconcile);
       // `annotate` records a link or review on a record without an agent; `swapPullRequest`
-      // replaces one pull request a record owns besides its primary one. Absent: none happens.
-      handover: Pick<Handover, "all" | "update"> & Partial<Pick<Handover, "transfer" | "annotate" | "swapPullRequest">>;
+      // replaces one pull request a record owns besides its primary one; `moves` lists the moves
+      // (see rebindMoved). Absent: none happens.
+      handover: Pick<Handover, "all" | "update"> & Partial<Pick<Handover, "transfer" | "annotate" | "swapPullRequest" | "moves">>;
       sessions: Pick<SessionRouter, "sessionFor" | "say" | "prompt" | "link" | "crashed" | "succeed" | "whileIdle">;
       // `issueState` finds a ticket that has no handover record by its identifier. Crash recovery
       // checks a crashed agent's ticket with `issueStatusAnyPool`, and keeps the states of all
@@ -1673,10 +1685,6 @@ export class PullRequestWatch {
           if (result !== "moved") continue;
           moved = true;
           this.transferNotes.delete(url);
-          // Messages routed to the old ticket by name and not sent yet go to the new one.
-          for (const message of [seen?.pending, ...(seen?.queued ?? [])]) if (message?.orphan && !message.sending) message.orphan = { tickets: [target.identifier] };
-          // So do the backstop's saved enqueues and stack moves that name it (see rebind).
-          rebind(seenByUrl, url, record.identifier, target.identifier, ownedPullRequests(record).filter((owned) => pullKey(owned) !== pullKey(url)));
           await this.deps.linear.linkUrl(target.id, url, "Pull request").catch((error: unknown) => console.error(`[linear-tickets] ${target.identifier}: linking ${url} failed: ${error instanceof Error ? error.message : error}`));
           console.log(`[linear-tickets] ${url} (${pullKey(url)}) moved from ${record.identifier} to ${target.identifier}: its title and description name only ${target.identifier}`);
         } catch (error) {
@@ -1702,6 +1710,22 @@ export class PullRequestWatch {
     console.log(`[linear-tickets] ${note}`);
   }
 
+  // Every journaled move (Handover.moves) rebinds what this host saved for the old ticket (see
+  // rebind), with the source's ownership as it is now, so several moves of one range in one poll
+  // and a restart before the state was saved both end the same way. `all`: the records as they
+  // are now. A failed journal read is logged; the next run rebinds. Returns the moves.
+  private async rebindMoved(seenByUrl: Record<string, Seen>, all: HandoverRecord[]): Promise<PullTransfer[]> {
+    const moves = await this.deps.handover.moves?.().catch((error: unknown) => {
+      console.error(`[linear-tickets] reading the moved pull requests failed: ${error instanceof Error ? error.message : error}`);
+      return [];
+    }) ?? [];
+    for (const move of moves) {
+      const source = all.find((record) => record.issueId === move.from.issueId);
+      rebind(seenByUrl, { url: move.url, from: move.from.identifier, to: move.to.identifier, at: move.at }, source ? ownedPullRequests(source) : []);
+    }
+    return moves;
+  }
+
   private async watch(): Promise<void> {
     const seenByUrl = await this.load();
     this.crashes = await readFile(this.crashPath, "utf8").then((text) => JSON.parse(text) as Record<string, Crash>, () => ({}));
@@ -1717,6 +1741,8 @@ export class PullRequestWatch {
     const listed = new Map<string, Promise<OpenPull[]>>();
     // Pull requests move to the ticket their title and body name before anything is routed.
     const { records: all, held } = await this.reconcile(await this.deps.handover.all(), this.context([], listed), seenByUrl);
+    // What this host saved for a moved pull request's old ticket follows it (see rebindMoved).
+    const moves = await this.rebindMoved(seenByUrl, all);
     // One poll watches one host's tickets (see ownership): another host's records stay here
     // untouched, so their pull requests are not read, routed, nudged or succeeded from this host.
     const mine = await this.ownedRecords(all);
@@ -1801,7 +1827,7 @@ export class PullRequestWatch {
     // A Done ticket whose stack has not landed goes back to work first, so its agent's crash is
     // restarted like any started ticket's in the same poll (see reopenDone).
     await this.reopenDone(mine, states, reserved, context, seenByUrl, stopped);
-    await this.crashPass(mine, states, reserved, seenByUrl, views);
+    await this.crashPass(mine, states, reserved, seenByUrl, views, moves);
     // Stalled pull requests are nudged, and closed ones followed to their replacement, after every
     // drop was handled: a drop's fix request comes first when both are for the same agent.
     const nudges: { record: HandoverRecord; url: string; view: PullRequestView }[] = [];
@@ -2191,6 +2217,7 @@ export class PullRequestWatch {
     const records = await this.ownedRecords(all);
     // Routing, stack ownership and pending messages see every pull request a record owns.
     const context = this.context(this.perPullRequest(records, new Set()), undefined, all);
+    await this.rebindMoved(seenByUrl, all);
     const save = () => this.save(seenByUrl);
     // Whether this host runs the repo-wide half of the backstop (see backstopHost).
     const repoWide = await this.backstopHost();
@@ -3274,10 +3301,10 @@ export class PullRequestWatch {
   // as `crash-recovery`; the reload and the resume need no Linear call. A failure for one agent, a
   // refused Linear request included, is logged and the pass goes on with the next agent.
   // `states`: the poll's one batch read of the tickets' states (see observeStates), shared with the
-  // stack policy's pass.
-  private async crashPass(all: HandoverRecord[], states: Map<string, IssueStatus> | null, reserved: Set<string>, seenByUrl: Record<string, Seen>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
+  // stack policy's pass. `moves`: the journaled pull request moves (see rebindMoved).
+  private async crashPass(all: HandoverRecord[], states: Map<string, IssueStatus> | null, reserved: Set<string>, seenByUrl: Record<string, Seen>, views: Map<string, Promise<PullRequestView>>, moves: PullTransfer[]): Promise<void> {
     await withPriority("interactive", "crash-recovery", async () => {
-      await this.pendingResumes(all, reserved);
+      await this.pendingResumes(all, reserved, moves);
       await this.crashedAgents(all, reserved, seenByUrl, views);
     });
   }
@@ -3567,9 +3594,11 @@ export class PullRequestWatch {
   // Resumes a restart left pending (see Crash), before anything else is sent: once the agent takes
   // a message, the resume goes out and is cleared after the send (a resume can arrive twice). It is
   // dropped unsent once it no longer applies: the ticket's record names another agent or is
-  // archived, the agent is gone, or the ticket is not started. Sent on a state Paseo last saw, it
-  // starts with the line to check the ticket first (unverifiedResume).
-  private async pendingResumes(all: HandoverRecord[], reserved: Set<string>): Promise<void> {
+  // archived, the agent is gone, the ticket is not started, or the pull request it is about moved
+  // to another ticket after the restart saved it (its last journaled move, see reconcile; a stack
+  // member that never moved stays the agent's). Sent on a state Paseo last saw, it starts with the
+  // line to check the ticket first (unverifiedResume).
+  private async pendingResumes(all: HandoverRecord[], reserved: Set<string>, moves: PullTransfer[]): Promise<void> {
     for (const [agentId, crash] of Object.entries(this.crashes)) {
       const resume = crash.resume;
       if (!resume || reserved.has(agentId)) continue;
@@ -3578,7 +3607,8 @@ export class PullRequestWatch {
       try {
         const state = record ? await this.ticketState(record) : null;
         if (record && !state) continue;
-        const moved = record && resume.url && !ownedPullRequests(record).some((owned) => pullKey(owned) === pullKey(resume.url!));
+        const last = resume.url ? moves.find((move) => pullKey(move.url) === pullKey(resume.url!)) : undefined;
+        const moved = record && last && last.to.issueId !== record.issueId && (Date.parse(last.at) || 0) >= (Date.parse(crash.restartedAt ?? "") || 0);
         if (!record || !state || state.statusType !== "started" || moved) {
           if (moved) console.log(`[linear-tickets] ${label}: the resume for restarted agent ${agentId.slice(0, 8)} is about ${resume.url}, which moved to another ticket; it is not sent`);
           else console.error(`[linear-tickets] ${label}: the resume for restarted agent ${agentId.slice(0, 8)} no longer applies; it is not sent`);
@@ -3774,8 +3804,8 @@ export class PullRequestWatch {
     const key = oversizeKey(record);
     const marker = oversizeMarker(key);
     const asks = await this.oversizeAsks();
-    const save = async (state: OversizeAsk["state"], body?: string) => {
-      asks[key] = { state, issueId: record.issueId, at: new Date(this.clock()).toISOString(), ...(body ? { body } : {}) };
+    const save = async (state: OversizeAsk["state"], body?: string, moved?: true) => {
+      asks[key] = { state, issueId: record.issueId, at: new Date(this.clock()).toISOString(), ...(body ? { body } : {}), ...(moved ? { moved } : {}) };
       await writeState(this.oversizePath, asks);
     };
     if (asks[key]?.state === "confirmed") {
@@ -3800,6 +3830,7 @@ export class PullRequestWatch {
     await save("pending", body);
     await this.dropResume(record.agentId);
     if ((await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(record.issueId, CODING_STATE);
+    await save("pending", body, true);
     await dispatch();
     await owned();
     await this.mention(record.issueId, `${body}\n\n${marker}`);
@@ -3808,8 +3839,9 @@ export class PullRequestWatch {
 
   // Pending asks whose event was already claimed (a restart, or a failure, between the claim and
   // the comment) are finished on every poll, by this host only for the tickets it owns (none while
-  // that cannot be told): found by their marker, else posted, then confirmed. A failure is logged
-  // and the next poll tries again.
+  // that cannot be told): the ticket back to its coding state unless that happened already (with
+  // status write-back on), then the comment, found by its marker or else posted, then confirmed.
+  // A failure is logged and the next poll tries again.
   private async finishOversizeAsks(): Promise<void> {
     const asks = await this.oversizeAsks();
     const pending = Object.entries(asks).filter(([, ask]) => ask.state === "pending" && typeof ask.body === "string");
@@ -3820,6 +3852,7 @@ export class PullRequestWatch {
       if (!owners?.has(ask.issueId)) continue;
       try {
         const marker = oversizeMarker(key);
+        if (!ask.moved && (await this.deps.settings.read()).writeback.status) await this.deps.linear.moveToStateNamed(ask.issueId, CODING_STATE);
         if (!(await this.deps.linear.hasComment(ask.issueId, marker))) await this.mention(ask.issueId, `${ask.body}\n\n${marker}`);
         asks[key] = { state: "confirmed", issueId: ask.issueId, at: new Date(this.clock()).toISOString() };
         await writeState(this.oversizePath, asks);

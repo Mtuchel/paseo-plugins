@@ -275,6 +275,12 @@ export class Handover {
     return last && last.to.issueId !== issueId ? last.to.identifier : null;
   }
 
+  // Each pull request's last move, applied to both records (see transfer): what the pull request
+  // watch rebinds its own saved work by.
+  moves(): Promise<PullTransfer[]> {
+    return this.serialize(async () => Object.values(await this.journal()).filter((entry) => entry.state === "completed"));
+  }
+
   // A record without an agent (see transfer) gets its pull request's link or review state; the
   // record otherwise stays as it is until an agent takes it over.
   annotate(issueId: string, change: { link?: [string, string]; review?: string }): Promise<void> {
