@@ -5,11 +5,15 @@ import type { RpcInput } from "@getpaseo/plugin";
 import type { launchAgentRpc, TicketDetail } from "../shared/contracts";
 import { Dispatcher } from "./dispatch";
 import { Launcher } from "./launch";
-import { MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter } from "./starter";
+import { MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter, WAITING_PLAN_REASON } from "./starter";
 import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE } from "./plan-policy";
 import type { LabeledIssue } from "./linear";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ParkedPlans } from "./parked";
 
 const baseSettings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false,
@@ -145,6 +149,34 @@ test("a ticket that already has an active agent is linked, not launched twice", 
   assert.equal(launches.length, 0);
   assert.deepEqual([...linear.labels.get("eng-1")!], ["paseo-running"]);
   assert.equal(dispatcher.snapshot().recent[0].outcome, "linked");
+});
+
+test("a ticket whose plan waits for the owner starts nothing: its trigger label is consumed even while focus holds it, and starts wait until the plan is decided", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "dispatch-parked-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const parked = new ParkedPlans(directory);
+  await parked.put({ issueId: "eng-1", identifier: "ENG-1", agentId: "planner-1", plan: "# Plan", line: "", reasons: [], model: null, parkedAt: "2026-01-01T00:00:00Z", announced: true });
+  const linear = new FakeLinear({ "eng-1": ["paseo"], "eng-2": ["paseo"] });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const launches: string[] = [];
+  const starter = new TicketStarter({
+    linear, parked,
+    launcher: { start: async (input) => { launches.push(input.id); return { agentId: `agent-${input.id}`, warnings: [] }; } },
+    branches: async () => ({ branches: [{ id: "refs/heads/dev", label: "dev" }], defaultBranch: "refs/heads/dev" }),
+  });
+  // Focus mode holds ENG-1: once it ends, a held label would start a second planner.
+  const focus = { admits: async (issueId: string) => issueId === "eng-1" ? "outside focus" : null };
+  const dispatcher = new Dispatcher({ linear, starter, launcher: new Launcher(linear as never), settings: { read: async () => baseSettings }, focus, parked });
+  dispatcher.attach(fakePaseo());
+  await dispatcher.tick();
+  assert.deepEqual(launches, ["eng-2"]);
+  assert.deepEqual([...linear.labels.get("eng-1")!], [], "the owner's decision starts the next agent, not the label");
+  assert.deepEqual(dispatcher.snapshot().recent.map((item) => `${item.identifier} ${item.outcome}`), ["ENG-2 launched", "ENG-1 linked"]);
+  // Every other start path (a queued thread, a restart, a forwarded activation) asks admission.
+  assert.deepEqual(await starter.admission("eng-1", fakePaseo(), baseSettings), { ok: false, reason: WAITING_PLAN_REASON });
+  // The decision unparks the plan last; its queued thread is admitted from then on.
+  await parked.remove("eng-1");
+  assert.equal((await starter.admission("eng-1", fakePaseo(), baseSettings)).ok, true);
 });
 
 test("when the claim cannot be written nothing launches and the ticket keeps its trigger label", async (t) => {

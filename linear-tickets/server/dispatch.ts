@@ -4,6 +4,7 @@ import type { ActivationSink } from "./activation";
 import type { LabelRepair } from "./label-repair";
 import type { Launcher } from "./launch";
 import type { Focus } from "./focus";
+import type { ParkedPlans } from "./parked";
 import type { LabeledIssue, LinearService } from "./linear";
 import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
 import type { CommentRelay } from "./relay";
@@ -47,6 +48,9 @@ type Deps = {
   // Focus mode (README, "Focus mode"): a labelled ticket outside focus keeps its label and waits,
   // a group included (its hand-out would start new work).
   focus?: Pick<Focus, "admits">;
+  // Parked plans (README, "Parked plans"): the owner's decision on a waiting plan starts the
+  // ticket's next agent, so its trigger label is consumed instead of starting a second planner.
+  parked?: Pick<ParkedPlans, "has">;
 };
 
 // The labels a dispatched ticket moves through, derived from the trigger label so a
@@ -228,6 +232,12 @@ export class Dispatcher {
     const { linear } = this.deps;
     const trigger = settings.dispatch.label;
     const labels = dispatchLabels(trigger);
+    // Before focus: a label focus mode only holds would start a second planner once focus ends.
+    if (this.deps.parked && await this.deps.parked.has(issue.id)) {
+      await linear.removeLabel(issue.id, trigger, issue.labels);
+      this.record(issue.identifier, "linked", "a plan for it waits for your decision in Plannotator; your decision starts the next agent");
+      return;
+    }
     // A ticket outside focus waits with its label (README, "Focus mode"), before anything is read.
     if (await this.deps.focus?.admits(issue.id, paseo)) return;
     // A ticket with open sub-issues goes to Paseo as a group (README, "Groups"): its thread hands
