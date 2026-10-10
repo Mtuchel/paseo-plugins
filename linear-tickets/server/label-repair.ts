@@ -3,6 +3,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { ActivationIntake } from "./activation-intake";
 import { dispatchLabels, type DispatchLabels } from "./dispatch";
 import { SetupError, type Launcher } from "./launch";
+import type { Focus } from "./focus";
 import { LinearApiError, type LinearService, type RepairCandidate } from "./linear";
 import { CODING_STATE, PLANNING_STATE } from "./plannotator";
 import { type ProcessInspector } from "./process-liveness";
@@ -75,6 +76,8 @@ type Deps = {
   now?: () => number;
   // Provider-process inspection for ghost agents; the tests inject a fake process table.
   inspect?: ProcessInspector;
+  // Focus mode (README, "Focus mode"): a ticket outside focus waits before its restart is claimed.
+  focus?: Pick<Focus, "admits">;
 };
 
 type Names = DispatchLabels & { trigger: string };
@@ -115,6 +118,8 @@ export class LabelRepair {
   private lastBlockerPoll = 0;
   private lastError: string | null = null;
   private lastBlockerError: string | null = null;
+  // Tickets whose restart waits for focus mode, so the wait is logged once, not on every pass.
+  private readonly focusWaits = new Set<string>();
 
   constructor(private readonly deps: Deps) {}
 
@@ -373,6 +378,15 @@ export class LabelRepair {
       return;
     }
     if (pass.restarted) return;
+    // Focus mode refuses the ticket: it waits unclaimed (no attempt, no record step, nothing in
+    // Linear) and starts at the first pass after focus admits it.
+    const unfocused = await this.deps.focus?.admits(ticket.id, paseo);
+    if (unfocused) {
+      if (!this.focusWaits.has(ticket.id)) console.log(`[linear-tickets] ${ticket.identifier}: label repair: its restart waits until focus admits it: ${unfocused}`);
+      this.focusWaits.add(ticket.id);
+      return;
+    }
+    this.focusWaits.delete(ticket.id);
     pass.restarted = true;
     // `-failed` is still on the ticket unless this pass removed it with the running label.
     await this.attempt(paseo, ticket, record, names, failed && !record.cleared);

@@ -1273,7 +1273,8 @@ meanwhile joins it within 5 minutes; while Linear cannot be
 read, the last set read decides, and before the first read only the tickets in flight start. The
 check is part of admission, so it applies to every automatic start path: the label dispatch, a
 group's hand-out, assignments and their threads, a successor for pull-request reviews or
-failing checks, the watchdog's recoveries, the label repair, activations forwarded by a draining
+failing checks, the watchdog's recoveries, the label repair (before it claims a restart),
+activations forwarded by a draining
 host, and the projects. A project starts no new planner run (Plan by hand still does; a run
 already planning finishes) and hands out or restarts only tickets in focus. Everything else waits
 exactly like a blocked ticket, with its label, thread or assignment kept and the reason
@@ -1509,6 +1510,11 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
     Needs input or review, or got an agent, a claim or a queued activation meanwhile is not
     started. Tickets carrying the trigger label (the dispatch has them), groups
     and tickets being deleted are left alone.
+  - While **Focus mode** is on, a ticket outside focus is not restarted, and its restart is not
+    claimed: it does not count toward the three, adds no step to the incident and writes nothing
+    to Linear (the stale label still comes off). The wait is logged once (again after a reload), and the ticket is
+    restarted at the first pass after focus admits it; it does not take the pass's one restart
+    from a ticket in focus.
   - Each incident is kept under `~repairs` in `projects.json` with its last ten steps. A restart
     and a comment are claimed there before they happen, so a reload never doubles one and never
     resets the count; an interrupted restart counts once 15 minutes passed without an agent. An
