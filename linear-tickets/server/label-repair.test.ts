@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import { Dispatcher } from "./dispatch";
+import { FOCUS_REASON } from "./focus";
 import { LabelRepair, type RepairRecord } from "./label-repair";
 import { Launcher, SetupError } from "./launch";
 import { LinearApiError, type IssueState, type LabeledIssue, type RepairCandidate } from "./linear";
@@ -56,6 +57,9 @@ async function world(t: TestContext, options: { label?: string; pageSize?: numbe
   const claims = new Set<string>();
   const pending = new Set<string>();
   const intakeState = { ready: true as boolean | Error };
+  // Tickets focus mode refuses; restartFor's admission refuses them too.
+  const unfocused = new Set<string>();
+  const focus = { admits: async (id: string) => unfocused.has(id) ? FOCUS_REASON : null };
   const fail = { comment: false, remove: 0 };
   let created = 0;
   const byId = (id: string) => tickets.get(id)!;
@@ -98,6 +102,7 @@ async function world(t: TestContext, options: { label?: string; pageSize?: numbe
     restarts.push(identifier);
     const gate = launcher.gate(issueId);
     if (!gate) return { kind: "deferred", reason: "A launch for this ticket is under way." };
+    if (unfocused.has(issueId)) { gate.release(); return { kind: "deferred", reason: FOCUS_REASON }; }
     try {
       const refused = await restartOptions.eligible?.();
       if (refused) return { kind: "deferred", reason: refused };
@@ -111,10 +116,10 @@ async function world(t: TestContext, options: { label?: string; pageSize?: numbe
       gate.release();
     }
   };
-  const make = () => new LabelRepair({ linear, store, launcher, intake, restart, now: () => now, inspect: options.inspect });
+  const make = () => new LabelRepair({ linear, store, launcher, intake, restart, focus, now: () => now, inspect: options.inspect });
   let repair = make();
   return {
-    tickets, agents, calls, comments, restarts, outcomes, claims, pending, intakeState, fail, store, launcher, linear, paseo,
+    tickets, agents, calls, comments, restarts, outcomes, claims, pending, intakeState, unfocused, fail, store, launcher, linear, paseo,
     get repair() { return repair; },
     settings: () => settings,
     setSettings: (next: PluginSettings) => { settings = next; },
@@ -249,6 +254,37 @@ test("Planning and In Progress restart; one restart per pass", async (t) => {
   assert.ok(w.calls.includes("TUC-2 -paseo-running"));
   await w.at(18);
   assert.deepEqual(w.restarts, ["TUC-1", "TUC-2"]);
+});
+
+test("a ticket focus mode refuses waits unclaimed and silent, leaves the pass's restart to a ticket in focus, and restarts once admitted", async (t) => {
+  const w = await world(t);
+  const log = t.mock.method(console, "log", () => {});
+  const lines = () => log.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes("TUC-1:"));
+  w.add(1, ["paseo-running"]);
+  w.add(2, ["paseo-running"]);
+  w.unfocused.add("i1");
+  await w.at(0);
+  await w.at(16);
+  assert.deepEqual(w.restarts, ["TUC-2"], "the ticket in focus takes the pass's restart");
+  const calls = [...w.calls];
+  const comments = [...w.comments];
+  const steps = (await w.record())?.log;
+  const logged = lines().length;
+  for (const minutes of [18, 20, 22, 24]) await w.at(minutes);
+  assert.deepEqual(w.restarts, ["TUC-2"], "no restart while focus refuses it");
+  assert.deepEqual([w.calls, w.comments], [calls, comments], "nothing written to Linear while it waits");
+  const record = await w.record();
+  assert.deepEqual([record?.state, record?.attempts, record?.log], ["watching", 0, steps], "no claim, the incident log does not grow");
+  assert.equal(lines().length, logged, "nothing logged on the passes it waits");
+  assert.equal(lines().filter((line) => line.includes("Focus mode is on")).length, 1, "the wait is logged once");
+  assert.ok(!lines().some((line) => /restart 1 of 3/.test(line)));
+
+  w.unfocused.delete("i1");
+  await w.at(26);
+  assert.deepEqual(w.restarts, ["TUC-2", "TUC-1"], "the first pass after focus admits it restarts it");
+  const restarted = await w.record();
+  assert.deepEqual([restarted?.state, restarted?.attempts], ["resolved", 1]);
+  assert.ok(restarted?.log.some((step) => step.action === "restart 1 of 3"));
 });
 
 test("a vanished agent is restarted at most three times, 15 minutes apart; a no-start gives the attempt back; a reload keeps the count", async (t) => {

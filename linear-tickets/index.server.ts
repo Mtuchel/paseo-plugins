@@ -209,7 +209,7 @@ export default function contribute(server: PluginServerContext) {
     }, restart: async (issueId, identifier) => restartOrThrow(await sessions.restartFor(issueId, identifier)), accountedFor: async (issueId) => launcher.underWay(issueId) || await sessions.threadHolds(issueId) });
   // Stale `-running` and `-failed` labels are reconciled, and their tickets started again (README,
   // "Repairing stale running and failed labels"); its records share projects.json with the projects.
-  const labelRepair = new LabelRepair({ linear, store: projectStore, launcher, intake, deletions, restart: (issueId, identifier, options) => sessions.restartFor(issueId, identifier, options) });
+  const labelRepair = new LabelRepair({ linear, store: projectStore, launcher, intake, deletions, focus, restart: (issueId, identifier, options) => sessions.restartFor(issueId, identifier, options) });
   const relay = new CommentRelay(linear, undefined, needsYou, route, replies);
   const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, repairs: labelRepair, focus });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
