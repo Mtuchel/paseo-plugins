@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { meteredArgs, meterShape, splitIncluded, responseOf } from "./gh-meter-core.mjs";
+import { meteredArgs, meterShape, splitIncluded, responseOf } from "../server/gh-meter-core.mjs";
 
 const METER = fileURLToPath(new URL("./gh-meter.mjs", import.meta.url));
 const root = mkdtempSync(join(tmpdir(), "gh-meter-"));

@@ -2782,8 +2782,11 @@ caller, from GitHub's answers, in day files that a report merges across hosts (T
   it starts (`tools/ci/*.mjs` from the queue backstop: the plugin writes the wrapper
   `$PASEO_HOME/linear-tickets/gh-meter/gh` at start and puts its directory first on the scripts'
   `PATH`; it runs `scripts/gh-meter.mjs`, which runs the real `gh`, the gh guard or the account
-  router behind it, with the same arguments, stdin, stderr, exit code and signals). Agents' own
-  `gh` calls are not metered.
+  router behind it, with the same arguments, stdin, stderr, exit code and signals). The plugin
+  finds that script in the checkout behind the plan-first extension's link (**The omp extension**
+  in [Native Linear agent](#native-linear-agent)), as
+  the planning smoke check does; without the link it writes no wrapper, logs that the repo
+  scripts run `gh` unmetered, and they do. Agents' own `gh` calls are not metered.
 - **Responses are read only where gh prints them untransformed:** `gh api` without `--jq`,
   `--template`, `--slurp`, `--silent`, `--paginate` (gh joins the pages differently with
   `--include`) or a non-JSON `Accept`. The meter adds `--include`, reads the status line and the

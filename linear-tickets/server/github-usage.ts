@@ -1,15 +1,15 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { accessSync, constants, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 import { hostname } from "node:os";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { accountOf, appendUsage, meteredArgs, meterShape, METER_ENV, responseOf, splitIncluded, usageDir, withoutDir, type AccountBasis, type UsageResponse } from "../scripts/gh-meter-core.mjs";
+import { accountOf, appendUsage, meteredArgs, meterShape, METER_ENV, responseOf, splitIncluded, usageDir, withoutDir, type AccountBasis, type UsageResponse } from "./gh-meter-core.mjs";
 import { githubCli, githubRouted } from "./github-cli";
 import { currentCallerName } from "./linear-usage";
+import { locatePluginScript } from "./planning-smoke";
 import { paseoHome } from "./ticket-mcp";
 
 const exec = promisify(execFile);
@@ -19,7 +19,6 @@ const exec = promisify(execFile);
 // (scripts/github-usage-report.mjs) can tell what spends the bot account's budget.
 export const RETENTION_DAYS = 14;
 const DAY_MS = 24 * 60 * 60 * 1000;
-const METER_SCRIPT = fileURLToPath(new URL("../scripts/gh-meter.mjs", import.meta.url));
 
 // The poll or backstop run a call belongs to, with its size (how much work it covered), so cost
 // per unit of work can be compared across days.
@@ -45,6 +44,8 @@ export class GitHubUsage {
     cli?: () => string;
     routed?: () => boolean;
     now?: () => number;
+    // The meter script; by default the checkout's scripts/gh-meter.mjs (see locatePluginScript).
+    script?: string | null;
   } = {}) {}
 
   get dir(): string {
@@ -160,20 +161,39 @@ export class GitHubUsage {
     };
   }
 
-  private wrapper(): string {
+  // The wrapper names its own directory, so a `gh` started without scriptEnv (gt, git's
+  // credential helper) still finds the gh behind the meter instead of the wrapper again.
+  private wrapper(script: string): string {
     const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-    return `#!/bin/sh\n# Written by the linear-tickets plugin (README, "GitHub usage").\nexec ${quote(nodeBinary())} ${quote(METER_SCRIPT)} "$@"\n`;
+    return `#!/bin/sh\n# Written by the linear-tickets plugin (README, "GitHub usage").\n${METER_ENV.meterDir}=${quote(this.meterDir)} exec ${quote(nodeBinary())} ${quote(script)} "$@"\n`;
   }
 
-  private installed = false;
+  private installed: string | null = null;
 
-  // Writes the wrapper `<meterDir>/gh`; checked before each script start, rewritten when gone.
-  install(): void {
+  // Writes the wrapper `<meterDir>/gh`; checked before each script start, rewritten when gone or
+  // when the checkout's meter script moved. Without a meter script (no plan-first extension link)
+  // or a wrapper that cannot be written it removes the wrapper and answers false: the scripts then
+  // run their gh unmetered, never a broken one.
+  install(): boolean {
     const path = join(this.meterDir, "gh");
-    if (this.installed && existsSync(path)) return;
-    mkdirSync(this.meterDir, { recursive: true, mode: 0o700 });
-    writeFileSync(path, this.wrapper(), { mode: 0o755 });
-    this.installed = true;
+    const located = this.options.script === undefined ? locatePluginScript("gh-meter.mjs") : this.options.script;
+    const script = located && existsSync(located) ? located : null;
+    try {
+      if (!script) {
+        rmSync(path, { force: true });
+        this.installed = null;
+        return false;
+      }
+      if (this.installed === script && existsSync(path)) return true;
+      mkdirSync(this.meterDir, { recursive: true, mode: 0o700 });
+      writeFileSync(path, this.wrapper(script), { mode: 0o755 });
+      this.installed = script;
+      return true;
+    } catch {
+      this.installed = null;
+      try { rmSync(path, { force: true }); } catch {}
+      return false;
+    }
   }
 
   // Day files older than RETENTION_DAYS go.
@@ -188,11 +208,7 @@ export class GitHubUsage {
   }
 
   start(): void {
-    try {
-      this.install();
-    } catch (error) {
-      console.error(`[linear-tickets] GitHub usage meter: the gh wrapper could not be written: ${error instanceof Error ? error.message : error}`);
-    }
+    if (!this.install()) console.error("[linear-tickets] GitHub usage meter: no gh wrapper (scripts/gh-meter.mjs not found through the plan-first extension link, or not writable); repo scripts run gh unmetered.");
     void this.prune();
     this.pruneTimer ??= setInterval(() => { void this.prune(); }, DAY_MS);
     this.pruneTimer.unref?.();

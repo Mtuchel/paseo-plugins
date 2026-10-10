@@ -21,12 +21,16 @@ export type SmokeRunner = (script: string, signal: AbortSignal) => Promise<Smoke
 // The plugin runs as a bundle evaluated from memory, so it does not know its own directory. The
 // checkout is found through the plan-first extension's link into omp (README, "The omp
 // extension"), the same checkout whose plan-first code the agents run.
-export function locateSmokeScript(home = homedir()): string | null {
+export function locatePluginScript(name: string, home = homedir()): string | null {
   try {
-    return join(dirname(dirname(realpathSync(join(home, ".omp", "agent", "extensions", "linear-tickets-plan-first.ts")))), "scripts", "planning-smoke.mjs");
+    return join(dirname(dirname(realpathSync(join(home, ".omp", "agent", "extensions", "linear-tickets-plan-first.ts")))), "scripts", name);
   } catch {
     return null;
   }
+}
+
+export function locateSmokeScript(home = homedir()): string | null {
+  return locatePluginScript("planning-smoke.mjs", home);
 }
 
 // Executor form: the plugin's TypeScript lib predates Promise.withResolvers.
