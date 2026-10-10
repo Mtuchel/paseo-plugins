@@ -136,6 +136,8 @@ async function linear(query, variables) {
 
 // The issue a tool acts on: this agent's ticket, or another one by identifier (ENG-123) or ID.
 const ISSUE = "query ticket($id: String!) { issue(id: $id) { id identifier title url description priorityLabel state { name type } assignee { name } project { id name } parent { identifier title } labels(first: 20) { nodes { name } } team { id key name states(first: 50) { nodes { id name type position } } } comments(first: 50) { nodes { body createdAt user { name } } } attachments(first: 20) { nodes { title url } } children(first: 50) { nodes { identifier title state { name } } } relations(first: 50) { nodes { type relatedIssue { identifier title } } } inverseRelations(first: 50) { nodes { type issue { identifier title } } } } }";
+// One page of an issue's comments; get_ticket and get_issue only carry the recent ones.
+const COMMENTS = "query comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { identifier comments(first: $first, after: $after) { nodes { id body createdAt url user { name } } pageInfo { hasNextPage endCursor } } } }";
 
 function reference(value) {
   if (value === undefined) return issueId;
@@ -293,6 +295,24 @@ const tools = [
         subIssues: ((issue.children && issue.children.nodes) || []).map((c) => ({ identifier: c.identifier, title: c.title, status: c.state ? c.state.name : null })),
         relations: relationsOf(issue), description: issue.description, comments, links: (issue.attachments && issue.attachments.nodes) || [],
         scope, youMay: ALLOWED[scope],
+      };
+    },
+  },
+  {
+    name: "get_comments",
+    description: "Read the full comment history of this agent's Linear ticket, or of another issue (issue), 50 comments per page, including comments the launch snapshot left out. Pass the returned nextCursor as cursor to read the next page.",
+    inputSchema: { type: "object", properties: { issue: ISSUE_PROPERTY, cursor: { type: "string", minLength: 1, maxLength: 500, description: "nextCursor of the previous page; omit for the first page." } }, additionalProperties: false },
+    annotations: { readOnlyHint: true },
+    async run(input) {
+      const after = input.cursor === undefined ? null : text(input.cursor, "cursor", 500);
+      const data = await linear(COMMENTS, { id: reference(input.issue), first: 50, after });
+      if (!data.issue) throw new Error(input.issue === undefined ? "Linear did not return this ticket. Check that the host's Linear connection can see it." : "Linear did not return " + input.issue + ".");
+      const page = data.issue.comments || {};
+      const info = page.pageInfo || {};
+      return {
+        issue: data.issue.identifier,
+        comments: (page.nodes || []).map((c) => ({ id: c.id, author: c.user ? c.user.name : null, createdAt: c.createdAt, url: c.url, body: c.body })),
+        nextCursor: info.hasNextPage === true && typeof info.endCursor === "string" && info.endCursor ? info.endCursor : null,
       };
     },
   },

@@ -185,8 +185,21 @@ work. Status changes arrive the same way: a compact **Status changes** line (for
 "Todo → In Progress → Done (currently Done)") and the raw state-history spans in the JSON
 snapshot. The JSON response is preserved in the prompt, including the description and any
 returned links. Linked documents and attachments are not downloaded. If comments
-are unavailable, the preview and agent prompt say so. Context over 200,000 characters
-is rejected rather than silently truncated.
+are unavailable, the preview and agent prompt say so.
+
+**Long tickets.** The snapshot holds 200,000 characters. A ticket over that still starts: the
+plugin's own status cards (Paseo progress, final reports, "Please reply with an option" stubs,
+the agent-thread stub) are left out first, oldest first; if it is still over, the oldest real
+comments follow, one whole comment at a time, until the snapshot and its notice fit. The
+description, labels, links, relations, state history and the newest real comment always stay,
+and no comment is ever cut in the middle. The preview and the prompt then say under **Context
+limitations** how many comments were left out (status cards and real ones), from which period
+("date unavailable" without dates), and that `get_comments` reads them; the JSON snapshot
+carries the same facts in `omittedComments`, including the Linear uploads of the omitted
+comments, so the attachment download still saves them. Nothing is deleted in Linear. A ticket
+that cannot fit even then (a description over the limit, or a newest comment that alone is too
+long) fails as before: "This ticket and its comments are too large to send in one prompt
+(200,000 characters maximum)."
 
 **Finished blockers.** When a ticket starts after blockers that are finished (see *Waiting their turn*), its prompt gets a
 **Finished blockers** section after the instructions: for each one, its links (pull requests,
@@ -307,6 +320,8 @@ agent's own ticket):
 - `get_issue` — any issue: text, status, project, labels, parent, sub-issues, relations,
   comments, links, and what the agent may change on it;
 - `search_issues` — full-text search over all issues;
+- `get_comments` — an issue's full comment history, 50 per page (pass the returned `nextCursor`
+  as `cursor`), including the comments a long ticket's snapshot left out;
 - `add_comment` — post a Markdown comment, on any issue;
 - `set_status` — move the ticket (or an issue the agent created) to another state of its team by
   name; a canceled or duplicate state needs a `reason`, posted on the issue before the move;

@@ -10,7 +10,7 @@ import { paseoHome } from "./ticket-mcp";
 const PERIOD = 3_600_000;
 const MAX_POINTS = 10_000;
 const MAX_BODY = 1024 * 1024;
-const TOOLS: Record<string, true> = { get_ticket: true, get_issue: true, search_issues: true, add_comment: true,
+const TOOLS: Record<string, true> = { get_ticket: true, get_issue: true, get_comments: true, search_issues: true, add_comment: true,
   set_status: true, link_url: true, add_relation: true, create_issue: true, update_issue: true, add_manual_task: true };
 const UNAVAILABLE = "The host's Linear budget service is unavailable; no request was sent. Retry after the plugin is running.";
 const UNKNOWN = "The Linear request may have completed; check the ticket before retrying a write.";

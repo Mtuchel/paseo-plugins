@@ -1,4 +1,5 @@
 import { LINEAR_ACCESS_NOTE, NO_LINEAR_ACCESS_NOTE, type Issue, type RelatedTicket, type TicketDetail, type TicketRelations } from "../shared/contracts";
+import { uploadReferences } from "./attachments";
 export function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Linear returned an unexpected response.");
@@ -214,14 +215,103 @@ function snapshotIssue(context: string): unknown {
   } catch { return undefined; }
 }
 
-export function buildContext(issueData: unknown, comments: unknown, stateHistory: unknown[] = []): string {
-  // Preserve all returned fields: description, labels, links and relationships
-  // should reach the agent without a lossy summary or silent truncation.
-  const context = JSON.stringify({ issue: issueData, comments, ...(stateHistory.length ? { stateHistory } : {}) }, null, 2);
-  if (context.length > 200_000) {
-    throw new Error("This ticket and its comments are too large to send in one prompt (200,000 characters maximum).");
+export const MAX_CONTEXT_CHARS = 200_000;
+export const CONTEXT_TOO_LARGE = "This ticket and its comments are too large to send in one prompt (200,000 characters maximum).";
+
+// The ticket still does not fit after every comment but its newest real one was left out. Typed so the
+// PR-successor path can tell it from any other start failure (sessions.ts, pr-watch.ts).
+export class ContextTooLargeError extends Error {
+  constructor() {
+    super(CONTEXT_TOO_LARGE);
+    this.name = "ContextTooLargeError";
   }
-  return context;
+}
+
+// What a trimmed snapshot left out, recorded in the snapshot itself (key `omittedComments`) so the
+// preview, the prompt and the attachment download all see the same thing.
+export type OmittedComments = { count: number; statusCards: number; oldComments: number; oldest: string | null; newest: string | null; undated: number; uploads: string[] };
+
+type CommentEntry = { index: number; value: unknown; status: boolean; at: number | null; size: number };
+
+function commentEntry(value: unknown, index: number): CommentEntry {
+  const fields = value && typeof value === "object" && !Array.isArray(value) ? value as { body?: unknown; createdAt?: unknown } : {};
+  const body = typeof fields.body === "string" ? fields.body.trim() : "";
+  const parsed = typeof fields.createdAt === "string" ? Date.parse(fields.createdAt) : Number.NaN;
+  // Its length as an element of the snapshot's `comments` array, indented two levels deeper.
+  const json = JSON.stringify(value, null, 2) ?? "null";
+  let newlines = 0;
+  for (let i = json.indexOf("\n"); i >= 0; i = json.indexOf("\n", i + 1)) newlines++;
+  return { index, value, status: STATUS_CARD.test(body), at: Number.isFinite(parsed) ? parsed : null, size: 4 + json.length + 4 * newlines };
+}
+
+// Oldest first; a comment without a readable date counts as older than every dated one; equal dates
+// keep Linear's order. Deterministic for any input order.
+function oldestFirst(a: CommentEntry, b: CommentEntry): number {
+  if (a.at !== b.at) return a.at === null ? -1 : b.at === null ? 1 : a.at - b.at;
+  return a.index - b.index;
+}
+
+// The line the agent and the owner see about a trimmed snapshot ("Context limitations:").
+export function omissionNotice(omitted: OmittedComments): string {
+  const at = (iso: string) => `${iso.slice(0, 16).replace("T", " ")} UTC`;
+  const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+  const period = omitted.oldest && omitted.newest ? `from ${at(omitted.oldest)} to ${at(omitted.newest)}${omitted.undated ? ` (${omitted.undated} without a date)` : ""}` : "date unavailable";
+  return `${count(omitted.count, "comment")} omitted (${count(omitted.statusCards, "status card")}; ${count(omitted.oldComments, "oldest comment")}), ${period}. Read omitted comments with the Linear comment-history tool (get_comments).`;
+}
+
+function serialize(issueData: unknown, comments: unknown, stateHistory: unknown[], omitted?: OmittedComments): string {
+  return JSON.stringify({ issue: issueData, comments, ...(omitted ? { omittedComments: omitted } : {}), ...(stateHistory.length ? { stateHistory } : {}) }, null, 2);
+}
+
+// The ticket snapshot for the launch prompt and the preview. Under the limit it is the full ticket.
+// Over it, the plugin's own status cards are left out first, then the oldest remaining comments,
+// until the snapshot plus its notice fits; the issue (description, labels, links, relations), the
+// state history and the newest real comment always stay. Ticket text is never cut mid-comment:
+// when that minimum does not fit either, ContextTooLargeError. Uploads of the omitted comments stay
+// listed (`omittedComments.uploads`), so the attachment download still finds them.
+export function boundedContext(issueData: unknown, comments: unknown, stateHistory: unknown[] = []): { context: string; notice: string | null } {
+  const full = serialize(issueData, comments, stateHistory);
+  if (full.length <= MAX_CONTEXT_CHARS) return { context: full, notice: null };
+  if (!Array.isArray(comments) || !comments.length) throw new ContextTooLargeError();
+  const entries = comments.map(commentEntry);
+  const real = entries.filter((entry) => !entry.status).sort(oldestFirst);
+  // Every status card, oldest first, then every real comment but the newest, oldest first.
+  const order = [...entries.filter((entry) => entry.status).sort(oldestFirst), ...real.slice(0, -1)];
+  const empty = serialize(issueData, [], stateHistory).length;
+  // Sizes are kept incrementally (array brackets and separators included) so trimming a long
+  // history does not serialize the whole ticket once per removed comment.
+  let keptSize = entries.reduce((sum, entry) => sum + entry.size, 0);
+  let kept = entries.length;
+  const omitted: OmittedComments = { count: 0, statusCards: 0, oldComments: 0, oldest: null, newest: null, undated: 0, uploads: [] };
+  const uploads = new Map<string, string>();
+  const gone = new Set<number>();
+  for (const entry of order) {
+    gone.add(entry.index);
+    keptSize -= entry.size;
+    kept--;
+    omitted.count++;
+    if (entry.status) omitted.statusCards++;
+    else omitted.oldComments++;
+    if (entry.at === null) omitted.undated++;
+    else {
+      const iso = new Date(entry.at).toISOString();
+      if (!omitted.oldest || iso < omitted.oldest) omitted.oldest = iso;
+      if (!omitted.newest || iso > omitted.newest) omitted.newest = iso;
+    }
+    for (const upload of uploadReferences(JSON.stringify([entry.value]))) uploads.set(upload.url, `[${upload.name.replace(/[[\]\n]/g, " ")}](${upload.url})`);
+    omitted.uploads = [...uploads.values()];
+    const notice = omissionNotice(omitted);
+    const estimate = empty + (kept ? keptSize + 2 * (kept - 1) + 4 : 0) + `,\n  "omittedComments": `.length + JSON.stringify(omitted, null, 2).replaceAll("\n", "\n  ").length;
+    if (estimate + notice.length > MAX_CONTEXT_CHARS) continue;
+    // The estimate decides when to look; the real serialization decides.
+    const context = serialize(issueData, comments.filter((_, index) => !gone.has(index)), stateHistory, omitted);
+    if (context.length + notice.length <= MAX_CONTEXT_CHARS) return { context, notice };
+  }
+  throw new ContextTooLargeError();
+}
+
+export function buildContext(issueData: unknown, comments: unknown, stateHistory: unknown[] = []): string {
+  return boundedContext(issueData, comments, stateHistory).context;
 }
 
 // Linear records status changes as "spans": one entry per period the ticket spent in a state

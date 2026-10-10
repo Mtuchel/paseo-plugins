@@ -418,9 +418,9 @@ test("omp ticket agents get the linear_ticket tools, run through the plugin's se
   try {
     extension({ on: () => {}, events: { emit: () => {} }, appendEntry: () => {}, sendMessage: () => {}, registerTool: (tool: Tool) => { tools.push(tool); }, zod: { object: () => ({}), string: field, number: field, enum: field } } as never);
     const mounted = Object.fromEntries(tools.filter((tool) => tool.name.startsWith("linear_ticket_")).map((tool) => [tool.name, tool]));
-    assert.deepEqual(Object.keys(mounted).sort(), ["add_comment", "add_manual_task", "add_relation", "create_issue", "get_issue", "get_ticket", "link_url", "search_issues", "set_status", "update_issue"].map((name) => `linear_ticket_${name}`));
+    assert.deepEqual(Object.keys(mounted).sort(), ["add_comment", "add_manual_task", "add_relation", "create_issue", "get_comments", "get_issue", "get_ticket", "link_url", "search_issues", "set_status", "update_issue"].map((name) => `linear_ticket_${name}`));
     // Read tools are direct, so Plannotator's planning phase (which refuses xd:// calls) lets them through.
-    assert.deepEqual(Object.values(mounted).filter((tool) => tool.loadMode === "essential").map((tool) => tool.name).sort(), ["linear_ticket_get_issue", "linear_ticket_get_ticket", "linear_ticket_search_issues"]);
+    assert.deepEqual(Object.values(mounted).filter((tool) => tool.loadMode === "essential").map((tool) => tool.name).sort(), ["linear_ticket_get_comments", "linear_ticket_get_issue", "linear_ticket_get_ticket", "linear_ticket_search_issues"]);
     const posted = JSON.parse((await mounted.linear_ticket_add_comment.execute("c1", { issue: "ENG-7", body: "FYI" })).content[0].text);
     assert.equal(posted.posted, true);
     assert.deepEqual(calls.at(-1)?.variables, { input: { issueId: "other-1", body: "FYI" } });
