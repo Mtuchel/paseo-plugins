@@ -12,14 +12,15 @@ import { TicketStarter } from "./starter";
 // Focus mode (focus.ts) against a fake Linear and a fake daemon: what the seed takes as in
 // flight, what the walk adds below it, what admission lets start, and the status it reports.
 
-const settings = { dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["TUC"] } } as PluginSettings;
+const settings = { dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["TUC"] }, activation: { mode: "local", peer: "https://peer.test" } } as PluginSettings;
 type Agent = { id: string; status: string; issueId: string; waiting?: boolean; subagent?: boolean };
 
 function node(id: string, change: Partial<FocusNode> = {}): FocusNode {
   return { id, identifier: `TUC-${id}`, title: `Ticket ${id}`, url: `https://linear.app/t/${id}`, status: "Todo", statusType: "unstarted", delegateId: null, labels: [], finished: false, agentLinked: false, children: [], blockers: [], ...change };
 }
 
-async function world(t: TestContext, tickets: FocusNode[], agents: Agent[], queueBlockers: string[] = []) {
+// `peer`: the tickets the peer host claims (null: no claims snapshot yet); `parked`: the parked plans' tickets.
+async function world(t: TestContext, tickets: FocusNode[], agents: Agent[], queueBlockers: string[] = [], options: { peer?: () => Promise<Set<string> | null>; parked?: string[] } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "focus-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const nodes = new Map(tickets.map((ticket) => [ticket.id, ticket]));
@@ -51,7 +52,9 @@ async function world(t: TestContext, tickets: FocusNode[], agents: Agent[], queu
     },
   } as unknown as PaseoApi;
   const path = join(directory, "focus.json");
-  const make = () => new Focus({ linear, settings: { read: async () => settings }, path, now: () => clock });
+  const parked = { all: async () => (options.parked ?? []).map((issueId) => ({ issueId, identifier: `TUC-${issueId}`, agentId: `planner-${issueId}`, plan: "# Plan", line: "", reasons: [], model: null, parkedAt: "2026-10-09T11:00:00Z", announced: true })) };
+  const intake = { claimedTickets: options.peer ?? (async () => null) };
+  const make = () => new Focus({ linear, settings: { read: async () => settings }, parked, intake, path, now: () => clock });
   return {
     focus: make(), make, paseo, nodes,
     advance: (ms: number) => { clock += ms; },
@@ -170,6 +173,29 @@ test("the status says what each ticket waits for, and focus is complete once all
   w.advance(5 * 60_000 + 1);
   const later = await w.make().status({ agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } } as unknown as PaseoApi);
   assert.deepEqual({ left: later.left, complete: later.complete }, { left: 0, complete: true });
+});
+
+test("the owner's manual tasks and parked plans wait for you, and a ticket the peer host's agent works is working", async (t) => {
+  let claims: () => Promise<Set<string> | null> = async () => new Set(["peer", "peer-review"]);
+  const w = await world(t, [
+    node("root", { statusType: "started", status: "In Progress", delegateId: "app", children: ["manual", "peer", "peer-review", "idle"] }),
+    node("manual", { labels: ["paseo-manual"] }),
+    node("parked", { statusType: "started", status: "Planning", delegateId: "app" }),
+    node("peer", { statusType: "started", status: "In Progress", delegateId: "peer-app" }),
+    node("peer-review", { statusType: "started", status: "In Review", delegateId: "peer-app" }),
+    node("idle"),
+  ], [{ id: "a1", status: "running", issueId: "root" }], [], { peer: () => claims(), parked: ["parked"] });
+  const status = await w.focus.enable(w.paseo);
+  const phases = Object.fromEntries(status.tickets.map((ticket) => [ticket.id, ticket.phase]));
+  assert.deepEqual(phases, { root: "working", manual: "needs-you", parked: "needs-you", peer: "working", "peer-review": "review", idle: "waiting" });
+  assert.deepEqual({ left: status.left, complete: status.complete }, { left: 5, complete: false });
+
+  // The peer's claims cannot be read: the ticket falls back to what this host and Linear know.
+  claims = async () => { throw new Error("claims unreadable"); };
+  w.advance(5 * 60_000 + 1);
+  const unread = await w.focus.status(w.paseo);
+  assert.equal(unread.error, null);
+  assert.equal(unread.tickets.find((ticket) => ticket.id === "peer")?.phase, "waiting");
 });
 
 test("a ticket started by hand joins focus; turning focus off lets everything start again", async (t) => {

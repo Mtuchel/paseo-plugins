@@ -1,12 +1,14 @@
 import type { PaseoApi } from "@getpaseo/client";
 import { join } from "node:path";
 import type { FocusPhase, FocusStatus, FocusTicket } from "../shared/contracts";
+import type { ActivationIntake } from "./activation-intake";
 import { JsonFile } from "./activation";
 import { dispatchLabels } from "./dispatch";
 import { inReviewState, type FocusNode, type LinearService } from "./linear";
+import type { ParkedPlans } from "./parked";
 import { PLAN_READY_LABEL } from "./plan-policy";
 import { LIVE_AGENT } from "./process-liveness";
-import type { Settings } from "./settings";
+import type { PluginSettings, Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
 // Focus mode (README, "Focus mode"): while it is on, no new ticket work starts. The tickets in
@@ -67,6 +69,10 @@ export class Focus {
   constructor(private readonly deps: {
     linear: Pick<LinearService, "focusTickets" | "focusSeed" | "focusQueueBlockers" | "trustedAppIds">;
     settings: Pick<Settings, "read">;
+    // The plans waiting for the owner's decision on the central Plannotator host (parked.ts).
+    parked?: Pick<ParkedPlans, "all">;
+    // The peer host's claims (activation-intake.ts): the tickets a live root agent works there.
+    intake?: Pick<ActivationIntake, "claimedTickets">;
     path?: string;
     now?: () => number;
   }) {
@@ -176,11 +182,22 @@ export class Focus {
     return this.refreshing;
   }
 
+  // The tickets a live root agent works on the peer host: its claims, read on the receiving host
+  // (activation local with a peer). Null when they cannot be told (no peer, no claims snapshot yet,
+  // unreadable); then a ticket's phase rests on this host's agents and Linear alone.
+  private async peerTickets(settings: PluginSettings): Promise<Set<string> | null> {
+    const { mode, peer } = settings.activation;
+    if (mode !== "local" || !peer || !this.deps.intake) return null;
+    return this.deps.intake.claimedTickets().catch(() => null);
+  }
+
   private async walk(paseo: PaseoApi): Promise<Snapshot> {
     const file = await this.file.load();
     const settings = await this.deps.settings.read();
     const labels = dispatchLabels(settings.dispatch.label);
     const agents = await agentsByTicket(paseo);
+    const peer = await this.peerTickets(settings);
+    const parked = new Set((await this.deps.parked?.all().catch(() => []) ?? []).map((plan) => plan.issueId));
     const reasons = new Map<string, FocusTicket["reason"]>(Object.keys(file.roots).map((id) => [id, "in-flight"]));
     const nodes = new Map<string, FocusNode>();
     for (const node of await this.deps.linear.focusQueueBlockers(settings.dispatch.teamKeys)) {
@@ -202,16 +219,20 @@ export class Focus {
       }
       frontier = next;
     }
-    const needsYou = new Set([labels.needsYou, labels.blocked, labels.failed].map((name) => name.toLowerCase()));
+    const needsYou = new Set([labels.needsYou, labels.blocked, labels.failed, labels.manual].map((name) => name.toLowerCase()));
     const tickets = [...reasons].flatMap(([id, reason]): FocusTicket[] => {
       const node = nodes.get(id);
       if (!node) return [];
       const agent = agents.get(id);
+      // `needs-you` also covers the owner's manual tasks (`-manual`, no agent takes them) and a plan
+      // parked for the owner's decision; a peer agent waiting for the owner shows through the
+      // labels and states its plugin writes, so a peer claim counts as working only after those.
       const phase: FocusPhase = CLOSED.includes(node.statusType) ? "done"
         : agent?.working ? "working"
-          : agent?.waiting || /needs input|plan review/i.test(node.status) || node.labels.some((name) => needsYou.has(name.toLowerCase())) ? "needs-you"
+          : agent?.waiting || parked.has(id) || /needs input|plan review/i.test(node.status) || node.labels.some((name) => needsYou.has(name.toLowerCase())) ? "needs-you"
             : inReviewState(node.status, node.statusType) ? (node.finished ? "done" : "review")
-              : "waiting";
+              : peer?.has(id) ? "working"
+                : "waiting";
       const waitingOn = node.blockers.filter((blocker) => !nodes.get(blocker.id)?.finished).map((blocker) => blocker.identifier);
       return [{ id, identifier: node.identifier, title: node.title, url: node.url, status: node.status, phase, reason, waitingOn }];
     });

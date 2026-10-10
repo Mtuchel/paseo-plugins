@@ -122,7 +122,8 @@ export default function contribute(server: PluginServerContext) {
   // Model tiers (README, "Model tiers"): the tier each ticket implements on.
   const tiers = new TierStore();
   // Focus mode (README, "Focus mode"): while on, every start path admits only the tickets in focus.
-  const focus = new Focus({ linear, settings });
+  // Its phases also read the parked plans and the peer's claims (both built below).
+  const focus = new Focus({ linear, settings, parked: { all: () => parking.plans.all() }, intake: { claimedTickets: (): Promise<Set<string> | null> => intake.claimedTickets() } });
   // The small-ticket route (README, "Small-ticket route"): the bridge carries attempts out, the
   // starter relaunches on a recorded route. The model guard is built further down; it is only
   // called once the plugin runs.
