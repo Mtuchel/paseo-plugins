@@ -22,7 +22,8 @@ const handovers = new Map((await records(join(root, "handover"))).map((record) =
 const rows = (await records(join(root, "model-tiers")))
   .map((record) => {
     const history = record.history ?? [];
-    const first = history.find((event) => event.source === "plan" || event.source === "start");
+    // The first tier decision: an approved plan's, a launch's, or the small-ticket route's.
+    const first = history.find((event) => event.source === "plan" || event.source === "start" || event.source === "route");
     const escalations = history.filter((event) => event.source === "escalated");
     const handover = handovers.get(record.issueId);
     return {

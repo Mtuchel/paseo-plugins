@@ -159,7 +159,7 @@ test("AC-3: an unreadable decision file counts as not accepted", async () => {
 test("AC-3: a pending attempt found expired after a restart is cancelled by the plugin and closed", async () => {
   await harness(async ({ routes, calls, clock, decision, directory }) => {
     await mkdir(join(directory, "small-route", "attempts"), { recursive: true });
-    await writeFile(join(directory, "small-route", "attempts", `${ROUTE}.json`), JSON.stringify({ routeId: ROUTE, agentId: "agent-1", issueId: "issue-1", identifier: "TUC-7", provider: "omp", facts: FACTS, expiresAt: new Date(NOW + 60_000).toISOString(), state: "pending", steps: {} }));
+    await writeFile(join(directory, "small-route", "attempts", `${ROUTE}.json`), JSON.stringify({ routeId: ROUTE, agentId: "agent-1", issueId: "issue-1", identifier: "TUC-7", provider: "omp", facts: FACTS, expiresAt: new Date(NOW + 60_000).toISOString(), state: "pending", createdAt: new Date(NOW).toISOString(), steps: {} }));
     await routes.sweep();
     assert.equal(await decision(), null, "the tool still waits");
     clock.now = NOW + 61_000;
@@ -237,5 +237,47 @@ test("AC-3: an approved plan later removes the route record and no-plan", async 
     calls.length = 0;
     await routes.sweep();
     assert.deepEqual(calls, [], "the closed attempt has nothing left to undo");
+  });
+});
+
+test("AC-3: an approved plan closes a route still being carried out; its remaining steps never restore it", async () => {
+  await harness(async ({ routes, labels, record, calls, fail }) => {
+    fail.add("comment");
+    await assert.rejects(routes.handle(event(), AGENT), /comment failed/);
+    await routes.planApproved("issue-1");
+    assert.equal(await record(), null);
+    calls.length = 0;
+    await routes.sweep();
+    assert.deepEqual(calls, [], "no comment, no no-plan, no small-route agent label after the plan");
+    assert.ok(!labels.includes("no-plan"));
+  });
+});
+
+test("AC-3: an owner request between publishing acceptance and a restart's recovery still undoes the route", async () => {
+  await harness(async ({ routes, calls, labels, record, clock, directory }) => {
+    // The plugin stopped after publishing `accepted`, before saving the accepted attempt.
+    await mkdir(join(directory, "small-route", "attempts"), { recursive: true });
+    await writeFile(join(directory, "small-route", "attempts", `${ROUTE}.json`), JSON.stringify({ routeId: ROUTE, agentId: "agent-1", issueId: "issue-1", identifier: "TUC-7", provider: "omp", facts: FACTS, expiresAt: new Date(NOW + 60_000).toISOString(), state: "pending", createdAt: new Date(NOW).toISOString(), steps: {} }));
+    await routes.publish(ROUTE, { decision: "accepted" });
+    clock.now = NOW + 5_000;
+    await routes.ownerRequested("issue-1");
+    clock.now = NOW + 61_000;
+    await routes.sweep();
+    assert.equal(await record(), null);
+    assert.ok(!labels.includes("no-plan"));
+    assert.ok(!calls.includes("label agent-1 linear.plan=small-route"));
+  });
+});
+
+test("AC-3: a ticket is active on the small route while an attempt is pending or carried out, and after", async () => {
+  await harness(async ({ routes, fail }) => {
+    assert.equal(await routes.active("issue-1"), false);
+    fail.add("comment");
+    await assert.rejects(routes.handle(event(), AGENT));
+    assert.equal(await routes.active("issue-1"), true, "accepted, steps unfinished");
+    await routes.sweep();
+    assert.equal(await routes.active("issue-1"), true, "done: the route record");
+    await routes.planApproved("issue-1");
+    assert.equal(await routes.active("issue-1"), false);
   });
 });

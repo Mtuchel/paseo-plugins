@@ -684,8 +684,9 @@ request in the session. Then it hands the attempt to the plugin and waits up to 
 
 The plugin ([`server/small-route.ts`](server/small-route.ts)) checks again with the ticket and
 your settings as they are now: still yours, not attended, no `plan` label or pending plan request,
-auto-approval on and the impact within its threshold, no plan decision of the agent still being
-carried out. Its answer is one file per attempt that is written once and never replaced:
+auto-approval on and the impact within its threshold, and no plan decision of the agent in
+progress or waiting for you (as for every plan decision, the decision journal's busy check). Its
+answer is one file per attempt that is written once and never replaced:
 `accepted`, `refused: <reason>`, or the tool's own `cancelled` when its wait ended first, so a late
 plugin never starts a route the agent already gave up on. An unreadable answer counts as not
 accepted. Only on `accepted` does the agent leave planning; the plugin then records the route
@@ -697,13 +698,18 @@ stopped and the comment is never posted twice. What you give up for such a ticke
 advisor's second rating; the agent's own decides, and the code review of every pull request runs
 as usual.
 
-Adding `plan` sends the ticket back to planning at any time (**Plan on a running agent**). The
-plugin undoes the route, whatever it had done: no route record, no `no-plan`, the strong tier
-again, the agent marked as planning. A relaunch takes the route again only with its record and
-only while the ticket and your settings still allow it (the impact is checked against today's
-threshold); otherwise, and for a `no-plan` label added by hand, the ticket plans. A running route
-continues when you change the settings. An approved plan later replaces the route and removes
-`no-plan`.
+Adding `plan` sends the ticket back to planning at any time (**Plan on a running agent**), also
+when the plugin first sees the agent after the label is on: a ticket on the small route cannot
+have had it before. A request taken while the agent was still planning closes the route for that
+session too. The plugin undoes the route, whatever it had done: no route record, no `no-plan`,
+the strong tier again, the agent marked as planning. A request counts from the moment the agent
+asked for the route, so one that came while the plugin was restarting is not lost. A relaunch
+takes the route again only with its record and only while the ticket and your settings still
+allow it (the impact is checked against today's threshold); otherwise, and for a `no-plan` label
+added by hand, the ticket plans. A running route continues when you change the settings. An
+approved plan later replaces the route: every unfinished attempt is closed, the record and
+`no-plan` are removed. The tier report (`npm run tier-report`) counts the route's tier as the
+ticket's first.
 
 **Overlap check.** Tickets are filed (by you, by agents, by intake) without a look at what else is
 open, so every plan starts with one. The prompt has the agent search Linear's open tickets

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -22,6 +22,7 @@ after(() => rmSync(root, { recursive: true, force: true }));
 type Result = { content: { text: string }[] };
 type Tool = { name: string; execute(id: string, params: Record<string, unknown>, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown): Promise<Result> };
 type Request = { payload: { mode: string }; respond(response: { status: string; result: { phase: string } }): void };
+type Hook = (event: { toolName: string; input: Record<string, unknown> }, ctx: unknown) => Promise<unknown>;
 
 const FACTS = {
   acceptanceCriteria: 1, expectedChangedLines: 40, impact: 1, reversibility: "revert",
@@ -38,10 +39,11 @@ function load() {
   const tools: Tool[] = [];
   const entries: { customType: string }[] = [];
   const modes: string[] = [];
+  const hooks: Hook[] = [];
   const phase = { now: "planning" };
   const field = () => ({ describe: field, optional: () => ({}) });
   extension({
-    on: () => {},
+    on: (event: string, handler: Hook) => { if (event === "tool_call") hooks.push(handler); },
     events: { emit: (_channel: string, request: Request) => {
       modes.push(request.payload.mode);
       if (request.payload.mode === "exit") phase.now = "idle";
@@ -55,7 +57,12 @@ function load() {
   const tool = tools.find((candidate) => candidate.name === "take_small_ticket_route");
   assert.ok(tool, "an offered omp planner gets the tool");
   const ctx = { cwd: root, sessionManager: { getBranch: () => [] } };
-  return { modes, entries, call: async (params: Record<string, unknown>, signal?: AbortSignal) => (await tool.execute("call", params, signal, undefined, ctx)).content[0].text };
+  return {
+    modes, entries,
+    call: async (params: Record<string, unknown>, signal?: AbortSignal) => (await tool.execute("call", params, signal, undefined, ctx)).content[0].text,
+    // omp's tool_call hook, run before any tool of the turn.
+    hook: (toolName: string) => Promise.all(hooks.map((hook) => hook({ toolName, input: {} }, ctx))),
+  };
 }
 
 // The plugin side on the same PASEO_HOME, handed the tool's event as the bridge's intake would.
@@ -124,4 +131,28 @@ test("AC-3: once the tool stops waiting its cancellation stands; the plugin's la
   await routes.handle(event, { id: "planner-1", issueId: "issue-2", identifier: "TUC-8", provider: "omp", planPolicy: "required", planDecisionOpen: false });
   assert.equal(await routes.get("issue-2"), null);
   assert.deepEqual(h.modes, ["status"]);
+});
+
+test("AC-3: the owner's plan request taken while already planning closes the route for the session", async () => {
+  const h = load();
+  const request = join(root, "linear-tickets", "plan-requests", "planner-1");
+  mkdirSync(join(request, ".."), { recursive: true });
+  writeFileSync(request, JSON.stringify({ identifier: "TUC-7", at: new Date().toISOString() }));
+  await h.hook("read");
+  assert.equal(existsSync(request), false, "the extension took the request");
+  assert.match(await h.call(FACTS, AbortSignal.timeout(3_000)), /owner asked for a plan on this ticket, so the small-ticket route is closed/);
+});
+
+test("AC-3: a standing acceptance is honoured even when the tool cannot write its own cancellation", async () => {
+  const h = load();
+  const { routes, nextEvent } = plugin();
+  const decisions = join(root, "linear-tickets", "small-route", "decisions");
+  const abort = new AbortController();
+  const answer = h.call(FACTS, abort.signal);
+  await routes.handle(await nextEvent(), { id: "planner-1", issueId: "issue-3", identifier: "TUC-9", provider: "omp", planPolicy: "required", planDecisionOpen: false });
+  chmodSync(decisions, 0o500);
+  try {
+    abort.abort();
+    assert.match(await answer, /Small-ticket route taken/);
+  } finally { chmodSync(decisions, 0o700); }
 });

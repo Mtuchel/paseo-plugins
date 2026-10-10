@@ -26,9 +26,11 @@ import { decisionText, NO_PLAN_LABEL, parseDecision, parseRouteFacts, routeRefus
 //
 // An accepted attempt is carried out step by step, each recorded in the attempt file after it went
 // through (restart-safe, like plan decisions). Before every step the owner fence is checked: a
-// `plan` request since acceptance (plan-requests.ts reports it here) turns the attempt into
+// `plan` request since the attempt was created (plan-requests.ts reports it here, also when it
+// first sees an agent on a routed ticket that already carries `plan`) turns the attempt into
 // `cancelled-by-owner`, whose own steps restore planning whatever ran before: no route record, no
 // `no-plan`, the strong tier, the agent's `linear.plan` label. Steps of one ticket never interleave.
+// An approved plan closes every open attempt of its ticket.
 
 export const SMALL_ROUTE_POLICY = "small-route";
 export const SMALL_ROUTE_REASON = "the small-ticket route";
@@ -47,6 +49,9 @@ type Attempt = {
   expiresAt: string;
   state: AttemptState;
   reason?: string;
+  // When the attempt was first written: owner requests from then on fence it, also one that came
+  // between publishing `accepted` and a restart's recovery of the attempt.
+  createdAt: string;
   acceptedAt?: string;
   steps: Record<string, unknown>;
 };
@@ -174,7 +179,7 @@ export class SmallRoutes {
           await this.publish(event.routeId, { decision: "refused", reason: `the route request was unreadable: ${parsed.problem}` });
           return;
         }
-        attempt = { routeId: event.routeId, agentId: agent.id, issueId, identifier: agent.identifier, provider: agent.provider, facts: parsed.facts, expiresAt: event.expiresAt, state: "pending", steps: {} };
+        attempt = { routeId: event.routeId, agentId: agent.id, issueId, identifier: agent.identifier, provider: agent.provider, facts: parsed.facts, expiresAt: event.expiresAt, state: "pending", createdAt: new Date(this.now()).toISOString(), steps: {} };
         await this.save(attempt);
       }
       if (attempt.state !== "pending") return;
@@ -225,13 +230,13 @@ export class SmallRoutes {
   }
 
   // The owner's `plan` request (plan-requests.ts): a request file for the agent the extension has
-  // not taken yet, or one recorded for the ticket since the attempt was accepted. Before acceptance
-  // the ticket's `plan` label, read fresh in `problems`, already refuses.
+  // not taken yet, or one recorded for the ticket since the attempt was created (before acceptance
+  // the ticket's `plan` label, read fresh in `problems`, refuses too).
   private async ownerAsked(attempt: Attempt): Promise<boolean> {
     const pending = await readFile(join(this.requests, attempt.agentId), "utf8").then(() => true, () => false);
     if (pending) return true;
     const owner = await this.readJson<{ at: string }>(this.path("owner", attempt.issueId));
-    return Boolean(owner && attempt.acceptedAt && owner.at >= attempt.acceptedAt);
+    return Boolean(owner && owner.at >= attempt.createdAt);
   }
 
   // plan-requests.ts: the owner added `plan` to the ticket. Recorded first (any instance may call
@@ -391,9 +396,36 @@ export class SmallRoutes {
     await this.save(attempt);
   }
 
-  // A plan was approved for the ticket later: the route no longer applies (README, "Small-ticket route").
+  // The ticket's attempts not yet closed or reverted.
+  private async openAttempts(issueId: string): Promise<Attempt[]> {
+    const names = (await readdir(join(this.directory, "attempts")).catch(() => [] as string[])).filter((name) => name.endsWith(".json") && !name.startsWith("."));
+    const open: Attempt[] = [];
+    for (const name of names) {
+      const attempt = await this.readJson<Attempt>(join(this.directory, "attempts", name));
+      if (attempt?.issueId === issueId && !["closed", "reverted"].includes(attempt.state)) open.push(attempt);
+    }
+    return open;
+  }
+
+  // Whether the ticket is on the small route or about to be: a route record, or an attempt still
+  // pending or being carried out. plan-requests.ts asks before it treats a `plan` label it sees on
+  // its first look at an agent as the owner's request.
+  async active(issueId: string): Promise<boolean> {
+    if (await this.get(issueId)) return true;
+    return (await this.openAttempts(issueId)).some((attempt) => attempt.state === "pending" || attempt.state === "accepted");
+  }
+
+  // A plan was approved for the ticket later: the route no longer applies (README, "Small-ticket
+  // route"). Every open attempt is closed first, so no unfinished step of one restores the route,
+  // and no undo overrides the approved plan's tier or label.
   async planApproved(issueId: string): Promise<void> {
     await this.serial(issueId, async () => {
+      for (const attempt of await this.openAttempts(issueId)) {
+        if (attempt.state === "pending") await this.publish(attempt.routeId, { decision: "refused", reason: "a plan was approved for the ticket" });
+        attempt.state = "closed";
+        attempt.reason = "a plan was approved for the ticket";
+        await this.save(attempt);
+      }
       if (!await this.get(issueId)) return;
       await this.deps.linear.removeLabel(issueId, NO_PLAN_LABEL);
       await rm(this.path("routes", issueId), { force: true });

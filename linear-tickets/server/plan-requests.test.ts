@@ -58,6 +58,22 @@ test("a label present when the agent is first seen was the launch's reason and r
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+test("AC-3: a plan label first seen on a ticket on the small-ticket route is the owner's request", async () => {
+  for (const active of [true, false]) {
+    const directory = await mkdtemp(join(tmpdir(), "paseo-plan-requests-"));
+    try {
+      const owner: string[] = [];
+      const routes = { active: async () => active, ownerRequested: async (issueId: string) => { owner.push(issueId); } };
+      const requests = new PlanRequests({ linear: { issueLabels: async () => new Map([["issue-1", ["plan"]]]) }, prompt: async () => "sent", directory, routes });
+      requests.attach({ agents: { list: async () => ({ entries: [{ agent: { id: "agent-1", labels: { "linear.issueId": "issue-1" } } }], pageInfo: { hasMore: false } }) } } as unknown as PaseoApi);
+      await requests.poll();
+      requests.stop();
+      assert.deepEqual(owner, active ? ["issue-1"] : [], `route active: ${active}`);
+      assert.deepEqual((await readdir(directory)).filter((name) => name !== "state.json"), active ? ["agent-1"] : []);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  }
+});
+
 test("a busy, waiting or crashed agent is told on a later poll unless its omp extension already took the request", async () => {
   // A crashed agent is not restarted here: the pull request watch restarts it. A waiting one has a
   // question open for the owner; the request waits until it takes messages again.

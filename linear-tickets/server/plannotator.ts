@@ -506,15 +506,15 @@ export class PlannotatorBridge {
     console.log(`[linear-tickets] ${issue.identifier}: ${note}`);
   }
 
-  // A small-ticket route attempt (small-route.ts decides it). An agent whose plan decision is still
-  // being carried out is refused: the approved plan's tier must not race the route's.
+  // A small-ticket route attempt (small-route.ts decides it). An agent with a plan decision still in
+  // progress or waiting for the owner (an attempt, an open unbound report, a conflict) is refused.
   private async route(event: RouteEvent, agentId: string, paseo: PaseoApi): Promise<void> {
     const routes = this.smallRoutes;
     if (!routes) return;
     const agent = (await paseo.agents.ref(agentId).refresh())?.agent;
     const labels = agent?.labels ?? {};
     const issueId = labels["paseo.parent-agent-id"] ? null : labels["linear.issueId"] ?? null;
-    const planDecisionOpen = this.journal.attempts().some((attempt) => attempt.agentId === agentId && attempt.state !== "applied" && attempt.state !== "void");
+    const planDecisionOpen = this.journal.busy(agentId);
     await routes.handle(event, { id: agentId, issueId, identifier: labels["linear.identifier"] || issueId || "this ticket", provider: agent?.provider ?? "", planPolicy: labels[PLAN_POLICY_LABEL] ?? null, planDecisionOpen });
   }
 

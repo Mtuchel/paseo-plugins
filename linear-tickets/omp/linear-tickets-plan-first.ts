@@ -131,20 +131,23 @@ function dropEvent(event: Record<string, unknown>): void {
 
 // Publishes a route attempt's decision unless one exists, and returns the one that stands: a
 // complete file linked into place, never replaced (server/small-route.ts writes the same way).
-// null: unreadable, which never counts as accepted.
+// null: unreadable or absent, which never counts as accepted. A failed write still reads the
+// target: the plugin's decision may stand already.
 function publishDecision(routeId: string, decision: RouteDecision): RouteDecision | null {
-  mkdirSync(ROUTE_DECISIONS, { recursive: true, mode: 0o700 });
   const target = join(ROUTE_DECISIONS, `${routeId}.decision`);
   const temporary = join(ROUTE_DECISIONS, `.${routeId}.${randomUUID()}.tmp`);
   try {
+    mkdirSync(ROUTE_DECISIONS, { recursive: true, mode: 0o700 });
     const fd = openSync(temporary, "wx", 0o600);
     try { writeSync(fd, decisionText(decision, "tool")); fsyncSync(fd); } finally { closeSync(fd); }
     linkSync(temporary, target);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") return null;
-  } finally {
+  } catch { /* EEXIST: the plugin decided first; anything else: read whatever stands */ } finally {
     rmSync(temporary, { force: true });
   }
+  return standingDecision(target);
+}
+
+function standingDecision(target: string): RouteDecision | null {
   try { return parseDecision(readFileSync(target, "utf8")); } catch { return null; }
 }
 
@@ -153,6 +156,7 @@ function publishDecision(routeId: string, decision: RouteDecision): RouteDecisio
 async function awaitDecision(routeId: string, expiresAt: number, signal: AbortSignal | undefined): Promise<RouteDecision | null> {
   const target = join(ROUTE_DECISIONS, `${routeId}.decision`);
   while (Date.now() < expiresAt && !signal?.aborted && !existsSync(target)) await sleep(ROUTE_POLL_MS);
+  if (existsSync(target)) return standingDecision(target);
   return publishDecision(routeId, { decision: "cancelled", reason: signal?.aborted ? "the tool call was aborted" : "the plugin did not answer in time" });
 }
 
@@ -328,6 +332,9 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
   // Plannotator did not answer once: without it there is no planning phase to enter, so the
   // request file is not checked again on every tool call (each check would wait for the timeout).
   let unanswered = false;
+  // The owner's `plan` request was taken in this session (also kept as a MARKER entry for resumes):
+  // the small-ticket route stays closed.
+  let ownerRequested = false;
   // Plan (absolute path, or local:// URI) → sha256 of the text the advisor's review was recorded for.
   const advised = new Map<string, string>();
   // omp's local:// plans as last written: the Plannotator bridge submits them from the same cache
@@ -429,12 +436,15 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     if (phase === null) { unanswered = true; return null; }
     if (phase === "planning") {
       rmSync(request, { force: true });
+      // Already planning, but the owner's request still closes the small-ticket route for this session.
+      if (message === OWNER_ASKED) { ownerRequested = true; pi.appendEntry(MARKER, { reason: "owner", at: new Date().toISOString() }); }
       return { entered: false, message };
     }
     if (phase === "executing") phase = await planMode("exit");
     if (phase === "idle") phase = await planMode("enter");
     if (phase !== "planning") return null;
     rmSync(request, { force: true });
+    if (message === OWNER_ASKED) ownerRequested = true;
     pi.appendEntry(MARKER, { reason: message === OWNER_ASKED ? "owner" : "plugin", at: new Date().toISOString() });
     return { entered: true, message };
   }
@@ -451,6 +461,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const entries = ctx.sessionManager.getBranch();
     const marks = entries.filter((entry) => entry.type === "custom" && entry.customType === MARKER);
     launched = marks.length > 0 || entries.some((entry) => entry.type === "message" && entry.message?.role === "assistant");
+    ownerRequested = marks.some((entry) => entry.data?.reason === "owner");
     restoreAdvice(entries);
   });
   for (const event of ["session_switch", "session_branch", "session_tree"] as const) {
@@ -587,7 +598,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     async execute(_id, params, signal, _onUpdate, ctx) {
       const plan = "Write the plan and submit it for review as usual.";
       if (ctx?.agent?.kind === "sub") return text("Only the ticket agent itself can take the small-ticket route.");
-      const ownerAsked = existsSync(request) || (ctx?.sessionManager.getBranch() ?? []).some((entry) => entry.type === "custom" && entry.customType === MARKER && entry.data?.reason === "owner");
+      const ownerAsked = ownerRequested || existsSync(request) || (ctx?.sessionManager.getBranch() ?? []).some((entry) => entry.type === "custom" && entry.customType === MARKER && entry.data?.reason === "owner");
       if (ownerAsked) return text(`The owner asked for a plan on this ticket, so the small-ticket route is closed. ${plan}`);
       const parsed = parseRouteFacts(params);
       if ("problem" in parsed) return text(`${parsed.problem} Call the tool again with every field, or plan.`);
