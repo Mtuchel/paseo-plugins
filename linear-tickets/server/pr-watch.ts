@@ -1,11 +1,10 @@
-import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
-import { promisify } from "node:util";
 import { z } from "zod";
 import { githubCli } from "./github-cli";
+import { githubUsage } from "./github-usage";
 import type { GreptileOutage, RetriggerResult } from "./greptile-outage";
 import type { Handover, HandoverRecord } from "./handover";
 import { KnownStates, type KnownState } from "./known-states";
@@ -30,7 +29,6 @@ import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 import type { Watchdog } from "./watchdog";
 
-const exec = promisify(execFile);
 const INTERVAL_MS = 2 * 60 * 1000;
 // The queue backstop (see queueBackstop) runs this often, and right after a poll claimed a drop
 // it re-enqueues.
@@ -367,11 +365,12 @@ export class PullRequestNotFoundError extends Error {
 // `at`: Graphite's time stamp as written ("Sep 29, 7:26 AM UTC"); `event`: the text after it.
 type Bullet = { text: string; event: string; at: string | null; kind: "queued" | "running" | "merged" | "dropped"; draft: number | null };
 
-// The routed gh, explicit override, or portable gh fallback: see github-cli.ts.
-// `parse` reads gh's output; JSON by default.
+// The routed gh, explicit override, or portable gh fallback: see github-cli.ts. Every call goes
+// through the GitHub usage meter (github-usage.ts), which records it and hands back gh's output
+// unchanged. `parse` reads gh's output; JSON by default.
 export async function ghJson<T>(args: string[], parse: (stdout: string) => T = (stdout) => JSON.parse(stdout) as T): Promise<T> {
   try {
-    const { stdout } = await exec(githubCli(), args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
+    const { stdout } = await githubUsage.exec(githubCli(), args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
     return parse(stdout);
   } catch (error) {
     const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr) : "";
@@ -390,7 +389,9 @@ export async function ghJson<T>(args: string[], parse: (stdout: string) => T = (
     const hasBody = args.some((arg) => /^body=|^--(?:raw-)?field=body=|^--body(?:=|$)|^-b$/.test(arg));
     // A CLI can echo the body escaped, reformatted, or split across lines. For writes carrying
     // a body, retain only safe diagnostics in stderr rather than trying substring redaction.
-    const metadata = { stdout, stderr: hasBody ? message : stderr, code, signal };
+    // `headers`: the response's, when the usage meter read them (see github-usage.ts).
+    const headers = error && typeof error === "object" && "headers" in error && error.headers instanceof Map ? error.headers as ReadonlyMap<string, string> : null;
+    const metadata = { stdout, stderr: hasBody ? message : stderr, code, signal, headers };
     // The router's exit 75 and GitHub's throttling both stop this round. Preserve the router's
     // retry time when no request body could have supplied it.
     if (code === 75 || /HTTP 429|rate limit|budgets? exhausted/i.test(stderr)) {
@@ -1237,15 +1238,15 @@ export class PullRequestWatch {
 
   // Background priority: requests stop at their pool's reserve. A pause ends the poll (logged once
   // per pool); unsaved records are retried on the next poll. One poll at a time: a tick while the
-  // last one still runs joins it.
+  // last one still runs joins it. Each poll and backstop run is one run of the GitHub usage meter.
   poll(): Promise<void> {
-    this.running ??= this.exclusive(() => withPriority("background", "pr-watch", () => this.watch())).finally(() => { this.running = null; });
+    this.running ??= this.exclusive(() => withPriority("background", "pr-watch", () => githubUsage.run("pr-watch", () => this.watch()))).finally(() => { this.running = null; });
     return this.running;
   }
 
   // One queue backstop run at a time (see queueBackstop); a tick while one runs joins it.
   backstop(): Promise<void> {
-    this.backstopping ??= this.exclusive(() => withPriority("background", "queue backstop", () => this.queueBackstop())).finally(() => { this.backstopping = null; });
+    this.backstopping ??= this.exclusive(() => withPriority("background", "queue backstop", () => githubUsage.run("queue backstop", () => this.queueBackstop()))).finally(() => { this.backstopping = null; });
     return this.backstopping;
   }
 
@@ -1475,6 +1476,7 @@ export class PullRequestWatch {
       const watched = !seen?.merged && (!seen?.closed || seen.replay === "asked") && !escalated(seen) && !quiet;
       if (record.status !== "archived" || seen?.pending || seen?.replay === "due" || seen?.advance === "due" || watched || await manual?.awaitingMerge(record.issueId)) records.push(record);
     }
+    githubUsage.size("watched", records.length);
     // Graphite's drafts and the open pull requests are listed once per repo and poll.
     const listDrafts = context.drafts;
     const listPulls = context.pulls;
@@ -1837,7 +1839,7 @@ export class PullRequestWatch {
 
   // `record`, for `retarget-orphan.mjs --apply`, goes to the script as the file `--record` names.
   private run(checkout: string, script: string, args: string[], repo: string, record: unknown | null = null) {
-    const env = { GITHUB_REPOSITORY: repo };
+    const env = { GITHUB_REPOSITORY: repo, ...githubUsage.scriptEnv(script) };
     const injected = this.deps.backstop?.run;
     if (script === RETARGET_ORPHAN) return injected ? withRecordFile(record, (extra) => injected(checkout, script, [...args, ...extra], env)) : runIsolatedRetarget(checkout, args, env, record);
     if (!injected && script === BACKSTOP_ENQUEUE) return runIsolatedEnqueue(checkout, args, env);
@@ -1951,6 +1953,7 @@ export class PullRequestWatch {
       else delete seen.greptile;
     }
     const repos = new Set([...records.map((record) => record.links["Pull request"] ?? ""), ...Object.keys(seenByUrl)].map((url) => PULL_URL.exec(url)?.[1] ?? "").filter(Boolean));
+    githubUsage.size("repos", repos.size);
     // Only the dispatch host asks Greptile and files the outage issue: README allows dispatch on
     // one host only, and its backstop runs one at a time, so every request has one writer.
     const writer = (await this.deps.settings.read()).dispatch.enabled;
@@ -2051,6 +2054,7 @@ export class PullRequestWatch {
         for (const action of seen.actions ?? []) {
           if (advanced.has(action.id) || !own(action)) continue;
           advanced.add(action.id);
+          githubUsage.size("actions", 1);
           await this.advanceAction(action, seenByUrl, context, checkout, save);
         }
       }
@@ -2088,6 +2092,7 @@ export class PullRequestWatch {
       }
       if (repoWide) {
         const ready = parseReady(await this.run(checkout, ENQUEUE_READY, readyArgs([...excluded].sort((a, b) => a - b), skips), repo));
+        githubUsage.size("candidates", ready.stacks.length);
         for (const found of ready.drops) {
           const url = pullUrl(repo, found.pr);
           if (watched.has(url) || handledDrops(seenByUrl[url]).includes(found.key)) continue;
@@ -2387,6 +2392,7 @@ export class PullRequestWatch {
       });
     }
     const candidates = parseRetargetList(await this.run(checkout, RETARGET_ORPHAN, ["--list"], repo));
+    githubUsage.size("candidates", candidates.length);
     // A move is forgotten only once its stack is no longer listed at the same heads: a stack still
     // stranded keeps its conflict, unclear or asked state, so it is never asked or written again.
     const listed = new Set(candidates.map((candidate) => `${candidate.pr}:${candidate.expect}:${candidate.baseSha}`));
