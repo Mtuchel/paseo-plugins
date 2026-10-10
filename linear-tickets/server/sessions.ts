@@ -286,6 +286,13 @@ export async function setAgentMode(agentId: string, modeId: string): Promise<voi
   await exec(paseoCli(), ["agent", "mode", agentId, modeId], { timeout: 15_000, env });
 }
 
+// Sets one label on an agent (the plugin SDK cannot), e.g. its plan policy after the small-ticket route.
+export async function setAgentLabel(agentId: string, name: string, value: string): Promise<void> {
+  const env = { ...process.env };
+  delete env.PASEO_AGENT_ID;
+  await exec(paseoCli(), ["agent", "update", agentId, "--label", `${name}=${value}`], { timeout: 15_000, env });
+}
+
 // Interrupts the agent's running turn. The plugin SDK has no cancel, so the CLI does it.
 export async function stopAgentTurn(agentId: string): Promise<void> {
   const env = { ...process.env };

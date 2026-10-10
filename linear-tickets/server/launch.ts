@@ -9,7 +9,7 @@ import { AgentEnvs } from "./agent-env";
 import { attachmentNote, saveAttachments, type Download } from "./attachments";
 import { buildPrompt, finishedBlockersNote } from "./context";
 import { inReviewState, type LinearService } from "./linear";
-import { advisorNote, PLAN_CONTEXT_ENV, PLAN_POLICY_ENV, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_TICKET_ENV, SAFE_MODES } from "./plan-policy";
+import { advisorNote, PLAN_CONTEXT_ENV, PLAN_POLICY_ENV, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE, PLAN_TICKET_ENV, SAFE_MODES } from "./plan-policy";
 import { findProject, ProjectUnavailableError, readBranches } from "./projects";
 import { repoOrientation } from "./repo-orientation";
 import type { PluginSettings } from "./settings";
@@ -354,7 +354,7 @@ export class Launcher {
     const providerKey = preference.model.split("/")[0];
     const warnings: string[] = [];
     const title = `Plan the work order of ${input.projectName}`.slice(0, 60);
-    const prompt = [input.brief, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, advisorNote(providerKey)].join("\n\n");
+    const prompt = [input.brief, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE, advisorNote(providerKey)].join("\n\n");
     // Written before any creation, so a lost response cannot leave the run without a record while
     // its agent exists (the run's next attempt adopts a live agent instead of starting one).
     onCreate();

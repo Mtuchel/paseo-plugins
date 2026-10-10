@@ -655,10 +655,61 @@ Pending source activations are never evicted.
 - When a session exists, the plan review, its decision and pull-request review changes update the progress comment instead of adding comments. The panel's own messages are copied into the ticket thread by Linear.
 
 **Plan-first.** Every ticket plans first, whatever launched it (sidebar, auto-dispatch,
-delegation, mention) and however small it is. The only exception is a ticket carrying
-`plan-ready`: its approved plan is implemented (below). There is no way to skip a plan: the old
-`no-plan` label and the sidebar's Plan-first toggle are gone, and so is omp's `skip_plan`. The
-prompt asks to keep the plan as short as the ticket allows.
+delegation, mention). The exceptions are a ticket carrying `plan-ready`, whose approved plan is
+implemented (below), and a small ticket an omp agent takes on the **Small-ticket route** (below).
+The sidebar's Plan-first toggle is gone. The prompt asks to keep the plan as short as the ticket
+allows.
+
+**Delivery slices.** A plan groups its acceptance criteria into pull requests by size and risk, not
+one pull request per criterion (TUC-1854): thin criteria share one (its body says
+`Covers: AC-1, AC-2`), aiming at roughly 200–600 changed lines; a pull request is split above
+roughly 1,500 lines or where the risk changes (a database migration, auth or permissions, money or
+the ERP, a contract other packages build on). A ticket keeps at most 3 unlanded pull requests
+(TUC-1824), so the slices are landable ranges that land bottom first. Acceptance criteria stay one
+per `## Reach` place; only pull requests group them. Every planner gets this note
+(`PLAN_SLICING_NOTE` in [`server/plan-policy.ts`](server/plan-policy.ts)), the project planner too.
+
+**Small-ticket route.** A small, low-risk ticket you wrote skips the plan review (TUC-1854,
+option A). The plugin offers the route to an omp planner at launch only when the ticket is yours
+(or a Paseo app's, as for trust), not from the feedback intake, not attended, has no `plan` label,
+and auto-approval is on (`LINEAR_TICKETS_SMALL_ROUTE=1`, plus the conditions in its instructions).
+Claude and Codex planners always plan: nothing would check their judgement. The omp extension's
+`take_small_ticket_route` tool takes the agent's facts: acceptance criteria and expected changed
+lines (one criterion, or about 300 lines at most), impact 0–4 and reversibility, whether there is a
+migration, an auth change, money or ERP, a cross-package contract, a new rule or a question for
+you, the model tier and why, the `Reach:` bullet the pull request will carry, and why the ticket is
+small. The tool refuses unless every condition holds and the tier passes the plan's `## Model`
+rule (`strongRequired`, [`shared/small-route.ts`](shared/small-route.ts)), and after your `plan`
+request in the session. Then it hands the attempt to the plugin and waits up to a minute.
+
+The plugin ([`server/small-route.ts`](server/small-route.ts)) checks again with the ticket and
+your settings as they are now: still yours, not attended, no `plan` label or pending plan request,
+auto-approval on and the impact within its threshold, and no plan decision of the agent in
+progress or waiting for you (as for every plan decision, the decision journal's busy check). Its
+answer is one file per attempt that is written once and never replaced:
+`accepted`, `refused: <reason>`, or the tool's own `cancelled` when its wait ended first, so a late
+plugin never starts a route the agent already gave up on. An unreadable answer counts as not
+accepted. Only on `accepted` does the agent leave planning; the plugin then records the route
+(`$PASEO_HOME/linear-tickets/small-route/`) and the tier (source `route`, never below a
+`model:strong` label or an earlier escalation), switches the agent to its usual mode, marks it as
+no longer planning, moves the ticket to In Progress, comments the conditions, tier and `Reach:`,
+and adds `no-plan`. Each step is recorded after it went through, so a restart continues where it
+stopped and the comment is never posted twice. What you give up for such a ticket is the plan
+advisor's second rating; the agent's own decides, and the code review of every pull request runs
+as usual.
+
+Adding `plan` sends the ticket back to planning at any time (**Plan on a running agent**), also
+when the plugin first sees the agent after the label is on: a ticket on the small route cannot
+have had it before. A request taken while the agent was still planning closes the route for that
+session too. The plugin undoes the route, whatever it had done: no route record, no `no-plan`,
+the strong tier again, the agent marked as planning. A request counts from the moment the agent
+asked for the route, so one that came while the plugin was restarting is not lost. A relaunch
+takes the route again only with its record and only while the ticket and your settings still
+allow it (the impact is checked against today's threshold); otherwise, and for a `no-plan` label
+added by hand, the ticket plans. A running route continues when you change the settings. An
+approved plan later replaces the route: every unfinished attempt is closed, the record and
+`no-plan` are removed. The tier report (`npm run tier-report`) counts the route's tier as the
+ticket's first.
 
 **Overlap check.** Tickets are filed (by you, by agents, by intake) without a look at what else is
 open, so every plan starts with one. The prompt has the agent search Linear's open tickets

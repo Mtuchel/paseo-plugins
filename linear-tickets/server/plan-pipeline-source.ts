@@ -20,6 +20,8 @@ export type NativeState = {
   phase?: string; phaseAt?: string; progress: string | null; planningAt?: string;
   hash?: string; advisor?: string; adviceAt?: string;
   revisions: NativeRevision[]; head?: string; unknown?: boolean; crashAt?: string; disposedAt?: string; error?: string; errorAt?: string;
+  // The omp extension's small-ticket route marker, written just before it leaves planning.
+  routedAt?: string;
 };
 export type NativeCursor = { path: string; inode: string; offset: number; anchor: string; state: NativeState };
 export type NativeEvidence = { state: NativeState; cursor: NativeCursor; complete: boolean; problem?: string };
@@ -247,8 +249,11 @@ function apply(state: NativeState, entry: ObjectValue): void {
         state.planningAt = at; state.hash = undefined; state.advisor = undefined; state.adviceAt = undefined;
         current(state, at);
       }
+      // Left planning: by the small-ticket route (approved without the owner, like the risk
+      // policy's approval), else cancelled.
       if (state.phase === "idle" && previous === "planning") {
-        const revision = current(state, at); revision.stage = "cancelled"; revision.resolvedAt = at;
+        const routed = Boolean(state.routedAt && state.planningAt && state.routedAt >= state.planningAt);
+        const revision = current(state, at); revision.stage = routed ? "auto-approved" : "cancelled"; revision.resolvedAt = at;
       }
       const revision = state.revisions.at(-1);
       if (state.phase === "executing" && revision) {
@@ -263,6 +268,8 @@ function apply(state: NativeState, entry: ObjectValue): void {
     const revision = state.revisions.at(-1);
     if (revision) { revision.stage = typeof data.approvedPlan === "string" ? "completed" : "auto-approved"; revision.resolvedAt = at; }
     state.phase = "executing"; state.phaseAt = at;
+  } else if (entry.type === "custom" && kind === "linear-tickets.small-route") {
+    state.routedAt = at;
   } else if (kind === "plannotator-complete" || kind === "plannotator-handoff") {
     const revision = state.revisions.at(-1);
     if (revision) { revision.stage = "completed"; revision.resolvedAt = at; }

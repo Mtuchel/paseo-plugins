@@ -6,7 +6,7 @@ import type { launchAgentRpc, TicketDetail } from "../shared/contracts";
 import { Dispatcher } from "./dispatch";
 import { Launcher } from "./launch";
 import { MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter } from "./starter";
-import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE } from "./plan-policy";
+import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE } from "./plan-policy";
 import type { LabeledIssue } from "./linear";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
@@ -96,7 +96,7 @@ test("a labeled ticket is claimed before its agent launches, and is not launched
   assert.equal(launches.length, 1);
   assert.deepEqual(launches[0], {
     id: "eng-1", projectId: "p1", baseBranch: "refs/heads/dev", provider: "claude/opus", modeId: "plan", thinkingOptionId: undefined,
-    instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("claude")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, markInProgress: false, requestId: launches[0].requestId,
+    instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("claude")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, markInProgress: false, requestId: launches[0].requestId,
   });
   assert.deepEqual(linear.writes.slice(1, 3), ["-paseo eng-1", "+paseo-running eng-1"]);
   assert.deepEqual([...linear.labels.get("eng-1")!].sort(), ["bug", "paseo-running"]);

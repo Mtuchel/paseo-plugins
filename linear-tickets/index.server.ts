@@ -42,9 +42,10 @@ import { closeAnswered, NeedsYouIssues } from "./server/needs-you";
 import { OWNER_ASK_DIRECTORY, OwnerAsks } from "./server/owner-asks";
 import { QueuedLabels } from "./server/queued-labels";
 import { extractWithOmp } from "./server/owner-ask-extract";
-import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, SessionRouter, SessionStore, stopAgentTurn, type HostOwnership } from "./server/sessions";
+import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, SessionRouter, SessionStore, setAgentLabel, setAgentMode, stopAgentTurn, type HostOwnership } from "./server/sessions";
+import { SmallRoutes } from "./server/small-route";
 import { LimitResumeStore, UsageReader } from "./server/limit-resume";
-import { planSetup, TicketStarter } from "./server/starter";
+import { isUntrusted, planSetup, TicketStarter } from "./server/starter";
 import { ShardAssignor } from "./server/worktree-shards";
 import { PLAN_TICKET_ENV } from "./server/plan-policy";
 import { AgentEnvs, sessionEnv } from "./server/agent-env";
@@ -122,7 +123,19 @@ export default function contribute(server: PluginServerContext) {
   const tiers = new TierStore();
   // Focus mode (README, "Focus mode"): while on, every start path admits only the tickets in focus.
   const focus = new Focus({ linear, settings });
-  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, deletions, shards, focus });
+  // The small-ticket route (README, "Small-ticket route"): the bridge carries attempts out, the
+  // starter relaunches on a recorded route. The model guard is built further down; it is only
+  // called once the plugin runs.
+  const smallRoutes = new SmallRoutes({
+    linear, settings, tiers, setMode: setAgentMode, setLabel: setAgentLabel,
+    untrusted: async (state) => isUntrusted(state, await linear.viewerId(), await linear.trustedAppIds()),
+    applyTier: (agentId) => modelGuard.apply(agentId),
+    agentGone: async (agentId) => {
+      const found = attachedPaseo ? await attachedPaseo.agents.ref(agentId).refresh() : undefined;
+      return found === null || Boolean(found?.agent.archivedAt);
+    },
+  });
+  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, routes: smallRoutes, deletions, shards, focus });
   // The decision journal (README, "Decision journal"): every owner decision on a plan is written
   // here first and carried out by the bridge's worker; the inbox lists what is being applied.
   const decisionJournal = new DecisionJournal();
@@ -342,6 +355,7 @@ export default function contribute(server: PluginServerContext) {
   plannotator.onProjectPlan(projects);
   plannotator.useFollowUps(followUps);
   plannotator.recordDecisions(decisions);
+  plannotator.useSmallRoutes(smallRoutes);
   const manualTasks = new ManualTasks({ linear, settings });
   const watchdog = new Watchdog({ store: watchdogStore, sessions, linear, settings, handover, needsYou, manualTasks });
   // The ticket states crash recovery last saw, fed by every state the plugin writes (README, "Crashed agents").
@@ -355,7 +369,7 @@ export default function contribute(server: PluginServerContext) {
     // was lost would hold its ticket in Needs input forever. The tickets this host handed to the
     // peer keep their waits (the peer's plugin ends them).
     ownerWaits: { reconcileWaiting: async () => { if (attachedPaseo) await writeback.reconcileWaiting(attachedPaseo, { handedOver: () => watchdogStore.handedOver() }); } } });
-  const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text) });
+  const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text), routes: smallRoutes });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => asCaller("session-webhook", () => sessions.receive(event)));
   // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").
   const stateLabels = new StateLabels({ linear, daemon: async () => { const client = await internalDaemon(); return client ? labelDaemon(client) : null; } });
@@ -567,7 +581,7 @@ export default function contribute(server: PluginServerContext) {
     // instead of forwarding a launch whose workspace the owner picked on this host.
     if (current.activation.mode === "remote") throw new Error(`This host forwards new Linear work to ${current.activation.peer ?? "the peer host"}; the agent starts there. Assign Paseo or add the trigger label on the ticket.`);
     const { template, agentLinearAccess } = current;
-    const setup = await planSetup(linear, input.id, input.provider, input.modeId, tiers);
+    const setup = await planSetup(linear, input.id, input.provider, input.modeId, { tiers, routes: smallRoutes, settings: current });
     const model = tierModel(current, input.provider.split("/")[0], setup.tier?.tier ?? null, { provider: input.provider, ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}) });
     const launch = { ...input, ...model, modeId: setup.modeId, instructions: [...setup.notes, input.instructions.trim()].filter(Boolean).join("\n\n") };
     const markInProgress = input.markInProgress && setup.policy !== "required";

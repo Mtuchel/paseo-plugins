@@ -16,8 +16,9 @@ export const TIER_LABELS: Record<Tier, string> = { cheap: "model:cheap", standar
 export const TIER_AGENT_LABEL = "linear.tier";
 
 // `plan`: an approved plan picked it; `start`: an agent started implementing on it; `escalated`:
-// the agent asked for the strong model.
-export type TierSource = "plan" | "start" | "escalated";
+// the agent asked for the strong model; `route`: the small-ticket route picked it (small-route.ts),
+// or set strong again when the owner sent the ticket back to planning.
+export type TierSource = "plan" | "start" | "escalated" | "route";
 export type TierEvent = { tier: Tier; source: TierSource; reason: string; agentId: string | null; model: string | null; at: string };
 // `agentId`: the agent the latest decision applies to; other agents on the ticket (a new planner)
 // run on the launch model until their own plan is approved.

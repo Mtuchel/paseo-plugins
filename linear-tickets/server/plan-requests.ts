@@ -6,6 +6,7 @@ import { PLAN_LABEL } from "./plan-policy";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
 import type { PromptOutcome } from "./sessions";
+import type { SmallRoutes } from "./small-route";
 
 const POLL_MS = 60_000;
 const STATE_FILE = "state.json";
@@ -17,7 +18,8 @@ export function planRequestsDirectory(home = paseoHome()): string {
 }
 
 type Prompt = (agentId: string, text: string) => Promise<PromptOutcome>;
-type Deps = { linear: Pick<LinearService, "issueLabels">; prompt: Prompt; directory?: string };
+// `routes`: the small-ticket route, cancelled by the owner's request (small-route.ts).
+type Deps = { linear: Pick<LinearService, "issueLabels">; prompt: Prompt; directory?: string; routes?: Pick<SmallRoutes, "ownerRequested" | "active"> };
 // Per agent: whether its ticket carried the `plan` label at the last poll, and whether the agent
 // still has to be told (it was busy, crashed, or Paseo was unavailable).
 type Entry = { plan: boolean; pending: boolean };
@@ -82,8 +84,14 @@ export class PlanRequests {
       if (!names) { if (before) next[agent.id] = before; continue; }
       const plan = names.includes(PLAN_LABEL);
       const entry: Entry = { plan, pending: plan && (before?.pending ?? false) };
-      if (plan && before && !before.plan) {
+      // A label already there at the first look is the ticket's state, not a request; except on a
+      // ticket taking the small route, which refuses a `plan` label, so it came afterwards.
+      const added = plan && (before ? !before.plan : await this.deps.routes?.active(agent.issueId) ?? false);
+      if (added) {
+        // The request file first: it alone reaches the running agent, and the route's fence reads it
+        // too. A failure before the owner record leaves no baseline saved, so the next poll retries.
         await this.writeRequest(agent);
+        await this.deps.routes?.ownerRequested(agent.issueId);
         entry.pending = true;
       }
       if (!plan && before?.pending) await rm(join(this.directory, agent.id), { force: true });
