@@ -99,7 +99,7 @@ export class GitHubUsage {
     const finish = (stdout: string, stderr: string, exit: number | string | null) => {
       const split = reading ? splitIncluded(stdout) : { block: null, body: stdout };
       const responses: UsageResponse[] = split.block ? [responseOf(split.block, { cachePossible: shape.cache || basis === "router", startedAt, text: `${split.body.slice(0, 2048)}\n${stderr}` })] : [];
-      appendUsage(this.dir, {
+      if (this.recording) appendUsage(this.dir, {
         at: new Date(startedAt).toISOString(),
         host: this.options.host ?? hostname(),
         call,
@@ -135,7 +135,7 @@ export class GitHubUsage {
       try {
         return await work();
       } finally {
-        appendUsage(this.dir, { kind: "run", at: new Date(this.now()).toISOString(), host: this.options.host ?? hostname(), run: run.id, caller, size: run.size });
+        if (this.recording) appendUsage(this.dir, { kind: "run", at: new Date(this.now()).toISOString(), host: this.options.host ?? hostname(), run: run.id, caller, size: run.size });
       }
     });
   }
@@ -170,11 +170,20 @@ export class GitHubUsage {
 
   private installed: string | null = null;
 
+  // Only the meter the plugin started (start(), in the daemon) records and wraps the scripts' gh,
+  // or one given its own `dir`: a test run of the plugin's code from any worktree on this host
+  // shares $PASEO_HOME and would otherwise write its fakes into the day files a report reads.
+  private started = false;
+  private get recording(): boolean {
+    return this.started || this.options.dir !== undefined;
+  }
+
   // Writes the wrapper `<meterDir>/gh`; checked before each script start, rewritten when gone or
   // when the checkout's meter script moved. Without a meter script (no plan-first extension link)
   // or a wrapper that cannot be written it removes the wrapper and answers false: the scripts then
-  // run their gh unmetered, never a broken one.
+  // run their gh unmetered, never a broken one. A meter that does not record answers false.
   install(): boolean {
+    if (!this.recording) return false;
     const path = join(this.meterDir, "gh");
     const located = this.options.script === undefined ? locatePluginScript("gh-meter.mjs") : this.options.script;
     const script = located && existsSync(located) ? located : null;
@@ -208,6 +217,7 @@ export class GitHubUsage {
   }
 
   start(): void {
+    this.started = true;
     if (!this.install()) console.error("[linear-tickets] GitHub usage meter: no gh wrapper (scripts/gh-meter.mjs not found through the plan-first extension link, or not writable); repo scripts run gh unmetered.");
     void this.prune();
     this.pruneTimer ??= setInterval(() => { void this.prune(); }, DAY_MS);
@@ -215,6 +225,7 @@ export class GitHubUsage {
   }
 
   stop(): void {
+    this.started = false;
     clearInterval(this.pruneTimer ?? undefined);
     this.pruneTimer = null;
   }
