@@ -3,7 +3,7 @@
 // directory first on the scripts' PATH. It runs the gh behind it ($LINEAR_TICKETS_GH_NEXT, or the
 // first gh on PATH without the meter's directory) with the same arguments, stdin and stderr,
 // passes its signals on, and ends with its exit code or signal. Stdout reaches the caller as gh
-// printed it; for an intercepted call (see shared/gh-meter-core.mjs) the header block the meter
+// printed it; for an intercepted call (see gh-meter-core.mjs) the header block the meter
 // asked for is cut off first. One record per call goes to the day file.
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -11,7 +11,7 @@ import { accessSync, constants, realpathSync } from "node:fs";
 import { hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { accountOf, appendUsage, meteredArgs, meterShape, METER_ENV, responseOf, splitIncluded, usageDir, withoutDir } from "../shared/gh-meter-core.mjs";
+import { accountOf, appendUsage, meteredArgs, meterShape, METER_ENV, responseOf, splitIncluded, usageDir, withoutDir } from "./gh-meter-core.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 

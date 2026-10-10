@@ -7,7 +7,7 @@ import { basename, isAbsolute, join } from "node:path";
 import { hostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { accountOf, appendUsage, meteredArgs, meterShape, METER_ENV, responseOf, splitIncluded, usageDir, withoutDir, type AccountBasis, type UsageResponse } from "../shared/gh-meter-core.mjs";
+import { accountOf, appendUsage, meteredArgs, meterShape, METER_ENV, responseOf, splitIncluded, usageDir, withoutDir, type AccountBasis, type UsageResponse } from "../scripts/gh-meter-core.mjs";
 import { githubCli, githubRouted } from "./github-cli";
 import { currentCallerName } from "./linear-usage";
 import { paseoHome } from "./ticket-mcp";
