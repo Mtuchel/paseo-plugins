@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
-import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_PAGES, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type Post } from "./linear";
+import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_CORE_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_PAGES, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 
 const issue = { id: "i1", identifier: "TUC-1", state: { id: "s1", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] } };
@@ -56,43 +56,52 @@ test("interactive reads go to the app's pool and never touch the key when the ap
   const reader: Pick<App, "query"> = {
     query: (query, variables) => {
       appCalls.push(query);
-      if ([ISSUE_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY].includes(query)) return Promise.resolve({ issue });
+      if ([ISSUE_STATE_QUERY, ISSUE_CORE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY].includes(query)) return Promise.resolve({ issue });
       if (query === ISSUE_STATUSES_QUERY) return Promise.resolve({ issues: { nodes: (variables.ids as string[]).map((id) => ({ id, state: { type: "started" }, completedAt: null })) } });
       return Promise.resolve({ issues: { nodes: [{ id: "i1", identifier: "TUC-1", priority: 2, team: { key: "TUC" }, labels: { nodes: [] } }] } });
     },
   };
   const { linear, keyCalls } = service(reader, () => { throw new Error("the key must not be used"); });
   assert.equal((await linear.issueState("i1")).identifier, "TUC-1");
+  assert.equal((await linear.issueCore("i1")).identifier, "TUC-1");
   assert.deepEqual(await linear.issueMetadata("i1"), { id: "i1", identifier: "TUC-1", labels: [] });
   assert.deepEqual(await linear.issueStatus("i1"), { status: "Todo", statusType: "unstarted" });
   assert.equal((await linear.issueStatuses([ID_A, ID_B])).size, 2);
   assert.equal((await linear.labeledIssues("paseo", ["TUC"])).length, 1);
-  assert.deepEqual(appCalls, [ISSUE_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY]);
+  assert.deepEqual(appCalls, [ISSUE_STATE_QUERY, ISSUE_CORE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY]);
   assert.deepEqual(keyCalls, []);
 });
 
 test("the key reads once when the app is not usable here", async () => {
   const { linear, keyCalls } = service({ query: () => Promise.resolve(null) }, () => ({ issue }));
   await linear.issueState("i1");
+  await linear.issueCore("i1");
   await linear.issueMetadata("i1");
   await linear.issueStatus("i1");
   await linear.issueAttachments("i1");
   await linear.issueWatchState("i1");
-  assert.deepEqual(keyCalls, [ISSUE_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_WATCH_STATE_QUERY]);
+  assert.deepEqual(keyCalls, [ISSUE_STATE_QUERY, ISSUE_CORE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_WATCH_STATE_QUERY]);
 });
 
 test("tickets the app cannot see are read with the key", async () => {
   const missingIssue = service({ query: () => Promise.resolve({ issue: null }) }, () => ({ issue }));
   assert.equal((await missingIssue.linear.issueState("i1")).identifier, "TUC-1");
+  assert.equal((await missingIssue.linear.issueCore("i1")).identifier, "TUC-1");
   assert.equal((await missingIssue.linear.issueMetadata("i1")).identifier, "TUC-1");
   assert.equal((await missingIssue.linear.issueStatus("i1")).statusType, "unstarted");
   assert.deepEqual(await missingIssue.linear.issueAttachments("i1"), []);
   assert.deepEqual(await missingIssue.linear.issueWatchState("i1"), { status: "Todo", statusType: "unstarted", labels: [] });
-  assert.deepEqual(missingIssue.keyCalls, [ISSUE_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_WATCH_STATE_QUERY]);
+  assert.deepEqual(missingIssue.keyCalls, [ISSUE_STATE_QUERY, ISSUE_CORE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_WATCH_STATE_QUERY]);
 
   const notFound = service({ query: () => Promise.reject(new Error("The Linear API request failed: Entity not found: Issue")) }, () => ({ issue }));
   await notFound.linear.issueState("i1");
-  assert.deepEqual(notFound.keyCalls, [ISSUE_STATE_QUERY]);
+  await notFound.linear.issueCore("i1");
+  assert.deepEqual(notFound.keyCalls, [ISSUE_STATE_QUERY, ISSUE_CORE_QUERY]);
+
+  // Neither pool returns the ticket: the read fails rather than decide on empty fields.
+  const nowhere = service({ query: () => Promise.resolve({ issue: null }) }, () => ({ issue: null }));
+  await assert.rejects(nowhere.linear.issueCore("i1"), /did not return this issue/);
+  assert.deepEqual(nowhere.keyCalls, [ISSUE_CORE_QUERY]);
 
   // The app sees one of two tickets: the key answers for the whole batch, so the blocker is not taken for deleted.
   const partial = service(
@@ -175,6 +184,7 @@ test("an app rate limit pauses an interactive read instead of spending the key",
   const limited = new RateLimitedError("app", Date.now() + 60_000);
   const { linear, keyCalls } = service({ query: () => Promise.reject(limited) }, () => ({ issue }));
   await assert.rejects(linear.issueState("i1"), (error: unknown) => error === limited);
+  await assert.rejects(linear.issueCore("i1"), (error: unknown) => error === limited);
   await assert.rejects(linear.issueMetadata("i1"), (error: unknown) => error === limited);
   await assert.rejects(linear.issueStatus("i1"), (error: unknown) => error === limited);
   await assert.rejects(linear.issueAttachments("i1"), (error: unknown) => error === limited);
@@ -267,4 +277,83 @@ test("the owner's asks are read with the owner's key, never the app, page by pag
   assert.deepEqual(appQueries, []);
   assert.deepEqual(keyCalls, Array(OWNER_ASKS_PAGES).fill(OWNER_ASKS_QUERY));
   assert.deepEqual(asks.map((issue) => issue.identifier), Array.from({ length: OWNER_ASKS_PAGES }, (_, index) => `TUC-${index + 1}`));
+});
+
+// TUC-1324: status moves and label removal read the ticket without its relations. A real
+// LinearService whose app answers reads and writes; `sent` lists each operation sent on either
+// pool (state writes with their target), and the 498-point ISSUE_STATE_QUERY is refused outright.
+const TEAM = [
+  { id: "todo", name: "Todo", type: "unstarted", position: 1 },
+  { id: "coding", name: "In Progress", type: "started", position: 2 },
+  { id: "planning", name: "Planning", type: "started", position: 3 },
+  { id: "review", name: "In Review", type: "started", position: 4 },
+  { id: "done", name: "Done", type: "completed", position: 5 },
+  { id: "canceled", name: "Canceled", type: "canceled", position: 6 },
+  { id: "dup", name: "Duplicate", type: "duplicate", position: 7 },
+];
+function ticket(stateId: string, labels: { id: string; name: string }[] = []) {
+  const { id, name, type } = TEAM.find((item) => item.id === stateId)!;
+  return { id: "i1", identifier: "TUC-1", state: { id, name, type }, team: { id: "t1" }, labels: { nodes: labels }, attachments: { nodes: [] } };
+}
+function mover(node: Record<string, unknown>) {
+  const sent: string[] = [];
+  const answer = (query: string, variables: Record<string, unknown>): Record<string, unknown> => {
+    const operation = /^\s*(?:query|mutation) (\w+)/.exec(query)?.[1] ?? "unknown";
+    sent.push(operation === "issueUpdateState" ? `${operation} ${variables.stateId}` : operation);
+    if (query === ISSUE_CORE_QUERY) return { issue: node };
+    if (query === TEAM_STATES_QUERY) return { team: { states: { nodes: TEAM } } };
+    if (operation === "issueUpdateState") return { issueUpdate: { success: true, issue: { id: "i1", state: { name: "Moved", type: "started" } } } };
+    if (operation === "comment") return { commentCreate: { success: true, comment: { id: "c1" } } };
+    if (operation === "removeLabel") return { issueRemoveLabel: { success: true } };
+    throw new Error(`unexpected operation ${operation}`);
+  };
+  const app: App = { query: async (query, variables) => answer(query, variables), mutate: async (query, variables) => answer(query, variables), viewer: () => Promise.reject(new Error("no viewer here")) };
+  return { sent, linear: new LinearService(new Credentials("/unused", "env-key"), async (_key, query, variables) => answer(query, variables), app) };
+}
+const CORE: IssueCore = { id: "i1", identifier: "TUC-1", status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, creatorId: null, labels: [{ id: "l1", name: "paseo-needs-you" }], attachmentUrls: [] };
+const NEEDS_YOU = [{ id: "l1", name: "Paseo-Needs-You" }];
+
+// Each helper keeps its own rule for closed tickets (README, "Rate limits"): one case it leaves alone, one it writes.
+const MOVES: { name: string; node?: Record<string, unknown>; run: (linear: LinearService) => Promise<unknown>; sent: string[] }[] = [
+  { name: "complete leaves a Done ticket alone", node: ticket("done"), run: (linear) => linear.complete("i1"), sent: ["issueCore"] },
+  { name: "complete moves a canceled ticket to Done", node: ticket("canceled"), run: (linear) => linear.complete("i1"), sent: ["issueCore", "teamStates", "issueUpdateState done"] },
+  { name: "cancel leaves a duplicate alone", node: ticket("dup"), run: (linear) => linear.cancel("i1", "Not needed."), sent: ["issueCore"] },
+  { name: "cancel posts the reason and cancels an open ticket", node: ticket("todo"), run: (linear) => linear.cancel("i1", "Not needed."), sent: ["issueCore", "teamStates", "comment", "issueUpdateState canceled"] },
+  { name: "moveToStateNamed leaves a canceled ticket alone", node: ticket("canceled"), run: (linear) => linear.moveToStateNamed("i1", "Planning"), sent: ["issueCore"] },
+  { name: "moveToStateNamed moves an open ticket", node: ticket("todo"), run: (linear) => linear.moveToStateNamed("i1", "Planning"), sent: ["issueCore", "teamStates", "issueUpdateState planning"] },
+  { name: "moveToStateNamed decides on the caller's read without reading", run: (linear) => linear.moveToStateNamed("i1", "Planning", CORE), sent: ["teamStates", "issueUpdateState planning"] },
+  { name: "moveToReady leaves an unstarted ticket alone", node: ticket("todo"), run: (linear) => linear.moveToReady("i1"), sent: ["issueCore"] },
+  { name: "moveToReady moves a started ticket to Todo", node: ticket("coding"), run: (linear) => linear.moveToReady("i1"), sent: ["issueCore", "teamStates", "issueUpdateState todo"] },
+  { name: "reopen leaves a ticket already in Todo alone", node: ticket("todo"), run: (linear) => linear.reopen("i1"), sent: ["issueCore", "teamStates"] },
+  { name: "reopen moves a Done ticket to Todo", node: ticket("done"), run: (linear) => linear.reopen("i1"), sent: ["issueCore", "teamStates", "issueUpdateState todo"] },
+  { name: "reopenToCoding leaves a canceled ticket alone", node: ticket("canceled"), run: (linear) => linear.reopenToCoding("i1"), sent: ["issueCore"] },
+  { name: "reopenToCoding moves a Done ticket back to work", node: ticket("done"), run: (linear) => linear.reopenToCoding("i1"), sent: ["issueCore", "teamStates", "issueUpdateState coding"] },
+  { name: "reopenToCoding decides on the caller's read without reading", run: (linear) => linear.reopenToCoding("i1", { ...CORE, status: "Done", statusId: "done", statusType: "completed" }), sent: ["teamStates", "issueUpdateState coding"] },
+  { name: "moveToReview leaves a Done ticket alone", node: ticket("done"), run: (linear) => linear.moveToReview("i1"), sent: ["issueCore"] },
+  { name: "moveToReview moves a started ticket to review", node: ticket("coding"), run: (linear) => linear.moveToReview("i1"), sent: ["issueCore", "teamStates", "issueUpdateState review"] },
+  { name: "moveToReview moves a duplicate too (only completed and canceled stay)", node: ticket("dup"), run: (linear) => linear.moveToReview("i1"), sent: ["issueCore", "teamStates", "issueUpdateState review"] },
+  { name: "removeLabel leaves a ticket without the label alone", node: ticket("todo"), run: (linear) => linear.removeLabel("i1", "paseo-needs-you"), sent: ["issueCore"] },
+  { name: "removeLabel removes the label whatever its case", node: ticket("todo", NEEDS_YOU), run: (linear) => linear.removeLabel("i1", "paseo-needs-you"), sent: ["issueCore", "removeLabel"] },
+  { name: "removeLabel decides on the caller's labels without reading", run: (linear) => linear.removeLabel("i1", "paseo-needs-you", CORE.labels), sent: ["removeLabel"] },
+];
+for (const row of MOVES) {
+  test(`${row.name}, never reading the ticket's relations`, async () => {
+    const { linear, sent } = mover(row.node ?? {});
+    await row.run(linear);
+    assert.deepEqual(sent, row.sent);
+  });
+}
+
+test("issueCore keeps exactly the fields it reads from one answer, on a cold service, and a status move decides on them", async () => {
+  const node = {
+    id: "i1", identifier: "TUC-1", state: { id: "planning", name: "Planning", type: "started" }, team: { id: "t1" }, project: { id: "p1" }, creator: { id: "u1" },
+    labels: { nodes: [{ id: "l1", name: "paseo" }] }, attachments: { nodes: [{ url: "https://github.com/o/r/pull/1" }] },
+  };
+  const { linear, sent } = mover(node);
+  assert.deepEqual(await linear.issueCore("i1"), {
+    id: "i1", identifier: "TUC-1", status: "Planning", statusId: "planning", statusType: "started", teamId: "t1", projectId: "p1", creatorId: "u1",
+    labels: [{ id: "l1", name: "paseo" }], attachmentUrls: ["https://github.com/o/r/pull/1"],
+  });
+  assert.deepEqual(await linear.moveToReview("i1"), { changed: true });
+  assert.deepEqual(sent, ["issueCore", "issueCore", "teamStates", "issueUpdateState review"]);
 });

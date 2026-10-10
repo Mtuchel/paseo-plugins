@@ -321,7 +321,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         if (linear.failure) throw linear.failure;
         calls.push(`link ${title} ${url}`);
       },
-      issueState: async (id) => {
+      issueCore: async (id) => {
         linear.issueReads.push(id);
         if (linear.issueFailure) throw linear.issueFailure;
         return { ...(linear.byIssue[id] ?? linear.state), attachmentUrls: linear.attachments } as never;
@@ -1635,6 +1635,18 @@ test("a ready stack nobody enqueued is enqueued by the backstop, with the pull r
   assert.match(promptOf(calls) ?? "", /Do not enqueue it again yourself\.$/);
   assert.deepEqual(await h.backstop(), [], "listed again, but enqueued already");
   assert.deepEqual(await h.poll(), [], "and no merge nudge either");
+});
+
+test("the enqueued comment reaches a ticket of the stack no record or manual task knows, found in Linear by its identifier", async (t) => {
+  const h = harness(t);
+  h.github.view = READY;
+  h.scripts.ready = { stacks: [{ ...STACK, tickets: ["TUC-1", "TUC-9"] }], drops: [] };
+  h.linear.byIssue["TUC-9"] = { id: "i9", identifier: "TUC-9", status: "In Progress", statusType: "started" };
+  await h.backstop();
+  assert.ok(h.linear.issueReads.includes("TUC-9"), "looked up by its identifier");
+  assert.equal(h.linear.comments.i9?.length, 1);
+  assert.match(h.linear.comments.i9?.[0] ?? "", /^Paseo's queue backstop enqueued /);
+  assert.equal(h.linear.comments.i1?.length, 1, "the recorded ticket by its record");
 });
 
 test("a held enqueue is retried on the next backstop run, once per run", async (t) => {
@@ -4234,6 +4246,35 @@ test("an interrupted reopen finishes its remaining steps on the next poll", asyn
   const again = await lost.poll();
   assert.ok(!again.some((call) => call.startsWith("comment")), "the comment is found by its mark, not repeated");
   assert.match(again.find((call) => call.startsWith("succeed a1")) ?? "", /^succeed a1\nThis ticket was in Done, but its stack has not landed\./);
+});
+
+test("a saved reopen reads the ticket again before the move: canceled meanwhile it stays and the decision goes, still Done it goes back to work", async (t) => {
+  const logs = t.mock.method(console, "log", () => {});
+  const saved = JSON.stringify({ i1: { reopen: { completedAt: "2026-10-09T08:49:39.000Z", at: new Date().toISOString(), moved: false, comment: "This ticket was in Done while its stack was open.", message: "This ticket was in Done, but its stack has not landed." } } });
+  const canceled = harness(t, { live: false, autoResume: true });
+  draftStack(canceled, 1);
+  // The poll's state batch still says Done; the owner cancels it before the reopen's own read.
+  canceled.linear.state = { status: "Done", statusType: "completed" };
+  canceled.linear.completedAt = "2026-10-09T08:49:39.000Z";
+  const reads = canceled.linear.issueReads;
+  reads.push = (...ids: string[]) => {
+    if (canceled.linear.stateReads.length) canceled.linear.state = { status: "Canceled", statusType: "canceled" };
+    return Array.prototype.push.apply(reads, ids);
+  };
+  await writeFile(join(await canceled.home(), "stack-policy.json"), saved);
+  assert.ok(!(await canceled.poll()).includes("reopen"), "finished by hand: not moved");
+  assert.ok(canceled.linear.issueReads.includes("i1"), "decided on a fresh read of the ticket");
+  assert.equal(countLogs(logs, /TUC-1: it is Canceled now, so it is not reopened/), 1);
+  assert.equal(JSON.parse(await canceled.policyFile()).i1?.reopen, undefined, "the decision goes");
+
+  const done = harness(t, { live: false, autoResume: true });
+  draftStack(done, 1);
+  done.paseo.succeed = startSuccessor;
+  done.linear.state = { status: "Done", statusType: "completed" };
+  done.linear.completedAt = "2026-10-09T08:49:39.000Z";
+  await writeFile(join(await done.home(), "stack-policy.json"), saved);
+  assert.ok((await done.poll()).includes("reopen"), "still Done: moved back to its coding state");
+  assert.equal(done.linear.state.statusType, "started");
 });
 
 // TUC-999/728/1322 on server087: planners idle since 2026-10-07 in the main checkout (configured

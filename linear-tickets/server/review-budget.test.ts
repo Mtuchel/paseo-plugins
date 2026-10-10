@@ -56,6 +56,7 @@ test("an inbox approval consumes the owner's reserve through the production deci
   const operations: string[] = [];
   const answers: Record<string, object> = {
     issueState: { issue: { id: "issue-1", identifier: "TUC-TEST", state: { id: "todo", name: "Todo", type: "unstarted" }, team: { id: "team-1" }, labels: { nodes: [] } } },
+    issueCore: { issue: { id: "issue-1", identifier: "TUC-TEST", state: { id: "todo", name: "Todo", type: "unstarted" }, team: { id: "team-1" }, labels: { nodes: [] } } },
     teamStates: { team: { states: { nodes: [{ id: "coding", name: "In Progress", type: "started", position: 1 }] } } },
     issueUpdateState: { issueUpdate: { success: true, issue: { id: "issue-1", state: { id: "coding", name: "In Progress", type: "started" } } } },
     labelByName: { issueLabels: { nodes: [{ id: "ready", name: "plan-ready" }] } },

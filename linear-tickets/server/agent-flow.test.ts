@@ -80,7 +80,7 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
   });
   const router = new SessionRouter({
     api: { activity: async (_s: string, content: { type: string; body?: string }) => { calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); }, openSessions: async () => [], activities: async () => [] } as never,
-    linear: { viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, issueState: async () => { throw new Error("unused"); }, admissionStates: async () => { throw new Error("unused"); }, issueGroup: async () => { throw new Error("unused"); }, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {}, comment: async () => {}, hasComment: async () => false, userUrl: async () => "https://linear.app/owner" },
+    linear: { viewerId: async () => OWNER, appUserId: async () => APP, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, cancel: async () => {}, issueState: async () => { throw new Error("unused"); }, issueStatus: async () => { throw new Error("unused"); }, admissionStates: async () => { throw new Error("unused"); }, issueGroup: async () => { throw new Error("unused"); }, moveToStateNamed: async () => ({ changed: false }), delegate: async () => {}, comment: async () => {}, hasComment: async () => false, userUrl: async () => "https://linear.app/owner" },
     starter: { start: async () => { throw new Error("unused"); }, admission: async () => ({ ok: true as const }) },
     handover: { resumeTarget: async () => null, handOff: async () => true },
     launcher: { gate: () => ({ release: () => {} }) },
@@ -748,10 +748,12 @@ test("the live feed shows completed commands and edits only", () => {
 // reads (README, "Who starts next").
 function starterHarness(state: { creatorId: string | null; labels: { id: string; name: string }[]; blockedBy: string[] }, running: number, appId: string | null = APP, away = false, planText = "# Plan\n1. Add the table", inspect?: ProcessInspector, tiers?: Pick<TierStore, "get" | "record">, routes?: Pick<SmallRoutes, "get">) {
   const launches: { provider?: string; thinkingOptionId?: string; modeId?: string; instructions: string; labels?: Record<string, string>; env?: Record<string, string>; markInProgress?: boolean }[] = [];
+  const read = async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, attachmentUrls: [], priority: 0, createdAt: "", unblocks: 0, ...state });
   const starter = new TicketStarter({
     linear: {
       detail: async () => ({ issue: { identifier: "TUC-1", project: "", team: "Team" }, projectId: null, teamId: "t1" }) as never,
-      issueState: async () => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", projectId: null, attachmentUrls: [], priority: 0, createdAt: "", unblocks: 0, ...state }),
+      issueState: read,
+      issueCore: read,
       viewerId: async () => OWNER,
       trustedAppIds: async () => appId ? [appId] : [],
       issueDocument: async (_id: string, title: string) => title === "Plan: TUC-1" ? { url: "https://linear.app/doc/plan", content: planText } : null,
@@ -824,6 +826,34 @@ test("an agent the daemon lists as running although its OMP process is gone free
   const unreadable = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0, APP, false, undefined, inspector(async () => { throw new Error("ps failed"); }));
   assert.match((await unreadable.starter.admission("i1", daemon(unreadable.paseo), one) as { reason: string }).reason, /Queued: 1 of 1/, "an inspection that fails counts the agent as today");
   assert.equal((await unreadable.starter.scheduler.counts(daemon(unreadable.paseo))).running, 1);
+});
+
+test("the scheduler takes a working agent's project from the ticket read without relations, once per ticket, and a ticket without one counts as none", async () => {
+  const reads: string[] = [];
+  const projects: Record<string, string | null> = { r1: "erp", r2: null };
+  const starter = new TicketStarter({
+    linear: {
+      detail: async () => { throw new Error("not used"); },
+      issueState: async () => { throw new Error("project attribution reads no relations"); },
+      issueCore: async (id: string) => { reads.push(id); return { id, identifier: id.toUpperCase(), status: "In Progress", statusId: "ip", statusType: "started", teamId: "t1", projectId: projects[id], creatorId: OWNER, labels: [], attachmentUrls: [] }; },
+      viewerId: async () => OWNER,
+      trustedAppIds: async () => [],
+      issueDocument: async () => null,
+    },
+    launcher: { start: async () => { throw new Error("not used"); } },
+  });
+  const paseo = { agents: { list: async () => ({ entries: ["r1", "r2"].map((id) => ({ agent: { id: `a-${id}`, status: "running", labels: { "linear.issueId": id } } })), pageInfo: { hasMore: false } }) } } as unknown as PaseoApi;
+  const waiting = (identifier: string, projectId: string | null, priority: number) => ({ issueId: identifier.toLowerCase(), identifier, projectId, priority, unblocks: 0, createdAt: "2026-01-01T00:00:00Z" });
+  const erp = waiting("TUC-1", "erp", 3);
+  const none = waiting("TUC-3", null, 1);
+  starter.scheduler.note([erp, none]);
+  const cap = { limit: 3, source: "settings" as const, lease: null };
+  // One agent each in erp and in no project: equal load, so urgency gives the one free slot to TUC-3.
+  // Had erp's agent been counted as no project, erp's ticket would have taken it.
+  assert.deepEqual(await starter.scheduler.admit(none, paseo, cap), { ok: true });
+  assert.deepEqual(reads.sort(), ["r1", "r2"]);
+  assert.equal((await starter.scheduler.admit(erp, paseo, cap)).ok, false);
+  assert.equal(reads.length, 2, "each working ticket's project is read once");
 });
 
 test("while the owner is away, only the implementation of an attended ticket waits; planning never does, even with no agent limit", async () => {

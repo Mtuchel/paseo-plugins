@@ -939,6 +939,7 @@ function resumeDestination(home: string, repo: string): { intake: ActivationInta
       teamId: "t1", projectId: "lp-1", context: "{}", warnings: [], relations: { related: [] },
     } as unknown as TicketDetail),
     issueState: async () => ({ id: ISSUE, identifier: "TUC-1", projectId: "lp-1", creatorId: OWNER, blockedBy: [], status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", labels: [], attachmentUrls: [], priority: 0, createdAt: "2026-01-01T00:00:00Z", unblocks: 0 }),
+    issueCore: async () => ({ id: ISSUE, identifier: "TUC-1", projectId: "lp-1", creatorId: OWNER, status: "Todo", statusId: "todo", statusType: "unstarted", teamId: "t1", labels: [], attachmentUrls: [] }),
     viewerId: async () => OWNER,
     trustedAppIds: async () => ["app-1"],
     issueDocument: async () => null,

@@ -43,7 +43,7 @@ class FakeLinear {
   // Other issues by id (the "Needs you" sub-issues); `state` is the ticket itself.
   readonly others = new Map<string, IssueState>();
   private comments = 0;
-  async issueState(id = "issue-1") {
+  async issueCore(id = "issue-1") {
     this.writes.push(id === this.state.id ? "state" : `state ${id}`);
     const found = id === this.state.id ? this.state : this.others.get(id);
     if (!found) throw new Error("Linear did not return this issue. Check that you have access to it.");
@@ -183,7 +183,7 @@ test("turn-start state changes keep cold prerequisites in the owner reserve at 3
       const { query, variables } = JSON.parse(String(init?.body));
       const operation = /^(?:query|mutation) (\w+)/.exec(query)?.[1];
       let data;
-      if (operation === "issueState") data = { issue: { id: "issue-1", state: { id: stateId, name: "Todo", type: "unstarted" }, team: { id: "team-1" } } };
+      if (operation === "issueCore") data = { issue: { id: "issue-1", state: { id: stateId, name: "Todo", type: "unstarted" }, team: { id: "team-1" } } };
       else if (operation === "teamStates") data = { team: { states: { nodes: [{ id: "coding", name: "In Progress", type: "started", position: 1 }, { id: "planning", name: "Planning", type: "started", position: 2 }] } } };
       else if (operation === "issueUpdateState") {
         stateId = variables.stateId;
@@ -207,9 +207,9 @@ test("a refused turn-start prerequisite does not consume the first state transit
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
   t.mock.method(console, "error", () => {});
   const linear = new FakeLinear();
-  const original = linear.issueState.bind(linear);
+  const original = linear.issueCore.bind(linear);
   let limited = true;
-  linear.issueState = async () => {
+  linear.issueCore = async () => {
     if (limited) throw new RateLimitedError("app", 60_000);
     return original();
   };
@@ -281,7 +281,7 @@ async function ownerQuestionAdmission(t: TestContext, endOfTurn: boolean): Promi
   for (const pool of ["key", "app"] as const) budget.acquire(pool, "owner").done(new Headers(headers), false);
   const sent: { operation: string; variables: Record<string, unknown> }[] = [];
   const data: Record<string, object> = {
-    issueState: { issue: { id: "issue-1", identifier: "ENG-1", state: { id: "coding", name: "In Progress", type: "started" }, team: { id: "team-1" }, labels: { nodes: [] } } },
+    issueCore: { issue: { id: "issue-1", identifier: "ENG-1", state: { id: "coding", name: "In Progress", type: "started" }, team: { id: "team-1" }, labels: { nodes: [] } } },
     viewerCheck: { viewer: { id: "owner" } },
     teamStates: { team: { states: { nodes: [{ id: "needs-input", name: "Needs input", type: "started", position: 1 }] } } },
     issueUpdateState: { issueUpdate: { success: true, issue: { id: "issue-1", state: { id: "needs-input", name: "Needs input", type: "started" } } } },
@@ -530,9 +530,9 @@ test("a rate-limited turn end is retried whenever Linear's pool refills, however
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
   t.mock.method(console, "error", () => {});
   const linear = new FakeLinear();
-  const issueState = linear.issueState.bind(linear);
+  const issueCore = linear.issueCore.bind(linear);
   let attempts = 0;
-  linear.issueState = async () => { if (++attempts <= 4) throw new RateLimitedError("key", Date.now() + 10 * MINUTE); return issueState(); };
+  linear.issueCore = async () => { if (++attempts <= 4) throw new RateLimitedError("key", Date.now() + 10 * MINUTE); return issueCore(); };
   const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), undefined, accept);
   await writeback.turnEnded(completedWithPr, linked);
   for (let retry = 1; retry <= 4; retry++) {
@@ -552,7 +552,7 @@ test("a turn end that stays rate-limited gives up after 6 h", async (t) => {
   const errors = t.mock.method(console, "error", () => {});
   const linear = new FakeLinear();
   let attempts = 0;
-  linear.issueState = async () => { attempts++; throw new RateLimitedError("key", Date.now() + 60 * MINUTE); };
+  linear.issueCore = async () => { attempts++; throw new RateLimitedError("key", Date.now() + 60 * MINUTE); };
   const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), undefined, accept);
   await writeback.turnEnded(completedWithPr, linked);
   for (let hour = 1; hour <= 6; hour++) {
@@ -571,9 +571,9 @@ test("a delayed retry overtaken by a newer event links its pull request but leav
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
   const errors = t.mock.method(console, "error", () => {});
   const linear = new FakeLinear();
-  const issueState = linear.issueState.bind(linear);
+  const issueCore = linear.issueCore.bind(linear);
   let limited = true;
-  linear.issueState = async () => { if (limited) { limited = false; throw new RateLimitedError("key", Date.now() + 10 * MINUTE); } return issueState(); };
+  linear.issueCore = async () => { if (limited) { limited = false; throw new RateLimitedError("key", Date.now() + 10 * MINUTE); } return issueCore(); };
   const { calls, bridge } = fakeBridge();
   const writeback = new Writeback(linear, { read: async () => allOn }, bridge, 0, outboxPath(), undefined, accept);
   await writeback.turnEnded(completedWithPr, linked);
@@ -634,7 +634,7 @@ test("other Linear outages are retried twice, after 30 s and 2 min, then dropped
   const errors = t.mock.method(console, "error", () => {});
   const linear = new FakeLinear();
   let attempts = 0;
-  linear.issueState = async () => { attempts++; throw new Error("The Linear API request failed (HTTP 503). Try again."); };
+  linear.issueCore = async () => { attempts++; throw new Error("The Linear API request failed (HTTP 503). Try again."); };
   const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), undefined, accept);
   await writeback.turnEnded(completedWithPr, linked);
   t.mock.timers.tick(30_000);

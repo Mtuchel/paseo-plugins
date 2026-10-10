@@ -25,7 +25,7 @@ import { shardDependencies, type ShardAssignor } from "./worktree-shards";
 
 export type Started = { agentId: string; warnings: string[]; provider: string; target: string; resumed: boolean; untrusted: boolean; plan: PlanPolicy | null };
 type Deps = {
-  linear: Pick<LinearService, "detail" | "issueState" | "viewerId" | "trustedAppIds" | "issueDocument">;
+  linear: Pick<LinearService, "detail" | "issueState" | "issueCore" | "viewerId" | "trustedAppIds" | "issueDocument">;
   launcher: Pick<Launcher, "start">;
   handover?: Pick<Handover, "resumeTarget">;
   branches?: typeof readBranches;
@@ -114,14 +114,14 @@ export type PlanSetup = { identifier: string; untrusted: boolean; policy: PlanPo
 // `routes` and `settings`: the small-ticket route (README, "Small-ticket route"), offered to an
 // omp planner of an eligible ticket, and taken again on a relaunch of a ticket that took it.
 export async function planSetup(
-  linear: Pick<LinearService, "issueState" | "viewerId" | "trustedAppIds" | "issueDocument">,
+  linear: Pick<LinearService, "issueCore" | "viewerId" | "trustedAppIds" | "issueDocument">,
   issueId: string,
   provider: string,
   usualModeId: string | undefined,
   context: { tiers?: Pick<TierStore, "get">; routes?: Pick<SmallRoutes, "get">; settings?: Pick<PluginSettings, "autoApprove" | "dispatch"> } = {},
 ): Promise<PlanSetup> {
   const { tiers, routes, settings } = context;
-  const state = await linear.issueState(issueId);
+  const state = await linear.issueCore(issueId);
   const untrusted = isUntrusted(state, await linear.viewerId(), await linear.trustedAppIds());
   const plan = await linear.issueDocument(issueId, `Plan: ${state.identifier}`).catch(() => null);
   const providerKey = provider.split("/")[0];
@@ -281,7 +281,7 @@ export class TicketStarter {
     this.capacity = deps.capacity ?? new Capacity();
     this.scheduler = deps.scheduler ?? new Scheduler({
       running: (paseo) => runningTicketAgents(paseo, deps.inspect),
-      projectOf: async (issueId) => (await deps.linear.issueState(issueId)).projectId,
+      projectOf: async (issueId) => (await deps.linear.issueCore(issueId)).projectId,
       ...(deps.presence ? { away: () => deps.presence!.away() } : {}),
     });
   }

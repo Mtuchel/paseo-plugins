@@ -365,7 +365,7 @@ export function planSteps(markdown: string): string[] {
 
 type Deps = {
   api: AgentApi;
-  linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "admissionStates" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
+  linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "admissionStates" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
   starter: Pick<TicketStarter, "start" | "admission">;
   // The ticket's handover record: a successor resumes from it and takes it over (succeed).
   handover: Pick<Handover, "resumeTarget" | "handOff">;
@@ -2046,7 +2046,7 @@ export class SessionRouter {
     if (await this.deps.deletions?.blocked(issue.id)) return { kind: "impossible", reason: "the ticket was deleted or is paused for deletion" };
     if (!this.paseo) return { kind: "wait", reason: "Paseo is not connected yet" };
     const paseo = this.paseo;
-    const state = await this.deps.linear.issueState(issue.id);
+    const state = await this.deps.linear.issueStatus(issue.id);
     if (["completed", "canceled", "duplicate"].includes(state.statusType.trim().toLowerCase())) return { kind: "impossible", reason: `${issue.identifier} is ${state.status}` };
     const gate = this.deps.launcher.gate(issue.id);
     if (!gate) return { kind: "wait", reason: "a launch for this ticket is under way" };
