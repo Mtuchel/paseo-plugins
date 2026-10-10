@@ -28,14 +28,18 @@ import { NEEDS_INPUT_STATE } from "./writeback";
 //   work state, not held) starts again, at most RESTART_CAP times, ORPHAN_GRACE_MS apart.
 // - `-failed` without one: started again after FAILED_BACKOFF_MINUTES, at most RESTART_CAP times;
 //   then the owner is mentioned once and the label stays.
+// - An orphan -- a ticket in Planning assigned to this host's Paseo app, without any Paseo state
+//   label, a parked plan, a waiting thread or an agent -- is started again after ORPHAN_GRACE_MS,
+//   like a vanished `-running` agent: nothing else would ever start it.
 // - A start that fails on the host's setup (SetupError) is not retried: the owner is mentioned once.
 // Every incident is a record in projects.json, claimed before each start and each comment, so a
 // reload never doubles a start or a comment and never resets a cap.
 
 // How often the pass runs: the cadence of the project reads.
 const REPAIR_POLL_MS = 2 * 60_000;
-// A ticket carries `-running` this long without an agent before the label comes off; also how long
-// an interrupted restart may still be starting, and the pause between two restarts of an orphan.
+// A ticket carries `-running` (or is an orphan) this long without an agent before the label comes
+// off and it starts again; also how long an interrupted restart may still be starting, and the
+// pause between two restarts of an orphan.
 const ORPHAN_GRACE_MS = 15 * 60_000;
 const RESTART_CAP = 3;
 // Retry N+1 of a failed start comes this many minutes after the failure before it.
@@ -50,29 +54,34 @@ const CLOSED_TYPES = new Set(["completed", "canceled", "duplicate"]);
 const RESTART_TYPES = new Set(["triage", "backlog", "unstarted"]);
 const RESTART_STARTED_STATES = new Set([PLANNING_STATE, CODING_STATE].map((name) => name.toLowerCase()));
 
-export type RepairKind = "running" | "failed";
+export type RepairKind = "running" | "failed" | "orphan";
 export type RepairState = "watching" | "restarting" | "resolved" | "exhausted";
 // One incident per ticket. `incident`: its id; every write checks it, so a reset by the owner meanwhile
 // is never overwritten. `orphanSince`/`failedSince`: when the grace or backoff of the next restart
 // started (unset after an owner retry until the next scan). `attempts`: restarts claimed.
 // `attemptAt`: when the restart under way was claimed. `cleared`: the repair removed the labels.
 // `owner`: the incident began with the owner's retry, so it goes on without a label. `setup`: it
-// stopped on a SetupError. `comments`: the comments already claimed. `log`: the last steps.
+// stopped on a SetupError. `comments`: the comments already claimed. `deferredAt`: when its last
+// restart waited for admission (focus, the agent limit), so the next pass tries others first.
+// `log`: the last steps.
 export type RepairRecord = {
   incident: string; identifier: string; kind: RepairKind; state: RepairState; attempts: number;
-  orphanSince?: string; failedSince?: string; attemptAt?: string; startedAgentId?: string; exhaustedAt?: string; resolvedAt?: string;
+  orphanSince?: string; failedSince?: string; attemptAt?: string; startedAgentId?: string; exhaustedAt?: string; resolvedAt?: string; deferredAt?: string;
   cleared?: boolean; owner?: boolean; setup?: boolean; lastReason?: string; comments?: string[];
   log: { at: string; action: string }[];
 };
 
 type Deps = {
-  linear: Pick<LinearService, "repairCandidates" | "addLabel" | "removeLabel" | "comment" | "issueState" | "userUrl" | "viewerId">;
+  linear: Pick<LinearService, "repairCandidates" | "addLabel" | "removeLabel" | "comment" | "issueState" | "userUrl" | "viewerId" | "appUserId">;
   store: Pick<ProjectStore, "repairs" | "updateRepairs">;
   launcher: Pick<Launcher, "gate" | "underWay">;
   // SessionRouter.restartFor.
   restart: (issueId: string, identifier: string, options: RestartOptions) => Promise<RestartResult>;
   intake: Pick<ActivationIntake, "claimFor" | "pendingFor" | "claimsReady">;
   deletions?: Pick<ReviewDeletions, "blocked">;
+  // A ticket without an agent that waits on purpose, so it is no orphan: its plan is parked for the
+  // owner's review (ParkedPlans.has) or a thread of it waits for its turn (SessionRouter.threadQueued).
+  waiting?: (issueId: string) => Promise<boolean>;
   now?: () => number;
   // Provider-process inspection for ghost agents; the tests inject a fake process table.
   inspect?: ProcessInspector;
@@ -92,11 +101,11 @@ function hasLabel(labels: { name: string }[], name: string): boolean {
 }
 
 function sinceOf(record: RepairRecord): string | undefined {
-  return record.kind === "running" ? record.orphanSince : record.failedSince;
+  return record.kind === "failed" ? record.failedSince : record.orphanSince;
 }
 
 function timed(record: RepairRecord, at: string): RepairRecord {
-  return record.kind === "running" ? { ...record, orphanSince: at } : { ...record, failedSince: at };
+  return record.kind === "failed" ? { ...record, failedSince: at } : { ...record, orphanSince: at };
 }
 
 // The state a replacement agent may start in: Triage, Backlog, Todo, Planning or In Progress.
@@ -107,6 +116,15 @@ function restartable(status: string, statusType: string): boolean {
 
 function heldBy(labels: { name: string }[], names: Names): string | null {
   return [names.hold, names.manual, names.needsYou].find((name) => hasLabel(labels, name)) ?? null;
+}
+
+// Shaped like an orphan: in Planning, assigned to this host's Paseo app (`appId`), and carrying none
+// of the trigger, running, failed, hold, manual and needs-you labels. The caller checks the rest
+// (no agent, no parked plan, no waiting thread).
+function orphanShaped(ticket: RepairCandidate, names: Names, appId: string | null): boolean {
+  return Boolean(appId) && ticket.delegateId === appId
+    && ticket.statusType.trim().toLowerCase() === "started" && ticket.status.trim().toLowerCase() === PLANNING_STATE.toLowerCase()
+    && ![names.trigger, names.running, names.failed, names.hold, names.manual, names.needsYou].some((name) => hasLabel(ticket.labels, name));
 }
 
 function sentence(reason: string): string {
@@ -144,15 +162,22 @@ export class LabelRepair {
         if (!await this.deps.intake.claimsReady()) return;
         const names = { ...dispatchLabels(settings.dispatch.label), trigger: settings.dispatch.label };
         const records = await this.deps.store.repairs();
-        const tickets = await this.deps.linear.repairCandidates({ labels: [names.running, names.failed], teamKeys: settings.dispatch.teamKeys, ids: Object.keys(records) });
+        // Without this host's Paseo app nothing is assigned to it, so there are no orphans to read.
+        const appId = await this.deps.linear.appUserId();
+        const tickets = await this.deps.linear.repairCandidates({ labels: [names.running, names.failed], teamKeys: settings.dispatch.teamKeys, ids: Object.keys(records), ...appId ? { state: PLANNING_STATE } : {} });
         const open = new Map(tickets.filter((ticket) => !CLOSED_TYPES.has(ticket.statusType.trim().toLowerCase())).map((ticket) => [ticket.id, ticket]));
         // Records whose ticket closed or is gone end with it.
         const gone = Object.keys(records).filter((id) => !open.has(id));
         if (gone.length) await this.deps.store.updateRepairs((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !gone.includes(id))));
         // One restart per pass: a start takes a minute or two, and the dispatcher's poll waits for it.
+        // A ticket whose last restart waited for admission goes after the others, so one that focus
+        // or the agent limit keeps waiting never takes every pass's restart.
         const pass = { restarted: false };
-        for (const ticket of open.values()) {
-          await this.repair(paseo, names, ticket, records[ticket.id] ?? null, pass)
+        const order = [...open.values()]
+          .filter((ticket) => records[ticket.id] || hasLabel(ticket.labels, names.running) || hasLabel(ticket.labels, names.failed) || orphanShaped(ticket, names, appId))
+          .sort((a, b) => (records[a.id]?.deferredAt ?? "").localeCompare(records[b.id]?.deferredAt ?? ""));
+        for (const ticket of order) {
+          await this.repair(paseo, names, ticket, records[ticket.id] ?? null, pass, appId)
             .catch((error: unknown) => console.error(`[linear-tickets] ${ticket.identifier}: repairing its labels failed, the next pass retries: ${message(error)}`));
         }
         this.lastError = null;
@@ -184,7 +209,8 @@ export class LabelRepair {
         const pass = { restarted: false };
         for (const ticket of tickets) {
           if (CLOSED_TYPES.has(ticket.statusType.trim().toLowerCase())) continue;
-          await this.repair(paseo, names, ticket, records[ticket.id] ?? null, pass)
+          // Only tickets carrying `-failed` are read here, and those are never orphans.
+          await this.repair(paseo, names, ticket, records[ticket.id] ?? null, pass, null)
             .catch((error: unknown) => console.error(`[linear-tickets] ${ticket.identifier}: repairing its labels failed, the next pass retries: ${message(error)}`));
         }
         this.lastBlockerError = null;
@@ -238,19 +264,22 @@ export class LabelRepair {
   }
 
   // Why the ticket may not get a replacement agent right now (null: it may), read fresh from Linear
-  // and the hosts. Runs inside restartFor, after its admission and right before the start.
-  private async refusal(paseo: PaseoApi, ticket: RepairCandidate, names: Names): Promise<string | null> {
+  // and the hosts. Runs inside restartFor, after its admission and right before the start. An
+  // orphan's restart is also refused once its plan is parked or a thread of it waits.
+  private async refusal(paseo: PaseoApi, ticket: RepairCandidate, names: Names, orphan: boolean): Promise<string | null> {
     const state = await this.deps.linear.issueState(ticket.id);
     if (CLOSED_TYPES.has(state.statusType.trim().toLowerCase())) return `${ticket.identifier} is ${state.status}`;
     if (hasLabel(state.labels, names.trigger)) return `${ticket.identifier} carries ${names.trigger} now`;
     const held = heldBy(state.labels, names);
     if (held) return `${ticket.identifier} carries ${held}`;
     if (!restartable(state.status, state.statusType)) return `${ticket.identifier} is in ${state.status}`;
+    if (orphan && await this.deps.waiting?.(ticket.id)) return `${ticket.identifier} waits on purpose (a parked plan or a queued thread)`;
     const own = await this.ownership(paseo, ticket, true);
     return own.works ? `an agent works on ${ticket.identifier} (${own.why})` : null;
   }
 
-  private async repair(paseo: PaseoApi, names: Names, ticket: RepairCandidate, stored: RepairRecord | null, pass: { restarted: boolean }): Promise<void> {
+  // `appId`: this host's Paseo app, whose tickets may be orphans (null: none are).
+  private async repair(paseo: PaseoApi, names: Names, ticket: RepairCandidate, stored: RepairRecord | null, pass: { restarted: boolean }, appId: string | null): Promise<void> {
     const { linear } = this.deps;
     const running = hasLabel(ticket.labels, names.running);
     const failed = hasLabel(ticket.labels, names.failed);
@@ -258,6 +287,9 @@ export class LabelRepair {
     // deleted to no one.
     if (hasLabel(ticket.labels, names.trigger) || ticket.openChildren) return;
     if (await this.deps.deletions?.blocked(ticket.id)) return;
+    // An orphan waits for no one: no label says an agent works on it or should, and neither a
+    // parked plan nor a waiting thread accounts for the missing agent. `own` below decides the rest.
+    const orphan = !running && !failed && orphanShaped(ticket, names, appId) && !await this.deps.waiting?.(ticket.id);
     const own = await this.ownership(paseo, ticket, false);
     const now = this.iso();
     let record = stored;
@@ -294,7 +326,7 @@ export class LabelRepair {
 
     if (record?.state === "resolved") {
       const old = this.now() - Date.parse(record.resolvedAt ?? now) > RESOLVED_KEEP_MS;
-      if (own.works || (!running && !failed)) {
+      if (own.works || (!running && !failed && !orphan)) {
         if (own.works && failed) await this.clearFailed(ticket, record, names, now, own);
         if (old) await this.commit(ticket.id, record.incident, null);
         return;
@@ -304,7 +336,7 @@ export class LabelRepair {
         record = null;
       } else {
         // Vanished again within a day: the same incident, its restarts and comments count on.
-        const reopened = logged(timed({ ...record, kind: running ? "running" : "failed", state: "watching", cleared: false, resolvedAt: undefined }, now), now, "no agent works on it again");
+        const reopened = logged(timed({ ...record, kind: running ? "running" : failed ? "failed" : "orphan", state: "watching", cleared: false, resolvedAt: undefined }, now), now, "no agent works on it again");
         await this.commit(ticket.id, record.incident, reopened);
         return;
       }
@@ -315,16 +347,17 @@ export class LabelRepair {
         if (failed) await this.clearFailed(ticket, null, names, now, own);
         return;
       }
-      if (!running && !failed) return;
-      const kind: RepairKind = running ? "running" : "failed";
+      if (!running && !failed && !orphan) return;
+      const kind: RepairKind = running ? "running" : failed ? "failed" : "orphan";
       const opened: RepairRecord = timed({ incident: randomUUID(), identifier: ticket.identifier, kind, state: "watching", attempts: 0, log: [] }, now);
-      await this.commit(ticket.id, null, logged(opened, now, kind === "running" ? `carries ${names.running} but no agent works on it` : `carries ${names.failed} and no agent works on it`));
+      await this.commit(ticket.id, null, logged(opened, now, kind === "running" ? `carries ${names.running} but no agent works on it`
+        : kind === "failed" ? `carries ${names.failed} and no agent works on it` : `is in ${ticket.status}, assigned to Paseo, but no agent works on it`));
       return;
     }
 
     // Watching. An owner's retry left the timing for this scan: it starts from the labels now.
     if (!sinceOf(record)) {
-      const kind: RepairKind = running ? "running" : failed ? "failed" : record.kind;
+      const kind: RepairKind = running ? "running" : failed ? "failed" : orphan ? "orphan" : record.kind;
       await this.commit(ticket.id, record.incident, logged(timed({ ...record, kind }, now), now, `watching the owner's start (${kind})`));
       return;
     }
@@ -334,9 +367,13 @@ export class LabelRepair {
         : logged({ ...record, state: "resolved", resolvedAt: now }, now, `an agent works on it: ${own.why}`));
       return;
     }
-    // The label went without the repair (the owner, an archived agent): nothing stale is left.
-    if (!running && !failed && !record.cleared && !record.owner) {
-      await this.commit(ticket.id, record.incident, null);
+    // The label went without the repair (the owner, an archived agent): nothing stale is left. An
+    // orphan that is no longer one (moved on, held, labelled, its plan parked, a thread queued)
+    // ends its incident; one already restarted is kept a day, so its restarts count on if it is
+    // orphaned again.
+    if (record.kind === "orphan" ? !orphan : !running && !failed && !record.cleared && !record.owner) {
+      await this.commit(ticket.id, record.incident, record.kind === "orphan" && record.attempts > 0
+        ? logged({ ...record, state: "resolved", resolvedAt: now }, now, "no longer an orphan") : null);
       return;
     }
     const held = heldBy(ticket.labels, names);
@@ -367,6 +404,8 @@ export class LabelRepair {
         await this.commit(ticket.id, record.incident, logged({ ...record, state: "resolved", resolvedAt: now }, now, `no new agent: ${held ? `it carries ${held}` : `it is in ${ticket.status}`}`));
         return;
       }
+    } else if (record.kind === "orphan") {
+      if (this.now() - Date.parse(sinceOf(record)!) < ORPHAN_GRACE_MS) return;
     } else {
       // A failed start in a state or with a label no agent starts for waits for the owner.
       if (!eligible) return;
@@ -398,10 +437,11 @@ export class LabelRepair {
     const n = watching.attempts + 1;
     const claimed = logged({ ...watching, attempts: n, state: "restarting", attemptAt: this.iso() }, this.iso(), `restart ${n} of ${RESTART_CAP}`);
     if (!await this.commit(ticket.id, watching.incident, claimed)) return;
-    console.log(`[linear-tickets] ${ticket.identifier}: ${watching.kind === "running" ? "no agent since its label came off" : `${names.failed} without an agent`}; restart ${n} of ${RESTART_CAP}`);
+    const cause = watching.kind === "running" ? "no agent since its label came off" : watching.kind === "orphan" ? `in ${ticket.status} without an agent` : `${names.failed} without an agent`;
+    console.log(`[linear-tickets] ${ticket.identifier}: ${cause}; restart ${n} of ${RESTART_CAP}`);
     const result = await this.deps.restart(ticket.id, ticket.identifier, {
       retryHint: `add the "${names.trigger}" label again`,
-      eligible: () => this.refusal(paseo, ticket, names),
+      eligible: () => this.refusal(paseo, ticket, names, watching.kind === "orphan"),
     }).catch((error: unknown): RestartResult => ({ kind: "failed", error: error instanceof Error ? error : new Error(String(error)) }));
     const at = this.iso();
     const { linear } = this.deps;
@@ -423,7 +463,7 @@ export class LabelRepair {
     }
     if (result.kind !== "failed") {
       const why = result.kind === "deferred" ? result.reason : result.kind === "forwarded" ? `handed to ${result.peer}` : "the ticket is deleted or paused for deletion";
-      await this.commit(ticket.id, claimed.incident, logged({ ...claimed, attempts: watching.attempts, state: "watching", attemptAt: undefined }, at, `restart ${n} did not start: ${why}`));
+      await this.commit(ticket.id, claimed.incident, logged({ ...claimed, attempts: watching.attempts, state: "watching", attemptAt: undefined, ...result.kind === "deferred" ? { deferredAt: at } : {} }, at, `restart ${n} did not start: ${why}`));
       return;
     }
     const reason = result.error.message;
@@ -457,6 +497,8 @@ export class LabelRepair {
     console.error(`[linear-tickets] ${ticket.identifier}: no agent after ${record.attempts} restarts; left to the owner`);
     if (record.kind === "running") {
       await this.post(ticket, `**Paseo could not start an agent for this ticket.** Its agent was gone, and Paseo started it again ${record.attempts} times, but no agent is working on it now (the start failed, or the agent never came up), so it stops trying. Last failure: ${sentence(reason)}. Start an agent for it from the Linear tickets sidebar, or add the \`${names.trigger}\` label to try again.`);
+    } else if (record.kind === "orphan") {
+      await this.post(ticket, `**Paseo could not start an agent for this ticket.** It is assigned to Paseo, but no agent was working on it and nothing would start one, so Paseo started it again ${record.attempts} times; no agent is working on it now (the start failed, or the agent never came up), so it stops trying. Last failure: ${sentence(reason)}. Start an agent for it from the Linear tickets sidebar, or add the \`${names.trigger}\` label to try again.`);
     } else {
       await this.post(ticket, `**Paseo could not start an agent for this ticket**, also after ${RESTART_CAP} more tries (${FAILED_BACKOFF_MINUTES.slice(0, -1).join(", ")} and ${FAILED_BACKOFF_MINUTES.at(-1)} minutes after each failure). Last failure: ${sentence(reason)}. The ticket stays \`${names.failed}\`: start an agent from the Linear tickets sidebar, or add the \`${names.trigger}\` label.`, true);
     }

@@ -66,6 +66,10 @@ export class ParkedPlans {
     return (await this.all()).find((plan) => plan.agentId === agentId) ?? null;
   }
 
+  async has(issueId: string): Promise<boolean> {
+    return stat(this.path(issueId)).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; });
+  }
+
   async put(plan: ParkedPlan): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     const path = this.path(plan.issueId);

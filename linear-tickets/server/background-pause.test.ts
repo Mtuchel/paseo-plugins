@@ -317,10 +317,12 @@ test("the label repair pauses at 19% of the points budget and sends at 21%", asy
   await repair(low).tick({} as PaseoApi, settings);
   assertPaused(low, "label-repair");
 
-  const high = fixture(t, () => ({ issues: { nodes: [], pageInfo: { hasNextPage: false } } }));
+  // Its first request reads the app's identity (the orphan rule restarts only this host's tickets).
+  const high = fixture(t, (call) => call.operation === "appViewer" ? { viewer: { id: "paseo-app", name: "Paseo" } } : { issues: { nodes: [], pageInfo: { hasNextPage: false } } });
   bothAt(high, HIGH_POINTS);
   await repair(high).tick({} as PaseoApi, settings);
-  assertSent(high, "key");
+  assertSent(high, "app");
+  assert.ok(high.calls.some((call) => call.operation === "repairCandidates"), "the candidates are read after it");
 });
 
 // AC-2: health's public check, which is where its caller context lives.

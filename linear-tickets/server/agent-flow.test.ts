@@ -119,6 +119,18 @@ test("a ticket's newest thread accounts for a missing agent only while it waits,
   await h.cleanup();
 });
 
+test("only a thread waiting for its turn keeps a ticket whose agent is gone from being an orphan", async () => {
+  const h = routerHarness([]);
+  assert.equal(await h.router.threadQueued("i1"), false, "no thread");
+  await h.store.put({ ...link, offer: "parked" });
+  assert.equal(await h.router.threadQueued("i1"), false, "an agent ran once and is gone: the label repair may restart it");
+  await h.store.put({ ...link, sessionId: "s2", agentId: null, queued: true, createdAt: "2026-01-02T00:00:00Z" });
+  assert.equal(await h.router.threadQueued("i1"), true, "it waits for blockers or a slot");
+  await h.store.patch("s2", { closed: true });
+  assert.equal(await h.router.threadQueued("i1"), false, "a closed thread waits for nothing");
+  await h.cleanup();
+});
+
 test("a start under way accounts for the ticket until it ends", async () => {
   const gate: { fail?: (error: Error) => void } = {};
   const h = routerHarness([], {
