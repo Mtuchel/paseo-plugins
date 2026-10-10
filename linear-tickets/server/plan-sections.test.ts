@@ -87,6 +87,8 @@ test("a plan carries at most three follow-ups across both sections", () => {
   assert.equal(parsed(plan(VERIFICATION, three, NO_RULE)).followUps.length, 3, "three follow-ups pass");
   const four = three.replace("- Returns page: follow-up — Show the date on returns\n", "- Returns page: follow-up — Show the date on returns\n- Seed data: follow-up — Seed the dates\n");
   assert.match(problem(plan(VERIFICATION, four, NO_RULE)), /The plan has 4 follow-ups; a plan files at most 3\. Keep the 3 that matter most and turn the rest into "include" \(fixed now\) or "n\/a — minor: <what>"\./);
+  // The cap holds at impact 0–1 too: a short section never files a fourth follow-up.
+  assert.match(problem(plan(`## Reach\n\n${four.replace("## Reach\n\n", "")}`, "## Principles and rules\n\nNone apply; no new rule.\n"), 1), /The plan has 4 follow-ups/);
   // The principles section counts too: its "Existing violations" follow-ups file the same way.
   assert.match(problem(plan(VERIFICATION, three, RULE)), /The plan has 4 follow-ups/);
 });
@@ -99,6 +101,8 @@ test("a follow-up that only points at an open ticket is refused; existing names 
   const ok = ref("- Seed data: existing — TUC-12 (the backfill covers it)");
   assert.deepEqual(parsed(ok), { followUps: ["Document the delivery date"], newRule: false }, "an existing place files nothing");
   assert.deepEqual(planExistingRefs(ok), ["TUC-12"]);
+  // A covered word and a ticket apart from each other state a finding of their own.
+  assert.deepEqual(parsed(ref("- Seed data: follow-up — Duplicate payments after retry (related to TUC-971)")).followUps, ["Document the delivery date", "Duplicate payments after retry (related to TUC-971)"]);
 });
 
 test("the reader files only titles that state a finding: bare identifiers and 'already filed' references stay with their tickets", () => {
@@ -108,11 +112,31 @@ test("the reader files only titles that state a finding: bare identifiers and 'a
     "- Mobile app: follow-up — TUC-935\n",
     "- CSV export: follow-up — Carry the date into the export (TUC-827, already Todo)\n",
     "- Delivery notes: follow-up — Print the date on notes (existing TUC-583; same comment)\n",
-    "- Returns page: follow-up — Menu stops pulling texts (related to TUC-971)\n",
+    "- Returns page: follow-up — Backfill the seed dates — TUC-563, exists\n",
+    "- Claims: follow-up — Existing ticket TUC-583 covers the seed data\n",
+    "- Invoices: follow-up — Already filed as TUC-563, the backfill\n",
+    "- Reports: follow-up — Menu stops pulling texts (related to TUC-971)\n",
     "- Seed data: existing — TUC-12 (the backfill covers it)\n",
     "## Principles and rules\n\nNone apply; no new rule.\n",
   ].join("\n");
   assert.deepEqual(planFollowUps(text), ["Document the delivery date", "Menu stops pulling texts (related to TUC-971)"]);
   assert.deepEqual(planExistingRefs(text), ["TUC-12"]);
   assert.deepEqual(planExistingRefs("# Plan\n\n## Reach\n\n- Changes: x\n- Order page: include — AC-1\n"), []);
+});
+
+test("a covered word or a ticket outside its own clause states a finding and is filed", () => {
+  const text = [
+    "# Plan\n\n## Reach\n\n- Changes: the delivery date\n",
+    "- Help page: follow-up — Document the delivery date\n",
+    "- Records: follow-up — Existing records truncate ISO-8601 timestamps\n",
+    "- Payments: follow-up — Duplicate payments after retry (related to TUC-971)\n",
+    "- Imports: follow-up — Fix UTF-8 handling: SHA-256 sums differ\n",
+    "## Principles and rules\n\nNone apply; no new rule.\n",
+  ].join("\n");
+  assert.deepEqual(planFollowUps(text), [
+    "Document the delivery date",
+    "Existing records truncate ISO-8601 timestamps",
+    "Duplicate payments after retry (related to TUC-971)",
+    "Fix UTF-8 handling: SHA-256 sums differ",
+  ]);
 });

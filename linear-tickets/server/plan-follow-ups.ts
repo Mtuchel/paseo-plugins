@@ -23,9 +23,9 @@ type Item = {
   url?: string;
   related: boolean;
   // Why the item is no longer worked on: the latest plan carried more follow-ups than it may file
-  // (`over-cap`, decided when the plan is read in), the Paseo app could not be used, the ticket is
+  // and this one was never created (`over-cap`), the Paseo app could not be used, the ticket is
   // not trusted, or (records written before the step stopped giving up) Linear kept failing. A new
-  // approval clears it and tries again — except `over-cap`, which each approval decides anew.
+  // approval clears it and tries again; only an uncreated over-cap item is decided anew.
   stopped?: "over-cap" | "no-app" | "gave-up" | "untrusted";
 };
 export type FollowUpRecord = {
@@ -89,15 +89,12 @@ export class PlanFollowUps {
       record.titles = titles.map((title) => title.toLowerCase());
       titles.forEach((title, index) => {
         const item = record.items[title.toLowerCase()] ??= { title, related: false };
-        if (index >= MAX_PLAN_FOLLOW_UPS) {
-          // Over the cap, counted from this plan's titles in order: recorded as never attempted, so
-          // no round files it and a repeated approval does not either. An item already filed keeps
-          // its ticket (and its pending link) and is never touched.
-          if (!item.id) item.stopped = "over-cap";
-          return;
-        }
-        // Under the cap a new approval clears an earlier stop: the app or the trust may be fixed.
-        delete item.stopped;
+        // Over the cap, counted from this plan's titles in order: an item that was never created is
+        // recorded so no round files it and a repeated approval does not either. An item that
+        // exists keeps its link work — clearing a stop a legacy record left on it — so an over-cap
+        // position can never wedge the step.
+        if (index >= MAX_PLAN_FOLLOW_UPS && !item.id) item.stopped = "over-cap";
+        else delete item.stopped;
       });
       record.attempts = 0;
       record.retryAt = null;

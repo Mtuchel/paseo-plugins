@@ -180,7 +180,7 @@ function confirmedRestart(record: ProjectRecord, run: PlannerRecord, requestId: 
 }
 export type ProjectRecord = { name?: string; planned?: string[]; plannedThrough?: string | null; planner: PlannerRecord | null; closedPlanner?: string; waiting?: Record<string, string>; withheld?: string[]; stalled?: Record<string, StalledRecord>; plannerLimitRestarts?: PlannerLimitRestart[] };
 
-type Read = { work: ProjectIssue[]; record: ProjectRecord; owner: string; readAt: string; planned: (issue: ProjectIssue) => boolean; unplanned: ProjectIssue[]; status: ProjectStatus };
+type Read = { work: ProjectIssue[]; record: ProjectRecord; owner: string; readAt: string; planned: (issue: ProjectIssue) => boolean; parked: (issue: ProjectIssue) => boolean; unplanned: ProjectIssue[]; status: ProjectStatus };
 
 // A ticket planner of an older version (a record carrying its Linear ticket's `identifier`): runs
 // have no Linear ticket, so it is dropped. Its `listed` tickets are NOT marked planned — the next
@@ -337,7 +337,7 @@ function orderLine(step: OrderStep): string {
 }
 
 type Deps = {
-  linear: Pick<LinearService, "labeledProjects" | "projectIssues" | "issueDescriptions" | "openTeamIssues" | "issueRef" | "addLabel" | "removeLabel" | "delegate" | "addBlocker" | "relate" | "comment" | "projectUpdate" | "appUserId" | "viewerId">;
+  linear: Pick<LinearService, "labeledProjects" | "projectIssues" | "issueDescriptions" | "openTeamIssues" | "issueRef" | "addLabel" | "removeLabel" | "delegate" | "addBlocker" | "relate" | "comment" | "projectUpdate" | "appUserId" | "viewerId" | "trustedAppIds">;
   scheduler: Pick<Scheduler, "note" | "admit" | "release">;
   // The cap the starter's start paths admit under (max agents, or a memory lease). Planner runs
   // bypass it: they only order tickets, and while one waits none of its project's new tickets can
@@ -530,9 +530,14 @@ export class ProjectFlow {
     // An old planner ticket still open would otherwise look like a ticket to hand out.
     const work = issues.filter((issue) => !issue.labels.some((name) => name.toLowerCase() === legacyPlanner));
     const owner = await this.deps.linear.viewerId();
+    // A follow-up Paseo filed in Backlog (README, "Plan follow-ups") waits for you: no planner run
+    // lists it and no hand-out takes it until you move it to Todo. Your own Backlog tickets, and
+    // everything in Todo, stay as before.
+    const appIds = await this.deps.linear.trustedAppIds();
+    const parked = (issue: ProjectIssue) => issue.statusType === "backlog" && issue.creatorId !== null && appIds.includes(issue.creatorId);
     const plannedIds = new Set(record.planned ?? []);
     const planned = (issue: ProjectIssue) => plannedIds.has(issue.id);
-    const unplanned = work.filter((issue) => !planned(issue) && (HAND_OUT_TYPES.has(issue.statusType) || issue.statusType === "triage")
+    const unplanned = work.filter((issue) => !planned(issue) && !parked(issue) && (HAND_OUT_TYPES.has(issue.statusType) || issue.statusType === "triage")
       && !issue.delegateId && !issue.parentId && (!issue.assigneeId || issue.assigneeId === owner));
     // Tickets the open run already lists are with it, not waiting for another plan.
     const listed = new Set(record.planner?.listed ?? []);
@@ -546,7 +551,7 @@ export class ProjectFlow {
     });
     record = updated ?? record;
     const planner = record.planner ? plannerSummary(record.planner) : null;
-    return { work, record, owner, readAt, planned, unplanned, status: { id: project.id, name: project.name, toPlan, plansAt: planner ? null : this.plansAt(record.waiting ?? {}, unplanned), planner, readAt } };
+    return { work, record, owner, readAt, planned, parked, unplanned, status: { id: project.id, name: project.name, toPlan, plansAt: planner ? null : this.plansAt(record.waiting ?? {}, unplanned), planner, readAt } };
   }
 
   // `linear.plan-project`: starts a run for the project's unplanned tickets right away instead of
@@ -898,7 +903,8 @@ export class ProjectFlow {
   // it in its reserved slot. A ticket with open sub-issues in the project is a group: assigning it
   // takes no slot, its sub-issues are handed out by the group. Withheld tickets are left to you, and
   // so are, until it is written, those an approved order not yet in Linear blocks, holds or marks
-  // attended: Linear does not show that order yet, so they would start against it.
+  // attended: Linear does not show that order yet, so they would start against it. A follow-up
+  // Paseo filed in Backlog is left to you too, until you move it to Todo (`read.parked`).
   private async handOut(projectId: string, read: Read, appId: string, paseo: PaseoApi, settings: PluginSettings): Promise<void> {
     const labels = dispatchLabels(settings.dispatch.label);
     const skip = new Set([labels.hold, labels.manual, labels.needsYou, labels.running, labels.failed, settings.dispatch.label].map((name) => name.toLowerCase()));
@@ -907,7 +913,7 @@ export class ProjectFlow {
     const pending = (await this.store.all())[projectId]?.planner?.approved;
     const ordered = new Set(pending ? parseOrder(pending.plan).flatMap((step) => step.kind === "blocks" ? [step.blocked] : step.kind === "hold" || step.kind === "attended" ? [step.ticket] : []) : []);
     const parents = new Set(read.work.map((issue) => issue.parentId).filter(Boolean));
-    const ready = await this.inFocus(read.work.filter((issue) => read.planned(issue) && !withheld.has(issue.id) && !repairing.has(issue.id) && !ordered.has(issue.identifier) && HAND_OUT_TYPES.has(issue.statusType) && !issue.delegateId && (!issue.assigneeId || issue.assigneeId === read.owner)
+    const ready = await this.inFocus(read.work.filter((issue) => read.planned(issue) && !read.parked(issue) && !withheld.has(issue.id) && !repairing.has(issue.id) && !ordered.has(issue.identifier) && HAND_OUT_TYPES.has(issue.statusType) && !issue.delegateId && (!issue.assigneeId || issue.assigneeId === read.owner)
       && !issue.parentId && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished)), paseo);
     for (const group of ready.filter((issue) => parents.has(issue.id))) {
       await this.deps.linear.delegate(group.id, appId);
@@ -952,14 +958,16 @@ export class ProjectFlow {
   // closed on purpose (a plan approved for later is back in Todo on purpose, a delegation by
   // someone else was refused). RESTART_GRACE_MS after it is first seen so it is started again with
   // a new thread, admitted like any start, at most RESTART_CAP times; then the owner is asked once.
-  // One restart per poll: a start takes a minute or two, and the dispatcher's poll waits for it.
+  // One restart per poll: a start takes a minute or two, and the dispatcher's poll waits for it. A
+  // follow-up Paseo filed in Backlog is no start that failed: nothing starts it again until you
+  // move it to Todo (`read.parked`), so it is no suspect and gets no owner ask either.
   private async reviveStalled(projectId: string, read: Read, appId: string, paseo: PaseoApi, settings: PluginSettings): Promise<void> {
     const labels = dispatchLabels(settings.dispatch.label);
     // Labelled tickets belong to the label dispatch, held ones and the owner's tasks to the owner.
     const skip = new Set([labels.hold, labels.manual, labels.needsYou, labels.running, labels.failed, settings.dispatch.label].map((name) => name.toLowerCase()));
     const parents = new Set(read.work.map((issue) => issue.parentId).filter(Boolean));
     const repairing = await this.repairing();
-    const suspects = await this.inFocus(read.work.filter((issue) => issue.delegateId === appId && HAND_OUT_TYPES.has(issue.statusType) && !parents.has(issue.id) && !repairing.has(issue.id)
+    const suspects = await this.inFocus(read.work.filter((issue) => issue.delegateId === appId && !read.parked(issue) && HAND_OUT_TYPES.has(issue.statusType) && !parents.has(issue.id) && !repairing.has(issue.id)
       && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished)), paseo);
     const stalled: ProjectIssue[] = [];
     for (const issue of suspects) {

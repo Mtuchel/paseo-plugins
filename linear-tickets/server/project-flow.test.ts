@@ -107,6 +107,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
     },
     appUserId: async () => { reads.push("appUserId"); if (fail.read) throw outage(); return APP; },
     viewerId: async () => { reads.push("viewerId"); if (fail.read) throw outage(); return OWNER; },
+    trustedAppIds: async () => { reads.push("trustedAppIds"); if (fail.read) throw outage(); return [APP]; },
   };
   const path = join(directory, "projects.json");
   const store = new ProjectStore(path, () => now);
@@ -899,6 +900,37 @@ test("tickets nobody may hand out stay put: started, someone else's, already wit
   r.advance(HOUR);
   await r.flow.tick(paseo, settings);
   assert.deepEqual(r.calls, ["delegate i4", "delegate i6"]);
+});
+
+test("a follow-up Paseo filed in Backlog waits for the owner: no planner run lists it and no hand-out takes it", async (t) => {
+  const parked = () => issue(1, { creatorId: APP, status: "Backlog", statusType: "backlog" });
+  const r = await room(t, [parked(), issue(2, { creatorId: OWNER, status: "Backlog", statusType: "backlog" })]);
+  const paseo = paseoWith(() => []);
+  const run = (await r.flow.planNow("erp", settings, paseo)).planner!.runId;
+  const brief = r.starts[0].brief;
+  assert.match(brief, /- \*\*TUC-2\*\* Ticket 2 \(Backlog · P3 · NEW\)/, "your own Backlog ticket is the new work");
+  assert.match(brief, /- \*\*TUC-1\*\* Ticket 1 \(Backlog · P3\)/, "the parked follow-up is only an open ticket in the list");
+  assert.doesNotMatch(brief, /### TUC-1 /, "and is not given in full as a NEW ticket");
+  await r.flow.applyPlan(run, "run-agent-1", "```project-order\n```", paseo, settings);
+  r.calls.length = 0;
+  r.advance(HOUR);
+  await r.flow.tick(paseo, settings);
+  assert.deepEqual(r.calls, ["delegate i2"], "the hand-out leaves the parked follow-up to you, also once a run listed it");
+
+  const only = await room(t, [parked()]);
+  await only.flow.tick(paseo, settings);
+  only.advance(HOUR);
+  await only.flow.tick(paseo, settings);
+  assert.equal((await only.flow.status())[0].toPlan, 0, "a parked follow-up is no new ticket");
+  await assert.rejects(only.flow.planNow("erp", settings, paseo), /No new tickets to plan/);
+
+  // A follow-up already assigned to Paseo (handed out before this rule) is no failed start:
+  // nothing restarts it, so the owner is not told a start failed either.
+  const delegated = await room(t, [issue(1, { creatorId: APP, status: "Backlog", statusType: "backlog", delegateId: APP })]);
+  await delegated.flow.tick(paseo, settings);
+  delegated.advance(11 * MINUTE);
+  await delegated.flow.tick(paseo, settings);
+  assert.deepEqual(delegated.calls, []);
 });
 
 test("in focus mode no planner run starts, and only tickets in focus are handed out or restarted", async (t) => {

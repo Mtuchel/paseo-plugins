@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -197,6 +197,40 @@ test("a place the plan leaves to an open ticket is listed in the notice, never f
     await followUps.file({ ...ORIGIN, plan });
     assert.equal(calls.filter((call) => call.startsWith("create")).length, 1);
     assert.match(comments(calls)[0], /Already covered by open tickets, so nothing was filed \(\[plan\]\(https:\/\/linear\.app\/doc\/plan\)\):\n- TUC-12/);
+  });
+});
+
+test("a legacy stop on the item past the cap does not wedge the filing: an already created ticket is still linked", async () => {
+  const plan = [
+    "# Plan\n\n## Reach\n\n- Changes: the delivery date\n",
+    "- One: follow-up — First finding\n",
+    "- Two: follow-up — Second finding\n",
+    "- Three: follow-up — Third finding\n",
+    "- Four: follow-up — Fourth finding\n",
+    "\n## Principles and rules\n\nNone apply; no new rule.\n",
+  ].join("\n");
+  await withFollowUps(async ({ calls, followUps, directory }) => {
+    // A record an earlier version wrote: four items, the fourth already created but never linked
+    // and stopped as `gave-up` — now past the cap.
+    await writeFile(join(directory, "origin-1.json"), JSON.stringify({
+      issueId: "origin-1", identifier: "TUC-50", documentUrl: "https://linear.app/doc/plan",
+      titles: ["first finding", "second finding", "third finding", "fourth finding"],
+      items: {
+        "first finding": { title: "First finding", id: "old-1", identifier: "TUC-101", url: "https://linear.app/TUC-101", related: true },
+        "second finding": { title: "Second finding", id: "old-2", identifier: "TUC-102", url: "https://linear.app/TUC-102", related: true },
+        "third finding": { title: "Third finding", id: "old-3", identifier: "TUC-103", url: "https://linear.app/TUC-103", related: true },
+        "fourth finding": { title: "Fourth finding", id: "old-4", identifier: "TUC-104", url: "https://linear.app/TUC-104", related: false, stopped: "gave-up" },
+      },
+      notice: null, attempts: 2, retryAt: Date.parse("2026-10-04T12:10:00Z"),
+    }));
+    await followUps.file({ ...ORIGIN, plan });
+    assert.deepEqual(calls, [
+      "relate old-4 origin-1 related",
+      "comment origin-1: 📌 Follow-ups filed from the approved plan ([plan](https://linear.app/doc/plan)):\n- [TUC-101](https://linear.app/TUC-101) First finding\n- [TUC-102](https://linear.app/TUC-102) Second finding\n- [TUC-103](https://linear.app/TUC-103) Third finding\n- [TUC-104](https://linear.app/TUC-104) Fourth finding",
+    ], "the created item past the cap is linked, not left stopped");
+    const record = JSON.parse(await readFile(join(directory, "origin-1.json"), "utf8")) as FollowUpRecord;
+    assert.equal(record.retryAt, null);
+    assert.ok(Object.values(record.items).every((item) => item.id && item.related && !item.stopped), "the legacy stop is gone and the step settles");
   });
 });
 
