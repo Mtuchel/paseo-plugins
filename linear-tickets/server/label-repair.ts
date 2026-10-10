@@ -81,7 +81,8 @@ type Deps = {
   deletions?: Pick<ReviewDeletions, "blocked">;
   // A ticket without an agent that waits on purpose, so it is no orphan: its plan is parked for the
   // owner's review (ParkedPlans.has) or a thread of it waits for its turn (SessionRouter.threadQueued).
-  waiting?: (issueId: string) => Promise<boolean>;
+  // `inTurn`: asked from inside the ticket's restart turn, which then is no waiting thread.
+  waiting?: (issueId: string, inTurn: boolean) => Promise<boolean>;
   now?: () => number;
   // Provider-process inspection for ghost agents; the tests inject a fake process table.
   inspect?: ProcessInspector;
@@ -273,7 +274,7 @@ export class LabelRepair {
     const held = heldBy(state.labels, names);
     if (held) return `${ticket.identifier} carries ${held}`;
     if (!restartable(state.status, state.statusType)) return `${ticket.identifier} is in ${state.status}`;
-    if (orphan && await this.deps.waiting?.(ticket.id)) return `${ticket.identifier} waits on purpose (a parked plan or a queued thread)`;
+    if (orphan && await this.deps.waiting?.(ticket.id, true)) return `${ticket.identifier} waits on purpose (a parked plan or a queued thread)`;
     const own = await this.ownership(paseo, ticket, true);
     return own.works ? `an agent works on ${ticket.identifier} (${own.why})` : null;
   }
@@ -289,7 +290,7 @@ export class LabelRepair {
     if (await this.deps.deletions?.blocked(ticket.id)) return;
     // An orphan waits for no one: no label says an agent works on it or should, and neither a
     // parked plan nor a waiting thread accounts for the missing agent. `own` below decides the rest.
-    const orphan = !running && !failed && orphanShaped(ticket, names, appId) && !await this.deps.waiting?.(ticket.id);
+    const orphan = !running && !failed && orphanShaped(ticket, names, appId) && !await this.deps.waiting?.(ticket.id, false);
     const own = await this.ownership(paseo, ticket, false);
     const now = this.iso();
     let record = stored;
