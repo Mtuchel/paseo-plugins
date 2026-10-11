@@ -284,6 +284,10 @@ test("the owner's asks are read with the owner's key, never the app, page by pag
 // pool (state writes with their target), and the 498-point ISSUE_STATE_QUERY is refused outright.
 const TEAM = [
   { id: "todo", name: "Todo", type: "unstarted", position: 1 },
+  // AC-7 (TUC-1289): the plan stages sit before In Review, so a review move that took the first
+  // started state named for review would land in Plan review.
+  { id: "plan-review", name: "Plan review", type: "started", position: 1.6 },
+  { id: "plan-approved", name: "Plan approved", type: "started", position: 1.7 },
   { id: "coding", name: "In Progress", type: "started", position: 2 },
   { id: "planning", name: "Planning", type: "started", position: 3 },
   { id: "review", name: "In Review", type: "started", position: 4 },
@@ -332,6 +336,8 @@ const MOVES: { name: string; node?: Record<string, unknown>; run: (linear: Linea
   { name: "moveToReview leaves a Done ticket alone", node: ticket("done"), run: (linear) => linear.moveToReview("i1"), sent: ["issueCore"] },
   { name: "moveToReview moves a started ticket to review", node: ticket("coding"), run: (linear) => linear.moveToReview("i1"), sent: ["issueCore", "teamStates", "issueUpdateState review"] },
   { name: "moveToReview moves a duplicate too (only completed and canceled stay)", node: ticket("dup"), run: (linear) => linear.moveToReview("i1"), sent: ["issueCore", "teamStates", "issueUpdateState review"] },
+  { name: "AC-7: moveToReview moves a ticket out of Plan review to In Review", node: ticket("plan-review"), run: (linear) => linear.moveToReview("i1"), sent: ["issueCore", "teamStates", "issueUpdateState review"] },
+  { name: "AC-7: moveToReview leaves a ticket already In Review alone", node: ticket("review"), run: (linear) => linear.moveToReview("i1"), sent: ["issueCore"] },
   { name: "removeLabel leaves a ticket without the label alone", node: ticket("todo"), run: (linear) => linear.removeLabel("i1", "paseo-needs-you"), sent: ["issueCore"] },
   { name: "removeLabel removes the label whatever its case", node: ticket("todo", NEEDS_YOU), run: (linear) => linear.removeLabel("i1", "paseo-needs-you"), sent: ["issueCore", "removeLabel"] },
   { name: "removeLabel decides on the caller's labels without reading", run: (linear) => linear.removeLabel("i1", "paseo-needs-you", CORE.labels), sent: ["removeLabel"] },

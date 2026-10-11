@@ -1250,10 +1250,10 @@ preserved. Genuine dependency, routing, capacity and process-exit waits retain t
 reason; terminal threads settle without waiting behind those gates.
 See *Who starts next* for the order in which waiting tickets get free slots.
 A blocker is finished when it is Done or Canceled, or when it is in review (a started state named
-like *In Review* or *Ready to merge*) and its pull requests are merged: at least one merged and
-none open or draft, as Linear's GitHub integration reports them. Links added by hand or by
-`link_url` carry no status and do not count. A blocker In Progress, Needs input or In Review with
-an open pull request still holds the ticket back.
+like *In Review* or *Ready to merge*, never the plan stage *Plan review*) and its pull requests are
+merged: at least one merged and none open or draft, as Linear's GitHub integration reports them.
+Links added by hand or by `link_url` carry no status and do not count. A blocker In Progress,
+Needs input, Plan review or In Review with an open pull request still holds the ticket back.
 
 **Wait line label.** Every ticket waiting in a host's line carries `paseo-queued`
 (`<trigger>-queued`): one the scheduler was asked to start and did not admit, and one with a
@@ -2737,7 +2737,8 @@ independently of the agent's own `linear_ticket` tools:
 - **Pull requests** — GitHub pull request URLs printed by the agent's completed shell
   commands during a turn (for example `gh pr create`) are attached to the ticket, the agent
   panel and the handover record, and the ticket then moves to its team's started state named
-  like *In Review*, but only for a pull request of that ticket: `gh pr view` on this host
+  like *In Review* (never the plan stage *Plan review*; a ticket there moves on to *In Review*),
+  but only for a pull request of that ticket: `gh pr view` on this host
   finds it, its title, description or head branch names the ticket identifier as a whole
   word (`Part of TUC-123`; `TUC-12` does not name `TUC-123`), and neither its title nor its
   `Linear:` line names another ticket instead (a TUC-630 pull request whose description lists

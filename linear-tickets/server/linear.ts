@@ -5,6 +5,7 @@ import { Credentials } from "./credentials";
 import type { LabelEvent, SweptIssue } from "./label-rules";
 import { currentCaller, currentPriority, poolOf, rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
 import { operationName } from "./linear-usage";
+import { planStage } from "./plan-policy";
 import { NEEDS_INPUT_STATE } from "./writeback";
 
 const endpoint = "https://api.linear.app/graphql";
@@ -262,10 +263,11 @@ export function resolveStartedState(states: TeamState[], preferredId?: string): 
 }
 
 // Where a linked pull request moves the ticket: a "started" state whose name mentions
-// review. Teams without one are left alone rather than guessed at.
+// review, never a plan stage (Plan review waits for the owner's plan decision, not for code
+// review). Teams without one are left alone rather than guessed at.
 export function resolveReviewState(states: TeamState[]): TeamState | null {
   return states
-    .filter((state) => state.type.trim().toLowerCase() === "started" && /review/i.test(state.name))
+    .filter((state) => state.type.trim().toLowerCase() === "started" && /review/i.test(state.name) && !planStage(state.name, state.type))
     .sort((a, b) => a.position - b.position)[0] ?? null;
 }
 
@@ -441,8 +443,9 @@ export type WrittenState = { name: string; type: string };
 // A blocker in review (In Review, Ready to merge) whose pull requests are merged has its code in:
 // the tickets waiting on it may start before someone marks it Done. Only pull requests Linear's
 // GitHub integration tracks have a status; at least one must be merged and none open or draft.
+// Plan review is a plan stage, not code review.
 export function inReviewState(name: string, type: string): boolean {
-  return type === "started" && /review|merge/i.test(name);
+  return type === "started" && /review|merge/i.test(name) && !planStage(name, type);
 }
 function pullRequestsMerged(attachments: unknown): boolean {
   const statuses = connection(attachments ?? { nodes: [] }).nodes.map((node) => record(node))
@@ -2212,14 +2215,15 @@ export class LinearService {
     });
   }
 
-  // Moves the ticket to its team's review state unless it is already there or past
-  // started work (completed or canceled tickets are left to people and integrations).
+  // Moves the ticket to its team's review state unless it is already in a code review state or
+  // past started work (completed or canceled tickets are left to people and integrations). A plan
+  // stage (Plan review) is not code review: a ticket there moves on.
   async moveToReview(issueId: string): Promise<{ changed: boolean; note?: string }> {
     return withPriority("owner", "status change", async () => {
       const state = await this.issueCore(issueId);
       const type = state.statusType.trim().toLowerCase();
       if (type === "completed" || type === "canceled") return { changed: false };
-      if (/review/i.test(state.status) && type === "started") return { changed: false };
+      if (/review/i.test(state.status) && type === "started" && !planStage(state.status, type)) return { changed: false };
       if (!state.teamId) return { changed: false, note: "The ticket has no team." };
       const target = resolveReviewState(await this.teamStates(state.teamId));
       if (!target) return { changed: false, note: "The ticket's team has no review state." };
