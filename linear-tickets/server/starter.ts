@@ -22,6 +22,7 @@ import { launchTier, recordStart, TIER_AGENT_LABEL, tierModel, tierNote, type Ti
 import { eligibilityProblems, SMALL_ROUTE_POLICY, type RouteRecord, type SmallRoutes } from "./small-route";
 import { NO_PLAN_LABEL, SMALL_ROUTE_ENV, smallRouteNote } from "../shared/small-route";
 import type { ReviewDeletions } from "./review-deletions";
+import type { DoneTickets } from "./retirement";
 import { shardDependencies, type ShardAssignor } from "./worktree-shards";
 
 export type Started = { agentId: string; warnings: string[]; provider: string; target: string; resumed: boolean; untrusted: boolean; plan: PlanPolicy | null };
@@ -46,6 +47,9 @@ type Deps = {
   // Parked plans (README, "Parked plans"): a ticket whose plan waits for the owner starts nothing
   // until the owner decides; the decision's own thread starts once the plan is unparked.
   parked?: Pick<ParkedPlans, "has">;
+  // Finished tickets (README, "Who starts next"): an agent of a Done or Canceled ticket quiet for
+  // more than an hour holds no slot (retirement.ts).
+  doneTickets?: Pick<DoneTickets, "releases">;
 };
 
 export const WAITING_PLAN_REASON = "A plan for this ticket waits for your decision in Plannotator; the next agent starts once you approve it or send it back.";
@@ -195,8 +199,10 @@ function smallRouteSetup(identifier: string, route: RouteRecord, tier: Tier, usu
 // agent waiting for the owner's answer or approval stays "running" in Paseo but works on nothing,
 // so it frees its slot (README, "Present and away") until the answer starts it again. A ghost
 // frees it too (README, "Ghost agents"): after a daemon restart the agents the listing still shows
-// as running without a process would otherwise fill every slot and refuse their own restarts.
-export async function runningTicketAgents(paseo: PaseoApi, inspect?: ProcessInspector): Promise<string[]> {
+// as running without a process would otherwise fill every slot and refuse their own restarts. So
+// does an agent `releases` names: one whose ticket is Done or Canceled and that has been quiet for
+// more than an hour (retirement.ts DoneTickets).
+export async function runningTicketAgents(paseo: PaseoApi, inspect?: ProcessInspector, releases?: (agent: PaseoAgent, now: number) => boolean): Promise<string[]> {
   const working: { agent: PaseoAgent; issueId: string }[] = [];
   let cursor: string | undefined;
   do {
@@ -207,9 +213,11 @@ export async function runningTicketAgents(paseo: PaseoApi, inspect?: ProcessInsp
     }
     cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
   } while (cursor);
+  const now = Date.now();
+  const counted = releases ? working.filter((item) => !releases(item.agent, now)) : working;
   // An inspection that fails anywhere reports no ghost (ghostAgents), so they count as today.
-  const ghosts = await ghostAgents(working.map((item) => item.agent), Date.now(), inspect);
-  return working.filter((item) => !ghosts.has(item.agent.id)).map((item) => item.issueId);
+  const ghosts = await ghostAgents(counted.map((item) => item.agent), now, inspect);
+  return counted.filter((item) => !ghosts.has(item.agent.id)).map((item) => item.issueId);
 }
 
 // Every agent of the ticket that is not archived, subagents included, on every page.
@@ -286,7 +294,7 @@ export class TicketStarter {
     this.branches = deps.branches ?? readBranches;
     this.capacity = deps.capacity ?? new Capacity();
     this.scheduler = deps.scheduler ?? new Scheduler({
-      running: (paseo) => runningTicketAgents(paseo, deps.inspect),
+      running: (paseo) => runningTicketAgents(paseo, deps.inspect, deps.doneTickets ? (agent, now) => deps.doneTickets!.releases(agent, now) : undefined),
       projectOf: async (issueId) => (await deps.linear.issueCore(issueId)).projectId,
       ...(deps.presence ? { away: () => deps.presence!.away() } : {}),
     });

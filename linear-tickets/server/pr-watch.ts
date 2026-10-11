@@ -28,6 +28,7 @@ import { githubBudget, GitHubPausedError, GitHubRateLimitedError, RateLimitedErr
 import { crashResume, unverifiedResume, type PromptOutcome, type Recovery, type SessionRouter, type Succession } from "./sessions";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
+import type { RetirePass, StackState } from "./retirement";
 import type { Watchdog } from "./watchdog";
 
 const INTERVAL_MS = 2 * 60 * 1000;
@@ -1212,6 +1213,9 @@ export class PullRequestWatch {
       // The ticket states crash recovery last saw (known-states.ts); the daemon passes the one the
       // plugin's own state writes feed. Absent: known-states.json next to pr-watch.json.
       knownStates?: KnownStates;
+      // Finished tickets' quiet agents and old ghosts (retirement.ts): archived in every poll, right
+      // after the stack policy reopened the Done tickets whose stack has not landed.
+      retire?: Pick<RetirePass, "pass" | "stop">;
     },
     private readonly path = join(paseoHome(), "linear-tickets", "pr-watch.json"),
   ) {
@@ -1245,6 +1249,7 @@ export class PullRequestWatch {
     this.resumeTimer = null;
     // No watchdog effect starts after the unload; one in flight drains under its lease.
     this.deps.watchdog?.stop();
+    this.deps.retire?.stop();
     // These runs may be awaiting GitHub before their next Linear write. Finish them
     // before the plugin's final hourly-usage flush and replacement instance start.
     await Promise.allSettled([this.running, this.backstopping]);
@@ -1876,10 +1881,22 @@ export class PullRequestWatch {
       });
     }
     // Crash recovery comes next, whatever the watchdog's Linear budget came to (see crashPass).
-    const states = await this.observeStates(mine);
+    const { states, sentAt } = await this.observeStates(mine);
     // A Done ticket whose stack has not landed goes back to work first, so its agent's crash is
     // restarted like any started ticket's in the same poll (see reopenDone).
     await this.reopenDone(mine, states, reserved, context, seenByUrl, stopped);
+    // Then the agents of finished tickets are archived (README, "Ghost agents"): a ticket reopened
+    // just now carries its new state, and one whose stack is still open keeps its agent.
+    if (this.deps.retire && !stopped.paused) {
+      await pass(async () => {
+        try {
+          await this.deps.retire!.pass({ states, sentAt, stack: (issueId) => this.stackSettled(mine, issueId, context, stopped) });
+        } catch (error) {
+          if (error instanceof RateLimitedError) throw error;
+          console.error(`[linear-tickets] retiring finished agents failed: ${error instanceof Error ? error.message : error}`);
+        }
+      });
+    }
     await this.crashPass(mine, states, reserved, seenByUrl, views, moves);
     // Stalled pull requests are nudged, and closed ones followed to their replacement, after every
     // drop was handled: a drop's fix request comes first when both are for the same agent.
@@ -3367,24 +3384,37 @@ export class PullRequestWatch {
   // per poll, on the API key's pool first (LinearService.read); skipped while both pools refuse it.
   // The read covers every record of the poll, the stack policy's Done tickets included (see
   // reopenDone), while only tickets with a running agent's record are kept. Tickets without a
-  // running agent's record are forgotten. Null: the read did not come back.
-  private async observeStates(all: HandoverRecord[]): Promise<Map<string, IssueStatus> | null> {
+  // running agent's record are forgotten. `states` is null when the read did not come back;
+  // `sentAt`: when it was sent.
+  private async observeStates(all: HandoverRecord[]): Promise<{ states: Map<string, IssueStatus> | null; sentAt: number }> {
     const running = all.filter((record) => record.status !== "archived").map((record) => record.issueId);
     await this.knownStates.retain(new Set(running));
     const ids = [...new Set(all.map((record) => record.issueId))];
-    if (!ids.length) return null;
     const sent = Date.now();
+    if (!ids.length) return { states: null, sentAt: sent };
     try {
       const states = await withPriority("background", "crash-recovery", () => this.deps.linear.issueStatuses(ids));
       for (const id of running) {
         const state = states.get(id);
         if (state) await this.knownStates.observe(id, { name: state.status, type: state.statusType }, sent);
       }
-      return states;
+      return { states, sentAt: sent };
     } catch (error) {
       if (!(error instanceof RateLimitedError)) console.error(`[linear-tickets] reading the tickets' Linear states failed: ${error instanceof Error ? error.message : error}`);
-      return null;
+      return { states: null, sentAt: sent };
     }
+  }
+
+  // Whether a Done ticket's stack landed, for the retire pass (retirement.ts): the owner moved it
+  // back to Done after a reopen, or the stack policy finds no open pull request of it. A reopen not
+  // yet carried out keeps it open. A ticket without a record here has no stack policy on this host.
+  private async stackSettled(mine: HandoverRecord[], issueId: string, context: RunContext, stopped: StopFlags): Promise<StackState> {
+    const record = mine.find((item) => item.issueId === issueId);
+    if (!record) return "settled";
+    const reopen = this.policy[issueId]?.reopen;
+    if (reopen) return reopen.respected ? "settled" : "open";
+    const open = await this.policyPulls(record, context, stopped);
+    return !open ? "unknown" : open.length ? "open" : "settled";
   }
 
   // The ticket's open pull requests that count for the stack policy: the open pull requests of its
@@ -3393,7 +3423,8 @@ export class PullRequestWatch {
   // (`do-not-merge`, the owner said no) and not the merge queue's own draft, one per pull request,
   // by number. The repositories are the recorded branch's worktree and the linked pull request;
   // without either, the one repository the ticket's attachments name (never a guess between
-  // several, as in discover). Null when they cannot be read, which is not "none".
+  // several, as in discover). Null when they cannot be read, which is not "none"; none when no
+  // repository is known at all.
   private async policyPulls(record: HandoverRecord, context: RunContext, stopped: StopFlags): Promise<OpenPull[] | null> {
     try {
       const repos = new Set<string>();
@@ -3406,7 +3437,8 @@ export class PullRequestWatch {
           const source = /^https:\/\/github\.com\/([A-Za-z0-9-]+\/[A-Za-z0-9_.-]+)\/pull\/[1-9]\d*\/?$/.exec(url);
           return source ? [source[1].toLowerCase()] : [];
         }));
-        if (attached.size !== 1) return null;
+        if (!attached.size) return [];
+        if (attached.size > 1) return null;
         repos.add([...attached][0]);
       }
       const names = namesTicket(record.identifier);

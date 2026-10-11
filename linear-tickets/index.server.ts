@@ -35,6 +35,7 @@ import { GreptileOutage } from "./server/greptile-outage";
 import { HealthMonitor } from "./server/health";
 import { KnownStates } from "./server/known-states";
 import { PullRequestWatch } from "./server/pr-watch";
+import { DoneTickets, RetiredLabels, RetirePass } from "./server/retirement";
 import { PullRequestBoard } from "./server/pull-requests";
 import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
@@ -138,7 +139,12 @@ export default function contribute(server: PluginServerContext) {
   });
   // Parked plans are built below with the Plannotator host; read only once the plugin runs.
   const waitingPlans = { has: (issueId: string) => parking.plans.has(issueId) };
-  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, routes: smallRoutes, deletions, shards, focus, parked: waitingPlans });
+  // Finished tickets (README, "Who starts next"): the slot count leaves out an agent of a Done or
+  // Canceled ticket quiet for more than an hour. Fed by the retire pass's reads and by every state
+  // the plugin writes, so a ticket Paseo reopens counts its agent again at once.
+  const doneTickets = new DoneTickets();
+  linear.onStateWritten((issueId, state) => doneTickets.written(issueId, state.type, Date.now()));
+  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, routes: smallRoutes, deletions, shards, focus, parked: waitingPlans, doneTickets });
   // The decision journal (README, "Decision journal"): every owner decision on a plan is written
   // here first and carried out by the bridge's worker; the inbox lists what is being applied.
   const decisionJournal = new DecisionJournal();
@@ -367,7 +373,10 @@ export default function contribute(server: PluginServerContext) {
   // The ticket states crash recovery last saw, fed by every state the plugin writes (README, "Crashed agents").
   const knownStates = new KnownStates();
   linear.onStateWritten((issueId, state) => { void knownStates.observe(issueId, state, Date.now()); });
-  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog, knownStates, outage: new GreptileOutage(linear, settings),
+  // Finished tickets' quiet agents and ghosts older than a day are archived in every pull request
+  // poll (README, "Ghost agents"), except where the owner waits or the peer host works.
+  const retire = new RetirePass({ sessions, linear, settings, handover, needsYou, watchdog: watchdogStore, deletions, owner: (issueId) => ticketOwner(issueId), doneTickets, labels: new RetiredLabels() });
+  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog, knownStates, retire, outage: new GreptileOutage(linear, settings),
     // Which tickets this host's pull request watch may work on (README, "Several hosts"): the same
     // claims rule SessionRouter reads per ticket, once for a whole poll (activation-guard.ts).
     owner: ticketOwners({ settings, drain, intake }),

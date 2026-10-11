@@ -2166,6 +2166,25 @@ export class SessionRouter {
     });
   }
 
+  // One step of the retirement of a finished ticket's agent or its running label (retirement.ts),
+  // in the ticket's turn and under its start gate like every recovery, so it never runs next to a
+  // start, a successor or a watchdog step of the same ticket. Not run (`reason`) while Paseo is not
+  // connected, the ticket is paused for deletion or a launch for it is under way.
+  retireTurn<T>(issueId: string, work: (paseo: PaseoApi) => Promise<T>): Promise<{ ran: true; value: T } | { ran: false; reason: string }> {
+    const paseo = this.paseo;
+    if (!paseo) return Promise.resolve({ ran: false, reason: "Paseo is not connected yet" });
+    return this.exclusive(issueId, async (): Promise<{ ran: true; value: T } | { ran: false; reason: string }> => {
+      if (await this.deps.deletions?.blocked(issueId)) return { ran: false, reason: "the ticket is paused for deletion" };
+      const gate = this.deps.launcher.gate(issueId);
+      if (!gate) return { ran: false, reason: "a launch for this ticket is under way" };
+      try {
+        return { ran: true, value: await work(paseo) };
+      } finally {
+        gate.release();
+      }
+    });
+  }
+
   private async watchdogEffect(request: WatchdogRequest): Promise<WatchdogOutcome> {
     const { issueId, rootId, action, text, marker } = request;
     const unloading: WatchdogOutcome = { kind: "skipped", reason: "the plugin is unloading", end: false };
