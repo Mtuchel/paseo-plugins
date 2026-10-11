@@ -237,13 +237,14 @@ test("auth failure releases pending API capacity without fetching as another acc
     requests++;
     return new Response('{"remaining":17}', { headers: { "content-type": "application/json" } });
   }, async (deps) => {
-    const validEnvironment = deps.environment;
     let authorized = false;
-    const emptyConfig = join(deps.home, "empty-gh");
-    mkdirSync(emptyConfig);
+    // An empty GH_CONFIG_DIR still finds macOS Keychain credentials. Make the
+    // auth command fail explicitly; never consult the host's real credentials.
+    const refusedGh = join(deps.home, "gh-denied");
+    writeFileSync(refusedGh, "#!/bin/sh\nexit 1\n", { mode: 0o700 });
     const read = apiReader({
       ...deps, ...readLease(),
-      environment: () => authorized ? validEnvironment() : { ...deps.env, GH_CONFIG_DIR: emptyConfig },
+      get realGh() { return authorized ? deps.realGh : refusedGh; },
     });
     await assert.rejects(read("/fixtures/auth"), /credentials unavailable/);
     assert.equal(requests, 0);

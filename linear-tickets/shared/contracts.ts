@@ -607,6 +607,12 @@ export const askQuestionSchema = z.object({
 });
 export const ownerAskSchema = z.object({
   issueId: z.string().min(1),
+  revision: z.string().min(1),
+  attention: z.enum(["owner", "advisor", "dependency", "info"]),
+  attentionReason: z.string(),
+  blockerIdentifier: z.string().nullable(),
+  disposition: z.enum(["research", "delegated", "deferred"]).nullable(),
+  deferredUntil: z.string().nullable(),
   identifier: z.string(),
   title: z.string(),
   url: z.string(),
@@ -628,22 +634,47 @@ export const ownerAskSchema = z.object({
 });
 export type OwnerAsk = z.infer<typeof ownerAskSchema>;
 
+export const decisionReceiptSchema = z.object({
+  id: z.string().min(1),
+  issueId: z.string().min(1),
+  identifier: z.string(),
+  revision: z.string().min(1),
+  action: z.enum(["answer", "done", "research", "delegate", "defer", "reopen"]),
+  text: z.string(),
+  at: z.string().datetime(),
+  delivery: z.string(),
+});
+export type DecisionReceipt = z.infer<typeof decisionReceiptSchema>;
+
 export const ownerAsksRpc = defineRpc({
   name: "linear.owner-asks",
   input: z.object({}),
-  output: z.object({ asks: z.array(ownerAskSchema), updatedAt: z.string() }),
+  output: z.object({ asks: z.array(ownerAskSchema), updatedAt: z.string(), history: z.array(decisionReceiptSchema).max(100) }),
 });
 
 export const answerAskRpc = defineRpc({
   name: "linear.answer-ask",
   input: z.object({
     issueId: z.string().min(1),
+    revision: z.string().min(1),
     // Question key → chosen option label(s) (multi-select joined with ", ") or free text.
     answers: z.record(z.string(), z.string()),
     note: z.string().max(4000).default(""),
     done: z.boolean().default(false),
   }),
   output: z.object({ delivered: z.enum(["agent", "continued", "queued", "comment", "closed"]), message: z.string() }),
+});
+
+export const triageAskRpc = defineRpc({
+  name: "linear.triage-ask",
+  input: z.object({
+    issueId: z.string().min(1),
+    revision: z.string().min(1),
+    action: z.enum(["research", "delegate", "defer", "reopen"]),
+    note: z.string().max(4000).default(""),
+    until: z.string().datetime({ offset: true }).optional(),
+  }),
+  output: z.object({ delivered: z.string(), message: z.string() }),
 });
 
 export const pullRequestsRpc = defineRpc({

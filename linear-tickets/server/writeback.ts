@@ -133,6 +133,13 @@ const OWNER_REQUEST = new RegExp([
 // Plan approval has its own flow (Planning, Plannotator) and never means Needs input.
 const PLAN_REVIEW = /\bplannotator\b|\b(?:approve|annotate)\b[^.\n]{0,60}\bplan\b/i;
 
+// A future plan approval is not today's owner action while the advisor still owns the next
+// step. Keep direct questions and concrete owner actions even in a mixed progress report.
+const ADVISOR_PENDING = /\b(?:once|when|after)\s+(?:the\s+)?(?:new\s+)?advisor\s+(?:answers|agrees|replies|finishes)\b|\b(?:wait(?:ing)?\s+(?:for|on)\s+(?:the\s+)?advisor|advisor(?:'s|’s)?\s+[^.\n]{0,80}(?:running|pending))\b/i;
+const NO_OWNER_ACTION = /\b(?:nothing\s+is\s+needed\s+from\s+you\s+(?:yet|now)|(?:no|nothing)\s+(?:input|action|decision)\s+(?:is\s+)?(?:needed|required)\s+from\s+you\s+(?:yet|now))\b/i;
+const FUTURE_APPROVAL = /\b(?:(?:plan|rating|impact)\b[^.\n]{0,160}\bneeds?\s+your\s+approval|plan\s+needs?\s+(?:the\s+)?owner(?:'s|’s)?\s+approval)\b/i;
+const CURRENT_OWNER_ACTION = /[^\s?]\?(?=\s|$|[)*_"”'’])|\b(?:please\s+(?:decide|approve|confirm|choose|provide)|(?:waiting|wait)\s+(?:for|on)\s+(?:you|your|owner)|(?:choose|decide|approve|confirm)\s+[^.\n]{0,80}\bnow)\b/i;
+
 // Code, commands and links are not questions to the owner (`?q=`, `a ? b : c`).
 const prose = (text: string) => text.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, "code").replace(/https?:\/\/\S+/g, "link");
 
@@ -156,7 +163,12 @@ export function ownerRequest(reply: string): string | null {
   for (let length = 0; start > 0 && length < OWNER_REQUEST_WINDOW;) length += all[--start].length;
   const window = all.slice(start);
   if (PLAN_REVIEW.test(prose(window.join("\n\n")))) return null;
-  const first = window.findIndex((paragraph) => OWNER_REQUEST.test(prose(paragraph)));
+  const pending = window.some((paragraph) => ADVISOR_PENDING.test(prose(paragraph)) || NO_OWNER_ACTION.test(prose(paragraph)));
+  const first = window.findIndex((paragraph) => {
+    const text = prose(paragraph);
+    if (!OWNER_REQUEST.test(text)) return false;
+    return !(pending && FUTURE_APPROVAL.test(text) && !CURRENT_OWNER_ACTION.test(text));
+  });
   return first === -1 ? null : window.slice(first).join("\n\n");
 }
 

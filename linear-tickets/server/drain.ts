@@ -378,7 +378,7 @@ export class DrainRouter implements ActivationSink {
   // this only for a ticket it has a claim for). No owner: 409, and the peer keeps its work pending.
   // The shared reply ledger reserves the activation before routing/sending. A failed receipt
   // write can replay the outcome, but cannot deliver into a newer permission request.
-  async deliver(issueId: string, text: string, receipt?: string): Promise<{ ok: boolean; reason?: string; duplicate?: boolean }> {
+  async deliver(issueId: string, text: string, receipt?: string, intent?: "triage"): Promise<{ ok: boolean; reason?: string; duplicate?: boolean }> {
     if (receipt && (await this.allowlist.load()).receipts[receipt]) return { ok: true, duplicate: true };
     const paseo = this.deps.paseo();
     if (!paseo) return { ok: false, reason: "Paseo is not connected on this host." };
@@ -387,7 +387,7 @@ export class DrainRouter implements ActivationSink {
     const deliver = this.deps.deliver ?? deliverToAgent;
     try {
       const ref = `activation:${receipt ?? createHash("sha256").update(`${issueId}:${text}`).digest("hex").slice(0, 16)}`;
-      const origin: DeliveryOrigin = { ref, responder: { kind: "linear-unverified", via: "activation", ref }, issueId };
+      const origin: DeliveryOrigin = { ref, responder: { kind: "linear-unverified", via: "activation", ref }, issueId, ...(intent ? { intent } : {}) };
       const result = await deliver(paseo, owner.id, text, origin, this.replies);
       if (!result.delivered) return { ok: false, reason: result.reply ?? "The message was not delivered." };
     } catch (error) {
@@ -445,6 +445,7 @@ export class DrainRouter implements ActivationSink {
       identifier: request.identifier,
       ...(request.sessionId ? { sessionId: request.sessionId } : {}),
       ...(text ? { text } : {}),
+      ...(request.intent ? { intent: request.intent } : {}),
       ...(request.label ? { label: request.label } : {}),
       ...(request.strictResume ? { strictResume: true } : {}),
       ...(resume ? { resume } : {}),

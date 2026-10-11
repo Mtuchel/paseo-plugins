@@ -8,6 +8,7 @@ import { setImmediate as setImmediatePromise } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
+import type { ActivationRequest, ActivationSink } from "./activation";
 import { AgentApi, AppAuth } from "./agent-app";
 import { verifyWebhook } from "./agent-webhook";
 import { fingerprint, type Candidate, type CorrectionActivity } from "./deputy";
@@ -208,7 +209,7 @@ type Call = string;
 type RouterLinear = Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "admissionStates" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
 // `reload`: the daemon's agent reload (null: the plugin has no daemon connection); `send`: runs
 // before each send is recorded.
-function harness(options: { now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; processLiveness?: typeof ticketProcessLiveness; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; admission?: (issueId: string, paseo: PaseoApi, settings: PluginSettings, read?: AdmissionState) => Promise<{ ok: true } | { ok: false; reason: string }>; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null> } = {}) {
+function harness(options: { route?: ActivationSink; now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; processLiveness?: typeof ticketProcessLiveness; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; admission?: (issueId: string, paseo: PaseoApi, settings: PluginSettings, read?: AdmissionState) => Promise<{ ok: true } | { ok: false; reason: string }>; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null> } = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -279,6 +280,7 @@ function harness(options: { now?: () => number; pending?: AgentPermissionRequest
     store,
     replies,
     needsYou: options.needsYou,
+    route: options.route,
     budget: options.budget,
     now: options.now,
     decidePlan: options.decidePlan,
@@ -600,6 +602,37 @@ test("an answer queued from the menu bar opens its own waiting thread, which its
   await h.router.startQueued();
   assert.equal(h.calls.filter((call) => call.startsWith("start ")).length, 1);
   assert.equal((await h.store.get("s-new"))?.agentId, "agent-new");
+});
+
+test("decision continuations on a peer keep scoped text and identity instead of starting a duplicate local agent", async (t) => {
+  const received: ActivationRequest[] = [];
+  const h = harness({ manual: true, route: { take: async (request) => { received.push(request); return { peer: "mac" }; } } });
+  t.after(h.cleanup);
+  const lead = "Research only. TUC-1 revision r1; compare alternatives without approving or changing production.";
+  const result = await h.router.restartFor("i1", "TUC-1", { lead, decisionId: "owner-ask:i1:r1", intent: "triage" });
+  assert.deepEqual(result, { kind: "forwarded", peer: "mac" });
+  assert.equal(received[0].text, lead);
+  assert.equal(received[0].id, "owner-ask:i1:r1");
+  assert.equal(received[0].intent, "triage");
+  assert.deepEqual(h.calls, [], "no labels, local start, delegation or completion");
+});
+
+test("queued research retains triage semantics after restart and leaves Needs-you work open", async (t) => {
+  const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ header: "Scope", question: "Implement it?", options: [{ label: "Yes" }] }] } };
+  const h = harness({ pending: [question], agents: [{ id: "agent-1", status: "idle", labels: { "linear.issueId": "i1" } }], checked: true, manual: true });
+  t.after(h.cleanup);
+  await h.router.queueAnswer("i1", "TUC-1", "Research alternatives only; do not implement.", { activityId: "decision-research", userId: OWNER, intent: "triage" }, "Waiting for a slot");
+  const reloaded = harness({ pending: [question], agents: [{ id: "agent-1", status: "idle", labels: { "linear.issueId": "i1" } }], checked: true, manual: true, directory: h.directory });
+  const effects: string[] = [];
+  reloaded.replies.recordEffects({
+    ownerAnswered: async () => { effects.push("evidence"); },
+    correctLate: async () => { effects.push("correction"); return { delivered: false, reply: "No correction" }; },
+    needsYou: async () => { effects.push("completed"); },
+  });
+  await reloaded.router.startQueued();
+  assert.equal(reloaded.calls.filter((call) => call.startsWith("checked q ")).length, 1);
+  assert.deepEqual(effects, []);
+  assert.equal((await reloaded.store.get("s-new"))?.queued, false);
 });
 
 test("needs-you completion follows confirmed session outcomes, including a delivered late correction, not rejected or unconfirmed answers", async (t) => {

@@ -12,6 +12,8 @@ export type DeliveryOrigin = {
   ref: string;
   responder: ({ kind: "owner" } & CorrectionActivity) | { kind: "linear-unverified"; via: string; ref: string };
   issueId?: string;
+  // Research/delegate is an instruction, not approval or completion of the owner task.
+  intent?: "triage";
 };
 export type BoundAnswer = { requestId: string; request?: AgentPermissionRequest; response?: AgentPermissionResponse };
 type Status = "reserved" | "submitted" | "applied" | "rejected" | "owner-first" | "deputy-first" | "gone" | "unconfirmed" | "sent" | "unchecked";
@@ -35,6 +37,7 @@ export type ReplyRecord = {
   at: string;
   responder: DeliveryOrigin["responder"] | { kind: "deputy"; intentId: string };
   issueId?: string;
+  intent?: "triage";
   status: Status;
   reason?: string;
   deputyIntentId?: string;
@@ -184,7 +187,7 @@ export class PermissionReplies implements PermissionArbiter {
     const work = this.single(origin.ref, async () => {
       const known = (await this.records())[origin.ref];
       if (known) { admitted(); return this.finish(await this.replay(known)); }
-      let record = await this.save(this.base(origin.ref, agentId, message, origin.responder, origin.issueId));
+      let record = await this.save({ ...this.base(origin.ref, agentId, message, origin.responder, origin.issueId), intent: origin.intent });
       const handle = paseo.agents.ref(agentId);
       const pending = bound ? [] : (await handle.refresh())?.agent.pendingPermissions ?? [];
       const question = bound?.request ?? pending.find((request) => request.kind === "question");
@@ -201,6 +204,7 @@ export class PermissionReplies implements PermissionArbiter {
         } finally { if (!key) this.leaveOwner(selectedKey); }
       } else {
         const approval = pending.find((request) => request.kind !== "question");
+        if (approval && origin.intent === "triage") throw new Error("Research/delegate cannot answer a security permission. Resolve that permission explicitly in Paseo.");
         admitted();
         const decision = approval ? approvalDecision(message) : null;
         if (approval && !decision) throw new Error(`The agent is waiting for approval of "${approval.title || approval.name}". Reply "@paseo approve" or "@paseo deny <reason>".`);
@@ -297,14 +301,14 @@ export class PermissionReplies implements PermissionArbiter {
         try { await work(); }
         catch (error) { console.error(`[linear-tickets] ${name} after ${record.ref} (${record.status}) failed; a replay completes it: ${reasonOf(error)}`); }
       };
-      if (record.status === "applied" && record.responder.kind === "owner" && record.request && record.response && !record.effects.evidence) {
+      if (!record.intent && record.status === "applied" && record.responder.kind === "owner" && record.request && record.response && !record.effects.evidence) {
         const responder = record.responder;
         await attempt("recording the owner's answer", async () => {
           await effects.ownerAnswered(record.agentId, record.request!, record.response!, responder, record.at);
           record = await this.save({ ...record, effects: { ...record.effects, evidence: true } });
         });
       }
-      if (record.status === "deputy-first" && !record.effects.correction) {
+      if (!record.intent && record.status === "deputy-first" && !record.effects.correction) {
         const responder = record.responder;
         await attempt("passing on the owner's correction", async () => {
           const correction = responder.kind === "owner"
@@ -314,7 +318,7 @@ export class PermissionReplies implements PermissionArbiter {
         });
         if (!record.effects.correction) record = { ...record, reply: "The deputy had already answered this question, and your correction could not be passed on. Tell the agent directly." };
       }
-      if (!record.effects.needsYou && (record.status === "applied" || record.status === "unchecked" || record.status === "sent" || (record.status === "deputy-first" && record.correctionDelivered))) {
+      if (!record.intent && !record.effects.needsYou && (record.status === "applied" || record.status === "unchecked" || record.status === "sent" || (record.status === "deputy-first" && record.correctionDelivered))) {
         await attempt("closing the Needs you sub-issue", async () => {
           await effects.needsYou(record.agentId, record.issueId);
           record = await this.save({ ...record, effects: { ...record.effects, needsYou: true } });

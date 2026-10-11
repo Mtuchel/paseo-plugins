@@ -7,7 +7,7 @@ import { runIsolatedOmp, runOmp, type OmpRunner } from "./omp-runner";
 // trusted: checkExtraction rejects anything that is not a strict JSON object within the caps.
 
 // Changing the prompt, the checks or the JSON shape makes earlier extractions stale.
-export const EXTRACTION_VERSION = "owner-ask-1";
+export const EXTRACTION_VERSION = "owner-ask-2";
 export const EXTRACTION_THINKING = "low";
 export const MAX_SOURCE_CHARS = 4_000;
 export const MAX_QUESTIONS = 6;
@@ -32,6 +32,7 @@ export const SYSTEM_PROMPT = [
   "- \"decision\": the owner must choose or answer something. Put every question the owner has to decide into `questions`.",
   "- \"manual\": the owner must do something outside Linear (a secret, a setting in another system, a physical step). `questions` is empty, and the summary says exactly what to do.",
   "- \"info\": nothing the owner can decide or do that answers the ask (a status update, a report to read). `questions` is empty.",
+  "Pending advisor reviews and future plan approvals are not current owner decisions. An explicit 'nothing needed from you yet' status is info, unless a separate concrete request/question needs the owner now. Preserve every real current owner question even when advisor/dependency waiting status is present.",
   "",
   "Options are things the owner chooses between, written as the ask words them (for example \"Agent does it\", \"You or the team\"). Never add a recommendation, never offer a \"Reply @paseo\" instruction, a workflow status line (\"Needs input\", \"In Progress\", \"Done\"), a question id or any other text that is not a choice. When the owner types the answer, leave `options` empty.",
   "multiSelect true only when the ask lets the owner pick more than one option.",

@@ -3998,10 +3998,10 @@ answer already given or work an agent did after it; override those.
 
 ## Owner asks
 
-Everything waiting for the owner in Linear's "Needs input" state is answerable from the Paseo
-Agents menu bar app as multiple-choice cards, without opening the ticket. `linear.owner-asks`
-reads the asks and `linear.answer-ask` answers one the way an owner's `@paseo <answer>` comment
-would. Both are read-only in Linear until an answer is sent.
+The Paseo Agents menu bar presents a decision inbox, not an undifferentiated list of every ticket in
+Linear's "Needs input" state. `linear.owner-asks` reads owner decisions, other waits and recent
+decision receipts; `linear.answer-ask` answers an exact revision of one ask. Reading does not answer,
+approve, complete or reassign anything in Linear.
 
 **What is read.** The owner's issues in the "Needs input" state, always with the owner's key (through
 the Paseo app "assigned to me" would mean the app; pages of 50, up to 250 issues a refresh; newest
@@ -4009,9 +4009,9 @@ the Paseo app "assigned to me" would mean the app; pages of 50, up to 250 issues
 records (`$PASEO_HOME/linear-tickets/needs-you/`) and handover records. The ask text per issue,
 first match wins: the description of a "Needs you" sub-issue or a `paseo-manual` issue; the plugin's
 own wait comment (`… is waiting for you: …`, read by id when it is older than those comments); the
-newest comment that hands the next step to the owner; else the description. An issue whose
-`updatedAt` has not moved is cached, so a refresh reads only what changed. An ask's ticket is the
-parent of a "Needs you" sub-issue or manual task, else the issue itself (a ticket under an epic is
+newest comment that hands the next step to the owner; else the description. Source comments are
+re-read even when the ticket's `updatedAt` has not moved, because comment edits can leave it unchanged.
+An ask's ticket is the parent of a "Needs you" sub-issue or manual task, else the issue itself (a ticket under an epic is
 still its own ticket). Each ask carries its route from this host's view: `agent` (the live asking
 agent), `continue` (the ticket's agent is gone: an answer starts a continuation agent through the
 starter's handover path), or `comment`.
@@ -4028,8 +4028,10 @@ a time. Results are cached in `$PASEO_HOME/linear-tickets/owner-asks/extract/<is
 (directory `0700`, file `0600`, keyed by the ask text and the extraction version), so a restart or a
 second refresh re-runs nothing.
 
-**Where an answer goes.** `linear.answer-ask` takes `{ issueId, answers, note?, done? }`, where
-`answers` maps each question key to the chosen option label or free text, and answers like an
+**Where an answer goes.** `linear.answer-ask` takes `{ issueId, revision, answers, note?, done? }`,
+where `revision` identifies the displayed source and question choices. A changed ask rejects the
+old answer; refresh and choose again. `answers` maps each question key to the chosen option label
+or free text, and answers like an
 `@paseo` reply: to the live agent that asked through the checked relay path (its pending question is
 answered, else the text is a prompt), else a continuation agent on the ticket (the answer is its
 lead, as an owner comment on a waiting ticket would start), else a comment on the issue. When the
@@ -4039,18 +4041,59 @@ the ticket that waits with the answer as its message, exactly like an `@paseo` t
 not start (see *Waiting their turn*), and the menu bar shows `queued` with the reason. `done:
 true` completes a `paseo-manual` issue and a "Needs you" sub-issue and moves them to Done; on a
 parent ticket it only records the comment and leaves the state to the agent, whose next turn settles
-the wait. Every answer records "Answered from the menu bar: …" on the issue. An answer is idempotent
-per issue and answer text for 10 minutes (a double click is one answer), and an answered ask stays
-out of the read until Linear's `updatedAt` moves past the answer by a minute, so the answer's own
-comment and state move do not resurrect it. An ask whose ticket holds a menu-bar answer in the wait
-line stays out of the read until that thread has its agent, since the wait line label moves
-`updatedAt` too (a manual task of the ticket is still shown). Failures throw with a sentence the
-menu bar shows.
+the wait. Every answer records "Answered from the menu bar: …" on the issue. The durable ledger
+binds each action to its source revision and exact answer/scope. An exact retry returns its recorded
+result instead of repeating delivery, including after a restart. An unconfirmed delivery is never
+replayed automatically; its error asks the owner to inspect the ticket or agent. A delivered answer,
+including a queued continuation, hides only that exact revision. A changed source or extraction
+appears immediately; unrelated questions on the same ticket are not suppressed. Failures throw
+with a sentence the menu bar shows.
 
-**Host choice.** The menu bar calls `linear.owner-asks` on its tickets host (server087 by default)
-and `linear.answer-ask` on the Mac daemon instead when a live agent there carries the ticket, so the
-answer reaches the agent's session; otherwise the tickets host answers, which starts the
-continuation when the asking agent is gone.
+**Host choice.** The menu bar calls `linear.owner-asks` on its canonical tickets host (server087 by
+default). It answers through a live Mac agent only when the Mac snapshot matches the displayed
+revision exactly; otherwise it sends the unchanged displayed revision to the tickets host.
+The existing activation claims route scoped continuation instructions to a peer owner when needed,
+preserving the decision identity and restricted triage intent. Both hosts must run this version
+before forwarding research/delegation. Deferral and other Linear triage always use the tickets host.
+
+**Attention and shared blockers.** Each ask carries `attention` (`owner`, `advisor`, `dependency`,
+or `info`) and an explanation. An uncertain or not-yet-extracted ask stays visible as an owner item.
+Future plan approval while an advisor is still reviewing is not a current owner decision; the
+turn-end detector also avoids opening new owner waits for that report. A separate concrete owner
+question still takes precedence. Other waits remain inspectable in the menu bar rather than being
+deleted or marked Done. Failed planners are labelled separately from decisions.
+
+An explicitly evidenced blocking ticket can supply `blockerIdentifier`. The menu bar groups
+related tickets under that blocker, without inferring that their approvals are interchangeable.
+There is no "approve all related tickets" operation, no automatic recommended answer, and no
+change to repository permission, production, spending or business-policy rules.
+
+**Research, delegation and deferral.** `linear.triage-ask` accepts
+`{ issueId, revision, action, note?, until? }`. Actions:
+
+- `research`: send the owner's specific evidence request through the existing agent/continuation
+  route. Research is not permission to implement or settle the business decision.
+- `delegate`: send an explicit scope for reversible technical work within the already-approved
+  task. It cannot authorize business policy, permissions, spending, destructive operations or
+  production changes, and does not override repository rules.
+- `defer`: keep the question blocked until the supplied time; this sends no approval or agent
+  restart. The owner can still inspect it under other waits.
+- `reopen`: return a triaged ask to the inbox; it does not start an agent.
+
+Research and delegation require instructions. They never complete a manual task or a "Needs you"
+sub-issue. Deferral and other triage states are scoped to the displayed revision: a changed
+question returns immediately, and a deferred question returns when its time expires.
+Live question cards use their existing question-response path for explicit research/delegation;
+security permission requests retain their original allow/deny controls. Live deferrals are local
+to the Mac and tied to the pending question identity, not a blanket mute of the agent.
+
+**Decision receipts.** The snapshot includes recent `history` entries identifying the issue,
+source revision, action, scope/answer, timestamp and delivery outcome. The plugin persists these
+receipts, and the native app retains local live-question receipts and deferrals across restarts
+in `~/Library/Application Support/PaseoAgents/decision-inbox.json` (mode `0600`).
+A receipt records the decision that was sent; it does not claim the downstream work is finished.
+Previous answers are evidence for that exact scope, not reusable blanket authority for another
+question or another ticket.
 
 ## Connection storage
 
