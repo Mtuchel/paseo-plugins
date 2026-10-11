@@ -10,7 +10,7 @@ import { questionsOf } from "./relay";
 import type { Handover, HandoverRecord, WaitingKind, WaitingPeriod } from "./handover";
 import type { IssueCore, LinearService } from "./linear";
 import type { NeedsYouIssues } from "./needs-you";
-import { PLAN_POLICY_LABEL, PLANNING_STATE } from "./plan-policy";
+import { PLAN_POLICY_LABEL, PLANNING_STATE, planStage } from "./plan-policy";
 import { logQuietly, questionEntry, type DecisionLog } from "./owner-decisions";
 import type { Deputy } from "./deputy";
 import { ticketPullRequest, type PullRequestCheck } from "./pull-request-check";
@@ -626,10 +626,13 @@ export class Writeback {
         if (settings.writeback.blocked && await this.waitingFor(issueId)) await this.clearWaiting({ id: issueId, identifier }, agent, settings);
         if (!settings.writeback.status || this.started.has(agent.id)) return;
         const state = await this.linear.issueCore(issueId);
-        // Work after merge (for example a deploy watch) never reopens a closed ticket.
+        // Work after merge (for example a deploy watch) never reopens a closed ticket. An
+        // implementer moves out of a plan stage to work; a planner starts a new plan round from
+        // Plan review or Plan approved (an orphan restart) and leaves other started states alone.
         if (!CLOSED_TYPES.includes(state.statusType.trim().toLowerCase())) {
+          const stage = planStage(state.status, state.statusType);
           const outcome = !planFirst ? await this.linear.markInProgress(state, state.teamId)
-            : state.statusType.trim().toLowerCase() === "started" ? { changed: false } : await this.linear.moveToStateNamed(issueId, PLANNING_STATE);
+            : state.statusType.trim().toLowerCase() === "started" && (!stage || stage === PLANNING_STATE) ? { changed: false } : await this.linear.moveToStateNamed(issueId, PLANNING_STATE, state);
           if (outcome.note) console.error(`[linear-tickets] ${issueId}: ${outcome.note}`);
         }
         this.started.add(agent.id);

@@ -70,9 +70,9 @@ async function world(t: TestContext, options: { label?: string; pageSize?: numbe
   let created = 0;
   const byId = (id: string) => tickets.get(id)!;
   const linear = {
-    repairCandidates: async ({ labels, ids, queueBlockers, state }: { labels: string[]; teamKeys: string[]; ids: string[]; queueBlockers?: boolean; state?: string }) => [...tickets.values()]
+    repairCandidates: async ({ labels, ids, queueBlockers, states }: { labels: string[]; teamKeys: string[]; ids: string[]; queueBlockers?: boolean; states?: string[] }) => [...tickets.values()]
       .filter((ticket) => ids.includes(ticket.id) || (!["completed", "canceled"].includes(ticket.statusType) && (!queueBlockers || ticket.queueBlocker)
-        && (ticket.labels.some((item) => labels.some((name) => name.toLowerCase() === item.name.toLowerCase())) || (!queueBlockers && state !== undefined && ticket.statusType === "started" && ticket.status.toLowerCase() === state.toLowerCase()))))
+        && (ticket.labels.some((item) => labels.some((name) => name.toLowerCase() === item.name.toLowerCase())) || (!queueBlockers && states !== undefined && ticket.statusType === "started" && states.some((state) => ticket.status.toLowerCase() === state.toLowerCase())))))
       .map((ticket) => ({ ...ticket, labels: [...ticket.labels] })),
     addLabel: async (id: string, name: string) => {
       calls.push(`${byId(id).identifier} +${name}`);
@@ -264,6 +264,16 @@ test("Planning and In Progress restart; one restart per pass", async (t) => {
   assert.deepEqual(w.restarts, ["TUC-1", "TUC-2"]);
 });
 
+test("AC-8: a lost agent on Plan review or Plan approved restarts like one on Planning", async (t) => {
+  const w = await world(t);
+  w.add(1, ["paseo-running"], { status: "Plan review", statusType: "started" });
+  w.add(2, ["paseo-running"], { status: "Plan approved", statusType: "started" });
+  await w.at(0);
+  await w.at(16);
+  await w.at(18);
+  assert.deepEqual(w.restarts, ["TUC-1", "TUC-2"]);
+});
+
 test("a ticket focus mode refuses waits unclaimed and silent, leaves the pass's restart to a ticket in focus, and restarts once admitted", async (t) => {
   const w = await world(t);
   const log = t.mock.method(console, "log", () => {});
@@ -331,6 +341,17 @@ test("an orphaned Planning ticket starts again after 15 minutes; three failed re
   w.reload();
   for (const minutes of [70, 200, 2000]) await w.at(minutes);
   assert.deepEqual([w.restarts.length, w.comments.length], [3, 1], "no fourth restart, no second comment");
+});
+
+test("AC-8: a Plan review orphan without a parked plan restarts, with one it waits; Plan approved is never an orphan", async (t) => {
+  const w = await world(t);
+  w.add(1, [], { ...ORPHAN, status: "Plan review" });
+  w.add(2, [], { ...ORPHAN, status: "Plan review" });
+  await w.parked.put({ issueId: "i2", identifier: "TUC-2", agentId: "retired", plan: "# Plan", line: "Owner review", reasons: [], model: null, parkedAt: new Date(T0).toISOString(), announced: true });
+  w.add(3, [], { ...ORPHAN, status: "Plan approved" });
+  for (const minutes of [0, 16, 40, 200]) await w.at(minutes);
+  assert.deepEqual(w.restarts, ["TUC-1"]);
+  assert.deepEqual(Object.keys(await w.store.repairs()), ["i1"]);
 });
 
 test("no orphan: a parked plan, a held ticket, a queued thread, no or another delegate, an agent anywhere, a group, another state", async (t) => {

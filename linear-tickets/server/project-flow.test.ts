@@ -1098,6 +1098,30 @@ test("stalled tickets restart one per poll, and a failed restart frees its slot 
   assert.deepEqual(await poll(2), ["restart i2"], "the only agent slot is free again");
 });
 
+test("AC-10: a Plan approved ticket whose queued thread was lost restarts like a Todo one; one with a queued thread or approved for later does not", async (t) => {
+  const approved = { delegateId: APP, statusType: "started", status: "Plan approved", labels: ["plan-ready"] };
+  const r = await room(t, [
+    issue(1, approved),
+    // A thread waits for a slot (SessionRouter.threadQueued).
+    issue(2, approved),
+    // Approved for later: back in Todo with plan-ready, its thread closed on purpose.
+    issue(3, { delegateId: APP, labels: ["plan-ready"] }),
+  ]);
+  r.held.add("i2");
+  r.held.add("i3");
+  r.fail.restart = true;
+  const none = paseoWith(() => []);
+  const poll = async (minutes: number) => {
+    r.calls.length = 0;
+    r.advance(minutes * MINUTE);
+    await r.flow.tick(none, settings);
+    return r.calls.filter((call) => call.startsWith("restart"));
+  };
+  assert.deepEqual(await poll(0), []);
+  assert.deepEqual(await poll(11), ["restart i1"]);
+  assert.deepEqual(Object.keys((await r.store.all()).erp.stalled ?? {}), ["i1"]);
+});
+
 test("a stalled ticket waits for a free slot without using up a restart, and is forgotten once its agent works", async (t) => {
   const running = ["x1", "x2"];
   const r = await room(t, [issue(1, { delegateId: APP }), issue(7, { delegateId: APP, blockers: [blocker(false)] })], running);

@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { ADVISOR_SECTION } from "../shared/plan-advisor";
 import { ESCALATE_TOOL, MODEL_SECTION, strongerTier, TIERS, workerDelegationNote, type Tier } from "../shared/plan-model";
 import { RISK_SECTION } from "../shared/plan-risk";
+import type { LinearService } from "./linear";
+import { RateLimitedError } from "./rate-budget";
 import type { PluginSettings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
@@ -30,6 +32,52 @@ const MAX_HISTORY = 50;
 export function labelTier(labels: { name: string }[]): Tier | null {
   const names = new Set(labels.map((label) => label.name.trim().toLowerCase()));
   return TIERS.filter((tier) => names.has(TIER_LABELS[tier])).reduce<Tier | null>(strongerTier, null);
+}
+
+// The Linear label group holding the tier labels (README, "Statuses and labels"): Linear allows one
+// label of a group per ticket.
+export const TIER_GROUP = "model";
+type TierLinear = Pick<LinearService, "labelCatalog" | "createLabel" | "changeLabels">;
+// Tier label ids per LinearService, looked up once in the label catalog.
+const tierLabelIds = new WeakMap<object, Map<Tier, string>>();
+
+// The ticket's tier label in one write: `tier` added and every other tier label it carries
+// (`current`) removed together, so the `model` group accepts the swap and the ticket never shows two
+// tiers, with or without the group. Nothing is written when it carries exactly this tier. A missing
+// tier label is created inside the group when the group exists. A write refused with a cached id
+// (the label was deleted and made again meanwhile) is tried once more with the ids read afresh.
+export async function writeTierLabel(linear: TierLinear, issueId: string, tier: Tier, current: { id: string; name: string }[]): Promise<void> {
+  const named = (label: { name: string }, wanted: Tier) => label.name.trim().toLowerCase() === TIER_LABELS[wanted];
+  const others = current.filter((label) => TIERS.some((other) => other !== tier && named(label, other)));
+  const has = current.some((label) => named(label, tier));
+  if (has && !others.length) return;
+  const write = async () => linear.changeLabels(issueId, has ? [] : [await tierLabelId(linear, tier)], others.map((label) => label.id));
+  const cached = !has && tierLabelIds.get(linear)?.has(tier);
+  try {
+    await write();
+  } catch (error) {
+    if (!cached || error instanceof RateLimitedError) throw error;
+    tierLabelIds.delete(linear);
+    await write();
+  }
+}
+
+async function tierLabelId(linear: TierLinear, tier: Tier): Promise<string> {
+  const cached = tierLabelIds.get(linear)?.get(tier);
+  if (cached) return cached;
+  const catalog = await linear.labelCatalog();
+  const ids = new Map<Tier, string>();
+  for (const each of TIERS) {
+    // A workspace label first: a team label cannot go on another team's ticket.
+    const found = catalog.filter((label) => !label.isGroup && label.name.trim().toLowerCase() === TIER_LABELS[each]).sort((a, b) => Number(Boolean(a.teamId)) - Number(Boolean(b.teamId)))[0];
+    if (found) ids.set(each, found.id);
+  }
+  if (!ids.has(tier)) {
+    const group = catalog.find((label) => label.isGroup && !label.teamId && label.name.trim().toLowerCase() === TIER_GROUP);
+    ids.set(tier, await linear.createLabel({ name: TIER_LABELS[tier], ...group ? { parentId: group.id } : {} }));
+  }
+  tierLabelIds.set(linear, ids);
+  return ids.get(tier)!;
 }
 
 // The model and thinking level a launch on `tier` uses. `base` is the launch choice (the strong

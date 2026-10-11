@@ -6,7 +6,7 @@ import { SetupError, type Launcher } from "./launch";
 import type { Focus } from "./focus";
 import { LinearApiError, type LinearService, type RepairCandidate } from "./linear";
 import { CODING_STATE } from "./plannotator";
-import { PLANNING_STATE } from "./plan-policy";
+import { PLAN_REVIEW_STATE, PLANNING_STATE, planStage } from "./plan-policy";
 import { type ProcessInspector } from "./process-liveness";
 import type { ProjectStore } from "./project-flow";
 import { RateLimitedError, withPriority } from "./rate-budget";
@@ -51,9 +51,14 @@ const RESOLVED_KEEP_MS = 24 * 60 * 60_000;
 const LOG_LIMIT = 10;
 const CLOSED_TYPES = new Set(["completed", "canceled", "duplicate"]);
 // Work states a replacement agent may start in; Needs input, review and other started states only
-// lose a stale label: the owner's answer or the pull request watch starts their next agent.
+// lose a stale label: the owner's answer or the pull request watch starts their next agent. The
+// plan stages are work states: a new agent plans (Planning, Plan review) or implements (Plan approved).
 const RESTART_TYPES = new Set(["triage", "backlog", "unstarted"]);
-const RESTART_STARTED_STATES = new Set([PLANNING_STATE, CODING_STATE].map((name) => name.toLowerCase()));
+const RESTART_STARTED_STATES = new Set([CODING_STATE.toLowerCase()]);
+// Where an orphan's plan stands: drafted (Planning) or waiting for the owner (Plan review, whose
+// parked plan the `waiting` check finds). Plan approved is no orphan: its implementation handoff
+// (a queued successor, the live agent switching over) is pending.
+const ORPHAN_STAGES = [PLANNING_STATE, PLAN_REVIEW_STATE];
 
 export type RepairKind = "running" | "failed" | "orphan";
 export type RepairState = "watching" | "restarting" | "resolved" | "exhausted";
@@ -110,22 +115,22 @@ function timed(record: RepairRecord, at: string): RepairRecord {
   return record.kind === "failed" ? { ...record, failedSince: at } : { ...record, orphanSince: at };
 }
 
-// The state a replacement agent may start in: Triage, Backlog, Todo, Planning or In Progress.
+// The state a replacement agent may start in: Triage, Backlog, Todo, a plan stage or In Progress.
 function restartable(status: string, statusType: string): boolean {
   const type = statusType.trim().toLowerCase();
-  return RESTART_TYPES.has(type) || (type === "started" && RESTART_STARTED_STATES.has(status.trim().toLowerCase()));
+  return RESTART_TYPES.has(type) || Boolean(planStage(status, type)) || (type === "started" && RESTART_STARTED_STATES.has(status.trim().toLowerCase()));
 }
 
 function heldBy(labels: { name: string }[], names: Names): string | null {
   return [names.hold, names.manual, names.needsYou].find((name) => hasLabel(labels, name)) ?? null;
 }
 
-// Shaped like an orphan: in Planning, assigned to this host's Paseo app (`appId`), and carrying none
-// of the trigger, running, failed, hold, manual and needs-you labels. The caller checks the rest
-// (no agent, no parked plan, no waiting thread).
+// Shaped like an orphan: in Planning or Plan review, assigned to this host's Paseo app (`appId`),
+// and carrying none of the trigger, running, failed, hold, manual and needs-you labels. The caller
+// checks the rest (no agent, no parked plan, no waiting thread).
 function orphanShaped(ticket: RepairCandidate, names: Names, appId: string | null): boolean {
-  return Boolean(appId) && ticket.delegateId === appId
-    && ticket.statusType.trim().toLowerCase() === "started" && ticket.status.trim().toLowerCase() === PLANNING_STATE.toLowerCase()
+  const stage = planStage(ticket.status, ticket.statusType);
+  return Boolean(appId) && ticket.delegateId === appId && stage !== null && ORPHAN_STAGES.includes(stage)
     && ![names.trigger, names.running, names.failed, names.hold, names.manual, names.needsYou].some((name) => hasLabel(ticket.labels, name));
 }
 
@@ -166,7 +171,7 @@ export class LabelRepair {
         const records = await this.deps.store.repairs();
         // Without this host's Paseo app nothing is assigned to it, so there are no orphans to read.
         const appId = await this.deps.linear.appUserId();
-        const tickets = await this.deps.linear.repairCandidates({ labels: [names.running, names.failed], teamKeys: settings.dispatch.teamKeys, ids: Object.keys(records), ...appId ? { state: PLANNING_STATE } : {} });
+        const tickets = await this.deps.linear.repairCandidates({ labels: [names.running, names.failed], teamKeys: settings.dispatch.teamKeys, ids: Object.keys(records), ...appId ? { states: ORPHAN_STAGES } : {} });
         const open = new Map(tickets.filter((ticket) => !CLOSED_TYPES.has(ticket.statusType.trim().toLowerCase())).map((ticket) => [ticket.id, ticket]));
         // Records whose ticket closed or is gone end with it.
         const gone = Object.keys(records).filter((id) => !open.has(id));

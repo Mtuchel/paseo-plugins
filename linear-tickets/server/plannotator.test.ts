@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { setImmediate as immediate } from "node:timers/promises";
 import { promisify } from "node:util";
 import type { PaseoApi } from "@getpaseo/client";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
-import { openInBrowser, parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, writeOpenScript, type Parking } from "./plannotator";
+import { openInBrowser, parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, planRound, roundStep, writeOpenScript, type Parking } from "./plannotator";
 import { ReviewClosedError } from "./sessions";
 import type { ParkedPlan } from "./parked";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
@@ -97,8 +97,14 @@ function setup(labels: Record<string, string>, ticket: { creatorId: string; labe
     async issueDocument(_issueId: string, title: string) { return title in documents ? { url: "https://linear.app/doc/1", content: documents[title] } : null; },
     async moveToStateNamed(issueId: string, name: string) { calls.push(`state ${issueId} ${name}`); return { changed: true }; },
     async moveToReady(issueId: string) { calls.push(`ready ${issueId}`); return { changed: true }; },
+    async moveToPlanStage(issueId: string, stage: string) { calls.push(`stage ${issueId} ${stage}`); return { changed: true }; },
+    async issueStatus() { return { status: "Todo", statusType: "unstarted" }; },
     async addLabel(issueId: string, name: string) { calls.push(`+${name} ${issueId}`); },
     async removeLabel(issueId: string, name: string) { calls.push(`-${name} ${issueId}`); },
+    // The tier labels' ids are their names (writeTierLabel's one write).
+    async changeLabels(issueId: string, added: string[], removed: string[]) { calls.push(`labels ${issueId}${added.map((id) => ` +${id}`).join("")}${removed.map((id) => ` -${id}`).join("")}`); },
+    async labelCatalog() { return ["model:cheap", "model:standard", "model:strong"].map((name) => ({ id: name, name, isGroup: false, parentId: null, teamId: null })); },
+    async createLabel(input: { name: string }) { calls.push(`create label ${input.name}`); return input.name; },
     async issueState() { return { identifier: labels["linear.identifier"], creatorId: ticket.creatorId, labels: ticket.labels.map((name, index) => ({ id: `l${index}`, name })) } as never; },
     async viewerId() { return "owner"; },
     async appUserId() { return "paseo-app"; },
@@ -139,12 +145,15 @@ test("a hand-off shows in the agent's chat and, for a ticket agent, as a Linear 
     bridge.stop();
     assert.deepEqual(calls, [
       "row agent-1: Handed off to Plannotator for review https://host.ts.net:4000/",
-      "state issue-1 Planning",
+      "stage issue-1 Plan review",
       "-plan-ready issue-1",
+      "-plan-rework issue-1",
       "comment issue-1: 📋 **Plan ready for review in Plannotator**: https://host.ts.net:4000/",
       "row agent-1: Plan approved in Plannotator",
+      "stage issue-1 Plan approved",
       "state issue-1 In Progress",
       "+plan-ready issue-1",
+      "-plan-rework issue-1",
       "document issue-1 Plan: TUC-25",
       "comment issue-1: ✅ **Plan approved** in Plannotator — [plan](https://linear.app/doc/1)",
     ]);
@@ -152,7 +161,74 @@ test("a hand-off shows in the agent's chat and, for a ticket agent, as a Linear 
   });
 });
 
-test("a plan sent back loses plan-ready, and a review the plugin closed itself is not taken as a decision", async () => {
+// AC-2 (TUC-1289): a submission whose stage write failed is retried after its decision was applied;
+// the retry writes nothing over the decision's status and labels (a send-back's Planning and
+// plan-rework; an approval's Plan approved, In Progress and plan-ready).
+test("a submission retried after its decision was applied leaves the decision's status and labels alone", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-01-01T10:10:00Z") });
+  t.mock.method(console, "error", () => {});
+  const cases: [boolean, string[]][] = [
+    [false, ["state issue-1 Planning", "-plan-ready issue-1", "+plan-rework issue-1"]],
+    [true, ["stage issue-1 Plan approved", "state issue-1 In Progress", "+plan-ready issue-1", "-plan-rework issue-1"]],
+  ];
+  for (const [approved, expected] of cases) {
+    const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+    const move = linear.moveToPlanStage;
+    let failing = true;
+    linear.moveToPlanStage = async (issueId: string, stage: string) => {
+      if (failing && stage === "Plan review") { failing = false; throw new Error("Linear is down"); }
+      return move(issueId, stage);
+    };
+    await withEvents([
+      { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
+      { type: "decided", agentId: "agent-1", approved, ...approved ? {} : { feedback: "More tests" }, planContent: "# Plan", at: "2026-01-01T10:05:00Z" },
+    ], async (directory) => {
+      const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+      bridge.attach(paseo);
+      for (let round = 0; round < 4; round++) {
+        await bridge.drain();
+        t.mock.timers.tick(10 * 60_000);
+      }
+      assert.deepEqual(await readdir(directory), [], "the failed submission was retried");
+      bridge.stop();
+    });
+    assert.equal(calls.filter((call) => call.startsWith("row agent-1: Handed off") || call.startsWith("row agent-1: Plan auto-approved")).length, 2, "the submission ran twice");
+    assert.deepEqual(calls.filter((call) => /^(stage|state|[+-]plan-)/.test(call)), expected, approved ? "approved" : "sent back");
+  }
+});
+
+// AC-3 (TUC-1289): the round is the previous plan document's plus one, read from the plugin's
+// header only; a decision whose document was written before rounds existed keeps its document's.
+test("a plan's review round follows the previous plan document's header and never its plan text", async () => {
+  const header = (round: number | null, body = "") => `> **Sent back with feedback** in Plannotator on 2026-01-01 10:00 UTC for TUC-25.${round ? `\n> **Review round:** ${round}` : ""}\n\n## Review feedback\n\nMore tests\n\n---\n\n${body}`;
+  assert.equal(planRound(header(2)), 2);
+  assert.equal(planRound(header(null, "> **Review round:** 7")), null);
+  assert.equal(planRound("# Plan\n\n> **Review round:** 4"), null);
+  const steps = (recorded: Record<string, unknown>) => ({
+    once: async <T>(name: string, work: () => Promise<T>): Promise<T> => name in recorded ? recorded[name] as T : (recorded[name] = await work()) as T,
+    value: <T>(name: string) => recorded[name] as T | undefined,
+  });
+  const linear = (content: string | null) => ({ issueDocument: async () => content === null ? null : { url: "u", content } });
+  assert.equal(await roundStep(steps({}), linear(null), "issue-1", "TUC-25"), 1, "no document: round 1");
+  assert.equal(await roundStep(steps({}), linear(header(null)), "issue-1", "TUC-25"), 2, "a document without the header was round 1");
+  assert.equal(await roundStep(steps({}), linear(header(2, "> **Review round:** 9")), "issue-1", "TUC-25"), 3);
+  assert.equal(await roundStep(steps({ document: "https://linear.app/doc/1" }), linear(header(2)), "issue-1", "TUC-25"), 2, "an old decision's own document");
+  assert.equal(await roundStep(steps({ document: "https://linear.app/doc/1" }), linear(header(null)), "issue-1", "TUC-25"), 1, "an old decision's legacy document");
+  assert.equal(await roundStep(steps({ round: 5 }), linear(header(2)), "issue-1", "TUC-25"), 5, "a retry keeps the recorded round");
+  assert.match(planDocument({ type: "decided", agentId: "a", approved: false, feedback: "x", planContent: "p", at: "2026-01-01T10:00:00Z" }, "TUC-25", "m", 3), /^> \*\*Sent back with feedback\*\*[^\n]*\n> \*\*Review round:\*\* 3\n> \*\*Planned with:\*\*/);
+
+  const { calls, documents, linear: fake, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  documents["Plan: TUC-25"] = header(2);
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: false, feedback: "Split step 2", at: new Date().toISOString() }], async (directory) => {
+    const bridge = new PlannotatorBridge(fake, { read: async () => settings }, directory);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.ok(calls.some((call) => call.startsWith("comment issue-1: ↩️ **Plan sent back** (round 3) from Plannotator")));
+});
+
+test("a plan sent back loses plan-ready and gets plan-rework, and a review the plugin closed itself is not taken as a decision", async () => {
   const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
   await withEvents([{ type: "decided", agentId: "agent-1", approved: false, feedback: "Split step 2", at: new Date().toISOString() }], async (directory) => {
     const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
@@ -162,6 +238,9 @@ test("a plan sent back loses plan-ready, and a review the plugin closed itself i
     assert.ok(calls.includes("-plan-ready issue-1"));
     assert.ok(calls.includes("state issue-1 Planning"));
     assert.ok(!calls.some((call) => call.startsWith("+plan-ready")));
+    // AC-3 (TUC-1289): Planning with plan-rework and the round, the first one here.
+    assert.ok(calls.includes("+plan-rework issue-1"));
+    assert.ok(calls.some((call) => call.startsWith("comment issue-1: ↩️ **Plan sent back** (round 1) from Plannotator")));
   });
   calls.length = 0;
   await withEvents([{ type: "opened", agentId: "agent-2", localUrl: "http://localhost:4002/", remoteUrl: null, at: "2026-01-01T10:00:00Z" }], async (directory) => {
@@ -405,7 +484,7 @@ function parkingFake(calls: string[], available = true) {
   return { plans, parking };
 }
 
-test("a plan that needs the owner is parked and its agent retired; the central host's review is announced once, and the decision moves the ticket on", async () => {
+test("a plan that needs the owner is parked and its agent retired; the central host's review is announced once and moves the ticket to Plan review once, and the decision moves the ticket on", async () => {
   const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
   const { plans, parking } = parkingFake(calls);
   const tabs: string[] = [];
@@ -425,7 +504,7 @@ test("a plan that needs the owner is parked and its agent retired; the central h
     bridge.stop();
   });
   await run([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" }]);
-  assert.deepEqual(calls, ["retire agent-1 http://localhost:4000/", "state issue-1 Planning", "-plan-ready issue-1"]);
+  assert.deepEqual(calls, ["retire agent-1 http://localhost:4000/"], "AC-2: the parking host's serve writes the stage, not the retired agent's host");
   assert.deepEqual({ decisions, tabs }, { decisions: [], tabs: [] }, "the agent's own review is neither decided nor opened");
   assert.deepEqual({ ...plans.get("issue-1"), parkedAt: "" }, { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "Risk: impact 2/4, revert. Needs your approval: no advisor review was recorded for this plan text; impact 2 is above the threshold 1.", reasons: ["no advisor review was recorded for this plan text", "impact 2 is above the threshold 1"], model: null, parkedAt: "", announced: false });
 
@@ -436,13 +515,16 @@ test("a plan that needs the owner is parked and its agent retired; the central h
   await run([{ ...hosted, localUrl: "http://localhost:5001/", at: "2026-01-01T11:00:00Z" }]);
   assert.deepEqual(tabs, ["http://localhost:5000/"]);
   assert.equal(calls.filter((call) => call.startsWith("comment issue-1: 📋 **Plan waiting for your review in Plannotator**: https://host.ts.net:5000/")).length, 1);
+  // AC-2 (TUC-1289): the first serve writes Plan review without plan-ready or plan-rework; a restart does not repeat it.
+  assert.deepEqual(calls.filter((call) => /^(stage|state|[+-]plan-)/.test(call)), ["stage issue-1 Plan review", "-plan-ready issue-1", "-plan-rework issue-1"]);
   assert.equal(plans.get("issue-1")?.announced, true);
+  assert.equal(plans.get("issue-1")?.staged, true);
   const parkedAt = plans.get("issue-1")?.parkedAt;
   assert.deepEqual(inbox.slice(1), [`agent-1 http://localhost:5000/ since ${parkedAt}`, `agent-1 http://localhost:5001/ since ${parkedAt}`], "the inbox keeps the time the plan was parked across host restarts");
 
   calls.length = 0;
   await run([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: RISKY(2), at: "2026-01-01T12:00:00Z" }]);
-  assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "+plan-ready issue-1", "ready issue-1", "comment issue-1: ✅ **Plan approved** in Plannotator ([plan](https://linear.app/doc/1))\n\nAssign Paseo again to implement it."]);
+  assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "+plan-ready issue-1", "-plan-rework issue-1", "ready issue-1", "comment issue-1: ✅ **Plan approved** in Plannotator ([plan](https://linear.app/doc/1))\n\nAssign Paseo again to implement it."], "decision 1: without an agent thread, Todo and the owner starts it");
   assert.equal(plans.size, 0);
 });
 
@@ -459,7 +541,7 @@ test("a parked plan sent back keeps no plan-ready and asks for a new plan; the r
     await bridge.drain();
     bridge.stop();
   });
-  assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "comment issue-1: ↩️ **Plan sent back** in Plannotator ([plan](https://linear.app/doc/1))\n\nSplit step 1\n\nAssign Paseo again to plan it again."]);
+  assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "stage issue-1 Planning", "-plan-ready issue-1", "+plan-rework issue-1", "comment issue-1: ↩️ **Plan sent back** (round 1) in Plannotator ([plan](https://linear.app/doc/1))\n\nSplit step 1\n\nAssign Paseo again to plan it again."]);
   assert.equal(plans.size, 0);
 });
 
@@ -512,6 +594,7 @@ test("a parked plan is judged again once its advisor review is recorded for exac
     "retire agent-1 null",
     "document issue-1 Plan: TUC-25",
     "+plan-ready issue-1",
+    "-plan-rework issue-1",
     "ready issue-1",
     "comment issue-1: ✅ **Plan approved** in Plannotator ([plan](https://linear.app/doc/1))\n\nAuto-approved by the risk policy. Risk: impact 1/4, revert.\n\nAssign Paseo again to implement it.",
   ]);
@@ -548,7 +631,7 @@ test("a parked decision whose hand-off fails on a Linear error is delivered in f
     assert.equal(onlyAttempt(bridge).state, "applied");
     await bridge.stop();
   });
-  assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "comment issue-1: ↩️ **Plan sent back** in Plannotator ([plan](https://linear.app/doc/1))\n\nCover every table\n\nAssign Paseo again to plan it again."]);
+  assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "stage issue-1 Planning", "-plan-ready issue-1", "+plan-rework issue-1", "comment issue-1: ↩️ **Plan sent back** (round 1) in Plannotator ([plan](https://linear.app/doc/1))\n\nCover every table\n\nAssign Paseo again to plan it again."]);
   assert.equal(plans.size, 0);
 });
 
@@ -652,9 +735,11 @@ test("a Plannotator decision reaches its cold-cache reads and writes through rea
     await withPriority("background", "decision ingress test", () => bridge.drain());
     assert.deepEqual(await readdir(directory), []);
   });
-  assert.deepEqual(sent, ["issueCore", "teamStates", "issueUpdateState", "labelByName", "addLabel", "issueDocuments", "documentCreate", "comment"]);
+  // The round's document read comes first; the Todo ticket of a team without Plan approved gets no
+  // stage write, and plan-rework is absent, so it is only read.
+  assert.deepEqual(sent, ["issueDocuments", "issueCore", "teamStates", "issueCore", "issueUpdateState", "labelByName", "addLabel", "issueCore", "issueDocuments", "documentCreate", "comment"]);
   await assert.rejects(linear.comment("issue-1", "ordinary agent progress"), RateLimitedError);
-  assert.equal(sent.length, 8, "ordinary interactive comments cannot consume the owner's last share");
+  assert.equal(sent.length, 11, "ordinary interactive comments cannot consume the owner's last share");
 });
 
 test("a parked decision is never given up while Linear stays unavailable for over an hour, and is applied once afterwards", async (t) => {
@@ -788,9 +873,9 @@ test("an approved standard plan sets the ticket's tier; an escalation from it re
     "TUC-25 escalated strong agent-1: the migration test still fails after two fixes",
   ]);
   assert.deepEqual(calls, [
-    "row agent-1: Plan approved in Plannotator", "+model:standard issue-1", "-model:cheap issue-1", "-model:strong issue-1", "apply agent-1",
-    "state issue-1 In Progress", "+plan-ready issue-1", "document issue-1 Plan: TUC-25", "comment issue-1: ✅ **Plan approved** in Plannotator — [plan](https://linear.app/doc/1)",
-    "+model:strong issue-1", "-model:cheap issue-1", "-model:standard issue-1", "apply agent-1", "comment issue-1: ⬆️ **Escalated to the strong model tier: the migration test still fails after two fixes**",
+    "row agent-1: Plan approved in Plannotator", "labels issue-1 +model:standard -l0", "apply agent-1",
+    "stage issue-1 Plan approved", "state issue-1 In Progress", "+plan-ready issue-1", "-plan-rework issue-1", "document issue-1 Plan: TUC-25", "comment issue-1: ✅ **Plan approved** in Plannotator — [plan](https://linear.app/doc/1)",
+    "labels issue-1 +model:strong -l0", "apply agent-1", "comment issue-1: ⬆️ **Escalated to the strong model tier: the migration test still fails after two fixes**",
   ]);
 });
 
@@ -913,7 +998,7 @@ test("rechecked plans cannot auto-approve even with matching fresh advice or an 
     try { await bridge.drain(); await bridge.drain(); } finally { bridge.stop(); }
   });
   assert.equal(decisions.includes(true), false);
-  assert.ok(calls.includes("state issue-1 Planning"));
+  assert.ok(calls.includes("stage issue-1 Plan review"));
   assert.ok(!calls.includes("+plan-ready issue-1"));
   const { plans, parking } = parkingFake(calls);
   plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(1), line: "Requires owner review", reasons: ["recheck"], model: null, parkedAt: "2026-01-01T10:00:00Z", announced: true });
@@ -958,7 +1043,7 @@ function panelFakes(calls: string[]) {
 const SPLIT_PLAN = "# Plan\n## Steps\n1. Add the domain\n2. Add the migration\n3. Wire the API\n";
 const PANEL = { sessionId: "session-1", agentId: "agent-1", issueId: "issue-1", identifier: "TUC-25", createdAt: "", handled: [], offer: null, review: { localUrl: "http://localhost:5000/", openedAt: "2026-01-01T10:00:00Z" } };
 
-test("approve, implement later: the session is held before the planner retires, the plan is recorded and the ticket goes back to Todo with plan-ready", async () => {
+test("approve, implement later: the session is held before the planner retires, the plan is recorded and the ticket goes back to Todo with plan-ready, without plan-rework", async () => {
   const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
   const { sessions } = panelFakes(calls);
   const { parking } = parkingFake(calls);
@@ -969,7 +1054,7 @@ test("approve, implement later: the session is held before the planner retires, 
     assert.equal(onlyAttempt(bridge).state, "applied");
     await bridge.stop();
   });
-  assert.deepEqual(calls, ["hold later", "document issue-1 Plan: TUC-25", "retire agent-1 null", "ready issue-1", "+plan-ready issue-1", "clear review", "reply Plan approved for later"]);
+  assert.deepEqual(calls, ["hold later", "document issue-1 Plan: TUC-25", "retire agent-1 null", "ready issue-1", "+plan-ready issue-1", "-plan-rework issue-1", "clear review", "reply Plan approved for later"]);
 });
 
 test("approve & split: a sub-issue Linear created whose answer was lost, then a plugin reload, still leaves every sub-issue created once", async (t) => {
@@ -1053,6 +1138,9 @@ function tracked(agentLabels: Record<string, string> = {}, ticket: { creatorId: 
   const states: string[] = [];
   let ready = false;
   let readyTransitions = 0;
+  // The ticket's plan stage, and how often each was entered (moveToPlanStage is idempotent).
+  let stage: string | null = null;
+  const stageEntries = new Map<string, number>();
   const linear = {
     async comment(issueId: string, body: string, id?: string) { calls.push(`comment ${issueId}`); commented.push(body); if (id) comments.set(id, body); },
     async commentById(id: string) { return comments.has(id) ? { id } : null; },
@@ -1071,9 +1159,20 @@ function tracked(agentLabels: Record<string, string> = {}, ticket: { creatorId: 
       return document ? { url: "https://linear.app/doc/1", content: document.content } : null;
     },
     async moveToStateNamed(issueId: string, name: string) { states.push(name); calls.push(`state ${issueId} ${name}`); return { changed: true }; },
-    async moveToReady(issueId: string) { if (!ready) { ready = true; readyTransitions++; } calls.push(`ready ${issueId}`); return { changed: true }; },
+    async moveToReady(issueId: string) { if (!ready) { ready = true; readyTransitions++; } stage = null; calls.push(`ready ${issueId}`); return { changed: true }; },
+    async moveToPlanStage(issueId: string, name: string) {
+      calls.push(`stage ${issueId} ${name}`);
+      if (stage === name) return { changed: false };
+      stage = name;
+      stageEntries.set(name, (stageEntries.get(name) ?? 0) + 1);
+      return { changed: true, moved: name };
+    },
+    async issueStatus() { return stage ? { status: stage, statusType: "started" } : { status: ready ? "Todo" : "Backlog", statusType: "unstarted" }; },
     async addLabel(issueId: string, name: string) { labelAdds.set(name, (labelAdds.get(name) ?? 0) + (labels.has(name) ? 0 : 1)); labels.add(name); calls.push(`+${name} ${issueId}`); },
     async removeLabel(issueId: string, name: string) { labels.delete(name); calls.push(`-${name} ${issueId}`); },
+    async changeLabels(issueId: string, added: string[], removed: string[]) { for (const id of removed) labels.delete(id); for (const id of added) labels.add(id); calls.push(`labels ${issueId}`); },
+    async labelCatalog() { return ["model:cheap", "model:standard", "model:strong"].map((name) => ({ id: name, name, isGroup: false, parentId: null, teamId: null })); },
+    async createLabel(input: { name: string }) { return input.name; },
     async issueState() { return { identifier: agentLabels["linear.identifier"] ?? "TUC-25", creatorId: ticket.creatorId, labels: ticket.labels.map((name, index) => ({ id: `l${index}`, name })) } as never; },
     async viewerId() { return "owner"; },
     async appUserId() { return "paseo-app"; },
@@ -1087,7 +1186,7 @@ function tracked(agentLabels: Record<string, string> = {}, ticket: { creatorId: 
       }),
     },
   } as unknown as PaseoApi;
-  return { calls, documents, comments, commented, labels, labelAdds, states, linear, paseo, readied: () => readyTransitions };
+  return { calls, documents, comments, commented, labels, labelAdds, states, linear, paseo, readied: () => readyTransitions, staged: (name: string) => stageEntries.get(name) ?? 0 };
 }
 
 // The Linear panel session behind a parked plan's decision, with the real requeue rule: the patch
@@ -1098,8 +1197,10 @@ function parkedSessions() {
   let queued = 0;
   const sessions = {
     sessionFor: async (agentId: string) => agentId === "agent-1" ? { sessionId: "session-1", agentId } as never : null,
+    queueable: async (_sessionId: string, agentId: string) => state.closed ? "none" as const : state.agentId !== agentId ? "moved-on" as const : "queueable" as const,
     requeueSession: async (_sessionId: string, agentId: string) => {
-      if (state.closed || state.agentId !== agentId) return "moved-on" as const;
+      if (state.closed) return "none" as const;
+      if (state.agentId !== agentId) return "moved-on" as const;
       state.agentId = null;
       queued++;
       return "queued" as const;
@@ -1108,15 +1209,177 @@ function parkedSessions() {
     said: async (id: string) => activities.has(id),
     plan: async () => {}, ask: async () => {}, expectReview: async () => {}, clearReview: async () => {}, parked: async () => {}, holdSession: async () => {}, groupSession: async () => {},
   };
-  return { sessions, activities, queued: () => queued };
+  return { sessions, activities, queued: () => queued, state };
 }
 
+// AC-4 (TUC-1289): a parked approval whose thread will start an agent enters Plan approved before
+// the requeue; the requeue's own answer settles it. A thread that closed after the preflight leaves
+// Todo and the owner's comment; a successor that already took the thread keeps Plan approved.
+test("a parked approval's handoff: Plan approved for a queued or moved-on thread, Todo with the comment when the thread closed after the preflight", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-01-01T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
+  for (const thread of ["queued", "moved-on", "closed-meanwhile"] as const) {
+    await withEvents([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: RISKY(2), at: new Date().toISOString() }], async (directory) => {
+      const f = tracked({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+      const { plans, parking } = parkingFake(f.calls);
+      plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T11:00:00.000Z", announced: true, staged: true });
+      const panel = parkedSessions();
+      if (thread === "moved-on") panel.state.agentId = "agent-2";
+      const preflight = panel.sessions.queueable;
+      panel.sessions.queueable = async (sessionId: string, agentId: string) => {
+        const answer = await preflight(sessionId, agentId);
+        if (thread === "closed-meanwhile") panel.state.closed = true;
+        return answer;
+      };
+      const bridge = new PlannotatorBridge(f.linear, { read: async () => settings }, directory, panel.sessions as never, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
+      bridge.attach(f.paseo);
+      await bridge.drain();
+      assert.equal(onlyAttempt(bridge).state, "applied", thread);
+      await bridge.stop();
+      const order = f.calls.filter((call) => call.startsWith("stage ") || call.startsWith("ready "));
+      if (thread === "closed-meanwhile") {
+        assert.deepEqual(order, ["stage issue-1 Plan approved", "ready issue-1"], thread);
+        assert.equal((await f.linear.issueStatus()).status, "Todo", thread);
+        assert.ok(f.commented.some((body) => body.includes("Assign Paseo again to implement it.")), thread);
+        assert.equal(panel.activities.size, 0, thread);
+      } else {
+        assert.deepEqual(order, ["stage issue-1 Plan approved"], thread);
+        assert.equal((await f.linear.issueStatus()).status, "Plan approved", thread);
+        assert.equal(panel.queued(), thread === "queued" ? 1 : 0, thread);
+        assert.equal(panel.activities.size, 1, thread);
+        assert.equal(f.commented.length, 0, thread);
+      }
+    });
+  }
+});
+
+// TUC-1289 review: a parked approval recorded by the code before the plan stages, whose `ready` and
+// `queue` already ran, keeps that outcome on its retry: its successor may already work and its
+// thread may be closed since, so neither a stage nor Todo is written.
+test("a legacy parked approval with ready and queue done never writes a stage or Todo on its retry", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-01-01T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: RISKY(2), at: new Date().toISOString() }], async (directory) => {
+    const f = tracked({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+    const { plans, parking } = parkingFake(f.calls);
+    plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T11:00:00.000Z", announced: true, staged: true });
+    const panel = parkedSessions();
+    const say = panel.sessions.say;
+    panel.sessions.say = armedCall("before", say);
+    const build = () => new PlannotatorBridge(f.linear, { read: async () => settings }, directory, panel.sessions as never, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
+    const first = build();
+    first.attach(f.paseo);
+    await first.drain();
+    assert.equal(onlyAttempt(first).state, "pending");
+    await first.stop();
+    // Rewrite the attempt as the old code left it: `ready` done instead of `handoff` and `stage`.
+    const decisions = join(dirname(directory), "decisions");
+    const files = (await readdir(decisions, { recursive: true })).map((name) => join(decisions, String(name))).filter((path) => path.endsWith(".json"));
+    let rewritten = 0;
+    for (const path of files) {
+      const entry: unknown = JSON.parse(await readFile(path, "utf8"));
+      if (!entry || typeof entry !== "object" || !("kind" in entry) || entry.kind !== "attempt" || !("steps" in entry) || !entry.steps || typeof entry.steps !== "object") continue;
+      const { handoff: _handoff, stage: _stage, ...rest } = entry.steps as Record<string, unknown>;
+      await writeFile(path, JSON.stringify({ ...entry, steps: { ...rest, ready: null } }));
+      rewritten++;
+    }
+    assert.equal(rewritten, 1);
+    // The successor took the thread over and implements; the thread is closed.
+    panel.state.closed = true;
+    f.linear.issueStatus = async () => ({ status: "In Progress", statusType: "started" });
+    f.calls.length = 0;
+    const second = build();
+    second.attach(f.paseo);
+    t.mock.timers.tick(3_000);
+    await second.drain();
+    await second.drain();
+    assert.equal(onlyAttempt(second).state, "applied");
+    assert.deepEqual(f.calls.filter((call) => call.startsWith("stage ") || call.startsWith("ready ")), []);
+    assert.equal(panel.activities.size, 1, "the pending note goes out");
+    await second.stop();
+  });
+});
+
+// TUC-1289 review: a current parked approval whose thread closed after the preflight, and whose
+// reconciliation failed once, reconciles on its retry: it is no legacy attempt (`handoff` is
+// recorded), so the ticket still leaves Plan approved for Todo with the owner's comment.
+test("a parked approval whose reconciliation failed once moves to Todo with the comment on its retry", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-01-01T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: RISKY(2), at: new Date().toISOString() }], async (directory) => {
+    const f = tracked({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+    const { plans, parking } = parkingFake(f.calls);
+    plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T11:00:00.000Z", announced: true, staged: true });
+    const panel = parkedSessions();
+    const preflight = panel.sessions.queueable;
+    panel.sessions.queueable = async (sessionId: string, agentId: string) => {
+      const answer = await preflight(sessionId, agentId);
+      panel.state.closed = true;
+      return answer;
+    };
+    f.linear.issueStatus = armedCall("before", f.linear.issueStatus);
+    const build = () => new PlannotatorBridge(f.linear, { read: async () => settings }, directory, panel.sessions as never, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
+    const first = build();
+    first.attach(f.paseo);
+    await first.drain();
+    assert.equal(onlyAttempt(first).state, "pending");
+    await first.stop();
+    const second = build();
+    second.attach(f.paseo);
+    t.mock.timers.tick(3_000);
+    await second.drain();
+    await second.drain();
+    assert.equal(onlyAttempt(second).state, "applied");
+    assert.deepEqual(f.calls.filter((call) => call.startsWith("stage ") || call.startsWith("ready ")), ["stage issue-1 Plan approved", "ready issue-1"]);
+    assert.equal((await f.linear.issueStatus()).status, "Todo");
+    assert.ok(f.commented.some((body) => body.includes("Assign Paseo again to implement it.")));
+    await second.stop();
+  });
+});
+
+// TUC-1289 review: a parked plan's Plan review staging and an owner decision arriving while it
+// waits on Linear never interleave: the decision is accepted only after the staging finished, so
+// its own writes come last and the parked record it removes is not written back.
+test("a decision arriving while a parked plan is staged waits for the staging, writes last and keeps the record removed", async () => {
+  const f = tracked({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(f.calls);
+  plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T09:00:00.000Z", announced: true });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let entered!: () => void;
+  const stagingEntered = new Promise<void>((resolve) => { entered = resolve; });
+  const move = f.linear.moveToPlanStage;
+  f.linear.moveToPlanStage = async (issueId: string, name: string) => {
+    if (name === "Plan review") { entered(); await gate; }
+    return move(issueId, name);
+  };
+  await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: null, at: "2026-01-01T10:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(f.linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.attach(f.paseo);
+    const serve = bridge.drain();
+    await stagingEntered;
+    const decision = bridge.decideOwner("http://localhost:4000/", true, "", "agent-1", { source: "inbox" });
+    for (let turn = 0; turn < 200; turn++) await immediate();
+    assert.equal(bridge.decisionJournal.attempts().length, 0, "nothing is accepted while the staging runs");
+    release();
+    await serve;
+    await decision;
+    await bridge.drain();
+    assert.equal(onlyAttempt(bridge).state, "applied");
+    assert.equal(plans.size, 0, "the decided record stays removed");
+    const order = f.calls.filter((call) => /^(stage|ready|[+-]plan-)/.test(call));
+    assert.deepEqual(order, ["stage issue-1 Plan review", "-plan-ready issue-1", "-plan-rework issue-1", "+plan-ready issue-1", "-plan-rework issue-1", "ready issue-1"]);
+    await bridge.stop();
+  });
+});
+
 // AC-1: every mandatory parked step, failed once before it ran, after it ran and in its journal
-// write, with a reload between the failure and the retry.
+// write, with a reload between the failure and the retry. AC-1, AC-4 (TUC-1289): with a thread
+// the ticket enters Plan approved once and never Todo; without one, Todo once.
 test("every mandatory parked step survives a one-off fault, a reload and a retry, with every effect exactly once", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-01-01T12:00:00Z") });
   t.mock.method(console, "error", () => {});
-  const steps = ["document", "follow-ups", "plan-ready", "ready", "comment", "queue", "notify", "unpark", "inbox"];
+  const steps = ["document", "follow-ups", "plan-ready", "stage", "handoff", "comment", "queue", "notify", "unpark", "inbox"];
   for (const step of steps) {
     for (const kind of ["before", "after", "journal"] as FaultKind[]) {
       const label = `${step} fails ${kind === "journal" ? "its journal write" : kind === "after" ? "after it ran" : "before it runs"}`;
@@ -1124,7 +1387,7 @@ test("every mandatory parked step survives a one-off fault, a reload and a retry
         const f = tracked({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
         const { plans, parking } = parkingFake(f.calls);
         plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T11:00:00.000Z", announced: true });
-        const panel = step === "queue" || step === "notify" ? parkedSessions() : null;
+        const panel = step === "queue" || step === "notify" || step === "handoff" ? parkedSessions() : null;
         const filed: string[] = [];
         const followUps = { file: async (origin: { issueId: string }) => { if (!filed.includes(origin.issueId)) filed.push(origin.issueId); }, retryPending: async () => {} };
         const inbox: string[] = [];
@@ -1139,7 +1402,8 @@ test("every mandatory parked step survives a one-off fault, a reload and a retry
           if (step === "document") f.linear.upsertIssueDocument = armedCall(crash, f.linear.upsertIssueDocument);
           if (step === "follow-ups") followUps.file = armedCall(crash, followUps.file);
           if (step === "plan-ready") f.linear.addLabel = armedCall(crash, f.linear.addLabel);
-          if (step === "ready") f.linear.moveToReady = armedCall(crash, f.linear.moveToReady);
+          if (step === "stage") f.linear.moveToReady = armedCall(crash, f.linear.moveToReady);
+          if (step === "handoff") panel!.sessions.queueable = armedCall(crash, panel!.sessions.queueable);
           if (step === "comment") f.linear.comment = armedCall(crash, f.linear.comment);
           if (step === "queue") panel!.sessions.requeueSession = armedCall(crash, panel!.sessions.requeueSession);
           if (step === "notify") panel!.sessions.say = armedCall(crash, panel!.sessions.say);
@@ -1171,7 +1435,8 @@ test("every mandatory parked step survives a one-off fault, a reload and a retry
         assert.equal(f.documents.get("Plan: TUC-25")?.creates ?? 0, 1, label);
         assert.equal(filed.length, 1, label);
         assert.equal(f.labelAdds.get("plan-ready") ?? 0, 1, label);
-        assert.equal(f.readied(), 1, label);
+        assert.equal(f.readied(), panel ? 0 : 1, label);
+        assert.equal(f.staged("Plan approved"), panel ? 1 : 0, label);
         assert.equal(inbox.length, 1, label);
         if (panel) {
           assert.equal(panel.queued(), 1, label);

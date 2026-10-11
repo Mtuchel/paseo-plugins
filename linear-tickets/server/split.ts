@@ -1,10 +1,10 @@
 import type { LinearService } from "./linear";
-import { CODING_STATE, planDocument } from "./plannotator";
-import { PLAN_READY_LABEL } from "./plan-policy";
+import { CODING_STATE, planDocument, roundStep } from "./plannotator";
+import { PLAN_READY_LABEL, PLAN_REWORK_LABEL } from "./plan-policy";
 import { MAX_SPLIT, planSteps } from "./sessions";
 import type { PlanFollowUps } from "./plan-follow-ups";
 import { planTier, strongStepNumbers } from "../shared/plan-model";
-import { TIER_LABELS } from "./model-tiers";
+import { writeTierLabel } from "./model-tiers";
 
 // The decision worker's step guard (plannotator.ts): a step recorded as done is skipped, and a
 // create reserves its Linear id first and is looked up by it before it is ever sent again.
@@ -17,7 +17,7 @@ export type Steps = {
 // What "Approve, implement later" and "Approve & split" do besides Linear: the Linear panel
 // session (null without one), retiring the planner and finishing the decision.
 export type PanelWork = {
-  linear: Pick<LinearService, "issueState" | "createIssue" | "issueById" | "addBlocker" | "delegate" | "upsertIssueDocument" | "moveToStateNamed" | "moveToReady" | "addLabel">;
+  linear: Pick<LinearService, "issueState" | "createIssue" | "issueById" | "addBlocker" | "delegate" | "upsertIssueDocument" | "issueDocument" | "moveToStateNamed" | "moveToReady" | "addLabel" | "removeLabel" | "changeLabels" | "labelCatalog" | "createLabel">;
   appUserId: () => Promise<string | null>;
   followUps?: Pick<PlanFollowUps, "file">;
   // The session is held first (offer "later" / "split"), so retiring the planner offers no Resume
@@ -38,7 +38,8 @@ export type PanelWork = {
 export type ApprovedPlan = { agentId: string | null; issueId: string; identifier: string; plan: string; model: string | null; at: string };
 
 async function approvedDocument(steps: Steps, work: PanelWork, decision: ApprovedPlan): Promise<string> {
-  const documentUrl = await steps.once("document", () => work.linear.upsertIssueDocument(decision.issueId, `Plan: ${decision.identifier}`, planDocument({ type: "decided", agentId: decision.agentId, approved: true, planContent: decision.plan, at: decision.at }, decision.identifier, decision.model)));
+  const round = await roundStep(steps, work.linear, decision.issueId, decision.identifier);
+  const documentUrl = await steps.once("document", () => work.linear.upsertIssueDocument(decision.issueId, `Plan: ${decision.identifier}`, planDocument({ type: "decided", agentId: decision.agentId, approved: true, planContent: decision.plan, at: decision.at }, decision.identifier, decision.model, round)));
   await steps.once("follow-ups", async () => { await work.followUps?.file({ issueId: decision.issueId, identifier: decision.identifier, plan: decision.plan, documentUrl: documentUrl || null }); });
   return documentUrl;
 }
@@ -52,8 +53,10 @@ async function finish(steps: Steps, work: PanelWork, summary: string): Promise<v
 }
 
 // "Approve, implement later": the plan is approved and recorded, but nobody codes yet. The
-// planner is retired, the ticket goes back to Todo with the plan-ready label, and the next agent
-// (assigned, labelled or a reply in this session) implements the plan instead of planning again.
+// planner is retired, the ticket goes back to Todo with the plan-ready label (README, "Statuses
+// and labels": Todo, not Plan approved, since nothing starts it until the owner does), and the
+// next agent (assigned, labelled or a reply in this session) implements the plan instead of
+// planning again.
 export async function applyLater(steps: Steps, work: PanelWork, decision: ApprovedPlan): Promise<void> {
   if (work.session) await steps.once("hold", () => work.session!.hold("later"));
   const documentUrl = await approvedDocument(steps, work, decision);
@@ -62,7 +65,10 @@ export async function applyLater(steps: Steps, work: PanelWork, decision: Approv
     const moved = await work.linear.moveToReady(decision.issueId);
     if (moved.note) console.error(`[linear-tickets] ${decision.identifier}: ${moved.note}`);
   });
-  await steps.once("plan-ready", () => work.linear.addLabel(decision.issueId, PLAN_READY_LABEL));
+  await steps.once("plan-ready", async () => {
+    await work.linear.addLabel(decision.issueId, PLAN_READY_LABEL);
+    await work.linear.removeLabel(decision.issueId, PLAN_REWORK_LABEL);
+  });
   await finish(steps, work, `Plan approved for later${documentUrl ? ` ([plan](${documentUrl}))` : ""}. The ticket is back in Todo with \`${PLAN_READY_LABEL}\`. Reply here, assign Paseo again or add the \`paseo\` label to implement it.`);
 }
 
@@ -121,7 +127,7 @@ export async function applySplit(steps: Steps, work: PanelWork, decision: Approv
     const issue = steps.value<{ id: string; identifier: string }>(`${name}:issue`)!;
     const previous = created.at(-1);
     if (previous) await steps.once(`blocker:${index + 1}`, () => work.linear.addBlocker(previous.id, issue.id));
-    if (tier?.tier === "strong" || strongSteps.has(index + 1)) await steps.once(`tier-label:${index + 1}`, () => work.linear.addLabel(issue.id, TIER_LABELS.strong));
+    if (tier?.tier === "strong" || strongSteps.has(index + 1)) await steps.once(`tier-label:${index + 1}`, () => writeTierLabel(work.linear, issue.id, "strong", []));
     created.push(issue);
   }
   const appUserId = await work.appUserId();
@@ -132,7 +138,10 @@ export async function applySplit(steps: Steps, work: PanelWork, decision: Approv
     const moved = await work.linear.moveToStateNamed(decision.issueId, CODING_STATE);
     if (moved.note) console.error(`[linear-tickets] ${decision.identifier}: ${moved.note}`);
   });
-  await steps.once("plan-ready", () => work.linear.addLabel(decision.issueId, PLAN_READY_LABEL));
+  await steps.once("plan-ready", async () => {
+    await work.linear.addLabel(decision.issueId, PLAN_READY_LABEL);
+    await work.linear.removeLabel(decision.issueId, PLAN_REWORK_LABEL);
+  });
   // The steps are the parent's sub-issues now: the parent closes when they are finished.
   if (work.session) await steps.once("group", () => work.session!.group());
   await finish(steps, work, `Split into ${created.length} sub-issues (${created.map((issue) => issue.identifier).join(", ")}), assigned to Paseo. They run one after another; each starts when the one before it is done.`);

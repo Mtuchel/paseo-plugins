@@ -69,7 +69,7 @@ function load() {
 function plugin() {
   const state: IssueState = { id: "issue-1", identifier: "TUC-7", status: "Planning", statusId: "s", statusType: "started", teamId: "t1", projectId: null, creatorId: "owner", labels: [], attachmentUrls: [], blockedBy: [], priority: 0, createdAt: "2026-10-01T00:00:00Z", unblocks: 0 };
   const routes = new SmallRoutes({
-    linear: { issueState: async () => state, comment: async () => {}, commentById: async () => null, addLabel: async () => {}, removeLabel: async () => {}, moveToStateNamed: async () => ({ changed: true }) },
+    linear: { issueState: async () => state, issueCore: async () => state, comment: async () => {}, commentById: async () => null, addLabel: async () => {}, removeLabel: async () => {}, moveToStateNamed: async () => ({ changed: true }), changeLabels: async () => {}, labelCatalog: async () => [], createLabel: async (input) => input.name },
     untrusted: async () => false,
     settings: { read: async () => settings },
     tiers: new TierStore(join(root, "linear-tickets", "model-tiers")),

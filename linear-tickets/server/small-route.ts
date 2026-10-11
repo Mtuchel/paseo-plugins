@@ -7,7 +7,7 @@ import { dispatchLabels } from "./dispatch";
 import { hasLabel, PLAN_LABEL, PLAN_POLICY_LABEL } from "./plan-policy";
 import { planRequestsDirectory } from "./plan-requests";
 // starter.ts imports this module; its trust rule (isUntrusted) comes in through `untrusted`.
-import { launchTier, TIER_LABELS, type TierStore } from "./model-tiers";
+import { launchTier, writeTierLabel, type TierStore } from "./model-tiers";
 import { paseoHome } from "./ticket-mcp";
 import { TIERS, type Tier } from "../shared/plan-model";
 import { decisionText, NO_PLAN_LABEL, parseDecision, parseRouteFacts, routeRefusals, SMALL_ROUTE_MAX_LINES, type RouteDecision, type RouteFacts } from "../shared/small-route";
@@ -59,7 +59,7 @@ type Attempt = {
 // `planDecisionOpen`: the decision journal holds a decision on this agent's plan not yet carried out.
 export type RouteAgent = { id: string; issueId: string | null; identifier: string; provider: string; planPolicy: string | null; planDecisionOpen: boolean };
 type Deps = {
-  linear: Pick<LinearService, "issueState" | "comment" | "commentById" | "addLabel" | "removeLabel" | "moveToStateNamed">;
+  linear: Pick<LinearService, "issueState" | "issueCore" | "comment" | "commentById" | "addLabel" | "removeLabel" | "moveToStateNamed" | "changeLabels" | "labelCatalog" | "createLabel">;
   // starter.ts isUntrusted for this ticket's state.
   untrusted: (state: IssueState) => Promise<boolean>;
   settings: Pick<Settings, "read">;
@@ -336,10 +336,7 @@ export class SmallRoutes {
       await this.step(attempt, name, work);
     }
     const tier = attempt.steps.record as Tier;
-    if (settings.writeback.status) await this.optional(attempt, "tier-label", async () => {
-      await this.deps.linear.addLabel(issue.id, TIER_LABELS[tier]);
-      for (const other of TIERS) if (other !== tier) await this.deps.linear.removeLabel(issue.id, TIER_LABELS[other]);
-    });
+    if (settings.writeback.status) await this.optional(attempt, "tier-label", async () => writeTierLabel(this.deps.linear, issue.id, tier, (await this.deps.linear.issueCore(issue.id)).labels));
     await this.optional(attempt, "tier-switch", () => this.deps.applyTier(attempt.agentId));
     attempt.state = "done";
     await this.save(attempt);

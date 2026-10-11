@@ -10,7 +10,7 @@ import { paseoHome } from "./ticket-mcp";
 import type { Handover } from "./handover";
 import { activeModel } from "./model";
 import { APPROVE_LATER, APPROVE_PLAN, decidePlannotatorReview, MAX_SPLIT, planSteps, ReviewClosedError, SEND_BACK, setAgentMode, SPLIT_PLAN, type SessionLink, type SessionRouter } from "./sessions";
-import { hasLabel, PLAN_POLICY_LABEL, PLAN_READY_LABEL, PLANNING_STATE } from "./plan-policy";
+import { hasLabel, PLAN_APPROVED_STATE, PLAN_POLICY_LABEL, PLAN_READY_LABEL, PLAN_REVIEW_STATE, PLAN_REWORK_LABEL, PLANNING_STATE, planStage } from "./plan-policy";
 import type { ParkedPlan, ParkedPlans } from "./parked";
 import type { ReviewLinks } from "./review-links";
 import { autoApproval, parsePlanRisk, ratingText, type ReviewFacts } from "../shared/plan-risk";
@@ -22,7 +22,7 @@ import { orderProblems, type ProjectFlow } from "./project-flow";
 import type { PlanFollowUps } from "./plan-follow-ups";
 import { feedbackEntry, logQuietly, type DecisionLog } from "./owner-decisions";
 import { modelProblem, modelSteps, planTier, strongerTier, TIERS, type Tier } from "../shared/plan-model";
-import { labelTier, onlyTierAdded, TIER_LABELS, tierModel, type TierStore } from "./model-tiers";
+import { labelTier, onlyTierAdded, tierModel, writeTierLabel, type TierStore } from "./model-tiers";
 import type { ReviewDeletions } from "./review-deletions";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import { DecisionJournal, DecisionPendingError, FencedError, HaltedError, type DecisionAttempt, type ResolveAction, type ReviewGeneration, type RouteSnapshot } from "./decision-journal";
@@ -72,8 +72,8 @@ type PlannotatorEvent = OpenedEvent | DecidedEvent | AdvisedEvent | EscalatedEve
 // Model tiers (README, "Model tiers"): where tier decisions are recorded, the model guard's
 // immediate switch of one agent, and sending a working agent back to planning (plan-requests.ts).
 export type Tiers = { store: Pick<TierStore, "record">; apply: (agentId: string) => Promise<unknown>; replan: (agent: { id: string; issueId: string; identifier: string }, message: string) => Promise<void> };
-type Linear = Pick<LinearService, "comment" | "commentById" | "upsertIssueDocument" | "issueDocument" | "moveToStateNamed" | "moveToReady" | "addLabel" | "removeLabel" | "issueState" | "viewerId" | "appUserId" | "trustedAppIds" | "createIssue" | "issueById" | "addBlocker" | "delegate">;
-type Sessions = Pick<SessionRouter, "sessionFor" | "plan" | "ask" | "say" | "said" | "expectReview" | "clearReview" | "parked" | "requeueSession" | "holdSession" | "groupSession">;
+type Linear = Pick<LinearService, "comment" | "commentById" | "upsertIssueDocument" | "issueDocument" | "moveToStateNamed" | "moveToReady" | "moveToPlanStage" | "issueStatus" | "addLabel" | "removeLabel" | "changeLabels" | "labelCatalog" | "createLabel" | "issueState" | "viewerId" | "appUserId" | "trustedAppIds" | "createIssue" | "issueById" | "addBlocker" | "delegate">;
+type Sessions = Pick<SessionRouter, "sessionFor" | "plan" | "ask" | "say" | "said" | "expectReview" | "clearReview" | "parked" | "queueable" | "requeueSession" | "holdSession" | "groupSession">;
 // What the risk policy made of an opened review: `line` tells the owner, in the panel and on Linear;
 // `reasons` why it needs the owner (empty when approved).
 type Judgement = { approved: boolean; line: string; reasons: string[] };
@@ -157,16 +157,43 @@ export function parseEvent(raw: string): PlannotatorEvent | null {
   return null;
 }
 
-export function planDocument(event: DecidedEvent, identifier: string, model?: string | null): string {
+// `round`: the review round of this plan (README, "Statuses and labels"), a header line the next
+// round reads back (planRound).
+export function planDocument(event: DecidedEvent, identifier: string, model?: string | null, round?: number): string {
   const date = event.at.slice(0, 16).replace("T", " ");
   const plan = (event.planContent ?? "").trim() || "_The plan text was not recorded._";
   return [
     `> **${event.approved ? "Approved" : "Sent back with feedback"}** in Plannotator on ${date} UTC for ${identifier}. Replaced on every review round; the decision comments on the ticket keep the history.`,
+    ...round ? [`> **Review round:** ${round}`] : [],
     model ? `> **Planned with:** \`${model}\`` : "",
     event.feedback ? `\n## Review feedback\n\n${event.feedback}` : "",
     "\n---\n",
     plan.length > MAX_PLAN_CHARS ? `${plan.slice(0, MAX_PLAN_CHARS)}\n\n… (truncated)` : plan,
   ].join("\n");
+}
+
+// The review round a plan document's header names: only the plugin's leading lines (before the
+// feedback heading or the first `---`) count, never the plan text. Null without one.
+export function planRound(content: string): number | null {
+  for (const line of content.split("\n")) {
+    const text = line.trim();
+    if (text === "---" || text.startsWith("#")) break;
+    const match = /^>\s*\*\*Review round:\*\*\s*(\d+)\b/.exec(text);
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
+
+// The round of the plan being decided, recorded once per decision so a retry keeps it: one after
+// the previous `Plan: TUC-N` document's round (a document without the header counts as round 1;
+// no document makes this round 1). A decision from before rounds whose document was written
+// already keeps that document's round instead of counting itself again.
+export async function roundStep(steps: { once<T>(name: string, work: () => Promise<T>): Promise<T>; value<T>(name: string): T | undefined }, linear: Pick<LinearService, "issueDocument">, issueId: string, identifier: string): Promise<number> {
+  return steps.once("round", async () => {
+    const previous = await linear.issueDocument(issueId, `Plan: ${identifier}`);
+    const round = previous ? planRound(previous.content) ?? 1 : 0;
+    return steps.value("document") !== undefined ? Math.max(round, 1) : round + 1;
+  });
 }
 
 function message(error: unknown): string {
@@ -441,10 +468,9 @@ export class PlannotatorBridge {
   // --- Tiers, escalations, advice ----------------------------------------------------------
 
   // The ticket's `model:` label follows its tier, so Linear shows (and filters) which tier a ticket
-  // runs on; the owner raises it by setting a stronger `model:` label.
+  // runs on; the owner raises it by setting a stronger `model:` label. One write (writeTierLabel).
   private async labelTier(issueId: string, tier: Tier, current: { id: string; name: string }[]): Promise<void> {
-    await this.linear.addLabel(issueId, TIER_LABELS[tier]);
-    for (const other of TIERS) if (other !== tier) await this.linear.removeLabel(issueId, TIER_LABELS[other], current);
+    await writeTierLabel(this.linear, issueId, tier, current);
   }
 
   // An approved plan's tier (README, "Model tiers"): the stronger of the plan's `## Model` section
@@ -855,12 +881,9 @@ export class PlannotatorBridge {
     // Tailnet links only: a local-only review has no link worth showing off this machine.
     const inSession = await this.toSession(event, review, agentId, model, event.remoteUrl ? url : null, planText, judgement);
     if (!issueId) return;
-    // Planning while a plan is out for review; a new review round removes plan-ready.
-    if (settings.writeback.status) {
-      const moved = await this.linear.moveToStateNamed(issueId, PLANNING_STATE);
-      if (moved.note) console.error(`[linear-tickets] ${identifier}: ${moved.note}`);
-      await this.linear.removeLabel(issueId, PLAN_READY_LABEL);
-    }
+    // Plan review while the plan waits for its review; the decision writes the next stage. An
+    // auto-approval writes nothing here: its decision writes the status and labels.
+    if (settings.writeback.status && !judgement?.approved) await this.stageReview(issueId, identifier, review);
     // With a session the panel shows the review, so the progress comment records it instead of new comments.
     if (inSession && this.handover && refreshed?.agent) {
       await this.handover.update({ id: issueId, identifier }, { id: agentId, title: refreshed.agent.title ?? null, cwd: refreshed.agent.cwd }, { plan: judgement ? `${judgement.approved ? "auto-approved" : "under review"} — ${judgement.line}` : "under review", link: ["Plan review", url], model });
@@ -875,19 +898,33 @@ export class PlannotatorBridge {
   // Parks a plan the owner has to decide (README, "Parked plans"). The record comes first, then
   // the closing of the agent's own review (so its report is a confirmation, never a decision);
   // then the agent is retired, freeing its slot. The central host serves the plan, and its
-  // `opened` event tells the owner (deliverParked).
+  // `opened` event tells the owner and moves the ticket to Plan review (deliverParked).
   private async park(event: OpenedEvent, review: ReviewGeneration, plan: ParkedPlan, paseo: PaseoApi): Promise<void> {
     const reason = "The owner has to decide this plan. It is parked in the central Plannotator host and you are being closed to free your slot: stop now and do not implement anything. A new agent continues once the owner decides.";
     await this.parking!.plans.put(plan);
     await this.sessions?.parked(plan.agentId);
     await this.journal.addClosing(review, false, reason);
     await this.parking!.retire(event.localUrl, plan.agentId, paseo, reason);
-    if ((await this.settings.read()).writeback.status) {
-      const moved = await this.linear.moveToStateNamed(plan.issueId, PLANNING_STATE);
-      if (moved.note) console.error(`[linear-tickets] ${plan.identifier}: ${moved.note}`);
-      await this.linear.removeLabel(plan.issueId, PLAN_READY_LABEL);
-    }
     console.log(`[linear-tickets] ${plan.identifier}: plan parked for the owner (${plan.reasons.join("; ")})`);
+  }
+
+  // A submitted plan waits for its review: Plan review, without plan-ready or plan-rework (README,
+  // "Statuses and labels"). Skipped once a decision on this review was accepted: that decision
+  // writes its own status and labels, which this must never overwrite. A decision still being
+  // confirmed does not count: once accepted, it writes after this. The check, the writes and
+  // `staged` run under the review's journal lock, which every acceptance takes too, so no decision
+  // is accepted (and applied) in between. False when skipped.
+  private stageReview(issueId: string, identifier: string, review: ReviewGeneration, staged?: () => Promise<void>): Promise<boolean> {
+    return this.journal.withReview(review.id, async () => {
+      const decided = this.journal.attempts().some((attempt) => attempt.reviewId === review.id && (attempt.state === "pending" || attempt.state === "applied"));
+      if (decided) return false;
+      const moved = await this.linear.moveToPlanStage(issueId, PLAN_REVIEW_STATE);
+      if (moved.note) console.error(`[linear-tickets] ${identifier}: ${moved.note}`);
+      await this.linear.removeLabel(issueId, PLAN_READY_LABEL);
+      await this.linear.removeLabel(issueId, PLAN_REWORK_LABEL);
+      await staged?.();
+      return true;
+    });
   }
 
   // A planner run's work order needs nobody (README, "Projects"): it only orders the project's
@@ -928,8 +965,9 @@ export class PlannotatorBridge {
   }
 
   // A parked plan's `opened` event, from the central host: it binds the stable link, inbox and
-  // panel to the host's review (and tells the owner the first time). The owner's decision on it
-  // is journaled like any other and carried out on the parked route.
+  // panel to the host's review, moves the ticket to Plan review (once, then `staged`; a crash
+  // between parking and this is repaired by the next serve) and tells the owner the first time.
+  // The owner's decision on it is journaled like any other and carried out on the parked route.
   private async deliverParked(event: OpenedEvent, parked: ParkedPlan, review: ReviewGeneration): Promise<void> {
     const stableLink = await this.reviews?.opened(parked.agentId, event, { identifier: parked.identifier, issueId: parked.issueId, since: parked.parkedAt, model: parked.model, reviewId: review.id }) ?? null;
     const url = stableLink ?? event.remoteUrl ?? event.localUrl;
@@ -938,6 +976,11 @@ export class PlannotatorBridge {
     const reviewLink = event.remoteUrl ? url : null;
     const link = await this.sessions?.sessionFor(parked.agentId) ?? null;
     if (link) await this.sessions!.expectReview(link.sessionId, event.localUrl, parked.plan, reviewLink, review.id);
+    // Not once decided: the decision's last step removes the record, which must not come back.
+    if (!parked.staged && (await this.settings.read()).writeback.status) {
+      const record = { ...parked, staged: true };
+      if (await this.stageReview(parked.issueId, parked.identifier, review, () => this.parking!.plans.put(record))) parked = record;
+    }
     if (parked.announced) return;
     if (!stableLink) this.show(event.localUrl);
     const model = parked.model ? `\n\nPlanned with ${parked.model}.` : "";
@@ -1079,42 +1122,88 @@ export class PlannotatorBridge {
     await steps.optional("chat", () => paseo.agents.ref(attempt.agentId).timeline.append({ type: "plugin", id: `plannotator-decided-${attempt.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: row }));
   }
 
-  // A parked plan's decision: the plan document, its follow-ups and Todo with plan-ready when
-  // approved, then the session thread queues a fresh agent (or a comment asks to assign Paseo).
-  // The parking ends last, so a decision not carried out yet keeps the plan parked.
+  // A parked plan's decision: the plan document, its follow-ups and the plan stage (README,
+  // "Statuses and labels"), then the session thread queues a fresh agent (or a comment asks to
+  // assign Paseo). Approved: plan-ready, then a read-only preflight of the thread (`handoff`), then
+  // Plan approved when an agent will take it over (Todo when nothing will: the owner starts it),
+  // written before the thread can start a successor; then the requeue, whose own result settles
+  // the stage (`reconcile`): a thread that closed after the preflight leaves Todo and the comment.
+  // Sent back: Planning with plan-rework. The parking ends last, so a decision not carried out yet
+  // keeps the plan parked.
   private async applyParked(attempt: DecisionAttempt, steps: WorkerSteps): Promise<void> {
     const parked = attempt.parked!;
     const issue = { id: parked.issueId, identifier: parked.identifier };
     const event = this.eventOf(attempt, parked.plan);
+    const sessionId = attempt.sessionId;
+    const sessions = this.sessions;
     await steps.once("log", () => this.logFeedback(attempt.agentId, event, issue));
-    const documentUrl = await steps.once("document", () => this.linear.upsertIssueDocument(issue.id, `Plan: ${issue.identifier}`, planDocument(event, issue.identifier, parked.model)));
+    const round = await roundStep(steps, this.linear, issue.id, issue.identifier);
+    const documentUrl = await steps.once("document", () => this.linear.upsertIssueDocument(issue.id, `Plan: ${issue.identifier}`, planDocument(event, issue.identifier, parked.model, round)));
+    let preflight: "queueable" | "moved-on" | "none" = "queueable";
     if (attempt.approved) {
       await steps.once("follow-ups", async () => { await this.followUps?.file({ issueId: issue.id, identifier: issue.identifier, plan: event.planContent ?? parked.plan, documentUrl: documentUrl || null }); });
-      await steps.once("plan-ready", () => this.linear.addLabel(issue.id, PLAN_READY_LABEL));
+      await steps.once("plan-ready", async () => {
+        await this.linear.addLabel(issue.id, PLAN_READY_LABEL);
+        await this.linear.removeLabel(issue.id, PLAN_REWORK_LABEL);
+      });
       await steps.once("small-route", async () => { await this.smallRoutes?.planApproved(issue.id); });
-      await steps.once("ready", async () => {
-        const moved = await this.linear.moveToReady(issue.id);
+      // An attempt from before the plan stages that already queued its thread (`ready` wrote Todo,
+      // `queue` ran, no `handoff` recorded) keeps that outcome: its successor may already work, so
+      // no stage is written. A current attempt always records `handoff` before `queue`.
+      const legacyQueue = steps.value("handoff") === undefined ? steps.value<"queued" | "moved-on" | "none">("queue") : undefined;
+      if (legacyQueue !== undefined) preflight = legacyQueue === "none" ? "none" : "queueable";
+      else {
+        preflight = await steps.once("handoff", async () => sessionId && sessions ? sessions.queueable(sessionId, attempt.agentId) : "none" as const);
+        await steps.once("stage", async () => {
+          const moved = preflight === "none" ? await this.toReadyUnlessWorking(issue.id) : await this.linear.moveToPlanStage(issue.id, PLAN_APPROVED_STATE, { orReady: true });
+          if (moved.note) console.error(`[linear-tickets] ${issue.identifier}: ${moved.note}`);
+        });
+      }
+    } else {
+      await steps.once("stage", async () => {
+        const moved = await this.linear.moveToPlanStage(issue.id, PLANNING_STATE);
         if (moved.note) console.error(`[linear-tickets] ${issue.identifier}: ${moved.note}`);
+        await this.linear.removeLabel(issue.id, PLAN_READY_LABEL);
+        await this.linear.addLabel(issue.id, PLAN_REWORK_LABEL);
       });
     }
     const plan = documentUrl ? ` ([plan](${documentUrl}))` : "";
-    const sessionId = attempt.sessionId;
-    const sessions = this.sessions;
-    const queued = await steps.once("queue", async () => sessionId && sessions ? sessions.requeueSession(sessionId, attempt.agentId) : "none");
+    const queued = await steps.once("queue", async () => preflight !== "none" && sessionId && sessions ? sessions.requeueSession(sessionId, attempt.agentId) : "none" as const);
+    // A successor that already runs is never moved back (moveToPlanStage's no-regression rule):
+    // only a ticket still in Plan approved goes to Todo when no agent will take it over.
+    if (attempt.approved && preflight !== "none" && steps.value("handoff") !== undefined) {
+      await steps.once("reconcile", async () => {
+        if (queued !== "none") return queued;
+        const now = await this.linear.issueStatus(issue.id);
+        if (planStage(now.status, now.statusType) !== PLAN_APPROVED_STATE) return "none";
+        const moved = await this.linear.moveToReady(issue.id);
+        if (moved.note) console.error(`[linear-tickets] ${issue.identifier}: ${moved.note}`);
+        return "none";
+      });
+    }
+    const sentBack = `Plan sent back (round ${round})`;
     if (queued !== "none" && sessionId && sessions) {
       const note = attempt.approved
         ? `Plan approved${plan}. A new agent implements it as soon as a slot is free.`
-        : `Plan sent back${plan}${attempt.feedback ? `: ${attempt.feedback.slice(0, 1_000)}` : ""}. A new agent plans again with your feedback as soon as a slot is free.`;
+        : `${sentBack}${plan}${attempt.feedback ? `: ${attempt.feedback.slice(0, 1_000)}` : ""}. A new agent plans again with your feedback as soon as a slot is free.`;
       await steps.created("notify", (id) => sessions.said(id), (id) => sessions.say(sessionId, "thought", note, false, id));
     } else {
-      const body = `${attempt.approved ? "✅ **Plan approved**" : "↩️ **Plan sent back**"} in Plannotator${plan}${attempt.feedback ? `\n\n${attempt.feedback.slice(0, 4_000)}` : ""}\n\nAssign Paseo again to ${attempt.approved ? "implement it" : "plan it again"}.`;
+      const body = `${attempt.approved ? "✅ **Plan approved**" : `↩️ **Plan sent back** (round ${round})`} in Plannotator${plan}${attempt.feedback ? `\n\n${attempt.feedback.slice(0, 4_000)}` : ""}\n\nAssign Paseo again to ${attempt.approved ? "implement it" : "plan it again"}.`;
       await steps.created("comment", async (id) => Boolean(await this.linear.commentById(id)), (id) => this.linear.comment(issue.id, body, id));
     }
     if (this.parking) await steps.once("unpark", () => this.parking!.plans.remove(issue.id));
   }
 
+  // Todo for an approved plan nothing will start (README, "Statuses and labels"), unless work
+  // already started on the ticket (a started state that is no plan stage): that is never moved back.
+  private async toReadyUnlessWorking(issueId: string): Promise<{ changed: boolean; note?: string }> {
+    const now = await this.linear.issueStatus(issueId);
+    if (now.statusType.trim().toLowerCase() === "started" && !planStage(now.status, now.statusType)) return { changed: false };
+    return this.linear.moveToReady(issueId);
+  }
+
   // A decision on a working ticket agent's own review: its mode and model tier, the ticket's state
-  // and plan-ready label, the plan document, follow-ups, and the progress comment (or a comment).
+  // and labels, the plan document, follow-ups, and the progress comment (or a comment).
   private async applyLive(attempt: DecisionAttempt, steps: WorkerSteps): Promise<void> {
     const issueId = attempt.issueId!;
     const identifier = attempt.identifier ?? "this ticket";
@@ -1122,8 +1211,9 @@ export class PlannotatorBridge {
     const event = this.eventOf(attempt);
     const settings = await this.settings.read();
     await steps.once("log", () => this.logFeedback(attempt.agentId, event, issue));
+    const round = await roundStep(steps, this.linear, issueId, identifier);
     await this.chatRow(attempt, steps);
-    await this.panelDecided(attempt, steps);
+    await this.panelDecided(attempt, steps, round);
     // A required plan started in the provider's safe mode; its approved plan unlocks the usual mode.
     if (attempt.approved && attempt.planPolicy === "required") {
       await steps.once("mode", async () => {
@@ -1143,15 +1233,27 @@ export class PlannotatorBridge {
     if (attempt.approved) await this.applyPlanTier(attempt, steps, settings);
     // An approved plan replaces a small-ticket route (README, "Small-ticket route").
     if (attempt.approved) await steps.once("small-route", async () => { await this.smallRoutes?.planApproved(issueId); });
-    // Planning after a send-back; coding once approved.
+    // Approved: Plan approved, then In Progress (the agent goes on implementing); an approval
+    // during implementation stays In Progress (moveToPlanStage's no-regression rule). A decision
+    // recorded before the plan stages existed (its `state` done) adds no Plan approved. Sent back:
+    // Planning with plan-rework. Each decision writes its own labels.
     if (settings.writeback.status) {
+      if (attempt.approved && steps.value("state") === undefined) {
+        await steps.once("approved-stage", async () => {
+          const moved = await this.linear.moveToPlanStage(issueId, PLAN_APPROVED_STATE);
+          if (moved.note) console.error(`[linear-tickets] ${identifier}: ${moved.note}`);
+        });
+      }
       await steps.once("state", async () => {
         const moved = await this.linear.moveToStateNamed(issueId, attempt.approved ? CODING_STATE : PLANNING_STATE);
         if (moved.note) console.error(`[linear-tickets] ${identifier}: ${moved.note}`);
       });
-      await steps.once("label", () => attempt.approved ? this.linear.addLabel(issueId, PLAN_READY_LABEL) : this.linear.removeLabel(issueId, PLAN_READY_LABEL));
+      await steps.once("label", async () => {
+        await this.linear[attempt.approved ? "addLabel" : "removeLabel"](issueId, PLAN_READY_LABEL);
+        await this.linear[attempt.approved ? "removeLabel" : "addLabel"](issueId, PLAN_REWORK_LABEL);
+      });
     }
-    const documentUrl = await steps.once("document", () => this.linear.upsertIssueDocument(issueId, `Plan: ${identifier}`, planDocument(event, identifier, attempt.model)));
+    const documentUrl = await steps.once("document", () => this.linear.upsertIssueDocument(issueId, `Plan: ${identifier}`, planDocument(event, identifier, attempt.model, round)));
     if (attempt.approved) await steps.once("follow-ups", async () => { await this.followUps?.file({ issueId, identifier, plan: attempt.planContent, documentUrl: documentUrl || null }); });
     // With a session the panel shows the review, so the progress comment records it instead of new comments.
     const via = await steps.once("report-via", async () => {
@@ -1159,17 +1261,17 @@ export class PlannotatorBridge {
       return agent ? { via: "progress", title: agent.title ?? null, cwd: agent.cwd } : { via: "comment" };
     }) as { via: "progress" | "comment"; title?: string | null; cwd?: string };
     if (via.via === "progress" && this.handover) {
-      await steps.once("progress", () => this.handover!.update(issue, { id: attempt.agentId, title: via.title ?? null, cwd: via.cwd ?? "" }, { plan: attempt.approved ? "approved" : `sent back${attempt.feedback ? ` — ${attempt.feedback.slice(0, 300)}` : ""}`, ...(documentUrl ? { link: ["Plan", documentUrl] as [string, string] } : {}), model: attempt.model ?? null }));
+      await steps.once("progress", () => this.handover!.update(issue, { id: attempt.agentId, title: via.title ?? null, cwd: via.cwd ?? "" }, { plan: attempt.approved ? "approved" : `sent back (round ${round})${attempt.feedback ? ` — ${attempt.feedback.slice(0, 300)}` : ""}`, ...(documentUrl ? { link: ["Plan", documentUrl] as [string, string] } : {}), model: attempt.model ?? null }));
       return;
     }
     const feedback = attempt.feedback ? `\n\n${attempt.feedback.slice(0, 4_000)}` : "";
-    const body = `${attempt.approved ? "✅ **Plan approved** in Plannotator" : "↩️ **Plan sent back** from Plannotator"}${documentUrl ? ` — [plan](${documentUrl})` : ""}${feedback}`;
+    const body = `${attempt.approved ? "✅ **Plan approved** in Plannotator" : `↩️ **Plan sent back** (round ${round}) from Plannotator`}${documentUrl ? ` — [plan](${documentUrl})` : ""}${feedback}`;
     await steps.created("comment", async (id) => Boolean(await this.linear.commentById(id)), (id) => this.linear.comment(issueId, body, id));
   }
 
   // The panel's side of a decision: the review is no longer open there, the plan checklist starts,
-  // and a note says what was decided (a convenience: best effort).
-  private async panelDecided(attempt: DecisionAttempt, steps: WorkerSteps): Promise<void> {
+  // and a note says what was decided (a convenience: best effort). `round`: the decided plan's.
+  private async panelDecided(attempt: DecisionAttempt, steps: WorkerSteps, round?: number): Promise<void> {
     const sessions = this.sessions;
     const sessionId = attempt.sessionId;
     if (!sessions || !sessionId) return;
@@ -1178,7 +1280,7 @@ export class PlannotatorBridge {
       const planned = attempt.approved ? planSteps(attempt.planContent) : [];
       if (planned.length) await sessions.plan(sessionId, planned.map((content, index) => ({ content, status: index === 0 ? "inProgress" as const : "pending" as const })));
     });
-    const note = attempt.approved ? "Plan approved — starting on it." : `Plan sent back${attempt.feedback ? `: ${attempt.feedback.slice(0, 1_000)}` : ""}.`;
+    const note = attempt.approved ? "Plan approved — starting on it." : `Plan sent back${round ? ` (round ${round})` : ""}${attempt.feedback ? `: ${attempt.feedback.slice(0, 1_000)}` : ""}.`;
     await steps.optional("panel-note", () => steps.created("panel-note:posted", (id) => sessions.said(id), (id) => sessions.say(sessionId, "thought", note, false, id)));
   }
 

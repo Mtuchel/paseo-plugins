@@ -2385,6 +2385,16 @@ export class SessionRouter {
     return "queued";
   }
 
+  // requeueSession's checks without its effects: what a requeue would answer now ("queueable" for
+  // "queued"). A preflight, not a reservation: the thread may close before the requeue runs.
+  async queueable(sessionId: string, agentId: string): Promise<"queueable" | "moved-on" | "none"> {
+    const link = await this.deps.store.get(sessionId);
+    if (!link || link.closed) return "none";
+    if (link.agentId !== agentId) return "moved-on";
+    if (await this.deps.deletions?.blocked(link.issueId)) return "none";
+    return "queueable";
+  }
+
   // "Approve, implement later" and "Approve & split" hold the session first: retiring the planner
   // then offers no Resume and starts no agent.
   async holdSession(sessionId: string, offer: "later" | "split"): Promise<void> {
