@@ -1300,6 +1300,43 @@ test("a legacy parked approval with ready and queue done never writes a stage or
   });
 });
 
+// TUC-1289 review: a current parked approval whose thread closed after the preflight, and whose
+// reconciliation failed once, reconciles on its retry: it is no legacy attempt (`handoff` is
+// recorded), so the ticket still leaves Plan approved for Todo with the owner's comment.
+test("a parked approval whose reconciliation failed once moves to Todo with the comment on its retry", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-01-01T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: RISKY(2), at: new Date().toISOString() }], async (directory) => {
+    const f = tracked({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+    const { plans, parking } = parkingFake(f.calls);
+    plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T11:00:00.000Z", announced: true, staged: true });
+    const panel = parkedSessions();
+    const preflight = panel.sessions.queueable;
+    panel.sessions.queueable = async (sessionId: string, agentId: string) => {
+      const answer = await preflight(sessionId, agentId);
+      panel.state.closed = true;
+      return answer;
+    };
+    f.linear.issueStatus = armedCall("before", f.linear.issueStatus);
+    const build = () => new PlannotatorBridge(f.linear, { read: async () => settings }, directory, panel.sessions as never, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
+    const first = build();
+    first.attach(f.paseo);
+    await first.drain();
+    assert.equal(onlyAttempt(first).state, "pending");
+    await first.stop();
+    const second = build();
+    second.attach(f.paseo);
+    t.mock.timers.tick(3_000);
+    await second.drain();
+    await second.drain();
+    assert.equal(onlyAttempt(second).state, "applied");
+    assert.deepEqual(f.calls.filter((call) => call.startsWith("stage ") || call.startsWith("ready ")), ["stage issue-1 Plan approved", "ready issue-1"]);
+    assert.equal((await f.linear.issueStatus()).status, "Todo");
+    assert.ok(f.commented.some((body) => body.includes("Assign Paseo again to implement it.")));
+    await second.stop();
+  });
+});
+
 // TUC-1289 review: a parked plan's Plan review staging and an owner decision arriving while it
 // waits on Linear never interleave: the decision is accepted only after the staging finished, so
 // its own writes come last and the parked record it removes is not written back.

@@ -1148,8 +1148,9 @@ export class PlannotatorBridge {
       });
       await steps.once("small-route", async () => { await this.smallRoutes?.planApproved(issue.id); });
       // An attempt from before the plan stages that already queued its thread (`ready` wrote Todo,
-      // `queue` ran) keeps that outcome: its successor may already work, so no stage is written.
-      const legacyQueue = steps.value<"queued" | "moved-on" | "none">("queue");
+      // `queue` ran, no `handoff` recorded) keeps that outcome: its successor may already work, so
+      // no stage is written. A current attempt always records `handoff` before `queue`.
+      const legacyQueue = steps.value("handoff") === undefined ? steps.value<"queued" | "moved-on" | "none">("queue") : undefined;
       if (legacyQueue !== undefined) preflight = legacyQueue === "none" ? "none" : "queueable";
       else {
         preflight = await steps.once("handoff", async () => sessionId && sessions ? sessions.queueable(sessionId, attempt.agentId) : "none" as const);
