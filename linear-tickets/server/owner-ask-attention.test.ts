@@ -43,3 +43,19 @@ test("blocker grouping requires explicit positive dependency evidence, not menti
   assert.equal(current.attention, "owner");
   assert.equal(current.blockerIdentifier, "TUC-1275", "group membership never shares an answer or conceals this ticket's question");
 });
+
+test("explicit causal blocker references group the live staging and bundle-cap questions without sharing approvals", () => {
+  for (const [source, expected] of [
+    ["TUC-1275's migration 20261203120003_document_upload_origin_goods_receipt_file failed ('current transaction is aborted': an earlier statement failed; the first error is not in the deploy log), so P3009 blocks all later migrations. How should this go?", "TUC-1275"],
+    ["Main already sits exactly at the cap (TUC-2070, which also blocks TUC-1435 and TUC-1074). How should I unblock it?", "TUC-2070"],
+    ["The same blocks TUC-1435 (filed as TUC-2070). How should I proceed?", "TUC-2070"],
+  ]) {
+    const result = classifyAttention(source, info, false);
+    assert.equal(result.blockerIdentifier, expected);
+    assert.equal(result.attention, "owner");
+  }
+  assert.equal(blockerIdentifier("TUC-1275's migration failed last week. See TUC-2070 for the new work."), null);
+  assert.equal(blockerIdentifier("TUC-2070 no longer blocks TUC-1435."), null);
+  assert.equal(blockerIdentifier("If TUC-2070 blocks TUC-1435, ask the owner."), null);
+  assert.equal(blockerIdentifier("TUC-2070 blocks TUC-1435. Blocked by TUC-1275 too."), null);
+});

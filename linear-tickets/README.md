@@ -4065,6 +4065,10 @@ deleted or marked Done. Failed planners are labelled separately from decisions.
 
 An explicitly evidenced blocking ticket can supply `blockerIdentifier`. The menu bar groups
 related tickets under that blocker, without inferring that their approvals are interchangeable.
+Evidence includes "blocked by TUC-123", an explicit subject ("TUC-123, which also blocks…"),
+and a ticket's named failed migration/build followed by its blocking consequence. A shared
+blocking issue explicitly "filed as TUC-123" is also recognized. Mere mentions, historical or
+conditional references, and competing blocker IDs do not form a group.
 There is no "approve all related tickets" operation, no automatic recommended answer, and no
 change to repository permission, production, spending or business-policy rules.
 
