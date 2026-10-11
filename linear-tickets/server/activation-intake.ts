@@ -391,6 +391,7 @@ export class ActivationIntake implements ActivationSink {
       identifier: request.identifier,
       ...(request.sessionId ? { sessionId: request.sessionId } : {}),
       ...(request.text ? { text: activationText(request.text) } : {}),
+      ...(request.intent ? { intent: request.intent } : {}),
       ...(request.label ? { label: request.label } : {}),
       ...(request.strictResume ? { strictResume: true } : {}),
       ...(request.resume ? { resume: request.resume } : {}),
@@ -406,13 +407,13 @@ export class ActivationIntake implements ActivationSink {
   // sender id is reported from that record instead of delivered twice. The receipt is still
   // written only after the message went out; a crash in between is reported unconfirmed by the
   // retry, never repeated.
-  async deliverLocal(issueId: string, text: string, receipt?: string): Promise<{ ok: boolean; reason?: string; duplicate?: boolean }> {
+  async deliverLocal(issueId: string, text: string, receipt?: string, intent?: "triage"): Promise<{ ok: boolean; reason?: string; duplicate?: boolean }> {
     if (receipt && (await this.claimsFile.load()).receipts[receipt]) return { ok: true, duplicate: true };
     const paseo = this.deps.paseo();
     if (!paseo) return { ok: false, reason: "Paseo is not connected on this host." };
     const agent = await this.liveAgent(paseo, issueId);
     if (!agent) return { ok: false, reason: "No agent of this host is working on the ticket." };
-    const failure = await this.sendMessage(paseo, agent.id, text, this.deliveryOrigin(issueId, receipt, text));
+    const failure = await this.sendMessage(paseo, agent.id, text, this.deliveryOrigin(issueId, receipt, text, intent));
     if (failure) return { ok: false, reason: failure };
     if (receipt) {
       const at = new Date(this.now()).toISOString();
@@ -575,7 +576,7 @@ export class ActivationIntake implements ActivationSink {
     }
     if (local) {
       if (envelope.text) {
-        const failure = await this.sendMessage(paseo, local.id, envelope.text, this.deliveryOrigin(envelope.issueId, envelope.id, envelope.text));
+        const failure = await this.sendMessage(paseo, local.id, envelope.text, this.deliveryOrigin(envelope.issueId, envelope.id, envelope.text, envelope.intent));
         if (failure) await this.settle(envelope.id, "pending", `The agent working on the ticket could not take the message: ${failure}`, this.minutesToWait(entry.attempts));
         else await this.settle(envelope.id, "done", `Delivered to the agent working on the ticket (${local.id.slice(0, 8)}).`);
       } else {
@@ -683,7 +684,7 @@ export class ActivationIntake implements ActivationSink {
     const secret = await readActivationSecret();
     if (!peer || !secret) return { ok: false, reason: "no peer origin or shared secret is configured" };
     try {
-      await postToPeer(this.request, peer, "/activation/deliver", secret, { issueId: claim.issueId, text: envelope.text ?? "", receipt: envelope.id });
+      await postToPeer(this.request, peer, "/activation/deliver", secret, { issueId: claim.issueId, text: envelope.text ?? "", receipt: envelope.id, ...(envelope.intent ? { intent: envelope.intent } : {}) });
       return { ok: true };
     } catch (error) {
       return { ok: false, reason: reason(error) };
@@ -695,12 +696,12 @@ export class ActivationIntake implements ActivationSink {
   // the path decides what it is and whether it may still go out. The envelope carries no author,
   // so none is invented: the origin is unverified, which keeps the owner's precedence without
   // attributing the text to him.
-  private deliveryOrigin(issueId: string, receipt: string | undefined, text: string): DeliveryOrigin {
+  private deliveryOrigin(issueId: string, receipt: string | undefined, text: string, intent?: "triage"): DeliveryOrigin {
     // The sender's receipt is the delivery's stable ref: a forwarded envelope carries its id, the
     // delivery POST its receipt. A sender without one (an older host) is covered by the ticket and
     // the text instead, so the same retry still reaches the same ledger record.
     const ref = receipt ? `activation:${receipt}` : `activation:${createHash("sha256").update(`${issueId}:${text}`).digest("hex").slice(0, 16)}`;
-    return { ref, responder: { kind: "linear-unverified", via: "activation", ref }, issueId };
+    return { ref, responder: { kind: "linear-unverified", via: "activation", ref }, issueId, ...(intent ? { intent } : {}) };
   }
 
   // One activation message through the checked path. Answers with the reason it did not go out,

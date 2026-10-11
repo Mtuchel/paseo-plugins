@@ -306,3 +306,30 @@ test("restart recovers unfinished confirmed effects without a caller replay or n
   assert.deepEqual(h.needsYou, ["i1"]);
   assert.deepEqual(h.sent.map(entry => entry.requestId), ["q1"]);
 });
+
+test("triage answers a question as scoped free text without completion or reusable owner approval evidence", async (t) => {
+  const h = await harness(t);
+  const instruction = "Research only: compare Node and Vitest. Do not accept either recommendation or implement changes.";
+  const origin: DeliveryOrigin = { ...owner("decision:research"), intent: "triage" };
+  const result = await h.replies.deliver(h.sdk, "a", instruction, origin);
+  assert.equal(result.delivered, true);
+  assert.deepEqual(h.sent[0].response, questionAnswer(q, instruction));
+  assert.deepEqual(h.needsYou, []);
+  assert.deepEqual(h.evidence, []);
+  h.pending([{ ...q, id: "q2", title: "Deploy now?" }]);
+  const reloaded = h.create();
+  await reloaded.recoverEffects();
+  await reloaded.deliver(h.sdk, "a", instruction, origin);
+  assert.deepEqual(h.sent.map((sent) => sent.requestId), ["q1"]);
+  assert.deepEqual(h.needsYou, []);
+  assert.deepEqual(h.evidence, []);
+});
+
+test("triage cannot approve or deny a security permission, including approval-shaped owner instructions", async (t) => {
+  const h = await harness(t);
+  h.pending([{ id: "security", provider: "omp", name: "bash", kind: "tool", title: "Production command", input: {} }]);
+  await assert.rejects(h.replies.deliver(h.sdk, "a", "Approve the recommended action", { ...owner("decision:delegate"), intent: "triage" }), /cannot answer a security permission/);
+  assert.deepEqual(h.sent, []);
+  assert.deepEqual(h.messages, []);
+  assert.deepEqual(h.needsYou, []);
+});

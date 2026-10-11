@@ -120,7 +120,7 @@ export type RestartResult =
 // `retryHint`: how the owner tries again, for a start that fails on setup. `eligible`: why the
 // ticket may not start any more (null: it may), checked last before the start. `lead`: the last
 // part of the new agent's first prompt (the owner's answer, for the menu bar's asks).
-export type RestartOptions = { retryHint?: string; eligible?: () => Promise<string | null>; lead?: string };
+export type RestartOptions = { retryHint?: string; eligible?: () => Promise<string | null>; lead?: string; decisionId?: string; intent?: "triage" };
 // The project flow's restarts: a deferred or failed restart throws, as before restartFor had a
 // result, so the caller's catch releases its scheduler reservation and logs why.
 export function restartOrThrow(result: RestartResult): void {
@@ -164,7 +164,7 @@ export type SessionLink = {
   // Who wrote `pendingText`, when that was verified as the owner (the thread's creator, or a reply
   // whose author was checked): only then does its delivery count as the owner's answer (README,
   // "Deputy for agent questions"). Null for a reply that named no author.
-  pendingFrom?: { activityId: string; userId: string } | null;
+  pendingFrom?: { activityId: string; userId: string; intent?: "triage" } | null;
   // A question with several parts, asked one part at a time.
   questions?: { requestId: string; request?: AgentPermissionRequest; index: number; answers: Record<string, string> } | null;
   // Replaced by a newer thread on the same ticket (every @mention opens one); told so and completed.
@@ -600,13 +600,14 @@ export class SessionRouter {
       : { delivered: false, reply: `${command.ref} is not an answer the deputy gave on this host, so nothing was passed on.` };
   }
 
-  private origin(link: Pick<SessionLink, "sessionId" | "issueId">, text: string, activity?: Omit<CorrectionActivity, "via"> | null): DeliveryOrigin {
+  private origin(link: Pick<SessionLink, "sessionId" | "issueId">, text: string, activity?: (Omit<CorrectionActivity, "via"> & { intent?: "triage" }) | null): DeliveryOrigin {
     const ref = activity?.activityId
       ? `session:${activity.activityId}`
       : `queued:${link.sessionId}:${createHash("sha256").update(text).digest("hex")}`;
     return {
       ref,
       issueId: link.issueId,
+      ...(activity?.intent ? { intent: activity.intent } : {}),
       responder: activity?.userId.trim()
         ? { kind: "owner", via: "linear-session", activityId: activity.activityId || ref, userId: activity.userId }
         : { kind: "linear-unverified", via: "linear-session", ref },
@@ -794,7 +795,7 @@ export class SessionRouter {
     const settings = await this.deps.settings.read();
     // This thread's next agent belongs to the peer (the host drains, or the ticket is claimed
     // there): the pending comment goes with it, and nothing starts here.
-    const routed = await this.deps.route?.take({ kind: "session", issueId: link.issueId, identifier: link.identifier, sessionId: link.sessionId, ...(link.pendingText ? { text: link.pendingText } : {}) });
+    const routed = await this.deps.route?.take({ kind: "session", issueId: link.issueId, identifier: link.identifier, sessionId: link.sessionId, ...(link.pendingText ? { text: link.pendingText } : {}), ...(link.pendingFrom?.intent ? { intent: link.pendingFrom.intent } : {}) });
     if (routed && "held" in routed) {
       // Nothing was started and nothing was forwarded: the thread keeps its message and the
       // sweep tries again.
@@ -1144,7 +1145,7 @@ export class SessionRouter {
         return;
       }
       // A draining host forwards before admission; a full host must not strand the peer's work.
-      const routed = await this.deps.route?.take({ kind: "session", issueId: link.issueId, identifier: link.identifier, sessionId: link.sessionId, ...(link.pendingText ? { text: link.pendingText } : {}) });
+      const routed = await this.deps.route?.take({ kind: "session", issueId: link.issueId, identifier: link.identifier, sessionId: link.sessionId, ...(link.pendingText ? { text: link.pendingText } : {}), ...(link.pendingFrom?.intent ? { intent: link.pendingFrom.intent } : {}) });
       if (routed && "held" in routed) {
         if (link.queueReason !== routed.held) await this.deps.store.patch(link.sessionId, { queueReason: routed.held });
         return;
@@ -1979,7 +1980,7 @@ export class SessionRouter {
       let stopped: Set<string>;
       // Everything up to the start only reads: a failure there started nothing (deferred).
       try {
-        const routed = await this.deps.route?.take({ kind: "session", issueId, identifier });
+        const routed = await this.deps.route?.take({ kind: "session", issueId, identifier, ...(options.lead ? { text: options.lead } : {}), ...(options.decisionId ? { id: options.decisionId } : {}), ...(options.intent ? { intent: options.intent } : {}) });
         if (routed && "held" in routed) return { kind: "deferred", reason: `Nothing was restarted: ${routed.held}. The project's next read tries again.` };
         if (routed) {
           console.log(`[linear-tickets] ${identifier}: the restart is handed to ${routed.peer}`);
@@ -2440,7 +2441,7 @@ export class SessionRouter {
   // thread on the ticket joins the wait line with the answer as its message, exactly as an
   // "@paseo" thread that could not start does. The minute sweep (startQueued) starts the agent
   // with it once the ticket is admitted, or passes it to an agent that took the ticket meanwhile.
-  async queueAnswer(issueId: string, identifier: string, text: string, from: { activityId: string; userId: string }, reason: string): Promise<string> {
+  async queueAnswer(issueId: string, identifier: string, text: string, from: { activityId: string; userId: string; intent?: "triage" }, reason: string): Promise<string> {
     this.opening.add(issueId);
     try {
       const sessionId = await this.deps.api.createSessionOnIssue(issueId);

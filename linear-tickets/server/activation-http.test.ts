@@ -11,6 +11,7 @@ import { activationEndpoints } from "./activation-endpoints";
 import { ticketOwnership, ticketOwners } from "./activation-guard";
 import { ActivationIntake } from "./activation-intake";
 import { DrainRouter } from "./drain";
+import { PermissionReplies } from "./permission-replies";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type ActivationSettings, type PluginSettings } from "./settings";
 
 // The two hosts over real HTTP (the review service's :8444 listener, activation-endpoints.ts):
@@ -71,8 +72,16 @@ async function hostOverHttp(t: TestContext, options: { name: string; activation:
   const starts: { issueId: string; options: unknown }[] = [];
   const comments: string[] = [];
   const settings = { read: async () => settingsFor(options.activation()) };
+  const completed: string[] = [];
+  const replies = new PermissionReplies({ directory: join(home, options.name), daemon: async () => null });
+  replies.recordEffects({
+    ownerAnswered: async () => {},
+    correctLate: async () => ({ delivered: false, reply: "No deputy correction" }),
+    needsYou: async (_agentId, issueId) => { completed.push(issueId ?? "all"); },
+  });
   const intake = new ActivationIntake({
     settings, paseo: () => daemon.paseo, host: options.name, home: join(home, options.name), log: () => {},
+    replies,
     linear: () => ({ comment: async (_id: string, body: string) => { comments.push(body); }, addLabel: async () => {}, removeLabel: async () => {} }),
     launcher: () => ({ gate: () => ({ release: () => {} }) }),
     starter: () => ({
@@ -85,7 +94,7 @@ async function hostOverHttp(t: TestContext, options: { name: string; activation:
   });
   // The process check has its own tests (process-liveness.test.ts): the fixture's agents have no
   // process of their own, so a real check would call every one of them a ghost.
-  const drain = new DrainRouter({ settings, paseo: () => daemon.paseo, host: options.name, home: join(home, options.name), log: () => {}, ghosts: async () => new Set<string>() });
+  const drain = new DrainRouter({ settings, paseo: () => daemon.paseo, host: options.name, home: join(home, options.name), log: () => {}, ghosts: async () => new Set<string>(), replies });
   const routes = activationEndpoints({ settings, secret: async () => SECRET, intake, drain });
   const server = createServer((request, response) => {
     void (async () => {
@@ -108,7 +117,7 @@ async function hostOverHttp(t: TestContext, options: { name: string; activation:
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise<void>((resolve) => { server.close(() => resolve()); }));
-  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, root: home, daemon, starts, comments, intake, drain };
+  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, root: home, daemon, starts, comments, completed, intake, drain };
 }
 
 // The draining host without a listener of its own: it observes (take) and pushes (fetch).
@@ -289,4 +298,26 @@ test("the watch's bulk ownership read follows the two hosts' real claims, and ev
   const coldOwns = ticketOwners({ settings: { read: async () => settingsFor({ mode: "remote", peer: server.url }) }, drain: unseeded.drain, intake: unseeded.intake });
   assert.equal(await coldOwns(ids), null, "a host that cannot read its agents keeps its tickets instead of handing them over");
   assert.deepEqual([server.starts, mac.daemon.sent], [[], []], "reading ownership started and sent nothing");
+});
+
+test("canonical triage crosses the claims HTTP route without closing owner work or duplicating delivery", async (t) => {
+  let macUrl = "";
+  const server = await hostOverHttp(t, { name: "server087", activation: () => ({ mode: "local", peer: macUrl }) });
+  const mac = await hostOverHttp(t, {
+    name: "mac", activation: () => ({ mode: "remote", peer: server.url }),
+    agents: [{ id: "a-run", issueId: "i1", identifier: "TUC-1", status: "running" }],
+  });
+  macUrl = mac.url;
+  await mac.drain.readyNow();
+  const request = { kind: "session" as const, issueId: "i1", identifier: "TUC-1", id: "owner-ask:i1:r1", intent: "triage" as const, text: "Research only: TUC-1 revision r1; compare alternatives without approving any recommendation." };
+  assert.deepEqual(await server.intake.take(request), { peer: "mac" });
+  await server.intake.idle();
+  assert.deepEqual(mac.daemon.sent, [{ agentId: "a-run", message: request.text }]);
+  assert.deepEqual(mac.completed, []);
+  assert.deepEqual(server.starts, []);
+  assert.deepEqual(mac.starts, []);
+  await server.intake.take(request);
+  await server.intake.idle();
+  assert.equal(mac.daemon.sent.length, 1);
+  assert.deepEqual(mac.completed, []);
 });

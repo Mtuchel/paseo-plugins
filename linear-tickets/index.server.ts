@@ -1,6 +1,6 @@
 import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, focusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setFocusRpc, setPresenceRpc, setSettingsRpc, skipPlanRpc, statusRpc, answerAskRpc, ownerAsksRpc, type CapacityState } from "./shared/contracts";
+import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, focusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setFocusRpc, setPresenceRpc, setSettingsRpc, skipPlanRpc, statusRpc, answerAskRpc, ownerAsksRpc, triageAskRpc, type CapacityState } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -269,6 +269,7 @@ export default function contribute(server: PluginServerContext) {
     linear,
     needsYou,
     handover,
+    remoteAgent: async (issueId) => (await settings.read()).activation.mode === "local" && Boolean(await intake.claimFor(issueId)),
     labels: async () => dispatchLabels((await settings.read()).dispatch.label),
     // The contract's model: the deputy's when set, else the cheap tier's omp model. Settings hold
     // Paseo provider ids ("omp/deepseek/deepseek-flash"); the isolated OMP call takes omp's own
@@ -279,8 +280,8 @@ export default function contribute(server: PluginServerContext) {
     },
     extract: (input, model) => extractWithOmp(input, model, OWNER_ASK_DIRECTORY()),
     deliver: (paseo, agentId, message, origin) => deliverToAgent(paseo, agentId, message, origin, replies),
-    continueTicket: async (issueId, identifier, lead) => {
-      const result = await sessions.restartFor(issueId, identifier, { lead, retryHint: "answer from the menu bar or assign Paseo again" });
+    continueTicket: async (issueId, identifier, lead, decision) => {
+      const result = await sessions.restartFor(issueId, identifier, { lead, decisionId: decision.id, intent: decision.intent, retryHint: "answer from the menu bar or assign Paseo again" });
       switch (result.kind) {
         case "started": return { kind: "started", agentId: result.agentId };
         case "failed": return { kind: "failed", reason: result.error.message };
@@ -291,9 +292,6 @@ export default function contribute(server: PluginServerContext) {
       }
     },
     queueAnswer: async (issueId, identifier, text, from, reason) => { await sessions.queueAnswer(issueId, identifier, text, from, reason); },
-    queuedAnswers: async () => new Set((await sessionStore.all())
-      .filter((link) => link.queued && !link.agentId && !link.closed && link.pendingFrom?.activityId.startsWith("owner-ask:"))
-      .map((link) => link.issueId)),
   });
   // The wait line in Linear (README, "Wait line label"): tickets waiting here for an agent slot,
   // and queued threads waiting to start (their answer or comment included), carry `<trigger>-queued`.
@@ -544,6 +542,7 @@ export default function contribute(server: PluginServerContext) {
   // model), answered through the same paths an "@paseo" reply takes.
   server.handle(ownerAsksRpc, async (_input, { paseo }) => { attach(paseo); return ownerAsks.snapshot(paseo); });
   server.handle(answerAskRpc, async (input, { paseo }) => { attach(paseo); return asCaller("owner-asks", () => ownerAsks.answer(input, paseo)); });
+  server.handle(triageAskRpc, async (input, { paseo }) => { attach(paseo); return asCaller("owner-asks", () => ownerAsks.triage(input, paseo)); });
   server.handle(connectRpc, ({ apiKey }) => asCaller("sidebar", () => linear.authenticate(apiKey)));
   server.handle(disconnectRpc, () => linear.disconnect());
   server.handle(listIssuesRpc, async ({ cursor, stateNames, relation }) => {

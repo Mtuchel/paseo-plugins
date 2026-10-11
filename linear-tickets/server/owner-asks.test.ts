@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { HandoverRecord } from "./handover";
 import type { OwnerAskComment, OwnerAskIssue } from "./linear";
-import { ANSWER_HIDE_MS, answerText, asksOwner, askRoute, deliveryText, OwnerAsks, selectAskText, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
+import { answerText, asksOwner, askRoute, deliveryText, OwnerAsks, selectAskText, type AnswerAskInput, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
 import type { OwnerAsk } from "../shared/contracts";
 import type { Extraction } from "./owner-ask-extract";
 import type { DeliveryOrigin, DeliveryResult } from "./permission-replies";
@@ -26,7 +26,18 @@ const comment = (id: string, body: string, createdAt = "2026-10-09T10:00:00.000Z
 
 const waitComment = "**TUC-1015: Post-Sale C2** (Paseo) finished its turn and is waiting for you:\n\n**Two questions for you**\n\n1. May the block refresh live?\n\nReply here with “@paseo <your answer>”.";
 
-type Harness = { ownerAsks: OwnerAsks; paseo: PaseoApi; directory: string; events: string[]; delivered: { agentId: string; message: string; origin: DeliveryOrigin }[]; continued: { issueId: string; identifier: string; lead: string }[]; extractedWith: { identifier: string; kind: string }[]; deps: OwnerAsksDeps; state: { issues: OwnerAskIssue[]; now: number } };
+type Harness = {
+  ownerAsks: OwnerAsks; paseo: PaseoApi; directory: string; events: string[]; deps: OwnerAsksDeps;
+  delivered: { agentId: string; message: string; origin: DeliveryOrigin }[];
+  continued: { issueId: string; identifier: string; lead: string; decision: { id: string; intent?: "triage" } }[];
+  queued: { text: string; from: { activityId: string; userId: string; intent?: "triage" } }[];
+  extractedWith: { identifier: string; kind: string }[];
+  state: {
+    issues: OwnerAskIssue[]; comments: Map<string, OwnerAskComment[]>;
+    needsYou: { id: string; identifier: string; parentId: string; agentId: string }[];
+    records: Map<string, HandoverRecord | null>; now: number; extraction: () => Promise<Extraction>;
+  };
+};
 
 async function setup(options: {
   issues: OwnerAskIssue[];
@@ -37,7 +48,7 @@ async function setup(options: {
   extraction?: () => Promise<Extraction>;
   continueOutcome?: ContinueOutcome;
   queueError?: string;
-} = { issues: [] }) {
+} = { issues: [] }): Promise<Harness> {
   const directory = await mkdtemp(join(tmpdir(), "owner-asks-"));
   const events: string[] = [];
   const extractedWith: { identifier: string; kind: string }[] = [];
@@ -47,12 +58,11 @@ async function setup(options: {
     needsYou: options.needsYou ?? [],
     records: options.records ?? new Map<string, HandoverRecord | null>(),
     now: NOW,
-    extraction: options.extraction ?? (async () => ({ ok: false as const, reason: "extraction not configured" })),
-    // Tickets with a menu-bar answer waiting in line (the router's queued threads).
-    queued: new Set<string>(),
+    extraction: options.extraction ?? (async (): Promise<Extraction> => ({ ok: true, value: { kind: "decision", summary: "Choose the scope.", questions: [{ key: "q1", question: "Which scope?", options: [{ label: "Agent does it", description: "Only the approved ticket scope." }, { label: "You or the team", description: "" }], multiSelect: false }] } })),
   };
   const delivered: { agentId: string; message: string; origin: DeliveryOrigin }[] = [];
-  const continued: { issueId: string; identifier: string; lead: string }[] = [];
+  const continued: { issueId: string; identifier: string; lead: string; decision: { id: string; intent?: "triage" } }[] = [];
+  const queued: { text: string; from: { activityId: string; userId: string; intent?: "triage" } }[] = [];
   const deps: OwnerAsksDeps = {
     linear: {
       ownerAskIssues: async () => state.issues,
@@ -65,6 +75,7 @@ async function setup(options: {
     },
     needsYou: { all: async () => state.needsYou, remove: async (id) => { events.push(`needsYou.remove ${id}`); } },
     handover: { read: async (issueId) => state.records.get(issueId) ?? null },
+    remoteAgent: async () => false,
     labels: async () => ({ needsYou: "paseo-needs-you", manual: "paseo-manual" }),
     resolveModel: async () => "omp/test-model",
     extract: async (input) => { extractedWith.push({ identifier: input.identifier, kind: input.kind }); return state.extraction(); },
@@ -72,13 +83,12 @@ async function setup(options: {
       delivered.push({ agentId, message, origin });
       return { status: "applied", reply: null, delivered: true, at } as DeliveryResult;
     },
-    continueTicket: async (issueId, identifier, lead) => { continued.push({ issueId, identifier, lead }); return options.continueOutcome ?? { kind: "started", agentId: "new-agent" }; },
+    continueTicket: async (issueId, identifier, lead, decision) => { continued.push({ issueId, identifier, lead, decision }); return options.continueOutcome ?? { kind: "started" }; },
     queueAnswer: async (issueId, identifier, text, from, reason) => {
       if (options.queueError) throw new Error(options.queueError);
       events.push(`queue ${issueId} ${identifier} from ${from.userId}: ${text} (${reason})`);
-      state.queued.add(issueId);
+      queued.push({ text, from });
     },
-    queuedAnswers: async () => state.queued,
     directory,
     now: () => state.now,
   };
@@ -91,8 +101,7 @@ async function setup(options: {
     },
   } as unknown as PaseoApi;
   const ownerAsks = new OwnerAsks(deps);
-  const harness: Harness = { ownerAsks, paseo, directory, events, delivered, continued, extractedWith, deps, state };
-  return harness;
+  return { ownerAsks, paseo, directory, events, delivered, continued, queued, extractedWith, deps, state };
 }
 
 // setImmediate turns starve Node's poll phase (the extraction's file writes): what waits here is
@@ -127,6 +136,15 @@ const untilAsk = async (h: Harness, predicate: (ask: OwnerAsk) => boolean): Prom
   throw new Error(`the ask never reached the expected state: ${JSON.stringify(ask)}`);
 };
 
+const inputFor = async (h: Harness, issueId = "i1", answers: Record<string, string> = { q1: "Agent does it" }, extra: Pick<AnswerAskInput, "note" | "done"> = {}): Promise<AnswerAskInput> => {
+  let ask: OwnerAsk | undefined;
+  await untilAsync(async () => {
+    ask = (await h.ownerAsks.snapshot(h.paseo)).asks.find((item) => item.issueId === issueId);
+    return Boolean(ask?.extracted);
+  });
+  return { issueId, revision: ask!.revision, answers, ...extra };
+};
+
 test("the ask text comes from the description for Needs-you and manual issues, the wait comment, the newest asking comment, else the description", () => {
   const comments = [comment("c3", "A later status update.", "2026-10-09T11:00:00.000Z"), comment("c2", waitComment), comment("c1", "An older note.")];
   assert.equal(selectAskText({ needsYou: true, manual: false, waitCommentId: "c2", comments }, { description: "sub-issue text" }), "sub-issue text");
@@ -153,7 +171,7 @@ test("the answer text names each question with the owner's choice, then the note
     { key: "q1", question: "Who takes TUC-1562?", options: [{ label: "Agent does it", description: "" }], multiSelect: false },
     { key: "q2", question: "Refresh live?", options: [], multiSelect: false },
   ];
-  const input = { issueId: "i1", answers: { q1: "Agent does it", q2: "Yes, on open" }, note: "Mention it in the plan." };
+  const input = { issueId: "i1", revision: "r1", answers: { q1: "Agent does it", q2: "Yes, on open" }, note: "Mention it in the plan." };
   assert.equal(answerText({ questions }, input), "Who takes TUC-1562? → Agent does it\nRefresh live? → Yes, on open\nMention it in the plan.");
   assert.equal(deliveryText({ questions }, { ...input, note: "", answers: { q1: "Agent does it" } }), "Agent does it", "a bare answer reaches the agent as the exact option an “@paseo” reply would pick");
   assert.equal(deliveryText({ questions }, { ...input, answers: { q1: "Agent does it" } }), "Agent does it\n\nMention it in the plan.", "the owner's note is never dropped");
@@ -171,11 +189,10 @@ test("an ask arrives unextracted (kind info, its title) and is extracted in the 
   });
   const first = await h.ownerAsks.snapshot(h.paseo);
   assert.equal(first.asks.length, 1);
-  assert.deepEqual(first.asks[0], {
-    issueId: "i1", identifier: "TUC-1616", title: "Needs you: Decision for you: who takes TUC-1562?", url: "https://linear.app/tuchel/issue/TUC-1616",
-    parentIdentifier: "TUC-1453", ticketIdentifier: "TUC-1453", kind: "info", summary: "Needs you: Decision for you: who takes TUC-1562?",
-    questions: [], source: issue().description, route: "agent", agentId: "a1", extracted: false, updatedAt: "2026-10-09T11:00:00.000Z",
-  });
+  assert.equal(first.asks[0].attention, "owner", "pending extraction must not move the ask out of the inbox");
+  assert.equal(first.asks[0].extracted, false);
+  assert.equal(first.asks[0].route, "agent");
+  assert.equal(first.asks[0].source, issue().description);
   await until(() => h.extractedWith.length === 1);
   assert.deepEqual(h.extractedWith, [{ identifier: "TUC-1616", kind: "needs-you" }], "the extraction reads the sub-issue's description");
   const second = await untilAsk(h, (ask) => ask.extracted);
@@ -212,161 +229,355 @@ test("a failing extraction leaves the ask unextracted without blocking the read,
   h.ownerAsks.stop();
 });
 
-test("an answer is delivered once per issue and answer text, however often it is sent", async () => {
+test("exact answer retries deliver once, persist full scope and survive restart and a new question", async (t) => {
   const h = await setup({
     issues: [issue()],
     needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }],
-    records: new Map([["p1", null]]),
-    agents: [{ id: "a1", status: "running", createdAt: "2026-10-01T00:00:00.000Z", issueId: "p1" }],
+    agents: [{ id: "a1", status: "running", createdAt: at, issueId: "p1" }],
   });
-  const input = { issueId: "i1", answers: { q1: "Agent does it" }, note: "" };
-  const [first, second] = await Promise.all([h.ownerAsks.answer(input, h.paseo), h.ownerAsks.answer(input, h.paseo)]);
-  assert.deepEqual(first, second);
-  assert.equal(h.delivered.length, 1, "a double click is one delivery");
-  assert.deepEqual(await h.ownerAsks.answer(input, h.paseo), first, "and a repeat reports what happened the first time");
+  t.after(() => h.ownerAsks.stop());
+  const input = await inputFor(h, "i1", { q1: "You or the team" }, { note: "Do not deploy." });
+  const [first, duplicate] = await Promise.all([h.ownerAsks.answer(input, h.paseo), h.ownerAsks.answer(input, h.paseo)]);
+  assert.deepEqual(duplicate, first);
+  assert.equal(first.delivered, "agent");
   assert.equal(h.delivered.length, 1);
-  assert.deepEqual(h.delivered[0].origin, { ref: h.delivered[0].origin.ref, responder: { kind: "owner", via: "menu-bar", activityId: "owner-ask:i1", userId: "owner-1" }, issueId: "i1" });
-  assert.match(h.delivered[0].message, /Agent does it/);
-  assert.ok(h.events.some((event) => event.startsWith("comment i1: Answered from the menu bar:")));
-
-  const other = await h.ownerAsks.answer({ issueId: "i1", answers: { q1: "You or the team" } }, h.paseo);
-  assert.equal(other.delivered, "agent");
-  assert.equal(h.delivered.length, 2, "a different answer is a new delivery");
-  h.ownerAsks.stop();
-});
-
-test("an answered ask stays out of the read until Linear says something new, across a reload", async () => {
-  const h = await setup({
-    issues: [issue({ id: "i3", identifier: "TUC-1015", title: "Post-Sale C2", parentId: "p3", parentIdentifier: "TUC-33", labels: [] })],
-    comments: new Map([["i3", [comment("c1", waitComment)]]]),
-    records: new Map([["p3", null]]),
-  });
-  assert.equal((await h.ownerAsks.snapshot(h.paseo)).asks.length, 1);
-  await h.ownerAsks.answer({ issueId: "i3", answers: { q1: "Yes, on open" }, note: "" }, h.paseo);
-  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).asks, [], "the answer hides the ask at once");
-  h.state.now += ANSWER_HIDE_MS - 1_000;
-  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).asks, [], "the plugin's own record comment and state move do not resurrect it");
-  // A reload of the plugin: the answered set comes back from the ledger.
+  const snapshot = await h.ownerAsks.snapshot(h.paseo);
+  assert.deepEqual(snapshot.asks, []);
+  assert.equal(snapshot.history.length, 1);
+  const receipt = snapshot.history[0];
+  assert.equal(receipt.revision, input.revision);
+  assert.equal(receipt.action, "answer");
+  assert.ok(receipt.text.includes(issue().description), "receipt keeps exact source, including choices not selected");
+  assert.match(receipt.text, /Which scope\? → You or the team\nDo not deploy\./);
+  assert.match(receipt.text, /Only the approved ticket scope/);
+  assert.equal(receipt.delivery, "agent");
+  h.state.issues[0] = { ...h.state.issues[0], description: "May I deploy to production now?" };
   const reloaded = new OwnerAsks(h.deps);
-  assert.deepEqual((await reloaded.snapshot(h.paseo)).asks, []);
-  // Linear moved on: the ask is new again.
-  h.state.issues = [issue({ id: "i3", identifier: "TUC-1015", title: "Post-Sale C2", parentId: "p3", parentIdentifier: "TUC-33", labels: [], updatedAt: new Date(NOW + ANSWER_HIDE_MS + 60_000).toISOString() })];
-  assert.equal((await reloaded.snapshot(h.paseo)).asks.length, 1);
-  reloaded.stop();
-  h.ownerAsks.stop();
+  t.after(() => reloaded.stop());
+  assert.deepEqual(await reloaded.answer(input, h.paseo), first, "retry reports old success, never applies it to the new question");
+  assert.equal(h.delivered.length, 1);
+  const next = await reloaded.snapshot(h.paseo);
+  assert.equal(next.asks.length, 1);
+  assert.notEqual(next.asks[0].revision, input.revision);
+  assert.deepEqual(next.history, snapshot.history);
 });
 
-test("answering a Needs-you sub-issue whose agent is gone continues the ticket with the answer and closes the sub-issue", async () => {
-  const h = await setup({
-    issues: [issue()],
-    needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }],
-    records: new Map([["p1", null]]),
-    agents: [{ id: "a1", status: "closed", createdAt: "2026-10-01T00:00:00.000Z", issueId: "p1" }],
-  });
-  const asks = await h.ownerAsks.snapshot(h.paseo);
-  assert.equal(asks.asks[0].route, "continue");
-  const result = await h.ownerAsks.answer({ issueId: "i1", answers: { q1: "Agent does it" }, note: "" }, h.paseo);
-  assert.equal(result.delivered, "continued");
-  assert.deepEqual(h.continued, [{ issueId: "p1", identifier: "TUC-1453", lead: "Agent does it" }]);
-  assert.ok(h.events.includes("needsYou.remove i1"));
-  assert.ok(h.events.includes("complete i1"));
-  assert.ok(h.events.some((event) => event.startsWith("comment p1: Answered from the menu bar: Agent does it")));
-  h.ownerAsks.stop();
-});
-
-test("an answer whose ticket has no free agent slot joins the wait line with the answer instead of failing", async () => {
-  const reason = "Queued: 2 of 2 ticket agents are working. It starts when one finishes.";
-  const h = await setup({
-    issues: [issue()],
-    needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }],
-    records: new Map([["p1", null]]),
-    agents: [{ id: "a1", status: "closed", createdAt: "2026-10-01T00:00:00.000Z", issueId: "p1" }],
-    continueOutcome: { kind: "deferred", reason },
-  });
-  await h.ownerAsks.snapshot(h.paseo);
-  const result = await h.ownerAsks.answer({ issueId: "i1", answers: { q1: "Agent does it" }, note: "" }, h.paseo);
-  assert.equal(result.delivered, "queued");
-  assert.match(result.message, /TUC-1453 is in the wait line with your answer\. Queued: 2 of 2/);
-  assert.ok(h.events.includes(`queue p1 TUC-1453 from owner-1: Agent does it (${reason})`), "the parent ticket waits, with the owner's answer as its lead");
-  assert.ok(h.events.includes("needsYou.remove i1"), "the sub-issue is answered");
-  assert.ok(h.events.some((event) => event.startsWith("comment p1: Answered from the menu bar: Agent does it")));
-  h.ownerAsks.stop();
-});
-
-test("an answer that can neither start an agent nor join the wait line fails and changes nothing in Linear", async () => {
-  const h = await setup({
-    issues: [issue()],
-    needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }],
-    records: new Map([["p1", null]]),
-    agents: [{ id: "a1", status: "closed", createdAt: "2026-10-01T00:00:00.000Z", issueId: "p1" }],
-    continueOutcome: { kind: "deferred", reason: "Queued: 1 of 1 ticket agents are working." },
-    queueError: "Linear did not create an agent session on the ticket.",
-  });
-  await h.ownerAsks.snapshot(h.paseo);
-  await assert.rejects(() => h.ownerAsks.answer({ issueId: "i1", answers: { q1: "Agent does it" }, note: "" }, h.paseo), /TUC-1453 cannot start an agent now \(Queued: 1 of 1.*could not join the wait line: Linear did not create/);
-  assert.deepEqual(h.events, [], "no comment, no closed sub-issue");
-  h.ownerAsks.stop();
-});
-
-test("an ask whose answer waits in line stays answered when Linear's updatedAt moves (the wait line label); a manual task of the ticket stays", async () => {
-  const record: HandoverRecord = { issueId: "i3", identifier: "TUC-1015", agentId: "a3", agentTitle: "agent", branch: null, worktreePath: null, lastCommit: null, summaries: [], links: {}, status: "waiting", progressCommentId: null, resumedFrom: null, updatedAt: at };
-  const h = await setup({
-    issues: [
-      issue({ id: "i3", identifier: "TUC-1015", title: "Post-Sale C2", parentId: "p3", parentIdentifier: "TUC-33", labels: [] }),
-      issue({ id: "i4", identifier: "TUC-1900", title: "Rotate the token", parentId: "i3", parentIdentifier: "TUC-1015", labels: ["paseo-manual"] }),
-    ],
-    comments: new Map([["i3", [comment("c1", waitComment)]]]),
-    records: new Map([["i3", record]]),
-    agents: [{ id: "a3", status: "closed", createdAt: "2026-10-01T00:00:00.000Z", issueId: "i3" }],
-    continueOutcome: { kind: "deferred", reason: "Queued: 2 of 2 ticket agents are working." },
-  });
-  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).asks.map((ask) => ask.identifier).sort(), ["TUC-1015", "TUC-1900"]);
-  assert.equal((await h.ownerAsks.answer({ issueId: "i3", answers: { q1: "Yes" }, note: "" }, h.paseo)).delivered, "queued");
-  h.state.now = NOW + 5 * 60_000;
-  h.state.issues[0] = { ...h.state.issues[0], updatedAt: new Date(NOW + 2 * 60_000).toISOString() };
-  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).asks.map((ask) => ask.identifier), ["TUC-1900"]);
-  h.ownerAsks.stop();
-});
-
-test("a ticket under an epic is its own ticket: its gone agent's answer continues it, not the epic", async () => {
-  const record: HandoverRecord = { issueId: "i3", identifier: "TUC-1015", agentId: "a3", agentTitle: "agent", branch: null, worktreePath: null, lastCommit: null, summaries: [], links: {}, status: "waiting", progressCommentId: null, resumedFrom: null, updatedAt: at };
-  const h = await setup({
-    issues: [issue({ id: "i3", identifier: "TUC-1015", title: "Post-Sale C2", parentId: "p3", parentIdentifier: "TUC-33", labels: [] })],
-    comments: new Map([["i3", [comment("c1", waitComment)]]]),
-    records: new Map([["i3", record]]),
-    agents: [{ id: "a3", status: "closed", createdAt: "2026-10-01T00:00:00.000Z", issueId: "i3" }],
-  });
-  const [ask] = (await h.ownerAsks.snapshot(h.paseo)).asks;
-  assert.equal(ask.ticketIdentifier, "TUC-1015");
-  assert.equal(ask.parentIdentifier, "TUC-33");
-  assert.equal(ask.route, "continue");
-  await h.ownerAsks.answer({ issueId: "i3", answers: { q1: "Yes" }, note: "" }, h.paseo);
-  assert.deepEqual(h.continued.map(({ issueId, identifier }) => ({ issueId, identifier })), [{ issueId: "i3", identifier: "TUC-1015" }]);
-  assert.ok(h.events.some((event) => event.startsWith("comment i3: Answered from the menu bar:")));
-  h.ownerAsks.stop();
-});
-
-test("a manual ask's Done completes the issue; a ticket's Done only comments and leaves the state to the agent", async () => {
-  const h = await setup({
-    issues: [
-      issue({ id: "i1", identifier: "TUC-1784", title: "Telegram bot: rotate token", parentId: null, parentIdentifier: null, labels: ["paseo-manual"] }),
-      issue({ id: "i2", identifier: "TUC-1015", title: "Post-Sale C2", parentId: "p3", parentIdentifier: "TUC-33", labels: [] }),
-    ],
-    comments: new Map([["i2", [comment("c1", waitComment)]]]),
-  });
-  const done = await h.ownerAsks.answer({ issueId: "i1", answers: {}, note: "", done: true }, h.paseo);
-  assert.equal(done.delivered, "closed");
-  assert.ok(h.events.includes("complete i1"));
-  const ticket = await h.ownerAsks.answer({ issueId: "i2", answers: { q1: "Yes" }, note: "", done: true }, h.paseo);
-  assert.equal(ticket.delivered, "comment");
-  assert.ok(h.events.some((event) => event.startsWith("comment i2: Answered from the menu bar:")));
-  assert.equal(h.events.filter((event) => event.startsWith("complete")).length, 1, "a parent ticket keeps its state");
-  h.ownerAsks.stop();
-});
-
-test("an answer with nothing to say, and an ask that is not waiting any more, are refused with a sentence", async () => {
+test("source edits without updatedAt changes and changed extraction payloads reject stale answers", async (t) => {
   const h = await setup({ issues: [issue()] });
-  await assert.rejects(() => h.ownerAsks.answer({ issueId: "i1", answers: {}, note: "" }, h.paseo), /Nothing to answer/);
-  await assert.rejects(() => h.ownerAsks.answer({ issueId: "gone", answers: { q1: "x" }, note: "" }, h.paseo), /not waiting for you in Linear any more/);
-  h.ownerAsks.stop();
+  t.after(() => h.ownerAsks.stop());
+  const input = await inputFor(h);
+  const oldTimestamp = h.state.issues[0].updatedAt;
+  const path = join(h.directory, "extract", "i1.json");
+  const cached = JSON.parse(await readFile(path, "utf8"));
+  cached.result.questions[0].options[0].description = "New authority: deploy everywhere";
+  await writeFile(path, JSON.stringify(cached));
+  const reloaded = new OwnerAsks(h.deps);
+  t.after(() => reloaded.stop());
+  await assert.rejects(reloaded.answer(input, h.paseo), /ask changed/);
+  assert.equal(h.state.issues[0].updatedAt, oldTimestamp);
+  h.state.issues[0] = { ...h.state.issues[0], description: "Please approve deleting the production database." };
+  await assert.rejects(h.ownerAsks.answer(input, h.paseo), /ask changed/);
+  assert.deepEqual(h.events, []);
+  assert.deepEqual(h.delivered, []);
+  assert.deepEqual((await reloaded.snapshot(h.paseo)).history, []);
+});
+
+test("an edited wait comment and a new comment with identical wording change the source revision", async (t) => {
+  const h = await setup({
+    issues: [issue({ title: "Ticket", labels: [], parentId: null })],
+    comments: new Map([["i1", [comment("c1", waitComment)]]]),
+  });
+  t.after(() => h.ownerAsks.stop());
+  const input = await inputFor(h);
+  h.state.comments.set("i1", [comment("c1", waitComment.replace("block refresh live", "production database be deleted"))]);
+  await assert.rejects(h.ownerAsks.answer(input, h.paseo), /ask changed/);
+  h.state.comments.set("i1", [comment("c2", waitComment)]);
+  await assert.rejects(h.ownerAsks.answer(input, h.paseo), /ask changed/);
+  assert.deepEqual(h.events, []);
+});
+
+test("pending-to-extracted transition changes revision; unknown question keys never become free-form approvals", async (t) => {
+  const h = await setup({ issues: [issue()] });
+  t.after(() => h.ownerAsks.stop());
+  const pending = (await h.ownerAsks.snapshot(h.paseo)).asks[0];
+  const input = await inputFor(h);
+  assert.notEqual(pending.revision, input.revision);
+  await assert.rejects(h.ownerAsks.answer({ ...input, revision: pending.revision }, h.paseo), /ask changed/);
+  await assert.rejects(h.ownerAsks.answer({ ...input, answers: { q99: "Approve everything" } }, h.paseo), /Unknown question key/);
+  assert.deepEqual(h.events, []);
+});
+
+test("trailing comment failure retries effects only, including after restart", async (t) => {
+  const h = await setup({
+    issues: [issue()],
+    needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }],
+    agents: [{ id: "a1", status: "running", createdAt: at, issueId: "p1" }],
+  });
+  t.after(() => h.ownerAsks.stop());
+  const input = await inputFor(h);
+  const comment = h.deps.linear.comment;
+  h.deps.linear.comment = async () => { throw new Error("Linear comment unavailable"); };
+  await assert.rejects(h.ownerAsks.answer(input, h.paseo), /Linear comment unavailable/);
+  assert.equal(h.delivered.length, 1);
+  assert.equal((await h.ownerAsks.snapshot(h.paseo)).history[0].delivery, "agent");
+  h.deps.linear.comment = comment;
+  const reloaded = new OwnerAsks(h.deps);
+  t.after(() => reloaded.stop());
+  assert.equal((await reloaded.answer(input, h.paseo)).delivered, "agent");
+  assert.equal(h.delivered.length, 1);
+  assert.equal(h.events.filter((event) => event.startsWith("comment ")).length, 1);
+});
+
+test("history read failures fail closed, and a failed initial write cannot deliver", async (t) => {
+  const h = await setup({ issues: [issue()] });
+  t.after(() => h.ownerAsks.stop());
+  const input = await inputFor(h);
+  const path = join(h.directory, "decisions.json");
+  await mkdir(path);
+  await assert.rejects(h.ownerAsks.answer(input, h.paseo));
+  assert.deepEqual(h.events, []);
+  await rm(path, { recursive: true });
+  await writeFile(path, "{bad json");
+  const reloaded = new OwnerAsks(h.deps);
+  t.after(() => reloaded.stop());
+  await assert.rejects(reloaded.snapshot(h.paseo));
+  await assert.rejects(reloaded.answer(input, h.paseo));
+  assert.deepEqual(h.events, []);
+});
+
+test("a receipt write failure after external delivery remains unconfirmed and never resends", async (t) => {
+  const h = await setup({
+    issues: [issue()],
+    needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }],
+    agents: [{ id: "a1", status: "running", createdAt: at, issueId: "p1" }],
+  });
+  t.after(() => h.ownerAsks.stop());
+  const input = await inputFor(h);
+  const deliver = h.deps.deliver;
+  const path = join(h.directory, "decisions.json");
+  const reserved = join(h.directory, "reserved.json");
+  h.deps.deliver = async (...args) => {
+    const result = await deliver(...args);
+    await rename(path, reserved);
+    await mkdir(path);
+    return result;
+  };
+  await assert.rejects(h.ownerAsks.answer(input, h.paseo));
+  assert.equal(h.delivered.length, 1);
+  await assert.rejects(h.ownerAsks.answer(input, h.paseo), /unconfirmed/);
+  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).history, [], "a failed journal commit is not reported as success");
+  await rm(path, { recursive: true });
+  await rename(reserved, path);
+  const reloaded = new OwnerAsks(h.deps);
+  t.after(() => reloaded.stop());
+  await assert.rejects(reloaded.answer(input, h.paseo), /unconfirmed/);
+  assert.equal(h.delivered.length, 1);
+});
+
+test("continuation and queued answers carry the exact scoped receipt and close only the answered sub-issue", async (t) => {
+  for (const outcome of [{ kind: "started" }, { kind: "deferred", reason: "No free agent slot." }, { kind: "forwarded", peer: "other-host" }] as const) {
+    const h = await setup({
+      issues: [issue()],
+      needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "gone" }],
+      continueOutcome: outcome,
+    });
+    t.after(() => h.ownerAsks.stop());
+    const input = await inputFor(h);
+    const result = await h.ownerAsks.answer(input, h.paseo);
+    assert.equal(result.delivered, outcome.kind === "deferred" ? "queued" : "continued");
+    const receipt = (await h.ownerAsks.snapshot(h.paseo)).history[0];
+    assert.equal(h.continued[0].lead, receipt.text);
+    assert.equal(h.continued[0].issueId, "p1");
+    assert.match(h.continued[0].lead, /Which scope\? → Agent does it/);
+    if (outcome.kind === "deferred") assert.equal(h.queued[0].text, receipt.text);
+    assert.ok(h.events.includes("complete i1"));
+    assert.ok(h.events.includes("needsYou.remove i1"));
+    await h.ownerAsks.answer(input, h.paseo);
+    assert.equal(h.continued.length, 1);
+  }
+});
+
+test("failed continuation/queue has no completion or delivered receipt", async (t) => {
+  for (const failQueue of [false, true]) {
+    const h = await setup({
+      issues: [issue()], needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "gone" }],
+      continueOutcome: failQueue ? { kind: "deferred", reason: "No slot." } : { kind: "failed", reason: "Start failed" },
+      queueError: failQueue ? "Queue unavailable" : undefined,
+    });
+    t.after(() => h.ownerAsks.stop());
+    const input = await inputFor(h);
+    await assert.rejects(h.ownerAsks.answer(input, h.paseo), /Start failed|Queue unavailable/);
+    assert.deepEqual(h.events, []);
+    assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).history, []);
+  }
+});
+
+test("a ticket under an epic continues itself, not the epic; queued source changes return immediately", async (t) => {
+  const h = await setup({
+    issues: [issue({ title: "Actual ticket", labels: [] })],
+    agents: [{ id: "gone", status: "closed", createdAt: at, issueId: "i1" }],
+    continueOutcome: { kind: "deferred", reason: "No slot" },
+  });
+  t.after(() => h.ownerAsks.stop());
+  const input = await inputFor(h);
+  await h.ownerAsks.answer(input, h.paseo);
+  assert.equal(h.continued[0].issueId, "i1");
+  h.state.issues[0] = { ...h.state.issues[0], description: "Please choose a new production policy." };
+  const next = await h.ownerAsks.snapshot(h.paseo);
+  assert.equal(next.asks.length, 1, "queued older answers never hide new questions");
+  assert.notEqual(next.asks[0].revision, input.revision);
+});
+
+test("manual Done completes only that task; a ticket Done comments without completing it", async (t) => {
+  const h = await setup({ issues: [
+    issue({ labels: ["paseo-manual"], title: "Rotate token" }),
+    issue({ id: "i2", title: "Ticket", labels: [] }),
+  ] });
+  t.after(() => h.ownerAsks.stop());
+  const manual = await inputFor(h, "i1", {}, { done: true });
+  assert.equal((await h.ownerAsks.answer(manual, h.paseo)).delivered, "closed");
+  const ticket = await inputFor(h, "i2", {}, { done: true });
+  assert.equal((await h.ownerAsks.answer(ticket, h.paseo)).delivered, "comment");
+  assert.deepEqual(h.events.filter((event) => event.startsWith("complete")), ["complete i1"]);
+  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).history.map((receipt) => receipt.action), ["done", "done"]);
+});
+
+test("research and delegate preserve open tasks, scope, disposition and history across restart", async (t) => {
+  for (const action of ["research", "delegate"] as const) {
+    for (const live of [false, true]) {
+      const h = await setup({
+        issues: [issue()],
+        needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }],
+        agents: live ? [{ id: "a1", status: "running", createdAt: at, issueId: "p1" }] : [],
+        continueOutcome: { kind: "deferred", reason: "No slot." },
+      });
+      t.after(() => h.ownerAsks.stop());
+      const ask = await inputFor(h);
+      const input = { issueId: ask.issueId, revision: ask.revision, action, note: "Compare reversible cache implementations; do not deploy." };
+      const result = await h.ownerAsks.triage(input, h.paseo);
+      assert.equal(result.delivered, live ? "agent" : "queued");
+      assert.deepEqual(h.events.filter((event) => /^(?:complete|needsYou.remove) /.test(event)), []);
+      const snapshot = await h.ownerAsks.snapshot(h.paseo);
+      assert.equal(snapshot.asks[0].disposition, action === "research" ? "research" : "delegated");
+      assert.equal(snapshot.history[0].action, action);
+      assert.match(snapshot.history[0].text, /Owner (?:instruction|scope): Compare reversible cache implementations/);
+      assert.match(snapshot.history[0].text, /No unselected recommendation is accepted/);
+      if (live) assert.equal(h.delivered[0].origin.intent, "triage");
+      else {
+        assert.equal(h.continued[0].decision.intent, "triage");
+        assert.equal(h.queued[0].from.intent, "triage");
+      }
+      const reloaded = new OwnerAsks(h.deps);
+      t.after(() => reloaded.stop());
+      assert.deepEqual(await reloaded.triage(input, h.paseo), result);
+      assert.equal(h.delivered.length + h.continued.length, 1);
+      assert.deepEqual((await reloaded.snapshot(h.paseo)).history, snapshot.history);
+      assert.equal((await reloaded.snapshot(h.paseo)).asks[0].disposition, snapshot.asks[0].disposition);
+    }
+  }
+});
+
+test("manual/comment-only research and delegate reject instead of claiming dispatch, even with recommendations", async (t) => {
+  for (const manual of [false, true]) {
+    const h = await setup({ issues: [issue({ title: "Rotate token", labels: manual ? ["paseo-manual"] : [] })] });
+    t.after(() => h.ownerAsks.stop());
+    const ask = await inputFor(h);
+    for (const action of ["research", "delegate"] as const) {
+      await assert.rejects(h.ownerAsks.triage({ issueId: "i1", revision: ask.revision, action, note: "" }, h.paseo), /explicit research instruction/);
+      await assert.rejects(h.ownerAsks.triage({ issueId: "i1", revision: ask.revision, action, note: "Do the recommended thing" }, h.paseo), /no agent route/);
+    }
+    assert.deepEqual(h.events, []);
+    assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).history, []);
+  }
+});
+
+test("defer persists, expires, wakes on new source and reopen is local-only", async (t) => {
+  const h = await setup({ issues: [issue()] });
+  t.after(() => h.ownerAsks.stop());
+  const ask = await inputFor(h);
+  const input = { issueId: "i1", revision: ask.revision, action: "defer" as const, until: new Date(NOW + 60_000).toISOString() };
+  await h.ownerAsks.triage(input, h.paseo);
+  const reloaded = new OwnerAsks(h.deps);
+  t.after(() => reloaded.stop());
+  assert.equal((await reloaded.snapshot(h.paseo)).asks[0].disposition, "deferred");
+  h.state.now += 60_000;
+  assert.equal((await reloaded.snapshot(h.paseo)).asks[0].disposition, null);
+  h.state.now = NOW;
+  await reloaded.triage({ issueId: "i1", revision: ask.revision, action: "reopen" }, h.paseo);
+  assert.equal((await reloaded.snapshot(h.paseo)).asks[0].disposition, null);
+  await reloaded.triage(input, h.paseo);
+  h.state.issues[0] = { ...h.state.issues[0], description: "A different question needs you now." };
+  const changed = await reloaded.snapshot(h.paseo);
+  assert.equal(changed.asks[0].disposition, null);
+  assert.notEqual(changed.asks[0].revision, ask.revision);
+  await assert.rejects(reloaded.triage({ issueId: "i1", revision: ask.revision, action: "reopen" }, h.paseo), /ask changed/);
+  assert.deepEqual(h.delivered, []);
+  assert.deepEqual(h.continued, []);
+  assert.deepEqual(h.events, []);
+});
+
+test("defer rejects invalid/past expiry and empty answers never create receipts", async (t) => {
+  const h = await setup({ issues: [issue()] });
+  t.after(() => h.ownerAsks.stop());
+  const ask = await inputFor(h);
+  for (const until of [undefined, "tomorrow", at]) {
+    await assert.rejects(h.ownerAsks.triage({ issueId: "i1", revision: ask.revision, action: "defer", until }, h.paseo), /future ISO timestamp/);
+  }
+  await assert.rejects(h.ownerAsks.answer({ ...ask, answers: {} }, h.paseo), /Nothing to answer/);
+  await assert.rejects(h.ownerAsks.answer({ ...ask, issueId: "gone" }, h.paseo), /not waiting for you in Linear/);
+  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).history, []);
+});
+
+test("canonical host routes a peer-owned ask through continuation even without local agent history", async (t) => {
+  const h = await setup({ issues: [issue({ title: "Ticket", labels: [] })], continueOutcome: { kind: "forwarded", peer: "mac" } });
+  t.after(() => h.ownerAsks.stop());
+  h.deps.remoteAgent = async () => true;
+  const input = await inputFor(h, "i1", { q1: "Approve" });
+  const ask = (await h.ownerAsks.snapshot(h.paseo)).asks[0];
+  assert.equal(ask.route, "continue");
+  const result = await h.ownerAsks.answer(input, h.paseo);
+  assert.equal(result.delivered, "continued");
+  assert.equal(h.continued[0].issueId, "i1");
+  assert.match(h.continued[0].lead, /^Approve\n\nDecision inbox/);
+  assert.match(h.continued[0].lead, new RegExp(input.revision));
+  assert.equal(h.delivered.length, 0);
+  await h.ownerAsks.answer(input, h.paseo);
+  assert.equal(h.continued.length, 1);
+});
+
+test("snapshot history caps at newest 100 while durable exact receipts are retained", async (t) => {
+  const h = await setup({ issues: [issue()] });
+  t.after(() => h.ownerAsks.stop());
+  const ask = await inputFor(h);
+  for (let index = 0; index < 102; index++) {
+    h.state.now++;
+    await h.ownerAsks.triage({ issueId: "i1", revision: ask.revision, action: "reopen", note: `Review ${index}` }, h.paseo);
+  }
+  const reloaded = new OwnerAsks(h.deps);
+  t.after(() => reloaded.stop());
+  const { history } = await reloaded.snapshot(h.paseo);
+  assert.equal(history.length, 100);
+  assert.match(history[0].text, /Owner note: Review 101/);
+  assert.match(history[99].text, /Owner note: Review 2\b/);
+  const persisted = JSON.parse(await readFile(join(h.directory, "decisions.json"), "utf8"));
+  assert.equal(Object.keys(persisted.records).length, 102, "the API limit does not discard durable receipts");
+});
+
+test("an unfinished completion effect cannot close a revised ask when its delivered answer is retried", async (t) => {
+  const h = await setup({
+    issues: [issue()], needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "gone" }],
+  });
+  t.after(() => h.ownerAsks.stop());
+  const input = await inputFor(h);
+  const remove = h.deps.needsYou.remove;
+  h.deps.needsYou.remove = async () => { throw new Error("Tracking store unavailable"); };
+  await assert.rejects(h.ownerAsks.answer(input, h.paseo), /Tracking store unavailable/);
+  h.deps.needsYou.remove = remove;
+  h.state.issues[0] = { ...h.state.issues[0], description: "May I deploy a different production change?" };
+  const reloaded = new OwnerAsks(h.deps);
+  t.after(() => reloaded.stop());
+  assert.equal((await reloaded.answer(input, h.paseo)).delivered, "continued");
+  assert.equal(h.continued.length, 1);
+  assert.deepEqual(h.events.filter((event) => /^(?:complete|needsYou.remove) /.test(event)), []);
+  assert.equal((await reloaded.snapshot(h.paseo)).asks.length, 1);
 });

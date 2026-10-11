@@ -120,6 +120,7 @@ export type ActivationRequest = {
   id?: string;
   label?: string;
   text?: string;
+  intent?: "triage";
   strictResume?: boolean;
   resume?: ActivationResume;
   watchdog?: unknown;
@@ -143,6 +144,7 @@ export const activationEnvelopeSchema = z.object({
   identifier: z.string().min(1).max(100),
   sessionId: z.string().max(100).optional(),
   text: z.string().max(MAX_ACTIVATION_TEXT).optional(),
+  intent: z.literal("triage").optional(),
   // The trigger label a ticket activation carried, so the receiving host claims the same one.
   label: z.string().max(80).optional(),
   strictResume: z.boolean().optional(),
@@ -173,6 +175,7 @@ export const deliverRequestSchema = z.object({
   issueId: z.string().min(1).max(100),
   text: z.string().min(1).max(MAX_ACTIVATION_TEXT),
   receipt: z.string().min(1).max(300),
+  intent: z.literal("triage").optional(),
 });
 export type DeliverRequest = z.infer<typeof deliverRequestSchema>;
 

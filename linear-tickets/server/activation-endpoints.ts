@@ -68,8 +68,8 @@ export function activationEndpoints(deps: ActivationEndpointDeps): ActivationRou
       const request = deliverRequestSchema.safeParse(parsed.value);
       if (!request.success) return activationJson(400, { error: "That is not a delivery." });
       const result = role === "drain"
-        ? await deps.drain.deliver(request.data.issueId, request.data.text, request.data.receipt)
-        : await deps.intake.deliverLocal(request.data.issueId, request.data.text, request.data.receipt);
+        ? await deps.drain.deliver(request.data.issueId, request.data.text, request.data.receipt, request.data.intent)
+        : await deps.intake.deliverLocal(request.data.issueId, request.data.text, request.data.receipt, request.data.intent);
       return result.ok ? activationJson(200, { ok: true, delivered: true, ...(result.duplicate ? { duplicate: true } : {}) }) : activationJson(409, { error: result.reason ?? "Not delivered." });
     }
 
