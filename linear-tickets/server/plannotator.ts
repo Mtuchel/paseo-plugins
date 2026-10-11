@@ -10,7 +10,7 @@ import { paseoHome } from "./ticket-mcp";
 import type { Handover } from "./handover";
 import { activeModel } from "./model";
 import { APPROVE_LATER, APPROVE_PLAN, decidePlannotatorReview, MAX_SPLIT, planSteps, ReviewClosedError, SEND_BACK, setAgentMode, SPLIT_PLAN, type SessionLink, type SessionRouter } from "./sessions";
-import { hasLabel, PLAN_POLICY_LABEL, PLAN_READY_LABEL } from "./plan-policy";
+import { hasLabel, PLAN_POLICY_LABEL, PLAN_READY_LABEL, PLANNING_STATE } from "./plan-policy";
 import type { ParkedPlan, ParkedPlans } from "./parked";
 import type { ReviewLinks } from "./review-links";
 import { autoApproval, parsePlanRisk, ratingText, type ReviewFacts } from "../shared/plan-risk";
@@ -95,8 +95,7 @@ class WaitError extends Error {}
 // The ticket was deleted: the decision is never carried out.
 class DeletedError extends Error {}
 
-// Workflow states the review moves a ticket through when status write-back is on.
-export const PLANNING_STATE = "Planning";
+// The workflow state an approved plan moves a ticket to when status write-back is on.
 export const CODING_STATE = "In Progress";
 
 export function plannotatorPaths(home = paseoHome()) {

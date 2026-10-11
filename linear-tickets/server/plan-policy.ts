@@ -25,8 +25,26 @@ export const PLAN_SECTIONS_NOTE = sectionSteps();
 // risk, not one per criterion (TUC-1854), within the 3-unlanded-PR cap (TUC-1824).
 export const PLAN_SLICING_NOTE = "Delivery slices: group the acceptance criteria into pull requests by size and risk, not one pull request per criterion. Thin criteria share a pull request (its body says e.g. `Covers: AC-1, AC-2`), aiming at roughly 200-600 changed lines; split above roughly 1,500 changed lines or where the risk changes (a database migration, auth or permissions, money or the ERP, a contract other packages build on). A ticket keeps at most 3 unlanded pull requests, so plan landable ranges that land bottom first. Acceptance criteria stay one per `## Reach` place; only pull requests group them.";
 
-// Marks a ticket whose plan is approved (TUC-9's feedback intake reads it as "planned").
+// Marks a ticket whose plan is approved (TUC-9's feedback intake reads it as "planned"). A machine
+// flag next to the status (README, "Statuses and labels"): the next agent implements the plan.
 export const PLAN_READY_LABEL = "plan-ready";
+// Marks a ticket whose plan the owner sent back; the next plan submission removes it (README,
+// "Statuses and labels").
+export const PLAN_REWORK_LABEL = "plan-rework";
+// The plan stages as Linear statuses (README, "Statuses and labels"): an agent drafts the plan,
+// the plan waits for the owner, the plan is approved and its implementation handoff is pending.
+export const PLANNING_STATE = "Planning";
+export const PLAN_REVIEW_STATE = "Plan review";
+export const PLAN_APPROVED_STATE = "Plan approved";
+export type PlanStage = typeof PLANNING_STATE | typeof PLAN_REVIEW_STATE | typeof PLAN_APPROVED_STATE;
+const PLAN_STAGES: Record<string, PlanStage> = { planning: PLANNING_STATE, "plan review": PLAN_REVIEW_STATE, "plan approved": PLAN_APPROVED_STATE };
+// The plan stage a status is: a started state named like one of the three (case and whitespace
+// aside). Every status reader decides plan stages through this.
+export function planStage(status: string, type: string): PlanStage | null {
+  if (type.trim().toLowerCase() !== "started") return null;
+  const key = status.trim().replace(/\s+/g, " ").toLowerCase();
+  return Object.hasOwn(PLAN_STAGES, key) ? PLAN_STAGES[key] : null;
+}
 // Ticket label the owner sets while an agent works: `plan` sends it back to planning (see
 // plan-requests.ts).
 export const PLAN_LABEL = "plan";

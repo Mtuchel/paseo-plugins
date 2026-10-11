@@ -801,8 +801,10 @@ test("finished blockers are the Done ones and reviews with merged pull requests,
       comments: { nodes: [{ body: "Done.", createdAt: "2026-10-01T00:00:00Z" }] } },
     review("c", "ENG-3", "In Review", [pr(3, "merged")]),
     review("d", "ENG-4", "In Review", [pr(4, "merged"), pr(5, "open")]),
+    // AC-7 (TUC-1289): Plan review is a plan stage, not code review, even with merged pull requests.
+    review("e", "ENG-5", "Plan review", [pr(6, "merged")]),
   ] } });
-  const blockers = await new LinearService(new Credentials("/unused", "key"), post).finishedBlockers(["a", "c", "d", "b"]);
+  const blockers = await new LinearService(new Credentials("/unused", "key"), post).finishedBlockers(["a", "c", "d", "e", "b"]);
   assert.deepEqual(blockers.map((blocker) => blocker.identifier), ["ENG-1", "ENG-3", "ENG-2"]);
   assert.deepEqual(blockers[0].links.map((link) => link.url), ["https://github.com/o/r/pull/1", "https://linear.app/doc"]);
   assert.deepEqual(blockers[0].comments, [{ body: "Done.", createdAt: "2026-10-01T00:00:00Z" }]);
@@ -820,9 +822,11 @@ test("a blocker in review whose pull requests are merged no longer holds the tic
     blocker("ENG-7", "Ready to merge", "started", [pr(8, "merged"), pr(9, "closed")]),
     blocker("ENG-8", "Done", "completed", []),
     blocker("ENG-9", "In Review", "started", []),
+    // AC-7 (TUC-1289): a plan waiting for review with an older merged pull request still blocks.
+    blocker("ENG-10", "Plan review", "started", [pr(10, "merged")]),
   ] } } });
   const state = await new LinearService(new Credentials("/unused", "key"), post).issueState("i1");
-  assert.deepEqual(state.blockedBy, ["ENG-3", "ENG-4", "ENG-5", "ENG-6", "ENG-9"]);
+  assert.deepEqual(state.blockedBy, ["ENG-3", "ENG-4", "ENG-5", "ENG-6", "ENG-9", "ENG-10"]);
 });
 
 test("pre-launch errors can retry, but uncertain agent creation is never automatically repeated", async () => {
@@ -1182,6 +1186,19 @@ test("a pull request only moves the ticket to a started state named for review",
   ];
   assert.equal(resolveReviewState(states)?.id, "rev");
   assert.equal(resolveReviewState(states.filter((state) => state.id !== "rev")), null);
+});
+
+test("AC-7: a pull request moves the ticket to In Review, never to the plan stage Plan review", () => {
+  const states: TeamState[] = [
+    { id: "todo", name: "Todo", type: "unstarted", position: 1 },
+    { id: "plan", name: "Planning", type: "started", position: 1.5 },
+    { id: "plan-review", name: "Plan review", type: "started", position: 1.6 },
+    { id: "plan-approved", name: "Plan approved", type: "started", position: 1.7 },
+    { id: "ip", name: "In Progress", type: "started", position: 2 },
+    { id: "rev", name: "In Review", type: "started", position: 3 },
+  ];
+  assert.equal(resolveReviewState(states)?.id, "rev");
+  assert.equal(resolveReviewState(states.filter((state) => state.id !== "rev")), null, "a team whose only review state is Plan review has none for pull requests");
 });
 
 test("labels are created once when missing and removed by name, case-insensitively", async () => {
