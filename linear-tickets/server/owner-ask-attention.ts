@@ -18,7 +18,12 @@ export function blockerIdentifier(source: string): string | null {
   // An arbitrary ticket mention (including the task's own title) is never a dependency.
   for (const clause of text.split(/[\n.!?]+/)) {
     if (/\b(?:(?:not|no longer|never|previously|formerly)\s+(?:blocked|dependent|waiting)|(?:was|were|might be|could be|if)\s+blocked)\b/i.test(clause)) continue;
+    if (/\b(?:if|unless|previously|formerly|no longer)\b/i.test(clause)) continue;
     for (const match of clause.matchAll(/\b(?:blocked\s+(?:by|on)|depends\s+on|dependent\s+on|blocker\s*:)\s*(?:ticket\s+)?([A-Z][A-Z0-9]*-\d+)\b/gi)) found.add(match[1].toUpperCase());
+    // Also accept an explicit blocking subject, or a named failure followed by its consequence.
+    for (const match of clause.matchAll(/\b([A-Z][A-Z0-9]*-\d+)\s*,?\s+(?:which\s+)?(?:also\s+)?blocks\b/gi)) found.add(match[1].toUpperCase());
+    for (const match of clause.matchAll(/\b([A-Z][A-Z0-9]*-\d+)['’]s\s+(?:migration|deployment|deploy|build|check|job)\b[^.!?\n]{0,220}\bfailed\b[^.!?\n]{0,240}\bso\b[^.!?\n]{0,80}\bblocks\b/gi)) found.add(match[1].toUpperCase());
+    for (const match of clause.matchAll(/\b(?:same|issue|failure|limit|cap|check)\s+blocks\b[^.!?\n]{0,120}\((?:filed|tracked)\s+as\s+([A-Z][A-Z0-9]*-\d+)\)/gi)) found.add(match[1].toUpperCase());
   }
   return found.size === 1 ? [...found][0] : null;
 }
