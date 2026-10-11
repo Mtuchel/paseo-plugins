@@ -363,6 +363,27 @@ test("only replies that hand the next step to the owner count as waiting, and pl
   assert.equal(ownerRequest(`Should I start?\n\n${"Report line.\n\n".repeat(150)}All checks pass.`), null);
 });
 
+test("an advisor-owned next step does not become an owner wait for future plan approval", () => {
+  const approval = "The advisor and I rate it impact 4, so it needs your approval.";
+  assert.equal(ownerRequest(`${approval}\n\nNext: once the advisor answers, I record its verdict and submit the plan to you.`), null);
+  assert.equal(ownerRequest(`${approval}\n\nNothing is needed from you yet.`), null);
+  assert.equal(ownerRequest(`${approval}\n\nThe advisor's third and last round is running.`), null);
+});
+
+test("an advisor wait does not hide a separate current owner decision", () => {
+  const pending = "Next: once the advisor answers, I submit the plan.";
+  const question = "While that runs, should we retain the old invoice numbers?";
+  assert.equal(ownerRequest(`${pending}\n\n${question}`), question);
+  const approval = "The production setting needs your approval. Please approve it now.";
+  assert.equal(ownerRequest(`${pending}\n\n${approval}`), approval);
+  const specificApproval = "The production setting needs your approval before I change it.";
+  assert.equal(ownerRequest(`${pending}\n\n${specificApproval}`), specificApproval);
+  const destructiveApproval = "The database deletion is irreversible and needs your approval.";
+  assert.equal(ownerRequest(`${pending}\n\n${destructiveApproval}`), destructiveApproval);
+  const pronounApproval = "The production setting is ready. It needs your approval.";
+  assert.equal(ownerRequest(`${pending}\n\n${pronounApproval}`), pronounApproval);
+});
+
 test("a wait on a closed ticket opens a Needs you sub-issue instead; follow-ups edit its comment and the answer closes it", async () => {
   const linear = new FakeLinear();
   linear.state = { ...linear.state, status: "Done", statusId: "done", statusType: "completed", creatorId: "creator" };
