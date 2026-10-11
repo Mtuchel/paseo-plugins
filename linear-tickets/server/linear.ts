@@ -666,6 +666,21 @@ export const LABEL_SWEEP_QUERY = `query labelSweep($first: Int!, $after: String,
 export const LABEL_HISTORY_QUERY = `query labelHistory($id: String!, $after: String) {
   issue(id: $id) { history(first: 100, after: $after) { nodes { createdAt actorId addedLabelIds removedLabelIds } pageInfo { hasNextPage endCursor } } }
 }`;
+// Status moves only, newest first, with whether a Linear app (a Paseo app) made them
+// (plan-stages-migration.ts finds the tickets the review-move defect put into Plan review).
+export const STATE_MOVES_QUERY = `query stateMoves($id: String!, $after: String) {
+  issue(id: $id) { history(first: 100, after: $after) { nodes { createdAt actor { id app } toState { name type } } pageInfo { hasNextPage endCursor } } }
+}`;
+// Every issue, archived ones included, carrying one of the labels (plan-stages-migration.ts: the
+// `model` group refuses a ticket with two of its labels).
+export const ISSUES_WITH_LABELS_QUERY = `query issuesWithLabels($first: Int!, $after: String, $filter: IssueFilter) {
+  issues(first: $first, after: $after, includeArchived: true, filter: $filter) {
+    nodes { id identifier state { name type } labels(first: 50) { nodes { id name } } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export type StateMove = { at: string; byApp: boolean; actorId: string | null; status: string; statusType: string };
+export type LabeledTicket = { id: string; identifier: string; status: string; statusType: string; labels: { id: string; name: string }[] };
 export const UPDATE_LABEL_QUERY = `mutation labelUpdate($id: String!, $input: IssueLabelUpdateInput!) {
   issueLabelUpdate(id: $id, input: $input) { success }
 }`;
@@ -1679,6 +1694,47 @@ export class LinearService {
 
   async moveLabelIntoGroup(labelId: string, groupId: string, name: string): Promise<void> {
     succeeded(record(await this.write(UPDATE_LABEL_QUERY, { id: labelId, input: { parentId: groupId } })), "issueLabelUpdate", `move the "${name}" label into its group`);
+  }
+
+  // Takes the label out of its group again (plan-stages-migration.ts `model-labels --ungroup`).
+  async moveLabelOutOfGroup(labelId: string, name: string): Promise<void> {
+    succeeded(record(await this.write(UPDATE_LABEL_QUERY, { id: labelId, input: { parentId: null } })), "issueLabelUpdate", `move the "${name}" label out of its group`);
+  }
+
+  // Every issue carrying one of the labels (any team, any state, archived ones too).
+  async issuesWithLabels(names: string[]): Promise<LabeledTicket[]> {
+    const tickets: LabeledTicket[] = [];
+    const filter = { labels: { some: { or: names.map((name) => ({ name: { eqIgnoreCase: name } })) } } };
+    let after: string | null = null;
+    do {
+      const page = connection(record(await this.read(ISSUES_WITH_LABELS_QUERY, { first: 100, after, filter })).issues);
+      for (const node of page.nodes.map((item) => record(item))) {
+        const state = record(node.state ?? {});
+        const id = label(node.id);
+        if (id) tickets.push({ id, identifier: label(node.identifier), status: label(state.name), statusType: label(state.type), labels: labelNodes(node.labels) });
+      }
+      after = page.hasNextPage ? page.endCursor : null;
+    } while (after);
+    return tickets;
+  }
+
+  // The issue's status moves, newest first, read until `enough` holds for one (at most
+  // HISTORY_PAGES pages).
+  async stateMoves(issueId: string, enough: (move: StateMove) => boolean): Promise<StateMove[]> {
+    const moves: StateMove[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < HISTORY_PAGES; page++) {
+      const history = connection(record(record(await this.read(STATE_MOVES_QUERY, { id: issueId, after })).issue ?? {}).history ?? { nodes: [] });
+      const found = history.nodes.map((item) => record(item)).filter((node) => node.toState).map((node): StateMove => {
+        const actor = node.actor ? record(node.actor) : null;
+        const state = record(node.toState);
+        return { at: label(node.createdAt), byApp: actor?.app === true, actorId: actor ? label(actor.id) || null : null, status: label(state.name), statusType: label(state.type) };
+      });
+      moves.push(...found);
+      if (found.some(enough) || !history.hasNextPage) break;
+      after = history.endCursor;
+    }
+    return moves;
   }
 
   // One page of the teams' issues, most recently updated first; `since` limits it to issues updated after then.

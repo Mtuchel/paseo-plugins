@@ -2866,6 +2866,35 @@ The three `model:` labels belong to the Linear label group `model`, so a ticket 
 one tier. The plugin swaps them in one write (add the new one, remove the others), which works with
 or without the group, and creates a missing tier label inside the group when the group exists.
 
+### One-time correction (`scripts/plan-stages-migration.ts`)
+
+Tickets written before the plan stages existed are corrected once, from the plugin folder on each
+host that runs the plugin. Every subcommand only lists without `--apply`; with it, each ticket is
+read again right before its write and skipped when its status or labels changed since the listing,
+so a rerun after an interrupted run finishes the rest. `--team <key>` (default `TUC`).
+
+```sh
+node --import tsx scripts/plan-stages-migration.ts stages [--apply]
+node --import tsx scripts/plan-stages-migration.ts review-victims [--cutoff <iso>] [--apply TUC-1,TUC-2]
+node --import tsx scripts/plan-stages-migration.ts model-labels [--apply [--hosts-ready]] [--ungroup]
+```
+
+- `stages`: tickets in Planning, Plan review or Plan approved, or with `plan-ready` before work
+  started, with this host's evidence (parked plans, open own reviews, queued threads, live ticket
+  agents). Only positive evidence moves a ticket: Planning with a parked plan or an open review
+  (and no approval evidence) to **Plan review**; Planning or not started with `plan-ready` and a
+  queued thread (and no review evidence) to **Plan approved**. Everything else, conflicting evidence
+  or a live agent included, is listed as `unresolved` and never written: the other host may own it.
+- `review-victims`: tickets a Paseo app moved into Plan review before the cutoff (the later of both
+  hosts' rollout of the review-move fix), with a pull request attached and no parked plan or open
+  review on this host. Check each one by hand (the review inbox shows both hosts' reviews);
+  `--apply` moves only the identifiers named, to In Review.
+- `model-labels`: every issue (any team, any state) with two or more `model:` labels keeps the
+  strongest; then the `model` group is created and the workspace tier labels move into it. The
+  grouping needs `--hosts-ready`, given only once both hosts run the one-write tier swap, and is
+  refused while a ticket still carries two tier labels. `--ungroup --apply` takes them out again
+  (rollback).
+
 ## Ticket state in the sidebar
 
 Each workspace with a ticket agent carries one workspace label naming its ticket's current Linear
