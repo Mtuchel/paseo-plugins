@@ -1289,7 +1289,13 @@ line. While slots under *max agents* are short, a free slot goes to:
 6. then the oldest ticket.
 
 The count is of agents that work: one the daemon still lists as running although its OMP process
-is gone (a ghost, see **Ghost agents**) holds no slot. An admitted ticket keeps its slot for 3
+is gone (a ghost, see **Ghost agents**) holds no slot. Neither does an agent whose ticket is Done or
+Canceled (or a duplicate) and that has been quiet for more than 60 minutes (no update in Paseo):
+it finished, and Paseo archives it shortly after (see **Ghost agents**). The ticket's state is the
+one the pull request watch's poll last saw, or the one Paseo itself wrote last, whichever is
+newer; so a Done ticket the stack policy reopens (see **Done tickets with open pull requests**)
+counts its agent again at once, and so does any activity of the agent. The scheduler reads the
+count at most every 5 seconds. An admitted ticket keeps its slot for 3
 minutes while its agent starts. Tickets you start from the sidebar skip the line. So does a
 project's planner run (see **Projects**): it only orders tickets, and while it waits none of its
 project's new tickets can be handed out, so its agent starts even when every slot under *max agents*
@@ -2127,6 +2133,41 @@ ghost (`agent … shows running but its OMP process is gone`). Only proven absen
 without a recorded session file or worktree, or a process table that cannot be read completely,
 keeps the agent live until the next poll.
 
+Finished agents are archived (TUC-1834), in every two-minute poll of the pull request watch, right
+after the stack policy reopened what it reopens: an agent of a Done, Canceled or duplicate ticket
+that is running or starting and has been quiet for more than 60 minutes, and a ghost quiet for more
+than 24 hours whatever its ticket's state. Before 2026-10-11 such agents held their slot and their
+ticket's `paseo-running` label until someone archived them by hand (TUC-1684's agent: six hours).
+The archive is the one Paseo's own connection does, the same as archiving in the app, so the ticket
+gets its usual final report. The log names each one: `TUC-1684: archived its quiet agent 3aecc4c1
+(ticket Done, quiet 6 h)`, `… archived its ghost … (quiet 25 h)`. One poll later the ticket's
+`<trigger>-running` label is removed, unless another agent of the ticket still works on it (a
+successor; stopped agents and ghosts do not count), or the archive's own write-back removed it
+already. That step is recorded in `$PASEO_HOME/linear-tickets/retired-labels.json` before the
+archive, so a failed removal or a plugin reload is retried on the next poll. Left alone, each named
+once in the log:
+
+- an agent that waits for you: a pending permission or question, its plan under review, a parked
+  plan or one approved for later, an open wait in its handover record, a "Needs you" sub-issue,
+  the `<trigger>-needs-you` label, the ticket in Needs input, or an agent you stopped. Such an agent
+  is looked at again after 15 minutes;
+- a Done ticket whose own pull requests are still open (see **Done tickets with open pull
+  requests**: it goes back to work instead), or whose pull requests cannot be read; a ticket you
+  moved back to Done after Paseo reopened it is archived;
+- a ticket the other host works on, or whose host cannot be told right now (see **Several hosts**);
+- a ticket the watchdog is recovering (see **Silent and stuck agents**), a ticket paused for
+  deletion, and a ticket whose agent is being started.
+
+Every condition is read again right before the archive, after the ticket's fresh Linear state; an
+agent that woke up in between keeps running. Paseo has no "archive only if still quiet", so an
+agent waking in the last round trip can still be archived: its conversation and worktree stay, and
+it can be resumed from the archive. A failed archive is logged and tried again on the next poll; the
+agent's slot stays free meanwhile. The archive's own write-back removes the running label without
+asking which host owns the ticket, as for an archive in the app; a ticket that moves to the other
+host in the minutes right after the archive can lose that host's label (the owner accepted this,
+TUC-1834). `paseo agent archive` on the command line answered `Agent not found` for running agents
+and ghosts on 2026-10-09; the plugin's own connection archives them by id.
+
 **Crashed agents.** An agent whose provider process exited or closed (Paseo shows it in error,
 for example "OMP RPC process is closed") receives no message. Crash recovery runs in every
 two-minute poll of the pull request watch, right after the watchdog and before any pull request
@@ -2212,7 +2253,9 @@ between the move, the comment and the notice) resumes where it stopped: the stat
 nothing when it already went through, the comment is found by its mark, and the notice is claimed
 before it goes out. At most three tickets are reopened per poll, so the first poll after this was
 rolled out works through the Done tickets with open pull requests (~16 in tuchel-platform on
-2026-10-09) without waking every agent at once; the rest follow on the next polls.
+2026-10-09) without waking every agent at once; the rest follow on the next polls. The quiet agent
+of a Done ticket is archived only once this rule found no open pull request of it, or you moved the
+ticket back to Done after a reopen (see **Ghost agents**).
 
 **Silent and stuck agents.** A ticket agent that stops making progress is recovered by the
 watchdog ([`server/watchdog.ts`](server/watchdog.ts)), which runs first in every two-minute poll

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 // Not mocked: the tests below mock setTimeout and Date only.
 import { setImmediate as nextTurn } from "node:timers/promises";
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { LinearService, postGraphQL, type IssueState } from "./linear";
 import { ticketPullRequest, type PullRequestText } from "./pull-request-check";
@@ -15,6 +15,7 @@ import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { NeedsYouIssues } from "./needs-you";
 import { MAX_SUMMARY_LENGTH, ownerRequest, turnPullRequests, turnReply, Writeback } from "./writeback";
+import { DoneTickets, RetiredLabels, RetirePass } from "./retirement";
 import { DecisionLog } from "./owner-decisions";
 import { Handover } from "./handover";
 import { AgentApi } from "./agent-app";
@@ -954,4 +955,63 @@ test("the reconcile leaves a ticket this host handed to the peer to the peer's p
   const tracked = await openedWait({ previousStateId: null, commentId: "c1", subIssueId: "sub-1", kind: "request", at: "2026-01-01T00:00:00.000Z" });
   await new Writeback(closed, { read: async () => allOn }, bridge(tracked), 0).reconcileWaiting(paseoWithRoots([]));
   assert.deepEqual(closed.writes, []);
+});
+
+// A finished ticket's agent archived by the retire pass (retirement.ts): the archive's own write-back
+// and the pass's label step on the next poll may both read the running label before either removes
+// it. The label is gone afterwards, removed at most once more than needed, and the final report
+// goes out once.
+test("the retire pass's archive, its write-back and its label step together remove the running label and report once", { timeout: 10_000 }, async (t) => {
+  t.mock.method(console, "log", () => {});
+  const directory = mkdtempSync(join(tmpdir(), "paseo-writeback-retire-"));
+  const linear = new FakeLinear();
+  linear.state = { ...linear.state, status: "Done", statusId: "done", statusType: "completed" };
+  const handover = new Handover(linear as never, directory, async () => ({ branch: "mtuchel/eng-1-fix", lastCommit: "abc123 the fix" }), () => "2026-01-01T10:00:00.000Z");
+  await handover.update({ id: "issue-1", identifier: "ENG-1" }, root, { summary: "Pushed the fix." });
+  let agent = { id: root.id, provider: "claude", cwd: "/repo", status: "running", title: root.title, createdAt: new Date(Date.now() - 3 * 3_600_000).toISOString(), updatedAt: new Date(Date.now() - 2 * 3_600_000).toISOString(), pendingPermissions: [], labels: { "linear.issueId": "issue-1", "linear.identifier": "ENG-1" }, persistence: null, archivedAt: null as string | null } as unknown as PaseoAgent;
+  const paseo = { agents: {
+    ref: () => ({ refresh: async () => ({ agent }), archive: async () => { agent = { ...agent, archivedAt: new Date().toISOString() }; } }),
+    list: async () => ({ entries: agent.archivedAt ? [] : [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
+  } } as unknown as PaseoApi;
+  const retire = new RetirePass({
+    sessions: {
+      watchdogRoots: async () => new Map(agent.archivedAt ? [] : [["issue-1", { issueId: "issue-1", identifier: "ENG-1", roots: [agent], ghosts: new Set<string>() }]]),
+      retireTurn: async <T>(_issueId: string, work: (api: PaseoApi) => Promise<T>) => ({ ran: true as const, value: await work(paseo) }),
+      sessionFor: async () => null,
+      watchdogThread: async () => null,
+    },
+    linear: {
+      issueStatuses: async () => new Map([["issue-1", { status: "Done", statusType: "completed", completedAt: null }]]),
+      issueWatchState: async () => ({ status: linear.state.status, statusType: linear.state.statusType, labels: linear.state.labels }),
+      issueCore: (id) => linear.issueCore(id) as never,
+      removeLabel: (id, name) => linear.removeLabel(id, name),
+    },
+    settings: { read: async () => allOn },
+    handover: { all: async () => [] },
+    watchdog: { read: async () => ({ version: 1 as const, tickets: {}, holds: {} }) },
+    doneTickets: new DoneTickets(),
+    labels: new RetiredLabels(join(directory, "retired-labels.json")),
+  });
+  const poll = { states: null, sentAt: Date.now(), asked: new Set<string>(), stack: async () => "settled" as const };
+  await retire.pass(poll);
+  assert.ok(agent.archivedAt, "archived by the pass");
+  // The write-back and the next poll's label step each read the label before either removes it.
+  const read = linear.issueCore.bind(linear);
+  let arrived = 0;
+  let release = () => {};
+  const both = new Promise<void>((resolve) => { release = resolve; });
+  linear.issueCore = async (id?: string) => {
+    const state = await read(id);
+    if (++arrived === 2) release();
+    await both;
+    return state;
+  };
+  await Promise.all([
+    new Writeback(linear, { read: async () => allOn }, { sessions: {} as never, handover }, 0, outboxPath()).archived({ agent: root, archivedAt: "now" }, paseo),
+    retire.pass(poll),
+  ]);
+  const removals = linear.writes.filter((write) => write === "-paseo-running").length;
+  assert.ok(removals >= 1 && removals <= 2, `${removals} removals`);
+  assert.ok(!linear.state.labels.some((label) => label.name === "paseo-running"));
+  assert.equal(linear.writes.filter((write) => write.includes("Paseo final report")).length, 1);
 });

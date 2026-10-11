@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -10,6 +11,8 @@ import type { RetriggerResult } from "./greptile-outage";
 import { Handover, type HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
 import { activityBullets, ConditionalPullView, githubReader, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft, type RateProbe } from "./pr-watch";
+import { DoneTickets, RetiredLabels, RetirePass, type RetirePoll, type StackState } from "./retirement";
+import { runningTicketAgents } from "./starter";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, GREPTILE_RETRIGGER, marker, RETARGET_ORPHAN, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
 import { GitHubBudget, GitHubPausedError, GitHubRateLimitedError, RateLimitedError, withPriority } from "./rate-budget";
 import { PermissionReplies } from "./permission-replies";
@@ -175,7 +178,7 @@ const MAIN_BROKEN: Judgment = {
 // injected `view` is the whole read, as for the tests that predate it.
 // `store`: a real Handover on temporary files instead of the in-memory records (the transfer
 // tests); `owns`: the only tickets the peer mechanism names as this host's.
-function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean; owner?: "all" | "none" | "unknown" | "throws"; backstop?: "auto" | "always" | "never"; watchdog?: Pick<Watchdog, "pass" | "stop">; store?: Handover; owns?: string[] } = {}, probe?: PullViewSource) {
+function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean; owner?: "all" | "none" | "unknown" | "throws"; backstop?: "auto" | "always" | "never"; watchdog?: Pick<Watchdog, "pass" | "stop">; retire?: Pick<RetirePass, "pass" | "stop">; store?: Handover; owns?: string[] } = {}, probe?: PullViewSource) {
   const waits = { runs: 0, failure: null as Error | null };
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open under `title`; `views`: other pull requests
@@ -231,8 +234,8 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // completion stamp (drives the stack policy's once-per-completion reopen), and `byIssue` the
   // states of tickets a run has several of (`state` is every other ticket's). `issueFailure` fails
   // the ticket reads (`issueReads`), `statesFailure` the per-poll batch of the running tickets
-  // (`stateReads`).
-  const linear = { failure: null as Error | null, issueFailure: null as Error | null, statesFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], stateReads: [] as string[][], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" }, completedAt: null as string | null, byIssue: {} as Record<string, { status: string; statusType: string; id?: string; identifier?: string }> };
+  // (`stateReads`). `written` hears the states the plugin writes (LinearService.onStateWritten).
+  const linear = { failure: null as Error | null, issueFailure: null as Error | null, statesFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], stateReads: [] as string[][], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" }, completedAt: null as string | null, byIssue: {} as Record<string, { status: string; statusType: string; id?: string; identifier?: string }>, written: (_issueId: string, _type: string) => {} };
   // No test worktree exists unless its git source is explicitly provided.
   const git = { origin: null as string | null, root: null as string | null, reads: [] as string[][] };
   // Open before-merge manual tasks of the ticket; `unreadable`: reading them fails.
@@ -305,6 +308,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         const moved = { status: "In Progress", statusType: "started" };
         if (linear.byIssue[id]) linear.byIssue[id] = moved;
         else linear.state = moved;
+        linear.written(id, moved.statusType);
         return { changed: true };
       },
       comment: async (id, body) => {
@@ -361,6 +365,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     outage: { follow: async () => scripts.outage.follow, sync: async (results) => { scripts.outage.syncs.push(results); } },
     ...(probe ? { probe } : {}),
     ...(agent.watchdog ? { watchdog: agent.watchdog } : {}),
+    ...(agent.retire ? { retire: agent.retire } : {}),
     view: async (url) => {
       github.reads.push(url);
       if (github.throttled || github.throttle.includes(url)) throw new GitHubRateLimitedError("GitHub is throttling gh: HTTP 403: API rate limit exceeded");
@@ -4160,6 +4165,77 @@ test("a canceled or duplicate ticket is never reopened, and neither is one whose
   vetoed.github.view = { ...vetoed.github.view, labels: ["do-not-merge"] };
   vetoed.github.open = vetoed.github.open.map((pull) => ({ ...pull, labels: ["do-not-merge"] }));
   assert.deepEqual(await vetoed.poll(), [], "do-not-merge only: nothing to land");
+});
+
+// A finished ticket's quiet agent (retirement.ts) next to the stack policy: the reopen the policy
+// writes after the poll's read of the states wins over that read, so the agent counts again.
+test("a Done ticket the stack policy reopens in the same poll keeps its quiet agent counted and unarchived", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const doneTickets = new DoneTickets();
+  const quiet = { id: "a1", provider: "claude", cwd: "/wt/tuc-1", status: "running", createdAt: new Date(Date.now() - 3 * 3_600_000).toISOString(), updatedAt: new Date(Date.now() - 61 * 60_000).toISOString(), lastUserMessageAt: null, pendingPermissions: [], labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" }, persistence: null, title: "T" } as unknown as PaseoAgent;
+  const archives: string[] = [];
+  const daemon = { agents: {
+    ref: (id: string) => ({ refresh: async () => ({ agent: quiet }), archive: async () => { archives.push(id); } }),
+    list: async () => ({ entries: [{ agent: quiet }], pageInfo: { hasMore: false, nextCursor: null } }),
+  } } as unknown as PaseoApi;
+  const home = await mkdtemp(join(tmpdir(), "paseo-retire-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const retire = new RetirePass({
+    sessions: {
+      watchdogRoots: async () => new Map([["i1", { issueId: "i1", identifier: "TUC-1", roots: [quiet], ghosts: new Set<string>() }]]),
+      retireTurn: async <T>(_issueId: string, work: (paseo: PaseoApi) => Promise<T>) => ({ ran: true as const, value: await work(daemon) }),
+      sessionFor: async () => null,
+      watchdogThread: async () => null,
+    },
+    linear: { issueStatuses: async () => new Map(), issueWatchState: async () => ({ status: "In Progress", statusType: "started", labels: [] }), issueCore: async () => ({ labels: [] }) as never, removeLabel: async () => {} },
+    settings: { read: async () => settings },
+    handover: { all: async () => [] },
+    watchdog: { read: async () => ({ version: 1 as const, tickets: {}, holds: {} }) },
+    doneTickets,
+    labels: new RetiredLabels(join(home, "retired-labels.json")),
+  });
+  const h = harness(t, { live: false, autoResume: true, retire });
+  h.linear.state = { status: "Done", statusType: "completed" };
+  h.linear.completedAt = "2026-10-09T08:49:39.000Z";
+  draftStack(h, 1);
+  h.paseo.succeed = startSuccessor;
+  h.linear.written = (issueId, type) => doneTickets.written(issueId, type, Date.now());
+  await h.poll();
+  assert.equal(h.linear.state.statusType, "started", "the stack policy reopened it after the poll's read");
+  assert.equal(doneTickets.type("i1"), "started", "the reopen's write wins over the poll's earlier read");
+  assert.deepEqual(archives, []);
+  assert.deepEqual(await runningTicketAgents(daemon, undefined, (agent, now) => doneTickets.releases(agent, now)), ["i1"], "it holds its slot again");
+});
+
+test("the retire pass waits for a Done ticket's stack: open while a reopen is pending, settled once respected or without any repository, unknown with several", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const seen: StackState[] = [];
+  const probe = (issueId = "i1") => ({ pass: async (poll: RetirePoll) => { seen.push(await poll.stack(issueId)); }, stop: () => {} });
+  const h = harness(t, { live: false, autoResume: true, retire: probe() });
+  h.linear.state = { status: "Done", statusType: "completed" };
+  h.linear.completedAt = "2026-10-09T08:49:39.000Z";
+  draftStack(h, 1);
+  h.paseo.succeed = startSuccessor;
+  await h.poll();
+  // The owner moves it to Done again: the reopen is respected, and the stack counts as settled.
+  h.linear.state = { status: "Done", statusType: "completed" };
+  h.linear.completedAt = "2026-10-09T09:30:00.000Z";
+  await h.poll();
+  assert.deepEqual(seen.splice(0), ["open", "settled"]);
+  // No worktree, no linked pull request and no pull request attachment: nothing can be open.
+  const bare = harness(t, { retire: probe() });
+  bare.records[0] = { ...bare.records[0], links: {}, worktreePath: null };
+  bare.linear.state = { status: "Done", statusType: "completed" };
+  await bare.poll();
+  // Attachments of two repositories: the stack policy never guesses between them.
+  const several = harness(t, { retire: probe() });
+  several.records[0] = { ...several.records[0], links: {}, worktreePath: null };
+  several.linear.attachments = ["https://github.com/o/one/pull/1", "https://github.com/o/two/pull/2"];
+  several.linear.state = { status: "Done", statusType: "completed" };
+  await several.poll();
+  // Another host's record, or none: no stack policy on this host.
+  await harness(t, { retire: probe("i9") }).poll();
+  assert.deepEqual(seen, ["settled", "unknown", "settled"]);
 });
 
 test("at most three Done tickets are reopened per poll", async (t) => {
