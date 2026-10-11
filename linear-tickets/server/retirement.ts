@@ -148,10 +148,11 @@ export type StackState = "settled" | "open" | "unknown";
 
 // What one pull request watch poll hands the pass.
 export type RetirePoll = {
-  // The poll's one batch read of its tickets' states, and when it was sent; null when it did not
-  // come back (PullRequestWatch.observeStates).
+  // The poll's one batch read of its tickets' states, when it was sent and which tickets it asked
+  // for; `states` is null when it did not come back (PullRequestWatch.observeStates).
   states: Map<string, IssueStatus> | null;
   sentAt: number;
+  asked: ReadonlySet<string>;
   stack: (issueId: string) => Promise<StackState>;
 };
 
@@ -272,6 +273,9 @@ export class RetirePass {
       if (state) {
         this.deps.doneTickets.read(issueId, state.statusType, poll.sentAt);
         known.add(issueId);
+      } else if (poll.states && poll.asked.has(issueId)) {
+        // Asked for and absent from a successful read: deleted or out of reach, so the agent counts.
+        this.deps.doneTickets.missing(issueId, poll.sentAt);
       } else lacking.push(issueId);
     }
     if (!lacking.length) return known;

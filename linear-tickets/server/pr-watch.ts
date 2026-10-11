@@ -1881,7 +1881,7 @@ export class PullRequestWatch {
       });
     }
     // Crash recovery comes next, whatever the watchdog's Linear budget came to (see crashPass).
-    const { states, sentAt } = await this.observeStates(mine);
+    const { states, sentAt, asked } = await this.observeStates(mine);
     // A Done ticket whose stack has not landed goes back to work first, so its agent's crash is
     // restarted like any started ticket's in the same poll (see reopenDone).
     await this.reopenDone(mine, states, reserved, context, seenByUrl, stopped);
@@ -1890,7 +1890,7 @@ export class PullRequestWatch {
     if (this.deps.retire && !stopped.paused) {
       await pass(async () => {
         try {
-          await this.deps.retire!.pass({ states, sentAt, stack: (issueId) => this.stackSettled(mine, issueId, context, stopped) });
+          await this.deps.retire!.pass({ states, sentAt, asked, stack: (issueId) => this.stackSettled(mine, issueId, context, stopped) });
         } catch (error) {
           if (error instanceof RateLimitedError) throw error;
           console.error(`[linear-tickets] retiring finished agents failed: ${error instanceof Error ? error.message : error}`);
@@ -3385,23 +3385,24 @@ export class PullRequestWatch {
   // The read covers every record of the poll, the stack policy's Done tickets included (see
   // reopenDone), while only tickets with a running agent's record are kept. Tickets without a
   // running agent's record are forgotten. `states` is null when the read did not come back;
-  // `sentAt`: when it was sent.
-  private async observeStates(all: HandoverRecord[]): Promise<{ states: Map<string, IssueStatus> | null; sentAt: number }> {
+  // `sentAt`: when it was sent; `asked`: the tickets it asked for.
+  private async observeStates(all: HandoverRecord[]): Promise<{ states: Map<string, IssueStatus> | null; sentAt: number; asked: ReadonlySet<string> }> {
     const running = all.filter((record) => record.status !== "archived").map((record) => record.issueId);
     await this.knownStates.retain(new Set(running));
     const ids = [...new Set(all.map((record) => record.issueId))];
+    const asked = new Set(ids);
     const sent = Date.now();
-    if (!ids.length) return { states: null, sentAt: sent };
+    if (!ids.length) return { states: null, sentAt: sent, asked };
     try {
       const states = await withPriority("background", "crash-recovery", () => this.deps.linear.issueStatuses(ids));
       for (const id of running) {
         const state = states.get(id);
         if (state) await this.knownStates.observe(id, { name: state.status, type: state.statusType }, sent);
       }
-      return { states, sentAt: sent };
+      return { states, sentAt: sent, asked };
     } catch (error) {
       if (!(error instanceof RateLimitedError)) console.error(`[linear-tickets] reading the tickets' Linear states failed: ${error instanceof Error ? error.message : error}`);
-      return { states: null, sentAt: sent };
+      return { states: null, sentAt: sent, asked };
     }
   }
 

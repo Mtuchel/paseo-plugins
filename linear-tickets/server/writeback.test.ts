@@ -992,7 +992,7 @@ test("the retire pass's archive, its write-back and its label step together remo
     doneTickets: new DoneTickets(),
     labels: new RetiredLabels(join(directory, "retired-labels.json")),
   });
-  const poll = { states: null, sentAt: Date.now(), stack: async () => "settled" as const };
+  const poll = { states: null, sentAt: Date.now(), asked: new Set<string>(), stack: async () => "settled" as const };
   await retire.pass(poll);
   assert.ok(agent.archivedAt, "archived by the pass");
   // The write-back and the next poll's label step each read the label before either removes it.

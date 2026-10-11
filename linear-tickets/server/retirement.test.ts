@@ -39,6 +39,8 @@ function world(t: TestContext) {
     needsYou: [] as NeedsYouIssue[],
     links: {} as Record<string, Partial<SessionLink>>,
     thread: null as Partial<SessionLink> | null,
+    // Tickets the poll's batch read asks for beyond the ones it returns (see `pass`).
+    asked: [] as string[],
     // The rpc-ui processes `ps` lists: none, so every agent with a session file is a ghost.
     processes: "",
     hooks: { roots: async () => {}, watchState: async () => {}, debt: async () => {} },
@@ -151,6 +153,8 @@ function world(t: TestContext) {
     await retire.pass({
       states: states ? new Map(Object.entries(states).map(([id, ticket]) => [id, { status: ticket.status, statusType: ticket.statusType, completedAt: null }])) : null,
       sentAt: clock.now - 1_000,
+      // The poll asks for every ticket it lists, plus the ones `asked` names (absent from its answer).
+      asked: new Set([...Object.keys(states ?? {}), ...s.asked]),
       stack: async () => s.stack,
     });
     return [...events];
@@ -332,6 +336,21 @@ test("a ticket found open on the fresh read is not archived and its agent counts
   assert.equal(w.archived("agent-01"), false);
   assert.equal(w.doneTickets.type("i1"), "started");
   assert.equal(w.doneTickets.releases(agent, w.clock.now), false);
+});
+
+test("a ticket the poll's successful read asked for but did not return counts its agent again, without another read", async (t) => {
+  const w = world(t);
+  const agent = w.add("agent-01");
+  w.s.stack = "open";
+  await w.pass({ i1: { status: "Done", statusType: "completed", labels: [] } });
+  assert.equal(w.doneTickets.releases(agent, w.clock.now), true);
+  w.clock.now += 2 * MINUTE;
+  // Deleted, or out of the key's reach: the poll asked for it and Linear left it out.
+  w.s.asked = ["i1"];
+  const events = await w.pass({});
+  assert.equal(w.doneTickets.releases(agent, w.clock.now), false);
+  assert.ok(!events.some((event) => event.startsWith("statuses")), events.join("; "));
+  assert.equal(w.archived("agent-01"), false);
 });
 
 test("a failed label debt write or archive is logged and retried on the next poll", async (t) => {
