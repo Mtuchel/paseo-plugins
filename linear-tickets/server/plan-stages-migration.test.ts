@@ -34,6 +34,7 @@ function fakeLinear(tickets: Ticket[], catalog: CatalogLabel[] = [], options: { 
     },
     moveToReview: async (id) => { const found = byId.get(id)!; writes.push(`${found.identifier} -> In Review`); found.status = "In Review"; return { changed: true }; },
     stateMoves: async (id) => byId.get(id)!.moves,
+    trustedAppIds: async () => ["app", "peer-app"],
     issuesWithLabels: async (names) => tickets.filter((item) => item.labels.some((label) => names.includes(label.name))).map((item): LabeledTicket => ({ id: item.id, identifier: item.identifier, status: item.status, statusType: item.statusType, labels: item.labels })),
     changeLabels: async (id, added, removed) => {
       const found = byId.get(id)!;
@@ -109,25 +110,30 @@ test("stages: a ticket changed since the listing is skipped, and a rerun after a
   assert.deepEqual(second.map((row) => `${row.identifier}: ${row.verdict}${row.result ? ` (${row.result})` : ""}`), ["TUC-1: correct - waits for the owner's review", "TUC-2: unresolved - review and approval evidence conflict", "TUC-3: move to Plan review (moved to Plan review)"]);
 });
 
-test("review-victims: lists app moves into Plan review before the cutoff with a pull request and no review here; apply moves only named candidates", async () => {
+test("review-victims: lists Paseo app moves into Plan review before the cutoff with a pull request and no review here; apply moves only named, unchanged candidates", async () => {
   const pr = ["https://github.com/o/r/pull/1"];
-  const before = (byApp = true): StateMove[] => [{ at: "2026-10-10T09:00:00.000Z", byApp, actorId: byApp ? "app" : "owner", status: "Plan review", statusType: "started" }];
+  const before = (actorId: string | null = "app"): StateMove[] => [{ at: "2026-10-10T09:00:00.000Z", actorId, status: "Plan review", statusType: "started" }];
   const tickets = [
     ticket(1, "Plan review", [], { attachmentUrls: pr, moves: before() }), // victim
-    ticket(2, "Plan review", [], { attachmentUrls: pr, moves: before() }), // victim, not named
+    ticket(2, "Plan review", [], { attachmentUrls: pr, moves: before("peer-app") }), // victim of the peer's app, not named
     ticket(3, "Plan review", [], { attachmentUrls: pr, moves: before() }), // parked here: a real review
     ticket(4, "Plan review", [], { attachmentUrls: pr, moves: [{ ...before()[0], at: "2026-10-11T09:00:00.000Z" }] }), // after the cutoff
-    ticket(5, "Plan review", [], { attachmentUrls: pr, moves: before(false) }), // moved by the owner
+    ticket(5, "Plan review", [], { attachmentUrls: pr, moves: before("owner") }), // moved by the owner
     ticket(6, "Plan review", [], { moves: before() }), // no pull request
+    ticket(7, "Plan review", [], { attachmentUrls: pr, moves: before("other-app") }), // another Linear app
+    ticket(8, "Plan review", [], { attachmentUrls: pr, moves: before() }), // victim whose labels change before the write
   ];
-  const { linear, writes } = fakeLinear(tickets);
+  let reads = 0;
+  const { linear, writes } = fakeLinear(tickets, [], { onRead: (id) => { if (id === "i8" && ++reads === 2) tickets[7].labels.push({ id: "plan-rework", name: "plan-rework" }); } });
   const evidence = host({ parked: ["i3"] });
   const listed = await runReviewVictims({ linear, host: evidence, teamKeys: ["TUC"], cutoff: "2026-10-11T00:00:00.000Z", apply: [] });
-  assert.deepEqual(listed.rows.map((row) => row.identifier), ["TUC-1", "TUC-2"]);
+  assert.deepEqual(listed.rows.map((row) => row.identifier), ["TUC-1", "TUC-2", "TUC-8"]);
   assert.deepEqual(writes, []);
-  const applied = await runReviewVictims({ linear, host: evidence, teamKeys: ["TUC"], cutoff: "2026-10-11T00:00:00.000Z", apply: ["tuc-1", "TUC-3"] });
+  const applied = await runReviewVictims({ linear, host: evidence, teamKeys: ["TUC"], cutoff: "2026-10-11T00:00:00.000Z", apply: ["tuc-1", "TUC-3", "TUC-8"] });
   assert.deepEqual(writes, ["TUC-1 -> In Review"]);
   assert.deepEqual(applied.refused, ["TUC-3"]);
+  assert.equal(applied.rows.find((row) => row.identifier === "TUC-8")?.result, "skipped: labels changed since the listing");
+  await assert.rejects(runReviewVictims({ linear: { ...linear, trustedAppIds: async () => [] }, host: evidence, teamKeys: ["TUC"], cutoff: "2026-10-11T00:00:00.000Z", apply: [] }), /unknown on this host/);
 });
 
 test("model-labels: duplicates on closed and other teams' issues keep the strongest before grouping; grouping waits for --hosts-ready; ungroup reverses it", async () => {
@@ -168,4 +174,20 @@ test("model-labels: a duplicate that could not be cleaned blocks the grouping", 
   const report = await runModelLabels({ linear, apply: true, hostsReady: true, ungroup: false });
   assert.deepEqual(writes, []);
   assert.deepEqual(report.group, ["not grouped: TUC-1 still carry two tier labels"]);
+});
+
+// A workspace and a team label of the same tier on one ticket: the workspace one stays (only it
+// joins the group), every other tier label goes in the same write.
+test("model-labels: a duplicate of the strongest tier itself keeps one label, the workspace one", async () => {
+  const labels: CatalogLabel[] = [
+    { id: "ws-strong", name: "model:strong", isGroup: false, parentId: null, teamId: null },
+    { id: "team-strong", name: "model:strong", isGroup: false, parentId: null, teamId: "t1" },
+    { id: "model:cheap", name: "model:cheap", isGroup: false, parentId: null, teamId: null },
+  ];
+  const tickets = [ticket(1, "Todo", [], { labels: [{ id: "team-strong", name: "model:strong" }, { id: "ws-strong", name: "model:strong" }, { id: "model:cheap", name: "model:cheap" }] })];
+  const { linear, writes } = fakeLinear(tickets, labels);
+  const report = await runModelLabels({ linear, apply: true, hostsReady: false, ungroup: false });
+  assert.deepEqual(writes, ["TUC-1 + -team-strong,model:cheap"]);
+  assert.deepEqual(tickets[0].labels.map((label) => label.id), ["ws-strong"]);
+  assert.equal(report.duplicates[0].result, "kept model:strong");
 });

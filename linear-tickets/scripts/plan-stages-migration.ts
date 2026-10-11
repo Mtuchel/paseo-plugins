@@ -12,11 +12,15 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { parseArgs } from "node:util";
+import { AgentApi } from "../server/agent-app";
 import { Credentials } from "../server/credentials";
 import { LinearService } from "../server/linear";
+import { AppOnlyToken } from "../server/owner-decisions";
 import { ParkedPlans } from "../server/parked";
+import { PeerAppUser } from "../server/peer-identity";
 import { renderModelLabels, renderStages, renderVictims, runModelLabels, runReviewVictims, runStages, type HostEvidence } from "../server/plan-stages-migration";
 import { SessionStore } from "../server/sessions";
+import { Settings } from "../server/settings";
 
 const run = promisify(execFile);
 const USAGE = "usage: plan-stages-migration.ts stages [--apply] | review-victims [--cutoff <iso>] [--apply <TUC-1,...>] | model-labels [--apply [--hosts-ready]] [--ungroup]  [--team <key>]";
@@ -51,7 +55,11 @@ async function main(): Promise<void> {
     },
     strict: false,
   });
-  const linear = new LinearService(new Credentials());
+  // Writes are authored by this host's Paseo app, like the plugin's own; its user and the peer's
+  // tell review-victims which moves a Paseo app made.
+  const linear = new LinearService(new Credentials(), undefined, new AgentApi(new AppOnlyToken()));
+  const peer = new PeerAppUser({ settings: new Settings() });
+  linear.peerAppUser = () => peer.id();
   const teamKeys = [String(values.team ?? "TUC")];
   const apply = values.apply;
   const command = positionals[0];
@@ -69,7 +77,7 @@ async function main(): Promise<void> {
     const cutoff = typeof values.cutoff === "string" ? new Date(values.cutoff).toISOString() : new Date().toISOString();
     const report = await runReviewVictims({ linear, host: hostEvidence(), teamKeys, cutoff, apply: named });
     process.stdout.write(`${renderVictims(report, cutoff)}\n`);
-    if (report.refused.length) process.exitCode = 1;
+    if (report.refused.length || report.rows.some((row) => row.result?.startsWith("failed"))) process.exitCode = 1;
     return;
   }
   if (command === "model-labels" && positionals.length === 1) {

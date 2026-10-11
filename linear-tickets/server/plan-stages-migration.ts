@@ -19,7 +19,7 @@ import { hasLabel, PLAN_APPROVED_STATE, PLAN_READY_LABEL, PLAN_REVIEW_STATE, PLA
 import { TIERS } from "../shared/plan-model";
 
 export type MigrationLinear = Pick<LinearService,
-  "repairCandidates" | "issueCore" | "moveToPlanStage" | "moveToReview" | "stateMoves" | "issuesWithLabels" | "changeLabels" | "labelCatalog" | "createLabel" | "moveLabelIntoGroup" | "moveLabelOutOfGroup">;
+  "repairCandidates" | "issueCore" | "moveToPlanStage" | "moveToReview" | "stateMoves" | "trustedAppIds" | "issuesWithLabels" | "changeLabels" | "labelCatalog" | "createLabel" | "moveLabelIntoGroup" | "moveLabelOutOfGroup">;
 
 // What this host knows about a ticket. `reviewAgent`: the agent whose own review is open (it is
 // live while it waits, so it is no other agent working on the ticket).
@@ -92,10 +92,12 @@ export async function runStages(input: { linear: MigrationLinear; host: HostEvid
 
 export type VictimRow = { identifier: string; movedAt: string; pullRequests: string[]; result?: string };
 
-// Tickets a Paseo app moved into Plan review before `cutoff`, with a pull request attached and no
-// parked plan or open review on this host. `apply`: the identifiers to move to In Review; any other
-// identifier is refused.
+// Tickets one of the Paseo apps (this host's or the peer's) moved into Plan review before `cutoff`,
+// with a pull request attached and no parked plan or open review on this host. `apply`: the
+// identifiers to move to In Review; any other identifier is refused.
 export async function runReviewVictims(input: { linear: MigrationLinear; host: Pick<HostEvidence, "parked" | "review">; teamKeys: string[]; cutoff: string; apply: string[] }): Promise<{ rows: VictimRow[]; refused: string[] }> {
+  const apps = new Set(await input.linear.trustedAppIds());
+  if (!apps.size) throw new Error("The Paseo app's Linear user is unknown on this host, so no move can be attributed to it.");
   const found = await input.linear.repairCandidates({ labels: [PLAN_READY_LABEL], teamKeys: input.teamKeys, ids: [], states: [PLAN_REVIEW_STATE] });
   const rows: VictimRow[] = [];
   const named = new Set(input.apply.map((identifier) => identifier.trim().toUpperCase()));
@@ -106,13 +108,13 @@ export async function runReviewVictims(input: { linear: MigrationLinear; host: P
     if (!pullRequests.length) continue;
     const entered = (move: StateMove) => planStage(move.status, move.statusType) === PLAN_REVIEW_STATE;
     const move = (await input.linear.stateMoves(ticket.id, entered)).find(entered);
-    if (!move || !move.byApp || move.at >= input.cutoff) continue;
+    if (!move || !move.actorId || !apps.has(move.actorId) || move.at >= input.cutoff) continue;
     const row: VictimRow = { identifier: ticket.identifier, movedAt: move.at, pullRequests };
     if (named.has(ticket.identifier.toUpperCase())) {
       named.delete(ticket.identifier.toUpperCase());
       try {
-        const now = await input.linear.issueCore(ticket.id);
-        if (planStage(now.status, now.statusType) !== PLAN_REVIEW_STATE) row.result = `skipped: now ${now.status}`;
+        const changed = await unchanged(input.linear, ticket);
+        if (changed) row.result = changed;
         else {
           const moved = await input.linear.moveToReview(ticket.id);
           row.result = moved.changed ? "moved to In Review" : `not moved${moved.note ? `: ${moved.note}` : ""}`;
@@ -148,18 +150,22 @@ export async function runModelLabels(input: { linear: MigrationLinear; apply: bo
     return { duplicates: [], group };
   }
   const tickets: LabeledTicket[] = await linear.issuesWithLabels(Object.values(TIER_LABELS));
+  // A workspace label is kept before a team label of the same name: only it joins the group.
+  const workspaceIds = new Set(tierLabels.filter((item) => !item.teamId).map((item) => item.id));
   const duplicates: TierRow[] = [];
   for (const ticket of tickets.sort((a, b) => a.identifier.localeCompare(b.identifier, undefined, { numeric: true }))) {
     const tiers = ticket.labels.filter((item) => tierName(item.name));
     if (tiers.length < 2) continue;
     const keep = labelTier(tiers)!;
+    const strongest = tiers.filter((item) => tierName(item.name) === keep);
+    const kept = strongest.find((item) => workspaceIds.has(item.id)) ?? strongest[0];
     const row: TierRow = { identifier: ticket.identifier, status: ticket.status, labels: tiers.map((item) => item.name), keep: TIER_LABELS[keep] };
     if (input.apply) {
       try {
         const changed = await unchanged(linear, ticket);
         if (changed) row.result = changed;
         else {
-          await linear.changeLabels(ticket.id, [], tiers.filter((item) => tierName(item.name) !== keep).map((item) => item.id));
+          await linear.changeLabels(ticket.id, [], tiers.filter((item) => item.id !== kept.id).map((item) => item.id));
           row.result = `kept ${TIER_LABELS[keep]}`;
         }
       } catch (error) { row.result = `failed: ${message(error)}`; }

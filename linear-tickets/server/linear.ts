@@ -666,10 +666,10 @@ export const LABEL_SWEEP_QUERY = `query labelSweep($first: Int!, $after: String,
 export const LABEL_HISTORY_QUERY = `query labelHistory($id: String!, $after: String) {
   issue(id: $id) { history(first: 100, after: $after) { nodes { createdAt actorId addedLabelIds removedLabelIds } pageInfo { hasNextPage endCursor } } }
 }`;
-// Status moves only, newest first, with whether a Linear app (a Paseo app) made them
-// (plan-stages-migration.ts finds the tickets the review-move defect put into Plan review).
+// Status moves only, newest first, with the user who made them (plan-stages-migration.ts finds the
+// tickets the review-move defect put into Plan review by the Paseo apps' users).
 export const STATE_MOVES_QUERY = `query stateMoves($id: String!, $after: String) {
-  issue(id: $id) { history(first: 100, after: $after) { nodes { createdAt actor { id app } toState { name type } } pageInfo { hasNextPage endCursor } } }
+  issue(id: $id) { history(first: 100, after: $after) { nodes { createdAt actor { id } toState { name type } } pageInfo { hasNextPage endCursor } } }
 }`;
 // Every issue, archived ones included, carrying one of the labels (plan-stages-migration.ts: the
 // `model` group refuses a ticket with two of its labels).
@@ -679,7 +679,7 @@ export const ISSUES_WITH_LABELS_QUERY = `query issuesWithLabels($first: Int!, $a
     pageInfo { hasNextPage endCursor }
   }
 }`;
-export type StateMove = { at: string; byApp: boolean; actorId: string | null; status: string; statusType: string };
+export type StateMove = { at: string; actorId: string | null; status: string; statusType: string };
 export type LabeledTicket = { id: string; identifier: string; status: string; statusType: string; labels: { id: string; name: string }[] };
 export const UPDATE_LABEL_QUERY = `mutation labelUpdate($id: String!, $input: IssueLabelUpdateInput!) {
   issueLabelUpdate(id: $id, input: $input) { success }
@@ -1728,7 +1728,7 @@ export class LinearService {
       const found = history.nodes.map((item) => record(item)).filter((node) => node.toState).map((node): StateMove => {
         const actor = node.actor ? record(node.actor) : null;
         const state = record(node.toState);
-        return { at: label(node.createdAt), byApp: actor?.app === true, actorId: actor ? label(actor.id) || null : null, status: label(state.name), statusType: label(state.type) };
+        return { at: label(node.createdAt), actorId: actor ? label(actor.id) || null : null, status: label(state.name), statusType: label(state.type) };
       });
       moves.push(...found);
       if (found.some(enough) || !history.hasNextPage) break;
