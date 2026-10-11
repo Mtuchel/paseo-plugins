@@ -5,6 +5,7 @@ import { ADVISOR_SECTION } from "../shared/plan-advisor";
 import { ESCALATE_TOOL, MODEL_SECTION, strongerTier, TIERS, workerDelegationNote, type Tier } from "../shared/plan-model";
 import { RISK_SECTION } from "../shared/plan-risk";
 import type { LinearService } from "./linear";
+import { RateLimitedError } from "./rate-budget";
 import type { PluginSettings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
@@ -43,13 +44,22 @@ const tierLabelIds = new WeakMap<object, Map<Tier, string>>();
 // The ticket's tier label in one write: `tier` added and every other tier label it carries
 // (`current`) removed together, so the `model` group accepts the swap and the ticket never shows two
 // tiers, with or without the group. Nothing is written when it carries exactly this tier. A missing
-// tier label is created inside the group when the group exists.
+// tier label is created inside the group when the group exists. A write refused with a cached id
+// (the label was deleted and made again meanwhile) is tried once more with the ids read afresh.
 export async function writeTierLabel(linear: TierLinear, issueId: string, tier: Tier, current: { id: string; name: string }[]): Promise<void> {
   const named = (label: { name: string }, wanted: Tier) => label.name.trim().toLowerCase() === TIER_LABELS[wanted];
   const others = current.filter((label) => TIERS.some((other) => other !== tier && named(label, other)));
   const has = current.some((label) => named(label, tier));
   if (has && !others.length) return;
-  await linear.changeLabels(issueId, has ? [] : [await tierLabelId(linear, tier)], others.map((label) => label.id));
+  const write = async () => linear.changeLabels(issueId, has ? [] : [await tierLabelId(linear, tier)], others.map((label) => label.id));
+  const cached = !has && tierLabelIds.get(linear)?.has(tier);
+  try {
+    await write();
+  } catch (error) {
+    if (!cached || error instanceof RateLimitedError) throw error;
+    tierLabelIds.delete(linear);
+    await write();
+  }
 }
 
 async function tierLabelId(linear: TierLinear, tier: Tier): Promise<string> {

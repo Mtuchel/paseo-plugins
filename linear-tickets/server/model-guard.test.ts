@@ -4,6 +4,7 @@ import { setImmediate } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
 import { drift, ModelGuard } from "./model-guard";
 import { launchTier, writeTierLabel, type TierRecord, type TierSource } from "./model-tiers";
+import { RateLimitedError } from "./rate-budget";
 import type { Tier } from "../shared/plan-model";
 
 const settings = { launchPreferences: { omp: { model: "omp/anthropic/claude-opus-5-5", modeId: "full", thinkingOptionId: "medium" } }, cheapModels: {}, standardModels: {} };
@@ -169,4 +170,27 @@ test("the tier label is swapped in one write, skipped when already right, and cr
   await writeTierLabel(linear, "i4", "standard", []);
   await writeTierLabel(linear, "i5", "standard", []);
   assert.deepEqual(writes, ["catalog", "i1 +strong -cheap,x", "i3 + -strong", "catalog", "create model:standard in g", "i4 +new-standard -", "i5 +new-standard -"]);
+});
+
+// A tier label deleted and made again meanwhile leaves a stale cached id: the refused write is
+// tried once more with the ids read afresh, and a rate limit is never retried here.
+test("a tier write refused with a stale cached id is retried once with fresh ids", async () => {
+  const writes: string[] = [];
+  let strongId = "old-strong";
+  const linear = {
+    labelCatalog: async () => { writes.push("catalog"); return [{ id: strongId, name: "model:strong", isGroup: false, parentId: null, teamId: null }]; },
+    createLabel: async () => "never",
+    changeLabels: async (issueId: string, added: string[], removed: string[]) => {
+      if (added.includes("old-strong") && strongId !== "old-strong") throw new Error("Entity not found: label");
+      writes.push(`${issueId} +${added.join(",")} -${removed.join(",")}`);
+    },
+  };
+  await writeTierLabel(linear, "i1", "strong", []);
+  strongId = "new-strong";
+  await writeTierLabel(linear, "i2", "strong", [{ id: "c", name: "model:cheap" }]);
+  assert.deepEqual(writes, ["catalog", "i1 +old-strong -", "catalog", "i2 +new-strong -c"]);
+  // With the ids cached, a rate limit still propagates at once: no second catalog read, no retry.
+  linear.changeLabels = async () => { writes.push("limited"); throw new RateLimitedError("app", Date.now() + 60_000); };
+  await assert.rejects(writeTierLabel(linear, "i3", "strong", []), RateLimitedError);
+  assert.deepEqual(writes.slice(4), ["limited"]);
 });

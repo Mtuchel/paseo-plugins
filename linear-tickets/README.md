@@ -2806,7 +2806,9 @@ Every open ticket assigned to Paseo has exactly one responsible next step — a 
 in your inbox, a queue entry, or a question to you — and its status names which. Labels only carry
 attributes next to the status. The plan stages are started states the team creates under these
 exact names (case and spacing aside); a team without them keeps the older behaviour described with
-each write.
+each write. Todo with `plan-ready` is the one owner-held case: the approval comment or panel reply
+is your prompt to start it, so it counts as a question to you. Tickets that break the rule are
+found and repaired separately (TUC-1290).
 
 | Status | Meaning | Who acts next |
 | -- | -- | -- |

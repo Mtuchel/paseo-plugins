@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { setImmediate as immediate } from "node:timers/promises";
 import { promisify } from "node:util";
@@ -1251,6 +1251,89 @@ test("a parked approval's handoff: Plan approved for a queued or moved-on thread
       }
     });
   }
+});
+
+// TUC-1289 review: a parked approval recorded by the code before the plan stages, whose `ready` and
+// `queue` already ran, keeps that outcome on its retry: its successor may already work and its
+// thread may be closed since, so neither a stage nor Todo is written.
+test("a legacy parked approval with ready and queue done never writes a stage or Todo on its retry", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-01-01T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: RISKY(2), at: new Date().toISOString() }], async (directory) => {
+    const f = tracked({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+    const { plans, parking } = parkingFake(f.calls);
+    plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T11:00:00.000Z", announced: true, staged: true });
+    const panel = parkedSessions();
+    const say = panel.sessions.say;
+    panel.sessions.say = armedCall("before", say);
+    const build = () => new PlannotatorBridge(f.linear, { read: async () => settings }, directory, panel.sessions as never, async () => "", undefined, undefined, undefined, async () => {}, () => {}, parking);
+    const first = build();
+    first.attach(f.paseo);
+    await first.drain();
+    assert.equal(onlyAttempt(first).state, "pending");
+    await first.stop();
+    // Rewrite the attempt as the old code left it: `ready` done instead of `handoff` and `stage`.
+    const decisions = join(dirname(directory), "decisions");
+    const files = (await readdir(decisions, { recursive: true })).map((name) => join(decisions, String(name))).filter((path) => path.endsWith(".json"));
+    let rewritten = 0;
+    for (const path of files) {
+      const entry: unknown = JSON.parse(await readFile(path, "utf8"));
+      if (!entry || typeof entry !== "object" || !("kind" in entry) || entry.kind !== "attempt" || !("steps" in entry) || !entry.steps || typeof entry.steps !== "object") continue;
+      const { handoff: _handoff, stage: _stage, ...rest } = entry.steps as Record<string, unknown>;
+      await writeFile(path, JSON.stringify({ ...entry, steps: { ...rest, ready: null } }));
+      rewritten++;
+    }
+    assert.equal(rewritten, 1);
+    // The successor took the thread over and implements; the thread is closed.
+    panel.state.closed = true;
+    f.linear.issueStatus = async () => ({ status: "In Progress", statusType: "started" });
+    f.calls.length = 0;
+    const second = build();
+    second.attach(f.paseo);
+    t.mock.timers.tick(3_000);
+    await second.drain();
+    await second.drain();
+    assert.equal(onlyAttempt(second).state, "applied");
+    assert.deepEqual(f.calls.filter((call) => call.startsWith("stage ") || call.startsWith("ready ")), []);
+    assert.equal(panel.activities.size, 1, "the pending note goes out");
+    await second.stop();
+  });
+});
+
+// TUC-1289 review: a parked plan's Plan review staging and an owner decision arriving while it
+// waits on Linear never interleave: the decision is accepted only after the staging finished, so
+// its own writes come last and the parked record it removes is not written back.
+test("a decision arriving while a parked plan is staged waits for the staging, writes last and keeps the record removed", async () => {
+  const f = tracked({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(f.calls);
+  plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "", reasons: [], model: null, parkedAt: "2026-01-01T09:00:00.000Z", announced: true });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let entered!: () => void;
+  const stagingEntered = new Promise<void>((resolve) => { entered = resolve; });
+  const move = f.linear.moveToPlanStage;
+  f.linear.moveToPlanStage = async (issueId: string, name: string) => {
+    if (name === "Plan review") { entered(); await gate; }
+    return move(issueId, name);
+  };
+  await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: null, at: "2026-01-01T10:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(f.linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.attach(f.paseo);
+    const serve = bridge.drain();
+    await stagingEntered;
+    const decision = bridge.decideOwner("http://localhost:4000/", true, "", "agent-1", { source: "inbox" });
+    for (let turn = 0; turn < 200; turn++) await immediate();
+    assert.equal(bridge.decisionJournal.attempts().length, 0, "nothing is accepted while the staging runs");
+    release();
+    await serve;
+    await decision;
+    await bridge.drain();
+    assert.equal(onlyAttempt(bridge).state, "applied");
+    assert.equal(plans.size, 0, "the decided record stays removed");
+    const order = f.calls.filter((call) => /^(stage|ready|[+-]plan-)/.test(call));
+    assert.deepEqual(order, ["stage issue-1 Plan review", "-plan-ready issue-1", "-plan-rework issue-1", "+plan-ready issue-1", "-plan-rework issue-1", "ready issue-1"]);
+    await bridge.stop();
+  });
 });
 
 // AC-1: every mandatory parked step, failed once before it ran, after it ran and in its journal

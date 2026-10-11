@@ -911,15 +911,20 @@ export class PlannotatorBridge {
   // A submitted plan waits for its review: Plan review, without plan-ready or plan-rework (README,
   // "Statuses and labels"). Skipped once a decision on this review was accepted: that decision
   // writes its own status and labels, which this must never overwrite. A decision still being
-  // confirmed does not count: once accepted, it writes after this. False when skipped.
-  private async stageReview(issueId: string, identifier: string, review: ReviewGeneration): Promise<boolean> {
-    const decided = this.journal.attempts().some((attempt) => attempt.reviewId === review.id && (attempt.state === "pending" || attempt.state === "applied"));
-    if (decided) return false;
-    const moved = await this.linear.moveToPlanStage(issueId, PLAN_REVIEW_STATE);
-    if (moved.note) console.error(`[linear-tickets] ${identifier}: ${moved.note}`);
-    await this.linear.removeLabel(issueId, PLAN_READY_LABEL);
-    await this.linear.removeLabel(issueId, PLAN_REWORK_LABEL);
-    return true;
+  // confirmed does not count: once accepted, it writes after this. The check, the writes and
+  // `staged` run under the review's journal lock, which every acceptance takes too, so no decision
+  // is accepted (and applied) in between. False when skipped.
+  private stageReview(issueId: string, identifier: string, review: ReviewGeneration, staged?: () => Promise<void>): Promise<boolean> {
+    return this.journal.withReview(review.id, async () => {
+      const decided = this.journal.attempts().some((attempt) => attempt.reviewId === review.id && (attempt.state === "pending" || attempt.state === "applied"));
+      if (decided) return false;
+      const moved = await this.linear.moveToPlanStage(issueId, PLAN_REVIEW_STATE);
+      if (moved.note) console.error(`[linear-tickets] ${identifier}: ${moved.note}`);
+      await this.linear.removeLabel(issueId, PLAN_READY_LABEL);
+      await this.linear.removeLabel(issueId, PLAN_REWORK_LABEL);
+      await staged?.();
+      return true;
+    });
   }
 
   // A planner run's work order needs nobody (README, "Projects"): it only orders the project's
@@ -972,9 +977,9 @@ export class PlannotatorBridge {
     const link = await this.sessions?.sessionFor(parked.agentId) ?? null;
     if (link) await this.sessions!.expectReview(link.sessionId, event.localUrl, parked.plan, reviewLink, review.id);
     // Not once decided: the decision's last step removes the record, which must not come back.
-    if (!parked.staged && (await this.settings.read()).writeback.status && await this.stageReview(parked.issueId, parked.identifier, review)) {
-      parked = { ...parked, staged: true };
-      await this.parking!.plans.put(parked);
+    if (!parked.staged && (await this.settings.read()).writeback.status) {
+      const record = { ...parked, staged: true };
+      if (await this.stageReview(parked.issueId, parked.identifier, review, () => this.parking!.plans.put(record))) parked = record;
     }
     if (parked.announced) return;
     if (!stableLink) this.show(event.localUrl);
@@ -1142,11 +1147,17 @@ export class PlannotatorBridge {
         await this.linear.removeLabel(issue.id, PLAN_REWORK_LABEL);
       });
       await steps.once("small-route", async () => { await this.smallRoutes?.planApproved(issue.id); });
-      preflight = await steps.once("handoff", async () => sessionId && sessions ? sessions.queueable(sessionId, attempt.agentId) : "none" as const);
-      await steps.once("stage", async () => {
-        const moved = preflight === "none" ? await this.linear.moveToReady(issue.id) : await this.linear.moveToPlanStage(issue.id, PLAN_APPROVED_STATE, { orReady: true });
-        if (moved.note) console.error(`[linear-tickets] ${issue.identifier}: ${moved.note}`);
-      });
+      // An attempt from before the plan stages that already queued its thread (`ready` wrote Todo,
+      // `queue` ran) keeps that outcome: its successor may already work, so no stage is written.
+      const legacyQueue = steps.value<"queued" | "moved-on" | "none">("queue");
+      if (legacyQueue !== undefined) preflight = legacyQueue === "none" ? "none" : "queueable";
+      else {
+        preflight = await steps.once("handoff", async () => sessionId && sessions ? sessions.queueable(sessionId, attempt.agentId) : "none" as const);
+        await steps.once("stage", async () => {
+          const moved = preflight === "none" ? await this.toReadyUnlessWorking(issue.id) : await this.linear.moveToPlanStage(issue.id, PLAN_APPROVED_STATE, { orReady: true });
+          if (moved.note) console.error(`[linear-tickets] ${issue.identifier}: ${moved.note}`);
+        });
+      }
     } else {
       await steps.once("stage", async () => {
         const moved = await this.linear.moveToPlanStage(issue.id, PLANNING_STATE);
@@ -1159,7 +1170,7 @@ export class PlannotatorBridge {
     const queued = await steps.once("queue", async () => preflight !== "none" && sessionId && sessions ? sessions.requeueSession(sessionId, attempt.agentId) : "none" as const);
     // A successor that already runs is never moved back (moveToPlanStage's no-regression rule):
     // only a ticket still in Plan approved goes to Todo when no agent will take it over.
-    if (attempt.approved && preflight !== "none") {
+    if (attempt.approved && preflight !== "none" && steps.value("handoff") !== undefined) {
       await steps.once("reconcile", async () => {
         if (queued !== "none") return queued;
         const now = await this.linear.issueStatus(issue.id);
@@ -1180,6 +1191,14 @@ export class PlannotatorBridge {
       await steps.created("comment", async (id) => Boolean(await this.linear.commentById(id)), (id) => this.linear.comment(issue.id, body, id));
     }
     if (this.parking) await steps.once("unpark", () => this.parking!.plans.remove(issue.id));
+  }
+
+  // Todo for an approved plan nothing will start (README, "Statuses and labels"), unless work
+  // already started on the ticket (a started state that is no plan stage): that is never moved back.
+  private async toReadyUnlessWorking(issueId: string): Promise<{ changed: boolean; note?: string }> {
+    const now = await this.linear.issueStatus(issueId);
+    if (now.statusType.trim().toLowerCase() === "started" && !planStage(now.status, now.statusType)) return { changed: false };
+    return this.linear.moveToReady(issueId);
   }
 
   // A decision on a working ticket agent's own review: its mode and model tier, the ticket's state
