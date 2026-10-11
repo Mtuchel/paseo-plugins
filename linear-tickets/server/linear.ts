@@ -5,7 +5,7 @@ import { Credentials } from "./credentials";
 import type { LabelEvent, SweptIssue } from "./label-rules";
 import { currentCaller, currentPriority, poolOf, rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
 import { operationName } from "./linear-usage";
-import { planStage } from "./plan-policy";
+import { PLAN_APPROVED_STATE, PLAN_REVIEW_STATE, PLANNING_STATE, planStage, type PlanStage } from "./plan-policy";
 import { NEEDS_INPUT_STATE } from "./writeback";
 
 const endpoint = "https://api.linear.app/graphql";
@@ -340,12 +340,12 @@ export function repairCandidateFilter(labels: string[], teamKeys: string[], opti
     ...(options.queueBlockers ? queueBlockerFilter() : {}),
   };
 }
-// The teams' tickets in the started state `state` (Planning), whatever their labels and delegate:
-// the label repair keeps those assigned to this host's app without any Paseo state label.
-export function orphanCandidateFilter(state: string, teamKeys: string[]): Record<string, unknown> {
+// The teams' tickets in the started states `states` (Planning, Plan review), whatever their labels
+// and delegate: the label repair keeps those assigned to this host's app without any Paseo state label.
+export function orphanCandidateFilter(states: string[], teamKeys: string[]): Record<string, unknown> {
   return {
     team: { key: { in: [...new Set(teamKeys)].sort() } },
-    state: { type: { eq: "started" }, name: { eqIgnoreCase: state } },
+    state: { type: { eq: "started" }, or: states.map((name) => ({ name: { eqIgnoreCase: name } })) },
   };
 }
 const REPAIR_IDS_BATCH = 50;
@@ -1181,14 +1181,15 @@ export class LinearService {
   }
 
   // Best-effort by design: callers surface `note` as a warning,
-  // and a failure here must never turn into a launch failure. `fromStarted`: move even out of a
-  // started state that is not work (writeback.ts sends a ticket whose wait ended back to work when
-  // nothing recorded the state the wait left); a closed ticket is still left alone.
+  // and a failure here must never turn into a launch failure. A plan stage (Planning, Plan review,
+  // Plan approved) is no work yet, so an implementer moves out of it. `fromStarted`: move even out
+  // of a started state that is not work (writeback.ts sends a ticket whose wait ended back to work
+  // when nothing recorded the state the wait left); a closed ticket is still left alone.
   async markInProgress(issue: Pick<Issue, "id" | "status" | "statusType">, teamId: string | null, options: { fromStarted?: boolean } = {}): Promise<{ changed: boolean; note?: string }> {
     return withPriority("owner", "status change", async () => {
       // Already started: avoid a repeat write and needless audit noise.
       const type = issue.statusType.trim().toLowerCase();
-      if (!options.fromStarted && type === "started") return { changed: false };
+      if (!options.fromStarted && type === "started" && !planStage(issue.status, type)) return { changed: false };
       if (options.fromStarted && (type === "completed" || type === "canceled" || type === "duplicate")) return { changed: false };
       if (!teamId) return { changed: false, note: "The ticket has no team, so it could not be marked in progress." };
       let states: TeamState[];
@@ -1230,13 +1231,13 @@ export class LinearService {
       .sort((a, b) => (a.priority || 5) - (b.priority || 5));
   }
 
-  // `state`: also read the teams' tickets in this started state (orphanCandidateFilter).
-  async repairCandidates(input: { labels: string[]; teamKeys: string[]; ids: string[]; queueBlockers?: boolean; state?: string }): Promise<RepairCandidate[]> {
+  // `states`: also read the teams' tickets in these started states (orphanCandidateFilter).
+  async repairCandidates(input: { labels: string[]; teamKeys: string[]; ids: string[]; queueBlockers?: boolean; states?: string[] }): Promise<RepairCandidate[]> {
     const found = new Map<string, RepairCandidate>();
     const ids = [...new Set(input.ids)].sort();
     const filters = [
       ...input.teamKeys.length ? [repairCandidateFilter(input.labels, input.teamKeys, { queueBlockers: input.queueBlockers })] : [],
-      ...input.teamKeys.length && input.state && !input.queueBlockers ? [orphanCandidateFilter(input.state, input.teamKeys)] : [],
+      ...input.teamKeys.length && input.states?.length && !input.queueBlockers ? [orphanCandidateFilter(input.states, input.teamKeys)] : [],
       // A queue-blocker read names the tickets it means: the record-id read would return the other
       // records' tickets too.
       ...(input.queueBlockers ? [] : Array.from({ length: Math.ceil(ids.length / REPAIR_IDS_BATCH) }, (_, index) => ({ id: { in: ids.slice(index * REPAIR_IDS_BATCH, (index + 1) * REPAIR_IDS_BATCH) } }))),
@@ -2131,6 +2132,36 @@ export class LinearService {
       if (!target) return { changed: false, note: "The ticket's team has no unstarted state." };
       succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
       return { changed: true };
+    });
+  }
+
+  // Moves the ticket into a plan stage (README, "Statuses and labels"), reading its status right
+  // before the write, never from a caller's earlier snapshot. Closed tickets and tickets already
+  // there are left alone. No regression: Plan approved is written only from Triage, Backlog, Todo,
+  // Planning or Plan review, never once implementation started (In Progress or later), so a
+  // successor that already works is never moved back; Planning and Plan review may be written from
+  // any open state (a send-back or a new plan round moves back on purpose). Linear has no
+  // compare-and-set: this holds for the plugin's own serialized writes, not for a hand-made move in
+  // the same instant. A team without Plan review gets Planning. One without Plan approved keeps
+  // today's behaviour: nothing is written, or with `orReady` (a parked plan's handoff) its first
+  // unstarted state (Todo), under the same rule. `moved`: the state written, when one was.
+  async moveToPlanStage(issueId: string, stage: PlanStage, options: { orReady?: boolean } = {}): Promise<{ changed: boolean; moved?: string; note?: string }> {
+    return withPriority("owner", "status change", async () => {
+      const state = await this.issueCore(issueId);
+      const type = state.statusType.trim().toLowerCase();
+      if (type === "completed" || type === "canceled" || type === "duplicate") return { changed: false };
+      if (!state.teamId) return { changed: false, note: "The ticket has no team." };
+      if (stage === PLAN_APPROVED_STATE && !(["triage", "backlog", "unstarted"].includes(type) || planStage(state.status, type))) return { changed: false };
+      const states = await this.teamStates(state.teamId);
+      const named = (wanted: PlanStage) => states.find((item) => planStage(item.name, item.type) === wanted);
+      const target = named(stage)
+        ?? (stage === PLAN_REVIEW_STATE ? named(PLANNING_STATE) : undefined)
+        ?? (stage === PLAN_APPROVED_STATE && options.orReady ? states.filter((item) => item.type === "unstarted").sort((a, b) => a.position - b.position)[0] : undefined);
+      if (!target) return stage === PLAN_APPROVED_STATE ? { changed: false } : { changed: false, note: `The ticket's team has no started state named "${stage}".` };
+      // The Todo fallback leaves a ticket that is not started yet where it is.
+      if (target.id === state.statusId || (target.type === "unstarted" && type !== "started")) return { changed: false };
+      succeeded(await this.writeState(issueId, target.id), "issueUpdate", `move the ticket to ${target.name}`);
+      return { changed: true, moved: target.name };
     });
   }
 

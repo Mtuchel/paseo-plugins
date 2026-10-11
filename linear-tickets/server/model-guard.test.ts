@@ -3,7 +3,7 @@ import test from "node:test";
 import { setImmediate } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
 import { drift, ModelGuard } from "./model-guard";
-import { launchTier, type TierRecord, type TierSource } from "./model-tiers";
+import { launchTier, writeTierLabel, type TierRecord, type TierSource } from "./model-tiers";
 import type { Tier } from "../shared/plan-model";
 
 const settings = { launchPreferences: { omp: { model: "omp/anthropic/claude-opus-5-5", modeId: "full", thinkingOptionId: "medium" } }, cheapModels: {}, standardModels: {} };
@@ -146,4 +146,27 @@ test("a tier decided right after a restore is applied at once, not after the qui
     "thinking max",
     "announce cheap deepseek/deepseek-flash · thinking max",
   ]);
+});
+
+// AC-12 (TUC-1289): the tier label swap is one write, so Linear's `model` label group (one label of
+// the group per ticket) never refuses it; a missing tier label is created inside the group.
+test("the tier label is swapped in one write, skipped when already right, and created inside the model group", async () => {
+  const writes: string[] = [];
+  const catalog = [
+    { id: "g", name: "model", isGroup: true, parentId: null, teamId: null },
+    { id: "team-cheap", name: "model:cheap", isGroup: false, parentId: null, teamId: "t1" },
+    { id: "cheap", name: "model:cheap", isGroup: false, parentId: "g", teamId: null },
+    { id: "strong", name: "Model:Strong", isGroup: false, parentId: "g", teamId: null },
+  ];
+  const linear = {
+    labelCatalog: async () => { writes.push("catalog"); return catalog; },
+    createLabel: async (input: { name: string; parentId?: string }) => { writes.push(`create ${input.name} in ${input.parentId}`); return "new-standard"; },
+    changeLabels: async (issueId: string, added: string[], removed: string[]) => { writes.push(`${issueId} +${added.join(",")} -${removed.join(",")}`); },
+  };
+  await writeTierLabel(linear, "i1", "strong", [{ id: "cheap", name: "model:cheap" }, { id: "x", name: "model:standard" }, { id: "p", name: "paseo" }]);
+  await writeTierLabel(linear, "i2", "strong", [{ id: "strong", name: "model:strong" }]);
+  await writeTierLabel(linear, "i3", "cheap", [{ id: "strong", name: "model:strong" }, { id: "cheap", name: "model:cheap" }]);
+  await writeTierLabel(linear, "i4", "standard", []);
+  await writeTierLabel(linear, "i5", "standard", []);
+  assert.deepEqual(writes, ["catalog", "i1 +strong -cheap,x", "i3 + -strong", "catalog", "create model:standard in g", "i4 +new-standard -", "i5 +new-standard -"]);
 });

@@ -20,6 +20,7 @@ import type { PluginSettings, Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 import { activeModel } from "./model";
 import { availability, candidates, LIMIT_DAY, LIMIT_SPACING, limitError, limitSchedule, limitTime, normalizeModel, type UsageReader } from "./limit-resume";
+import { PLAN_APPROVED_STATE, planStage } from "./plan-policy";
 
 // Projects carrying the trigger label move forward on their own (README, "Projects"):
 // 1. Whenever a project has had unplanned tickets long enough, the plugin starts a planner run of
@@ -952,8 +953,8 @@ export class ProjectFlow {
   // Tickets assigned to Paseo that never got an agent: the launch failed (TUC-53: "Daemon client
   // closed", TUC-534: OMP did not come up) or Linear's webhook never arrived (TUC-290). The ticket
   // stays assigned to Paseo, so the hand-out never takes it again, and assigning Paseo once more
-  // opens no new thread. Such a ticket still waits in Backlog or Todo (a started agent moves it
-  // on), is not a group (a parent waits there while its sub-issues work), has no live agent, no
+  // opens no new thread. Such a ticket still waits in Backlog, Todo or Plan approved (a started
+  // agent moves it on), is not a group (a parent waits there while its sub-issues work), has no live agent, no
   // start under way, and its newest thread neither waits for a slot, ever had an agent nor was
   // closed on purpose (a plan approved for later is back in Todo on purpose, a delegation by
   // someone else was refused). RESTART_GRACE_MS after it is first seen so it is started again with
@@ -967,7 +968,7 @@ export class ProjectFlow {
     const skip = new Set([labels.hold, labels.manual, labels.needsYou, labels.running, labels.failed, settings.dispatch.label].map((name) => name.toLowerCase()));
     const parents = new Set(read.work.map((issue) => issue.parentId).filter(Boolean));
     const repairing = await this.repairing();
-    const suspects = await this.inFocus(read.work.filter((issue) => issue.delegateId === appId && !read.parked(issue) && HAND_OUT_TYPES.has(issue.statusType) && !parents.has(issue.id) && !repairing.has(issue.id)
+    const suspects = await this.inFocus(read.work.filter((issue) => issue.delegateId === appId && !read.parked(issue) && (HAND_OUT_TYPES.has(issue.statusType) || planStage(issue.status, issue.statusType) === PLAN_APPROVED_STATE) && !parents.has(issue.id) && !repairing.has(issue.id)
       && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished)), paseo);
     const stalled: ProjectIssue[] = [];
     for (const issue of suspects) {

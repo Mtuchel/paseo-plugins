@@ -6,7 +6,7 @@ import { JsonFile } from "./activation";
 import { dispatchLabels } from "./dispatch";
 import { inReviewState, type FocusNode, type LinearService } from "./linear";
 import type { ParkedPlans } from "./parked";
-import { PLAN_READY_LABEL } from "./plan-policy";
+import { PLAN_APPROVED_STATE, PLAN_READY_LABEL, PLAN_REVIEW_STATE, planStage } from "./plan-policy";
 import { LIVE_AGENT } from "./process-liveness";
 import type { PluginSettings, Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
@@ -101,9 +101,10 @@ export class Focus {
   // this host, a dispatch status label (`-running`, `-needs-you`, `-blocked`, `-failed`), or a
   // started ticket of the dispatch teams that Paseo has (delegated to this host's or the peer's
   // app, carrying a Paseo agent link, or carrying `plan-ready`: an approved plan being implemented,
-  // also once its agent was archived). An approved plan that no agent implements yet (Todo or
-  // Backlog with `plan-ready`, no live agent) is new work and waits. Already on: the tickets in
-  // flight now that are not roots yet join them, and none leaves, so it never lets new work start.
+  // also once its agent was archived). An approved plan that no agent implements yet (Todo,
+  // Backlog or Plan approved with `plan-ready`, no live agent) is new work and waits. Already on:
+  // the tickets in flight now that are not roots yet join them, and none leaves, so it never lets
+  // new work start.
   async enable(paseo: PaseoApi): Promise<FocusStatus> {
     const settings = await this.deps.settings.read();
     const labels = dispatchLabels(settings.dispatch.label);
@@ -118,7 +119,7 @@ export class Focus {
     }
     for (const node of await this.deps.linear.focusTickets([...agents.keys()].filter((id) => !candidates.has(id)))) candidates.set(node.id, node);
     const roots = Object.fromEntries([...candidates.values()]
-      .filter((node) => !(["unstarted", "backlog", "triage"].includes(node.statusType) && planReady(node) && !agents.get(node.id)?.live))
+      .filter((node) => !((["unstarted", "backlog", "triage"].includes(node.statusType) || planStage(node.status, node.statusType) === PLAN_APPROVED_STATE) && planReady(node) && !agents.get(node.id)?.live))
       .map((node) => [node.id, node.identifier]));
     const since = new Date(this.now()).toISOString();
     // -1: focus was off and starts now; otherwise how many tickets in flight joined it.
@@ -229,7 +230,7 @@ export class Focus {
       // labels and states its plugin writes, so a peer claim counts as working only after those.
       const phase: FocusPhase = CLOSED.includes(node.statusType) ? "done"
         : agent?.working ? "working"
-          : agent?.waiting || parked.has(id) || /needs input|plan review/i.test(node.status) || node.labels.some((name) => needsYou.has(name.toLowerCase())) ? "needs-you"
+          : agent?.waiting || parked.has(id) || /needs input/i.test(node.status) || planStage(node.status, node.statusType) === PLAN_REVIEW_STATE || node.labels.some((name) => needsYou.has(name.toLowerCase())) ? "needs-you"
             : inReviewState(node.status, node.statusType) ? (node.finished ? "done" : "review")
               : peer?.has(id) ? "working"
                 : "waiting";

@@ -14,6 +14,7 @@ import { PLANNOTATOR_HOST_SOURCE } from "./plannotator-host-source";
 // decision starts a fresh agent that implements the plan, or plans again with the feedback.
 
 // `announced`: the owner was told (comment, panel question, tab) once; a host restart only rebinds.
+// `staged`: the ticket's status (Plan review) and labels were written for this parked plan.
 export type ParkedPlan = {
   issueId: string;
   identifier: string;
@@ -24,6 +25,7 @@ export type ParkedPlan = {
   model: string | null;
   parkedAt: string;
   announced: boolean;
+  staged?: boolean;
 };
 
 export function parkedPaths(home?: string) {

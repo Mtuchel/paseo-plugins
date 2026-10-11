@@ -57,6 +57,11 @@ async function harness(run: (h: Harness) => Promise<void>) {
       addLabel: async (_issueId, name) => { if (!labels.includes(name)) labels.push(name); calls.push(`+${name}`); },
       removeLabel: async (_issueId, name) => { const at = labels.indexOf(name); if (at !== -1) labels.splice(at, 1); calls.push(`-${name}`); },
       moveToStateNamed: async (_issueId, name) => { calls.push(`state ${name}`); return { changed: true }; },
+      issueCore: async () => state(),
+      // Label ids are their names; the tier swap is one write.
+      changeLabels: async (_issueId, added, removed) => { for (const name of removed) labels.splice(labels.indexOf(name), 1); for (const name of added) if (!labels.includes(name)) labels.push(name); calls.push(`labels +${added.join(",")} -${removed.join(",")}`); },
+      labelCatalog: async () => ["model:cheap", "model:standard", "model:strong"].map((name) => ({ id: name, name, isGroup: false, parentId: null, teamId: null })),
+      createLabel: async (input) => input.name,
     },
     untrusted: async () => owner.untrusted,
     settings: { read: async () => settings },
@@ -85,7 +90,7 @@ test("AC-3: an eligible attempt is accepted once, then recorded, switched, comme
   await harness(async ({ routes, calls, labels, comments, tiers, decision, record }) => {
     await routes.handle(event(), AGENT);
     assert.equal((await decision())?.decision, "accepted");
-    assert.deepEqual(calls, ["mode agent-1 full", "label agent-1 linear.plan=small-route", "state In Progress", "comment", "+no-plan", "+model:cheap", "-model:standard", "-model:strong", "apply agent-1"]);
+    assert.deepEqual(calls, ["mode agent-1 full", "label agent-1 linear.plan=small-route", "state In Progress", "comment", "+no-plan", "labels +model:cheap -", "apply agent-1"]);
     assert.deepEqual(labels, ["no-plan", "model:cheap"]);
     assert.equal((await tiers.get("issue-1"))?.tier, "cheap");
     assert.equal((await tiers.get("issue-1"))?.history.at(-1)?.source, "route");

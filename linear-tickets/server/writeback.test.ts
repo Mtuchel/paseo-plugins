@@ -173,6 +173,24 @@ test("a required-plan agent's first turn moves its ticket to Planning, unless th
   assert.deepEqual(approved.writes, ["state"]);
 });
 
+test("a planner's first turn on Plan review or Plan approved starts a new round in Planning; an implementer leaves the plan stage", async () => {
+  const planFirst = paseoWithLabels({ "linear.issueId": "issue-1", "linear.plan": "required" });
+  for (const status of ["Plan review", "Plan approved"]) {
+    const linear = new FakeLinear();
+    linear.state = { ...linear.state, status, statusType: "started" };
+    await new Writeback(linear, { read: async () => allOn }, undefined, 0).turnStarted({ agent: root, turnId: "a" }, planFirst);
+    assert.deepEqual(linear.writes, ["state", "move issue-1 Planning"], status);
+  }
+  const planning = new FakeLinear();
+  planning.state = { ...planning.state, status: "Planning", statusType: "started" };
+  await new Writeback(planning, { read: async () => allOn }, undefined, 0).turnStarted({ agent: root, turnId: "a" }, planFirst);
+  assert.deepEqual(planning.writes, ["state"]);
+  const implementer = new FakeLinear();
+  implementer.state = { ...implementer.state, status: "Plan approved", statusType: "started" };
+  await new Writeback(implementer, { read: async () => allOn }, undefined, 0).turnStarted({ agent: root, turnId: "a" }, linked);
+  assert.deepEqual(implementer.writes, ["state", "in-progress issue-1"]);
+});
+
 test("turn-start state changes keep cold prerequisites in the owner reserve at 3% points", async (t) => {
   for (const planFirst of [false, true]) {
     const budget = new RateBudget(() => 0);

@@ -73,18 +73,22 @@ test("turning focus on takes the tickets with work under way, but not an approve
     node("implementing", { labels: ["plan-ready"] }),
     // In Progress on an approved plan whose agent was archived and whose agent link is gone.
     node("orphaned", { statusType: "started", status: "In Progress", labels: ["plan-ready"] }),
+    // AC-9 (TUC-1289): approved, its implementing agent queued but not started yet.
+    node("approved", { statusType: "started", status: "Plan approved", delegateId: "app", labels: ["plan-ready"] }),
+    node("approved-live", { statusType: "started", status: "Plan approved", delegateId: "app", labels: ["plan-ready"] }),
     node("fresh"),
   ], [
     { id: "a1", status: "idle", issueId: "agent" },
     { id: "a2", status: "closed", issueId: "parked" },
     { id: "a3", status: "running", issueId: "implementing" },
     { id: "a4", status: "running", issueId: "fresh", subagent: true },
+    { id: "a5", status: "running", issueId: "approved-live" },
   ]);
   const status = await w.focus.enable(w.paseo);
   assert.equal(status.active, true);
-  assert.deepEqual(status.tickets.map((ticket) => ticket.id).sort(), ["agent", "delegated", "implementing", "labelled", "linked", "orphaned"]);
+  assert.deepEqual(status.tickets.map((ticket) => ticket.id).sort(), ["agent", "approved-live", "delegated", "implementing", "labelled", "linked", "orphaned"]);
   assert.ok(status.tickets.every((ticket) => ticket.reason === "in-flight"));
-  for (const id of ["human", "parked", "fresh"]) assert.equal(await w.focus.admits(id, w.paseo), FOCUS_REASON, id);
+  for (const id of ["human", "parked", "fresh", "approved"]) assert.equal(await w.focus.admits(id, w.paseo), FOCUS_REASON, id);
   assert.equal(await w.focus.admits("implementing", w.paseo), null);
 });
 
@@ -178,17 +182,18 @@ test("the status says what each ticket waits for, and focus is complete once all
 test("the owner's manual tasks and parked plans wait for you, and a ticket the peer host's agent works is working", async (t) => {
   let claims: () => Promise<Set<string> | null> = async () => new Set(["peer", "peer-review"]);
   const w = await world(t, [
-    node("root", { statusType: "started", status: "In Progress", delegateId: "app", children: ["manual", "peer", "peer-review", "idle"] }),
+    node("root", { statusType: "started", status: "In Progress", delegateId: "app", children: ["manual", "peer", "peer-review", "idle", "approved"] }),
     node("manual", { labels: ["paseo-manual"] }),
     node("parked", { statusType: "started", status: "Planning", delegateId: "app" }),
     node("peer", { statusType: "started", status: "In Progress", delegateId: "peer-app" }),
     node("peer-review", { statusType: "started", status: "In Review", delegateId: "peer-app" }),
     node("idle"),
+    node("approved", { statusType: "started", status: "Plan approved", delegateId: "app", labels: ["plan-ready"] }),
   ], [{ id: "a1", status: "running", issueId: "root" }], [], { peer: () => claims(), parked: ["parked"] });
   const status = await w.focus.enable(w.paseo);
   const phases = Object.fromEntries(status.tickets.map((ticket) => [ticket.id, ticket.phase]));
-  assert.deepEqual(phases, { root: "working", manual: "needs-you", parked: "needs-you", peer: "working", "peer-review": "review", idle: "waiting" });
-  assert.deepEqual({ left: status.left, complete: status.complete }, { left: 5, complete: false });
+  assert.deepEqual(phases, { root: "working", manual: "needs-you", parked: "needs-you", peer: "working", "peer-review": "review", idle: "waiting", approved: "waiting" });
+  assert.deepEqual({ left: status.left, complete: status.complete }, { left: 6, complete: false });
 
   // The peer's claims cannot be read: the ticket falls back to what this host and Linear know.
   claims = async () => { throw new Error("claims unreadable"); };

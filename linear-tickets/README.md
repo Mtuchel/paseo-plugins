@@ -856,7 +856,8 @@ reviewed like a new plan. A `model:` label or an earlier decided tier on the tic
 skips this.
 
 When the approved plan is implemented, the agent starts on the strongest of: the ticket's
-`model:cheap` / `model:standard` / `model:strong` label (set by the plugin on approval; change it to
+`model:cheap` / `model:standard` / `model:strong` label (one Linear label group `model`, so one per
+ticket; set by the plugin on approval; change it to
 override), the ticket's latest decided tier (an approved plan or an escalation; an escalation
 stays), and the plan's tier, which its risk rating raises to `strong` when a rule above requires
 it. The cheap tier runs the provider's model in `cheapModels` (default for omp:
@@ -897,9 +898,10 @@ before every shell command, reads included) and starts in Plannotator's planning
 The prompt asks only for a plan and, for a ticket that neither you nor a Paseo app (this host's or
 the peer's) wrote, or one labelled `feedback`, marks its text as untrusted input. With status
 write-back on, the ticket starts in **Planning** instead
-of In Progress. Approving the plan switches the agent to your usual mode. A plan you sent back is
-planned again by the next agent, which gets the previous plan and your feedback from the ticket's
-plan document.
+of In Progress, and moves through **Plan review** and **Plan approved** (see
+[Statuses and labels](#statuses-and-labels)). Approving the plan switches the agent to your usual
+mode. A plan you sent back is planned again by the next agent, which gets the previous plan and
+your feedback from the ticket's plan document.
 
 **Plan on a running agent.** Add `plan` to the ticket while its agent implements an approved plan:
 within a minute the plugin asks the agent for a new plan. An omp agent enters the planning phase at
@@ -1001,18 +1003,20 @@ extension's record their plans always reach you.
 
 **Parked plans.** A plan that needs you does not keep its agent (an agent slot and its memory)
 waiting. The plugin saves it to `$PASEO_HOME/linear-tickets/plannotator/parked/<issue>.json`,
-closes the agent's own review, archives the agent, and moves the ticket to **Planning** without
-`plan-ready`. A central Plannotator host the plugin runs (`plannotator/host.mjs`, a detached Bun
+closes the agent's own review, archives the agent, and moves the ticket to **Plan review** without
+`plan-ready` or `plan-rework` (once per parked plan). A central Plannotator host the plugin runs (`plannotator/host.mjs`, a detached Bun
 process) serves every parked plan with Plannotator's own review page, published in the tailnet
 like any review, so the review inbox, the agent's stable link, the panel and the Linear comment
 work as before; like any review with a stable link, it opens no browser tab (the inbox and its
 notification take that place).
 Your decision there, or **Approve plan** / **Send back** in the panel:
 
-- approve: the plan document, `plan-ready`, the ticket back to Todo, and a fresh agent that
-  implements the plan as soon as a slot is free (with a Linear agent session; otherwise assign
-  Paseo again);
-- send back: the plan document with your feedback, and a fresh agent that plans again from it.
+- approve: the plan document, `plan-ready`, and a fresh agent that implements the plan as soon as
+  a slot is free. With a Linear agent session the ticket moves to **Plan approved** before that
+  agent can start; without one (or when the session closed meanwhile) it goes back to Todo and
+  you assign Paseo again;
+- send back: the plan document with your feedback, **Planning** with `plan-rework`, and a fresh
+  agent that plans again from it.
 
 While a plan waits for you, nothing else starts an agent on its ticket: every automatic start
 path (a queued thread, a restart, a forwarded activation) is refused with "A plan for this ticket
@@ -1182,14 +1186,16 @@ directory to keep a trial out of the ops digest.
 
 **`plan-ready`.** Every approved plan adds the `plan-ready` label: always for a split or
 “Approve, implement later”, and with status write-back on for Plannotator and panel approvals,
-where a new review round or a plan sent back removes it again.
+where a new review round or a plan sent back removes it again. It is the plugin's own marker
+next to the status (see [Statuses and labels](#statuses-and-labels)).
 A ticket that carries it starts its next agent in your usual mode, with the approved
 “Plan: <ticket>” document in the prompt and the instruction to implement it rather than plan
 again.
 
 **Approve, implement later.** The plan review also offers **Approve, implement later**. The
 plan is saved as the plan document, the planning agent is closed (no Resume offer), and the
-ticket goes back to Todo with `plan-ready`. Reply in the panel, assign Paseo again or add the
+ticket goes back to Todo with `plan-ready` (not **Plan approved**: nothing starts it until you
+do). Reply in the panel, assign Paseo again or add the
 trigger label to start the implementing agent. Like **Approve & split**, it is journaled first
 (see **Decision journal**): if a step fails, the panel answers `Approved — being applied:
 <reason>. Retried every minute until it goes through.` and the rest follows on its own, without a
@@ -1342,8 +1348,9 @@ root ticket agent on this host that is not archived, every open ticket of the di
 carrying `paseo-running`, `paseo-needs-you`, `paseo-blocked` or `paseo-failed`, and every started
 ticket of those teams (In Progress, In Review, …) that is delegated to this host's or the peer's
 Paseo app, carries a Paseo agent link, or carries `plan-ready` (an approved plan being implemented,
-also after its agent was archived). An approved plan that no agent implements yet (Todo or
-Backlog with `plan-ready`, no live agent) is new work and is not in flight. Turning focus on
+also after its agent was archived). An approved plan that no agent implements yet (Todo,
+Backlog or **Plan approved** with `plan-ready`, no live agent) is new work and is not in flight.
+Turning focus on
 while it is on reads the tickets in flight again: the ones it did not have join, none leaves, and
 focus does not start over.
 
@@ -1559,7 +1566,7 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
 - **Restarting a failed start.** A ticket stays assigned to Paseo when its start fails (the
   launch timed out, the daemon connection dropped) or Linear's webhook never arrives, so the
   hand-out never takes it again. So every project read also checks each ticket assigned to Paseo
-  that is still in Backlog or Todo (a started agent moves it on), is not a group, carries none of
+  that is still in Backlog, Todo or **Plan approved** (a started agent moves it on), is not a group, carries none of
   the `paseo`, `paseo-running`, `paseo-failed`, `paseo-hold`, `paseo-manual` or `paseo-needs-you`
   labels, has every blocker finished and was not created by Paseo (a follow-up it filed in
   Backlog waits for you: nothing restarts it and no failed start is reported for it). When it has
@@ -1587,7 +1594,7 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
     `paseo-running` stays, and `paseo-failed` comes off with a comment.
   - *`paseo-running` without one for 15 minutes:* the label (and `paseo-failed`, if it carries
     both) comes off under the ticket's start lock, after a last look, with one comment. A ticket
-    in Triage, Backlog, Todo, Planning or In Progress without `paseo-hold`, `paseo-manual` or
+    in Triage, Backlog, Todo, Planning, Plan review, Plan approved or In Progress without `paseo-hold`, `paseo-manual` or
     `paseo-needs-you` is started again, continuing its recorded branch, 15 minutes apart, at most
     three times; then Paseo comments once and stops. Other tickets only lose the label: in Needs
     input your answer starts the next agent, in review the pull request watch does.
@@ -1595,13 +1602,13 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
     minutes after the failure was first seen, then 30 and 90 minutes after each failed retry. A
     retry that starts an agent removes `paseo-failed` and says so; after the third failure you are
     mentioned once and the label stays.
-  - *An orphan:* a ticket in Planning that is assigned to this host's Paseo app (not the peer's,
+  - *An orphan:* a ticket in Planning or Plan review that is assigned to this host's Paseo app (not the peer's,
     not nobody's) and carries none of the `paseo`, `paseo-running`, `paseo-failed`, `paseo-hold`,
     `paseo-manual` and `paseo-needs-you` labels, without an agent (as above), a parked plan or a
     thread waiting for its turn. Its agent was archived or stopped while planning, its review was
     never delivered, or a send-back's fresh agent failed, and neither the hand-out nor
-    **Restarting a failed start** (Backlog and Todo only) would ever start it. The same pass reads
-    the dispatch teams' Planning tickets for it, and 15 minutes after an orphan was first seen it
+    **Restarting a failed start** (Backlog, Todo and Plan approved only) would ever start it. The
+    same pass reads the dispatch teams' Planning and Plan review tickets for it, and 15 minutes after an orphan was first seen it
     is started again like a vanished agent: continuing its recorded branch, 15 minutes apart, at
     most three times, then Paseo comments once and stops. A ticket that stops being an orphan
     (an agent, a label, a parked plan, another state) ends the incident; once restarted it is kept
@@ -2616,9 +2623,11 @@ and their buttons are forwarded to it.
   drops is removed. Subscribe on one host's inbox: each host notifies its own subscribers.
 
 With status write-back on, a ticket moves to its team's started state named **Planning**
-when a plan is handed off (and stays there when it is sent back), and to **In Progress** once
-the plan is approved. Create a “Planning” state of type *started* in the team for this; teams
-without one are left alone.
+while an agent drafts the plan, to **Plan review** when the plan waits for you, to
+**Plan approved** once it is approved and to **In Progress** when the implementing agent starts
+(see [Statuses and labels](#statuses-and-labels)). Create these states of type *started* in the
+team; a team without **Plan review** gets Planning there, one without **Plan approved** goes
+straight on as before, and a team without Planning is left alone.
 
 When a review is decided, the omp plan extension (`~/.omp/agent/extensions/plannotator-omp-plan.ts`)
 records the plan and your feedback. The plugin then adds a chat row and, for ticket agents,
@@ -2685,7 +2694,9 @@ written as the Paseo app (see [Who Linear shows as the author](#who-linear-shows
 independently of the agent's own `linear_ticket` tools:
 
 - **Status** — the agent's first turn moves the ticket into its team's In Progress state,
-  following the same rules as the launch-time setting. A completed or canceled ticket is left
+  following the same rules as the launch-time setting; an implementing agent also moves it out
+  of a plan stage (Planning, Plan review, Plan approved), and a planning agent on Plan review or
+  Plan approved (a new plan round) moves it back to Planning. A completed or canceled ticket is left
   as it is: an agent still working after its merge closed the ticket does not reopen it.
 - **Turn summaries** — each completed turn's final reply is posted as a comment (capped at
   4,000 characters), a failed turn posts its error, and archiving an agent that never linked
@@ -2789,6 +2800,70 @@ replayed, and a Linear failure is logged (`paseo plugin logs linear-tickets`) wi
 affecting the agent. A write-back that hits Linear's rate limit waits for the quota instead
 (see [Rate limits](#rate-limits)).
 
+## Statuses and labels
+
+Every open ticket assigned to Paseo has exactly one responsible next step — a live agent, a review
+in your inbox, a queue entry, or a question to you — and its status names which. Labels only carry
+attributes next to the status. The plan stages are started states the team creates under these
+exact names (case and spacing aside); a team without them keeps the older behaviour described with
+each write.
+
+| Status | Meaning | Who acts next |
+| -- | -- | -- |
+| Triage, Backlog, Todo | not started; Todo with `plan-ready` is an approved plan held for you (**Approve, implement later**, or a parked plan approved without a Linear agent session) | you, the hand-out or the trigger label start it |
+| Planning | an agent drafts the plan, advisor rounds included; with `plan-rework` the previous plan was sent back | the planning agent |
+| Plan review | the plan waits for your decision; the stable inbox link is on the ticket | you |
+| Plan approved | the plan is approved (by you or the risk policy) and the handoff to the implementing agent is pending: the planner switching over, or a queued thread waiting for a slot | Paseo |
+| In Progress | an agent implements the plan | the implementing agent |
+| Needs input | an agent waits for your answer | you |
+| In Review, Ready to merge | a pull request is open | the pull request watch, then you |
+| Done, Canceled | finished | nobody |
+
+How a plan moves (with status write-back on):
+
+- An agent planning: **Planning** (its first turn moves a ticket from Plan review or Plan approved
+  back there: a new plan round).
+- A plan submitted for your review, its agent's own or a parked one: **Plan review**, and
+  `plan-ready` and `plan-rework` come off. A decision already accepted for that review keeps its
+  own status and labels.
+- Approved, its agent goes on: **Plan approved**, then **In Progress**; the risk policy's approval
+  says so in its comment. An approval that arrives while the ticket is already In Progress or
+  later (a re-plan during implementation) stays there: a status never moves back from work to
+  Plan approved.
+- Approved parked plan: **Plan approved** before the queued agent can start, then In Progress when
+  it starts; without a Linear agent session, or when the session closed meanwhile, Todo with the
+  "Assign Paseo again" comment.
+- **Approve, implement later**: Todo with `plan-ready`. **Approve & split**: the parent In Progress
+  with `plan-ready`, its steps in Todo.
+- Sent back: **Planning** with `plan-rework`; the comment, progress note or panel note says
+  `Plan sent back (round N)`. N is read from the `> **Review round:** N` header line of the
+  previous `Plan: <ticket>` document (1 for the first, or for a document written before rounds
+  existed), so it survives restarts and both hosts.
+- An agent opens a pull request: **In Review** (never Plan review).
+
+Every ticket label the plugin sets, and what removes it:
+
+| Label | Set by | Removed by (or why it stays) |
+| -- | -- | -- |
+| `paseo` (the trigger) | you | the dispatcher when it claims the ticket, hands it out as a group, or a plan for it waits for you |
+| `paseo-running` | a start (dispatch, thread, project, successor, restart, label repair) | a failed start (swapped for `paseo-failed`), the last root agent archived, or the label repair after 15 minutes without an agent |
+| `paseo-failed` | a failed launch, or a start failing on this host's setup | a retry that starts an agent, an agent working on the ticket, the label repair; after the third failed retry it stays and you are mentioned once |
+| `paseo-blocked` | a failed turn (write-back **Blocked**) | the next completed turn, or the agent archived |
+| `paseo-needs-you` | a wait for you (write-back) | the wait ending (answered, turn ended, agent archived, lost wait found); on a "Needs you" sub-issue it stays: answering closes the sub-issue |
+| `paseo-manual` | a manual task an agent registered | stays on the task's sub-issue: closing the task ends it, and the saved view filters by status |
+| `paseo-hold` | a planner run's `hold`, a duplicate closed by the order, or you | a planner run's `release`, or you |
+| `paseo-attended` | a planner run's `attended`, or you | a planner run's `unattended`, or you |
+| `paseo-queued` | the wait line | admission, 20 minutes after it was last seen waiting, or a renamed trigger |
+| `plan` | you, while an agent works | you: only adding it asks for a plan, so it may stay; remove and add it to ask again |
+| `plan-ready` | an approval (machine flag: the next agent implements the plan; agent starts, away mode, focus mode, the night order and the deputy read it) | the next plan submission or a send-back |
+| `plan-rework` | a send-back | the next plan submission or an approval |
+| `no-plan` | the small-ticket route | the route undone by your `plan`, or an approved plan replacing the route |
+| `model:cheap`, `model:standard`, `model:strong` | an approved plan, the small-ticket route, an escalation, a strong split step | swapped in one write when the tier changes; never cleared |
+
+The three `model:` labels belong to the Linear label group `model`, so a ticket carries at most
+one tier. The plugin swaps them in one write (add the new one, remove the others), which works with
+or without the group, and creates a missing tier label inside the group when the group exists.
+
 ## Ticket state in the sidebar
 
 Each workspace with a ticket agent carries one workspace label naming its ticket's current Linear
@@ -2796,7 +2871,9 @@ state, for example `Linear: In Review`. The sidebar shows it as a chip next to t
 badge. Labels that start with `Linear: ` belong to the plugin. When the state changes, the old one
 is removed, and workspaces without a ticket agent lose theirs. Other labels are never touched.
 The colour comes from the state type: triage orange, backlog indigo, unstarted sky, completed
-emerald, canceled red. Started states are split by name: review violet, merge teal, planning blue,
+emerald, canceled red. Started states are split by name: the plan stages by their exact names
+(Planning blue, Plan review pink like Needs input, Plan approved sky like Todo: the daemon has
+ten label colours and every one is taken), then review violet, merge teal, planning blue,
 needs input pink, and anything else, such as In Progress, amber. A workspace whose agents work on
 different tickets shows the ticket its name carries (`TUC-1: …` or a `tuc-1-…` branch). Otherwise
 it shows the ticket of its oldest agent.

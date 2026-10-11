@@ -12,11 +12,13 @@ const IN_PROGRESS: TicketState = { name: "In Progress", type: "started" };
 test("colours follow the state type, and the stages of started work look different", () => {
   const colors = Object.fromEntries([
     ["Triage", "triage"], ["Backlog", "backlog"], ["Todo", "unstarted"], ["In Progress", "started"], ["In Review", "started"], ["Ready to merge", "started"],
-    ["Planning", "started"], ["Needs input", "started"], ["Done", "completed"], ["Canceled", "canceled"], ["Duplicate", "duplicate"], ["Odd", "unknown"],
+    ["Planning", "started"], ["Plan review", "started"], ["Plan approved", "started"], ["Needs input", "started"], ["Done", "completed"], ["Canceled", "canceled"], ["Duplicate", "duplicate"], ["Odd", "unknown"],
   ].map(([name, type]) => [name, stateLabelColor({ name, type })]));
+  // AC-11 (TUC-1289): the plan stages are not code review; with every daemon colour taken they share
+  // the colour of the state they wait like (Needs input, Todo).
   assert.deepEqual(colors, {
     Triage: "orange", Backlog: "indigo", Todo: "sky", "In Progress": "amber", "In Review": "violet", "Ready to merge": "teal",
-    Planning: "blue", "Needs input": "pink", Done: "emerald", Canceled: "red", Duplicate: "red", Odd: "sky",
+    Planning: "blue", "Plan review": "pink", "Plan approved": "sky", "Needs input": "pink", Done: "emerald", Canceled: "red", Duplicate: "red", Odd: "sky",
   });
 });
 

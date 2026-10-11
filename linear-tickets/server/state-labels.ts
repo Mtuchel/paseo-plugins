@@ -1,6 +1,7 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { UUID, type LinearService, type WrittenState } from "./linear";
 import { RateLimitedError, withPriority } from "./rate-budget";
+import { PLAN_APPROVED_STATE, PLAN_REVIEW_STATE, PLANNING_STATE, planStage, type PlanStage } from "./plan-policy";
 
 // Each ticket workspace carries one workspace label naming its ticket's Linear state
 // ("Linear: In Review"), so the sidebar row shows it next to the PR badge. Labels with this prefix
@@ -45,6 +46,16 @@ const COLOR_BY_TYPE: Record<string, LabelColor> = {
   canceled: "red",
   duplicate: "red",
 };
+// The plan stages by exact name (plan-policy.ts planStage) before the name patterns: Plan review
+// waits for the owner's plan decision, not for code review. The daemon has ten label colours and
+// every one is taken, so the stages share the colour of the state they mean the same as: Plan
+// review waits for the owner like Needs input (pink), Plan approved waits for an agent to start
+// like Todo (sky).
+const PLAN_STAGE_COLORS: Record<PlanStage, LabelColor> = {
+  [PLANNING_STATE]: "blue",
+  [PLAN_REVIEW_STATE]: "pink",
+  [PLAN_APPROVED_STATE]: "sky",
+};
 const STARTED_STAGES: [RegExp, LabelColor][] = [
   [/review/i, "violet"],
   [/merge/i, "teal"],
@@ -54,6 +65,8 @@ const STARTED_STAGES: [RegExp, LabelColor][] = [
 
 export function stateLabelColor(state: TicketState): LabelColor {
   const type = state.type.trim().toLowerCase();
+  const stage = planStage(state.name, type);
+  if (stage) return PLAN_STAGE_COLORS[stage];
   if (type === "started") return STARTED_STAGES.find(([pattern]) => pattern.test(state.name))?.[1] ?? COLOR_BY_TYPE.started;
   return COLOR_BY_TYPE[type] ?? COLOR_BY_TYPE.unstarted;
 }
