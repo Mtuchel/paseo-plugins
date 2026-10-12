@@ -158,6 +158,17 @@ test("the ask text comes from the description for Needs-you and manual issues, t
   assert.equal(asksOwner("Please reply yes and I'll proceed once you decide."), true, "the same detector write-back uses for a turn that ended by asking");
 });
 
+test("delivery receipts quoting an old ask never replace a newer owner question", () => {
+  const current = "**TUC-1** (Paseo) is waiting for an answer: choose the warehouse for the replacement.";
+  const comments = [
+    comment("browser-receipt", `Answered from the decision inbox: ${waitComment}`),
+    comment("historical-receipt", `Answered from the menu bar: ${waitComment}`),
+    comment("current", current),
+  ];
+  assert.equal(selectAskText({ needsYou: false, manual: false, waitCommentId: null, comments },
+    { description: "Previous ticket context" }), current);
+});
+
 test("the answer goes to the live asking agent, to a continuation when the ticket's agent is gone, and to a comment otherwise", () => {
   assert.deepEqual(askRoute({ manual: false, asking: "a1", live: new Set(["a1"]), history: true }), { route: "agent", agentId: "a1" });
   assert.deepEqual(askRoute({ manual: false, asking: "a1", live: new Set(), history: true }), { route: "continue", agentId: null });

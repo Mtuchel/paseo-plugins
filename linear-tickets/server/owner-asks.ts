@@ -73,7 +73,8 @@ type StoredExtraction = { hash: string; version: string; model: string; result: 
 const WAIT_COMMENT = /\) is waiting for (?:an answer|plan approval|permission):|\) finished its turn and is waiting for you:|Reply here with (?:“|")@paseo/;
 
 export function asksOwner(body: string): boolean {
-  if (body.startsWith("Answered from the menu bar:")) return false;
+  // Historical menu-bar receipts also quote asks; neither receipt is a new owner question.
+  if (/^Answered from (?:the menu bar|the decision inbox):/.test(body)) return false;
   return WAIT_COMMENT.test(body) || ownerRequest(body) !== null;
 }
 
@@ -286,7 +287,7 @@ export class OwnerAsks {
       await this.ledger.put(key, record);
       const sent = await this.dispatch(draft, input, value, text, key, paseo);
       record.result = sent.result;
-      if (sent.commentIssueId) record.comment = { issueId: sent.commentIssueId, body: `Answered from the menu bar: ${text}`, done: false };
+      if (sent.commentIssueId) record.comment = { issueId: sent.commentIssueId, body: `Answered from the decision inbox: ${text}`, done: false };
       if (!triage && draft.needsYou) record.close = { issueId: draft.issue.id, needsYou: true, done: false };
     }
     record.receipt.delivery = record.result.delivered;
@@ -303,7 +304,7 @@ export class OwnerAsks {
       return { result: { delivered: "closed", message: `Marked ${draft.issue.identifier} done.` }, commentIssueId: draft.issue.id };
     }
     if (!triage && (input.done || draft.route === "comment" || !paseo)) {
-      await this.deps.linear.comment(draft.issue.id, `Answered from the menu bar: ${text}`);
+      await this.deps.linear.comment(draft.issue.id, `Answered from the decision inbox: ${text}`);
       return { result: { delivered: "comment", message: `Recorded your answer as a comment on ${draft.issue.identifier}.` } };
     }
     const tell = async (agentId: string) => {
