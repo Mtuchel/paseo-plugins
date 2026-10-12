@@ -84,6 +84,9 @@ export function overrideCommand(message: string): { ref: string; text: string } 
 }
 
 export function fingerprint(request: AgentPermissionRequest): string {
+  // Bound browser permission answers must fence command/input and action changes too.
+  // Preserve existing question identities used by the deputy's durable candidates.
+  if (request.kind !== "question") return createHash("sha256").update(JSON.stringify(request)).digest("hex").slice(0, 24);
   return createHash("sha256").update(JSON.stringify({ kind: request.kind, title: request.title ?? "", description: request.description ?? "", questions: questionsOf(request) })).digest("hex").slice(0, 24);
 }
 

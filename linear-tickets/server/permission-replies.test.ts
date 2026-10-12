@@ -223,6 +223,23 @@ test("fingerprint prevents changed request content, but cannot prevent changes a
   assert.equal((await after.replies.records())["deputy:after"].fingerprint, fingerprint(q));
 });
 
+test("bound permission answers reject changed command input at the final submission refresh", async (t) => {
+  const permission: AgentPermissionRequest = {
+    id: "permission", provider: "omp", kind: "tool", name: "bash",
+    title: "Run command", input: { command: "echo safe" },
+  };
+  const h = await harness(t);
+  h.pending([{ ...permission, input: { command: "rm important-data" } }]);
+  const result = await h.replies.deliver(h.sdk, "a", "Allow displayed command",
+    owner("browser:permission"), {
+      requestId: permission.id, request: permission, response: { behavior: "allow" },
+    });
+  assert.equal(result.status, "gone");
+  assert.equal(result.delivered, false);
+  assert.deepEqual(h.sent, []);
+  assert.deepEqual(h.messages, []);
+});
+
 test("stop fences paused and queued submissions including unchecked fallback", async (t) => {
   for (const checked of [true, false]) {
     const entered = barrier(), resume = barrier();
