@@ -3329,7 +3329,10 @@ agents stay watched until their after-merge tasks are due.
 
 **Checks.** A task can carry a shell command that exits 0 once the step is done, for example a
 script that confirms a Railway variable exists. When you mark the task done, the plugin runs it
-(no stdin, 60 s timeout, in the agent's worktree, or your home directory when that is gone):
+(no stdin, 60 s timeout) in the agent's worktree. An archived agent's worktree is deleted later,
+so within a minute of a task's registration the plugin records the main checkout of that
+worktree's repository, and the check runs there once the worktree is gone (your home directory
+only when neither exists, where repository commands such as `gh pr view` fail):
 a pass comments "✓ Verified", a failure moves the task back to Todo and mentions you. The
 output only goes to `paseo plugin logs linear-tickets`, never to Linear, since it could hold a
 secret. A before-merge task marked done still gates until its check passes. The command is

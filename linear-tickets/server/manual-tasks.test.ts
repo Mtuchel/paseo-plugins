@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -28,7 +29,7 @@ class FakeLinear {
   async userUrl() { return OWNER; }
 }
 
-async function setup(tasks: ManualTask[], check?: (command: string, cwd: string) => Promise<CheckResult>) {
+async function setup(tasks: ManualTask[], check?: (command: string, directories: string[]) => Promise<CheckResult>) {
   const directory = await mkdtemp(join(tmpdir(), "paseo-manual-tasks-"));
   for (const item of tasks) await writeFile(join(directory, `${item.id}.json`), JSON.stringify(item));
   const linear = new FakeLinear();
@@ -65,8 +66,8 @@ test("new manual tasks get the label and one owner mention per ticket, only once
 test("a done task runs its check once per completion: passing verifies, failing reopens without leaking output", async () => {
   const runs: string[] = [];
   let pass = false;
-  const { linear, manual, stored, cleanup } = await setup([task("a", { check: "railway variables | grep -q X" }), task("plain"), task("dropped", { check: "true" })], async (command, cwd) => {
-    runs.push(`${command} @ ${cwd}`);
+  const { linear, manual, stored, cleanup } = await setup([task("a", { check: "railway variables | grep -q X" }), task("plain"), task("dropped", { check: "true" })], async (command, directories) => {
+    runs.push(`${command} @ ${directories.join(", ")}`);
     return { ok: pass, code: pass ? 0 : 3, output: "SECRET=hunter2", cwd: "/home/me" };
   });
   try {
@@ -150,14 +151,41 @@ test("an approval waits for before-merge tasks, then moves to Ready to merge; ar
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
-test("checks run without stdin in their directory, falling back to home when it is gone", async () => {
+test("checks run without stdin in the first directory that exists, falling back to home when none does", async () => {
   const directory = await mkdtemp(join(tmpdir(), "paseo-check-"));
   try {
     await mkdir(join(directory, "sub"));
-    const here = await runCheck("pwd; read line; test -z \"$line\"", join(directory, "sub"));
+    const here = await runCheck("pwd; read line; test -z \"$line\"", [join(directory, "missing"), join(directory, "sub")]);
     assert.equal(here.ok, true);
     assert.match(here.output, /paseo-check-.*\/sub/);
-    const failed = await runCheck("exit 4", join(directory, "missing"));
+    const failed = await runCheck("exit 4", [join(directory, "missing")]);
     assert.deepEqual({ ok: failed.ok, code: failed.code, cwd: failed.cwd }, { ok: false, code: 4, cwd: homedir() });
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a task whose worktree was deleted runs its check in the repository's main checkout", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "paseo-check-repo-")));
+  const main = join(root, "main");
+  const worktree = join(root, "worktree");
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: main, stdio: "ignore" });
+  await mkdir(main);
+  git("init", "-q");
+  git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init");
+  git("worktree", "add", "-q", worktree);
+  const { linear, manual, stored, cleanup } = await setup([task("a", { check: "git rev-parse --show-toplevel", cwd: worktree }), task("plain", { cwd: join(root, "missing") })]);
+  try {
+    linear.statuses.set("a", { status: "Todo", statusType: "unstarted", completedAt: null });
+    linear.statuses.set("plain", { status: "Todo", statusType: "unstarted", completedAt: null });
+    await manual.poll();
+    assert.equal((await stored()).a.repository, main, "looked up while the worktree exists");
+    assert.equal((await stored()).plain.repository, null, "a directory already gone has no repository");
+
+    git("worktree", "remove", "--force", worktree);
+    linear.statuses.set("a", { status: "Done", statusType: "completed", completedAt: "t1" });
+    await manual.poll();
+    assert.deepEqual(linear.writes, [`comment a: ✓ Verified: the check passed (ran in \`${main}\`).`]);
+  } finally {
+    await cleanup();
+    await rm(root, { recursive: true, force: true });
+  }
 });
