@@ -9,6 +9,10 @@ import type { OwnerAsk } from "../shared/contracts";
 import type { BrowserDecisionAction, DecisionHost } from "../shared/decision-inbox";
 import { BrowserDecisionInbox, type BrowserDecisionInboxDeps } from "./decision-inbox";
 import { PermissionReplies } from "./permission-replies";
+import { INBOX_DISPLAYED_HEADER } from "./inbox-transport";
+
+const PEER_BACKEND = "d1fdc181-dbf0-4ee4-b792-de58e7695484";
+const LOCAL_BACKEND = "96b93fd3-9ef6-40d7-875d-7b8a9b35f6b8";
 
 const question: AgentPermissionRequest = {
   id: "q1", provider: "omp", name: "ask", kind: "question", title: "Runner?",
@@ -35,7 +39,7 @@ function barrier() {
   const promise = new Promise<void>((resolve) => { release = resolve; });
   return { promise, release };
 }
-async function harness(t: TestContext) {
+async function harness(t: TestContext, host = "laptop") {
   const directory = await mkdtemp(join(tmpdir(), "decision-inbox-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   let now = Date.parse("2026-10-12T00:00:00.000Z");
@@ -74,11 +78,11 @@ async function harness(t: TestContext) {
     answer: async (input) => { ownerActions.push({ operation: "answer", input }); return { delivered: "agent", message: "Owner ask answered." }; },
     triage: async (input) => { ownerActions.push({ operation: "triage", input }); return { delivered: "local", message: "Owner ask deferred." }; },
   };
-  const create = () => {
+  const create = (backendInstanceId?: () => string | undefined) => {
     const replies = new PermissionReplies({ directory: join(directory, "replies"), daemon, now: () => now });
     replies.attach(sdk);
     const inbox = new BrowserDecisionInbox({ ownerAsks, paseo: () => sdk, replies, peers: async () => peers,
-      canonicalPeer: async () => canonical, host: "laptop", agentUrl: async (id) => `https://paseo.test/agents/${id}`,
+      canonicalPeer: async () => canonical, host, backendInstanceId, agentUrl: async (id) => `https://paseo.test/agents/${id}`,
       directory: join(directory, "inbox"), now: () => now });
     return { inbox, replies };
   };
@@ -93,7 +97,7 @@ async function harness(t: TestContext) {
     const snapshot = await selected.local();
     const live = snapshot.live.find((item) => item.requestId === requestId);
     assert.ok(live);
-    return { host: "laptop", target: "live", operation: "answer", agentId: live.agentId, requestId, revision: live.revision, answers: { Runner: "Node" } };
+    return { host: snapshot.host, ...(snapshot.backendInstanceId ? { backendInstanceId: snapshot.backendInstanceId } : {}), target: "live", operation: "answer", agentId: live.agentId, requestId, revision: live.revision, answers: { Runner: "Node" } };
   };
   return { inbox, replies, sdk, directory, sent, agents, ownerActions, listCalls, create, post, action,
     clock: (value: number) => { now = value; }, now: () => now,
@@ -103,16 +107,16 @@ async function harness(t: TestContext) {
   };
 }
 function peerSnapshot(host = "server087"): DecisionHost {
-  return { host, asks: [ownerAsk], live: [], history: [], updatedAt: "2026-10-12T00:00:00.000Z", error: null };
+  return { host, backendInstanceId: PEER_BACKEND, asks: [ownerAsk], live: [], history: [], updatedAt: "2026-10-12T00:00:00.000Z", error: null };
 }
-function mockPeers(t: TestContext, answer: (url: string, method: string, body: unknown) => Promise<Response> | Response) {
+function mockPeers(t: TestContext, answer: (url: string, method: string, body: unknown, headers: Headers) => Promise<Response> | Response) {
   const calls: { url: string; method: string; body: unknown }[] = [];
   t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const method = init?.method ?? "GET";
     const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : null;
     calls.push({ url, method, body });
-    return answer(url, method, body);
+    return answer(url, method, body, new Headers(init?.headers));
   });
   return calls;
 }
@@ -336,12 +340,13 @@ test("forwarding selects only the configured origin and exposes an unknown outco
   const h = await harness(t);
   const peer = "https://server087.test:8444";
   h.peers([peer]);
-  const calls = mockPeers(t, (url, method) => {
+  const calls = mockPeers(t, (url, method, _body, headers) => {
     assert.ok(url.startsWith(`${peer}/api/decisions/`));
     if (method === "GET") return Response.json(peerSnapshot());
+    assert.equal(headers.get(INBOX_DISPLAYED_HEADER), PEER_BACKEND);
     throw new Error("peer socket closed after submission");
   });
-  const result = await h.post({ ...await h.action(), host: "server087" });
+  const result = await h.post({ ...await h.action(), host: "server087", backendInstanceId: PEER_BACKEND });
   assert.equal(result.status, 502);
   assert.equal(result.body.outcomeUnknown, true);
   assert.match(String(result.body.error), /not retried automatically/);
@@ -447,3 +452,65 @@ test("owner read errors remain visible within the cache window and clear on a su
   assert.equal(h.ownerReads(), 2);
 });
 
+
+for (const status of ["confirmed", "unconfirmed"] as const) {
+  test(`transport metadata migration preserves ${status} activity replay across backend reload`, async (t) => {
+    const h = await harness(t);
+    const input = await h.action();
+    if (status === "unconfirmed") h.onSubmit(async () => { throw new Error("lost acknowledgement"); });
+    const original = await h.post(input);
+    assert.equal(original.status, status === "confirmed" ? 200 : 502);
+    for (const backendInstanceId of [LOCAL_BACKEND, PEER_BACKEND]) {
+      const replacement = h.create(() => backendInstanceId).inbox;
+      const replay = await h.post({ ...input, backendInstanceId }, replacement);
+      assert.deepEqual(replay, original);
+    }
+    assert.equal(h.sent.length, 1, "transport metadata never creates another permission activity");
+  });
+}
+
+test("captured decision backend epoch rejects missing or stale local and peer provenance before delivery", async (t) => {
+  const h = await harness(t);
+  const local = h.create(() => LOCAL_BACKEND).inbox;
+  const input = await h.action("q1", local);
+  for (const backendInstanceId of [undefined, PEER_BACKEND]) {
+    assert.equal((await h.post({ ...input, backendInstanceId }, local)).status, 409);
+  }
+  h.peers(["https://server087.test:8444"]);
+  const calls = mockPeers(t, () => Response.json(peerSnapshot()));
+  for (const backendInstanceId of [undefined, LOCAL_BACKEND]) {
+    assert.equal((await h.post({ ...input, host: "server087", backendInstanceId }, local)).status, 409);
+  }
+  assert.equal(calls.filter((call) => call.method === "POST").length, 0);
+  assert.deepEqual(h.sent, []);
+});
+
+for (const [sourceHost, targetHost, sourceEpoch, targetEpoch] of [
+  ["laptop", "server087", LOCAL_BACKEND, PEER_BACKEND],
+  ["server087", "laptop", PEER_BACKEND, LOCAL_BACKEND],
+]) {
+  test(`decision actions from ${sourceHost} reach ${targetHost}'s checked authority exactly once`, async (t) => {
+    const source = await harness(t, sourceHost);
+    const target = await harness(t, targetHost);
+    const sourceInbox = source.create(() => sourceEpoch).inbox;
+    const targetInbox = target.create(() => targetEpoch).inbox;
+    const peer = `https://${targetHost}.test:8444`;
+    source.peers([peer]); source.canonical(peer);
+    const calls = mockPeers(t, async (url, method, body, headers) => {
+      assert.ok(url.startsWith(`${peer}/api/decisions/`));
+      if (method === "GET") return Response.json(await targetInbox.local());
+      assert.equal(headers.get(INBOX_DISPLAYED_HEADER), targetEpoch);
+      const response = await targetInbox.route({ method, path: "/api/decisions/action", headers: { host: new URL(url).host, "x-review-action": "1", "content-type": "application/json" }, body: JSON.stringify(body) });
+      assert.ok(response);
+      return new Response(response.body, { status: response.status, headers: response.headers });
+    });
+    const displayed = await target.action("q1", targetInbox);
+    assert.equal((await source.post(displayed, sourceInbox)).status, 200);
+    assert.equal(target.sent.length, 1);
+    assert.deepEqual(source.sent, []);
+    assert.equal((await source.post({ host: targetHost, backendInstanceId: targetEpoch, target: "owner", operation: "answer", issueId: ownerAsk.issueId, revision: ownerAsk.revision, answers: { q1: "Node" } }, sourceInbox)).status, 200);
+    assert.equal(target.ownerActions.length, 1);
+    assert.deepEqual(source.ownerActions, []);
+    assert.equal(calls.filter((call) => call.method === "POST").length, 2);
+  });
+}

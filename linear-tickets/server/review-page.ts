@@ -2,6 +2,7 @@ import { parsePlanRisk, combinedRating, ratingText } from "../shared/plan-risk";
 import { planFollowUps } from "../shared/plan-sections";
 import type { PipelineHost } from "../shared/plan-pipeline";
 import { pipelinePage, PIPELINE_STYLE, PIPELINE_CLIENT } from "./review-pipeline-page";
+import type { InboxAvailability } from "./inbox-transport";
 
 // The review inbox's pages (README, "Review inbox"): the inbox, the closed-review page, and the
 // service worker that shows its notifications. Everything here renders data; review-links.ts
@@ -37,6 +38,11 @@ export type ApplyState = "pending" | "uncertain" | "unbound" | "conflict" | "con
 // shown: approved, auto-approved, sent back, ended) and `decidedAt`; a "Being applied" row adds
 // the journal entry to settle, the decision itself and its last failure.
 export type InboxRow = {
+  // The review generation these rows were composed from: what a page sends back so a decision is
+  // applied to the review it displayed, never to whatever is latest by then.
+  reviewId?: string;
+  // The target host's backend instance, distinct from the frontdoor snapshot displayed by the page.
+  backendInstanceId?: string;
   agentId: string;
   name: string;
   link: string;
@@ -69,6 +75,7 @@ const PAGE_STYLE = `:root{color-scheme:light dark;--bg:#f2f2f7;--card:#fff;--fg:
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}body{margin:0;font:17px/1.45 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;color:var(--fg);background:var(--bg);font-variant-numeric:tabular-nums}::selection{background:color-mix(in srgb,var(--tint) 30%,transparent)}a{color:var(--tint)}
 .bar{position:sticky;top:0;z-index:2;padding:calc(env(safe-area-inset-top) + 14px) max(20px,env(safe-area-inset-right)) 10px max(20px,env(safe-area-inset-left));background:color-mix(in srgb,var(--bg) 80%,transparent);-webkit-backdrop-filter:saturate(1.8) blur(20px);backdrop-filter:saturate(1.8) blur(20px);border-bottom:.5px solid var(--line)}
 .bar>div,main{max-width:36rem;margin:0 auto}.bar>div{display:flex;align-items:flex-end;gap:12px}.bar>div>div{flex:1;min-width:0}h1{margin:0;font-size:1.75rem;line-height:1.15;font-weight:700;letter-spacing:-.02em}.sub{margin:2px 0 0;font-size:.875rem;color:var(--muted)}.sub.offline::after{content:" · offline, retrying";color:var(--warn)}.missing{margin:4px 0 0;font-size:.8125rem;color:var(--warn)}
+.offline{margin:8px 0 0;padding:8px 10px;border-radius:10px;font-size:.8125rem;color:var(--warn);background:var(--warn-bg)}.offline b{font-weight:700}.offline .why{color:inherit;opacity:.85}
 main{padding:4px max(16px,env(safe-area-inset-right)) calc(48px + env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}
 h2{display:flex;align-items:baseline;gap:8px;margin:28px 4px 4px;font-size:1.25rem;font-weight:700;letter-spacing:-.01em}h2 .n{font-size:1rem;font-weight:600;color:var(--muted)}h2 .hint{margin-left:auto;font-size:.8125rem;font-weight:500;color:var(--muted)}
 h3{margin:18px 4px 6px;font-size:.8125rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
@@ -219,9 +226,22 @@ self.addEventListener("install",()=>self.skipWaiting());self.addEventListener("a
 // own frame (and so its unsent annotations) until it leaves the list while every host answers,
 // and #<agentId> in the URL reopens it on reload. Resting the pointer on a row starts loading its
 // review out of sight, so a click mostly finds it loaded; only the latest such unopened one stays.
-const CLIENT_SCRIPT = `(()=>{let busy=false,selected=null,hovered=null,hover=0,query="",composing=false;const pending=new Set();
+const CLIENT_SCRIPT = `(()=>{let busy=false,selected=null,hovered=null,hover=0,query="",composing=false;const pending=new Set(),uncertain=new Map();
 ${PIPELINE_CLIENT}
 const writing=()=>!!document.querySelector("form.back:not([hidden]),.delete-dialog[open]");
+// Start closed: this script runs in the head, before the queue exists, so a DOM read here would
+// report a live page on an offline one. readGate() runs once the body is parsed.
+let readOnly=true,displayedEpoch=null;
+function readGate(){const q=document.querySelector(".queue");readOnly=!q||q.dataset.readonly!=="0";displayedEpoch=q?.dataset.displayed||null}
+const sourceKey=(item)=>JSON.stringify([item.dataset.host,item.dataset.backend||null,item.dataset.agent,item.dataset.entry?"entry":"review",item.dataset.entry||item.dataset.review||null]);
+// Cancellation is local and remains usable offline. Unconfirmed deliveries stay locked even when
+// a later refresh replaces the row or the availability gate opens again.
+function gate(){for(const b of document.querySelectorAll("button[data-act]:not([data-act=cancel]):not([data-act=cancel-delete]),#delete-form button[type=submit],form.back button[type=submit]")){if(readOnly||b.closest("li[data-uncertain],li.done")){if(!b.disabled&&!b.dataset.gate){b.disabled=true;b.dataset.gate="G"}}else if(b.dataset.gate){b.disabled=false;delete b.dataset.gate}}}
+function lockDown(){readOnly=true;document.querySelector(".sub")?.classList.add("offline");gate()}
+function unlock(){readOnly=false;document.querySelector(".sub")?.classList.remove("offline");gate()}
+// A readiness probe never changes the displayed epoch or unlocks a failed gate. Recovery requires
+// an actual live queue replacement; open drafts pause replacement until locally cancelled.
+async function checkAvailability(){let live=null;try{const r=await fetch("/api/inbox/availability",{cache:"no-store"});const a=await r.json();if(r.ok&&a.readOnly===false&&!a.stale&&a.backendState==="ready")live=a}catch{}if(!live){lockDown();return}if(!readOnly&&displayedEpoch&&live.displayedInstanceId===displayedEpoch)return;lockDown();await refresh()}
 const badge=()=>{const n=Number(document.querySelector("[data-waiting]")?.getAttribute("data-waiting")||0);if(navigator.setAppBadge)(n?navigator.setAppBadge(n):navigator.clearAppBadge()).catch(()=>{})};
 const notifyButton=()=>{const b=document.querySelector("button[data-act=notify]");if(b)b.hidden=typeof Notification!=="undefined"&&Notification.permission==="granted"&&localStorage.getItem("reviews-notify")==="on"};
 const items=()=>[...document.querySelectorAll(".queue li[data-agent]")];
@@ -232,14 +252,14 @@ function frameFor(item){const id=item.dataset.agent;let frame=frames().find((f)=
 function warm(item){for(const f of frames())if(!f.dataset.opened&&f.dataset.agent!==item.dataset.agent)f.remove();frameFor(item)}
 function select(item){const frame=frameFor(item),link=item.querySelector("a.row").href;frame.dataset.opened="1";for(const f of frames())f.classList.toggle("off",f!==frame);document.querySelector(".pick").hidden=true;const bar=document.querySelector(".pane-bar");bar.hidden=false;bar.querySelector("b").textContent=item.dataset.name;bar.querySelector("a").href=link;selected=item.dataset.agent;history.replaceState(null,"","#"+encodeURIComponent(selected));mark();frame.focus()}
 function filter(){const terms=query.trim().toLocaleLowerCase().split(/\\s+/).filter(Boolean);for(const li of document.querySelectorAll("li[data-search]"))li.hidden=!terms.every((term)=>li.dataset.search.includes(term));for(const group of document.querySelectorAll(".day-group"))group.hidden=![...group.querySelectorAll("li")].some((li)=>!li.hidden);let found=0;for(const section of document.querySelectorAll("[data-review-section]")){const rows=[...section.querySelectorAll("li[data-search]")],count=rows.filter((li)=>!li.hidden).length;found+=count;section.hidden=!!terms.length&&!count;const n=section.querySelector("[data-filter-count]");if(n)n.textContent=terms.length?count+" of "+rows.length:String(rows.length)}const empty=document.querySelector("[data-search-empty]");if(empty)empty.hidden=!terms.length||found>0}
-const settle=()=>{badge();notifyButton();mark();filter();tickPipeline()};
+const settle=()=>{for(const item of items()){const message=uncertain.get(sourceKey(item));if(message){item.dataset.uncertain="1";const status=item.querySelector(".status");status.className="status failed";status.textContent=message}}badge();notifyButton();mark();filter();gate();tickPipeline()};
 async function refresh(){
-tickPipeline();if(busy||pending.size||document.hidden||writing()||composing)return;busy=true;
+tickPipeline();if(busy||pending.size||document.hidden||writing()||composing)return false;busy=true;
 try{
 const response=await fetch(location.pathname,{cache:"no-store"});if(!response.ok)throw new Error(String(response.status));
 const next=new DOMParser().parseFromString(await response.text(),"text/html"),fresh=next.querySelector(".queue");if(!fresh||!fresh.querySelector("[data-pipeline]"))throw new Error("no pipeline list");
 // A note, modal, action or IME composition may have started while the request was in flight.
-if(pending.size||writing()||composing)return;
+if(pending.size||writing()||composing)return false;
 const queue=document.querySelector(".queue"),search=document.querySelector("#review-search"),active=document.activeElement;
 const focused=active===search,start=search?.selectionStart,end=search?.selectionEnd,direction=search?.selectionDirection;
 const details=document.querySelector("#pipeline-details"),expanded=details?.open,pipelineFocus=details?.contains(active),focusLink=pipelineFocus&&active?.closest("a")?.getAttribute("href");
@@ -247,14 +267,19 @@ const top=queue.scrollTop,left=queue.scrollLeft;query=search?.value??query;
 // Reuse the exact input node, including its query, selection and browser editing state.
 if(search)fresh.querySelector("#review-search")?.replaceWith(search);
 const freshDetails=fresh.querySelector("#pipeline-details");if(freshDetails)freshDetails.open=!!expanded;
-clearTimeout(hover);hovered=null;document.title=next.title;queue.replaceChildren(...fresh.childNodes);settle();
+clearTimeout(hover);hovered=null;document.title=next.title;queue.dataset.readonly=fresh.dataset.readonly??"1";queue.dataset.displayed=fresh.dataset.displayed??"";queue.replaceChildren(...fresh.childNodes);readGate();if(readOnly)lockDown();else unlock();settle();
 if(focused){search.focus({preventScroll:true});if(start!==null&&end!==null)search.setSelectionRange(start,end,direction)}
 else if(pipelineFocus){const target=focusLink&&[...document.querySelectorAll("#pipeline-details a")].find((a)=>a.getAttribute("href")===focusLink);(target||document.querySelector("#pipeline-details summary"))?.focus({preventScroll:true})}
-queue.scrollTop=top;queue.scrollLeft=left;
-}catch{document.querySelector(".sub")?.classList.add("offline");pipelineFetchFailed()}finally{busy=false}
+queue.scrollTop=top;queue.scrollLeft=left;return true;
+}catch{lockDown();pipelineFetchFailed();return false}finally{busy=false}
 }
-async function post(path,body){const response=await fetch(path,{method:"POST",headers:{"content-type":"application/json","x-review-action":"1"},body:JSON.stringify(body)});const answer=await response.json().catch(()=>({}));if(!response.ok)throw new Error(answer.error||("HTTP "+response.status));return answer}
-async function act(item,action,body,label){const id=item.dataset.agent,status=item.querySelector(".status");pending.add(id);for(const b of item.querySelectorAll("button"))b.disabled=true;status.className="status";status.textContent=label?label+"…":action==="delete"?"Deleting plan and issue…":action==="recheck"?"Sending landscape recheck…":body.approve?"Approving…":"Sending back…";try{await post("/api/reviews/"+encodeURIComponent(id)+"/"+action,body);status.textContent=label?label+" done.":action==="delete"?"Plan and Linear issue deleted.":action==="recheck"?"Sent back to check code, PRs and issues, then resubmit for review.":body.approve?"Approved. The agent takes it from here.":"Sent back with your note.";item.classList.add("done");if(action==="delete"){for(const f of frames())if(f.dataset.agent===id)f.remove();if(selected===id){selected=null;document.querySelector(".pane-bar").hidden=true;document.querySelector(".pick").hidden=false;history.replaceState(null,"",location.pathname)}}setTimeout(()=>refresh(),2500)}catch(error){status.className="status failed";status.textContent=(action==="delete"?"Deletion not completed: ":action==="recheck"?"Recheck not sent: ":"Not decided: ")+error.message;for(const b of item.querySelectorAll("button"))b.disabled=false}finally{pending.delete(id)}}
+async function post(path,body){
+const encoded=JSON.stringify(body);let response,answer;
+try{response=await fetch(path,{method:"POST",headers:{"content-type":"application/json","x-review-action":"1",...(displayedEpoch?{"x-paseo-inbox-displayed":displayedEpoch}:{})},body:encoded});answer=await response.json();if(!answer||typeof answer!=="object"||Array.isArray(answer)||(response.ok?answer.ok!==true:typeof answer.error!=="string"))throw new Error("The server did not return a readable acknowledgement.")}
+catch(cause){const error=new Error(cause instanceof Error?cause.message:"Connection interrupted.");error.outcomeUnknown=true;throw error}
+if(!response.ok){const error=new Error(answer.error);error.outcomeUnknown=answer.outcomeUnknown===true;throw error}return answer
+}
+async function act(item,action,body,label){const id=item.dataset.agent,status=item.querySelector(".status");if(readOnly||pending.has(id)||item.dataset.uncertain||item.classList.contains("done"))return;if(item.dataset.backend)body={...body,backendInstanceId:item.dataset.backend};if(item.dataset.review&&["decision","recheck","delete"].includes(action))body={...body,reviewId:item.dataset.review};pending.add(id);for(const b of item.querySelectorAll("button:not([data-act=cancel]):not([data-act=cancel-delete])"))b.disabled=true;status.className="status";status.textContent=label?label+"…":action==="delete"?"Deleting plan and issue…":action==="recheck"?"Sending landscape recheck…":body.approve?"Approving…":"Sending back…";try{await post("/api/reviews/"+encodeURIComponent(id)+"/"+action,body);status.textContent=label?label+" done.":action==="delete"?"Plan and Linear issue deleted.":action==="recheck"?"Sent back to check code, PRs and issues, then resubmit for review.":body.approve?"Approved. The agent takes it from here.":"Sent back with your note.";item.classList.add("done");if(action==="delete"){for(const f of frames())if(f.dataset.agent===id)f.remove();if(selected===id){selected=null;document.querySelector(".pane-bar").hidden=true;document.querySelector(".pick").hidden=false;history.replaceState(null,"",location.pathname)}}setTimeout(()=>refresh(),2500)}catch(error){status.className="status failed";status.textContent=error.outcomeUnknown?"Delivery unconfirmed: "+error.message+" The outcome is unknown; nothing was retried. Check the source and history before taking another action.":(action==="delete"?"Deletion not completed: ":action==="recheck"?"Recheck not sent: ":"Not decided: ")+error.message;if(error.outcomeUnknown){item.dataset.uncertain="1";uncertain.set(sourceKey(item),status.textContent)}else for(const b of item.querySelectorAll("button"))b.disabled=false}finally{pending.delete(id);gate()}}
 const decide=(item,approve,feedback)=>act(item,"decision",{approve,feedback});
 function confirmDelete(item){const dialog=document.querySelector("#delete-dialog");dialog.dataset.agent=item.dataset.agent;dialog.querySelector("[data-delete-issue]").textContent=item.dataset.name;dialog.querySelector("[data-delete-confirm]").textContent=item.dataset.name;const input=dialog.querySelector("input");input.value="";input.setCustomValidity("");dialog.showModal();input.focus()}
 const urlKey=(key)=>{const padded=(key+"=".repeat((4-key.length%4)%4)).replace(/-/g,"+").replace(/_/g,"/");return Uint8Array.from(atob(padded),(c)=>c.charCodeAt(0))};
@@ -264,9 +289,9 @@ document.addEventListener("mouseover",(event)=>{const item=event.target.closest(
 document.addEventListener("input",(event)=>{if(event.target.id==="review-search"){query=event.target.value;filter()}else if(event.target.id==="delete-identifier")event.target.setCustomValidity("")});
 document.addEventListener("compositionstart",(event)=>{if(event.target.id==="review-search")composing=true});
 document.addEventListener("compositionend",(event)=>{if(event.target.id==="review-search"){composing=false;query=event.target.value;filter()}});
-document.addEventListener("click",(event)=>{const button=event.target.closest("button[data-act]");if(!button)return;const action=button.dataset.act;if(action==="notify")return void subscribe(button);if(action==="cancel-delete")return void document.querySelector("#delete-dialog").close();const item=button.closest("[data-agent]");if(!item)return;const form=item.querySelector("form.back");if(action==="approve"){if(confirm("Approve the plan for "+item.dataset.name+"?"))decide(item,true,"")}else if(action==="back"){form.hidden=false;form.querySelector("textarea").focus()}else if(action==="cancel")form.hidden=true;else if(action==="recheck"){if(confirm("Send "+item.dataset.name+" back to check current code, PRs and issues, resolve conflicts, and resubmit for review? This does not approve or start implementation."))act(item,"recheck",{})}else if(action==="delete")confirmDelete(item);else if(action==="resolve")act(item,"resolve",{entryId:button.dataset.entry,action:button.dataset.action},button.textContent)});
-document.addEventListener("submit",(event)=>{const deletion=event.target.closest("#delete-form");if(deletion){event.preventDefault();const dialog=document.querySelector("#delete-dialog"),item=items().find((li)=>li.dataset.agent===dialog.dataset.agent),input=deletion.querySelector("input");if(!item){dialog.close();return}if(input.value!==item.dataset.name){input.setCustomValidity("Type "+item.dataset.name+" exactly to confirm.");input.reportValidity();return}dialog.close();act(item,"delete",{identifier:input.value});return}const form=event.target.closest("form.back");if(!form)return;event.preventDefault();const note=form.querySelector("textarea").value.trim();if(!note)return;form.hidden=true;decide(form.closest("[data-agent]"),false,note)});
-document.addEventListener("DOMContentLoaded",()=>{settle();const id=decodeURIComponent(location.hash.slice(1));const item=id&&wide()&&items().find((li)=>li.dataset.agent===id);if(item)select(item)});setInterval(()=>refresh(),${INBOX_REFRESH_S * 1000});document.addEventListener("visibilitychange",()=>refresh());addEventListener("focus",()=>refresh());addEventListener("pageshow",(event)=>{if(event.persisted)refresh()})})()`;
+document.addEventListener("click",(event)=>{const button=event.target.closest("button[data-act]");if(!button)return;const action=button.dataset.act;if(readOnly&&action!=="cancel"&&action!=="cancel-delete")return;if(action==="notify"){if(readOnly)return;return void subscribe(button)}if(action==="cancel-delete")return void document.querySelector("#delete-dialog").close();const item=button.closest("[data-agent]");if(!item)return;const form=item.querySelector("form.back");if(action==="approve"){if(confirm("Approve the plan for "+item.dataset.name+"?"))decide(item,true,"")}else if(action==="back"){form.hidden=false;form.querySelector("textarea").focus()}else if(action==="cancel")form.hidden=true;else if(action==="recheck"){if(confirm("Send "+item.dataset.name+" back to check current code, PRs and issues, resolve conflicts, and resubmit for review? This does not approve or start implementation."))act(item,"recheck",{})}else if(action==="delete")confirmDelete(item);else if(action==="resolve")act(item,"resolve",{entryId:button.dataset.entry,action:button.dataset.action},button.textContent)});
+document.addEventListener("submit",(event)=>{const deletion=event.target.closest("#delete-form"),form=event.target.closest("form.back");if(!deletion&&!form)return;event.preventDefault();if(readOnly)return;if(deletion){const dialog=document.querySelector("#delete-dialog"),item=items().find((li)=>li.dataset.agent===dialog.dataset.agent),input=deletion.querySelector("input");if(!item){dialog.close();return}if(input.value!==item.dataset.name){input.setCustomValidity("Type "+item.dataset.name+" exactly to confirm.");input.reportValidity();return}dialog.close();act(item,"delete",{identifier:input.value});return}const note=form.querySelector("textarea").value.trim();if(!note)return;form.hidden=true;decide(form.closest("[data-agent]"),false,note)});
+document.addEventListener("DOMContentLoaded",()=>{readGate();settle();const id=decodeURIComponent(location.hash.slice(1));const item=id&&wide()&&items().find((li)=>li.dataset.agent===id);if(item)select(item)});setInterval(()=>refresh(),${INBOX_REFRESH_S * 1000});setInterval(()=>{if(!document.hidden)checkAvailability()},5000);document.addEventListener("visibilitychange",()=>{if(!document.hidden){checkAvailability();refresh()}});addEventListener("focus",()=>{checkAvailability();refresh()});addEventListener("pageshow",(event)=>{checkAvailability();if(event.persisted)refresh()})})()`;
 
 // The row's second line: where to follow up (Linear), who planned it, where it runs.
 function facts(row: InboxRow, multiHost: boolean): string[] {
@@ -284,13 +309,27 @@ function areaChips(row: InboxRow): string {
   return row.areas?.length ? `<div class="chips">${row.areas.map((area) => `<span class="chip area">Area: ${escapeHtml(area)}</span>`).join("")}</div>` : "";
 }
 
-function waitingRow(row: InboxRow, now: Date, dates: Dates, multiHost: boolean): string {
+// The inbox page's own availability gate: while the checked backend is unavailable (or this
+// frontdoor has not received a live snapshot from it), every mutation control is rendered
+// disabled and the page says what it is showing. The client repeats the check every 5 seconds
+// (inbox-frontdoor.ts serves /api/inbox/availability) and disables them again if it fails.
+const gate = (readOnly: boolean): string => readOnly ? ` disabled data-gate="1"` : "";
+
+const offlineNote = (availability: InboxAvailability, dates: Dates): string => {
+  const reason = availability.reason ? ` <span class="why">${escapeHtml(availability.reason)}</span>` : "";
+  return availability.capturedAt
+    ? `<p class="offline" role="status"><b>Backend unavailable</b> — cached snapshot from ${escapeHtml(dates.full.format(new Date(availability.capturedAt)))} — read-only.${reason}</p>`
+    : `<p class="offline" role="status"><b>Backend unavailable</b> — no snapshot received; the current inbox contents are unknown.${reason}</p>`;
+};
+
+function waitingRow(row: InboxRow, now: Date, dates: Dates, multiHost: boolean, readOnly: boolean): string {
   const opened = new Date(row.since);
   const stale = now.getTime() - opened.getTime() >= STALE_HOURS * 3_600_000;
   const when = `<span class="when${stale ? " stale" : ""}"><time datetime="${escapeHtml(row.since)}" title="Opened ${dates.full.format(opened)}">${dates.clock.format(opened)}</time> · ${ago(row.since, now)}</span>`;
-  const actions = `<span class="acts"><button type="button" data-act="back">Send back</button><button type="button" class="approve" data-act="approve">Approve</button><button type="button" data-act="recheck" title="Send back to check current code, PRs and issues, then resubmit for review">Recheck landscape</button>${row.deleteable ? `<button type="button" class="danger" data-act="delete">Delete plan + issue</button>` : ""}</span>`;
-  const form = `<form class="back" hidden><textarea name="feedback" required maxlength="4000" aria-label="What should change" placeholder="What should change?"></textarea><div><button type="button" data-act="cancel">Cancel</button><button type="submit" class="approve">Send back</button></div></form>`;
-  return `<li data-agent="${escapeHtml(row.agentId)}" data-name="${escapeHtml(row.name)}" data-search="${searchText(row)}"><a class="row" href="${escapeHtml(row.link)}"><div class="top"><span class="id">${escapeHtml(row.name)}</span>${when}</div>${areaChips(row)}${detailRows(row.details, true)}${CHEVRON}</a><div class="facts">${facts(row, multiHost).join("<span aria-hidden=\"true\">·</span>")}${actions}</div>${form}<p class="status" role="status"></p></li>`;
+  const blocked = gate(readOnly);
+  const actions = `<span class="acts"><button type="button" data-act="back"${blocked}>Send back</button><button type="button" class="approve" data-act="approve"${blocked}>Approve</button><button type="button" data-act="recheck" title="Send back to check current code, PRs and issues, then resubmit for review"${blocked}>Recheck landscape</button>${row.deleteable ? `<button type="button" class="danger" data-act="delete"${blocked}>Delete plan + issue</button>` : ""}</span>`;
+  const form = `<form class="back" hidden><textarea name="feedback" required maxlength="4000" aria-label="What should change" placeholder="What should change?"></textarea><div><button type="button" data-act="cancel">Cancel</button><button type="submit" class="approve"${blocked}>Send back</button></div></form>`;
+  return `<li data-agent="${escapeHtml(row.agentId)}" data-host="${escapeHtml(row.host)}" data-backend="${escapeHtml(row.backendInstanceId ?? "")}" data-review="${escapeHtml(row.reviewId ?? "")}" data-name="${escapeHtml(row.name)}" data-search="${searchText(row)}"><a class="row" href="${escapeHtml(row.link)}"><div class="top"><span class="id">${escapeHtml(row.name)}</span>${when}</div>${areaChips(row)}${detailRows(row.details, true)}${CHEVRON}</a><div class="facts">${facts(row, multiHost).join("<span aria-hidden=\"true\">·</span>")}${actions}</div>${form}<p class="status" role="status"></p></li>`;
 }
 
 function decidedRow(row: InboxRow, now: Date, dates: Dates, multiHost: boolean): string {
@@ -322,8 +361,8 @@ function applyChip(row: InboxRow): string {
 // or the other one; once the accepted one went through anyway, only Dismiss remains. An
 // unconfirmed decision still being sent again has no buttons. Buttons post /resolve like the
 // decision buttons.
-function applyActions(row: InboxRow): string {
-  const button = (action: string, label: string, tone = "") => `<button type="button"${tone} data-act="resolve" data-entry="${escapeHtml(row.entryId ?? "")}" data-action="${action}">${label}</button>`;
+function applyActions(row: InboxRow, readOnly: boolean): string {
+  const button = (action: string, label: string, tone = "") => `<button type="button"${tone} data-act="resolve" data-entry="${escapeHtml(row.entryId ?? "")}" data-action="${action}"${gate(readOnly)}>${label}</button>`;
   const carryOrDrop = `<span class="acts">${button("carry-out", "Carry it out", " class=\"approve\"")}${button("drop", "Drop it", " class=\"danger\"")}</span>`;
   switch (row.applyState) {
     case "uncertain": return row.ownerNeeded ? carryOrDrop : "";
@@ -334,7 +373,7 @@ function applyActions(row: InboxRow): string {
   }
 }
 
-function applyingRow(row: InboxRow, now: Date, dates: Dates, multiHost: boolean): string {
+function applyingRow(row: InboxRow, now: Date, dates: Dates, multiHost: boolean, readOnly: boolean): string {
   // Pending rows say what carrying the decision out is doing; an unconfirmed one why it is not
   // carried out yet; the other kinds wait for the owner.
   const line = row.applyState === "pending"
@@ -344,43 +383,48 @@ function applyingRow(row: InboxRow, now: Date, dates: Dates, multiHost: boolean)
       : "";
   const tone = row.applyState === "pending" || row.applyState === "uncertain" ? (row.approved === false ? " back" : " approved") : "";
   const extra = facts(row, multiHost);
-  const actions = applyActions(row);
+  const actions = applyActions(row, readOnly);
   const name = row.applyState === "unreadable" ? "" : `<span class="id">${escapeHtml(row.name)}</span>`;
   const footer = extra.length || actions ? `<div class="facts">${extra.join("<span aria-hidden=\"true\">·</span>")}${actions}</div>` : "";
-  return `<li data-agent="${escapeHtml(row.agentId)}" data-name="${escapeHtml(row.name)}" data-search="${searchText(row)}"><div class="row"><div class="top">${name}<span class="outcome${tone}">${escapeHtml(applyChip(row))}</span></div>${areaChips(row)}${detailRows(row.details, false)}${line}</div>${footer}<p class="status" role="status"></p></li>`;
+  return `<li data-agent="${escapeHtml(row.agentId)}" data-host="${escapeHtml(row.host)}" data-backend="${escapeHtml(row.backendInstanceId ?? "")}" data-review="${escapeHtml(row.reviewId ?? "")}" data-entry="${escapeHtml(row.entryId ?? "")}" data-name="${escapeHtml(row.name)}" data-search="${searchText(row)}"><div class="row"><div class="top">${name}<span class="outcome${tone}">${escapeHtml(applyChip(row))}</span></div>${areaChips(row)}${detailRows(row.details, false)}${line}</div>${footer}<p class="status" role="status"></p></li>`;
 }
 
 // The root of :8444: every review waiting for the owner on this host and its peers, newest first
 // and grouped by the day the owner got it, plus the latest decisions. On a wide screen the pane
-// beside the list shows the selected review's Plannotator page.
-export function inboxPage(view: InboxView, now: Date, timeZone: string | undefined): string {
+// beside the list shows the selected review's Plannotator page. `availability` describes what the
+// persistent frontdoor last received from the checked backend: while it is read-only every action
+// button is rendered disabled, and without any snapshot the page says the contents are unknown
+// instead of showing an empty inbox.
+export function inboxPage(view: InboxView, now: Date, timeZone: string | undefined, availability?: InboxAvailability): string {
   const { open, decided, applying } = view;
   const dates = new Dates(now, timeZone);
   const multiHost = view.hosts.length > 1;
+  const readOnly = availability?.readOnly ?? false;
+  const unknown = readOnly && availability !== undefined && availability.capturedAt === null;
   const days: { label: string; rows: string[] }[] = [];
   for (const row of open) {
     const label = dates.dayLabel(new Date(row.since));
     const last = days.at(-1);
-    if (last?.label === label) last.rows.push(waitingRow(row, now, dates, multiHost));
-    else days.push({ label, rows: [waitingRow(row, now, dates, multiHost)] });
+    if (last?.label === label) last.rows.push(waitingRow(row, now, dates, multiHost, readOnly));
+    else days.push({ label, rows: [waitingRow(row, now, dates, multiHost, readOnly)] });
   }
-  const waiting = open.length
+  const waiting = unknown ? "" : open.length
     ? `<section data-review-section><h2>Waiting <span class="n" data-filter-count>${open.length}</span><span class="hint">newest first</span></h2>${days.map((day) => `<div class="day-group"><h3>${escapeHtml(day.label)}</h3><ul class="list">${day.rows.join("")}</ul></div>`).join("")}</section>`
     : `<section data-review-section><h2>Waiting</h2><p class="empty"><b>Nothing to review.</b>New plan reviews show up here on their own.</p></section>`;
-  const beingApplied = applying.length
-    ? `<section data-review-section><h2>Being applied <span class="n" data-filter-count>${applying.length}</span></h2><ul class="list">${applying.map((row) => applyingRow(row, now, dates, multiHost)).join("")}</ul></section>`
-    : "";
-  const recent = decided.length
-    ? `<section data-review-section><h2>Recently decided <span class="n" data-filter-count>${decided.length}</span></h2><ul class="list">${decided.map((row) => decidedRow(row, now, dates, multiHost)).join("")}</ul></section>`
-    : "";
+  const beingApplied = unknown || !applying.length ? "" : `<section data-review-section><h2>Being applied <span class="n" data-filter-count>${applying.length}</span></h2><ul class="list">${applying.map((row) => applyingRow(row, now, dates, multiHost, readOnly)).join("")}</ul></section>`;
+  const recent = unknown || !decided.length ? "" : `<section data-review-section><h2>Recently decided <span class="n" data-filter-count>${decided.length}</span></h2><ul class="list">${decided.map((row) => decidedRow(row, now, dates, multiHost)).join("")}</ul></section>`;
+  const unknownSection = `<section data-review-section><h2>Inbox contents unknown</h2><p class="empty"><b>No snapshot received.</b>The inbox backend has not been read since this service started, so what is waiting is unknown.</p></section>`;
   const oldest = open.at(-1);
-  const status = [open.length ? `${open.length} waiting` : "Nothing waiting", ...(oldest ? [`oldest ${ago(oldest.since, now)}`] : []), `updated ${dates.clock.format(now)}`].join(" · ");
+  const status = unknown
+    ? "Inbox contents unknown · the checked backend has not been read yet"
+    : [open.length ? `${open.length} waiting` : "Nothing waiting", ...(oldest ? [`oldest ${ago(oldest.since, now)}`] : []), `updated ${dates.clock.format(now)}`].join(" · ");
   const missing = view.unreachable.length ? `<p class="missing">Not reachable, so its reviews are missing: ${escapeHtml(view.unreachable.join(", "))}</p>` : "";
-  const notify = view.push ? `<button type="button" class="notify" data-act="notify">Notify me</button>` : "";
-  const header = `<header class="bar" data-waiting="${open.length}"><div><div><h1>Plan reviews</h1><p class="sub">${status}</p>${missing}<nav class="sub" aria-label="Inboxes"><a href="/decisions">Decision inbox</a></nav></div>${notify}</div><div class="search"><label for="review-search">Search reviews</label><input id="review-search" type="search" autocomplete="off" placeholder="Issue, plan or area…" aria-controls="review-list"></div></header>`;
+  const notify = view.push ? `<button type="button" class="notify" data-act="notify"${gate(readOnly)}>Notify me</button>` : "";
+  const notice = availability && readOnly ? offlineNote(availability, dates) : "";
+  const header = `<header class="bar" data-waiting="${open.length}"><div><div><h1>Plan reviews</h1><p class="sub">${status}</p>${notice}${missing}<nav class="sub" aria-label="Inboxes"><a href="/decisions">Decision inbox</a></nav></div>${notify}</div><div class="search"><label for="review-search">Search reviews</label><input id="review-search" type="search" autocomplete="off" placeholder="Issue, plan or area…" aria-controls="review-list"></div></header>`;
   const head = `<noscript><meta http-equiv="refresh" content="${INBOX_REFRESH_S}"></noscript><meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)"><meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Reviews"><link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/icon.png"><link rel="icon" href="/icon.png"><style>${PIPELINE_STYLE}</style><script>${CLIENT_SCRIPT}</script>`;
   const pane = `<aside class="pane" aria-label="Plan review"><div class="pane-bar" hidden><b></b><a target="_blank" rel="noopener">Open in new tab ↗</a></div><div class="frames"><p class="pick"><b>Pick a review</b>It opens here in Plannotator: annotate, comment, approve or send back as on its own page.</p></div></aside>`;
-  const deletion = `<dialog id="delete-dialog" class="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-explanation"><form id="delete-form"><h2 id="delete-title">Delete plan and issue?</h2><p id="delete-explanation">This removes the waiting plan and moves its underlying Linear issue <strong data-delete-issue></strong> to Linear’s Trash. Its queued work is stopped. This is not a send-back or an approval.</p><label for="delete-identifier">Type <strong data-delete-confirm></strong> to confirm</label><input id="delete-identifier" name="identifier" required autocomplete="off" spellcheck="false"><div class="dialog-acts"><button type="button" data-act="cancel-delete">Cancel</button><button type="submit" class="danger">Delete plan + issue</button></div></form></dialog>`;
+  const deletion = `<dialog id="delete-dialog" class="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-explanation"><form id="delete-form"><h2 id="delete-title">Delete plan and issue?</h2><p id="delete-explanation">This removes the waiting plan and moves its underlying Linear issue <strong data-delete-issue></strong> to Linear’s Trash. Its queued work is stopped. This is not a send-back or an approval.</p><label for="delete-identifier">Type <strong data-delete-confirm></strong> to confirm</label><input id="delete-identifier" name="identifier" required autocomplete="off" spellcheck="false"><div class="dialog-acts"><button type="button" data-act="cancel-delete">Cancel</button><button type="submit" class="danger"${gate(readOnly)}>Delete plan + issue</button></div></form></dialog>`;
   const pipeline = pipelinePage({ pipeline: view.pipeline, hosts: view.hosts, unreachable: view.unreachable, ready: open.length, now, escapeHtml });
-  return page(open.length ? `Plan reviews (${open.length})` : "Plan reviews", `<div class="queue">${header}<main id="review-list">${pipeline}${waiting}${beingApplied}${recent}<p class="empty search-empty" data-search-empty role="status" hidden><b>No matching reviews.</b>Try another issue, plan title or area.</p></main></div>${pane}${deletion}`, head);
+  return page(open.length ? `Plan reviews (${open.length})` : "Plan reviews", `<div class="queue" data-readonly="${readOnly ? "1" : "0"}" data-displayed="${escapeHtml(availability?.displayedInstanceId ?? "")}">${header}<main id="review-list">${pipeline}${unknown ? unknownSection : `${waiting}${beingApplied}${recent}`}<p class="empty search-empty" data-search-empty role="status" hidden><b>No matching reviews.</b>Try another issue, plan title or area.</p></main></div>${pane}${deletion}`, head);
 }

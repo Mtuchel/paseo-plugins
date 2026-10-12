@@ -2506,6 +2506,43 @@ host it runs on when the inbox lists several. Decided rows keep the title and th
 you return to it, keeping your scroll position and search (not while you are writing a note);
 when the host cannot be reached it says so and keeps retrying.
 
+**Persistent inbox transport.** The inbox (`/`, `/decisions`) and every stable review link are
+served by a separately supervised frontdoor — a launchd agent on the Mac, a `systemd --user` unit
+on Linux — so the pages keep answering while the plugin is reloaded, which today closes the
+listener they live on. It listens on `127.0.0.1:47832`, the port `tailscale serve` publishes on
+`:8444`; the plugin's checked inbox backend moves to `127.0.0.1:47834` and keeps every permission
+check, decision journal, receipt, revision fence and the activation protocol. The frontdoor only
+renders what that backend last reported and forwards a browser's mutation with the instance it was
+displayed from, so a replaced or closing backend refuses it. Its two private routes
+(`/_inbox/ready`, `/_inbox/snapshot`) answer the shared credential only
+(`$PASEO_HOME/linear-tickets/inbox-transport/backend-secret`, 0600) and do not exist on the
+browser surface. While no backend answers, the pages keep the last successful snapshot, labelled
+stale with the time it was captured, and every mutation control is disabled and refused — nothing
+is reported as sent or queued from the cache, and an admitted mutation whose acknowledgement was
+lost is reported unknown, never retried. A review link opened while the plugin is away says
+**Review closed — unavailable** rather than a plan that pretends to be interactive; the review
+proxy on `127.0.0.1:47833` stays with the plugin.
+
+Recovery stays read-only until the page has received a successful live snapshot; a readiness
+probe alone cannot unlock cached controls. Peer rows retain the backend instance that produced
+their source, and forwarded actions carry that exact instance rather than a later probe's one.
+Review decisions, rechecks and deletions also name the displayed review generation. If an
+acknowledgement is lost, refreshing the same source does not unlock its actions or resend them.
+Local draft cancellation remains available while the backend is down.
+
+`node tools/inbox-service-install.mjs prepare|install|start|stop|status|rollback|uninstall` builds a
+versioned standalone bundle from this directory and stages it under `$PASEO_HOME/inbox-frontdoor`
+(`versions/`, the `current` symlink, `config.json`, `state/`, `logs/`). Installing registers the
+supervisor without starting it and never touches a listener: a busy `47832` is an explicit failure,
+not a kill, because the plugin owns that port until the cutover. That cutover belongs to the host
+rollout tooling and is a plugin rollout first (which drops the `:8444` publication and moves the
+backend to `47834`), then `start`, then `tailscale serve --https=8444 http://127.0.0.1:47832`;
+Tailscale Funnel stays off. `rollback` points `current` at another staged version and restarts the
+service if one is registered, preserving the installed ports, public origin, state directory,
+credential and Node executable; it refuses an unreadable or wrong-version configuration before
+changing the active bundle. `uninstall` removes its own files and registration and leaves the
+shared credential.
+
 A review you decided stays out of **Recently decided** until the decision journal (see
 **Decision journal**) carried it out: until then it is listed under **Being applied**, between
 the waiting reviews and the decided ones, with `approved — being applied` or `sent back — being

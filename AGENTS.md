@@ -46,11 +46,12 @@ There is no GitHub CI: these local checks are the merge gate.
   build check, and reloads only when it is needed, one rollout at a time. Use `--force` for a config-only reload,
   and after exit 2 ("cannot tell which code runs") read the reason; if the plugin should run the checkout's code,
   rerun with `--force`.
-  - Reading state: a load takes about 2.5 minutes. A 60 s CLI timeout
-    (`Timeout waiting for message (60000ms)`) and a `failed` status in `paseo plugin ls` during the first
-    ~3 minutes are not failures: wait for `[paseo] Plugin ready` in `paseo plugin logs <id>` (or `running` in
-    `paseo plugin ls`), act only on a `[paseo] Plugin failed to load` line, and never reload again while a load
-    runs — each reload starts the load over.
+  - Reading state: a load can take several minutes. A 60 s CLI timeout
+    (`Timeout waiting for message (60000ms)`) does not cancel it. Older daemons also
+    report `failed` while loading; that status alone is not a terminal failure.
+    Wait for the latest `[paseo] Plugin ready` outcome and confirm `running` before
+    recording success. Act on `[paseo] Plugin failed to load`, not an older ready
+    event followed by a stop or another load. Never reload again while a load runs.
   - Known limitation: the tool assumes plugins are reloaded only through it or by a Paseo restart. A reload from
     Paseo Settings (or a bare `paseo plugin reload`) whose log line has already scrolled out of the 500-line
     plugin log goes unnoticed: normally one unnecessary reload later; in one rare case (plugin code changed,

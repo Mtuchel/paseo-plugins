@@ -32,8 +32,10 @@ node tools/plugin-rollout.mjs linear-tickets
 ```
 
 After a config change, add `--force`. The tool pulls, installs, runs the build
-check, and reloads only when needed; see AGENTS.md for the wait rules (a load
-takes about 2.5 minutes).
+check, and reloads only when needed. A CLI timeout does not cancel a load:
+the tool waits for the latest lifecycle outcome and confirms `running` before
+recording success. A superseded ready event is not a successful rollout.
+At the deadline, it leaves the load alone; the next rollout settles it first.
 
 Each plugin's README covers its own setup, permissions and behavior.
 

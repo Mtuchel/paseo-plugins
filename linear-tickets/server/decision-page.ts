@@ -1,3 +1,4 @@
+import type { InboxAvailability } from "./inbox-transport";
 import type { DecisionView } from "../shared/decision-inbox";
 
 // Scoped extension of the review inbox: Apple system light/dark, Operate mode.
@@ -17,6 +18,8 @@ const STYLE = `
 const CLIENT = String.raw`
 (() => {
   let view = JSON.parse(document.getElementById('decision-data').textContent);
+  let availability = view.availability || null;
+  let availabilityError = '', recoveryPending = false;
   let selected = null, selectedSnapshot = null, stale = false, busy = false, refreshing = false;
   let refreshError = '', lastUpdated = Date.now();
   const drafts = new Map(), results = new Map(), completed = new Set(), uncertain = new Set();
@@ -26,7 +29,7 @@ const CLIENT = String.raw`
   const detail = document.getElementById('detail');
   const search = document.getElementById('search');
   const escape = value => String(value ?? '').replace(/[&<>"']/g, char => '&#' + char.charCodeAt(0) + ';');
-  const key = row => JSON.stringify([row.host, row.target, row.id, row.revision]);
+  const key = row => JSON.stringify([row.host, row.backendInstanceId || null, row.target, row.id, row.revision]);
   const identity = row => JSON.stringify([row.host, row.target, row.id]);
   const date = value => {
     const at = new Date(value);
@@ -44,14 +47,14 @@ const CLIENT = String.raw`
     const items = [];
     for (const host of view.hosts) {
       if (host.host === view.canonicalHost) {
-        for (const ask of host.asks) items.push({host:host.host, target:'owner', id:ask.issueId, revision:ask.revision, data:ask});
+        for (const ask of host.asks) items.push({host:host.host, backendInstanceId:host.backendInstanceId, target:'owner', id:ask.issueId, revision:ask.revision, data:ask});
       }
-      for (const live of host.live) items.push({host:host.host, target:'live', id:JSON.stringify([live.agentId, live.requestId]), revision:live.revision, data:live});
+      for (const live of host.live) items.push({host:host.host, backendInstanceId:host.backendInstanceId, target:'live', id:JSON.stringify([live.agentId, live.requestId]), revision:live.revision, data:live});
     }
     return items;
   }
   function receipts() {
-    return view.hosts.flatMap(host => host.history.map(receipt => ({host:host.host, target:'receipt', id:receipt.id, revision:receipt.revision, data:receipt})))
+    return view.hosts.flatMap(host => host.history.map(receipt => ({host:host.host, backendInstanceId:host.backendInstanceId, target:'receipt', id:receipt.id, revision:receipt.revision, data:receipt})))
       .sort((a, b) => Date.parse(b.data.at) - Date.parse(a.data.at));
   }
   function other(row) {
@@ -70,10 +73,22 @@ const CLIENT = String.raw`
   function fingerprint(row) {
     const data = row.data;
     // Timestamps and dispositions can change without changing the question or its source.
-    return JSON.stringify([row.revision, data.title, data.source, data.summary, data.questions, data.actions, data.kind, data.attention, data.attentionReason, data.blockerIdentifier, data.ticketIdentifier, data.route, data.agentId, data.url, data.issueUrl, data.agentUrl]);
+    return JSON.stringify([row.backendInstanceId || null, row.revision, data.title, data.source, data.summary, data.questions, data.actions, data.kind, data.attention, data.attentionReason, data.blockerIdentifier, data.ticketIdentifier, data.route, data.agentId, data.url, data.issueUrl, data.agentUrl]);
+  }
+  // Only a live displayed snapshot may send. Availability probes can close the gate but cannot
+  // replace its displayed frontdoor epoch or open it without a successful data replacement.
+  function unavailable() {
+    return recoveryPending || !!availabilityError || !availability || availability.stale || availability.readOnly || availability.backendState !== 'ready';
+  }
+  function availabilityReason() {
+    if (!availability) return 'The inbox backend has not answered yet; no snapshot was received.';
+    if (availabilityError) return availabilityError;
+    if (recoveryPending) return 'Backend recovery is awaiting a live decision snapshot. Refresh before sending.';
+    return (availability.reason || 'The inbox backend is not ready.') + ' Displayed decisions are the last received' + (availability.capturedAt ? ' snapshot from ' + date(availability.capturedAt) : ' data') + '.';
   }
   function hostProblem(row) {
     const host = view.hosts.find(item => item.host === row.host);
+    if (unavailable()) return availabilityReason();
     if (refreshError) return 'Refresh failed. This source has not been checked. Refresh before sending.';
     if (!host || view.unreachable.includes(row.host)) return 'This host is unavailable. Its displayed source may be stale; actions are paused.';
     if (row.target === 'owner' && row.host !== view.canonicalHost) return 'The canonical owner-ask host changed. Select the current canonical ask before acting.';
@@ -81,6 +96,7 @@ const CLIENT = String.raw`
   }
   function coverage() {
     const warnings = [];
+    if (unavailable()) warnings.push(availabilityReason());
     if (!view.canonicalHost) warnings.push('Canonical Linear owner-ask host unavailable. Owner asks are not shown.');
     else if (!view.hosts.some(host => host.host === view.canonicalHost)) warnings.push('Canonical Linear owner-ask host ' + view.canonicalHost + ' is missing.');
     for (const host of view.unreachable) warnings.push(host + ' unavailable; its decisions may be missing.');
@@ -91,7 +107,7 @@ const CLIENT = String.raw`
     element.classList.toggle('warning', warnings.length > 0);
     element.innerHTML = warnings.length ? '<b>Incomplete coverage</b>' + warnings.map(text => '<p>' + escape(text) + '</p>').join('') :
       '<b>Connected hosts</b><p>' + view.hosts.map(host => escape(host.host)).join(' · ') + '</p><p>Linear owner asks: ' + escape(view.canonicalHost) + '</p>';
-    document.getElementById('refresh-state').textContent = refreshing ? 'Refreshing…' : 'Updated ' + date(new Date(lastUpdated).toISOString()) + ' · refreshes every 30 seconds';
+    document.getElementById('refresh-state').textContent = refreshing ? 'Refreshing…' : unavailable() ? 'Read-only — the checked backend is not reachable' : 'Updated ' + date(availability.lastCheckedAt || new Date(lastUpdated).toISOString()) + ' · refreshes every 30 seconds';
   }
   function queueRow(row) {
     const data = row.data;
@@ -230,7 +246,7 @@ const CLIENT = String.raw`
     const nextRounds = stale && selected.target === 'live' ? rows().filter(row => row.target === 'live' && row.host === selected.host && row.data.agentId === selected.data.agentId && identity(row) !== identity(selected)) : [];
     warning.innerHTML = stale ? '<b>Source changed or the current round ended.</b><p>Your previous draft has not been applied to another request or revision. Review and reselect the current source before sending.</p><button type="button" data-reselect="true">Review current source</button>' +
       nextRounds.map(row => '<button type="button" data-current="' + escape(key(row)) + '">Review live request: ' + escape(row.data.title) + '</button>').join('') : escape(problem);
-    const blocked = stale || !!problem || busy || completed.has(id) || uncertain.has(id);
+    const blocked = stale || !!problem || busy || completed.has(id) || uncertain.has(id) || unavailable();
     for (const element of pane.querySelectorAll('form input, form textarea, form button, [data-operation]')) {
       element.disabled = blocked || (element.type === 'submit' && selected.data.kind === 'permission' && !selected.data.actions.length);
     }
@@ -261,6 +277,39 @@ const CLIENT = String.raw`
     } else if (!stale) selected = current;
     updateSafety();
   }
+  // The page's own availability check (every 5 seconds, and on focus/pageshow), separate from the
+  // 30-second data refresh: a failed check disables every send control at once, and a recovered
+  // one fetches the current snapshot before anything can be sent.
+  async function checkAvailability() {
+    const wasUnavailable = unavailable();
+    const previousInstance = availability ? availability.displayedInstanceId : null;
+    let next = null;
+    try {
+      const response = await fetch('/api/inbox/availability', {cache:'no-store', headers:{accept:'application/json'}});
+      const answer = await response.json();
+      if (!response.ok || !answer || typeof answer !== 'object' || typeof answer.backendState !== 'string') throw new Error('The backend availability check failed (' + response.status + ').');
+      next = answer;
+    } catch (error) {
+      availabilityError = error instanceof Error ? error.message : 'The backend availability check failed.';
+    }
+    if (!next || next.stale || next.readOnly || next.backendState !== 'ready') {
+      if (next) availabilityError = next.reason || 'The inbox backend is not ready.';
+      recoveryPending = true;
+      coverage(); updateSafety();
+      return;
+    }
+    const instanceChanged = previousInstance !== (next.displayedInstanceId || null);
+    if (wasUnavailable || unavailable() || instanceChanged) {
+      // Close before clearing the probe error or awaiting refresh, including when another refresh
+      // or a send is already busy. Only the replacement snapshot may clear this latch.
+      recoveryPending = true;
+      availabilityError = '';
+      coverage(); updateSafety();
+      await refresh();
+      return;
+    }
+    coverage(); updateSafety();
+  }
   async function refresh() {
     if (refreshing || busy) return;
     refreshing = true;
@@ -270,6 +319,15 @@ const CLIENT = String.raw`
       const next = await response.json();
       if (!response.ok) throw new Error(typeof next.error === 'string' ? next.error : 'Decision refresh failed (' + response.status + ').');
       if (!Array.isArray(next.hosts) || !Array.isArray(next.unreachable) || !(typeof next.canonicalHost === 'string' || next.canonicalHost === null)) throw new Error('The decision snapshot is unavailable.');
+      const previousInstance = availability ? availability.displayedInstanceId : null;
+      // Use only the envelope received with these displayed decisions, never the probe's epoch.
+      availability = next.availability && typeof next.availability === 'object' ? next.availability : null;
+      recoveryPending = !availability || availability.stale || availability.readOnly || availability.backendState !== 'ready';
+      availabilityError = '';
+      if (previousInstance && previousInstance !== (availability ? availability.displayedInstanceId : null)) {
+        captureDraft();
+        selectedSnapshot = null;
+      }
       view = next;
       refreshError = '';
       lastUpdated = Date.now();
@@ -282,7 +340,7 @@ const CLIENT = String.raw`
     }
   }
   function baseAction(row, operation) {
-    return {host:row.host, target:row.target, operation, revision:row.revision, ...(row.target === 'owner' ? {issueId:row.id} : {agentId:row.data.agentId, requestId:row.data.requestId})};
+    return {host:row.host, ...(row.backendInstanceId ? {backendInstanceId:row.backendInstanceId} : {}), target:row.target, operation, revision:row.revision, ...(row.target === 'owner' ? {issueId:row.id} : {agentId:row.data.agentId, requestId:row.data.requestId})};
   }
   function answers(row, saved) {
     const entries = row.data.questions.map((question, index) => {
@@ -303,6 +361,7 @@ const CLIENT = String.raw`
   async function send(action, row) {
     const id = key(row);
     if (busy || stale || hostProblem(row) || completed.has(id) || uncertain.has(id)) return;
+    if (unavailable()) { showStatus(availabilityReason() + ' Nothing was sent.'); return; }
     busy = true;
     results.delete(id);
     showStatus('Sending once… Waiting for a delivery receipt.', '');
@@ -310,7 +369,7 @@ const CLIENT = String.raw`
     let requestStarted = false;
     try {
       requestStarted = true;
-      const response = await fetch('/api/decisions/action', {method:'POST', headers:{'content-type':'application/json', 'x-review-action':'1', accept:'application/json'}, body:JSON.stringify(action)});
+      const response = await fetch('/api/decisions/action', {method:'POST', headers:{'content-type':'application/json', 'x-review-action':'1', ...(availability && availability.displayedInstanceId ? { "x-paseo-inbox-displayed": availability.displayedInstanceId } : {}), accept:'application/json'}, body:JSON.stringify(action)});
       const result = await response.json();
       if (!response.ok) {
         if (typeof result.error !== 'string') throw new Error('The server did not return a delivery receipt.');
@@ -405,19 +464,23 @@ const CLIENT = String.raw`
   });
   search.addEventListener('input', renderQueue);
   document.getElementById('refresh').addEventListener('click', () => { void refresh(); });
-  addEventListener('focus', () => { void refresh(); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) void refresh(); });
-  addEventListener('pageshow', event => { if (event.persisted) void refresh(); });
+  addEventListener('focus', () => { void checkAvailability(); void refresh(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { void checkAvailability(); void refresh(); } });
+  addEventListener('pageshow', event => { void checkAvailability(); if (event.persisted) void refresh(); });
   setInterval(() => { if (!document.hidden) void refresh(); }, 30000);
+  setInterval(() => { if (!document.hidden) void checkAvailability(); }, 5000);
   renderQueue();
   renderDetail();
 })();
 `;
 
-/** Self-contained browser inbox. No client dependency, navigation, or menu-bar changes. */
-export function decisionPage(view: DecisionView): string {
+/** Self-contained browser inbox. No client dependency, navigation, or menu-bar changes. The
+ * `availability` envelope (inbox-transport.ts) says whether the persistent frontdoor's snapshot is
+ * current: while it is stale, read-only or the backend is not ready, the page disables every send
+ * control, and a snapshot that only returned cached data never counts as a refresh. */
+export function decisionPage(view: DecisionView, availability?: InboxAvailability): string {
   // JSON sits in a raw-text element: prevent closing it or introducing JS separators.
-  const data = JSON.stringify(view).replace(/</g, "\\u003c").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+  const data = JSON.stringify({ ...view, ...(availability ? { availability } : {}) }).replace(/</g, "\\u003c").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Decision inbox</title><style>${STYLE}</style></head>
 <body><a class="skip" href="#detail">Skip to selected decision</a>

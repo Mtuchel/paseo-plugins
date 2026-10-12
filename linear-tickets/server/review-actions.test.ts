@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Credentials } from "./credentials";
+import { startInboxFrontdoor, type InboxFrontdoor } from "./inbox-frontdoor";
+import { INBOX_DISPLAYED_HEADER } from "./inbox-transport";
 import { LinearRefusedError, LinearService } from "./linear";
 import { ReviewDeletions } from "./review-deletions";
 import { ReviewLinks, type ReviewLinksOptions } from "./review-links";
@@ -12,33 +14,55 @@ import { ReviewClosedError } from "./sessions";
 const ISSUE = "3b241101-e2bb-4255-8caf-4136c566a962";
 const OTHER = "0c7f5f9e-83a5-4e4b-b7f3-2f7d3c1b5a10";
 const IDENTIFIER = "TUC-630";
+const REVIEW = { reviewId: "review-1" };
 const event = { type: "opened" as const, agentId: "agent-1", localUrl: "http://localhost:50001/", remoteUrl: "https://host.tail.ts.net:50001/", at: "2026-01-01T10:00:00Z" };
 
 async function fixture(run: (h: {
   links: ReviewLinks; journal: ReviewDeletions; file: string;
+  origin: string; refresh: () => Promise<void>;
   post: (path: string, body: unknown, headers?: Record<string, string>) => Promise<Response>;
   rows: () => Promise<{ open: { name: string; areas?: string[]; deleteable?: boolean }[]; decided: { name: string }[] }>;
-}) => Promise<void>, options: ReviewLinksOptions = {}) {
+}) => Promise<void>, options: ReviewLinksOptions = {}, checkedFrontdoor = false) {
   const directory = await mkdtemp(join(tmpdir(), "paseo-review-actions-"));
   const file = join(directory, "deletions.json");
   const journal = new ReviewDeletions(file);
   const links = new ReviewLinks({
+    ...(checkedFrontdoor ? { inbox: { credential: async () => "test-inbox-secret", decisions: async () => ({ hosts: [], canonicalHost: null, unreachable: [] }) } } : {}),
     port: 0, proxyPort: 0, file: join(directory, "reviews.json"), sweepMs: 3_600_000,
-    serve: async () => "https://host.tail.ts.net:8444", route: async () => {}, unserve: async () => {}, alive: async () => true,
+    origin: async () => "https://host.tail.ts.net:8444", route: async () => {}, unserve: async () => {}, alive: async () => true,
     fetchPlan: async () => "", issueInfo: async () => ({ issueId: ISSUE, areas: ["Purchasing"] }),
     issueLink: async () => ({ issueId: ISSUE, identifier: IDENTIFIER }),
     deleteIssue: async () => {}, cleanupIssue: async () => {}, deletions: journal, ...options,
   });
+  let frontdoor: InboxFrontdoor | undefined;
   try {
     await links.start();
-    await links.opened("agent-1", event, { identifier: IDENTIFIER, issueId: ISSUE });
-    const origin = `http://127.0.0.1:${links.listeningPort}`;
+    await links.opened("agent-1", event, { identifier: IDENTIFIER, issueId: ISSUE, ...REVIEW });
+    let origin = `http://127.0.0.1:${links.listeningPort}`;
+    if (checkedFrontdoor) {
+      links.seam!.ready();
+      const credentialFile = join(directory, "backend.secret");
+      await writeFile(credentialFile, "test-inbox-secret", { mode: 0o600 });
+      frontdoor = await startInboxFrontdoor({ port: 0, backendPort: links.listeningPort!, publicOrigin: "https://host.tail.ts.net:8444", stateDirectory: join(directory, "frontdoor"),
+        credentialFile, refreshMs: 0 });
+      origin = `http://127.0.0.1:${frontdoor.port}`;
+    }
+    const refresh = async () => {
+      if (frontdoor) {
+        const answer = await (await fetch(`${origin}/api/inbox/availability`)).json();
+        assert.equal(answer.stale, false);
+      }
+    };
+    await refresh();
     await run({
-      links, journal, file,
-      post: (path, body, headers = { "x-review-action": "1" }) => fetch(`${origin}${path}`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) }),
+      links, journal, file, origin, refresh,
+      post: async (path, body, headers = { "x-review-action": "1" }) => {
+        await refresh();
+        return fetch(`${origin}${path}`, { method: "POST", headers: { "content-type": "application/json", ...(frontdoor ? { [INBOX_DISPLAYED_HEADER]: links.seam!.instanceId } : {}), ...headers }, body: JSON.stringify(body) });
+      },
       rows: async () => (await fetch(`${origin}/api/inbox`)).json(),
     });
-  } finally { links.stop(); await rm(directory, { recursive: true, force: true }); }
+  } finally { await frontdoor?.close(); links.stop(); await rm(directory, { recursive: true, force: true }); }
 }
 
 const DELETE = "/api/reviews/agent-1/delete";
@@ -52,9 +76,9 @@ test("destructive review actions require same-origin JSON and exact ticket confi
       assert.equal((await post(path, {}, { "x-review-action": "1", origin: "https://evil.example" })).status, 403);
       assert.equal((await post(path, {}, { "x-review-action": "1", origin: "null" })).status, 403);
     }
-    assert.equal((await post(DELETE, { identifier: "tuc-630" })).status, 400);
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER, issueId: OTHER })).status, 400);
-    assert.equal((await post(RECHECK, { feedback: "implement immediately" })).status, 400);
+    assert.equal((await post(DELETE, { identifier: "tuc-630", ...REVIEW })).status, 400);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, issueId: OTHER, ...REVIEW })).status, 400);
+    assert.equal((await post(RECHECK, { feedback: "implement immediately", ...REVIEW })).status, 400);
     assert.equal(mutations, 0);
     assert.deepEqual((await rows()).open.map((row) => row.name), [IDENTIFIER]);
   }, { deleteIssue: async () => { mutations++; } });
@@ -68,12 +92,12 @@ test("delete revalidates saved issue identity, current linkage and latest waitin
     const row = (await rows()).open[0];
     assert.deepEqual({ areas: row.areas, deleteable: row.deleteable }, { areas: ["Purchasing"], deleteable: true });
     current = OTHER;
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 409);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, ...REVIEW })).status, 409);
     current = ISSUE; linked = OTHER;
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 409);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, ...REVIEW })).status, 409);
     linked = ISSUE;
     await links.decided("agent-1", true);
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 409);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, ...REVIEW })).status, 409);
     assert.equal(mutations, 0);
   }, {
     issueInfo: async () => ({ issueId: current, areas: ["Purchasing"] }),
@@ -84,13 +108,13 @@ test("delete revalidates saved issue identity, current linkage and latest waitin
 
 test("a non-ticket review and unverified metadata never offer or execute deletion", async () => {
   await fixture(async ({ links, post, rows }) => {
-    await links.opened("agent-1", event);
+    await links.opened("agent-1", event, REVIEW);
     assert.equal((await rows()).open[0].deleteable, false);
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 400);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, ...REVIEW })).status, 400);
   }, { issueLink: async () => null });
   await fixture(async ({ post, rows }) => {
     assert.equal((await rows()).open[0].deleteable, false);
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 409);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, ...REVIEW })).status, 409);
   }, { issueInfo: async () => null });
 });
 
@@ -98,7 +122,7 @@ test("Linear refusal clears the durable pause without clearing or deciding the r
   let cleanups = 0;
   let decisions = 0;
   await fixture(async ({ post, journal, rows }) => {
-    const response = await post(DELETE, { identifier: IDENTIFIER });
+    const response = await post(DELETE, { identifier: IDENTIFIER, ...REVIEW });
     assert.equal(response.status, 409);
     assert.match((await response.json()).error, /Linear refused deletion; the review was preserved/);
     assert.equal(await journal.get(ISSUE), null);
@@ -113,12 +137,12 @@ test("confirmed deletion is durable before cleanup, and cleanup retries never de
   let journalFile = "";
   await fixture(async ({ post, journal, file, rows }) => {
     journalFile = file;
-    const response = await post(DELETE, { identifier: IDENTIFIER });
+    const response = await post(DELETE, { identifier: IDENTIFIER, ...REVIEW });
     assert.equal(response.status, 500);
     assert.match((await response.json()).error, /underlying issue TUC-630 is already deleted.*local cleanup failed/);
     assert.equal((await rows()).open[0].deleteable, true);
     assert.equal((await new ReviewDeletions(file).get(ISSUE))?.phase, "deleted");
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 200);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, ...REVIEW })).status, 200);
     assert.deepEqual((await rows()).open, []);
     assert.equal((await journal.get(ISSUE))?.phase, "deleted");
     assert.equal(mutations, 1); assert.equal(cleanups, 2);
@@ -136,15 +160,19 @@ test("an unknown mutation result cannot be retried from disappeared or stale tic
   let mutations = 0;
   let visible = true;
   await fixture(async ({ post, journal, file }) => {
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 502);
+    const lost = await post(DELETE, { identifier: IDENTIFIER, ...REVIEW });
+    assert.equal(lost.status, 502);
+    assert.equal((await lost.json()).outcomeUnknown, true);
     assert.equal((await new ReviewDeletions(file).get(ISSUE))?.phase, "pending");
     visible = false;
-    const uncertain = await post(DELETE, { identifier: IDENTIFIER });
+    const uncertain = await post(DELETE, { identifier: IDENTIFIER, ...REVIEW });
     assert.equal(uncertain.status, 409);
-    assert.match((await uncertain.json()).error, /outcome is unknown.*no duplicate deletion/);
+    const answer = await uncertain.json();
+    assert.equal(answer.outcomeUnknown, true);
+    assert.match(answer.error, /outcome is unknown.*no duplicate deletion/);
     assert.equal(mutations, 1);
     visible = true;
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 200);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, ...REVIEW })).status, 200);
     assert.equal(mutations, 2);
     assert.equal((await journal.get(ISSUE))?.phase, "deleted");
   }, {
@@ -155,32 +183,34 @@ test("an unknown mutation result cannot be retried from disappeared or stale tic
 
 test("recheck sends back and requires owner approval across review rounds, while refused feedback rolls back the flag", async () => {
   const feedback: string[] = [];
+  const generations: (string | undefined)[] = [];
   await fixture(async ({ post, links }) => {
-    assert.equal((await post(RECHECK, {})).status, 200);
+    assert.equal((await post(RECHECK, REVIEW)).status, 200);
     assert.equal(await links.requiresOwner(ISSUE), true);
-    await links.opened("agent-2", { ...event, agentId: "agent-2", localUrl: "http://localhost:50002/", remoteUrl: "https://host.tail.ts.net:50002/" }, { identifier: IDENTIFIER, issueId: ISSUE });
+    await links.opened("agent-2", { ...event, agentId: "agent-2", localUrl: "http://localhost:50002/", remoteUrl: "https://host.tail.ts.net:50002/" }, { identifier: IDENTIFIER, issueId: ISSUE, reviewId: "review-2" });
     assert.equal(await links.requiresOwner(ISSUE), true);
-    assert.equal((await post("/api/reviews/agent-2/decision", { approve: true })).status, 200);
+    assert.equal((await post("/api/reviews/agent-2/decision", { approve: true, reviewId: "review-2" })).status, 200);
     assert.equal(await links.requiresOwner(ISSUE), true, "a decision being applied still requires the owner");
     // The decision worker marks the review decided once the journal carried the approval out.
     await links.decided("agent-2", true);
     assert.equal(await links.requiresOwner(ISSUE), false);
     assert.match(feedback[0], /current code and main branch.*recently merged pull requests.*related Linear issues and plans.*active reviews/);
     assert.match(feedback[0], /fresh advisor review of the exact revised text.*user's review.*Do not implement anything and do not auto-approve/);
-  }, { decide: async (_url, approved, text) => { feedback.push(`${approved} ${text}`); } });
+    assert.deepEqual(generations, ["review-1", "review-2"]);
+  }, { decide: async (_url, approved, text, _agentId, review) => { feedback.push(`${approved} ${text}`); generations.push(review.reviewId); } });
   await fixture(async ({ post, links }) => {
-    assert.equal((await post(RECHECK, {})).status, 409);
+    assert.equal((await post(RECHECK, REVIEW)).status, 409);
     assert.equal(await links.requiresOwner(ISSUE), false);
   }, { decide: async () => { throw new ReviewClosedError("Plannotator refused feedback."); } });
   await fixture(async ({ post, links }) => {
-    assert.equal((await post(RECHECK, {})).status, 502);
+    assert.equal((await post(RECHECK, REVIEW)).status, 502);
     assert.equal(await links.requiresOwner(ISSUE), true);
   }, { decide: async () => { throw new ReviewClosedError("Plannotator did not answer.", true); } });
 });
 
 test("tombstones suppress replayed opened reviews after a fixture restart", async () => {
   await fixture(async ({ post, links, file }) => {
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 200);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, ...REVIEW })).status, 200);
     assert.equal(await links.opened("old-agent", { ...event, agentId: "old-agent" }, { identifier: IDENTIFIER, issueId: ISSUE }), null);
     const restarted = new ReviewLinks({ file: join(file, "..", "reviews.json"), deletions: new ReviewDeletions(file) });
     assert.equal(await restarted.opened("agent-1", event, { identifier: IDENTIFIER, issueId: ISSUE }), null);
@@ -200,19 +230,21 @@ test("Linear issueDelete refusal and missing success are errors, not false local
 test("peer actions reach the owner without a previous inbox load and preserve partial deletion errors", async () => {
   let cleanups = 0;
   await fixture(async (peer) => {
-    await peer.links.opened("agent-9", { ...event, agentId: "agent-9", localUrl: "http://localhost:50009/", remoteUrl: "https://host.tail.ts.net:50009/" }, { identifier: IDENTIFIER, issueId: ISSUE });
+    await peer.links.opened("agent-9", { ...event, agentId: "agent-9", localUrl: "http://localhost:50009/", remoteUrl: "https://host.tail.ts.net:50009/" }, { identifier: IDENTIFIER, issueId: ISSUE, reviewId: "review-9" });
     await fixture(async ({ post, links }) => {
-      assert.equal((await post("/api/reviews/agent-9/recheck", {})).status, 200);
+      assert.equal((await post("/api/reviews/agent-9/recheck", { reviewId: "review-9", backendInstanceId: peer.links.seam!.instanceId })).status, 200);
       assert.equal(await peer.links.requiresOwner(ISSUE), true);
-      await peer.links.opened("agent-9", { ...event, agentId: "agent-9", localUrl: "http://localhost:50010/", remoteUrl: "https://host.tail.ts.net:50010/" }, { identifier: IDENTIFIER, issueId: ISSUE });
-      const partial = await post("/api/reviews/agent-9/delete", { identifier: IDENTIFIER });
+      await peer.links.opened("agent-9", { ...event, agentId: "agent-9", localUrl: "http://localhost:50010/", remoteUrl: "https://host.tail.ts.net:50010/" }, { identifier: IDENTIFIER, issueId: ISSUE, reviewId: "review-10" });
+      await peer.refresh();
+      const partial = await post("/api/reviews/agent-9/delete", { identifier: IDENTIFIER, reviewId: "review-10", backendInstanceId: peer.links.seam!.instanceId });
       assert.equal(partial.status, 500);
       assert.match((await partial.json()).error, /underlying issue TUC-630 is already deleted.*local cleanup failed/);
       assert.equal(await links.requiresOwner(ISSUE), false, "the forwarding host never sent feedback locally");
-      assert.equal((await post("/api/reviews/agent-9/delete", { identifier: IDENTIFIER })).status, 200);
+      await peer.refresh();
+      assert.equal((await post("/api/reviews/agent-9/delete", { identifier: IDENTIFIER, reviewId: "review-10", backendInstanceId: peer.links.seam!.instanceId })).status, 200);
       assert.deepEqual((await peer.rows()).open, []);
-    }, { peers: async () => [`http://127.0.0.1:${peer.links.listeningPort}`] });
-  }, { decide: async () => {}, cleanupIssue: async () => { if (++cleanups === 1) throw new Error("remote archive failed"); } });
+    }, { peers: async () => [peer.origin] });
+  }, { decide: async () => {}, cleanupIssue: async () => { if (++cleanups === 1) throw new Error("remote archive failed"); } }, true);
 });
 
 test("deletion rejects a newer waiting review that arrived during fresh identity verification", async () => {
@@ -222,9 +254,9 @@ test("deletion rejects a newer waiting review that arrived during fresh identity
   await fixture(async ({ links, post }) => {
     replace = async () => {
       now = new Date(now.getTime() + 1);
-      await links.opened("agent-1", { ...event, localUrl: "http://localhost:50002/", remoteUrl: "https://host.tail.ts.net:50002/" }, { identifier: IDENTIFIER, issueId: ISSUE });
+      await links.opened("agent-1", { ...event, localUrl: "http://localhost:50002/", remoteUrl: "https://host.tail.ts.net:50002/" }, { identifier: IDENTIFIER, issueId: ISSUE, reviewId: "review-2" });
     };
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 409);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, ...REVIEW })).status, 409);
     assert.equal(mutations, 0);
   }, {
     now: () => now,
@@ -240,12 +272,11 @@ for (const reuse of [false, true]) {
     const replacement = { ...event, localUrl: "http://localhost:50002/", remoteUrl: "https://host.tail.ts.net:50002/" };
     await fixture(async ({ links, post, journal, rows }) => {
       replace = async () => {
-        await links.opened("agent-1", replacement, { identifier: IDENTIFIER, issueId: ISSUE });
-        if (reuse) await links.opened("agent-1", event, { identifier: IDENTIFIER, issueId: ISSUE });
+        await links.opened("agent-1", replacement, { identifier: IDENTIFIER, issueId: ISSUE, reviewId: "review-2" });
+        if (reuse) await links.opened("agent-1", event, { identifier: IDENTIFIER, issueId: ISSUE, reviewId: "review-3" });
       };
-      const response = await post(DELETE, { identifier: IDENTIFIER });
+      const response = await post(DELETE, { identifier: IDENTIFIER, ...REVIEW });
       assert.equal(response.status, 409);
-      assert.deepEqual(await response.json(), { error: "The waiting review changed while its ticket was verified; nothing was deleted." });
       assert.deepEqual(effects, { prepare: 0, delete: 0, cleanup: 0, unserve: 0 });
       assert.equal(await journal.get(ISSUE), null);
       assert.deepEqual((await rows()).open.map((row) => row.name), [IDENTIFIER]);
@@ -266,10 +297,10 @@ for (const reuse of [false, true]) {
 test("an unchanged frozen-clock review deletes once and retries cleanup without another deletion", async () => {
   let mutations = 0;
   await fixture(async ({ post, journal, rows }) => {
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 200);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, ...REVIEW })).status, 200);
     assert.equal((await journal.get(ISSUE))?.phase, "deleted");
     assert.deepEqual((await rows()).open, []);
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 200);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, ...REVIEW })).status, 200);
     assert.equal(mutations, 1);
   }, { now: () => new Date("2026-01-01T10:00:00Z"), deleteIssue: async () => { mutations++; } });
 });
@@ -285,12 +316,12 @@ test("peer-forwarded deletion rejects the owner's tied replacement without mutat
     unserve: async () => { effects.unserve++; },
   };
   await fixture(async (owner) => {
-    await owner.links.opened("agent-9", { ...event, agentId: "agent-9", localUrl: "http://localhost:50009/", remoteUrl: "https://host.tail.ts.net:50009/" }, { identifier: IDENTIFIER, issueId: ISSUE });
+    await owner.links.opened("agent-9", { ...event, agentId: "agent-9", localUrl: "http://localhost:50009/", remoteUrl: "https://host.tail.ts.net:50009/" }, { identifier: IDENTIFIER, issueId: ISSUE, reviewId: "review-9" });
     replace = async () => {
-      await owner.links.opened("agent-9", { ...event, agentId: "agent-9", localUrl: "http://localhost:50010/", remoteUrl: "https://host.tail.ts.net:50010/" }, { identifier: IDENTIFIER, issueId: ISSUE });
+      await owner.links.opened("agent-9", { ...event, agentId: "agent-9", localUrl: "http://localhost:50010/", remoteUrl: "https://host.tail.ts.net:50010/" }, { identifier: IDENTIFIER, issueId: ISSUE, reviewId: "review-10" });
     };
     await fixture(async ({ post, journal }) => {
-      const response = await post("/api/reviews/agent-9/delete", { identifier: IDENTIFIER });
+      const response = await post("/api/reviews/agent-9/delete", { identifier: IDENTIFIER, reviewId: "review-9", backendInstanceId: owner.links.seam!.instanceId });
       assert.equal(response.status, 409);
       assert.match((await response.json()).error, /waiting review changed/);
       assert.equal(await journal.get(ISSUE), null);
@@ -299,18 +330,18 @@ test("peer-forwarded deletion rejects the owner's tied replacement without mutat
       const redirect = await fetch(`http://127.0.0.1:${owner.links.listeningPort}/review/agent-9`, { redirect: "manual" });
       assert.equal(redirect.status, 302);
       assert.equal(redirect.headers.get("location"), "https://host.tail.ts.net:50010/");
-    }, { ...options, peers: async () => [`http://127.0.0.1:${owner.links.listeningPort}`] });
+    }, { ...options, peers: async () => [owner.origin] });
   }, {
     ...options,
     issueInfo: async (_identifier, options) => { if (options?.fresh) await replace?.(); return { issueId: ISSUE, areas: [] }; },
-  });
+  }, true);
 });
 
 test("cached row linkage cannot authorize deletion when its independent fresh read fails", async () => {
   let mutations = 0;
   await fixture(async ({ rows, post }) => {
     assert.equal((await rows()).open[0].deleteable, true);
-    assert.equal((await post(DELETE, { identifier: IDENTIFIER })).status, 409);
+    assert.equal((await post(DELETE, { identifier: IDENTIFIER, ...REVIEW })).status, 409);
     assert.equal(mutations, 0);
   }, { issueInfo: async (_identifier, options) => options?.fresh ? null : { issueId: ISSUE, areas: [] }, deleteIssue: async () => { mutations++; } });
 });
@@ -318,11 +349,111 @@ test("cached row linkage cannot authorize deletion when its independent fresh re
 test("pre-mutation cleanup preparation failure restores actionability without a false unknown remote outcome", async () => {
   let mutations = 0;
   await fixture(async ({ journal, post, rows }) => {
-    const response = await post(DELETE, { identifier: IDENTIFIER });
+    const response = await post(DELETE, { identifier: IDENTIFIER, ...REVIEW });
     assert.equal(response.status, 409);
     assert.match((await response.json()).error, /Deletion did not start/);
     assert.equal(await journal.get(ISSUE), null);
     assert.equal((await rows()).open[0].deleteable, true);
     assert.equal(mutations, 0);
   }, { prepareDelete: async () => { throw new Error("in-flight start did not settle"); }, deleteIssue: async () => { mutations++; } });
+});
+
+for (const [sourceHost, targetHost] of [["laptop", "server087"], ["server087", "laptop"]]) {
+  test(`review actions from ${sourceHost} use ${targetHost}'s captured backend and review generation`, async () => {
+    const delivered: { agentId: string; reviewId?: string; approve: boolean }[] = [];
+    let deleted = 0;
+    await fixture(async (target) => {
+      await target.links.opened("agent-9", { ...event, agentId: "agent-9", localUrl: "http://localhost:50009/", remoteUrl: "https://host.tail.ts.net:50009/" }, { identifier: IDENTIFIER, issueId: ISSUE, reviewId: "review-9" });
+      await fixture(async (source) => {
+        const selected = { reviewId: "review-9", backendInstanceId: target.links.seam!.instanceId };
+        const path = "/api/reviews/agent-9";
+        for (const backendInstanceId of [undefined, source.links.seam!.instanceId]) {
+          assert.equal((await source.post(`${path}/decision`, { ...selected, approve: true, backendInstanceId })).status, 409);
+        }
+        assert.deepEqual(delivered, []);
+        assert.equal((await source.post(`${path}/decision`, { ...selected, approve: true })).status, 200);
+        assert.deepEqual(delivered, [{ agentId: "agent-9", reviewId: "review-9", approve: true }]);
+        await target.links.opened("agent-9", { ...event, agentId: "agent-9", localUrl: "http://localhost:50009/", remoteUrl: "https://host.tail.ts.net:50009/" }, { identifier: IDENTIFIER, issueId: ISSUE, reviewId: "review-10" });
+        await target.refresh();
+        for (const operation of ["decision", "recheck", "delete"]) {
+          const body = operation === "decision" ? { ...selected, approve: true } : operation === "delete" ? { ...selected, identifier: IDENTIFIER } : selected;
+          assert.equal((await source.post(`${path}/${operation}`, body)).status, 409);
+        }
+        assert.equal(delivered.length, 1);
+        assert.equal(deleted, 0);
+        await target.refresh();
+        assert.equal((await source.post(`${path}/recheck`, { ...selected, reviewId: "review-10" })).status, 200);
+        assert.deepEqual(delivered[1], { agentId: "agent-9", reviewId: "review-10", approve: false });
+        await target.refresh();
+        assert.equal((await source.post(`${path}/delete`, { ...selected, reviewId: "review-10", identifier: IDENTIFIER })).status, 200);
+        assert.equal(deleted, 1);
+        assert.deepEqual((await target.rows()).open, []);
+      }, { host: sourceHost, peers: async () => [target.origin], decide: async () => { throw new Error("wrong decision authority"); }, deleteIssue: async () => { throw new Error("wrong deletion authority"); } }, true);
+    }, { host: targetHost, decide: async (_url, approve, _feedback, agentId, review) => { delivered.push({ agentId, reviewId: review.reviewId, approve }); }, deleteIssue: async () => { deleted++; } }, true);
+  });
+}
+
+for (const operation of ["decision", "recheck"]) {
+  test(`${operation} refuses a concurrent same-URL replacement during its waiting check`, async () => {
+    let replace: (() => Promise<void>) | undefined;
+    let delivered = 0;
+    await fixture(async ({ links, post }) => {
+      replace = async () => {
+        replace = undefined;
+        await links.opened("agent-1", event, { identifier: IDENTIFIER, issueId: ISSUE, reviewId: "review-2" });
+      };
+      const body = operation === "decision" ? { ...REVIEW, approve: true } : REVIEW;
+      assert.equal((await post(`/api/reviews/agent-1/${operation}`, body)).status, 409);
+      assert.equal(delivered, 0);
+      assert.equal(await links.requiresOwner(ISSUE), false);
+    }, { alive: async () => { await replace?.(); return true; }, decide: async () => { delivered++; } });
+  });
+}
+
+test("deletion rechecks the generation after preparation without consuming a concurrent replacement", async (t) => {
+  let startReplacement: (() => Promise<void>) | undefined;
+  let replacement: Promise<unknown> | undefined;
+  let release!: () => void;
+  let entered!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const admission = new Promise<void>((resolve) => { entered = resolve; });
+  let deleted = 0;
+  await fixture(async ({ links, journal, post, rows }) => {
+    const forAgent = journal.forAgent.bind(journal);
+    let hold = false;
+    t.mock.method(journal, "forAgent", async (agentId: string) => {
+      const recorded = await forAgent(agentId);
+      if (hold) { hold = false; entered(); await held; }
+      return recorded;
+    });
+    startReplacement = async () => {
+      hold = true;
+      replacement = links.opened("agent-1", event, { identifier: IDENTIFIER, reviewId: "review-2" });
+      await admission;
+    };
+    const response = await post(DELETE, { ...REVIEW, identifier: IDENTIFIER });
+    assert.equal(response.status, 409);
+    assert.equal(deleted, 0);
+    assert.equal(await journal.get(ISSUE), null);
+    assert.equal((await rows()).open[0].name, IDENTIFIER);
+    assert.equal((await post(DELETE, { reviewId: "review-1", identifier: IDENTIFIER })).status, 409);
+  }, {
+    issueInfo: async (_identifier, options) => { if (options?.fresh) await startReplacement?.(); return { issueId: ISSUE, areas: [] }; },
+    prepareDelete: async () => { release(); await replacement; },
+    deleteIssue: async () => { deleted++; },
+  });
+});
+
+test("a refused manual retry preserves an earlier unknown deletion pause", async () => {
+  let preparationFails = false;
+  let deleted = 0;
+  await fixture(async ({ post, journal }) => {
+    assert.equal((await post(DELETE, { ...REVIEW, identifier: IDENTIFIER })).status, 502);
+    preparationFails = true;
+    const retry = await post(DELETE, { ...REVIEW, identifier: IDENTIFIER });
+    assert.equal(retry.status, 409);
+    assert.equal((await retry.json()).outcomeUnknown, true);
+    assert.equal((await journal.get(ISSUE))?.phase, "pending");
+    assert.equal(deleted, 1);
+  }, { prepareDelete: async () => { if (preparationFails) throw new Error("cannot settle in-flight work"); }, deleteIssue: async () => { deleted++; throw new Error("lost response"); } });
 });

@@ -9,6 +9,8 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import contribute from "../index.server";
 import { agentStatusRpc } from "../shared/contracts";
+import type { DecisionJournal } from "./decision-journal";
+import { INBOX_INSTANCE_HEADER } from "./inbox-transport";
 import { PlannotatorHost } from "./parked";
 import { PlannotatorBridge } from "./plannotator";
 import { rateBudget, RateLimitedError, withPriority } from "./rate-budget";
@@ -36,10 +38,16 @@ test("an inbox approval consumes the owner's reserve through the production deci
   const localUrl = `http://127.0.0.1:${address.port}/`;
   let inbox: ReviewLinks | undefined;
   let bridge: PlannotatorBridge | undefined;
+  let journal: DecisionJournal | undefined;
+  const useJournal = PlannotatorBridge.prototype.useJournal;
+  t.mock.method(PlannotatorBridge.prototype, "useJournal", function (this: PlannotatorBridge, value: DecisionJournal) {
+    journal = value;
+    useJournal.call(this, value);
+  });
   const startInbox = ReviewLinks.prototype.start;
   t.mock.method(ReviewLinks.prototype, "start", function (this: ReviewLinks) {
     inbox = this;
-    Object.assign(this, { port: 0, proxyPort: 0, serve: async () => "https://review.fixture.test", peers: async () => [] });
+    Object.assign(this, { port: 0, proxyPort: 0, peers: async () => [] });
     return startInbox.call(this);
   });
   const attachBridge = PlannotatorBridge.prototype.attach;
@@ -92,11 +100,22 @@ test("an inbox approval consumes the owner's reserve through the production deci
   } } as unknown as PaseoApi;
   assert.ok(readStatus);
   await readStatus({}, { paseo });
-  assert.ok(inbox && bridge);
+  // The plugin creates the inbox through its production ingress, whose credential step is
+  // asynchronous: wait for the listener the plugin itself made, not for the mocked start's return.
+  // setImmediate is used because this fixture mocks setTimeout and setInterval.
+  for (let waited = 0; waited < 5_000 && !(inbox && inbox.listeningPort !== null); waited++) await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(inbox && bridge && journal);
   await inbox.start();
-  await inbox.opened("agent-1", { type: "opened", agentId: "agent-1", localUrl, remoteUrl: "https://review.fixture.test", at: new Date().toISOString() }, { issueId: "issue-1", identifier: "TUC-TEST" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const at = new Date().toISOString();
+  const generation = await journal.ensureReview({ agentId: "agent-1", localUrl, openedAt: at });
+  await inbox.opened("agent-1", { type: "opened", agentId: "agent-1", localUrl, remoteUrl: "https://review.fixture.test", at }, { issueId: "issue-1", identifier: "TUC-TEST", reviewId: generation.id });
+  // The row's review identity as the production inbox reports it, so the decision names the review
+  // the page displayed rather than whatever is latest by then.
+  const listed = await (await fetch(`http://127.0.0.1:${inbox.listeningPort}/api/inbox`)).json();
+  const entry = listed.open.find((row: { agentId: string }) => row.agentId === "agent-1");
   const response = await fetch(`http://127.0.0.1:${inbox.listeningPort}/api/reviews/agent-1/decision`, {
-    method: "POST", headers: { "content-type": "application/json", "x-review-action": "1" }, body: JSON.stringify({ approve: true }),
+    method: "POST", headers: { "content-type": "application/json", "x-review-action": "1", [INBOX_INSTANCE_HEADER]: inbox.seam!.instanceId }, body: JSON.stringify({ approve: true, reviewId: entry?.reviewId, backendInstanceId: listed.backendInstanceId }),
   });
   assert.equal(response.status, 200, await response.text());
   assert.equal(approved, true);
