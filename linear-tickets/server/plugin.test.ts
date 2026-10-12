@@ -810,6 +810,26 @@ test("finished blockers are the Done ones and reviews with merged pull requests,
   assert.deepEqual(blockers[0].comments, [{ body: "Done.", createdAt: "2026-10-01T00:00:00Z" }]);
 });
 
+test("a blocker in review is finished for the agent that starts after it by its own merged pull request, not by a linked one that is still open", async () => {
+  const pr = (n: number, status: string, linkKind: string) => ({ title: `PR ${n}`, url: `https://github.com/o/r/pull/${n}`, sourceType: "github", metadata: { status, linkKind } });
+  const review = (id: string, identifier: string, prs: unknown[]) => ({ id, identifier, title: identifier, url: id, completedAt: null, state: { name: "In Review", type: "started" }, attachments: { nodes: prs }, documents: { nodes: [] }, comments: { nodes: [] } });
+  const post: Post = async () => ({ issues: { nodes: [
+    // TUC-2070: its merged own pull requests make it finished although a linked pull request of another ticket is still open.
+    review("a", "ENG-1", [pr(1, "merged", "contributes"), pr(2, "merged", "closes"), pr(3, "open", "links"), pr(4, "draft", "links")]),
+    // No merged pull request of its own: the linked one stays open, so it still holds the ticket back.
+    review("b", "ENG-2", [pr(5, "merged", "contributes"), pr(6, "open", "closes"), pr(7, "merged", "links")]),
+    // A merged pull request that only mentions the ticket is not its work.
+    review("c", "ENG-3", [pr(8, "merged", "links")]),
+    // An older attachment without a link kind counts as its own pull request, as before.
+    review("d", "ENG-4", [pr(9, "merged", "links"), { title: "PR 10", url: "https://github.com/o/r/pull/10", sourceType: "github", metadata: { status: "merged" } }]),
+  ] } });
+  const blockers = await new LinearService(new Credentials("/unused", "key"), post).finishedBlockers(["a", "b", "c", "d"]);
+  assert.deepEqual(blockers.map(({ identifier, status, completedAt }) => ({ identifier, status, completedAt })), [
+    { identifier: "ENG-1", status: "In Review", completedAt: null },
+    { identifier: "ENG-4", status: "In Review", completedAt: null },
+  ]);
+});
+
 test("a blocker in review whose pull requests are merged no longer holds the ticket back; open, draft, untracked or in-progress work does", async () => {
   const pr = (n: number, status: string, sourceType = "github") => ({ url: `https://github.com/o/r/pull/${n}`, sourceType, metadata: sourceType === "github" ? { status } : {} });
   const blocker = (identifier: string, name: string, type: string, prs: unknown[]) => ({ type: "blocks", issue: { identifier, state: { name, type }, attachments: { nodes: prs } } });
@@ -827,6 +847,27 @@ test("a blocker in review whose pull requests are merged no longer holds the tic
   ] } } });
   const state = await new LinearService(new Credentials("/unused", "key"), post).issueState("i1");
   assert.deepEqual(state.blockedBy, ["ENG-3", "ENG-4", "ENG-5", "ENG-6", "ENG-9", "ENG-10"]);
+});
+
+test("a reviewed blocker's own merged pull requests finish it even while a linked pull request of another ticket is open, and an open one of its own still holds the ticket back", async () => {
+  const pr = (n: number, status: string, linkKind: string) => ({ url: `https://github.com/o/r/pull/${n}`, sourceType: "github", metadata: { status, linkKind } });
+  const blocker = (identifier: string, name: string, type: string, prs: unknown[]) => ({ type: "blocks", issue: { identifier, state: { name, type }, attachments: { nodes: prs } } });
+  const post: Post = async () => ({ issue: { id: "i1", identifier: "ENG-1", state: { id: "s", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [
+    // TUC-2070: own merged pull requests finish it; the open linked ones of TUC-1145 do not count.
+    blocker("ENG-2", "In Review", "started", [pr(1, "merged", "contributes"), pr(2, "merged", "closes"), pr(3, "open", "links")]),
+    // No merged pull request of its own: the linked merged one does not stand in for it.
+    blocker("ENG-3", "In Review", "started", [pr(4, "open", "closes"), pr(5, "merged", "links")]),
+    // Its own merged pull request decides, whatever else is attached.
+    blocker("ENG-4", "In Review", "started", [pr(6, "merged", "closes"), pr(7, "draft", "links")]),
+    // Attachments without a link kind (older data) count as before.
+    blocker("ENG-5", "In Review", "started", [{ url: "https://github.com/o/r/pull/8", sourceType: "github", metadata: { status: "open" } }]),
+    blocker("ENG-6", "In Progress", "started", [pr(9, "merged", "contributes")]),
+    blocker("ENG-7", "In Review", "started", [pr(10, "merged", "closes"), pr(11, "closed", "closes")]),
+    blocker("ENG-8", "Done", "completed", []),
+    blocker("ENG-9", "In Review", "started", []),
+  ] } } });
+  const state = await new LinearService(new Credentials("/unused", "key"), post).issueState("i1");
+  assert.deepEqual(state.blockedBy, ["ENG-3", "ENG-5", "ENG-6", "ENG-9"]);
 });
 
 test("pre-launch errors can retry, but uncertain agent creation is never automatically repeated", async () => {
