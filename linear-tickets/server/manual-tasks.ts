@@ -1,9 +1,10 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { promisify } from "node:util";
 import { dispatchLabels } from "./dispatch";
 import type { IssueStatus, LinearService } from "./linear";
 import { RateLimitedError, withPriority } from "./rate-budget";
@@ -14,6 +15,8 @@ const INTERVAL_MS = 60 * 1000;
 const MANUAL_COLOR = "#f2994a";
 const CHECK_TIMEOUT_MS = 60 * 1000;
 const CHECK_OUTPUT_BYTES = 64 * 1024;
+// Tools such as gh, git and railway live in Homebrew, which a daemon's PATH often lacks.
+const TOOL_PATH = [join(homedir(), ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin", process.env.PATH ?? "/usr/bin:/bin"].join(":");
 const CLOSED = ["canceled", "duplicate"];
 const WHEN_TEXT: Record<ManualTask["when"], string> = { before_merge: "before merge", after_merge: "after merge", anytime: "due now" };
 
@@ -30,6 +33,10 @@ export type ManualTask = {
   // Only ever read from this private file, never from Linear, which anyone in the workspace can edit.
   check: string | null;
   cwd: string;
+  // Plugin-owned: the main checkout of `cwd`'s Git repository, looked up while `cwd` still exists
+  // (null: it was gone or not in a repository). The check runs there once the worktree is gone.
+  // Absent: not looked up yet.
+  repository?: string | null;
   createdAt: string;
   announced: boolean;
   activated: boolean;
@@ -40,14 +47,23 @@ export type ManualTask = {
 export type CheckResult = { ok: boolean; code: number | null; output: string; cwd: string };
 type Linear = Pick<LinearService, "addLabel" | "comment" | "moveToReady" | "reopen" | "issueStatuses" | "viewerId" | "userUrl">;
 
-// Runs a check with no stdin, a timeout and capped output. Tools such as gh and railway live in
-// Homebrew, which a daemon's PATH often lacks.
-export function runCheck(command: string, cwd: string): Promise<CheckResult> {
-  const where = existsSync(cwd) ? cwd : homedir();
-  const path = [join(homedir(), ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin", process.env.PATH ?? "/usr/bin:/bin"].join(":");
+// The main checkout of the Git repository `directory` is in: for a linked worktree, the checkout
+// it was added from. Null when `directory` is gone or not in a repository.
+async function mainCheckout(directory: string): Promise<string | null> {
+  if (!existsSync(directory)) return null;
+  const found = await promisify(execFile)("git", ["-C", directory, "rev-parse", "--path-format=absolute", "--git-common-dir"], { timeout: CHECK_TIMEOUT_MS, env: { ...process.env, PATH: TOOL_PATH } }).catch(() => null);
+  const common = found?.stdout.trim();
+  if (!common) return null;
+  return basename(common) === ".git" ? dirname(common) : common;
+}
+
+// Runs a check with no stdin, a timeout and capped output, in the first of `directories` that
+// exists, else the home directory.
+export function runCheck(command: string, directories: string[]): Promise<CheckResult> {
+  const where = directories.find((directory) => existsSync(directory)) ?? homedir();
   // Executor form: the plugin's TypeScript lib predates Promise.withResolvers.
   return new Promise((resolve) => {
-    const child = spawn("/bin/sh", ["-c", command], { cwd: where, env: { ...process.env, PATH: path }, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("/bin/sh", ["-c", command], { cwd: where, env: { ...process.env, PATH: TOOL_PATH }, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     const collect = (chunk: Buffer) => { if (output.length < CHECK_OUTPUT_BYTES) output += chunk.toString("utf8").slice(0, CHECK_OUTPUT_BYTES - output.length); };
     child.stdout.on("data", collect);
@@ -70,7 +86,7 @@ export class ManualTasks {
     private readonly deps: {
       linear: Linear;
       settings: Pick<Settings, "read">;
-      check?: (command: string, cwd: string) => Promise<CheckResult>;
+      check?: (command: string, directories: string[]) => Promise<CheckResult>;
     },
     private readonly directory = join(paseoHome(), "linear-tickets", "manual-tasks"),
   ) {}
@@ -104,6 +120,19 @@ export class ManualTasks {
 
   private async forget(task: ManualTask): Promise<void> {
     await rm(join(this.directory, `${task.id}.json`), { force: true });
+  }
+
+  // Records the task's main checkout once (see ManualTask.repository). A failed save leaves it
+  // unrecorded for the next poll.
+  private async located(task: ManualTask): Promise<ManualTask> {
+    if (task.repository !== undefined) return task;
+    const located = { ...task, repository: await mainCheckout(task.cwd) };
+    try {
+      await this.save(located);
+    } catch (error) {
+      console.error(`[linear-tickets] manual task ${task.identifier}: recording its repository failed: ${error instanceof Error ? error.message : error}`);
+    }
+    return located;
   }
 
   private async mention(issueId: string, body: string): Promise<void> {
@@ -157,7 +186,9 @@ export class ManualTasks {
   }
 
   private async run(): Promise<void> {
-    const tasks = await this.tasks();
+    // A new task's repository is looked up on the first poll after the agent wrote it, while its
+    // worktree still exists: an archived agent's worktree is deleted later.
+    const tasks = await Promise.all((await this.tasks()).map((task) => this.located(task)));
     if (!tasks.length) return;
     let statuses: Map<string, IssueStatus>;
     try {
@@ -203,7 +234,7 @@ export class ManualTasks {
     if (status.statusType !== "completed") return;
     if (!task.check) return this.forget(task);
     if (task.verifiedFor === status.completedAt) return;
-    const result = await (this.deps.check ?? runCheck)(task.check, task.cwd);
+    const result = await (this.deps.check ?? runCheck)(task.check, task.repository ? [task.cwd, task.repository] : [task.cwd]);
     if (result.ok) {
       await this.deps.linear.comment(task.id, `✓ Verified: the check passed (ran in \`${result.cwd}\`).`);
       await this.forget(task);
