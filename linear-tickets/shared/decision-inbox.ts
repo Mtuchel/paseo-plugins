@@ -14,6 +14,7 @@ export const liveDecisionSchema = z.object({
 export type LiveDecision = z.infer<typeof liveDecisionSchema>;
 export const decisionHostSchema = z.object({
   host: z.string(), asks: z.array(ownerAskSchema), live: z.array(liveDecisionSchema),
+  backendInstanceId: z.string().uuid().optional(),
   history: z.array(decisionReceiptSchema), updatedAt: z.string(), error: z.string().nullable(),
 });
 export type DecisionHost = z.infer<typeof decisionHostSchema>;
@@ -24,6 +25,7 @@ export type DecisionView = {
 };
 export type BrowserDecisionAction = {
   host: string;
+  backendInstanceId?: string;
   target: "owner" | "live";
   operation: "answer" | "triage";
   issueId?: string;

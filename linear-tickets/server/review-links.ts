@@ -9,13 +9,15 @@ import { z } from "zod";
 import { isActivationPath, MAX_ACTIVATION_BODY_BYTES, type ActivationRoute } from "./activation";
 import { DecisionPendingError, FencedError, StaleResolutionError, type ApplyingEntry, type ResolveAction } from "./decision-journal";
 import { FUNNEL_PORT } from "./funnel";
+import { InboxBackend, type InboxBackendOptions } from "./inbox-backend";
+import { INBOX_BACKEND_PORT, INBOX_DISPLAYED_HEADER } from "./inbox-transport";
 import { plannotatorPaths, readReviewPlan, type OpenedEvent } from "./plannotator";
 import { ReviewBundles } from "./review-bundle";
 import { REVIEW_ICON_PNG } from "./review-icon";
 import { closedPage, inboxPage, MANIFEST, planDetails, SERVICE_WORKER, type ApplyState, type InboxRow, type InboxView, type PlanDetails } from "./review-page";
 import { createReviewProxy } from "./review-proxy";
 import { pushSubscription, ReviewPush, type PushSend } from "./review-push";
-import { tailscaleBinary } from "./tailscale";
+import { tailscaleBinary, tailnetOrigin } from "./tailscale";
 import { PipelineHost, type PipelineHost as HostPipeline } from "../shared/plan-pipeline";
 import { AuthenticationError, refusedByLinear } from "./linear";
 import { ReviewDeletions } from "./review-deletions";
@@ -24,11 +26,14 @@ import type { PipelineReview } from "./plan-pipeline";
 import { ReviewClosedError } from "./sessions";
 
 const exec = promisify(execFile);
-export const REVIEW_PORT = 47_832;
+// The checked inbox backend. The browser-facing port 127.0.0.1:47832 and the tailnet origin
+// :8444 belong to the persistent inbox frontdoor now (inbox-frontdoor.ts, installed by
+// tools/inbox-service-install.mjs); this server answers only the frontdoor and is never published.
+export const REVIEW_BACKEND_PORT = 47_834;
 // The compressing proxy every review's tailnet route points at (review-proxy.ts).
 export const REVIEW_PROXY_PORT = 47_833;
-// Tailnet-only (`tailscale serve`, never Funnel): 8443 stays the public webhook.
-export const REVIEW_SERVE_PORT = 8444;
+// The tailnet-only review-service port (`tailscale serve`, never Funnel): 8443 stays the public webhook.
+export const REVIEW_TAILNET_PORT = 8444;
 const SWEEP_MS = 30_000;
 const MISSES_TO_CLOSE = 2;
 const AGENT_ID = /^[A-Za-z0-9_-]+$/;
@@ -81,8 +86,9 @@ export type ReviewLinksOptions = {
   now?: () => Date;
   // Whether the review's own Plannotator server still answers.
   alive?: (localUrl: string) => Promise<boolean>;
-  // Publishes the local port on :8444 and returns the tailnet origin, or null.
-  serve?: (localPort: number) => Promise<string | null>;
+  // This host's published tailnet origin (https://<machine>.<tailnet>.ts.net:8444), read from
+  // Tailscale; the persistent inbox frontdoor owns that route now, this server never publishes.
+  origin?: () => Promise<string | null>;
   // Removes one per-review tailnet route.
   unserve?: (port: number) => Promise<void>;
   // Points one review's tailnet route at the compressing proxy.
@@ -113,6 +119,10 @@ export type ReviewLinksOptions = {
   sendPush?: PushSend;
   // Draining a host: the /activation* routes this server also answers (activation-endpoints.ts).
   routes?: ActivationRoute;
+  // The checked inbox backend's private seam (inbox-backend.ts): the frontdoor's ready/snapshot
+  // routes and the admission fence forwarded mutations pass. Without it (tests, embedded use)
+  // this server is a plain checked backend.
+  inbox?: Omit<InboxBackendOptions, "inbox">;
 };
 
 class DecisionError extends Error {
@@ -127,11 +137,6 @@ async function backendAlive(localUrl: string): Promise<boolean> {
   } catch { return false; }
 }
 
-async function serveReviews(localPort: number): Promise<string | null> {
-  const { stdout, stderr } = await exec(tailscaleBinary(), ["serve", "--bg", `--https=${REVIEW_SERVE_PORT}`, `http://127.0.0.1:${localPort}`], { timeout: 12_000 });
-  return `${stdout}\n${stderr}`.match(new RegExp(`https://[^\\s/]+:${REVIEW_SERVE_PORT}\\b`))?.[0] ?? null;
-}
-
 async function unserveReview(port: number): Promise<void> {
   await exec(tailscaleBinary(), ["serve", `--https=${port}`, "off"], { timeout: 12_000 });
 }
@@ -143,7 +148,7 @@ async function routeReview(port: number, proxyPort: number): Promise<void> {
 // The tailnet port of a review's route; null for the ports this plugin must never touch.
 function reviewPort(remoteUrl: string | null): number | null {
   const port = remoteUrl ? Number(new URL(remoteUrl).port) : 0;
-  return port && port !== FUNNEL_PORT && port !== REVIEW_SERVE_PORT ? port : null;
+  return port && port !== FUNNEL_PORT && port !== REVIEW_TAILNET_PORT ? port : null;
 }
 
 // When the owner got the plan: what the inbox shows, sorts and groups waiting reviews by.
@@ -168,6 +173,7 @@ const PeerDetails = z.object({
 });
 // One row of a peer's /api/inbox: links are web links, ticket links point at Linear.
 const PeerRow = z.object({
+  reviewId: z.string().optional(),
   agentId: z.string().regex(AGENT_ID),
   name: text(200),
   link: text(2_000).regex(/^https?:\/\//),
@@ -187,18 +193,20 @@ const PeerRow = z.object({
   nextAttemptAt: text(40).refine((value) => !Number.isNaN(Date.parse(value))).optional(),
   ownerNeeded: z.boolean().optional(),
 });
-const PeerInbox = z.object({ host: text(100), open: z.array(z.unknown()), decided: z.array(z.unknown()), applying: z.array(z.unknown()).optional(), pipeline: z.unknown().optional() });
-const DecisionRequest = z.object({ approve: z.boolean(), feedback: z.string().optional() });
-const ResolveRequest = z.object({ entryId: z.string().min(1).max(200), action: z.enum(["carry-out", "drop", "keep", "other", "dismiss"]) }).strict();
-const RecheckRequest = z.object({}).strict();
-const DeleteRequest = z.object({ identifier: z.string() }).strict();
-const ErrorAnswer = z.object({ error: z.string() });
+const BackendInstanceId = z.string().uuid().optional();
+const ReviewId = z.string().min(1).max(200);
+const PeerInbox = z.object({ host: text(100), backendInstanceId: BackendInstanceId, open: z.array(z.unknown()), decided: z.array(z.unknown()), applying: z.array(z.unknown()).optional(), pipeline: z.unknown().optional() });
+const DecisionRequest = z.object({ approve: z.boolean(), feedback: z.string().optional(), reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
+const ResolveRequest = z.object({ entryId: z.string().min(1).max(200), action: z.enum(["carry-out", "drop", "keep", "other", "dismiss"]), backendInstanceId: BackendInstanceId }).strict();
+const RecheckRequest = z.object({ reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
+const DeleteRequest = z.object({ identifier: z.string(), reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
+const ErrorAnswer = z.object({ error: z.string(), outcomeUnknown: z.boolean().optional() });
 
 // A peer's rows; a row this inbox could not render is left out, not the whole peer.
-function peerRows(rows: unknown[], host: string): InboxRow[] {
+function peerRows(rows: unknown[], host: string, backendInstanceId?: string): InboxRow[] {
   return rows.flatMap((raw) => {
     const parsed = PeerRow.safeParse(raw);
-    return parsed.success ? [{ ...parsed.data, host }] : [];
+    return parsed.success ? [{ ...parsed.data, host, backendInstanceId }] : [];
   });
 }
 
@@ -234,22 +242,27 @@ function json(status: number, value: unknown): { status: number; headers: Record
 // moves the page's inline Plannotator app to /plannotator/<sha256>.js|css here (review-bundle.ts),
 // so a browser loads it once per Plannotator version instead of once per review.
 export class ReviewLinks {
+  // The private seam the persistent frontdoor reads (inbox-backend.ts); null without the option.
+  readonly seam: InboxBackend | null;
   private server: Server | null = null;
   private proxy: Server | null = null;
   private timer: NodeJS.Timeout | null = null;
   private starting: Promise<void> | null = null;
+  // Once stopped, this instance never serves again: nothing that was awaited across the stop may
+  // resurrect a listener, a proxy or a timer (a replacement plugin owns the ports from then on).
+  private disposed = false;
   private origin: string | null = null;
   private registry: Registry | null = null;
   private queue: Promise<unknown> = Promise.resolve();
   private readonly misses = new Map<string, number>();
   // The peer each listed review belongs to, from the last inbox load: where its decision goes.
-  private readonly peerOf = new Map<string, string>();
+  private readonly peerOf = new Map<string, { origin: string; backendInstanceId?: string }>();
   private readonly port: number;
   private readonly file: string;
   private readonly sweepMs: number;
   private readonly now: () => Date;
   private readonly alive: (localUrl: string) => Promise<boolean>;
-  private readonly serve: (localPort: number) => Promise<string | null>;
+  private readonly originOf: () => Promise<string | null>;
   private readonly unserve: (port: number) => Promise<void>;
   private readonly route: (port: number, proxyPort: number) => Promise<void>;
   private readonly proxyPort: number;
@@ -273,12 +286,15 @@ export class ReviewLinks {
   private readonly pipelineSource: ReviewLinksOptions["pipeline"];
 
   constructor(options: ReviewLinksOptions = {}) {
-    this.port = options.port ?? REVIEW_PORT;
+    this.port = options.port ?? REVIEW_BACKEND_PORT;
     this.file = options.file ?? join(plannotatorPaths().directory, "reviews.json");
     this.sweepMs = options.sweepMs ?? SWEEP_MS;
     this.now = options.now ?? (() => new Date());
     this.alive = options.alive ?? backendAlive;
-    this.serve = options.serve ?? serveReviews;
+    this.originOf = options.origin ?? (() => tailnetOrigin(REVIEW_TAILNET_PORT));
+    // The seam's review view is this server's own inbox view: the frontdoor never instantiates
+    // another live ReviewLinks (its reads enrich the registry), it reads this one.
+    this.seam = options.inbox ? new InboxBackend({ ...options.inbox, inbox: () => this.view() }) : null;
     this.unserve = options.unserve ?? unserveReview;
     this.route = options.route ?? routeReview;
     this.proxyPort = options.proxyPort ?? REVIEW_PROXY_PORT;
@@ -312,6 +328,7 @@ export class ReviewLinks {
   }
 
   start(): Promise<void> {
+    if (this.disposed) return Promise.resolve();
     return this.starting ??= (async () => {
       const server = createServer((request, response) => {
         const chunks: Buffer[] = [];
@@ -340,12 +357,16 @@ export class ReviewLinks {
         server.once("error", reject);
         server.listen(this.port, "127.0.0.1", () => { server.off("error", reject); resolve(); });
       });
-      const port = this.listeningPort ?? this.port;
-      this.origin = await this.serve(port).catch((error: unknown) => {
-        console.error(`[linear-tickets] publishing review links on :${REVIEW_SERVE_PORT} failed: ${error instanceof Error ? error.message.split("\n")[0] : error}`);
+      // stop() may have run while the listen was in flight: close what was just created and leave
+      // the fixed backend port to the replacement plugin instead of holding it.
+      if (this.disposed) { server.close(); server.closeAllConnections(); if (this.server === server) this.server = null; return; }
+      this.origin = await this.originOf().catch((error: unknown) => {
+        console.error(`[linear-tickets] reading this host's tailnet origin failed; review links stay local: ${error instanceof Error ? error.message.split("\n")[0] : error}`);
         return null;
       });
+      if (this.disposed) { server.close(); server.closeAllConnections(); if (this.server === server) this.server = null; return; }
       await this.startProxy();
+      if (this.disposed) { this.proxy?.close(); this.proxy?.closeAllConnections(); this.proxy = null; server.close(); server.closeAllConnections(); if (this.server === server) this.server = null; return; }
       this.timer = setInterval(() => { void this.sweep().then(() => this.announce()); }, this.sweepMs);
       this.timer.unref?.();
     })().catch((error: unknown) => {
@@ -354,6 +375,7 @@ export class ReviewLinks {
   }
 
   stop(): void {
+    this.disposed = true;
     clearInterval(this.timer ?? undefined);
     this.timer = null;
     this.server?.close();
@@ -522,13 +544,26 @@ export class ReviewLinks {
 
   private async respond(method: string, url: string, headers: IncomingHttpHeaders, body: string): Promise<{ status: number; headers?: Record<string, string>; body?: string | Buffer }> {
     const path = new URL(url, "http://localhost").pathname;
+    const action = /^\/api\/reviews\/([^/]+)\/(decision|recheck|delete|resolve)$/.exec(path);
+    // The private frontdoor seam (inbox-backend.ts) answers first: /_inbox/* only, and it holds
+    // the instance epoch and the draining state of this checked backend.
+    if (this.seam) {
+      const seam = await this.seam.route({ method, path, headers });
+      if (seam) return seam;
+      // Every mutation the frontdoor forwards carries the instance it was displayed from; the
+      // fence runs before any handler, so a replaced or draining backend refuses instead of
+      // rebinding an old action. A direct caller without the header is not the frontdoor.
+      if (method === "POST" && (action || path === "/api/push/subscribe" || path === "/api/decisions/action")) {
+        const refusal = this.seam.admit(headers);
+        if (refusal) return refusal;
+      }
+    }
     // Draining a host: /activation* goes to the authenticated activation protocol, which answers
     // 401 for a request without the shared secret (and null for every other path).
     if (this.routes) {
       const custom = await this.routes({ method, path, headers, body });
       if (custom) return custom;
     }
-    const action = /^\/api\/reviews\/([^/]+)\/(decision|recheck|delete|resolve)$/.exec(path);
     if (action || path === "/api/push/subscribe") {
       if (method !== "POST") return { status: 405, headers: { allow: "POST" } };
       // A page on another site cannot send these: the custom header needs a CORS preflight, which
@@ -558,19 +593,24 @@ export class ReviewLinks {
           if (operation === "delete") return this.deleteFor(agentId, parsed);
           if (operation === "resolve") return this.resolveFor(agentId, parsed);
           if (operation === "recheck") {
-            if (!RecheckRequest.safeParse(parsed).success) throw new DecisionError(400, "Recheck takes an empty JSON object.");
+            const request = RecheckRequest.safeParse(parsed);
+            if (!request.success) throw new DecisionError(400, "Name the review to recheck.");
             const entry = latest(await this.load(), agentId);
-            if (!entry) return this.forward(agentId, "recheck", {});
+            if (!entry) return this.forward(agentId, "recheck", request.data);
+            this.checkBackend(request.data.backendInstanceId);
+            this.checkReview(entry, request.data.reviewId);
             await this.waiting(entry);
             if (!this.decide) throw new DecisionError(503, "This host cannot decide reviews.");
             const prior = entry.recheckRequested;
             const linked = !entry.issueId && this.issueLink ? await this.issueLink(agentId).catch(() => null) : null;
-            await this.change(() => {
+            await this.change((registry) => {
+              this.checkReview(entry, request.data.reviewId, registry);
               if (linked && linked.identifier === entry.identifier) entry.issueId = linked.issueId;
               entry.recheckRequested = true;
             });
-            try { await this.decideFor(agentId, { approve: false, feedback: RECHECK_FEEDBACK }); } catch (error) {
-              if (!(error instanceof DecisionError && error.outcomeUnknown)) await this.change(() => {
+            try { await this.decideFor(agentId, { approve: false, feedback: RECHECK_FEEDBACK, ...request.data }); } catch (error) {
+              if (!(error instanceof DecisionError && error.outcomeUnknown)) await this.change((registry) => {
+                if (latest(registry, agentId) !== entry) return;
                 if (prior) entry.recheckRequested = prior;
                 else delete entry.recheckRequested;
               });
@@ -584,7 +624,7 @@ export class ReviewLinks {
         try { await work; } finally { if (this.actions.get(actionKey) === work) this.actions.delete(actionKey); }
         return json(200, { ok: true });
       } catch (error) {
-        if (error instanceof DecisionError) return json(error.status, { error: error.message });
+        if (error instanceof DecisionError) return json(error.status, { error: error.message, ...(error.outcomeUnknown ? { outcomeUnknown: true } : {}) });
         throw error;
       }
     }
@@ -598,7 +638,7 @@ export class ReviewLinks {
       return { status: 200, headers: { "content-type": file.type, "cache-control": "public, max-age=31536000, immutable", "access-control-allow-origin": "*", vary: "Accept-Encoding", ...(br ? { "content-encoding": "br" } : {}) }, body: br ?? file.raw };
     }
     if (path === "/") return { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: inboxPage(await this.view(), this.now(), this.timeZone) };
-    if (path === "/api/inbox") return json(200, { host: this.host, ...await this.rows() });
+    if (path === "/api/inbox") return json(200, { host: this.host, backendInstanceId: this.seam?.instanceId, ...await this.rows() });
     if (path === "/api/push/key") return json(200, { publicKey: await this.push.publicKey() });
     if (path === "/manifest.webmanifest") return { status: 200, headers: { "content-type": "application/manifest+json" }, body: MANIFEST };
     if (path === "/sw.js") return { status: 200, headers: { "content-type": "text/javascript; charset=utf-8", "service-worker-allowed": "/" }, body: SERVICE_WORKER };
@@ -626,12 +666,19 @@ export class ReviewLinks {
     const approve = request.data.approve;
     const feedback = request.data.feedback?.trim().slice(0, MAX_FEEDBACK_CHARS) ?? "";
     if (!approve && !feedback) throw new DecisionError(400, "Say what should change.");
+    // The review the page displayed decides which review is being decided: an action composed
+    // against an earlier plan is refused rather than rebound to whatever is latest by now, and the
+    // displayed review id travels to the peer that owns it.
+    const displayed = request.data.reviewId;
     const entry = latest(await this.load(), agentId);
     if (!entry) {
-      return this.forward(agentId, "decision", { approve, feedback });
+      return this.forward(agentId, "decision", { ...request.data, approve, feedback });
     }
+    this.checkBackend(request.data.backendInstanceId);
+    this.checkReview(entry, displayed);
     await this.waiting(entry);
     if (!this.decide) throw new DecisionError(503, "This host cannot decide reviews.");
+    this.checkReview(entry, displayed);
     try { await this.decide(entry.localUrl, approve, approve ? "" : feedback, agentId, { reviewId: entry.reviewId, source: "inbox" }); } catch (error) {
       // The journal refused: a decision for this review is in progress. Otherwise Plannotator's
       // own answer decides, and only a lost answer leaves the outcome unknown.
@@ -654,6 +701,7 @@ export class ReviewLinks {
     const applying = await this.decisions.applying();
     const local = applying.some((item) => item.kind !== "unreadable" && item.entry.id === request.data.entryId && item.entry.agentId === agentId);
     if (!local) return this.forward(agentId, "resolve", request.data);
+    this.checkBackend(request.data.backendInstanceId);
     try { await this.decisions.resolve(request.data.entryId, request.data.action); } catch (error) {
       if (error instanceof StaleResolutionError) throw new DecisionError(409, error.message);
       if (error instanceof FencedError) throw new DecisionError(503, error.message);
@@ -661,22 +709,33 @@ export class ReviewLinks {
     }
   }
 
+  private checkBackend(displayed?: string): void {
+    if (this.seam && displayed !== this.seam.instanceId) throw new DecisionError(409, "The target inbox backend changed since this page was displayed; nothing was sent. Reload the page.");
+  }
+
+  private checkReview(entry: ReviewEntry, displayed: string, registry: Registry = this.registry!): void {
+    if (displayed !== entry.reviewId || latest(registry, entry.agentId) !== entry) throw new DecisionError(409, "The waiting review changed since this page was displayed; nothing was sent or deleted. Reload the page and use the current plan.");
+  }
+
   private async waiting(entry: ReviewEntry): Promise<void> {
     if (entry.closedAt || entry.outcome || !entry.remoteUrl || !await this.alive(entry.localUrl)) throw new DecisionError(409, "This review is already closed.");
     if (await this.deletions.forAgent(entry.agentId) || entry.issueId && await this.deletions.blocked(entry.issueId)) throw new DecisionError(409, "Deletion is pending for this ticket; resolve or retry deletion first.");
+    this.checkReview(entry, entry.reviewId ?? "");
   }
 
-  private async forward(agentId: string, operation: string, body: unknown): Promise<void> {
+  private async forward(agentId: string, operation: string, body: { backendInstanceId?: string; [field: string]: unknown }): Promise<void> {
     let peer = this.peerOf.get(agentId);
     if (!peer) { await this.view(); peer = this.peerOf.get(agentId); }
     if (!peer) throw new DecisionError(404, "This review is not listed any more.");
-    const response = await fetch(`${peer}/api/reviews/${encodeURIComponent(agentId)}/${operation}`, {
-      method: "POST", headers: { "content-type": "application/json", "x-review-action": "1" },
-      body: JSON.stringify(body), signal: AbortSignal.timeout(60_000),
-    }).catch((error: unknown) => { throw new DecisionError(502, `${new URL(peer).hostname} did not answer; the action's outcome is unknown: ${error instanceof Error ? error.message : error}`); });
+    const displayed = body.backendInstanceId;
+    if (!displayed || displayed !== peer.backendInstanceId) throw new DecisionError(409, "The target inbox backend is missing or changed since this page was displayed; no action was forwarded. Reload the page.");
+    const response = await fetch(`${peer.origin}/api/reviews/${encodeURIComponent(agentId)}/${operation}`, {
+      method: "POST", headers: { "content-type": "application/json", "x-review-action": "1", [INBOX_DISPLAYED_HEADER]: displayed },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(60_000), redirect: "error",
+    }).catch((error: unknown) => { throw new DecisionError(502, `${new URL(peer.origin).hostname} did not answer; the action's outcome is unknown: ${error instanceof Error ? error.message : error}`, true); });
     if (response.ok) return;
     const answer = ErrorAnswer.safeParse(await response.json().catch(() => null));
-    throw new DecisionError(response.status, answer.success ? answer.data.error : `${new URL(peer).hostname} answered HTTP ${response.status}.`);
+    throw new DecisionError(response.status, answer.success ? answer.data.error : `${new URL(peer.origin).hostname} answered HTTP ${response.status}.`, answer.success && answer.data.outcomeUnknown === true);
   }
 
   private async deleteFor(agentId: string, raw: unknown): Promise<void> {
@@ -684,7 +743,11 @@ export class ReviewLinks {
     if (!request.success) throw new DecisionError(400, "Confirm the exact ticket identifier.");
     const entry = latest(await this.load(), agentId);
     let deletion = await this.deletions.forAgent(agentId);
+    const deletionWasPending = deletion?.phase === "pending";
     if (!entry && !deletion) return this.forward(agentId, "delete", request.data);
+    this.checkBackend(request.data.backendInstanceId);
+    if (entry) this.checkReview(entry, request.data.reviewId);
+    else if (deletion?.phase !== "deleted") throw new DecisionError(409, "The waiting review is no longer verifiable; nothing was deleted.");
     if (!this.deleteIssue || !this.cleanupIssue || !this.issueInfo) throw new DecisionError(503, "This host cannot delete tickets.");
     const identifier = deletion?.identifier ?? entry?.identifier;
     if (!identifier || request.data.identifier !== identifier) throw new DecisionError(400, "The confirmation must exactly match this review's ticket identifier.");
@@ -699,12 +762,19 @@ export class ReviewLinks {
       await this.deletions.put(deletion);
     } else if (deletion.phase === "pending") {
       const current = await this.issueInfo(identifier, { fresh: true });
-      if (!current || current.issueId !== deletion.issueId) throw new DecisionError(409, "The previous deletion's outcome is unknown. The same ticket is not verifiably present; no duplicate deletion was sent.");
+      if (!current || current.issueId !== deletion.issueId) throw new DecisionError(409, "The previous deletion's outcome is unknown. The same ticket is not verifiably present; no duplicate deletion was sent.", true);
     }
     if (deletion.phase === "pending") {
       try { await this.prepareDelete?.(deletion.issueId); } catch (error) {
+        if (deletionWasPending) throw new DecisionError(409, `The previous deletion's outcome remains unknown; preparation failed and no new deletion was sent: ${error instanceof Error ? error.message : error}`, true);
         await this.deletions.remove(deletion.issueId);
         throw new DecisionError(409, `Deletion did not start; the review was preserved: ${error instanceof Error ? error.message : error}`);
+      }
+      // Preparation and journal writes may await a concurrently published replacement. Check the
+      // captured generation again immediately before dispatching the irreversible remote delete.
+      try { this.checkReview(entry!, request.data.reviewId); } catch (error) {
+        if (!deletionWasPending) await this.deletions.remove(deletion.issueId);
+        throw error;
       }
       try {
         await this.deleteIssue(deletion.issueId);
@@ -713,7 +783,7 @@ export class ReviewLinks {
           await this.deletions.remove(deletion.issueId);
           throw new DecisionError(409, `Linear refused deletion; the review was preserved: ${error instanceof Error ? error.message : error}`);
         }
-        throw new DecisionError(502, `Deletion outcome is unknown; the ticket is paused and its review preserved. Retry only after verifying the same ticket still exists: ${error instanceof Error ? error.message : error}`);
+        throw new DecisionError(502, `Deletion outcome is unknown; the ticket is paused and its review preserved. Retry only after verifying the same ticket still exists: ${error instanceof Error ? error.message : error}`, true);
       }
       deletion = { ...deletion, phase: "deleted" };
     }
@@ -753,7 +823,7 @@ export class ReviewLinks {
         const pipeline: HostPipeline = status.success
           ? { ...status.data, host: answer.host, rows: status.data.rows.map((row) => ({ ...row, host: answer.host })) }
           : { host: answer.host, checkedAt: null, lastArrivalAt: null, rows: [], error: "Plan monitoring is unavailable on this host." };
-        return { peer, host: answer.host, open: peerRows(answer.open, answer.host), decided: peerRows(answer.decided, answer.host), applying: peerRows(answer.applying ?? [], answer.host), pipeline };
+        return { peer, host: answer.host, backendInstanceId: answer.backendInstanceId, open: peerRows(answer.open, answer.host, answer.backendInstanceId), decided: peerRows(answer.decided, answer.host, answer.backendInstanceId), applying: peerRows(answer.applying ?? [], answer.host, answer.backendInstanceId), pipeline };
       } catch { return { peer, host: peerName(peer), unreachable: true as const, applying: [], pipeline: { host: peerName(peer), checkedAt: null, lastArrivalAt: null, rows: [], error: "Host unreachable; plan progress is unknown." } satisfies HostPipeline }; }
     }));
     const open = [...own.open];
@@ -765,7 +835,7 @@ export class ReviewLinks {
     for (const answer of answers) {
       pipeline.push(answer.pipeline);
       if ("unreachable" in answer) { unreachable.push(answer.host); continue; }
-      for (const row of [...answer.open, ...answer.decided, ...answer.applying]) this.peerOf.set(row.agentId, answer.peer);
+      for (const row of [...answer.open, ...answer.decided, ...answer.applying]) this.peerOf.set(row.agentId, { origin: answer.peer, backendInstanceId: answer.backendInstanceId });
       open.push(...answer.open);
       decided.push(...answer.decided);
       applying.push(...answer.applying);
@@ -784,10 +854,12 @@ export class ReviewLinks {
     const workspace = this.linearWorkspace ? await this.linearWorkspace().catch(() => null) : null;
     const row = (entry: ReviewEntry): InboxRow => ({
       agentId: entry.agentId,
+      reviewId: entry.reviewId,
       name: entry.identifier ?? `Plan review · agent ${entry.agentId.slice(0, 8)}`,
       link: `${this.origin ?? ""}/review/${encodeURIComponent(entry.agentId)}`,
       since: waitingSince(entry),
       host: this.host,
+      backendInstanceId: this.seam?.instanceId,
       ...(entry.details ? { details: entry.details } : {}),
       ...(entry.model ? { model: entry.model } : {}),
       ...(workspace && entry.identifier ? { issueUrl: `${workspace}/issue/${encodeURIComponent(entry.identifier)}` } : {}),
@@ -875,6 +947,7 @@ export class ReviewLinks {
       link: `${this.origin ?? ""}/review/${encodeURIComponent(agentId)}`,
       since,
       host: this.host,
+      backendInstanceId: this.seam?.instanceId,
       ...(listed?.details ? { details: listed.details } : {}),
       ...(listed?.model ? { model: listed.model } : {}),
       applyState,

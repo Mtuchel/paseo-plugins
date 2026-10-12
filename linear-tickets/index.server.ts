@@ -27,6 +27,8 @@ import { AgentApi, AppAuth } from "./server/agent-app";
 import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
 import { ensureFunnel, type FunnelStatus } from "./server/funnel";
 import { ReviewLinks } from "./server/review-links";
+import { ensureBackendSecret } from "./server/inbox-transport";
+import { tailnetOrigin } from "./server/tailscale";
 import { BrowserDecisionInbox } from "./server/decision-inbox";
 import { closeInternalDaemon, internalDaemon, modelSetter, ownConnection } from "./server/connection";
 import { ModelGuard } from "./server/model-guard";
@@ -310,6 +312,7 @@ export default function contribute(server: PluginServerContext) {
     paseo: () => attachedPaseo,
     replies,
     host: hostName,
+    backendInstanceId: () => reviewLinks.seam?.instanceId,
     peers: async () => (await settings.read()).reviewPeers,
     canonicalPeer: async () => {
       const { activation } = await settings.read();
@@ -323,8 +326,14 @@ export default function contribute(server: PluginServerContext) {
   const activationRoutes = activationEndpoints({ settings, intake, drain, appUserId: () => linear.appUserId() });
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   // Its root is the review inbox, listing the peer hosts' reviews too (README, "Review inbox").
-  const reviewLinks = new ReviewLinks({
+  // The checked backend listens on 127.0.0.1:47834 only; the persistent frontdoor
+  // (inbox-frontdoor.ts, README "Inbox transport") owns 47832 and :8444 and reads the two private
+  // routes the `inbox` seam adds (`decisions` plus this server's own inbox view), forwarding the
+  // browser's mutations with the instance they were displayed from.
+  const reviewLinks: ReviewLinks = new ReviewLinks({
     peers: async () => (await settings.read()).reviewPeers,
+    inbox: { decisions: () => browserDecisions.view() },
+    origin: () => tailnetOrigin(),
     decide: decideReview,
     decisions: { applying: () => decisionJournal.applying(), resolve: (entryId, action): Promise<void> => plannotator.resolve(entryId, action) },
     linearWorkspace: () => linear.workspaceUrl(),
@@ -484,7 +493,14 @@ export default function contribute(server: PluginServerContext) {
       if (first) asCaller("session-sweep", () => { void replies.recoverEffects().catch((error: unknown) => console.error(`[linear-tickets] recovering permission reply effects failed: ${error instanceof Error ? error.message : error}`)); });
     }).catch((error: unknown) => console.error(`[linear-tickets] restoring owner question holds failed: ${error instanceof Error ? error.message : error}`));
     if (!stopped) {
-      asCaller("review-links", () => { void reviewLinks.start(); });
+      // The checked backend and the inbox frontdoor's private credential before the listener: a
+      // frontdoor that started first waits for the file rather than talking to an unauthenticated
+      // backend. `ready` is only reported once the listener actually answers.
+      asCaller("review-links", () => {
+        void ensureBackendSecret().catch((error: unknown) => console.error(`[linear-tickets] creating the inbox backend credential failed: ${error instanceof Error ? error.message : error}`))
+          .then(() => reviewLinks.start())
+          .then(() => { if (reviewLinks.listeningPort !== null) reviewLinks.seam?.ready(); });
+      });
       asCaller("drain", () => drain.start());
       asCaller("intake", () => intake.start());
       if (first) asCaller("parked-plans", () => { void startHost(); });
@@ -652,6 +668,9 @@ export default function contribute(server: PluginServerContext) {
   planningSmoke.start();
   return async () => {
     stopped = true;
+    // The checked inbox backend stops admitting before anything it uses closes: a mutation the
+    // frontdoor forwards from here on is refused, never rebound to the replacement plugin.
+    reviewLinks.seam?.draining();
     // The bridge stops admitting decisions and lets every admitted one finish (each call is
     // bounded) before anything it uses closes; only then does the journal's lease move on.
     await plannotator.stop();

@@ -13,6 +13,7 @@ import type { OwnerAsks } from "./owner-asks";
 import type { DeliveryResult, PermissionReplies, ReplyRecord } from "./permission-replies";
 import { answerableQuestions, matchOption, questionAnswer, questionKey, questionsOf } from "./relay";
 import { paseoHome } from "./ticket-mcp";
+import { INBOX_DISPLAYED_HEADER } from "./inbox-transport";
 
 export type BrowserDecisionInboxDeps = {
   ownerAsks: Pick<OwnerAsks, "snapshot" | "answer" | "triage">;
@@ -21,6 +22,7 @@ export type BrowserDecisionInboxDeps = {
   peers: () => Promise<string[]>;
   canonicalPeer: () => Promise<string | null>;
   host?: string;
+  backendInstanceId?: () => string | undefined;
   agentUrl?: (id: string) => Promise<string | null>;
   directory?: string;
   now?: () => number;
@@ -36,6 +38,7 @@ class InboxError extends Error {
 }
 const actionSchema = z.object({
   host: z.string().min(1), target: z.enum(["owner", "live"]), operation: z.enum(["answer", "triage"]),
+  backendInstanceId: z.string().uuid().optional(),
   issueId: z.string().min(1).optional(), agentId: z.string().min(1).optional(), requestId: z.string().min(1).optional(),
   revision: z.string().min(1), answers: z.record(z.string(), z.string().max(4000)).optional(),
   note: z.string().max(4000).optional(), done: z.boolean().optional(),
@@ -230,6 +233,7 @@ export class BrowserDecisionInbox {
       text: record.text, at: record.at, delivery: record.status,
     }));
     return { host: this.host, asks: owner?.snapshot.asks ?? [], live,
+      backendInstanceId: this.deps.backendInstanceId?.(),
       history: [...owner?.snapshot.history ?? [], ...receipts, ...deferrals.history].sort((a, b) => b.at.localeCompare(a.at)).slice(0, 100),
       updatedAt: owner?.snapshot.updatedAt ?? new Date(this.now()).toISOString(), error: errors.length ? errors.join("\n") : null };
   }
@@ -282,6 +286,8 @@ export class BrowserDecisionInbox {
 
   private async action(input: BrowserDecisionAction) {
     if (input.host === this.host) {
+      const backendInstanceId = this.deps.backendInstanceId?.();
+      if (backendInstanceId !== undefined && input.backendInstanceId !== backendInstanceId) throw new InboxError(409, "The decision backend changed since this page was displayed; nothing was delivered. Refresh the inbox.");
       if (input.target === "owner") {
         if (await this.deps.canonicalPeer() !== null) throw new InboxError(409, "Owner asks can only be answered on the configured canonical host.");
         try {
@@ -298,6 +304,7 @@ export class BrowserDecisionInbox {
     const sources = await Promise.all(configured.map(async (peer) => ({ peer, snapshot: await this.readPeer(peer).catch(() => null) })));
     const matches = sources.filter((source) => source.snapshot?.host === input.host);
     if (matches.length !== 1) throw new InboxError(404, "Unknown or unavailable decision host; no action was forwarded.");
+    if (!input.backendInstanceId || matches[0].snapshot?.backendInstanceId !== input.backendInstanceId) throw new InboxError(409, "The target decision backend is missing or changed since this page was displayed; no action was forwarded. Refresh the inbox.");
     const peer = matches[0].peer;
     if (input.target === "owner") {
       const canonical = await this.deps.canonicalPeer();
@@ -305,7 +312,7 @@ export class BrowserDecisionInbox {
     }
     try {
       return await deadline(async () => {
-        const response = await fetch(`${peer}/api/decisions/action`, { method: "POST", headers: { "content-type": "application/json", "x-review-action": "1" }, body: JSON.stringify(input), signal: AbortSignal.timeout(ACTION_TIMEOUT_MS), redirect: "error" });
+        const response = await fetch(`${peer}/api/decisions/action`, { method: "POST", headers: { "content-type": "application/json", "x-review-action": "1", [INBOX_DISPLAYED_HEADER]: input.backendInstanceId! }, body: JSON.stringify(input), signal: AbortSignal.timeout(ACTION_TIMEOUT_MS), redirect: "error" });
         const raw: unknown = await response.json();
         if (response.ok) {
           const parsed = actionResultSchema.safeParse(raw);
@@ -326,7 +333,9 @@ export class BrowserDecisionInbox {
   }
 
   private async liveAction(input: BrowserDecisionAction) {
-    const ref = `${PREFIX}${hash(input)}`;
+    // The backend epoch fences transport, not the durable identity of this exact owner activity.
+    const { backendInstanceId: _backendInstanceId, ...activity } = input;
+    const ref = `${PREFIX}${hash(activity)}`;
     // Replay the durable exact activity before consulting Q2. Never rebind a confirmed retry to a newer round.
     if (input.operation === "answer" || input.action === "research" || input.action === "delegate") {
       const recorded = await this.deps.replies.recorded(ref);
