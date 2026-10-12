@@ -485,8 +485,20 @@ async function steps({ pluginArg, force, deadline, env }, { run }) {
     const events = lifecycle(await readLogs(id));
     loadSequence ??= events.find((event) => event.kind === "loading" && event.sequence > afterSequence)?.sequence ?? null;
     if (loadSequence !== null) {
-      const outcome = events.find((event) => event.sequence > loadSequence && (event.kind === "ready" || event.kind === "failed"));
-      if (outcome) {
+      const outcome = events.at(-1);
+      if (outcome && outcome.sequence > loadSequence && (outcome.kind === "ready" || outcome.kind === "failed")) {
+        if (outcome.kind === "ready") {
+          if (events.some((event) => event.kind === "loading" && event.sequence > loadSequence)) {
+            throw new Fail("the rollout's load was superseded by another reload; its code is unconfirmed and nothing is retried", 2);
+          }
+          const current = (await listPlugins()).find((entry) => entry.id === id);
+          if (current?.status !== "running") {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) throw new Fail("Plugin ready was not confirmed by a running status at the deadline; not reloading again");
+            await delay(Math.min(settings.pollMs, remaining));
+            continue;
+          }
+        }
         writeAtomically(
           receiptFile,
           `${JSON.stringify({ ...pending, state: outcome.kind === "ready" ? "loaded" : "failed", loadSequence }, null, 2)}\n`,

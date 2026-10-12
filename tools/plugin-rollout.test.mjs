@@ -79,6 +79,14 @@ if (a === "daemon" && b === "status") {
     // A startup burst can push the load's own lines out of the 500-entry window.
     for (let i = 0; i < Number(process.argv[6]); i += 1) log(s, b, "[" + b + "] starting up");
     if (process.argv[4] === "ready") { log(s, b, "[paseo] Plugin ready"); plugin(s, b).status = "running"; }
+    else if (process.argv[4] === "ready-then-failed") {
+      log(s, b, "[paseo] Plugin ready");
+      log(s, b, "[paseo] Stopping plugin");
+      log(s, b, "[paseo] Plugin stopped");
+      log(s, b, "[paseo] Loading plugin");
+      log(s, b, "[paseo] Plugin failed to load: queued reload failed");
+      plugin(s, b).status = "failed";
+    }
     else if (process.argv[4] === "failed") log(s, b, "[paseo] Plugin failed to load: Build failed with 1 error: boom");
   });
 } else if (a === "__event") {
@@ -265,6 +273,16 @@ test("a load that fails exits 1 with Paseo's line and records the failure", asyn
   assert.equal(run.code, 1, run.out);
   assert.match(run.out, /\[paseo\] Plugin failed to load: Build failed with 1 error: boom/);
   assert.equal(ctx.receipt("alpha").state, "failed");
+  assert.equal(reloads(ctx), 1);
+});
+
+test("an immediately superseded ready event never records a successful deployment", async (t) => {
+  const ctx = setup(t);
+  ctx.update((s) => (s.behavior.alpha = { outcome: "ready-then-failed", loadMs: 200 }));
+  const run = await ctx.rollout("alpha", "--force");
+  assert.equal(run.code, 1, run.out);
+  assert.match(run.out, /queued reload failed/);
+  assert.notEqual(ctx.receipt("alpha").state, "loaded");
   assert.equal(reloads(ctx), 1);
 });
 
