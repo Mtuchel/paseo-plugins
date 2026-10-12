@@ -27,6 +27,7 @@ import { AgentApi, AppAuth } from "./server/agent-app";
 import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
 import { ensureFunnel, type FunnelStatus } from "./server/funnel";
 import { ReviewLinks } from "./server/review-links";
+import { BrowserDecisionInbox } from "./server/decision-inbox";
 import { closeInternalDaemon, internalDaemon, modelSetter, ownConnection } from "./server/connection";
 import { ModelGuard } from "./server/model-guard";
 import { recordStart, TIER_AGENT_LABEL, tierModel, TierStore } from "./server/model-tiers";
@@ -304,6 +305,22 @@ export default function contribute(server: PluginServerContext) {
     },
     admitted: () => starter.scheduler.admittedIds(),
   });
+  const browserDecisions = new BrowserDecisionInbox({
+    ownerAsks,
+    paseo: () => attachedPaseo,
+    replies,
+    host: hostName,
+    peers: async () => (await settings.read()).reviewPeers,
+    canonicalPeer: async () => {
+      const { activation } = await settings.read();
+      return activation.mode === "remote" ? activation.peer : null;
+    },
+    agentUrl: async (agentId) => {
+      const serverId = await daemonServerId();
+      return serverId ? paseoAgentUrl(serverId, agentId) : null;
+    },
+  });
+  const activationRoutes = activationEndpoints({ settings, intake, drain, appUserId: () => linear.appUserId() });
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   // Its root is the review inbox, listing the peer hosts' reviews too (README, "Review inbox").
   const reviewLinks = new ReviewLinks({
@@ -320,7 +337,7 @@ export default function contribute(server: PluginServerContext) {
     },
     // Draining a host: /activation, /activation/claims, /activation/deliver and
     // /activation/health ride this tailnet service (activation-endpoints.ts).
-    routes: activationEndpoints({ settings, intake, drain, appUserId: () => linear.appUserId() }),
+    routes: async (request) => await activationRoutes(request) ?? await browserDecisions.route(request),
     deletions,
     issueInfo: (identifier, options) => issueInfos.forIdentifier(identifier, options),
     issueLink: async (agentId) => {

@@ -3996,9 +3996,41 @@ default.
 for their grace period at once; `shadow` ends waiting live candidates too. Neither undoes an
 answer already given or work an agent did after it; override those.
 
+## Browser decision inbox
+
+Open `https://<host>:8444/decisions` on the same tailnet-only service as the plan-review inbox.
+The plan-review page links to it; the decision page links back. No new listener, public route,
+Linear app installation, or menu-bar removal is required.
+
+The browser has a searchable queue and a full-size detail pane; narrow screens open one decision
+with a Back button. It shows canonical Linear owner asks, live questions and security permissions
+from this host and its configured `reviewPeers`, other waits, original sources, and recent receipts.
+The canonical Linear host is local in activation `local` mode, or `activation.peer` in `remote`
+mode. An unavailable canonical host is reported, never silently replaced by another host's asks.
+The generated ask summary is the existing extraction, not a separate issue-impact or Haiku briefing.
+
+`GET /api/decisions/local` returns this host only; `GET /api/decisions` combines the configured
+hosts without recursive peer reads. `POST /api/decisions/action` accepts an explicit owner-ask or
+live-request action and routes only to known hosts. Like review mutations, it requires JSON,
+`x-review-action: 1`, and a matching browser Origin; cross-site requests are refused.
+
+Owner answers and research/delegation/defer/reopen use the same revision-bound `OwnerAsks` backend
+as the menu bar. Live answers bind the displayed agent, request, and full source revision to the
+existing checked permission-reply ledger. Security permissions retain their original action IDs
+and behaviors; changed command inputs are fenced again at submission. OMP selection rounds remain
+separate: select one original current-round option, then review the next round; “Other” opens the
+provider's editor and “Done selecting” completes the selection. No option is preselected.
+
+Browser refresh preserves drafts only for an unchanged source. A changed or missing request pauses
+its old form until the owner explicitly selects the current source. Unconfirmed delivery is not
+automatically retried. A receipt confirms delivery or queueing, not downstream completion.
+Browser live-question deferrals persist privately on the question's host and do not answer or
+restart an agent; they are separate from the native app's local live-question snoozes. Linear
+triage and actual answers are shared with the menu bar, which remains available in parallel.
+
 ## Owner asks
 
-The Paseo Agents menu bar presents a decision inbox, not an undifferentiated list of every ticket in
+The browser and Paseo Agents menu bar present a decision inbox, not an undifferentiated list of every ticket in
 Linear's "Needs input" state. `linear.owner-asks` reads owner decisions, other waits and recent
 decision receipts; `linear.answer-ask` answers an exact revision of one ask. Reading does not answer,
 approve, complete or reassign anything in Linear.
@@ -4041,7 +4073,7 @@ the ticket that waits with the answer as its message, exactly like an `@paseo` t
 not start (see *Waiting their turn*), and the menu bar shows `queued` with the reason. `done:
 true` completes a `paseo-manual` issue and a "Needs you" sub-issue and moves them to Done; on a
 parent ticket it only records the comment and leaves the state to the agent, whose next turn settles
-the wait. Every answer records "Answered from the menu bar: …" on the issue. The durable ledger
+the wait. Every answer records "Answered from the decision inbox: …" on the issue. The durable ledger
 binds each action to its source revision and exact answer/scope. An exact retry returns its recorded
 result instead of repeating delivery, including after a restart. An unconfirmed delivery is never
 replayed automatically; its error asks the owner to inspect the ticket or agent. A delivered answer,
