@@ -447,10 +447,18 @@ export type WrittenState = { name: string; type: string };
 export function inReviewState(name: string, type: string): boolean {
   return type === "started" && /review|merge/i.test(name) && !planStage(name, type);
 }
+// A pull request counts for its ticket when Linear's GitHub integration tracks it as the ticket's
+// own work: `closes` names it (magic words like "Closes TUC-1"), `contributes` a stack member.
+// `links` is one that merely mentions the ticket ("Related to TUC-1"): another ticket's pull
+// request says nothing about this one's progress, so it never decides here. Attachments without
+// a link kind (older data, other integrations) count as before. At least one own pull request must
+// be merged and none open or draft.
 function pullRequestsMerged(attachments: unknown): boolean {
   const statuses = connection(attachments ?? { nodes: [] }).nodes.map((node) => record(node))
     .filter((node) => label(node.sourceType) === "github" && /\/pull\/\d+/.test(label(node.url)) && node.metadata && typeof node.metadata === "object")
-    .map((node) => label(record(node.metadata).status));
+    .map((node) => ({ linkKind: label(record(node.metadata).linkKind), status: label(record(node.metadata).status) }))
+    .filter((pull) => pull.linkKind !== "links")
+    .map((pull) => pull.status);
   return statuses.includes("merged") && !statuses.some((status) => status === "open" || status === "draft");
 }
 
@@ -1144,15 +1152,13 @@ export class LinearService {
     });
   }
 
-  // The blockers among `ids` that are finished: Done, or in review with their pull requests merged.
+  // The blockers among `ids` that are finished as far as blockers count (`finishedIssue`): Done,
+  // Canceled or a duplicate, or in review with their own pull requests merged.
   // Read on the app's pool; tickets the app cannot see are read again with the key. Returned in the order of `ids`.
   async finishedBlockers(ids: string[]): Promise<FinishedBlocker[]> {
     if (!ids.length) return [];
     const data = await this.read(FINISHED_BLOCKERS_QUERY, { ids }, (result) => connection(record(result.issues)).nodes.length === ids.length);
-    const nodes = connection(record(data.issues)).nodes.map((node) => record(node)).filter((node) => {
-      const state = record(node.state ?? {});
-      return label(state.type) === "completed" || (inReviewState(label(state.name), label(state.type)) && pullRequestsMerged(node.attachments));
-    });
+    const nodes = connection(record(data.issues)).nodes.map((node) => record(node)).filter(finishedIssue);
     return nodes.sort((a, b) => ids.indexOf(label(a.id)) - ids.indexOf(label(b.id))).map((node) => ({
       identifier: label(node.identifier),
       title: label(node.title),

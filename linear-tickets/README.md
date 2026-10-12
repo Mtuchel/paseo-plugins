@@ -1258,8 +1258,11 @@ See *Who starts next* for the order in which waiting tickets get free slots.
 A blocker is finished when it is Done or Canceled, or when it is in review (a started state named
 like *In Review* or *Ready to merge*, never the plan stage *Plan review*) and its pull requests are
 merged: at least one merged and none open or draft, as Linear's GitHub integration reports them.
-Links added by hand or by `link_url` carry no status and do not count. A blocker In Progress,
-Needs input, Plan review or In Review with an open pull request still holds the ticket back.
+Only the blocker's own pull requests count: those that close it or are part of its stack. A pull
+request of another ticket that only mentions this one ("Related to TUC-1") is ignored, so it can
+neither finish the blocker nor hold it back. Links added by hand or by `link_url` carry no status
+and do not count. A blocker In Progress, Needs input, Plan review or In Review with an open pull
+request still holds the ticket back.
 
 **Wait line label.** Every ticket waiting in a host's line carries `paseo-queued`
 (`<trigger>-queued`): one the scheduler was asked to start and did not admit, and one with a
