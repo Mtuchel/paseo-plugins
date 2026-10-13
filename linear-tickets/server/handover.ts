@@ -451,7 +451,10 @@ export class Handover {
   // Marks the agent as stopped and posts the final report.
   async finish(issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, status: "finished" | "failed" | "archived", reason: string, model?: string | null): Promise<HandoverRecord> {
     const record = await this.update(issue, agent, { status, model });
-    await this.linear.comment(issue.id, finalBody(record, reason));
+    const body = record.agentId === agent.id
+      ? finalBody(record, reason)
+      : handedOverBody(agent.title ?? `Paseo agent on ${issue.identifier}`, record.agentTitle);
+    await this.linear.comment(issue.id, body);
     return record;
   }
 

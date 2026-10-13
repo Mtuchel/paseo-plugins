@@ -608,6 +608,33 @@ function ownershipFixture(t: TestContext) {
   return { linear, issue, handover, writeback, paseo, errors };
 }
 
+for (const event of ["failed", "archived"] as const) {
+  test(`a former owner's delayed ${event} event reports only its handover, not the current owner's work`, async (t) => {
+    const { linear, issue, handover, writeback, paseo, errors } = ownershipFixture(t);
+    const successor = { ...root, id: "agent-2", title: "ENG-1: Successor" };
+    const third = { ...root, id: "agent-3", title: "ENG-1: Third owner" };
+    await handover.update(issue, root, { summary: "The predecessor's recorded work." });
+    await handover.handOff(issue, root.id, successor);
+    await handover.handOff(issue, successor.id, third);
+    const current = await handover.update(issue, third, { status: "archived", plan: "approved", summary: "The current owner's private report." });
+    linear.writes.length = 0;
+    if (event === "failed") {
+      await writeback.turnEnded({ agent: root, turnId: "late-failure", outcome: { kind: "failed", error: { message: "The predecessor failed." } }, timeline: [] }, paseo);
+    } else {
+      await writeback.archived({ agent: root, archivedAt: "later" }, paseo);
+    }
+    assert.deepEqual(await handover.read(issue.id), current);
+    assert.deepEqual(linear.writes.filter((write) => write.includes("🛠 **Paseo progress**")), []);
+    const reports = linear.writes.filter((write) => write.startsWith("comment: 🏁"));
+    assert.equal(reports.length, 1);
+    assert.ok(reports[0].includes(`**Paseo final report** — ${root.title}`));
+    assert.ok(reports[0].includes(`handed over to ${third.title}`));
+    assert.ok(!reports[0].includes("The current owner's private report."));
+    assert.ok(!reports[0].includes("The predecessor failed."));
+    assert.equal(errors.mock.calls.length, 0);
+  });
+}
+
 test("AC-7 b1: a handoff before a predecessor's turn end leaves the successor's entire record unchanged", async (t) => {
   const { linear, issue, handover, writeback, paseo, errors } = ownershipFixture(t);
   const successor = { ...root, id: "agent-2", title: "ENG-1: Successor" };
