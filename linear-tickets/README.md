@@ -1639,6 +1639,11 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
     hand-out and **Restarting a failed start** leave tickets with an open incident alone. Adding
     the trigger label or starting an agent from the sidebar ends the incident: a later failure
     starts with fresh retries.
+  - *`paseo-blocked`* (with **Blocked** write-back on) marks a failed turn. The same pass reads every
+    ticket carrying it and removes it from a closed ticket and from an open one whose root agent on
+    this host is in a turn again (no ghost; a subagent does not count): a resumed agent can work
+    for hours in one turn, and a closed ticket has no next turn. A ticket whose agent runs on the
+    peer host keeps it until that host's next completed turn.
 - **New tickets.** A ticket is planned once a run listed it (by ticket, not by creation
   time), so a ticket filed while a run starts, or moved into the project from
   another one, is new too. Tickets that leave the project's open tickets (closed, moved out) drop
@@ -2767,7 +2772,11 @@ independently of the agent's own `linear_ticket` tools:
   whose end was lost) — unless someone moved it out of Needs input meanwhile. A ticket whose
   team has no In Progress state, or that is closed, is left where it is. The next wait gets a fresh comment. A
   failed turn adds `<label>-blocked`, which marks errors only; the next completed turn
-  removes it. Started agents are asked to put everything they need from you (answers,
+  removes it, and so does the label repair (see **Repairing stale running and failed labels**)
+  once the ticket closed or its agent is in a turn again. A message that reaches an agent
+  mid-turn and is refused ("Agent is already processing", usually Paseo's finish notification
+  of a subagent the agent started) is no failed turn: the agent keeps working, so nothing is
+  written. Started agents are asked to put everything they need from you (answers,
   decisions, approvals, secrets, manual steps) into one question request.
   Those ending events can get lost — a host or daemon restart kills the process a question
   belonged to, an agent is closed or archived while the plugin is down, the plugin is
@@ -2897,7 +2906,7 @@ Every ticket label the plugin sets, and what removes it:
 | `paseo` (the trigger) | you | the dispatcher when it claims the ticket, hands it out as a group, or a plan for it waits for you |
 | `paseo-running` | a start (dispatch, thread, project, successor, restart, label repair) | a failed start (swapped for `paseo-failed`), the last root agent archived, or the label repair after 15 minutes without an agent |
 | `paseo-failed` | a failed launch, or a start failing on this host's setup | a retry that starts an agent, an agent working on the ticket, the label repair; after the third failed retry it stays and you are mentioned once |
-| `paseo-blocked` | a failed turn (write-back **Blocked**) | the next completed turn, or the agent archived |
+| `paseo-blocked` | a failed turn (write-back **Blocked**) | the next completed turn, the agent archived, or the label repair once the ticket closed or a root agent on this host is in a turn again |
 | `paseo-needs-you` | a wait for you (write-back) | the wait ending (answered, turn ended, agent archived, lost wait found); on a "Needs you" sub-issue it stays: answering closes the sub-issue |
 | `paseo-manual` | a manual task an agent registered | stays on the task's sub-issue: closing the task ends it, and the saved view filters by status |
 | `paseo-hold` | a planner run's `hold`, a duplicate closed by the order, or you | a planner run's `release`, or you |
