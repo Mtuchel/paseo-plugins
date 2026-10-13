@@ -2414,7 +2414,7 @@ test("the panel's immediate apply and the sweep together run one apply", async (
 
 // A contradicting report recorded while the worker waits on a Linear call pauses the decision:
 // the step in flight finishes, no further step starts, and it is never marked applied.
-test("a conflict recorded while the worker is mid-step stops it before the next step", async () => {
+test("a conflict recorded while the worker is mid-step stops it before the next step", { timeout: 10_000 }, async (t) => {
   const f = tracked({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -2428,12 +2428,21 @@ test("a conflict recorded while the worker is mid-step stops it before the next 
     await bridge.drain();
     const decision = bridge.decideOwner("http://localhost:4000/", true, "", "agent-1", { source: "inbox" });
     await documentEntered;
+    const journal = bridge.decisionJournal;
+    let recorded!: () => void;
+    const reportRecorded = new Promise<void>((resolve) => { recorded = resolve; });
+    const report = journal.report.bind(journal);
+    t.mock.method(journal, "report", async (...args: Parameters<typeof report>) => {
+      const outcome = await report(...args);
+      recorded();
+      return outcome;
+    });
     await writeFile(join(directory, "2.json"), JSON.stringify({ type: "decided", agentId: "agent-1", approved: false, feedback: "No, plan again.", planContent: RISKY(2), at: "2026-01-01T10:05:00Z" }));
     const sweep = bridge.drain();
-    const journal = bridge.decisionJournal;
-    for (let turn = 0; turn < 1_000 && !journal.applying().some((row) => row.kind === "conflict"); turn++) await immediate();
-    assert.ok(journal.applying().some((row) => row.kind === "conflict"), "the report is a conflict");
-    release();
+    try {
+      await reportRecorded;
+      assert.ok(journal.applying().some((row) => row.kind === "conflict"), "the report is a conflict");
+    } finally { release(); }
     await decision;
     await sweep;
     const attempt = onlyAttempt(bridge);
