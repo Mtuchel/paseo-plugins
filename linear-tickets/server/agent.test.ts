@@ -403,6 +403,17 @@ test("a mention on a ticket with a running agent is passed to that agent instead
   await h.cleanup();
 });
 
+test("a mention whose webhook never came keeps its text when the sweep adopts the thread, also for a ticket another host handles", async (t) => {
+  const received: ActivationRequest[] = [];
+  const missed = { id: "s9", status: "pending", createdAt: new Date().toISOString(), creatorId: OWNER, issueId: "i1", identifier: "TUC-1", commentBody: "@paseo Begrenzte Ausnahme" };
+  const api = { activity: async () => {}, updateSession: async () => {}, openSessions: async () => [missed], activities: async () => [], sessionStatus: async () => "pending", sessionStatuses: async () => new Map() };
+  const h = harness({ manual: true, api: api as never, route: { take: async (request) => { received.push(request); return { peer: "server087" }; } } });
+  t.after(h.cleanup);
+  await h.router.sweep();
+  assert.deepEqual(received.map((request) => ("text" in request ? request.text : undefined)), ["Begrenzte Ausnahme"]);
+  assert.equal((await h.store.get("s9"))?.remote, "server087");
+});
+
 test("a mention on a Needs you sub-issue goes to the agent that asked on the parent ticket and closes the sub-issue", async () => {
   const needsYou = new NeedsYouIssues(mkdtempSync(join(tmpdir(), "needs-you-")));
   await needsYou.add({ id: "sub-1", identifier: "TUC-2", parentId: "i1", agentId: "agent-1" });

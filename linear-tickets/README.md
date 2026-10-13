@@ -593,8 +593,10 @@ cadence instead of every minute, and a webhook whose read is due pulls that read
 webhook. A session it never webhooked for, or without one for over 5 minutes, is read every minute
 as before, so a missed webhook costs what the sweep always cost and no reply is missed (see
 [Rate limits](#rate-limits) for what that saves and how it is measured); the sweep also picks up a
-new thread Linear already marked stale because this host was down when it arrived (up to two hours
-old, unless the ticket got a newer thread since). Ordinary failures skip only the affected sweep
+new thread whose `created` webhook never came, pending or already marked stale because this host was
+down when it arrived (up to two hours old, unless the ticket got a newer thread since). It reads the
+`@paseo` comment that opened the thread along with it, so the text reaches the agent or the host
+that handles the ticket as the webhook would have carried it. Ordinary failures skip only the affected sweep
 part or thread. A rate limit stops the part with one pause log; while the app's background budget
 is paused, the whole sweep is skipped until it refills.
 The Paseo Agents menu bar app's **Control panel → Linear agent** shows the state.
