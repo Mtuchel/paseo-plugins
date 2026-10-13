@@ -7,18 +7,17 @@ import { dispatchLabels } from "./dispatch";
 import { activeModel } from "./model";
 import { limitError } from "./limit-resume";
 import { questionsOf } from "./relay";
-import type { Handover, HandoverRecord, WaitingKind, WaitingPeriod } from "./handover";
+import type { Handover, WaitingKind, WaitingPeriod } from "./handover";
 import type { IssueCore, LinearService } from "./linear";
 import type { NeedsYouIssues } from "./needs-you";
 import { PLAN_POLICY_LABEL, PLANNING_STATE, planStage } from "./plan-policy";
 import { logQuietly, questionEntry, type DecisionLog } from "./owner-decisions";
 import type { Deputy } from "./deputy";
 import { ticketPullRequest, type PullRequestCheck } from "./pull-request-check";
-import type { ProcessInspector } from "./process-liveness";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
-import { classifyTicketAgents, issueAgents, type TicketAgents } from "./starter";
+import { issueAgents } from "./starter";
 import { paseoHome } from "./ticket-mcp";
 
 export const MAX_SUMMARY_LENGTH = 4_000;
@@ -34,10 +33,6 @@ const RETRY_DELAYS_MS = [30_000, 120_000];
 // `-blocked`, no resume, and the handover record stays open. The usual sender is Paseo's
 // finish notification of a subagent the agent started (2026-10-12: TUC-1925, TUC-1686, TUC-1386).
 const REFUSED_MESSAGE = /^Agent is already processing\b/;
-// A recorded wait with no live agent is given this long before the reconcile closes it: a daemon or
-// plugin that just restarted lists its agents again within moments, and a wait that outlives them
-// is a wait whose ending event was lost, not one racing the listing.
-const WAIT_NO_AGENT_GRACE_MS = 10 * 60_000;
 // Rate-limited write-backs wait for the pool to refill however often it takes, up to this long.
 const RATE_LIMIT_GIVE_UP_MS = 6 * 60 * 60 * 1000;
 const MIN_RATE_LIMIT_DELAY_MS = 5_000;
@@ -65,9 +60,6 @@ export type AgentBridge = {
 type Linear = Pick<LinearService, "issueCore" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "upsertComment" | "commentBody" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "isPerson" | "userUrl" | "createIssue" | "complete">;
 // What a waiting period needs of its agent: enough to write the record back without a hook event.
 type WaitingAgent = { id: string; title: string | null; cwd: string };
-// What the reconcile below gets from the host: the tickets this host forwarded to the peer host
-// (their waits belong to the peer's plugin) and, for tests, the process table ghosts are read from.
-export type ReconcileDeps = { handedOver?: () => Promise<Map<string, string>>; inspect?: ProcessInspector };
 
 // The turn's reply: assistant text after the last user message. Streaming providers may
 // split one reply across several items, so the pieces are joined without separators.
@@ -328,6 +320,12 @@ export class Writeback {
     if (known !== undefined) return known;
     const refreshed = await paseo.agents.ref(agent.id).refresh();
     const labels = refreshed?.agent.labels ?? {};
+    // Verifiers only report through steward_verdict. Their turns and retirement must not
+    // replace the implementation handover, clear owner decisions, or offer a resume.
+    if (labels["linear-tickets.steward"]) {
+      this.links.set(agent.id, null);
+      return null;
+    }
     const issueId = labels["linear.issueId"];
     const link = issueId ? { issueId, identifier: labels["linear.identifier"] || issueId, planFirst: labels[PLAN_POLICY_LABEL] === "required" } : null;
     this.links.set(agent.id, link);
@@ -352,11 +350,41 @@ export class Writeback {
     else this.waitingPeriods.delete(issue.id);
   }
 
+  // The ticket's last root agent, for a wait the plugin opens on the ticket's behalf rather than on
+  // an agent's event (steward.ts). Without one the wait is anchored to the steward's own id, which
+  // no agent carries, so the ticket does not count as started by it.
+  private async anchor(issueId: string, identifier: string): Promise<WaitingAgent> {
+    const record = await this.agentBridge?.handover?.read(issueId).catch(() => null) ?? null;
+    if (record?.agentId) return { id: record.agentId, title: record.agentTitle, cwd: record.worktreePath ?? "" };
+    return { id: `steward-${issueId.slice(0, 8)}`, title: `Paseo's ticket steward on ${identifier}`, cwd: "" };
+  }
+
+  // The steward's escalation (steward.ts): one owner-visible decision item on the ticket — the
+  // Needs input state, the needs-you label and one comment carrying the reason and its options —
+  // through the same waiting path an agent's question takes, so the owner answers it in Linear or
+  // in the decision inbox like any other ask (README, "Ticket steward"). The kind is `decision`:
+  // only the owner's answer or retry ends it, never an agent-liveness check. `subject` titles a
+  // closed ticket's Needs-you sub-issue; open tickets are moved and commented on themselves.
+  async escalate(issueId: string, identifier: string, subject: string, body: string): Promise<void> {
+    const settings = await this.settings.read();
+    const agent = await this.anchor(issueId, identifier);
+    await this.markWaiting({ id: issueId, identifier }, agent, settings, subject, body, false, "decision", { once: async <T>(_step: string, fn: () => Promise<T>) => fn() });
+  }
+
+  // The steward's end of a wait no live agent can still end (steward.ts): the needs-you label comes
+  // off, the ticket goes back to the state it left (unless someone moved it meanwhile), and the wait
+  // period is dropped. A "Needs you" sub-issue is left to the owner: the wait may be a manual step.
+  async clearWait(issueId: string, identifier: string): Promise<void> {
+    const settings = await this.settings.read();
+    const agent = await this.anchor(issueId, identifier);
+    await this.clearWaiting({ id: issueId, identifier }, agent, settings);
+  }
+
   // Opens or continues a waiting period: the ticket moves to Needs input (teams without that state
   // skip it), gets the needs-you label, and one comment mentions the owner, edited per question.
   // A closed ticket stays closed: a "Needs you" sub-issue in Needs input carries the label and the
   // comment instead. `subject` (one line) titles that sub-issue. `kind` says what opened the wait,
-  // so a wait no live agent can end can be told from a live one (reconcileWaiting).
+  // so a wait no live agent can end can be told from a live one (steward.ts).
   private markWaiting(issue: { id: string; identifier: string }, agent: WaitingAgent, settings: PluginSettings, subject: string, body: string, inSession: boolean, kind: WaitingKind, { once }: WritebackContext): Promise<void> {
     return this.serialize(issue.id, () => withPriority("owner", "owner question", async () => {
       const waiting = await this.waitingFor(issue.id);
@@ -447,101 +475,6 @@ export class Writeback {
     });
   }
 
-  // A recorded wait whose ending event never arrived -- a question killed with its agent's process
-  // by a host or daemon restart, an agent closed or archived while the plugin was down, a reload in
-  // between -- holds its ticket in Needs input under its label, and no later event ends it. The
-  // pull request poll calls this every two minutes: every recorded wait is compared with the
-  // ticket's live agents, and one no live agent can still end is closed the way a normal end is
-  // (label off, the state it left restored, unless someone moved the ticket meanwhile). A live
-  // wait, and a wait of a ticket this host handed to the peer host (whose plugin ends it), stays.
-  async reconcileWaiting(paseo: PaseoApi, deps: ReconcileDeps = {}): Promise<void> {
-    const handover = this.agentBridge?.handover;
-    if (!handover?.all) return;
-    const settings = await this.settings.read();
-    if (!settings.writeback.blocked) return;
-    // Read once per pass. An unreadable answer decides nothing: clearing a wait the peer's plugin
-    // owns would take the label off a ticket that is waiting there.
-    let handed: Map<string, string> | null | undefined;
-    const handedOver = async (): Promise<Map<string, string> | null> => {
-      if (handed !== undefined) return handed;
-      try { handed = await deps.handedOver?.() ?? new Map(); }
-      catch (error) {
-        handed = null;
-        console.error(`[linear-tickets] the waits for the owner: the tickets handed to the peer could not be read (${error instanceof Error ? error.message : error}); none is closed this pass`);
-      }
-      return handed;
-    };
-    for (const record of await handover.all()) {
-      // Sub-issue waits (closed tickets) are the owner's to close, and waits whose ticket was moved
-      // by hand are ended by clearWaiting either way.
-      if (!record.waiting || record.waiting.subIssueId) continue;
-      try {
-        await this.reconcileWait(paseo, record, settings, deps, handedOver);
-      } catch (error) {
-        console.error(`[linear-tickets] ${record.identifier}: checking the wait for the owner failed: ${error instanceof Error ? error.message : error}`);
-      }
-    }
-  }
-
-  // One recorded wait against this host's agents for its ticket: closes it when nothing can end it.
-  private async reconcileWait(paseo: PaseoApi, record: HandoverRecord, settings: PluginSettings, deps: ReconcileDeps, handedOver: () => Promise<Map<string, string> | null>): Promise<void> {
-    const waiting = record.waiting;
-    // A record without an agent (Handover.transfer) never opened a wait.
-    if (!waiting || record.agentId === null) return;
-    const issue = { id: record.issueId, identifier: record.identifier };
-    const agent: WaitingAgent = { id: record.agentId, title: record.agentTitle, cwd: record.worktreePath ?? "" };
-    const now = Date.now();
-    const found = await classifyTicketAgents(paseo, record.issueId, now, deps.inspect);
-    const pending = found.live.some((live) => (live.pendingPermissions?.length ?? 0) > 0);
-    let kind: WaitingKind | null = waiting.kind ?? null;
-    // A period from before the kind was recorded: its own comment says what opened it. Read only
-    // where the answer decides the outcome (a live agent, nothing pending on it).
-    if (!kind && !pending && found.live.length > 0) {
-      kind = await this.waitingKind(waiting.commentId);
-      // Backfilled under the ticket's own queue and re-read first: a question that arrived while the
-      // comment was read has its own, newer period, which must not be overwritten by this one.
-      const derived = kind;
-      if (derived) await this.serialize(record.issueId, async () => {
-        const current = await this.waitingFor(record.issueId);
-        if (current && !current.kind && current.commentId === waiting.commentId) await this.setWaiting(issue, agent, { ...current, kind: derived });
-      });
-    }
-    const reason = await this.leftBehind(record, waiting, kind, found, pending, now, handedOver);
-    if (!reason) return;
-    console.log(`[linear-tickets] ${record.identifier}: the wait for the owner was left behind (${reason}); removing ${dispatchLabels(settings.dispatch.label).needsYou}${waiting.previousStateId ? " and restoring the state it left, unless the ticket was moved meanwhile" : ""}`);
-    await this.clearWaiting(issue, agent, settings);
-  }
-
-  // Whether nothing can end the wait any more, and why. A pending request on a live agent is
-  // answerable; a live agent without one can still take its next turn (a `turn-end` wait, and an
-  // unclassified one, stays); with no live agent the wait is over unless it is only minutes old (a
-  // daemon that just restarted still has to list its agents) or its ticket was handed to the peer.
-  private async leftBehind(record: HandoverRecord, waiting: WaitingPeriod, kind: WaitingKind | null, found: TicketAgents, pending: boolean, now: number, handedOver: () => Promise<Map<string, string> | null>): Promise<string | null> {
-    if (pending) return null;
-    if (found.live.length > 0) return kind === "request" ? "nothing is pending on the agent any more" : null;
-    if (now - (Date.parse(waiting.at ?? record.updatedAt) || 0) < WAIT_NO_AGENT_GRACE_MS) return null;
-    const newest = [...found.live, ...found.ghosts, ...found.stopped].reduce((at, agent) => Math.max(at, Date.parse(agent.createdAt) || 0), 0);
-    const handed = await handedOver();
-    if (handed === null) return null;
-    const transferred = handed.get(record.issueId);
-    if (transferred && newest <= (Date.parse(transferred) || 0)) return null;
-    return "the agent is gone";
-  }
-
-  // What a recorded wait's own comment says opened it: the plugin writes one of two bodies (their
-  // titles vary). Null: Linear has no such comment any more, or could not be read -- the caller
-  // then only ends the wait if no live agent can.
-  private async waitingKind(commentId: string | null): Promise<WaitingKind | null> {
-    if (!commentId) return null;
-    const body = await this.linear.commentBody(commentId);
-    if (body === null) return null;
-    if (/\) finished its turn and is waiting for you:/.test(body)) return "turn-end";
-    if (/\) is waiting for (?:an answer|plan approval|permission):/.test(body)) return "request";
-    return null;
-  }
-
-  // Each event takes the agent's next sequence number; a newer event of the same kind cancels the
-  // older one's scheduled retry (its pull requests are safe in the outbox).
   private run(event: string, agent: PluginHookAgent, paseo: PaseoApi, work: Work): Promise<void> {
     const seq = (this.latest.get(agent.id) ?? 0) + 1;
     this.latest.set(agent.id, seq);

@@ -557,6 +557,9 @@ export type WatchdogDeps = {
   // The owner's open manual tasks (manual-tasks.ts keeps one per task until it is done).
   manualTasks?: { tasks(): Promise<{ parentId: string; identifier: string }[]> };
   activity?: (handle: unknown, now: number) => Promise<ActivityResult>;
+  // The steward's escalation (steward.ts): the exhausted cycle's terminal step is an owner-visible
+  // Needs-input item with options, not a bare owner mention. Absent: the plain mention stays.
+  escalate?: (issueId: string, identifier: string, reason: string) => Promise<void>;
   now?: () => number;
 };
 
@@ -1039,8 +1042,14 @@ export class Watchdog {
             const entry = file.tickets[issueId]?.reports?.find((item) => item.key === report.key);
             if (entry) entry.attempted = true;
           });
-          const mention = report.mention ? `${await this.deps.linear.userUrl(await this.deps.linear.viewerId())} ` : "";
-          await this.deps.linear.comment(issueId, `${mention}${report.body}\n\n${mark}`);
+          if (report.mention && this.deps.escalate) {
+            // The cycle is spent: the steward asks the owner with the reason and its options
+            // (steward.ts escalateExhausted), the same way its own pass escalates.
+            await this.deps.escalate(issueId, ticket?.identifier ?? issueId, report.body);
+          } else {
+            const mention = report.mention ? `${await this.deps.linear.userUrl(await this.deps.linear.viewerId())} ` : "";
+            await this.deps.linear.comment(issueId, `${mention}${report.body}\n\n${mark}`);
+          }
         }
         await this.dropReport(issueId, report.key);
       } catch (error) {

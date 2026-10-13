@@ -12,10 +12,22 @@ export const liveDecisionSchema = z.object({
   deferredUntil: z.string().nullable(),
 });
 export type LiveDecision = z.infer<typeof liveDecisionSchema>;
+// The ticket steward's flow summary (steward.ts StewardSnapshot): what each in-scope open ticket
+// of the dispatch teams is waiting for, for the inbox page's Flow section. `at`: the pass it is
+// from; null before the first pass or while the steward is off. Absent from a host that does not
+// run the steward.
+export const stewardFlowSchema = z.object({
+  at: z.string().nullable(),
+  counts: z.record(z.string(), z.number().int()),
+  oldest: z.array(z.object({ identifier: z.string(), situation: z.string(), since: z.string() })),
+  error: z.string().nullable(),
+});
+export type StewardFlow = z.infer<typeof stewardFlowSchema>;
 export const decisionHostSchema = z.object({
   host: z.string(), asks: z.array(ownerAskSchema), live: z.array(liveDecisionSchema),
   backendInstanceId: z.string().uuid().optional(),
   history: z.array(decisionReceiptSchema), updatedAt: z.string(), error: z.string().nullable(),
+  flow: stewardFlowSchema.nullable().default(null),
 });
 export type DecisionHost = z.infer<typeof decisionHostSchema>;
 export type DecisionView = {

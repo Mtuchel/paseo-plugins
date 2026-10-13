@@ -322,6 +322,16 @@ export const dispatchStatusSchema = z.object({
     outcome: z.enum(["launched", "linked", "grouped", "failed"]),
     detail: z.string(),
   })),
+  // The ticket steward (README, "Ticket steward"): what every in-scope open ticket of the dispatch
+  // teams is in, and the oldest of each state. Null while the plugin is not attached to Paseo or
+  // before the steward's first pass.
+  steward: z.object({
+    enabled: z.boolean(),
+    lastPassAt: z.string().nullable(),
+    lastError: z.string().nullable(),
+    counts: z.record(z.string(), z.number().int()),
+    oldest: z.array(z.object({ identifier: z.string(), situation: z.string(), since: z.string() })),
+  }).nullable(),
 });
 export type DispatchStatus = z.infer<typeof dispatchStatusSchema>;
 export const dispatchStatusRpc = defineRpc({

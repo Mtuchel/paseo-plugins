@@ -17,7 +17,7 @@ export const PARKED_PLAN_LINE = "submitted — waits for your review in Plannota
 // What opened a waiting period: a question or permission request ("request"), which ends when
 // nothing is pending any more, or a turn that ended by asking the owner ("turn-end"), which ends
 // when the agent's next turn starts or the agent itself is gone.
-export type WaitingKind = "request" | "turn-end";
+export type WaitingKind = "request" | "turn-end" | "decision";
 
 // While an agent waits for an answer or approval: the state the ticket left for "Needs input"
 // (restored afterwards) and the mention comment edited for each further question. A ticket already

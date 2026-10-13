@@ -38,7 +38,7 @@ async function withBackend(run: (context: Backend) => Promise<void>): Promise<vo
     route: async () => {}, unserve: async () => {},
     inbox: {
       credential: async () => SECRET,
-      decisions: async () => ({ hosts: [{ host: "laptop", asks: [], live: [], history: [], updatedAt: "2026-01-01T09:00:00.000Z", error: null }], canonicalHost: "laptop", unreachable: [] }),
+      decisions: async () => ({ hosts: [{ host: "laptop", asks: [], live: [], history: [], updatedAt: "2026-01-01T09:00:00.000Z", error: null, flow: null }], canonicalHost: "laptop", unreachable: [] }),
     },
     routes: async ({ path, headers }) => {
       if (path !== "/activation") return null;

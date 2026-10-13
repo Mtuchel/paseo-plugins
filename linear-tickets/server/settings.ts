@@ -70,6 +70,24 @@ export type WorktreeShardSettings = { enabled: boolean; pools: Record<string, st
 export const DEFAULT_WORKTREE_SHARDS: WorktreeShardSettings = { enabled: false, pools: {} };
 export const MAX_SHARD_POOLS = 10;
 export const MAX_SHARD_ROOTS = 12;
+// The ticket steward (README, "Ticket steward"): one level-triggered reconciler that walks every
+// in-scope open ticket of the dispatch teams on each pass and repairs what is neither moving nor
+// waiting on purpose — a vanished agent, a landed stack, a stale owner wait, a finished parent, an
+// agent of a finished ticket — with one action per ticket and pass. `enabled`: off stops every
+// repair (the states are still computed and shown). `queuedEscalateHours`: a ticket that waits in
+// the queue longer is escalated to the owner. `idleMinutes`: a live root agent with no progress
+// this long, no owner wait and no open pull request gets one resume before a verifier judges it.
+// `maxActionsPerPass`: at most this many starts, successors, verifiers and resumes per pass, so a
+// backlog does not flood the capacity; closes, archives and escalations are not capped.
+export type StewardSettings = { enabled: boolean; queuedEscalateHours: number; idleMinutes: number; maxActionsPerPass: number };
+export const DEFAULT_STEWARD: StewardSettings = { enabled: true, queuedEscalateHours: 24, idleMinutes: 30, maxActionsPerPass: 5 };
+export const MIN_STEWARD_HOURS = 1;
+export const MAX_STEWARD_HOURS = 168;
+export const MIN_STEWARD_IDLE_MINUTES = 5;
+export const MAX_STEWARD_IDLE_MINUTES = 2_880;
+export const MIN_STEWARD_ACTIONS = 1;
+export const MAX_STEWARD_ACTIONS = 20;
+
 export type PluginSettings = {
   template: string | null;
   markInProgress: boolean;
@@ -82,6 +100,8 @@ export type PluginSettings = {
   writeback: WritebackSettings;
   // The watchdog's timing thresholds (README, "Silent and stuck agents").
   watchdog: WatchdogTimings;
+  // The ticket steward's switch and budgets (README, "Ticket steward").
+  steward: StewardSettings;
   // Plans rated at or below the threshold are approved without the owner (README, "Plan risk and auto-approval").
   autoApprove: AutoApprovePolicy;
   // The cheap and standard tiers' models per provider; `{}` turns that tier's own model off.
@@ -109,6 +129,7 @@ type SettingsFile = {
   dispatch?: Partial<DispatchSettings>;
   writeback?: Partial<WritebackSettings>;
   watchdog?: Partial<WatchdogTimings>;
+  steward?: Partial<StewardSettings>;
   autoApprove?: Partial<AutoApprovePolicy>;
   cheapModels?: Record<string, TierModel>;
   standardModels?: Record<string, TierModel>;
@@ -283,6 +304,34 @@ function validBackstop(value: { run?: unknown }): BackstopSettings {
   return { run };
 }
 
+// Malformed stored values fall back to that field's default rather than breaking the settings read.
+export function normalizeSteward(value: unknown): StewardSettings {
+  const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const number = (key: "queuedEscalateHours" | "idleMinutes" | "maxActionsPerPass", min: number, max: number) => {
+    const raw = candidate[key];
+    return typeof raw === "number" && Number.isInteger(raw) && raw >= min && raw <= max ? raw : DEFAULT_STEWARD[key];
+  };
+  return {
+    enabled: typeof candidate.enabled === "boolean" ? candidate.enabled : DEFAULT_STEWARD.enabled,
+    queuedEscalateHours: number("queuedEscalateHours", MIN_STEWARD_HOURS, MAX_STEWARD_HOURS),
+    idleMinutes: number("idleMinutes", MIN_STEWARD_IDLE_MINUTES, MAX_STEWARD_IDLE_MINUTES),
+    maxActionsPerPass: number("maxActionsPerPass", MIN_STEWARD_ACTIONS, MAX_STEWARD_ACTIONS),
+  };
+}
+
+// A user edit is rejected rather than silently repaired, so the settings form can say why.
+function validSteward(value: { enabled?: unknown; queuedEscalateHours?: unknown; idleMinutes?: unknown; maxActionsPerPass?: unknown }): StewardSettings {
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") throw new Error("The ticket steward's switch must be true or false.");
+  const whole = (key: "queuedEscalateHours" | "idleMinutes" | "maxActionsPerPass", min: number, max: number, what: string) => {
+    const raw = value[key];
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < min || raw > max) throw new Error(`${what} must be a whole number from ${min} to ${max}.`);
+  };
+  whole("queuedEscalateHours", MIN_STEWARD_HOURS, MAX_STEWARD_HOURS, "The steward's queued-ticket escalation limit (hours)");
+  whole("idleMinutes", MIN_STEWARD_IDLE_MINUTES, MAX_STEWARD_IDLE_MINUTES, "The steward's idle-agent threshold (minutes)");
+  whole("maxActionsPerPass", MIN_STEWARD_ACTIONS, MAX_STEWARD_ACTIONS, "The steward's actions per pass");
+  return normalizeSteward(value);
+}
+
 export function normalizeAutoApprove(value: unknown): AutoApprovePolicy {
   const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const [maxImpact, maxImpactWithFlag] = (["maxImpact", "maxImpactWithFlag"] as const).map((key) => {
@@ -369,6 +418,7 @@ export type SettingsPatch = {
   dispatch?: Partial<DispatchSettings>;
   writeback?: Partial<WritebackSettings>;
   watchdog?: Partial<WatchdogTimings>;
+  steward?: Partial<StewardSettings>;
   autoApprove?: Partial<AutoApprovePolicy>;
   // Sets one provider's model for the cheap or standard tier; `model: null` removes it (that
   // tier then implements on the provider's launch model).
@@ -433,6 +483,7 @@ export class Settings {
       dispatch: normalizeDispatch(value.dispatch),
       writeback: normalizeWriteback(value.writeback),
       watchdog: normalizeWatchdog(value.watchdog),
+      steward: normalizeSteward(value.steward),
       autoApprove: normalizeAutoApprove(value.autoApprove),
       cheapModels: normalizeTierModels(value.cheapModels, DEFAULT_CHEAP_MODELS),
       standardModels: normalizeTierModels(value.standardModels, DEFAULT_STANDARD_MODELS),
@@ -469,6 +520,7 @@ export class Settings {
       dispatch: patch.dispatch ? validDispatch({ ...current.dispatch, ...patch.dispatch }) : current.dispatch,
       writeback: patch.writeback ? normalizeWriteback({ ...current.writeback, ...patch.writeback }) : current.writeback,
       watchdog: patch.watchdog ? validWatchdog({ ...current.watchdog, ...patch.watchdog }) : current.watchdog,
+      steward: patch.steward ? validSteward({ ...current.steward, ...patch.steward }) : current.steward,
       autoApprove: patch.autoApprove ? normalizeAutoApprove({ ...current.autoApprove, ...patch.autoApprove }) : current.autoApprove,
       deputy: patch.deputy ? validDeputy({ ...current.deputy, ...patch.deputy }) : current.deputy,
       backstop: patch.backstop ? validBackstop({ run: patch.backstop.run ?? current.backstop.run }) : current.backstop,
@@ -514,6 +566,7 @@ export class Settings {
     const customDispatch = JSON.stringify(value.dispatch) !== JSON.stringify(DEFAULT_DISPATCH);
     const customWriteback = JSON.stringify(value.writeback) !== JSON.stringify(DEFAULT_WRITEBACK);
     const customWatchdog = JSON.stringify(value.watchdog) !== JSON.stringify(DEFAULT_WATCHDOG);
+    const customSteward = JSON.stringify(value.steward) !== JSON.stringify(DEFAULT_STEWARD);
     const customAutoApprove = JSON.stringify(value.autoApprove) !== JSON.stringify(DEFAULT_AUTO_APPROVE);
     const customCheapModels = JSON.stringify(value.cheapModels) !== JSON.stringify(DEFAULT_CHEAP_MODELS);
     const customStandardModels = JSON.stringify(value.standardModels) !== JSON.stringify(DEFAULT_STANDARD_MODELS);
@@ -521,7 +574,7 @@ export class Settings {
     const customDeputy = JSON.stringify(value.deputy) !== JSON.stringify(DEFAULT_DEPUTY);
     const customBackstop = JSON.stringify(value.backstop) !== JSON.stringify(DEFAULT_BACKSTOP);
     const customWorktreeShards = JSON.stringify(value.worktreeShards) !== JSON.stringify(DEFAULT_WORKTREE_SHARDS);
-    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customWatchdog && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length && !customActivation && !customDeputy && !customBackstop && !customWorktreeShards) {
+    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customWatchdog && !customSteward && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length && !customActivation && !customDeputy && !customBackstop && !customWorktreeShards) {
       await rm(this.path, { force: true });
       return value;
     }
@@ -539,6 +592,7 @@ export class Settings {
     if (customDispatch) fileValue.dispatch = value.dispatch;
     if (customWriteback) fileValue.writeback = value.writeback;
     if (customWatchdog) fileValue.watchdog = value.watchdog;
+    if (customSteward) fileValue.steward = value.steward;
     if (customAutoApprove) fileValue.autoApprove = value.autoApprove;
     if (customCheapModels) fileValue.cheapModels = value.cheapModels;
     if (customStandardModels) fileValue.standardModels = value.standardModels;

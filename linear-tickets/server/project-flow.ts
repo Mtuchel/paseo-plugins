@@ -14,7 +14,6 @@ import { classifyRunAgents, classifyTicketAgents, type TicketAgents } from "./st
 import type { Focus } from "./focus";
 import { type ProcessInspector } from "./process-liveness";
 import { SetupError, type PlannerStart } from "./launch";
-import type { RepairRecord } from "./label-repair";
 import { withPriority } from "./rate-budget";
 import type { PluginSettings, Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
@@ -119,7 +118,6 @@ export type PlannerRecord = {
 };
 // A ticket assigned to Paseo whose start failed: `since` it was first seen so or last started
 // again, `restarts` so far, `ownerAsked` past RESTART_CAP.
-export type StalledRecord = { since: string; restarts: number; ownerAsked?: boolean };
 
 // Validate the durable status fields without stripping lifecycle/recovery metadata or legacy
 // planner-ticket fields. Unknown state must fail the status read, not dismiss an owner's alert.
@@ -179,7 +177,7 @@ function confirmedRestart(record: ProjectRecord, run: PlannerRecord, requestId: 
     ...(run.recovery?.handledAgentId ? { failedAgentId: run.recovery.handledAgentId } : {}),
   }] };
 }
-export type ProjectRecord = { name?: string; planned?: string[]; plannedThrough?: string | null; planner: PlannerRecord | null; closedPlanner?: string; waiting?: Record<string, string>; withheld?: string[]; stalled?: Record<string, StalledRecord>; plannerLimitRestarts?: PlannerLimitRestart[] };
+export type ProjectRecord = { name?: string; planned?: string[]; plannedThrough?: string | null; planner: PlannerRecord | null; closedPlanner?: string; waiting?: Record<string, string>; withheld?: string[]; plannerLimitRestarts?: PlannerLimitRestart[] };
 
 type Read = { work: ProjectIssue[]; record: ProjectRecord; owner: string; readAt: string; planned: (issue: ProjectIssue) => boolean; parked: (issue: ProjectIssue) => boolean; unplanned: ProjectIssue[]; status: ProjectStatus };
 
@@ -208,8 +206,9 @@ function plannedAfter(record: ProjectRecord, planner: PlannerRecord, issues: Pro
   return [...new Set([...(record.planned ?? []), ...(planner.listed ?? [])])].filter((id) => open.has(id));
 }
 
-// The label repair's records (label-repair.ts) share projects.json under this key; project ids
-// never start with "~", and older versions keep the key because they write the whole file back.
+// An older version kept the label repair's records (removed; the steward's restarts live in
+// steward.json) under this key in projects.json; project ids never start with "~", and the whole
+// file is written back, so the key stays filtered out.
 const REPAIRS_KEY = "~repairs";
 
 export class ProjectStore {
@@ -239,10 +238,6 @@ export class ProjectStore {
     return projects as Record<string, ProjectRecord>;
   }
 
-  async repairs(): Promise<Record<string, RepairRecord>> {
-    return ((await this.raw())[REPAIRS_KEY] ?? {}) as Record<string, RepairRecord>;
-  }
-
   // Changes run one after another, each on the file as it is then, so a poll and an approval never
   // overwrite each other's record. `change` returns the project's new record, or null to keep it.
   update(projectId: string, change: (current: ProjectRecord | undefined) => ProjectRecord | null): Promise<ProjectRecord | null> {
@@ -254,18 +249,6 @@ export class ProjectStore {
         await this.save({ ...file, [projectId]: next });
       }
       return next;
-    });
-  }
-
-  // The label repair's records, changed on the same queue as the projects': `change` returns them
-  // all as they should be, or null to keep them. Resolves to the records as they are afterwards.
-  updateRepairs(change: (current: Record<string, RepairRecord>) => Record<string, RepairRecord> | null): Promise<Record<string, RepairRecord>> {
-    return this.queued(async () => {
-      const file = await this.raw();
-      const current = (file[REPAIRS_KEY] ?? {}) as Record<string, RepairRecord>;
-      const next = change(current);
-      if (next) await this.save({ ...file, [REPAIRS_KEY]: next });
-      return next ?? current;
     });
   }
 
@@ -357,14 +340,6 @@ type Deps = {
   startPlanner: (input: PlannerStart, paseo: PaseoApi, settings: PluginSettings) => Promise<{ agentId: string }>;
   // Stops the run's turn and archives it once its plan is applied, skipped, or replaced.
   retire: (agentId: string, paseo: PaseoApi) => Promise<void>;
-  // Starts a new agent with a new Linear thread for a stalled ticket (SessionRouter.restartFor).
-  // Assigning the ticket to Paseo again is no restart: Linear opens no new thread for it, and a
-  // thread whose launch failed is in error.
-  restart: (issueId: string, identifier: string) => Promise<void>;
-  // Whether something still accounts for a missing agent: a start under way, or the ticket's newest
-  // Linear thread waits for blockers or a slot, had an agent once or was closed on purpose
-  // (Launcher.underWay, SessionRouter.threadHolds).
-  accountedFor: (issueId: string) => Promise<boolean>;
   now?: () => number;
   // Provider-process inspection for ghost agents; the tests inject a fake process table.
   inspect?: ProcessInspector;
@@ -418,20 +393,6 @@ export class ProjectFlow {
     this.requireOwner(await this.currentSettings(settings));
     // Keep the operation's label/model snapshot coherent; only fresh ownership can abort it.
     return settings;
-  }
-
-  // Whether a top-level agent works on the ticket: live by its status and not a ghost, on any page
-  // of its agents. A ghost is logged, so a restart it causes is explained.
-  private async working(paseo: PaseoApi, issueId: string, identifier: string): Promise<boolean> {
-    const agents = await classifyTicketAgents(paseo, issueId, this.now(), this.deps.inspect);
-    for (const ghost of agents.ghosts) console.log(`[linear-tickets] ${identifier}: agent ${ghost.id.slice(0, 8)} shows ${ghost.status} but its OMP process is gone; it counts as stopped`);
-    return agents.live.length > 0;
-  }
-
-  // Tickets the label repair (label-repair.ts) watches, restarts or left to the owner: the
-  // hand-out and the stalled-ticket restart leave them alone, so no second restart cycle starts.
-  private async repairing(): Promise<Set<string>> {
-    return new Set(Object.entries(await this.store.repairs()).filter(([, record]) => record.state !== "resolved").map(([id]) => id));
   }
 
   // Keep the last successful ticket read, but take planner state from disk: a reload or Linear
@@ -502,8 +463,6 @@ export class ProjectFlow {
             settings = await this.currentSettings(settings);
             if (settings.activation.mode === "remote") return;
             await this.handOut(project.id, read, appId, paseo, settings);
-            await this.reviveStalled(project.id, read, appId, paseo, settings)
-              .catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: restarting stalled tickets failed, the next read retries: ${message(error)}`));
           });
         } catch (error) {
           console.error(`[linear-tickets] project ${project.name}: ${message(error)}`);
@@ -910,11 +869,10 @@ export class ProjectFlow {
     const labels = dispatchLabels(settings.dispatch.label);
     const skip = new Set([labels.hold, labels.manual, labels.needsYou, labels.running, labels.failed, settings.dispatch.label].map((name) => name.toLowerCase()));
     const withheld = new Set(read.record.withheld ?? []);
-    const repairing = await this.repairing();
     const pending = (await this.store.all())[projectId]?.planner?.approved;
     const ordered = new Set(pending ? parseOrder(pending.plan).flatMap((step) => step.kind === "blocks" ? [step.blocked] : step.kind === "hold" || step.kind === "attended" ? [step.ticket] : []) : []);
     const parents = new Set(read.work.map((issue) => issue.parentId).filter(Boolean));
-    const ready = await this.inFocus(read.work.filter((issue) => read.planned(issue) && !read.parked(issue) && !withheld.has(issue.id) && !repairing.has(issue.id) && !ordered.has(issue.identifier) && HAND_OUT_TYPES.has(issue.statusType) && !issue.delegateId && (!issue.assigneeId || issue.assigneeId === read.owner)
+    const ready = await this.inFocus(read.work.filter((issue) => read.planned(issue) && !read.parked(issue) && !withheld.has(issue.id) && !ordered.has(issue.identifier) && HAND_OUT_TYPES.has(issue.statusType) && !issue.delegateId && (!issue.assigneeId || issue.assigneeId === read.owner)
       && !issue.parentId && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished)), paseo);
     for (const group of ready.filter((issue) => parents.has(issue.id))) {
       await this.deps.linear.delegate(group.id, appId);
@@ -950,67 +908,6 @@ export class ProjectFlow {
     return kept;
   }
 
-  // Tickets assigned to Paseo that never got an agent: the launch failed (TUC-53: "Daemon client
-  // closed", TUC-534: OMP did not come up) or Linear's webhook never arrived (TUC-290). The ticket
-  // stays assigned to Paseo, so the hand-out never takes it again, and assigning Paseo once more
-  // opens no new thread. Such a ticket still waits in Backlog, Todo or Plan approved (a started
-  // agent moves it on), is not a group (a parent waits there while its sub-issues work), has no live agent, no
-  // start under way, and its newest thread neither waits for a slot, ever had an agent nor was
-  // closed on purpose (a plan approved for later is back in Todo on purpose, a delegation by
-  // someone else was refused). RESTART_GRACE_MS after it is first seen so it is started again with
-  // a new thread, admitted like any start, at most RESTART_CAP times; then the owner is asked once.
-  // One restart per poll: a start takes a minute or two, and the dispatcher's poll waits for it. A
-  // follow-up Paseo filed in Backlog is no start that failed: nothing starts it again until you
-  // move it to Todo (`read.parked`), so it is no suspect and gets no owner ask either.
-  private async reviveStalled(projectId: string, read: Read, appId: string, paseo: PaseoApi, settings: PluginSettings): Promise<void> {
-    const labels = dispatchLabels(settings.dispatch.label);
-    // Labelled tickets belong to the label dispatch, held ones and the owner's tasks to the owner.
-    const skip = new Set([labels.hold, labels.manual, labels.needsYou, labels.running, labels.failed, settings.dispatch.label].map((name) => name.toLowerCase()));
-    const parents = new Set(read.work.map((issue) => issue.parentId).filter(Boolean));
-    const repairing = await this.repairing();
-    const suspects = await this.inFocus(read.work.filter((issue) => issue.delegateId === appId && !read.parked(issue) && (HAND_OUT_TYPES.has(issue.statusType) || planStage(issue.status, issue.statusType) === PLAN_APPROVED_STATE) && !parents.has(issue.id) && !repairing.has(issue.id)
-      && !issue.labels.some((name) => skip.has(name.toLowerCase())) && issue.blockers.every((blocker) => blocker.finished)), paseo);
-    const stalled: ProjectIssue[] = [];
-    for (const issue of suspects) {
-      if (await this.working(paseo, issue.id, issue.identifier)) continue;
-      if (await this.deps.accountedFor(issue.id)) continue;
-      stalled.push(issue);
-    }
-    const now = new Date(this.now()).toISOString();
-    const records = await this.store.update(projectId, (current) => {
-      const base = current ?? read.record;
-      const previous = base.stalled ?? {};
-      const next = Object.fromEntries(stalled.map((issue) => [issue.id, previous[issue.id] ?? { since: now, restarts: 0 }]));
-      return JSON.stringify(next) === JSON.stringify(previous) ? null : { ...base, stalled: next };
-    }).then((record) => record?.stalled ?? read.record.stalled ?? {});
-    for (const issue of stalled) {
-      const entry = records[issue.id];
-      if (!entry || entry.ownerAsked || this.now() - Date.parse(entry.since) < RESTART_GRACE_MS) continue;
-      if (entry.restarts >= RESTART_CAP) {
-        await this.deps.linear.comment(issue.id, `**Paseo could not start an agent for this ticket.** It is assigned to Paseo, but Paseo restarted it ${entry.restarts} times and no agent is working on it now (the start failed, or the agent never came up), so it stops trying. Start an agent for it from the Linear tickets sidebar, or add the \`${settings.dispatch.label}\` label to try again.`);
-        await this.store.update(projectId, (current) => current?.stalled?.[issue.id] ? { ...current, stalled: { ...current.stalled, [issue.id]: { ...entry, ownerAsked: true } } } : null);
-        console.error(`[linear-tickets] ${issue.identifier}: no live agent after ${entry.restarts} restarts; left to the owner`);
-        continue;
-      }
-      // Admitted like a hand-out, so a restart never takes more than the free slots; one that
-      // waits for its turn is not counted.
-      const admission = await this.deps.scheduler.admit({
-        issueId: issue.id, identifier: issue.identifier, projectId, priority: issue.priority, unblocks: issue.blocks.length, createdAt: issue.createdAt,
-        attended: needsOwner(issue.labels, settings.dispatch.label),
-        night: nightInput(issue.labels, (await this.deps.tiers?.get(issue.id)) ?? null),
-      }, paseo, this.deps.capacity.limit(settings.dispatch.maxRunning));
-      if (!admission.ok) continue;
-      // Counted before the start, so a start that keeps failing still reaches the cap, and the
-      // grace runs from now: a start still under way at the next poll is not doubled.
-      await this.store.update(projectId, (current) => current?.stalled?.[issue.id] ? { ...current, stalled: { ...current.stalled, [issue.id]: { since: now, restarts: entry.restarts + 1 } } } : null);
-      console.log(`[linear-tickets] ${issue.identifier}: assigned to Paseo without an agent since ${entry.since}; restart ${entry.restarts + 1} of ${RESTART_CAP}`);
-      await this.deps.restart(issue.id, issue.identifier).catch((error: unknown) => {
-        this.deps.scheduler.release(issue.id);
-        console.error(`[linear-tickets] ${issue.identifier}: restart failed, the first poll after ${RESTART_GRACE_MS / 60_000} minutes retries: ${message(error)}`);
-      });
-      return;
-    }
-  }
 
   // Whether the run is a project's planner: the open one, or the one closed last (a late report of
   // its review is routed as a work order, and `applyPlan` ignores it).

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { HandoverRecord } from "./handover";
 import type { OpenPull } from "./pr-watch";
-import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import type { SessionLink } from "./sessions";
 import {
@@ -20,7 +20,7 @@ const iso = (at: number) => new Date(at).toISOString();
 
 const settings = (change: Partial<PluginSettings> = {}): PluginSettings => ({
   template: null, markInProgress: false, showClosed: false, lastProvider: "omp", launchPreferences: {}, projectMappings: {}, agentLinearAccess: false,
-  dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE,
+  dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE,
   cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS, ...change,
 });
 

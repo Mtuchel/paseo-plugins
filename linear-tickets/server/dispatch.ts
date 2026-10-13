@@ -1,7 +1,7 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { DispatchStatus } from "../shared/contracts";
 import type { ActivationSink } from "./activation";
-import type { LabelRepair } from "./label-repair";
+import type { Steward } from "./steward";
 import type { Launcher } from "./launch";
 import type { Focus } from "./focus";
 import type { ParkedPlans } from "./parked";
@@ -43,7 +43,9 @@ type Deps = {
   // Stale running and failed labels (README, "Repairing stale running and failed labels"), repaired
   // after the projects; `ownerRetried` ends a ticket's incident before the owner's label starts it.
   // `tickQueueBlockers` is the paused poll's queue-blocker-only pass (README, "Auto-dispatch").
-  repairs?: Pick<LabelRepair, "tick" | "ownerRetried" | "tickQueueBlockers">;
+  // The ticket steward (steward.ts) replaces the old label repair: the same trigger-label reset
+  // (ownerRetried) and the same queue-blocker repair (tickQueueBlockers), plus its own pass.
+  steward?: Pick<Steward, "tick" | "ownerRetried" | "tickQueueBlockers">;
   budget?: Pick<RateBudget, "pausedUntil">;
   // Focus mode (README, "Focus mode"): a labelled ticket outside focus keeps its label and waits,
   // a group included (its hand-out would start new work).
@@ -77,7 +79,7 @@ export class Dispatcher {
   private polling: Promise<void> | null = null;
   private rerun = false;
   private stopped = false;
-  private readonly status: DispatchStatus = { active: false, lastPollAt: null, lastError: null, recent: [] };
+  private readonly status: DispatchStatus = { active: false, lastPollAt: null, lastError: null, recent: [], steward: null };
 
   constructor(private readonly deps: Deps) {}
 
@@ -190,7 +192,7 @@ export class Dispatcher {
           if (this.stopped) return;
           await this.dispatch(issue, settings, paseo);
         }
-        await this.deps.repairs?.tickQueueBlockers(paseo, settings);
+        await this.deps.steward?.tickQueueBlockers(paseo, settings);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
         if (message !== this.blockerError) console.error(`[linear-tickets] queue-blocker dispatch failed: ${message}`);
@@ -207,10 +209,10 @@ export class Dispatcher {
       this.launchRoom();
       await this.dispatch(issue, settings, paseo);
     }
-    for (const next of [this.deps.projects, this.deps.repairs]) {
+    for (const next of [this.deps.projects, this.deps.steward]) {
       if (this.stopped || !next) continue;
       this.launchRoom();
-      await asCaller(next === this.deps.projects ? "project-flow" : "label-repair", () => next.tick(paseo, settings));
+      await asCaller(next === this.deps.projects ? "project-flow" : "steward", () => next.tick(paseo, settings));
     }
   }
 
@@ -287,9 +289,9 @@ export class Dispatcher {
     // The owner asked for this start: an incident of the label repair ends first, durably, so a
     // failure of this start is a new incident with fresh retries. Without that, nothing starts.
     try {
-      await this.deps.repairs?.ownerRetried(issue.id);
+      await this.deps.steward?.ownerRetried(issue.id);
     } catch (error) {
-      this.record(issue.identifier, "failed", `its label repair record could not be reset (${error instanceof Error ? error.message : error}); the label stays and the next poll retries`);
+      this.record(issue.identifier, "failed", `its steward record could not be reset (${error instanceof Error ? error.message : error}); the label stays and the next poll retries`);
       return;
     }
     // Claim. If the trigger label cannot be removed, nothing else happens: the next poll retries.

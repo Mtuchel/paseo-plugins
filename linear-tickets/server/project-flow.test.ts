@@ -12,7 +12,7 @@ import type { ProcessInspector } from "./process-liveness";
 import { orderProblems, parseOrder, plannerBrief, ProjectFlow, ProjectStore, type PlannerRecord, type ProjectRecord } from "./project-flow";
 import { Scheduler } from "./scheduler";
 import { TierStore } from "./model-tiers";
-import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { type UsageReport } from "./limit-resume";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 
@@ -34,7 +34,7 @@ const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: "omp",
   launchPreferences: { omp: { model: "anthropic/claude-opus-5-5", modeId: "full" } }, projectMappings: {}, agentLinearAccess: false,
   dispatch: { ...DEFAULT_DISPATCH, enabled: true, teamKeys: ["TUC"], maxRunning: 2 }, writeback: DEFAULT_WRITEBACK,
-  watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [],
+  watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [],
   activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
 };
 
@@ -196,7 +196,7 @@ test("a forwarding poll leaves pending, failed and approved planners and planned
   ];
   for (const planner of planners) {
     const r = await room(t, [issue(1), issue(2), issue(3, { delegateId: APP })]);
-    await r.seed({ planned: ["i1"], planner, waiting: { i2: "2026-01-01T23:00:00Z" }, stalled: { i3: { since: "2026-01-01T23:00:00Z", restarts: 0 } } });
+    await r.seed({ planned: ["i1"], planner, waiting: { i2: "2026-01-01T23:00:00Z" } });
     const before = await readFile(r.path, "utf8");
     const archived: string[] = [];
     const agentReads: string[] = [];
@@ -950,12 +950,6 @@ test("in focus mode no planner run starts, and only tickets in focus are handed 
   planned.advance(HOUR);
   await planned.flow.tick(paseo, settings);
   assert.deepEqual(planned.calls, ["delegate i2"], "Plan by hand still plans; the hand-out takes only the ticket in focus");
-
-  const stalled = await room(t, [issue(3, { delegateId: APP }), issue(4, { delegateId: APP })], [], undefined, undefined, focus);
-  await stalled.flow.tick(paseo, settings);
-  stalled.advance(11 * MINUTE);
-  await stalled.flow.tick(paseo, settings);
-  assert.deepEqual(stalled.calls.filter((call) => call.startsWith("restart")), ["restart i4"]);
 });
 
 test("only new tickets the project could hand out get a run", async (t) => {
@@ -1048,103 +1042,6 @@ test("a large project's brief stays within the prompt limit and lists every NEW 
   assert.match(brief, /Only the \d+ most recently updated are listed; search Linear for older ones\./);
 });
 
-// A ticket assigned to Paseo by an earlier read, and how its blockers stand.
-const blocker = (finished: boolean) => ({ id: "b1", identifier: "TUC-90", status: finished ? "Done" : "In Progress", statusType: finished ? "completed" : "started", delegateId: null, finished });
-
-test("a ticket assigned to Paseo whose start failed (TUC-53) is started again after ten minutes, at most three times, then left to the owner", async (t) => {
-  const r = await room(t, [
-    issue(1, { delegateId: APP }),
-    // Not stalled: a thread waits for a slot, the label dispatch owns it, it is worked on, it is a
-    // group whose sub-issue works, or it waits for its blocker.
-    issue(2, { delegateId: APP }),
-    issue(3, { delegateId: APP, labels: ["paseo-failed"] }),
-    issue(4, { delegateId: APP, statusType: "started", status: "In Progress" }),
-    issue(5, { delegateId: APP }), issue(6, { parentId: "i5", statusType: "started", status: "In Progress" }),
-    issue(7, { delegateId: APP, blockers: [blocker(false)] }),
-  ]);
-  r.held.add("i2");
-  r.fail.restart = true;
-  const none = paseoWith(() => []);
-  const poll = async (minutes: number) => {
-    r.calls.length = 0;
-    r.advance(minutes * MINUTE);
-    await r.flow.tick(none, settings);
-    return r.calls.filter((call) => call.startsWith("restart") || call.startsWith("comment"));
-  };
-  assert.deepEqual(await poll(0), [], "first seen without an agent: its start may still be under way");
-  assert.deepEqual(await poll(9), []);
-  assert.deepEqual(await poll(2), ["restart i1"]);
-  assert.deepEqual(await poll(9), [], "the grace runs again from the restart");
-  assert.deepEqual(await poll(2), ["restart i1"]);
-  assert.deepEqual(await poll(11), ["restart i1"]);
-  assert.deepEqual(await poll(11), ["comment i1 **Paseo could not start an agent for this ticket.** It is assigned to Paseo, but Paseo restarted it 3 times and no agent is working on it now (the start failed, or the agent never came up), so it stops trying. Start an agent for it from the Linear tickets sidebar, or add the `paseo` label to try again."]);
-  assert.deepEqual(await poll(60), [], "asked once, then left to the owner");
-  assert.deepEqual((await r.store.all()).erp.stalled, { i1: { since: "2026-01-02T00:33:00.000Z", restarts: 3, ownerAsked: true } });
-});
-
-test("stalled tickets restart one per poll, and a failed restart frees its slot for the next one", async (t) => {
-  const r = await room(t, [issue(1, { delegateId: APP }), issue(2, { delegateId: APP })]);
-  r.fail.restart = true;
-  const one = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 1 } };
-  const none = paseoWith(() => []);
-  const poll = async (minutes: number) => {
-    r.calls.length = 0;
-    r.advance(minutes * MINUTE);
-    await r.flow.tick(none, one);
-    return r.calls.filter((call) => call.startsWith("restart"));
-  };
-  assert.deepEqual(await poll(0), []);
-  assert.deepEqual(await poll(11), ["restart i1"]);
-  assert.deepEqual(await poll(2), ["restart i2"], "the only agent slot is free again");
-});
-
-test("AC-10: a Plan approved ticket whose queued thread was lost restarts like a Todo one; one with a queued thread or approved for later does not", async (t) => {
-  const approved = { delegateId: APP, statusType: "started", status: "Plan approved", labels: ["plan-ready"] };
-  const r = await room(t, [
-    issue(1, approved),
-    // A thread waits for a slot (SessionRouter.threadQueued).
-    issue(2, approved),
-    // Approved for later: back in Todo with plan-ready, its thread closed on purpose.
-    issue(3, { delegateId: APP, labels: ["plan-ready"] }),
-  ]);
-  r.held.add("i2");
-  r.held.add("i3");
-  r.fail.restart = true;
-  const none = paseoWith(() => []);
-  const poll = async (minutes: number) => {
-    r.calls.length = 0;
-    r.advance(minutes * MINUTE);
-    await r.flow.tick(none, settings);
-    return r.calls.filter((call) => call.startsWith("restart"));
-  };
-  assert.deepEqual(await poll(0), []);
-  assert.deepEqual(await poll(11), ["restart i1"]);
-  assert.deepEqual(Object.keys((await r.store.all()).erp.stalled ?? {}), ["i1"]);
-});
-
-test("a stalled ticket waits for a free slot without using up a restart, and is forgotten once its agent works", async (t) => {
-  const running = ["x1", "x2"];
-  const r = await room(t, [issue(1, { delegateId: APP }), issue(7, { delegateId: APP, blockers: [blocker(false)] })], running);
-  const agents: Agent[] = [];
-  const local = paseoWith(() => agents);
-  const poll = async (minutes: number) => {
-    r.calls.length = 0;
-    r.advance(minutes * MINUTE);
-    await r.flow.tick(local, settings);
-    return r.calls.filter((call) => call.startsWith("restart"));
-  };
-  assert.deepEqual(await poll(0), []);
-  assert.deepEqual(await poll(30), [], "both agent slots are taken");
-  assert.deepEqual((await r.store.all()).erp.stalled?.i1.restarts, 0);
-  running.length = 0;
-  r.issues[1] = issue(7, { delegateId: APP, blockers: [blocker(true)] });
-  assert.deepEqual(await poll(2), ["restart i1"], "a slot is free");
-  assert.deepEqual((await r.store.all()).erp.stalled?.i7, { since: "2026-01-02T00:32:00.000Z", restarts: 0 }, "TUC-7's blocker finished only now, so its grace starts now");
-  agents.push({ id: "agent-1", status: "running", labels: { "linear.issueId": "i1" } });
-  assert.deepEqual(await poll(8), []);
-  assert.deepEqual(await poll(2), ["restart i7"]);
-  assert.deepEqual((await r.store.all()).erp.stalled, { i7: { since: "2026-01-02T00:42:00.000Z", restarts: 1 } }, "TUC-1 is forgotten once its agent works");
-});
 
 async function limitedRoom(t: TestContext, error = "usage limit model=anthropic/claude-opus-5-5", delay = 5 * HOUR) {
   const r = await room(t, [issue(1)]);
@@ -1562,7 +1459,7 @@ test("retirement failure cannot rewrite a persisted successful restart as failed
   assert.equal(r.starts.length, 1);
 });
 
-test("project updates expire restart evidence after eight days while preserving repair records", async (t) => {
+test("project updates expire restart evidence after eight days while preserving the removed label repair's records", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "restart-history-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const now = Date.parse("2026-01-10T00:00:00Z");
@@ -1570,8 +1467,12 @@ test("project updates expire restart evidence after eight days while preserving 
   const boundary = { runId: "run", requestId: "request", agentId: "agent", confirmedAt: new Date(now - 8 * 24 * HOUR).toISOString() };
   await writeFile(join(directory, "projects.json"), JSON.stringify({ erp: { planner: null, plannerLimitRestarts: [boundary, { ...boundary, requestId: "expired", confirmedAt: new Date(now - 8 * 24 * HOUR - 1).toISOString() }] }, "~repairs": { sentinel: { incident: "unchanged" } } }));
   await store.update("erp", (record) => ({ ...record!, planned: ["i1"] }));
+  await store.update("erp", (record) => ({ ...record!, waiting: { i1: "2026-01-10T00:00:00Z" } }));
   assert.deepEqual((await store.all()).erp.plannerLimitRestarts, [boundary]);
-  assert.deepEqual(await store.repairs(), { sentinel: { incident: "unchanged" } });
+  // An older version kept the label repair's records under "~repairs": the store never reads them
+  // as projects, and writing the file back keeps them for a rolled-back host.
+  assert.deepEqual(Object.keys(await store.all()), ["erp"]);
+  assert.deepEqual(JSON.parse(await readFile(join(directory, "projects.json"), "utf8"))["~repairs"], { sentinel: { incident: "unchanged" } });
 });
 
 test("malformed restart reporting evidence cannot block Skip or erase the unreadable evidence", async (t) => {

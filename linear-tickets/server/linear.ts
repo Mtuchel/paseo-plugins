@@ -313,45 +313,176 @@ const ISSUE_LABELS_BATCH = 50;
 // `openChildren`: the ticket has at least one sub-issue that is not completed or canceled.
 export type LabeledIssue = { id: string; identifier: string; teamKey: string; priority: number; labels: { id: string; name: string }[]; openChildren: boolean };
 
-// The label repair (label-repair.ts): open tickets of the dispatch teams carrying a stale-able
-// label, the teams' tickets in one started state whatever their labels (orphans, see
-// orphanCandidateFilter), and the tickets of its open records whatever their labels or state, all
-// pages.
-export const REPAIR_CANDIDATES_QUERY = `query repairCandidates($first: Int!, $after: String, $filter: IssueFilter) {
-  issues(first: $first, after: $after, includeArchived: false, filter: $filter) {
-    nodes { id identifier title state { name type } project { id } delegate { id } labels(first: 50) { nodes { id name } } children(first: 1, filter: { state: { type: { nin: ["completed", "canceled"] } } }) { nodes { id } } }
+// The tickets the steward reconciles (steward.ts): the dispatch teams' open tickets carrying any
+// Paseo label, the tickets delegated to a Paseo app, and the tickets it tracked before (whatever
+// their labels or state, so a finished ticket's quiet agent is still archived). Everything the
+// classifier decides on comes with it: state, labels, delegate, parent, sub-issues, blockers with
+// their own pull requests (finishedIssue), and the ticket's own pull request attachments (the
+// Linear GitHub links the landed check reads). Three separate reads, merged by id: Linear's `or`
+// around a multi-field filter matched every ticket of the team (see stewardLabelFilter).
+export const STEWARD_ISSUES_QUERY = `query stewardIssues($first: Int!, $after: String, $filter: IssueFilter) {
+  issues(first: $first, after: $after, includeArchived: false, orderBy: updatedAt, filter: $filter) {
+    nodes {
+      id identifier title state { name type } updatedAt
+      team { id key } project { id name } delegate { id } parent { id }
+      labels(first: 50) { nodes { id name } }
+      children(first: 100) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id identifier state { name type } delegate { id } assignee { id } }
+      }
+      inverseRelations(first: 50) { nodes { type issue { identifier state { name type } attachments(first: 10) { nodes { url sourceType metadata } } } } }
+      attachments(first: 25) { nodes { url sourceType metadata } }
+    }
     pageInfo { hasNextPage endCursor }
   }
 }`;
-// `queueBlocker`: the ticket is a queue blocker (README, "Auto-dispatch"): a read filtered to the
-// markers marks every candidate, the unfiltered read recognizes the title prefix. `delegateId`: the
-// app the ticket is assigned to (the orphan rule restarts only this host's).
-export type RepairCandidate = { id: string; identifier: string; status: string; statusType: string; projectId: string | null; delegateId: string | null; labels: { id: string; name: string }[]; openChildren: boolean; queueBlocker: boolean };
+// The sub-issues a ticket's first page left unread (STEWARD_ISSUES_QUERY asks for 100 of them), one
+// page at a time: a parent whose children run past the page must not look like a parent whose
+// children all finished. `stewardIssues` follows the cursor until this connection is exhausted.
+export const STEWARD_CHILDREN_QUERY = `query stewardChildren($id: String!, $after: String) {
+  issue(id: $id) {
+    children(first: 100, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes { id identifier state { name type } delegate { id } assignee { id } }
+    }
+  }
+}`;
+export const STEWARD_PAGE = 100;
+// How many pages one steward read may take before it gives up on the pass: 30 × 100 tickets.
+export const STEWARD_MAX_PAGES = 30;
+// The tracked tickets are read by id, 50 per request.
+export const STEWARD_IDS_BATCH = 50;
 
-// Separate reads, merged by id: Linear's `or` around this multi-field filter matched every ticket of
-// the team (1210 of TUC, 2026-10-07), so the record ids are read on their own. `queueBlockers`
-// adds the marker filter, so only queue-blocker tickets are returned (the dispatch fallback's
-// read while the background share is paused).
-export function repairCandidateFilter(labels: string[], teamKeys: string[], options: { queueBlockers?: boolean } = {}): Record<string, unknown> {
+export type StewardChild = { id: string; identifier: string; status: string; statusType: string; delegateId: string | null; assigneeId: string | null };
+export type StewardBlocker = { identifier: string; statusType: string; merged: boolean };
+export type StewardAttachment = { url: string; sourceType: string; status: string | null; linkKind: string | null };
+export type StewardIssue = {
+  id: string;
+  identifier: string;
+  title: string;
+  status: string;
+  statusType: string;
+  teamId: string;
+  teamKey: string;
+  projectId: string | null;
+  projectName: string | null;
+  delegateId: string | null;
+  parentId: string | null;
+  labels: { id: string; name: string }[];
+  children: StewardChild[];
+  // Whether the ticket's sub-issue list was read in full: `false` means the first page reported more
+  // children than came with the ticket (or a later page failed), so what is here is a prefix and a
+  // parent must not be taken for one whose children all finished.
+  childrenComplete: boolean;
+  blockers: StewardBlocker[];
+  attachments: StewardAttachment[];
+  updatedAt: string | null;
+};
+
+// The open tickets of one dispatch team carrying any of the Paseo labels.
+export function stewardLabelFilter(labels: string[], teamKeys: string[]): Record<string, unknown> {
   return {
     labels: { some: { or: labels.map((name) => ({ name: { eqIgnoreCase: name } })) } },
     team: { key: { in: [...new Set(teamKeys)].sort() } },
     state: { type: { nin: ["completed", "canceled"] } },
-    ...(options.queueBlockers ? queueBlockerFilter() : {}),
   };
 }
-// The teams' tickets in the started states `states` (Planning, Plan review), whatever their labels
-// and delegate: the label repair keeps those assigned to this host's app without any Paseo state label.
-export function orphanCandidateFilter(states: string[], teamKeys: string[]): Record<string, unknown> {
+
+export function stewardDelegateFilter(appIds: string[], teamKeys: string[]): Record<string, unknown> {
+  return {
+    delegate: { id: { in: [...new Set(appIds)] } },
+    team: { key: { in: [...new Set(teamKeys)].sort() } },
+    state: { type: { nin: ["completed", "canceled"] } },
+  };
+}
+
+// The teams' tickets in these started states, whatever their labels and delegate. The steward
+// itself never needs it; the plan-stages migration (plan-stages-migration.ts) lists the tickets of
+// the plan stages that way, including ones whose labels were already moved.
+export function stewardStateFilter(states: string[], teamKeys: string[]): Record<string, unknown> {
   return {
     team: { key: { in: [...new Set(teamKeys)].sort() } },
     state: { type: { eq: "started" }, or: states.map((name) => ({ name: { eqIgnoreCase: name } })) },
   };
 }
-const REPAIR_IDS_BATCH = 50;
 
-// One ticket with its blockers and what it blocks (each blocker's state and pull requests), for
-// decisions on dependencies; everything else reads ISSUE_CORE_QUERY (498 against 8 points).
+function stewardChild(node: Record<string, unknown>): StewardChild {
+  const state = record(node.state ?? {});
+  return {
+    id: label(node.id),
+    identifier: label(node.identifier),
+    status: label(state.name),
+    statusType: label(state.type),
+    delegateId: label(record(node.delegate ?? {}).id) || null,
+    assigneeId: label(record(node.assignee ?? {}).id) || null,
+  };
+}
+
+// One page of a ticket's sub-issues (the `children` connection of an issue, from either
+// STEWARD_ISSUES_QUERY or STEWARD_CHILDREN_QUERY): the children, and `cursor`, the position of the
+// rest when Linear reported more. `complete` is false as long as a page is outstanding — Linear's
+// children connection is a prefix, not the whole list, unless it says otherwise.
+type StewardChildPage = { children: StewardChild[]; complete: boolean; cursor: string | null };
+
+function stewardChildren(node: Record<string, unknown>): StewardChildPage {
+  const page = connection(node.children ?? { nodes: [] });
+  return {
+    children: page.nodes.map((item) => stewardChild(record(item))),
+    complete: page.hasNextPage !== true,
+    cursor: page.endCursor,
+  };
+}
+
+function stewardAttachments(node: Record<string, unknown>): StewardAttachment[] {
+  return connection(node.attachments ?? { nodes: [] }).nodes.map((item) => record(item)).map((attachment) => {
+    const metadata = record(attachment.metadata ?? {});
+    return {
+      url: label(attachment.url),
+      sourceType: label(attachment.sourceType),
+      status: label(metadata.status) || null,
+      linkKind: label(metadata.linkKind) || null,
+    };
+  });
+}
+
+function stewardBlockers(node: Record<string, unknown>): StewardBlocker[] {
+  return connection(node.inverseRelations ?? { nodes: [] }).nodes.map((item) => record(item))
+    .filter((relation) => label(relation.type) === "blocks")
+    .map((relation) => {
+      const issue = record(relation.issue ?? {});
+      const state = record(issue.state ?? {});
+      return { identifier: label(issue.identifier), statusType: label(state.type), merged: pullRequestsMerged(issue) };
+    });
+}
+
+function parseStewardIssue(node: Record<string, unknown>, children: StewardChildPage): StewardIssue | null {
+  const id = label(node.id);
+  if (!id) return null;
+  const state = record(node.state ?? {});
+  const team = record(node.team ?? {});
+  const project = record(node.project ?? {});
+  return {
+    id,
+    identifier: label(node.identifier),
+    title: label(node.title),
+    status: label(state.name),
+    statusType: label(state.type),
+    teamId: label(team.id),
+    teamKey: label(team.key),
+    projectId: label(project.id) || null,
+    projectName: label(project.name) || null,
+    delegateId: label(record(node.delegate ?? {}).id) || null,
+    parentId: label(record(node.parent ?? {}).id) || null,
+    labels: labelNodes(node.labels),
+    children: children.children,
+    childrenComplete: children.complete,
+    blockers: stewardBlockers(node),
+    attachments: stewardAttachments(node),
+    updatedAt: label(node.updatedAt) || null,
+  };
+}
+
+
 export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
   issue(id: $id) {
     id identifier title priority createdAt state { id name type } team { id } project { id } creator { id } labels(first: 50) { nodes { id name } } attachments(first: 50) { nodes { url } }
@@ -1252,37 +1383,79 @@ export class LinearService {
       .sort((a, b) => (a.priority || 5) - (b.priority || 5));
   }
 
-  // `states`: also read the teams' tickets in these started states (orphanCandidateFilter).
-  async repairCandidates(input: { labels: string[]; teamKeys: string[]; ids: string[]; queueBlockers?: boolean; states?: string[] }): Promise<RepairCandidate[]> {
-    const found = new Map<string, RepairCandidate>();
-    const ids = [...new Set(input.ids)].sort();
+  // The tickets the steward reconciles (steward.ts): one read per filter — the teams' open tickets
+  // with any Paseo label, those delegated to a Paseo app, the teams' tickets in the `states` asked
+  // for (the plan-stages migration), and the tracked ids (any state) — merged by id, every page. A
+  // ticket Linear does not return is missing from the result; the caller then keeps no state for it.
+  // `queueBlockers`: every one of those filters asks for the queue-blocker alerts only
+  // (queueBlockerFilter ANDs in), so that pass reads its tickets in the same one query per filter.
+  async stewardIssues(input: { teamKeys: string[]; labels: string[]; appIds: string[]; ids: string[]; states?: string[]; queueBlockers?: boolean }): Promise<StewardIssue[]> {
+    const found = new Map<string, StewardIssue>();
+    const blockers = input.queueBlockers ? queueBlockerFilter() : {};
     const filters = [
-      ...input.teamKeys.length ? [repairCandidateFilter(input.labels, input.teamKeys, { queueBlockers: input.queueBlockers })] : [],
-      ...input.teamKeys.length && input.states?.length && !input.queueBlockers ? [orphanCandidateFilter(input.states, input.teamKeys)] : [],
-      // A queue-blocker read names the tickets it means: the record-id read would return the other
-      // records' tickets too.
-      ...(input.queueBlockers ? [] : Array.from({ length: Math.ceil(ids.length / REPAIR_IDS_BATCH) }, (_, index) => ({ id: { in: ids.slice(index * REPAIR_IDS_BATCH, (index + 1) * REPAIR_IDS_BATCH) } }))),
+      ...input.teamKeys.length && input.labels.length ? [{ ...stewardLabelFilter(input.labels, input.teamKeys), ...blockers }] : [],
+      ...input.teamKeys.length && input.appIds.length ? [{ ...stewardDelegateFilter(input.appIds, input.teamKeys), ...blockers }] : [],
+      ...input.teamKeys.length && input.states?.length ? [{ ...stewardStateFilter(input.states, input.teamKeys), ...blockers }] : [],
     ];
+    const ids = [...new Set(input.ids)].sort();
+    for (let start = 0; start < ids.length; start += STEWARD_IDS_BATCH) filters.push({ id: { in: ids.slice(start, start + STEWARD_IDS_BATCH) }, ...blockers });
     for (const filter of filters) {
       let after: string | null = null;
-      do {
-        const data = record(await this.read(REPAIR_CANDIDATES_QUERY, { first: 100, after, filter }));
+      for (let pageNumber = 0; ; pageNumber++) {
+        if (pageNumber >= STEWARD_MAX_PAGES) throw new Error(`The steward read took more than ${STEWARD_MAX_PAGES} pages of ${STEWARD_PAGE} tickets.`);
+        const data = record(await this.read(STEWARD_ISSUES_QUERY, { first: STEWARD_PAGE, after, filter }));
         const page = record(data.issues ?? {});
         for (const node of connection(page).nodes.map((item) => record(item))) {
-          const state = record(node.state ?? {});
-          const id = label(node.id);
-          if (id) found.set(id, {
-            id, identifier: label(node.identifier), status: label(state.name), statusType: label(state.type),
-            projectId: label(record(node.project ?? {}).id) || null, delegateId: label(record(node.delegate ?? {}).id) || null, labels: labelNodes(node.labels),
-            openChildren: connection(node.children ?? { nodes: [] }).nodes.length > 0,
-            queueBlocker: input.queueBlockers === true || label(node.title).startsWith(QUEUE_BLOCKER_TITLE_PREFIX),
-          });
+          const children = stewardChildren(node);
+          const issue = parseStewardIssue(node, children);
+          if (!issue) continue;
+          found.set(issue.id, issue);
+          // A ticket whose sub-issues ran past the first page: read the rest before the pass judges
+          // it, so a truncated list never looks like a parent whose children all finished.
+          if (!children.complete) await this.stewardChildPages(issue, children.cursor);
         }
         const info = record(page.pageInfo ?? {});
         after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
-      } while (after);
+        if (!after) break;
+      }
     }
     return [...found.values()];
+  }
+
+  // The rest of one ticket's sub-issues, page by page, after the first page STEWARD_ISSUES_QUERY
+  // carried (STEWARD_CHILDREN_QUERY, following the cursor to the end of the connection). A page that
+  // fails is logged and leaves the children read so far in place with `childrenComplete` false: one
+  // parent's read must not fail the pass. A rate limit is never swallowed — it propagates so the
+  // work pauses. A child already collected from an earlier page is kept once.
+  private async stewardChildPages(issue: StewardIssue, cursor: string | null): Promise<void> {
+    const seen = new Set(issue.children.map((child) => child.id));
+    let after = cursor;
+    while (after) {
+      const page = await this.readStewardChildPage(issue, after);
+      if (!page) return;
+      for (const child of page.children) {
+        if (seen.has(child.id)) continue;
+        seen.add(child.id);
+        issue.children.push(child);
+      }
+      if (page.complete) { issue.childrenComplete = true; return; }
+      after = page.cursor;
+    }
+  }
+
+  // One page of a ticket's sub-issues past the first. Null when Linear did not answer it in full,
+  // with the failure logged: the caller then keeps the children it has. A rate limit is not a
+  // page failure — it propagates.
+  private async readStewardChildPage(issue: StewardIssue, after: string): Promise<StewardChildPage | null> {
+    try {
+      const data = record(await this.read(STEWARD_CHILDREN_QUERY, { id: issue.id, after }));
+      if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue.");
+      return stewardChildren(record(data.issue));
+    } catch (error) {
+      if (error instanceof RateLimitedError) throw error;
+      console.error(`[linear-tickets] ${issue.identifier}: reading its sub-issues past the first page failed: ${error instanceof Error ? error.message : error}`);
+      return null;
+    }
   }
 
   // Label names by ticket id, lower-cased. The Paseo app's pool first; the key when the app cannot
@@ -1579,9 +1752,10 @@ export class LinearService {
     succeeded(record(await this.write(RELATION_QUERY, { input: { issueId: blockerId, relatedIssueId: blockedId, type: "blocks" } })), "issueRelationCreate", "link the tickets");
   }
 
-  // `related`: both tickets touch the same work. `duplicate`: `issueId` is a duplicate of
+  // `blocks`: `issueId` must be finished before `relatedId` starts (the same link `addBlocker`
+  // makes). `related`: both tickets touch the same work. `duplicate`: `issueId` is a duplicate of
   // `relatedId`; Linear then moves it to its Duplicate status.
-  async relate(issueId: string, relatedId: string, type: "related" | "duplicate"): Promise<void> {
+  async relate(issueId: string, relatedId: string, type: "blocks" | "related" | "duplicate"): Promise<void> {
     succeeded(record(await this.write(RELATION_QUERY, { input: { issueId, relatedIssueId: relatedId, type } })), "issueRelationCreate", "link the tickets");
   }
 
@@ -1600,6 +1774,13 @@ export class LinearService {
 
   async updateDescription(issueId: string, description: string): Promise<void> {
     succeeded(record(await this.write(`mutation describe($id: String!, $description: String!) { issueUpdate(id: $id, input: { description: $description }) { success } }`, { id: issueId, description })), "issueUpdate", "update the ticket");
+  }
+
+  // The ticket's due date, or none when `date` is null. Linear takes a date without a time
+  // (TimelessDate), so the shape is checked here instead of leaving it to Linear.
+  async setDueDate(issueId: string, date: string | null): Promise<void> {
+    if (date !== null && !/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("The due date must be YYYY-MM-DD.");
+    succeeded(record(await this.write(`mutation dueDate($id: String!, $dueDate: TimelessDate) { issueUpdate(id: $id, input: { dueDate: $dueDate }) { success } }`, { id: issueId, dueDate: date })), "issueUpdate", "update the ticket");
   }
 
   // Moves the ticket to its team's first completed state (Done).

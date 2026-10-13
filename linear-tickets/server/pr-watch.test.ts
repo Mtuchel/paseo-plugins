@@ -10,9 +10,9 @@ import { CONTEXT_TOO_LARGE } from "./context";
 import type { RetriggerResult } from "./greptile-outage";
 import { Handover, type HandoverRecord } from "./handover";
 import type { ReviewThread } from "./pr-nudge";
-import { activityBullets, ConditionalPullView, githubReader, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft, type RateProbe } from "./pr-watch";
-import { DoneTickets, RetiredLabels, RetirePass, type RetirePoll, type StackState } from "./retirement";
+import { activityBullets, ConditionalPullView, githubReader, PullRequestNotFoundError, PullRequestWatch, type CheckRun, type OpenPull, type PullRequestView, type PullViewSource, type QueueDraft, type RateProbe, type StackState } from "./pr-watch";
 import { runningTicketAgents } from "./starter";
+import { DoneTickets, RetiredLabels } from "./steward";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, GREPTILE_RETRIGGER, marker, RETARGET_ORPHAN, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
 import { GitHubBudget, GitHubPausedError, GitHubRateLimitedError, RateLimitedError, withPriority } from "./rate-budget";
 import { PermissionReplies } from "./permission-replies";
@@ -178,7 +178,7 @@ const MAIN_BROKEN: Judgment = {
 // injected `view` is the whole read, as for the tests that predate it.
 // `store`: a real Handover on temporary files instead of the in-memory records (the transfer
 // tests); `owns`: the only tickets the peer mechanism names as this host's.
-function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean; owner?: "all" | "none" | "unknown" | "throws"; backstop?: "auto" | "always" | "never"; watchdog?: Pick<Watchdog, "pass" | "stop">; retire?: Pick<RetirePass, "pass" | "stop">; store?: Handover; owns?: string[] } = {}, probe?: PullViewSource) {
+function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; live?: boolean; updatedAt?: string; crash?: boolean; autoResume?: boolean; dispatch?: boolean; owner?: "all" | "none" | "unknown" | "throws"; backstop?: "auto" | "always" | "never"; watchdog?: Pick<Watchdog, "pass" | "stop">; steward?: { pass: () => Promise<void>; stop: () => void }; store?: Handover; owns?: string[] } = {}, probe?: PullViewSource) {
   const waits = { runs: 0, failure: null as Error | null };
   const records = [{ issueId: "i1", identifier: "TUC-1", agentId: "a1", agentTitle: "T", worktreePath: "/wt/tuc-1", links: { "Pull request": PR }, status: agent.status ?? "working", updatedAt: agent.updatedAt ?? new Date().toISOString() } as unknown as HandoverRecord];
   // `view`: the watched pull request, listed while open under `title`; `views`: other pull requests
@@ -365,7 +365,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     outage: { follow: async () => scripts.outage.follow, sync: async (results) => { scripts.outage.syncs.push(results); } },
     ...(probe ? { probe } : {}),
     ...(agent.watchdog ? { watchdog: agent.watchdog } : {}),
-    ...(agent.retire ? { retire: agent.retire } : {}),
+    ...(agent.steward ? { steward: agent.steward } : {}),
     view: async (url) => {
       github.reads.push(url);
       if (github.throttled || github.throttle.includes(url)) throw new GitHubRateLimitedError("GitHub is throttling gh: HTTP 403: API rate limit exceeded");
@@ -468,9 +468,8 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         return answer(next.code, next.answer);
       },
     },
-    // The waits the plugin recorded for the owner (writeback.ts, reconcileWaiting): every poll
-    // checks them; `waitsFailing` makes that check fail.
-    ownerWaits: { reconcileWaiting: async () => { waits.runs++; if (waits.failure) throw waits.failure; } },
+    // The steward's pass (steward.ts): every poll runs it; `waits.failure` makes it throw.
+    steward: { pass: async () => { waits.runs++; if (waits.failure) throw waits.failure; }, stop: () => {} },
   }, join(home, "pr-watch.json")));
   let watch = create();
   const poll = async () => {
@@ -3890,7 +3889,7 @@ test("TUC-1265: members compare by repo and number whatever the URL's spelling, 
   assert.ok(!orphan.github.reads.includes(prUrl(440)));
 });
 
-test("every poll checks the waits the plugin recorded for the owner; a failure there is logged and never ends the poll", async (t) => {
+test("every poll runs the steward's pass; a failure there is logged and never ends the poll", async (t) => {
   const errors = t.mock.method(console, "error", () => {});
   const h = harness(t);
   await h.poll();
@@ -3900,7 +3899,7 @@ test("every poll checks the waits the plugin recorded for the owner; a failure t
   h.waits.failure = new Error("Linear is unreachable");
   await h.poll();
   assert.equal(h.waits.runs, 3);
-  assert.ok(errors.mock.calls.some((call) => /closing left-behind owner waits failed: Linear is unreachable/.test(String(call.arguments[0]))));
+  assert.ok(errors.mock.calls.some((call) => /the ticket steward's pass failed: Linear is unreachable/.test(String(call.arguments[0]))));
 });
 // --- One host per ticket and one per repo (TUC-538) ----------------------------------------------
 
@@ -4167,7 +4166,7 @@ test("a canceled or duplicate ticket is never reopened, and neither is one whose
   assert.deepEqual(await vetoed.poll(), [], "do-not-merge only: nothing to land");
 });
 
-// A finished ticket's quiet agent (retirement.ts) next to the stack policy: the reopen the policy
+// A finished ticket's quiet agent next to the stack policy (steward.ts): the reopen the policy
 // writes after the poll's read of the states wins over that read, so the agent counts again.
 test("a Done ticket the stack policy reopens in the same poll keeps its quiet agent counted and unarchived", async (t) => {
   t.mock.method(console, "log", () => {});
@@ -4178,23 +4177,7 @@ test("a Done ticket the stack policy reopens in the same poll keeps its quiet ag
     ref: (id: string) => ({ refresh: async () => ({ agent: quiet }), archive: async () => { archives.push(id); } }),
     list: async () => ({ entries: [{ agent: quiet }], pageInfo: { hasMore: false, nextCursor: null } }),
   } } as unknown as PaseoApi;
-  const home = await mkdtemp(join(tmpdir(), "paseo-retire-"));
-  t.after(() => rm(home, { recursive: true, force: true }));
-  const retire = new RetirePass({
-    sessions: {
-      watchdogRoots: async () => new Map([["i1", { issueId: "i1", identifier: "TUC-1", roots: [quiet], ghosts: new Set<string>() }]]),
-      retireTurn: async <T>(_issueId: string, work: (paseo: PaseoApi) => Promise<T>) => ({ ran: true as const, value: await work(daemon) }),
-      sessionFor: async () => null,
-      watchdogThread: async () => null,
-    },
-    linear: { issueStatuses: async () => new Map(), issueWatchState: async () => ({ status: "In Progress", statusType: "started", labels: [] }), issueCore: async () => ({ labels: [] }) as never, removeLabel: async () => {} },
-    settings: { read: async () => settings },
-    handover: { all: async () => [] },
-    watchdog: { read: async () => ({ version: 1 as const, tickets: {}, holds: {} }) },
-    doneTickets,
-    labels: new RetiredLabels(join(home, "retired-labels.json")),
-  });
-  const h = harness(t, { live: false, autoResume: true, retire });
+  const h = harness(t, { live: false, autoResume: true });
   h.linear.state = { status: "Done", statusType: "completed" };
   h.linear.completedAt = "2026-10-09T08:49:39.000Z";
   draftStack(h, 1);
@@ -4207,35 +4190,40 @@ test("a Done ticket the stack policy reopens in the same poll keeps its quiet ag
   assert.deepEqual(await runningTicketAgents(daemon, undefined, (agent, now) => doneTickets.releases(agent, now)), ["i1"], "it holds its slot again");
 });
 
-test("the retire pass waits for a Done ticket's stack: open while a reopen is pending, settled once respected or without any repository, unknown with several", async (t) => {
+// The stack state the steward asks for before it archives a finished ticket's agents: open while a
+// reopen is pending, settled once respected or without any repository, unknown with several.
+test("the stack state of a Done ticket: open while a reopen is pending, settled once respected, unknown with several repositories", async (t) => {
   t.mock.method(console, "log", () => {});
-  const seen: StackState[] = [];
-  const probe = (issueId = "i1") => ({ pass: async (poll: RetirePoll) => { seen.push(await poll.stack(issueId)); }, stop: () => {} });
-  const h = harness(t, { live: false, autoResume: true, retire: probe() });
+  const h = harness(t, { live: false, autoResume: true });
   h.linear.state = { status: "Done", statusType: "completed" };
   h.linear.completedAt = "2026-10-09T08:49:39.000Z";
   draftStack(h, 1);
   h.paseo.succeed = startSuccessor;
   await h.poll();
+  assert.equal(await (await h.watch()).stackState("i1"), "open", "the reopen is not carried out yet");
   // The owner moves it to Done again: the reopen is respected, and the stack counts as settled.
   h.linear.state = { status: "Done", statusType: "completed" };
   h.linear.completedAt = "2026-10-09T09:30:00.000Z";
   await h.poll();
-  assert.deepEqual(seen.splice(0), ["open", "settled"]);
+  assert.equal(await (await h.watch()).stackState("i1"), "settled");
   // No worktree, no linked pull request and no pull request attachment: nothing can be open.
-  const bare = harness(t, { retire: probe() });
+  const bare = harness(t);
   bare.records[0] = { ...bare.records[0], links: {}, worktreePath: null };
   bare.linear.state = { status: "Done", statusType: "completed" };
   await bare.poll();
+  assert.equal(await (await bare.watch()).stackState("i1"), "settled");
   // Attachments of two repositories: the stack policy never guesses between them.
-  const several = harness(t, { retire: probe() });
+  const several = harness(t);
   several.records[0] = { ...several.records[0], links: {}, worktreePath: null };
   several.linear.attachments = ["https://github.com/o/one/pull/1", "https://github.com/o/two/pull/2"];
   several.linear.state = { status: "Done", statusType: "completed" };
   await several.poll();
+  assert.equal(await (await several.watch()).stackState("i1"), "unknown");
   // Another host's record, or none: no stack policy on this host.
-  await harness(t, { retire: probe("i9") }).poll();
-  assert.deepEqual(seen, ["settled", "unknown", "settled"]);
+  const other = harness(t, { owns: [] });
+  other.linear.state = { status: "Done", statusType: "completed" };
+  await other.poll();
+  assert.equal(await (await other.watch()).stackState("i9"), "settled");
 });
 
 test("at most three Done tickets are reopened per poll", async (t) => {
@@ -4774,4 +4762,22 @@ test("saved work that names a ticket two moves back follows the pull request to 
   await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, actions: [action] } });
   await h.poll();
   assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"))[PR].actions[0].tickets, ["TUC-3"]);
+});
+
+test("completion checks fresh multi-repository PRs, including reopened and vetoed work", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...OPEN_PR, state: "MERGED" };
+  const other = "https://github.com/o/other/pull/2";
+  h.linear.attachments = [other];
+  h.github.views[other] = { ...OPEN_PR, state: "CLOSED" };
+  const watch = await h.watch();
+  assert.equal(await watch.completionPulls("i1", "TUC-1", [PR]), "settled");
+  h.github.views[other] = { ...OPEN_PR, labels: ["do-not-merge"] };
+  assert.equal(await watch.completionPulls("i1", "TUC-1", [PR]), "open", "a reopened attachment is unfinished even when the retirement policy would omit it");
+  h.github.views[other] = { ...OPEN_PR, state: "CLOSED" };
+  h.github.open = [{ ...listed("https://github.com/o/other/pull/3", OPEN_PR, "Implement TUC-1"), headRepo: "fork/other", labels: ["do-not-merge"] }];
+  assert.equal(await watch.completionPulls("i1", "TUC-1", [PR]), "open", "unrecorded slices in every attached repository block completion");
+  h.github.open = [];
+  h.github.broken = [other];
+  assert.equal(await watch.completionPulls("i1", "TUC-1", [PR]), "unknown", "an unreadable PR is never proof of completion");
 });
