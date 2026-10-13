@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -258,7 +258,7 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "get_issue", "get_comments", "search_issues", "add_comment", "set_status", "link_url", "add_relation", "create_issue", "update_issue", "steward_verdict", "add_manual_task"]);
+    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "get_issue", "get_comments", "search_issues", "add_comment", "set_status", "link_url", "add_relation", "create_issue", "update_issue", "add_manual_task"], "an ordinary ticket agent never sees the steward's verdict tool");
 
     const ticket = JSON.parse((await mcp.call("get_ticket")).text);
     assert.equal(ticket.identifier, "ENG-42");
@@ -954,6 +954,43 @@ test("at three percent a read-only planner's searches pause too", async () => {
   }
 });
 
+test("only the steward's verifier gets the verdict tool, and its first verdict is the one that counts", async () => {
+  const { home, script } = await host("paseo-linear-mcp-verdict-");
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home, "--verifier", "marker-1"], {});
+  try {
+    const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
+    assert.ok(list.tools.some((tool) => tool.name === "steward_verdict"), "the verifier sees the tool it reports through");
+    // Every shape the verdict contract does not allow is refused before anything is written.
+    assert.match((await mcp.call("steward_verdict", { verdict: "resume" })).text, /resume needs instruction/);
+    assert.match((await mcp.call("steward_verdict", { verdict: "park" })).text, /park needs reason/);
+    assert.match((await mcp.call("steward_verdict", { verdict: "ask_owner" })).text, /ask_owner needs question and options/);
+    assert.match((await mcp.call("steward_verdict", { verdict: "follow_up", remaining: "x" })).text, /verdict must be one of: close, resume, park, ask_owner/);
+    const closed = await mcp.call("steward_verdict", { verdict: "close" });
+    assert.equal(closed.isError, false, closed.text);
+    assert.equal(JSON.parse(closed.text).recorded, true);
+    // The record is on disk, bound to the verifier generation that issued it.
+    const directory = join(home, "linear-tickets", "steward-verdicts", ISSUE_ID);
+    const files = await readdir(directory);
+    assert.equal(files.length, 1, "exactly one record");
+    const record = JSON.parse(await readFile(join(directory, files[0]), "utf8"));
+    assert.deepEqual({ issueId: record.issueId, verifier: record.verifier, verdict: record.verdict }, { issueId: ISSUE_ID, verifier: "marker-1", verdict: "close" });
+    assert.ok(Date.parse(record.at) > 0, "stamped when it was recorded");
+    // A second call is refused: one verifier generation records one verdict.
+    assert.match((await mcp.call("steward_verdict", { verdict: "resume", instruction: "keep going" })).text, /already recorded/);
+    assert.equal((await readdir(directory)).length, 1, "no second record, and the first one stands");
+  } finally { mcp.stop(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("a ticket agent started without a verifier marker has no verdict tool at all", async () => {
+  const { home, script } = await host("paseo-linear-mcp-verdict-none-");
+  const mcp = startOn(home, script);
+  try {
+    const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
+    assert.ok(!list.tools.some((tool) => tool.name === "steward_verdict"), "the tool is not mounted");
+    assert.equal(((await mcp.request("tools/call", { name: "steward_verdict", arguments: { verdict: "close" } })).error as { code: number }).code, -32602, "and it is unknown, not merely refusing");
+  } finally { mcp.stop(); await rm(home, { recursive: true, force: true }); }
+});
+
 test("without the broker the tools stay available and every request fails closed", async () => {
   const { home, script } = await host("paseo-linear-mcp-nobroker-");
   const linear = await fakeLinear(answers);
@@ -962,7 +999,7 @@ test("without the broker the tools stay available and every request fails closed
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.equal(list.tools.length, 12, "the tools stay mounted when the broker is down");
+    assert.equal(list.tools.length, 11, "the tools stay mounted when the broker is down");
     for (const call of [() => mcp.call("get_ticket"), () => mcp.call("add_comment", { body: "Started." })]) {
       const result = await call();
       assert.equal(result.isError, true);

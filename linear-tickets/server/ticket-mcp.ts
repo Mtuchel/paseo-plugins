@@ -55,8 +55,13 @@ async function reusable(path: string, source: string): Promise<boolean> {
 // Only the issue id and a path go into the saved agent config; the key is read at call time.
 // The daemon's own runtime avoids the agent's PATH; under Electron it runs as Node only with ELECTRON_RUN_AS_NODE.
 // A null issue id launches the same script read-only: it reads any Linear issue and writes nothing.
-export function ticketMcpServer(scriptPath: string, issueId: string | null, home = paseoHome(), runtime = daemonRuntime): TicketMcpServer {
+// `verifier` is the marker the ticket steward generated for the verifier generation this start
+// belongs to (steward.ts). Appended last, only for that start, so the verdict the agent records
+// through the script is bound to the verifier that was started and a later one cannot be answered
+// with an earlier verdict. Every other launch passes null and gets the plain args.
+export function ticketMcpServer(scriptPath: string, issueId: string | null, home = paseoHome(), runtime = daemonRuntime, verifier: string | null = null): TicketMcpServer {
   const args = issueId === null ? [scriptPath, "--read-only", "--paseo-home", home] : [scriptPath, "--issue", issueId, "--paseo-home", home];
+  if (verifier) args.push("--verifier", verifier);
   const server: TicketMcpServer = { type: "stdio", command: runtime.execPath, args };
   return runtime.electron ? { ...server, env: { ELECTRON_RUN_AS_NODE: "1" } } : server;
 }

@@ -25,6 +25,7 @@ import { answerableQuestions, approvalDecision, deliverToAgent, matchOption, que
 import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./permission-replies";
 import type { PluginSettings, Settings } from "./settings";
 import { issueAgents, type TicketStarter } from "./starter";
+import { STEWARD_VERIFIER_LABEL } from "./steward";
 import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 import { WATCHDOG_LABEL, type TicketRoots, type WatchdogOutcome, type WatchdogRequest, type WatchdogStore } from "./watchdog";
 import type { ReviewDeletions } from "./review-deletions";
@@ -2023,7 +2024,9 @@ export class SessionRouter {
   // nor is a ghost (idle or running without a process, see ghostAgents): a restart replaces it.
   async liveSuccessorFor(issueId: string, exclude: string[] = []): Promise<{ id: string; title: string | null; cwd: string } | null> {
     const candidates = (await issueAgents(this.paseo!, issueId))
-      .filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && !exclude.includes(agent.id) && LIVE_AGENT[agent.status]);
+      // The steward's verifier is a short-lived read-only check, never the continuation of the
+      // ticket's work: a successor never takes the record over from it (steward.ts).
+      .filter((agent) => !agent.labels?.["paseo.parent-agent-id"] && !agent.labels?.[STEWARD_VERIFIER_LABEL] && !exclude.includes(agent.id) && LIVE_AGENT[agent.status]);
     const ghosts = await ghostAgents(candidates, this.clock(), this.deps.processInspector);
     const live = candidates.filter((agent) => !ghosts.has(agent.id)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
     return live ? { id: live.id, title: live.title ?? null, cwd: live.cwd } : null;

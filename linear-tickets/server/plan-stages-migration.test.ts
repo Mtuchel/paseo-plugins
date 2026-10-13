@@ -7,7 +7,7 @@ type Ticket = StewardIssue & { attachmentUrls: string[]; moves: StateMove[]; arc
 
 function ticket(n: number, status: string, labels: string[] = [], extra: Partial<Ticket> = {}): Ticket {
   const statusType = ["Todo"].includes(status) ? "unstarted" : status === "Backlog" ? "backlog" : status === "Done" ? "completed" : "started";
-  return { id: `i${n}`, identifier: `TUC-${n}`, title: `Ticket ${n}`, status, statusType, teamId: "t1", teamKey: "TUC", projectId: null, projectName: null, delegateId: "app", parentId: null, labels: labels.map((name) => ({ id: name, name })), children: [], blockers: [], attachments: [], updatedAt: null, attachmentUrls: [], moves: [], ...extra };
+  return { id: `i${n}`, identifier: `TUC-${n}`, title: `Ticket ${n}`, status, statusType, teamId: "t1", teamKey: "TUC", projectId: null, projectName: null, delegateId: "app", parentId: null, labels: labels.map((name) => ({ id: name, name })), children: [], childrenComplete: true, blockers: [], attachments: [], updatedAt: null, attachmentUrls: [], moves: [], ...extra };
 }
 
 // A Linear holding `tickets`, recording every write. `onRead`: runs before each issueCore read, so a

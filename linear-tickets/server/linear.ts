@@ -326,11 +326,25 @@ export const STEWARD_ISSUES_QUERY = `query stewardIssues($first: Int!, $after: S
       id identifier title state { name type } updatedAt
       team { id key } project { id name } delegate { id } parent { id }
       labels(first: 50) { nodes { id name } }
-      children(first: 50) { nodes { id identifier state { name type } delegate { id } assignee { id } } }
+      children(first: 100) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id identifier state { name type } delegate { id } assignee { id } }
+      }
       inverseRelations(first: 50) { nodes { type issue { identifier state { name type } attachments(first: 10) { nodes { url sourceType metadata } } } } }
       attachments(first: 25) { nodes { url sourceType metadata } }
     }
     pageInfo { hasNextPage endCursor }
+  }
+}`;
+// The sub-issues a ticket's first page left unread (STEWARD_ISSUES_QUERY asks for 100 of them), one
+// page at a time: a parent whose children run past the page must not look like a parent whose
+// children all finished. `stewardIssues` follows the cursor until this connection is exhausted.
+export const STEWARD_CHILDREN_QUERY = `query stewardChildren($id: String!, $after: String) {
+  issue(id: $id) {
+    children(first: 100, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes { id identifier state { name type } delegate { id } assignee { id } }
+    }
   }
 }`;
 export const STEWARD_PAGE = 100;
@@ -356,6 +370,10 @@ export type StewardIssue = {
   parentId: string | null;
   labels: { id: string; name: string }[];
   children: StewardChild[];
+  // Whether the ticket's sub-issue list was read in full: `false` means the first page reported more
+  // children than came with the ticket (or a later page failed), so what is here is a prefix and a
+  // parent must not be taken for one whose children all finished.
+  childrenComplete: boolean;
   blockers: StewardBlocker[];
   attachments: StewardAttachment[];
   updatedAt: string | null;
@@ -400,6 +418,21 @@ function stewardChild(node: Record<string, unknown>): StewardChild {
   };
 }
 
+// One page of a ticket's sub-issues (the `children` connection of an issue, from either
+// STEWARD_ISSUES_QUERY or STEWARD_CHILDREN_QUERY): the children, and `cursor`, the position of the
+// rest when Linear reported more. `complete` is false as long as a page is outstanding — Linear's
+// children connection is a prefix, not the whole list, unless it says otherwise.
+type StewardChildPage = { children: StewardChild[]; complete: boolean; cursor: string | null };
+
+function stewardChildren(node: Record<string, unknown>): StewardChildPage {
+  const page = connection(node.children ?? { nodes: [] });
+  return {
+    children: page.nodes.map((item) => stewardChild(record(item))),
+    complete: page.hasNextPage !== true,
+    cursor: page.endCursor,
+  };
+}
+
 function stewardAttachments(node: Record<string, unknown>): StewardAttachment[] {
   return connection(node.attachments ?? { nodes: [] }).nodes.map((item) => record(item)).map((attachment) => {
     const metadata = record(attachment.metadata ?? {});
@@ -422,7 +455,7 @@ function stewardBlockers(node: Record<string, unknown>): StewardBlocker[] {
     });
 }
 
-function parseStewardIssue(node: Record<string, unknown>): StewardIssue | null {
+function parseStewardIssue(node: Record<string, unknown>, children: StewardChildPage): StewardIssue | null {
   const id = label(node.id);
   if (!id) return null;
   const state = record(node.state ?? {});
@@ -441,7 +474,8 @@ function parseStewardIssue(node: Record<string, unknown>): StewardIssue | null {
     delegateId: label(record(node.delegate ?? {}).id) || null,
     parentId: label(record(node.parent ?? {}).id) || null,
     labels: labelNodes(node.labels),
-    children: connection(node.children ?? { nodes: [] }).nodes.map((item) => stewardChild(record(item))),
+    children: children.children,
+    childrenComplete: children.complete,
     blockers: stewardBlockers(node),
     attachments: stewardAttachments(node),
     updatedAt: label(node.updatedAt) || null,
@@ -1353,15 +1387,18 @@ export class LinearService {
   // with any Paseo label, those delegated to a Paseo app, the teams' tickets in the `states` asked
   // for (the plan-stages migration), and the tracked ids (any state) — merged by id, every page. A
   // ticket Linear does not return is missing from the result; the caller then keeps no state for it.
-  async stewardIssues(input: { teamKeys: string[]; labels: string[]; appIds: string[]; ids: string[]; states?: string[] }): Promise<StewardIssue[]> {
+  // `queueBlockers`: every one of those filters asks for the queue-blocker alerts only
+  // (queueBlockerFilter ANDs in), so that pass reads its tickets in the same one query per filter.
+  async stewardIssues(input: { teamKeys: string[]; labels: string[]; appIds: string[]; ids: string[]; states?: string[]; queueBlockers?: boolean }): Promise<StewardIssue[]> {
     const found = new Map<string, StewardIssue>();
+    const blockers = input.queueBlockers ? queueBlockerFilter() : {};
     const filters = [
-      ...input.teamKeys.length && input.labels.length ? [stewardLabelFilter(input.labels, input.teamKeys)] : [],
-      ...input.teamKeys.length && input.appIds.length ? [stewardDelegateFilter(input.appIds, input.teamKeys)] : [],
-      ...input.teamKeys.length && input.states?.length ? [stewardStateFilter(input.states, input.teamKeys)] : [],
+      ...input.teamKeys.length && input.labels.length ? [{ ...stewardLabelFilter(input.labels, input.teamKeys), ...blockers }] : [],
+      ...input.teamKeys.length && input.appIds.length ? [{ ...stewardDelegateFilter(input.appIds, input.teamKeys), ...blockers }] : [],
+      ...input.teamKeys.length && input.states?.length ? [{ ...stewardStateFilter(input.states, input.teamKeys), ...blockers }] : [],
     ];
     const ids = [...new Set(input.ids)].sort();
-    for (let start = 0; start < ids.length; start += STEWARD_IDS_BATCH) filters.push({ id: { in: ids.slice(start, start + STEWARD_IDS_BATCH) } });
+    for (let start = 0; start < ids.length; start += STEWARD_IDS_BATCH) filters.push({ id: { in: ids.slice(start, start + STEWARD_IDS_BATCH) }, ...blockers });
     for (const filter of filters) {
       let after: string | null = null;
       for (let pageNumber = 0; ; pageNumber++) {
@@ -1369,8 +1406,13 @@ export class LinearService {
         const data = record(await this.read(STEWARD_ISSUES_QUERY, { first: STEWARD_PAGE, after, filter }));
         const page = record(data.issues ?? {});
         for (const node of connection(page).nodes.map((item) => record(item))) {
-          const issue = parseStewardIssue(node);
-          if (issue) found.set(issue.id, issue);
+          const children = stewardChildren(node);
+          const issue = parseStewardIssue(node, children);
+          if (!issue) continue;
+          found.set(issue.id, issue);
+          // A ticket whose sub-issues ran past the first page: read the rest before the pass judges
+          // it, so a truncated list never looks like a parent whose children all finished.
+          if (!children.complete) await this.stewardChildPages(issue, children.cursor);
         }
         const info = record(page.pageInfo ?? {});
         after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
@@ -1378,6 +1420,42 @@ export class LinearService {
       }
     }
     return [...found.values()];
+  }
+
+  // The rest of one ticket's sub-issues, page by page, after the first page STEWARD_ISSUES_QUERY
+  // carried (STEWARD_CHILDREN_QUERY, following the cursor to the end of the connection). A page that
+  // fails is logged and leaves the children read so far in place with `childrenComplete` false: one
+  // parent's read must not fail the pass. A rate limit is never swallowed — it propagates so the
+  // work pauses. A child already collected from an earlier page is kept once.
+  private async stewardChildPages(issue: StewardIssue, cursor: string | null): Promise<void> {
+    const seen = new Set(issue.children.map((child) => child.id));
+    let after = cursor;
+    while (after) {
+      const page = await this.readStewardChildPage(issue, after);
+      if (!page) return;
+      for (const child of page.children) {
+        if (seen.has(child.id)) continue;
+        seen.add(child.id);
+        issue.children.push(child);
+      }
+      if (page.complete) { issue.childrenComplete = true; return; }
+      after = page.cursor;
+    }
+  }
+
+  // One page of a ticket's sub-issues past the first. Null when Linear did not answer it in full,
+  // with the failure logged: the caller then keeps the children it has. A rate limit is not a
+  // page failure — it propagates.
+  private async readStewardChildPage(issue: StewardIssue, after: string): Promise<StewardChildPage | null> {
+    try {
+      const data = record(await this.read(STEWARD_CHILDREN_QUERY, { id: issue.id, after }));
+      if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue.");
+      return stewardChildren(record(data.issue));
+    } catch (error) {
+      if (error instanceof RateLimitedError) throw error;
+      console.error(`[linear-tickets] ${issue.identifier}: reading its sub-issues past the first page failed: ${error instanceof Error ? error.message : error}`);
+      return null;
+    }
   }
 
   // Label names by ticket id, lower-cased. The Paseo app's pool first; the key when the app cannot
@@ -1674,9 +1752,10 @@ export class LinearService {
     succeeded(record(await this.write(RELATION_QUERY, { input: { issueId: blockerId, relatedIssueId: blockedId, type: "blocks" } })), "issueRelationCreate", "link the tickets");
   }
 
-  // `related`: both tickets touch the same work. `duplicate`: `issueId` is a duplicate of
+  // `blocks`: `issueId` must be finished before `relatedId` starts (the same link `addBlocker`
+  // makes). `related`: both tickets touch the same work. `duplicate`: `issueId` is a duplicate of
   // `relatedId`; Linear then moves it to its Duplicate status.
-  async relate(issueId: string, relatedId: string, type: "related" | "duplicate"): Promise<void> {
+  async relate(issueId: string, relatedId: string, type: "blocks" | "related" | "duplicate"): Promise<void> {
     succeeded(record(await this.write(RELATION_QUERY, { input: { issueId, relatedIssueId: relatedId, type } })), "issueRelationCreate", "link the tickets");
   }
 
@@ -1695,6 +1774,13 @@ export class LinearService {
 
   async updateDescription(issueId: string, description: string): Promise<void> {
     succeeded(record(await this.write(`mutation describe($id: String!, $description: String!) { issueUpdate(id: $id, input: { description: $description }) { success } }`, { id: issueId, description })), "issueUpdate", "update the ticket");
+  }
+
+  // The ticket's due date, or none when `date` is null. Linear takes a date without a time
+  // (TimelessDate), so the shape is checked here instead of leaving it to Linear.
+  async setDueDate(issueId: string, date: string | null): Promise<void> {
+    if (date !== null && !/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("The due date must be YYYY-MM-DD.");
+    succeeded(record(await this.write(`mutation dueDate($id: String!, $dueDate: TimelessDate) { issueUpdate(id: $id, input: { dueDate: $dueDate }) { success } }`, { id: issueId, dueDate: date })), "issueUpdate", "update the ticket");
   }
 
   // Moves the ticket to its team's first completed state (Done).

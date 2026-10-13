@@ -12,6 +12,14 @@ function arg(name) { const index = argv.indexOf(name); return index >= 0 ? argv[
 const paseoHome = arg("--paseo-home");
 const readOnly = argv.includes("--read-only");
 const issueArg = arg("--issue");
+// The marker the steward generated for the verifier generation this server belongs to
+// (steward.ts). Only the verifier Paseo's ticket steward started carries one; it is written into
+// the verdict record, so a verdict answers the verifier that was started for it.
+const verifierArg = arg("--verifier");
+if (verifierArg !== undefined && !/^[A-Za-z0-9-]{1,64}$/.test(verifierArg)) {
+  process.stderr.write("linear-ticket MCP: --verifier <marker> must be 1 to 64 characters of letters, digits or dashes\n");
+  process.exit(2);
+}
 if (readOnly === argv.includes("--issue")) {
   process.stderr.write("linear-ticket MCP: pass exactly one of --issue <id> or --read-only, plus --paseo-home <path>\n");
   process.exit(2);
@@ -167,9 +175,11 @@ const MANUAL = "query manual($id: String!) { issue(id: $id) { id identifier proj
 const MANUAL_DIRECTORY = join(paseoHome, "linear-tickets", "manual-tasks");
 // The ticket steward's verifiers (steward.ts): a short-lived read-only agent records exactly one
 // verdict about a landed ticket here, one private file per verdict under the ticket's id, and the
-// steward applies it (close, a Backlog follow-up, the owner, or work left for the agent).
+// steward applies it (close the ticket, send it back to its agent, park it on a blocker or a date,
+// or put the owner's decision in front of them). Each record carries the marker of the verifier
+// generation that wrote it, so a verdict is never taken for a later one.
 const VERDICT_DIRECTORY = issueId === null ? null : join(paseoHome, "linear-tickets", "steward-verdicts", issueId);
-const VERDICT_KINDS = ["close", "follow_up", "ask_owner", "resume"];
+const VERDICT_KINDS = ["close", "resume", "park", "ask_owner"];
 const FINISHED_TYPES = ["completed", "canceled", "duplicate"];
 
 // Atomic, private (0600) JSON record: written to a temporary name, then renamed into place.
@@ -489,30 +499,38 @@ const tools = [
   },
   {
     name: "steward_verdict",
-    description: "Only for the verifier Paseo's ticket steward started: record exactly one verdict on whether this ticket's work is complete, then stop. close: the landed work completes the ticket and nothing remains. follow_up: it is complete apart from work Paseo must file as a Backlog follow-up (remaining). ask_owner: only the owner can decide (question, options) — for a missing decision, access or approval, never for work an agent can do. resume: the ticket's agent must still do something (instruction). The steward applies the verdict; nothing else happens, and a second call is ignored.",
+    description: "Only for the verifier Paseo's ticket steward started: record exactly one verdict on whether this ticket's work is complete, then stop. Only the first verdict counts; a second call is refused. close: the landed work completes the ticket and nothing remains. resume: the ticket's agent must still do something (instruction). park: the ticket waits for another ticket (blockedBy, that ticket's identifier) and/or a date (dueDate, YYYY-MM-DD) — the reason says why — and the plugin moves it to Todo. ask_owner: only the owner can decide (question, options), for a missing decision, access or approval, never for work an agent can do.",
     inputSchema: {
       type: "object",
       properties: {
-        verdict: { type: "string", enum: VERDICT_KINDS, description: "close, follow_up, ask_owner or resume." },
-        remaining: { type: "string", minLength: 1, maxLength: 4000, description: "follow_up: what work remains, for the follow-up ticket." },
+        verdict: { type: "string", enum: VERDICT_KINDS, description: "close, resume, park or ask_owner." },
+        instruction: { type: "string", minLength: 1, maxLength: 4000, description: "resume: what the ticket's agent must still do." },
+        blockedBy: { type: "string", pattern: "^[A-Za-z0-9-]{1,40}$", description: "park: the identifier of the ticket this one waits for, for example ENG-42." },
+        dueDate: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$", description: "park: the date (YYYY-MM-DD) the wait is due, when it has one." },
+        reason: { type: "string", minLength: 1, maxLength: 2000, description: "park: why the ticket is parked, and what ends the wait." },
         question: { type: "string", minLength: 1, maxLength: 2000, description: "ask_owner: the one question the owner must answer." },
         options: { type: "array", minItems: 1, maxItems: 6, items: { type: "string", minLength: 1, maxLength: 300 }, description: "ask_owner: the options the owner can choose, one line each." },
-        instruction: { type: "string", minLength: 1, maxLength: 4000, description: "resume: what the ticket's agent must still do." },
       },
       required: ["verdict"],
       additionalProperties: false,
     },
     async run(input) {
+      if (verifierArg === undefined) throw new Error("This server was not started as a steward verifier; only the verifier Paseo's ticket steward starts records a verdict.");
       if (VERDICT_DIRECTORY === null) throw new Error("This server is read-only; a verdict is recorded by the verifier the steward starts.");
       if (!VERDICT_KINDS.includes(input.verdict)) throw new Error("verdict must be one of: " + VERDICT_KINDS.join(", "));
-      const remaining = input.remaining === undefined ? null : text(input.remaining, "remaining", 4000);
+      const instruction = input.instruction === undefined ? null : text(input.instruction, "instruction", 4000);
+      const blockedBy = input.blockedBy === undefined ? null : text(input.blockedBy, "blockedBy", 40);
+      const dueDate = input.dueDate === undefined ? null : text(input.dueDate, "dueDate", 10);
+      const reason = input.reason === undefined ? null : text(input.reason, "reason", 2000);
       const question = input.question === undefined ? null : text(input.question, "question", 2000);
       const options = input.options === undefined ? null : (Array.isArray(input.options) && input.options.length && input.options.length <= 6 ? input.options.map((option) => text(option, "option", 300)) : (() => { throw new Error("options must be 1 to 6 strings."); })());
-      const instruction = input.instruction === undefined ? null : text(input.instruction, "instruction", 4000);
-      if (input.verdict === "follow_up" && !remaining) throw new Error("follow_up needs remaining: the work to file.");
-      if (input.verdict === "ask_owner" && (!question || !options)) throw new Error("ask_owner needs question and options.");
       if (input.verdict === "resume" && !instruction) throw new Error("resume needs instruction: what the agent must still do.");
-      await writePrivate(VERDICT_DIRECTORY, randomUUID() + ".json", { issueId, at: new Date().toISOString(), verdict: input.verdict, remaining, question, options, instruction });
+      if (input.verdict === "park" && !reason) throw new Error("park needs reason: why the ticket is parked.");
+      if (input.verdict === "ask_owner" && (!question || !options)) throw new Error("ask_owner needs question and options.");
+      const names = await readdir(VERDICT_DIRECTORY).catch(() => []);
+      const recorded = await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readFile(join(VERDICT_DIRECTORY, name), "utf8").then((raw) => JSON.parse(raw), () => null).catch(() => null)));
+      if (recorded.some((record) => record && record.verifier === verifierArg)) throw new Error("A verdict was already recorded for this verifier; only the first one counts.");
+      await writePrivate(VERDICT_DIRECTORY, randomUUID() + ".json", { issueId, at: new Date().toISOString(), verifier: verifierArg, verdict: input.verdict, instruction, blockedBy, dueDate, reason, question, options });
       return { recorded: true, verdict: input.verdict, ticket: issueId };
     },
   },
@@ -573,8 +591,15 @@ const tools = [
 ];
 
 // Write tools are simply not mounted in read-only mode: tools/call for one answers "Unknown tool",
-// the same as for a name that was never a tool.
-const exposed = readOnly ? tools.filter((tool) => tool.name === "get_issue" || tool.name === "search_issues") : tools;
+// the same as for a name that was never a tool. A verifier (the steward's --verifier marker) gets
+// the read tools and the single tool it reports through — never a mutation tool, whatever its brief
+// says: a read-only judgement must not be able to change Linear.
+const READ_TOOLS = ["get_ticket", "get_issue", "get_comments", "search_issues"];
+const exposed = readOnly
+  ? tools.filter((tool) => tool.name === "get_issue" || tool.name === "search_issues")
+  : verifierArg !== undefined
+    ? tools.filter((tool) => READ_TOOLS.includes(tool.name) || tool.name === "steward_verdict")
+    : tools.filter((tool) => tool.name !== "steward_verdict");
 
 function send(message) { process.stdout.write(JSON.stringify(message) + "\n"); }
 

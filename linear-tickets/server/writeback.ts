@@ -320,6 +320,12 @@ export class Writeback {
     if (known !== undefined) return known;
     const refreshed = await paseo.agents.ref(agent.id).refresh();
     const labels = refreshed?.agent.labels ?? {};
+    // Verifiers only report through steward_verdict. Their turns and retirement must not
+    // replace the implementation handover, clear owner decisions, or offer a resume.
+    if (labels["linear-tickets.steward"]) {
+      this.links.set(agent.id, null);
+      return null;
+    }
     const issueId = labels["linear.issueId"];
     const link = issueId ? { issueId, identifier: labels["linear.identifier"] || issueId, planFirst: labels[PLAN_POLICY_LABEL] === "required" } : null;
     this.links.set(agent.id, link);
@@ -356,12 +362,13 @@ export class Writeback {
   // The steward's escalation (steward.ts): one owner-visible decision item on the ticket — the
   // Needs input state, the needs-you label and one comment carrying the reason and its options —
   // through the same waiting path an agent's question takes, so the owner answers it in Linear or
-  // in the decision inbox like any other ask (README, "Ticket steward"). `subject` titles a closed
-  // ticket's Needs-you sub-issue; open tickets are moved and commented on themselves.
+  // in the decision inbox like any other ask (README, "Ticket steward"). The kind is `decision`:
+  // only the owner's answer or retry ends it, never an agent-liveness check. `subject` titles a
+  // closed ticket's Needs-you sub-issue; open tickets are moved and commented on themselves.
   async escalate(issueId: string, identifier: string, subject: string, body: string): Promise<void> {
     const settings = await this.settings.read();
     const agent = await this.anchor(issueId, identifier);
-    await this.markWaiting({ id: issueId, identifier }, agent, settings, subject, body, false, "request", { once: async <T>(_step: string, fn: () => Promise<T>) => fn() });
+    await this.markWaiting({ id: issueId, identifier }, agent, settings, subject, body, false, "decision", { once: async <T>(_step: string, fn: () => Promise<T>) => fn() });
   }
 
   // The steward's end of a wait no live agent can still end (steward.ts): the needs-you label comes

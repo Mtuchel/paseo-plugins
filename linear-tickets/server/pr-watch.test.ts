@@ -4763,3 +4763,21 @@ test("saved work that names a ticket two moves back follows the pull request to 
   await h.poll();
   assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"))[PR].actions[0].tickets, ["TUC-3"]);
 });
+
+test("completion checks fresh multi-repository PRs, including reopened and vetoed work", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...OPEN_PR, state: "MERGED" };
+  const other = "https://github.com/o/other/pull/2";
+  h.linear.attachments = [other];
+  h.github.views[other] = { ...OPEN_PR, state: "CLOSED" };
+  const watch = await h.watch();
+  assert.equal(await watch.completionPulls("i1", "TUC-1", [PR]), "settled");
+  h.github.views[other] = { ...OPEN_PR, labels: ["do-not-merge"] };
+  assert.equal(await watch.completionPulls("i1", "TUC-1", [PR]), "open", "a reopened attachment is unfinished even when the retirement policy would omit it");
+  h.github.views[other] = { ...OPEN_PR, state: "CLOSED" };
+  h.github.open = [{ ...listed("https://github.com/o/other/pull/3", OPEN_PR, "Implement TUC-1"), headRepo: "fork/other", labels: ["do-not-merge"] }];
+  assert.equal(await watch.completionPulls("i1", "TUC-1", [PR]), "open", "unrecorded slices in every attached repository block completion");
+  h.github.open = [];
+  h.github.broken = [other];
+  assert.equal(await watch.completionPulls("i1", "TUC-1", [PR]), "unknown", "an unreadable PR is never proof of completion");
+});

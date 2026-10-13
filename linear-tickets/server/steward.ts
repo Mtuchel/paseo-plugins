@@ -4,20 +4,22 @@ import { dirname, join } from "node:path";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import type { ActivationIntake } from "./activation-intake";
 import { dispatchLabels, type DispatchLabels } from "./dispatch";
-import type { Focus } from "./focus";
+import { FOCUS_REASON, type Focus } from "./focus";
 import type { Handover, HandoverRecord } from "./handover";
 import type { Launcher } from "./launch";
-import type { LinearService, StewardIssue } from "./linear";
+import type { IssueCore, LinearService, StewardIssue } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
 import type { NeedsYouIssues } from "./needs-you";
+import type { ParkedPlans } from "./parked";
 import { LIVE_AGENT, type ProcessInspector } from "./process-liveness";
-import { planStage } from "./plan-policy";
+import { PLAN_REVIEW_STATE, planStage } from "./plan-policy";
 import type { PullState, StackState } from "./pr-watch";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import type { ReviewDeletions } from "./review-deletions";
+import { AWAY_REASON } from "./scheduler";
 import type { HostOwnership, RestartResult, SessionRouter, Succession } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
-import { classifyTicketAgents, type TicketStarter } from "./starter";
+import { classifyTicketAgents, WAITING_PLAN_REASON, type TicketStarter } from "./starter";
 import { paseoHome } from "./ticket-mcp";
 import type { TicketRoots, WatchedAgent, WatchdogFile, WatchdogStore } from "./watchdog";
 import { NEEDS_INPUT_STATE, type Writeback } from "./writeback";
@@ -80,9 +82,12 @@ export const STEWARD_VERIFIER_LABEL = "linear-tickets.steward";
 // The agent id a wait the steward opened for a ticket without an agent is anchored to: no agent
 // ever carries it, so the ticket does not count as started by it.
 const STEWARD_ANCHOR = "steward";
+// The reason the start gate gives when a live agent took the ticket over between the read and the
+// start: not a failure — somebody works on it.
+const LIVE_AGAIN_PREFIX = "an agent works on ";
 
 type Linear = Pick<LinearService,
-  "stewardIssues" | "issueStatus" | "issueCore" | "addLabel" | "removeLabel" | "comment" | "upsertComment" | "createIssue" | "relate" | "complete" | "cancel" | "trustedAppIds">;
+  "stewardIssues" | "issueStatus" | "issueCore" | "issueRef" | "addLabel" | "removeLabel" | "comment" | "upsertComment" | "createIssue" | "relate" | "complete" | "moveToReady" | "setDueDate" | "trustedAppIds">;
 type Sessions = Pick<SessionRouter, "restartFor" | "succeed" | "prompt" | "watchdogRoots" | "watchdogThread" | "retireTurn" | "threadQueued">;
 
 export type StewardDeps = {
@@ -90,7 +95,9 @@ export type StewardDeps = {
   store: StewardStore;
   linear: Linear;
   sessions: Sessions;
-  starter: Pick<TicketStarter, "start">;
+  // `admission`: the same gate every start takes (focus, parked plans, blockers, the scheduler's
+  // slot and RAM lease, presence). The verifier takes it too (README, "Ticket steward").
+  starter: Pick<TicketStarter, "start" | "admission">;
   launcher: Pick<Launcher, "gate">;
   handover: Pick<Handover, "all">;
   // The owner-visible side of an escalation and the end of a stale wait (writeback.ts).
@@ -102,13 +109,18 @@ export type StewardDeps = {
   // Which host owns a ticket's automatic work (activation-guard.ts ticketOwnership).
   owner: (issueId: string) => Promise<HostOwnership>;
   // The pull request watch's own state for the tickets' recorded pull requests (pr-watch.ts
-  // `Seen`), and one ticket's stack state: its open pull requests as the watch last saw them.
+  // `Seen`), and the complete fresh pull-request inventory of one ticket for a verdict's close
+  // (pr-watch.ts `completionPulls`): every attached and recorded pull request, across all of its
+  // repositories, read from GitHub now — not the retirement policy's cached set, not a veto list.
   pulls: (urls: string[]) => Promise<Map<string, PullState>>;
-  stacked: (issueId: string) => Promise<StackState>;
+  completionPulls: (issueId: string, identifier: string, urls: string[]) => Promise<StackState>;
   intake: Pick<ActivationIntake, "claimsReady">;
   doneTickets: DoneTickets;
   // The `<trigger>-running` labels still to remove after an archive (retired-labels.json).
   labels: Pick<RetiredLabels, "all" | "add" | "remove">;
+  // The parked plans of the Plannotator host (parked.ts): a plan that waits for the owner's
+  // decision is a deliberate wait, never recovered.
+  planned?: Pick<ParkedPlans, "has">;
   deletions?: Pick<ReviewDeletions, "blocked">;
   focus?: Pick<Focus, "admits">;
   inspect?: ProcessInspector;
@@ -128,15 +140,16 @@ export type StewardDeps = {
 // --- Situations -----------------------------------------------------------------------------------
 
 // The five states every in-scope open ticket is in — MOVING, WAITING_OWNER, WAITING_BLOCKER,
-// QUEUED, CLOSEABLE — and the defects a pass repairs. `closed` is a finished ticket with nothing
-// left to do (its agents archived); it is outside the five on purpose, as the invariant covers
-// open tickets.
+// QUEUED, PARKED — and the defects a pass repairs. `closed` is a finished ticket with nothing left
+// to do (its agents archived); it is outside the five on purpose, as the invariant covers open
+// tickets. No situation completes or cancels a ticket any more: a group parent is closed by
+// sessions.ts stepGroup and every other ticket only by a verifier's verdict.
 export const STEWARD_SITUATIONS = [
   "moving",
   "waiting-owner",
   "waiting-blocker",
   "queued",
-  "closeable",
+  "parked",
   "closed",
   "terminal-agents",
   "landed",
@@ -156,7 +169,7 @@ export const STEWARD_SITUATIONS = [
 ] as const;
 export type StewardSituation = (typeof STEWARD_SITUATIONS)[number];
 
-export type StewardAction = "start" | "restart" | "succeed" | "resume" | "verify" | "complete" | "cancel" | "archive" | "clear-wait" | "escalate";
+export type StewardAction = "start" | "restart" | "succeed" | "resume" | "verify" | "archive" | "clear-wait" | "escalate";
 
 // The one action of each situation (null: none — the ticket is exactly where it should be). A
 // Record, not a switch: a new situation without an action is a type error.
@@ -165,7 +178,7 @@ export const STEWARD_ACTION: Record<StewardSituation, StewardAction | null> = {
   "waiting-owner": null,
   "waiting-blocker": null,
   "queued": null,
-  "closeable": "complete",
+  "parked": null,
   "closed": null,
   "terminal-agents": "archive",
   "landed": "verify",
@@ -190,7 +203,7 @@ export const STEWARD_STATES: Record<StewardSituation, boolean> = {
   "waiting-owner": true,
   "waiting-blocker": true,
   "queued": true,
-  "closeable": true,
+  "parked": true,
   "closed": false,
   "terminal-agents": false,
   "landed": false,
@@ -217,21 +230,41 @@ export function isDefect(situation: StewardSituation): boolean {
 
 export type StewardPullFacts = { url: string; merged: boolean; closed: boolean; missing: boolean; decision: string | null; replay: "due" | "asked" | null };
 
+// A deliberate wait, put there by the owner or the policy: no automatic mechanism may recover it
+// (the deleted retirement's fences and the watchdog's exclusion list, folded in here).
+export type StewardDeliberate =
+  // The owner's own veto or step.
+  | "hold" | "manual" | "do-not-merge" | "stopped" | "needs-you"
+  // The plan waits for the owner: the status, a parked plan, an open review or a retirement offer.
+  | "plan-review"
+  // The ticket's thread is with the peer host (drain), or a live root waits for an answer.
+  | "remote" | "permissions"
+  // The admission gates the ticket waits behind: focus mode.
+  | "focus";
+
 // Everything the classifier decides on, read fresh each pass.
 export type StewardFacts = {
   identifier: string;
   status: string;
   statusType: string;
   terminal: boolean;
-  // The ticket's own sub-issues: how many, how many are open, and whether every finished one is
-  // canceled or a duplicate (then the parent is canceled too, sessions.ts stepGroup).
-  children: { total: number; open: number; canceledOnly: boolean };
+  // The ticket's own sub-issues: how many, how many are open, and whether the list was read in
+  // full (`complete`: without it no parent is ever treated as finished).
+  children: { total: number; open: number; complete: boolean };
+  // The deliberate wait the ticket is in, if any: recovery never touches it.
+  deliberate: StewardDeliberate | null;
+  // An open group link: sessions.ts stepGroup hands out the members and closes the parent.
+  groupLinked: boolean;
+  // A verifier parked the ticket (the park verdict): it waits for a blocker or a date.
+  parked: boolean;
   // An unfinished blocker (linear.ts finishedIssue: done, canceled, duplicate, or in review with
   // merged pull requests).
   blocker: string | null;
   live: boolean;
   // The live roots' silence: null while one of them has an open turn, else their quiet time.
   idleMinutes: number | null;
+  // The silence that makes a live root idle (steward.idleMinutes).
+  idleThreshold: number;
   // A recorded wait for the owner: `live` while something can still end it, `stale` when nothing
   // can (the agent is gone and the grace has passed), `none` without one.
   ownerWait: "none" | "live" | "stale";
@@ -239,7 +272,12 @@ export type StewardFacts = {
   resumed: boolean;
   // A thread of the ticket waits for its blockers or a slot (sessions.ts startQueued).
   queuedThread: boolean;
+  // The steward's own admission deferral: the last start waited for its turn (no budget spent).
+  queuedAt: string | null;
   queuedSince: string | null;
+  queuedTooLong: boolean;
+  // The queue deadline the too-long escalation reads (steward.queuedEscalateHours).
+  queuedHours: number;
   openPulls: StewardPullFacts[];
   landedPulls: StewardPullFacts[];
   closedPulls: StewardPullFacts[];
@@ -263,29 +301,42 @@ export type StewardFacts = {
 
 // The one situation of a ticket. Exhaustive and ordered: the first match wins, and the order is
 // the precedence the tests pin — a finished ticket beats everything, a claimed verifier beats the
-// facts it is judging, a finished parent closes, an open pull request beats a landed one, and a
-// watchdog cycle that is recovering the ticket counts as moving.
+// facts it is judging, a group link and a deliberate wait beat every repair, a finished parent is
+// judged only after its own live/owner/blocker/pull-request facts, and the recovery budgets are
+// checked before the successor branches that would spend them.
 export function classifyTicket(facts: StewardFacts): StewardSituation {
   if (facts.terminal) return facts.live ? "terminal-agents" : "closed";
   if (facts.verifier) return "verifying";
-  if (facts.children.total > 0 && facts.children.open === 0) return "closeable";
+  // The group path owns the ticket: stepGroup hands out the members and closes the parent.
+  if (facts.groupLinked) return "moving";
+  // A deliberate wait: the ticket is where it should be, and nothing automatic may touch it.
+  if (facts.deliberate === "focus" || facts.deliberate === "remote") return "queued";
+  if (facts.deliberate) return "waiting-owner";
   if (facts.live) {
     if (facts.ownerWait === "live") return "waiting-owner";
-    if (facts.idleMinutes !== null && facts.openPulls.length === 0) return facts.resumed ? "idle-unresponsive" : "idle";
+    if (facts.idleMinutes !== null && facts.idleMinutes >= facts.idleThreshold && facts.openPulls.length === 0) return facts.resumed ? "idle-unresponsive" : "idle";
     return "moving";
   }
   if (facts.ownerWait === "live") return "waiting-owner";
   if (facts.ownerWait === "stale") return "wait-stale";
   if (facts.blocker) return "waiting-blocker";
+  if (facts.parked) return "parked";
   if (facts.watchdog === "active") return "moving";
-  if (facts.openPulls.length > 0) return "open-pr";
+  // A start that waited for its turn stays queued and is retried; its budget is untouched.
+  const queued = facts.queuedThread || facts.queuedAt !== null;
+  if (queued) return facts.queuedTooLong ? "queued-too-long" : "queued";
+  if (facts.refusals >= REFUSAL_CAP) return "refused";
+  // Every branch below starts something: the recovery budget is checked before each of them.
+  if (facts.openPulls.length > 0) return facts.restarts >= RESTART_CAP ? "restart-exhausted" : "open-pr";
   if (facts.landedPulls.length > 0 && facts.beforeMerge === 0) return facts.verified === facts.landedSignature ? "escalated" : "landed";
+  if (facts.restarts >= RESTART_CAP) return "restart-exhausted";
   if (facts.closedPulls.some((pull) => pull.replay !== "asked")) return "closed-unmerged";
   if (facts.closedPulls.length > 0) return "escalated";
-  if (facts.queuedThread) return "queued";
-  if (facts.refusals >= REFUSAL_CAP) return "refused";
+  // A parent whose sub-issues all finished is judged like any ticket: a verifier, never a straight
+  // completion (its own work — a pull request, a blocker, the owner — comes first), and never a
+  // restart (its sub-issues say the work is finished).
+  if (facts.children.total > 0 && facts.children.open === 0 && facts.children.complete) return facts.verified === facts.landedSignature ? "escalated" : "landed";
   if (facts.refusals > 0 && !facts.startable) return "refused";
-  if (facts.restarts >= RESTART_CAP) return "restart-exhausted";
   if (facts.watchdog === "exhausted") return "watchdog-exhausted";
   if (facts.started) return facts.startable ? "stalled" : "escalated";
   return facts.startable ? "unstarted" : "escalated";
@@ -295,9 +346,27 @@ export function classifyTicket(facts: StewardFacts): StewardSituation {
 
 // `claimed`: written right before the effect; a restart that finds it cannot know whether the
 // effect happened (the crash gap) and never repeats it blindly. `done`/`failed`: the outcome.
-export type StewardClaim = { action: StewardAction; marker: string; at: string; state: "claimed" | "done" | "failed"; result?: string };
-// The verifier a pass started for a ticket, and the verdict it returned.
-export type StewardVerifier = { agentId: string; marker: string; at: string };
+// `deferred`: nothing was attempted (the start waited for admission); no budget was spent and the
+// pass retries the action from the ticket's `queued` record.
+export type StewardClaim = { action: StewardAction; marker: string; at: string; state: "claimed" | "done" | "failed" | "deferred"; result?: string };
+// The verifier a pass started for a ticket, and the verdict it returned. `marker` binds a verdict
+// to the verifier generation that issued it (ticket-mcp-source.ts `steward_verdict`) and is also
+// the value the verifier's agent label carries, so an interrupted launch is adopted by marker
+// instead of losing its verdict. `agentId` is null between the marker's persistence and the
+// launch's return; the label is what ties the two together across a reload.
+export type StewardVerifier = { agentId: string | null; marker: string; at: string };
+// A start the steward attempted and admission deferred (no slot, focus, a blocker, presence): the
+// ticket waits in the queue without spending a restart or a refusal, and the pass retries the
+// recorded action until it is admitted (or `steward.queuedEscalateHours` passes).
+export type StewardQueued = { situation: StewardSituation; action: StewardAction; at: string; reason: string };
+// A verifier's verdict being applied: written before the first effect, with the steps that already
+// committed, so a reload never repeats a close or loses the verdict (steward.ts `verdict`).
+// `timeout` and `exhausted` are the verifier's terminal outcomes (it never reported, or its
+// resume verdict outran the recovery budget): they are journaled like a verdict, so their
+// owner-facing escalation is retried instead of being lost between the archive and the call.
+export type StewardApplying = { marker: string; verdict: StewardVerdictKind | "timeout" | "exhausted"; step: "claimed" | "closed" | "parked" | "escalated" | "resumed"; at: string };
+// The verifier's park (the `park` verdict): the ticket waits for a blocker or a date.
+export type StewardParked = { at: string; blockedBy: string | null; dueDate: string | null; reason: string };
 export type StewardTicket = {
   identifier: string;
   // The last situation and when it was first seen (the flow view, and the grace before a defect is
@@ -320,6 +389,11 @@ export type StewardTicket = {
   ownerAt: string | null;
   // The steward's status card on this ticket, when it has one.
   card: { commentId: string; at: string } | null;
+  // An admission deferral the pass retries (see StewardQueued), a verdict being applied, and a
+  // verifier's park.
+  queued: StewardQueued | null;
+  applying: StewardApplying | null;
+  parked: StewardParked | null;
   log: { at: string; action: string }[];
 };
 // The flow view: the counts of the last pass and the oldest tickets of each state.
@@ -391,7 +465,7 @@ export class StewardStore {
   ticket(file: StewardFile, issueId: string, identifier: string, at: string): StewardTicket {
     file.tickets[issueId] ??= {
       identifier, situation: "moving", since: at, at, claim: null, restarts: [], refusals: [], resumedAt: null,
-      verifier: null, verified: null, escalated: null, ownerAt: null, card: null, log: [],
+      verifier: null, verified: null, escalated: null, ownerAt: null, card: null, queued: null, applying: null, parked: null, log: [],
     };
     if (identifier && identifier !== issueId) file.tickets[issueId].identifier = identifier;
     return file.tickets[issueId];
@@ -401,7 +475,6 @@ export class StewardStore {
 // --- Finished tickets, their labels and the stack check --------------------------------------------
 
 export const QUIET_DONE_MS = 60 * 60_000;
-export const OLD_GHOST_MS = 24 * 60 * 60_000;
 const TERMINAL: Record<string, true> = { completed: true, canceled: true, duplicate: true };
 
 // How long the agent has been quiet: since its last update in Paseo. Null for an unreadable or
@@ -516,34 +589,61 @@ export class RetiredLabels {
 
 // --- The verifier's verdict ------------------------------------------------------------------------
 
-export type StewardVerdictKind = "close" | "follow_up" | "ask_owner" | "resume";
-// What one verifier recorded through the `steward_verdict` tool: exactly one verdict.
+// Design correction B: exactly four verdicts. `follow_up` is gone — the owner files no follow-up
+// issues for open tickets. `park` hands the ticket back to Linear as startable work: a blocking
+// relation and/or a due date, Todo, and the trigger label only when there is a blocker to wait for.
+export type StewardVerdictKind = "close" | "resume" | "park" | "ask_owner";
+// What one verifier recorded through the `steward_verdict` tool: exactly one verdict, bound to the
+// verifier generation that issued it (`verifier`: the marker the steward started it with).
 export type StewardVerdict = {
   issueId: string;
   at: string;
+  verifier: string;
   verdict: StewardVerdictKind;
-  // `close`: nothing left. `follow_up`: what remains, filed as one Backlog follow-up. `ask_owner`:
-  // the question and its options. `resume`: what the ticket's agent should still do.
-  remaining: string | null;
+  // `resume`: what the ticket's agent must still do. `park`: why the ticket waits, the blocker
+  // ticket (an identifier) and/or the date it waits for. `ask_owner`: the question and its options.
+  instruction: string | null;
+  blockedBy: string | null;
+  dueDate: string | null;
+  reason: string | null;
   question: string | null;
   options: string[] | null;
-  instruction: string | null;
 };
 
-const VERDICT_KINDS: StewardVerdictKind[] = ["close", "follow_up", "ask_owner", "resume"];
+const VERDICT_KINDS: StewardVerdictKind[] = ["close", "resume", "park", "ask_owner"];
+
+// A real calendar date: the shape alone accepts 2026-02-31, which Linear would refuse later and
+// which would park a ticket that nothing ever wakes.
+export function calendarDate(date: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date;
+}
 
 export function parseVerdict(value: unknown): StewardVerdict | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
   const verdict = VERDICT_KINDS.find((kind) => kind === raw.verdict);
-  if (!verdict || typeof raw.issueId !== "string" || typeof raw.at !== "string") return null;
+  if (!verdict || typeof raw.issueId !== "string" || typeof raw.at !== "string" || typeof raw.verifier !== "string" || !raw.verifier.trim()) return null;
   const field = (key: string, limit: number) => typeof raw[key] === "string" && (raw[key] as string).trim() ? (raw[key] as string).trim().slice(0, limit) : null;
   const options = Array.isArray(raw.options) ? raw.options.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 6) : null;
-  return { issueId: raw.issueId, at: raw.at, verdict, remaining: field("remaining", 4_000), question: field("question", 2_000), options, instruction: field("instruction", 4_000) };
+  const record: StewardVerdict = {
+    issueId: raw.issueId, at: raw.at, verifier: raw.verifier.trim().slice(0, 64), verdict,
+    instruction: field("instruction", 4_000), blockedBy: field("blockedBy", 40), dueDate: field("dueDate", 10),
+    reason: field("reason", 2_000), question: field("question", 2_000), options,
+  };
+  // A verdict that does not name what it needs is refused rather than applied as a guess: a park
+  // without a blocker or a date would wait for nothing, forever.
+  if (verdict === "resume" && !record.instruction) return null;
+  if (verdict === "park" && (!record.reason || (!record.blockedBy && !record.dueDate))) return null;
+  if (verdict === "park" && record.dueDate && !calendarDate(record.dueDate)) return null;
+  if (verdict === "ask_owner" && (!record.question || !record.options?.length)) return null;
+  return record;
 }
 
 // The verifier's records, oldest first, from its own directory (ticket-mcp-source.ts
-// `steward_verdict`).
+// `steward_verdict`). The first record of the verifier generation that issued it is the verdict;
+// later ones (a second call, a crashed retry) are ignored by the caller.
 export async function readVerdicts(directory: string): Promise<StewardVerdict[]> {
   const names = await readdir(directory).catch(() => [] as string[]);
   const verdicts: StewardVerdict[] = [];
@@ -585,7 +685,7 @@ const ESCALATION_OPTIONS: Record<string, string[]> = {
   "refused": ["Clear what refuses the start (the state, a hold label, the setup it fails on).", "Start the ticket's agent from the Linear tickets sidebar.", "Move the ticket back to Todo if it is in a state Paseo does not start work in."],
   "escalated": ["Decide what the ticket should do next and start its agent from the sidebar.", "Add the trigger label again for a fresh steward round.", "Close the ticket if the work is no longer needed."],
   "closed-unmerged": ["Tell the agent what to do with the closed pull request (start it from the sidebar).", "Close the ticket if its work landed elsewhere.", "Replace the pull request by hand."],
-  "landed": ["Confirm that the landed work completes the ticket and close it.", "File what remains as a follow-up ticket.", "Send the ticket's agent back to work with what is missing."],
+  "landed": ["Confirm that the landed work completes the ticket and close it.", "Send the ticket's agent back to work with what is missing (the verifier can park it for a blocker or a date instead).", "Move the ticket back to Todo with a blocker or a due date if it must wait."],
   "idle-unresponsive": ["Resume the agent yourself and tell it what to do next.", "Start a replacement agent from the Linear tickets sidebar.", "Close the ticket if its work is done."],
   "verifying": ["Answer the verifier's question and start the ticket's agent from the sidebar.", "Add the trigger label again for a fresh steward round.", "Close the ticket."],
 };
@@ -622,7 +722,7 @@ export function verifierBrief(issue: StewardIssue, facts: StewardFacts, record: 
     summaries ? `The last agent's own reports:\n${summaries}` : "",
     record?.plan ? `The ticket's plan: ${record.plan}` : "",
     "",
-    "Read the ticket and its comments (the linear_ticket tools get_ticket and get_comments), the plan document if there is one, and the landed pull requests (gh pr view and gh pr diff). Judge whether the ticket's work is complete against its description and acceptance criteria, then use the steward_verdict tool (omp shows it as linear_ticket_steward_verdict) exactly once with one verdict: close (nothing remains), follow_up with what remains, ask_owner with the question and its options, or resume with what the ticket's agent must still do. Then stop.",
+    "Read the ticket and its comments (the linear_ticket tools get_ticket and get_comments), the plan document if there is one, and the landed pull requests (gh pr view and gh pr diff). Judge whether the ticket's work is complete against its description and acceptance criteria, then use the steward_verdict tool (omp shows it as linear_ticket_steward_verdict) exactly once with one verdict: close (nothing remains), resume with what the ticket's agent must still do, park with why it must wait (blockedBy names the ticket it waits for, dueDate when a date decides it), or ask_owner with the question and its options when only the owner can decide. Then stop.",
   ].filter(Boolean).join("\n");
 }
 
@@ -640,6 +740,10 @@ export type StewardSnapshot = {
 
 type Candidate = { issue: StewardIssue; facts: StewardFacts; situation: StewardSituation; ticket: StewardTicket };
 type Pass = { actions: number; cap: number; cards: number };
+// What one action came to: `done` (the effect went out), `deferred` (nothing was attempted —
+// admission waits; the ticket stays queued and the pass retries, no budget spent), `failed` (it did
+// not run; `permanent`: the owner is asked at once rather than after REFUSAL_CAP refusals).
+type StewardOutcome = { state: "done" | "failed" | "deferred"; reason: string; permanent?: boolean };
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -669,7 +773,24 @@ export function finishedBlocker(blocker: { statusType: string; merged: boolean }
   return type === "started" && blocker.merged;
 }
 
+// Whether a verifier's park still waits: its named blocker is on the ticket and unfinished, or
+// its due date has not arrived. A park whose gates are both gone — the blocker finished, the
+// relation was removed, the date passed — is no wait any more: the ticket is recovered like any
+// other, and the owner's own retry clears the record outright (steward.ts `ownerRetried`).
+export function parkStillWaits(parked: StewardParked, issue: StewardIssue, now: number): boolean {
+  const blocker = parked.blockedBy ? issue.blockers.find((entry) => entry.identifier === parked.blockedBy) ?? null : null;
+  const blockerWaits = blocker !== null && !finishedBlocker(blocker);
+  const dateWaits = Boolean(parked.dueDate) && Date.parse(`${parked.dueDate}T00:00:00.000Z`) > now;
+  return blockerWaits || dateWaits;
+}
+
 const short = (id: string) => id.slice(0, 8);
+
+// The agent of the ticket's verifier generation, when its launch returned one: the agent a verdict
+// must never mistake for an implementation agent (and never archive twice).
+function verifierIdOf(candidate: Candidate): string | null {
+  return candidate.ticket.verifier?.agentId ?? null;
+}
 
 export class Steward {
   private revoked = false;
@@ -707,14 +828,15 @@ export class Steward {
 
   // The owner started or continued the ticket (the trigger label, the sidebar): the restarts spent,
   // the refusals and the escalation of the current situation are forgotten, so a later failure is a
-  // new round with a fresh budget (label-repair.ts ownerRetried, unchanged). Throws when the record
+  // new round with a fresh budget (label-repair.ts ownerRetried, unchanged), and a verifier's park
+  // is over — the owner's own continuation ends the wait the park recorded. Throws when the record
   // could not be written: the caller then starts nothing.
   async ownerRetried(issue: string): Promise<void> {
     await this.deps.store.update((file) => {
       const id = Object.keys(file.tickets).find((key) => key === issue || file.tickets[key].identifier === issue);
       if (!id) return null;
       const ticket = file.tickets[id];
-      file.tickets[id] = { ...ticket, restarts: [], refusals: [], resumedAt: null, escalated: null, verified: null, ownerAt: this.iso() };
+      file.tickets[id] = { ...ticket, restarts: [], refusals: [], resumedAt: null, escalated: null, verified: null, parked: null, ownerAt: this.iso() };
       console.log(`[linear-tickets] ${ticket.identifier}: started again by the owner; the steward's budgets begin anew`);
     });
   }
@@ -802,10 +924,11 @@ export class Steward {
     const names: DispatchLabels & { trigger: string } = { ...dispatchLabels(settings.dispatch.label), trigger: settings.dispatch.label };
     const labelNames = [names.trigger, names.running, names.failed, names.blocked, names.needsYou, names.manual, names.hold, names.attended, names.queued];
     const appIds = (await this.deps.linear.trustedAppIds().catch(() => [])).filter(Boolean);
-    const all = await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: labelNames, appIds, ids: Object.keys(file.tickets) });
-    const issues = options.queueBlockers ? all.filter((issue) => issue.title.startsWith("Queue blocker:") && hasLabel(issue.labels, names.failed)) : all;
-    if (options.queueBlockers && !issues.length) return;
-    // The local facts, read once per pass.
+    // The local inventory first: the reads below name the tickets no label or delegate filter
+    // reaches — the root agents of finished tickets (a quiet one still holds a scheduler slot),
+    // tickets known only through a handover record, the parents of Needs-you sub-issues, and
+    // everything an earlier pass tracked — and they go into the batched Linear read, so the first
+    // pass on an empty store manages them too.
     const [roots, records, watchdog, needsYou, handed] = await Promise.all([
       this.deps.sessions.watchdogRoots(),
       this.deps.handover.all(),
@@ -814,16 +937,25 @@ export class Steward {
       this.deps.watchdog.handedOver().catch(() => new Map<string, string>()),
     ]);
     const recordOf = new Map(records.map((record) => [record.issueId, record]));
-    const inScope = issues.filter((issue) => (options.queueBlockers ? true : this.inScope(issue, names, appIds, recordOf, file.tickets)));
-    const pulls = await this.deps.pulls([...new Set(inScope.flatMap((issue) => recordPulls(recordOf.get(issue.id))))]);
+    const inventory = new Set<string>([...Object.keys(file.tickets), ...records.map((record) => record.issueId), ...roots.keys(), ...needsYou.map((entry) => entry.parentId)]);
+    const all = await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: labelNames, appIds, ids: [...inventory], queueBlockers: options.queueBlockers === true });
+    const teams = new Set(settings.dispatch.teamKeys.map((key) => key.trim().toLowerCase()).filter(Boolean));
+    const inTeam = (issue: StewardIssue) => teams.has(issue.teamKey.trim().toLowerCase());
+    const issues = options.queueBlockers ? all.filter((issue) => inTeam(issue) && hasLabel(issue.labels, names.failed)) : all;
+    if (options.queueBlockers && !issues.length) return;
+    const inScope = issues.filter((issue) => (options.queueBlockers ? true : this.inScope(issue, names, settings.dispatch.teamKeys, appIds, recordOf, roots, file.tickets)));
+    const pulls = await this.deps.pulls([...new Set(inScope.flatMap((issue) => pullUrls(issue, recordOf.get(issue.id))))]);
     const candidates: Candidate[] = [];
     for (const issue of inScope) {
       if (!this.alive()) return;
       if (await this.deps.owner(issue.id).catch(() => "unknown" as HostOwnership) !== "here") continue;
       const ticket = file.tickets[issue.id] ?? null;
-      const facts = await this.facts(issue, { names, roots, record: recordOf.get(issue.id) ?? null, watchdog, handed, pulls, now, ticket });
-      candidates.push({ issue, facts, situation: classifyTicket(facts), ticket: ticket ?? { identifier: issue.identifier, situation: "moving", since: this.iso(now), at: this.iso(now), claim: null, restarts: [], refusals: [], resumedAt: null, verifier: null, verified: null, escalated: null, ownerAt: null, card: null, log: [] } });
+      const facts = await this.facts(issue, paseo, { names, roots, record: recordOf.get(issue.id) ?? null, watchdog, needsYou, handed, pulls, now, ticket, settings });
+      candidates.push({ issue, facts, situation: classifyTicket(facts), ticket: ticket ?? newTicket(issue.identifier, this.iso(now)) });
     }
+    // The `<trigger>-running` labels an archive still owes: settled from the pass's own agent
+    // reading, before this pass's effects add new debt.
+    await this.settleLabels(paseo, names, roots);
     const pass: Pass = { actions: 0, cap: settings.steward.maxActionsPerPass, cards: 0 };
     for (const candidate of candidates) {
       if (!this.alive()) return;
@@ -843,29 +975,35 @@ export class Steward {
     }
   }
 
-  // Whether a ticket is inside the steward's scope: open, of a dispatch team, and Paseo is
-  // involved — delegated to a Paseo app, carrying a Paseo label, with a handover record, a
-  // sub-issue or parent of one, or tracked by an earlier pass. Tickets of humans with no Paseo
-  // involvement are out of scope.
-  private inScope(issue: StewardIssue, names: DispatchLabels & { trigger: string }, appIds: string[], records: Map<string, HandoverRecord>, stored: Record<string, StewardTicket>): boolean {
+  // Whether a ticket is inside the steward's scope: open, of a *configured* dispatch team, and
+  // Paseo is involved — delegated to a Paseo app, carrying a Paseo label, with a handover record, a
+  // root agent, a sub-issue or parent of one, or tracked by an earlier pass. Tickets of humans with
+  // no Paseo involvement are out of scope, and so is every ticket of a team that is not configured:
+  // a ticket moved out of the dispatch teams (or a team removed from the settings, or an empty
+  // list) is never moved by this steward again, however the inventory reached it.
+  private inScope(issue: StewardIssue, names: DispatchLabels & { trigger: string }, teamKeys: string[], appIds: string[], records: Map<string, HandoverRecord>, roots: Map<string, TicketRoots>, stored: Record<string, StewardTicket>): boolean {
+    const teams = new Set(teamKeys.map((key) => key.trim().toLowerCase()).filter(Boolean));
+    if (!teams.size || !teams.has(issue.teamKey.trim().toLowerCase())) return false;
     const terminal = CLOSED_TYPES.includes(issue.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number]);
-    if (terminal && !stored[issue.id] && !records.has(issue.id)) return false;
+    if (terminal && !stored[issue.id] && !records.has(issue.id) && !roots.has(issue.id)) return false;
     if (issue.delegateId && appIds.includes(issue.delegateId)) return true;
     if ([names.trigger, names.running, names.failed, names.blocked, names.needsYou, names.manual, names.hold, names.attended, names.queued].some((name) => hasLabel(issue.labels, name))) return true;
-    if (records.has(issue.id) || stored[issue.id]) return true;
-    return Boolean(issue.parentId && (records.has(issue.parentId) || stored[issue.parentId]));
+    if (records.has(issue.id) || stored[issue.id] || roots.has(issue.id)) return true;
+    return Boolean(issue.parentId && (records.has(issue.parentId) || stored[issue.parentId] || roots.has(issue.parentId)));
   }
 
   // Everything the classifier decides on, from the pass's reads.
-  private async facts(issue: StewardIssue, input: {
+  private async facts(issue: StewardIssue, paseo: PaseoApi, input: {
     names: DispatchLabels & { trigger: string };
     roots: Map<string, TicketRoots>;
     record: HandoverRecord | null;
     watchdog: WatchdogFile | null;
+    needsYou: { parentId: string }[];
     handed: Map<string, string>;
     pulls: Map<string, PullState>;
     now: number;
     ticket: StewardTicket | null;
+    settings: PluginSettings;
   }): Promise<StewardFacts> {
     const { names, record, now } = input;
     const terminal = CLOSED_TYPES.includes(issue.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number]);
@@ -875,45 +1013,78 @@ export class Steward {
     const live = liveRoots.length > 0;
     const idle = live ? idleMinutesOf(liveRoots, now) : null;
     const openChildren = issue.children.filter((child) => !CLOSED_TYPES.includes(child.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number]));
-    const canceledOnly = issue.children.length > 0 && issue.children.every((child) => child.statusType === "canceled" || child.statusType === "duplicate");
     const blocker = issue.blockers.find((candidate) => !finishedBlocker(candidate))?.identifier ?? null;
-    const pullFacts: StewardPullFacts[] = recordPulls(record ?? undefined).map((url) => {
+    const pullFacts: StewardPullFacts[] = pullUrls(issue, record ?? undefined).map((url) => {
       const state = input.pulls.get(url);
       return { url, merged: state?.merged === true, closed: state?.closed === true, missing: state?.missing === true, decision: state?.decision ?? null, replay: state?.replay ?? null };
     });
     const openPulls = pullFacts.filter((pull) => !pull.merged && !pull.closed && !pull.missing);
     const landedPulls = pullFacts.filter((pull) => pull.merged);
     const closedPulls = pullFacts.filter((pull) => pull.closed && !pull.merged);
-    const beforeMerge = landedPulls.length ? await this.deps.manualTasks.openBlockers(issue.id).then((tasks) => tasks.length).catch(() => 0) : 0;
+    // An unreadable task list counts as one open task: the merge stays held rather than verified
+    // away (the old pr-watch gate's unknown handling).
+    const beforeMerge = landedPulls.length ? await this.deps.manualTasks.openBlockers(issue.id).then((tasks) => tasks.length).catch(() => 1) : 0;
     const waiting = record?.waiting ?? null;
     const ownerWait = waiting ? await this.waitState(issue, waiting, liveRoots, input, now) : "none";
     const thread = await this.deps.sessions.watchdogThread(issue.id).catch(() => null);
     const queuedThread = Boolean(thread?.queued) || await this.deps.sessions.threadQueued(issue.id).catch(() => false);
+    const planned = (await this.deps.planned?.has(issue.id).catch(() => false)) === true;
+    const focused = Boolean(await this.deps.focus?.admits(issue.id, paseo).catch(() => null));
     const cycle = input.watchdog?.tickets[issue.id] ?? null;
     const stripAnchor = (record?.agentId ?? "").startsWith(STEWARD_ANCHOR);
     const started = Boolean(record && record.agentId && !stripAnchor) || roots.length > 0 || pullFacts.length > 0;
-    const held = [names.hold, names.manual, names.needsYou].find((name) => hasLabel(issue.labels, name)) ?? null;
+    const permissions = live && liveRoots.some((agent) => (agent.pendingPermissions?.length ?? 0) > 0);
+    const offer = thread?.offer && ["split", "later", "parked"].includes(thread.offer) ? thread.offer : null;
+    // The deliberate waits, strongest first: the owner's own veto or step, the plan under review,
+    // the watchdog's owner Stop, the peer host, an unanswered question, a Needs-you item, focus.
+    const deliberate: StewardDeliberate | null =
+      hasLabel(issue.labels, names.hold) ? "hold"
+        : hasLabel(issue.labels, names.manual) ? "manual"
+          : hasLabel(issue.labels, DO_NOT_MERGE) ? "do-not-merge"
+            : planStage(issue.status, issue.statusType) === PLAN_REVIEW_STATE || Boolean(thread?.review) || planned || offer ? "plan-review"
+              : input.watchdog?.holds[issue.id] ? "stopped"
+                : thread?.remote ? "remote"
+                  : permissions ? "permissions"
+                    : input.needsYou.some((entry) => entry.parentId === issue.id) ? "needs-you"
+                      : focused ? "focus"
+                        : null;
+    const storedPark = input.ticket?.parked ?? null;
+    const parked = storedPark !== null && parkStillWaits(storedPark, issue, now);
+    const queuedAt = input.ticket?.queued?.at ?? null;
     const resumedAt = input.ticket?.resumedAt ? Date.parse(input.ticket.resumedAt) : NaN;
-    const quietSince = live ? now - (Math.max(...liveRoots.map((agent) => Date.parse(agent.updatedAt) || 0, now - (idle ?? 0) * 60_000))) : 0;
+    // The silence began at the live roots' latest activity: a stamp, never a duration compared to
+    // one — a later turn of the agent starts a new silence with its own resume.
+    const silenceStart = live ? Math.max(...liveRoots.map((agent) => Date.parse(agent.updatedAt) || 0, now - (idle ?? 0) * 60_000)) : 0;
+    // When the queue began: the steward's own admission deferral stamps it, a thread's wait is
+    // aged by the situation it has been in.
+    const queuedSince = input.ticket?.queued?.at ?? (input.ticket?.situation === "queued" || input.ticket?.situation === "queued-too-long" ? input.ticket.since : null);
+    const queuedTooLong = Boolean((queuedThread || queuedAt) && queuedSince && now - Date.parse(queuedSince) >= input.settings.steward.queuedEscalateHours * 60 * 60_000);
     return {
       identifier: issue.identifier,
       status: issue.status,
       statusType: issue.statusType,
       terminal,
-      children: { total: issue.children.length, open: openChildren.length, canceledOnly },
+      children: { total: issue.children.length, open: openChildren.length, complete: issue.childrenComplete },
+      deliberate,
+      groupLinked: Boolean(thread?.group),
+      parked,
       blocker,
       live,
       idleMinutes: idle,
+      idleThreshold: input.settings.steward.idleMinutes,
       ownerWait,
-      resumed: Number.isFinite(resumedAt) && resumedAt >= quietSince,
+      resumed: Number.isFinite(resumedAt) && resumedAt >= silenceStart,
       queuedThread,
-      queuedSince: input.ticket?.situation === "queued" || input.ticket?.situation === "queued-too-long" ? input.ticket.since : null,
+      queuedAt,
+      queuedSince,
+      queuedTooLong,
+      queuedHours: input.settings.steward.queuedEscalateHours,
       openPulls,
       landedPulls,
       closedPulls,
       beforeMerge,
       started,
-      startable: !terminal && !held && !hasLabel(issue.labels, DO_NOT_MERGE) && restartable(issue.status, issue.statusType) && !blocker && !waiting && !queuedThread,
+      startable: !terminal && !deliberate && !input.ticket?.parked && restartable(issue.status, issue.statusType) && !blocker && !waiting && !queuedThread,
       restarts: recent(input.ticket?.restarts ?? [], now).length,
       refusals: (input.ticket?.refusals ?? []).filter((entry) => Number.isFinite(Date.parse(entry.at)) && now - Date.parse(entry.at) < STEWARD_WINDOW_MS).length,
       lastRefusal: input.ticket?.refusals?.at(-1)?.reason ?? null,
@@ -929,8 +1100,10 @@ export class Steward {
   // can (writeback.ts reconcileWaiting, folded in here). A pending request on a live agent is
   // answerable; a live agent without one can still take its next turn (a `turn-end` wait stays);
   // with no live agent the wait is over unless it is minutes old (a daemon that just restarted
-  // still lists its agents) or its ticket was handed to the peer host.
+  // still lists its agents) or its ticket was handed to the peer host. A `decision` wait is the
+  // steward's own escalation: only the owner's answer or retry ends it, never a liveness check.
   private async waitState(issue: StewardIssue, waiting: { kind?: string; at?: string }, liveRoots: WatchedAgent[], input: { handed: Map<string, string>; record: HandoverRecord | null; roots: Map<string, TicketRoots> }, now: number): Promise<"live" | "stale"> {
+    if (waiting.kind === "decision") return "live";
     if (liveRoots.some((agent) => (agent.pendingPermissions?.length ?? 0) > 0)) return "live";
     if (liveRoots.length > 0) return waiting.kind === "request" ? "stale" : "live";
     const at = Date.parse(waiting.at ?? input.record?.updatedAt ?? "") || 0;
@@ -941,26 +1114,29 @@ export class Steward {
     return "stale";
   }
 
-  // One ticket: record its situation, then take its one action (if the cap allows it).
+  // One ticket: record its situation, then take its one action (if the cap allows it). A ticket
+  // whose start admission deferred stays queued and retries the same action on every pass, without
+  // spending a restart or a refusal; the recovery budgets are rolling 24-hour windows that only the
+  // owner's own retry clears.
   private async ticket(paseo: PaseoApi, settings: PluginSettings, names: DispatchLabels & { trigger: string }, candidate: Candidate, pass: Pass, now: number): Promise<void> {
     const { issue, facts, situation } = candidate;
     const previous = candidate.ticket;
     // The situation's age: kept while it does not change, so the grace and the flow view can tell a
     // ticket that just got stuck from one that has been for hours.
     const since = previous.situation === situation ? previous.since : this.iso(now);
-    const moved = ["moving", "waiting-owner", "waiting-blocker", "queued", "closeable", "closed"].includes(situation);
     await this.deps.store.update((file) => {
       const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
-      // A ticket that moved on by itself starts its repairs with a fresh budget.
-      if (previous.situation !== situation && moved) {
-        ticket.restarts = [];
-        ticket.refusals = [];
-        ticket.resumedAt = null;
-        ticket.escalated = null;
-      }
       ticket.situation = situation;
       ticket.since = since;
       ticket.at = this.iso(now);
+      // A queue entry that no longer describes the ticket is dropped; the ticket moved on.
+      if (ticket.queued && situation !== "queued") ticket.queued = null;
+      // A park whose blocker finished or whose date arrived is over: the record goes, and the
+      // ticket is classified and recovered like any other on this same pass.
+      if (ticket.parked && !facts.parked) {
+        ticket.log = [...ticket.log, { at: this.iso(now), action: "park ended: its blocker finished or its date arrived" }].slice(-LOG_LIMIT);
+        ticket.parked = null;
+      }
       if (ticket.claim?.state === "claimed" && this.clock() - Date.parse(ticket.claim.at) >= CLAIM_GRACE_MS) {
         ticket.claim = { ...ticket.claim, state: "failed", result: "outcome unknown after a restart" };
       }
@@ -971,13 +1147,24 @@ export class Steward {
       this.once(`claim:${issue.id}`, `${issue.identifier}: the steward's ${stored.claim.action} is claimed but has no outcome yet; it is not repeated`);
       return;
     }
+    // A recovered ticket with a live root does not keep a stale `<t>-failed` of an earlier attempt.
+    if (situation === "moving" && facts.live && hasLabel(issue.labels, names.failed)) await this.clearFailed(issue, names);
+    const retry = situation === "queued" ? stored?.queued ?? null : null;
+    if (retry) {
+      if (!this.enabled) return;
+      const retryCandidate: Candidate = { ...candidate, situation: retry.situation };
+      if (!this.cap(pass, retryCandidate, retry.action)) return;
+      console.log(`[linear-tickets] ${issue.identifier}: steward: its ${retry.action} waits in the queue (${retry.reason}); trying again`);
+      await this.act(paseo, settings, names, retryCandidate, retry.situation, retry.action, now);
+      return;
+    }
     // A ticket already escalated for this reason waits for the owner, whatever its situation now is.
     const key = situation === "escalated" ? (stored?.escalated?.key ?? "escalated") : situation;
     const ownerNewer = Boolean(stored?.ownerAt && stored.escalated && Date.parse(stored.ownerAt) > Date.parse(stored.escalated.at));
     const escalated = Boolean(stored?.escalated && stored.escalated.key === key && !ownerNewer);
     const action = situation === "escalated" || escalated ? "escalate" : STEWARD_ACTION[situation];
     if (!action) {
-      await this.verdict(paseo, settings, candidate, now);
+      await this.verdict(paseo, settings, names, candidate, pass, now);
       return;
     }
     if (!this.enabled) return;
@@ -988,18 +1175,25 @@ export class Steward {
       this.once(`escalated:${issue.id}`, `${issue.identifier}: the steward already asked the owner (${key}); it waits for their answer`);
       return;
     }
+    if (!this.cap(pass, candidate, action)) return;
+    await this.act(paseo, settings, names, candidate, situation, action, now);
+  }
+
+  // The per-pass action cap: starts, successors, resumes and verifiers wait for the next pass;
+  // closes, archives and escalations are not capped (README, "Ticket steward").
+  private cap(pass: Pass, candidate: Candidate, action: StewardAction): boolean {
     const heavy = action === "start" || action === "restart" || action === "succeed" || action === "resume" || action === "verify";
     if (heavy && pass.actions >= pass.cap) {
-      this.once(`cap:${issue.identifier}`, `${issue.identifier}: the steward's per-pass action cap (${pass.cap}) is used up; its ${situation} waits for the next pass`);
-      return;
+      this.once(`cap:${candidate.issue.identifier}`, `${candidate.issue.identifier}: the steward's per-pass action cap (${pass.cap}) is used up; its ${candidate.situation} waits for the next pass`);
+      return false;
     }
     if (heavy) pass.actions++;
-    await this.act(paseo, settings, names, candidate, situation, action, now);
+    return true;
   }
 
   // The one action of a ticket per pass, claimed before its effect.
   private async act(paseo: PaseoApi, settings: PluginSettings, names: DispatchLabels & { trigger: string }, candidate: Candidate, situation: StewardSituation, action: StewardAction, now: number): Promise<void> {
-    const { issue, facts } = candidate;
+    const { issue } = candidate;
     const claim: StewardClaim = { action, marker: `${action}:${randomUUID().slice(0, 8)}`, at: this.iso(now), state: "claimed" };
     const written = await this.deps.store.update((file) => {
       const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
@@ -1008,10 +1202,14 @@ export class Steward {
       return true;
     });
     if (!written) return;
-    const settle = async (state: "done" | "failed", result?: string) => {
+    const settle = async (state: "done" | "failed" | "deferred", result?: string) => {
       await this.deps.store.update((file) => {
         const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
         ticket.claim = { ...claim, state, ...(result ? { result: result.slice(0, 500) } : {}) };
+        // A deferral is the ticket's queue entry (no budget was spent, the pass retries it); any
+        // other outcome ends the entry.
+        if (state === "deferred") ticket.queued = { situation, action, at: ticket.queued?.situation === situation ? ticket.queued.at : this.iso(now), reason: (result ?? "waiting for admission").slice(0, 300) };
+        else if (ticket.queued?.situation === situation) ticket.queued = null;
         ticket.log = [...ticket.log, { at: this.iso(), action: `${action}: ${state}${result ? ` (${result.slice(0, 200)})` : ""}` }].slice(-LOG_LIMIT);
       });
     };
@@ -1025,7 +1223,7 @@ export class Steward {
           return;
         }
         case "succeed": {
-          const result = await this.succeed(candidate);
+          const result = await this.succeed(names, candidate);
           await settle(result.state, result.reason);
           if (result.permanent) await this.escalate(candidate, result.reason);
           return;
@@ -1033,7 +1231,7 @@ export class Steward {
         case "resume": {
           const root = await this.liveRoot(paseo, issue.id);
           if (!root) return settle("failed", "the live agent is gone");
-          const outcome = await this.deps.sessions.prompt(root.id, resumeText(issue.identifier, facts.idleMinutes ?? 0));
+          const outcome = await this.deps.sessions.prompt(root.id, resumeText(issue.identifier, candidate.facts.idleMinutes ?? 0));
           if (outcome === "busy" || outcome === "waiting" || outcome === "unavailable") return settle("failed", `the resume did not go out (${outcome})`);
           await this.deps.store.update((file) => {
             const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
@@ -1044,12 +1242,8 @@ export class Steward {
         case "verify": {
           const result = await this.verify(paseo, settings, candidate, now);
           await settle(result.state, result.reason);
+          if (result.permanent) await this.escalate(candidate, result.reason);
           return;
-        }
-        case "complete":
-        case "cancel": {
-          await this.close(paseo, candidate, action === "cancel" || (facts.children.total > 0 && facts.children.canceledOnly));
-          return settle("done", action);
         }
         case "archive": {
           const result = await this.archive(paseo, settings, names, candidate, now);
@@ -1075,9 +1269,12 @@ export class Steward {
   }
 
   // A restart (or a first start): the same path the label repair took, under the same gates — the
-  // ticket's start gate, admission, the recorded branch. The restart counts against the cap before
-  // it runs: a start that fails has still been tried.
-  private async restart(paseo: PaseoApi, names: DispatchLabels & { trigger: string }, candidate: Candidate, now: number): Promise<{ state: "done" | "failed"; reason: string; permanent: boolean }> {
+  // ticket's start gate, admission, the recorded branch. The attempt counts against the 24-hour
+  // budget before it runs (a start that fails has still been tried) and is refunded only when
+  // nothing was attempted because admission deferred it: a capacity or focus wait spends no budget
+  // and stays queued. A start that went out never refunds anything, however quickly its agent
+  // vanishes again.
+  private async restart(paseo: PaseoApi, names: DispatchLabels & { trigger: string }, candidate: Candidate, now: number): Promise<StewardOutcome> {
     const { issue } = candidate;
     const attempt = candidate.facts.restarts + 1;
     await this.deps.store.update((file) => {
@@ -1091,19 +1288,21 @@ export class Steward {
       lead: candidate.facts.started ? undefined : restartText(issue.identifier, attempt, cause),
       eligible: async () => {
         const agents = await classifyTicketAgents(paseo, issue.id, this.clock(), this.deps.inspect);
-        const working = [...agents.live, ...agents.stopped].sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+        const working = agents.live.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
         return working ? `an agent works on ${issue.identifier} again (agent ${short(working.id)} is ${working.status})` : null;
       },
     }).catch((error: unknown): RestartResult => ({ kind: "failed", error: error instanceof Error ? error : new Error(String(error)) }));
     if (result.kind === "started" || result.kind === "live") {
-      await this.refused(issue, now, null);
+      await this.clearFailed(issue, names);
       return { state: "done", reason: result.kind === "started" ? `started agent ${short(result.agentId)}` : "an agent works on it again", permanent: false };
     }
     if (result.kind === "forwarded") return { state: "done", reason: `handed to ${result.peer}`, permanent: false };
     if (result.kind === "skipped") return { state: "failed", reason: "the ticket is deleted or paused for deletion", permanent: true };
     if (result.kind === "deferred") {
-      // A deferral names a wait (admission, a gate, a route, a fresh agent): it is retried, and only
-      // escalated after REFUSAL_CAP refusals.
+      if (queueWait(result.reason)) {
+        await this.unspend(issue, now);
+        return { state: "deferred", reason: result.reason, permanent: false };
+      }
       const count = await this.refused(issue, now, result.reason);
       return { state: "failed", reason: `the start is refused${count > 1 ? ` ${count} times` : ""}: ${result.reason}`, permanent: count >= REFUSAL_CAP };
     }
@@ -1112,6 +1311,15 @@ export class Steward {
     const permanent = /^No Paseo project is mapped|^No provider has been chosen|^Could not pick a base branch|^This ticket is paused/.test(reason) || count >= REFUSAL_CAP;
     console.error(`[linear-tickets] ${issue.identifier}: steward: restart ${attempt} of ${RESTART_CAP} failed: ${reason}`);
     return { state: "failed", reason: `restart ${attempt} failed: ${reason}`, permanent };
+  }
+
+  // The attempt a deferral refunds: nothing was attempted, so the rolling budget is untouched.
+  private unspend(issue: StewardIssue, now: number): Promise<void> {
+    const at = this.iso(now);
+    return this.deps.store.update((file) => {
+      const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, at);
+      ticket.restarts = ticket.restarts.filter((entry) => entry !== at);
+    });
   }
 
   // One refusal of a start, counted within the window (null clears them after a start went out).
@@ -1126,8 +1334,10 @@ export class Steward {
 
   // A successor for a ticket whose pull request nobody works on: the open pull request's lifecycle
   // step, or the replay of a stack whose pull request was closed without merging. The message is
-  // claimed by the session router right before its start, so a failed start is tried again.
-  private async succeed(candidate: Candidate): Promise<{ state: "done" | "failed"; reason: string; permanent: boolean }> {
+  // claimed by the session router right before its start, so a failed start is tried again. The
+  // attempt counts against the same rolling budget as a restart (the classifier refuses the branch
+  // when it is spent), and an admission wait refunds it and stays queued.
+  private async succeed(names: DispatchLabels & { trigger: string }, candidate: Candidate): Promise<StewardOutcome> {
     const { issue, facts } = candidate;
     const pull = facts.openPulls[0] ?? facts.closedPulls[0];
     if (!pull) return { state: "failed", reason: "no pull request to continue", permanent: true };
@@ -1142,127 +1352,386 @@ export class Steward {
     const result: Succession = await this.deps.sessions.succeed(issue.id, issue.identifier, record?.agentId ?? null, lead, async () => {
       console.log(`[linear-tickets] ${issue.identifier}: steward: successor ${attempt} of ${RESTART_CAP}`);
     }).catch((error: unknown): Succession => ({ kind: "impossible", reason: message(error) }));
-    if (result.kind === "started" || result.kind === "live") {
-      await this.refused(issue, now, null);
-      return { state: "done", reason: result.kind === "started" ? `started a successor ${short(result.agent.id)}` : "a live agent takes the pull request over", permanent: false };
+    if (result.kind === "wait" || result.kind === "impossible") {
+      const reason = result.kind === "wait" ? `the successor waits: ${result.reason}` : `no successor can start: ${successionReason(result)}`;
+      if (result.kind === "wait" && queueWait(result.reason)) {
+        await this.unspend(issue, now);
+        return { state: "deferred", reason: result.reason, permanent: false };
+      }
+      const count = await this.refused(issue, now, reason);
+      return { state: "failed", reason, permanent: count >= REFUSAL_CAP || result.kind === "impossible" };
     }
-    if (result.kind === "wait") {
-      const count = await this.refused(issue, now, result.reason);
-      return { state: "failed", reason: `the successor waits: ${result.reason}`, permanent: count >= REFUSAL_CAP };
-    }
-    return { state: "failed", reason: `no successor can start: ${successionReason(result)}`, permanent: true };
+    // The remaining member carries the agent (a live or started successor); narrow by shape, since
+    // its discriminant is a two-value union TypeScript cannot split.
+    if (!("agent" in result)) throw new Error("the successor result carries neither an agent nor a reason");
+    await this.clearFailed(issue, names);
+    return { state: "done", reason: result.kind === "started" ? `started a successor ${short(result.agent.id)}` : "a live agent takes the pull request over", permanent: false };
   }
 
   // The verifier for a landed stack: a short-lived cheap agent with the fact sheet, which records
-  // exactly one verdict through its ticket tool. One verifier per ticket, claim-journaled.
-  private async verify(paseo: PaseoApi, settings: PluginSettings, candidate: Candidate, now: number): Promise<{ state: "done" | "failed"; reason: string }> {
+  // exactly one verdict through its ticket tool. One verifier per ticket, claim-journaled. It takes
+  // the same admission as any start — focus, parked plans, blockers, the scheduler's slot and RAM
+  // lease, presence — so no verifier is ever started beside a full host or outside focus, and an
+  // admission wait is a queue entry, not a refusal. A live idle root (the unresponsive case) is
+  // handed over first; a stopped or error root is no work at all and never blocks the verifier.
+  // The generation (marker) is persisted *before* the launch and carried as the verifier's own
+  // agent label, so an interrupted launch is adopted by marker on the next pass: its verdict is
+  // never lost to a reload between agent creation and the store write.
+  private async verify(paseo: PaseoApi, settings: PluginSettings, candidate: Candidate, now: number): Promise<StewardOutcome> {
     const { issue, facts } = candidate;
     const gate = this.deps.launcher.gate(issue.id);
-    if (!gate) return { state: "failed", reason: "a launch for this ticket is under way" };
+    if (!gate) return { state: "deferred", reason: "a launch for this ticket is under way" };
     try {
-      const agents = await classifyTicketAgents(paseo, issue.id, now, this.deps.inspect);
-      const working = [...agents.live, ...agents.stopped][0];
-      if (working) return { state: "failed", reason: `an agent works on the ticket again (${short(working.id)})` };
+      const agents = (await classifyTicketAgents(paseo, issue.id, now, this.deps.inspect)).live;
+      const verified = (agent: { labels?: Record<string, string> | undefined }) => agent.labels?.[STEWARD_VERIFIER_LABEL] ?? null;
+      // A generation is still pending only when its launch has not been confirmed yet; the
+      // adoption that resolves it lives in `verdict`, where every pass reaches it.
+      if (candidate.ticket.verifier && !candidate.ticket.verifier.agentId) return { state: "deferred", reason: "the verifier's launch is being confirmed" };
+      const idle = agents
+        .filter((agent) => verified(agent) === null && !agent.activeTurn && agent.status !== "running" && agent.status !== "initializing" && !(agent.pendingPermissions?.length))
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      const working = agents.filter((agent) => verified(agent) === null && !idle.includes(agent));
+      if (working.length) return { state: "failed", reason: `an agent works on the ticket again (${short(working[0].id)})` };
+      // The verifier reports through its ticket MCP server: without Linear access for agents it has
+      // no steward_verdict tool, so it is started only when that is on.
+      if (!settings.agentLinearAccess) return { state: "failed", reason: `the verifier cannot report a verdict: agent Linear access is off (${issue.identifier} keeps its verifier claim until it is on)`, permanent: true };
+      const admission = await this.deps.starter.admission(issue.id, paseo, settings);
+      if (!admission.ok) return { state: "deferred", reason: admission.reason };
+      // Only now, with the tooling and the slot confirmed, is the ticket's silent root handed over:
+      // a refused admission must not leave the ticket with no agent and no verifier (B2).
+      for (const agent of idle) await this.archiveAgent(paseo, agent.id);
       const record = (await this.deps.handover.all()).find((item) => item.issueId === issue.id) ?? null;
-      const started = await this.deps.starter.start(issue.id, paseo, settings, {
-        retryHint: "start the verifier again",
-        resumeOnly: true,
-        labels: { [STEWARD_VERIFIER_LABEL]: "verifier" },
-        verifier: { brief: verifierBrief(issue, facts, record) },
-      });
+      const marker = randomUUID();
+      // The generation is durable before anything is created: a crash right after the launch
+      // leaves an adoptable verifier, not an anonymous agent with an unreadable verdict.
       await this.deps.store.update((file) => {
         const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
-        ticket.verifier = { agentId: started.agentId, marker: randomUUID().slice(0, 8), at: this.iso(now) };
+        ticket.verifier = { agentId: null, marker, at: this.iso(now) };
+      });
+      let started: { agentId: string };
+      try {
+        started = await this.deps.starter.start(issue.id, paseo, settings, {
+          retryHint: "start the verifier again",
+          resumeOnly: true,
+          labels: { [STEWARD_VERIFIER_LABEL]: marker },
+          verifier: { brief: verifierBrief(issue, facts, record), marker },
+        });
+      } catch (error) {
+        // The generation stays pending: the next pass adopts the agent if the launch created one
+        // and drops the generation (with a refusal) if it did not.
+        const reason = `the verifier could not start: ${message(error)}`;
+        console.error(`[linear-tickets] ${issue.identifier}: steward: ${reason}`);
+        return { state: "failed", reason };
+      }
+      await this.deps.store.update((file) => {
+        const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
+        if (ticket.verifier?.marker === marker) ticket.verifier = { agentId: started.agentId, marker, at: this.iso(now) };
       });
       console.log(`[linear-tickets] ${issue.identifier}: steward: started verifier ${short(started.agentId)} for the landed stack`);
       return { state: "done", reason: `verifier ${short(started.agentId)}` };
     } catch (error) {
-      return { state: "failed", reason: `the verifier could not start: ${message(error)}` };
+      // A verifier that cannot start is a refusal like any other start: after REFUSAL_CAP the owner
+      // is asked instead of the pass trying the same broken start forever.
+      const reason = `the verifier could not start: ${message(error)}`;
+      const count = await this.refused(issue, now, reason);
+      return { state: "failed", reason, permanent: count >= REFUSAL_CAP };
     } finally {
       gate.release();
     }
   }
 
-  // A verifier's verdict, applied: close (with what the verifier says must remain, if anything),
-  // follow_up, ask_owner or resume. Read from the verifier's own record directory.
-  private async verdict(paseo: PaseoApi, settings: PluginSettings, candidate: Candidate, now: number): Promise<void> {
+  // A verifier's verdict, applied: close, resume (a successor with the instruction), park (Todo,
+  // a blocking relation and/or a due date) or ask_owner. The record must carry the verifier
+  // generation's marker, and only its first verdict counts. The application is claimed and its
+  // committed steps are recorded before anything else runs, and the verifier is consumed only once
+  // the effects are in — so a reload neither repeats a close nor loses a verdict. Nothing is
+  // mutated while `steward.enabled` is off, and a successor spends the per-pass cap and the
+  // recovery budget like any other start.
+  private async verdict(paseo: PaseoApi, settings: PluginSettings, names: DispatchLabels & { trigger: string }, candidate: Candidate, pass: Pass, now: number): Promise<void> {
     const { issue } = candidate;
     const verifier = candidate.ticket.verifier;
     if (!verifier) return;
     const read = this.deps.verdicts ?? ((issueId: string) => readVerdicts(join(paseoHome(), "linear-tickets", STEWARD_VERDICT_DIRECTORY, issueId)));
-    const verdict = (await read(issue.id).catch(() => [] as StewardVerdict[])).filter((entry) => Date.parse(entry.at) >= Date.parse(verifier.at)).at(-1) ?? null;
-    if (!verdict && now - Date.parse(verifier.at) <= VERIFY_TIMEOUT_MS) return;
-    await this.archiveAgent(paseo, verifier.agentId);
-    const clear = () => this.deps.store.update((file) => {
-      const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
-      ticket.verifier = null;
-      ticket.verified = candidate.facts.landedSignature || null;
-    });
+    // Only the verifier generation's own first verdict counts: a second record, or one another
+    // ticket agent wrote, is ignored.
+    const verdict = (await read(issue.id).catch(() => [] as StewardVerdict[]))
+      .filter((entry) => entry.verifier === verifier.marker && Date.parse(entry.at) >= Date.parse(verifier.at))
+      .at(0) ?? null;
+    // The journal's step for the effects a branch commits, and whether the consumed verifier's
+    // landed set counts as verified (only a close says so).
+    const verifiedOf = (kind: StewardApplying["verdict"]) => (kind === "close" ? candidate.facts.landedSignature || null : null);
     if (!verdict) {
-      await clear();
-      await this.escalate(candidate, "the verifier did not report within 45 minutes");
-      return;
-    }
-    console.log(`[linear-tickets] ${issue.identifier}: the verifier's verdict is ${verdict.verdict}`);
-    switch (verdict.verdict) {
-      case "close":
-      case "follow_up": {
-        await clear();
-        if (verdict.verdict === "follow_up") await this.followUp(issue, verdict.remaining ?? "The verifier reported remaining work without naming it.");
-        await this.close(paseo, candidate, false);
-        return;
-      }
-      case "ask_owner": {
-        await clear();
-        await this.escalate(candidate, verdict.question ?? "the verifier asked the owner for a decision", verdict.options ?? undefined);
-        return;
-      }
-      case "resume": {
-        await this.deps.store.update((file) => {
-          const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
-          ticket.verifier = null;
-        });
-        const record = (await this.deps.handover.all()).find((item) => item.issueId === issue.id) ?? null;
-        const instruction = verdict.instruction ?? "The verifier found the ticket's work incomplete; continue it.";
-        const result = await this.deps.sessions.succeed(issue.id, issue.identifier, record?.agentId ?? null, instruction, async () => {}).catch((error: unknown): Succession => ({ kind: "impossible", reason: message(error) }));
-        if (result.kind === "started" || result.kind === "live") {
-          console.log(`[linear-tickets] ${issue.identifier}: steward: the verifier asked for more work; a successor continues it`);
+      // A generation whose launch never returned an agent: the marker on the launch's label finds
+      // it again, so its verdict is read instead of the ticket being classified as ordinary work.
+      if (!verifier.agentId) {
+        const adopted = (await classifyTicketAgents(paseo, issue.id, now, this.deps.inspect).catch(() => null))?.live
+          .find((agent) => agent.labels?.[STEWARD_VERIFIER_LABEL] === verifier.marker) ?? null;
+        if (adopted) {
+          await this.deps.store.update((file) => {
+            const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
+            if (ticket.verifier?.marker === verifier.marker) ticket.verifier = { ...ticket.verifier, agentId: adopted.id };
+          });
+          console.log(`[linear-tickets] ${issue.identifier}: steward: adopted verifier ${short(adopted.id)} (generation ${verifier.marker.slice(0, 8)})`);
           return;
         }
-        await this.escalate(candidate, `the verifier asked for more work but no successor could start: ${successionReason(result)}`);
+        if (now - Date.parse(verifier.at) > CLAIM_GRACE_MS) {
+          if (!this.enabled) return;
+          await this.deps.store.update((file) => {
+            const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
+            if (ticket.verifier?.marker === verifier.marker) ticket.verifier = null;
+          });
+          await this.refused(issue, now, "the verifier's launch left no agent");
+          return;
+        }
+      }
+      if (now - Date.parse(verifier.at) <= VERIFY_TIMEOUT_MS) return;
+      if (!this.enabled) return;
+      const applying = candidate.ticket.applying?.marker === verifier.marker ? candidate.ticket.applying : null;
+      if (applying && applying.step === "claimed" && now - Date.parse(applying.at) < CLAIM_GRACE_MS) return;
+      if (applying && applying.step !== "claimed") {
+        await this.archiveAgent(paseo, verifier.agentId);
+        await this.consume(issue, verifiedOf(applying.verdict));
+        return;
+      }
+      // The timeout is journaled like a verdict, and its owner-facing escalation is committed
+      // before the verifier is consumed: a failed call or a reload retries the decision instead of
+      // losing it and launching a fresh verifier over the same ticket.
+      if (!await this.claimApplication(issue, verifier.marker, "timeout", now)) return;
+      await this.archiveAgent(paseo, verifier.agentId);
+      await this.escalate(candidate, "the verifier did not report within 45 minutes");
+      await this.step(issue, verifier.marker, "escalated", now);
+      await this.consume(issue, null);
+      return;
+    }
+    if (!this.enabled) return;
+    console.log(`[linear-tickets] ${issue.identifier}: the verifier's verdict is ${verdict.verdict}`);
+    const applying = candidate.ticket.applying?.marker === verifier.marker ? candidate.ticket.applying : null;
+    // Another pass is applying this verdict right now; the effects committed before a reload are
+    // only consumed. Neither case repeats an effect.
+    if (applying && applying.step === "claimed" && now - Date.parse(applying.at) < CLAIM_GRACE_MS && applying.verdict === verdict.verdict) return;
+    if (applying && applying.step !== "claimed") {
+      await this.archiveAgent(paseo, verifier.agentId);
+      await this.consume(issue, verifiedOf(applying.verdict));
+      return;
+    }
+    // A successor the verdict asks for is a start like any other: it spends the per-pass cap (its
+    // application waits for the next pass, nothing consumed) and the rolling recovery budget, and a
+    // deliberate wait that appeared while the verifier ran wins over it.
+    if (verdict.verdict === "resume") {
+      if (candidate.facts.deliberate) {
+        this.once(`verdict:${issue.id}`, `${issue.identifier}: the verifier asked for more work but the ticket deliberately waits (${candidate.facts.deliberate}); it waits`);
+        return;
+      }
+      if (!this.cap(pass, candidate, "resume")) return;
+      if (candidate.facts.restarts >= RESTART_CAP) {
+        // The recovery budget is spent: the verdict does not open a way around it, and the decision
+        // is journaled before the verifier is consumed.
+        if (!await this.claimApplication(issue, verifier.marker, "exhausted", now)) return;
+        await this.archiveAgent(paseo, verifier.agentId);
+        await this.escalate(candidate, `the verifier asked for more work but the ticket's restart budget (${RESTART_CAP} in 24 hours) is spent`);
+        await this.step(issue, verifier.marker, "escalated", now);
+        await this.consume(issue, candidate.facts.landedSignature || null);
         return;
       }
     }
+    if (!await this.claimApplication(issue, verifier.marker, verdict.verdict, now)) return;
+    // The verifier is archived before any effect: its verdict is already on disk, and it must never
+    // be mistaken for the implementation agent a `resume` is looking for.
+    await this.archiveAgent(paseo, verifier.agentId);
+    try {
+      switch (verdict.verdict) {
+        case "close": {
+          // The evidence is re-read before the ticket is closed: a pull request opened (or recorded)
+          // while the verifier ran, an owner hold, a fresh blocker or a live agent aborts the close,
+          // and the next pass classifies the ticket anew.
+          const blocked = await this.completionFence(paseo, settings, names, candidate, now);
+          if (blocked) {
+            console.log(`[linear-tickets] ${issue.identifier}: the verifier's close verdict is not applied — ${blocked}`);
+            await this.consume(issue, null);
+            return;
+          }
+          await this.close(paseo, candidate, "its verifier judged the landed work complete");
+          await this.step(issue, verifier.marker, "closed", now);
+          await this.consume(issue, candidate.facts.landedSignature || null);
+          return;
+        }
+        case "ask_owner": {
+          await this.escalate(candidate, verdict.question ?? "the verifier asked the owner for a decision", verdict.options ?? undefined);
+          await this.step(issue, verifier.marker, "escalated", now);
+          await this.consume(issue, null);
+          return;
+        }
+        case "park": {
+          await this.park(issue, candidate, names, verdict);
+          await this.step(issue, verifier.marker, "parked", now);
+          await this.consume(issue, null);
+          return;
+        }
+        case "resume": {
+          const record = (await this.deps.handover.all()).find((item) => item.issueId === issue.id) ?? null;
+          const instruction = verdict.instruction ?? "The verifier found the ticket's work incomplete; continue it.";
+          // The admitted attempt is charged before the start, exactly like the ordinary successor
+          // path: a verdict is not a way around the rolling budget.
+          await this.deps.store.update((file) => {
+            const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
+            ticket.restarts = [...recent(ticket.restarts, now), this.iso(now)];
+          });
+          const result = await this.deps.sessions.succeed(issue.id, issue.identifier, record?.agentId ?? null, instruction, async () => {
+            console.log(`[linear-tickets] ${issue.identifier}: steward: the verifier asked for more work; a successor continues it`);
+          }).catch((error: unknown): Succession => ({ kind: "impossible", reason: message(error) }));
+          if ("agent" in result && result.agent.id !== verifier.agentId) {
+            await this.step(issue, verifier.marker, "resumed", now);
+            await this.consume(issue, null);
+            return;
+          }
+          if ("agent" in result) {
+            // The live agent it would take over from is the verifier itself: no implementation
+            // successor exists, so nothing is consumed and the next pass turns this into a decision.
+            const reason = "the only live agent on the ticket is its verifier";
+            const count = await this.refused(issue, now, reason);
+            this.once(`verdict:${issue.id}`, `${issue.identifier}: ${reason}; the next pass retries or asks the owner`);
+            if (count >= REFUSAL_CAP) await this.exhausted(candidate, verifier.marker, reason, now);
+            return;
+          }
+          if (result.kind === "wait" && queueWait(result.reason)) {
+            // Nothing was attempted: the attempt is refunded and the verdict waits for admission.
+            await this.unspend(issue, now);
+            this.once(`verdict:${issue.id}`, `${issue.identifier}: the verifier's successor waits (${result.reason}); the next pass retries`);
+            return;
+          }
+          const reason = result.kind === "wait" ? `the successor waits: ${result.reason}` : `no successor can start: ${successionReason(result)}`;
+          const count = await this.refused(issue, now, reason);
+          this.once(`verdict:${issue.id}`, `${issue.identifier}: ${reason}; the next pass tries again`);
+          if (count >= REFUSAL_CAP) await this.exhausted(candidate, verifier.marker, reason, now);
+          return;
+        }
+      }
+    } catch (error) {
+      // The claim and the verdict stay: the next pass resumes from the recorded step.
+      this.once(`verdict:${issue.id}`, `${issue.identifier}: applying the verifier's ${verdict.verdict} failed: ${message(error)}; the next pass retries`);
+      throw error;
+    }
   }
 
-  // One Backlog follow-up for what a verifier says remains, related to the ticket (the
-  // plan-follow-ups path's shape: a Backlog ticket in the origin's project).
-  private async followUp(issue: StewardIssue, remaining: string): Promise<void> {
-    const created = await this.deps.linear.createIssue({
-      teamId: issue.teamId,
-      title: `Follow-up for ${issue.identifier}`.slice(0, 80),
-      description: `${remaining}\n\nFiled by Paseo's ticket steward from a verifier's verdict on ${issue.identifier}.`,
-      backlog: true,
-      ...(issue.projectId ? { projectId: issue.projectId } : {}),
+  // The verdict application's claim, written before its first effect. False: another pass holds
+  // it, or this pass just applied it.
+  private claimApplication(issue: StewardIssue, marker: string, verdict: StewardApplying["verdict"], now: number): Promise<boolean> {
+    return this.deps.store.update((file) => {
+      const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
+      const current = ticket.applying;
+      if (current?.marker === marker && this.clock() - Date.parse(current.at) < CLAIM_GRACE_MS) return false;
+      ticket.applying = { marker, verdict, step: "claimed", at: this.iso(now) };
+      return true;
     });
-    await this.deps.linear.relate(created.id, issue.id, "related").catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: relating the follow-up ${created.identifier} failed: ${message(error)}`));
-    await this.deps.linear.comment(issue.id, `A verifier found the ticket's work complete and its remaining work was filed as ${created.identifier}: ${remaining.slice(0, 500)}`).catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: the follow-up comment failed: ${message(error)}`));
   }
 
-  // The parent of finished sub-issues: complete (or cancel when everything was canceled), then
-  // archive its agents. Also the close of a landing verifier's verdict.
-  private async close(paseo: PaseoApi, candidate: Candidate, canceled: boolean): Promise<void> {
-    const { issue, facts } = candidate;
+  // The verdict successor outran every budget: the verifier's ask becomes the owner's decision,
+  // journaled before the verifier is consumed (the same shape as its timeout).
+  private async exhausted(candidate: Candidate, marker: string, reason: string, now: number): Promise<void> {
+    const { issue } = candidate;
+    // This pass owns the application (same marker), so the journal is rewritten without the grace.
+    await this.deps.store.update((file) => {
+      const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
+      ticket.applying = { marker, verdict: "exhausted", step: "claimed", at: this.iso(now) };
+    });
+    console.log(`[linear-tickets] ${issue.identifier}: steward: the verifier's successor cannot run (${reason})`);
+    await this.escalate(candidate, reason);
+    await this.step(issue, marker, "escalated", now);
+    await this.consume(issue, null);
+  }
+
+  // Whether the close verdict may still be applied, read fresh at effect time: the ticket's own
+  // current facts (host ownership, deletion, an owner hold or manual step, a plan under review, a
+  // newly open sub-issue, a fresh blocker, a live implementation agent, an owner wait), then the
+  // complete pull-request inventory of the ticket — every attached and recorded pull request, read
+  // from GitHub now by pr-watch's `completionPulls` across all of its repositories, without the
+  // retirement policy's veto exclusions and without trusting a recorded closed state.
+  private async completionFence(paseo: PaseoApi, settings: PluginSettings, names: DispatchLabels & { trigger: string }, candidate: Candidate, now: number): Promise<string | null> {
+    const { issue } = candidate;
+    if (await this.deps.deletions?.blocked(issue.id).catch(() => true)) return "the ticket is paused for deletion";
+    const ownership = await this.deps.owner(issue.id).catch(() => "unknown" as HostOwnership);
+    if (ownership !== "here") return `another host owns the ticket (${ownership})`;
+    const appIds = (await this.deps.linear.trustedAppIds().catch(() => [])).filter(Boolean);
+    const labelNames = [names.trigger, names.running, names.failed, names.blocked, names.needsYou, names.manual, names.hold, names.attended, names.queued];
+    const fresh = (await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: labelNames, appIds, ids: [issue.id] }))[0] ?? null;
+    if (!fresh) return "the ticket cannot be read";
+    if (CLOSED_TYPES.includes(fresh.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number])) return `the ticket is already ${fresh.status}`;
+    if (hasLabel(fresh.labels, names.hold)) return `the owner put the ticket on hold (${names.hold})`;
+    if (hasLabel(fresh.labels, names.manual)) return `the ticket carries a manual step (${names.manual})`;
+    if (hasLabel(fresh.labels, DO_NOT_MERGE)) return "the ticket is marked do-not-merge";
+    if (planStage(fresh.status, fresh.statusType)) return `the ticket's plan is in ${fresh.status}`;
+    const openChildren = fresh.children.filter((child) => !CLOSED_TYPES.includes(child.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number])).length;
+    if (openChildren > 0 || !fresh.childrenComplete) return "a sub-issue is still open";
+    const blocker = fresh.blockers.find((entry) => !finishedBlocker(entry));
+    if (blocker) return `it waits for ${blocker.identifier}`;
+    const live = (await classifyTicketAgents(paseo, issue.id, now, this.deps.inspect)).live
+      .filter((agent) => !agent.labels?.[STEWARD_VERIFIER_LABEL] && agent.id !== verifierIdOf(candidate));
+    if (live.length) return `an agent works on it again (${short(live[0].id)})`;
+    const record = (await this.deps.handover.all()).find((item) => item.issueId === issue.id) ?? null;
+    if (record?.waiting) {
+      const handed = await this.deps.watchdog.handedOver().catch(() => new Map<string, string>());
+      const wait = await this.waitState(fresh, record.waiting, [], { handed, record, roots: new Map() }, now);
+      if (wait === "live") return "it waits for the owner";
+    }
+    // The complete, fresh inventory: everything the ticket recorded plus everything Linear carries
+    // as its pull request, reopened or not, do-not-merge or fork or another repository.
+    const urls = pullUrls(fresh, record ?? undefined);
+    const stack = await this.deps.completionPulls(issue.id, issue.identifier, urls).catch(() => "unknown" as StackState);
+    if (stack === "open") return "an open pull request of the ticket exists";
+    if (stack === "unknown") return "the ticket's pull requests cannot be read";
+    return null;
+  }
+
+  // One committed step of a verdict application, written before the next effect runs.
+  private step(issue: StewardIssue, marker: string, step: StewardApplying["step"], now: number): Promise<void> {
+    return this.deps.store.update((file) => {
+      const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
+      if (ticket.applying?.marker === marker) ticket.applying = { ...ticket.applying, step, at: this.iso(now) };
+    });
+  }
+
+  // The verifier is consumed only here, after its verdict's effects are in: the claim goes, and the
+  // landed set it judged is remembered so the next pass does not verify the same work twice.
+  private consume(issue: StewardIssue, verified: string | null): Promise<void> {
+    return this.deps.store.update((file) => {
+      const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso());
+      ticket.verifier = null;
+      ticket.applying = null;
+      if (verified !== null) ticket.verified = verified;
+    });
+  }
+
+  // The verifier's park: the ticket waits for another ticket (`blockedBy`) and/or a date, is moved
+  // to Todo, and carries the trigger label only when a blocker must finish first — the label
+  // dispatch starts it then. Without a blocker nothing starts it: the `parked` marker keeps the
+  // steward's hands off until the owner acts.
+  private async park(issue: StewardIssue, candidate: Candidate, names: DispatchLabels & { trigger: string }, verdict: StewardVerdict): Promise<void> {
+    const reason = verdict.reason ?? "the verifier parked the ticket";
+    const blocker = verdict.blockedBy ? await this.deps.linear.issueRef(verdict.blockedBy) : null;
+    if (verdict.blockedBy && !blocker) throw new Error(`Linear has no ticket ${verdict.blockedBy}`);
+    if (blocker) await this.deps.linear.relate(blocker.id, issue.id, "blocks");
+    if (verdict.dueDate) await this.deps.linear.setDueDate(issue.id, verdict.dueDate);
+    const moved = await this.deps.linear.moveToReady(issue.id);
+    if (blocker) await this.deps.linear.addLabel(issue.id, names.trigger);
+    const waits = [blocker ? `${blocker.identifier} to finish` : null, verdict.dueDate ? `the date ${verdict.dueDate}` : null].filter(Boolean).join(" and ");
+    await this.deps.linear.comment(issue.id, `Paseo's ticket steward parked this ticket${waits ? `: it waits for ${waits}` : ""}. ${reason}`).catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: the park comment failed: ${message(error)}`));
+    await this.deps.store.update((file) => {
+      const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso());
+      ticket.parked = { at: this.iso(), blockedBy: blocker?.identifier ?? null, dueDate: verdict.dueDate, reason: reason.slice(0, 300) };
+      ticket.log = [...ticket.log, { at: this.iso(), action: `parked: ${reason.slice(0, 200)}` }].slice(-LOG_LIMIT);
+    });
+    console.log(`[linear-tickets] ${issue.identifier}: steward: parked (${reason}${moved.note ? `; ${moved.note}` : ""})`);
+  }
+
+  // The close of a landing verifier's verdict: complete the ticket, comment why, then archive its
+  // agents (they hold no slot any more).
+  private async close(paseo: PaseoApi, candidate: Candidate, why: string): Promise<void> {
+    const { issue } = candidate;
     const list = issue.children.map((child) => `- ${child.identifier}: ${child.status}`).join("\n");
-    if (canceled) await this.deps.linear.cancel(issue.id, `Every sub-issue was canceled, so ${issue.identifier} is canceled too.\n\n${list}`);
-    else await this.deps.linear.complete(issue.id);
-    await this.deps.doneTickets.written(issue.id, canceled ? "canceled" : "completed", this.clock());
-    const why = canceled
-      ? "every sub-issue is finished and canceled"
-      : facts.landedPulls.length ? `its pull requests landed (${facts.landedPulls.map((pull) => pull.url).join(", ")})` : "every sub-issue is finished";
-    await this.deps.linear.comment(issue.id, `Paseo's ticket steward completed this ticket: ${why}.${list ? `\n\n${list}` : ""}`).catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: the completion comment failed: ${message(error)}`));
-    // The ticket's agents hold no slot any more: archive them, in the ticket's turn and under its
-    // start gate like every recovery.
+    await this.deps.linear.complete(issue.id);
+    await this.deps.doneTickets.written(issue.id, "completed", this.clock());
+    const landed = candidate.facts.landedPulls.length ? ` Its pull requests landed (${candidate.facts.landedPulls.map((pull) => pull.url).join(", ")}).` : "";
+    await this.deps.linear.comment(issue.id, `Paseo's ticket steward completed this ticket: ${why}.${landed}${list ? `\n\n${list}` : ""}`).catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: the completion comment failed: ${message(error)}`));
     await this.deps.sessions.retireTurn(issue.id, async () => {
       const roots = (await this.rootsOf(paseo, issue.id)).filter((agent) => !agent.archivedAt);
       for (const agent of roots) await this.archiveAgent(paseo, agent.id);
@@ -1291,7 +1760,7 @@ export class Steward {
     const record = (await this.deps.handover.all()).find((item) => item.issueId === issue.id) ?? null;
     if (record?.waiting) return { state: "failed", reason: "the ticket has a recorded wait for the owner" };
     if (type === "completed") {
-      const stack = await this.deps.stacked(issue.id).catch(() => "unknown" as StackState);
+      const stack = await this.deps.completionPulls(issue.id, issue.identifier, pullUrls(issue, record ?? undefined)).catch(() => "unknown" as StackState);
       if (stack === "open") return { state: "failed", reason: "the ticket's stack has open pull requests" };
       if (stack === "unknown") return { state: "failed", reason: "the ticket's open pull requests cannot be read" };
     }
@@ -1306,9 +1775,10 @@ export class Steward {
         if (!fresh || fresh.archivedAt || fresh.updatedAt !== agent.updatedAt || fresh.pendingPermissions?.length) continue;
         await this.archiveAgent(paseo, agent.id);
         archived++;
-        const core = await this.deps.linear.issueCore(issue.id).catch(() => null);
-        if (core && hasLabel(core.labels, names.running)) await this.deps.linear.removeLabel(issue.id, names.running, core.labels).catch(() => {});
-        await this.deps.labels.remove(agent.id);
+        // The label comes off only once a fresh read confirms it is there, and the debt is dropped
+        // only once the removal went through: a failed read or a rate limit keeps it for the next
+        // pass (settleLabels), never losing it.
+        await this.settleLabel(issue.id, issue.identifier, agent.id, names);
       }
       void settings;
       return archived ? { state: "done", reason: `archived ${archived} quiet agent(s) of ${state.status}` } : { state: "failed", reason: "the agent was active again" };
@@ -1317,8 +1787,65 @@ export class Steward {
     }
   }
 
-  // The archive of one agent: refresh first, then archive. A gone agent is nothing to do.
-  private async archiveAgent(paseo: PaseoApi, agentId: string): Promise<void> {
+  // The `<trigger>-running` labels archived agents still owe, settled from the pass's own agent
+  // reading (retired-labels.json, written before the archive). A ticket whose next root agent is
+  // unarchived keeps the label (the successor owns it) and only drops the debt; one that moved to
+  // the peer host drops the debt too, since the peer manages its labels.
+  private async settleLabels(paseo: PaseoApi, names: DispatchLabels & { trigger: string }, roots: Map<string, TicketRoots>): Promise<void> {
+    const debt = await this.deps.labels.all().catch((error: unknown) => {
+      this.once("labels", `the steward could not read the archived agents' labels: ${message(error)}; the next pass retries`);
+      return [] as RetiredLabel[];
+    });
+    for (const entry of debt) {
+      if (!this.alive()) return;
+      const ownership = await this.deps.owner(entry.issueId).catch(() => "unknown" as HostOwnership);
+      if (ownership === "unknown") continue;
+      if (ownership === "elsewhere") {
+        await this.deps.labels.remove(entry.agentId).catch(() => undefined);
+        continue;
+      }
+      const agents = roots.get(entry.issueId)?.roots ?? await this.rootsOf(paseo, entry.issueId).catch(() => [] as WatchedAgent[]);
+      const mine = agents.find((agent) => agent.id === entry.agentId);
+      if (mine && !mine.archivedAt) continue; // the archive never happened: the label is this agent's
+      if (agents.some((agent) => agent.id !== entry.agentId && !agent.archivedAt)) {
+        await this.deps.labels.remove(entry.agentId).catch(() => undefined); // a successor re-added it
+        continue;
+      }
+      await this.settleLabel(entry.issueId, entry.identifier, entry.agentId, names);
+    }
+  }
+
+  // One archived agent's label: read the ticket, remove the label when it is still there, then drop
+  // the debt. An unreadable ticket or a failed removal keeps the debt for the next pass.
+  private async settleLabel(issueId: string, identifier: string, agentId: string, names: DispatchLabels & { trigger: string }): Promise<void> {
+    const core: IssueCore | null = await this.deps.linear.issueCore(issueId).catch(() => null);
+    if (!core) {
+      this.once(`labels:${agentId}`, `${identifier}: its ${names.running} label cannot be settled (the ticket cannot be read); the next pass retries`);
+      return;
+    }
+    if (hasLabel(core.labels, names.running)) {
+      try {
+        await this.deps.linear.removeLabel(issueId, names.running, core.labels);
+      } catch (error) {
+        if (error instanceof RateLimitedError) throw error;
+        this.once(`labels:${agentId}`, `${identifier}: removing its ${names.running} label failed: ${message(error)}; the next pass retries`);
+        return;
+      }
+    }
+    await this.deps.labels.remove(agentId).catch((error: unknown) => this.once(`labels:${agentId}`, `${identifier}: dropping the archived label record failed: ${message(error)}; the next pass retries`));
+  }
+
+  // The stale `<trigger>-failed` of an earlier attempt comes off once an agent works the ticket
+  // again (README, "Statuses and labels"): after a successful start or a successor.
+  private async clearFailed(issue: StewardIssue, names: DispatchLabels & { trigger: string }): Promise<void> {
+    if (!hasLabel(issue.labels, names.failed)) return;
+    await this.deps.linear.removeLabel(issue.id, names.failed, issue.labels).catch((error: unknown) => this.once(`failed:${issue.id}`, `${issue.identifier}: clearing its ${names.failed} label failed: ${message(error)}; the next pass retries`));
+  }
+
+  // The archive of one agent: refresh first, then archive. A gone agent is nothing to do. An empty
+  // id is a verifier generation whose launch never returned an agent.
+  private async archiveAgent(paseo: PaseoApi, agentId: string | null): Promise<void> {
+    if (!agentId) return;
     const current = await paseo.agents.ref(agentId).refresh().catch(() => null);
     if (!current || current.agent.archivedAt) return;
     await paseo.agents.ref(agentId).archive().catch((error: unknown) => console.error(`[linear-tickets] archiving agent ${short(agentId)} failed: ${message(error)}`));
@@ -1432,6 +1959,33 @@ function recordPulls(record: HandoverRecord | undefined): string[] {
   return [...urls];
 }
 
+// Every pull request of one ticket: the record's own links and the GitHub pull request attachments
+// Linear carries, so a pull request in another repository is judged too (the landed set, the close
+// check).
+function pullUrls(issue: StewardIssue, record: HandoverRecord | undefined): string[] {
+  const urls = new Set(recordPulls(record));
+  for (const attachment of issue.attachments) if (attachment.sourceType === "github" && /\/pull\/\d+/.test(attachment.url)) urls.add(attachment.url);
+  return [...urls];
+}
+
+// A ticket the store does not know yet, at the moment a pass first classifies it.
+function newTicket(identifier: string, at: string): StewardTicket {
+  return {
+    identifier, situation: "moving", since: at, at, claim: null, restarts: [], refusals: [], resumedAt: null,
+    verifier: null, verified: null, escalated: null, ownerAt: null, card: null, queued: null, applying: null, parked: null, log: [],
+  };
+}
+
+// A start admission refused without anything being attempted: the ticket waits in the queue for a
+// slot, focus, a blocker, a parked plan or the owner's presence, and the pass retries it. Nothing
+// was tried, so no recovery budget is spent (finding: ordinary admission deferrals are queue
+// entries, not failures). Everything else a deferral can mean is a failure like any other.
+function queueWait(reason: string): boolean {
+  return /^(Queued: |This ticket is paused for deletion|Paseo is not connected yet|A launch for this ticket is under way|Waiting for .+ to finish)/.test(reason)
+    || reason === FOCUS_REASON || reason === WAITING_PLAN_REASON || reason === AWAY_REASON
+    || reason.startsWith(LIVE_AGAIN_PREFIX);
+}
+
 // How long the live roots have been quiet: null while one of them has an open turn, else the
 // longest quiet time among them (Paseo's own agent update; the watchdog's deeper evidence rules
 // when it acts).
@@ -1443,7 +1997,7 @@ function idleMinutesOf(roots: WatchedAgent[], now: number): number | null {
 
 function refusalReason(facts: StewardFacts, situation: StewardSituation): string {
   const reasons: Partial<Record<StewardSituation, string>> = {
-    "queued-too-long": "it has waited in the queue for more than a day",
+    "queued-too-long": `it has waited in the queue for more than ${facts.queuedHours} hours`,
     "restart-exhausted": `its restarts (${facts.restarts} of ${RESTART_CAP}) left no agent`,
     "watchdog-exhausted": "the watchdog used both of its recovery cycles in the last 24 hours",
     "refused": `every start it tried was refused${facts.lastRefusal ? ` (last: ${facts.lastRefusal})` : ""}`,

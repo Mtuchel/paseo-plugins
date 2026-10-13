@@ -324,8 +324,9 @@ export class TicketStarter {
   // start fresh. `lead`: the last part of the first prompt (see Launcher). `verifier`: a
   // short-lived read-only check of the ticket's recorded work (steward.ts): no plan policy and no
   // fresh branch (always the recorded one), the cheap tier, and instructions instead of the plan
-  // notes, so a verifier never plans, implements or pushes.
-  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string; resume?: ActivationResume; verifier?: { brief: string } }): Promise<Started> {
+  // notes, so a verifier never plans, implements or pushes. Its `marker` is the generation the
+  // steward created for this check: it goes into the launch, so the verdict answers that verifier.
+  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string; resume?: ActivationResume; verifier?: { brief: string; marker: string } }): Promise<Started> {
     if (await this.deps.deletions?.blocked(issueId)) throw new Error("This ticket is paused for deletion; no agent was started.");
     const detail: TicketDetail = await this.deps.linear.detail(issueId);
     const source = { projectId: detail.projectId, projectName: detail.issue.project, teamId: detail.teamId, teamName: detail.issue.team };
@@ -367,11 +368,14 @@ export class TicketStarter {
     const resume = options.fresh ? null
       : options.resume ? await this.importedResume(project, detail.issue.identifier, options.resume)
       : recordedResume;
-    const resumeOnly = options.resumeOnly || Boolean(options.verifier);
+    const resumeOnly = options.resumeOnly || Boolean(options.verifier && resume);
     if (resumeOnly && !resume) throw new ResumeUnavailableError(`${detail.issue.identifier} has no recorded branch to continue on.`);
     if (resumeOnly && project.projectKind !== "git") throw new ResumeUnavailableError(`${target} is not a Git project, so ${detail.issue.identifier}'s branch cannot be continued.`);
     const setup = options.verifier
-      ? { identifier: detail.issue.identifier, untrusted: true, policy: null, modeId: undefined, notes: [options.verifier.brief], labels: {}, env: {}, tier: { tier: "cheap" as const, reason: "a steward verifier runs on the cheap tier" } }
+      // A verifier reads and judges only: the provider's safe (read-only) mode, the cheap tier, the
+      // read-only brief as its whole instructions, no plan policy. `SAFE_MODES` is the same mapping
+      // the planner runs take; a provider without one keeps the owner's usual mode.
+      ? { identifier: detail.issue.identifier, untrusted: true, policy: null, modeId: SAFE_MODES[preference.model.split("/")[0]] ?? undefined, notes: [options.verifier.brief], labels: {}, env: {}, tier: { tier: "cheap" as const, reason: "a steward verifier runs on the cheap tier" } }
       : await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, { tiers: this.deps.tiers, routes: this.deps.routes, settings });
     const model = tierModel(settings, preference.model.split("/")[0], setup.tier?.tier ?? null, { provider: preference.model, ...(preference.thinkingOptionId ? { thinkingOptionId: preference.thinkingOptionId } : {}) });
     const base = {
@@ -384,9 +388,19 @@ export class TicketStarter {
       // A required plan goes to Planning on the agent's first turn (write-back), not In Progress.
       markInProgress: settings.markInProgress && setup.policy !== "required" && !options.verifier,
     };
-    const launchOptions = { promptTemplate: settings.template ?? undefined, markInProgress: base.markInProgress, linearAccess: settings.agentLinearAccess, labels: { ...options.labels, ...setup.labels }, env: setup.env, ...(options.lead ? { lead: options.lead } : {}) };
+    // The owner's prompt template describes the ticket work (branch, checks, pull request): a
+    // verifier gets none of it — its whole prompt is the read-only brief.
+    const launchOptions = { promptTemplate: options.verifier ? undefined : settings.template ?? undefined, markInProgress: base.markInProgress, linearAccess: settings.agentLinearAccess, labels: { ...options.labels, ...setup.labels }, env: setup.env, ...(options.lead ? { lead: options.lead } : {}), ...(options.verifier ? { verifier: options.verifier.marker } : {}) };
     const plan = { untrusted: setup.untrusted, plan: setup.policy };
     const started = (result: { agentId: string }) => recordStart(this.deps.tiers, { id: issueId, identifier: detail.issue.identifier }, setup.tier, result.agentId, model.provider);
+    // A verifier reads the ticket's work where it lives: on the recorded branch when that can be
+    // opened, otherwise in the mapped checkout — never a fresh branch or worktree of its own, and
+    // never the "no recorded branch" refusal ladder that would leave a finished parent unverifiable.
+    const verifierInCheckout = async () => {
+      const result = await this.deps.launcher.start({ ...base, requestId: randomUUID() }, paseo, { ...launchOptions, readOnlyCheckout: true });
+      await started(result);
+      return { ...result, warnings: [...result.warnings, ...shardWarnings], provider: model.provider, target, resumed: false, ...plan };
+    };
     if (resume && project.projectKind === "git") {
       try {
         const result = await this.deps.launcher.start({ ...base, requestId: randomUUID() }, paseo, { ...launchOptions, resume });
@@ -394,11 +408,18 @@ export class TicketStarter {
         return { ...result, warnings: [...result.warnings, ...shardWarnings], provider: model.provider, target, resumed: true, ...plan };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (options.verifier) {
+          // The recorded worktree and its branch are gone: the verifier still judges the ticket,
+          // read-only, in the checkout.
+          console.error(`[linear-tickets] ${detail.issue.identifier}: the verifier could not open the recorded branch (${message}); it reads the checkout instead`);
+          return await verifierInCheckout();
+        }
         if (options.resumeOnly || options.resume?.branch) throw new ResumeUnavailableError(`Could not continue ${detail.issue.identifier} on ${resume.branch}: ${message}`);
         // A deleted or merged branch cannot be continued; a fresh start is the useful fallback.
         console.error(`[linear-tickets] ${detail.issue.identifier}: resume failed, starting fresh: ${message}`);
       }
     }
+    if (options.verifier) return await verifierInCheckout();
     let baseBranch: string | undefined;
     if (project.projectKind === "git") {
       const available = await this.branches(project.projectRootPath);

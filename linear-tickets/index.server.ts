@@ -243,11 +243,11 @@ export default function contribute(server: PluginServerContext) {
     watchdog: watchdogStore, manualTasks, needsYou, settings,
     // Which host owns a ticket's automatic work (activation-guard.ts ticketOwnership).
     owner: (issueId) => ticketOwner(issueId),
-    // The pull request watch's own state for the tickets' recorded pull requests, and one ticket's
-    // stack state (pr-watch.ts pullStates and stackState).
+    // Cached PR facts for classification; completion separately checks the current,
+    // full PR inventory across every attached, recorded and worktree repository.
     pulls: (urls) => pullRequests.pullStates(urls),
-    stacked: (issueId) => pullRequests.stackState(issueId),
-    intake, doneTickets, labels: new RetiredLabels(), deletions, focus,
+    completionPulls: (issueId, identifier, urls) => pullRequests.completionPulls(issueId, identifier, urls),
+    intake, doneTickets, labels: new RetiredLabels(), deletions, focus, planned: waitingPlans,
   });
   const relay = new CommentRelay(linear, undefined, needsYou, route, replies);
   const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, steward, focus, parked: waitingPlans });

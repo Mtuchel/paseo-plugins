@@ -27,9 +27,11 @@ export type PlannerStart = { runId: string; linearProjectId: string; projectName
 // `resume` continues another agent's work: same branch (and worktree while it still exists),
 // with the handover text ahead of the ticket prompt. `labels` are added to the agent, `env` to
 // its provider process. `lead`: why Paseo started the agent now (the pull request's next step for
-// a successor the pull request watch started), the last part of its first prompt.
+// a successor the pull request watch started), the last part of its first prompt. `verifier`: the
+// marker of the steward's verifier generation this start belongs to (steward.ts); it reaches the
+// ticket MCP server's args, so the verdict the agent records is bound to that verifier.
 export type ResumeTarget = { branch: string; worktreePath: string | null; handover: string };
-type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess?: boolean; labels?: Record<string, string>; env?: Record<string, string>; resume?: ResumeTarget; lead?: string };
+type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess?: boolean; labels?: Record<string, string>; env?: Record<string, string>; resume?: ResumeTarget; lead?: string; verifier?: string; readOnlyCheckout?: boolean };
 // A held per-ticket start gate (see Launcher.gate); `release` is idempotent.
 export type Gate = { release(): void };
 export const LEAD_INTRO = "Paseo started you because the pull request needs this now:";
@@ -116,7 +118,7 @@ export class Launcher {
   }
 
   start(input: Start, paseo: PaseoApi, options: Options = {}): Promise<Result> {
-    const fingerprint = JSON.stringify([input.id, input.projectId, input.baseBranch, input.provider, input.modeId, input.thinkingOptionId, input.instructions, options.promptTemplate ?? "", options.markInProgress ?? false, options.linearAccess ?? false, options.lead ?? ""]);
+    const fingerprint = JSON.stringify([input.id, input.projectId, input.baseBranch, input.provider, input.modeId, input.thinkingOptionId, input.instructions, options.promptTemplate ?? "", options.markInProgress ?? false, options.linearAccess ?? false, options.lead ?? "", options.verifier ?? ""]);
     return this.tracked(input.id, input.requestId, fingerprint, "This launch request has already been used. Reopen the ticket to start another agent.", (onCreate) => this.launch(input, paseo, options, onCreate));
   }
 
@@ -241,7 +243,7 @@ export class Launcher {
     }
     if (await this.deletions?.blocked(detail.issue.id)) throw new Error("This ticket is paused for deletion; no agent was started.");
     // Written before any creation so a failure here cannot leave a half-launched ticket.
-    const mcpServers = options.linearAccess ? { [TICKET_MCP_NAME]: ticketMcpServer(await this.ticketScript(), detail.issue.id) } : undefined;
+    const mcpServers = options.linearAccess ? { [TICKET_MCP_NAME]: ticketMcpServer(await this.ticketScript(), detail.issue.id, undefined, undefined, options.verifier ?? null) } : undefined;
     onCreate();
     const title = `${detail.issue.identifier}: ${detail.issue.title}`.slice(0, 60);
     const slug = detail.issue.identifier.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) || "ticket";
@@ -252,7 +254,17 @@ export class Launcher {
     const fallback = `${slug}-${input.requestId.slice(0, 8)}`;
     const branchNames = project.projectKind === "git" ? (canonical ? [canonical, `${canonical}-${input.requestId.slice(0, 8)}`] : [fallback]) : [fallback];
     let workspace;
-    if (options.resume) {
+    if (options.readOnlyCheckout) {
+      // A verifier reads the ticket's landed work in the mapped checkout: no worktree and no branch
+      // is created, so a read-only judgement never leaves work (or a branch) behind.
+      workspace = await paseo.workspaces.create({
+        title,
+        requestId: `${input.requestId}-workspace`,
+        source: { kind: "directory", projectId: project.projectId, path: project.projectRootPath },
+      }).catch((error: unknown) => {
+        throw new Error(`Could not open ${project.projectRootPath} for the verifier: ${error instanceof Error ? error.message : "unknown error"}`);
+      });
+    } else if (options.resume) {
       const { branch, worktreePath } = options.resume;
       // The old worktree keeps uncommitted work, so it is reused while it exists; otherwise
       // the branch is checked out into a new worktree.
@@ -325,12 +337,19 @@ export class Launcher {
       provider: input.provider,
       modeId: input.modeId,
       thinkingOptionId: input.thinkingOptionId,
-      // The prompt is built per attempt, so the retry without tools never promises them.
-      prompt: (linearAccess) => [options.resume?.handover, buildPrompt(detail, instructions, options.promptTemplate, linearAccess), options.lead ? `${LEAD_INTRO}\n\n${options.lead}` : ""].filter(Boolean).join("\n\n"),
+      // The prompt is built per attempt, so the retry without tools never promises them. A verifier
+      // gets neither the continuation preamble nor a lead: its whole prompt is the read-only brief,
+      // never "keep going and implement".
+      prompt: (linearAccess) => [
+        options.verifier ? "" : options.resume?.handover,
+        buildPrompt(detail, instructions, options.promptTemplate, linearAccess),
+        options.verifier || !options.lead ? "" : `${LEAD_INTRO}\n\n${options.lead}`,
+      ].filter(Boolean).join("\n\n"),
       labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
       env: { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier },
       mcpServers,
       warnings,
+      ...(options.verifier ? { verifier: true } : {}),
       retry: "Check the workspace's agents before reopening this ticket to try again.",
       blocked: async () => (await this.deletions?.blocked(detail.issue.id)) ? "This ticket is paused for deletion; no agent was started." : null,
     });
@@ -390,6 +409,9 @@ export class Launcher {
     prompt: (linearAccess: boolean) => string; labels: Record<string, string>; env: Record<string, string>;
     mcpServers: Record<string, TicketMcpServer> | undefined; warnings: string[];
     retry: string; blocked?: () => Promise<string | null>;
+    // The steward's verifier: it reports through its ticket tool, so a provider that cannot load
+    // MCP servers is refused instead of started without the tool it needs.
+    verifier?: boolean;
   }): Promise<PaseoAgentHandle> {
     const create = async (linearAccess: boolean, requestId: string, attach: boolean) => {
       const prompt = spec.prompt(linearAccess);
@@ -429,6 +451,10 @@ export class Launcher {
       // The daemon refuses MCP servers for providers that cannot load them before it creates
       // anything, so the same agent starts again without the Linear ticket tools and with the no-write note.
       if (!withTools || viaExtension || !(error instanceof Error && error.message.includes("does not support MCP servers"))) throw unconfirmed(error);
+      // A verifier without its ticket tool cannot report a verdict at all: it would sit until the
+      // 45-minute timeout and its generation would be dropped. Refuse loudly instead — the steward
+      // counts it and puts the choice of provider (or the plugin's omp extension) in front of you.
+      if (spec.verifier) throw unconfirmed(new Error("This provider does not load MCP servers, so the verifier has no steward_verdict tool; choose another provider (for omp, install the plugin's omp extension) to let the steward verify tickets."));
       withTools = false;
       spec.warnings.push("This provider does not load MCP servers, so the agent started without the Linear ticket tools and was told not to change Linear; choose another provider (for omp, install the plugin's omp extension) to let it update Linear.");
       return create(false, `${contextRequestId}-no-mcp`, false).catch((retryError: unknown) => { throw unconfirmed(retryError); });

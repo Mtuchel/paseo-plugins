@@ -3424,6 +3424,40 @@ export class PullRequestWatch {
     return states;
   }
 
+  // Completion is stricter than retirement policy: owner-vetoed and fork PRs are still
+  // unfinished work. Check fresh attachment/record URLs and every known repository,
+  // never the persisted watch state or the policy's deliberate exclusions.
+  async completionPulls(issueId: string, identifier: string, urls: string[]): Promise<StackState> {
+    try {
+      const all = await this.deps.handover.all();
+      const record = all.find((entry) => entry.issueId === issueId);
+      const known = new Set([...urls, ...await this.deps.linear.issueAttachments(issueId), ...(record ? ownedPullRequests(record) : [])]);
+      const repos = new Set<string>();
+      for (const url of known) {
+        const source = PULL_URL.exec(url);
+        if (!source) continue;
+        repos.add(source[1].toLowerCase());
+        const view = await this.view(url);
+        if (view.state.toUpperCase() === "OPEN") return "open";
+        if (!["CLOSED", "MERGED"].includes(view.state.toUpperCase())) return "unknown";
+      }
+      const context = this.context(record ? [record] : [], undefined, all);
+      if (record?.worktreePath) {
+        const repo = await context.repo(record.worktreePath);
+        if (repo) repos.add(repo.toLowerCase());
+      }
+      const names = namesTicket(identifier);
+      for (const repo of repos) {
+        const open = await context.pulls(repo);
+        if (open.some((pull) => !pull.title.startsWith(QUEUE_DRAFT_TITLE) && (names.test(pull.title) || (record && onBranch(record, pull, context))))) return "open";
+      }
+      return "settled";
+    } catch (error) {
+      console.error(`[linear-tickets] ${identifier}: fresh completion PR check failed: ${error instanceof Error ? error.message : error}`);
+      return "unknown";
+    }
+  }
+
   // The steward's terminal-ticket check (steward.ts): whether the ticket's stack landed, by the
   // same rule the poll applies before it reopens a Done ticket (see stackSettled below) -- the
   // owner moved it back to Done after a reopen, or no pull request of it is open. Read off the poll

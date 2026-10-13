@@ -203,6 +203,19 @@ test("agents without a Linear link and subagents never touch Linear", async () =
   assert.deepEqual(linear.writes, []);
 });
 
+test("verifier lifecycle never changes the implementation ticket or its handover", async () => {
+  const linear = new FakeLinear();
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  const verifier = paseoWithLabels({ "linear.issueId": "issue-1", "linear-tickets.steward": "9bba6885-1959-4725-a4ce-8980a9c5b8d" });
+  await writeback.turnStarted({ agent: root, turnId: "verify" }, verifier);
+  await writeback.turnEnded({
+    agent: root, turnId: "verify", outcome: { kind: "completed" },
+    timeline: [{ type: "assistant_message", text: "Verdict recorded. Should I continue?" }],
+  }, verifier);
+  await writeback.archived({ agent: root, archivedAt: new Date().toISOString() }, verifier);
+  assert.deepEqual(linear.writes, []);
+});
+
 test("a completed turn posts its reply, truncated, and links a new pull request then moves to review", async () => {
   const linear = new FakeLinear();
   const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath(), undefined, accept);

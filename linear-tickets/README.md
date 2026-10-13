@@ -1389,7 +1389,7 @@ meanwhile joins it within 5 minutes; while Linear cannot be
 read, the last set read decides, and before the first read only the tickets in flight start. The
 check is part of admission, so it applies to every automatic start path: the label dispatch, a
 group's hand-out, assignments and their threads, a successor for pull-request reviews or
-failing checks, the watchdog's recoveries, the label repair (before it claims a restart),
+failing checks, the watchdog's recoveries, the steward (before it claims a restart),
 activations forwarded by a draining
 host, and the projects. A project starts no new planner run (Plan by hand still does; a run
 already planning finishes) and hands out or restarts only tickets in focus. Everything else waits
@@ -2689,8 +2689,8 @@ has an active Paseo agent, no second one starts; if a plan for it waits for your
 **Parked plans**), the trigger label comes off and nothing starts. When a launch cannot proceed — no mapping,
 no remembered provider, an unavailable project — the ticket gets `<label>-failed` and a
 comment saying why; fix the cause and add the trigger label again. Stale `<label>-running` and
-`<label>-failed` labels are repaired on their own (see **Repairing stale running and failed
-labels** under Projects).
+`<label>-failed` labels are repaired on their own by the **Ticket steward** (see **Ticket steward**
+under Projects).
 
 **Queue blockers are not skipped by a Linear budget pause.** A queue blocker is a ticket the
 merge queue's alert opens under `TUC-538` (tuchel-platform's `tools/ci/queue-blocker-alert.mjs`):
@@ -2700,7 +2700,7 @@ work is paused (see [Rate limits](#rate-limits)), every poll still runs one smal
 to tickets carrying the trigger label **and** a blocker marker, and starts one on sight — a
 blocker holds the merge queue for every stack until it is fixed. A blocker whose launch then
 failed on the pause (it carries `<label>-failed`) is picked up by a blocker-only pass of the
-label repair (see **Repairing stale running and failed labels** under Projects). Both run at
+**Ticket steward** (see **Ticket steward** under Projects). Both run at
 **interactive** priority, the class ticket agents' own Linear work uses: they are admitted above
 the 5% kept for owner decisions and never spend it, and every other ticket keeps waiting for the
 background share. The filtered read is the poll's own `labeledIssues` query with the marker
@@ -2755,7 +2755,7 @@ independently of the agent's own `linear_ticket` tools:
   whose end was lost) — unless someone moved it out of Needs input meanwhile. A ticket whose
   team has no In Progress state, or that is closed, is left where it is. The next wait gets a fresh comment. A
   failed turn adds `<label>-blocked`, which marks errors only; the next completed turn
-  removes it, and so does the label repair (see **Repairing stale running and failed labels**)
+  removes it, and so does the **Ticket steward** (see **Ticket steward** under Projects)
   once the ticket closed or its agent is in a turn again. A message that reaches an agent
   mid-turn and is refused ("Agent is already processing", usually Paseo's finish notification
   of a subagent the agent started) is no failed turn: the agent keeps working, so nothing is
@@ -2856,17 +2856,21 @@ and repairs a ticket that is in none of the five states below with exactly one a
 | **MOVING** | A live root agent with progress inside `steward.idleMinutes` (30 by default), or a watchdog cycle already recovering the ticket, or an idle agent with an open pull request (its own watch nudges it). |
 | **WAITING_OWNER** | A recorded wait for you that something can still end: Needs input, the `paseo-needs-you` label and a decision on the ticket. |
 | **WAITING_BLOCKER** | A named blocker that is not finished (done, canceled, duplicate or in review with merged pull requests). |
-| **QUEUED** | A thread of the ticket waits in the scheduler's line for its blockers or a slot. |
-| **CLOSEABLE** | A parent whose sub-issues are all finished; the pass completes it (canceled when every finished sub-issue was canceled). |
+| **QUEUED** | A thread of the ticket waits in the scheduler's line for its blockers or a slot, or an admission deferral the steward recorded — no budget was spent, the pass retries it; past `steward.queuedEscalateHours` (24 by default) the wait itself reaches you. |
+| **PARKED** | A verifier parked the ticket: it waits for a named blocker and/or a due date, in Todo. |
 
 **Anything else is a defect**, and the steward repairs it with at most one action per ticket and
-pass: a verifier for a landed stack, a successor for an open pull request nobody works on, the
+pass: a verifier for a landed stack (a parent whose sub-issues all finished is only verified too —
+its own live agent, wait for you, blocker or open pull request comes first, and a group-linked
+parent is left to `stepGroup`), a successor for an open pull request nobody works on, the
 replay instruction for a closed-unmerged pull request, a restart for a ticket whose agent vanished,
 a start for an unblocked ticket that never started, one resume for a silent agent, the clearing of
-a stale owner wait, the archive of a finished ticket's agents, a completed parent, or an
-escalation. Restarts are capped at three per ticket within 24 hours and at `steward.maxActionsPerPass`
+a stale owner wait, the archive of a finished ticket's agents, or an escalation. Restarts are capped at three per ticket within 24 hours and at `steward.maxActionsPerPass`
 starts, successors, verifiers and resumes per pass, so a backlog never floods the capacity; closes,
-archives and escalations are not capped.
+archives and escalations are not capped. A deliberate wait — the `hold`/`manual`/`do-not-merge`
+labels, a plan under review or a parked plan, the watchdog's owner Stop, a pending permission, a
+Needs-you item, focus mode, the peer host — is never recovered or escalated by any of them: only
+the owner's own answer, retry (the trigger label) or a fresh instruction ends it.
 
 **Scope.** The open tickets of `dispatch.teamKeys` that Paseo is involved in: delegated to this
 host's Paseo app, carrying any dispatch label, with a handover record, in a labelled project, or a
@@ -2879,11 +2883,19 @@ else).
 the steward starts a short-lived verifier — the cheap tier, the ticket's recorded branch, no plan
 policy and no implementation work — with a fact sheet (the ticket, its sub-issues, the landed pull
 requests, the last agent's reports). It records exactly one verdict through the `steward_verdict`
-tool of its ticket MCP server: `close`, `follow_up` (what remains is filed as one Backlog
-follow-up), `ask_owner` (the question and its options) or `resume` (what the agent must still do).
-One verifier per ticket at a time, claim-journaled, archived once its verdict is applied; one that
-does not report within 45 minutes escalates. A landed set already judged once is not verified
-again — it escalates instead.
+tool of its ticket MCP server, bound to the generation marker the steward started it with (a
+second call, and any verdict carrying another marker, is ignored):
+`close` (nothing remains), `resume` (the ticket's agent must still do this), `park` (the ticket
+waits: a blocking relation to `blockedBy` and/or a `dueDate` is written, the ticket moves to Todo,
+and it carries the trigger label only when a blocker must finish first, so dispatch starts it
+once that blocker is done) or `ask_owner` (the question and its options, for a decision only the
+owner can make). There is no follow-up verdict: an open ticket's leftover work is not filed as a
+new issue. One verifier per ticket at a time, claim-journaled, archived once its verdict is
+applied; its application is journaled step by step, so a reload neither repeats a close nor loses
+a verdict, and a `close` re-reads every pull request of the ticket (a newly opened or unrecorded
+one aborts the close and the next pass classifies the ticket anew). One that does not report
+within 45 minutes escalates. A landed set already judged once is not verified again — it
+escalates instead.
 
 **Escalation** is the steward's terminal step, never a bare comment: the ticket is moved to Needs
 input, gets the `paseo-needs-you` label and one comment that names the reason and lettered options,
@@ -2966,9 +2978,9 @@ Every ticket label the plugin sets, and what removes it:
 | Label | Set by | Removed by (or why it stays) |
 | -- | -- | -- |
 | `paseo` (the trigger) | you | the dispatcher when it claims the ticket, hands it out as a group, or a plan for it waits for you |
-| `paseo-running` | a start (dispatch, thread, project, successor, restart, label repair) | a failed start (swapped for `paseo-failed`), the last root agent archived, or the label repair after 15 minutes without an agent |
-| `paseo-failed` | a failed launch, or a start failing on this host's setup | a retry that starts an agent, an agent working on the ticket, the label repair; after the third failed retry it stays and you are mentioned once |
-| `paseo-blocked` | a failed turn (write-back **Blocked**) | the next completed turn, the agent archived, or the label repair once the ticket closed or a root agent on this host is in a turn again |
+| `paseo-running` | a start (dispatch, thread, project, successor, restart, the steward) | a failed start (swapped for `paseo-failed`), the last root agent archived, or the steward after 15 minutes without an agent |
+| `paseo-failed` | a failed launch, or a start failing on this host's setup | a retry that starts an agent, an agent working on the ticket, the steward; after the third failed retry it stays and you are mentioned once |
+| `paseo-blocked` | a failed turn (write-back **Blocked**) | the next completed turn, the agent archived, or the steward once the ticket closed or a root agent on this host is in a turn again |
 | `paseo-needs-you` | a wait for you (write-back) | the wait ending (answered, turn ended, agent archived, lost wait found); on a "Needs you" sub-issue it stays: answering closes the sub-issue |
 | `paseo-manual` | a manual task an agent registered | stays on the task's sub-issue: closing the task ends it, and the saved view filters by status |
 | `paseo-hold` | a planner run's `hold`, a duplicate closed by the order, or you | a planner run's `release`, or you |
@@ -3118,7 +3130,7 @@ neither a request nor points; Linear's error responses do count. The totals cove
 Calls are counted when their fetch settles. Caller context follows awaited work and timers;
 nested callers override it. Unscoped requests are labelled `op:<operation>`.
 
-The caller names distinguish dispatch, project flow, comment relay, label repair, PR watch,
+The caller names distinguish dispatch, project flow, comment relay, the steward, PR watch,
 crash recovery (`crash-recovery`), session-sweep parts, session webhooks, the agent panel's live
 feed (`session-live-feed`), lifecycle write-backs, sidebar reads, health, manual tasks, state
 labels, label rules and plan handling. Each pool also includes the most recently
@@ -3213,7 +3225,7 @@ No tokens, query bodies or ticket text appear in the report.
   619, `writeback.turn-ended` 262,944 in 534, `status change` 129,978 in 261,
   `writeback.archived` 6,474 in 13).
 - **Three priorities reserve room for owner intent on both dimensions.**
-  - Background work leaves **20%**: auto-dispatch, comment relay, project flow, label repair,
+  - Background work leaves **20%**: auto-dispatch, comment relay, project flow, the steward,
     health, label rules, manual tasks, plan requests, PR watch, queue backstop, state labels
     and the session sweep. Polls resume as the budget refills; the sweep skips its whole round
     while paused. Auto-dispatch shows `paused: …`, and persistent pauses are logged once per pool/cause.
