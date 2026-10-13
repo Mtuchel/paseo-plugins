@@ -14,7 +14,9 @@ export type SessionPlanStep = { content: string; status: "pending" | "inProgress
 export type ExternalUrl = { label: string; url: string };
 export type SelectOption = { label: string; value: string };
 export type AgentActivity = { id: string; createdAt: string; signal: string | null; type: string; body: string; userId: string | null };
-export type OpenSession = { id: string; status: string; createdAt: string; creatorId: string | null; issueId: string | null; identifier: string | null };
+// `commentBody`: the comment that opened the session: an `@paseo` mention, or Linear's own "This
+// thread is for an agent session ..." for an assignment (`created` ignores that one).
+export type OpenSession = { id: string; status: string; createdAt: string; creatorId: string | null; issueId: string | null; identifier: string | null; commentBody: string | null };
 
 export function agentAppDirectory(home = paseoHome()): string {
   return join(home, "linear-tickets", "agent-app");
@@ -119,7 +121,7 @@ const APP_VIEWER_QUERY = `query appViewer { viewer { id name } }`;
 // its own app (README, "Several hosts"), so the viewer read alongside tells this host's apart.
 const OPEN_SESSIONS_QUERY = `query openSessions($first: Int!) {
   viewer { id }
-  agentSessions(first: $first, orderBy: updatedAt) { nodes { id status createdAt appUser { id } creator { id } issue { id identifier } } }
+  agentSessions(first: $first, orderBy: updatedAt) { nodes { id status createdAt appUser { id } creator { id } issue { id identifier } comment { body } } }
 }`;
 const SESSION_STATUS_QUERY = `query sessionStatus($id: String!) {
   agentSession(id: $id) { status }
@@ -246,6 +248,7 @@ export class AgentApi {
       creatorId: node.creator ? String(record(node.creator).id ?? "") || null : null,
       issueId: node.issue ? String(record(node.issue).id ?? "") || null : null,
       identifier: node.issue ? String(record(node.issue).identifier ?? "") || null : null,
+      commentBody: node.comment && typeof record(node.comment).body === "string" ? String(record(node.comment).body) : null,
     })).filter((session) => session.id);
   }
 

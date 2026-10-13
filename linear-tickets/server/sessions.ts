@@ -1365,10 +1365,12 @@ export class SessionRouter {
         if (!link) {
           // A webhook missed while this host was down: Linear marks a thread nobody answered `stale`
           // after about a minute, so a stale thread without a link is started like a pending one,
-          // unless the ticket has a newer thread (assigned again): that one starts the agent.
+          // unless the ticket has a newer thread (assigned again): that one starts the agent. The
+          // comment that opened it goes along, as the webhook would have carried it: without it an
+          // `@paseo` answer would start or reach the agent with nothing to say.
           const stale = session.status === "stale" && !sessions.some((other) => other.id !== session.id && other.issueId === session.issueId && other.createdAt > session.createdAt);
           if ((session.status === "pending" || stale) && Date.now() - Date.parse(session.createdAt) < ADOPT_WINDOW_MS && session.issueId) {
-            await this.handle({ type: "AgentSessionEvent", action: "created", agentSession: { id: session.id, creatorId: session.creatorId, issueId: session.issueId, issue: { id: session.issueId, identifier: session.identifier } } });
+            await this.handle({ type: "AgentSessionEvent", action: "created", agentSession: { id: session.id, creatorId: session.creatorId, issueId: session.issueId, issue: { id: session.issueId, identifier: session.identifier }, ...(session.commentBody ? { comment: { body: session.commentBody } } : {}) } });
           }
           continue;
         }
