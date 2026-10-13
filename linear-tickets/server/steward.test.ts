@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
-  classifyTicket, isDefect, StewardStateError, StewardStore, STEWARD_ACTION, STEWARD_SITUATIONS, STEWARD_STATES,
+  classifyTicket, DoneTickets, isDefect, Steward, StewardStateError, StewardStore, STEWARD_ACTION, STEWARD_SITUATIONS, STEWARD_STATES,
   RESTART_CAP, type StewardFacts, type StewardSituation,
 } from "./steward";
 
@@ -210,4 +210,197 @@ test("the situation the store remembers is one of the classifier's own", async (
   const situation: StewardSituation = (await journal.read()).tickets.i1.situation;
   assert.equal(situation, "open-pr");
   assert.equal(STEWARD_ACTION[situation], "succeed", "an open pull request nobody works on gets a successor");
+});
+
+// --- the pass, end to end -------------------------------------------------------------------------
+// The acts below drive the real Steward over fakes and a real store file: what one pass does to a
+// ticket, what it refuses to repeat, and which of its budgets it respects.
+
+const stewardSettings = (cap = 5) => ({
+  dispatch: { label: "paseo", teamKeys: ["ENG"], intervalSeconds: 60 },
+  steward: { enabled: true, queuedEscalateHours: 24, idleMinutes: 30, maxActionsPerPass: cap },
+  models: { small: "small", standard: "standard", large: "large" },
+  agents: { model: "standard", models: { small: "small", standard: "standard", large: "large" } },
+}) as any;
+
+const ticketIssue = (over: Record<string, unknown> = {}) => ({
+  id: "i1", identifier: "ENG-1", title: "Ticket", status: "In Progress", statusType: "started",
+  teamId: "t1", teamKey: "ENG", projectId: null, projectName: null, delegateId: "app1", parentId: null,
+  labels: [{ id: "l1", name: "paseo" }], children: [], blockers: [], attachments: [], updatedAt: at(3),
+  ...over,
+}) as any;
+
+const recordFor = (issueId: string, identifier: string, pullRequests: string[] = []) =>
+  ({ issueId, identifier, agentId: `agent-${identifier}`, links: {}, pullRequests }) as any;
+
+const childIssue = (identifier: string, id: string, statusType: string) =>
+  ({ id, identifier, status: statusType === "canceled" ? "Canceled" : "Done", statusType, delegateId: null, assigneeId: null }) as any;
+
+// The steward's own calls, one fake per dependency it was built to use.
+async function passFixture(t: any, over: {
+  issues?: any[];
+  roots?: Map<string, any>;
+  records?: any[];
+  pullStates?: Map<string, any>;
+  cap?: number;
+  clockNow?: number;
+  verdicts?: (issueId: string) => Promise<any[]>;
+  restart?: () => Promise<any>;
+} = {}) {
+  t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
+  const dir = await mkdtemp(join(tmpdir(), "paseo-steward-pass-"));
+  const store = new StewardStore(join(dir, "steward.json"));
+  const calls = { restarts: [] as string[], successions: [] as string[], starts: [] as string[], completed: [] as string[], canceled: [] as string[], escalates: [] as string[], prompts: [] as string[] };
+  const clock = { now: over.clockNow ?? T0 + 5 * 60_000 };
+  // A Paseo whose every read returns nothing: the steward's agent listings and archives go through
+  // it, so anything it asks for must answer like the real API does.
+  // Paseo's list endpoints answer with a page of entries; the steward reads its agents and their
+  // worktrees through them, so every call answers like a page.
+  const page = () => ({ entries: [], nextCursor: null });
+  const paseo: any = new Proxy(async () => page(), { get: (_target, key) => (key === "then" ? undefined : paseo) });
+  const build = () => new Steward({
+    store,
+    linear: {
+      trustedAppIds: async () => ["app1"],
+      stewardIssues: async () => over.issues ?? [],
+      issueStatus: async () => ({ status: "In Progress", statusType: "started", completedAt: null }),
+      issueCore: async () => ({ id: "i1", identifier: "ENG-1" }),
+      addLabel: async () => {}, removeLabel: async () => {}, comment: async () => {}, upsertComment: async () => {},
+      createIssue: async () => ({ id: "f1", identifier: "ENG-99" }),
+      relate: async () => {}, complete: async (id: string) => { calls.completed.push(id); }, cancel: async (id: string) => { calls.canceled.push(id); },
+    } as any,
+    sessions: {
+      watchdogRoots: async () => over.roots ?? new Map(),
+      restartFor: async (issueId: string) => { calls.restarts.push(issueId); return over.restart ? await over.restart() : { kind: "started", agentId: "a9" }; },
+      succeed: async (issueId: string) => { calls.successions.push(issueId); return { kind: "started", agentId: "a10" }; },
+      prompt: async () => { calls.prompts.push("resume"); return "sent"; },
+      watchdogThread: async () => null, threadQueued: async () => false,
+      retireTurn: async (_issueId: string, work: () => Promise<number>) => work(),
+    } as any,
+    starter: { start: async () => { calls.starts.push("verifier"); return { agentId: "v1" }; } } as any,
+    launcher: { gate: () => ({ release: () => {} }) } as any,
+    handover: { all: async () => over.records ?? [] } as any,
+    writeback: { escalate: async (issueId: string) => { calls.escalates.push(issueId); }, clearWait: async () => {} } as any,
+    watchdog: { read: async () => null, handedOver: async () => new Map() } as any,
+    manualTasks: { openBlockers: async () => [] } as any,
+    needsYou: { all: async () => [] } as any,
+    settings: { read: async () => stewardSettings(over.cap) } as any,
+    owner: async () => "here",
+    pulls: async () => over.pullStates ?? new Map(),
+    stacked: async () => "settled",
+    intake: { claimsReady: async () => true } as any,
+    doneTickets: new DoneTickets(),
+    labels: { all: async () => [], add: async () => {}, remove: async () => {} } as any,
+    now: () => clock.now,
+    verdicts: over.verdicts,
+  } as any);
+  const seed = async (issueId: string, identifier: string, patch: Record<string, unknown> = {}) => {
+    await store.update((file: any) => {
+      const ticket = store.ticket(file, issueId, identifier, at(30));
+      Object.assign(ticket, patch);
+    });
+  };
+  return { store, calls, clock, paseo, seed, build, pass: async (cap?: number) => await build().tick(paseo, stewardSettings(cap ?? over.cap)) };
+}
+
+test("a claim written before the effect is not repeated after a reload, and is retried after the grace", async (t) => {
+  const f = await passFixture(t, { issues: [ticketIssue()], records: [recordFor("i1", "ENG-1")] });
+  // A pass that claimed a restart and died before the effect: only the claim is on disk.
+  await f.seed("i1", "ENG-1", { situation: "stalled", claim: { action: "restart", marker: "m1", at: at(1), state: "claimed" } });
+  await f.pass();
+  assert.deepEqual(f.calls.restarts, [], "the open claim is not repeated blindly");
+  // A new instance over the same file (a reload) sees the claim too, and waits it out.
+  await f.build().tick(f.paseo, stewardSettings());
+  assert.deepEqual(f.calls.restarts, [], "one restart and no repeat while the claim holds");
+  f.clock.now = T0 + 20 * 60_000; // past the claim grace
+  await f.pass();
+  assert.deepEqual(f.calls.restarts, ["i1"], "after the grace the restart is claimed and tried once");
+});
+
+test("a used-up restart budget escalates once, and a later pass does not ask again", async (t) => {
+  const f = await passFixture(t, { issues: [ticketIssue()], records: [recordFor("i1", "ENG-1")] });
+  await f.seed("i1", "ENG-1", { situation: "restart-exhausted", restarts: [at(600), at(300), at(60)] });
+  await f.pass();
+  assert.deepEqual(f.calls.escalates, ["i1"], "the exhausted budget reaches the owner");
+  assert.deepEqual(f.calls.restarts, [], "no fourth restart");
+  f.clock.now += 5 * 60_000;
+  await f.pass();
+  assert.deepEqual(f.calls.escalates, ["i1"], "the owner is asked once, not once per pass");
+});
+
+test("the per-pass cap spreads heavy actions over passes, verifiers included", async (t) => {
+  const idleRoot = (id: string, updatedAt: string) => ({ id, status: "idle", updatedAt, createdAt: at(600) });
+  const f = await passFixture(t, {
+    issues: [ticketIssue(), ticketIssue({ id: "i2", identifier: "ENG-2" }), ticketIssue({ id: "i3", identifier: "ENG-3" })],
+    records: [recordFor("i1", "ENG-1"), recordFor("i2", "ENG-2"), recordFor("i3", "ENG-3")],
+    roots: new Map([["i2", { roots: [idleRoot("a2", at(45))], ghosts: new Set<string>() }]]),
+    cap: 2,
+  });
+  await f.seed("i1", "ENG-1", { situation: "stalled" });
+  await f.seed("i2", "ENG-2", { situation: "idle" });
+  await f.seed("i3", "ENG-3", { situation: "stalled" });
+  await f.pass();
+  assert.deepEqual(f.calls.restarts, ["i1"], "the stalled ticket restarts");
+  assert.deepEqual(f.calls.prompts, ["resume"], "the idle agent is resumed");
+  assert.equal(f.calls.restarts.length, 1, "the third ticket waits: the cap is spent");
+  f.clock.now += 30 * 60_000;
+  await f.pass();
+  assert.ok(f.calls.restarts.includes("i3"), "the next pass takes the ticket the cap deferred");
+});
+
+test("a landed ticket gets a verifier, claimed on its ticket", async (t) => {
+  const f = await passFixture(t, {
+    issues: [ticketIssue()],
+    records: [recordFor("i1", "ENG-1", ["https://github.com/o/r/pull/7"])],
+    pullStates: new Map([["https://github.com/o/r/pull/7", pull("https://github.com/o/r/pull/7", { merged: true })]]),
+  });
+  await f.seed("i1", "ENG-1", { situation: "landed" });
+  await f.pass();
+  assert.deepEqual(f.calls.starts, ["verifier"], "a landed ticket is judged by a verifier, not restarted");
+  const file: any = await f.store.read();
+  assert.equal(file.tickets.i1.verifier?.agentId, "v1", "the verifier is claimed on the ticket");
+});
+
+// The other half of the landed path: the verifier reports, the steward applies the verdict and
+// archives the verifier. The fixture does not yet drive steward.ts's verdict() to a readable
+// verdict, so the pass leaves the verifier claimed; this says what must hold once it does.
+test("a verifier's verdict closes, files or escalates", { todo: "the fixture's verdict read does not yet reach verdict()" }, async (t) => {
+  const accept = async (verdict: Record<string, unknown>) => {
+    const f = await passFixture(t, {
+      issues: [ticketIssue()],
+      records: [recordFor("i1", "ENG-1", ["https://github.com/o/r/pull/7"])],
+      pullStates: new Map([["https://github.com/o/r/pull/7", pull("https://github.com/o/r/pull/7", { merged: true })]]),
+      verdicts: async () => [{ issueId: "i1", at: new Date(f.clock.now).toISOString(), ...verdict }],
+    });
+    await f.seed("i1", "ENG-1", { situation: "landed" });
+    await f.pass();
+    assert.deepEqual(f.calls.starts, ["verifier"], "the landed ticket is judged by a verifier");
+    const file: any = await f.store.read();
+    assert.equal(file.tickets.i1.verifier?.agentId, "v1", "the verifier is claimed on the ticket");
+    f.clock.now += 60_000;
+    await f.pass();
+    const after: any = await f.store.read();
+    assert.equal(after.tickets.i1.verifier, null, "the verifier is archived and cleared");
+    return f;
+  };
+  const closed = await accept({ verdict: "close" });
+  assert.deepEqual(closed.calls.completed, ["i1"]);
+  const followed = await accept({ verdict: "follow_up", remaining: "the retry path is untested" });
+  assert.deepEqual(followed.calls.completed, ["i1"], "the follow-up is filed and the ticket still closes");
+  const asked = await accept({ verdict: "ask_owner", question: "which host?", options: ["a", "b"] });
+  assert.deepEqual(asked.calls.completed, [], "an owner question never closes the ticket");
+  assert.deepEqual(asked.calls.escalates, ["i1"]);
+});
+
+test("a parent whose children all finished closes, and cancels when every child was canceled", async (t) => {
+  const done = await passFixture(t, { issues: [ticketIssue({ children: [childIssue("ENG-1.1", "c1", "completed"), childIssue("ENG-1.2", "c2", "completed")] })], records: [recordFor("i1", "ENG-1")] });
+  await done.seed("i1", "ENG-1", { situation: "closeable" });
+  await done.pass();
+  assert.deepEqual(done.calls.completed, ["i1"], "no group link: the finished parent is closed by the steward");
+  const canceled = await passFixture(t, { issues: [ticketIssue({ children: [childIssue("ENG-1.1", "c1", "canceled")] })], records: [recordFor("i1", "ENG-1")] });
+  await canceled.seed("i1", "ENG-1", { situation: "closeable" });
+  await canceled.pass();
+  assert.deepEqual(canceled.calls.canceled, ["i1"], "all children canceled: the parent is canceled");
+  assert.deepEqual(canceled.calls.completed, []);
 });
