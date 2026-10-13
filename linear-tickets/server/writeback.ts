@@ -29,6 +29,11 @@ const CLOSED_TYPES = ["completed", "canceled", "duplicate"];
 const MAX_NEEDS_YOU_TITLE = 80;
 const TRANSIENT = /HTTP 50\d|Could not reach|timed out|ECONNRESET|fetch failed/i;
 const RETRY_DELAYS_MS = [30_000, 120_000];
+// OMP refuses a message that reaches an agent in the middle of its turn, and Paseo reports the
+// refusal as a failed turn. The agent's own turn goes on, so it is no failure: no error comment, no
+// `-blocked`, no resume, and the handover record stays open. The usual sender is Paseo's
+// finish notification of a subagent the agent started (2026-10-12: TUC-1925, TUC-1686, TUC-1386).
+const REFUSED_MESSAGE = /^Agent is already processing\b/;
 // A recorded wait with no live agent is given this long before the reconcile closes it: a daemon or
 // plugin that just restarted lists its agents again within moments, and a wait that outlives them
 // is a wait whose ending event was lost, not one racing the listing.
@@ -705,6 +710,8 @@ export class Writeback {
           else await once("comment", () => this.linear.comment(issueId, `**${title}** (Paseo) finished a turn:\n\n${truncateSummary(reply)}`));
         }
         if (state) await this.linear.removeLabel(issueId, blocked, state.labels);
+      } else if (outcome.kind === "failed" && REFUSED_MESSAGE.test(outcome.error.message)) {
+        console.log(`[linear-tickets] ${identifier}: agent ${agent.id.slice(0, 8)} refused a message that arrived mid-turn (${outcome.error.message.slice(0, 160)}); it keeps working, so this is not a failed turn`);
       } else if (outcome.kind === "failed") {
         await once("session:error", () => this.session(agent.id, async (sessionId, sessions) => {
           await sessions.unfollow(agent.id);

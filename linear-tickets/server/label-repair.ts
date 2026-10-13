@@ -78,7 +78,7 @@ export type RepairRecord = {
 };
 
 type Deps = {
-  linear: Pick<LinearService, "repairCandidates" | "addLabel" | "removeLabel" | "comment" | "issueState" | "userUrl" | "viewerId" | "appUserId">;
+  linear: Pick<LinearService, "repairCandidates" | "issuesWithLabels" | "addLabel" | "removeLabel" | "comment" | "issueState" | "userUrl" | "viewerId" | "appUserId">;
   store: Pick<ProjectStore, "repairs" | "updateRepairs">;
   launcher: Pick<Launcher, "gate" | "underWay">;
   // SessionRouter.restartFor.
@@ -187,6 +187,7 @@ export class LabelRepair {
           await this.repair(paseo, names, ticket, records[ticket.id] ?? null, pass, appId)
             .catch((error: unknown) => console.error(`[linear-tickets] ${ticket.identifier}: repairing its labels failed, the next pass retries: ${message(error)}`));
         }
+        if (settings.writeback.blocked) await this.clearBlocked(paseo, names);
         this.lastError = null;
       } catch (error) {
         if (message(error) !== this.lastError) console.error(`[linear-tickets] the label repair pass failed: ${message(error)}`);
@@ -240,6 +241,29 @@ export class LabelRepair {
       console.log(`[linear-tickets] ${old.identifier}: started again by the owner; its label repair begins anew`);
       return { ...current, [id]: logged(reset, this.iso(), "the owner started it again; a new incident") };
     });
+  }
+
+  // `<trigger>-blocked` marks a failed turn (write-back Blocked). The next completed turn or the
+  // archive removes it, but a resumed agent can work for hours in one turn, and a closed ticket has
+  // no next turn. So it comes off a closed ticket, and off an open one whose root agent on this
+  // host is in a turn again (live, no ghost). A ticket worked on the peer host keeps it: the peer's
+  // next completed turn removes it. Each removal failure is logged; the next pass tries again.
+  private async clearBlocked(paseo: PaseoApi, names: Names): Promise<void> {
+    for (const ticket of await this.deps.linear.issuesWithLabels([names.blocked])) {
+      try {
+        let why: string;
+        if (CLOSED_TYPES.has(ticket.statusType.trim().toLowerCase())) why = `${ticket.identifier} is ${ticket.status}`;
+        else {
+          const working = (await classifyTicketAgents(paseo, ticket.id, this.now(), this.deps.inspect)).live.find((agent) => agent.status === "running");
+          if (!working) continue;
+          why = `agent ${working.id.slice(0, 8)} is working on it again`;
+        }
+        await this.deps.linear.removeLabel(ticket.id, names.blocked, ticket.labels);
+        console.log(`[linear-tickets] ${ticket.identifier}: label repair: removed ${names.blocked}: ${why}`);
+      } catch (error) {
+        console.error(`[linear-tickets] ${ticket.identifier}: removing ${names.blocked} failed, the next pass retries: ${message(error)}`);
+      }
+    }
   }
 
   // Writes the ticket's record as `next` (null deletes it) if it still is incident `incident` (null:

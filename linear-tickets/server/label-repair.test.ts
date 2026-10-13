@@ -74,6 +74,9 @@ async function world(t: TestContext, options: { label?: string; pageSize?: numbe
       .filter((ticket) => ids.includes(ticket.id) || (!["completed", "canceled"].includes(ticket.statusType) && (!queueBlockers || ticket.queueBlocker)
         && (ticket.labels.some((item) => labels.some((name) => name.toLowerCase() === item.name.toLowerCase())) || (!queueBlockers && states !== undefined && ticket.statusType === "started" && states.some((state) => ticket.status.toLowerCase() === state.toLowerCase())))))
       .map((ticket) => ({ ...ticket, labels: [...ticket.labels] })),
+    issuesWithLabels: async (names: string[]) => [...tickets.values()]
+      .filter((ticket) => ticket.labels.some((item) => names.some((name) => name.toLowerCase() === item.name.toLowerCase())))
+      .map((ticket) => ({ id: ticket.id, identifier: ticket.identifier, status: ticket.status, statusType: ticket.statusType, labels: [...ticket.labels] })),
     addLabel: async (id: string, name: string) => {
       calls.push(`${byId(id).identifier} +${name}`);
       if (!byId(id).labels.some((item) => item.name === name)) byId(id).labels.push({ id: name, name });
@@ -776,6 +779,42 @@ test("the project flow's restart throws for a deferred or failed result only", (
   for (const result of [{ kind: "started", agentId: "a", marked: true }, { kind: "live" }, { kind: "forwarded", peer: "mac" }, { kind: "skipped" }] as RestartResult[]) {
     assert.doesNotThrow(() => restartOrThrow(result), result.kind);
   }
+});
+
+test("the blocked label comes off a closed ticket and an open one whose agent is in a turn again, only with blocked write-back", async (t) => {
+  const ps = { table: "" };
+  const inspect: ProcessInspector = { processes: async () => ps.table, cwd: async () => "/elsewhere", canonicalPath: async (path) => path };
+  for (const blocked of [true, false]) {
+    const w = await world(t, { label: "agent", inspect });
+    w.setSettings({ ...settingsFor("agent"), writeback: { ...DEFAULT_WRITEBACK, blocked } });
+    w.add(1, ["agent-blocked"], { status: "Done", statusType: "completed" });
+    w.add(2, ["agent-blocked"], { status: "In Progress", statusType: "started" });
+    w.add(3, ["agent-blocked"], { status: "In Progress", statusType: "started" });
+    w.add(4, ["agent-blocked"], { status: "In Progress", statusType: "started" });
+    w.add(5, ["agent-blocked"], { status: "In Progress", statusType: "started" });
+    // 2: resumed, in a turn. 3: the failed agent, idle. 4: a running ghost. 5: only a subagent runs.
+    w.agents.push(
+      agent("resumed", "i2", "running"),
+      agent("failed", "i3", "idle"),
+      agent("ghost", "i4", "running", T0 - 60 * MINUTE, { provider: "omp", persistence: { nativeHandle: "/sessions/ghost.jsonl" } }),
+      agent("child", "i5", "running", T0 - 60 * MINUTE, { labels: { "linear.issueId": "i5", "paseo.parent-agent-id": "parent" } }),
+    );
+    await w.at(0);
+    assert.deepEqual(w.calls.sort(), blocked ? ["TUC-1 -agent-blocked", "TUC-2 -agent-blocked"] : [], `blocked write-back ${blocked}`);
+    assert.deepEqual(w.comments, []);
+    assert.deepEqual(w.labels("i3"), ["agent-blocked"], "a failed agent that has not resumed keeps it");
+  }
+});
+
+test("a blocked label that cannot be removed now is tried again on the next pass", async (t) => {
+  const w = await world(t);
+  w.setSettings({ ...settingsFor(), writeback: { ...DEFAULT_WRITEBACK, blocked: true } });
+  w.add(1, ["paseo-blocked"], { status: "Done", statusType: "completed" });
+  w.fail.remove = 1;
+  await w.at(0);
+  assert.deepEqual(w.labels(), ["paseo-blocked"]);
+  await w.at(2);
+  assert.deepEqual(w.labels(), []);
 });
 
 function HOURS(n: number): number {

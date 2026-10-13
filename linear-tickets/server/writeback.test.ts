@@ -655,6 +655,16 @@ test("a retry after partial success repeats no comment, report or session activi
   assert.deepEqual(native.writes.filter((write) => write === "+paseo-blocked"), ["+paseo-blocked"]);
 });
 
+test("a message refused mid-turn is no failed turn: no error, no blocked label, no resume, the record stays open", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const linear = new FakeLinear();
+  const { calls, bridge } = fakeBridge();
+  const refused = "Agent is already processing. Use steer() or followUp() to queue messages, or wait for completion.";
+  await new Writeback(linear, { read: async () => allOn }, bridge, 0, outboxPath()).turnEnded({ agent: root, turnId: "t", outcome: { kind: "failed", error: { message: refused } }, timeline: [] }, linked);
+  assert.deepEqual(calls, []);
+  assert.ok(!linear.writes.some((write) => write === "+paseo-blocked" || write.startsWith("comment: ")), linear.writes.join("\n"));
+});
+
 test("a pull request left in the outbox is linked by the next plugin instance on its first write-back", async (t) => {
   t.mock.method(console, "error", () => {});
   const path = outboxPath();
