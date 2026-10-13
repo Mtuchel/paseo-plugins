@@ -165,6 +165,11 @@ const MANUAL_WHEN = ["before_merge", "after_merge", "anytime"];
 const WHEN_TEXT = { before_merge: "due before the pull request is merged", after_merge: "due once the pull request is merged", anytime: "due now, independent of the merge" };
 const MANUAL = "query manual($id: String!) { issue(id: $id) { id identifier project { id } team { id states(first: 50) { nodes { id name type position } } } children(first: 100) { nodes { id identifier url title state { type } } } } }";
 const MANUAL_DIRECTORY = join(paseoHome, "linear-tickets", "manual-tasks");
+// The ticket steward's verifiers (steward.ts): a short-lived read-only agent records exactly one
+// verdict about a landed ticket here, one private file per verdict under the ticket's id, and the
+// steward applies it (close, a Backlog follow-up, the owner, or work left for the agent).
+const VERDICT_DIRECTORY = issueId === null ? null : join(paseoHome, "linear-tickets", "steward-verdicts", issueId);
+const VERDICT_KINDS = ["close", "follow_up", "ask_owner", "resume"];
 const FINISHED_TYPES = ["completed", "canceled", "duplicate"];
 
 // Atomic, private (0600) JSON record: written to a temporary name, then renamed into place.
@@ -480,6 +485,35 @@ const tools = [
       const data = await linear("mutation edit($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }", { id: issue.id, input: changes });
       if (!data.issueUpdate || !data.issueUpdate.success) throw new Error("Linear did not apply the change.");
       return { updated: true, issue: issue.identifier, fields: Object.keys(changes) };
+    },
+  },
+  {
+    name: "steward_verdict",
+    description: "Only for the verifier Paseo's ticket steward started: record exactly one verdict on whether this ticket's work is complete, then stop. close: the landed work completes the ticket and nothing remains. follow_up: it is complete apart from work Paseo must file as a Backlog follow-up (remaining). ask_owner: only the owner can decide (question, options) — for a missing decision, access or approval, never for work an agent can do. resume: the ticket's agent must still do something (instruction). The steward applies the verdict; nothing else happens, and a second call is ignored.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        verdict: { type: "string", enum: VERDICT_KINDS, description: "close, follow_up, ask_owner or resume." },
+        remaining: { type: "string", minLength: 1, maxLength: 4000, description: "follow_up: what work remains, for the follow-up ticket." },
+        question: { type: "string", minLength: 1, maxLength: 2000, description: "ask_owner: the one question the owner must answer." },
+        options: { type: "array", minItems: 1, maxItems: 6, items: { type: "string", minLength: 1, maxLength: 300 }, description: "ask_owner: the options the owner can choose, one line each." },
+        instruction: { type: "string", minLength: 1, maxLength: 4000, description: "resume: what the ticket's agent must still do." },
+      },
+      required: ["verdict"],
+      additionalProperties: false,
+    },
+    async run(input) {
+      if (VERDICT_DIRECTORY === null) throw new Error("This server is read-only; a verdict is recorded by the verifier the steward starts.");
+      if (!VERDICT_KINDS.includes(input.verdict)) throw new Error("verdict must be one of: " + VERDICT_KINDS.join(", "));
+      const remaining = input.remaining === undefined ? null : text(input.remaining, "remaining", 4000);
+      const question = input.question === undefined ? null : text(input.question, "question", 2000);
+      const options = input.options === undefined ? null : (Array.isArray(input.options) && input.options.length && input.options.length <= 6 ? input.options.map((option) => text(option, "option", 300)) : (() => { throw new Error("options must be 1 to 6 strings."); })());
+      const instruction = input.instruction === undefined ? null : text(input.instruction, "instruction", 4000);
+      if (input.verdict === "follow_up" && !remaining) throw new Error("follow_up needs remaining: the work to file.");
+      if (input.verdict === "ask_owner" && (!question || !options)) throw new Error("ask_owner needs question and options.");
+      if (input.verdict === "resume" && !instruction) throw new Error("resume needs instruction: what the agent must still do.");
+      await writePrivate(VERDICT_DIRECTORY, randomUUID() + ".json", { issueId, at: new Date().toISOString(), verdict: input.verdict, remaining, question, options, instruction });
+      return { recorded: true, verdict: input.verdict, ticket: issueId };
     },
   },
   {

@@ -11,11 +11,10 @@ import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/se
 import { LinearService, postGraphQL, type IssueState } from "./linear";
 import { ticketPullRequest, type PullRequestText } from "./pull-request-check";
 import { GitHubRateLimitedError, RateBudget, RateLimitedError, withPriority } from "./rate-budget";
-import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
+import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { NeedsYouIssues } from "./needs-you";
 import { MAX_SUMMARY_LENGTH, ownerRequest, turnPullRequests, turnReply, Writeback } from "./writeback";
-import { DoneTickets, RetiredLabels, RetirePass } from "./retirement";
 import { DecisionLog } from "./owner-decisions";
 import { Handover, PARKED_PLAN_LINE } from "./handover";
 import { PlannotatorBridge } from "./plannotator";
@@ -31,7 +30,7 @@ type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
 const allOn: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true,
   dispatch: DEFAULT_DISPATCH,
-  writeback: { status: true, summaries: true, blocked: true, pullRequests: true, mentions: true, autoResume: false, watchdog: true }, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
+  writeback: { status: true, summaries: true, blocked: true, pullRequests: true, mentions: true, autoResume: false, watchdog: true }, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
 };
 const root: PluginHookAgent = { id: "agent-1", workspaceId: "w1", parentAgentId: null, provider: "claude", cwd: "/repo", title: "ENG-1: Fix sign-in" };
 
@@ -1081,143 +1080,9 @@ test("a failing decision log never stops the waiting write-back", async () => {
   assert.match(String(errors.mock.calls[0]?.arguments[0]), /decision log: question on issue-1 failed: disk full/);
 });
 
-// --- the reconcile of waits whose ending event was lost (reconcileWaiting) ---
-
-// The ticket's agents as the daemon lists them: none, a live root, or a root whose process is gone.
-function paseoWithRoots(agents: { status?: string; pending?: { id: string }[]; createdAt?: string }[]): PaseoApi {
-  const entries = agents.map(({ status = "running", pending = [], createdAt = new Date().toISOString() }) => ({
-    agent: { id: "agent-1", createdAt, title: "T", cwd: "/repo", status, labels: { "linear.issueId": "issue-1" }, pendingPermissions: pending },
-  }));
-  return { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" } } }) }), list: async () => ({ entries }) } } as unknown as PaseoApi;
-}
-
-// The waiting record a plugin restart, a killed question or a missed archive event leaves behind.
-async function openedWait(waiting: Record<string, unknown>): Promise<Handover> {
-  const directory = mkdtempSync(join(tmpdir(), "paseo-writeback-wait-"));
-  const handover = new Handover(new FakeLinear() as never, directory, async () => ({ branch: null, lastCommit: null }), () => "2026-01-01T00:00:00.000Z");
-  await handover.setWaiting({ id: "issue-1", identifier: "ENG-1" }, { id: "agent-1", title: "ENG-1: Fix sign-in", cwd: "/repo" }, waiting as never);
-  return handover;
-}
-
-const bridge = (handover: Handover) => ({ sessions: {} as never, handover });
-
-test("the reconcile closes a wait no live agent can end: the label comes off and the state it left is restored", async () => {
-  const linear = new FakeLinear();
-  // The ticket sits in Needs input where the wait put it; "ip" is the state that wait left.
-  linear.state = { ...linear.state, status: "Needs input", statusId: "ni", statusType: "started" };
-  // TUC-854-shaped: the agent is closed, the wait is a day old, nothing will end it any more.
-  const handover = await openedWait({ previousStateId: "ip", commentId: "c1", kind: "request", at: "2026-01-01T00:00:00.000Z" });
-  await new Writeback(linear, { read: async () => allOn }, bridge(handover), 0).reconcileWaiting(paseoWithRoots([{ status: "closed" }]));
-  assert.deepEqual(linear.writes, ["state", "-paseo-needs-you", "restore ip"]);
-  assert.equal(await handover.waiting("issue-1"), null);
-});
-
-test("the reconcile leaves a wait with a pending request on a live agent and one whose agent can still take its turn", async () => {
-  const asking = new FakeLinear();
-  const asked = await openedWait({ previousStateId: "ip", commentId: "c1", kind: "request", at: "2026-01-01T00:00:00.000Z" });
-  await new Writeback(asking, { read: async () => allOn }, bridge(asked), 0).reconcileWaiting(paseoWithRoots([{ pending: [{ id: "q1" }] }]));
-  assert.deepEqual(asking.writes, []);
-  assert.ok(await asked.waiting("issue-1"));
-
-  // A turn-end wait ends when the agent's next turn starts, not while it is alive and idle.
-  const quiet = new FakeLinear();
-  const ended = await openedWait({ previousStateId: "ip", commentId: "c1", kind: "turn-end", at: "2026-01-01T00:00:00.000Z" });
-  await new Writeback(quiet, { read: async () => allOn }, bridge(ended), 0).reconcileWaiting(paseoWithRoots([{}]));
-  assert.deepEqual(quiet.writes, []);
-});
-
-test("the reconcile closes a request wait whose question is gone while its agent still works", async () => {
-  const linear = new FakeLinear();
-  linear.state = { ...linear.state, status: "Needs input", statusId: "ni", statusType: "started" };
-  const handover = await openedWait({ previousStateId: "ip", commentId: "c1", kind: "request", at: "2026-01-01T00:00:00.000Z" });
-  await new Writeback(linear, { read: async () => allOn }, bridge(handover), 0).reconcileWaiting(paseoWithRoots([{ pending: [] }]));
-  assert.deepEqual(linear.writes, ["state", "-paseo-needs-you", "restore ip"]);
-});
-
-test("a wait that opened while the ticket was already in Needs input ends in In Progress", async () => {
-  // The ticket waits on the server, the owner takes it over here: the second period opens while it
-  // already sits in Needs input, so nothing records the state it left (TUC-581-shaped).
-  const linear = new FakeLinear();
-  linear.state = { ...linear.state, status: "Needs input", statusId: "ni", statusType: "started" };
-  const handover = await openedWait({ previousStateId: null, commentId: "c1", kind: "request", at: "2026-01-01T00:00:00.000Z" });
-  await new Writeback(linear, { read: async () => allOn }, bridge(handover), 0).reconcileWaiting(paseoWithRoots([{ status: "closed" }]));
-  assert.deepEqual(linear.writes, ["state", "-paseo-needs-you", "in-progress issue-1"]);
-  assert.equal(await handover.waiting("issue-1"), null);
-
-  // A ticket someone moved out of Needs input meanwhile is left alone, as before.
-  const elsewhere = new FakeLinear();
-  elsewhere.state = { ...elsewhere.state, status: "Canceled", statusId: "canceled", statusType: "canceled" };
-  const moved = await openedWait({ previousStateId: null, commentId: "c1", kind: "request", at: "2026-01-01T00:00:00.000Z" });
-  await new Writeback(elsewhere, { read: async () => allOn }, bridge(moved), 0).reconcileWaiting(paseoWithRoots([{ status: "closed" }]));
-  assert.deepEqual(elsewhere.writes, ["state", "-paseo-needs-you"]);
-});
-
-test("a question answered on a ticket that already waited in Needs input returns it to In Progress", async () => {
-  // The event path, end to end: markWaiting cannot record a previous state here either.
-  const linear = new FakeLinear();
-  linear.state = { ...linear.state, status: "Needs input", statusId: "ni", statusType: "started", creatorId: "creator" };
-  let pending: { id: string }[] = [{ id: "q1" }];
-  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" }, pendingPermissions: pending } }) }) } } as unknown as PaseoApi;
-  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0);
-  await writeback.permissionRequested({ agent: root, request: { id: "q1", provider: "omp", name: "ask", kind: "question", title: "Which bucket?" } }, paseo);
-  assert.ok(!linear.writes.some((write) => write.startsWith("restore")));
-  linear.writes.length = 0;
-  pending = [];
-  await writeback.permissionResolved({ agent: root, requestId: "q1", resolution: { behavior: "allow" } }, paseo);
-  assert.deepEqual(linear.writes, ["state", "-paseo-needs-you", "in-progress issue-1"]);
-});
-
-test("the reconcile classifies a wait recorded before the kind existed from its own comment", async () => {
-  // A request: the agent is live and holds nothing, so the question is over.
-  const asking = new FakeLinear();
-  asking.state = { ...asking.state, status: "Needs input", statusId: "ni", statusType: "started" };
-  asking.bodies.set("c7", "**ENG-1: Fix sign-in** (Paseo) is waiting for an answer: Which bucket?\n\nReply here with “@paseo <your answer>”.");
-  const asked = await openedWait({ previousStateId: "ip", commentId: "c7", at: "2026-01-01T00:00:00.000Z" });
-  await new Writeback(asking, { read: async () => allOn }, bridge(asked), 0).reconcileWaiting(paseoWithRoots([{}]));
-  assert.deepEqual(asking.writes, ["body c7", "state", "-paseo-needs-you", "restore ip"]);
-
-  // A turn that ended asking: the live agent can still take its next turn.
-  const quiet = new FakeLinear();
-  quiet.bodies.set("c7", "**ENG-1: Fix sign-in** (Paseo) finished its turn and is waiting for you:\n\nShould I push?");
-  const ended = await openedWait({ previousStateId: "ip", commentId: "c7", at: "2026-01-01T00:00:00.000Z" });
-  await new Writeback(quiet, { read: async () => allOn }, bridge(ended), 0).reconcileWaiting(paseoWithRoots([{}]));
-  assert.deepEqual(quiet.writes, ["body c7"]);
-});
-
-test("the reconcile leaves a wait that just opened alone while a restarting daemon still lists no agents", async () => {
-  // A host or plugin restart re-lists its agents within moments; a wait minutes old is racing that.
-  const linear = new FakeLinear();
-  const handover = await openedWait({ previousStateId: "ip", commentId: "c1", kind: "turn-end", at: new Date().toISOString() });
-  await new Writeback(linear, { read: async () => allOn }, bridge(handover), 0).reconcileWaiting(paseoWithRoots([]));
-  assert.deepEqual(linear.writes, []);
-  // And an unreadable "handed to the peer" answer decides nothing.
-  const unknown = await openedWait({ previousStateId: "ip", commentId: "c1", kind: "request", at: "2026-01-01T00:00:00.000Z" });
-  const errors = test.mock.method(console, "error", () => {});
-  const out = new FakeLinear();
-  await new Writeback(out, { read: async () => allOn }, bridge(unknown), 0).reconcileWaiting(paseoWithRoots([]), { handedOver: async () => { throw new Error("watchdog.json cannot be read (EACCES)"); } });
-  errors.mock.restore();
-  assert.deepEqual(out.writes, []);
-});
-
-test("the reconcile leaves a ticket this host handed to the peer to the peer's plugin, and a Needs you sub-issue wait to the owner", async () => {
-  // The peer's plugin ends the waits of its own agents; its label must not come off from here.
-  const linear = new FakeLinear();
-  const handed = await openedWait({ previousStateId: "ip", commentId: "c1", kind: "request", at: "2026-01-01T00:00:00.000Z" });
-  await new Writeback(linear, { read: async () => allOn }, bridge(handed), 0).reconcileWaiting(paseoWithRoots([]), { handedOver: async () => new Map([["issue-1", "2026-06-01T00:00:00.000Z"]]) });
-  assert.deepEqual(linear.writes, []);
-
-  // A closed ticket's wait lives in its sub-issue, which the owner closes.
-  const closed = new FakeLinear();
-  const tracked = await openedWait({ previousStateId: null, commentId: "c1", subIssueId: "sub-1", kind: "request", at: "2026-01-01T00:00:00.000Z" });
-  await new Writeback(closed, { read: async () => allOn }, bridge(tracked), 0).reconcileWaiting(paseoWithRoots([]));
-  assert.deepEqual(closed.writes, []);
-});
-
-// A finished ticket's agent archived by the retire pass (retirement.ts): the archive's own write-back
-// and the pass's label step on the next poll may both read the running label before either removes
-// it. The label is gone afterwards, removed at most once more than needed, and the final report
-// goes out once.
-test("the retire pass's archive, its write-back and its label step together remove the running label and report once", { timeout: 10_000 }, async (t) => {
+// A finished ticket's agent archived (steward.ts archives it; this is the write-back that follows):
+// the final report goes back to the ticket and the running label comes off.
+test("the archive of a finished ticket's agent writes the final report back and removes the running label", { timeout: 10_000 }, async (t) => {
   t.mock.method(console, "log", () => {});
   const directory = mkdtempSync(join(tmpdir(), "paseo-writeback-retire-"));
   const linear = new FakeLinear();
@@ -1229,45 +1094,7 @@ test("the retire pass's archive, its write-back and its label step together remo
     ref: () => ({ refresh: async () => ({ agent }), archive: async () => { agent = { ...agent, archivedAt: new Date().toISOString() }; } }),
     list: async () => ({ entries: agent.archivedAt ? [] : [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
   } } as unknown as PaseoApi;
-  const retire = new RetirePass({
-    sessions: {
-      watchdogRoots: async () => new Map(agent.archivedAt ? [] : [["issue-1", { issueId: "issue-1", identifier: "ENG-1", roots: [agent], ghosts: new Set<string>() }]]),
-      retireTurn: async <T>(_issueId: string, work: (api: PaseoApi) => Promise<T>) => ({ ran: true as const, value: await work(paseo) }),
-      sessionFor: async () => null,
-      watchdogThread: async () => null,
-    },
-    linear: {
-      issueStatuses: async () => new Map([["issue-1", { status: "Done", statusType: "completed", completedAt: null }]]),
-      issueWatchState: async () => ({ status: linear.state.status, statusType: linear.state.statusType, labels: linear.state.labels }),
-      issueCore: (id) => linear.issueCore(id) as never,
-      removeLabel: (id, name) => linear.removeLabel(id, name),
-    },
-    settings: { read: async () => allOn },
-    handover: { all: async () => [] },
-    watchdog: { read: async () => ({ version: 1 as const, tickets: {}, holds: {} }) },
-    doneTickets: new DoneTickets(),
-    labels: new RetiredLabels(join(directory, "retired-labels.json")),
-  });
-  const poll = { states: null, sentAt: Date.now(), asked: new Set<string>(), stack: async () => "settled" as const };
-  await retire.pass(poll);
-  assert.ok(agent.archivedAt, "archived by the pass");
-  // The write-back and the next poll's label step each read the label before either removes it.
-  const read = linear.issueCore.bind(linear);
-  let arrived = 0;
-  let release = () => {};
-  const both = new Promise<void>((resolve) => { release = resolve; });
-  linear.issueCore = async (id?: string) => {
-    const state = await read(id);
-    if (++arrived === 2) release();
-    await both;
-    return state;
-  };
-  await Promise.all([
-    new Writeback(linear, { read: async () => allOn }, { sessions: {} as never, handover }, 0, outboxPath()).archived({ agent: root, archivedAt: "now" }, paseo),
-    retire.pass(poll),
-  ]);
-  const removals = linear.writes.filter((write) => write === "-paseo-running").length;
-  assert.ok(removals >= 1 && removals <= 2, `${removals} removals`);
-  assert.ok(!linear.state.labels.some((label) => label.name === "paseo-running"));
-  assert.equal(linear.writes.filter((write) => write.includes("Paseo final report")).length, 1);
+  await new Writeback(linear, { read: async () => allOn }, { sessions: {} as never, handover }, 0, outboxPath()).archived({ agent: root, archivedAt: "now" }, paseo);
+  assert.equal(linear.writes.filter((write) => write.includes("Paseo final report")).length, 1, "one final report");
+  assert.ok(!linear.state.labels.some((label) => label.name === "paseo-running"), "the running label is gone");
 });

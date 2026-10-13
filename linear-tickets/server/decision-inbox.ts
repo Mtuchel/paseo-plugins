@@ -6,7 +6,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { z } from "zod";
 import { askQuestionSchema, decisionReceiptSchema, ownerAskSchema, type DecisionReceipt } from "../shared/contracts";
-import { decisionHostSchema, liveDecisionSchema, type BrowserDecisionAction, type DecisionHost, type DecisionView, type LiveDecision } from "../shared/decision-inbox";
+import { decisionHostSchema, liveDecisionSchema, type BrowserDecisionAction, type DecisionHost, type DecisionView, type LiveDecision, type StewardFlow } from "../shared/decision-inbox";
 import type { ActivationRoute } from "./activation";
 import { decisionPage } from "./decision-page";
 import type { OwnerAsks } from "./owner-asks";
@@ -24,6 +24,9 @@ export type BrowserDecisionInboxDeps = {
   host?: string;
   backendInstanceId?: () => string | undefined;
   agentUrl?: (id: string) => Promise<string | null>;
+  // The ticket steward's flow summary for the page's Flow section (Steward.snapshot, steward.ts).
+  // Absent: the page shows no flow.
+  flow?: () => Promise<StewardFlow>;
   directory?: string;
   now?: () => number;
 };
@@ -235,7 +238,22 @@ export class BrowserDecisionInbox {
     return { host: this.host, asks: owner?.snapshot.asks ?? [], live,
       backendInstanceId: this.deps.backendInstanceId?.(),
       history: [...owner?.snapshot.history ?? [], ...receipts, ...deferrals.history].sort((a, b) => b.at.localeCompare(a.at)).slice(0, 100),
-      updatedAt: owner?.snapshot.updatedAt ?? new Date(this.now()).toISOString(), error: errors.length ? errors.join("\n") : null };
+      updatedAt: owner?.snapshot.updatedAt ?? new Date(this.now()).toISOString(), error: errors.length ? errors.join("\n") : null,
+      // The steward's flow summary (README, "Ticket steward"). Its failure is a page warning, not
+      // an inbox error: the decisions below are still answerable.
+      flow: await this.readFlow(errors) };
+  }
+
+  // The steward's flow for the page's Flow section; its failure is named there.
+  private async readFlow(errors: string[]): Promise<StewardFlow | null> {
+    if (!this.deps.flow) return null;
+    try {
+      return await this.deps.flow();
+    } catch (error) {
+      const reason = `Ticket flow unavailable: ${reasonOf(error)}`;
+      errors.push(reason);
+      return { at: null, counts: {}, oldest: [], error: reason };
+    }
   }
 
   private async readPeer(peer: string): Promise<DecisionHost> {
@@ -268,7 +286,7 @@ export class BrowserDecisionInbox {
     for (const source of sources) {
       if (!source.snapshot || identities.has(source.snapshot.host)) {
         unreachable.push(source.configured);
-        hosts.push({ host: source.configured, asks: [], live: [], history: [], updatedAt: new Date(this.now()).toISOString(), error: `Decision source ${source.configured} unavailable: ${source.error ?? "duplicate host identity"}` });
+        hosts.push({ host: source.configured, asks: [], live: [], history: [], updatedAt: new Date(this.now()).toISOString(), error: `Decision source ${source.configured} unavailable: ${source.error ?? "duplicate host identity"}`, flow: null });
         continue;
       }
       identities.add(source.snapshot.host);

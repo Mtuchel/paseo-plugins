@@ -12,7 +12,7 @@ import { ticketOwnership, ticketOwners } from "./activation-guard";
 import { ActivationIntake } from "./activation-intake";
 import { DrainRouter } from "./drain";
 import { PermissionReplies } from "./permission-replies";
-import { DEFAULT_WORKTREE_SHARDS, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_DEPUTY, type ActivationSettings, type PluginSettings } from "./settings";
+import { DEFAULT_WORKTREE_SHARDS, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type ActivationSettings, type PluginSettings } from "./settings";
 
 // The two hosts over real HTTP (the review service's :8444 listener, activation-endpoints.ts):
 // the Mac drains, the server answers, and both talk to each other exactly as they do in the
@@ -23,7 +23,7 @@ process.env.PASEO_ACTIVATION_SECRET = SECRET;
 function settingsFor(activation: ActivationSettings): PluginSettings {
   return {
     template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: false,
-    dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
+    dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
   };
 }
 

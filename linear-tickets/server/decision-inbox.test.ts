@@ -107,7 +107,7 @@ async function harness(t: TestContext, host = "laptop") {
   };
 }
 function peerSnapshot(host = "server087"): DecisionHost {
-  return { host, backendInstanceId: PEER_BACKEND, asks: [ownerAsk], live: [], history: [], updatedAt: "2026-10-12T00:00:00.000Z", error: null };
+  return { host, backendInstanceId: PEER_BACKEND, asks: [ownerAsk], live: [], history: [], updatedAt: "2026-10-12T00:00:00.000Z", error: null, flow: null };
 }
 function mockPeers(t: TestContext, answer: (url: string, method: string, body: unknown, headers: Headers) => Promise<Response> | Response) {
   const calls: { url: string; method: string; body: unknown }[] = [];

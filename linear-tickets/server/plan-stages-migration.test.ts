@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { CatalogLabel, IssueCore, LabeledTicket, RepairCandidate, StateMove } from "./linear";
+import type { CatalogLabel, IssueCore, LabeledTicket, StateMove, StewardIssue } from "./linear";
 import { runModelLabels, runReviewVictims, runStages, type HostEvidence, type MigrationLinear } from "./plan-stages-migration";
 
-type Ticket = RepairCandidate & { attachmentUrls: string[]; moves: StateMove[]; archived?: boolean };
+type Ticket = StewardIssue & { attachmentUrls: string[]; moves: StateMove[]; archived?: boolean };
 
 function ticket(n: number, status: string, labels: string[] = [], extra: Partial<Ticket> = {}): Ticket {
   const statusType = ["Todo"].includes(status) ? "unstarted" : status === "Backlog" ? "backlog" : status === "Done" ? "completed" : "started";
-  return { id: `i${n}`, identifier: `TUC-${n}`, status, statusType, projectId: null, delegateId: "app", labels: labels.map((name) => ({ id: name, name })), openChildren: false, queueBlocker: false, attachmentUrls: [], moves: [], ...extra };
+  return { id: `i${n}`, identifier: `TUC-${n}`, title: `Ticket ${n}`, status, statusType, teamId: "t1", teamKey: "TUC", projectId: null, projectName: null, delegateId: "app", parentId: null, labels: labels.map((name) => ({ id: name, name })), children: [], blockers: [], attachments: [], updatedAt: null, attachmentUrls: [], moves: [], ...extra };
 }
 
 // A Linear holding `tickets`, recording every write. `onRead`: runs before each issueCore read, so a
@@ -17,7 +17,7 @@ function fakeLinear(tickets: Ticket[], catalog: CatalogLabel[] = [], options: { 
   const byId = new Map(tickets.map((item) => [item.id, item]));
   // Listings are snapshots, like Linear's answers.
   const linear: MigrationLinear = {
-    repairCandidates: async ({ labels, states }) => tickets.filter((item) => !["completed", "canceled"].includes(item.statusType)
+    stewardIssues: async ({ labels, states }) => tickets.filter((item) => !["completed", "canceled"].includes(item.statusType)
       && (item.labels.some((label) => labels.includes(label.name)) || (item.statusType === "started" && (states ?? []).includes(item.status)))).map((item) => ({ ...item, labels: [...item.labels] })),
     issueCore: async (id) => {
       options.onRead?.(id);

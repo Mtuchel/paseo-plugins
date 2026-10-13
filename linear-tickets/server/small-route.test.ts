@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { IssueState } from "./linear";
 import { TierStore } from "./model-tiers";
-import { DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WORKTREE_SHARDS, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
+import { DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DEPUTY, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_WORKTREE_SHARDS, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { SmallRoutes, type RouteAgent, type RouteEvent } from "./small-route";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { decisionText, type RouteFacts } from "../shared/small-route";
@@ -20,7 +20,7 @@ const FACTS: RouteFacts = {
 const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: "omp", launchPreferences: { omp: { model: "omp/opus", modeId: "full" } },
   projectMappings: {}, agentLinearAccess: false,
-  dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true }, watchdog: DEFAULT_WATCHDOG, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
+  dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true }, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
 };
 const AGENT: RouteAgent = { id: "agent-1", issueId: "issue-1", identifier: "TUC-7", provider: "omp", planPolicy: "required", planDecisionOpen: false };
 

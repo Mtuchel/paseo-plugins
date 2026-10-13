@@ -28,7 +28,6 @@ import { githubBudget, GitHubPausedError, GitHubRateLimitedError, RateLimitedErr
 import { crashResume, unverifiedResume, type PromptOutcome, type Recovery, type SessionRouter, type Succession } from "./sessions";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
-import type { RetirePass, StackState } from "./retirement";
 import type { Watchdog } from "./watchdog";
 
 const INTERVAL_MS = 2 * 60 * 1000;
@@ -331,6 +330,14 @@ function rebind(seenByUrl: Record<string, Seen>, move: { url: string; from: stri
 // A poll's stopped state (see the `stopped` flags in watch): a rate limit or a burnt budget ends
 // the poll's GitHub reads.
 type StopFlags = { paused: RateLimitedError | null; budget: GitHubPausedError | null; throttled: GitHubRateLimitedError | null };
+
+// A pull request's recorded state, as the steward's facts read it (steward.ts StewardPullFacts).
+export type PullState = { merged: boolean; closed: boolean; missing: boolean; decision: string | null; replay: "due" | "asked" | null };
+
+// Whether a ticket's stack landed: `open` while the stack policy would reopen it or reopened it,
+// `unknown` while its pull requests cannot be read. Read by the policy itself (reopenDone) and by
+// the steward, whose archive of a finished ticket's agents waits for `settled` (steward.ts).
+export type StackState = "settled" | "open" | "unknown";
 
 const pullUrl = (repo: string, number: number) => `https://github.com/${repo}/pull/${number}`;
 const PULL_URL = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/;
@@ -1206,16 +1213,15 @@ export class PullRequestWatch {
       outage?: Pick<GreptileOutage, "follow" | "sync">;
       // The silent-agent watchdog (watchdog.ts): it runs first in every poll.
       watchdog?: Pick<Watchdog, "pass" | "stop">;
-      // The waits the plugin recorded for the owner whose ending event was lost (writeback.ts,
-      // reconcileWaiting): checked every poll, after the watchdog, so a ticket the plugin parked in
-      // Needs input is never left there once no live agent can end the wait.
-      ownerWaits?: { reconcileWaiting: () => Promise<void> };
       // The ticket states crash recovery last saw (known-states.ts); the daemon passes the one the
       // plugin's own state writes feed. Absent: known-states.json next to pr-watch.json.
       knownStates?: KnownStates;
-      // Finished tickets' quiet agents and old ghosts (retirement.ts): archived in every poll, right
-      // after the stack policy reopened the Done tickets whose stack has not landed.
-      retire?: Pick<RetirePass, "pass" | "stop">;
+      // The ticket steward (steward.ts): one level-triggered reconciler over every in-scope open
+      // ticket of the dispatch teams, run at the end of every poll -- after the passes whose
+      // effects it must see (the stack policy's reopens, crash recovery's restarts) -- so a ticket
+      // nothing else moved is repaired by exactly one action. It replaced the retire pass (its
+      // archives), the lost-owner-wait reconcile (its stale waits) and the label-repair restarts.
+      steward?: { pass: () => Promise<void>; stop: () => void };
     },
     private readonly path = join(paseoHome(), "linear-tickets", "pr-watch.json"),
   ) {
@@ -1249,7 +1255,7 @@ export class PullRequestWatch {
     this.resumeTimer = null;
     // No watchdog effect starts after the unload; one in flight drains under its lease.
     this.deps.watchdog?.stop();
-    this.deps.retire?.stop();
+    this.deps.steward?.stop();
     // These runs may be awaiting GitHub before their next Linear write. Finish them
     // before the plugin's final hourly-usage flush and replacement instance start.
     await Promise.allSettled([this.running, this.backstopping]);
@@ -1316,6 +1322,11 @@ export class PullRequestWatch {
   // poll after load then reopens the Done tickets with open pull requests a few at a time (see
   // reopenDone) and asks every over-cap stack once.
   private policy: PolicyState = {};
+
+  // The state the running poll or backstop loaded (Steward's pull facts, see pullStates below): the
+  // file is only written at the end of a run, so the steward reads the run's own view of the pull
+  // requests it just looked at.
+  private currentSeen: Record<string, Seen> | null = null;
 
   private get policyPath(): string {
     return join(dirname(this.path), "stack-policy.json");
@@ -1786,6 +1797,7 @@ export class PullRequestWatch {
 
   private async watch(): Promise<void> {
     const seenByUrl = await this.load();
+    this.currentSeen = seenByUrl;
     this.crashes = await readFile(this.crashPath, "utf8").then((text) => JSON.parse(text) as Record<string, Crash>, () => ({}));
     this.policy = await this.loadPolicy();
     // The crash cutover (see cutOverCrashes) runs on every load and writes its one change back.
@@ -1867,37 +1879,26 @@ export class PullRequestWatch {
         }
       });
     }
-    // Waits the plugin recorded for the owner, whose ending event was lost (writeback.ts): the
-    // ticket would stay in Needs input under its label with nothing waiting, so each poll closes
-    // the ones no live agent can end. Its own failures are logged; they never end the poll.
-    if (this.deps.ownerWaits) {
-      await pass(async () => {
-        try {
-          await this.deps.ownerWaits!.reconcileWaiting();
-        } catch (error) {
-          if (error instanceof RateLimitedError) throw error;
-          console.error(`[linear-tickets] closing left-behind owner waits failed: ${error instanceof Error ? error.message : error}`);
-        }
-      });
-    }
     // Crash recovery comes next, whatever the watchdog's Linear budget came to (see crashPass).
     const { states, sentAt, asked } = await this.observeStates(mine);
     // A Done ticket whose stack has not landed goes back to work first, so its agent's crash is
     // restarted like any started ticket's in the same poll (see reopenDone).
     await this.reopenDone(mine, states, reserved, context, seenByUrl, stopped);
-    // Then the agents of finished tickets are archived (README, "Ghost agents"): a ticket reopened
-    // just now carries its new state, and one whose stack is still open keeps its agent.
-    if (this.deps.retire && !stopped.paused) {
+    await this.crashPass(mine, states, reserved, seenByUrl, views, moves);
+    // The steward (steward.ts) runs here, after the passes whose effects it must see -- the stack
+    // policy's reopens, crash recovery's restarts: one level-triggered pass over every in-scope open
+    // ticket of the dispatch teams, repairing the tickets none of them moved with exactly one action
+    // per ticket. Its own failures are logged; they never end the poll.
+    if (this.deps.steward && !stopped.paused) {
       await pass(async () => {
         try {
-          await this.deps.retire!.pass({ states, sentAt, asked, stack: (issueId) => this.stackSettled(mine, issueId, context, stopped) });
+          await this.deps.steward!.pass();
         } catch (error) {
           if (error instanceof RateLimitedError) throw error;
-          console.error(`[linear-tickets] retiring finished agents failed: ${error instanceof Error ? error.message : error}`);
+          console.error(`[linear-tickets] the ticket steward's pass failed: ${error instanceof Error ? error.message : error}`);
         }
       });
     }
-    await this.crashPass(mine, states, reserved, seenByUrl, views, moves);
     // Stalled pull requests are nudged, and closed ones followed to their replacement, after every
     // drop was handled: a drop's fix request comes first when both are for the same agent.
     const nudges: { record: HandoverRecord; url: string; view: PullRequestView }[] = [];
@@ -2281,6 +2282,7 @@ export class PullRequestWatch {
   // claimed for its own tickets (see advanceAction) and delivers its own pending messages.
   private async queueBackstop(): Promise<void> {
     const seenByUrl = await this.load();
+    this.currentSeen = seenByUrl;
     const all = await this.deps.handover.all();
     // Discovery links a ticket's open pull requests to its record, so it is this host's tickets'
     // work: another host's records keep their state here untouched.
@@ -3406,9 +3408,50 @@ export class PullRequestWatch {
     }
   }
 
-  // Whether a Done ticket's stack landed, for the retire pass (retirement.ts): the owner moved it
-  // back to Done after a reopen, or the stack policy finds no open pull request of it. A reopen not
-  // yet carried out keeps it open. A ticket without a record here has no stack policy on this host.
+  // What the steward's facts need of the pull requests it recorded on its tickets (steward.ts
+  // PullState): landed, closed without merging, missing (its read said it does not exist), the last
+  // review decision and how far a closed-without-merging replay got (`due`: not looked at yet,
+  // `asked`: its agent was asked to replay). Read from the run's own state while one runs, else from
+  // the file; a URL this host never saw has no entry and no claim is made about it.
+  async pullStates(urls: string[]): Promise<Map<string, PullState>> {
+    const seen = this.currentSeen ?? await this.load();
+    const states = new Map<string, PullState>();
+    for (const url of urls) {
+      const entry = seen[url];
+      if (!entry) continue;
+      states.set(url, { merged: entry.merged, closed: entry.closed === true && !entry.merged, missing: entry.missing === true, decision: entry.decision ?? null, replay: entry.replay === "due" || entry.replay === "asked" ? entry.replay : null });
+    }
+    return states;
+  }
+
+  // The steward's terminal-ticket check (steward.ts): whether the ticket's stack landed, by the
+  // same rule the poll applies before it reopens a Done ticket (see stackSettled below) -- the
+  // owner moved it back to Done after a reopen, or no pull request of it is open. Read off the poll
+  // (the steward's pass runs between polls), so it builds its own context and reads its own
+  // records; a rate limit or a burnt GitHub budget ends it as "unknown", which the steward retries
+  // next pass. A ticket without a record here has no stack policy on this host.
+  async stackState(issueId: string): Promise<StackState> {
+    const stopped: StopFlags = { paused: null, budget: null, throttled: null };
+    let all: HandoverRecord[];
+    try {
+      all = await this.deps.handover.all();
+    } catch (error) {
+      console.error(`[linear-tickets] the steward's stack check could not read the handover records: ${error instanceof Error ? error.message : error}`);
+      return "unknown";
+    }
+    const mine = await this.ownedRecords(all).catch(() => []);
+    const record = mine.find((item) => item.issueId === issueId);
+    if (!record) return "settled";
+    const reopen = this.policy[issueId]?.reopen;
+    if (reopen) return reopen.respected ? "settled" : "open";
+    const open = await this.policyPulls(record, this.context([record], undefined, all), stopped);
+    if (stopped.paused || stopped.budget || stopped.throttled) return "unknown";
+    return !open ? "unknown" : open.length ? "open" : "settled";
+  }
+
+  // Whether a Done ticket's stack landed, for the stack policy below (reopenDone): the owner moved
+  // it back to Done after a reopen, or the stack policy finds no open pull request of it. A reopen
+  // not yet carried out keeps it open. A ticket without a record here has no stack policy on this host.
   private async stackSettled(mine: HandoverRecord[], issueId: string, context: RunContext, stopped: StopFlags): Promise<StackState> {
     const record = mine.find((item) => item.issueId === issueId);
     if (!record) return "settled";

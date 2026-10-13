@@ -258,7 +258,7 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "get_issue", "get_comments", "search_issues", "add_comment", "set_status", "link_url", "add_relation", "create_issue", "update_issue", "add_manual_task"]);
+    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "get_issue", "get_comments", "search_issues", "add_comment", "set_status", "link_url", "add_relation", "create_issue", "update_issue", "steward_verdict", "add_manual_task"]);
 
     const ticket = JSON.parse((await mcp.call("get_ticket")).text);
     assert.equal(ticket.identifier, "ENG-42");
@@ -962,7 +962,7 @@ test("without the broker the tools stay available and every request fails closed
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.equal(list.tools.length, 11, "the tools stay mounted when the broker is down");
+    assert.equal(list.tools.length, 12, "the tools stay mounted when the broker is down");
     for (const call of [() => mcp.call("get_ticket"), () => mcp.call("add_comment", { body: "Started." })]) {
       const result = await call();
       assert.equal(result.isError, true);

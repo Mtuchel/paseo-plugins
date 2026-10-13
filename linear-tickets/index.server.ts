@@ -38,7 +38,7 @@ import { GreptileOutage } from "./server/greptile-outage";
 import { HealthMonitor } from "./server/health";
 import { KnownStates } from "./server/known-states";
 import { PullRequestWatch } from "./server/pr-watch";
-import { DoneTickets, RetiredLabels, RetirePass } from "./server/retirement";
+import { DoneTickets, RetiredLabels, Steward, StewardStore } from "./server/steward";
 import { PullRequestBoard } from "./server/pull-requests";
 import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
@@ -46,7 +46,7 @@ import { closeAnswered, NeedsYouIssues } from "./server/needs-you";
 import { OWNER_ASK_DIRECTORY, OwnerAsks } from "./server/owner-asks";
 import { QueuedLabels } from "./server/queued-labels";
 import { extractWithOmp } from "./server/owner-ask-extract";
-import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, restartOrThrow, SessionRouter, SessionStore, setAgentLabel, setAgentMode, stopAgentTurn, type HostOwnership } from "./server/sessions";
+import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, SessionRouter, SessionStore, setAgentLabel, setAgentMode, stopAgentTurn, type HostOwnership } from "./server/sessions";
 import { SmallRoutes } from "./server/small-route";
 import { LimitResumeStore, UsageReader } from "./server/limit-resume";
 import { isUntrusted, planSetup, TicketStarter } from "./server/starter";
@@ -59,7 +59,6 @@ import { labelDaemon, StateLabels } from "./server/state-labels";
 import { LabelSync, PullRequestFiles } from "./server/label-sync";
 import { ProjectFlow, ProjectStore } from "./server/project-flow";
 import { ProjectIssueCache } from "./server/project-issues";
-import { LabelRepair } from "./server/label-repair";
 import { Presence } from "./server/presence";
 import { Focus } from "./server/focus";
 import { rateBudget, withPriority } from "./server/rate-budget";
@@ -143,8 +142,8 @@ export default function contribute(server: PluginServerContext) {
   // Parked plans are built below with the Plannotator host; read only once the plugin runs.
   const waitingPlans = { has: (issueId: string) => parking.plans.has(issueId) };
   // Finished tickets (README, "Who starts next"): the slot count leaves out an agent of a Done or
-  // Canceled ticket quiet for more than an hour. Fed by the retire pass's reads and by every state
-  // the plugin writes, so a ticket Paseo reopens counts its agent again at once.
+  // Canceled ticket quiet for more than an hour. Fed by the steward's reads and by every state the
+  // plugin writes, so a ticket Paseo reopens counts its agent again at once.
   const doneTickets = new DoneTickets();
   linear.onStateWritten((issueId, state) => doneTickets.written(issueId, state.type, Date.now()));
   const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, routes: smallRoutes, deletions, shards, focus, parked: waitingPlans, doneTickets });
@@ -231,16 +230,27 @@ export default function contribute(server: PluginServerContext) {
     retire: async (agentId, api) => {
       await stopAgentTurn(agentId).catch(() => {});
       await api.agents.ref(agentId).archive().catch(() => {});
-    }, restart: async (issueId, identifier) => restartOrThrow(await sessions.restartFor(issueId, identifier)), accountedFor: async (issueId) => launcher.underWay(issueId) || await sessions.threadHolds(issueId) });
-  // Stale `-running` and `-failed` labels are reconciled, and their tickets started again, as are
-  // orphaned Planning tickets (README, "Repairing stale running and failed labels"); its records
-  // share projects.json with the projects.
-  const labelRepair = new LabelRepair({ linear, store: projectStore, launcher, intake, deletions, focus,
-    waiting: async (issueId, inTurn) => await parking.plans.has(issueId) || await sessions.threadQueued(issueId, inTurn),
-    restart: (issueId, identifier, options) => sessions.restartFor(issueId, identifier, options) });
-  const relay = new CommentRelay(linear, undefined, needsYou, route, replies);
-  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, repairs: labelRepair, focus, parked: waitingPlans });
+    } });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
+  // The before-merge manual tasks of a ticket (manual-tasks.ts), read by the steward's facts.
+  const manualTasks = new ManualTasks({ linear, settings });
+  // The steward's pass runs inside the pull request watch's poll (see below); the watch is built
+  // after it, so its readers are reached lazily, when the first pass runs.
+  let steward: Steward | null = null;
+  steward = new Steward({
+    store: new StewardStore(),
+    linear, sessions, starter, launcher, handover, writeback,
+    watchdog: watchdogStore, manualTasks, needsYou, settings,
+    // Which host owns a ticket's automatic work (activation-guard.ts ticketOwnership).
+    owner: (issueId) => ticketOwner(issueId),
+    // The pull request watch's own state for the tickets' recorded pull requests, and one ticket's
+    // stack state (pr-watch.ts pullStates and stackState).
+    pulls: (urls) => pullRequests.pullStates(urls),
+    stacked: (issueId) => pullRequests.stackState(issueId),
+    intake, doneTickets, labels: new RetiredLabels(), deletions, focus,
+  });
+  const relay = new CommentRelay(linear, undefined, needsYou, route, replies);
+  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, steward, focus, parked: waitingPlans });
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
   const decisions = new DecisionLog();
   writeback.recordDecisions(decisions);
@@ -322,6 +332,11 @@ export default function contribute(server: PluginServerContext) {
       const serverId = await daemonServerId();
       return serverId ? paseoAgentUrl(serverId, agentId) : null;
     },
+    // The steward's flow summary for the page's Flow section (README, "Ticket steward").
+    flow: async () => {
+      const snapshot = await steward!.snapshot();
+      return { at: snapshot.lastPassAt, counts: snapshot.counts, oldest: snapshot.oldest, error: snapshot.lastError };
+    },
   });
   const activationRoutes = activationEndpoints({ settings, intake, drain, appUserId: () => linear.appUserId() });
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
@@ -392,22 +407,24 @@ export default function contribute(server: PluginServerContext) {
   plannotator.useFollowUps(followUps);
   plannotator.recordDecisions(decisions);
   plannotator.useSmallRoutes(smallRoutes);
-  const manualTasks = new ManualTasks({ linear, settings });
-  const watchdog = new Watchdog({ store: watchdogStore, sessions, linear, settings, handover, needsYou, manualTasks });
+  const watchdog: Watchdog = new Watchdog({ store: watchdogStore, sessions, linear, settings, handover, needsYou, manualTasks,
+    // The exhausted cycle's terminal step is the steward's escalation (README, "Ticket steward").
+    escalate: (issueId, identifier, reason) => steward!.escalateExhausted(issueId, identifier, reason) });
   // The ticket states crash recovery last saw, fed by every state the plugin writes (README, "Crashed agents").
   const knownStates = new KnownStates();
   linear.onStateWritten((issueId, state) => { void knownStates.observe(issueId, state, Date.now()); });
-  // Finished tickets' quiet agents and ghosts older than a day are archived in every pull request
-  // poll (README, "Ghost agents"), except where the owner waits or the peer host works.
-  const retire = new RetirePass({ sessions, linear, settings, handover, needsYou, watchdog: watchdogStore, deletions, owner: (issueId) => ticketOwner(issueId), doneTickets, labels: new RetiredLabels() });
-  const pullRequests = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog, knownStates, retire, outage: new GreptileOutage(linear, settings),
+  // The ticket steward (README, "Ticket steward"): one level-triggered reconciler over every
+  // in-scope open ticket of the dispatch teams. It runs at the end of every pull request poll (and
+  // in the dispatch poll with the label-repair cadence); the watch that runs it is built first,
+  // with a lazy reference to it, because the steward reads the watch's own state: the pull request
+  // records it keeps, and its stack check. Built here so the project flow's start paths and the
+  // dispatcher can reach it.
+  const pullRequests: PullRequestWatch = new PullRequestWatch({ handover, sessions, linear, settings, manualTasks, watchdog, knownStates, outage: new GreptileOutage(linear, settings),
     // Which tickets this host's pull request watch may work on (README, "Several hosts"): the same
     // claims rule SessionRouter reads per ticket, once for a whole poll (activation-guard.ts).
     owner: ticketOwners({ settings, drain, intake }),
-    // The waits the plugin recorded for the owner, checked in every poll: a wait whose ending event
-    // was lost would hold its ticket in Needs input forever. The tickets this host handed to the
-    // peer keep their waits (the peer's plugin ends them).
-    ownerWaits: { reconcileWaiting: async () => { if (attachedPaseo) await writeback.reconcileWaiting(attachedPaseo, { handedOver: () => watchdogStore.handedOver() }); } } });
+    // The steward's pass, at the end of every poll (steward.ts).
+    steward: { pass: async () => { if (steward && attachedPaseo) await steward.tick(attachedPaseo, await settings.read()); }, stop: () => steward?.stop() } });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text), routes: smallRoutes });
   const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => asCaller("session-webhook", () => sessions.receive(event)));
   // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").
@@ -544,7 +561,18 @@ export default function contribute(server: PluginServerContext) {
     return Object.keys(env).length ? { ...request, env: { ...request.env, ...env } } : undefined;
   });
   server.handle(statusRpc, (_input, { paseo }) => { attach(paseo); return linear.status(); });
-  server.handle(dispatchStatusRpc, (_input, { paseo }) => { attach(paseo); return dispatcher.snapshot(); });
+  server.handle(dispatchStatusRpc, async (_input, { paseo }) => {
+    attach(paseo);
+    // The steward's flow summary rides the dispatch status (README, "Ticket steward"); a failure to
+    // read it is named here instead of hiding the dispatch state.
+    const status = await dispatcher.snapshot();
+    try {
+      const snapshot = await steward!.snapshot();
+      return { ...status, steward: { enabled: snapshot.enabled, lastPassAt: snapshot.lastPassAt, lastError: snapshot.lastError, counts: snapshot.counts, oldest: snapshot.oldest } };
+    } catch (error) {
+      return { ...status, steward: { enabled: false, lastPassAt: null, lastError: `the steward's state could not be read: ${error instanceof Error ? error.message : error}`, counts: {}, oldest: [] } };
+    }
+  });
   server.handle(projectsStatusRpc, (_input, { paseo }) => { attach(paseo); return projects.status(); });
   server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { attach(paseo); return asCaller("project-flow", async () => projects.planNow(projectId, await settings.read(), paseo, true)); });
   server.handle(skipPlanRpc, async ({ projectId }, { paseo }) => { attach(paseo); return asCaller("project-flow", async () => projects.skipPlan(projectId, await settings.read(), paseo)); });
@@ -632,9 +660,9 @@ export default function contribute(server: PluginServerContext) {
     const model = tierModel(current, input.provider.split("/")[0], setup.tier?.tier ?? null, { provider: input.provider, ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}) });
     const launch = { ...input, ...model, modeId: setup.modeId, instructions: [...setup.notes, input.instructions.trim()].filter(Boolean).join("\n\n") };
     const markInProgress = input.markInProgress && setup.policy !== "required";
-    // The owner's own start ends any label-repair incident of the ticket first (README, "Repairing
-    // stale running and failed labels"), so a failure of it is a new incident with fresh retries.
-    await labelRepair.ownerRetried(input.id);
+    // The owner's own start ends any steward incident of the ticket first (README, "Ticket
+    // steward"), so a failure of it is a new round with fresh retries.
+    await steward!.ownerRetried(input.id);
     const result = await launcher.start(launch, paseo, { promptTemplate: template ?? undefined, markInProgress, linearAccess: agentLinearAccess, labels: setup.labels, env: setup.env });
     await recordStart(tiers, { id: input.id, identifier: setup.identifier }, setup.tier, result.agentId, model.provider);
     // Started by hand while focus is on: in flight now, so its successors start too.

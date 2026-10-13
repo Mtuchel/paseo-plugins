@@ -22,7 +22,7 @@ import { launchTier, recordStart, TIER_AGENT_LABEL, tierModel, tierNote, type Ti
 import { eligibilityProblems, SMALL_ROUTE_POLICY, type RouteRecord, type SmallRoutes } from "./small-route";
 import { NO_PLAN_LABEL, SMALL_ROUTE_ENV, smallRouteNote } from "../shared/small-route";
 import type { ReviewDeletions } from "./review-deletions";
-import type { DoneTickets } from "./retirement";
+import type { DoneTickets } from "./steward";
 import { shardDependencies, type ShardAssignor } from "./worktree-shards";
 
 export type Started = { agentId: string; warnings: string[]; provider: string; target: string; resumed: boolean; untrusted: boolean; plan: PlanPolicy | null };
@@ -48,7 +48,7 @@ type Deps = {
   // until the owner decides; the decision's own thread starts once the plan is unparked.
   parked?: Pick<ParkedPlans, "has">;
   // Finished tickets (README, "Who starts next"): an agent of a Done or Canceled ticket quiet for
-  // more than an hour holds no slot (retirement.ts).
+  // more than an hour holds no slot (steward.ts).
   doneTickets?: Pick<DoneTickets, "releases">;
 };
 
@@ -201,7 +201,7 @@ function smallRouteSetup(identifier: string, route: RouteRecord, tier: Tier, usu
 // frees it too (README, "Ghost agents"): after a daemon restart the agents the listing still shows
 // as running without a process would otherwise fill every slot and refuse their own restarts. So
 // does an agent `releases` names: one whose ticket is Done or Canceled and that has been quiet for
-// more than an hour (retirement.ts DoneTickets).
+// more than an hour (steward.ts DoneTickets).
 export async function runningTicketAgents(paseo: PaseoApi, inspect?: ProcessInspector, releases?: (agent: PaseoAgent, now: number) => boolean): Promise<string[]> {
   const working: { agent: PaseoAgent; issueId: string }[] = [];
   let cursor: string | undefined;
@@ -321,8 +321,11 @@ export class TicketStarter {
   }
 
   // `resumeOnly`: continue the recorded branch and worktree or throw ResumeUnavailableError, never
-  // start fresh. `lead`: the last part of the first prompt (see Launcher).
-  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string; resume?: ActivationResume }): Promise<Started> {
+  // start fresh. `lead`: the last part of the first prompt (see Launcher). `verifier`: a
+  // short-lived read-only check of the ticket's recorded work (steward.ts): no plan policy and no
+  // fresh branch (always the recorded one), the cheap tier, and instructions instead of the plan
+  // notes, so a verifier never plans, implements or pushes.
+  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string; resume?: ActivationResume; verifier?: { brief: string } }): Promise<Started> {
     if (await this.deps.deletions?.blocked(issueId)) throw new Error("This ticket is paused for deletion; no agent was started.");
     const detail: TicketDetail = await this.deps.linear.detail(issueId);
     const source = { projectId: detail.projectId, projectName: detail.issue.project, teamId: detail.teamId, teamName: detail.issue.team };
@@ -364,9 +367,12 @@ export class TicketStarter {
     const resume = options.fresh ? null
       : options.resume ? await this.importedResume(project, detail.issue.identifier, options.resume)
       : recordedResume;
-    if (options.resumeOnly && !resume) throw new ResumeUnavailableError(`${detail.issue.identifier} has no recorded branch to continue on.`);
-    if (options.resumeOnly && project.projectKind !== "git") throw new ResumeUnavailableError(`${target} is not a Git project, so ${detail.issue.identifier}'s branch cannot be continued.`);
-    const setup = await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, { tiers: this.deps.tiers, routes: this.deps.routes, settings });
+    const resumeOnly = options.resumeOnly || Boolean(options.verifier);
+    if (resumeOnly && !resume) throw new ResumeUnavailableError(`${detail.issue.identifier} has no recorded branch to continue on.`);
+    if (resumeOnly && project.projectKind !== "git") throw new ResumeUnavailableError(`${target} is not a Git project, so ${detail.issue.identifier}'s branch cannot be continued.`);
+    const setup = options.verifier
+      ? { identifier: detail.issue.identifier, untrusted: true, policy: null, modeId: undefined, notes: [options.verifier.brief], labels: {}, env: {}, tier: { tier: "cheap" as const, reason: "a steward verifier runs on the cheap tier" } }
+      : await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, { tiers: this.deps.tiers, routes: this.deps.routes, settings });
     const model = tierModel(settings, preference.model.split("/")[0], setup.tier?.tier ?? null, { provider: preference.model, ...(preference.thinkingOptionId ? { thinkingOptionId: preference.thinkingOptionId } : {}) });
     const base = {
       id: issueId,
@@ -374,9 +380,9 @@ export class TicketStarter {
       provider: model.provider,
       modeId: setup.modeId,
       thinkingOptionId: model.thinkingOptionId,
-      instructions: [...setup.notes, QUESTIONS_NOTE].join("\n\n"),
+      instructions: options.verifier ? setup.notes.join("\n\n") : [...setup.notes, QUESTIONS_NOTE].join("\n\n"),
       // A required plan goes to Planning on the agent's first turn (write-back), not In Progress.
-      markInProgress: settings.markInProgress && setup.policy !== "required",
+      markInProgress: settings.markInProgress && setup.policy !== "required" && !options.verifier,
     };
     const launchOptions = { promptTemplate: settings.template ?? undefined, markInProgress: base.markInProgress, linearAccess: settings.agentLinearAccess, labels: { ...options.labels, ...setup.labels }, env: setup.env, ...(options.lead ? { lead: options.lead } : {}) };
     const plan = { untrusted: setup.untrusted, plan: setup.policy };

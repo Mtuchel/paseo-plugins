@@ -13,13 +13,13 @@
 //   a check by hand; only the identifiers named with apply move to In Review.
 // - model-labels: issues with two or more `model:` labels keep the strongest; then the three labels
 //   join the `model` group (only once both hosts run the one-write tier swap), or leave it again.
-import type { LabeledTicket, LinearService, RepairCandidate, StateMove } from "./linear";
+import type { LabeledTicket, LinearService, StateMove, StewardIssue } from "./linear";
 import { labelTier, TIER_GROUP, TIER_LABELS } from "./model-tiers";
 import { hasLabel, PLAN_APPROVED_STATE, PLAN_READY_LABEL, PLAN_REVIEW_STATE, PLANNING_STATE, planStage, type PlanStage } from "./plan-policy";
 import { TIERS } from "../shared/plan-model";
 
 export type MigrationLinear = Pick<LinearService,
-  "repairCandidates" | "issueCore" | "moveToPlanStage" | "moveToReview" | "stateMoves" | "trustedAppIds" | "issuesWithLabels" | "changeLabels" | "labelCatalog" | "createLabel" | "moveLabelIntoGroup" | "moveLabelOutOfGroup">;
+  "stewardIssues" | "issueCore" | "moveToPlanStage" | "moveToReview" | "stateMoves" | "trustedAppIds" | "issuesWithLabels" | "changeLabels" | "labelCatalog" | "createLabel" | "moveLabelIntoGroup" | "moveLabelOutOfGroup">;
 
 // What this host knows about a ticket. `reviewAgent`: the agent whose own review is open (it is
 // live while it waits, so it is no other agent working on the ticket).
@@ -30,7 +30,7 @@ export type HostEvidence = {
   liveAgents: (issueId: string) => Promise<string[]>;
 };
 
-type Listed = Pick<RepairCandidate, "id" | "identifier" | "status" | "statusType" | "labels">;
+type Listed = Pick<StewardIssue, "id" | "identifier" | "status" | "statusType" | "labels">;
 export type StageRow = { identifier: string; status: string; evidence: string[]; verdict: string; target: PlanStage | null; result?: string };
 
 const BEFORE_WORK = new Set(["triage", "backlog", "unstarted"]);
@@ -69,7 +69,7 @@ export async function stageVerdict(ticket: Listed, host: HostEvidence): Promise<
 }
 
 export async function runStages(input: { linear: MigrationLinear; host: HostEvidence; teamKeys: string[]; apply: boolean }): Promise<StageRow[]> {
-  const found = await input.linear.repairCandidates({ labels: [PLAN_READY_LABEL], teamKeys: input.teamKeys, ids: [], states: [PLANNING_STATE, PLAN_REVIEW_STATE, PLAN_APPROVED_STATE] });
+  const found = await input.linear.stewardIssues({ labels: [PLAN_READY_LABEL], teamKeys: input.teamKeys, ids: [], appIds: [], states: [PLANNING_STATE, PLAN_REVIEW_STATE, PLAN_APPROVED_STATE] });
   const tickets = found.filter((ticket) => planStage(ticket.status, ticket.statusType) || (BEFORE_WORK.has(ticket.statusType.trim().toLowerCase()) && hasLabel(ticket.labels, PLAN_READY_LABEL)))
     .sort((a, b) => a.identifier.localeCompare(b.identifier, undefined, { numeric: true }));
   const rows: StageRow[] = [];
@@ -98,7 +98,7 @@ export type VictimRow = { identifier: string; movedAt: string; pullRequests: str
 export async function runReviewVictims(input: { linear: MigrationLinear; host: Pick<HostEvidence, "parked" | "review">; teamKeys: string[]; cutoff: string; apply: string[] }): Promise<{ rows: VictimRow[]; refused: string[] }> {
   const apps = new Set(await input.linear.trustedAppIds());
   if (!apps.size) throw new Error("The Paseo app's Linear user is unknown on this host, so no move can be attributed to it.");
-  const found = await input.linear.repairCandidates({ labels: [PLAN_READY_LABEL], teamKeys: input.teamKeys, ids: [], states: [PLAN_REVIEW_STATE] });
+  const found = await input.linear.stewardIssues({ labels: [PLAN_READY_LABEL], teamKeys: input.teamKeys, ids: [], appIds: [], states: [PLAN_REVIEW_STATE] });
   const rows: VictimRow[] = [];
   const named = new Set(input.apply.map((identifier) => identifier.trim().toUpperCase()));
   for (const ticket of found.filter((item) => planStage(item.status, item.statusType) === PLAN_REVIEW_STATE).sort((a, b) => a.identifier.localeCompare(b.identifier, undefined, { numeric: true }))) {
