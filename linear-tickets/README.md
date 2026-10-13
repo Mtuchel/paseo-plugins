@@ -2529,6 +2529,9 @@ proxy on `127.0.0.1:47833` stays with the plugin.
 Recovery stays read-only until the page has received a successful live snapshot; a readiness
 probe alone cannot unlock cached controls. Peer rows retain the backend instance that produced
 their source, and forwarded actions carry that exact instance rather than a later probe's one.
+An action for the instance that is ready now, arriving while the frontdoor still holds the
+previous instance's snapshot (a peer inbox forwards actions without loading this host's pages),
+waits for one live snapshot read and is admitted only if that read succeeds from the same instance.
 Review decisions, rechecks and deletions also name the displayed review generation. If an
 acknowledgement is lost, refreshing the same source does not unlock its actions or resend them.
 Local draft cancellation remains available while the backend is down.

@@ -310,6 +310,33 @@ test("a replaced backend refuses the displayed page's action instead of rebindin
   });
 });
 
+// A peer inbox reads this host's rows from the backend itself (/api/inbox, /api/decisions/local)
+// and forwards actions carrying that backend's instance; nothing loads this host's own pages. After
+// a plugin reload the frontdoor's snapshot is from the previous instance, so admission reads the
+// ready one live instead of refusing every action until someone opens this host's page.
+test("an action for the instance that is ready now is admitted after a live read, never on the probe alone", async () => {
+  const fake = await fakeBackend();
+  await withFrontdoor(fake, async (frontdoor) => {
+    await until(async () => (await readAvailability(frontdoor.port)).stale === false);
+    fake.settings.instance = randomUUID();
+    const decisions = () => fake.calls.filter((item) => item.path === "/api/reviews/agent-1/decision");
+    // The live read fails: the probe alone does not admit the action.
+    fake.settings.hold = (call, response) => {
+      if (call.path !== "/_inbox/snapshot") return false;
+      response.writeHead(500).end();
+      return true;
+    };
+    const refused = await mutation(frontdoor.port, { approve: true }, { [INBOX_DISPLAYED_HEADER]: fake.settings.instance });
+    assert.equal(refused.status, 409);
+    assert.equal(decisions().length, 0, "nothing reached the backend without a live snapshot");
+    fake.settings.hold = null;
+    const admitted = await mutation(frontdoor.port, { approve: true }, { [INBOX_DISPLAYED_HEADER]: fake.settings.instance });
+    assert.equal(admitted.status, 200, admitted.text);
+    assert.equal(decisions().length, 1);
+    assert.equal(decisions()[0].headers[INBOX_INSTANCE_HEADER], fake.settings.instance);
+  });
+});
+
 test("an admitted mutation whose acknowledgement is lost is unknown and is never retried", async () => {
   const fake = await fakeBackend();
   await withFrontdoor(fake, async (frontdoor) => {
