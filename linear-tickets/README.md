@@ -2543,7 +2543,9 @@ supervisor without starting it and never touches a listener: a busy `47832` is a
 not a kill, because the plugin owns that port until the cutover. That cutover belongs to the host
 rollout tooling and is a plugin rollout first (which drops the `:8444` publication and moves the
 backend to `47834`), then `start`, then `tailscale serve --https=8444 http://127.0.0.1:47832`;
-Tailscale Funnel stays off. `rollback` points `current` at another staged version and restarts the
+Tailscale Funnel stays off. To upgrade, `install` then `start`: on a running frontdoor `start`
+restarts it on the newly installed bundle (`launchctl kickstart -k`, `systemctl --user restart`).
+`rollback` points `current` at another staged version and restarts the
 service if one is registered, preserving the installed ports, public origin, state directory,
 credential and Node executable; it refuses an unreadable or wrong-version configuration before
 changing the active bundle. `uninstall` removes its own files and registration and leaves the

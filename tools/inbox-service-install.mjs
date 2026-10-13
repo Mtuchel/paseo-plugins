@@ -6,7 +6,7 @@
 //
 //   node tools/inbox-service-install.mjs prepare   [options]   build + stage the bundle, write config
 //   node tools/inbox-service-install.mjs install   [options]   prepare, then register the supervisor
-//   node tools/inbox-service-install.mjs start     [options]   start the supervised frontdoor
+//   node tools/inbox-service-install.mjs start     [options]   start the supervised frontdoor, or restart it on the installed bundle
 //   node tools/inbox-service-install.mjs stop      [options]   stop it (registration stays)
 //   node tools/inbox-service-install.mjs status    [options]   installed version, service and port state
 //   node tools/inbox-service-install.mjs rollback  [options]   point at a previous version, restart
@@ -348,8 +348,10 @@ function start(settings) {
     const already = run(launchctl, ["print", `${domain}/${SERVICE_LABEL}`]).status === 0;
     runOk(launchctl, already ? ["kickstart", "-k", `${domain}/${SERVICE_LABEL}`] : ["bootstrap", domain, supervisorPath("darwin")], "starting the inbox frontdoor");
   } else {
+    // `restart` starts an inactive unit and replaces a running one, like `kickstart -k` above:
+    // after `install` staged a new bundle, a plain `start` would leave the old process running.
     const systemctl = commandFor(settings.env, "INBOX_INSTALL_SYSTEMCTL", "systemctl");
-    runOk(systemctl, ["--user", "start", LINUX_UNIT], "starting the inbox frontdoor");
+    runOk(systemctl, ["--user", "restart", LINUX_UNIT], "starting the inbox frontdoor");
   }
 }
 
@@ -453,7 +455,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       const result = install(settings);
       const command = settings.platform === "darwin"
         ? `launchctl bootstrap gui/${process.getuid?.() ?? 0} ${result.supervisor}`
-        : `systemctl --user start ${LINUX_UNIT}`;
+        : `systemctl --user restart ${LINUX_UNIT}`;
       console.log(`[inbox-service] frontdoor ${result.prepared.version} installed; supervisor ${result.supervisor}`);
       console.log(`[inbox-service] registration only: the service is not started (the plugin may still own 127.0.0.1:${settings.loopbackPort})`);
       console.log(`[inbox-service] cutover: 1) node tools/inbox-service-install.mjs start  2) tailscale serve --https=${REVIEW_TAILNET} http://127.0.0.1:${settings.loopbackPort}`);

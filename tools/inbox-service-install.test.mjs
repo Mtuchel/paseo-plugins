@@ -33,13 +33,17 @@ if (command === "bootstrap" || command === "kickstart") { writeFileSync(state, "
 if (command === "bootout") { rmSync(state, { force: true }); process.exit(0); }
 process.exit(0);
 `;
+// The state file counts process launches, as systemd does: `start` on an active unit launches
+// nothing, `restart` always launches a new process.
 const SYSTEMCTL = `#!/usr/bin/env node
-import { appendFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 appendFileSync(process.env.STUB_LOG, JSON.stringify(process.argv.slice(2)) + "\\n");
 const [, command] = process.argv.slice(2);
 const state = process.env.STUB_STATE;
+const launches = existsSync(state) ? Number(readFileSync(state, "utf8")) || 1 : 0;
 if (command === "is-active") { console.log(existsSync(state) ? "active" : "inactive"); process.exit(existsSync(state) ? 0 : 3); }
-if (command === "start") { writeFileSync(state, "active"); process.exit(0); }
+if (command === "start") { if (!launches) writeFileSync(state, "1"); process.exit(0); }
+if (command === "restart") { writeFileSync(state, String(launches + 1)); process.exit(0); }
 if (command === "stop") { rmSync(state, { force: true }); process.exit(0); }
 process.exit(0);
 `;
@@ -183,6 +187,27 @@ test("install registers the systemd user unit enabled but not started", async ()
     assert.match(body, /WantedBy=default.target/);
     assert.deepEqual(calls(fixture_), [["--user", "daemon-reload"], ["--user", "enable", "paseo-inbox-frontdoor.service"]]);
     assert.equal(calls(fixture_).some((command) => command.includes("start")), false);
+  } finally {
+    rmSync(fixture_.root, { recursive: true, force: true });
+  }
+});
+
+test("start on Linux replaces a running frontdoor, so a newly installed bundle is the one that runs", async () => {
+  const fixture_ = fixture();
+  try {
+    assert.equal((await install(fixture_, ["install", "--platform", "linux"])).status, 0);
+    const port = await freePort();
+    const service = availabilityServer(port);
+    await service.listen;
+    try {
+      assert.equal((await install(fixture_, ["start", "--platform", "linux", "--port", String(port)])).status, 0);
+      assert.equal(readFileSync(fixture_.state, "utf8"), "1");
+      // An upgrade: `install` staged a new bundle while the old process still runs.
+      assert.equal((await install(fixture_, ["install", "--platform", "linux"])).status, 0);
+      const second = await install(fixture_, ["start", "--platform", "linux", "--port", String(port)]);
+      assert.equal(second.status, 0, second.stderr);
+      assert.equal(readFileSync(fixture_.state, "utf8"), "2", "the running frontdoor was replaced");
+    } finally { service.close(); }
   } finally {
     rmSync(fixture_.root, { recursive: true, force: true });
   }
