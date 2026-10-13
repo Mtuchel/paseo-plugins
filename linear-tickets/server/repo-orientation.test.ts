@@ -141,6 +141,20 @@ test("the scout sentence names each harness's exploration subagent and keeps it 
   assert.doesNotMatch(other, /scout|Explore/);
 });
 
+test("edit-anchor guidance reaches only omp providers, with or without a Git checkout", async () => {
+  const paragraph = "Edit anchors (omp hashline edits): an edit's anchors must be lines its `[path#tag]` displayed; the tool also keeps lines an earlier edit left at the same number with the same content. Line numbers from shell output (`grep -n`, `sed -n`, `cat -n`, `nl`, `git diff`), from an older tag of the file or from text you wrote yourself do not count: look the lines up with the `grep` or `read` tool and use that tag. Changes you plan from one view of a file are best sent as one edit call with that view's numbers. After an edit, read a range again before anchoring to lines its response did not show. When an edit is refused as \"never displayed\", compare the content it shows with the line you meant, and retry unchanged only when they match.";
+  for (const provider of ["omp", "omp/anthropic/claude-opus-5-5", "claude/opus", "codex/gpt-5"]) {
+    const notes = [
+      (await repoOrientation({ cwd: null, git: false, provider, detail: ticket({}) })).note,
+      (await orientation(erp, {}, provider)).note,
+    ];
+    for (const note of notes) {
+      if (provider.split("/")[0] === "omp") assert.ok(note.split("\n\n").includes(paragraph), provider);
+      else assert.doesNotMatch(note, /Edit anchors|hashline|\[path#tag\]/, provider);
+    }
+  }
+});
+
 test("every template carries the instructions: the default, a template with the slot, and one without it", () => {
   const detail = { ...ticket({ title: "Sales orders" }), teamId: null, projectId: null, warnings: [], relations: { parent: null, subissues: [], related: [] } };
   const note = "ORIENTATION-NOTE";

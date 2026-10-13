@@ -522,9 +522,9 @@ in total are downloaded; a failed or skipped file becomes a launch warning, neve
 
 ## Repository orientation
 
-Every launch adds three things to the instructions, so the agent neither hunts for the
-repository's area guides nor fills its own context with exploration, and meets the library lookup
-rule where it decides:
+Every launch adds the applicable notes below, so the agent neither hunts for the repository's
+area guides nor fills its own context with exploration, meets the library lookup rule where it
+decides, and uses valid edit anchors:
 
 - **Domain guides.** In a Git project, the plugin lists the checkout's tracked `AGENTS.md`
   files (all but the root one) with each guide's first `# ` heading. Guides the ticket names are
@@ -549,10 +549,19 @@ rule where it decides:
   failure fallbacks stay. A helper reuses its parent's documentation lookup only when the parent
   passes the relevant content and its source. The reminder restates the existing rule (TUC-665);
   no read is intercepted or refused, and nothing checks compliance.
+- **Edit anchors (omp only).** Use lines displayed under the file's current `[path#tag]`, not
+  shell line numbers, older views or text the agent wrote itself; omp also preserves lines an
+  edit left at the same number with the same content. Batch changes planned from one view when
+  practical, read again before anchoring to lines an edit response did not show, and compare the
+  rejection's content with the intended line before retrying unchanged. TUC-664's server087 pilot
+  (2026-10-10 21:00 → 10-12 21:00 UTC) found 958 such refusals among 1,522 failed edits out of
+  21,376 edits; this reminder targets the observed shell-output, own-payload and older-view
+  sources. It restates omp's own rules; nothing is intercepted. Claude and Codex agents do not
+  receive it because their editors work differently.
 
 A guide that cannot be read is listed without its heading, and a failed `git ls-files` drops
-the list; both become a launch warning, never a failure. Non-Git projects get the scout and
-library-lookup notes only. The notes reach new ticket agents (including a new agent continuing a
+the list; both become a launch warning, never a failure. Non-Git projects still get the scout,
+library-lookup and provider-appropriate edit-anchor notes. The notes reach new ticket agents (including a new agent continuing a
 ticket) under the default and any custom prompt template, since both always carry the
 instructions; already-running agents and their helpers do not receive them.
 
