@@ -294,7 +294,7 @@ export class Launcher {
         warnings.push(`Could not save the ticket's Linear attachments: ${error instanceof Error ? error.message : "unknown error"}`);
       }
     }
-    // Never fails the launch: without a readable checkout only the scout and library-lookup notes are added.
+    // Never fails the launch: without a readable checkout the scout, library-lookup and omp edit-anchor notes still apply.
     const orientation = await repoOrientation({ cwd, git: project.projectKind === "git", provider: input.provider, detail });
     warnings.push(...orientation.warnings);
     instructions = [instructions.trim(), orientation.note].filter(Boolean).join("\n\n");

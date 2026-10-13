@@ -35,6 +35,12 @@ export function scoutNote(provider: string): string {
 // restates that existing rule at the decision point; it adds no obligation and enforces nothing.
 const LIBRARY_LOOKUP = "Library behavior lookup: where this repository's applicable instructions already require documentation-first, distinguish behavior questions from exact installed signature/version checks before inspecting installed package files. Follow those instructions' documentation pointer for behavior; where `docs/libraries.md` is the registry, use its Docs entry. Documentation-first means returned content relevant to the question, not merely an ID resolution, registry/skill read or bundled-doc filename listing. Use version-matched bundled docs when the repository directs you there. Exact installed signatures/options/versions may use `.d.ts` or `package.json` directly where the applicable instructions allow it. Preserve the repository's no-pointer exceptions and failure/refusal fallbacks; do not import another repository's registry or invent an obligation. When relying on earlier parent documentation for a delegated lookup, pass the relevant content and provenance; otherwise the helper performs whatever lookup its own applicable instructions require. Unrelated, later or unpassed parent docs are not evidence of documentation-first.";
 
+// TUC-664: restates omp's seen-line guard; other providers have different editors.
+function editAnchorNote(provider: string): string {
+  if (provider.split("/")[0] !== "omp") return "";
+  return "Edit anchors (omp hashline edits): an edit's anchors must be lines its `[path#tag]` displayed; the tool also keeps lines an earlier edit left at the same number with the same content. Line numbers from shell output (`grep -n`, `sed -n`, `cat -n`, `nl`, `git diff`), from an older tag of the file or from text you wrote yourself do not count: look the lines up with the `grep` or `read` tool and use that tag. Changes you plan from one view of a file are best sent as one edit call with that view's numbers. After an edit, read a range again before anchoring to lines its response did not show. When an edit is refused as \"never displayed\", compare the content it shows with the line you meant, and retry unchanged only when they match.";
+}
+
 // Only the ticket's own words: title, description, labels and comments (not related tickets).
 export function ticketWords(detail: Pick<TicketDetail, "issue" | "context">): Ticket {
   let comments: string[] = [];
@@ -114,7 +120,7 @@ export async function guidePaths(cwd: string): Promise<string[]> {
 // Never throws: a launch without the guide list is still a launch. Emits only repository paths
 // and headings, never ticket text.
 export async function repoOrientation(input: { cwd: string | null; git: boolean; provider: string; detail: Pick<TicketDetail, "issue" | "context"> }): Promise<{ note: string; warnings: string[] }> {
-  const scout = [scoutNote(input.provider), LIBRARY_LOOKUP].join("\n\n");
+  const scout = [scoutNote(input.provider), LIBRARY_LOOKUP, editAnchorNote(input.provider)].filter(Boolean).join("\n\n");
   if (!input.git || !input.cwd) return { note: scout, warnings: [] };
   let paths: string[];
   try {
