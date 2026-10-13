@@ -219,8 +219,9 @@ class Frontdoor implements InboxFrontdoor {
   // ------------------------------------------------------------------------------------------
 
   // Probes the backend when the last check is due and refreshes the snapshot when it is missing,
-  // stale or older than `refreshMs`; every caller shares one in-flight read.
-  private async freshen(): Promise<void> {
+  // stale or older than `refreshMs`; every caller shares one in-flight read. `force` skips the
+  // retry gap for a read an owner's action is waiting on.
+  private async freshen(force = false): Promise<void> {
     if (this.closed) return;
     if (this.flight) return this.flight;
     const now = Date.now();
@@ -236,7 +237,7 @@ class Frontdoor implements InboxFrontdoor {
         if (probe.state !== "ready" || changed || probe.instanceId !== this.cache?.snapshot.instanceId) this.fresh = false;
       }
       if (this.state.state !== "ready" || this.fresh && Date.now() - this.lastSnapshotAt < this.refreshMs) return;
-      if (Date.now() - this.lastSnapshotAttemptAt < MIN_SNAPSHOT_GAP_MS) return;
+      if (!force && Date.now() - this.lastSnapshotAttemptAt < MIN_SNAPSHOT_GAP_MS) return;
       this.lastSnapshotAttemptAt = Date.now();
       const snapshot = await this.fetchSnapshot();
       if (!snapshot) {
@@ -474,6 +475,14 @@ class Frontdoor implements InboxFrontdoor {
     if (probe.state === "unavailable") return json(503, { error: `${probe.reason ?? "The checked inbox backend is unreachable."} Nothing was sent.` });
     if (probe.state !== "ready") return json(503, { error: `${probe.reason ?? "The checked inbox backend is not ready."} Nothing was sent.` });
     if (probe.instanceId !== displayed) return json(409, { error: "This page was displayed from a different checked backend instance than the one that is ready now, so its action cannot be applied to what it shows. Nothing was sent; reload the page and try again." });
+    // Only page loads and availability checks on this host refresh the snapshot, and a peer inbox
+    // forwards actions without either: after a plugin reload this snapshot is still the previous
+    // instance's. Read the ready one live now (a shared in-flight read first, then a fresh one)
+    // rather than refusing every action until someone opens this host's own page.
+    if (!this.fresh || this.cache?.snapshot.instanceId !== displayed) {
+      await this.flight?.catch(() => {});
+      if (!this.fresh || this.cache?.snapshot.instanceId !== displayed) await this.freshen(true).catch(() => {});
+    }
     if (!this.fresh || !this.cache || this.cache.snapshot.instanceId !== displayed) return json(409, { error: "This page's snapshot is not current: it was not received from the backend that is ready now. Nothing was sent; refresh the page and try again." });
     return null;
   }
