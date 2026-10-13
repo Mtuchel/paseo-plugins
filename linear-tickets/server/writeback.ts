@@ -60,7 +60,7 @@ type OutboxEntry = { agentId: string; agentTitle: string | null; cwd: string; is
 // write-back keeps working without the Paseo Linear app installed.
 export type AgentBridge = {
   sessions: Pick<SessionRouter, "sessionFor" | "say" | "action" | "ask" | "askQuestion" | "link" | "offerResume" | "resumeNow" | "scheduleLimitResume" | "holdIfStopped" | "follow" | "unfollow">;
-  handover: Pick<Handover, "read" | "all" | "update" | "finish" | "handOff" | "waiting" | "setWaiting">;
+  handover: Pick<Handover, "read" | "all" | "update" | "remember" | "finish" | "handOff" | "waiting" | "setWaiting">;
 };
 type Linear = Pick<LinearService, "issueCore" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "upsertComment" | "commentBody" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "isPerson" | "userUrl" | "createIssue" | "complete">;
 // What a waiting period needs of its agent: enough to write the record back without a hook event.
@@ -684,10 +684,13 @@ export class Writeback {
         await once("outbox", () => this.changeOutbox((entries) => [...entries, ...added.filter((entry) => !entries.some((known) => known.agentId === entry.agentId && known.url === entry.url))]));
       }
       const reply = outcome.kind === "completed" ? turnReply(timeline) : "";
-      const request = writeback.blocked ? ownerRequest(reply) : null;
-      const title = agent.title ?? "Paseo agent";
       const handover = this.agentBridge?.handover;
       const issue = { id: issueId, identifier };
+      if (writeback.summaries && reply && handover) {
+        await once("handover:summary", () => handover.remember(issue, named, { summary: reply }));
+      }
+      const request = writeback.blocked ? ownerRequest(reply) : null;
+      const title = agent.title ?? "Paseo agent";
       // Deliver the owner's notification before ordinary progress work can hit its reserve.
       if (request) {
         const inSession = Boolean(await this.agentBridge?.sessions.sessionFor(agent.id).catch(() => null));

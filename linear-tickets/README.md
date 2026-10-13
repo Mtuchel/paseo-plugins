@@ -1020,6 +1020,19 @@ process) serves every parked plan with Plannotator's own review page, published 
 like any review, so the review inbox, the agent's stable link, the panel and the Linear comment
 work as before; like any review with a stable link, it opens no browser tab (the inbox and its
 notification take that place).
+
+Before saving the parked plan or closing the agent, the plugin records
+`submitted — waits for your review in Plannotator` and a submission report with the advisor's
+verdict for that exact plan text. Progress, the final report and the next agent's handover then
+show the submission even when closing cuts off the planner's own last reply. An unrecorded,
+unknown or mismatched verdict is reported as no verdict on record, never as agreement.
+If the local record cannot be saved, parking and retirement wait for the event's retry.
+
+An advisor's finish notification wakes a closed (not archived) planner through Paseo, without
+involving Linear. After a Paseo restart loses that in-memory notification, the watchdog's idle
+resume is the fallback after 2 hours by default, only while it is on, the owner has not stopped
+the agent, the ticket is not waiting for the owner and it has no open pull request.
+
 Your decision there, or **Approve plan** / **Send back** in the panel:
 
 - approve: the plan document, `plan-ready`, and a fresh agent that implements the plan as soon as
@@ -2371,6 +2384,17 @@ record, so the pull request watch keeps following them; only "Open in Paseo" mov
 agent. The record changes owner at a takeover only while it still names the old agent (or none):
 once the new agent wrote to it, the old agent's archive leaves it alone, and the old agent's final
 report then only says who took over. A third agent's record is never touched.
+
+A completed turn's reply is saved locally before its Linear delivery, so a failed write does
+not lose the last report. Repeated replies are deduplicated in their stored, clipped form.
+After a park, the submission remains the planner's last report; delayed turn or closing replies
+cannot replace it. A successor's own reports can continue normally.
+
+Local-only memories never take over another agent's record. Ordinary progress updates still
+let a new agent take over, but refuse a former owner inside the same serialized record write,
+without a Linear call or save. The record keeps its last 20 former owners; an explicit hand-off
+may give the record back to one of them and removes that agent from the former-owner list.
+Refused writes are logged with the incoming agent and current owner.
 
 **Moving a pull request to another ticket.** A pull request belongs to the ticket whose record
 links it. To move it, rename it: once an open pull request's title names exactly one other

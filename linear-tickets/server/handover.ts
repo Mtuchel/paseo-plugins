@@ -11,6 +11,8 @@ import { paseoHome } from "./ticket-mcp";
 const exec = promisify(execFile);
 const MAX_SUMMARY = 1_500;
 const KEPT_SUMMARIES = 3;
+const KEPT_FORMER_AGENTS = 20;
+export const PARKED_PLAN_LINE = "submitted — waits for your review in Plannotator";
 
 // What opened a waiting period: a question or permission request ("request"), which ends when
 // nothing is pending any more, or a turn that ended by asking the owner ("turn-end"), which ends
@@ -31,6 +33,8 @@ export type HandoverRecord = {
   // Null for a ticket that took over a pull request (see Handover.transfer) before any agent worked
   // on it; such a record is `archived` until an agent takes it over.
   agentId: string | null;
+  // Former owners cannot reclaim the record through a late lifecycle write; handOff may give it back.
+  formerAgents?: string[];
   agentTitle: string;
   branch: string | null;
   worktreePath: string | null;
@@ -119,6 +123,12 @@ async function readWorkState(cwd: string): Promise<{ branch: string | null; comm
 
 const clip = (text: string, limit: number) => (text.length <= limit ? text : `${text.slice(0, limit).trimEnd()} …`);
 
+function appendSummary(summaries: string[], summary: string | undefined, locked: boolean): string[] {
+  if (!summary || locked) return summaries;
+  const stored = clip(summary, MAX_SUMMARY);
+  return summaries.at(-1) === stored ? summaries : [...summaries, stored].slice(-KEPT_SUMMARIES);
+}
+
 const PHASE: Record<HandoverStatus, string> = {
   working: "Working",
   waiting: "Waiting for you",
@@ -148,6 +158,7 @@ export function finalBody(record: HandoverRecord, reason: string): string {
     `**Outcome:** ${PHASE[record.status]}${reason ? ` — ${reason}` : ""}`,
     ...(record.model ? [`**Model:** \`${record.model}\``] : []),
     `**Branch:** ${record.branch ? `\`${record.branch}\`` : "—"} · **Last commit:** ${record.lastCommit ? `\`${record.lastCommit}\`` : "—"}`,
+    ...(record.plan ? [`**Plan:** ${record.plan}`] : []),
     record.summaries.length ? `**Last report:**\n\n${record.summaries[record.summaries.length - 1]}` : "**Last report:** none",
     `**Continue:** assign Paseo again, @mention it, or re-add the \`paseo\` label — the next agent picks up on ${record.branch ? `\`${record.branch}\`` : "this ticket"} with this record.`,
   ].join("\n\n");
@@ -324,14 +335,50 @@ export class Handover {
     } finally { await rm(temporary, { force: true }); }
   }
 
+  // Keeps a turn or parked submission locally, before any Linear delivery. Only the current owner
+  // (or the first agent, with no record yet) may write; this never discovers git or agent links.
+  remember(issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, change: { summary?: string; plan?: string }): Promise<HandoverRecord> {
+    return this.serialize(async () => {
+      const previous = await this.raw(issue.id);
+      if (previous && previous.agentId !== agent.id) {
+        console.log(`[linear-tickets] ${issue.identifier}: remember from agent ${agent.id} refused; record belongs to ${previous.agentId}`);
+        return previous;
+      }
+      const base: HandoverRecord = previous ?? {
+        issueId: issue.id, identifier: issue.identifier, agentId: agent.id, agentTitle: agent.title ?? `Paseo agent on ${issue.identifier}`,
+        branch: null, worktreePath: agent.cwd, lastCommit: null, summaries: [], links: {}, status: "working", progressCommentId: null, resumedFrom: null, updatedAt: this.now(),
+      };
+      const record: HandoverRecord = {
+        ...base,
+        summaries: appendSummary(base.summaries, change.summary, base.plan === PARKED_PLAN_LINE && change.plan !== PARKED_PLAN_LINE),
+        ...(change.plan !== undefined ? { plan: change.plan } : {}),
+        updatedAt: this.now(),
+      };
+      await this.save(record);
+      return record;
+    });
+  }
+
   // Updates the record for this agent (a new agent on the ticket starts a new progress comment)
   // and edits the progress comment. Returns the record.
   update(issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, change: { status?: HandoverStatus; summary?: string; link?: [string, string]; plan?: string; review?: string; model?: string | null }): Promise<HandoverRecord> {
-    return this.serialize(async () => this.write(await this.raw(issue.id), issue, agent, change));
+    return this.serialize(async () => {
+      const previous = await this.raw(issue.id);
+      if (previous && previous.agentId !== agent.id && previous.formerAgents?.includes(agent.id)) {
+        console.log(`[linear-tickets] ${issue.identifier}: update from former agent ${agent.id} refused; record belongs to ${previous.agentId}`);
+        return previous;
+      }
+      return this.write(previous, issue, agent, change);
+    });
   }
 
   private async write(previous: HandoverRecord | null, issue: { id: string; identifier: string }, agent: { id: string; title: string | null; cwd: string }, change: { status?: HandoverStatus; summary?: string; link?: [string, string]; plan?: string; review?: string; model?: string | null }): Promise<HandoverRecord> {
     const sameAgent = previous?.agentId === agent.id;
+    // write is also handOff's explicit giveback path: the new current owner leaves the history.
+    const formerAgents = sameAgent ? previous.formerAgents ?? [] : [
+      ...(previous?.formerAgents ?? []).filter((id) => id !== previous?.agentId && id !== agent.id),
+      ...(previous?.agentId ? [previous.agentId] : []),
+    ].slice(-KEPT_FORMER_AGENTS);
     const movedTo = change.link?.[0] === "Pull request" ? await this.movedAway(issue.id, change.link[1]) : null;
     if (movedTo) {
       console.log(`[linear-tickets] ${issue.identifier}: ${change.link![1]} moved to ${movedTo}; the late link to this ticket is not recorded`);
@@ -343,12 +390,13 @@ export class Handover {
       issueId: issue.id,
       identifier: issue.identifier,
       agentId: agent.id,
+      ...(formerAgents.length ? { formerAgents } : {}),
       // Hook events can carry no title; the one seen earlier for this agent stays.
       agentTitle: agent.title ?? (sameAgent ? previous.agentTitle : null) ?? `Paseo agent on ${issue.identifier}`,
       branch: git.branch ?? (sameAgent ? previous.branch : null),
       worktreePath: agent.cwd,
       lastCommit: git.lastCommit ?? (sameAgent ? previous.lastCommit : null),
-      summaries: [...(sameAgent ? previous.summaries : previous?.summaries ?? []), ...(change.summary ? [clip(change.summary, MAX_SUMMARY)] : [])].slice(-KEPT_SUMMARIES),
+      summaries: appendSummary(previous?.summaries ?? [], change.summary, sameAgent && previous.plan === PARKED_PLAN_LINE),
       // The ticket's links (its pull request above all, which the pull request watch follows)
       // stay when another agent takes over; only the agent's own Paseo link is its own.
       links: { ...(paseoUrl ? { "Open in Paseo": paseoUrl } : {}), ...Object.fromEntries(Object.entries(previous?.links ?? {}).filter(([name]) => sameAgent || name !== "Open in Paseo")), ...(change.link ? { [change.link[0]]: change.link[1] } : {}) },
@@ -374,11 +422,11 @@ export class Handover {
     return record;
   }
 
-  // A takeover: the only way the record changes owner when one agent follows another (README,
-  // "Durable record and resume"). A record that names the predecessor, or no record, becomes the
-  // successor's (working, carried over as for any new agent); one that names the successor already
-  // keeps its state (a waiting or finished successor stays so), and one that names a third agent is
-  // not touched, so whichever event comes last never hands the ticket back. `report` (the
+  // An explicit takeover, including a giveback to a former owner (removed from formerAgents).
+  // A record that names the predecessor, or no record, becomes the successor's (working, carried
+  // over as for any new agent); one that names the successor already keeps its state (a waiting
+  // or finished successor stays so), and one that names a third agent is not touched, so whichever
+  // event comes last never hands the ticket back. `report` (the
   // predecessor was closed): its final report, from the record as it was before the takeover when
   // that record was its own, else only who took over. Returns whether the record was rewritten.
   // A null `predecessorId` takes over a record without an agent (see transfer).

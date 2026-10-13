@@ -7,7 +7,7 @@ import type { IssueState, LinearService } from "./linear";
 import type { PluginSettings, Settings } from "./settings";
 import { PLANNOTATOR_OPEN_SOURCE } from "./plannotator-open-source";
 import { paseoHome } from "./ticket-mcp";
-import type { Handover } from "./handover";
+import { PARKED_PLAN_LINE, type Handover } from "./handover";
 import { activeModel } from "./model";
 import { APPROVE_LATER, APPROVE_PLAN, decidePlannotatorReview, MAX_SPLIT, planSteps, ReviewClosedError, SEND_BACK, setAgentMode, SPLIT_PLAN, type SessionLink, type SessionRouter } from "./sessions";
 import { hasLabel, PLAN_APPROVED_STATE, PLAN_POLICY_LABEL, PLAN_READY_LABEL, PLAN_REVIEW_STATE, PLAN_REWORK_LABEL, PLANNING_STATE, planStage } from "./plan-policy";
@@ -57,6 +57,15 @@ const RECHECK_MS = 15_000;
 const PRUNE_MS = 60 * 60_000;
 // The generation a decision binds to when its review was opened before the journal existed.
 const LEGACY_OPENED_AT = "1970-01-01T00:00:00.000Z";
+// What the ticket's record says when its plan is parked for the owner (TUC-2275): the plugin
+// writes it itself, because the closing of the agent cuts off the agent's own last message. The
+// advisor's verdict is quoted only when it was recorded for exactly the parked plan text.
+const ADVISOR_VERDICTS: Record<string, string> = {
+  agreed: "agreed",
+  disagreements: "open disagreements, listed in the plan's Advisor review section",
+  unavailable: "unavailable, the reason is in the plan's Advisor review section",
+};
+const NO_ADVISOR_VERDICT = "no verdict on record for this exact plan text";
 
 export type PlannotatorRow = { title: string; url?: string; detail?: string };
 export type OpenedEvent = { type: "opened"; agentId: string | null; localUrl: string; remoteUrl: string | null; at: string };
@@ -253,7 +262,7 @@ export class PlannotatorBridge {
     private readonly events = plannotatorPaths().events,
     private readonly sessions?: Sessions,
     private readonly fetchPlan: (localUrl: string) => Promise<string> = readReviewPlan,
-    private readonly handover?: Pick<Handover, "update">,
+    private readonly handover?: Pick<Handover, "update" | "remember">,
     private readonly setMode: (agentId: string, modeId: string) => Promise<void> = setAgentMode,
     private readonly reviews?: Pick<ReviewLinks, "opened" | "decided" | "described" | "describedFor"> & Partial<Pick<ReviewLinks, "requiresOwner">>,
     private readonly decide: (localUrl: string, approve: boolean, feedback: string) => Promise<void> = decidePlannotatorReview,
@@ -866,7 +875,8 @@ export class PlannotatorBridge {
     const settings = await this.settings.read();
     const judgement = issueId ? await this.judge(review, event.localUrl, agentId, issueId, planText, settings) : null;
     if (issueId && !judgement?.approved && planText.trim() && this.parking?.available()) {
-      await this.park(event, review, { issueId, identifier, agentId, plan: planText, line: judgement?.line ?? "The plan has no readable risk rating, so it needs your approval.", reasons: judgement?.reasons ?? ["no readable risk rating"], model, parkedAt: new Date().toISOString(), announced: false }, paseo);
+      const agent = refreshed?.agent ? { id: refreshed.agent.id, title: refreshed.agent.title ?? null, cwd: refreshed.agent.cwd } : null;
+      await this.park(event, review, { issueId, identifier, agentId, plan: planText, line: judgement?.line ?? "The plan has no readable risk rating, so it needs your approval.", reasons: judgement?.reasons ?? ["no readable risk rating"], model, parkedAt: new Date().toISOString(), announced: false }, paseo, agent);
       return;
     }
     // The inbox's details are a convenience: a failure must not retry (and repeat) the hand-off.
@@ -895,12 +905,28 @@ export class PlannotatorBridge {
       : `📋 **Plan ready for review in Plannotator**${model ? ` (planned with \`${model}\`)` : ""}: ${url}${event.remoteUrl ? "" : "\n\n(Local link only: Tailscale was unavailable on the host.)"}${risk}`);
   }
 
-  // Parks a plan the owner has to decide (README, "Parked plans"). The record comes first, then
-  // the closing of the agent's own review (so its report is a confirmation, never a decision);
-  // then the agent is retired, freeing its slot. The central host serves the plan, and its
-  // `opened` event tells the owner and moves the ticket to Plan review (deliverParked).
-  private async park(event: OpenedEvent, review: ReviewGeneration, plan: ParkedPlan, paseo: PaseoApi): Promise<void> {
+  // The ticket's record reports a parked submission itself (TUC-2275): the closing of the agent
+  // cuts off its own last message, so the plugin writes the submission and the advisor's verdict
+  // before anything else. The verdict is quoted only when it was recorded for exactly the parked
+  // plan text; anything else, including a missing review, reads as no verdict on record.
+  private async submissionReport(plan: ParkedPlan): Promise<string> {
+    const advice = await this.advice(plan.agentId);
+    const verdict = advice && advice.hash === planHash(plan.plan) && Object.hasOwn(ADVISOR_VERDICTS, advice.verdict) ? ADVISOR_VERDICTS[advice.verdict] : NO_ADVISOR_VERDICT;
+    return `Plan submitted for your review. Plan advisor: ${verdict}. The agent was closed to free its slot; a new agent continues once you decide.`;
+  }
+
+  // Parks a plan the owner has to decide (README, "Parked plans"). The ticket's record gets the
+  // submission first, then the parked record, then the closing of the agent's own review (so its
+  // report is a confirmation, never a decision); then the agent is retired, freeing its slot. The
+  // central host serves the plan, and its `opened` event tells the owner and moves the ticket to
+  // Plan review (deliverParked). The record step comes before the parked record exists, so a
+  // failed local write leaves no parked plan and the event's retry starts the park over.
+  private async park(event: OpenedEvent, review: ReviewGeneration, plan: ParkedPlan, paseo: PaseoApi, agent: { id: string; title: string | null; cwd: string } | null): Promise<void> {
     const reason = "The owner has to decide this plan. It is parked in the central Plannotator host and you are being closed to free your slot: stop now and do not implement anything. A new agent continues once the owner decides.";
+    if (this.handover) {
+      if (agent) await this.handover.remember({ id: plan.issueId, identifier: plan.identifier }, agent, { plan: PARKED_PLAN_LINE, summary: await this.submissionReport(plan) });
+      else console.error(`[linear-tickets] ${plan.identifier}: the parked submission was not recorded: agent ${plan.agentId.slice(0, 8)} could not be refreshed`);
+    }
     await this.parking!.plans.put(plan);
     await this.sessions?.parked(plan.agentId);
     await this.journal.addClosing(review, false, reason);
