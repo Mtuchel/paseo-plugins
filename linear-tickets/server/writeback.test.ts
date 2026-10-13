@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -17,7 +17,8 @@ import { NeedsYouIssues } from "./needs-you";
 import { MAX_SUMMARY_LENGTH, ownerRequest, turnPullRequests, turnReply, Writeback } from "./writeback";
 import { DoneTickets, RetiredLabels, RetirePass } from "./retirement";
 import { DecisionLog } from "./owner-decisions";
-import { Handover } from "./handover";
+import { Handover, PARKED_PLAN_LINE } from "./handover";
+import { PlannotatorBridge } from "./plannotator";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
 
@@ -94,6 +95,77 @@ function paseoWithLabels(labels: Record<string, string>): PaseoApi {
   return { agents: { ref: () => ({ refresh: async () => ({ agent: { labels } }) }), list: async () => ({ entries: [] }) } } as unknown as PaseoApi;
 }
 const linked = paseoWithLabels({ "linear.issueId": "issue-1" });
+
+test("a completed reply survives a failed Linear read and is the archived final report, without duplicate clipped summaries", async (t) => {
+  t.mock.method(console, "error", () => {});
+  for (const reply of ["The plan was submitted.", "x".repeat(1_700)]) {
+    const directory = mkdtempSync(join(tmpdir(), "paseo-local-reply-"));
+    try {
+      const linear = new FakeLinear();
+      const handover = new Handover(linear as never, directory, async () => ({ branch: "ticket-work", lastCommit: "abc123 fix" }));
+      const issueCore = linear.issueCore.bind(linear);
+      linear.issueCore = async () => { throw new Error("No access to this issue"); };
+      const writeback = new Writeback(linear, { read: async () => allOn }, { sessions: {} as never, handover }, 0, outboxPath());
+      const event: PluginLifecycleEvents["agent.turn_ended"] = { agent: root, turnId: "failed-delivery", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: reply }] };
+      await writeback.turnEnded(event, linked);
+      const remembered = await handover.read("issue-1");
+      assert.equal(remembered?.summaries.length, 1, "the reply is durable before Linear's failure");
+      const saved = remembered!.summaries[0];
+      assert.equal(saved, reply.length <= 1_500 ? reply : `${reply.slice(0, 1_500)} …`);
+      linear.issueCore = issueCore;
+      await writeback.archived({ agent: root, archivedAt: "now" }, linked);
+      const report = linear.writes.find((body) => body.startsWith("comment: 🏁")) ?? "";
+      assert.ok(report.includes(`**Last report:**\n\n${saved}`));
+      await writeback.turnEnded({ ...event, turnId: "redelivered" }, linked);
+      assert.deepEqual((await handover.read("issue-1"))?.summaries, [saved], "local remember and progress refresh compare the clipped form");
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  }
+});
+
+test("a planning agent closed during its advisor round stays in Planning with Resume, never Plan review or an approval ask", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-closed-planner-"));
+  const events = join(directory, "events");
+  await mkdir(events);
+  const linear = new FakeLinear();
+  linear.state = { ...linear.state, status: "Planning", statusType: "started" };
+  const handover = new Handover(linear as never, join(directory, "handover"), async () => ({ branch: "ticket-work", lastCommit: "abc123 plan" }));
+  await handover.update({ id: "issue-1", identifier: "ENG-1" }, root, { summary: "Waiting for the advisor; the plan is not submitted yet." });
+  const calls: string[] = [];
+  Object.assign(linear, { moveToPlanStage: async (id: string, stage: string) => {
+    calls.push(`plan stage ${stage}`);
+    return linear.moveToStateNamed(id, stage);
+  } });
+  const sessions = {
+    sessionFor: async () => ({ sessionId: "s1" }), holdIfStopped: async () => false,
+    offerResume: async () => { calls.push("resume"); },
+    ask: async (_id: string, _body: string, options: { label: string }[]) => { calls.push(...options.map((option) => option.label)); },
+  };
+  const bridge = new PlannotatorBridge(linear as never, { read: async () => allOn }, events, sessions as never);
+  try {
+    await new Writeback(linear, { read: async () => allOn }, { sessions: sessions as never, handover }, 0, outboxPath()).archived({ agent: root, archivedAt: "now" }, linked);
+    bridge.attach(linked);
+    await bridge.drain();
+    assert.equal(linear.state.status, "Planning");
+    assert.ok(!linear.writes.some((write) => /Plan review/.test(write)));
+    assert.deepEqual(calls, ["resume"], "no opened submission means no Approve plan ask");
+  } finally { bridge.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a delayed completed turn cannot replace the parked submission in the final report", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-parked-reply-"));
+  try {
+    const linear = new FakeLinear();
+    const handover = new Handover(linear as never, directory, async () => ({ branch: "ticket-work", lastCommit: "abc123 plan" }));
+    await handover.update({ id: "issue-1", identifier: "ENG-1" }, root, { summary: "Waiting for the advisor." });
+    const submitted = "Plan submitted for your review. Plan advisor: agreed.";
+    await handover.remember({ id: "issue-1", identifier: "ENG-1" }, root, { plan: PARKED_PLAN_LINE, summary: submitted });
+    const writeback = new Writeback(linear, { read: async () => allOn }, { sessions: {} as never, handover }, 0, outboxPath());
+    await writeback.turnEnded({ agent: root, turnId: "late", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "Round 3 is with the advisor, not submitted yet." }] }, linked);
+    assert.deepEqual((await handover.read("issue-1"))?.summaries, ["Waiting for the advisor.", submitted]);
+    await writeback.archived({ agent: root, archivedAt: "now" }, linked);
+    assert.ok(linear.writes.some((write) => write.startsWith("comment: 🏁") && write.includes(`**Last report:**\n\n${submitted}`)));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
 
 test("the turn reply is the final answer after the last tool call, streamed pieces joined and repeats dropped", () => {
   const timeline: Timeline = [
@@ -524,6 +596,140 @@ test("an archived predecessor hands the record to its successor beyond the first
   assert.deepEqual({ agentId: (await own.read("issue-1"))?.agentId, status: (await own.read("issue-1"))?.status }, { agentId: "agent-1", status: "archived" });
 });
 
+function ownershipFixture(t: TestContext) {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-writeback-ownership-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const linear = new FakeLinear();
+  const issue = { id: linear.state.id, identifier: linear.state.identifier };
+  const handover = new Handover(linear as never, directory, async () => ({ branch: "mtuchel/eng-1-fix", lastCommit: "abc123 the fix" }));
+  const writeback = new Writeback(linear, { read: async () => allOn }, { sessions: { sessionFor: async () => null } as never, handover }, 0, join(directory, "outbox.json"));
+  const paseo = paseoWithLabels({ "linear.issueId": issue.id, "linear.identifier": issue.identifier });
+  const errors = t.mock.method(console, "error", () => {});
+  return { linear, issue, handover, writeback, paseo, errors };
+}
+
+for (const event of ["failed", "archived"] as const) {
+  test(`a former owner's delayed ${event} event reports only its handover, not the current owner's work`, async (t) => {
+    const { linear, issue, handover, writeback, paseo, errors } = ownershipFixture(t);
+    const successor = { ...root, id: "agent-2", title: "ENG-1: Successor" };
+    const third = { ...root, id: "agent-3", title: "ENG-1: Third owner" };
+    await handover.update(issue, root, { summary: "The predecessor's recorded work." });
+    await handover.handOff(issue, root.id, successor);
+    await handover.handOff(issue, successor.id, third);
+    const current = await handover.update(issue, third, { status: "archived", plan: "approved", summary: "The current owner's private report." });
+    linear.writes.length = 0;
+    if (event === "failed") {
+      await writeback.turnEnded({ agent: root, turnId: "late-failure", outcome: { kind: "failed", error: { message: "The predecessor failed." } }, timeline: [] }, paseo);
+    } else {
+      await writeback.archived({ agent: root, archivedAt: "later" }, paseo);
+    }
+    assert.deepEqual(await handover.read(issue.id), current);
+    assert.deepEqual(linear.writes.filter((write) => write.includes("🛠 **Paseo progress**")), []);
+    const reports = linear.writes.filter((write) => write.startsWith("comment: 🏁"));
+    assert.equal(reports.length, 1);
+    assert.ok(reports[0].includes(`**Paseo final report** — ${root.title}`));
+    assert.ok(reports[0].includes(`handed over to ${third.title}`));
+    assert.ok(!reports[0].includes("The current owner's private report."));
+    assert.ok(!reports[0].includes("The predecessor failed."));
+    assert.equal(errors.mock.calls.length, 0);
+  });
+}
+
+test("AC-7 b1: a handoff before a predecessor's turn end leaves the successor's entire record unchanged", async (t) => {
+  const { linear, issue, handover, writeback, paseo, errors } = ownershipFixture(t);
+  const successor = { ...root, id: "agent-2", title: "ENG-1: Successor" };
+  await handover.update(issue, root, { summary: "The predecessor's recorded work.", plan: "under review" });
+  assert.equal(await handover.handOff(issue, root.id, successor), true);
+  const takenOver = await handover.update(issue, successor, { status: "waiting", plan: "approved", summary: "The successor's own work." });
+  linear.writes.length = 0;
+
+  await writeback.turnEnded({ agent: root, turnId: "late-predecessor", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "The predecessor's delayed reply." }] }, paseo);
+
+  assert.deepEqual(await handover.read(issue.id), takenOver);
+  assert.deepEqual(linear.writes.filter((write) => write.includes("🛠 **Paseo progress**")), [], "neither the refused remember nor the later update writes progress");
+  assert.equal(errors.mock.calls.length, 0, "the lifecycle delivery completed rather than failing before the guarded update");
+});
+
+for (const takeovers of [1, 2]) {
+  test(`AC-7 b${takeovers + 1}: a predecessor paused after remember cannot reclaim the record after ${takeovers} takeover(s)`, async (t) => {
+    const { linear, issue, handover, writeback, paseo, errors } = ownershipFixture(t);
+    const successor = { ...root, id: "agent-2", title: "ENG-1: Successor" };
+    const third = { ...root, id: "agent-3", title: "ENG-1: Third owner" };
+    await handover.update(issue, root, { summary: "The predecessor's recorded work.", plan: "under review" });
+    let release!: () => void;
+    const paused = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const reachedLinear = new Promise<void>((resolve) => { entered = resolve; });
+    const issueCore = linear.issueCore.bind(linear);
+    linear.issueCore = async (id) => {
+      entered();
+      await paused;
+      return issueCore(id);
+    };
+    const reply = "Completed the predecessor's last change.";
+    const turn = writeback.turnEnded({ agent: root, turnId: "paused-predecessor", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: reply }] }, paseo);
+    try {
+      await Promise.race([reachedLinear, turn.then(() => assert.fail("turnEnded finished before reaching the deferred Linear read"))]);
+      assert.equal((await handover.read(issue.id))?.summaries.at(-1), reply, "turnEnded remembered its reply before awaiting Linear");
+      assert.equal(await handover.handOff(issue, root.id, successor), true);
+      if (takeovers === 2) assert.equal(await handover.handOff(issue, successor.id, third), true);
+      const owner = takeovers === 2 ? third : successor;
+      const takenOver = await handover.update(issue, owner, { status: "waiting", plan: "approved", summary: "The current owner's work." });
+      assert.deepEqual(takenOver.formerAgents, takeovers === 2 ? [root.id, successor.id] : [root.id]);
+      assert.ok(takenOver.summaries.includes(reply), "the reply remembered before takeover travels with the record");
+      linear.writes.length = 0;
+
+      release();
+      await turn;
+
+      assert.deepEqual(await handover.read(issue.id), takenOver, "the carried-over reply is not appended again and all successor metadata stays");
+      assert.deepEqual(linear.writes.filter((write) => write.includes("🛠 **Paseo progress**")), [], "no predecessor progress refresh follows release");
+      assert.equal(errors.mock.calls.length, 0, "the delivery reached the ownership guard without an earlier failure");
+    } finally {
+      release();
+      await turn;
+    }
+  });
+}
+
+test("AC-7 c: a never-owner's first turn end still takes over without an explicit handoff", async (t) => {
+  const { issue, handover, writeback, paseo, errors } = ownershipFixture(t);
+  await handover.update(issue, root, { summary: "The predecessor's recorded work." });
+  const newcomer = { ...root, id: "agent-new", title: "ENG-1: New owner" };
+
+  await writeback.turnEnded({ agent: newcomer, turnId: "newcomer-first-turn", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "The newcomer continued the fix." }] }, paseo);
+
+  const record = (await handover.read(issue.id))!;
+  assert.equal(record.agentId, newcomer.id);
+  assert.equal(record.resumedFrom, root.id);
+  assert.deepEqual(record.formerAgents, [root.id]);
+  assert.deepEqual(record.summaries, ["The predecessor's recorded work.", "The newcomer continued the fix."]);
+  assert.equal(errors.mock.calls.length, 0);
+});
+
+test("AC-7 d: an explicit handoff from the third owner back to the predecessor permits its next turn", async (t) => {
+  const { issue, handover, writeback, paseo, errors } = ownershipFixture(t);
+  const successor = { ...root, id: "agent-2", title: "ENG-1: Successor" };
+  const third = { ...root, id: "agent-3", title: "ENG-1: Third owner" };
+  await handover.update(issue, root, { summary: "The predecessor's recorded work." });
+  await handover.handOff(issue, root.id, successor);
+  await handover.handOff(issue, successor.id, third);
+  assert.deepEqual((await handover.read(issue.id))?.formerAgents, [root.id, successor.id]);
+
+  assert.equal(await handover.handOff(issue, third.id, root), true);
+  const givenBack = (await handover.read(issue.id))!;
+  assert.equal(givenBack.agentId, root.id);
+  assert.equal(givenBack.resumedFrom, third.id);
+  assert.deepEqual(givenBack.formerAgents, [successor.id, third.id]);
+  await writeback.turnEnded({ agent: root, turnId: "explicit-giveback-turn", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "Continued after the explicit giveback." }] }, paseo);
+
+  const continued = (await handover.read(issue.id))!;
+  assert.equal(continued.agentId, root.id);
+  assert.equal(continued.summaries.at(-1), "Continued after the explicit giveback.");
+  assert.deepEqual(continued.formerAgents, [successor.id, third.id]);
+  assert.equal(errors.mock.calls.length, 0);
+});
+
 test("a Linear failure is logged and never thrown back into the daemon hook", async (t) => {
   const errors = t.mock.method(console, "error", () => {});
   const linear = new FakeLinear();
@@ -559,6 +765,7 @@ function fakeBridge() {
     },
     handover: {
       read: async () => null, waiting: async () => null, setWaiting: async () => {},
+      remember: async () => ({}),
       update: async (_issue: unknown, _agent: unknown, change: object) => { calls.push(`handover ${JSON.stringify(change)}`); return {}; },
       finish: async (_issue: unknown, _agent: unknown, status: string) => { calls.push(`finish ${status}`); return {}; },
     },

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { Handover, ownedPullRequests, type GitState, type HandoverStatus } from "./handover";
+import { Handover, ownedPullRequests, PARKED_PLAN_LINE, type GitState, type HandoverStatus } from "./handover";
 
 const exec = promisify(execFile);
 
@@ -33,12 +33,12 @@ function fakeLinear() {
   return { linear: linear as never, writes };
 }
 
-async function withHandover(run: (handover: Handover, writes: Write[]) => Promise<void>): Promise<void> {
+async function withHandover(run: (handover: Handover, writes: Write[], directory: string) => Promise<void>): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "paseo-handover-takeover-"));
   try {
     const { linear, writes } = fakeLinear();
     const handover = new Handover(linear, directory, async () => GIT, () => "2026-01-01T10:00:00.000Z");
-    await run(handover, writes);
+    await run(handover, writes, directory);
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
@@ -46,6 +46,150 @@ async function withHandover(run: (handover: Handover, writes: Write[]) => Promis
 async function predecessorWrote(handover: Handover): Promise<void> {
   await handover.update(ISSUE, PREDECESSOR, { summary: "Rebased on main and pushed the fix." });
 }
+
+test("remember persists a minimal record without Linear, git or agent URL calls, readable after restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-handover-memory-"));
+  try {
+    const unexpected = async (): Promise<never> => assert.fail("remember must be local-only");
+    const linear = { upsertComment: unexpected, comment: unexpected, upsertAttachment: unexpected, removeAttachments: unexpected };
+    const handover = new Handover(linear, directory, unexpected, () => "2026-01-01T10:00:00.000Z", unexpected);
+    const record = await handover.remember(ISSUE, { ...PREDECESSOR, title: null }, { summary: "The plan is ready.", plan: "under review" });
+    assert.equal(record.agentId, PREDECESSOR.id);
+    assert.equal(record.plan, "under review");
+    assert.deepEqual(record.summaries, ["The plan is ready."]);
+    assert.deepEqual(await new Handover(linear, directory, unexpected).read(ISSUE.id), record);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("remember and update dedupe the clipped stored summary and keep only the last three reports", async () => {
+  await withHandover(async (handover) => {
+    const prefix = "x".repeat(1_500);
+    await handover.remember(ISSUE, PREDECESSOR, { summary: `${prefix} first tail` });
+    await handover.remember(ISSUE, PREDECESSOR, { summary: `${prefix} another tail` });
+    await handover.update(ISSUE, PREDECESSOR, { summary: `${prefix} another tail` });
+    assert.deepEqual((await handover.read(ISSUE.id))?.summaries, [`${prefix} …`]);
+
+    await handover.update(ISSUE, PREDECESSOR, { summary: "Second report." });
+    await handover.remember(ISSUE, PREDECESSOR, { summary: "Second report." });
+    await handover.remember(ISSUE, PREDECESSOR, { summary: "Third report." });
+    const last = await handover.remember(ISSUE, PREDECESSOR, { summary: "Fourth report." });
+    assert.deepEqual(last.summaries, ["Second report.", "Third report.", "Fourth report."]);
+  });
+});
+
+test("remember preserves current owner metadata and refuses even a never-owner without saving", async () => {
+  await withHandover(async (handover, writes, directory) => {
+    const before = await handover.update(ISSUE, PREDECESSOR, { status: "waiting", plan: "under review", model: "omp/model", link: ["Plan", "https://example.com/plan"] });
+    const remembered = await handover.remember(ISSUE, PREDECESSOR, { summary: "Waiting for the advisor." });
+    assert.deepEqual(remembered, { ...before, summaries: ["Waiting for the advisor."] });
+    const path = join(directory, `${ISSUE.id}.json`);
+    const stored = await readFile(path, "utf8");
+    writes.length = 0;
+    assert.deepEqual(await handover.remember(ISSUE, THIRD, { summary: "Not mine.", plan: PARKED_PLAN_LINE }), remembered);
+    assert.equal(await readFile(path, "utf8"), stored);
+    assert.deepEqual(writes, []);
+  });
+});
+
+test("a parked submission displaces the prior report once and survives ordinary summaries and finish", async () => {
+  await withHandover(async (handover, writes) => {
+    await handover.update(ISSUE, PREDECESSOR, { summary: "Waiting for the advisor.", status: "waiting", plan: "under review" });
+    const submission = "Plan submitted for your review. Plan advisor: agreed.";
+    const parked = await handover.remember(ISSUE, PREDECESSOR, { plan: PARKED_PLAN_LINE, summary: submission });
+    assert.deepEqual(parked.summaries, ["Waiting for the advisor.", submission]);
+    await handover.remember(ISSUE, PREDECESSOR, { plan: PARKED_PLAN_LINE, summary: submission });
+    await handover.remember(ISSUE, PREDECESSOR, { summary: "The aborted turn's old reply." });
+    const updated = await handover.update(ISSUE, PREDECESSOR, { summary: "The closing reply." });
+    assert.deepEqual(updated.summaries, parked.summaries);
+    assert.equal(updated.plan, PARKED_PLAN_LINE);
+
+    const closed = await handover.finish(ISSUE, PREDECESSOR, "archived", "closed to free its slot");
+    assert.deepEqual(closed.summaries, parked.summaries);
+    const report = writes.find((write) => write.kind === "report")!.body;
+    assert.ok(report.includes(`**Plan:** ${PARKED_PLAN_LINE}`));
+    assert.ok(report.indexOf("**Branch:**") < report.indexOf("**Plan:**"));
+    assert.ok(report.indexOf("**Plan:**") < report.indexOf("**Last report:**"));
+    assert.ok(report.includes(`**Last report:**\n\n${submission}`));
+    assert.ok(writes.filter((write) => write.kind === "progress").at(-1)!.body.includes(`**Latest:**\n\n${submission}`));
+    assert.ok((await handover.resumeTarget(ISSUE.id))!.handover!.includes(submission));
+
+    const successor = await handover.update(ISSUE, SUCCESSOR, { summary: "Implementing the approved plan." });
+    assert.equal(successor.plan, null, "the lock belongs to the parked agent, not its successor");
+    assert.equal(successor.summaries.at(-1), "Implementing the approved plan.");
+  });
+});
+
+test("former owners cannot update or remember after multiple takeovers; the stored record is untouched", async () => {
+  await withHandover(async (handover, writes, directory) => {
+    await predecessorWrote(handover);
+    assert.equal((await handover.read(ISSUE.id))?.formerAgents, undefined, "legacy records need no empty field");
+    await handover.handOff(ISSUE, PREDECESSOR.id, SUCCESSOR);
+    await handover.handOff(ISSUE, SUCCESSOR.id, THIRD);
+    const current = await handover.update(ISSUE, THIRD, { status: "waiting", plan: "approved", summary: "The third agent's report." });
+    assert.deepEqual(current.formerAgents, [PREDECESSOR.id, SUCCESSOR.id]);
+    const path = join(directory, `${ISSUE.id}.json`);
+    const stored = await readFile(path, "utf8");
+    writes.length = 0;
+    for (const former of [PREDECESSOR, SUCCESSOR]) {
+      assert.deepEqual(await handover.update(ISSUE, former, { status: "failed", summary: "A late former-owner report.", plan: PARKED_PLAN_LINE }), current);
+      assert.deepEqual(await handover.remember(ISSUE, former, { summary: "A late former-owner memory.", plan: PARKED_PLAN_LINE }), current);
+    }
+    assert.equal(await readFile(path, "utf8"), stored, "refusals do not save");
+    assert.deepEqual(writes, [], "refusals do not refresh a progress comment");
+  });
+});
+
+test("former-owner checks read ownership inside the same serialized operation as the write", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-handover-ownership-"));
+  let release!: () => void;
+  const paused = new Promise<void>((resolve) => { release = resolve; });
+  let entered!: () => void;
+  const takingOver = new Promise<void>((resolve) => { entered = resolve; });
+  try {
+    const { linear, writes } = fakeLinear();
+    let gitCalls = 0;
+    const handover = new Handover(linear, directory, async () => {
+      if (++gitCalls === 2) { entered(); await paused; }
+      return GIT;
+    });
+    await predecessorWrote(handover);
+    const takeover = handover.handOff(ISSUE, PREDECESSOR.id, SUCCESSOR);
+    await takingOver;
+    const lateUpdate = handover.update(ISSUE, PREDECESSOR, { summary: "A late update." });
+    const lateMemory = handover.remember(ISSUE, PREDECESSOR, { summary: "A late memory." });
+    release();
+    assert.equal(await takeover, true);
+    const current = await handover.read(ISSUE.id);
+    assert.deepEqual(await lateUpdate, current);
+    assert.deepEqual(await lateMemory, current);
+    assert.equal(gitCalls, 2, "a refused update never discovers git");
+    assert.equal(writes.filter((write) => write.kind === "progress").length, 2, "only the predecessor and takeover write progress");
+  } finally {
+    release();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("takeovers keep the last twenty former owners without duplicates and handOff can explicitly give back", async () => {
+  await withHandover(async (handover) => {
+    await predecessorWrote(handover);
+    const agents = [PREDECESSOR, ...Array.from({ length: 22 }, (_, index) => ({ ...SUCCESSOR, id: `successor-${index}` }))];
+    for (let index = 1; index < agents.length; index++) {
+      assert.equal(await handover.handOff(ISSUE, agents[index - 1].id, agents[index]), true);
+    }
+    const current = (await handover.read(ISSUE.id))!;
+    assert.deepEqual(current.formerAgents, agents.slice(2, -1).map((agent) => agent.id));
+    const returning = agents[5];
+    assert.equal(await handover.handOff(ISSUE, agents.at(-1)!.id, returning), true);
+    const returned = await handover.update(ISSUE, returning, { summary: "Continuing after an explicit giveback." });
+    assert.equal(returned.agentId, returning.id);
+    assert.equal(returned.summaries.at(-1), "Continuing after an explicit giveback.");
+    assert.deepEqual(returned.formerAgents, [...current.formerAgents!.filter((id) => id !== returning.id), agents.at(-1)!.id]);
+    assert.equal(await handover.handOff(ISSUE, returning.id, agents.at(-1)!), true);
+    const again = (await handover.read(ISSUE.id))!;
+    assert.deepEqual(again.formerAgents, [...returned.formerAgents!.filter((id) => id !== agents.at(-1)!.id), returning.id]);
+  });
+});
 
 test("a hand-off to a successor that has not written yet moves the record to it and reports the predecessor's own work", async () => {
   await withHandover(async (handover, writes) => {

@@ -11,6 +11,8 @@ import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_
 import { openInBrowser, parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, planRound, roundStep, writeOpenScript, type Parking } from "./plannotator";
 import { ReviewClosedError } from "./sessions";
 import type { ParkedPlan } from "./parked";
+import { Handover, PARKED_PLAN_LINE, type HandoverRecord } from "./handover";
+import { Writeback } from "./writeback";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
 import { DecisionLog, type LogEntry } from "./owner-decisions";
@@ -109,13 +111,24 @@ function setup(labels: Record<string, string>, ticket: { creatorId: string; labe
     async viewerId() { return "owner"; },
     async appUserId() { return "paseo-app"; },
     async trustedAppIds() { return ["paseo-app"]; },
+    // The durable record's one progress comment (Handover) and the ticket read the archive
+    // write-back needs (Writeback.archived).
+    async upsertComment(issueId: string, body: string, commentId: string | null) { calls.push(`progress ${issueId}${commentId ? ` (${commentId})` : ""}: ${body}`); return commentId ?? "comment-1"; },
+    async issueCore(issueId: string) { calls.push(`core ${issueId}`); return { id: issueId, identifier: labels["linear.identifier"], creatorId: ticket.creatorId, status: "Plan review", statusId: "plan-review", statusType: "started", labels: [], attachmentUrls: [] }; },
   };
   const paseo = {
     agents: {
+      // The snapshot of the agent: Handover.remember takes its id, title and cwd from it.
       ref: (id: string) => ({
-        refresh: async () => ({ agent: { labels } }),
+        refresh: async () => ({ agent: { id, title: labels["linear.identifier"] ?? null, cwd: "/repo", labels } }),
         timeline: { append: async (item: { data: { title: string; url?: string } }) => { calls.push(`row ${id}: ${item.data.title}${item.data.url ? ` ${item.data.url}` : ""}`); } },
       }),
+      // The ticket's agents, as writeback.ts lists them (Writeback.archived).
+      list: async (input: { filter?: { labels?: Record<string, string> } }) => {
+        const wanted = input.filter?.labels ?? {};
+        const match = Object.entries(wanted).every(([name, value]) => labels[name] === value);
+        return { entries: match ? [{ agent: { id: "agent-1", title: labels["linear.identifier"] ?? null, cwd: "/repo", createdAt: "2026-01-01T09:00:00Z", labels } }] : [], pageInfo: { hasMore: false } };
+      },
     },
   } as unknown as PaseoApi;
   return { calls, documents, linear, paseo };
@@ -598,6 +611,115 @@ test("a parked plan is judged again once its advisor review is recorded for exac
     "ready issue-1",
     "comment issue-1: ✅ **Plan approved** in Plannotator ([plan](https://linear.app/doc/1))\n\nAuto-approved by the risk policy. Risk: impact 1/4, revert.\n\nAssign Paseo again to implement it.",
   ]);
+});
+
+// --- The parked plan's own submission report (TUC-2275) -------------------------------------
+
+// A plan parked through the bridge with the real Handover on a temp directory. `atRetire` holds
+// the record as it stood when the parking's retire ran; `calls` is the shared Linear fake's log.
+async function parkedRun(plan: string, events: object[]) {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(calls);
+  const directory = await mkdtemp(join(tmpdir(), "paseo-plannotator-parked-"));
+  const handover = new Handover(linear as never, join(directory, "handover"), async () => ({ branch: "mtuchel/tuc-2275-parked", lastCommit: "abc123 the parked plan" }), () => "2026-01-01T10:00:00.000Z");
+  const atRetire: (HandoverRecord | null)[] = [];
+  parking.retire = async (localUrl, agentId) => { atRetire.push(await handover.read("issue-1")); calls.push(`retire ${agentId} ${localUrl}`); };
+  return {
+    calls, plans, linear, paseo, handover, atRetire, directory,
+    run: () => withEvents(events, async (eventsDirectory) => {
+      const bridge = new PlannotatorBridge(linear, { read: async () => settings }, eventsDirectory, undefined, async () => plan, handover, undefined, undefined, async () => {}, () => {}, parking);
+      bridge.attach(paseo);
+      await bridge.drain();
+      bridge.stop();
+    }),
+  };
+}
+
+test("a parked plan's record reports the submission and the advisor's verdict for exactly its text", async () => {
+  const plan = RISKY(2);
+  const opened = { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: null, at: "2026-01-01T10:00:00Z" };
+  const advised = (verdict: string, hash: string) => ({ type: "advised", agentId: "agent-1", verdict, hash, at: "2026-01-01T09:59:00Z" });
+  const noVerdict = "no verdict on record for this exact plan text";
+  const cases: { advice: object[]; verdict: string }[] = [
+    { advice: [advised("agreed", planHash(plan))], verdict: "agreed" },
+    { advice: [advised("disagreements", planHash(plan))], verdict: "open disagreements, listed in the plan's Advisor review section" },
+    { advice: [advised("unavailable", planHash(plan))], verdict: "unavailable, the reason is in the plan's Advisor review section" },
+    { advice: [advised("needs more work", planHash(plan))], verdict: noVerdict },
+    { advice: [advised("agreed", planHash(`${plan}\nOne more step.\n`))], verdict: noVerdict },
+    { advice: [], verdict: noVerdict },
+  ];
+  for (const { advice, verdict } of cases) {
+    const run = await parkedRun(plan, [...advice, opened]);
+    try {
+      await run.run();
+      const record = await run.handover.read("issue-1");
+      assert.equal(record?.plan, PARKED_PLAN_LINE);
+      assert.equal(record?.summaries.length, 1);
+      const summary = record!.summaries[0];
+      assert.ok(summary.startsWith("Plan submitted for your review."));
+      assert.ok(summary.includes(`Plan advisor: ${verdict}.`));
+      assert.deepEqual(run.atRetire.map((state) => ({ plan: state?.plan, summary: state?.summaries.at(-1) })), [{ plan: PARKED_PLAN_LINE, summary }], "AC-2: the submission is on record before the agent is retired");
+      assert.deepEqual(run.calls.filter((call) => !call.startsWith("retire ")), [], "the record step stays local: no Linear call");
+      assert.equal(run.plans.size, 1);
+    } finally { await rm(run.directory, { recursive: true, force: true }); }
+  }
+});
+
+test("a parking whose record write fails leaves nothing parked; the redelivered event records the submission once", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(calls);
+  const root = await mkdtemp(join(tmpdir(), "paseo-plannotator-record-"));
+  const store = join(root, "handover");
+  // A file where the record's directory goes: the local write fails, like a full or unwritable disk.
+  await writeFile(store, "not a directory");
+  const handover = new Handover(linear as never, store, async () => ({ branch: null, lastCommit: null }), () => "2026-01-01T10:00:00.000Z");
+  try {
+    await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: null, at: "2026-01-01T10:00:00Z" }], async (directory) => {
+      const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), handover, undefined, undefined, async () => {}, () => {}, parking);
+      bridge.attach(paseo);
+      await bridge.drain();
+      assert.deepEqual({ parked: plans.size, retires: calls.filter((call) => call.startsWith("retire ")) }, { parked: 0, retires: [] }, "no parked record and no retirement: the event is kept for its retry");
+      // The disk is repaired and the same event is delivered again.
+      await rm(store);
+      await bridge.drain();
+      bridge.stop();
+      const record = await handover.read("issue-1");
+      assert.equal(record?.plan, PARKED_PLAN_LINE);
+      assert.equal(record?.summaries.length, 1, "redelivery stores the submission exactly once");
+      assert.ok(record!.summaries[0].includes("no verdict on record for this exact plan text"));
+      assert.deepEqual(calls.filter((call) => call.startsWith("retire ")), ["retire agent-1 http://localhost:4000/"], "and retires the agent exactly once");
+      assert.equal(plans.size, 1);
+    });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a parked plan's record shows in the progress comment, the final report and the next agent's prompt", async () => {
+  const plan = RISKY(2);
+  const run = await parkedRun(plan, [
+    { type: "advised", agentId: "agent-1", verdict: "agreed", hash: planHash(plan), at: "2026-01-01T09:59:00Z" },
+    { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: null, at: "2026-01-01T10:00:00Z" },
+  ]);
+  try {
+    await run.run();
+    const summary = (await run.handover.read("issue-1"))!.summaries.at(-1)!;
+    assert.ok(summary.includes("Plan advisor: agreed."));
+    // Paseo archives the closed agent; the parked record is the ticket's record (Writeback.archived).
+    const writeback = new Writeback(run.linear as never, { read: async () => settings }, { sessions: { sessionFor: async () => null } as never, handover: run.handover }, 0, join(run.directory, "outbox.json"));
+    await writeback.archived({ agent: { id: "agent-1", workspaceId: "w1", parentAgentId: null, provider: "claude", cwd: "/repo", title: "TUC-25: plan the column" }, archivedAt: "2026-01-01T10:05:00Z" }, run.paseo);
+
+    const progress = run.calls.filter((call) => call.startsWith("progress ")).at(-1) ?? "";
+    assert.ok(progress.includes("**Plan:** submitted — waits for your review in Plannotator"), `AC-5: the progress comment names the parked plan: ${progress}`);
+    assert.ok(progress.includes(`**Latest:**\n\n${summary}`), `AC-5: the progress comment's latest is the submission: ${progress}`);
+    const final = run.calls.filter((call) => call.startsWith("comment issue-1: 🏁 **Paseo final report**")).at(-1) ?? "";
+    assert.ok(final.includes("**Plan:** submitted — waits for your review in Plannotator"), `AC-5: the final report names the parked plan: ${final}`);
+    assert.ok(final.includes(`**Last report:**\n\n${summary}`), `AC-5: the final report's last report is the submission: ${final}`);
+
+    const target = await run.handover.resumeTarget("issue-1");
+    assert.equal(target?.branch, "mtuchel/tuc-2275-parked");
+    assert.ok((target?.handover ?? "").includes(`--- report 1 ---\n${summary}`), "AC-6: the next agent's prompt carries the submission as its last report");
+    assert.ok(!(target?.handover ?? "").includes("--- report 2 ---"), "AC-6: nothing follows the submission in the record");
+  } finally { await rm(run.directory, { recursive: true, force: true }); }
 });
 
 // The journal's one attempt of a test's bridge.
@@ -2292,7 +2414,7 @@ test("the panel's immediate apply and the sweep together run one apply", async (
 
 // A contradicting report recorded while the worker waits on a Linear call pauses the decision:
 // the step in flight finishes, no further step starts, and it is never marked applied.
-test("a conflict recorded while the worker is mid-step stops it before the next step", async () => {
+test("a conflict recorded while the worker is mid-step stops it before the next step", { timeout: 10_000 }, async (t) => {
   const f = tracked({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -2306,12 +2428,21 @@ test("a conflict recorded while the worker is mid-step stops it before the next 
     await bridge.drain();
     const decision = bridge.decideOwner("http://localhost:4000/", true, "", "agent-1", { source: "inbox" });
     await documentEntered;
+    const journal = bridge.decisionJournal;
+    let recorded!: () => void;
+    const reportRecorded = new Promise<void>((resolve) => { recorded = resolve; });
+    const report = journal.report.bind(journal);
+    t.mock.method(journal, "report", async (...args: Parameters<typeof report>) => {
+      const outcome = await report(...args);
+      recorded();
+      return outcome;
+    });
     await writeFile(join(directory, "2.json"), JSON.stringify({ type: "decided", agentId: "agent-1", approved: false, feedback: "No, plan again.", planContent: RISKY(2), at: "2026-01-01T10:05:00Z" }));
     const sweep = bridge.drain();
-    const journal = bridge.decisionJournal;
-    for (let turn = 0; turn < 1_000 && !journal.applying().some((row) => row.kind === "conflict"); turn++) await immediate();
-    assert.ok(journal.applying().some((row) => row.kind === "conflict"), "the report is a conflict");
-    release();
+    try {
+      await reportRecorded;
+      assert.ok(journal.applying().some((row) => row.kind === "conflict"), "the report is a conflict");
+    } finally { release(); }
     await decision;
     await sweep;
     const attempt = onlyAttempt(bridge);
