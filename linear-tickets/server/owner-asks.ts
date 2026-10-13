@@ -63,7 +63,11 @@ type TriageAskResult = NonNullable<DecisionRecord["result"]>;
 // (empty while it is pending or failed). `ticketId`/`ticketIdentifier` name the ticket the ask
 // belongs to: the parent of a "Needs you" sub-issue or manual task, else the issue itself (a
 // ticket under an epic is still its own ticket).
-type Draft = { issue: OwnerAskIssue; manual: boolean; text: string; sourceId: string; needsYou: string | null; route: OwnerAsk["route"]; agentId: string | null; ticketAgentId: string | null; ticketId: string; ticketIdentifier: string };
+// `request`: the ticket waits on a permission request (WaitingKind "request") while a live agent of
+// it runs on this host; "pending" while one of its agents still holds a question, "answered" once
+// none does (the steward's stale wait, steward.ts waitState) — write-back moves the ticket out of
+// Needs input moments later, and until then the ask only repeats a question already answered.
+type Draft = { issue: OwnerAskIssue; manual: boolean; text: string; sourceId: string; needsYou: string | null; route: OwnerAsk["route"]; agentId: string | null; ticketAgentId: string | null; ticketId: string; ticketIdentifier: string; request: "pending" | "answered" | null };
 type ExtractionState = { hash: string; value: ExtractedAsk | null; attempts: number; nextAt: number; running: boolean };
 type ExtractionJob = { issueId: string; hash: string; input: ExtractInput };
 type StoredExtraction = { hash: string; version: string; model: string; result: ExtractedAsk | null; attempts: number; nextAt: string | null; at: string };
@@ -193,6 +197,7 @@ export class OwnerAsks {
       const sourceRevision = revision(draft, value);
       const decision = this.ledger.latest(draft.issue.id, sourceRevision);
       if (decision && (decision.receipt.action === "answer" || decision.receipt.action === "done")) continue;
+      if (draft.request === "answered") continue;
       const expired = decision?.disposition === "deferred" && Date.parse(decision.deferredUntil ?? "") <= this.now();
       asks.push({
         issueId: draft.issue.id,
@@ -211,6 +216,7 @@ export class OwnerAsks {
         source: draft.text.slice(0, MAX_SOURCE_CHARS),
         route: draft.route,
         agentId: draft.route === "agent" ? draft.agentId : null,
+        mirrorsLiveRequest: draft.request === "pending",
         extracted: Boolean(value),
         updatedAt: draft.issue.updatedAt,
       });
@@ -245,7 +251,7 @@ export class OwnerAsks {
     // Re-read the source: edits to a comment can leave the ticket timestamp unchanged.
     // Never route a stale draft, even when its question keys match.
     const draft = (await this.collect(paseo)).find((item) => item.issue.id === input.issueId);
-    if (!draft) throw new Error("That ask is not waiting for you in Linear any more (or is not assigned to you), so nothing was answered.");
+    if (!draft || draft.request === "answered") throw new Error("That ask is not waiting for you in Linear any more (or is not assigned to you), so nothing was answered.");
     const state = await this.extractionFor(draft.issue.id, extractionHash(draft));
     const value = state?.value ?? null;
     if (!input.revision || revision(draft, value) !== input.revision) throw new Error("This ask changed. Refresh the inbox and answer the current revision; nothing was delivered.");
@@ -407,19 +413,23 @@ export class OwnerAsks {
       const asking = needsYouById.get(issue.id)?.agentId ?? (issue.id === ticketId ? ticketRecord?.agentId ?? null : null);
       const remote = !manual(issue) && await this.deps.remoteAgent(ticketId);
       const route = remote ? { route: "continue" as const, agentId: null } : askRoute({ manual: manual(issue), asking, live: agents.live, history: Boolean(ticketRecord) || needsYouById.has(issue.id) || agents.issues.has(ticketId) });
-      drafts.push({ issue, manual: manual(issue), text, sourceId, needsYou: isNeedsYou(issue) ? issue.id : null, route: route.route, agentId: route.agentId, ticketAgentId: agents.newest.get(ticketId) ?? null, ticketId, ticketIdentifier });
+      const request = !subIssue && !remote && waiting?.kind === "request" && agents.asking && agents.newest.has(ticketId) ? agents.asking.has(ticketId) ? "pending" : "answered" : null;
+      drafts.push({ issue, manual: manual(issue), text, sourceId, needsYou: isNeedsYou(issue) ? issue.id : null, route: route.route, agentId: route.agentId, ticketAgentId: agents.newest.get(ticketId) ?? null, ticketId, ticketIdentifier, request });
     }
     return drafts;
   }
 
-  // This host's unarchived agents: who is live, which tickets have an agent at all, and the
-  // newest live root agent per ticket (the one a comment on the ticket reaches, as in the relay).
-  private async agentIndex(paseo: PaseoApi | null): Promise<{ live: Set<string>; issues: Set<string>; newest: Map<string, string> }> {
+  // This host's unarchived agents: who is live, which tickets have an agent at all, the newest
+  // live root agent per ticket (the one a comment on the ticket reaches, as in the relay), and the
+  // tickets one of whose live agents (subagents included) holds a pending request — null when the
+  // agents could not all be read, so no wait is taken for answered on partial evidence.
+  private async agentIndex(paseo: PaseoApi | null): Promise<{ live: Set<string>; issues: Set<string>; newest: Map<string, string>; asking: Set<string> | null }> {
     const live = new Set<string>();
     const issues = new Set<string>();
     const newestAgent = new Map<string, { id: string; createdAt: string }>();
     const newest = new Map<string, string>();
-    if (!paseo) return { live, issues, newest };
+    let asking: Set<string> | null = new Set<string>();
+    if (!paseo) return { live, issues, newest, asking: null };
     try {
       let cursor: string | undefined;
       do {
@@ -427,6 +437,7 @@ export class OwnerAsks {
         for (const { agent } of page.entries) {
           if (LIVE_AGENT[agent.status]) live.add(agent.id);
           const issueId = agent.labels?.["linear.issueId"];
+          if (issueId && LIVE_AGENT[agent.status] && (agent.pendingPermissions?.length ?? 0) > 0) asking.add(issueId);
           if (!issueId || agent.labels?.["paseo.parent-agent-id"]) continue;
           issues.add(issueId);
           const known = newestAgent.get(issueId);
@@ -436,9 +447,10 @@ export class OwnerAsks {
       } while (cursor);
     } catch (error) {
       console.error(`[linear-tickets] reading this host's agents for the owner asks failed: ${error instanceof Error ? error.message : error}`);
+      asking = null;
     }
     for (const [issueId, agent] of newestAgent) newest.set(issueId, agent.id);
-    return { live, issues, newest };
+    return { live, issues, newest, asking };
   }
 
   // ---------------------------------------------------------------------------------------------

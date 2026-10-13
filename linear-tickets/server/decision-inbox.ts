@@ -196,10 +196,13 @@ export class BrowserDecisionInbox {
     ]);
     if (owner?.error) errors.push(owner.error);
     const live: LiveDecision[] = [];
+    // Tickets whose agents hold a pending request now; null while the agents are not fully read.
+    let asking: Set<string> | null = null;
     const paseo = this.deps.paseo();
     if (!paseo) errors.push("Live agents unavailable: Paseo is disconnected.");
     else {
       try {
+        const pending = new Set<string>();
         let cursor: string | undefined;
         const seen = new Set<string>();
         const seenRequests = new Set<string>();
@@ -208,6 +211,8 @@ export class BrowserDecisionInbox {
           for (const { agent } of page.entries) {
             if (agent.archivedAt) continue;
             for (const request of agent.pendingPermissions ?? []) {
+              const issueId = agent.labels?.["linear.issueId"];
+              if (issueId) pending.add(issueId);
               const key = hash([agent.id, request.id]);
               if (seenRequests.has(key)) continue;
               seenRequests.add(key);
@@ -228,6 +233,7 @@ export class BrowserDecisionInbox {
           if (page.pageInfo.hasMore && (!cursor || seen.has(cursor))) throw new Error("Paseo returned an incomplete or repeated agent-page cursor.");
           if (cursor) seen.add(cursor);
         } while (cursor);
+        asking = pending;
       } catch (error) { errors.push(`Live agents incomplete: ${reasonOf(error)}`); }
     }
     const receipts = Object.values(records).filter((record) => record.ref.startsWith(PREFIX) && record.request).map((record): DecisionReceipt => ({
@@ -235,7 +241,10 @@ export class BrowserDecisionInbox {
       action: record.intent ? (record.text.startsWith("Research only:") ? "research" : "delegate") : "answer",
       text: record.text, at: record.at, delivery: record.status,
     }));
-    return { host: this.host, asks: owner?.snapshot.asks ?? [], live,
+    // The owner snapshot is cached for minutes; the live requests are read now. An ask mirroring a
+    // live question goes with that question, wherever it was answered.
+    const asks = (owner?.snapshot.asks ?? []).filter((ask) => !ask.mirrorsLiveRequest || !asking || asking.has(ask.issueId));
+    return { host: this.host, asks, live,
       backendInstanceId: this.deps.backendInstanceId?.(),
       history: [...owner?.snapshot.history ?? [], ...receipts, ...deferrals.history].sort((a, b) => b.at.localeCompare(a.at)).slice(0, 100),
       updatedAt: owner?.snapshot.updatedAt ?? new Date(this.now()).toISOString(), error: errors.length ? errors.join("\n") : null,

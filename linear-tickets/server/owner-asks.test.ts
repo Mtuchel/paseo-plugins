@@ -44,7 +44,7 @@ async function setup(options: {
   comments?: Map<string, OwnerAskComment[]>;
   needsYou?: { id: string; identifier: string; parentId: string; agentId: string }[];
   records?: Map<string, HandoverRecord | null>;
-  agents?: { id: string; status: string; createdAt: string; issueId?: string }[];
+  agents?: { id: string; status: string; createdAt: string; issueId?: string; pending?: boolean }[];
   extraction?: () => Promise<Extraction>;
   continueOutcome?: ContinueOutcome;
   queueError?: string;
@@ -95,7 +95,7 @@ async function setup(options: {
   const paseo = {
     agents: {
       list: async () => ({
-        entries: (options.agents ?? []).map((agent) => ({ agent: { id: agent.id, status: agent.status, createdAt: agent.createdAt, labels: agent.issueId ? { "linear.issueId": agent.issueId } : {} } })),
+        entries: (options.agents ?? []).map((agent) => ({ agent: { id: agent.id, status: agent.status, createdAt: agent.createdAt, labels: agent.issueId ? { "linear.issueId": agent.issueId } : {}, pendingPermissions: agent.pending ? [{ id: "q", provider: "omp", name: "ask", kind: "question" }] : [] } })),
         pageInfo: { hasMore: false },
       }),
     },
@@ -305,6 +305,27 @@ test("an edited wait comment and a new comment with identical wording change the
   h.state.comments.set("i1", [comment("c2", waitComment)]);
   await assert.rejects(h.ownerAsks.answer(input, h.paseo), /ask changed/);
   assert.deepEqual(h.events, []);
+});
+
+test("an ask repeating a live agent's request goes once the request is answered and cannot be answered again", async (t) => {
+  const record = (kind: "request" | "turn-end"): HandoverRecord => ({ issueId: "i1", identifier: "TUC-1616", agentId: "a1", agentTitle: "agent", branch: null, worktreePath: null, lastCommit: null, summaries: [], links: {}, status: "waiting", progressCommentId: null, resumedFrom: null, updatedAt: at, waiting: { previousStateId: "ip", commentId: "c1", kind, at } });
+  const agents = [{ id: "a1", status: "idle", createdAt: at, issueId: "i1", pending: true }];
+  const h = await setup({
+    issues: [issue({ title: "Ticket", labels: [], parentId: null })],
+    comments: new Map([["i1", [comment("c1", waitComment)]]]),
+    records: new Map([["i1", record("request")]]),
+    agents,
+  });
+  t.after(() => h.ownerAsks.stop());
+  const input = await inputFor(h);
+  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).asks.map((ask) => [ask.issueId, ask.route, ask.mirrorsLiveRequest]), [["i1", "agent", true]]);
+  agents[0].pending = false;
+  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).asks, [], "the question was answered; Linear has not caught up yet");
+  await assert.rejects(h.ownerAsks.answer(input, h.paseo), /not waiting for you/);
+  assert.deepEqual(h.delivered, []);
+  // A wait the agent opened by ending its turn with a question has no request to answer: it stays.
+  h.state.records.set("i1", record("turn-end"));
+  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).asks.map((ask) => [ask.issueId, ask.mirrorsLiveRequest]), [["i1", false]]);
 });
 
 test("pending-to-extracted transition changes revision; unknown question keys never become free-form approvals", async (t) => {

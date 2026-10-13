@@ -639,6 +639,10 @@ export const ownerAskSchema = z.object({
   // Where an answer goes from this host's view (server/owner-asks.ts).
   route: z.enum(["agent", "continue", "comment"]),
   agentId: z.string().nullable(),
+  // The ticket waits on a pending request of a live agent on this host: the ask repeats that live
+  // question and is gone once the question is answered (server/owner-asks.ts). Absent from an
+  // older host's snapshot.
+  mirrorsLiveRequest: z.boolean().default(false),
   extracted: z.boolean(),
   updatedAt: z.string(),
 });

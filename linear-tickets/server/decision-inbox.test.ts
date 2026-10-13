@@ -31,7 +31,7 @@ const ownerAsk: OwnerAsk = {
   disposition: null, deferredUntil: null, identifier: "TUC-1", title: "Choose runner", url: "https://linear.app/test/issue/TUC-1",
   parentIdentifier: null, ticketIdentifier: "TUC-1", kind: "decision", summary: "Choose runner",
   questions: [{ key: "q1", question: "Runner?", options: [{ label: "Node", description: "Built in" }], multiSelect: false }],
-  source: "Runner?", route: "agent", agentId: "a", extracted: true, updatedAt: "2026-10-12T00:00:00.000Z",
+  source: "Runner?", route: "agent", agentId: "a", mirrorsLiveRequest: false, extracted: true, updatedAt: "2026-10-12T00:00:00.000Z",
 };
 type Agent = { id: string; title: string; status: string; labels: Record<string, string>; archivedAt?: string | null; pendingPermissions: AgentPermissionRequest[] };
 function barrier() {
@@ -39,7 +39,7 @@ function barrier() {
   const promise = new Promise<void>((resolve) => { release = resolve; });
   return { promise, release };
 }
-async function harness(t: TestContext, host = "laptop") {
+async function harness(t: TestContext, host = "laptop", asks: OwnerAsk[] = [ownerAsk]) {
   const directory = await mkdtemp(join(tmpdir(), "decision-inbox-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   let now = Date.parse("2026-10-12T00:00:00.000Z");
@@ -74,7 +74,7 @@ async function harness(t: TestContext, host = "laptop") {
     else agents.find((agent) => agent.id === agentId)!.pendingPermissions = agents.find((agent) => agent.id === agentId)!.pendingPermissions.filter((request) => request.id !== requestId);
   } });
   const ownerAsks: BrowserDecisionInboxDeps["ownerAsks"] = {
-    snapshot: async () => { ownerReads++; await ownerRead?.(); return { asks: [ownerAsk], history: [], updatedAt: new Date(now).toISOString() }; },
+    snapshot: async () => { ownerReads++; await ownerRead?.(); return { asks, history: [], updatedAt: new Date(now).toISOString() }; },
     answer: async (input) => { ownerActions.push({ operation: "answer", input }); return { delivered: "agent", message: "Owner ask answered." }; },
     triage: async (input) => { ownerActions.push({ operation: "triage", input }); return { delivered: "local", message: "Owner ask deferred." }; },
   };
@@ -405,6 +405,22 @@ test("owner reads are single-flight and cached for two minutes while live questi
   h.clock(h.now() + 90_000);
   assert.notEqual((await h.inbox.local()).updatedAt, checkedAt);
   assert.equal(h.ownerReads(), 2);
+});
+
+test("a cached owner ask mirroring a live question leaves with that question; other asks stay", async (t) => {
+  const twin: OwnerAsk = { ...ownerAsk, mirrorsLiveRequest: true };
+  const other: OwnerAsk = { ...ownerAsk, issueId: "i2", identifier: "TUC-2", ticketIdentifier: "TUC-2", revision: "owner-r2" };
+  const h = await harness(t, "laptop", [twin, other]);
+  h.agents[0].labels = { "linear.issueId": "i1" };
+  assert.deepEqual((await h.inbox.local()).asks.map((ask) => ask.issueId), ["i1", "i2"]);
+  assert.equal((await h.post(await h.action())).status, 200);
+  const after = await h.inbox.local();
+  assert.equal(h.ownerReads(), 1, "still the cached owner snapshot");
+  assert.deepEqual(after.live, []);
+  assert.deepEqual(after.asks.map((ask) => ask.issueId), ["i2"]);
+  // Without a complete read of the live agents nothing is taken for answered.
+  h.sdk.agents.list = async () => { throw new Error("daemon busy"); };
+  assert.deepEqual((await h.inbox.local()).asks.map((ask) => ask.issueId), ["i1", "i2"]);
 });
 
 test("a stalled Linear owner read does not prevent viewing live questions or multiply the read", async (t) => {

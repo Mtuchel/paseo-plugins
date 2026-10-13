@@ -4181,6 +4181,18 @@ still its own ticket). Each ask carries its route from this host's view: `agent`
 agent), `continue` (the ticket's agent is gone: an answer starts a continuation agent through the
 starter's handover path), or `comment`.
 
+**Asks that repeat a live question.** A ticket whose wait was opened by a permission request (the
+agent's question or approval, wait kind `request`) and that has a live root agent on this host
+carries `mirrorsLiveRequest: true` while one of its live agents (subagents included) still holds a
+pending request: the ask is the Linear copy of that live question. Once none does, the question was
+answered — in the browser, the menu bar or on Linear — and the ask is left out of the snapshot and
+refused by `linear.answer-ask` ("not waiting for you"), the same stale-wait rule the steward
+applies; write-back moves the ticket out of Needs input moments later. A `turn-end` wait (the agent
+ended its turn with a question) and a `decision` wait are unaffected. The browser inbox caches the
+owner snapshot for two minutes but reads the live agents on every view, so it drops a mirroring
+ask as soon as its live question is gone. When the agents cannot all be read, nothing is taken for
+answered.
+
 **The extraction.** `linear.owner-asks` never waits for a model. An ask whose ask text is new (or
 whose earlier extraction failed) is returned right away with `extracted: false` (kind `info`,
 summary = title) and extracted in the background: one isolated, tool-less OMP call per ask text
