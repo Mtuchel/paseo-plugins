@@ -14,7 +14,7 @@ import type { DeliveryResult, PermissionReplies, ReplyRecord } from "./permissio
 import { answerableQuestions, matchOption, questionAnswer, questionKey, questionsOf } from "./relay";
 import { paseoHome } from "./ticket-mcp";
 import { INBOX_DISPLAYED_HEADER } from "./inbox-transport";
-import { CURATION_INTERVAL_MS, DecisionCuration } from "./decision-curation";
+import { CURATION_INTERVAL_MS, DecisionCuration, curateDecisions } from "./decision-curation";
 
 export type BrowserDecisionInboxDeps = {
   ownerAsks: Pick<OwnerAsks, "snapshot" | "answer" | "triage">;
@@ -33,6 +33,7 @@ export type BrowserDecisionInboxDeps = {
 };
 const OWNER_CACHE_MS = CURATION_INTERVAL_MS;
 const READ_TIMEOUT_MS = 5_000;
+const TRANSPORT_CACHE_MS = 30_000;
 const ACTION_TIMEOUT_MS = 65_000;
 const PREFIX = "decision-inbox:";
 const json = (status: number, value: unknown) => ({ status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify(value) });
@@ -128,6 +129,9 @@ export class BrowserDecisionInbox {
   private ownerGeneration = 0;
   private storeQueue: Promise<unknown> = Promise.resolve();
   private readonly curation: DecisionCuration;
+  private transportCache: { view: DecisionView; at: number; generation: number } | null = null;
+  private transportFlight: Promise<DecisionView> | null = null;
+  private readonly peerFlights = new Map<string, Promise<DecisionHost>>();
 
   constructor(private readonly deps: BrowserDecisionInboxDeps) {
     this.host = deps.host ?? hostname().replace(/\.local$/, "");
@@ -144,6 +148,7 @@ export class BrowserDecisionInbox {
     this.ownerGeneration++;
     this.ownerCache = null;
     this.ownerFlight = null;
+    this.transportFlight = null;
     this.curation.invalidate();
     return this.curation.refresh();
   }
@@ -171,6 +176,7 @@ export class BrowserDecisionInbox {
           this.ownerGeneration++;
           this.ownerCache = null;
           this.ownerFlight = null;
+          this.transportFlight = null;
           this.curation.invalidate();
         }
       }
@@ -207,14 +213,16 @@ export class BrowserDecisionInbox {
       try { canonical = await this.deps.canonicalPeer() === null; }
       catch (error) { canonical = false; errors.push(`Canonical source unavailable: ${reasonOf(error)}`); }
     }
-    const [owner, deferrals, records] = await Promise.all([
-      canonical ? deadline(() => this.ownerSnapshot(), READ_TIMEOUT_MS).catch((error) => ({
-        snapshot: { asks: [], history: [], updatedAt: new Date(this.now()).toISOString() },
-        checkedAt: this.now(), error: `Owner asks unavailable: ${reasonOf(error)}`,
-      })) : Promise.resolve(null),
+    // Owner collection is background work, never a prerequisite for reading or answering
+    // live questions. The peer's deadline must not expire while this host scans Linear.
+    if (canonical) void this.ownerSnapshot();
+    const [deferrals, records] = await Promise.all([
       this.readDeferrals().catch((error) => { errors.push(`Live deferrals unavailable: ${reasonOf(error)}`); return { deferrals: {}, history: [] } as DeferralFile; }),
       this.deps.replies.records().catch((error) => { errors.push(`Live history unavailable: ${reasonOf(error)}`); return {} as Record<string, ReplyRecord>; }),
     ]);
+    const owner = canonical ? this.ownerCache : null;
+    if (canonical && !owner) errors.push("Owner asks are being collected; live agent questions remain available.");
+    else if (owner && this.now() - owner.checkedAt >= OWNER_CACHE_MS) errors.push("Owner asks are refreshing; showing the previous collection.");
     if (owner?.error) errors.push(owner.error);
     if (owner && "coverage" in owner.snapshot) errors.push(...owner.snapshot.coverage ?? []);
     const live: LiveDecision[] = [];
@@ -287,22 +295,48 @@ export class BrowserDecisionInbox {
   }
 
   private async readPeer(peer: string): Promise<DecisionHost> {
-    return deadline(async () => {
+    const pending = this.peerFlights.get(peer);
+    if (pending) return pending;
+    const flight = deadline(async () => {
       const response = await fetch(`${peer}/api/decisions/local`, { signal: AbortSignal.timeout(READ_TIMEOUT_MS), redirect: "error", headers: { accept: "application/json" } });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const parsed = peerSchema.safeParse(await response.json());
       if (!parsed.success) throw new Error("The peer returned an invalid decision snapshot.");
       return parsed.data;
     }, READ_TIMEOUT_MS);
+    this.peerFlights.set(peer, flight);
+    try { return await flight; }
+    finally { if (this.peerFlights.get(peer) === flight) this.peerFlights.delete(peer); }
   }
 
-  view(): Promise<DecisionView> { return this.curation.view(); }
+  async view(): Promise<DecisionView> {
+    // Keep the fifteen-minute Linear scan independent of the browser transport. A page read
+    // refreshes live requests and peer reachability without waiting for that scan to finish.
+    void this.curation.view();
+    const generation = this.ownerGeneration;
+    let view: DecisionView;
+    if (this.transportCache?.generation === generation && this.now() - this.transportCache.at < TRANSPORT_CACHE_MS) {
+      view = this.transportCache.view;
+    } else {
+      if (!this.transportFlight) {
+        const flight = this.collectView(false).then(view => {
+          if (generation === this.ownerGeneration) this.transportCache = { view, at: this.now(), generation };
+          return view;
+        });
+        this.transportFlight = flight;
+        void flight.finally(() => { if (this.transportFlight === flight) this.transportFlight = null; }).catch(() => {});
+      }
+      view = await this.transportFlight;
+    }
+    if (generation !== this.ownerGeneration) return this.view();
+    return { ...view, tasks: curateDecisions(view, this.now()), curation: this.curation.current().curation };
+  }
 
-  private async collectView(): Promise<DecisionView> {
-    // The background scan owns full collection; interactive local/peer reads stay bounded.
-    if (!this.ownerFlight) this.ownerCache = null;
+  private async collectView(collectOwners = true): Promise<DecisionView> {
+    // Only the daemon-owned fifteen-minute pass forces a full owner collection.
+    if (collectOwners && !this.ownerFlight) this.ownerCache = null;
     const [configuredPeers, canonicalPeer] = await Promise.all([this.deps.peers(), this.deps.canonicalPeer()]);
-    if (canonicalPeer === null) await this.ownerSnapshot();
+    if (collectOwners && canonicalPeer === null) await this.ownerSnapshot();
     const localPromise = this.local(canonicalPeer === null);
     const sources = await Promise.all([...new Set(configuredPeers)].map(async (configured) => {
       try { const peer = peerOrigin(configured); return { configured, peer, snapshot: await this.readPeer(peer), error: null }; }
@@ -348,7 +382,7 @@ export class BrowserDecisionInbox {
             ? await this.deps.ownerAsks.answer({ issueId: input.issueId!, revision: input.revision, answers: input.answers!, ...(input.note !== undefined ? { note: input.note } : {}), ...(input.done !== undefined ? { done: input.done } : {}) }, this.deps.paseo())
             : await this.deps.ownerAsks.triage({ issueId: input.issueId!, revision: input.revision, action: input.action!, ...(input.note !== undefined ? { note: input.note } : {}), ...(input.until !== undefined ? { until: input.until } : {}) }, this.deps.paseo());
           return json(200, result);
-        } finally { this.ownerGeneration++; this.ownerCache = null; this.ownerFlight = null; }
+        } finally { this.ownerGeneration++; this.ownerCache = null; this.ownerFlight = null; this.transportFlight = null; }
       }
       return this.liveAction(input);
     }
