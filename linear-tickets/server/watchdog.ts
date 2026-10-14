@@ -16,8 +16,9 @@ import { paseoHome } from "./ticket-mcp";
 // the pull request watch's two-minute poll, before any other recovery, and walks each ticket's
 // current root agent through bounded steps: a non-cancelling steer, a stop with a resume, a reload
 // with a resume, a replacement on the recorded branch, then one mention of the owner. A closed or
-// idle root gets one resume; a proven ghost goes straight to the replacement. Every step is
-// claimed in watchdog.json before it is taken, so a restart never repeats one blindly.
+// idle root gets one resume; a proven ghost is reloaded from its session at once (it has no process
+// that could end its turn) and replaced when that brings no progress. Every step is claimed in
+// watchdog.json before it is taken, so a restart never repeats one blindly.
 
 export const WATCHDOG_CYCLES = 2;
 export const WATCHDOG_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -54,7 +55,7 @@ export type WatchdogEffect = Exclude<WatchdogAction, "mention">;
 const STEPS: Record<WatchdogKind, WatchdogAction[]> = {
   silent: ["steer", "interrupt", "reload", "succeed", "mention"],
   idle: ["resume", "mention"],
-  ghost: ["succeed", "mention"],
+  ghost: ["reload", "succeed", "mention"],
 };
 
 export const WATCHDOG_LINES: Record<WatchdogEffect, string> = {
@@ -108,6 +109,9 @@ export type WatchdogCycle = {
   successor: { marker: string; at: string } | null;
   // The replacement must wait for proof the predecessor is gone, at most until then.
   retireBy?: string | null;
+  // The predecessor was retired and proven gone then: the replacement only waits for its start (a
+  // free slot, the route to the peer), which `retireBy` no longer bounds.
+  retiredAt?: string | null;
 };
 // A ticket line or the owner mention still to post; `attempted` once a send may have gone out.
 export type WatchdogReport = { key: string; body: string; agentId: string | null; mention: boolean; attempted?: boolean };
@@ -511,11 +515,12 @@ export type TicketRoots = { issueId: string; identifier: string; roots: WatchedA
 // What SessionRouter.watchdogAct came to. `done`: the effect went out. `skipped`: nothing was sent
 // (`end`: the cycle no longer applies; else try again on the next poll). `failed`: the effect was
 // claimed and attempted but did not succeed (`retry`: the same step may run again, e.g. while the
-// predecessor's absence is not proven yet).
+// predecessor's absence is not proven yet; `retired`: the predecessor is retired and proven gone,
+// only the replacement's start waits).
 export type WatchdogOutcome =
   | { kind: "done"; successor?: { id: string; title: string | null; cwd: string } | null; peer?: string; note?: string }
   | { kind: "skipped"; reason: string; end: boolean; dispatched?: boolean }
-  | { kind: "failed"; reason: string; retry?: boolean; unloadable?: boolean };
+  | { kind: "failed"; reason: string; retry?: boolean; unloadable?: boolean; retired?: boolean };
 
 export type WatchdogRequest = {
   issueId: string; identifier: string; rootId: string; action: WatchdogEffect;
@@ -917,7 +922,7 @@ export class Watchdog {
     // The final mention and a replacement past its retirement deadline answer to the same
     // exclusions as an effect: a ticket that meanwhile waits for the owner, closed or got vetoed
     // ends its cycle without a mention; one whose state cannot be read waits.
-    if (cycle.stage === "mention" || (cycle.stage === "succeed" && cycle.retireBy && now >= ms(cycle.retireBy)!)) {
+    if (cycle.stage === "mention" || (cycle.stage === "succeed" && !cycle.retiredAt && cycle.retireBy && now >= ms(cycle.retireBy)!)) {
       let veto: string | null;
       try { veto = await this.exclusion(issueId, identifier, root, true, poll, cycle.kind, settings); } catch (error) {
         this.once(`wait:${issueId}`, `${label}: the end of cycle ${short(cycle.id)} waits: ${error instanceof Error ? error.message : error}`);
@@ -933,10 +938,12 @@ export class Watchdog {
     const action = cycle.stage as WatchdogEffect;
     if (action === "succeed") {
       if (!settings.writeback.watchdog) return;
-      cycle = cycle.retireBy ? cycle : await this.patchCycle(issueId, identifier, { retireBy: iso(now + settings.watchdog.recoveryGraceMinutes * MINUTE) });
-      if (now >= ms(cycle.retireBy)!) {
-        await this.exhaust(issueId, identifier, cycle.rootId, `the silent agent ${short(cycle.rootId)} could not be proven gone within ${settings.watchdog.recoveryGraceMinutes} minutes, so no replacement was started`);
-        return;
+      if (!cycle.retiredAt) {
+        cycle = cycle.retireBy ? cycle : await this.patchCycle(issueId, identifier, { retireBy: iso(now + settings.watchdog.recoveryGraceMinutes * MINUTE) });
+        if (now >= ms(cycle.retireBy)!) {
+          await this.exhaust(issueId, identifier, cycle.rootId, `the silent agent ${short(cycle.rootId)} could not be proven gone within ${settings.watchdog.recoveryGraceMinutes} minutes, so no replacement was started`);
+          return;
+        }
       }
     }
     const marker = `${cycle.id}:${action}`;
@@ -956,6 +963,18 @@ export class Watchdog {
     if (outcome.kind === "skipped") {
       if (outcome.end) await this.endCycle(issueId, `${label}: ${outcome.reason}; cycle ${short(cycle.id)} ends${outcome.dispatched ? " (the turn was already stopped)" : ""}`);
       else this.once(`wait:${issueId}`, `${label}: the ${action} of cycle ${short(cycle.id)} waits: ${outcome.reason}`);
+      return;
+    }
+    // The predecessor is gone and only the start waits (a slot, the peer's route): like a queued
+    // ticket, it waits without a deadline and is logged once until the reason changes.
+    if (outcome.kind === "failed" && outcome.retry && outcome.retired) {
+      await this.deps.store.update((file) => {
+        const ticket = this.deps.store.ticket(file, issueId, identifier);
+        if (!ticket.cycle) return;
+        ticket.cycle.claim = null;
+        ticket.cycle.retiredAt ??= iso(this.clock());
+      });
+      this.once(`wait:${issueId}`, `${label}: ${short(cycle.rootId)} is retired; its replacement waits: ${outcome.reason}`);
       return;
     }
     this.logged.delete(`wait:${issueId}`);

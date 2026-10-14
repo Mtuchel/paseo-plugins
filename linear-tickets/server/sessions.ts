@@ -2393,8 +2393,17 @@ export class SessionRouter {
     if (action === "reload") {
       const reload = await this.deps.reloader?.();
       if (!reload) return { kind: "skipped", reason: "the daemon's agent reload is not available", end: false };
+      // A ghost has no process that could end its turn, so a Stop is never acknowledged: it is
+      // reloaded from its session without one. The reload starts a process again, so it waits for
+      // a slot like any start.
+      const ghost = (await ghostAgents([agent], this.clock(), this.deps.processInspector)).has(rootId);
+      if (ghost) {
+        const admission = await this.deps.starter.admission(issueId, this.paseo!, await this.deps.settings.read());
+        if (!admission.ok) return { kind: "skipped", reason: admission.reason, end: false };
+        if (!request.alive()) return unloading;
+      }
       await request.claim();
-      return this.watchdogResume(request, found!, running, reload);
+      return this.watchdogResume(request, found!, running && !ghost, reload);
     }
     // `resume`: a closed or idle agent. A closed one is loaded again by the message itself, once its
     // ticket's terminal OMP roots are proven gone; a crashed one is reloaded first.
@@ -2482,7 +2491,10 @@ export class SessionRouter {
     await request.claim();
     if (found) {
       let current: { handle: PaseoAgentHandle; agent: PaseoAgent } | null = found;
-      if (current.agent.activeTurn || current.agent.status === "running") {
+      // A ghost's turn has no process to end it, so its Stop is never acknowledged: it is retired
+      // without one, and the process check below still proves the ticket's workers gone.
+      const ghost = (await ghostAgents([current.agent], this.clock(), this.deps.processInspector)).has(rootId);
+      if (!ghost && (current.agent.activeTurn || current.agent.status === "running")) {
         current = await this.stopTurn(rootId);
         if (current && (current.agent.activeTurn || current.agent.status === "running")) return { kind: "failed", reason: `the silent agent's turn did not stop within ${STOP_WAIT_MS / 1000} seconds`, retry: true };
       }
@@ -2504,12 +2516,12 @@ export class SessionRouter {
       kind: "recover", issueId, identifier, id: `watchdog:${issueId}:${request.marker}`,
       text: request.text, strictResume: true, ...(request.history ? { watchdog: request.history } : {}),
     });
-    if (routed && "held" in routed) return { kind: "failed", reason: `the replacement is not routed yet: ${routed.held}`, retry: true };
+    if (routed && "held" in routed) return { kind: "failed", reason: `the replacement is not routed yet: ${routed.held}`, retry: true, retired: true };
     if (routed) return { kind: "done", peer: routed.peer };
     if (!await this.deps.handover.resumeTarget(issueId)) return { kind: "failed", reason: "no branch is recorded for the ticket" };
     const settings = await this.deps.settings.read();
     const admission = await this.deps.starter.admission(issueId, paseo, settings);
-    if (!admission.ok) return { kind: "failed", reason: admission.reason, retry: true };
+    if (!admission.ok) return { kind: "failed", reason: admission.reason, retry: true, retired: true };
     const running = dispatchLabels(settings.dispatch.label).running;
     await this.deps.linear.addLabel(issueId, running).catch(() => {});
     const last = await this.watchdogFence(request, null, Boolean(found));
