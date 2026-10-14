@@ -207,9 +207,10 @@ test("plan checklists come from checkboxes, or numbered steps under a Steps head
 
 type Call = string;
 type RouterLinear = Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "admissionStates" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
+type ContinuationDeps = Partial<Pick<ConstructorParameters<typeof SessionRouter>[0], "parentResumeWait" | "starter" | "handover" | "launcher" | "deletions">>;
 // `reload`: the daemon's agent reload (null: the plugin has no daemon connection); `send`: runs
 // before each send is recorded.
-function harness(options: { route?: ActivationSink; now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; processLiveness?: typeof ticketProcessLiveness; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; admission?: (issueId: string, paseo: PaseoApi, settings: PluginSettings, read?: AdmissionState) => Promise<{ ok: true } | { ok: false; reason: string }>; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null> } = {}) {
+function harness(options: { owner?: (issueId: string) => Promise<"here" | "elsewhere" | "unknown">; route?: ActivationSink; now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; processLiveness?: typeof ticketProcessLiveness; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; admission?: (issueId: string, paseo: PaseoApi, settings: PluginSettings, read?: AdmissionState) => Promise<{ ok: true } | { ok: false; reason: string }>; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null> } & ContinuationDeps = {}) {
   const calls: Call[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
@@ -273,14 +274,17 @@ function harness(options: { route?: ActivationSink; now?: () => number; pending?
       moveToStateNamed: async (id: string, name: string) => { calls.push(`move ${id} to ${name}`); return { changed: true }; },
       delegate: options.delegate ?? (async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); }),
     },
-    starter: { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false, untrusted: false, plan: null }; }, admission: options.admission ?? (async () => ({ ok: true as const })) },
-    handover: { resumeTarget: async () => null, handOff: async () => true },
-    launcher: { gate: () => ({ release: () => {} }) },
+    starter: options.starter ?? { start: async (_issue: string, _paseo: PaseoApi, _settings: PluginSettings, launch: { labels?: Record<string, string> }) => { calls.push(`start ${JSON.stringify(launch.labels)}`); return { agentId: "agent-new", warnings: [], provider: "omp/x", target: "repo", resumed: false, untrusted: false, plan: null }; }, admission: options.admission ?? (async () => ({ ok: true as const })) },
+    handover: options.handover ?? { resumeTarget: async () => null, handOff: async () => true },
+    launcher: options.launcher ?? { gate: () => ({ release: () => {} }) },
     settings: { read: async () => settings },
     store,
     replies,
     needsYou: options.needsYou,
     route: options.route,
+    owner: options.owner,
+    parentResumeWait: options.parentResumeWait,
+    deletions: options.deletions,
     budget: options.budget,
     now: options.now,
     decidePlan: options.decidePlan,
@@ -297,6 +301,145 @@ function harness(options: { route?: ActivationSink; now?: () => number; pending?
 }
 
 const link = (change: Partial<SessionLink> = {}): SessionLink => ({ sessionId: "s1", agentId: "agent-1", issueId: "i1", identifier: "TUC-1", createdAt: "2026-01-01T00:00:00Z", handled: [], review: null, offer: null, ...change });
+
+function parentContinuation(t: TestContext, over: Parameters<typeof harness>[0] = {}) {
+  const effects: string[] = [];
+  const starts: Parameters<NonNullable<ContinuationDeps["starter"]>["start"]>[3][] = [];
+  const agents: ProcessAgent[] = [];
+  const worker = { id: "implementation", title: "TUC-1: Continue", cwd: "/worktree", provider: "claude", status: "idle" as const,
+    createdAt: new Date().toISOString(), labels: { "linear.issueId": "i1" } };
+  const state = { admitted: true, wait: null as string | null, target: false, failure: null as Error | null, pending: [] as AgentPermissionRequest[] };
+  const h = harness({
+    manual: true, agents, owner: async () => "here", processLiveness: async () => "absent",
+    parentResumeWait: async () => state.wait,
+    snapshot: async () => ({ agent: { ...worker, pendingPermissions: state.pending } }),
+    send: async () => { effects.push("send"); },
+    starter: {
+      admission: async () => {
+        effects.push("admission");
+        return state.admitted ? { ok: true } : { ok: false, reason: "Queued: 1 of 1 worker slots used." };
+      },
+      start: async (_issueId, _paseo, _settings, options) => {
+        effects.push("start"); starts.push(options);
+        if (state.failure) throw state.failure;
+        agents.push(worker);
+        return { agentId: worker.id, warnings: [], provider: "claude/test", target: "repo", resumed: state.target, untrusted: false, plan: null };
+      },
+    },
+    handover: {
+      resumeTarget: async () => state.target ? { branch: "recorded", worktreePath: "/worktree", handover: "Prior work" } : null,
+      handOff: async () => { effects.push("handoff"); return true; },
+    },
+    ...over,
+  });
+  t.after(h.cleanup);
+  return { ...h, state, effects, starts, agents, worker, claim: async () => { effects.push("claim"); } };
+}
+
+test("verified branchless parent waits uncharged for worker capacity, then starts once with its actionable instruction", async (t) => {
+  const h = parentContinuation(t);
+  h.state.admitted = false;
+  const lead = "Implement the missing rollback check identified by parent verification.";
+  for (let pass = 0; pass < 4; pass++) {
+    const result = await h.router.resumeVerifiedParent("i1", "TUC-1", null, lead, h.claim);
+    assert.equal(result.kind, "wait");
+  }
+  assert.equal(h.starts.length, 0);
+  assert.equal(h.effects.includes("claim"), false);
+  assert.equal(h.calls.some((call) => call.startsWith("+") || call.startsWith("send ")), false);
+  h.state.admitted = true;
+  const started = await h.router.resumeVerifiedParent("i1", "TUC-1", null, lead, h.claim);
+  assert.equal(started.kind, "started");
+  assert.deepEqual(h.starts.map((start) => ({ lead: start.lead, resumeOnly: start.resumeOnly, verifier: start.verifier })), [
+    { lead, resumeOnly: false, verifier: undefined },
+  ]);
+  assert.deepEqual(h.effects.slice(-4), ["admission", "claim", "start", "handoff"]);
+  assert.equal((await h.store.get("s-new"))?.agentId, h.worker.id);
+  const retried = await h.router.resumeVerifiedParent("i1", "TUC-1", null, lead, h.claim);
+  assert.equal(retried.kind, "live");
+  assert.equal(h.starts.length, 1, "retry reuses the implementation agent instead of creating another");
+});
+
+test("ordinary succeed remains branch-required; a recorded parent branch failure never falls back fresh", async (t) => {
+  const h = parentContinuation(t);
+  const strict = await h.router.succeed("i1", "TUC-1", null, "Continue", h.claim);
+  assert.equal(strict.kind, "impossible");
+  assert.equal(h.starts.length, 0);
+  assert.equal(h.effects.includes("claim"), false);
+  h.state.target = true;
+  h.state.failure = new Error("Recorded branch cannot be restored");
+  const result = await h.router.resumeVerifiedParent("i1", "TUC-1", null, "Continue recorded work", h.claim);
+  assert.equal(result.kind, "impossible");
+  assert.deepEqual(h.starts.map((start) => start.resumeOnly), [true]);
+  assert.equal(h.effects.filter((effect) => effect === "claim").length, 1);
+});
+
+test("verified parent reuses even its live predecessor and sends the instruction before handing off", async (t) => {
+  const h = parentContinuation(t);
+  h.agents.push(h.worker);
+  const lead = "Address acceptance item 3, preserving the already landed child work.";
+  const result = await h.router.resumeVerifiedParent("i1", "TUC-1", h.worker.id, lead, h.claim);
+  assert.equal(result.kind, "live");
+  assert.equal(h.starts.length, 0);
+  assert.deepEqual(h.effects, ["claim", "send", "handoff"]);
+  assert.deepEqual(h.calls.filter((call) => call.startsWith("send ")), [`send implementation: ${lead}`]);
+});
+
+test("parent continuation rechecks owner authority after admission and claims nothing when a new hold appears", async (t) => {
+  let checks = 0;
+  const h = parentContinuation(t, { parentResumeWait: async () => ++checks === 1 ? null : "A registered manual task now needs the owner" });
+  const result = await h.router.resumeVerifiedParent("i1", "TUC-1", null, "Continue", h.claim);
+  assert.equal(result.kind, "wait");
+  assert.deepEqual(h.effects, ["admission"]);
+  assert.equal(h.starts.length, 0);
+});
+
+test("missing, unreadable and denying parent authority never claims or dispatches a continuation", async (t) => {
+  const guards: ContinuationDeps["parentResumeWait"][] = [
+    undefined, async () => { throw new Error("manual inventory unreadable"); }, async () => "The owner's answer is pending",
+  ];
+  for (const guard of guards) {
+    const h = parentContinuation(t, { parentResumeWait: guard });
+    const result = await h.router.resumeVerifiedParent("i1", "TUC-1", null, "Continue", h.claim);
+    assert.equal(result.kind, "wait");
+    assert.equal(h.effects.length, 0);
+  }
+});
+
+test("an unreadable recorded branch is not treated as an absent branch for fresh parent implementation", async (t) => {
+  const h = parentContinuation(t, { handover: {
+    resumeTarget: async () => { throw new Error("Handover record is unavailable"); },
+    handOff: async () => true,
+  } });
+  const result = await h.router.resumeVerifiedParent("i1", "TUC-1", null, "Continue", h.claim);
+  assert.equal(result.kind, "wait");
+  assert.equal(h.effects.length, 0);
+  assert.equal(h.starts.length, 0);
+});
+
+test("stopped parents, live parked reviews, ownership denial and busy launch gates cannot be bypassed by verifier resume", async (t) => {
+  for (const held of ["stopped", "parked", "ownership", "gate"] as const) {
+    const h = parentContinuation(t, {
+      ...(held === "ownership" ? { owner: async () => "unknown" as const } : {}),
+      ...(held === "gate" ? { launcher: { gate: () => null } } : {}),
+    });
+    if (held === "stopped") await h.store.put(link({ agentId: null, closed: true, group: { delegated: true, stopped: true } }));
+    if (held === "parked") await h.store.put(link({ agentId: null, offer: "parked" }));
+    const result = await h.router.resumeVerifiedParent("i1", "TUC-1", null, "Continue", h.claim);
+    assert.equal(result.kind, "wait", held);
+    assert.equal(h.effects.length, 0, held);
+  }
+});
+
+test("a live implementation's owner question is preserved when a verifier asks it to continue", async (t) => {
+  const h = parentContinuation(t);
+  h.agents.push(h.worker);
+  h.state.pending.push({ id: "question", provider: "claude", name: "AskUserQuestion", kind: "question", input: {} });
+  const result = await h.router.resumeVerifiedParent("i1", "TUC-1", null, "Continue", h.claim);
+  assert.equal(result.kind, "wait");
+  assert.equal(h.effects.length, 0);
+  assert.equal(h.calls.some((call) => call.startsWith("send ")), false);
+});
 
 test("a delegation from someone else is refused; the owner's starts an agent linked to the session", async () => {
   const other = harness();
@@ -343,14 +486,11 @@ test("assigning a parent with open sub-issues hands out the open ones nobody els
   assert.ok(!h.calls.some((call) => call.startsWith("start ")), "no agent for the parent");
   assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")), ["delegate tuc-2 to paseo-app", "delegate tuc-3 to paseo-app", "delegate tuc-7 to paseo-app"]);
   assert.ok(h.calls.includes("move i1 to In Progress"));
-  assert.equal(h.calls.at(-1), [
-    "thought:1 of 5 sub-issues finished. TUC-1 closes when all are.",
-    "- TUC-2: starting",
-    "- TUC-3: waits for TUC-2",
-    "- TUC-4: assigned to someone else; TUC-1 waits for it",
-    "- TUC-5: Done",
-    "- TUC-7: waits for TUC-88 (not with Paseo, nobody is working on it here)",
-  ].join("\n"));
+  const progress = await h.router.parentProgress("i1");
+  assert.equal(progress?.phase, "children");
+  assert.deepEqual(progress?.children.map((child) => [child.identifier, child.finished]), [
+    ["TUC-2", false], ["TUC-3", false], ["TUC-4", false], ["TUC-5", true], ["TUC-7", false],
+  ]);
   assert.deepEqual((await h.store.get("s1"))?.group?.delegated, true);
   await h.cleanup();
 });
@@ -361,31 +501,257 @@ test("a blocked parent hands out nothing until its blockers finish; unassigning 
   const h = harness({ groups, blockedBy });
   await h.router.created({ id: "s1", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" } });
   assert.ok(!h.calls.some((call) => call.startsWith("delegate ")));
-  assert.match(h.calls.at(-1) ?? "", /^thought:TUC-1 is blocked by TUC-9; its sub-issues are handed out once that is finished\./);
+  assert.deepEqual((await h.router.parentProgress("i1"))?.blockers, ["TUC-9"]);
   blockedBy.i1 = [];
   await h.router.advanceGroups();
   assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")), ["delegate tuc-2 to paseo-app"]);
   groups.i1 = parent([child("TUC-2", { delegateId: "paseo-app" })], { delegateId: null });
   await h.router.advanceGroups();
-  assert.equal(h.calls.at(-1), "response:Paseo was unassigned from TUC-1, so it stopped handing out sub-issues. Agents already working continue.");
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "closed");
   assert.equal((await h.store.get("s1"))?.closed, true);
   await h.cleanup();
 });
 
-test("the parent closes when every sub-issue is finished: Done when any was done, Canceled with the reason when all were canceled", async () => {
-  const done = harness({ groups: { i1: parent([child("TUC-2", { status: "Done", statusType: "completed", finished: true }), child("TUC-3", { status: "Canceled", statusType: "canceled", finished: true }), child("TUC-4", { labels: ["paseo-manual"] })]) } });
-  await done.store.put(link({ agentId: null, group: { delegated: true } }));
-  await done.router.advanceGroups();
-  assert.ok(done.calls.includes("complete i1"), "an open manual task does not hold the parent open");
-  assert.match(done.calls.at(-1) ?? "", /^response:All sub-issues are finished, so TUC-1 is done\./);
-  assert.equal((await done.store.get("s1"))?.closed, true);
-  await done.cleanup();
+test("terminal member children require verification; unresolved owner tasks remain gates and are never assigned", async (t) => {
+  const groups = { i1: parent([
+    child("TUC-2", { status: "Done", statusType: "completed", finished: true }),
+    child("TUC-3", { status: "Canceled", statusType: "canceled", finished: true }),
+    child("TUC-4", { labels: ["paseo-manual"] }),
+    child("TUC-5", { labels: ["paseo-needs-you"] }),
+  ]) };
+  const h = harness({ groups });
+  t.after(h.cleanup);
+  await h.store.put(link({ agentId: null, group: { delegated: true } }));
+  await h.router.advanceGroups();
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "paused");
+  assert.deepEqual((await h.router.parentProgress("i1"))?.blockers, ["TUC-4", "TUC-5"]);
+  assert.ok(!h.calls.some((call) => /^(complete|cancel|delegate) /.test(call)));
+  groups.i1.children = groups.i1.children.map((child) => ({ ...child, status: "Done", statusType: "completed", finished: true }));
+  await h.router.advanceGroups();
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "verification");
+  assert.notEqual((await h.store.get("s1"))?.closed, true);
+  assert.ok(!h.calls.some((call) => /^(complete|cancel|delegate) /.test(call)));
+});
 
-  const canceled = harness({ groups: { i1: parent([child("TUC-2", { status: "Canceled", statusType: "canceled", finished: true })]) } });
-  await canceled.store.put(link({ agentId: null, group: { delegated: true } }));
-  await canceled.router.advanceGroups();
-  assert.deepEqual(canceled.calls.slice(0, 1), ["cancel i1: Every sub-issue was canceled, so TUC-1 is canceled too."]);
-  await canceled.cleanup();
+test("all canceled or duplicate children still require parent acceptance verification", async (t) => {
+  const h = harness({ groups: { i1: parent([
+    child("TUC-2", { status: "Canceled", statusType: "canceled", finished: true }),
+    child("TUC-3", { status: "Duplicate", statusType: "duplicate", finished: true }),
+  ]) } });
+  t.after(h.cleanup);
+  await h.store.put(link({ agentId: null, group: { delegated: true } }));
+  await h.router.advanceGroups();
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "verification");
+  assert.ok(!h.calls.some((call) => /^(complete|cancel) /.test(call)));
+});
+
+test("explicit parent handoff persists and advances even without a Linear session webhook", async (t) => {
+  const h = harness({ groups: { i1: parent([child("TUC-2")], { delegateId: null }) } });
+  t.after(h.cleanup);
+  assert.equal(await h.router.handOffGroup("i1"), "grouped");
+  assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")), [
+    "delegate i1 to paseo-app", "delegate tuc-2 to paseo-app",
+  ]);
+  assert.deepEqual(await h.store.all(), []);
+  assert.equal((await h.router.parentProgress("i1"))?.sessionId, null);
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "children");
+});
+
+test("child ownership gates prevent taking a child owned elsewhere while local siblings proceed", async (t) => {
+  const h = harness({ groups: { i1: parent([child("TUC-2"), child("TUC-3")]) },
+    owner: async (id) => id === "tuc-2" ? "elsewhere" : "here",
+  });
+  t.after(h.cleanup);
+  await h.store.put(link({ agentId: null, group: { delegated: true } }));
+  await h.router.advanceGroups();
+  assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")), ["delegate tuc-3 to paseo-app"]);
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "children");
+});
+
+test("twelve peer-owned or unknown children do not starve later local handouts", async (t) => {
+  for (const ownership of ["elsewhere", "unknown"] as const) {
+    const children = Array.from({ length: 26 }, (_, index) => child(`TUC-${index + 2}`));
+    const skipped = new Set(children.slice(0, 12).map((child) => child.id));
+    const h = harness({ groups: { i1: parent(children) },
+      owner: async (id) => skipped.has(id) ? ownership : "here",
+    });
+    t.after(h.cleanup);
+    await h.store.put(link({ agentId: null, closed: true, group: { delegated: true } }));
+    await h.router.advanceGroups();
+    assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")),
+      children.slice(12, 24).map((child) => `delegate ${child.id} to paseo-app`));
+    await h.router.advanceGroups();
+    assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")),
+      children.slice(12).map((child) => `delegate ${child.id} to paseo-app`));
+  }
+});
+
+test("a closed group UI migrates, survives lost links and restart, and does not repeat stale assignments", async (t) => {
+  const groups = { i1: parent([child("TUC-2")]) };
+  const h = harness({ groups });
+  t.after(h.cleanup);
+  await h.store.put(link({ agentId: null, closed: true, group: { delegated: true } }));
+  await h.router.advanceGroups();
+  assert.deepEqual(h.calls, ["delegate tuc-2 to paseo-app", "move i1 to In Progress"]);
+  assert.equal((await h.router.parentProgress("i1"))?.sessionId, null);
+  await h.store.removeIssue("i1");
+  const restarted = harness({ groups, directory: h.directory });
+  await restarted.router.advanceGroups();
+  assert.deepEqual(restarted.calls, [], "stale undelegated child does not repeat the accepted handout");
+  groups.i1.children = [child("TUC-2", { status: "Done", statusType: "completed", finished: true })];
+  await restarted.router.advanceGroups();
+  assert.equal((await restarted.router.parentProgress("i1"))?.phase, "verification");
+  assert.deepEqual(await restarted.store.all(), []);
+  assert.deepEqual(restarted.calls, []);
+});
+
+test("overlapping passes and duplicate threads hand out each child once per parent", async (t) => {
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const delegated: string[] = [];
+  const h = harness({ groups: { i1: parent([child("TUC-2")]) }, delegate: async (id) => {
+    delegated.push(id); entered(); await waiting;
+  } });
+  t.after(h.cleanup);
+  await h.store.put(link({ agentId: null, group: { delegated: true } }));
+  await h.store.put(link({ sessionId: "s2", agentId: null, group: { delegated: true } }));
+  const first = h.router.advanceGroups();
+  await started;
+  await h.router.advanceGroups();
+  release();
+  await first;
+  await h.router.advanceGroups();
+  assert.deepEqual(delegated, ["tuc-2"]);
+  assert.equal((await h.router.parentProgresses()).length, 1);
+});
+
+test("own-child parent blockers permit child handout but external blockers still stop it", async (t) => {
+  const blockedBy = { i1: ["TUC-2", "TUC-3", "TUC-9"] };
+  const h = harness({ groups: { i1: parent([child("TUC-2"), child("TUC-3", { labels: ["paseo-manual"] })]) }, blockedBy });
+  t.after(h.cleanup);
+  await h.store.put(link({ agentId: null, group: { delegated: true } }));
+  await h.router.advanceGroups();
+  assert.deepEqual((await h.router.parentProgress("i1"))?.blockers, ["TUC-9"]);
+  assert.ok(!h.calls.some((call) => call.startsWith("delegate ")));
+  blockedBy.i1 = ["TUC-2", "TUC-3"];
+  await h.router.advanceGroups();
+  assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")), ["delegate tuc-2 to paseo-app"]);
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "children");
+});
+
+test("merged-In-Review children do not make a parent ready for verification", async (t) => {
+  const h = harness({ groups: { i1: parent([child("TUC-2", { status: "In Review", statusType: "started", finished: true, delegateId: "paseo-app" })]) } });
+  t.after(h.cleanup);
+  await h.store.put(link({ agentId: null, group: { delegated: true } }));
+  await h.router.advanceGroups();
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "children");
+  assert.equal((await h.router.parentProgress("i1"))?.children[0]?.finished, false);
+  assert.ok(!h.calls.some((call) => /^(complete|cancel) /.test(call)));
+});
+
+test("unknown, remote and unreadable ownership deny all group effects and can recover", async (t) => {
+  for (const ownership of ["unknown", "elsewhere", "throw"] as const) {
+    let local = false;
+    const h = harness({ groups: { i1: parent([child("TUC-2")]) }, owner: async () => {
+      if (local) return "here";
+      if (ownership === "throw") throw new Error("claim unavailable");
+      return ownership;
+    } });
+    t.after(h.cleanup);
+    await h.store.put(link({ agentId: null, group: { delegated: true } }));
+    await h.router.advanceGroups();
+    assert.equal(h.calls.length, 0);
+    assert.equal((await h.router.parentProgress("i1"))?.phase, "paused");
+    local = true;
+    await h.router.advanceGroups();
+    assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")), ["delegate tuc-2 to paseo-app"]);
+  }
+});
+
+test("ownership lost during handout stops later children, parent movement and UI effects", async (t) => {
+  let local = true;
+  const delegated: string[] = [];
+  const h = harness({ groups: { i1: parent([child("TUC-2"), child("TUC-3")]) },
+    owner: async () => local ? "here" : "elsewhere",
+    delegate: async (id) => { delegated.push(id); local = false; },
+  });
+  t.after(h.cleanup);
+  await h.store.put(link({ agentId: null, group: { delegated: true } }));
+  await h.router.advanceGroups();
+  assert.deepEqual(delegated, ["tuc-2"]);
+  assert.deepEqual(h.calls, []);
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "paused");
+});
+
+test("handout is bounded per pass and successful receipts let the next batch advance", async (t) => {
+  const h = harness({ groups: { i1: parent(Array.from({ length: 15 }, (_, index) => child(`TUC-${index + 2}`))) } });
+  t.after(h.cleanup);
+  await h.store.put(link({ agentId: null, closed: true, group: { delegated: true } }));
+  await h.router.advanceGroups();
+  assert.equal(h.calls.filter((call) => call.startsWith("delegate ")).length, 12);
+  await h.router.advanceGroups();
+  assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")),
+    Array.from({ length: 15 }, (_, index) => `delegate tuc-${index + 2} to paseo-app`));
+});
+
+test("terminal parent and explicit owner stop remain stopped after reconstruction", async (t) => {
+  for (const stop of ["terminal", "owner"] as const) {
+    const groups = { i1: parent([child("TUC-2")], stop === "terminal" ? { status: "Done", statusType: "completed" } : {}) };
+    const h = harness({ groups });
+    t.after(h.cleanup);
+    await h.store.put(link({ agentId: null, group: { delegated: true } }));
+    if (stop === "owner") await h.router.prompted("s1", { id: "stop", userId: OWNER, signal: "stop" });
+    await h.router.advanceGroups();
+    assert.equal((await h.router.parentProgress("i1"))?.phase, "closed");
+    await h.store.removeIssue("i1");
+    const restarted = harness({ groups, directory: h.directory });
+    await restarted.router.advanceGroups();
+    assert.deepEqual(restarted.calls, []);
+    assert.equal((await restarted.router.parentProgress("i1"))?.phase, "closed");
+  }
+});
+
+test("complete large parents progress in bounded batches and retain owner tasks beyond twenty labels", async (t) => {
+  const children = Array.from({ length: 60 }, (_, index) => child(`TUC-${index + 2}`, {
+    labels: Array.from({ length: 20 }, (_, label) => `label-${label}`),
+  }));
+  children[0].labels.push("paseo-manual");
+  const groups = { i1: parent(children) };
+  const h = harness({ groups, blockedBy: { i1: children.map((child) => child.identifier) } });
+  t.after(h.cleanup);
+  await h.store.put(link({ agentId: null, closed: true, group: { delegated: true } }));
+  for (let pass = 0; pass < 5; pass++) await h.router.advanceGroups();
+  assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")),
+    children.slice(1).map((child) => `delegate ${child.id} to paseo-app`));
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "children");
+  for (const child of children.slice(1)) { child.status = "Done"; child.statusType = "completed"; }
+  await h.router.advanceGroups();
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "paused");
+  assert.deepEqual((await h.router.parentProgress("i1"))?.blockers, ["TUC-2"]);
+  children[0].status = "Done"; children[0].statusType = "completed";
+  await h.router.advanceGroups();
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "verification");
+  assert.ok(!h.calls.some((call) => /^(complete|cancel) /.test(call)));
+});
+
+test("an incomplete group read pauses before effects and a complete retry resumes normally", async (t) => {
+  let readable = false;
+  const group = parent([child("TUC-2")]);
+  const h = harness({ groups: { get i1() {
+    if (!readable) throw new Error("Linear returned a missing or repeated cursor for children");
+    return group;
+  } } });
+  t.after(h.cleanup);
+  await h.store.put(link({ agentId: null, group: { delegated: true } }));
+  await h.router.advanceGroups();
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "paused");
+  assert.equal(h.calls.length, 0);
+  readable = true;
+  await h.router.advanceGroups();
+  assert.equal((await h.router.parentProgress("i1"))?.phase, "children");
+  assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")), ["delegate tuc-2 to paseo-app"]);
 });
 
 test("a ticket whose sub-issues are all finished, or only the owner's manual tasks, starts an agent of its own", async () => {

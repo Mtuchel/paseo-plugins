@@ -1,8 +1,7 @@
 import type { GroupChild, IssueGroup } from "./linear";
 
-// A ticket with open sub-issues is handed to Paseo as a group (README, "Groups"): no agent works
-// on the parent; each open sub-issue is assigned to Paseo and starts once its blockers are
-// finished, and the parent closes when every sub-issue is finished.
+// Group children keep their own dispatcher/admission gates. Finishing them makes the parent
+// eligible for verification, never an automatic Done/Canceled transition.
 
 // `members`: the sub-issues the group waits for. The owner's own sub-issues (manual tasks and
 // "Needs you" questions, recognised by their labels) are not members.
@@ -13,18 +12,19 @@ export type GroupProgress = {
   handOut: GroupChild[];
   others: GroupChild[];
   finished: boolean;
-  outcome: "done" | "canceled" | null;
+  ownerTasks: GroupChild[];
 };
 
 export function groupProgress(group: IssueGroup, ownerId: string, appId: string, ownLabels: string[]): GroupProgress {
-  const members = group.children.filter((child) => !child.labels.some((name) => ownLabels.includes(name)));
+  // Linear's general `finished` also accepts merged-In-Review; parent readiness must not.
+  const children = group.children.map((child) => ({ ...child, finished: ["completed", "canceled", "duplicate"].includes(child.statusType) }));
+  const ownerTasks = children.filter((child) => child.labels.some((name) => ownLabels.includes(name)));
+  const members = children.filter((child) => !ownerTasks.includes(child));
   const open = members.filter((child) => !child.finished);
   const handOut = open.filter((child) => !child.delegateId && (!child.assigneeId || child.assigneeId === ownerId));
   const others = open.filter((child) => child.delegateId !== appId && !handOut.includes(child));
   const finished = members.length > 0 && open.length === 0;
-  // Canceled only when nothing in the group was done: every member canceled or a duplicate.
-  const outcome = !finished ? null : members.every((child) => child.statusType === "canceled" || child.statusType === "duplicate") ? "canceled" : "done";
-  return { members, handOut, others, finished, outcome };
+  return { members, handOut, others, finished, ownerTasks };
 }
 
 // Whether a ticket is handed to Paseo as a group rather than worked on by one agent.
@@ -53,6 +53,6 @@ export function groupStatus(identifier: string, progress: GroupProgress, appId: 
   });
   const head = parentBlockers.length
     ? `${identifier} is blocked by ${parentBlockers.join(", ")}; its sub-issues are handed out once that is finished.`
-    : `${done} of ${progress.members.length} sub-issues finished. ${identifier} closes when all are.`;
+    : `${done} of ${progress.members.length} sub-issues finished. ${identifier} requires verification after they finish.`;
   return [head, ...lines].join("\n");
 }

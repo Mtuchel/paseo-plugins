@@ -12,9 +12,10 @@ import { agentAppDirectory } from "./agent-app";
 import { recoverActivationId, type ActivationSink } from "./activation";
 import type { AgentSessionWebhook } from "./agent-webhook";
 import { groupProgress, groupStatus, isGroup } from "./groups";
+import { ParentStore, type ParentProgress } from "./parents";
 import { planHash, type PendingReview, type ReviewOutcome } from "./review-outcome";
 import { ContextTooLargeError } from "./context";
-import { dispatchLabels } from "./dispatch";
+import { dispatchLabels, type GroupHandoff } from "./dispatch";
 import type { Handover } from "./handover";
 import type { AdmissionState, IssueGroup, LinearService } from "./linear";
 import type { Launcher } from "./launch";
@@ -37,6 +38,7 @@ const exec = promisify(execFile);
 const HANDLED_LIMIT = 200;
 const SWEEP_MS = 60_000;
 const QUEUED_OWNER_MAX_PAGES = 100;
+const PARENT_HANDOUT_LIMIT = 12;
 // A session Linear webhooks for is re-read on this fallback cadence instead of every sweep, and a
 // webhook whose read is due pulls it forward instead of waiting for the sweep (README, "Rate
 // limits"). The webhook delivers the prompt itself, so the read only backstops a delivery Linear
@@ -177,10 +179,9 @@ export type SessionLink = {
   // The peer host that took this thread's work over (DrainRouter/ActivationIntake): its replies
   // are forwarded, and no local agent id is ever stored for it.
   remote?: string;
-  // Handed to Paseo as a group (groups.ts): no agent of its own; its sub-issues are handed out and
-  // it closes when they are finished. `delegated`: the ticket was assigned to Paseo when the group
-  // started, so unassigning it stops the group. `status`: the last status posted in the panel.
-  group?: { delegated: boolean; status?: string };
+  // Group UI linkage only; issue-keyed responsibility lives in ParentStore.
+  // `stopped` distinguishes an explicit Stop from a closed/superseded UI thread.
+  group?: { delegated: boolean; status?: string; stopped?: boolean };
 };
 
 // Every @mention or assignment opens a new Linear thread, so a ticket collects threads while one
@@ -377,6 +378,10 @@ type Deps = {
   route?: ActivationSink;
   settings: Pick<Settings, "read">;
   store: SessionStore;
+  parents?: ParentStore;
+  // Fresh owner/manual/parked authority for the verifier's implementation continuation.
+  // Called inside this router's ticket turn; absence denies only resumeVerifiedParent.
+  parentResumeWait?: (issueId: string) => Promise<string | null>;
   replies?: PermissionReplies;
   stop?: (agentId: string) => Promise<void>;
   // The owner's decisions in the panel, journaled before anything happens (plannotator.ts,
@@ -455,9 +460,11 @@ export class SessionRouter {
   // Explicit overrides retain their existing path; confirmed answer evidence is owned by replies.
   private deputy: Pick<Deputy, "byRef" | "correct"> | null = null;
   private readonly replies: PermissionReplies;
+  private readonly parents: ParentStore;
 
   constructor(private readonly deps: Deps) {
     this.replies = deps.replies ?? new PermissionReplies({ directory: dirname(deps.store.path), daemon: async () => null });
+    this.parents = deps.parents ?? new ParentStore(dirname(deps.store.path));
   }
 
   recordDeputy(deputy: Pick<Deputy, "byRef" | "correct">): void {
@@ -882,7 +889,8 @@ export class SessionRouter {
     if (link.group && link.closed) { await this.say(sessionId, "response", `Paseo no longer hands out ${link.identifier}'s sub-issues. Assign Paseo to it again to continue.`); return; }
     if (link.group && !link.review) {
       if (signal === "stop") {
-        await this.deps.store.patch(sessionId, { closed: true });
+        await this.stopParent(link);
+        await this.deps.store.patch(sessionId, { closed: true, group: { ...link.group, stopped: true } });
         await this.say(sessionId, "response", "Stopped handing out sub-issues. Agents already working continue; assign Paseo again to continue.");
         return;
       }
@@ -1180,37 +1188,64 @@ export class SessionRouter {
     }
   }
 
-  // A ticket with open sub-issues is worked on through them instead of by an agent of its own:
-  // each open sub-issue nobody else has is assigned to Paseo (its own thread then starts it once
-  // its blockers are finished), and the ticket closes when all of them are finished.
+  // A group owns durable coordination, not a worker. Its children retain normal admission gates.
   private async startGroup(link: SessionLink, read?: { group: IssueGroup; appId: string }): Promise<boolean> {
     const known = read ?? await this.readGroup(link.issueId);
-    if (!isGroup(groupProgress(known.group, await this.owner(), known.appId, await this.ownLabels()))) return false;
+    const existing = await this.parentProgress(link.issueId);
+    if (!existing && !isGroup(groupProgress(known.group, await this.owner(), known.appId, await this.ownLabels()))) return false;
     const group = { delegated: known.group.delegateId === known.appId };
     await this.deps.store.put({ ...link, group });
+    await this.parents.update(link.issueId, (current) => ({
+      ...(current ?? this.parentSeed({ ...link, group })),
+      sessionId: link.sessionId, delegated: group.delegated, phase: "children",
+      updatedAt: new Date().toISOString(), nextAction: "Read current child progress", status: undefined,
+    }));
+    if (!await this.parentMayAct(link.issueId)) return true;
     for (const other of await this.deps.store.all()) {
       if (other.issueId !== link.issueId || !other.group || other.closed || other.sessionId === link.sessionId) continue;
       await this.deps.store.patch(other.sessionId, { closed: true });
-      await this.say(other.sessionId, "response", "Continued in the newest Paseo thread on this ticket. Follow and reply there; this thread is closed.").catch(() => {});
     }
-    await this.say(link.sessionId, "thought", `${link.identifier} has open sub-issues, so Paseo works on them instead of on ${link.identifier} itself: each one is assigned to Paseo and starts once its blockers are finished. ${link.identifier} closes when they are all finished.`);
     await this.advanceGroup({ ...link, group }, known);
     return true;
   }
 
-  // A labelled ticket with open sub-issues becomes a group too: it is assigned to Paseo, whose
-  // thread hands out the sub-issues. True when the ticket is a group; without a usable Paseo app
-  // there are no threads, so the ticket starts an agent like any other.
-  async handOffGroup(issueId: string): Promise<boolean> {
-    if (!await this.deps.linear.appUserId()) return false;
-    const known = await this.readGroup(issueId);
-    if (!isGroup(groupProgress(known.group, await this.owner(), known.appId, await this.ownLabels()))) return false;
-    // Assigning opens the ticket's thread, which starts the group (`created`).
-    if (known.group.delegateId !== known.appId) { await this.deps.linear.delegate(issueId, known.appId); return true; }
-    if ((await this.deps.store.all()).some((other) => other.issueId === issueId && other.group && !other.closed)) return true;
-    const sessionId = await this.deps.api.createSessionOnIssue(issueId);
-    await this.startGroup({ sessionId, agentId: null, issueId, identifier: known.group.identifier, createdAt: new Date().toISOString(), handled: [], review: null, offer: null }, known);
-    return true;
+  // An explicit trigger may reactivate a stopped parent. Sweeps never do so on their own.
+  // `not-group` alone permits a parent-worker launch; a denied group must keep its trigger.
+  async handOffGroup(issueId: string, openChildren = true): Promise<GroupHandoff> {
+    const existing = await this.parentProgress(issueId);
+    if (!existing && !openChildren) return "not-group";
+    if (this.advancing.has(issueId)) return "deferred";
+    this.advancing.add(issueId);
+    try {
+      if (!await this.parentMayAct(issueId)) return "deferred";
+      const appId = await this.deps.linear.appUserId();
+      if (!appId) return existing ? "deferred" : "not-group";
+      const group = await this.deps.linear.issueGroup(issueId);
+      if (!existing && !isGroup(groupProgress(group, await this.owner(), appId, await this.ownLabels()))) return "not-group";
+      if (["completed", "canceled", "duplicate"].includes(group.statusType)) return "deferred";
+      if (!await this.parentMayAct(issueId)) return "deferred";
+      // The explicit activation replaces an earlier owner Stop. Persist that continuation before
+      // accepting responsibility; a failed write leaves the dispatch trigger available to retry.
+      await this.deps.watchdog?.continued(issueId);
+      // Delegation normally opens a UI thread, but responsibility must not wait for its webhook.
+      if (group.delegateId !== appId) await this.deps.linear.delegate(issueId, appId);
+      const accepted = await this.parents.update(issueId, (current) => current && current.phase !== "closed"
+        ? { ...current, delegated: true }
+        : {
+          issueId, identifier: group.identifier, sessionId: null, phase: "children",
+          updatedAt: new Date().toISOString(), nextAction: "Read current child progress",
+          blockers: [], children: [], delegated: true, handedOut: [],
+        });
+      // Old closed UI links remain closed, but their obsolete Stop must not describe the new run.
+      for (const link of await this.deps.store.all()) {
+        if (link.issueId === issueId && link.group?.stopped) {
+          await this.deps.store.patch(link.sessionId, { group: { ...link.group, stopped: undefined } });
+        }
+      }
+      if (!await this.parentMayAct(issueId)) return "deferred";
+      await this.stepParent(accepted, { group: { ...group, delegateId: appId }, appId });
+      return await this.parentMayAct(issueId) && (await this.parents.get(issueId))?.phase !== "closed" ? "grouped" : "deferred";
+    } finally { this.advancing.delete(issueId); }
   }
 
   private async readGroup(issueId: string): Promise<{ group: IssueGroup; appId: string }> {
@@ -1225,70 +1260,157 @@ export class SessionRouter {
     return [labels.manual, labels.needsYou];
   }
 
-  async advanceGroups(): Promise<void> {
+  private parentSeed(link: SessionLink): ParentProgress {
+    return {
+      issueId: link.issueId, identifier: link.identifier, sessionId: link.closed ? null : link.sessionId,
+      phase: link.group?.stopped ? "closed" : "children", updatedAt: new Date().toISOString(),
+      nextAction: link.group?.stopped ? "Stopped by owner; assign Paseo again to continue" : "Read current child progress",
+      blockers: [], children: [], delegated: link.group?.delegated ?? false, handedOut: [],
+    };
+  }
+
+  // Migration is local-only; a closed UI thread never proves that responsibility ended.
+  private async migrateParents(): Promise<void> {
+    const latest = new Map<string, SessionLink>();
     for (const link of await this.deps.store.all()) {
-      if (!link.group || link.closed) continue;
+      if (!link.group) continue;
+      const previous = latest.get(link.issueId);
+      if (!previous || previous.createdAt <= link.createdAt) latest.set(link.issueId, link);
+    }
+    for (const link of latest.values()) {
+      if (await this.parents.get(link.issueId)) continue;
+      await this.parents.update(link.issueId, (current) => current ?? this.parentSeed(link));
+    }
+  }
+
+  async parentProgress(issueId: string): Promise<ParentProgress | null> {
+    await this.migrateParents();
+    return this.parents.get(issueId);
+  }
+
+  async parentProgresses(): Promise<ParentProgress[]> {
+    await this.migrateParents();
+    return this.parents.all();
+  }
+
+  private async stopParent(link: SessionLink): Promise<void> {
+    await this.parents.update(link.issueId, (current) => ({
+      ...(current ?? this.parentSeed(link)), phase: "closed", updatedAt: new Date().toISOString(),
+      nextAction: "Stopped by owner; assign Paseo again to continue",
+    }));
+  }
+
+  private async parentMayAct(issueId: string): Promise<boolean> {
+    let ownership: HostOwnership = "unknown";
+    try {
+      ownership = this.deps.owner ? await this.deps.owner(issueId) : "here";
+      if (await this.deps.deletions?.blocked(issueId)) ownership = "unknown";
+      if ((await this.deps.store.all()).some((link) => link.issueId === issueId && link.remote && !link.closed)) ownership = "elsewhere";
+    } catch { ownership = "unknown"; }
+    if (ownership === "here") return true;
+    const parent = await this.parents.get(issueId);
+    if (parent && parent.phase !== "closed") await this.parents.update(issueId, (current) => ({
+      ...current!, phase: current!.phase === "closed" ? "closed" : "paused",
+      updatedAt: new Date().toISOString(), nextAction: `Wait for local ownership (${ownership})`,
+      blockers: [`Host ownership: ${ownership}`],
+    }));
+    return false;
+  }
+
+  async advanceGroups(): Promise<void> {
+    for (const parent of await this.parentProgresses()) {
+      if (parent.phase === "closed") continue;
       try {
-        await this.advanceGroup({ ...link, group: link.group });
+        await this.advanceParent(parent.issueId);
       } catch (error) {
         if (error instanceof RateLimitedError) throw error;
-        console.error(`[linear-tickets] ${link.identifier}: advancing the group failed: ${error instanceof Error ? error.message : error}`);
+        await this.parents.update(parent.issueId, (current) => ({
+          ...current!, phase: current!.phase === "closed" ? "closed" : "paused",
+          updatedAt: new Date().toISOString(), nextAction: "Retry reading parent progress",
+          blockers: [error instanceof Error ? error.message : String(error)],
+        }));
+        console.error(`[linear-tickets] ${parent.identifier}: advancing the group failed: ${error instanceof Error ? error.message : error}`);
       }
     }
   }
 
-  // Hands out the group's new sub-issues once the parent itself is not blocked, closes the parent
-  // when every sub-issue is finished, and posts what each one waits for whenever that changes.
-  // One advance per thread at a time: the minute sweep, a reply and the thread's start can overlap,
-  // and two would close the parent or post the same status twice. A skipped one is redone next minute.
+  // Thread start, reply and sweep share one issue-keyed guard, including after thread loss.
   private readonly advancing = new Set<string>();
   private async advanceGroup(link: SessionLink & { group: NonNullable<SessionLink["group"]> }, read?: { group: IssueGroup; appId: string }): Promise<void> {
-    if (this.advancing.has(link.sessionId)) return;
-    this.advancing.add(link.sessionId);
-    try {
-      await this.stepGroup(link, read);
-    } finally {
-      this.advancing.delete(link.sessionId);
-    }
+    await this.parentProgress(link.issueId);
+    await this.advanceParent(link.issueId, read);
   }
 
-  private async stepGroup(link: SessionLink & { group: NonNullable<SessionLink["group"]> }, read?: { group: IssueGroup; appId: string }): Promise<void> {
-    const { group, appId } = read ?? await this.readGroup(link.issueId);
+  private async advanceParent(issueId: string, read?: { group: IssueGroup; appId: string }): Promise<void> {
+    if (this.advancing.has(issueId)) return;
+    this.advancing.add(issueId);
+    try {
+      const parent = await this.parents.get(issueId);
+      if (!parent || parent.phase === "closed" || !await this.parentMayAct(issueId)) return;
+      await this.stepParent(parent, read);
+    } finally { this.advancing.delete(issueId); }
+  }
+
+  private async stepParent(parent: ParentProgress, read?: { group: IssueGroup; appId: string }): Promise<void> {
+    const { group, appId } = read ?? await this.readGroup(parent.issueId);
+    const link = parent.sessionId ? await this.deps.store.get(parent.sessionId) : null;
+    const sessionId = link && !link.closed ? link.sessionId : null;
     const end = async (body: string) => {
-      await this.deps.store.patch(link.sessionId, { closed: true });
-      await this.say(link.sessionId, "response", body);
+      await this.parents.update(parent.issueId, (current) => ({ ...current!, sessionId, phase: "closed", updatedAt: new Date().toISOString(), nextAction: body }));
+      if (sessionId) {
+        await this.deps.store.patch(sessionId, { closed: true });
+        if (await this.parentMayAct(parent.issueId)) await this.say(sessionId, "response", body);
+      }
     };
-    if (["completed", "canceled", "duplicate"].includes(group.statusType)) return end(`${link.identifier} was moved to ${group.status}, so Paseo stopped handing out its sub-issues.`);
-    if (link.group.delegated && group.delegateId !== appId) return end(`Paseo was unassigned from ${link.identifier}, so it stopped handing out sub-issues. Agents already working continue.`);
+    if (["completed", "canceled", "duplicate"].includes(group.statusType)) return end(`${parent.identifier} was moved to ${group.status}, so Paseo stopped handing out its sub-issues.`);
+    if (parent.delegated && group.delegateId !== appId) return end(`Paseo was unassigned from ${parent.identifier}, so it stopped handing out sub-issues. Agents already working continue.`);
     const progress = groupProgress(group, await this.owner(), appId, await this.ownLabels());
-    if (progress.finished) {
-      const list = progress.members.map((child) => `- ${child.identifier}: ${child.status}`).join("\n");
-      if (progress.outcome === "canceled") await this.deps.linear.cancel(link.issueId, `Every sub-issue was canceled, so ${link.identifier} is canceled too.\n\n${list}`);
-      else await this.deps.linear.complete(link.issueId);
-      return end(`All sub-issues are finished, so ${link.identifier} is ${progress.outcome === "canceled" ? "canceled" : "done"}.\n\n${list}`);
-    }
-    let parentBlockers: string[] = [];
+    const ticket = await this.deps.linear.issueState(parent.issueId);
+    // Own children constrain parent completion, not handing out those same children.
+    const childIdentifiers = new Set(group.children.map((child) => child.identifier));
+    const parentBlockers = ticket.blockedBy.filter((identifier) => !childIdentifiers.has(identifier));
+    const ownerTasks = progress.ownerTasks.filter((child) => !child.finished).map((child) => child.identifier);
+    const childrenFinished = progress.members.every((child) => child.finished);
+    const blockers = [...parentBlockers, ...(childrenFinished ? ownerTasks : [])];
+    const phase = blockers.length ? "paused" : childrenFinished ? "verification" : "children";
+    const nextAction = parentBlockers.length ? `Wait for external blockers: ${parentBlockers.join(", ")}`
+      : childrenFinished && ownerTasks.length ? `Wait for owner tasks: ${ownerTasks.join(", ")}`
+      : childrenFinished ? "Verify parent acceptance, landed child work and required runtime/deployment evidence"
+      : "Hand out eligible children through their normal dispatcher and wait for terminal states";
+    await this.parents.update(parent.issueId, (current) => ({
+      ...current!, sessionId, phase: current!.phase === "closed" ? "closed" : phase,
+      updatedAt: new Date().toISOString(), nextAction, blockers,
+      delegated: current!.delegated || group.delegateId === appId,
+      children: progress.members.map((child) => ({ issueId: child.id, identifier: child.identifier, status: child.status, finished: child.finished })),
+    }));
     const failures: string[] = [];
-    if (progress.handOut.length) {
-      const parent = await this.deps.linear.issueState(link.issueId);
-      parentBlockers = parent.blockedBy;
-      if (!parentBlockers.length) {
-        for (const child of progress.handOut) {
-          try {
-            await this.deps.linear.delegate(child.id, appId);
-            child.delegateId = appId;
-          } catch (error) {
-            if (error instanceof RateLimitedError) throw error;
-            failures.push(`Could not assign ${child.identifier} to Paseo: ${error instanceof Error ? error.message : error}`);
-          }
+    let handedOut = false;
+    if (!parentBlockers.length && !childrenFinished) {
+      const receipt = new Set(parent.handedOut);
+      let attempted = 0;
+      for (const child of progress.handOut) {
+        if (attempted >= PARENT_HANDOUT_LIMIT) break;
+        if (receipt.has(child.id)) continue;
+        if (!await this.parentMayAct(parent.issueId) || (await this.parents.get(parent.issueId))?.phase === "closed") return;
+        if (!await this.parentMayAct(child.id)) continue;
+        attempted++;
+        try {
+          // Delegation opens the existing child thread; no direct start or admission bypass.
+          await this.deps.linear.delegate(child.id, appId);
+          child.delegateId = appId;
+          handedOut = true;
+          await this.parents.update(parent.issueId, (current) => ({ ...current!, handedOut: [...new Set([...current!.handedOut, child.id])] }));
+        } catch (error) {
+          if (error instanceof RateLimitedError) throw error;
+          failures.push(`Could not assign ${child.identifier} to Paseo: ${error instanceof Error ? error.message : error}`);
         }
-        if (progress.handOut.some((child) => child.delegateId === appId)) {
-          const moved = await this.deps.linear.moveToStateNamed(link.issueId, CODING_STATE, parent).catch((error: unknown) => {
-            if (error instanceof RateLimitedError) throw error;
-            return { changed: false, note: error instanceof Error ? error.message : String(error) };
-          });
-          if (moved.note) console.error(`[linear-tickets] ${link.identifier}: ${moved.note}`);
-        }
+      }
+      if (handedOut && await this.parentMayAct(parent.issueId) && (await this.parents.get(parent.issueId))?.phase !== "closed") {
+        const moved = await this.deps.linear.moveToStateNamed(parent.issueId, CODING_STATE, ticket).catch((error: unknown) => {
+          if (error instanceof RateLimitedError) throw error;
+          return { changed: false, note: error instanceof Error ? error.message : String(error) };
+        });
+        if (moved.note) console.error(`[linear-tickets] ${parent.identifier}: ${moved.note}`);
       }
     }
     const agents = new Map<string, "working" | "queued" | "group">();
@@ -1298,10 +1420,11 @@ export class SessionRouter {
       else if (other.agentId) agents.set(other.issueId, "working");
       else if (other.queued) agents.set(other.issueId, "queued");
     }
-    const status = [groupStatus(link.identifier, progress, appId, agents, parentBlockers), ...failures].join("\n");
-    if (status === link.group.status) return;
-    await this.deps.store.patch(link.sessionId, { group: { ...link.group, status } });
-    await this.say(link.sessionId, "thought", status);
+    const status = [groupStatus(parent.identifier, progress, appId, agents, parentBlockers), ...(childrenFinished ? [nextAction] : []), ...failures].join("\n");
+    if (!sessionId || status === parent.status || !await this.parentMayAct(parent.issueId) || (await this.parents.get(parent.issueId))?.phase === "closed") return;
+    // Reporting failure cannot discard responsibility. Retry only the report next pass.
+    await this.say(sessionId, "thought", status);
+    await this.parents.update(parent.issueId, (current) => ({ ...current!, status }));
   }
 
   // Catch-up for missed webhooks: queued threads now admitted, new sessions nobody started, and prompts
@@ -2047,7 +2170,42 @@ export class SessionRouter {
     return this.exclusive(issueId, () => this.succeedNow({ id: issueId, identifier }, predecessorId, lead, onDispatch));
   }
 
-  private async succeedNow(issue: { id: string; identifier: string }, predecessorId: string | null, lead: string, onDispatch: () => Promise<void>): Promise<Succession> {
+  // A parent verifier may find implementation work before any parent branch exists. This is
+  // the only successor entry point allowed to create that first branch, after normal admission.
+  resumeVerifiedParent(issueId: string, identifier: string, predecessorId: string | null, lead: string, onDispatch: () => Promise<void>): Promise<Succession> {
+    return this.exclusive(issueId, async (): Promise<Succession> => {
+      let dispatched = false;
+      try {
+        return await this.succeedNow({ id: issueId, identifier }, predecessorId, lead, async () => {
+          await onDispatch();
+          dispatched = true;
+        }, true);
+      } catch (error) {
+        return { kind: dispatched ? "impossible" : "wait", reason: error instanceof Error ? error.message : String(error) };
+      }
+    });
+  }
+
+  private async parentResumeReason(issueId: string): Promise<string | null> {
+    try {
+      if (!this.deps.parentResumeWait) return "Parent verification authority is unavailable";
+      if (await this.deps.deletions?.blocked(issueId)) return "the ticket was deleted or is paused for deletion";
+      if ((await this.parentProgress(issueId))?.phase === "closed") return "parent coordination was stopped; explicit activation is required";
+      if (!await this.parentMayAct(issueId)) return "parent implementation waits for verified local ownership";
+      const links = (await this.deps.store.all()).filter((link) => link.issueId === issueId && !link.closed);
+      if (links.some((link) => link.review || link.questions || link.offer === "parked" || link.offer === "later")) return "the parent waits for the owner's review or answer";
+      if ((await this.deps.watchdog?.read())?.holds[issueId]) return "the owner stopped the parent";
+      const held = await this.deps.parentResumeWait(issueId);
+      if (held) return held;
+      if ((await this.parents.get(issueId))?.phase === "closed") return "parent coordination was stopped; explicit activation is required";
+      if (!await this.parentMayAct(issueId)) return "parent implementation waits for verified local ownership";
+      return null;
+    } catch (error) {
+      return `parent implementation waits for readable authority: ${error instanceof Error ? error.message : error}`;
+    }
+  }
+
+  private async succeedNow(issue: { id: string; identifier: string }, predecessorId: string | null, lead: string, onDispatch: () => Promise<void>, verifiedParent = false): Promise<Succession> {
     const gone = predecessorId ? `gone agent ${predecessorId.slice(0, 8)}` : "the ticket without an agent";
     if (await this.deps.deletions?.blocked(issue.id)) return { kind: "impossible", reason: "the ticket was deleted or is paused for deletion" };
     if (!this.paseo) return { kind: "wait", reason: "Paseo is not connected yet" };
@@ -2060,11 +2218,25 @@ export class SessionRouter {
       console.error(`[linear-tickets] ${issue.identifier}: ${step} failed: ${error instanceof Error ? error.message : error}`);
     });
     try {
+      if (verifiedParent) {
+        const reason = await this.parentResumeReason(issue.id);
+        if (reason) return { kind: "wait", reason };
+      }
       const wait = await this.processWait(issue.id);
       if (wait) return { kind: "wait", reason: wait };
-      const live = await this.liveSuccessorFor(issue.id, predecessorId ? [predecessorId] : []);
+      const live = await this.liveSuccessorFor(issue.id, !verifiedParent && predecessorId ? [predecessorId] : []);
       if (live) {
-        // Nothing is claimed: a failed hand-off is tried again with the message on the next poll.
+        if (verifiedParent) {
+          const current = await this.agent(live.id);
+          if (!current || !LIVE_AGENT[current.agent.status] || current.agent.labels?.[STEWARD_VERIFIER_LABEL] || crashedProcess(current.agent)) return { kind: "wait", reason: "the implementation agent changed; retry its current state" };
+          if (current.agent.pendingPermissions?.length) return { kind: "wait", reason: "the implementation agent waits for the owner" };
+          if (busy(current.agent)) return { kind: "wait", reason: "the implementation agent is busy" };
+          const reason = await this.parentResumeReason(issue.id);
+          if (reason) return { kind: "wait", reason };
+          await onDispatch();
+          await current.handle.send(lead);
+        }
+        // Ordinary successors leave delivery to their caller; a verifier resume sent its lead above.
         await later("handing the record to the live agent", () => this.deps.handover.handOff(issue, predecessorId, live));
         return { kind: "live", agent: live };
       }
@@ -2072,7 +2244,7 @@ export class SessionRouter {
       // ask and its handover snapshot go with it. The message is claimed right before forwarding,
       // and a failed forward stays in the peer's or this host's durable queue -- never a local
       // start, and never a fresh branch when the recorded one cannot be continued there.
-      const routed = await this.deps.route?.take({
+      const routed = verifiedParent ? null : await this.deps.route?.take({
         kind: "recover", issueId: issue.id, identifier: issue.identifier,
         id: recoverActivationId(issue.id, predecessorId, lead),
         text: lead, strictResume: true,
@@ -2087,17 +2259,22 @@ export class SessionRouter {
         console.log(`[linear-tickets] ${issue.identifier}: the pull request's message for ${gone} is handed to ${routed.peer}`);
         return { kind: "started", agent: { id: `peer:${routed.peer}`, title: `an agent on ${routed.peer}`, cwd: "" } };
       }
-      if (!await this.deps.handover.resumeTarget(issue.id)) return { kind: "impossible", reason: "no branch is recorded for the ticket" };
+      const target = await this.deps.handover.resumeTarget(issue.id);
+      if (!target && !verifiedParent) return { kind: "impossible", reason: "no branch is recorded for the ticket" };
       const settings = await this.deps.settings.read();
       const admission = await this.deps.starter.admission(issue.id, paseo, settings);
       if (!admission.ok) return { kind: "wait", reason: admission.reason };
+      if (verifiedParent) {
+        const reason = await this.parentResumeReason(issue.id);
+        if (reason) return { kind: "wait", reason };
+      }
       await onDispatch();
       console.log(`[linear-tickets] ${issue.identifier}: the pull request's message for ${gone} is claimed; starting a successor`);
       const running = dispatchLabels(settings.dispatch.label).running;
       await this.deps.linear.addLabel(issue.id, running).catch(() => {});
       let agentId: string;
       try {
-        agentId = (await this.deps.starter.start(issue.id, paseo, settings, { retryHint: "assign Paseo again", resumeOnly: true, lead })).agentId;
+        agentId = (await this.deps.starter.start(issue.id, paseo, settings, { retryHint: "assign Paseo again", resumeOnly: !verifiedParent || Boolean(target), lead })).agentId;
       } catch (error) {
         await this.deps.linear.removeLabel(issue.id, running).catch(() => {});
         return { kind: "impossible", reason: error instanceof Error ? error.message : String(error), ...(error instanceof ContextTooLargeError ? { tooLarge: true as const } : {}) };

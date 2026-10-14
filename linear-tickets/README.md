@@ -1302,11 +1302,11 @@ labels first (about 500 points on the owner's key), so a reload that dropped a b
 once cost about 40k points on 2026-10-09; the 20-minute memory avoids that.
 
 **Who starts next.** Every way a ticket starts (label, assignment, group, project) waits in one
-line. While slots under *max agents* are short, a free slot goes to:
+line. Parent-verification controls rank ahead of workers. Among workers, a free slot goes to:
 
 0. a queue blocker first (a ticket titled `Queue blocker: …`, opened by the merge queue's alert,
    see *Auto-dispatch*): while it waits, every stack's queue run waits with it, so it takes the next
-   free slot ahead of every other ticket, whatever its project's load or the night order. It still
+   free worker slot ahead of other workers, whatever its project's load or the night order. It still
    waits for a free slot: a full *max agents* or memory lease holds it like any ticket;
 1. while you are away, the night order first: a ticket whose approved plan implements on the cheap
    model tier, then one on the standard tier, then everything else — a strong implementation, a
@@ -1333,6 +1333,17 @@ minutes while its agent starts. Tickets you start from the sidebar skip the line
 project's planner run (see **Projects**): it only orders tickets, and while it waits none of its
 project's new tickets can be handed out, so its agent starts even when every slot under *max agents*
 is taken and under any memory lease. It still counts as a working agent.
+
+Parent verifiers with children carry `linear.coordination: parent-verification`. With a finite
+effective cap of at least 2, one slot **within that cap** is held for parent verification:
+worker-only occupancy stops at cap minus one. Once a running or reserved control uses that
+headroom, workers can use the remaining slots; controls can also use general slots. Total running
+agents plus pending reservations remains capped. Existing workers are not killed to make room;
+a control waits for a vacancy if the host is already full. At cap 1 no idle slot is held back,
+but a queued control ranks first. A zero lease admits no control or worker, even on a reserved
+retry. Focus, presence, ownership and the existing planner policy are unchanged. Diagnostics keep
+the `running` / `reserved` / `waiting` counts; running control labels come from the same cached
+agent/liveness enumeration as workers. Concurrent refreshes share that enumeration.
 
 **Present and away.** Planning never waits: every ticket plans at any time, also at night. A plan
 that needs you is parked (see **Parked plans**) and takes no slot, so the plans are ready for your
@@ -1418,27 +1429,54 @@ one is finished, which for code means Done or in review with its pull requests m
 **Groups.** Assigning Paseo to a ticket that has open sub-issues, or adding the trigger label
 to it, hands the whole group to Paseo instead of starting an agent on the parent:
 
+A denied or deferred group activation retains its trigger label and never falls through to a
+parent implementation agent. The trigger is consumed only after a successful group handoff;
+only a confirmed non-group takes the ordinary agent-launch path. An explicit trigger on an
+already tracked parent can resume coordination even when its children are terminal, subject to
+current local ownership.
+
 - Every open sub-issue that is unassigned or assigned to you, and not handed to Paseo yet, is
   assigned to Paseo, lowest number first. Each gets its own thread and agent and goes through
   the rules above: it starts once its blockers are finished and a slot under *max agents* is free.
   Blocking relations are the only ordering; sub-issues that do not block each other run side by
   side. A sub-issue that has sub-issues of its own becomes a group too.
 - Sub-issues assigned to someone else are not taken but waited for. Your [manual
-  tasks](#manual-tasks) and "Needs you" sub-issues are neither taken nor waited for.
-- A parent that is itself blocked hands out nothing until its blockers are finished. Once the
-  first sub-issue is handed out, the parent moves to In Progress.
+  tasks](#manual-tasks) and "Needs you" sub-issues are never delegated; unfinished ones gate
+  parent verification after member work finishes, rather than stopping other children.
+- External blockers on the parent pause handout. Its own children blocking it do not: those
+  children must run before they can unblock it. Once the first child is handed out, the parent
+  moves to In Progress.
 - The parent's panel lists what each sub-issue waits for and is updated whenever that changes,
   so a blocker nobody works on ("TUC-88 (not with Paseo …)") shows up. Any reply in the panel
   posts the current list. Sub-issues added later are handed out within a minute.
-- When every sub-issue is finished (by the blocker rule above), the parent moves to Done, or
-  to Canceled with the reason when all of them were canceled, and the thread completes. Split
-  plans close their parent the same way.
+- Only actual Done, Canceled or Duplicate member states advance the parent to verification.
+  In Review with a merged PR is not terminal child evidence. Finished children never auto-close
+  the parent: the ticket steward verifies acceptance, child PR evidence, and required deployed
+  SHA/runtime proof first. All-canceled or duplicate children also require explicit scope
+  disposition; they do not automatically mean either Done or Canceled for the parent.
 - Unassigning Paseo from the parent, Stop in its panel, or closing the parent stops handing out.
-  Agents already working continue.
+  Agents already working continue. Closing or losing only the UI thread does not end ownership.
+  Stale remote, review, offer and queue flags on a closed UI link do not gate a durable parent.
+  Live thread waits, persisted parked plans, watchdog Stop, explicit parent Stop and current
+  host ownership still gate work.
 
-A ticket whose sub-issues are all finished, or are only your manual tasks, starts an agent of
-its own as before. Without a usable Paseo app (no threads), a labelled parent starts an agent
-as before.
+Without an existing durable group, a ticket whose sub-issues are all finished, or are only your
+manual tasks, starts an agent of its own as before. Without a usable Paseo app, a labelled parent
+starts an agent as before.
+
+Coordination is persisted by issue ID in `$PASEO_HOME/linear-tickets/agent-app/parents.json`,
+independent of agent/session links. Existing group links, including closed UI links, migrate on
+read/sweep; no unrelated parent is enrolled by scanning. Progress phases are `children`,
+`verification`, `paused`, and `closed`, with current child states, blockers, and the next action.
+Handout remains deterministic and bounded to 12 assignments per parent pass; successful assignment
+receipts survive restart. Child threads keep their existing dispatcher, agent-reuse and admission
+paths. Unknown or remote ownership pauses effects. Incomplete or unreadable child membership or
+owner-task evidence pauses rather than pretending the parent is ready for completion.
+
+`linear.parents-status` takes `{}` and returns `{ parents: [...] }` from the shared persisted store.
+Each snapshot contains `issueId`, `identifier`, nullable `sessionId`, `phase`, `updatedAt`,
+`nextAction`, `blockers`, and `children` (`issueId`, `identifier`, `status`, `finished`).
+The RPC is read-only: it does not migrate links, query Linear, launch agents, or advance parents.
 
 **Projects.** Adding the trigger label (`paseo`) to a Linear *project* lets Paseo work through
 the whole project without you assigning each ticket. Auto-dispatch must be on; projects are read
@@ -2860,9 +2898,9 @@ and repairs a ticket that is in none of the five states below with exactly one a
 | **PARKED** | A verifier parked the ticket: it waits for a named blocker and/or a due date, in Todo. |
 
 **Anything else is a defect**, and the steward repairs it with at most one action per ticket and
-pass: a verifier for a landed stack (a parent whose sub-issues all finished is only verified too —
-its own live agent, wait for you, blocker or open pull request comes first, and a group-linked
-parent is left to `stepGroup`), a successor for an open pull request nobody works on, the
+pass: a verifier for a landed stack (including a group parent whose sub-issues all finished —
+its own live agent, wait for you, blocker or open pull request comes first; only unfinished
+members stay with the deterministic coordinator), a successor for an open pull request nobody works on, the
 replay instruction for a closed-unmerged pull request, a restart for a ticket whose agent vanished,
 a start for an unblocked ticket that never started, one resume for a silent agent, the clearing of
 a stale owner wait, the archive of a finished ticket's agents, or an escalation. Restarts are capped at three per ticket within 24 hours and at `steward.maxActionsPerPass`
@@ -2880,9 +2918,10 @@ else).
 
 **Verifiers.** A landed stack (every pull request merged or closed with the repo's
 `externally-merged` evidence, none open, no open before-merge manual task) is not closed blindly:
-the steward starts a short-lived verifier — the cheap tier, the ticket's recorded branch, no plan
-policy and no implementation work — with a fact sheet (the ticket, its sub-issues, the landed pull
-requests, the last agent's reports). It records exactly one verdict through the `steward_verdict`
+the steward starts a short-lived verifier — the cheap tier, no plan policy and no implementation
+work — with a fact sheet (the ticket, its sub-issues, the landed pull requests, the last agent's
+reports). A parent without a recorded branch/worktree uses the mapped checkout read-only rather
+than failing resume or creating an implementation worktree. It records exactly one verdict through the `steward_verdict`
 tool of its ticket MCP server, bound to the generation marker the steward started it with (a
 second call, and any verdict carrying another marker, is ignored):
 `close` (nothing remains), `resume` (the ticket's agent must still do this), `park` (the ticket
@@ -2892,10 +2931,40 @@ once that blocker is done) or `ask_owner` (the question and its options, for a d
 owner can make). There is no follow-up verdict: an open ticket's leftover work is not filed as a
 new issue. One verifier per ticket at a time, claim-journaled, archived once its verdict is
 applied; its application is journaled step by step, so a reload neither repeats a close nor loses
-a verdict, and a `close` re-reads every pull request of the ticket (a newly opened or unrecorded
-one aborts the close and the next pass classifies the ticket anew). One that does not report
-within 45 minutes escalates. A landed set already judged once is not verified again — it
-escalates instead.
+a verdict. A `close` re-reads the parent and each child's PR inventory, terminal child states,
+the generation's exact child membership, host ownership, and owner/manual gates. Unresolved
+before-merge, after-merge or anytime tasks — including completed tasks whose check has not passed
+for that completion — block close. A changed child set, reopened child/PR, unreadable evidence,
+explicit stop/unassignment, or paused coordination invalidates the close. A legacy parent verifier
+without a membership snapshot must verify again. One that does not report within 45 minutes
+escalates. A landed set already judged once is not verified again — it escalates instead.
+
+A parent `resume` sends the concrete instruction to its live implementation agent, resumes its
+recorded implementation branch, or starts a fresh implementation when the parent never had one.
+That continuation takes ordinary worker admission, never the verifier's reserved control slot.
+Admission or owner-gate waits retain the verdict without spending recovery attempts or refusals;
+the attempt is charged immediately before an admitted dispatch, including a dispatch that fails.
+The existing branch-only successor path never falls back to a fresh implementation.
+
+Both close and parent continuation re-read authoritative owner gates: persisted parked plans,
+watchdog Stop, current host ownership, live thread review/question/offer/queue state and registered owner
+tasks. Stale flags on a closed UI thread remain non-authoritative for durable parents. Completion
+and continuation use strict manual-task and Needs-you inventories: only a missing inventory
+directory means empty; failed enumeration, unreadable/disappearing files, malformed records or
+mismatched record identities block the effect. Background reconciliation and comment relay keep
+their tolerant inventory readers, which cannot authorize either effect.
+
+Classification reads durable parent snapshots once per steward pass. Parent verifier launch and
+close separately read the complete group, exhausting every child and child-label page; failed or
+incomplete pagination supplies no verifier evidence. The brief and persisted generation include
+all children, including owner tasks, not just the first inventory page. There is no child-count
+cutoff. Unrelated tickets do not incur per-ticket parent-store reads or group queries.
+
+The verifier reads the repository's delivery instructions and existing deployment receipts/statuses:
+required deployed SHA, affected services/environments and runtime checks must be evidenced, not
+inferred from a merge. Safe read-only runtime verification is allowed; implementation and deployment
+are not. Missing acceptance, child PR or required runtime/deployment evidence yields an actionable
+`resume`, `park` with a real blocker/date, or `ask_owner`, never invented completion evidence.
 
 **Escalation** is the steward's terminal step, never a bare comment: the ticket is moved to Needs
 input, gets the `paseo-needs-you` label and one comment that names the reason and lettered options,

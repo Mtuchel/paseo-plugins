@@ -340,6 +340,28 @@ export const dispatchStatusRpc = defineRpc({
   output: dispatchStatusSchema,
 });
 
+// Persisted coordination snapshots only: reading status never starts work or changes Linear.
+export const parentProgressSchema = z.object({
+  issueId: z.string(),
+  identifier: z.string(),
+  sessionId: z.string().nullable(),
+  phase: z.enum(["children", "verification", "paused", "closed"]),
+  updatedAt: z.string(),
+  nextAction: z.string(),
+  blockers: z.array(z.string()),
+  children: z.array(z.object({
+    issueId: z.string(),
+    identifier: z.string(),
+    status: z.string(),
+    finished: z.boolean(),
+  })),
+});
+export const parentsStatusRpc = defineRpc({
+  name: "linear.parents-status",
+  input: z.object({}),
+  output: z.object({ parents: z.array(parentProgressSchema) }),
+});
+
 // Labelled projects (README, "Projects"): how many new tickets wait for a plan, when the batching
 // rule will start planning them, and the planning run, if one is open.
 export const projectStatusSchema = z.object({

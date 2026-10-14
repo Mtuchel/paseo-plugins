@@ -11,6 +11,7 @@ import type { IssueCore, LinearService, StewardIssue } from "./linear";
 import type { ManualTasks } from "./manual-tasks";
 import type { NeedsYouIssues } from "./needs-you";
 import type { ParkedPlans } from "./parked";
+import type { ParentPhase, ParentProgress } from "./parents";
 import { LIVE_AGENT, type ProcessInspector } from "./process-liveness";
 import { PLAN_REVIEW_STATE, planStage } from "./plan-policy";
 import type { PullState, StackState } from "./pr-watch";
@@ -87,8 +88,8 @@ const STEWARD_ANCHOR = "steward";
 const LIVE_AGAIN_PREFIX = "an agent works on ";
 
 type Linear = Pick<LinearService,
-  "stewardIssues" | "issueStatus" | "issueCore" | "issueRef" | "addLabel" | "removeLabel" | "comment" | "upsertComment" | "createIssue" | "relate" | "complete" | "moveToReady" | "setDueDate" | "trustedAppIds">;
-type Sessions = Pick<SessionRouter, "restartFor" | "succeed" | "prompt" | "watchdogRoots" | "watchdogThread" | "retireTurn" | "threadQueued">;
+  "stewardIssues" | "issueGroup" | "issueStatus" | "issueStatuses" | "issueCore" | "issueRef" | "addLabel" | "removeLabel" | "comment" | "upsertComment" | "createIssue" | "relate" | "complete" | "moveToReady" | "setDueDate" | "trustedAppIds">;
+type Sessions = Pick<SessionRouter, "restartFor" | "succeed" | "resumeVerifiedParent" | "prompt" | "watchdogRoots" | "watchdogThread" | "retireTurn" | "threadQueued" | "parentProgress" | "parentProgresses">;
 
 export type StewardDeps = {
   // The durable store (steward.json); the daemon passes the default path.
@@ -103,8 +104,8 @@ export type StewardDeps = {
   // The owner-visible side of an escalation and the end of a stale wait (writeback.ts).
   writeback: Pick<Writeback, "escalate" | "clearWait">;
   watchdog: Pick<WatchdogStore, "read" | "handedOver">;
-  manualTasks: Pick<ManualTasks, "openBlockers">;
-  needsYou: Pick<NeedsYouIssues, "all">;
+  manualTasks: Pick<ManualTasks, "openBlockers" | "tasksStrict">;
+  needsYou: Pick<NeedsYouIssues, "all" | "allStrict">;
   settings: Pick<Settings, "read">;
   // Which host owns a ticket's automatic work (activation-guard.ts ticketOwnership).
   owner: (issueId: string) => Promise<HostOwnership>;
@@ -142,8 +143,8 @@ export type StewardDeps = {
 // The five states every in-scope open ticket is in — MOVING, WAITING_OWNER, WAITING_BLOCKER,
 // QUEUED, PARKED — and the defects a pass repairs. `closed` is a finished ticket with nothing left
 // to do (its agents archived); it is outside the five on purpose, as the invariant covers open
-// tickets. No situation completes or cancels a ticket any more: a group parent is closed by
-// sessions.ts stepGroup and every other ticket only by a verifier's verdict.
+// tickets. No situation completes or cancels a ticket: the group coordinator hands out children,
+// and the steward closes parents only after a verifier's verdict and fresh completion fences.
 export const STEWARD_SITUATIONS = [
   "moving",
   "waiting-owner",
@@ -253,7 +254,9 @@ export type StewardFacts = {
   children: { total: number; open: number; complete: boolean };
   // The deliberate wait the ticket is in, if any: recovery never touches it.
   deliberate: StewardDeliberate | null;
-  // An open group link: sessions.ts stepGroup hands out the members and closes the parent.
+  // Durable parent lifecycle, independent of the latest UI thread's open/closed state.
+  parentPhase: ParentPhase | null;
+  // A coordinator still handing out children (or an open legacy group awaiting migration).
   groupLinked: boolean;
   // A verifier parked the ticket (the park verdict): it waits for a blocker or a date.
   parked: boolean;
@@ -301,17 +304,17 @@ export type StewardFacts = {
 
 // The one situation of a ticket. Exhaustive and ordered: the first match wins, and the order is
 // the precedence the tests pin — a finished ticket beats everything, a claimed verifier beats the
-// facts it is judging, a group link and a deliberate wait beat every repair, a finished parent is
-// judged only after its own live/owner/blocker/pull-request facts, and the recovery budgets are
-// checked before the successor branches that would spend them.
+// facts it is judging, deliberate waits beat every repair, and only unfinished group members stay
+// with the coordinator. A finished parent is judged after its own live/owner/blocker/pull-request
+// facts, and recovery budgets are checked before successor branches that would spend them.
 export function classifyTicket(facts: StewardFacts): StewardSituation {
   if (facts.terminal) return facts.live ? "terminal-agents" : "closed";
   if (facts.verifier) return "verifying";
-  // The group path owns the ticket: stepGroup hands out the members and closes the parent.
-  if (facts.groupLinked) return "moving";
   // A deliberate wait: the ticket is where it should be, and nothing automatic may touch it.
   if (facts.deliberate === "focus" || facts.deliberate === "remote") return "queued";
   if (facts.deliberate) return "waiting-owner";
+  if (facts.parentPhase === "paused" || facts.parentPhase === "closed") return facts.blocker ? "waiting-blocker" : "waiting-owner";
+  if (facts.groupLinked && (!facts.children.complete || facts.children.open > 0)) return "moving";
   if (facts.live) {
     if (facts.ownerWait === "live") return "waiting-owner";
     if (facts.idleMinutes !== null && facts.idleMinutes >= facts.idleThreshold && facts.openPulls.length === 0) return facts.resumed ? "idle-unresponsive" : "idle";
@@ -335,7 +338,7 @@ export function classifyTicket(facts: StewardFacts): StewardSituation {
   // A parent whose sub-issues all finished is judged like any ticket: a verifier, never a straight
   // completion (its own work — a pull request, a blocker, the owner — comes first), and never a
   // restart (its sub-issues say the work is finished).
-  if (facts.children.total > 0 && facts.children.open === 0 && facts.children.complete) return facts.verified === facts.landedSignature ? "escalated" : "landed";
+  if ((facts.children.total > 0 || facts.parentPhase === "verification") && facts.children.open === 0 && facts.children.complete) return facts.verified === facts.landedSignature ? "escalated" : "landed";
   if (facts.refusals > 0 && !facts.startable) return "refused";
   if (facts.watchdog === "exhausted") return "watchdog-exhausted";
   if (facts.started) return facts.startable ? "stalled" : "escalated";
@@ -354,7 +357,7 @@ export type StewardClaim = { action: StewardAction; marker: string; at: string; 
 // the value the verifier's agent label carries, so an interrupted launch is adopted by marker
 // instead of losing its verdict. `agentId` is null between the marker's persistence and the
 // launch's return; the label is what ties the two together across a reload.
-export type StewardVerifier = { agentId: string | null; marker: string; at: string };
+export type StewardVerifier = { agentId: string | null; marker: string; at: string; children?: string[] };
 // A start the steward attempted and admission deferred (no slot, focus, a blocker, presence): the
 // ticket waits in the queue without spending a restart or a refusal, and the pass retries the
 // recorded action until it is admitted (or `steward.queuedEscalateHours` passes).
@@ -722,6 +725,9 @@ export function verifierBrief(issue: StewardIssue, facts: StewardFacts, record: 
     summaries ? `The last agent's own reports:\n${summaries}` : "",
     record?.plan ? `The ticket's plan: ${record.plan}` : "",
     "",
+    "Verify the parent's acceptance criteria against each child's actual landed PR evidence, not merely terminal child statuses or merged PRs. Canceled or duplicate children are not successful delivery: identify their explicit scope disposition and prove the remaining parent acceptance criteria are satisfied before choosing close.",
+    "Read the repository's delivery instructions and consult its existing deployment receipts/statuses. Where deployment or runtime verification is required, require proof for the landed SHA and each affected service/environment, plus the required runtime checks. A merged PR alone is not deployment proof. Never invent deployment evidence or assume a deployment source exists. Safe read-only runtime verification is allowed; implementation, deployment, fixes and other mutations are not.",
+    "Check unresolved manual owner tasks and Needs-you questions, including after-merge tasks and checks still awaiting verification. Missing acceptance, child PR, deployment or runtime evidence must produce an actionable resume instruction, park with a real blocker/date, or ask_owner with concrete options; never close on missing evidence.",
     "Read the ticket and its comments (the linear_ticket tools get_ticket and get_comments), the plan document if there is one, and the landed pull requests (gh pr view and gh pr diff). Judge whether the ticket's work is complete against its description and acceptance criteria, then use the steward_verdict tool (omp shows it as linear_ticket_steward_verdict) exactly once with one verdict: close (nothing remains), resume with what the ticket's agent must still do, park with why it must wait (blockedBy names the ticket it waits for, dueDate when a date decides it), or ask_owner with the question and its options when only the owner can decide. Then stop.",
   ].filter(Boolean).join("\n");
 }
@@ -841,6 +847,37 @@ export class Steward {
     });
   }
 
+  // Called only inside SessionRouter's owned resume turn, immediately before dispatch. This
+  // authorizes implementation, not closure: no acceptance, landed-stack or child-terminal test.
+  async parentResumeWait(issueId: string): Promise<string | null> {
+    if (!this.alive()) return "the steward is stopped";
+    const settings = await this.deps.settings.read();
+    if (!settings.steward.enabled) return "the steward is disabled";
+    if (await this.deps.deletions?.blocked(issueId)) return "the ticket is paused for deletion";
+    if (await this.deps.owner(issueId) !== "here") return "the parent is not owned by this host";
+    const names = { ...dispatchLabels(settings.dispatch.label), trigger: settings.dispatch.label };
+    const appIds = await this.deps.linear.trustedAppIds();
+    const issue = (await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: Object.values(names), appIds, ids: [issueId] })).find((entry) => entry.id === issueId);
+    if (!issue) return "the parent cannot be read";
+    const fresh = await this.completeParentIssue(issue);
+    if (CLOSED_TYPES.includes(fresh.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number])) return `the parent is ${fresh.status}`;
+    const parent = await this.deps.sessions.parentProgress(issueId);
+    if (parent?.phase === "paused" || parent?.phase === "closed") return `parent orchestration is ${parent.phase}: ${parent.nextAction}`;
+    if (parent?.delegated && (!fresh.delegateId || !appIds.includes(fresh.delegateId))) return "Paseo is no longer delegated to the parent";
+    const authority = await this.ownerAuthorityFence(fresh, names, parent, true);
+    if (authority) return authority;
+    const tasks = await this.ownerCompletionFence(fresh);
+    if (tasks) return tasks;
+    const record = (await this.deps.handover.all()).find((entry) => entry.issueId === issueId) ?? null;
+    if (record?.waiting) {
+      const [roots, handed] = await Promise.all([this.deps.sessions.watchdogRoots(), this.deps.watchdog.handedOver()]);
+      const group = roots.get(issueId);
+      const live = group?.roots.filter((agent) => LIVE_AGENT[agent.status] && !group.ghosts.has(agent.id)) ?? [];
+      if (await this.waitState(fresh, record.waiting, live, { handed, record, roots }, this.clock()) === "live") return "the parent waits for the owner";
+    }
+    return null;
+  }
+
   // Whether a steward effect is under way for the ticket (a claimed action, a verifier): the
   // project hand-out leaves it alone, so no second start races the steward's.
   async underway(issueId: string): Promise<boolean> {
@@ -929,28 +966,30 @@ export class Steward {
     // tickets known only through a handover record, the parents of Needs-you sub-issues, and
     // everything an earlier pass tracked — and they go into the batched Linear read, so the first
     // pass on an empty store manages them too.
-    const [roots, records, watchdog, needsYou, handed] = await Promise.all([
+    const [roots, records, watchdog, needsYou, handed, parents] = await Promise.all([
       this.deps.sessions.watchdogRoots(),
       this.deps.handover.all(),
       this.deps.watchdog.read().catch(() => null),
       this.deps.needsYou.all().catch(() => [] as { parentId: string }[]),
       this.deps.watchdog.handedOver().catch(() => new Map<string, string>()),
+      this.deps.sessions.parentProgresses(),
     ]);
     const recordOf = new Map(records.map((record) => [record.issueId, record]));
-    const inventory = new Set<string>([...Object.keys(file.tickets), ...records.map((record) => record.issueId), ...roots.keys(), ...needsYou.map((entry) => entry.parentId)]);
+    const parentOf = new Map(parents.map((parent) => [parent.issueId, parent]));
+    const inventory = new Set<string>([...Object.keys(file.tickets), ...records.map((record) => record.issueId), ...roots.keys(), ...needsYou.map((entry) => entry.parentId), ...parentOf.keys()]);
     const all = await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: labelNames, appIds, ids: [...inventory], queueBlockers: options.queueBlockers === true });
     const teams = new Set(settings.dispatch.teamKeys.map((key) => key.trim().toLowerCase()).filter(Boolean));
     const inTeam = (issue: StewardIssue) => teams.has(issue.teamKey.trim().toLowerCase());
     const issues = options.queueBlockers ? all.filter((issue) => inTeam(issue) && hasLabel(issue.labels, names.failed)) : all;
     if (options.queueBlockers && !issues.length) return;
-    const inScope = issues.filter((issue) => (options.queueBlockers ? true : this.inScope(issue, names, settings.dispatch.teamKeys, appIds, recordOf, roots, file.tickets)));
+    const inScope = issues.filter((issue) => (options.queueBlockers ? true : (inTeam(issue) && parentOf.has(issue.id)) || this.inScope(issue, names, settings.dispatch.teamKeys, appIds, recordOf, roots, file.tickets)));
     const pulls = await this.deps.pulls([...new Set(inScope.flatMap((issue) => pullUrls(issue, recordOf.get(issue.id))))]);
     const candidates: Candidate[] = [];
     for (const issue of inScope) {
       if (!this.alive()) return;
       if (await this.deps.owner(issue.id).catch(() => "unknown" as HostOwnership) !== "here") continue;
       const ticket = file.tickets[issue.id] ?? null;
-      const facts = await this.facts(issue, paseo, { names, roots, record: recordOf.get(issue.id) ?? null, watchdog, needsYou, handed, pulls, now, ticket, settings });
+      const facts = await this.facts(issue, paseo, { names, roots, record: recordOf.get(issue.id) ?? null, parent: parentOf.get(issue.id) ?? null, watchdog, needsYou, handed, pulls, now, ticket, settings });
       candidates.push({ issue, facts, situation: classifyTicket(facts), ticket: ticket ?? newTicket(issue.identifier, this.iso(now)) });
     }
     // The `<trigger>-running` labels an archive still owes: settled from the pass's own agent
@@ -997,6 +1036,7 @@ export class Steward {
     names: DispatchLabels & { trigger: string };
     roots: Map<string, TicketRoots>;
     record: HandoverRecord | null;
+    parent: ParentProgress | null;
     watchdog: WatchdogFile | null;
     needsYou: { parentId: string }[];
     handed: Map<string, string>;
@@ -1005,7 +1045,7 @@ export class Steward {
     ticket: StewardTicket | null;
     settings: PluginSettings;
   }): Promise<StewardFacts> {
-    const { names, record, now } = input;
+    const { names, record, parent, now } = input;
     const terminal = CLOSED_TYPES.includes(issue.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number]);
     const group = input.roots.get(issue.id) ?? null;
     const roots = group?.roots ?? [];
@@ -1027,23 +1067,26 @@ export class Steward {
     const waiting = record?.waiting ?? null;
     const ownerWait = waiting ? await this.waitState(issue, waiting, liveRoots, input, now) : "none";
     const thread = await this.deps.sessions.watchdogThread(issue.id).catch(() => null);
-    const queuedThread = Boolean(thread?.queued) || await this.deps.sessions.threadQueued(issue.id).catch(() => false);
+    // A durable parent's responsibility outlives its UI link. Only a live link may supply UI
+    // waits; persisted parked plans, watchdog holds and current host ownership remain authoritative.
+    const activeThread = parent && thread?.closed ? null : thread;
+    const queuedThread = Boolean(activeThread?.queued) || await this.deps.sessions.threadQueued(issue.id).catch(() => false);
     const planned = (await this.deps.planned?.has(issue.id).catch(() => false)) === true;
     const focused = Boolean(await this.deps.focus?.admits(issue.id, paseo).catch(() => null));
     const cycle = input.watchdog?.tickets[issue.id] ?? null;
     const stripAnchor = (record?.agentId ?? "").startsWith(STEWARD_ANCHOR);
     const started = Boolean(record && record.agentId && !stripAnchor) || roots.length > 0 || pullFacts.length > 0;
     const permissions = live && liveRoots.some((agent) => (agent.pendingPermissions?.length ?? 0) > 0);
-    const offer = thread?.offer && ["split", "later", "parked"].includes(thread.offer) ? thread.offer : null;
+    const offer = activeThread?.offer && ["split", "later", "parked"].includes(activeThread.offer) ? activeThread.offer : null;
     // The deliberate waits, strongest first: the owner's own veto or step, the plan under review,
     // the watchdog's owner Stop, the peer host, an unanswered question, a Needs-you item, focus.
     const deliberate: StewardDeliberate | null =
       hasLabel(issue.labels, names.hold) ? "hold"
         : hasLabel(issue.labels, names.manual) ? "manual"
           : hasLabel(issue.labels, DO_NOT_MERGE) ? "do-not-merge"
-            : planStage(issue.status, issue.statusType) === PLAN_REVIEW_STATE || Boolean(thread?.review) || planned || offer ? "plan-review"
+            : planStage(issue.status, issue.statusType) === PLAN_REVIEW_STATE || Boolean(activeThread?.review) || planned || offer ? "plan-review"
               : input.watchdog?.holds[issue.id] ? "stopped"
-                : thread?.remote ? "remote"
+                : activeThread?.remote ? "remote"
                   : permissions ? "permissions"
                     : input.needsYou.some((entry) => entry.parentId === issue.id) ? "needs-you"
                       : focused ? "focus"
@@ -1064,9 +1107,12 @@ export class Steward {
       status: issue.status,
       statusType: issue.statusType,
       terminal,
-      children: { total: issue.children.length, open: openChildren.length, complete: issue.childrenComplete },
+      children: parent
+        ? { total: parent.children.length, open: parent.children.filter((child) => !child.finished).length, complete: parent.children.length > 0 || parent.phase === "verification" }
+        : { total: issue.children.length, open: openChildren.length, complete: issue.childrenComplete },
       deliberate,
-      groupLinked: Boolean(thread?.group),
+      parentPhase: parent?.phase ?? null,
+      groupLinked: parent ? parent.phase === "children" || parent.phase === "verification" : Boolean(thread?.group && !thread.closed),
       parked,
       blocker,
       live,
@@ -1378,10 +1424,18 @@ export class Steward {
   // agent label, so an interrupted launch is adopted by marker on the next pass: its verdict is
   // never lost to a reload between agent creation and the store write.
   private async verify(paseo: PaseoApi, settings: PluginSettings, candidate: Candidate, now: number): Promise<StewardOutcome> {
-    const { issue, facts } = candidate;
+    let { issue } = candidate;
+    const { facts } = candidate;
     const gate = this.deps.launcher.gate(issue.id);
     if (!gate) return { state: "deferred", reason: "a launch for this ticket is under way" };
     try {
+      if (facts.parentPhase !== null || issue.children.length > 0) {
+        const complete = await this.completeParentIssue(issue).catch(() => null);
+        if (!complete) return { state: "deferred", reason: "Waiting for complete parent child and label evidence." };
+        issue = complete;
+        if (CLOSED_TYPES.includes(issue.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number])) return { state: "deferred", reason: "The parent is already terminal." };
+        if (issue.children.some((child) => !CLOSED_TYPES.includes(child.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number]))) return { state: "deferred", reason: "Waiting for all children, including owner tasks, to reach terminal states." };
+      }
       const agents = (await classifyTicketAgents(paseo, issue.id, now, this.deps.inspect)).live;
       const verified = (agent: { labels?: Record<string, string> | undefined }) => agent.labels?.[STEWARD_VERIFIER_LABEL] ?? null;
       // A generation is still pending only when its launch has not been confirmed yet; the
@@ -1395,7 +1449,8 @@ export class Steward {
       // The verifier reports through its ticket MCP server: without Linear access for agents it has
       // no steward_verdict tool, so it is started only when that is on.
       if (!settings.agentLinearAccess) return { state: "failed", reason: `the verifier cannot report a verdict: agent Linear access is off (${issue.identifier} keeps its verifier claim until it is on)`, permanent: true };
-      const admission = await this.deps.starter.admission(issue.id, paseo, settings);
+      const parentVerifier = issue.children.length > 0;
+      const admission = await this.deps.starter.admission(issue.id, paseo, settings, undefined, parentVerifier ? { control: true } : undefined);
       if (!admission.ok) return { state: "deferred", reason: admission.reason };
       // Only now, with the tooling and the slot confirmed, is the ticket's silent root handed over:
       // a refused admission must not leave the ticket with no agent and no verifier (B2).
@@ -1406,14 +1461,14 @@ export class Steward {
       // leaves an adoptable verifier, not an anonymous agent with an unreadable verdict.
       await this.deps.store.update((file) => {
         const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
-        ticket.verifier = { agentId: null, marker, at: this.iso(now) };
+        ticket.verifier = { agentId: null, marker, at: this.iso(now), children: issue.children.map((child) => child.id).sort() };
       });
       let started: { agentId: string };
       try {
         started = await this.deps.starter.start(issue.id, paseo, settings, {
           retryHint: "start the verifier again",
-          resumeOnly: true,
-          labels: { [STEWARD_VERIFIER_LABEL]: marker },
+          resumeOnly: !parentVerifier && facts.parentPhase === null,
+          labels: { [STEWARD_VERIFIER_LABEL]: marker, ...(parentVerifier ? { "linear.coordination": "parent-verification" } : {}) },
           verifier: { brief: verifierBrief(issue, facts, record), marker },
         });
       } catch (error) {
@@ -1425,7 +1480,7 @@ export class Steward {
       }
       await this.deps.store.update((file) => {
         const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
-        if (ticket.verifier?.marker === marker) ticket.verifier = { agentId: started.agentId, marker, at: this.iso(now) };
+        if (ticket.verifier?.marker === marker) ticket.verifier = { ...ticket.verifier, agentId: started.agentId };
       });
       console.log(`[linear-tickets] ${issue.identifier}: steward: started verifier ${short(started.agentId)} for the landed stack`);
       return { state: "done", reason: `verifier ${short(started.agentId)}` };
@@ -1438,6 +1493,13 @@ export class Steward {
     } finally {
       gate.release();
     }
+  }
+
+  // issueGroup succeeds only after exhausting every child and child-label page; no partial
+  // result is usable as verifier evidence. Classification uses the once-per-pass durable snapshot.
+  private async completeParentIssue(issue: StewardIssue): Promise<StewardIssue> {
+    const group = await this.deps.linear.issueGroup(issue.id);
+    return { ...issue, status: group.status, statusType: group.statusType, delegateId: group.delegateId, children: group.children, childrenComplete: true };
   }
 
   // A verifier's verdict, applied: close, resume (a successor with the instruction), park (Todo,
@@ -1570,15 +1632,27 @@ export class Steward {
         case "resume": {
           const record = (await this.deps.handover.all()).find((item) => item.issueId === issue.id) ?? null;
           const instruction = verdict.instruction ?? "The verifier found the ticket's work incomplete; continue it.";
-          // The admitted attempt is charged before the start, exactly like the ordinary successor
-          // path: a verdict is not a way around the rolling budget.
-          await this.deps.store.update((file) => {
-            const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
-            ticket.restarts = [...recent(ticket.restarts, now), this.iso(now)];
-          });
-          const result = await this.deps.sessions.succeed(issue.id, issue.identifier, record?.agentId ?? null, instruction, async () => {
+          const parentResume = candidate.facts.parentPhase !== null || Boolean(verifier.children?.length);
+          let charged = false;
+          const charge = async () => {
+            await this.deps.store.update((file) => {
+              const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
+              ticket.restarts = [...recent(ticket.restarts, now), this.iso(now)];
+            });
+            charged = true;
+          };
+          // Parent continuations charge only after worker admission and fresh authority checks.
+          // An admitted failure still spends its attempt; a capacity wait keeps the instruction
+          // and budget intact. The existing branch-only successor semantics remain unchanged.
+          if (!parentResume) await charge();
+          const onDispatch = async () => {
+            if (parentResume) await charge();
             console.log(`[linear-tickets] ${issue.identifier}: steward: the verifier asked for more work; a successor continues it`);
-          }).catch((error: unknown): Succession => ({ kind: "impossible", reason: message(error) }));
+          };
+          const result = await (parentResume
+            ? this.deps.sessions.resumeVerifiedParent(issue.id, issue.identifier, record?.agentId ?? null, instruction, onDispatch)
+            : this.deps.sessions.succeed(issue.id, issue.identifier, record?.agentId ?? null, instruction, onDispatch)
+          ).catch((error: unknown): Succession => ({ kind: "impossible", reason: message(error) }));
           if ("agent" in result && result.agent.id !== verifier.agentId) {
             await this.step(issue, verifier.marker, "resumed", now);
             await this.consume(issue, null);
@@ -1593,9 +1667,10 @@ export class Steward {
             if (count >= REFUSAL_CAP) await this.exhausted(candidate, verifier.marker, reason, now);
             return;
           }
-          if (result.kind === "wait" && queueWait(result.reason)) {
-            // Nothing was attempted: the attempt is refunded and the verdict waits for admission.
-            await this.unspend(issue, now);
+          if (result.kind === "wait" && (parentResume || queueWait(result.reason))) {
+            // No dispatched parent attempt is charged; retain its verdict through any owner or
+            // admission wait. Ordinary branch-only capacity waits keep their existing refund.
+            if (charged) await this.unspend(issue, now);
             this.once(`verdict:${issue.id}`, `${issue.identifier}: the verifier's successor waits (${result.reason}); the next pass retries`);
             return;
           }
@@ -1653,23 +1728,35 @@ export class Steward {
     if (ownership !== "here") return `another host owns the ticket (${ownership})`;
     const appIds = (await this.deps.linear.trustedAppIds().catch(() => [])).filter(Boolean);
     const labelNames = [names.trigger, names.running, names.failed, names.blocked, names.needsYou, names.manual, names.hold, names.attended, names.queued];
-    const fresh = (await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: labelNames, appIds, ids: [issue.id] }))[0] ?? null;
+    let fresh = (await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: labelNames, appIds, ids: [issue.id] })).find((entry) => entry.id === issue.id) ?? null;
     if (!fresh) return "the ticket cannot be read";
+    if (candidate.facts.parentPhase !== null || fresh.children.length > 0 || candidate.ticket.verifier?.children?.length) {
+      const complete = await this.completeParentIssue(fresh).catch(() => null);
+      if (!complete) return "complete parent child and label evidence cannot be read";
+      fresh = complete;
+    }
     if (CLOSED_TYPES.includes(fresh.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number])) return `the ticket is already ${fresh.status}`;
-    if (hasLabel(fresh.labels, names.hold)) return `the owner put the ticket on hold (${names.hold})`;
-    if (hasLabel(fresh.labels, names.manual)) return `the ticket carries a manual step (${names.manual})`;
-    if (hasLabel(fresh.labels, DO_NOT_MERGE)) return "the ticket is marked do-not-merge";
-    if (planStage(fresh.status, fresh.statusType)) return `the ticket's plan is in ${fresh.status}`;
+    const parent = await this.deps.sessions.parentProgress(issue.id);
+    if (parent?.phase === "paused" || parent?.phase === "closed") return `parent orchestration is ${parent.phase}: ${parent.nextAction}`;
+    if (parent?.delegated && (!fresh.delegateId || !appIds.includes(fresh.delegateId))) return "Paseo is no longer delegated to the parent";
+    const authority = await this.ownerAuthorityFence(fresh, names, parent);
+    if (authority) return authority;
     const openChildren = fresh.children.filter((child) => !CLOSED_TYPES.includes(child.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number])).length;
     if (openChildren > 0 || !fresh.childrenComplete) return "a sub-issue is still open";
+    const children = candidate.ticket.verifier?.children;
+    if (!children && (parent || fresh.children.length > 0)) return "the verifier has no child membership snapshot; a fresh verification is required";
+    if (children && JSON.stringify(children) !== JSON.stringify(fresh.children.map((child) => child.id).sort())) return "the parent's child membership changed during verification";
+    const ownerTasks = await this.ownerCompletionFence(fresh);
+    if (ownerTasks) return ownerTasks;
     const blocker = fresh.blockers.find((entry) => !finishedBlocker(entry));
     if (blocker) return `it waits for ${blocker.identifier}`;
     const live = (await classifyTicketAgents(paseo, issue.id, now, this.deps.inspect)).live
       .filter((agent) => !agent.labels?.[STEWARD_VERIFIER_LABEL] && agent.id !== verifierIdOf(candidate));
     if (live.length) return `an agent works on it again (${short(live[0].id)})`;
-    const record = (await this.deps.handover.all()).find((item) => item.issueId === issue.id) ?? null;
+    const records = await this.deps.handover.all();
+    const record = records.find((item) => item.issueId === issue.id) ?? null;
     if (record?.waiting) {
-      const handed = await this.deps.watchdog.handedOver().catch(() => new Map<string, string>());
+      const handed = await this.deps.watchdog.handedOver();
       const wait = await this.waitState(fresh, record.waiting, [], { handed, record, roots: new Map() }, now);
       if (wait === "live") return "it waits for the owner";
     }
@@ -1679,6 +1766,63 @@ export class Steward {
     const stack = await this.deps.completionPulls(issue.id, issue.identifier, urls).catch(() => "unknown" as StackState);
     if (stack === "open") return "an open pull request of the ticket exists";
     if (stack === "unknown") return "the ticket's pull requests cannot be read";
+    for (const child of fresh.children) {
+      const childRecord = records.find((item) => item.issueId === child.id);
+      const childStack = await this.deps.completionPulls(child.id, child.identifier, childRecord?.pullRequests ?? []).catch(() => "unknown" as StackState);
+      if (childStack === "open") return `child ${child.identifier} has an open pull request`;
+      if (childStack === "unknown") return `child ${child.identifier}'s pull requests cannot be read`;
+    }
+    return null;
+  }
+
+  // Verification wins classification, not authority to ignore a newer owner gate. No failure
+  // fallback here: unreadable evidence rejects the effect. inTurn ignores only the router's own
+  // exclusive resume turn; threadQueued still checks actual live queued links.
+  private async ownerAuthorityFence(issue: StewardIssue, names: DispatchLabels, parent: ParentProgress | null, inTurn = false): Promise<string | null> {
+    const [watchdog, planned, thread, queuedThread] = await Promise.all([
+      this.deps.watchdog.read(),
+      this.deps.planned?.has(issue.id) ?? Promise.resolve(false),
+      this.deps.sessions.watchdogThread(issue.id),
+      this.deps.sessions.threadQueued(issue.id, inTurn),
+    ]);
+    if (watchdog?.holds[issue.id]) return "the owner stopped recovery for this ticket";
+    if (planned) return "the ticket has a persisted parked plan";
+    const activeThread = parent && thread?.closed ? null : thread;
+    if (activeThread?.review || (activeThread?.offer && ["split", "later", "parked"].includes(activeThread.offer))) return "the live ticket thread waits for a plan decision";
+    if (activeThread?.questions) return "the live ticket thread waits for the owner's answer";
+    if (activeThread?.remote) return "the live ticket thread belongs to the peer host";
+    if (activeThread?.queued || queuedThread) return "the ticket has a live queued thread or turn";
+    if (hasLabel(issue.labels, names.hold)) return `the owner put the ticket on hold (${names.hold})`;
+    if (hasLabel(issue.labels, names.manual)) return `the ticket carries a manual step (${names.manual})`;
+    if (hasLabel(issue.labels, names.needsYou)) return `the ticket needs the owner (${names.needsYou})`;
+    if (hasLabel(issue.labels, DO_NOT_MERGE)) return "the ticket is marked do-not-merge";
+    const stage = planStage(issue.status, issue.statusType);
+    if (stage && (!inTurn || stage === PLAN_REVIEW_STATE)) return `the ticket's plan is in ${issue.status}`;
+    return null;
+  }
+
+  // Group handout excludes owner tasks; completion cannot. Re-read every registered task's
+  // status and check receipt, including after-merge tasks on the parent or its child tickets.
+  private async ownerCompletionFence(issue: StewardIssue): Promise<string | null> {
+    const scope = new Set([issue.id, ...issue.children.map((child) => child.id)]);
+    const [tasks, needsYou] = await Promise.all([this.deps.manualTasks.tasksStrict(), this.deps.needsYou.allStrict()]);
+    const manual = tasks.filter((task) => scope.has(task.parentId));
+    const questions = needsYou.filter((task) => scope.has(task.parentId));
+    if (!manual.length && !questions.length) return null;
+    // The batched API includes completedAt; issueStatus alone only returns name/type.
+    const statuses = await this.deps.linear.issueStatuses([...new Set([...manual, ...questions].map((task) => task.id))]);
+    for (const task of manual) {
+      const status = statuses.get(task.id);
+      if (!status) return `manual task ${task.identifier} cannot be read`;
+      const type = status.statusType.trim().toLowerCase();
+      if (type === "canceled" || type === "duplicate") continue;
+      if (type !== "completed") return `manual task ${task.identifier} is still open`;
+      if (task.check && (!status.completedAt || task.verifiedFor !== status.completedAt)) return `manual task ${task.identifier} still needs its completion check`;
+    }
+    for (const task of questions) {
+      const status = statuses.get(task.id);
+      if (!status || !CLOSED_TYPES.includes(status.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number])) return `owner question ${task.identifier} is unresolved`;
+    }
     return null;
   }
 
@@ -1936,7 +2080,7 @@ export class Steward {
     const lines = issue.children.map((child) => `- ${child.identifier}: ${byIssue.get(child.id)?.situation ?? child.status}`);
     const open = issue.children.filter((child) => !CLOSED_TYPES.includes(child.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number])).length;
     const body = [
-      `**Paseo's ticket steward: ${issue.children.length - open} of ${issue.children.length} sub-issues finished.**${open ? ` ${issue.identifier} closes when all are finished.` : " It is complete."}`,
+      `**Paseo's ticket steward: ${issue.children.length - open} of ${issue.children.length} sub-issues finished.**${open ? " The coordinator continues the unfinished children." : " Parent acceptance and required deployment/runtime evidence still need verification before completion."}`,
       "",
       ...lines,
       "",

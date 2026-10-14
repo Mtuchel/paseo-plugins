@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +16,7 @@ import { DoneTickets, RetiredLabels } from "./steward";
 import { BACKSTOP_ENQUEUE, ENQUEUE_READY, GREPTILE_RETRIGGER, marker, RETARGET_ORPHAN, WAIT_QUEUE, type ScriptOutput } from "./queue-backstop";
 import { GitHubBudget, GitHubPausedError, GitHubRateLimitedError, RateLimitedError, withPriority } from "./rate-budget";
 import { PermissionReplies } from "./permission-replies";
+import { ParentStore } from "./parents";
 import { SessionRouter, type IdleRun, type Succession } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { Watchdog, WatchdogStore, type WatchedAgent } from "./watchdog";
@@ -122,13 +123,14 @@ const RESTARTED = { status: "idle", lastError: CRASH, pendingPermissions: [] };
 // A real SessionRouter on a fake Paseo daemon with one agent: its snapshot is `agent`, a reload
 // (`reload <id>` in the calls) sets it to `reloaded`, and a send is recorded like the fake
 // router's prompts (`send` runs first and may throw).
-function crashDaemon(calls: string[]) {
+function crashDaemon(t: TestContext, calls: string[]) {
   const daemon = { agent: CRASHED as Record<string, unknown>, reloaded: RESTARTED as Record<string, unknown>, send: async () => {}, router: null as unknown as SessionRouter };
   let held = false;
-  // The fake store has no path, so the router cannot derive its ledger directory from it: give it
-  // an isolated one of its own (these paths send through the agent handle, not the reply ledger,
-  // so no file is written).
-  const replies = new PermissionReplies({ directory: join(tmpdir(), `paseo-pr-watch-${process.pid}-${Math.random().toString(36).slice(2)}`), daemon: async () => null });
+  // This fake session store has no path: supply both durable stores explicitly in an isolated
+  // directory instead of asking the router to derive their location from the fake.
+  const directory = mkdtempSync(join(tmpdir(), "paseo-pr-watch-crash-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const replies = new PermissionReplies({ directory, daemon: async () => null });
   daemon.router = new SessionRouter({
     launcher: { gate: () => {
       if (held) return null;
@@ -137,6 +139,7 @@ function crashDaemon(calls: string[]) {
     } },
     store: { forAgent: async () => null },
     replies,
+    parents: new ParentStore(directory),
     reloader: async () => async (agentId: string) => { calls.push(`reload ${agentId}`); daemon.agent = daemon.reloaded; },
   } as never);
   Object.assign(daemon.router, { paseo: { agents: {
@@ -258,7 +261,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   const calls: string[] = [];
   // Every successor start asked for, as `<issue id> <predecessor>`.
   const successions: string[] = [];
-  const daemon = agent.crash ? crashDaemon(calls) : null;
+  const daemon = agent.crash ? crashDaemon(t, calls) : null;
   // This host's Paseo server id, as the tickets' `Paseo agent` attachments name it (see ownership).
   const server = { id: "srv_test" };
   const directory = mkdtemp(join(tmpdir(), "paseo-pr-watch-"));

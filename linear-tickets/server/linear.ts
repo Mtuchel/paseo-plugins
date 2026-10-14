@@ -603,19 +603,43 @@ function finishedIssue(node: Record<string, unknown>): boolean {
 
 // A parent and its sub-issues, for handing the group to Paseo (groups.ts): each sub-issue's
 // assignee, delegate (the Paseo app once handed out), labels and blockers.
-export const ISSUE_GROUP_QUERY = `query issueGroup($id: String!) {
+export const ISSUE_GROUP_QUERY = `query issueGroup($id: String!, $after: String) {
   issue(id: $id) {
     id identifier state { name type } delegate { id }
-    children(first: 50) { nodes {
-      id identifier state { name type } assignee { id } delegate { id } labels(first: 20) { nodes { name } }
-      attachments(first: 10) { nodes { url sourceType metadata } }
-      inverseRelations(first: 10) { nodes { type issue { id identifier state { name type } delegate { id } attachments(first: 10) { nodes { url sourceType metadata } } } } }
-    } }
+    children(first: 50, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id identifier state { name type } assignee { id } delegate { id }
+        labels(first: 20) { nodes { name } pageInfo { hasNextPage endCursor } }
+        attachments(first: 10) { nodes { url sourceType metadata } }
+        inverseRelations(first: 10) { nodes { type issue { id identifier state { name type } delegate { id } attachments(first: 10) { nodes { url sourceType metadata } } } } }
+      }
+    }
+  }
+}`;
+export const ISSUE_GROUP_LABELS_QUERY = `query issueGroupLabels($id: String!, $after: String!) {
+  issue(id: $id) {
+    id
+    labels(first: 20, after: $after) { nodes { name } pageInfo { hasNextPage endCursor } }
   }
 }`;
 export type GroupIssue = { id: string; identifier: string; status: string; statusType: string; delegateId: string | null; finished: boolean };
 export type GroupChild = GroupIssue & { assigneeId: string | null; labels: string[]; blockers: GroupIssue[] };
 export type IssueGroup = GroupIssue & { children: GroupChild[] };
+
+// Group reads authorize handout and verification: absent metadata is not an empty last page.
+// Track returned cursors per connection so a failed traversal never returns a partial group.
+function groupPage(value: unknown, context: string, seen: Set<string>): { nodes: unknown[]; after: string | null } {
+  const raw = record(value);
+  if (!Array.isArray(raw.nodes)) throw new Error(`Linear did not return ${context}.`);
+  const page = connection(raw);
+  if (page.hasNextPage === null) throw new Error(`Linear did not return pagination metadata for ${context}.`);
+  if (!page.hasNextPage) return { nodes: page.nodes, after: null };
+  if (!page.endCursor || seen.has(page.endCursor)) throw new Error(`Linear returned a missing or repeated cursor for ${context}.`);
+  seen.add(page.endCursor);
+  return { nodes: page.nodes, after: page.endCursor };
+}
+
 function groupIssue(node: Record<string, unknown>): GroupIssue {
   const state = record(node.state ?? {});
   return { id: label(node.id), identifier: label(node.identifier), status: label(state.name), statusType: label(state.type), delegateId: label(record(node.delegate ?? {}).id) || null, finished: finishedIssue(node) };
@@ -1680,22 +1704,59 @@ export class LinearService {
     return node && label(node.id) ? { id: label(node.id), identifier: label(node.identifier), title: label(node.title) } : null;
   }
 
+  // Complete children and child labels, or an error. Never expose a partial group as complete.
   async issueGroup(id: string): Promise<IssueGroup> {
-    const data = record(await this.read(ISSUE_GROUP_QUERY, { id }, (found) => Boolean(found.issue && typeof found.issue === "object")));
-    if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
-    const issue = record(data.issue);
-    const children = connection(issue.children ?? { nodes: [] }).nodes.map((node) => record(node)).map((child) => ({
-      ...groupIssue(child),
-      assigneeId: label(record(child.assignee ?? {}).id) || null,
-      labels: connection(child.labels ?? { nodes: [] }).nodes.map((node) => label(record(node).name)).filter(Boolean),
-      blockers: connection(child.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
-        .filter((relation) => label(relation.type) === "blocks")
-        .map((relation) => groupIssue(record(relation.issue ?? {})))
-        .filter((blocker) => blocker.id),
-    }));
+    const children = new Map<string, GroupChild>();
+    const cursors = new Set<string>();
+    let parent: GroupIssue | null = null;
+    let after: string | null = null;
+    do {
+      const data = record(await this.read(ISSUE_GROUP_QUERY, { id, after }, (found) => Boolean(found.issue && typeof found.issue === "object")));
+      if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
+      const issue = record(data.issue);
+      const current = groupIssue(issue);
+      if (!current.id || (parent && current.id !== parent.id)) throw new Error("Linear returned inconsistent group identity.");
+      parent ??= current;
+      const page = groupPage(issue.children, `${parent.identifier}'s children`, cursors);
+      for (const node of page.nodes) {
+        const child = record(node);
+        const fields = groupIssue(child);
+        if (!fields.id || !fields.identifier) throw new Error("Linear returned a child without its identity.");
+        children.set(fields.id, {
+          ...fields,
+          assigneeId: label(record(child.assignee ?? {}).id) || null,
+          labels: await this.groupChildLabels(fields.id, fields.identifier, child.labels),
+          // These describe waits; actual child starts still use full admission-state checks.
+          blockers: connection(child.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
+            .filter((relation) => label(relation.type) === "blocks")
+            .map((relation) => groupIssue(record(relation.issue ?? {})))
+            .filter((blocker) => blocker.id),
+        });
+      }
+      after = page.after;
+    } while (after);
     // Lowest number first: the order they were filed in, and the order they are handed out.
-    children.sort((a, b) => a.identifier.localeCompare(b.identifier, undefined, { numeric: true }));
-    return { ...groupIssue(issue), children };
+    return { ...parent, children: [...children.values()].sort((a, b) => a.identifier.localeCompare(b.identifier, undefined, { numeric: true })) };
+  }
+
+  private async groupChildLabels(id: string, identifier: string, first: unknown): Promise<string[]> {
+    const names = new Set<string>();
+    const cursors = new Set<string>();
+    let value = first;
+    for (;;) {
+      const page = groupPage(value, `${identifier}'s labels`, cursors);
+      for (const node of page.nodes) {
+        const name = label(record(node).name);
+        if (!name) throw new Error(`Linear returned an unnamed label on ${identifier}.`);
+        names.add(name);
+      }
+      if (!page.after) return [...names];
+      const data = record(await this.read(ISSUE_GROUP_LABELS_QUERY, { id, after: page.after }, (found) => Boolean(found.issue && typeof found.issue === "object")));
+      if (!data.issue || typeof data.issue !== "object") throw new Error(`Linear did not return ${identifier}'s remaining labels.`);
+      const issue = record(data.issue);
+      if (issue.id !== id) throw new Error(`Linear returned inconsistent label owner for ${identifier}.`);
+      value = issue.labels;
+    }
   }
 
   // `ready` puts the ticket into the team's first unstarted state (Todo) instead of Triage, for

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
-import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_CORE_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_PAGES, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
+import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_CORE_QUERY, ISSUE_GROUP_QUERY, ISSUE_GROUP_LABELS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_PAGES, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 
 const issue = { id: "i1", identifier: "TUC-1", state: { id: "s1", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] } };
@@ -19,6 +19,127 @@ function service(reader: Pick<App, "query"> | undefined, answers: (query: string
   const app: App | undefined = reader && { query: reader.query, mutate: () => Promise.reject(new Error("no writes here")), viewer: () => Promise.reject(new Error("no viewer here")) };
   return { keyCalls, linear: new LinearService(new Credentials("/unused", "env-key"), post, app) };
 }
+
+const groupConnection = (nodes: unknown[], after: string | null = null) => ({
+  nodes, pageInfo: { hasNextPage: after !== null, endCursor: after },
+});
+const groupChild = (number: number) => ({
+  id: `child-${number}`, identifier: `TUC-${number}`, state: { name: "Done", type: "completed" },
+  delegate: { id: "app" }, assignee: { id: "owner" }, labels: groupConnection([]),
+  attachments: { nodes: [] }, inverseRelations: { nodes: [] },
+});
+
+test("issueGroup reads every child and label page, retaining late owner labels and child blockers", async () => {
+  const children = Array.from({ length: 75 }, (_, index) => groupChild(index + 2));
+  children[74].state = { name: "Todo", type: "unstarted" };
+  const labels = [...Array.from({ length: 40 }, (_, index) => ({ name: `label-${index}` })), { name: "paseo-manual" }];
+  const ownerTask = {
+    ...children[0], labels: groupConnection(labels.slice(0, 20), "labels-20"),
+    inverseRelations: { nodes: [{ type: "blocks", issue: {
+      id: "external", identifier: "TUC-99", state: { name: "Todo", type: "unstarted" }, delegate: null, attachments: { nodes: [] },
+    } }] },
+  };
+  const { linear } = service(undefined, (query, variables) => {
+    if (query === ISSUE_GROUP_QUERY) return { issue: { ...issue, delegate: { id: "app" },
+      children: variables.after === null
+        ? groupConnection([ownerTask, ...children.slice(1, 50)], "children-50")
+        : groupConnection(children.slice(50)),
+    } };
+    assert.equal(query, ISSUE_GROUP_LABELS_QUERY);
+    assert.equal(variables.id, ownerTask.id);
+    return { issue: { id: ownerTask.id, labels: variables.after === "labels-20"
+      ? groupConnection(labels.slice(20, 40), "labels-40") : groupConnection(labels.slice(40)) } };
+  });
+  const group = await linear.issueGroup("i1");
+  assert.equal(group.delegateId, "app");
+  assert.deepEqual(group.children.map((child) => child.id), children.map((child) => child.id));
+  assert.deepEqual(group.children[0].labels, labels.map((label) => label.name));
+  assert.deepEqual(group.children[0].blockers, [{
+    id: "external", identifier: "TUC-99", status: "Todo", statusType: "unstarted", delegateId: null, finished: false,
+  }]);
+  assert.equal(group.children[74].finished, false, "the last page's open child must remain visible");
+  assert.equal(group.children[74].statusType, "unstarted");
+});
+
+test("explicit last-page metadata accepts exactly 50 children and exactly 20 labels without a size heuristic", async () => {
+  const labels = Array.from({ length: 20 }, (_, index) => ({ name: `label-${index}` }));
+  const children = Array.from({ length: 50 }, (_, index) => ({ ...groupChild(index + 2), labels: groupConnection(labels) }));
+  const { linear } = service(undefined, (query) => {
+    if (query !== ISSUE_GROUP_QUERY) throw new Error("A terminal label page must not request another page");
+    return { issue: { ...issue, children: groupConnection(children) } };
+  });
+  const group = await linear.issueGroup("i1");
+  assert.deepEqual(group.children.map((child) => [child.id, child.labels]), children.map((child) => [child.id, labels.map((label) => label.name)]));
+});
+
+test("overlapping child pages keep one current child row and numeric handout order", async () => {
+  const { linear } = service(undefined, (_query, variables) => ({
+    issue: { ...issue, children: variables.after === null
+      ? groupConnection([groupChild(10), groupChild(2)], "next")
+      : groupConnection([{ ...groupChild(10), state: { name: "Todo", type: "unstarted" } }, groupChild(3)]),
+    },
+  }));
+  const group = await linear.issueGroup("i1");
+  assert.deepEqual(group.children.map((child) => [child.identifier, child.finished]), [["TUC-2", true], ["TUC-3", true], ["TUC-10", false]]);
+});
+
+test("incomplete child or label pagination rejects the whole group instead of exposing a prefix", async () => {
+  const invalid: Record<string, unknown> = {
+    "missing metadata": { nodes: [] },
+    "missing nodes": { pageInfo: { hasNextPage: false, endCursor: null } },
+    "missing cursor": { nodes: [], pageInfo: { hasNextPage: true, endCursor: null } },
+    "repeated cursor": groupConnection([], "next"),
+  };
+  for (const field of ["children", "labels"] as const) {
+    for (const [failure, page] of Object.entries(invalid)) {
+      const { linear } = service(undefined, (query, variables) => {
+        if (field === "children") return { issue: { ...issue, children: variables.after === null
+          ? groupConnection([groupChild(2)], "next") : page } };
+        if (query === ISSUE_GROUP_QUERY) return { issue: { ...issue,
+          children: groupConnection([{ ...groupChild(2), labels: groupConnection([{ name: "paseo" }], "next") }]),
+        } };
+        return { issue: { id: "child-2", labels: page } };
+      });
+      await assert.rejects(linear.issueGroup("i1"), /Linear/, `${field}: ${failure}`);
+    }
+  }
+});
+
+test("missing first-page metadata cannot be mistaken for a complete empty group or label list", async () => {
+  for (const children of [
+    { nodes: [] },
+    groupConnection([{ ...groupChild(2), labels: { nodes: [] } }]),
+  ]) {
+    const { linear } = service(undefined, () => ({ issue: { ...issue, children } }));
+    await assert.rejects(linear.issueGroup("i1"), /pagination metadata/);
+  }
+});
+
+test("failed later child or label reads propagate and never return partial success", async () => {
+  for (const field of ["children", "labels"] as const) {
+    for (const failure of ["unavailable", "deleted", "rate limited"] as const) {
+      const limited = new RateLimitedError("key", Date.now() + 60_000);
+      const { linear } = service(undefined, (query, variables) => {
+        if (query === ISSUE_GROUP_QUERY && variables.after === null) return { issue: { ...issue,
+          children: field === "children" ? groupConnection([groupChild(2)], "next")
+            : groupConnection([{ ...groupChild(2), labels: groupConnection([], "next") }]),
+        } };
+        if (failure === "deleted") return { issue: null };
+        if (failure === "rate limited") throw limited;
+        throw new Error("page unavailable");
+      });
+      await assert.rejects(linear.issueGroup("i1"), (error: unknown) => failure === "rate limited"
+        ? error === limited : error instanceof Error, `${field}: ${failure}`);
+    }
+  }
+});
+
+test("a cursor cycle longer than one page also fails closed", async () => {
+  const { linear } = service(undefined, (_query, variables) => ({
+    issue: { ...issue, children: groupConnection([], variables.after === "a" ? "b" : "a") },
+  }));
+  await assert.rejects(linear.issueGroup("i1"), /repeated cursor/);
+});
 
 test("createIssue sends a client-chosen id with the assignee and priority, in Todo, and no project when none is given", async () => {  // TUC-1208 AC-9
   const inputs: Record<string, unknown>[] = [];

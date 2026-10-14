@@ -203,6 +203,11 @@ function smallRouteSetup(identifier: string, route: RouteRecord, tier: Tier, usu
 // does an agent `releases` names: one whose ticket is Done or Canceled and that has been quiet for
 // more than an hour (steward.ts DoneTickets).
 export async function runningTicketAgents(paseo: PaseoApi, inspect?: ProcessInspector, releases?: (agent: PaseoAgent, now: number) => boolean): Promise<string[]> {
+  return (await runningTicketSnapshot(paseo, inspect, releases)).map((item) => item.issueId);
+}
+
+// Scheduler classifications come from the same listing and liveness inspection, not a second scan.
+async function runningTicketSnapshot(paseo: PaseoApi, inspect?: ProcessInspector, releases?: (agent: PaseoAgent, now: number) => boolean): Promise<{ issueId: string; control: boolean }[]> {
   const working: { agent: PaseoAgent; issueId: string }[] = [];
   let cursor: string | undefined;
   do {
@@ -217,7 +222,10 @@ export async function runningTicketAgents(paseo: PaseoApi, inspect?: ProcessInsp
   const counted = releases ? working.filter((item) => !releases(item.agent, now)) : working;
   // An inspection that fails anywhere reports no ghost (ghostAgents), so they count as today.
   const ghosts = await ghostAgents(counted.map((item) => item.agent), now, inspect);
-  return counted.filter((item) => !ghosts.has(item.agent.id)).map((item) => item.issueId);
+  return counted.filter((item) => !ghosts.has(item.agent.id)).map((item) => ({
+    issueId: item.issueId,
+    control: item.agent.labels?.["linear.coordination"] === "parent-verification",
+  }));
 }
 
 // Every agent of the ticket that is not archived, subagents included, on every page.
@@ -294,7 +302,7 @@ export class TicketStarter {
     this.branches = deps.branches ?? readBranches;
     this.capacity = deps.capacity ?? new Capacity();
     this.scheduler = deps.scheduler ?? new Scheduler({
-      running: (paseo) => runningTicketAgents(paseo, deps.inspect, deps.doneTickets ? (agent, now) => deps.doneTickets!.releases(agent, now) : undefined),
+      running: (paseo) => runningTicketSnapshot(paseo, deps.inspect, deps.doneTickets ? (agent, now) => deps.doneTickets!.releases(agent, now) : undefined),
       projectOf: async (issueId) => (await deps.linear.issueCore(issueId)).projectId,
       ...(deps.presence ? { away: () => deps.presence!.away() } : {}),
     });
@@ -304,7 +312,7 @@ export class TicketStarter {
   // finished, and the scheduler gives it a slot (none while the owner is away for an approved plan
   // that may need them). `read`: the ticket's state the caller read in this same pass (the queue's
   // batched read); without it, read fresh.
-  async admission(issueId: string, paseo: PaseoApi, settings: PluginSettings, read?: AdmissionState): Promise<Admission> {
+  async admission(issueId: string, paseo: PaseoApi, settings: PluginSettings, read?: AdmissionState, options?: { control?: boolean }): Promise<Admission> {
     if (await this.deps.deletions?.blocked(issueId)) return { ok: false, reason: "This ticket is paused for deletion." };
     const unfocused = await this.deps.focus?.admits(issueId, paseo);
     if (unfocused) return { ok: false, reason: unfocused };
@@ -317,7 +325,7 @@ export class TicketStarter {
     // The night order's tier comes from what is already here (README, "Who starts next"): the
     // ticket's labels and its recorded tier, never from reading its plan document.
     const night = nightInput(labels, (await this.deps.tiers?.get(issueId)) ?? null);
-    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended, night, queueBlocker: state.queueBlocker === true }, paseo, this.capacity.limit(settings.dispatch.maxRunning));
+    return this.scheduler.admit({ issueId, identifier: state.identifier, projectId: state.projectId, priority: state.priority, unblocks: state.unblocks, createdAt: state.createdAt, attended, night, queueBlocker: state.queueBlocker === true, control: options?.control === true }, paseo, this.capacity.limit(settings.dispatch.maxRunning));
   }
 
   // `resumeOnly`: continue the recorded branch and worktree or throw ResumeUnavailableError, never

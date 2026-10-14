@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -7,6 +7,16 @@ import {
   calendarDate, classifyTicket, DoneTickets, isDefect, parseVerdict, Steward, StewardStateError, StewardStore, STEWARD_ACTION, STEWARD_SITUATIONS, STEWARD_STATES,
   RESTART_CAP, type StewardFacts, type StewardSituation,
 } from "./steward";
+import type { ParentProgress } from "./parents";
+import { ManualTasks, type ManualTask } from "./manual-tasks";
+import type { IssueGroup, IssueStatus, StewardIssue } from "./linear";
+import type { StackState } from "./pr-watch";
+import { TicketStarter } from "./starter";
+import type { Launcher } from "./launch";
+import { detailSchema } from "../shared/contracts";
+import type { WatchdogFile } from "./watchdog";
+import type { HostOwnership, SessionRouter } from "./sessions";
+import { NeedsYouIssues } from "./needs-you";
 
 // The classifier's own tests: every fact set lands on exactly one situation, and the precedence
 // between them is pinned here (steward.ts's order is what runs).
@@ -21,7 +31,7 @@ const pull = (url: string, over: Partial<{ merged: boolean; closed: boolean; mis
 function facts(over: Partial<StewardFacts> = {}): StewardFacts {
   return {
     identifier: "TUC-1", status: "In Progress", statusType: "started", terminal: false,
-    children: { total: 0, open: 0, complete: true }, deliberate: null, groupLinked: false, parked: false, blocker: null,
+    children: { total: 0, open: 0, complete: true }, deliberate: null, parentPhase: null, groupLinked: false, parked: false, blocker: null,
     live: true, idleMinutes: null, idleThreshold: 30, ownerWait: "none", resumed: false,
     queuedThread: false, queuedAt: null, queuedSince: null, queuedTooLong: false, queuedHours: 24,
     openPulls: [], landedPulls: [], closedPulls: [], beforeMerge: 0,
@@ -189,10 +199,16 @@ test("a parent whose child list was not read in full is never treated as finishe
   assert.notEqual(classifyTicket(truncated), "landed", "no verifier over a parent that may still have open children");
 });
 
-test("a group-linked parent is left to the group step, whatever its own facts look like", () => {
-  const linked = facts({ groupLinked: true, children: { total: 2, open: 0, complete: true }, live: false, openPulls: [pull("https://github.com/o/r/pull/1")] });
-  assert.equal(classifyTicket(linked), "moving", "sessions.ts stepGroup hands out the members and closes the parent");
-  assert.equal(STEWARD_ACTION[classifyTicket(linked)], null, "the steward does nothing to it");
+test("group coordination yields finished parents to verification without bypassing owner gates", () => {
+  const linked = facts({ groupLinked: true, parentPhase: "children", children: { total: 2, open: 1, complete: true }, live: false });
+  assert.equal(classifyTicket(linked), "moving", "unfinished children stay with the coordinator");
+  const finished = { ...linked, children: { total: 2, open: 0, complete: true } };
+  assert.equal(classifyTicket(finished), "landed", "a stale group phase cannot suppress finished-parent verification");
+  assert.equal(classifyTicket({ ...finished, deliberate: "manual" }), "waiting-owner");
+  assert.equal(classifyTicket({ ...finished, parentPhase: "paused" }), "waiting-owner");
+  assert.equal(classifyTicket({ ...finished, parentPhase: "closed" }), "waiting-owner", "explicitly stopped parents are not recovered");
+  assert.equal(classifyTicket({ ...finished, openPulls: [pull("https://github.com/o/r/pull/1")] }), "open-pr");
+  assert.equal(classifyTicket({ ...linked, parentPhase: "verification" }), "moving", "a reopened child returns to coordination");
 });
 
 // --- The durable store -----------------------------------------------------------------------------
@@ -301,10 +317,24 @@ async function passFixture(t: any, over: {
   restart?: () => Promise<any>;
   succession?: () => Promise<any>;
   admission?: { ok: boolean; reason?: string };
-  completionPulls?: string;
+  completionPulls?: StackState | ((issueId: string) => StackState);
   listing?: any[];
   teams?: string[];
   thread?: any;
+  parents?: ParentProgress[];
+  manualTasks?: ManualTask[];
+  needsYou?: { id: string; parentId: string; identifier: string }[];
+  issueStatus?: (issueId: string) => Promise<IssueStatus | null>;
+  start?: TicketStarter["start"];
+  issueGroup?: (issueId: string) => Promise<IssueGroup>;
+  planned?: boolean;
+  threadQueued?: boolean;
+  watchdog?: WatchdogFile;
+  owner?: HostOwnership;
+  gateReadError?: "watchdog" | "planned" | "thread" | "queue" | "handed";
+  parentResume?: SessionRouter["resumeVerifiedParent"];
+  manualInventory?: () => Promise<ManualTask[]>;
+  ownerInventory?: () => Promise<{ id: string; parentId: string; identifier: string }[]>;
 } = {}) {
   t.mock.method(console, "error", () => {});
   t.mock.method(console, "log", () => {});
@@ -312,9 +342,11 @@ async function passFixture(t: any, over: {
   const store = new StewardStore(join(dir, "steward.json"));
   const calls = {
     restarts: [] as string[], successions: [] as string[], starts: [] as string[], completed: [] as string[],
+    parentResumes: [] as string[],
     escalates: [] as string[], clears: [] as string[], prompts: [] as string[], relates: [] as string[],
     dueDates: [] as string[], moves: [] as string[], labels: [] as string[], archives: [] as string[],
     completionUrls: [] as string[][],
+    admissions: [] as unknown[][], startOptions: [] as Parameters<TicketStarter["start"]>[3][],
   };
   const clock = { now: over.clockNow ?? T0 + 5 * 60_000 };
   const admission = { value: over.admission ?? { ok: true as boolean, reason: undefined as string | undefined } };
@@ -340,7 +372,25 @@ async function passFixture(t: any, over: {
     linear: {
       trustedAppIds: async () => ["app1"],
       stewardIssues: async () => over.issues ?? [],
-      issueStatus: async () => ({ status: "In Progress", statusType: "started", completedAt: null }),
+      issueGroup: async (issueId: string): Promise<IssueGroup> => {
+        if (over.issueGroup) return over.issueGroup(issueId);
+        const issue: StewardIssue | undefined = over.issues?.find((entry) => entry.id === issueId);
+        if (!issue || !issue.childrenComplete) throw new Error("Complete group evidence unavailable");
+        return {
+          id: issue.id, identifier: issue.identifier, status: issue.status, statusType: issue.statusType,
+          delegateId: issue.delegateId, finished: false,
+          children: issue.children.map((child) => ({ ...child, finished: child.statusType === "completed", labels: [], blockers: [] })),
+        };
+      },
+      issueStatus: over.issueStatus ?? (async () => ({ status: "In Progress", statusType: "started", completedAt: null })),
+      issueStatuses: async (ids: string[]) => {
+        const statuses = new Map<string, IssueStatus>();
+        for (const id of ids) {
+          const status = over.issueStatus ? await over.issueStatus(id) : { status: "In Progress", statusType: "started", completedAt: null };
+          if (status) statuses.set(id, status);
+        }
+        return statuses;
+      },
       issueCore: async () => ({ id: "i1", identifier: "ENG-1", labels: [{ id: "l1", name: "paseo" }] }),
       issueRef: async (identifier: string) => (identifier === "ENG-2" ? { id: "i2", identifier: "ENG-2" } : null),
       addLabel: async (_id: string, name: string) => { calls.labels.push(`+${name}`); },
@@ -356,13 +406,27 @@ async function passFixture(t: any, over: {
       watchdogRoots: async () => roots,
       restartFor: async (issueId: string) => { calls.restarts.push(issueId); return over.restart ? await over.restart() : { kind: "started", agentId: "a9" }; },
       succeed: async (issueId: string) => { calls.successions.push(issueId); return over.succession ? await over.succession() : { kind: "started", agent: { id: "a10", title: null, cwd: "" } }; },
+      resumeVerifiedParent: async (...args: Parameters<SessionRouter["resumeVerifiedParent"]>) => {
+        calls.parentResumes.push(args[0]);
+        if (over.parentResume) return over.parentResume(...args);
+        await args[4]?.();
+        return { kind: "started", agent: { id: "a10", title: null, cwd: "" } };
+      },
       prompt: async () => { calls.prompts.push("resume"); return "sent"; },
-      watchdogThread: async () => over.thread ?? null, threadQueued: async () => false,
+      watchdogThread: async () => { if (over.gateReadError === "thread") throw new Error("thread store unreadable"); return over.thread ?? null; },
+      threadQueued: async () => { if (over.gateReadError === "queue") throw new Error("queue store unreadable"); return over.threadQueued ?? false; },
+      parentProgress: async (issueId: string) => over.parents?.find((parent) => parent.issueId === issueId) ?? null,
+      parentProgresses: async () => over.parents ?? [],
       retireTurn: async (_issueId: string, work: () => Promise<number>) => work(),
     } as any,
     starter: {
-      admission: async () => admission.value,
-      start: async () => { calls.starts.push("verifier"); return { agentId: "v1" }; },
+      admission: async (...args: unknown[]) => { calls.admissions.push(args); return admission.value; },
+      start: async (issueId: string, paseo: Parameters<TicketStarter["start"]>[1], settings: Parameters<TicketStarter["start"]>[2], options: Parameters<TicketStarter["start"]>[3]) => {
+        calls.startOptions.push(options);
+        const result = over.start ? await over.start(issueId, paseo, settings, options) : { agentId: "v1" };
+        calls.starts.push("verifier");
+        return result;
+      },
     } as any,
     launcher: { gate: () => ({ release: () => {} }) } as any,
     handover: { all: async () => records } as any,
@@ -370,13 +434,14 @@ async function passFixture(t: any, over: {
       escalate: async (issueId: string) => { if (fail.escalate) throw new Error("Writeback is down."); calls.escalates.push(issueId); },
       clearWait: async (issueId: string) => { calls.clears.push(issueId); },
     } as any,
-    watchdog: { read: async () => null, handedOver: async () => new Map() } as any,
-    manualTasks: { openBlockers: async () => [] } as any,
-    needsYou: { all: async () => [] } as any,
+    watchdog: { read: async () => { if (over.gateReadError === "watchdog") throw new Error("watchdog store unreadable"); return over.watchdog ?? null; }, handedOver: async () => { if (over.gateReadError === "handed") throw new Error("owner wait handoff unreadable"); return new Map(); } },
+    manualTasks: { openBlockers: async () => [], tasksStrict: over.manualInventory ?? (async () => over.manualTasks ?? []) } as any,
+    needsYou: { all: async () => over.needsYou ?? [], allStrict: over.ownerInventory ?? (async () => over.needsYou ?? []) } as any,
     settings: { read: async () => stewardSettings(over.cap) } as any,
-    owner: async () => "here",
+    planned: { has: async () => { if (over.gateReadError === "planned") throw new Error("parked plan store unreadable"); return over.planned ?? false; } },
+    owner: async () => over.owner ?? "here",
     pulls: async () => over.pullStates ?? new Map(),
-    completionPulls: async (_issueId: string, _identifier: string, urls: string[]) => { calls.completionUrls.push(urls); return (over.completionPulls ?? "settled") as any; },
+    completionPulls: async (issueId: string, _identifier: string, urls: string[]) => { calls.completionUrls.push(urls); return typeof over.completionPulls === "function" ? over.completionPulls(issueId) : over.completionPulls ?? "settled"; },
     intake: { claimsReady: async () => true } as any,
     doneTickets: new DoneTickets(),
     labels: { all: async () => [], add: async () => {}, remove: async () => {} } as any,
@@ -890,21 +955,22 @@ test("a verdict that names no gate is refused, and so is an impossible calendar 
   assert.equal(calendarDate("2026-02-29"), false, "a non-leap 29 February is not");
 });
 
-test("a parent is never closed by the steward: it reaches a verifier like any other ticket", async (t) => {
-  const url = "https://github.com/o/r/pull/7";
+test("finished parents with open or stale closed group links get a verifier, never automatic completion", async (t) => {
   const children = [childIssue("ENG-1.1", "c1", "completed"), childIssue("ENG-1.2", "c2", "completed")];
-  // A group link owns the parent: sessions.ts stepGroup hands out the members and closes it.
-  const linked = await passFixture(t, { issues: [ticketIssue({ children })], records: [recordFor("i1", "ENG-1")], thread: { group: "g1" } });
-  await linked.seed("i1", "ENG-1", { situation: "moving" });
-  await linked.pass();
-  assert.deepEqual(linked.calls.completed, [], "a group-linked parent is not closed by the steward");
-  assert.deepEqual(linked.calls.starts, [], "and gets no verifier");
-  // Every other finished parent goes to the verifier, never straight to Done.
-  const plain = await passFixture(t, { issues: [ticketIssue({ children })], records: [recordFor("i1", "ENG-1", [url])], pullStates: merged(url) });
-  await plain.seed("i1", "ENG-1", { situation: "landed" });
-  await plain.pass();
-  assert.deepEqual(plain.calls.completed, [], "the finished parent is not completed directly");
-  assert.deepEqual(plain.calls.starts, ["verifier"], "it is verified first");
+  for (const closed of [false, true]) {
+    const linked = await passFixture(t, {
+      issues: [ticketIssue({ children })], records: [recordFor("i1", "ENG-1")],
+      thread: { group: { delegated: true }, closed },
+      parents: [parentProgress()],
+    });
+    await linked.seed("i1", "ENG-1", { situation: "landed" });
+    await linked.pass();
+    assert.deepEqual(linked.calls.completed, [], "the group never completes the parent itself");
+    assert.deepEqual(linked.calls.starts, ["verifier"], "the verifier is not suppressed by either UI-link state");
+    assert.deepEqual(linked.calls.admissions[0]?.[4], { control: true });
+    assert.equal(linked.calls.startOptions[0]?.labels?.["linear.coordination"], "parent-verification");
+    assert.deepEqual((await linked.ticket("i1"))?.verifier?.children, ["c1", "c2"], "the generation pins the membership across reloads");
+  }
   // A parent whose own agent is still alive keeps working.
   const live = await passFixture(t, {
     issues: [ticketIssue({ children })],
@@ -915,4 +981,479 @@ test("a parent is never closed by the steward: it reaches a verifier like any ot
   await live.pass();
   assert.deepEqual(live.calls.completed, [], "a live parent agent keeps the ticket moving");
   assert.deepEqual(live.calls.starts, []);
+});
+
+function parentProgress(over: Partial<ParentProgress> = {}): ParentProgress {
+  return {
+    issueId: "i1", identifier: "ENG-1", sessionId: "s1", phase: "verification",
+    updatedAt: at(1), nextAction: "Verify parent acceptance", blockers: [],
+    children: [], delegated: true, handedOut: [], ...over,
+  };
+}
+
+test("durable parent responsibility survives a missing link and labels, but unfinished children stay coordinated", async (t) => {
+  const issue = ticketIssue({ labels: [], delegateId: null, children: [childIssue("ENG-2", "c1", "completed")] });
+  const parents = [parentProgress()];
+  const f = await passFixture(t, { issues: [issue], parents });
+  await f.pass();
+  assert.equal((await f.ticket("i1"))?.situation, "landed", "durable inventory keeps an otherwise invisible parent in scope");
+  f.clock.now += 20 * 60_000;
+  await f.pass();
+  assert.deepEqual(f.calls.starts, ["verifier"]);
+  const unfinished = await passFixture(t, {
+    issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "started")] })],
+    parents: [parentProgress({ phase: "children" })],
+  });
+  await unfinished.seed("i1", "ENG-1", { situation: "moving" });
+  await unfinished.pass();
+  assert.deepEqual(unfinished.calls.starts, []);
+  assert.deepEqual(unfinished.calls.restarts, []);
+  assert.deepEqual(unfinished.calls.completed, []);
+});
+
+test("parent membership changes and reopened children invalidate a persisted verifier across reloads", async (t) => {
+  for (const change of ["added", "removed", "replaced", "reopened", "incomplete"] as const) {
+    const issue = ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] });
+    const f = await passFixture(t, {
+      issues: [issue], parents: [parentProgress()],
+      verdicts: async () => {
+        const generation = (await f.ticket("i1"))?.verifier;
+        return generation ? [verifierVerdict(f, { verifier: generation.marker })] : [];
+      },
+    });
+    await f.seed("i1", "ENG-1", { situation: "landed" });
+    await f.pass();
+    assert.deepEqual(f.calls.starts, ["verifier"]);
+    if (change === "added") issue.children.push(childIssue("ENG-3", "c2", "completed"));
+    if (change === "removed") issue.children = [];
+    if (change === "replaced") issue.children = [childIssue("ENG-3", "c2", "completed")];
+    if (change === "reopened") issue.children = [childIssue("ENG-2", "c1", "started")];
+    if (change === "incomplete") issue.childrenComplete = false;
+    f.clock.now += 2 * 60_000;
+    await f.pass();
+    assert.deepEqual(f.calls.completed, [], change);
+    assert.equal((await f.ticket("i1"))?.verifier, null, "stale verdict consumed without completion");
+  }
+});
+
+test("unchanged finished parent closes only after current child pull evidence is settled", async (t) => {
+  for (const childState of ["settled", "open", "unknown"] as const) {
+    const f = await passFixture(t, {
+      issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+      parents: [parentProgress()],
+      records: [recordFor("c1", "ENG-2", ["https://github.com/o/r/pull/8"])],
+      completionPulls: (issueId) => issueId === "c1" ? childState : "settled",
+      verdicts: async () => [verifierVerdict(f, {})],
+    });
+    await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { ...VERIFIER, children: ["c1"] } });
+    await f.pass();
+    assert.deepEqual(f.calls.completed, childState === "settled" ? ["i1"] : [], childState);
+    assert.deepEqual(f.calls.completionUrls.at(-1), ["https://github.com/o/r/pull/8"], "child evidence includes its recorded PRs");
+  }
+});
+
+test("all-canceled children reach verification rather than automatically completing or canceling the parent", async (t) => {
+  const f = await passFixture(t, {
+    issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "canceled"), childIssue("ENG-3", "c2", "duplicate")] })],
+    parents: [parentProgress()],
+  });
+  await f.seed("i1", "ENG-1", { situation: "landed" });
+  await f.pass();
+  assert.deepEqual(f.calls.starts, ["verifier"]);
+  assert.deepEqual(f.calls.completed, []);
+});
+
+test("parent close revalidates every manual-task timing and completion-check receipt", async (t) => {
+  for (const when of ["before_merge", "after_merge", "anytime"] as const) {
+    for (const state of ["open", "unchecked", "verified", "unknown"] as const) {
+      const task: ManualTask = {
+        id: "m1", identifier: "ENG-9", url: "", title: "Verify runtime", parentId: "c1",
+        parentIdentifier: "ENG-2", when, check: "read-only-check", cwd: "/tmp",
+        createdAt: at(10), announced: true, activated: true, verifiedAt: null,
+        verifiedFor: state === "verified" ? at(1) : null,
+      };
+      const f = await passFixture(t, {
+        issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+        parents: [parentProgress()], manualTasks: [task],
+        issueStatus: async () => state === "unknown" ? null : {
+          status: state === "open" ? "Todo" : "Done", statusType: state === "open" ? "unstarted" : "completed", completedAt: at(1),
+        },
+        verdicts: async () => [verifierVerdict(f, {})],
+      });
+      await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { ...VERIFIER, children: ["c1"] } });
+      await f.pass();
+      assert.deepEqual(f.calls.completed, state === "verified" ? ["i1"] : [], `${when}/${state}`);
+    }
+  }
+});
+
+test("an unresolved owner question outside group membership blocks a close until answered", async (t) => {
+  for (const statusType of ["started", "completed"]) {
+    const f = await passFixture(t, {
+      issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+      parents: [parentProgress()], needsYou: [{ id: "q1", identifier: "ENG-9", parentId: "i1" }],
+      issueStatus: async () => ({ status: statusType, statusType, completedAt: statusType === "completed" ? at(1) : null }),
+      verdicts: async () => [verifierVerdict(f, {})],
+    });
+    await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { ...VERIFIER, children: ["c1"] } });
+    await f.pass();
+    assert.deepEqual(f.calls.completed, statusType === "completed" ? ["i1"] : []);
+  }
+});
+
+test("paused or explicitly stopped parents reject an already-issued close verdict", async (t) => {
+  for (const phase of ["paused", "closed"] as const) {
+    const f = await passFixture(t, {
+      issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+      parents: [parentProgress({ phase })], verdicts: async () => [verifierVerdict(f, {})],
+    });
+    await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { ...VERIFIER, children: ["c1"] } });
+    await f.pass();
+    assert.deepEqual(f.calls.completed, []);
+    assert.equal((await f.ticket("i1"))?.verifier, null);
+  }
+});
+
+test("legacy parent verdicts without a child snapshot cannot close unverified membership", async (t) => {
+  const f = await passFixture(t, {
+    issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+    parents: [parentProgress()], verdicts: async () => [verifierVerdict(f, {})],
+  });
+  await f.seed("i1", "ENG-1", { situation: "verifying", verifier: VERIFIER });
+  await f.pass();
+  assert.deepEqual(f.calls.completed, []);
+  assert.equal((await f.ticket("i1"))?.verifier, null);
+});
+
+test("a group parent without any recorded worktree starts a real verifier in the mapped checkout", async (t) => {
+  const launches: Parameters<Launcher["start"]>[2][] = [];
+  const unused = async (): Promise<never> => { throw new Error("a verifier must not read implementation policy"); };
+  const starter = new TicketStarter({
+    linear: {
+      detail: async () => detailSchema.parse({
+        issue: {
+          id: "i1", identifier: "ENG-1", title: "Parent", url: "", status: "In Progress",
+          priority: "", project: "", description: "", team: "ENG", labels: [], updatedAt: at(1),
+        },
+        teamId: "t1", context: "", warnings: [],
+      }),
+      issueState: unused, issueCore: unused, viewerId: unused, trustedAppIds: unused, issueDocument: unused,
+    },
+    handover: { resumeTarget: async () => null },
+    launcher: {
+      start: async (_input, _paseo, options) => {
+        launches.push(options);
+        return { agentId: "checkout-verifier", warnings: [] };
+      },
+    },
+  });
+  const f = await passFixture(t, {
+    issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+    parents: [parentProgress()],
+    start: (issueId, paseo, settings, options) => starter.start(issueId, paseo, {
+      ...settings, lastProvider: "omp", launchPreferences: { omp: { model: "omp/opus", modeId: "full" } },
+      projectMappings: { "team:t1": { projectId: "p1", label: "Repo", baseBranch: "refs/heads/main" } },
+      cheapModels: {},
+    }, options),
+  });
+  f.paseo.projects = { list: async () => ({ projects: [{ projectId: "p1", projectKind: "git", projectRootPath: "/repo", projectDisplayName: "Repo" }] }) };
+  await f.seed("i1", "ENG-1", { situation: "landed" });
+  await f.pass();
+  assert.deepEqual(f.calls.starts, ["verifier"], "no prior parent agent or branch is required");
+  assert.equal((await f.ticket("i1"))?.verifier?.agentId, "checkout-verifier");
+  assert.equal(launches[0]?.readOnlyCheckout, true, "uses existing checkout rather than creating implementation work");
+  assert.equal(launches[0]?.verifier, (await f.ticket("i1"))?.verifier?.marker);
+  assert.equal(launches[0]?.labels?.["linear.coordination"], "parent-verification");
+  f.clock.now += 2 * 60_000;
+  await f.pass();
+  assert.deepEqual(f.calls.starts, ["verifier"], "a later pass preserves the one pending verifier rather than launching another");
+  assert.equal((await f.ticket("i1"))?.verifier?.agentId, "checkout-verifier");
+});
+
+test("close selects the requested parent's fresh facts even when the inventory returns another ticket first", async (t) => {
+  const f = await passFixture(t, {
+    issues: [
+      ticketIssue({ id: "other", identifier: "ENG-9", status: "Done", statusType: "completed" }),
+      ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] }),
+    ],
+    parents: [parentProgress()], verdicts: async () => [verifierVerdict(f, {})],
+  });
+  await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { ...VERIFIER, children: ["c1"] } });
+  await f.pass();
+  assert.deepEqual(f.calls.completed, ["i1"]);
+});
+
+test("fresh unassignment rejects completion before the lifecycle sweep observes it", async (t) => {
+  const f = await passFixture(t, {
+    issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")], delegateId: null })],
+    parents: [parentProgress()], verdicts: async () => [verifierVerdict(f, {})],
+  });
+  await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { ...VERIFIER, children: ["c1"] } });
+  await f.pass();
+  assert.deepEqual(f.calls.completed, []);
+  assert.equal((await f.ticket("i1"))?.verifier, null);
+});
+
+test("parent verification uses complete group membership beyond the steward inventory's first page", async (t) => {
+  for (const reopenLastChild of [false, true]) {
+    const children: IssueGroup["children"] = Array.from({ length: 101 }, (_, index) => ({
+      id: `c${index}`, identifier: `ENG-${index + 2}`, status: "Done", statusType: "completed",
+      delegateId: null, assigneeId: null, finished: true, labels: [], blockers: [],
+    }));
+    const group: IssueGroup = { id: "i1", identifier: "ENG-1", status: "In Progress", statusType: "started", delegateId: "app1", finished: false, children };
+    const f = await passFixture(t, {
+      issues: [ticketIssue({ children: children.slice(0, 50), childrenComplete: false })],
+      parents: [parentProgress({ children: children.map((child) => ({ issueId: child.id, identifier: child.identifier, status: child.status, finished: true })) })],
+      issueGroup: async () => group,
+      verdicts: async () => {
+        const generation = (await f.ticket("i1"))?.verifier;
+        return generation ? [verifierVerdict(f, { verifier: generation.marker })] : [];
+      },
+    });
+    await f.seed("i1", "ENG-1", { situation: "landed" });
+    await f.pass();
+    assert.deepEqual(f.calls.starts, ["verifier"], "a large parent is not stuck behind a first-page count");
+    assert.deepEqual((await f.ticket("i1"))?.verifier?.children, children.map((child) => child.id).sort(), "generation pins every child, not just the first page");
+    if (reopenLastChild) children[100] = { ...children[100], status: "In Progress", statusType: "started", finished: false };
+    f.clock.now += 2 * 60_000;
+    await f.pass();
+    assert.deepEqual(f.calls.completed, reopenLastChild ? [] : ["i1"], "a reopened child beyond the first page vetoes close");
+  }
+});
+
+test("unreadable complete group evidence defers launch and invalidates a close verdict", async (t) => {
+  const f = await passFixture(t, {
+    issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+    parents: [parentProgress()], issueGroup: async () => { throw new Error("child label continuation failed"); },
+    verdicts: async () => [verifierVerdict(f, {})],
+  });
+  await f.seed("i1", "ENG-1", { situation: "landed" });
+  await f.pass();
+  assert.deepEqual(f.calls.starts, []);
+  assert.equal((await f.ticket("i1"))?.queued?.action, "verify");
+  await f.seed("i1", "ENG-1", { situation: "verifying", claim: null, verifier: { ...VERIFIER, children: ["c1"] } });
+  f.clock.now += 2 * 60_000;
+  await f.pass();
+  assert.deepEqual(f.calls.completed, []);
+  assert.equal((await f.ticket("i1"))?.verifier, null);
+});
+
+test("closed group UI waits cannot suppress a durable parent's verification", async (t) => {
+  for (const uiWait of [
+    { remote: "peer-host" },
+    { review: { url: "https://review.invalid" } },
+    { offer: "parked" },
+    { offer: "later" },
+    { offer: "split" },
+    { queued: true },
+    { remote: "peer-host", review: { url: "https://review.invalid" }, offer: "parked", queued: true },
+  ]) {
+    const f = await passFixture(t, {
+      issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+      parents: [parentProgress()],
+      thread: { group: { delegated: true }, closed: true, ...uiWait },
+    });
+    await f.seed("i1", "ENG-1", { situation: "landed" });
+    await f.pass();
+    assert.deepEqual(f.calls.starts, ["verifier"], JSON.stringify(uiWait));
+    assert.deepEqual(f.calls.completed, []);
+    assert.equal((await f.ticket("i1"))?.verifier?.agentId, "v1");
+  }
+});
+
+test("live group UI waits and persisted owner gates still prevent parent verification", async (t) => {
+  for (const gate of [
+    { thread: { review: { url: "https://review.invalid" }, closed: false }, situation: "waiting-owner" },
+    { thread: { offer: "parked", closed: false }, situation: "waiting-owner" },
+    { thread: { remote: "peer-host", closed: false }, situation: "queued" },
+    { thread: { queued: true, closed: false }, situation: "queued" },
+    { thread: { review: { url: "https://review.invalid" }, closed: true }, planned: true, situation: "waiting-owner" },
+    { thread: { queued: true, closed: true }, threadQueued: true, situation: "queued" },
+  ]) {
+    const f = await passFixture(t, {
+      issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+      parents: [parentProgress()], ...gate,
+    });
+    await f.seed("i1", "ENG-1", { situation: "landed" });
+    await f.pass();
+    assert.deepEqual(f.calls.starts, [], JSON.stringify(gate));
+    assert.deepEqual(f.calls.completed, []);
+    assert.equal((await f.ticket("i1"))?.situation, gate.situation);
+  }
+});
+
+test("a closed UI link does not clear watchdog Stop, durable parent Stop or current host ownership", async (t) => {
+  for (const gate of ["watchdog", "parent", "elsewhere", "unknown"] as const) {
+    const f = await passFixture(t, {
+      issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+      parents: [parentProgress({ phase: gate === "parent" ? "closed" : "verification" })],
+      thread: { group: { delegated: true }, closed: true, remote: "old-peer", queued: true },
+      watchdog: gate === "watchdog" ? { version: 1, tickets: {}, holds: { i1: { agentId: null, at: at(1) } } } : undefined,
+      owner: gate === "elsewhere" || gate === "unknown" ? gate : "here",
+    });
+    await f.seed("i1", "ENG-1", { situation: "landed" });
+    await f.pass();
+    assert.deepEqual(f.calls.starts, [], gate);
+    assert.deepEqual(f.calls.completed, []);
+    assert.deepEqual(f.calls.escalates, []);
+    if (gate === "watchdog" || gate === "parent") assert.equal((await f.ticket("i1"))?.situation, "waiting-owner");
+  }
+});
+
+test("a parent close rechecks authoritative owner gates that appear after verifier launch", async (t) => {
+  for (const gate of ["watchdog", "planned", "review", "questions", "offer", "queued", "turn", "remote", "stale-closed"] as const) {
+    const input: NonNullable<Parameters<typeof passFixture>[1]> = {
+      issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+      parents: [parentProgress()],
+    };
+    const f = await passFixture(t, input);
+    await f.seed("i1", "ENG-1", { situation: "landed" });
+    await f.pass();
+    const generation = (await f.ticket("i1"))!.verifier!;
+    assert.deepEqual(f.calls.starts, ["verifier"]);
+    input.verdicts = async () => [verifierVerdict(f, { verifier: generation.marker })];
+    if (gate === "watchdog") input.watchdog = { version: 1, tickets: {}, holds: { i1: { agentId: null, at: new Date(f.clock.now).toISOString() } } };
+    if (gate === "planned") input.planned = true;
+    if (gate === "review") input.thread = { closed: false, review: { url: "https://review.invalid" } };
+    if (gate === "questions") input.thread = { closed: false, questions: [{ question: "Which scope?" }] };
+    if (gate === "offer") input.thread = { closed: false, offer: "parked" };
+    if (gate === "queued") input.thread = { closed: false, queued: true };
+    if (gate === "turn") input.threadQueued = true;
+    if (gate === "remote") input.thread = { closed: false, remote: "peer" };
+    if (gate === "stale-closed") input.thread = { closed: true, queued: true, review: {}, questions: [{ question: "Old scope?" }], offer: "parked", remote: "old-peer" };
+    f.clock.now += 2 * 60_000;
+    await f.pass();
+    assert.deepEqual(f.calls.completed, gate === "stale-closed" ? ["i1"] : [], gate);
+  }
+});
+
+test("unreadable authoritative gate evidence never authorizes parent completion", async (t) => {
+  for (const gate of ["watchdog", "planned", "thread", "queue"] as const) {
+    const input: NonNullable<Parameters<typeof passFixture>[1]> = {
+      issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+      parents: [parentProgress()],
+    };
+    const f = await passFixture(t, input);
+    await f.seed("i1", "ENG-1", { situation: "landed" });
+    await f.pass();
+    const generation = (await f.ticket("i1"))!.verifier!;
+    input.verdicts = async () => [verifierVerdict(f, { verifier: generation.marker })];
+    input.gateReadError = gate;
+    f.clock.now += 2 * 60_000;
+    await f.pass();
+    assert.deepEqual(f.calls.completed, [], gate);
+    assert.equal((await f.ticket("i1"))?.verifier?.marker, generation.marker, "unreadable authority keeps the verdict pending");
+  }
+});
+
+test("a parent resume retains its instruction and recovery budget through capacity denial, then dispatches once", async (t) => {
+  let admitted = false;
+  const dispatched: string[] = [];
+  const roots = new Map<string, any>();
+  const f = await passFixture(t, {
+    issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+    parents: [parentProgress()], roots,
+    verdicts: async () => [verifierVerdict(f, { verdict: "resume", instruction: "Implement the missing acceptance criterion and verify production." })],
+    parentResume: async (_id, _identifier, predecessor, instruction, onDispatch) => {
+      assert.equal(predecessor, null, "this parent never had an implementation handover");
+      if (!admitted) return { kind: "wait", reason: "All worker slots are occupied." };
+      await onDispatch?.();
+      assert.equal((await f.ticket("i1"))?.restarts.length, 1, "the admitted attempt is durable before dispatch");
+      dispatched.push(instruction);
+      roots.set("i1", { roots: [{ id: "implementation", status: "running", createdAt: at(1), updatedAt: at(1) }], ghosts: new Set() });
+      return { kind: "started", agent: { id: "implementation", title: null, cwd: "/repo" } };
+    },
+  });
+  await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { ...VERIFIER, children: ["c1"] } });
+  for (let attempt = 0; attempt < RESTART_CAP + 1; attempt++) {
+    await f.pass();
+    const ticket = await f.ticket("i1");
+    assert.deepEqual(ticket?.restarts, [], "admission denial spends no recovery attempt");
+    assert.deepEqual(ticket?.refusals, [], "a capacity wait is not a failure");
+    assert.equal(ticket?.verifier?.marker, VERIFIER.marker, "the instruction's generation remains pending across reconstructed stewards");
+    f.clock.now += 11 * 60_000;
+  }
+  assert.deepEqual(dispatched, []);
+  assert.deepEqual(f.calls.escalates, []);
+  admitted = true;
+  await f.pass();
+  assert.deepEqual(dispatched, ["Implement the missing acceptance criterion and verify production."]);
+  assert.equal((await f.ticket("i1"))?.verifier, null);
+  assert.equal((await f.ticket("i1"))?.restarts.length, 1);
+  f.clock.now += 11 * 60_000;
+  await f.pass();
+  assert.deepEqual(dispatched, ["Implement the missing acceptance criterion and verify production."], "a consumed verdict cannot launch again");
+  assert.deepEqual(f.calls.successions, [], "no strict branch-only fallback");
+});
+
+test("an admitted parent continuation failure still spends its recovery attempt", async (t) => {
+  const f = await passFixture(t, {
+    issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+    parents: [parentProgress()],
+    verdicts: async () => [verifierVerdict(f, { verdict: "resume", instruction: "Complete the missing work." })],
+    parentResume: async (_id, _identifier, _predecessor, _instruction, onDispatch) => {
+      await onDispatch?.();
+      throw new Error("Implementation launch failed after admission");
+    },
+  });
+  await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { ...VERIFIER, children: ["c1"] } });
+  await f.pass();
+  assert.equal((await f.ticket("i1"))?.restarts.length, 1);
+  assert.equal((await f.ticket("i1"))?.refusals.length, 1);
+  assert.equal((await f.ticket("i1"))?.verifier?.marker, VERIFIER.marker, "the failed dispatch does not consume its instruction");
+});
+
+test("unreadable registered owner inventories prevent both close and parent continuation", async (t) => {
+  for (const source of ["manual", "owner"] as const) {
+    const directory = await mkdtemp(join(tmpdir(), "paseo-parent-authority-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const path = join(directory, "inventory");
+    await writeFile(path, "not a directory");
+    const manual = new ManualTasks({} as any, path);
+    const questions = new NeedsYouIssues(path);
+    const f = await passFixture(t, {
+      issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+      parents: [parentProgress()],
+      manualInventory: source === "manual" ? () => manual.tasksStrict() : undefined,
+      ownerInventory: source === "owner" ? () => questions.allStrict() : undefined,
+      verdicts: async () => [verifierVerdict(f, {})],
+    });
+    await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { ...VERIFIER, children: ["c1"] } });
+    await f.pass();
+    assert.deepEqual(f.calls.completed, [], source);
+    assert.equal((await f.ticket("i1"))?.verifier?.marker, VERIFIER.marker, "unreadable authority leaves completion pending");
+    await assert.rejects(f.build().parentResumeWait("i1"), { code: "ENOTDIR" });
+  }
+});
+
+test("parent continuation authority checks current owner tasks without requiring close acceptance", async (t) => {
+  const overrides: Parameters<typeof passFixture>[1] = {
+    issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "started")] })],
+    parents: [parentProgress({ phase: "children" })],
+    needsYou: [],
+    thread: { closed: true, remote: true, queued: true, review: { url: "old" }, offer: "parked" },
+  };
+  const f = await passFixture(t, overrides);
+  assert.equal(await f.build().parentResumeWait("i1"), null, "open implementation work and stale closed UI gates do not prevent continuation");
+  assert.deepEqual(f.calls.completionUrls, [], "implementation admission is not a close verdict");
+  overrides.needsYou = [{ id: "question", identifier: "ENG-9", parentId: "c1" }];
+  assert.match((await f.build().parentResumeWait("i1")) ?? "", /owner question ENG-9/);
+  overrides.needsYou = [];
+  overrides.planned = true;
+  assert.match((await f.build().parentResumeWait("i1")) ?? "", /persisted parked plan/);
+});
+
+test("unreadable watchdog handoff evidence cannot clear a parent's recorded owner wait", async (t) => {
+  const f = await passFixture(t, {
+    issues: [ticketIssue({ children: [childIssue("ENG-2", "c1", "completed")] })],
+    parents: [parentProgress()],
+    records: [{ ...recordFor("i1", "ENG-1"), waiting: { kind: "turn-end", at: at(120) } }],
+    gateReadError: "handed",
+    verdicts: async () => [verifierVerdict(f, {})],
+  });
+  await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { ...VERIFIER, children: ["c1"] } });
+  await f.pass();
+  assert.deepEqual(f.calls.completed, []);
+  assert.equal((await f.ticket("i1"))?.verifier?.marker, VERIFIER.marker);
+  await assert.rejects(f.build().parentResumeWait("i1"), /owner wait handoff unreadable/);
 });

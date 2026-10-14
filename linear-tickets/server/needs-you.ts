@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { z } from "zod";
 import type { LinearService } from "./linear";
 import { paseoHome } from "./ticket-mcp";
 
@@ -10,6 +11,11 @@ import { paseoHome } from "./ticket-mcp";
 // starting with "@paseo" reach `agentId`.
 export type NeedsYouIssue = { id: string; identifier: string; parentId: string; agentId: string };
 
+const needsYouIssueSchema = z.object({
+  id: z.string().min(1), identifier: z.string().min(1),
+  parentId: z.string().min(1), agentId: z.string().min(1),
+});
+
 // One private file per open sub-issue, so the comment relay can route replies after a restart.
 export class NeedsYouIssues {
   constructor(private readonly directory = join(paseoHome(), "linear-tickets", "needs-you")) {}
@@ -18,6 +24,20 @@ export class NeedsYouIssues {
     const names = await readdir(this.directory).catch(() => [] as string[]);
     const entries = await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readFile(join(this.directory, name), "utf8").then((text) => JSON.parse(text) as NeedsYouIssue, () => null)));
     return entries.filter((entry): entry is NeedsYouIssue => Boolean(entry?.id && entry.parentId && entry.agentId));
+  }
+
+  // Completion authority; unlike the tolerant relay reader, unreadable registered questions
+  // cannot disappear from the inventory. Only an absent directory is evidence of no questions.
+  async allStrict(): Promise<NeedsYouIssue[]> {
+    const names = await readdir(this.directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [] as string[];
+      throw error;
+    });
+    return Promise.all(names.filter((name) => name.endsWith(".json")).map(async (name) => {
+      const entry = needsYouIssueSchema.parse(JSON.parse(await readFile(join(this.directory, name), "utf8")));
+      if (`${entry.id}.json` !== name) throw new Error(`Needs-you record identity does not match ${name}`);
+      return entry;
+    }));
   }
 
   async add(entry: NeedsYouIssue): Promise<void> {
