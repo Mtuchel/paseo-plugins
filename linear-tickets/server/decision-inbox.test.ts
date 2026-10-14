@@ -407,6 +407,22 @@ test("owner reads share their collection while live questions stay fresh and exp
   assert.equal(h.ownerReads(), 2);
 });
 
+test("background curation publishes complete owner sources after the interactive deadline", async (t) => {
+  const h = await harness(t);
+  const entered = barrier(), release = barrier();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  h.onOwnerRead(async () => { entered.release(); await release.promise; });
+  const collecting = h.inbox.view();
+  await entered.promise;
+  t.mock.timers.tick(6_000);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  release.release();
+  const view = await collecting;
+  assert.deepEqual(view.hosts[0].asks.map(ask => ask.revision), [ownerAsk.revision]);
+  assert.equal(view.hosts[0].error, null);
+  assert.equal(view.tasks?.some(task => task.target === "owner" && task.revision === ownerAsk.revision), true);
+});
+
 test("answering a live request revalidates owner sources instead of hiding every ask on its ticket", async t => {
   const twin: OwnerAsk = { ...ownerAsk, mirrorsLiveRequest: true };
   const other: OwnerAsk = { ...ownerAsk, revision: "independent-policy-r2", title: "Independent policy question" };

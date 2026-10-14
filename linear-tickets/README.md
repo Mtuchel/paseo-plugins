@@ -4288,6 +4288,9 @@ mode. An unavailable canonical host is reported, never silently replaced by anot
 The generated ask summary is the existing extraction, not a separate issue-impact or Haiku briefing.
 
 The curated task list collects immediately and every fifteen minutes even with no browser open.
+Background canonical collection awaits the full owner scan before publishing; it does not use the
+five-second interactive read deadline. Local and peer HTTP reads remain bounded while that scan
+runs, and the frontdoor can retain an explicitly stale snapshot until the new collection arrives.
 It groups owner decisions, unresolved source review, research/delegated waits and receipts.
 Source counts are separate from steward ticket-state counts: `waiting-owner` is not a count of
 actionable questions. Per-host collection timestamps and incomplete/stale coverage stay visible.
