@@ -1378,6 +1378,12 @@ slots used (…)`. The lease lives in the plugin's memory only: when it runs out
 `lease: null`, or the daemon restarts, *max agents* applies again. It only gates new starts and
 never stops or touches agents already working.
 
+Capacity observation never waits behind a slow full agent listing when a previous snapshot
+exists. Responses include `observedAt`, `stale`, and `observationError`; refresh runs in the
+background. Without a first observation the request fails after one second rather than inventing
+zero running agents. Actual admission still requires a fresh listing. Updating a RAM lease does
+not depend on that listing succeeding.
+
 **Focus mode.** Focus mode finishes the work that is under way before anything new starts, so
 that at the end every pull request of that work can be merged. Turn it on with the Focus button
 of the Paseo Agents menu bar app (the `linear.set-focus` RPC). The host that hands out tickets
@@ -2896,6 +2902,21 @@ fall out of, and a ticket that falls out of all of them sits still while nothing
 **ticket steward** (`server/steward.ts`) is the level-triggered reconciler that closes that gap:
 every pass it recomputes, from fresh facts, what each in-scope open ticket of the dispatch teams is,
 and repairs a ticket that is in none of the five states below with exactly one action.
+
+**Acknowledged continuations.** Recovery messages use a stable operation ID stored under
+`linear-tickets/continuations/`. A busy worker leaves the operation `queued`; an independent
+one-minute drain retries it after fresh owner, ticket, worker-generation, process, and PR-veto
+checks. `sent` means the transport acknowledged the message, not that useful work finished.
+`started` requires a matching native user-message marker followed by assistant/tool progress on
+the current transcript branch. Before sending, the operation is durably marked `unknown`;
+after a crash or ambiguous transport failure that operation is reconciled, never blindly resent.
+A proven “Agent is already processing” refusal returns to `queued`. Owner Stop, terminal
+tickets, and a superseding worker cancel the old operation. Permission and review waits remain
+untouched. Reusing an operation ID with a different worker, ticket, or message is rejected.
+
+The watchdog also exposes a separate pass that does not acquire the PR poll's lock. Recovery
+diagnostic helpers use the control admission lane and never count as ticket implementation roots.
+A verifier launch that fails ambiguously is not retried in a second checkout.
 
 **The five states.** Every in-scope open ticket is always in exactly one of them:
 

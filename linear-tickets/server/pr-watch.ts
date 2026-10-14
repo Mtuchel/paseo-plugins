@@ -1456,6 +1456,31 @@ export class PullRequestWatch {
     return this.running;
   }
 
+  // Independent recovery clock: never queue behind slow PR/CI reconciliation.
+  async watchdogPass(): Promise<void> {
+    if (!this.deps.watchdog) return;
+    const all = await this.deps.handover.all();
+    const mine = await this.ownedRecords(all);
+    const context = this.context(this.perPullRequest(mine, new Set()), undefined, all);
+    await this.deps.watchdog.pass({ records: mine, reserved: new Set(), pulls: (ticket) => this.ticketPulls(ticket, context) });
+  }
+
+  async recoveryWait(issueId: string, identifier: string, urls: string[] = []): Promise<string | null> {
+    try {
+      const all = await this.deps.handover.all();
+      const record = all.find((item) => item.issueId === issueId);
+      const context = this.context(all);
+      const pulls = await this.ticketPulls({ issueId, identifier: record?.identifier ?? identifier, worktree: record?.worktreePath ?? null, link: record?.links["Pull request"] ?? urls[0] ?? null }, context);
+      if (!pulls) return "the ticket's pull requests cannot be read";
+      if (pulls.some((pull) => pull.labels.some((label) => label.toLowerCase() === DO_NOT_MERGE_LABEL))) return "a ticket pull request carries do-not-merge";
+      for (const url of new Set([...urls, ...(record ? ownedPullRequests(record) : [])])) {
+        const view = await this.view(url);
+        if (view.labels.some((label) => label.toLowerCase() === DO_NOT_MERGE_LABEL)) return "a recorded pull request carries do-not-merge";
+      }
+      return null;
+    } catch { return "the ticket's pull request veto could not be checked"; }
+  }
+
   // One queue backstop run at a time (see queueBackstop); a tick while one runs joins it.
   backstop(): Promise<void> {
     this.backstopping ??= this.exclusive(() => withPriority("background", "queue backstop", () => githubUsage.run("queue backstop", () => this.queueBackstop()))).finally(() => { this.backstopping = null; });

@@ -180,6 +180,7 @@ export default function contribute(server: PluginServerContext) {
     limitResumes: new LimitResumeStore(), usage,
     owner: (issueId) => ticketOwner(issueId),
     parentResumeWait: (issueId) => steward ? steward.parentResumeWait(issueId) : Promise.resolve("Parent verification authority is unavailable"),
+    recoveryWait: (issueId) => pullRequests.recoveryWait(issueId, issueId),
     decideReview,
     decidePlan: (link, mode): Promise<string | null> => plannotator.decidePanel(link, mode),
     reviewOutcome: (review) => reviewOutcome(review),
@@ -595,7 +596,7 @@ export default function contribute(server: PluginServerContext) {
   // Memory lease (README, "Memory lease"): the menu bar app's RAM cap on new starts.
   const capacityState = async (paseo: PaseoApi): Promise<CapacityState> => {
     const { maxRunning } = (await settings.read()).dispatch;
-    return { maxRunning, ...starter.capacity.limit(maxRunning), ...await starter.scheduler.counts(paseo) };
+    return { maxRunning, ...starter.capacity.limit(maxRunning), ...await starter.scheduler.observedCounts(paseo) };
   };
   server.handle(capacityRpc, (_input, { paseo }) => capacityState(paseo));
   server.handle(setCapacityRpc, ({ lease }, { paseo }) => {

@@ -107,6 +107,7 @@ export class Scheduler {
   private readonly projects = new Map<string, string | null>();
   private runningCache: { at: number; agents: RunningTicket[] } | null = null;
   private refreshing: Promise<void> | null = null;
+  private observationError: string | null = null;
 
   constructor(private readonly deps: Deps) {}
 
@@ -201,6 +202,34 @@ export class Scheduler {
     return { running: this.runningCache!.agents.length, reserved: this.reserved.size, waiting: this.waiting.size };
   }
 
+  // Control-plane reads must not wait behind the daemon's full agent/process listing.
+  // Admissions still use refresh() and never use an old observation to authorize a start.
+  async observedCounts(paseo: PaseoApi): Promise<{ running: number; reserved: number; waiting: number; observedAt: string; stale: boolean; observationError: string | null }> {
+    const refresh = this.refresh(paseo).catch((error: unknown) => {
+      this.observationError = error instanceof Error ? error.message : String(error);
+      throw error;
+    });
+    // Keep rejection handled even when a cached observation lets this request return immediately.
+    void refresh.catch(() => {});
+    if (!this.runningCache) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([refresh, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Agent counts are not observed yet; refresh continues in the background.")), 1_000);
+        })]);
+      } finally { clearTimeout(timer); }
+    }
+    const observed = this.runningCache;
+    if (!observed) throw new Error("Agent counts are unavailable.");
+    const now = (this.deps.now ?? Date.now)();
+    this.prune(now);
+    return {
+      running: observed.agents.length, reserved: this.reserved.size, waiting: this.waiting.size,
+      observedAt: new Date(observed.at).toISOString(), stale: now - observed.at > RUNNING_CACHE_MS,
+      observationError: this.observationError,
+    };
+  }
+
   // Tickets asked for within the last WAITING_MS and not admitted: the wait line as it stands.
   waitingIds(): string[] {
     const now = (this.deps.now ?? Date.now)();
@@ -226,15 +255,16 @@ export class Scheduler {
           at: (this.deps.now ?? Date.now)(),
           agents: agents.map((agent) => typeof agent === "string" ? { issueId: agent } : agent),
         };
+        this.observationError = null;
       }).finally(() => { this.refreshing = null; });
     }
     await this.refreshing;
   }
 
   private prune(now: number): void {
-    const running = new Set(this.runningCache?.agents.map((agent) => agent.issueId));
-    for (const [issueId, reservation] of this.reserved) if (reservation.until < now || running.has(issueId)) this.reserved.delete(issueId);
-    for (const [issueId, waiting] of this.waiting) if (now - waiting.seenAt > WAITING_MS || running.has(issueId) || this.reserved.has(issueId)) this.waiting.delete(issueId);
+    const running = new Set(this.runningCache?.agents.map((agent) => `${agent.control ? "control" : "worker"}:${agent.issueId}`));
+    for (const [issueId, reservation] of this.reserved) if (reservation.until < now || running.has(`${reservation.control ? "control" : "worker"}:${issueId}`)) this.reserved.delete(issueId);
+    for (const [issueId, waiting] of this.waiting) if (now - waiting.seenAt > WAITING_MS || running.has(`${waiting.control ? "control" : "worker"}:${issueId}`) || this.reserved.has(issueId)) this.waiting.delete(issueId);
   }
 
   private reserve(candidate: Candidate, now: number): Admission {

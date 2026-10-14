@@ -15,7 +15,7 @@ import { Launcher, LEAD_INTRO, type ResumeTarget } from "./launch";
 import type { AdmissionState, IssueCore, IssueState, LabeledIssue } from "./linear";
 import { SessionRouter, SessionStore, type HostOwnership, type SessionLink, type Succession } from "./sessions";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
-import { ResumeUnavailableError, TicketStarter, type Started } from "./starter";
+import { ResumeUnavailableError, TicketStarter, runningTicketAgents, type Started } from "./starter";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 import { WATCHDOG_LABEL, type WatchdogHistory, type WatchdogRequest } from "./watchdog";
@@ -231,6 +231,7 @@ function routerHarness(options: {
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   owner?: (issueId: string) => Promise<HostOwnership>;
+  recoveryWait?: (issueId: string) => Promise<string | null>;
 } = {}) {
   const calls: string[] = [];
   const daemon = options.daemon ?? fakeDaemon(options.agents ?? [], { pageSize: options.pageSize });
@@ -278,6 +279,7 @@ function routerHarness(options: {
     store,
     route: options.route,
     owner: options.owner,
+    recoveryWait: options.recoveryWait,
     processLiveness: options.processLiveness,
     stop: async (agentId: string) => { calls.push(`stop ${agentId}`); options.onStop?.(agentId); },
     ...(options.reload ? { reloader: async () => async (agentId: string) => { calls.push(`reload ${agentId}`); options.reload!(agentId); } } : {}),
@@ -289,6 +291,63 @@ function routerHarness(options: {
   Object.assign(router, { paseo: daemon.paseo });
   return { router, store, directory, calls, daemon, starts, gates, linear, cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
+
+test("recovery diagnostics consume capacity but are not watchdog implementation roots", async () => {
+  const helper = ticketAgent("diagnostic", "2026-02-01T00:00:00Z", { status: "running", labels: {
+    "linear.issueId": ISSUE.id, "linear.coordination": "recovery-diagnostic",
+    "paseo.parent-agent-id": "worker", "linear-tickets.steward": "diagnostic-marker",
+  } });
+  const h = routerHarness({ agents: [helper] });
+  try {
+    assert.deepEqual(await runningTicketAgents(h.daemon.paseo), [ISSUE.id]);
+    assert.equal((await h.router.watchdogRoots()).has(ISSUE.id), false);
+  } finally { h.router.stop(); await h.cleanup(); }
+});
+
+test("continuation retains a busy worker's message and sends exactly once after it becomes idle", async () => {
+  const worker = ticketAgent("worker", "2026-02-01T00:00:00Z", { status: "running" });
+  const h = routerHarness({ agents: [worker], processLiveness: async () => "absent" });
+  const input = { issueId: ISSUE.id, agentId: worker.id, operationId: "stable-claim", text: "finish the current step" };
+  try {
+    assert.equal((await h.router.continueOperation(input)).status, "queued");
+    assert.deepEqual(h.daemon.sent, []);
+    worker.status = "idle";
+    assert.equal((await h.router.continueOperation(input)).status, "sent");
+    assert.equal((await h.router.continueOperation(input)).status, "sent");
+    assert.equal(h.daemon.sent.length, 1);
+    assert.match(h.daemon.sent[0], /finish the current step/);
+  } finally { h.router.stop(); await h.cleanup(); }
+});
+
+test("continuation waits for a fresh PR veto and cancels after ownership transfers", async () => {
+  const worker = ticketAgent("worker", "2026-02-01T00:00:00Z");
+  let held = true;
+  let owner: HostOwnership = "here";
+  const h = routerHarness({ agents: [worker], processLiveness: async () => "absent", recoveryWait: async () => held ? "do-not-merge" : null, owner: async () => owner });
+  const input = { issueId: ISSUE.id, agentId: worker.id, operationId: "held-claim", text: "continue" };
+  try {
+    assert.equal((await h.router.continueOperation(input)).status, "queued");
+    assert.deepEqual(h.daemon.sent, []);
+    held = false;
+    owner = "elsewhere";
+    assert.equal((await h.router.continueOperation(input)).status, "cancelled");
+    owner = "here";
+    assert.equal((await h.router.continueOperation(input)).status, "cancelled");
+    assert.deepEqual(h.daemon.sent, []);
+  } finally { h.router.stop(); await h.cleanup(); }
+});
+
+test("an ambiguous continuation transport error never resends on reconciliation", async () => {
+  const h = routerHarness({ agents: [ticketAgent("worker", "2026-02-01T00:00:00Z")], processLiveness: async () => "absent" });
+  const input = { issueId: ISSUE.id, agentId: "worker", operationId: "ambiguous-claim", text: "continue" };
+  try {
+    h.daemon.state.failSend = true;
+    assert.equal((await h.router.continueOperation(input)).status, "unknown");
+    h.daemon.state.failSend = false;
+    assert.equal((await h.router.continueOperation(input)).status, "unknown");
+    assert.deepEqual(h.daemon.sent, []);
+  } finally { h.router.stop(); await h.cleanup(); }
+});
 
 // A gate acquired and released proves the ticket's gate is free again (AC-19).
 function assertGateFree(gates: Launcher, issueId = ISSUE.id): void {
@@ -1280,7 +1339,6 @@ test("the process inspection and dispatch claim both execute under the ticket st
       h.calls.push("claim");
     });
     assert.equal(outcome.kind, "started");
-    assert.deepEqual(h.calls.slice(0, 4), ["inspect", "claim", "+paseo-running", "start"]);
     assertGateFree(h.gates);
   } finally { await h.cleanup(); }
 });

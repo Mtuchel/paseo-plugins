@@ -244,3 +244,42 @@ test("visible control reservations reconcile once and expired controls restore t
   assert.equal((await instance.admit(ticket("W-4"), paseo, max(2))).ok, false);
   assert.equal((await instance.admit(parent, paseo, max(2))).ok, true);
 });
+
+test("capacity observation returns stale counts while admission waits for a fresh snapshot", async () => {
+  let now = 0;
+  let finish!: (agents: string[]) => void;
+  let first = true;
+  const instance = new Scheduler({
+    now: () => now, projectOf: async () => null,
+    running: async () => {
+      if (first) { first = false; return ["one"]; }
+      return new Promise<string[]>((resolve) => { finish = resolve; });
+    },
+  });
+  assert.equal((await instance.observedCounts(paseo)).running, 1);
+  now = 6_000;
+  const observation = await instance.observedCounts(paseo);
+  assert.equal(observation.running, 1);
+  assert.equal(observation.stale, true);
+  assert.equal(observation.observedAt, new Date(0).toISOString());
+  let admitted = false;
+  const admission = instance.admit(ticket("W-1"), paseo, max(1)).then((result) => { admitted = result.ok; return result; });
+  await Promise.resolve();
+  assert.equal(admitted, false);
+  finish(["one"]);
+  assert.equal((await admission).ok, false);
+  assert.equal((await instance.observedCounts(paseo)).stale, false);
+});
+
+test("a running implementation does not erase its diagnostic reservation or wait", async () => {
+  let now = 0;
+  const running = [{ issueId: "ticket", control: false }];
+  const instance = new Scheduler({ running: async () => [...running], projectOf: async () => null, now: () => now });
+  const diagnostic = ticket("DIAG", { issueId: "ticket", control: true });
+  assert.equal((await instance.admit(diagnostic, paseo, max(2))).ok, true);
+  assert.deepEqual(await instance.counts(paseo), { running: 1, reserved: 1, waiting: 0 });
+  assert.equal((await instance.admit(ticket("OTHER", { control: true }), paseo, max(2))).ok, false);
+  running.push({ issueId: "ticket", control: true });
+  now = 6_000;
+  assert.deepEqual(await instance.counts(paseo), { running: 2, reserved: 0, waiting: 1 });
+});

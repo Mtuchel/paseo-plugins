@@ -126,8 +126,7 @@ const RESTARTED = { status: "idle", lastError: CRASH, pendingPermissions: [] };
 function crashDaemon(t: TestContext, calls: string[]) {
   const daemon = { agent: CRASHED as Record<string, unknown>, reloaded: RESTARTED as Record<string, unknown>, send: async () => {}, router: null as unknown as SessionRouter };
   let held = false;
-  // This fake session store has no path: supply both durable stores explicitly in an isolated
-  // directory instead of asking the router to derive their location from the fake.
+  // Give every derived durable store an isolated directory.
   const directory = mkdtempSync(join(tmpdir(), "paseo-pr-watch-crash-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const replies = new PermissionReplies({ directory, daemon: async () => null });
@@ -137,7 +136,7 @@ function crashDaemon(t: TestContext, calls: string[]) {
       held = true;
       return { release: () => { held = false; } };
     } },
-    store: { forAgent: async () => null },
+    store: { path: join(directory, "sessions.json"), forAgent: async () => null },
     replies,
     parents: new ParentStore(directory),
     reloader: async () => async (agentId: string) => { calls.push(`reload ${agentId}`); daemon.agent = daemon.reloaded; },

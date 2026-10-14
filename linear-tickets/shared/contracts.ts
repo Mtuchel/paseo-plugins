@@ -481,6 +481,9 @@ export const capacityStateSchema = z.object({
   running: z.number().int(),
   reserved: z.number().int(),
   waiting: z.number().int(),
+  observedAt: z.string().optional(),
+  stale: z.boolean().optional(),
+  observationError: z.string().nullable().optional(),
 });
 export type CapacityState = z.infer<typeof capacityStateSchema>;
 export const capacityRpc = defineRpc({

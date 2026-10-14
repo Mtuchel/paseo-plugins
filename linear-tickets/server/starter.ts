@@ -214,7 +214,8 @@ async function runningTicketSnapshot(paseo: PaseoApi, inspect?: ProcessInspector
     const page = await paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
     for (const { agent } of page.entries) {
       const issueId = agent.labels?.["linear.issueId"];
-      if (issueId && !agent.labels["paseo.parent-agent-id"] && (agent.status === "running" || agent.status === "initializing") && !agent.pendingPermissions?.length) working.push({ agent, issueId });
+      const control = ["parent-verification", "recovery-diagnostic"].includes(agent.labels?.["linear.coordination"] ?? "");
+      if (issueId && (!agent.labels["paseo.parent-agent-id"] || control) && (agent.status === "running" || agent.status === "initializing") && !agent.pendingPermissions?.length) working.push({ agent, issueId });
     }
     cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
   } while (cursor);
@@ -224,7 +225,7 @@ async function runningTicketSnapshot(paseo: PaseoApi, inspect?: ProcessInspector
   const ghosts = await ghostAgents(counted.map((item) => item.agent), now, inspect);
   return counted.filter((item) => !ghosts.has(item.agent.id)).map((item) => ({
     issueId: item.issueId,
-    control: item.agent.labels?.["linear.coordination"] === "parent-verification",
+    control: ["parent-verification", "recovery-diagnostic"].includes(item.agent.labels?.["linear.coordination"] ?? ""),
   }));
 }
 
@@ -416,12 +417,9 @@ export class TicketStarter {
         return { ...result, warnings: [...result.warnings, ...shardWarnings], provider: model.provider, target, resumed: true, ...plan };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (options.verifier) {
-          // The recorded worktree and its branch are gone: the verifier still judges the ticket,
-          // read-only, in the checkout.
-          console.error(`[linear-tickets] ${detail.issue.identifier}: the verifier could not open the recorded branch (${message}); it reads the checkout instead`);
-          return await verifierInCheckout();
-        }
+        // A failed launch may already have created its worker. The steward reconciles the
+        // persisted marker; never launch a second verifier on an ambiguous failure.
+        if (options.verifier) throw error;
         if (options.resumeOnly || options.resume?.branch) throw new ResumeUnavailableError(`Could not continue ${detail.issue.identifier} on ${resume.branch}: ${message}`);
         // A deleted or merged branch cannot be continued; a fresh start is the useful fallback.
         console.error(`[linear-tickets] ${detail.issue.identifier}: resume failed, starting fresh: ${message}`);
