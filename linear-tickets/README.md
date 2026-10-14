@@ -2295,10 +2295,20 @@ comment):
 | Running, no progress for 45 min | OMP `/steer` (the turn keeps running): report the lifecycle step and continue it — "Watchdog: asked the silent agent to report and continue." | 20 min |
 | Still silent | Stop the turn (waiting up to 60 s for it to end), then a resume that runs `git status` first — "Watchdog: stopped the silent turn and asked the agent to continue." | 20 min |
 | Still silent | Stop if needed, reload the agent (`paseo agent reload`), resume — "Watchdog: reloaded the silent agent and asked it to continue." | 20 min |
-| Still silent | Retire the agent (Stop, archive), prove no OMP process of the ticket remains, start a successor on the recorded branch and worktree — "Watchdog: started a replacement on the recorded branch." | 20 min |
+| Still silent | Retire the agent (Stop, archive; a ghost is archived without a Stop), prove no OMP process of the ticket remains, start a successor on the recorded branch and worktree — "Watchdog: started a replacement on the recorded branch." | 20 min |
 | Closed or idle for 2 h, ticket open, no open pull request, nobody waited on | One resume ("continue the lifecycle step you were on"); an agent that cannot be loaded goes to the replacement step — "Watchdog: asked the stopped agent to continue the lifecycle step it was on." | 20 min |
-| A ghost (see **Ghost agents**) | The replacement step at once | 20 min |
+| A ghost (see **Ghost agents**) | At once, once a slot admits it: reload it from its session without a Stop, then the resume; still silent after 20 min (or the reload failed), the replacement step | 20 min |
 | No progress after the last step, or a predecessor that cannot be proven gone within 20 min | One comment mentioning you: "Automatic recovery could not restore progress on this ticket. Please take over." No further agent. | — |
+
+A ghost has no process that could end its turn, so a Stop sent to it is never acknowledged: until
+2026-10-14 the replacement waited for that Stop, retried it for 20 minutes and then mentioned you
+(after server087's daemon restart at 12:28 UTC that day, 51 tickets got the mention and one
+replacement started, although sending TUC-2205's ghost a message resumed it at once). Now a ghost
+is reloaded from its session, the way a message to it loads it, and is never stopped first. A
+replacement whose predecessor is archived and proven gone and that only waits for its start (no
+free slot, a peer route not ready) waits like a queued ticket, logged once
+(`… is retired; its replacement waits: Queued: …`); the 20 minutes bound only the proof of
+absence. A ghost reload that no slot admits waits the same way.
 
 A failed step says so ("Watchdog: <action> failed; <reason>.") and the next step follows.
 Progress means a new assistant message, tool start or tool result on the current branch of the

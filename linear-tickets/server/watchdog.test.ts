@@ -266,7 +266,7 @@ test("an unreadable watchdog state runs no recovery and is never reset", async (
   await h.cleanup();
 });
 
-test("a closed agent quiet for two hours is resumed once unless its ticket has an open pull request; a ghost is replaced at once", async (t) => {
+test("a closed agent quiet for two hours is resumed once unless its ticket has an open pull request; a ghost is reloaded at once", async (t) => {
   quiet(t);
   const closed = () => agent("agent-1", { status: "closed", activeTurn: null });
   const open = await harness();
@@ -299,8 +299,21 @@ test("a closed agent quiet for two hours is resumed once unless its ticket has a
   ghost.state.roots = [agent("agent-1", { status: "idle", activeTurn: null })];
   ghost.state.ghosts.add("agent-1");
   await ghost.poll(1);
-  assert.deepEqual(ghost.acts.map((act) => act.action), ["succeed"], "a proven ghost is replaced without waiting");
+  assert.deepEqual(ghost.acts.map((act) => act.action), ["reload"], "a proven ghost is reloaded without waiting");
   await ghost.cleanup();
+});
+
+test("a ghost the reload brings no progress is replaced 20 minutes later", async (t) => {
+  quiet(t);
+  const h = await harness();
+  h.state.roots = [agent("agent-1", { status: "running" })];
+  h.state.ghosts.add("agent-1");
+  await h.poll(1);
+  await h.poll(20);
+  assert.deepEqual(h.acts.map((act) => act.action), ["reload"]);
+  await h.poll(22);
+  assert.deepEqual(h.acts.map((act) => act.action), ["reload", "succeed"]);
+  await h.cleanup();
 });
 
 test("a replacement that cannot prove its predecessor gone is retried until its window ends, then the owner is mentioned", async (t) => {
@@ -308,13 +321,43 @@ test("a replacement that cannot prove its predecessor gone is retried until its 
   const h = await harness();
   h.state.roots = [agent("agent-1", { status: "idle", activeTurn: null })];
   h.state.ghosts.add("agent-1");
-  h.state.answer = async () => ({ kind: "failed", reason: "a provider process of the ticket is still running", retry: true });
+  h.state.answer = async (request) => request.action === "reload"
+    ? { kind: "failed", reason: "the agent could not be loaded" }
+    : { kind: "failed", reason: "a provider process of the ticket is still running", retry: true };
   await h.poll(1);
+  await h.poll(2);
   await h.poll(10);
-  assert.deepEqual(h.acts.map((act) => act.action), ["succeed", "succeed"]);
-  await h.poll(22);
-  assert.equal(h.acts.length, 2, "no replacement once the retirement window is over");
-  assert.equal(h.comments.length, 1);
+  assert.deepEqual(h.acts.map((act) => act.action), ["reload", "succeed", "succeed"]);
+  await h.poll(23);
+  assert.equal(h.acts.length, 3, "no replacement once the retirement window is over");
+  assert.equal(h.comments.filter((body) => body.includes(WATCHDOG_MENTION)).length, 1);
+  await h.cleanup();
+});
+
+test("a replacement whose predecessor is retired waits for a slot past the retirement window, without mentioning the owner", async (t) => {
+  quiet(t);
+  const h = await harness();
+  h.state.roots = [agent("agent-1", { status: "idle", activeTurn: null })];
+  h.state.ghosts.add("agent-1");
+  let slot = false;
+  h.state.answer = async (request) => {
+    if (request.action === "reload") return { kind: "failed", reason: "the agent could not be loaded" };
+    if (!slot) {
+      h.state.roots = [];
+      return { kind: "failed", reason: "Queued: RAM-limited, 11 of 11 slots used (memory). It starts when memory frees up.", retry: true, retired: true };
+    }
+    h.state.roots = [agent("agent-2", { status: "idle", activeTurn: null, createdAt: iso(h.state.now), labels: { "linear.issueId": ISSUE.id, [WATCHDOG_LABEL]: request.marker } })];
+    return { kind: "done", successor: { id: "agent-2", title: null, cwd: "/repo/wt" } };
+  };
+  await h.poll(1);
+  await h.poll(2);
+  await h.poll(30);
+  assert.deepEqual(h.acts.map((act) => act.action), ["reload", "succeed", "succeed"], "still waiting after the 20 minutes");
+  assert.equal(h.comments.some((body) => body.includes(WATCHDOG_MENTION)), false);
+  slot = true;
+  await h.poll(32);
+  assert.deepEqual(h.acts.map((act) => act.action), ["reload", "succeed", "succeed", "succeed"]);
+  assert.ok(h.said.includes(WATCHDOG_LINES.succeed), "the replacement started");
   await h.cleanup();
 });
 
@@ -342,11 +385,13 @@ test("a ticket that waits for the owner by the end of a cycle is not reported as
   h.state.roots = [agent("agent-1", { status: "idle", activeTurn: null })];
   h.state.ghosts.add("agent-1");
   h.state.answer = async (request) => {
+    if (request.action === "reload") return { kind: "failed", reason: "the agent could not be loaded" };
     h.state.ghosts.clear();
     h.state.roots = [agent("agent-2", { status: "idle", activeTurn: null, labels: { "linear.issueId": ISSUE.id, [WATCHDOG_LABEL]: request.marker } })];
     return { kind: "done", successor: { id: "agent-2", title: null, cwd: "/repo/wt" } };
   };
   await h.poll(1);
+  await h.poll(2);
   h.state.status = { status: "Needs input", statusType: "started", labels: [] };
   await h.poll(30);
   assert.equal(h.comments.some((body) => body.includes(WATCHDOG_MENTION)), false);

@@ -226,6 +226,8 @@ function routerHarness(options: {
   processInspector?: ProcessInspector;
   // Called with the agent a Stop went to (the watchdog's interrupt and retirement).
   onStop?: (agentId: string) => void;
+  // The daemon's agent reload (`paseo agent reload`); absent: no reload is available.
+  reload?: (agentId: string) => void;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   owner?: (issueId: string) => Promise<HostOwnership>;
@@ -278,6 +280,7 @@ function routerHarness(options: {
     owner: options.owner,
     processLiveness: options.processLiveness,
     stop: async (agentId: string) => { calls.push(`stop ${agentId}`); options.onStop?.(agentId); },
+    ...(options.reload ? { reloader: async () => async (agentId: string) => { calls.push(`reload ${agentId}`); options.reload!(agentId); } } : {}),
     ...(options.sleep ? { sleep: options.sleep } : {}),
     ...(options.now ? { now: options.now } : {}),
     ...(options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[], _inspect?: ProcessInspector, mode?: { subagents?: boolean }) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector, mode), processInspector: options.processInspector } : {}),
@@ -1351,6 +1354,50 @@ test("a watchdog replacement retires its predecessor, waits while a worker lives
   assert.equal(started.kind, "done");
   assert.equal(started.kind === "done" ? started.successor?.id : null, "agent-new");
   assert.deepEqual(h.starts[0].options, { retryHint: "assign Paseo again", resumeOnly: true, lead: "The previous agent stopped making progress.", labels: { [WATCHDOG_LABEL]: "cycle-1:succeed" } });
+  assertGateFree(h.gates);
+  await h.cleanup();
+});
+
+// As TUC-2205's root stood after server087's daemon restart on 2026-10-14: listed running in its
+// turn, no process. A Stop to it is never acknowledged; a message or reload loads it again.
+const ghostRoot = () => ompRoot("agent-old", { status: "running", activeTurn: { turnId: "turn-1", startedAt: "2026-01-01T00:00:00Z" }, updatedAt: "2026-01-01T00:09:44Z" });
+const QUEUED = "Queued: RAM-limited, 11 of 11 slots used (memory). It starts when memory frees up.";
+
+test("the watchdog reloads a ghost without a Stop once a slot admits it, then resumes it", async () => {
+  const agents = [ghostRoot()];
+  let admission: { ok: true } | { ok: false; reason: string } = { ok: false, reason: QUEUED };
+  let clock = Date.parse("2026-01-02T00:00:00Z");
+  const h = routerHarness({
+    agents, processInspector: processInspection(""), admission: async () => admission, now: () => clock, sleep: async (ms) => { clock += ms; },
+    reload: () => { agents[0].status = "idle"; agents[0].activeTurn = null; agents[0].updatedAt = new Date(clock).toISOString(); },
+  });
+  const request = watchdogRequest(h.calls, { action: "reload", marker: "cycle-1:reload" });
+  assert.deepEqual(await h.router.watchdogAct(request), { kind: "skipped", reason: QUEUED, end: false });
+  assert.deepEqual(h.calls, [], "no claim, Stop or reload while no slot admits the process the reload starts");
+
+  admission = { ok: true };
+  assert.deepEqual(await h.router.watchdogAct(request), { kind: "done" });
+  assert.deepEqual(h.calls, ["claim", "reload agent-old"], "reloaded without a Stop it could never acknowledge");
+  assert.deepEqual(h.daemon.sent, ["agent-old: Report and continue."]);
+  assertGateFree(h.gates);
+  await h.cleanup();
+});
+
+test("a ghost's replacement retires it without a Stop, and a start that only waits for a slot reports its predecessor retired", async () => {
+  let admission: { ok: true } | { ok: false; reason: string } = { ok: false, reason: QUEUED };
+  let clock = Date.parse("2026-01-02T00:00:00Z");
+  const h = routerHarness({ agents: [ghostRoot()], processInspector: processInspection(""), admission: async () => admission, now: () => clock, sleep: async (ms) => { clock += ms; } });
+  const request = watchdogRequest(h.calls, { action: "succeed", marker: "cycle-1:succeed", text: "The previous agent stopped making progress." });
+  const waiting = await h.router.watchdogAct(request);
+  assert.deepEqual(waiting, { kind: "failed", reason: QUEUED, retry: true, retired: true });
+  assert.ok(!h.calls.includes("stop agent-old"), "no Stop to a ghost");
+  assert.deepEqual(h.daemon.archived, ["agent-old"]);
+  assert.equal(h.starts.length, 0);
+
+  admission = { ok: true };
+  const started = await h.router.watchdogAct(request);
+  assert.equal(started.kind === "done" ? started.successor?.id : null, "agent-new");
+  assert.deepEqual(h.daemon.archived, ["agent-old"], "the archived predecessor is not retired twice");
   assertGateFree(h.gates);
   await h.cleanup();
 });
