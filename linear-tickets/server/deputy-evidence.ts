@@ -41,11 +41,19 @@ export function shadowEvidence(entries: LogEntry[], version: string): Evidence {
   for (const entry of entries) if (entry.kind === "owner-answer" && entry.userId.trim() && !owners.has(entry.id)) owners.set(entry.id, entry);
   const applied = by("deputy-answer");
   const evidence: Evidence = { version, pairs: [], matches: 0, agreement: null, unknown: [], late: [], unpaired: [], refusals: {}, ready: false };
+  const predictions = new Map<string, Extract<LogEntry, { kind: "deputy-prediction" }>>();
+  const refusals = new Map<string, Extract<LogEntry, { kind: "deputy-refusal" }>>();
   for (const entry of entries) {
-    if (entry.kind === "deputy-refusal" && entry.version === version) evidence.refusals[entry.category ?? "no-knowledge"] = (evidence.refusals[entry.category ?? "no-knowledge"] ?? 0) + 1;
+    if (entry.kind === "deputy-refusal" && entry.version === version) refusals.set(entry.id, entry);
+    if (entry.kind === "deputy-prediction" && entry.version === version && entry.mode === "shadow" && !predictions.has(entry.id)) predictions.set(entry.id, entry);
   }
-  for (const prediction of by("deputy-prediction").values()) {
-    if (prediction.version !== version || applied.has(prediction.id)) continue;
+  // Coverage counts questions, not retry attempts. A recovered refusal that now has a
+  // prediction is predicted coverage, not a second question seen.
+  for (const refusal of refusals.values()) {
+    if (!predictions.has(refusal.id)) evidence.refusals[refusal.category ?? "no-knowledge"] = (evidence.refusals[refusal.category ?? "no-knowledge"] ?? 0) + 1;
+  }
+  for (const prediction of predictions.values()) {
+    if (applied.has(prediction.id)) continue;
     const predictedAt = Date.parse(prediction.at);
     const resolved = resolutions.get(prediction.id);
     const owner = owners.get(prediction.id);

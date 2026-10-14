@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -14,6 +14,7 @@ import { assessRisk, type Part } from "./deputy-risk";
 import { gatherSources, registerEntries, type Source, type SourceReaders } from "./deputy-sources";
 import type { IssueState } from "./linear";
 import { DecisionLog, type LogEntry } from "./owner-decisions";
+import { PermissionReplies } from "./permission-replies";
 import { DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_WRITEBACK, DEFAULT_WORKTREE_SHARDS, type DeputySettings, type PluginSettings } from "./settings";
 
 const OWNER = "owner-1";
@@ -141,6 +142,7 @@ test("an unreadable source that should exist makes the deputy abstain rather tha
   assert.match((await gatherSources(readers({ plan: async () => { throw new Error("HTTP 500"); } }), asked, "/repo/platform")).abstain ?? "", /plan/);
   assert.match((await gatherSources(readers({ plan: async () => null }), asked, "/repo/platform")).abstain ?? "", /no plan document/, "a plan-ready ticket without its plan");
   assert.match((await gatherSources(readers({ plan: async () => ({ url: "https://linear.app/doc/plan", content: "# Draft\n\nTests use node:test." }) }), asked, "/repo/platform")).abstain ?? "", /not marked approved/);
+  assert.match((await gatherSources(readers({ ownerAnswers: async () => { throw new Error("journal unavailable"); } }), asked, "/repo/platform")).abstain ?? "", /earlier owner answers/);
 });
 
 test("a decision that is not binding stays so in every excerpt: its subsections and the cut-off rest of a long one", async () => {
@@ -193,6 +195,23 @@ test("unverified, blank, late and deputy-answered cases never count as agreement
   assert.deepEqual(late.late, ["a:1"]);
   const unusable = shadowEvidence([prediction, { kind: "owner-answer", id: "a:1", at: "2026-10-01T00:10:00Z", key: "c1", via: "linear-comment", userId: OWNER, answers: { Runner: "" } }], VERSION);
   assert.equal(unusable.unknown.length, 1);
+});
+
+test("refusal retries count one question and recovered predictions do not double-count coverage", () => {
+  const refusal: LogEntry = { kind: "deputy-refusal", id: "a:0", at: "2026-10-01T00:00:00Z", identifier: "TUC-1", issueId: "i1", version: VERSION, mode: "shadow", category: "source-unavailable", reason: "offline" };
+  const changed: LogEntry = { ...refusal, key: "retry", category: "no-knowledge", reason: "no rule decides" };
+  assert.deepEqual(shadowEvidence([refusal, changed], VERSION).refusals, { "no-knowledge": 1 });
+  const recovered = shadowEvidence([refusal, changed, ...cases(1, 1)], VERSION);
+  assert.deepEqual(recovered.refusals, {});
+  assert.equal(recovered.pairs.length, 1);
+  assert.equal(recovered.ready, false);
+});
+
+test("live-mode predictions and earlier evaluator versions cannot satisfy the shadow gate", () => {
+  const live = cases(30, 30).map((entry): LogEntry => entry.kind === "deputy-prediction" ? { ...entry, mode: "live" } : entry);
+  assert.equal(shadowEvidence(live, VERSION).pairs.length, 0);
+  const old = cases(1, 1, "old-version").filter((entry) => entry.kind === "deputy-prediction");
+  assert.equal(shadowEvidence([...old, ...cases(1, 1)], VERSION).pairs.length, 1, "the current version is not masked by an older prediction");
 });
 
 // --- The lifecycle ----------------------------------------------------------------------------------
@@ -296,6 +315,170 @@ test("a refused question is logged with its reason and stays with the owner", as
   assert.equal((await h.candidate()).status, "refused");
 });
 
+test("a transient ticket outage recovers without another observation and never answers in shadow", async (t) => {
+  const h = await harness(t, { mode: "shadow" });
+  const read = h.deps.linear.issueState;
+  h.deps.linear.issueState = async () => { throw new Error("Linear offline"); };
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  assert.equal((await h.candidate()).refusalCategory, "source-unavailable");
+  h.deps.linear.issueState = read;
+  h.advance(5 * 60_000 - 1);
+  await h.settle();
+  assert.equal(h.evaluations(), 0, "no early model retry");
+  h.advance(1);
+  await h.settle();
+  assert.equal((await h.candidate()).status, "predicted");
+  assert.equal(h.evaluations(), 1);
+  assert.deepEqual(shadowEvidence(await h.log.entries(), VERSION).refusals, {});
+  assert.deepEqual([h.responses, h.comments, h.said], [[], [], []]);
+});
+
+test("unchanged evidence does not repeat an abstaining model call; changed evidence is revalidated", async (t) => {
+  const h = await harness(t, { mode: "shadow" });
+  let attempts = 0;
+  const evaluate = h.deps.evaluate;
+  h.deps.evaluate = async (input, model) => {
+    attempts++;
+    return attempts === 1 ? { ok: false, reason: "no rule decides this question" } : evaluate(input, model);
+  };
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal(attempts, 1);
+  assert.equal((await h.candidate()).status, "refused");
+  h.deps.readers.plan = async () => ({ url: "https://linear.app/doc/plan", content: PLAN.replace("Tests use the node:test runner", "Tests use a different runner") });
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal(attempts, 2);
+  assert.equal((await h.candidate()).status, "refused", "the old quote no longer supports an answer");
+  assert.equal((await kinds(h)).includes("deputy-prediction"), false);
+  h.deps.readers.plan = async () => ({ url: "https://linear.app/doc/plan", content: `${PLAN}\nThis module follows the test runner rule.\n` });
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal(attempts, 3);
+  assert.equal((await h.candidate()).status, "predicted");
+});
+
+test("an evaluator outage retries the same evidence without classifying it as missing knowledge", async (t) => {
+  const h = await harness(t, { mode: "shadow" });
+  const evaluate = h.deps.evaluate;
+  h.deps.evaluate = async () => { throw new Error("capacity exceeded"); };
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  assert.equal((await h.candidate()).refusalCategory, "evaluator-unavailable");
+  h.deps.evaluate = evaluate;
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal((await h.candidate()).status, "predicted");
+  assert.deepEqual(h.responses, []);
+});
+
+test("source recovery rechecks risk and does not relax the business or owner-reserved floor", async (t) => {
+  const h = await harness(t, { mode: "shadow" });
+  h.deps.readers.recall = async () => { throw new Error("offline"); };
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.deps.readers.recall = async () => [];
+  h.state.labels.push({ id: "attended", name: `${h.settings.dispatch.label}-attended` });
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal((await h.candidate()).refusalCategory, "attended");
+  assert.equal((await h.candidate()).retryAt, undefined);
+  assert.equal(h.evaluations(), 0);
+  for (const description of [
+    "The new mainAt contract breaks probes. Authorize an exception to the approved plan before merging.",
+    "The API contract changes customer pricing in production.",
+    "The technical contract test would drop the table.",
+  ]) assert.equal(assessRisk(question("r", undefined, { description }), trusted).ok, false);
+});
+
+for (const change of ["owner", "resolved", "changed", "gone", "off"] as const) {
+  test(`a refused question cannot revive after ${change}`, async (t) => {
+    const h = await harness(t, { mode: "shadow" });
+    h.deps.readers.recall = async () => { throw new Error("offline"); };
+    await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+    await h.settle();
+    h.deps.readers.recall = async () => [];
+    if (change === "owner") await h.deputy.ownerAnswered("a1", question(), { behavior: "allow", updatedInput: { answers: { Runner: "vitest" } } }, { via: "menu-bar", activityId: "owner-reply", userId: OWNER }, "2026-10-07T10:01:00Z");
+    if (change === "resolved") await h.deputy.resolved("a1", "r1");
+    if (change === "changed") h.daemon.pending = [question("r1", ["node:test", "mocha"])];
+    if (change === "gone") h.daemon.pending = [];
+    if (change === "off") h.settings.deputy.mode = "off";
+    h.advance(5 * 60_000);
+    await h.settle();
+    assert.equal(h.evaluations(), 0);
+    assert.equal((await kinds(h)).includes("deputy-prediction"), false);
+    assert.deepEqual(h.responses, []);
+    assert.ok(["owner-answered", "resolved", "canceled"].includes((await h.candidate()).status));
+  });
+}
+
+test("an owner answer during reevaluation prevents a prediction even while waiting for its lane", async (t) => {
+  const h = await harness(t, { mode: "shadow" });
+  h.deps.readers.recall = async () => { throw new Error("offline"); };
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.deps.readers.recall = async () => [];
+  const evaluate = h.deps.evaluate;
+  let release!: () => void;
+  let entered!: () => void;
+  const evaluating = new Promise<void>((resolve) => { entered = resolve; });
+  const hold = new Promise<void>((resolve) => { release = resolve; });
+  h.deps.evaluate = async (input, model) => { entered(); await hold; return evaluate(input, model); };
+  h.advance(5 * 60_000);
+  await evaluating;
+  let recorded!: () => void;
+  const logged = new Promise<void>((resolve) => { recorded = resolve; });
+  const append = h.log.append.bind(h.log);
+  t.mock.method(h.log, "append", async (entry: LogEntry) => { await append(entry); if (entry.kind === "owner-answer") recorded(); });
+  const reply = h.deputy.ownerAnswered("a1", question(), { behavior: "allow", updatedInput: { answers: { Runner: "vitest" } } }, { via: "menu-bar", activityId: "racing-owner", userId: OWNER }, "2026-10-07T10:05:00Z");
+  await logged;
+  release();
+  await reply;
+  await h.settle();
+  assert.equal((await kinds(h)).includes("deputy-prediction"), false);
+  assert.deepEqual(h.responses, []);
+});
+
+test("a restart recovers legacy source refusals from the journal, not from a guessed risk exemption", async (t) => {
+  const h = await harness(t, { mode: "shadow" });
+  h.deps.readers.recall = async () => { throw new Error("offline"); };
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.deputy.stop();
+  const store = await readCandidates(h.directory);
+  delete store["a1:r1"].refusalCategory;
+  delete store["a1:r1"].retryAt;
+  await writeFile(join(h.directory, "candidates.json"), JSON.stringify(store));
+  h.deps.readers.recall = async () => [];
+  const restarted = new Deputy(h.deps);
+  t.after(() => restarted.stop());
+  restarted.attach(h.paseo);
+  await restarted.idle();
+  h.advance(5 * 60_000);
+  await restarted.idle();
+  assert.equal((await h.candidate()).status, "predicted");
+  assert.equal(h.evaluations(), 1);
+});
+
+test("a recovered source cannot open the live gate without real shadow pairs", async (t) => {
+  const fake = arbiter();
+  const h = await harness(t, { mode: "live" }, { arbiter: fake.value });
+  h.deps.readers.recall = async () => { throw new Error("offline"); };
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.deps.readers.recall = async () => [];
+  h.advance(5 * 60_000);
+  await h.settle();
+  h.advance(1);
+  await h.settle();
+  assert.equal((await h.candidate()).status, "blocked");
+  assert.equal(shadowEvidence(await h.log.entries(), VERSION).ready, false);
+  assert.deepEqual(fake.calls, []);
+});
+
 test("live without a checked answer connection stays blocked and answers nothing", async (t) => {
   const h = await harness(t, { mode: "live" });
   await h.log.append({ kind: "question", id: "seed", at: "2026-10-01T00:00:00Z", identifier: "TUC-0", issueId: "i0", questions: [] });
@@ -317,6 +500,7 @@ function arbiter(result: ArbitratedOutcome = "applied") {
   const outcomes = new Map<string, ArbitratedOutcome>();
   const value: PermissionArbiter = {
     respond: async (input) => {
+      if (!input.canSubmit()) return "revoked";
       calls.push({ requestId: input.requestId, fingerprint: input.fingerprint, answers: input.response.behavior === "allow" ? input.response.updatedInput : undefined });
       outcomes.set(input.intentId, result);
       return result;
@@ -799,3 +983,142 @@ test("waiting time counts every question asked in the window, unanswered ones li
   assert.ok(report.includes(`Shadow evidence for ${VERSION}`));
   assert.match(report, /Answered by the deputy: 1/);
 });
+
+test("a journal outage after evaluation cannot strand the candidate or permit an unchecked prediction", async (t) => {
+  const h = await harness(t, { mode: "shadow" });
+  const entries = h.log.entries.bind(h.log);
+  const evaluate = h.deps.evaluate;
+  h.deps.evaluate = async (input, model) => {
+    const verdict = await evaluate(input, model);
+    h.log.entries = async () => { throw new Error("journal unavailable"); };
+    return verdict;
+  };
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  assert.equal((await h.candidate()).refusalCategory, "source-unavailable");
+  h.log.entries = entries;
+  assert.equal((await kinds(h)).includes("deputy-prediction"), false);
+  h.deps.evaluate = evaluate;
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal((await h.candidate()).status, "predicted");
+  assert.deepEqual(h.responses, []);
+});
+
+for (const change of ["amended-plan", "blocking-source", "source-revision", "missing-fingerprint"] as const) {
+  test(`dispatch invalidates ${change} even when the original citation remains verbatim`, async (t) => {
+    const h = await liveHarness(t);
+    await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+    await h.settle();
+    if (change === "amended-plan") h.deps.readers.plan = async () => ({ url: "https://linear.app/doc/plan", content: `${PLAN}\nException: this module's tests must use vitest instead.\n` });
+    if (change === "blocking-source") h.deps.readers.recall = async () => [{ id: "m1", text: "vitest test runner discussion" }, { id: "conflict", text: "This module's test runner choice is disputed; do not use node:test." }];
+    if (change === "source-revision") {
+      const principles = h.deps.readers.principles;
+      h.deps.readers.principles = async (repository) => ({ ...await principles(repository), commit: "new-revision" });
+    }
+    if (change === "missing-fingerprint") {
+      const store = await readCandidates(h.directory);
+      delete store["a1:r1"].evidenceFingerprint;
+      await writeFile(join(h.directory, "candidates.json"), JSON.stringify(store));
+    }
+    h.advance(5 * 60_000);
+    await h.settle();
+    assert.equal((await h.candidate()).status, "canceled");
+    assert.deepEqual([h.calls, h.responses, h.comments], [[], [], []]);
+    assert.equal((await kinds(h)).includes("deputy-answer"), false);
+  });
+}
+
+for (const boundary of ["readiness", "sources", "checked-submit"] as const) {
+  for (const change of ["off", "shadow", "model", "off-then-live", "model-then-original"] as const) {
+    test(`${change} revokes a dispatch awaiting ${boundary}`, async (t) => {
+      const fake = arbiter();
+      const h = await harness(t, { mode: "live" }, { arbiter: fake.value });
+      for (const entry of cases(LIVE_MIN_CASES, LIVE_MIN_CASES)) await h.log.append(entry);
+      await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+      await h.settle();
+      let entered!: () => void;
+      const checking = new Promise<void>((resolve) => { entered = resolve; });
+      let resume!: () => void;
+      const paused = new Promise<void>((resolve) => { resume = resolve; });
+      if (boundary === "readiness") {
+        const entries = h.log.entries.bind(h.log);
+        t.mock.method(h.log, "entries", async () => { const snapshot = await entries(); entered(); await paused; return snapshot; });
+      } else if (boundary === "sources") {
+        const plan = h.deps.readers.plan;
+        h.deps.readers.plan = async (...args) => { const snapshot = await plan(...args); entered(); await paused; return snapshot; };
+      } else {
+        const respond = fake.value.respond;
+        t.mock.method(fake.value, "respond", async (input: Parameters<PermissionArbiter["respond"]>[0]) => { entered(); await paused; return respond(input); });
+      }
+      h.advance(5 * 60_000);
+      await checking;
+      if (change === "model" || change === "model-then-original") h.settings.deputy.model = "omp/new-model";
+      else h.settings.deputy.mode = change === "shadow" ? "shadow" : "off";
+      const notifications = [h.deputy.settingsChanged()];
+      if (change === "off-then-live" || change === "model-then-original") {
+        h.settings.deputy = { ...h.settings.deputy, mode: "live", model: "omp/test-model" };
+        notifications.push(h.deputy.settingsChanged());
+      }
+      resume();
+      await Promise.all(notifications);
+      await h.settle();
+      assert.deepEqual([fake.calls, h.responses, h.comments], [[], [], []]);
+      assert.equal((await h.candidate()).status, "canceled");
+      assert.equal((await kinds(h)).includes("deputy-answer"), false);
+    });
+  }
+}
+
+test("a live model change cancels waiting predictions; old-model shadow pairs cannot open the new model's gate", async (t) => {
+  const h = await liveHarness(t);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.settings.deputy.model = "omp/new-model";
+  await h.deputy.settingsChanged();
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal((await h.candidate()).status, "canceled");
+  assert.equal(shadowEvidence(await h.log.entries(), policyVersion("omp/new-model")).ready, false);
+  assert.deepEqual(h.calls, []);
+});
+
+for (const change of ["off", "model"] as const) {
+  test(`${change} revokes at the real checked-send boundary before settingsChanged can finish its own read`, async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "deputy-boundary-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const sent: string[] = [];
+    let entered!: () => void;
+    const atBoundary = new Promise<void>((resolve) => { entered = resolve; });
+    let resume!: () => void;
+    const boundaryPause = new Promise<void>((resolve) => { resume = resolve; });
+    const replies = new PermissionReplies({
+      directory,
+      daemon: async () => ({ respondToPermissionAndWait: async (_agentId, requestId) => { sent.push(requestId); } }),
+      beforeSubmit: async () => { entered(); await boundaryPause; },
+    });
+    t.after(() => replies.stop());
+    const h = await harness(t, { mode: "live" }, { arbiter: replies });
+    replies.attach(h.paseo);
+    for (const entry of cases(LIVE_MIN_CASES, LIVE_MIN_CASES)) await h.log.append(entry);
+    await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+    await h.settle();
+    h.advance(5 * 60_000);
+    await atBoundary;
+    if (change === "off") h.settings.deputy.mode = "off";
+    else h.settings.deputy.model = "omp/new-model";
+    let finishRead!: () => void;
+    const settingsPause = new Promise<void>((resolve) => { finishRead = resolve; });
+    t.mock.method(h.deps.settings, "read", async () => { await settingsPause; return h.settings; });
+    const changing = h.deputy.settingsChanged();
+    resume();
+    await h.settle();
+    assert.deepEqual(sent, [], "revocation is synchronous; it does not wait for the settings read or deputy lane");
+    const candidate = await h.candidate();
+    assert.equal(candidate.status, "canceled");
+    assert.equal(await replies.outcome(candidate.intentId!), "revoked");
+    assert.equal((await kinds(h)).includes("deputy-answer"), false);
+    finishRead();
+    await changing;
+  });
+}

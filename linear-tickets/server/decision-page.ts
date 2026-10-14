@@ -47,17 +47,23 @@ const CLIENT = String.raw`
     const items = [];
     for (const host of view.hosts) {
       if (host.host === view.canonicalHost) {
-        for (const ask of host.asks) items.push({host:host.host, backendInstanceId:host.backendInstanceId, target:'owner', id:ask.issueId, revision:ask.revision, data:ask});
+        for (const ask of host.asks) items.push({host:host.host, backendInstanceId:host.backendInstanceId, target:'owner', id:JSON.stringify([ask.issueId, ask.sourceId || ask.revision]), revision:ask.revision, data:ask});
       }
       for (const live of host.live) items.push({host:host.host, backendInstanceId:host.backendInstanceId, target:'live', id:JSON.stringify([live.agentId, live.requestId]), revision:live.revision, data:live});
     }
-    return items;
+    if (!view.tasks) return items.filter(row => !completed.has(key(row)));
+    const bySource = new Map(items.map(row => [JSON.stringify([row.host, row.target, row.id, row.revision]), row]));
+    return view.tasks.flatMap(task => {
+      const row = bySource.get(JSON.stringify([task.host, task.target, task.id, task.revision]));
+      return row && !completed.has(key(row)) ? [{...row, task}] : [];
+    });
   }
   function receipts() {
     return view.hosts.flatMap(host => host.history.map(receipt => ({host:host.host, backendInstanceId:host.backendInstanceId, target:'receipt', id:receipt.id, revision:receipt.revision, data:receipt})))
       .sort((a, b) => Date.parse(b.data.at) - Date.parse(a.data.at));
   }
   function other(row) {
+    if (row.task) return row.task.priority === 'waiting';
     const data = row.data;
     const deferred = data.deferredUntil && Date.parse(data.deferredUntil) > Date.now();
     return row.target === 'owner' ? data.attention !== 'owner' || (data.disposition && data.disposition !== 'deferred') || deferred : deferred;
@@ -65,8 +71,10 @@ const CLIENT = String.raw`
   function state(row) {
     const data = row.data;
     if (row.target === 'receipt') return data.action + ' · delivery: ' + data.delivery;
+    if (data.deliveryUnknown) return 'Delivery unknown · inspect the original source';
     if (data.deferredUntil && Date.parse(data.deferredUntil) > Date.now()) return 'Deferred until ' + date(data.deferredUntil);
     if (row.target === 'live') return data.kind === 'permission' ? 'Permission · choose an original action' : 'Live question';
+    if (!data.extracted) return 'Unresolved extraction · original source retained';
     const labels = {owner:'Needs owner', advisor:'Advisor wait', dependency:'Dependency wait', info:'Information'};
     return [labels[data.attention], data.disposition, data.blockerIdentifier ? 'Blocked by ' + data.blockerIdentifier : ''].filter(Boolean).join(' · ');
   }
@@ -90,13 +98,23 @@ const CLIENT = String.raw`
     const host = view.hosts.find(item => item.host === row.host);
     if (unavailable()) return availabilityReason();
     if (refreshError) return 'Refresh failed. This source has not been checked. Refresh before sending.';
+    if (view.curation?.error) return 'Collection failed. Displayed tasks may be stale; wait for a successful collection before sending.';
+    if (row.data.deliveryUnknown) return 'Delivery for this source is unconfirmed. Inspect the original ticket or agent; do not send another answer.';
     if (!host || view.unreachable.includes(row.host)) return 'This host is unavailable. Its displayed source may be stale; actions are paused.';
     if (row.target === 'owner' && row.host !== view.canonicalHost) return 'The canonical owner-ask host changed. Select the current canonical ask before acting.';
     return '';
   }
-  // The ticket steward's flow (steward.ts): per host, what every in-scope open ticket is waiting
-  // for and the oldest tickets of each state. A summary, not a queue: the tickets themselves are
-  // worked by the steward, and anything that needs the owner is an item in the lists below.
+  function recoveryContext(ticket) {
+    return '<dl class="context"><dt>Recovery state</dt><dd>' + escape(ticket.situation) + ' · since ' + escape(date(ticket.since)) + '</dd>' +
+      '<dt>Evidence</dt><dd>' + escape(ticket.reason || 'No reason supplied') + '</dd>' +
+      '<dt>Next action</dt><dd>' + escape(ticket.nextAction || 'Not supplied') + '</dd>' +
+      '<dt>Waiting for</dt><dd>' + escape(ticket.waitReason || 'No wait reason supplied') + '</dd>' +
+      '<dt>Next check</dt><dd>' + escape(ticket.nextCheckAt ? date(ticket.nextCheckAt) : 'Not scheduled in this snapshot') + '</dd>' +
+      '<dt>Responsible generation</dt><dd>' + escape(ticket.responsibleGeneration || 'Not supplied') + '</dd>' +
+      '<dt>Last verified advancement</dt><dd>' + escape(ticket.lastVerifiedAdvancementAt ? date(ticket.lastVerifiedAdvancementAt) : 'None recorded') + '</dd></dl>';
+  }
+  // Steward counts describe ticket states, not actionable owner decisions. A waiting-owner
+  // state alone does not establish an original question or manual action.
   function flow() {
     const hosts = view.hosts.filter(host => host.flow);
     if (!hosts.length) return '';
@@ -104,10 +122,17 @@ const CLIENT = String.raw`
       const data = host.flow;
       const counts = Object.entries(data.counts || {}).sort((a, b) => b[1] - a[1]);
       const oldest = (data.oldest || []).slice(0, 5);
-      return '<section class="flow"><h3>Flow' + (view.hosts.length > 1 ? ' · ' + escape(host.host) : '') + '</h3>' +
+      const control = data.control;
+      return '<section class="flow"><h3>Ticket flow' + (view.hosts.length > 1 ? ' · ' + escape(host.host) : '') + '</h3>' +
         (data.error ? '<p>' + escape(data.error) + '</p>' : '') +
         '<p>' + (data.at ? 'Pass ' + date(data.at) + '. ' : 'No pass yet. ') + (counts.length ? counts.map(([state, count]) => escape(state) + ' ' + count).join(' · ') : 'No open tickets in scope.') + '</p>' +
+        '<p>These are ticket-state totals, not counts of actionable decisions. Waiting-owner does not by itself establish a current owner question. Collected question and manual-action sources are listed separately.</p>' +
         (oldest.length ? '<p>Oldest: ' + oldest.map(item => escape(item.identifier) + ' — ' + escape(item.situation) + ' since ' + date(item.since)).join(' · ') + '</p>' : '') +
+        (control ? '<p>Recovery control: ' + (control.passStartedAt ? 'pass started ' + escape(date(control.passStartedAt)) : 'no pass in flight') +
+          ' · overdue ' + escape(Math.round(control.overduePassMs / 1000)) + 's · maximum unattended ' + escape(Math.round(control.maxUnattendedMs / 1000)) + 's.</p>' +
+          '<p>Outcomes: ' + Object.entries(control.recoveryOutcomes).map(([outcome, count]) => escape(outcome) + ' ' + escape(count)).join(' · ') + '</p>' : '') +
+        (data.tickets?.length ? '<details><summary>Recovery evidence · ' + data.tickets.length + ' tickets</summary>' +
+          data.tickets.map(ticket => '<section class="section"><h3>' + escape(ticket.identifier) + '</h3>' + recoveryContext(ticket) + '</section>').join('') + '</details>' : '') +
         '</section>';
     }).join('');
   }
@@ -117,14 +142,34 @@ const CLIENT = String.raw`
     if (!view.canonicalHost) warnings.push('Canonical Linear owner-ask host unavailable. Owner asks are not shown.');
     else if (!view.hosts.some(host => host.host === view.canonicalHost)) warnings.push('Canonical Linear owner-ask host ' + view.canonicalHost + ' is missing.');
     for (const host of view.unreachable) warnings.push(host + ' unavailable; its decisions may be missing.');
-    for (const host of view.hosts) if (host.error) warnings.push(host.host + ' partial or unavailable: ' + host.error);
+    const interval = view.curation?.intervalMs || 900000;
+    for (const host of view.hosts) {
+      if (host.error) warnings.push(host.host + ' partial or unavailable: ' + host.error);
+      const checked = Date.parse(host.updatedAt);
+      if (!Number.isFinite(checked)) warnings.push(host.host + ' source snapshot time is unavailable.');
+      else if (Date.now() - checked > interval + 30000) warnings.push(host.host + ' source snapshot is older than the collection interval; decisions may have changed.');
+    }
     if (!view.hosts.length) warnings.push('No hosts returned a decision snapshot. This is not an empty inbox.');
     if (refreshError) warnings.push(refreshError + ' Displayed decisions are the last received snapshot.');
+    if (view.curation?.error) warnings.push('Decision collection failed: ' + view.curation.error);
+    if (view.curation && !view.curation.running) warnings.push('Background collection is not running. The list is collected only while requested.');
+    if (view.curation?.running && view.curation.nextRefreshAt && Date.now() - Date.parse(view.curation.nextRefreshAt) > 30000) warnings.push('Scheduled collection is overdue. The received task list may be stale.');
     const element = document.getElementById('coverage');
     element.classList.toggle('warning', warnings.length > 0);
-    element.innerHTML = flow() + (warnings.length ? '<b>Incomplete coverage</b>' + warnings.map(text => '<p>' + escape(text) + '</p>').join('') :
-      '<b>Connected hosts</b><p>' + view.hosts.map(host => escape(host.host)).join(' · ') + '</p><p>Linear owner asks: ' + escape(view.canonicalHost) + '</p>');
-    document.getElementById('refresh-state').textContent = refreshing ? 'Refreshing…' : unavailable() ? 'Read-only — the checked backend is not reachable' : 'Updated ' + date(availability.lastCheckedAt || new Date(lastUpdated).toISOString()) + ' · refreshes every 30 seconds';
+    const sources = view.hosts.map(host => '<p><b>' + escape(host.host) + '</b> · ' + host.asks.length + ' owner sources · ' + host.live.length + ' live requests<br>Source snapshot: ' + escape(date(host.updatedAt)) + '</p>').join('');
+    const retained = rows();
+    const unresolved = retained.filter(row => row.target === 'owner' && !row.data.extracted).length;
+    const expanded = element.querySelector('#source-coverage')?.open;
+    element.innerHTML = (warnings.length ? '<b>Incomplete or stale coverage</b>' + warnings.map(text => '<p>' + escape(text) + '</p>').join('') : '') +
+      '<details id="source-coverage"' + (expanded ? ' open' : '') + '><summary>' + retained.length + ' source tasks · ' + unresolved + ' unresolved · coverage</summary>' + sources +
+      '<p>Collected every 15 minutes, even with this page closed. Retained after exact-source deduplication and confirmed answers; includes waits and unresolved extraction, not just immediately actionable decisions.</p>' +
+      (view.canonicalHost ? '<p>Canonical Linear source: ' + escape(view.canonicalHost) + '</p>' : '') +
+      '<details><summary>Ticket flow — not decision counts</summary>' + flow() + '</details></details>';
+    const curation = view.curation;
+    document.getElementById('refresh-state').textContent = refreshing ? 'Checking for updates…' :
+      curation ? 'Updated: ' + (curation.lastRefreshAt ? date(curation.lastRefreshAt) : 'not yet collected') +
+        ' · Next: ' + (curation.nextRefreshAt ? date(curation.nextRefreshAt) : 'collection stopped') :
+        'Snapshot received ' + date(availability?.lastCheckedAt || new Date(lastUpdated).toISOString()) + ' · Background collection status unavailable';
   }
   function queueRow(row) {
     const data = row.data;
@@ -133,6 +178,7 @@ const CLIENT = String.raw`
     return '<li><button type="button" class="row" data-key="' + escape(key(row)) + '" aria-current="' + (selected && key(selected) === key(row) ? 'true' : 'false') + '">' +
       '<span class="meta">' + escape(meta) + '</span><span class="title">' + escape(title) + '</span>' +
       (data.summary ? '<span class="summary">' + escape(data.summary) + '</span>' : '') +
+      (row.task?.reason ? '<span class="summary">' + escape(row.task.reason) + '</span>' : '') +
       '<span class="state">' + escape(state(row)) + '</span></button></li>';
   }
   function renderQueue() {
@@ -141,9 +187,9 @@ const CLIENT = String.raw`
     const matches = row => terms.every(term => JSON.stringify([row.host, row.data]).toLocaleLowerCase().includes(term));
     const all = rows();
     const groups = [
-      ['Owner decisions', all.filter(row => row.target === 'owner' && !other(row))],
-      ['Live questions & permissions', all.filter(row => row.target === 'live' && !other(row))],
-      ['Other waits', all.filter(other)],
+      ['Needs your decision', all.filter(row => !other(row) && (row.task ? row.task.priority === 'owner' : row.target === 'live' || row.data.extracted))],
+      ['Needs source review', all.filter(row => !other(row) && (row.task ? row.task.priority === 'review' : row.target === 'owner' && !row.data.extracted))],
+      ['Research, delegated & other waits', all.filter(other)],
       ['Recent receipts', receipts()]
     ];
     let found = 0;
@@ -180,7 +226,7 @@ const CLIENT = String.raw`
     return '<b>' + escape(receipt.identifier + ' · ' + receipt.action) + '</b><p class="muted">' + escape(date(receipt.at)) + ' · delivery: ' + escape(receipt.delivery) + '</p><p class="pre">' + escape(receipt.text) + '</p>';
   }
   function renderReceipt(row) {
-    const current = rows().find(item => item.host === row.host && item.target === 'owner' && item.id === row.data.issueId);
+    const current = rows().find(item => item.host === row.host && item.target === 'owner' && item.data.issueId === row.data.issueId && item.revision === row.data.revision);
     pane.innerHTML = '<header class="detail-heading"><p class="muted">Receipt · ' + escape(row.host) + '</p><h2 tabindex="-1" id="detail-title">' + escape(row.data.identifier + ' · ' + row.data.action) + '</h2></header>' +
       '<section class="section">' + receiptMarkup(row.data) + '<p class="help">A delivery receipt records where the decision went. It does not confirm that downstream work is complete.</p>' +
       (current ? '<button type="button" data-current="' + escape(key(current)) + '">Open current ask</button>' : '<p class="help">No current canonical ask for this receipt is in the received snapshot. Historical revisions cannot be answered or reopened here.</p>') + '</section>';
@@ -193,9 +239,9 @@ const CLIENT = String.raw`
     if (selected.target === 'receipt') { renderReceipt(selected); return; }
     const row = selected, data = row.data, saved = draft(row);
     const permission = row.target === 'live' && data.kind === 'permission';
-    const why = row.target === 'owner' ? data.attentionReason || 'No owner-attention reason was supplied.' : permission ? 'The agent is waiting for an explicit permission decision.' : 'The agent is waiting for your answer to its original questions.';
+    const why = row.task?.reason || (row.target === 'owner' ? data.attentionReason || 'No owner-attention reason was supplied.' : permission ? 'The agent is waiting for an explicit permission decision.' : 'The agent is waiting for your answer to its original questions.');
     // Receipts have issue IDs, not live request IDs. Never invent a live-request join.
-    const history = receipts().filter(receipt => receipt.host === row.host && (row.target === 'live' || receipt.data.issueId === row.id));
+    const history = receipts().filter(receipt => receipt.host === row.host && (row.target === 'live' || (receipt.data.issueId === data.issueId && receipt.data.revision === row.revision)));
     const links = safeLink(row.target === 'owner' ? data.url : data.issueUrl, 'Open Linear ticket') + (row.target === 'live' ? safeLink(data.agentUrl, 'Open agent') : '');
     let answer;
     if (permission) {
@@ -212,11 +258,15 @@ const CLIENT = String.raw`
     pane.innerHTML = '<header class="detail-heading"><p class="muted">' + escape([data.identifier, row.host, row.target === 'owner' ? data.ticketIdentifier : data.kind].filter(Boolean).join(' · ')) + '</p>' +
       '<h2 tabindex="-1" id="detail-title">' + escape(data.title) + '</h2><div class="links">' + links + '</div></header>' +
       '<div id="source-warning" class="notice" role="alert" hidden></div><div id="action-status" class="notice status" role="status" aria-live="polite" hidden></div>' +
-      (row.target === 'owner' ? '<section class="section"><h3>Ask summary <span class="muted">' + (data.extracted ? '· generated' : '· extraction pending') + '</span></h3><p class="pre">' + escape(data.summary || 'No summary available. Read the original source below.') + '</p><p class="help">The summary is not an approval or an answer. Your explicit choice is sent.</p></section>' : '') +
-      '<section class="section"><h3>Decision context</h3><dl class="context"><dt>Why it needs you</dt><dd>' + escape(why) + '</dd><dt>Wait / group</dt><dd>' + escape(state(row)) + '</dd>' +
+      (row.target === 'owner' ? '<section class="section"><h3>Ask summary <span class="muted">' + (data.extracted ? '· generated' : '· unresolved extraction') + '</span></h3><p class="pre">' + escape(data.summary || 'No summary available. Read the original source below.') + '</p>' + (!data.extracted ? '<p class="help">Extraction is pending or failed. This source remains visible; read the original request before replying. No choices or authorization have been inferred.</p>' : '') + '<p class="help">The summary is not an approval or an answer. Your explicit choice is sent.</p></section>' : '') +
+      '<p class="help">' + escape(why) + '</p><details class="section"><summary>Decision context</summary><dl class="context"><dt>Why it needs you</dt><dd>' + escape(why) + '</dd><dt>Wait / group</dt><dd>' + escape(state(row)) + '</dd>' +
+      '<dt>Blocked work</dt><dd>' + escape(row.task?.blockedWork || 'No additional blocked-work evidence supplied.') + '</dd>' +
+      '<dt>Owner last resort</dt><dd>Use scoped research or delegation when authority already exists. This list never invents authorization or accepts a recommendation for you.</dd>' +
       (row.target === 'owner' ? '<dt>Blocker</dt><dd>' + escape(data.blockerIdentifier || 'No blocker identified in this snapshot.') + '</dd><dt>Answer route</dt><dd>' + escape(data.route) + (data.agentId ? ' · agent ' + escape(data.agentId) : '') + '</dd>' : '<dt>Request</dt><dd>' + escape(data.requestId) + '</dd><dt>Agent</dt><dd>' + escape(data.agentId) + '</dd>') +
-      '<dt>Revision</dt><dd>' + escape(row.revision) + '</dd></dl></section>' +
-      '<section class="section"><h3>Original source</h3><pre class="pre">' + escape(data.source || 'No source text supplied.') + '</pre></section>' +
+      (data.sourceId ? '<dt>Source</dt><dd>' + escape(data.sourceId === 'description' ? 'Issue description' : 'Comment ' + data.sourceId) + '</dd>' : '') +
+      '<dt>Revision</dt><dd>' + escape(row.revision) + '</dd></dl></details>' +
+      (row.task?.flow ? '<section class="section"><h3>Recovery evidence</h3>' + recoveryContext(row.task.flow) + '<p class="help">Queued recovery is waiting, not verified progress. This evidence never grants authority or creates an owner decision by itself.</p></section>' : '') +
+      '<details class="section"' + (permission || !data.questions.length || (row.target === 'owner' && !data.extracted) ? ' open' : '') + '><summary>Original source</summary><pre class="pre">' + escape(data.source || 'No source text supplied.') + '</pre></details>' +
       '<form id="answer-form" class="form-section"><h3>' + (permission ? 'Permission decision' : 'Your answer') + '</h3>' + answer +
       (row.target === 'owner' && !data.questions.length ? '<label class="field-label" for="note">Your reply</label><textarea id="note" maxlength="4000">' + escape(saved.note) + '</textarea>' : row.target === 'owner' || permission ? '<label class="field-label" for="note">' + noteLabel + '</label><textarea id="note" maxlength="4000">' + escape(saved.note) + '</textarea>' : '') +
       '<p class="help">Nothing is preselected. Sending confirms delivery only, not completion of the work.</p><div class="actions"><button class="primary" type="submit"' + (permission && !data.actions.length ? ' disabled' : '') + '>' + (permission ? 'Send permission decision' : row.target === 'live' && !data.questions.length ? 'Continue current round' : 'Send answer') + '</button></div>' +
@@ -225,9 +275,9 @@ const CLIENT = String.raw`
       (!permission ? '<form id="scope-form" class="form-section"><h3>Research or delegate</h3><p class="help">Request scoped work, not approval. State the task and what must not change.</p>' +
       '<label class="field-label" for="scope">Scope / question to resolve</label><textarea id="scope" maxlength="3000">' + escape(saved.scope) + '</textarea>' +
       '<label class="field-label" for="boundaries">Boundaries / stop conditions</label><textarea id="boundaries" maxlength="1000">' + escape(saved.boundaries) + '</textarea>' +
-      '<div class="actions"><button type="submit" data-triage="research">Request research</button><button type="submit" data-triage="delegate">Delegate scoped work</button></div></form>' +
+      '<div class="actions"><button type="submit" data-triage="research">Request research</button><button type="submit" data-triage="delegate">Delegate scoped work</button></div></form>' : '') +
       '<section class="form-section"><h3>Timing</h3><p class="help">Defer pauses this decision; it does not answer or approve it. Tomorrow means 9:00 in this browser’s local time.</p><div class="actions"><button type="button" data-operation="hour">Defer 1 hour</button><button type="button" data-operation="tomorrow">Defer until tomorrow</button>' +
-      (data.disposition || data.deferredUntil ? '<button type="button" data-operation="reopen">Reopen decision</button>' : '') + '</div></section>' : '') +
+      (data.disposition || data.deferredUntil ? '<button type="button" data-operation="reopen">Reopen decision</button>' : '') + '</div></section>' +
       '<section class="section"><h3>' + (row.target === 'live' ? 'Host history' : 'History') + '</h3>' +
       (row.target === 'live' ? '<p class="help">Receipts from this host may belong to other decisions. This history does not associate receipts with live request IDs.</p>' : '') +
       (history.length ? '<ul class="history">' + history.map(receipt => '<li>' + receiptMarkup(receipt.data) + '</li>').join('') + '</ul>' : '<p class="muted">No receipts in the returned history for this scope. All received receipts are available in the queue.</p>') + '</section>';
@@ -259,7 +309,7 @@ const CLIENT = String.raw`
     const id = key(selected), problem = hostProblem(selected);
     const warning = document.getElementById('source-warning');
     if (!warning) return;
-    warning.hidden = !stale && !problem;
+    warning.hidden = completed.has(id) || (!stale && !problem);
     const nextRounds = stale && selected.target === 'live' ? rows().filter(row => row.target === 'live' && row.host === selected.host && row.data.agentId === selected.data.agentId && identity(row) !== identity(selected)) : [];
     warning.innerHTML = stale ? '<b>Source changed or the current round ended.</b><p>Your previous draft has not been applied to another request or revision. Review and reselect the current source before sending.</p><button type="button" data-reselect="true">Review current source</button>' +
       nextRounds.map(row => '<button type="button" data-current="' + escape(key(row)) + '">Review live request: ' + escape(row.data.title) + '</button>').join('') : escape(problem);
@@ -357,7 +407,7 @@ const CLIENT = String.raw`
     }
   }
   function baseAction(row, operation) {
-    return {host:row.host, ...(row.backendInstanceId ? {backendInstanceId:row.backendInstanceId} : {}), target:row.target, operation, revision:row.revision, ...(row.target === 'owner' ? {issueId:row.id} : {agentId:row.data.agentId, requestId:row.data.requestId})};
+    return {host:row.host, ...(row.backendInstanceId ? {backendInstanceId:row.backendInstanceId} : {}), target:row.target, operation, revision:row.revision, ...(row.target === 'owner' ? {issueId:row.data.issueId} : {agentId:row.data.agentId, requestId:row.data.requestId})};
   }
   function answers(row, saved) {
     const entries = row.data.questions.map((question, index) => {
@@ -502,7 +552,7 @@ export function decisionPage(view: DecisionView, availability?: InboxAvailabilit
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Decision inbox</title><style>${STYLE}</style></head>
 <body><a class="skip" href="#detail">Skip to selected decision</a>
 <div class="shell"><aside class="queue" aria-label="Decision queue">
-<header class="queue-header"><div class="top"><h1>Decision inbox</h1><button id="refresh" type="button">Refresh</button></div><p id="refresh-state" class="muted" role="status" aria-live="polite"></p><label class="search" for="search">Search decisions &amp; history</label><input id="search" type="search" placeholder="Ticket, title, host, or source" autocomplete="off"></header>
+<header class="queue-header"><div class="top"><h1>Decision tasks</h1><button id="refresh" type="button">Check updates</button></div><p id="refresh-state" class="muted" role="status" aria-live="polite"></p><p class="muted">Original choices, explicit answers. Research or delegate first when it is already within scope.</p><label class="search" for="search">Search decisions &amp; history</label><input id="search" type="search" placeholder="Ticket, title, host, or source" autocomplete="off"></header>
 <div id="coverage" class="coverage" role="status" aria-live="polite"></div><div id="queue-list"></div>
 </aside><main id="detail" class="detail" tabindex="-1" aria-label="Selected decision"><div class="detail-inner"><nav class="detail-nav" aria-label="Inbox navigation"><button id="back" class="back" type="button">Back to decisions</button><a href="/">Plan review inbox</a></nav><div id="detail-content"></div></div></main></div>
 <noscript><p class="coverage warning">JavaScript is required to load decisions and send explicit answers. No actions are sent without it.</p></noscript>

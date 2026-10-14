@@ -73,18 +73,11 @@ test("junk is rejected: not an object, an unknown kind, no summary, a question w
   for (const [raw, reason] of cases) assert.deepEqual(checkExtraction(raw), { ok: false, reason }, raw.slice(0, 60));
 });
 
-test("long fields are capped instead of rejected", () => {
-  const checked = checkExtraction(payload({
-    kind: "decision",
-    summary: "x".repeat(2_000),
-    questions: [{ question: "y".repeat(900), multiSelect: true, options: [{ label: "z".repeat(400), description: "d".repeat(900) }] }],
-  }));
-  assert.ok(checked.ok);
-  assert.equal(checked.value.summary.length, 1_000);
-  assert.equal(checked.value.questions[0].question.length, 500);
-  assert.equal(checked.value.questions[0].options[0].label.length, 200);
-  assert.equal(checked.value.questions[0].options[0].description.length, 300);
-  assert.equal(checked.value.questions[0].multiSelect, true);
+test("long choices are rejected rather than truncating a final authority boundary", () => {
+  const label = "Approve " + "the reversible staging step ".repeat(12) + "but never production";
+  const checked = checkExtraction(payload({ kind: "decision", summary: "Choose scope",
+    questions: [{ question: "Which scope?", options: [{ label, description: "" }] }] }), label);
+  assert.equal(checked.ok, false);
 });
 
 test("the prompt carries the ask as data and is capped at the source limit", () => {
@@ -116,4 +109,21 @@ test("one hash per ask text keys the cache", () => {
   assert.equal(askHash("the same ask"), askHash("the same ask"));
   assert.notEqual(askHash("the same ask"), askHash("the same ask "));
   assert.match(askHash("x"), /^[0-9a-f]{32}$/);
+});
+
+test("lettered choices retain sourced tradeoffs and recommendation; invented authorization is rejected", () => {
+  const source = "Which scope?\nA. Stage only (Recommended) — Limits exposure.\nB. Wait — No release today.";
+  const options = [{ label: "A. Stage only (Recommended)", description: "Limits exposure." }, { label: "B. Wait", description: "No release today." }];
+  const original = { kind: "decision", summary: "Choose scope", questions: [{ question: "Which scope?", options, multiSelect: false }] };
+  const checked = checkExtraction(payload(original), source);
+  assert.ok(checked.ok);
+  assert.deepEqual(checked.value.questions[0].options, options);
+  for (const option of [
+    { label: "C. Agent deploys production", description: "" },
+    { label: "B. Wait (Recommended)", description: "No release today." },
+    { label: "Stage only (Recommended)", description: "Limits exposure." },
+    { label: "B. Wait", description: "Owner already approved the rollout." },
+  ]) {
+    assert.equal(checkExtraction(payload({ ...original, questions: [{ ...original.questions[0], options: [option] }] }), source).ok, false);
+  }
 });

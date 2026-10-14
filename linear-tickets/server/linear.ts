@@ -942,7 +942,6 @@ export type OwnerAskIssue = {
 };
 export type OwnerAskComment = { id: string; body: string; createdAt: string };
 export const OWNER_ASKS_PAGE = 50;
-export const OWNER_ASKS_PAGES = 5;
 const OWNER_ASK_FIELDS = `id identifier title url updatedAt description state { name type } parent { id identifier } labels(first: 50) { nodes { name } }`;
 export const OWNER_ASKS_QUERY = `query ownerAskIssues($first: Int!, $after: String, $filter: IssueFilter) {
   issues(first: $first, after: $after, includeArchived: false, orderBy: updatedAt, filter: $filter) {
@@ -955,15 +954,14 @@ export const OWNER_ASKS_BY_ID_QUERY = `query ownerAskIssuesById($ids: [ID!]!, $f
     nodes { ${OWNER_ASK_FIELDS} }
   }
 }`;
-// The newest OWNER_ASK_COMMENTS comments of one issue. Linear's `comments(first:)` returns the
-// newest first (its `last:` returns the oldest), so a single page is the recent history.
+// Every comment page, newest first, batched across issues without truncating older asks.
 export const OWNER_ASK_COMMENT_BATCH = 10;
-export const OWNER_ASK_COMMENTS = 12;
+export const OWNER_ASK_COMMENTS = 50;
 export function ownerAskCommentsQuery(count: number): string {
   const indexes = Array.from({ length: count }, (_, index) => index);
-  const declarations = indexes.map((index) => `$i${index}: ID!`).join(", ");
+  const declarations = indexes.map((index) => `$i${index}: ID!, $a${index}: String`).join(", ");
   const fields = indexes.map((index) => `t${index}: issues(first: 1, filter: { id: { eq: $i${index} } }) {
-    nodes { comments(first: ${OWNER_ASK_COMMENTS}) { nodes { id body createdAt } } }
+    nodes { comments(first: ${OWNER_ASK_COMMENTS}, after: $a${index}) { nodes { id body createdAt } pageInfo { hasNextPage endCursor } } }
   }`).join("\n  ");
   return `query ownerAskComments(${declarations}) {\n  ${fields}\n}`;
 }
@@ -2215,23 +2213,25 @@ export class LinearService {
     return empty;
   }
 
-  // The owner's asks (README, "Owner asks"): the issues in "Needs input", newest change first,
-  // OWNER_ASKS_PAGE a read, at most OWNER_ASKS_PAGES reads. Always with the owner's key, as
-  // `issues()`: the filter's `isMe` would name the Paseo app through the app's token.
-  async ownerAskIssues(): Promise<OwnerAskIssue[]> {
-    const issues: OwnerAskIssue[] = [];
+  // Read every page with the owner's key: the app token's `isMe` names Paseo instead.
+  // Browser collection includes normal open issues, not only Needs input.
+  async ownerAskIssues(allOpen = false): Promise<OwnerAskIssue[]> {
+    const issues = new Map<string, OwnerAskIssue>();
+    const cursors = new Set<string>();
     let after: string | null = null;
-    let pages = 0;
     do {
-      const page = record(record(await this.withKey((key) => this.post(key, OWNER_ASKS_QUERY, { first: OWNER_ASKS_PAGE, after, filter: listIssueFilter([NEEDS_INPUT_STATE]) }))).issues ?? {});
+      const page = record(record(await this.withKey((key) => this.post(key, OWNER_ASKS_QUERY, { first: OWNER_ASKS_PAGE, after, filter: listIssueFilter(allOpen ? undefined : [NEEDS_INPUT_STATE]) }))).issues ?? {});
       for (const node of connection(page).nodes) {
         const issue = ownerAskIssue(record(node));
-        if (issue.id) issues.push(issue);
+        if (issue.id) issues.set(issue.id, issue);
       }
       const info = record(page.pageInfo ?? {});
-      after = ++pages < OWNER_ASKS_PAGES && info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
+      if (info.hasNextPage !== true) break;
+      after = label(info.endCursor);
+      if (!after || cursors.has(after)) throw new Error("Linear returned an incomplete or repeated owner-issue cursor.");
+      cursors.add(after);
     } while (after);
-    return issues;
+    return [...issues.values()];
   }
 
   // Named issues (the acceptance smoke test): read by id, closed ones included.
@@ -2241,24 +2241,40 @@ export class LinearService {
     return connection(record(data.issues)).nodes.map((node) => ownerAskIssue(record(node))).filter((issue) => issue.id);
   }
 
-  // The newest OWNER_ASK_COMMENTS comments of each issue, in one read per OWNER_ASK_COMMENT_BATCH
-  // issues. An issue neither credential returns is left out (deleted, or not visible).
+  // Paginate every issue's comments independently; never advertise a partial inventory as complete.
   async ownerAskComments(ids: string[]): Promise<Map<string, OwnerAskComment[]>> {
     const comments = new Map<string, OwnerAskComment[]>();
     for (let start = 0; start < ids.length; start += OWNER_ASK_COMMENT_BATCH) {
-      const batch = ids.slice(start, start + OWNER_ASK_COMMENT_BATCH);
-      const variables: Record<string, unknown> = {};
-      batch.forEach((id, index) => Object.assign(variables, { [`i${index}`]: id }));
-      const data = await this.read(ownerAskCommentsQuery(batch.length), variables, (result) =>
-        batch.every((_, index) => Boolean(connection(record(result[`t${index}`] ?? {})).nodes[0])));
-      batch.forEach((id, index) => {
-        const issue = connection(record(data[`t${index}`] ?? {})).nodes[0];
-        if (!issue) return;
-        comments.set(id, connection(record(record(issue).comments ?? {})).nodes.map((node) => {
-          const entry = record(node);
-          return { id: label(entry.id), body: label(entry.body), createdAt: label(entry.createdAt) };
-        }).filter((comment) => comment.id));
-      });
+      let round = ids.slice(start, start + OWNER_ASK_COMMENT_BATCH).map(id => ({ id, after: null as string | null, seen: new Set<string>() }));
+      while (round.length) {
+        const variables: Record<string, unknown> = {};
+        round.forEach((item, index) => Object.assign(variables, { [`i${index}`]: item.id, [`a${index}`]: item.after }));
+        const data = await this.read(ownerAskCommentsQuery(round.length), variables, (result) =>
+          round.every((_, index) => Boolean(connection(record(result[`t${index}`] ?? {})).nodes[0])));
+        const next: typeof round = [];
+        round.forEach((item, index) => {
+          const issue = connection(record(data[`t${index}`] ?? {})).nodes[0];
+          if (!issue) throw new Error(`Linear could not read owner-question comments for ${item.id}.`);
+          const found = connection(record(record(issue).comments ?? {}));
+          const list = comments.get(item.id) ?? [];
+          const known = new Set(list.map(comment => comment.id));
+          for (const node of found.nodes) {
+            const entry = record(node);
+            const id = label(entry.id);
+            if (id && !known.has(id)) {
+              list.push({ id, body: label(entry.body), createdAt: label(entry.createdAt) });
+              known.add(id);
+            }
+          }
+          comments.set(item.id, list);
+          if (found.hasNextPage) {
+            if (!found.endCursor || item.seen.has(found.endCursor)) throw new Error(`Linear returned an incomplete or repeated comment cursor for ${item.id}.`);
+            item.seen.add(found.endCursor);
+            next.push({ ...item, after: found.endCursor });
+          }
+        });
+        round = next;
+      }
     }
     return comments;
   }

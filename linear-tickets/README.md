@@ -2290,31 +2290,29 @@ rolled out works through the Done tickets with open pull requests (~16 in tuchel
 of a Done ticket is archived only once this rule found no open pull request of it, or you moved the
 ticket back to Done after a reopen (see **Ghost agents**).
 
-**Silent and stuck agents.** A ticket agent that stops making progress is recovered by the
-watchdog ([`server/watchdog.ts`](server/watchdog.ts)), which runs first in every two-minute poll
-of the pull request watch. It judges each ticket's current root agent (never a subagent) and
-walks it through bounded steps, each one leaving a line in the agent panel (else a ticket
-comment):
+**Silent and stuck agents.** The watchdog ([`server/watchdog.ts`](server/watchdog.ts)) runs on
+an independent, non-overlapping one-minute clock as well as before the pull request poll.
+Slow PR work does not hold its clock. It judges implementation roots, never subagents or
+recovery diagnostics. The target is a first safe reaction after five minutes, then a different
+action or named wait by ten minutes, plus polling and infrastructure latency—not forced completion.
 
 | Situation | Step | Next look |
 | --- | --- | --- |
-| Running, no progress for 45 min | OMP `/steer` (the turn keeps running): report the lifecycle step and continue it — "Watchdog: asked the silent agent to report and continue." | 20 min |
-| Still silent | Stop the turn (waiting up to 60 s for it to end), then a resume that runs `git status` first — "Watchdog: stopped the silent turn and asked the agent to continue." | 20 min |
-| Still silent | Stop if needed, reload the agent (`paseo agent reload`), resume — "Watchdog: reloaded the silent agent and asked it to continue." | 20 min |
-| Still silent | Retire the agent (Stop, archive; a ghost is archived without a Stop), prove no OMP process of the ticket remains, start a successor on the recorded branch and worktree — "Watchdog: started a replacement on the recorded branch." | 20 min |
-| Closed or idle for 2 h, ticket open, no open pull request, nobody waited on | One resume ("continue the lifecycle step you were on"); an agent that cannot be loaded goes to the replacement step — "Watchdog: asked the stopped agent to continue the lifecycle step it was on." | 20 min |
-| A ghost (see **Ghost agents**) | At once, once a slot admits it: reload it from its session without a Stop, then the resume; still silent after 20 min (or the reload failed), the replacement step | 20 min |
-| No progress after the last step, or a predecessor that cannot be proven gone within 20 min | One comment mentioning you: "Automatic recovery could not restore progress on this ticket. Please take over." No further agent. | — |
+| Running, silent for 5 min | Non-cancelling OMP `/steer`: report and continue the lifecycle step | Within 5 min |
+| Still silent after the steer | Hand recovery responsibility to bounded read-only diagnosis; no timed interrupt/kill ladder | Within 5 min |
+| Closed or idle for 5 min, ticket open, no open pull request or deliberate wait | One resume; failed recovery goes to diagnosis | Within 5 min |
+| Proven ghost | Reload without Stop; replacement only after process absence and fresh authority checks | Within 5 min |
+| Retired predecessor, replacement awaiting admission | Classify as queued with a reason and next check, not moving | Within 5 min |
+| Recovery budget exhausted | Diagnose before asking the owner; budget exhaustion alone is not an owner decision | Within 5 min |
 
 A ghost has no process that could end its turn, so a Stop sent to it is never acknowledged: until
 2026-10-14 the replacement waited for that Stop, retried it for 20 minutes and then mentioned you
 (after server087's daemon restart at 12:28 UTC that day, 51 tickets got the mention and one
 replacement started, although sending TUC-2205's ghost a message resumed it at once). Now a ghost
-is reloaded from its session, the way a message to it loads it, and is never stopped first. A
-replacement whose predecessor is archived and proven gone and that only waits for its start (no
-free slot, a peer route not ready) waits like a queued ticket, logged once
-(`… is retired; its replacement waits: Queued: …`); the 20 minutes bound only the proof of
-absence. A ghost reload that no slot admits waits the same way.
+is reloaded from its session, the way a message to it loads it, and is never stopped first.
+A replacement whose predecessor is archived and proven gone but whose admission is unavailable
+waits as queued work with a persisted reason and next check. The five-minute retirement bound
+does not authorize killing a live process. A ghost reload that no slot admits also waits.
 
 A failed step says so ("Watchdog: <action> failed; <reason>.") and the next step follows.
 Progress means a new assistant message, tool start or tool result on the current branch of the
@@ -2334,17 +2332,17 @@ for later, paused for deletion, or has two live root agents. A ticket whose repo
 known (no linked pull request, a worktree without a GitHub origin Git can read, such as a main
 checkout configured `core.bare`) and whose attachments name no pull request has no open pull
 request; only a failed read of the attachments or of a repository's pull requests vetoes. A
-quiet agent kept out this way is judged again 15 minutes later, not every poll (each judgement
-reads Linear and GitHub), so its recovery can start up to 15 minutes after the reason ends. Your
+quiet agent kept out this way is judged again within five minutes rather than on every poll
+(each judgement reads Linear and GitHub). The veto remains authoritative while it holds. Your
 Stop in Linear holds the ticket until you reply, resume or open a new thread: it is saved before
 the Stop goes out and survives reloads. Every step is re-checked inside the ticket's turn and
 start gate right before it, and claimed in `$PASEO_HOME/linear-tickets/watchdog.json` before its
 effect. A claim whose outcome a restart lost is never repeated: the next step follows after its
-window, and an unproven replacement is awaited by its label (`linear-tickets.watchdog`) or ends
-with the mention. A turn, message or session the watchdog did not cause (yours, another nudge's)
-ends the cycle; new progress ends it too. At most two cycles start per ticket in any 24 hours; a
-third silence gets the mention once and nothing more until the agent makes progress or you
-continue. A corrupt or unreadable `watchdog.json` stops all recovery (it is never reset).
+window, and an unproven replacement is reconciled by its label (`linear-tickets.watchdog`).
+A turn, message or session the watchdog did not cause (yours, another nudge's) ends the cycle;
+new transcript activity ends it too. At most two cycles start per ticket in any 24 hours;
+exhaustion hands responsibility to the steward's bounded diagnostic path rather than immediately
+asking you. A corrupt or unreadable `watchdog.json` stops recovery; it is never reset.
 Unloading the plugin stops new steps; a step in flight finishes under a host-local lease the next
 instance waits for.
 
@@ -2358,13 +2356,12 @@ and the handover (see **Drain one host into another** under [Native Linear agent
 and never falls back to a local start.
 
 **Watchdog** has its own switch, independent of *Start a new agent automatically*, and is on by
-default. Turn it off, or change the minutes (whole numbers 1–1440), with `linear.set-settings`:
-`"writeback": { "watchdog": false }` and `"watchdog": { "silentMinutes": 45, "steerGraceMinutes": 20,
-"recoveryGraceMinutes": 20, "idleMinutes": 120 }` (omitted fields keep their value). Turning it
-off stops further steps; it does not undo a step already taken. To roll back, revert the change
-and reload the plugin; keep `watchdog.json`, which holds the claims and budgets. A long quiet
-command (a build, a test run) without output can be interrupted after 45 minutes: raise
-`silentMinutes` where that is normal.
+default. Turn it off with `linear.set-settings`: `"writeback": { "watchdog": false }`.
+The effective `silentMinutes`, `steerGraceMinutes`, `recoveryGraceMinutes` and `idleMinutes`
+are whole minutes from 1 through 5; older persisted longer values are clamped to 5 on read.
+Turning it off stops further steps, not effects already sent. Roll back by reverting the change
+and reloading; keep `watchdog.json`, which holds claims and budgets. A quiet build or test is not
+interrupted merely because five minutes elapsed: the next step is read-only diagnosis.
 
 **Health.** Every 5 minutes the plugin checks the Linear key, the Paseo app, Tailscale Funnel
 and the local receiver. A problem confirmed twice opens one urgent ticket, "⚠️ Paseo needs
@@ -2935,7 +2932,7 @@ and PR fences are checked again immediately before creating the helper.
 
 | State | What it means |
 |---|---|
-| **MOVING** | A live root agent with progress inside `steward.idleMinutes` (30 by default), or a watchdog cycle already recovering the ticket, or an idle agent with an open pull request (its own watch nudges it). |
+| **MOVING** | A live root with recent activity inside `steward.idleMinutes` (5 by default), an active recovery action, or an idle agent with an open PR under its own watch. A retired replacement awaiting admission is queued, not moving. |
 | **WAITING_OWNER** | A recorded wait for you that something can still end: Needs input, the `paseo-needs-you` label and a decision on the ticket. |
 | **WAITING_BLOCKER** | A named blocker that is not finished (done, canceled, duplicate or in review with merged pull requests). |
 | **QUEUED** | A thread of the ticket waits in the scheduler's line for its blockers or a slot, or an admission deferral the steward recorded — no budget was spent, the pass retries it; past `steward.queuedEscalateHours` (24 by default) the wait itself reaches you. |
@@ -2980,8 +2977,8 @@ the generation's exact child membership, host ownership, and owner/manual gates.
 before-merge, after-merge or anytime tasks — including completed tasks whose check has not passed
 for that completion — block close. A changed child set, reopened child/PR, unreadable evidence,
 explicit stop/unassignment, or paused coordination invalidates the close. A legacy parent verifier
-without a membership snapshot must verify again. One that does not report within 45 minutes
-escalates. A landed set already judged once is not verified again — it escalates instead.
+without a membership snapshot must verify again. A verifier that does not report within five
+minutes, or a landed set already judged without resolution, goes to bounded diagnosis.
 
 A parent `resume` sends the concrete instruction to its live implementation agent, resumes its
 recorded implementation branch, or starts a fresh implementation when the parent never had one.
@@ -3026,11 +3023,11 @@ blindly; a claimed action still claimed after its grace ends counts as failed an
 forever. The pass is level-triggered: missed events do not matter, because every pass recomputes
 from Linear, the handover records, the agent listing and the pull request watch's own state.
 
-**Cadence and cost.** The steward runs at the end of every pull request poll (every two minutes),
-after the passes whose effects it must see, and in the dispatch poll with the same trigger-label
-reset the old label repair had. It reads the in-scope tickets in one paginated query, respects the
-rate budget's background reserve, background pause, deletion pause, focus mode, presence and the
-peer host's claims, and takes a scheduler slot for the verifiers it starts like any other agent.
+**Cadence and cost.** Independent, non-overlapping one-minute watchdog and steward ticks run
+alongside the slower PR and dispatch passes. They retain cross-instance leases and stop admitting
+effects on unload. The steward reads paginated in-scope tickets and respects the Linear budget,
+deletion pause, focus mode, presence and peer ownership. Diagnostic helpers consume real capacity
+through the control lane; they do not become implementation roots.
 
 **Where to see it.** The flow summary — the counts per state, the oldest ticket of each state and
 the pass's health — is in the browser decision inbox page's **Flow** section
@@ -3040,8 +3037,33 @@ finished") with its members and what each of them is, refreshed at most every 30
 
 **Settings.** `steward.enabled` (default true; off stops every repair, the states are still computed
 and shown), `steward.queuedEscalateHours` (24: a ticket waiting in the queue longer is escalated),
-`steward.idleMinutes` (30: the silence that makes a live root agent idle) and
-`steward.maxActionsPerPass` (5).
+`steward.idleMinutes` (5; older longer values are clamped) and `steward.maxActionsPerPass` (5).
+
+**Responsibility and advancement.** Each observed ticket retains its responsible host and work
+generation, next action, wait reason, next check and last verified stage advancement. Transcript
+activity is liveness, not advancement. Plan state, child completion, PR head, CI and review state
+supply stage evidence; unknown reads must not fabricate progress.
+
+**Bounded diagnosis.** A short-lived OMP helper reads evidence and returns exactly one structured
+`continue`, `replace`, `wait` or `ask-owner` verdict. At most two diagnoses per ticket per day
+run for at most five minutes each. Continue uses a durable operation ID; replacement preserves
+the recorded branch and requires the old worker to be absent. A wait names its reason and a next
+check within five minutes. Owner escalation must identify the actual decision and choices.
+An uncertain helper launch retains its marker across reloads; timeout is not cancellation and
+never permits a second blind launch. Late matching helpers are retired, not implementation roots.
+
+The browser flow exposes recovery-control health, overdue checks, unattended age, responsible
+generation, last advancement and recovery outcomes. These are operational signals, not proof that
+an answer was delivered or that the ticket is complete.
+
+Recovery counters are prospective and local to the steward journal. `owner-retry` counts each
+retry entry for a tracked ticket, not every manual prompt or deduplicated user intent.
+`owner-escalation` counts successfully resolved write-back escalations recorded durably, excluding
+failed attempts. `advancement-after-recovery` counts one later observed stage transition after a
+confirmed restart/replacement or sent/started continuation receipt, not a transport receipt alone.
+It is temporal association, not causal attribution. `advanced` records progress during diagnosis;
+`ask-owner` records a completed diagnostic owner-question outcome. No metric labels an escalation
+“unnecessary” without evidence; the counters support comparison, not that conclusion by themselves.
 
 ## Statuses and labels
 
@@ -4142,6 +4164,16 @@ one per agent and request, kept 14 days):
 Citations store the source's id, revision (document hash, commit or memory id) and the quote, so
 they keep saying what they relied on after the source changes.
 
+Readiness evidence is versioned by the `deputy-4` policy and model; old-policy predictions cannot
+satisfy the live gate. Evaluator outages are retryable unavailable evidence, not permanent
+knowledge refusals. Dispatch rebuilds and fingerprints the complete evaluator input, including
+source order and blocking-only sources. Missing or changed fingerprints cancel the prediction,
+even when the original quotation still appears verbatim. Settings changes synchronously revoke
+unsent work, including change-away/change-back. The checked reply arbiter tests that authority
+immediately before the response call, after asynchronous admission. Revoked intents never replay;
+responses already on the wire retain their actual outcome. Shadow mode remains appropriate until
+current-policy paired owner evidence meets the readiness threshold.
+
 **Modes** (`deputy.mode`):
 
 - `off` (default): nothing is evaluated.
@@ -4255,6 +4287,15 @@ The canonical Linear host is local in activation `local` mode, or `activation.pe
 mode. An unavailable canonical host is reported, never silently replaced by another host's asks.
 The generated ask summary is the existing extraction, not a separate issue-impact or Haiku briefing.
 
+The curated task list collects immediately and every fifteen minutes even with no browser open.
+It groups owner decisions, unresolved source review, research/delegated waits and receipts.
+Source counts are separate from steward ticket-state counts: `waiting-owner` is not a count of
+actionable questions. Per-host collection timestamps and incomplete/stale coverage stay visible.
+Standalone live questions without a Linear identifier remain included. Original lettered choices,
+tradeoffs and scoped research/delegation controls remain attached to the exact source revision.
+The separate inbox frontdoor must be rebuilt and restarted on both hosts when deploying page
+changes; plugin reload alone does not publish new browser HTML.
+
 `GET /api/decisions/local` returns this host only; `GET /api/decisions` combines the configured
 hosts without recursive peer reads. `POST /api/decisions/action` accepts an explicit owner-ask or
 live-request action and routes only to known hosts. Like review mutations, it requires JSON,
@@ -4281,14 +4322,14 @@ Linear's "Needs input" state. `linear.owner-asks` reads owner decisions, other w
 decision receipts; `linear.answer-ask` answers an exact revision of one ask. Reading does not answer,
 approve, complete or reassign anything in Linear.
 
-**What is read.** The owner's issues in the "Needs input" state, always with the owner's key (through
-the Paseo app "assigned to me" would mean the app; pages of 50, up to 250 issues a refresh; newest
-12 comments each, ten issues per read), their descriptions, this host's "Needs you"
-records (`$PASEO_HOME/linear-tickets/needs-you/`) and handover records. The ask text per issue,
-first match wins: the description of a "Needs you" sub-issue or a `paseo-manual` issue; the plugin's
-own wait comment (`… is waiting for you: …`, read by id when it is older than those comments); the
-newest comment that hands the next step to the owner; else the description. Source comments are
-re-read even when the ticket's `updatedAt` has not moved, because comment edits can leave it unchanged.
+**What is read.** All open issues assigned to the owner, including normal issue decisions and
+manual work—not just "Needs input"—are read with the owner's credential. Issue pages and each
+issue's comments are paginated to completion. Failed or incomplete collection is reported as
+incomplete coverage, not an empty successful inbox. Descriptions, source comments, this host's
+`needs-you/` records and handover records provide distinct revision-bound decision sources.
+The plugin's wait comment is read directly when necessary. Comment edits are re-read even
+when the ticket's `updatedAt` has not changed. Equal ticket IDs or wording alone do not merge
+independent decisions, and unanswered extraction remains visible for source review.
 An ask's ticket is the parent of a "Needs you" sub-issue or manual task, else the issue itself (a ticket under an epic is
 still its own ticket). Each ask carries its route from this host's view: `agent` (the live asking
 agent), `continue` (the ticket's agent is gone: an answer starts a continuation agent through the
@@ -4302,13 +4343,14 @@ answered — in the browser, the menu bar or on Linear — and the ask is left o
 refused by `linear.answer-ask` ("not waiting for you"), the same stale-wait rule the steward
 applies; write-back moves the ticket out of Needs input moments later. A `turn-end` wait (the agent
 ended its turn with a question) and a `decision` wait are unaffected. The browser inbox caches the
-owner snapshot for two minutes but reads the live agents on every view, so it drops a mirroring
+owner snapshot for fifteen minutes but reads live agents on every view. Explicit refresh and
+answers invalidate collection; the background collector runs even with the page closed. It drops a mirroring
 ask as soon as its live question is gone. When the agents cannot all be read, nothing is taken for
 answered.
 
 **The extraction.** `linear.owner-asks` never waits for a model. An ask whose ask text is new (or
-whose earlier extraction failed) is returned right away with `extracted: false` (kind `info`,
-summary = title) and extracted in the background: one isolated, tool-less OMP call per ask text
+whose earlier extraction failed) is returned right away with `extracted: false`; manual
+classification is preserved. Extraction runs in the background: one isolated, tool-less OMP call per ask text
 (no MCP servers, extensions, skills, rules or memory; the ask is data, never instructions), thinking
 `low`, on `deputy.model` when set, else the cheap tier's `cheapModels.omp` model. Strict JSON is
 accepted: kind `decision` (with questions and options), `manual` (the owner does something outside

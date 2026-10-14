@@ -331,6 +331,12 @@ export const dispatchStatusSchema = z.object({
     lastError: z.string().nullable(),
     counts: z.record(z.string(), z.number().int()),
     oldest: z.array(z.object({ identifier: z.string(), situation: z.string(), since: z.string() })),
+    control: z.object({
+      passStartedAt: z.string().nullable(),
+      overduePassMs: z.number().nonnegative(),
+      maxUnattendedMs: z.number().nonnegative(),
+      recoveryOutcomes: z.record(z.string(), z.number().int().nonnegative()),
+    }).nullable().optional(),
   }).nullable(),
 });
 export type DispatchStatus = z.infer<typeof dispatchStatusSchema>;

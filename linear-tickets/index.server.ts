@@ -252,6 +252,7 @@ export default function contribute(server: PluginServerContext) {
     // full PR inventory across every attached, recorded and worktree repository.
     pulls: (urls) => pullRequests.pullStates(urls),
     completionPulls: (issueId, identifier, urls) => pullRequests.completionPulls(issueId, identifier, urls),
+    recoveryWait: (issueId, identifier, urls) => pullRequests.recoveryWait(issueId, identifier, urls),
     intake, doneTickets, labels: new RetiredLabels(), deletions, focus, planned: waitingPlans,
   });
   const relay = new CommentRelay(linear, undefined, needsYou, route, replies);
@@ -285,6 +286,7 @@ export default function contribute(server: PluginServerContext) {
   // answered through the same paths an owner's "@paseo" reply takes.
   const ownerAsks = new OwnerAsks({
     linear,
+    issues: () => linear.ownerAskIssues(true),
     needsYou,
     handover,
     remoteAgent: async (issueId) => (await settings.read()).activation.mode === "local" && Boolean(await intake.claimFor(issueId)),
@@ -340,7 +342,7 @@ export default function contribute(server: PluginServerContext) {
     // The steward's flow summary for the page's Flow section (README, "Ticket steward").
     flow: async () => {
       const snapshot = await steward!.snapshot();
-      return { at: snapshot.lastPassAt, counts: snapshot.counts, oldest: snapshot.oldest, error: snapshot.lastError };
+      return { at: snapshot.lastPassAt, counts: snapshot.counts, oldest: snapshot.oldest, error: snapshot.lastError, tickets: snapshot.tickets, control: snapshot.control };
     },
   });
   const activationRoutes = activationEndpoints({ settings, intake, drain, appUserId: () => linear.appUserId() });
@@ -502,6 +504,19 @@ export default function contribute(server: PluginServerContext) {
   // The central Plannotator host starts once, after the hook it runs for each parked review exists.
   const startHost = async () => { if (await plannotatorHook() && !stopped) await plannotatorHost.start(); };
   let holdSeed: Promise<void> | null = null;
+  let controlTimer: NodeJS.Timeout | undefined;
+  let watchdogRun: Promise<void> | null = null;
+  let stewardRun: Promise<void> | null = null;
+  const controlTick = () => {
+    if (stopped || !attachedPaseo) return;
+    // Separate single flights: a slow PR inventory or a diagnostic admission cannot gate liveness.
+    watchdogRun ??= asCaller("watchdog", () => pullRequests.watchdogPass())
+      .catch((error: unknown) => console.error("[linear-tickets] watchdog control pass failed:", error))
+      .finally(() => { watchdogRun = null; });
+    stewardRun ??= asCaller("steward", async () => steward!.tick(attachedPaseo!, await settings.read()))
+      .catch((error: unknown) => console.error("[linear-tickets] steward control pass failed:", error))
+      .finally(() => { stewardRun = null; });
+  };
   const attach = (paseo: PaseoApi) => {
     const first = !attached;
     attached = true;
@@ -510,6 +525,12 @@ export default function contribute(server: PluginServerContext) {
     holdSeed ??= sessions.seedHolds();
     void holdSeed.then(() => {
       if (stopped) return;
+      browserDecisions.start();
+      if (!controlTimer) {
+        controlTimer = setInterval(controlTick, 60_000);
+        controlTimer.unref?.();
+        controlTick();
+      }
       asCaller("deputy", () => deputy.attach(paseo));
       asCaller("session-sweep", () => sessions.attach(paseo));
       if (first) asCaller("session-sweep", () => { void replies.recoverEffects().catch((error: unknown) => console.error(`[linear-tickets] recovering permission reply effects failed: ${error instanceof Error ? error.message : error}`)); });
@@ -579,9 +600,9 @@ export default function contribute(server: PluginServerContext) {
     const status = await dispatcher.snapshot();
     try {
       const snapshot = await steward!.snapshot();
-      return { ...status, steward: { enabled: snapshot.enabled, lastPassAt: snapshot.lastPassAt, lastError: snapshot.lastError, counts: snapshot.counts, oldest: snapshot.oldest } };
+      return { ...status, steward: { enabled: snapshot.enabled, lastPassAt: snapshot.lastPassAt, lastError: snapshot.lastError, counts: snapshot.counts, oldest: snapshot.oldest, control: snapshot.control } };
     } catch (error) {
-      return { ...status, steward: { enabled: false, lastPassAt: null, lastError: `the steward's state could not be read: ${error instanceof Error ? error.message : error}`, counts: {}, oldest: [] } };
+      return { ...status, steward: { enabled: false, lastPassAt: null, lastError: `the steward's state could not be read: ${error instanceof Error ? error.message : error}`, counts: {}, oldest: [], control: null } };
     }
   });
   server.handle(parentsStatusRpc, async () => ({ parents: await parents.all() }));
@@ -708,9 +729,13 @@ export default function contribute(server: PluginServerContext) {
   planningSmoke.start();
   return async () => {
     stopped = true;
+    clearInterval(controlTimer);
+    watchdog.stop();
+    steward?.stop();
     // The checked inbox backend stops admitting before anything it uses closes: a mutation the
     // frontdoor forwards from here on is refused, never rebound to the replacement plugin.
     reviewLinks.seam?.draining();
+    browserDecisions.stop();
     // The bridge stops admitting decisions and lets every admitted one finish (each call is
     // bounded) before anything it uses closes; only then does the journal's lease move on.
     await plannotator.stop();
@@ -728,6 +753,7 @@ export default function contribute(server: PluginServerContext) {
     ownerAsks.stop(); queuedLabels.stop();
     void closeInternalDaemon();
     await stoppedPullRequests;
+    await Promise.allSettled([watchdogRun, stewardRun]);
     await brokerReady;
     await broker.stop();
     await linearUsage.stop();

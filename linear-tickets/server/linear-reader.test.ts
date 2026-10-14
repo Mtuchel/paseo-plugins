@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
-import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_CORE_QUERY, ISSUE_GROUP_QUERY, ISSUE_GROUP_LABELS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_PAGES, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
+import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_CORE_QUERY, ISSUE_GROUP_QUERY, ISSUE_GROUP_LABELS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 
 const issue = { id: "i1", identifier: "TUC-1", state: { id: "s1", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] } };
@@ -386,18 +386,41 @@ test("relay comments: an app rate limit fails the read without falling back to t
 
 // Through the app's token `isMe` is the Paseo app, which is assigned nothing: the server returned
 // no asks at all while the owner had 38 in Needs input.
-test("the owner's asks are read with the owner's key, never the app, page by page up to the cap", async () => {
+test("owner collection uses the owner's credential and reaches normal asks beyond five pages", async () => {
   const appQueries: string[] = [];
-  const node = (n: number) => ({ id: `i${n}`, identifier: `TUC-${n}`, title: "t", url: "u", updatedAt: "2026-10-09T00:00:00Z", description: "", state: { name: "Needs input", type: "started" }, parent: null, labels: { nodes: [] } });
   let page = 0;
-  const { linear, keyCalls } = service({ query: (query) => { appQueries.push(query); return Promise.resolve({ issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } }); } }, () => {
+  const { linear } = service({ query: (query) => { appQueries.push(query); return Promise.resolve({ issues: groupConnection([]) }); } }, (query, variables) => {
+    assert.equal(query, OWNER_ASKS_QUERY);
+    assert.ok(variables.filter && typeof variables.filter === "object" && "assignee" in variables.filter);
+    assert.deepEqual(variables.filter.assignee, { isMe: { eq: true } });
     page++;
-    return { issues: { nodes: [node(page)], pageInfo: { hasNextPage: true, endCursor: `c${page}` } } };
+    return { issues: groupConnection([{ ...issue, id: `i${page}`, identifier: `TUC-${page}`, description: page === 7 ? "Which deployment region?" : "" }], page < 7 ? `c${page}` : null) };
   });
-  const asks = await linear.ownerAskIssues();
+  const asks = await linear.ownerAskIssues(true);
   assert.deepEqual(appQueries, []);
-  assert.deepEqual(keyCalls, Array(OWNER_ASKS_PAGES).fill(OWNER_ASKS_QUERY));
-  assert.deepEqual(asks.map((issue) => issue.identifier), Array.from({ length: OWNER_ASKS_PAGES }, (_, index) => `TUC-${index + 1}`));
+  assert.equal(asks.find(item => item.identifier === "TUC-7")?.description, "Which deployment region?");
+  assert.deepEqual(asks.map(item => item.id), ["i1", "i2", "i3", "i4", "i5", "i6", "i7"]);
+});
+
+test("owner collection refuses a repeating issue cursor instead of claiming completeness", async () => {
+  const { linear } = service(undefined, () => ({ issues: groupConnection([issue], "repeated") }));
+  await assert.rejects(linear.ownerAskIssues(true), /repeated owner-issue cursor/);
+});
+
+test("owner comment inventory reaches an old unresolved question while other issues finish early", async () => {
+  const recent = Array.from({ length: 50 }, (_, i) => ({ id: `recent-${i}`, body: "Progress update", createdAt: "2026-10-14T00:00:00Z" }));
+  const oldAsk = { id: "old-question", body: "A: EU region or B: US region?", createdAt: "2026-10-01T00:00:00Z" };
+  const { linear } = service(undefined, (_query, variables) => variables.a0
+    ? { t0: groupConnection([{ comments: groupConnection([oldAsk]) }]) }
+    : { t0: groupConnection([{ comments: groupConnection(recent, "older") }]), t1: groupConnection([{ comments: groupConnection([]) }]) });
+  const found = await linear.ownerAskComments([ID_A, ID_B]);
+  assert.deepEqual(found.get(ID_A)?.at(-1), oldAsk);
+  assert.deepEqual(found.get(ID_B), []);
+});
+
+test("an incomplete comment cursor rejects the owner inventory rather than dropping asks", async () => {
+  const { linear } = service(undefined, () => ({ t0: groupConnection([{ comments: { nodes: [], pageInfo: { hasNextPage: true, endCursor: null } } }]) }));
+  await assert.rejects(linear.ownerAskComments([ID_A]), /incomplete or repeated comment cursor/);
 });
 
 // TUC-1324: status moves and label removal read the ticket without its relations. A real

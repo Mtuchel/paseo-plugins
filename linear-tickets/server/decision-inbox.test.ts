@@ -387,7 +387,7 @@ test("reopen clears only the matching live deferral and keeps the local action h
   assert.deepEqual(h.sent, []);
 });
 
-test("owner reads are single-flight and cached for two minutes while live questions stay fresh", async (t) => {
+test("owner reads share their collection while live questions stay fresh and explicit refresh recollects", async (t) => {
   const h = await harness(t);
   const gate = barrier();
   h.onOwnerRead(() => gate.promise);
@@ -402,25 +402,26 @@ test("owner reads are single-flight and cached for two minutes while live questi
   assert.equal(refreshed.live[0].requestId, "q2");
   assert.equal(refreshed.updatedAt, checkedAt);
   assert.equal(h.ownerReads(), 1);
-  h.clock(h.now() + 90_000);
+  await h.inbox.refresh();
   assert.notEqual((await h.inbox.local()).updatedAt, checkedAt);
   assert.equal(h.ownerReads(), 2);
 });
 
-test("a cached owner ask mirroring a live question leaves with that question; other asks stay", async (t) => {
+test("answering a live request revalidates owner sources instead of hiding every ask on its ticket", async t => {
   const twin: OwnerAsk = { ...ownerAsk, mirrorsLiveRequest: true };
-  const other: OwnerAsk = { ...ownerAsk, issueId: "i2", identifier: "TUC-2", ticketIdentifier: "TUC-2", revision: "owner-r2" };
-  const h = await harness(t, "laptop", [twin, other]);
+  const other: OwnerAsk = { ...ownerAsk, revision: "independent-policy-r2", title: "Independent policy question" };
+  const asks = [twin, other];
+  const h = await harness(t, "laptop", asks);
   h.agents[0].labels = { "linear.issueId": "i1" };
-  assert.deepEqual((await h.inbox.local()).asks.map((ask) => ask.issueId), ["i1", "i2"]);
+  await h.inbox.local();
+  h.onSubmit(async () => { h.agents[0].pendingPermissions = []; asks.splice(0, 1); });
   assert.equal((await h.post(await h.action())).status, 200);
   const after = await h.inbox.local();
-  assert.equal(h.ownerReads(), 1, "still the cached owner snapshot");
+  assert.equal(h.ownerReads(), 2, "answer invalidates the owner cache for immediate collection");
   assert.deepEqual(after.live, []);
-  assert.deepEqual(after.asks.map((ask) => ask.issueId), ["i2"]);
-  // Without a complete read of the live agents nothing is taken for answered.
+  assert.deepEqual(after.asks.map(ask => ask.revision), ["independent-policy-r2"]);
   h.sdk.agents.list = async () => { throw new Error("daemon busy"); };
-  assert.deepEqual((await h.inbox.local()).asks.map((ask) => ask.issueId), ["i1", "i2"]);
+  assert.deepEqual((await h.inbox.local()).asks.map(ask => ask.revision), ["independent-policy-r2"]);
 });
 
 test("a stalled Linear owner read does not prevent viewing live questions or multiply the read", async (t) => {
@@ -461,7 +462,7 @@ test("owner read errors remain visible within the cache window and clear on a su
   assert.equal(cached.updatedAt, failed.updatedAt);
   assert.equal(h.ownerReads(), 1);
   h.onOwnerRead(async () => {});
-  h.clock(h.now() + 90_000);
+  await h.inbox.refresh();
   const recovered = await h.inbox.local();
   assert.equal(recovered.error, null);
   assert.deepEqual(recovered.asks.map((ask) => ask.issueId), ["i1"]);
@@ -530,3 +531,44 @@ for (const [sourceHost, targetHost, sourceEpoch, targetEpoch] of [
     assert.equal(calls.filter((call) => call.method === "POST").length, 2);
   });
 }
+
+test("a curated live choice is revalidated immediately, before the fifteen-minute refresh", async t => {
+  const h = await harness(t);
+  await h.inbox.start();
+  t.after(() => h.inbox.stop());
+  const displayed = await h.inbox.view();
+  const pending = displayed.hosts[0].live[0];
+  h.agents[0].pendingPermissions[0] = { ...question, title: "A different authority boundary" };
+  const result = await h.post({ host: "laptop", target: "live", operation: "answer", agentId: pending.agentId,
+    requestId: pending.requestId, revision: pending.revision, answers: { Runner: "Node" } });
+  assert.equal(result.status, 409);
+  assert.deepEqual(h.sent, []);
+  const current = await h.inbox.view();
+  assert.notEqual(current.hosts[0].live[0].revision, pending.revision);
+  assert.equal(current.curation?.running, true);
+});
+
+test("confirmed answers disappear from curated tasks immediately without waiting for collection cadence", async t => {
+  const h = await harness(t);
+  const displayed = await h.inbox.view();
+  const pending = displayed.hosts[0].live[0];
+  assert.equal((await h.post({ host: "laptop", target: "live", operation: "answer", agentId: pending.agentId,
+    requestId: pending.requestId, revision: pending.revision, answers: { Runner: "Node" } })).status, 200);
+  const current = await h.inbox.view();
+  assert.deepEqual(current.tasks?.filter(task => task.target === "live"), []);
+  assert.equal(h.sent.length, 1);
+});
+
+test("unknown live delivery stays visible and cannot be retried with a different choice", async t => {
+  const h = await harness(t);
+  const input = await h.action();
+  h.onSubmit(async () => { throw new Error("connection lost after submission"); });
+  const first = await h.post(input);
+  assert.equal(first.body.outcomeUnknown, true);
+  const snapshot = await h.inbox.view();
+  assert.equal(snapshot.hosts[0].live[0].deliveryUnknown, true);
+  assert.equal(snapshot.tasks?.find(task => task.target === "live")?.priority, "review");
+  const different = await h.post({ ...input, answers: { Runner: "Vitest" } });
+  assert.equal(different.body.outcomeUnknown, true);
+  assert.equal(h.sent.length, 1);
+});

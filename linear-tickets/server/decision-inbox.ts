@@ -5,15 +5,16 @@ import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { z } from "zod";
-import { askQuestionSchema, decisionReceiptSchema, ownerAskSchema, type DecisionReceipt } from "../shared/contracts";
-import { decisionHostSchema, liveDecisionSchema, type BrowserDecisionAction, type DecisionHost, type DecisionView, type LiveDecision, type StewardFlow } from "../shared/decision-inbox";
+import { askQuestionSchema, decisionReceiptSchema, type DecisionReceipt } from "../shared/contracts";
+import { browserOwnerAskSchema, decisionHostSchema, liveDecisionSchema, type BrowserDecisionAction, type DecisionHost, type DecisionView, type LiveDecision, type StewardFlow } from "../shared/decision-inbox";
 import type { ActivationRoute } from "./activation";
 import { decisionPage } from "./decision-page";
-import type { OwnerAsks } from "./owner-asks";
+import type { OwnerAsks, OwnerAskSnapshot } from "./owner-asks";
 import type { DeliveryResult, PermissionReplies, ReplyRecord } from "./permission-replies";
 import { answerableQuestions, matchOption, questionAnswer, questionKey, questionsOf } from "./relay";
 import { paseoHome } from "./ticket-mcp";
 import { INBOX_DISPLAYED_HEADER } from "./inbox-transport";
+import { CURATION_INTERVAL_MS, DecisionCuration } from "./decision-curation";
 
 export type BrowserDecisionInboxDeps = {
   ownerAsks: Pick<OwnerAsks, "snapshot" | "answer" | "triage">;
@@ -30,7 +31,7 @@ export type BrowserDecisionInboxDeps = {
   directory?: string;
   now?: () => number;
 };
-const OWNER_CACHE_MS = 120_000;
+const OWNER_CACHE_MS = CURATION_INTERVAL_MS;
 const READ_TIMEOUT_MS = 5_000;
 const ACTION_TIMEOUT_MS = 65_000;
 const PREFIX = "decision-inbox:";
@@ -64,7 +65,7 @@ const actionSchema = z.object({
 const peerQuestionSchema = askQuestionSchema.extend({ options: z.array(askQuestionSchema.shape.options.element.strict()) }).strict();
 const peerSchema = decisionHostSchema.extend({
   host: z.string().min(1), updatedAt: z.string().datetime({ offset: true }),
-  asks: z.array(ownerAskSchema.extend({ questions: z.array(peerQuestionSchema) }).strict()),
+  asks: z.array(browserOwnerAskSchema.extend({ questions: z.array(peerQuestionSchema) }).strict()),
   live: z.array(liveDecisionSchema.extend({ questions: z.array(liveDecisionSchema.shape.questions.element.extend({ options: z.array(askQuestionSchema.shape.options.element.strict()) }).strict()), actions: z.array(liveDecisionSchema.shape.actions.element.strict()) }).strict()),
   history: z.array(decisionReceiptSchema.strict()),
 }).strict();
@@ -73,7 +74,7 @@ const errorSchema = z.object({ error: z.string(), outcomeUnknown: z.boolean().op
 const deferralSchema = z.object({ agentId: z.string(), requestId: z.string(), revision: z.string(), until: z.string().datetime() }).strict();
 const deferralFileSchema = z.object({ deferrals: z.record(z.string(), deferralSchema), history: z.array(decisionReceiptSchema.strict()) }).strict();
 type DeferralFile = z.infer<typeof deferralFileSchema>;
-type OwnerSnapshot = Awaited<ReturnType<OwnerAsks["snapshot"]>>;
+type OwnerSnapshot = OwnerAskSnapshot;
 
 function stable(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
@@ -126,11 +127,25 @@ export class BrowserDecisionInbox {
   private ownerFlight: Promise<NonNullable<BrowserDecisionInbox["ownerCache"]>> | null = null;
   private ownerGeneration = 0;
   private storeQueue: Promise<unknown> = Promise.resolve();
+  private readonly curation: DecisionCuration;
 
   constructor(private readonly deps: BrowserDecisionInboxDeps) {
     this.host = deps.host ?? hostname().replace(/\.local$/, "");
     this.directory = deps.directory ?? join(paseoHome(), "linear-tickets", "decision-inbox");
     this.now = deps.now ?? Date.now;
+    this.curation = new DecisionCuration(() => this.collectView(), this.now);
+  }
+
+  // Parent starts this once Paseo/peer discovery is attached, and stops it on plugin disposal.
+  // start() collects immediately; the daemon interval continues with every browser closed.
+  start(): Promise<void> { return this.curation.start(); }
+  stop(): void { this.curation.stop(); }
+  refresh(): Promise<void> {
+    this.ownerGeneration++;
+    this.ownerCache = null;
+    this.ownerFlight = null;
+    this.curation.invalidate();
+    return this.curation.refresh();
   }
 
   readonly route: ActivationRoute = async ({ method, path, headers, body }) => {
@@ -151,7 +166,13 @@ export class BrowserDecisionInbox {
         try { raw = JSON.parse(body); } catch { return json(400, { error: "The request is not JSON." }); }
         const parsed = actionSchema.safeParse(raw);
         if (!parsed.success) return json(400, { error: parsed.error.issues.map((issue) => issue.message).join(" ") });
-        return await this.action(parsed.data);
+        try { return await this.action(parsed.data); }
+        finally {
+          this.ownerGeneration++;
+          this.ownerCache = null;
+          this.ownerFlight = null;
+          this.curation.invalidate();
+        }
       }
       if (method !== "GET") return json(405, { error: "Use GET for the decision inbox." });
       if (path === "/api/decisions/local") return json(200, await this.local());
@@ -172,7 +193,7 @@ export class BrowserDecisionInbox {
       const updatedAt = new Date(checkedAt).toISOString();
       let result: NonNullable<BrowserDecisionInbox["ownerCache"]>;
       try { result = { snapshot: await this.deps.ownerAsks.snapshot(this.deps.paseo()), checkedAt, error: null }; }
-      catch (error) { result = { snapshot: { asks: [], history: [], updatedAt }, checkedAt, error: `Owner asks unavailable (checked ${updatedAt}): ${reasonOf(error)}` }; }
+      catch (error) { result = { snapshot: this.ownerCache?.snapshot ?? { asks: [], history: [], updatedAt }, checkedAt, error: `Owner asks unavailable (checked ${updatedAt}): ${reasonOf(error)}` }; }
       if (generation === this.ownerGeneration) this.ownerCache = result;
       return result;
     })();
@@ -195,14 +216,12 @@ export class BrowserDecisionInbox {
       this.deps.replies.records().catch((error) => { errors.push(`Live history unavailable: ${reasonOf(error)}`); return {} as Record<string, ReplyRecord>; }),
     ]);
     if (owner?.error) errors.push(owner.error);
+    if (owner && "coverage" in owner.snapshot) errors.push(...owner.snapshot.coverage ?? []);
     const live: LiveDecision[] = [];
-    // Tickets whose agents hold a pending request now; null while the agents are not fully read.
-    let asking: Set<string> | null = null;
     const paseo = this.deps.paseo();
     if (!paseo) errors.push("Live agents unavailable: Paseo is disconnected.");
     else {
       try {
-        const pending = new Set<string>();
         let cursor: string | undefined;
         const seen = new Set<string>();
         const seenRequests = new Set<string>();
@@ -211,13 +230,15 @@ export class BrowserDecisionInbox {
           for (const { agent } of page.entries) {
             if (agent.archivedAt) continue;
             for (const request of agent.pendingPermissions ?? []) {
-              const issueId = agent.labels?.["linear.issueId"];
-              if (issueId) pending.add(issueId);
               const key = hash([agent.id, request.id]);
               if (seenRequests.has(key)) continue;
               seenRequests.add(key);
               const currentRevision = revision(request);
               const deferred = deferrals.deferrals[key];
+              const activity = Object.values(records).filter(record => record.ref.startsWith(PREFIX) && record.agentId === agent.id
+                && record.requestId === request.id && record.request && revision(record.request) === currentRevision);
+              if (activity.some(record => record.status === "applied")) continue;
+              const deliveryUnknown = activity.some(record => ["reserved", "submitted", "unconfirmed", "sent", "unchecked"].includes(record.status));
               let agentUrl: string | null = null;
               try { agentUrl = await this.deps.agentUrl?.(agent.id) ?? null; }
               catch (error) { errors.push(`Agent link ${agent.id} unavailable: ${reasonOf(error)}`); }
@@ -226,6 +247,7 @@ export class BrowserDecisionInbox {
                 issueUrl: agent.labels?.["linear.url"] ?? null, agentUrl, source: sourceOf(request),
                 questions: request.kind === "question" ? normalizedQuestions(request) : [], kind: request.kind === "question" ? "question" : "permission",
                 actions: request.kind === "question" ? [] : permissionActions(request),
+                deliveryUnknown,
                 deferredUntil: deferred?.revision === currentRevision && Date.parse(deferred.until) > this.now() ? deferred.until : null });
             }
           }
@@ -233,7 +255,6 @@ export class BrowserDecisionInbox {
           if (page.pageInfo.hasMore && (!cursor || seen.has(cursor))) throw new Error("Paseo returned an incomplete or repeated agent-page cursor.");
           if (cursor) seen.add(cursor);
         } while (cursor);
-        asking = pending;
       } catch (error) { errors.push(`Live agents incomplete: ${reasonOf(error)}`); }
     }
     const receipts = Object.values(records).filter((record) => record.ref.startsWith(PREFIX) && record.request).map((record): DecisionReceipt => ({
@@ -241,9 +262,9 @@ export class BrowserDecisionInbox {
       action: record.intent ? (record.text.startsWith("Research only:") ? "research" : "delegate") : "answer",
       text: record.text, at: record.at, delivery: record.status,
     }));
-    // The owner snapshot is cached for minutes; the live requests are read now. An ask mirroring a
-    // live question goes with that question, wherever it was answered.
-    const asks = (owner?.snapshot.asks ?? []).filter((ask) => !ask.mirrorsLiveRequest || !asking || asking.has(ask.issueId));
+    // Never hide every ask on a ticket because one agent's request disappeared. OwnerAsks
+    // resolves the exact wait-comment source; curation deduplicates only source identities.
+    const asks = owner?.snapshot.asks ?? [];
     return { host: this.host, asks, live,
       backendInstanceId: this.deps.backendInstanceId?.(),
       history: [...owner?.snapshot.history ?? [], ...receipts, ...deferrals.history].sort((a, b) => b.at.localeCompare(a.at)).slice(0, 100),
@@ -275,7 +296,11 @@ export class BrowserDecisionInbox {
     }, READ_TIMEOUT_MS);
   }
 
-  async view(): Promise<DecisionView> {
+  view(): Promise<DecisionView> { return this.curation.view(); }
+
+  private async collectView(): Promise<DecisionView> {
+    // Each curation pass collects Linear again; peer/local reads still share the short cache.
+    if (!this.ownerFlight) this.ownerCache = null;
     const [configuredPeers, canonicalPeer] = await Promise.all([this.deps.peers(), this.deps.canonicalPeer()]);
     const localPromise = this.local(canonicalPeer === null);
     const sources = await Promise.all([...new Set(configuredPeers)].map(async (configured) => {
@@ -373,6 +398,10 @@ export class BrowserDecisionInbox {
     const agent = (await paseo.agents.ref(input.agentId!).refresh())?.agent;
     const request = agent?.archivedAt ? undefined : agent?.pendingPermissions?.find((pending) => pending.id === input.requestId);
     if (!request || revision(request) !== input.revision) throw new InboxError(409, "This live request changed or is no longer waiting. Refresh the inbox; nothing was delivered.");
+    const prior = Object.values(await this.deps.replies.records()).filter(record => record.ref.startsWith(PREFIX)
+      && record.agentId === input.agentId && record.requestId === input.requestId && record.request && revision(record.request) === input.revision);
+    if (prior.some(record => record.status === "applied")) throw new InboxError(409, "This exact request already has a confirmed response. Refresh for the next round; nothing was delivered.");
+    if (prior.some(record => ["reserved", "submitted", "unconfirmed", "sent", "unchecked"].includes(record.status))) throw new InboxError(502, "Delivery for this exact request is unconfirmed. Inspect the agent before taking another action; nothing was retried.", true);
     if (input.operation === "triage" && (input.action === "defer" || input.action === "reopen")) {
       return this.defer(input, request);
     }
