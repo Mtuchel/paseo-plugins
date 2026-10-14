@@ -1945,12 +1945,12 @@ agent like a drop: a successor when it is gone, the ticket when none can start. 
 starts directly is not serialized with a move; the leases keep the push safe, the final base
 change has no compare-and-swap.
 
-**One Greptile review per PR.** A `complex-review` pull request gets exactly one Greptile review
-in its whole lifetime (TUC-2427); a fix diff never buys a second round, Astra re-checks it
-instead (the repository's `AGENTS.md`). Greptile reviews only pull requests that are not drafts
-and ignores a label CI adds to a published one; `.greptile/config.json` sets `autoReview: []`, so
-no event starts a review either, and without the repository's own request such a pull request
-waits forever for it (the ops digest's "complex-review: no Greptile review yet"). Per repo and
+**One Greptile review per PR.** The repository requests Greptile once per PR (TUC-2427);
+fix diffs go to Astra instead (the repository's `AGENTS.md`). This caps our requests, not
+vendor activity: branches carrying the old config retain automatic reviews until rebased
+onto the new `main`. Direct manual triggers also bypass our helper. With
+`.greptile/config.json`'s `autoReview: []`, no event starts a review, so an unreviewed
+`complex-review` PR needs the repository's one request. Per repo and
 run, `node tools/ci/greptile-request.mjs --trigger [--follow <pr>]…` decides and posts: every open,
 published `complex-review` pull request without a Greptile review gets one comment `@greptileai`
 (marked `<!-- greptile-request:<head sha> -->`, from the bot) as soon as the backstop sees it
