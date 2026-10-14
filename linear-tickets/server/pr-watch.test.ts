@@ -126,8 +126,7 @@ const RESTARTED = { status: "idle", lastError: CRASH, pendingPermissions: [] };
 function crashDaemon(t: TestContext, calls: string[]) {
   const daemon = { agent: CRASHED as Record<string, unknown>, reloaded: RESTARTED as Record<string, unknown>, send: async () => {}, router: null as unknown as SessionRouter };
   let held = false;
-  // This fake session store has no path: supply both durable stores explicitly in an isolated
-  // directory instead of asking the router to derive their location from the fake.
+  // Give every derived durable store an isolated directory.
   const directory = mkdtempSync(join(tmpdir(), "paseo-pr-watch-crash-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const replies = new PermissionReplies({ directory, daemon: async () => null });
@@ -137,7 +136,7 @@ function crashDaemon(t: TestContext, calls: string[]) {
       held = true;
       return { release: () => { held = false; } };
     } },
-    store: { forAgent: async () => null },
+    store: { path: join(directory, "sessions.json"), forAgent: async () => null },
     replies,
     parents: new ParentStore(directory),
     reloader: async () => async (agentId: string) => { calls.push(`reload ${agentId}`); daemon.agent = daemon.reloaded; },
@@ -4783,4 +4782,31 @@ test("completion checks fresh multi-repository PRs, including reopened and vetoe
   h.github.open = [];
   h.github.broken = [other];
   assert.equal(await watch.completionPulls("i1", "TUC-1", [PR]), "unknown", "an unreadable PR is never proof of completion");
+});
+
+test("steward PR evidence persists head and CI transitions without timestamp, URL or ordering churn", async (t) => {
+  const h = harness(t);
+  h.github.view = { ...OPEN_PR, checks: [RUNNING_CI, { ...RUNNING_CI, name: "typecheck" }] };
+  await h.poll();
+  const first = (await (await h.watch()).pullStates([PR])).get(PR)!;
+  assert.equal(first.headSha, HEAD);
+  assert.deepEqual(JSON.parse(first.ci!), [[RUNNING_CI.name, "pending", RUNNING_CI.conclusion], ["typecheck", "pending", RUNNING_CI.conclusion]].sort((a, b) => a[0].localeCompare(b[0])));
+  h.github.view = { ...h.github.view, updatedAt: new Date().toISOString(), checks: h.github.view.checks.toReversed().map((check) => ({ ...check, url: `${check.url}?retried=1` })) };
+  await h.poll();
+  assert.equal((await (await h.watch()).pullStates([PR])).get(PR)?.ci, first.ci);
+  h.github.view = { ...h.github.view, checks: h.github.view.checks.map((check) => ({ ...check, state: "passed", conclusion: "success" })) };
+  await h.poll();
+  const passed = (await (await h.watch()).pullStates([PR])).get(PR)!;
+  assert.notEqual(passed.ci, first.ci, "completed checks are independently observed advancement");
+  await h.restart();
+  assert.deepEqual((await (await h.watch()).pullStates([PR])).get(PR), passed, "evidence survives restart before another GitHub read");
+  h.github.broken = [PR];
+  await h.poll();
+  assert.deepEqual((await (await h.watch()).pullStates([PR])).get(PR), passed, "failed reads cannot erase the last observed head or CI");
+  h.github.broken = [];
+  h.github.view = { ...h.github.view, headSha: "new-head", checks: [], checksComplete: false };
+  await h.poll();
+  const pushed = (await (await h.watch()).pullStates([PR])).get(PR)!;
+  assert.equal(pushed.headSha, "new-head");
+  assert.equal(pushed.ci, null, "old-head success is not evidence about the new head");
 });

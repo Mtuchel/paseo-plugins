@@ -9,7 +9,7 @@ import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_BA
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import type { SessionLink } from "./sessions";
 import {
-  historyOf, importHistory, readActivity, Watchdog, WATCHDOG_LABEL, WATCHDOG_LINES, WATCHDOG_MENTION, WatchdogStore,
+  historyOf, importHistory, readActivity, Watchdog, WATCHDOG_LABEL, WATCHDOG_LINES, WatchdogStore,
   type ActivityResult, type WatchdogDeps, type WatchdogOutcome, type WatchdogRequest, type WatchedAgent,
 } from "./watchdog";
 
@@ -105,6 +105,7 @@ async function harness(options: { settings?: PluginSettings } = {}) {
     handover: { all: async () => state.records }, needsYou: { all: async () => [] },
     manualTasks: { tasks: async () => state.manualTasks.map((identifier) => ({ parentId: ISSUE.id, identifier })) },
     activity: async () => state.activity, now: () => state.now,
+    escalate: async (_issueId, _identifier, reason) => { comments.push(reason); },
   };
   const watchdog = new Watchdog(deps);
   const reserved = new Set<string>();
@@ -124,46 +125,23 @@ const quiet = (t: { mock: { method: (object: object, name: string, impl: () => v
   t.mock.method(console, "error", () => {});
 };
 
-test("a silent running agent is steered, stopped, reloaded and replaced on schedule, then the owner is mentioned once", async (t) => {
+test("silence gets a non-cancelling reaction at five minutes and diagnosis by ten, never a timed kill", async (t) => {
   quiet(t);
   const h = await harness();
-  await h.poll(44);
-  assert.equal(h.acts.length, 0, "44 quiet minutes are not silence yet");
-  await h.poll(46);
+  await h.poll(4);
+  assert.equal(h.acts.length, 0);
+  await h.poll(5);
   assert.deepEqual(h.acts.map((act) => act.action), ["steer"]);
-  assert.ok(h.acts[0].claimedBefore, "the step is claimed before its effect");
-  assert.ok(h.reserved.has("agent-1"), "the rest of the poll leaves the agent alone");
-  assert.deepEqual(h.said, [WATCHDOG_LINES.steer]);
-  const [file] = [(await h.store.read()).tickets[ISSUE.id]];
-  assert.equal(file.starts.length, 1, "the cycle counts once it starts");
-
-  await h.poll(65);
-  assert.equal(h.acts.length, 1, "the steer's 20 minutes are not over");
-  await h.poll(67);
-  assert.deepEqual(h.acts.map((act) => act.action), ["steer", "interrupt"]);
-  // The interrupt's resume opened a new turn: the watchdog's own transition, not someone else's.
-  h.state.roots = [agent("agent-1", { activeTurn: { turnId: "turn-2", startedAt: iso(T0 + 67 * MINUTE) } })];
-  await h.poll(80);
-  assert.equal(h.acts.length, 2);
-  await h.poll(88);
-  assert.deepEqual(h.acts.map((act) => act.action), ["steer", "interrupt", "reload"]);
-  h.state.answer = async (request) => (request.action === "succeed" ? { kind: "done", successor: { id: "agent-2", title: null, cwd: "/repo/wt" } } : { kind: "done" });
-  await h.poll(109);
-  assert.deepEqual(h.acts.map((act) => act.action), ["steer", "interrupt", "reload", "succeed"]);
-  // The replacement carries the cycle's label and stays silent as well.
-  const marker = h.acts[3].marker;
-  h.state.roots = [agent("agent-2", { createdAt: iso(T0 + 109 * MINUTE), labels: { "linear.issueId": ISSUE.id, [WATCHDOG_LABEL]: marker }, activeTurn: { turnId: "turn-9", startedAt: iso(T0 + 110 * MINUTE) } })];
-  await h.poll(120);
+  assert.ok(h.acts[0].claimedBefore);
+  assert.ok(h.reserved.has("agent-1"));
+  await h.poll(9);
   assert.equal(h.comments.length, 0);
-  await h.poll(131);
-  assert.equal(h.acts.length, 4, "no second replacement");
-  assert.equal(h.comments.length, 1);
-  assert.match(h.comments[0], new RegExp(`^https://linear.app/t/profiles/owner ${WATCHDOG_MENTION.replace(/\./g, "\\.")}`));
-  await h.poll(200);
-  await h.poll(400);
-  assert.equal(h.acts.length, 4);
-  assert.equal(h.comments.length, 1, "the owner is mentioned once");
-  assert.deepEqual(h.said, [WATCHDOG_LINES.steer, WATCHDOG_LINES.interrupt, WATCHDOG_LINES.reload, WATCHDOG_LINES.succeed]);
+  await h.poll(10);
+  assert.deepEqual(h.acts.map((act) => act.action), ["steer"], "running tool is not interrupted or replaced");
+  assert.equal(h.comments.length, 1, "bounded diagnosis is requested");
+  await h.poll(30);
+  assert.equal(h.comments.length, 1, "recovery responsibility is handed over once");
+  assert.equal((await h.store.read()).tickets[ISSUE.id].cycle, null);
   await h.cleanup();
 });
 
@@ -183,7 +161,6 @@ test("progress ends a cycle; at most two cycles start per rolling day, then the 
   await h.poll(150);
   assert.equal(h.acts.length, 2, "the third silence within 24 hours takes no action");
   assert.equal(h.comments.length, 1);
-  assert.match(h.comments[0], /Please take over\./);
   await h.poll(170);
   assert.equal(h.comments.length, 1, "one mention for the exhausted budget");
 
@@ -221,18 +198,15 @@ test("owner waits, holds, plan reviews, subagents, vetoes and unreadable evidenc
   }
 });
 
-test("a quiet ticket kept out by an exclusion is read again only every 15 minutes, and recovered once the exclusion clears", async (t) => {
+test("an excluded ticket is rechecked within five minutes after the gate clears", async (t) => {
   quiet(t);
   const h = await harness();
-  const reads = t.mock.method(h.deps.linear, "issueWatchState");
   h.state.status = { status: "Needs input", statusType: "started", labels: [] };
-  await h.poll(46);
-  await h.poll(48);
+  await h.poll(5);
   h.state.status = { status: "In Progress", statusType: "started", labels: [] };
-  await h.poll(60);
-  assert.equal(reads.mock.callCount(), 1, "one Linear read for the excluded ticket within 15 minutes");
-  assert.equal(h.acts.length, 0, "the verdict holds until it is read again");
-  await h.poll(61);
+  await h.poll(9);
+  assert.equal(h.acts.length, 0);
+  await h.poll(10);
   assert.deepEqual(h.acts.map((act) => act.action), ["steer"]);
   await h.cleanup();
 });
@@ -252,7 +226,8 @@ test("a step whose outcome a restart lost is never repeated; the next step follo
   await poll(60);
   assert.equal(h.acts.length, 1);
   await poll(67);
-  assert.deepEqual(h.acts.map((act) => act.action), ["steer", "interrupt"]);
+  assert.deepEqual(h.acts.map((act) => act.action), ["steer"]);
+  assert.equal(h.comments.length, 1, "unknown steer proceeds to diagnosis, never a second delivery");
   await h.cleanup();
 });
 
@@ -266,7 +241,7 @@ test("an unreadable watchdog state runs no recovery and is never reset", async (
   await h.cleanup();
 });
 
-test("a closed agent quiet for two hours is resumed once unless its ticket has an open pull request; a ghost is reloaded at once", async (t) => {
+test("a closed agent is resumed after five minutes unless blocked; a ghost is reloaded immediately", async (t) => {
   quiet(t);
   const closed = () => agent("agent-1", { status: "closed", activeTurn: null });
   const open = await harness();
@@ -285,14 +260,13 @@ test("a closed agent quiet for two hours is resumed once unless its ticket has a
 
   const h = await harness();
   h.state.roots = [closed()];
-  await h.poll(110);
+  await h.poll(4);
   assert.equal(h.acts.length, 0);
-  await h.poll(121);
+  await h.poll(5);
   assert.deepEqual(h.acts.map((act) => act.action), ["resume"]);
-  assert.match(h.acts[0].text, /git status/, "a resume that may arrive twice looks at the state first");
-  await h.poll(142);
+  await h.poll(10);
   assert.equal(h.acts.length, 1, "no second resume");
-  assert.equal(h.comments.length, 1, "the owner is mentioned when the resume brought no progress");
+  assert.equal(h.comments.length, 1, "no advancement requests a diagnosis");
   await h.cleanup();
 
   const ghost = await harness();
@@ -303,15 +277,15 @@ test("a closed agent quiet for two hours is resumed once unless its ticket has a
   await ghost.cleanup();
 });
 
-test("a ghost the reload brings no progress is replaced 20 minutes later", async (t) => {
+test("a ghost with no progress after reload is considered for guarded replacement five minutes later", async (t) => {
   quiet(t);
   const h = await harness();
   h.state.roots = [agent("agent-1", { status: "running" })];
   h.state.ghosts.add("agent-1");
   await h.poll(1);
-  await h.poll(20);
+  await h.poll(5);
   assert.deepEqual(h.acts.map((act) => act.action), ["reload"]);
-  await h.poll(22);
+  await h.poll(6);
   assert.deepEqual(h.acts.map((act) => act.action), ["reload", "succeed"]);
   await h.cleanup();
 });
@@ -326,38 +300,36 @@ test("a replacement that cannot prove its predecessor gone is retried until its 
     : { kind: "failed", reason: "a provider process of the ticket is still running", retry: true };
   await h.poll(1);
   await h.poll(2);
-  await h.poll(10);
+  await h.poll(4);
   assert.deepEqual(h.acts.map((act) => act.action), ["reload", "succeed", "succeed"]);
   await h.poll(23);
   assert.equal(h.acts.length, 3, "no replacement once the retirement window is over");
-  assert.equal(h.comments.filter((body) => body.includes(WATCHDOG_MENTION)).length, 1);
+  assert.equal(h.comments.length, 1, "unproven process absence goes to diagnosis");
   await h.cleanup();
 });
 
-test("a replacement whose predecessor is retired waits for a slot past the retirement window, without mentioning the owner", async (t) => {
+test("a retired worker leaves a named bounded queue wait across restart, not moving forever", async (t) => {
   quiet(t);
   const h = await harness();
   h.state.roots = [agent("agent-1", { status: "idle", activeTurn: null })];
   h.state.ghosts.add("agent-1");
-  let slot = false;
   h.state.answer = async (request) => {
     if (request.action === "reload") return { kind: "failed", reason: "the agent could not be loaded" };
-    if (!slot) {
-      h.state.roots = [];
-      return { kind: "failed", reason: "Queued: RAM-limited, 11 of 11 slots used (memory). It starts when memory frees up.", retry: true, retired: true };
-    }
-    h.state.roots = [agent("agent-2", { status: "idle", activeTurn: null, createdAt: iso(h.state.now), labels: { "linear.issueId": ISSUE.id, [WATCHDOG_LABEL]: request.marker } })];
-    return { kind: "done", successor: { id: "agent-2", title: null, cwd: "/repo/wt" } };
+    h.state.roots = [];
+    return { kind: "failed", reason: "Queued: RAM-limited", retry: true, retired: true };
   };
   await h.poll(1);
   await h.poll(2);
-  await h.poll(30);
-  assert.deepEqual(h.acts.map((act) => act.action), ["reload", "succeed", "succeed"], "still waiting after the 20 minutes");
-  assert.equal(h.comments.some((body) => body.includes(WATCHDOG_MENTION)), false);
-  slot = true;
-  await h.poll(32);
-  assert.deepEqual(h.acts.map((act) => act.action), ["reload", "succeed", "succeed", "succeed"]);
-  assert.ok(h.said.includes(WATCHDOG_LINES.succeed), "the replacement started");
+  const waiting = (await h.store.read()).tickets[ISSUE.id].cycle!;
+  assert.equal(waiting.waitReason, "Queued: RAM-limited");
+  assert.equal(waiting.nextCheckAt, iso(T0 + 3 * MINUTE));
+  assert.equal(waiting.waitDeadline, iso(T0 + 7 * MINUTE));
+  const next = new Watchdog(h.deps);
+  h.state.now = T0 + 7 * MINUTE;
+  await next.pass({ records: h.state.records, reserved: new Set(), pulls: async () => [] });
+  assert.deepEqual(h.acts.map((act) => act.action), ["reload", "succeed"], "expired queue does not launch blindly");
+  assert.equal(h.comments.length, 1);
+  assert.equal((await h.store.read()).tickets[ISSUE.id].cycle, null);
   await h.cleanup();
 });
 
@@ -375,7 +347,7 @@ test("an idle agent that cannot be loaded is replaced, and a quiet replacement e
   assert.deepEqual(h.acts.map((act) => act.action), ["resume", "succeed"]);
   await h.poll(150);
   assert.deepEqual(h.acts.map((act) => act.action), ["resume", "succeed"], "the replacement is not resumed");
-  assert.equal(h.comments.filter((body) => body.includes(WATCHDOG_MENTION)).length, 1, "the cycle ends with the mention");
+  assert.equal(h.comments.length, 1, "the unresolved replacement requests diagnosis");
   await h.cleanup();
 });
 
@@ -394,7 +366,7 @@ test("a ticket that waits for the owner by the end of a cycle is not reported as
   await h.poll(2);
   h.state.status = { status: "Needs input", statusType: "started", labels: [] };
   await h.poll(30);
-  assert.equal(h.comments.some((body) => body.includes(WATCHDOG_MENTION)), false);
+  assert.equal(h.comments.length, 0);
   assert.equal((await h.store.read()).tickets[ISSUE.id].cycle, null, "the cycle ends without the mention");
   await h.cleanup();
 });
@@ -417,7 +389,7 @@ test("the owner's continuation ends a cycle, and an unloaded watchdog starts not
   // The owner replied: the reply is the latest message to the agent, which postpones the next cycle.
   await h.store.continued(ISSUE.id, iso(T0 + 50 * MINUTE));
   h.state.roots = [agent("agent-1", { lastUserMessageAt: iso(T0 + 50 * MINUTE) })];
-  await h.poll(70);
+  await h.poll(54);
   assert.equal(h.acts.length, 1);
   assert.equal((await h.store.read()).tickets[ISSUE.id].cycle, null);
 

@@ -101,12 +101,17 @@ export function rankWaiting(waiting: Candidate[], load: Map<string | null, numbe
   return picked;
 }
 
+function laneKey(candidate: { issueId: string; control?: boolean }): string {
+  return `${candidate.control ? "control" : "worker"}:${candidate.issueId}`;
+}
+
 export class Scheduler {
   private readonly waiting = new Map<string, Candidate & { seenAt: number }>();
-  private readonly reserved = new Map<string, { projectId: string | null; control: boolean; until: number }>();
+  private readonly reserved = new Map<string, { issueId: string; projectId: string | null; control: boolean; until: number }>();
   private readonly projects = new Map<string, string | null>();
   private runningCache: { at: number; agents: RunningTicket[] } | null = null;
   private refreshing: Promise<void> | null = null;
+  private observationError: string | null = null;
 
   constructor(private readonly deps: Deps) {}
 
@@ -115,15 +120,15 @@ export class Scheduler {
   note(candidates: Candidate[]): void {
     const now = (this.deps.now ?? Date.now)();
     for (const candidate of candidates) {
-      this.waiting.set(candidate.issueId, { ...candidate, seenAt: now });
+      this.waiting.set(laneKey(candidate), { ...candidate, seenAt: now });
       this.projects.set(candidate.issueId, candidate.projectId);
     }
   }
 
   // An admitted ticket that will not start after all (handing it to Paseo failed). Paths that
   // cannot tell let the reservation run out instead.
-  release(issueId: string): void {
-    this.reserved.delete(issueId);
+  release(issueId: string, control = false): void {
+    this.reserved.delete(laneKey({ issueId, control }));
   }
 
   // `cap.limit` null: no limit; 0 admits nothing (a memory lease). Asking registers the ticket as waiting.
@@ -131,16 +136,16 @@ export class Scheduler {
     // Presence and a zero lease apply even when an earlier ask held a reservation.
     const away = (await this.deps.away?.()) ?? false;
     if (away && candidate.attended) {
-      this.waiting.delete(candidate.issueId);
+      this.waiting.delete(laneKey(candidate));
       return { ok: false, reason: AWAY_REASON };
     }
     this.note([candidate]);
     const limit = cap.limit;
     if (limit === null) {
       const now = (this.deps.now ?? Date.now)();
-      const reservation = this.reserved.get(candidate.issueId);
+      const reservation = this.reserved.get(laneKey(candidate));
       if (reservation && reservation.until >= now) {
-        this.waiting.delete(candidate.issueId);
+        this.waiting.delete(laneKey(candidate));
         return { ok: true };
       }
       return this.reserve(candidate, now);
@@ -149,7 +154,7 @@ export class Scheduler {
     // Project reads yield too: make the admission decision only after ALL asynchronous work.
     // No await may separate occupancy/ranking from reserving the resulting slot.
     this.prune((this.deps.now ?? Date.now)());
-    if (this.runningCache!.agents.length + this.reserved.size < limit && !this.reserved.has(candidate.issueId)) {
+    if (this.runningCache!.agents.length + this.reserved.size < limit && !this.reserved.has(laneKey(candidate))) {
       for (const { issueId } of this.runningCache!.agents) {
         if (!this.projects.has(issueId)) this.projects.set(issueId, await this.deps.projectOf(issueId).catch(() => null));
       }
@@ -158,14 +163,14 @@ export class Scheduler {
     this.prune(now);
     const running = this.runningCache!.agents;
     const used = running.length + this.reserved.size;
-    const alreadyReserved = this.reserved.has(candidate.issueId);
+    const alreadyReserved = this.reserved.has(laneKey(candidate));
     if (limit === 0 || used > limit || (!alreadyReserved && used >= limit)) {
       return { ok: false, reason: cap.source === "ram" && cap.lease
         ? `Queued: RAM-limited, ${used} of ${limit} slots used (${cap.lease.reason}). It starts when memory frees up.`
         : `Queued: ${used} of ${limit} ticket agents are working. It starts when one finishes.` };
     }
     if (alreadyReserved) {
-      this.waiting.delete(candidate.issueId);
+      this.waiting.delete(laneKey(candidate));
       return { ok: true };
     }
     const load = new Map<string | null, number>();
@@ -183,14 +188,14 @@ export class Scheduler {
       // A single-slot host must still run workers. Larger caps hold back exactly one slot
       // until a running, reserved or selected control uses it; controls share the hard cap.
       if (!item.control && limit > 1 && !controlOccupied && slots === 1) continue;
-      if (item.issueId === candidate.issueId) return this.reserve(candidate, now);
+      if (laneKey(item) === laneKey(candidate)) return this.reserve(candidate, now);
       slots--;
       controlOccupied ||= Boolean(item.control);
     }
     if (!candidate.control && limit > 1 && !controlOccupied && limit - used === 1) {
       return { ok: false, reason: `Queued: one of ${limit} agent slots is reserved for parent verification. It starts when a worker slot frees up.` };
     }
-    const ahead = ranked.findIndex((item) => item.issueId === candidate.issueId);
+    const ahead = ranked.findIndex((item) => laneKey(item) === laneKey(candidate));
     return { ok: false, reason: `Queued: ${limit - used} free agent slot${limit - used === 1 ? "" : "s"}, ${ahead} ticket${ahead === 1 ? "" : "s"} ahead. It starts when its turn comes.` };
   }
 
@@ -201,17 +206,46 @@ export class Scheduler {
     return { running: this.runningCache!.agents.length, reserved: this.reserved.size, waiting: this.waiting.size };
   }
 
+  // Control-plane reads must not wait behind the daemon's full agent/process listing.
+  // Admissions still use refresh() and never use an old observation to authorize a start.
+  async observedCounts(paseo: PaseoApi): Promise<{ running: number; reserved: number; waiting: number; observedAt: string; stale: boolean; observationError: string | null }> {
+    const refresh = this.refresh(paseo).catch((error: unknown) => {
+      this.observationError = error instanceof Error ? error.message : String(error);
+      throw error;
+    });
+    // Keep rejection handled even when a cached observation lets this request return immediately.
+    void refresh.catch(() => {});
+    if (!this.runningCache) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([refresh, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Agent counts are not observed yet; refresh continues in the background.")), 1_000);
+        })]);
+      } finally { clearTimeout(timer); }
+    }
+    const observed = this.runningCache;
+    if (!observed) throw new Error("Agent counts are unavailable.");
+    const now = (this.deps.now ?? Date.now)();
+    this.prune(now);
+    return {
+      running: observed.agents.length, reserved: this.reserved.size, waiting: this.waiting.size,
+      observedAt: new Date(observed.at).toISOString(), stale: now - observed.at > RUNNING_CACHE_MS,
+      observationError: this.observationError,
+    };
+  }
+
   // Tickets asked for within the last WAITING_MS and not admitted: the wait line as it stands.
   waitingIds(): string[] {
     const now = (this.deps.now ?? Date.now)();
-    const admitted = new Set(this.admittedIds());
-    return [...this.waiting.values()].filter((item) => now - item.seenAt <= WAITING_MS && !admitted.has(item.issueId)).map((item) => item.issueId);
+    const admitted = new Set([...this.reserved].filter(([, reservation]) => reservation.until >= now).map(([key]) => key));
+    for (const agent of this.runningCache?.agents ?? []) admitted.add(laneKey(agent));
+    return [...new Set([...this.waiting.values()].filter((item) => now - item.seenAt <= WAITING_MS && !admitted.has(laneKey(item))).map((item) => item.issueId))];
   }
 
   // Tickets out of the line: admitted (a reservation not run out) or with a working agent, as last read.
   admittedIds(): string[] {
     const now = (this.deps.now ?? Date.now)();
-    const reserved = [...this.reserved].filter(([, reservation]) => reservation.until >= now).map(([issueId]) => issueId);
+    const reserved = [...this.reserved.values()].filter((reservation) => reservation.until >= now).map((reservation) => reservation.issueId);
     return [...new Set([...reserved, ...(this.runningCache?.agents.map((agent) => agent.issueId) ?? [])])];
   }
 
@@ -226,20 +260,21 @@ export class Scheduler {
           at: (this.deps.now ?? Date.now)(),
           agents: agents.map((agent) => typeof agent === "string" ? { issueId: agent } : agent),
         };
+        this.observationError = null;
       }).finally(() => { this.refreshing = null; });
     }
     await this.refreshing;
   }
 
   private prune(now: number): void {
-    const running = new Set(this.runningCache?.agents.map((agent) => agent.issueId));
-    for (const [issueId, reservation] of this.reserved) if (reservation.until < now || running.has(issueId)) this.reserved.delete(issueId);
-    for (const [issueId, waiting] of this.waiting) if (now - waiting.seenAt > WAITING_MS || running.has(issueId) || this.reserved.has(issueId)) this.waiting.delete(issueId);
+    const running = new Set(this.runningCache?.agents.map(laneKey));
+    for (const [key, reservation] of this.reserved) if (reservation.until < now || running.has(key)) this.reserved.delete(key);
+    for (const [key, waiting] of this.waiting) if (now - waiting.seenAt > WAITING_MS || running.has(key) || this.reserved.has(key)) this.waiting.delete(key);
   }
 
   private reserve(candidate: Candidate, now: number): Admission {
-    this.waiting.delete(candidate.issueId);
-    this.reserved.set(candidate.issueId, { projectId: candidate.projectId, control: Boolean(candidate.control), until: now + RESERVED_MS });
+    this.waiting.delete(laneKey(candidate));
+    this.reserved.set(laneKey(candidate), { issueId: candidate.issueId, projectId: candidate.projectId, control: Boolean(candidate.control), until: now + RESERVED_MS });
     return { ok: true };
   }
 }

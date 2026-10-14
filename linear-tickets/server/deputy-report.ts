@@ -94,6 +94,10 @@ function evidenceLines(evidence: Evidence): string[] {
     "",
     `- Ready for live: ${evidence.ready ? "yes" : "no"} (needs ${LIVE_MIN_CASES} paired cases at ${LIVE_MIN_AGREEMENT * 100}% agreement)`,
     `- Paired with the owner's own answer: ${evidence.pairs.length}; matches ${evidence.matches}, mismatches ${evidence.pairs.length - evidence.matches}; agreement ${evidence.agreement === null ? "n/a" : `${(evidence.agreement * 100).toFixed(1)}%`}`,
+    `- Readiness blockers: ${[
+      ...(evidence.pairs.length < LIVE_MIN_CASES ? [`${LIVE_MIN_CASES - evidence.pairs.length} more qualifying paired cases required`] : []),
+      ...(evidence.agreement === null ? ["agreement cannot be measured without paired cases"] : evidence.agreement < LIVE_MIN_AGREEMENT ? [`agreement is below ${LIVE_MIN_AGREEMENT * 100}%`] : []),
+    ].join("; ") || "none (the checked answer connection is a separate live gate)"}`,
     `- Coverage: predicted ${predictions} of ${seen} questions seen${seen ? ` (${((predictions / seen) * 100).toFixed(1)}%)` : ""}; refused ${refused}`,
     `- Owner answer unusable for comparison: ${evidence.unknown.length}; predicted too late: ${evidence.late.length}; not (yet) paired: ${evidence.unpaired.length}`,
     "",
@@ -134,6 +138,17 @@ export function renderReport(input: { entries: LogEntry[]; candidates: Candidate
     lines.push(`- ${entry.identifier} \`${entry.id}\` ${entry.at}: ${JSON.stringify(entry.answers)}; sources ${entry.citations.map((citation) => `${citation.sourceId}@${citation.revision}`).join(", ")}${overridden.length ? `; overridden: ${overridden.map((override) => JSON.stringify(override.text)).join(", ")}` : ""}`);
   }
   if (answers.length) lines.push("");
+  const refusals = new Map<string, Extract<LogEntry, { kind: "deputy-refusal" }>>();
+  for (const entry of entries) if (entry.kind === "deputy-refusal" && entry.version === version) refusals.set(entry.id, entry);
+  const predicted = new Set(entries.flatMap((entry) => entry.kind === "deputy-prediction" && entry.version === version ? [entry.id] : []));
+  const reasons = new Map<string, number>();
+  for (const refusal of refusals.values()) if (!predicted.has(refusal.id)) {
+    const reason = `${refusal.category ?? "no-knowledge"}: ${refusal.reason}`;
+    reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+  }
+  lines.push("## Abstention diagnostics", "", ...([...reasons].sort((a, b) => b[1] - a[1]).map(([reason, count]) => `- ${count} question(s): ${reason}`)), "");
+  const retrying = candidates.filter((candidate) => candidate.status === "refused" && candidate.retryAt);
+  if (retrying.length) lines.push("Pending evidence rechecks (not permission to answer):", "", ...retrying.map((candidate) => `- ${candidate.identifier} ${candidate.ref}: ${candidate.refusalCategory}, next check ${candidate.retryAt}; ${candidate.reason}`), "");
   const open = candidates.filter((candidate) => ["evaluating", "waiting", "dispatching"].includes(candidate.status) || (candidate.status === "applied" && candidate.notice && !(candidate.notice.comment && candidate.notice.session)));
   lines.push("## Open cases", "", ...(open.length ? open.map((candidate) => `- ${candidate.identifier} ${candidate.ref} \`${candidate.key}\`: ${candidate.status}${candidate.status === "applied" ? " (notice not delivered yet)" : ""}${candidate.graceDeadline ? `, grace until ${candidate.graceDeadline}` : ""}`) : ["None."]), "");
   if (input.windows) {

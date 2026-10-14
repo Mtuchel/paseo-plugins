@@ -29,14 +29,15 @@ export const DEPUTY_DIRECTORY = () => join(paseoHome(), "linear-tickets", "deput
 const KEEP_MS = 14 * 24 * 60 * 60 * 1000;
 const SETTLEMENT_RETRY_MS = 5 * 60 * 1000;
 const MAX_PARALLEL_EVALUATIONS = 2;
+const RETRYABLE_REFUSALS: Record<string, true | undefined> = { "source-unavailable": true, "evaluator-unavailable": true, "no-knowledge": true, "no-evaluator": true };
 export const CHECKED_CONNECTION_MISSING = "no checked answer connection to the local Paseo daemon";
 
-export type ArbitratedOutcome = "applied" | "owner-first" | "gone";
+export type ArbitratedOutcome = "applied" | "owner-first" | "gone" | "revoked";
 // Plugin-local precedence and a checked result, idempotent per intent. The daemon cannot compare
 // request fingerprints or identify other responders; answers outside the plugin are unattributed.
 // `outcome` reports an earlier confirmed intent after an interruption (null: unknown).
 export type PermissionArbiter = {
-  respond(input: { agentId: string; requestId: string; fingerprint: string; intentId: string; response: AgentPermissionResponse }): Promise<ArbitratedOutcome>;
+  respond(input: { agentId: string; requestId: string; fingerprint: string; intentId: string; response: AgentPermissionResponse; canSubmit: () => boolean }): Promise<ArbitratedOutcome>;
   outcome(intentId: string): Promise<ArbitratedOutcome | null>;
 };
 
@@ -64,6 +65,11 @@ export type Candidate = {
   status: CandidateStatus;
   reason?: string;
   version?: string;
+  refusalCategory?: string;
+  // The exact evaluator input last refused for lack of knowledge. Unchanged evidence is not
+  // sent to the model again; unavailable sources/evaluators are checked at most every five minutes.
+  evidenceFingerprint?: string;
+  retryAt?: string;
   graceDeadline?: string;
   selections?: Record<string, string>;
   citations?: Citation[];
@@ -131,6 +137,9 @@ export class Deputy {
   private paseo: PaseoApi | null = null;
   private recovered = false;
   private stopped = false;
+  // Incremented synchronously on settings notification, before disk reads or candidate lanes.
+  // An unsent intent keeps its original generation even if settings change away and back.
+  private settingsGeneration = 0;
   private storeQueue: Promise<unknown> = Promise.resolve();
   private readonly lanes = new Map<string, Promise<unknown>>();
   private readonly timers = new Map<string, NodeJS.Timeout>();
@@ -255,8 +264,11 @@ export class Deputy {
   }
 
   private async refuse(candidate: Candidate, version: string, reason: string, category?: string): Promise<void> {
-    await logQuietly(() => this.deps.log.append({ kind: "deputy-refusal", id: candidate.key, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version, mode: candidate.mode, reason, ...(category ? { category } : {}) }), `deputy refusal on ${candidate.identifier}`);
-    await this.patch(candidate.key, { status: "refused", reason, version });
+    if (candidate.status !== "refused" || candidate.reason !== reason || candidate.version !== version || candidate.refusalCategory !== category) {
+      await logQuietly(() => this.deps.log.append({ kind: "deputy-refusal", id: candidate.key, key: randomUUID(), at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version, mode: candidate.mode, reason, ...(category ? { category } : {}) }), `deputy refusal on ${candidate.identifier}`);
+    }
+    await this.patch(candidate.key, { status: "refused", reason, version, refusalCategory: category, retryAt: category && RETRYABLE_REFUSALS[category] ? new Date(this.now() + SETTLEMENT_RETRY_MS).toISOString() : undefined });
+    if (category && RETRYABLE_REFUSALS[category]) this.retrySettlement();
     console.log(`[linear-tickets] deputy: ${candidate.identifier} question ${candidate.ref} stays with the owner: ${reason}`);
   }
 
@@ -269,7 +281,12 @@ export class Deputy {
     } catch (error) {
       return { ok: false, reason: `the ticket could not be read (${message(error)})`, category: "source-unavailable" };
     }
-    const trusted = !isUntrusted(state, await this.deps.linear.viewerId(), await this.deps.linear.trustedAppIds());
+    let trusted: boolean;
+    try {
+      trusted = !isUntrusted(state, await this.deps.linear.viewerId(), await this.deps.linear.trustedAppIds());
+    } catch (error) {
+      return { ok: false, reason: `the ticket's authorship could not be checked (${message(error)})`, category: "source-unavailable" };
+    }
     // The ticket's plan is approved (plan-ready); before that a question decides the plan.
     const planApproved = planPolicy(state.labels) === null;
     const risk = assessRisk(candidate.request, { trusted, planning: !planApproved, attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()) });
@@ -279,9 +296,11 @@ export class Deputy {
     return { ok: true, parts: risk.parts, sources: snapshot.sources };
   }
 
-  private async evaluate(key: string): Promise<void> {
-    const candidate = (await this.readStore())[key];
-    if (!candidate || candidate.status !== "evaluating") return;
+  private async evaluate(key: string, retry = false): Promise<void> {
+    const generation = this.settingsGeneration;
+    let candidate = (await this.readStore())[key];
+    if (!candidate || this.stopped || (retry ? !this.retryable(candidate) : candidate.status !== "evaluating")) return;
+    if (retry && !await this.stillPending(candidate)) return;
     const settings = await this.deps.settings.read();
     const { mode, model } = settings.deputy;
     if (mode === "off") { await this.patch(key, { status: "canceled", reason: "the deputy was switched off" }); return; }
@@ -289,30 +308,43 @@ export class Deputy {
     const assessed = await this.assess(candidate, settings);
     if (!assessed.ok) { await this.refuse(candidate, version, assessed.reason, assessed.category); return; }
     if (!model) { await this.refuse(candidate, version, "no evaluator model is configured (deputy.model)", "no-evaluator"); return; }
-    const verdict = await this.deps.evaluate({ identifier: candidate.identifier, parts: assessed.parts, context: candidate.request.description ?? "", sources: assessed.sources }, model)
-      .catch((error: unknown): Verdict => ({ ok: false, reason: `the evaluator failed: ${message(error)}` }));
+    const input: EvaluationInput = { identifier: candidate.identifier, parts: assessed.parts, context: candidate.request.description ?? "", sources: assessed.sources };
+    const evidenceFingerprint = createHash("sha256").update(JSON.stringify([version, input])).digest("hex");
+    if (retry && candidate.refusalCategory === "no-knowledge" && candidate.evidenceFingerprint === evidenceFingerprint) {
+      await this.patch(key, { retryAt: new Date(this.now() + SETTLEMENT_RETRY_MS).toISOString() });
+      this.retrySettlement();
+      return;
+    }
+    candidate = { ...candidate, mode, version, evidenceFingerprint };
+    await this.patch(key, { status: "evaluating", mode, version, evidenceFingerprint, retryAt: undefined });
+    const verdict = await this.deps.evaluate(input, model)
+      .catch((error: unknown): Verdict => ({ ok: false, reason: `the evaluator failed: ${message(error)}`, category: "evaluator-unavailable" }));
     if (!verdict.ok) { await this.refuse(candidate, version, verdict.reason, verdict.category ?? "no-knowledge"); return; }
     const now = await this.deps.settings.read();
     if (now.deputy.mode === "off") { await this.patch(key, { status: "canceled", reason: "the deputy was switched off" }); return; }
+    // An owner reply is journaled before it waits for this candidate's lane. Do not turn that
+    // reply into knowledge for a new prediction of the very question it already answered.
+    if (this.stopped || !await this.stillPending(candidate)) return;
+    if (generation !== this.settingsGeneration) { await this.outcome(candidate, "canceled", "the deputy settings changed during evaluation"); return; }
     // Recorded once, before any dispatch: the evidence compares it with the owner's later answer.
     await this.deps.log.append({ kind: "deputy-prediction", id: key, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version, mode: candidate.mode, selections: verdict.selections, citations: verdict.citations });
     const latest = (await this.readStore())[key];
     if (!latest || latest.status !== "evaluating") return;
     if (now.deputy.mode !== "live") {
-      await this.patch(key, { status: "predicted", version, selections: verdict.selections, citations: verdict.citations });
+      await this.patch(key, { status: "predicted", reason: undefined, refusalCategory: undefined, version, selections: verdict.selections, citations: verdict.citations });
       return;
     }
     const graceDeadline = new Date(Date.parse(candidate.observedAt) + now.deputy.graceMinutes * 60_000).toISOString();
-    const waiting = await this.patch(key, { status: "waiting", version, selections: verdict.selections, citations: verdict.citations, graceDeadline });
-    if (waiting) this.schedule(waiting);
+    const waiting = await this.patch(key, { status: "waiting", reason: undefined, refusalCategory: undefined, version, selections: verdict.selections, citations: verdict.citations, graceDeadline });
+    if (waiting) this.schedule(waiting, generation);
   }
 
-  private schedule(candidate: Candidate): void {
+  private schedule(candidate: Candidate, generation = this.settingsGeneration): void {
     if (this.stopped || !candidate.graceDeadline) return;
     clearTimeout(this.timers.get(candidate.key));
     const timer = setTimeout(() => {
       this.timers.delete(candidate.key);
-      this.background(this.lane(candidate.key, () => this.dispatch(candidate.key)));
+      this.background(this.lane(candidate.key, () => this.dispatch(candidate.key, generation)));
     }, Math.max(0, Date.parse(candidate.graceDeadline) - this.now()));
     timer.unref?.();
     this.timers.set(candidate.key, timer);
@@ -342,10 +374,11 @@ export class Deputy {
   }
 
   // The grace period is over: every gate is checked again right before the one possible write.
-  private async dispatch(key: string): Promise<void> {
+  private async dispatch(key: string, generation: number): Promise<void> {
     const candidate = (await this.readStore())[key];
     if (!candidate || candidate.status !== "waiting" || !candidate.selections) return;
-    const settings = await this.deps.settings.read();
+    const read = await this.deps.settings.read();
+    const settings = { ...read, deputy: { ...read.deputy } };
     if (settings.deputy.mode !== "live") { await this.outcome(candidate, "canceled", `the deputy is ${settings.deputy.mode} now`); return; }
     if (!settings.deputy.model || policyVersion(settings.deputy.model) !== candidate.version) { await this.outcome(candidate, "canceled", "the evaluator changed since the prediction"); return; }
     const paseo = this.paseo;
@@ -363,6 +396,11 @@ export class Deputy {
     // passage must still be in today's sources.
     const assessed = await this.assess(candidate, settings);
     if (!assessed.ok) { await this.outcome(candidate, "canceled", `the question no longer qualifies: ${assessed.reason}`); return; }
+    const input: EvaluationInput = { identifier: candidate.identifier, parts: assessed.parts, context: candidate.request.description ?? "", sources: assessed.sources };
+    const evidenceFingerprint = createHash("sha256").update(JSON.stringify([candidate.version, input])).digest("hex");
+    // Quotes alone are insufficient: amended policy can retain the quote, and a new
+    // blocking-only source can contradict it. Legacy predictions without a snapshot fail closed.
+    if (candidate.evidenceFingerprint !== evidenceFingerprint) { await this.outcome(candidate, "canceled", "the evaluator evidence changed since the prediction"); return; }
     const stale = (candidate.citations ?? []).find((citation) => typeof verifyCitation(assessed.sources, citation.sourceId, citation.quote) === "string");
     if (stale) { await this.outcome(candidate, "canceled", `the sources changed since the prediction (${stale.sourceId})`); return; }
     const arbiter = await this.arbiter();
@@ -376,9 +414,17 @@ export class Deputy {
       answers[part] = candidate.selections?.[part] ?? "";
     });
     if (this.stopped) { await this.outcome({ ...candidate, intentId }, "canceled", "the plugin stopped before the answer was submitted"); return; }
+    const latest = (await this.deps.settings.read()).deputy;
+    if (latest.mode !== "live" || !latest.model || policyVersion(latest.model) !== candidate.version || latest.principlesRepository !== settings.deputy.principlesRepository || latest.graceMinutes !== settings.deputy.graceMinutes) {
+      await this.outcome({ ...candidate, intentId }, "canceled", "the deputy settings changed before submission");
+      return;
+    }
+    // PermissionReplies calls this synchronously AFTER its own awaits, immediately before
+    // invoking the checked daemon send. A settings notification cannot queue behind this lane.
+    const canSubmit = () => !this.stopped && generation === this.settingsGeneration;
     let result: ArbitratedOutcome;
     try {
-      result = await arbiter.respond({ agentId: candidate.agentId, requestId: candidate.requestId, fingerprint: candidate.fingerprint, intentId, response: { behavior: "allow", updatedInput: { answers } } });
+      result = await arbiter.respond({ agentId: candidate.agentId, requestId: candidate.requestId, fingerprint: candidate.fingerprint, intentId, response: { behavior: "allow", updatedInput: { answers } }, canSubmit });
     } catch (error) {
       await this.outcome({ ...candidate, intentId }, "unknown", `the daemon did not confirm the answer (${message(error)}); it is not submitted again`);
       return;
@@ -389,6 +435,7 @@ export class Deputy {
   private async settle(candidate: Candidate, result: ArbitratedOutcome): Promise<void> {
     try {
       if (result === "owner-first") { await this.outcome(candidate, "owner-won", "the owner answered first"); return; }
+      if (result === "revoked") { await this.outcome(candidate, "canceled", "the deputy authorization was revoked before submission"); return; }
       if (result === "gone") { await this.outcome(candidate, "resolved", "the request was gone when the answer arrived"); return; }
       await this.deps.log.append({ kind: "deputy-answer", id: candidate.key, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version: candidate.version ?? "", key: candidate.intentId ?? "", answers: candidate.selections ?? {}, citations: candidate.citations ?? [] });
       const applied = await this.patch(candidate.key, { status: "applied", notice: { comment: false, session: false, commentId: null } });
@@ -426,7 +473,43 @@ export class Deputy {
   }
 
   private owesSettlement(candidate: Candidate): boolean {
+    // Refusal retries are separate from dispatch settlement: they never replay an answer.
     return candidate.status === "dispatching" || Boolean(candidate.status === "applied" && candidate.notice && !(candidate.notice.comment && candidate.notice.session));
+  }
+
+  private retryable(candidate: Candidate): boolean {
+    return candidate.status === "refused" && RETRYABLE_REFUSALS[candidate.refusalCategory ?? ""] === true;
+  }
+
+  private async stillPending(candidate: Candidate): Promise<boolean> {
+    let entries: LogEntry[];
+    try {
+      entries = await this.deps.log.entries();
+    } catch (error) {
+      await this.refuse(candidate, candidate.version ?? "no-evaluator", `recorded answers could not be checked (${message(error)})`, "source-unavailable");
+      return false;
+    }
+    if (entries.some((entry) => entry.id === candidate.key && (entry.kind === "answer" || entry.kind === "owner-answer" || entry.kind === "deputy-answer"))) {
+      await this.outcome(candidate, "resolved", "the request already has a recorded answer");
+      return false;
+    }
+    const found = await this.paseo?.agents.ref(candidate.agentId).refresh().catch(() => null);
+    // A connection outage is not evidence that the question disappeared.
+    if (!found) {
+      await this.refuse(candidate, candidate.version ?? "no-evaluator", "the pending request could not be checked", "source-unavailable");
+      return false;
+    }
+    const agent = found.agent;
+    const pending = agent.pendingPermissions?.find((request) => request.id === candidate.requestId);
+    if (agent.archivedAt || agent.status === "closed" || agent.labels?.["linear.issueId"] !== candidate.issueId || !pending) {
+      await this.outcome(candidate, "resolved", "the request is no longer pending on the linked agent");
+      return false;
+    }
+    if (fingerprint(pending) !== candidate.fingerprint) {
+      await this.outcome(candidate, "canceled", "the request changed since it was observed");
+      return false;
+    }
+    return true;
   }
 
   private retrySettlement(): void {
@@ -438,11 +521,11 @@ export class Deputy {
     this.retryTimer.unref?.();
   }
 
-  // Complete confirmed answers and their notices, never submit another permission response.
+  // Complete confirmed answers and notices; reconsider retryable refusals without replaying a response.
   private async retryPending(): Promise<void> {
     if (this.stopped) return;
     try {
-      for (const candidate of (await this.candidates()).filter((item) => this.owesSettlement(item))) {
+      for (const candidate of (await this.candidates()).filter((item) => this.owesSettlement(item) || (this.retryable(item) && Date.parse(item.retryAt ?? "") <= this.now()))) {
         try {
           await this.lane(candidate.key, async () => {
             if (this.stopped) return;
@@ -453,12 +536,13 @@ export class Deputy {
               const known = arbiter && current.intentId ? await arbiter.outcome(current.intentId) : null;
               if (known) await this.settle(current, known);
             } else if (this.owesSettlement(current)) await this.notify(current);
+            else if (this.retryable(current)) await this.slot(() => this.evaluate(current.key, true));
           });
         } catch (error) {
           console.error(`[linear-tickets] deputy: settlement for ${candidate.identifier} ${candidate.ref} failed, retrying later: ${message(error)}`);
         }
       }
-      if ((await this.candidates()).some((candidate) => this.owesSettlement(candidate))) this.retrySettlement();
+      if ((await this.candidates()).some((candidate) => this.owesSettlement(candidate) || this.retryable(candidate))) this.retrySettlement();
     } catch (error) {
       this.retrySettlement();
       throw error;
@@ -468,6 +552,7 @@ export class Deputy {
   // After a reload: candidates continue where they were, checked against the requests that are
   // actually pending. An interrupted dispatch is never submitted again.
   private async recover(): Promise<void> {
+    let refusals: Map<string, Extract<LogEntry, { kind: "deputy-refusal" }>> | undefined;
     for (const candidate of await this.candidates()) {
       try {
         await this.lane(candidate.key, async () => {
@@ -484,6 +569,20 @@ export class Deputy {
             return;
           }
           if (this.owesSettlement(current)) { this.retrySettlement(); return; }
+          if (current.status === "refused") {
+            // Existing candidates predate persisted categories. Recover only the journaled
+            // refusal matching this candidate; never infer safety from the question's words.
+            if (!current.refusalCategory && !refusals) {
+              refusals = new Map((await this.deps.log.entries()).flatMap((entry) => entry.kind === "deputy-refusal" ? [[entry.id, entry] as const] : []));
+            }
+            const logged = refusals?.get(current.key);
+            const category = current.refusalCategory ?? (logged && logged.reason === current.reason ? logged.category ?? "no-knowledge" : undefined);
+            if (category && RETRYABLE_REFUSALS[category]) {
+              await this.patch(current.key, { refusalCategory: category, retryAt: current.retryAt ?? new Date(this.now() + SETTLEMENT_RETRY_MS).toISOString() });
+              this.retrySettlement();
+            }
+            return;
+          }
           if (current.status !== "evaluating" && current.status !== "waiting") return;
           const found = await this.paseo?.agents.ref(current.agentId).refresh().catch(() => null);
           const pending = found?.agent.pendingPermissions?.some((request) => request.id === current.requestId);
@@ -505,7 +604,7 @@ export class Deputy {
     this.unschedule(key);
     await this.lane(key, async () => {
       const candidate = (await this.readStore())[key];
-      if (candidate && OPEN.includes(candidate.status)) await this.patch(key, { status: "resolved", reason: "the request was resolved" });
+      if (candidate && (OPEN.includes(candidate.status) || this.retryable(candidate))) await this.patch(key, { status: "resolved", retryAt: undefined, reason: "the request was resolved" });
     });
   }
 
@@ -522,7 +621,7 @@ export class Deputy {
     this.unschedule(key);
     await this.lane(key, async () => {
       const candidate = (await this.readStore())[key];
-      if (candidate && OPEN.includes(candidate.status)) await this.patch(key, { status: "owner-answered", reason: "the owner answered" });
+      if (candidate && (OPEN.includes(candidate.status) || this.retryable(candidate))) await this.patch(key, { status: "owner-answered", retryAt: undefined, reason: "the owner answered" });
     });
   }
 
@@ -595,16 +694,17 @@ export class Deputy {
     });
   }
 
-  // Off or shadow stops live work at once: candidates waiting for their grace period end.
+  // Every settings notification revokes unsent work synchronously. The later durable
+  // cancellation may wait for a candidate lane, but the final checked-send guard never does.
   async settingsChanged(): Promise<void> {
+    this.settingsGeneration++;
     const { mode } = (await this.deps.settings.read()).deputy;
-    if (mode === "live") return;
     for (const candidate of await this.candidates()) {
-      if (candidate.status !== "waiting" && !(mode === "off" && candidate.status === "evaluating")) continue;
+      if (candidate.status !== "waiting" && candidate.status !== "evaluating" && !(mode === "off" && this.retryable(candidate))) continue;
       this.unschedule(candidate.key);
       await this.lane(candidate.key, async () => {
         const current = (await this.readStore())[candidate.key];
-        if (current && (current.status === "waiting" || current.status === "evaluating")) await this.outcome(current, "canceled", `the deputy was switched to ${mode}`);
+        if (current && (current.status === "waiting" || current.status === "evaluating" || (mode === "off" && this.retryable(current)))) await this.outcome(current, "canceled", "the deputy settings changed");
       });
     }
   }

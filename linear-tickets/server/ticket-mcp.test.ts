@@ -991,6 +991,27 @@ test("a ticket agent started without a verifier marker has no verdict tool at al
   } finally { mcp.stop(); await rm(home, { recursive: true, force: true }); }
 });
 
+test("recovery diagnostic verdicts enforce read-only decisions and bounded named waits", async () => {
+  const { home, script } = await host("paseo-linear-mcp-diagnostic-");
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home, "--verifier", "diagnostic-example"], {});
+  try {
+    assert.equal((await mcp.call("steward_verdict", { verdict: "close" })).isError, true, "diagnosis cannot complete a ticket");
+    assert.equal((await mcp.call("steward_verdict", { verdict: "continue" })).isError, true, "continuation needs concrete work");
+    assert.equal((await mcp.call("steward_verdict", { verdict: "ask_owner", question: "Approve?", options: ["A", "B"] })).isError, true, "owner escalation needs a diagnostic reason");
+    assert.equal((await mcp.call("steward_verdict", { verdict: "wait", instruction: "Check CI", reason: "CI running", nextCheckAt: new Date(Date.now() + 10 * 60_000).toISOString() })).isError, true, "an unbounded wait is rejected");
+    const nextCheckAt = new Date(Date.now() + 3 * 60_000).toISOString();
+    const result = await mcp.call("steward_verdict", { verdict: "wait", instruction: "Check CI", reason: "CI running", nextCheckAt });
+    assert.equal(result.isError, false, result.text);
+    const directory = join(home, "linear-tickets", "steward-verdicts", ISSUE_ID);
+    const records = await readdir(directory);
+    const record = JSON.parse(await readFile(join(directory, records[0]), "utf8"));
+    assert.equal(record.verifier, "diagnostic-example");
+    assert.equal(record.verdict, "wait");
+    assert.equal(record.nextCheckAt, nextCheckAt);
+    assert.equal((await mcp.call("steward_verdict", { verdict: "replace", instruction: "Finish recorded PR" })).isError, true, "a second decision cannot replace the first");
+  } finally { mcp.stop(); await rm(home, { recursive: true, force: true }); }
+});
+
 test("without the broker the tools stay available and every request fails closed", async () => {
   const { home, script } = await host("paseo-linear-mcp-nobroker-");
   const linear = await fakeLinear(answers);

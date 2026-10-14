@@ -331,6 +331,12 @@ export const dispatchStatusSchema = z.object({
     lastError: z.string().nullable(),
     counts: z.record(z.string(), z.number().int()),
     oldest: z.array(z.object({ identifier: z.string(), situation: z.string(), since: z.string() })),
+    control: z.object({
+      passStartedAt: z.string().nullable(),
+      overduePassMs: z.number().nonnegative(),
+      maxUnattendedMs: z.number().nonnegative(),
+      recoveryOutcomes: z.record(z.string(), z.number().int().nonnegative()),
+    }).nullable().optional(),
   }).nullable(),
 });
 export type DispatchStatus = z.infer<typeof dispatchStatusSchema>;
@@ -481,6 +487,9 @@ export const capacityStateSchema = z.object({
   running: z.number().int(),
   reserved: z.number().int(),
   waiting: z.number().int(),
+  observedAt: z.string().optional(),
+  stale: z.boolean().optional(),
+  observationError: z.string().nullable().optional(),
 });
 export type CapacityState = z.infer<typeof capacityStateSchema>;
 export const capacityRpc = defineRpc({

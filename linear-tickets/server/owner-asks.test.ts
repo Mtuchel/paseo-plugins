@@ -6,7 +6,7 @@ import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { HandoverRecord } from "./handover";
 import type { OwnerAskComment, OwnerAskIssue } from "./linear";
-import { answerText, asksOwner, askRoute, deliveryText, OwnerAsks, selectAskText, type AnswerAskInput, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
+import { answerText, asksOwner, askRoute, deliveryText, OwnerAsks, selectAskText, selectAskSources, type AnswerAskInput, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
 import type { OwnerAsk } from "../shared/contracts";
 import type { Extraction } from "./owner-ask-extract";
 import type { DeliveryOrigin, DeliveryResult } from "./permission-replies";
@@ -226,8 +226,6 @@ test("a failing extraction leaves the ask unextracted without blocking the read,
     JSON.parse(await readFile(join(h.directory, "extract", "i2.json"), "utf8").catch(() => "{}"));
   const asks = await h.ownerAsks.snapshot(h.paseo);
   assert.equal(asks.asks[0].extracted, false, "the read never waits for the model");
-  assert.equal(asks.asks[0].kind, "info");
-  assert.equal(asks.asks[0].summary, "Telegram bot: rotate token");
   assert.equal(asks.asks[0].route, "comment", "a manual task is the owner's own step");
   await until(() => calls === 1);
   release!();
@@ -311,7 +309,7 @@ test("an ask repeating a live agent's request goes once the request is answered 
   const record = (kind: "request" | "turn-end"): HandoverRecord => ({ issueId: "i1", identifier: "TUC-1616", agentId: "a1", agentTitle: "agent", branch: null, worktreePath: null, lastCommit: null, summaries: [], links: {}, status: "waiting", progressCommentId: null, resumedFrom: null, updatedAt: at, waiting: { previousStateId: "ip", commentId: "c1", kind, at } });
   const agents = [{ id: "a1", status: "idle", createdAt: at, issueId: "i1", pending: true }];
   const h = await setup({
-    issues: [issue({ title: "Ticket", labels: [], parentId: null })],
+    issues: [issue({ title: "Ticket", description: "", labels: [], parentId: null })],
     comments: new Map([["i1", [comment("c1", waitComment)]]]),
     records: new Map([["i1", record("request")]]),
     agents,
@@ -612,4 +610,63 @@ test("an unfinished completion effect cannot close a revised ask when its delive
   assert.equal(h.continued.length, 1);
   assert.deepEqual(h.events.filter((event) => /^(?:complete|needsYou.remove) /.test(event)), []);
   assert.equal((await reloaded.snapshot(h.paseo)).asks.length, 1);
+});
+
+test("normal issue questions and recovery comments remain independent without a live agent", async t => {
+  const normal = issue({ title: "Rollout policy", labels: [], parentId: null, description: "Which rollout policy?", status: "In Progress" });
+  const h = await setup({ issues: [normal], comments: new Map([["i1", [
+    comment("recovery", "Which replacement generation should recover the job?"),
+    comment("pricing", "Which pricing policy should this use?"),
+  ]]]) });
+  t.after(() => h.ownerAsks.stop());
+  h.deps.issues = async () => h.state.issues;
+  h.deps.linear.ownerAskIssues = async () => { throw new Error("the narrow reader must not be used"); };
+  await untilAsync(async () => {
+    const asks = (await h.ownerAsks.snapshot(null)).asks;
+    return asks.length === 3 && asks.every(ask => ask.extracted);
+  });
+  const snapshot = await h.ownerAsks.snapshot(null);
+  assert.deepEqual(snapshot.coverage, []);
+  assert.deepEqual(new Set(snapshot.asks.map(ask => ask.sourceId)), new Set(["description", "recovery", "pricing"]));
+  assert.ok(snapshot.asks.every(ask => ask.route === "comment"));
+  const recovery = snapshot.asks.find(ask => ask.sourceId === "recovery")!;
+  await h.ownerAsks.answer({ issueId: recovery.issueId, revision: recovery.revision, answers: { q1: "Agent does it" } }, null);
+  assert.deepEqual(new Set((await h.ownerAsks.snapshot(null)).asks.map(ask => ask.sourceId)), new Set(["description", "pricing"]));
+  assert.equal(h.delivered.length, 0);
+  assert.equal(h.continued.length, 0);
+  const pricing = snapshot.asks.find(ask => ask.sourceId === "pricing")!;
+  h.state.comments.get("i1")!.find(comment => comment.id === "pricing")!.body = "Which production deletion policy should this use?";
+  await assert.rejects(h.ownerAsks.answer({ issueId: pricing.issueId, revision: pricing.revision, answers: { q1: "Agent does it" } }, null), /ask changed/);
+  assert.equal(h.events.filter(event => event.startsWith("comment ")).length, 1);
+});
+
+test("source collection deduplicates comment IDs, not wording or ticket identity", () => {
+  const text = "Which policy?";
+  const sources = selectAskSources({ needsYou: false, manual: false, waitCommentId: "c1",
+    comments: [comment("c1", text), comment("c1", text), comment("c2", text)] }, { description: text });
+  assert.deepEqual(sources.map(source => source.sourceId), ["c1", "description", "c2"]);
+});
+
+test("an unconfirmed owner delivery remains visible and cannot be bypassed by changing the answer", async t => {
+  const h = await setup({ issues: [issue()], agents: [{ id: "a1", status: "running", createdAt: at, issueId: "p1" }],
+    needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }] });
+  t.after(() => h.ownerAsks.stop());
+  const input = await inputFor(h);
+  let deliveries = 0;
+  h.deps.deliver = async () => { deliveries++; throw new Error("transport disconnected after submission"); };
+  await assert.rejects(h.ownerAsks.answer(input, h.paseo), /transport disconnected/);
+  const snapshot = await h.ownerAsks.snapshot(h.paseo);
+  assert.equal(snapshot.asks[0].deliveryUnknown, true);
+  await assert.rejects(h.ownerAsks.answer({ ...input, answers: { q1: "You or the team" } }, h.paseo), /unconfirmed/);
+  await assert.rejects(h.ownerAsks.triage({ issueId: input.issueId, revision: input.revision, action: "defer", until: new Date(NOW + 60_000).toISOString() }, h.paseo), /unconfirmed/);
+  assert.equal(deliveries, 1);
+});
+
+test("manual actions remain classified and visible while extraction is unresolved", async t => {
+  const h = await setup({ issues: [issue({ title: "Rotate the owner credential", labels: ["paseo-manual"], description: "Rotate the credential in the owner console." })],
+    extraction: async () => ({ ok: false, reason: "extraction unavailable" }) });
+  t.after(() => h.ownerAsks.stop());
+  const snapshot = await h.ownerAsks.snapshot(null);
+  assert.deepEqual(snapshot.asks.map(ask => ({ kind: ask.kind, attention: ask.attention, extracted: ask.extracted, source: ask.source })),
+    [{ kind: "manual", attention: "owner", extracted: false, source: "Rotate the credential in the owner console." }]);
 });

@@ -449,3 +449,23 @@ test("outside ticket agents the Linear tools are not blocked", async () => {
   assert.equal(await outcome({}), null);
   assert.equal((await outcome({ LINEAR_TICKETS_ISSUE: "ENG-1" }))?.block, true, "the same load blocks it for a ticket agent");
 });
+
+test("diagnostic capability blocks mutation and nested execution while allowing evidence and its verdict", async () => {
+  // A separate module load is required: the capability is captured from the launch environment.
+  const script = `
+    const { default: extension } = await import(process.env.EXTENSION);
+    let gate;
+    extension({ on: (event, handler) => { if (event === "tool_call") gate = handler; }, events: { emit() {} }, appendEntry() {}, sendMessage() {}, registerTool() {}, zod: { object: () => ({}), string: () => ({ optional: () => ({}) }), enum: () => ({}) } });
+    const names = ["bash", "eval", "write", "edit", "task", "create_agent", "linear_ticket_set_status", "future_mutating_tool", "read", "grep", "glob", "linear_ticket_get_comments", "linear_ticket_steward_verdict"];
+    const results = {};
+    for (const toolName of names) results[toolName] = Boolean((await gate({ toolName, input: {} }, { sessionManager: { getBranch: () => [] } }))?.block);
+    console.log(JSON.stringify(results));
+  `;
+  const env = { PATH: process.env.PATH ?? "", PASEO_AGENT_ID: "diagnostic-1", PASEO_HOME: root, LINEAR_TICKETS_ISSUE: "ENG-1", LINEAR_TICKETS_DIAGNOSTIC: "1", EXTENSION: new URL("../omp/linear-tickets-plan-first.ts", import.meta.url).href };
+  const { stdout } = await promisify(execFile)(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], { cwd: fileURLToPath(new URL("..", import.meta.url)), env });
+  assert.deepEqual(JSON.parse(stdout), {
+    bash: true, eval: true, write: true, edit: true, task: true, create_agent: true,
+    linear_ticket_set_status: true, future_mutating_tool: true,
+    read: false, grep: false, glob: false, linear_ticket_get_comments: false, linear_ticket_steward_verdict: false,
+  });
+});

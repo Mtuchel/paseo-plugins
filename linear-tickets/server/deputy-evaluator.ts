@@ -14,7 +14,7 @@ import { runIsolatedOmp, runOmp, type OmpRunner } from "./omp-runner";
 export const EVALUATOR_THINKING = "low";
 // Changing the prompt, the checks or the source handling makes earlier shadow evidence stale:
 // readiness counts only cases recorded under the current version.
-export const POLICY_VERSION = "deputy-2";
+export const POLICY_VERSION = "deputy-4";
 export const policyVersion = (model: string) => `${POLICY_VERSION}/${model}/${EVALUATOR_THINKING}`;
 
 export const SYSTEM_PROMPT = [
@@ -89,6 +89,6 @@ export { authBlock, finalAnswer, runOmp, type OmpRun, type OmpRunner } from "./o
 // `directory`: the deputy's private state directory; the isolated OMP agent directory lives in it.
 export async function evaluateWithOmp(input: EvaluationInput, model: string, directory: string, runner: OmpRunner = runOmp, env: NodeJS.ProcessEnv = process.env): Promise<Verdict> {
   const answer = await runIsolatedOmp({ directory, subject: "evaluator", systemPrompt: SYSTEM_PROMPT, promptFile: "question.md", prompt: evaluationPrompt(input), instruction: "Judge the question in the attached file.", model, thinking: EVALUATOR_THINKING }, runner, env);
-  if (!answer.ok) return { ok: false, reason: answer.reason };
+  if (!answer.ok) return { ok: false, reason: answer.reason, category: "evaluator-unavailable" };
   return checkVerdict(answer.text, input.parts, input.sources);
 }

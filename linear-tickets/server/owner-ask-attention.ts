@@ -43,7 +43,9 @@ export function classifyAttention(source: string, value: ExtractedAsk | null, ma
     if (/\b(?:please|can you|could you|choose|decide|confirm|approve now)\b/i.test(line)) return true;
     return !/\b(?:advisor|nothing (?:is )?(?:needed|required)|no (?:owner |user )?(?:input|action|decision|approval)|once|after|later|will (?:need|require)|needs your approval|requires your approval)\b/i.test(line);
   }).join("\n");
-  if (/\?|\b(?:please\s+(?:choose|decide|approve|confirm|provide)|(?:choose|decide|approve|confirm)\b[^.\n]{0,80}\bnow)\b/i.test(current) || ownerRequest(text) !== null) return result("owner", "The source contains a current question or request for you.");
+  const request = current.split(/\n|(?<=[.!?])\s+/).find(line => /\?|\b(?:please\s+(?:choose|decide|approve|confirm|provide)|(?:choose|decide|approve|confirm)\b[^.\n]{0,80}\bnow)\b/i.test(line))
+    ?? ownerRequest(text);
+  if (request) return result("owner", `Source asks: ${request.trim().slice(0, 400)}`);
   if (advisor) return result("advisor", "Waiting for the advisor; no current owner request is evidenced.");
   if (noInput) return result("info", "The source explicitly says no input is needed yet.");
   if (value.questions.length || value.kind === "decision") return result("owner", "The extracted question needs an explicit answer.");

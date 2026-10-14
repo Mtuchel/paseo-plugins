@@ -214,7 +214,8 @@ async function runningTicketSnapshot(paseo: PaseoApi, inspect?: ProcessInspector
     const page = await paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
     for (const { agent } of page.entries) {
       const issueId = agent.labels?.["linear.issueId"];
-      if (issueId && !agent.labels["paseo.parent-agent-id"] && (agent.status === "running" || agent.status === "initializing") && !agent.pendingPermissions?.length) working.push({ agent, issueId });
+      const control = ["parent-verification", "recovery-diagnostic"].includes(agent.labels?.["linear.coordination"] ?? "");
+      if (issueId && (!agent.labels["paseo.parent-agent-id"] || control) && (agent.status === "running" || agent.status === "initializing") && !agent.pendingPermissions?.length) working.push({ agent, issueId });
     }
     cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
   } while (cursor);
@@ -224,7 +225,7 @@ async function runningTicketSnapshot(paseo: PaseoApi, inspect?: ProcessInspector
   const ghosts = await ghostAgents(counted.map((item) => item.agent), now, inspect);
   return counted.filter((item) => !ghosts.has(item.agent.id)).map((item) => ({
     issueId: item.issueId,
-    control: item.agent.labels?.["linear.coordination"] === "parent-verification",
+    control: ["parent-verification", "recovery-diagnostic"].includes(item.agent.labels?.["linear.coordination"] ?? ""),
   }));
 }
 
@@ -334,7 +335,7 @@ export class TicketStarter {
   // fresh branch (always the recorded one), the cheap tier, and instructions instead of the plan
   // notes, so a verifier never plans, implements or pushes. Its `marker` is the generation the
   // steward created for this check: it goes into the launch, so the verdict answers that verifier.
-  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string; resume?: ActivationResume; verifier?: { brief: string; marker: string } }): Promise<Started> {
+  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string; resume?: ActivationResume; verifier?: { brief: string; marker: string; check?: () => Promise<string | null> } }): Promise<Started> {
     if (await this.deps.deletions?.blocked(issueId)) throw new Error("This ticket is paused for deletion; no agent was started.");
     const detail: TicketDetail = await this.deps.linear.detail(issueId);
     const source = { projectId: detail.projectId, projectName: detail.issue.project, teamId: detail.teamId, teamName: detail.issue.team };
@@ -386,6 +387,11 @@ export class TicketStarter {
       ? { identifier: detail.issue.identifier, untrusted: true, policy: null, modeId: SAFE_MODES[preference.model.split("/")[0]] ?? undefined, notes: [options.verifier.brief], labels: {}, env: {}, tier: { tier: "cheap" as const, reason: "a steward verifier runs on the cheap tier" } }
       : await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, { tiers: this.deps.tiers, routes: this.deps.routes, settings });
     const model = tierModel(settings, preference.model.split("/")[0], setup.tier?.tier ?? null, { provider: preference.model, ...(preference.thinkingOptionId ? { thinkingOptionId: preference.thinkingOptionId } : {}) });
+    const diagnostic = options.verifier?.marker.startsWith("diagnostic-") ?? false;
+    const diagnosticProvider = model.provider.split("/")[0];
+    if (diagnostic && diagnosticProvider !== "omp") {
+      throw new Error(`Recovery diagnostics require OMP's enforced read-only tool capability; ${diagnosticProvider} is not supported.`);
+    }
     const base = {
       id: issueId,
       projectId: project.projectId,
@@ -398,7 +404,7 @@ export class TicketStarter {
     };
     // The owner's prompt template describes the ticket work (branch, checks, pull request): a
     // verifier gets none of it — its whole prompt is the read-only brief.
-    const launchOptions = { promptTemplate: options.verifier ? undefined : settings.template ?? undefined, markInProgress: base.markInProgress, linearAccess: settings.agentLinearAccess, labels: { ...options.labels, ...setup.labels }, env: setup.env, ...(options.lead ? { lead: options.lead } : {}), ...(options.verifier ? { verifier: options.verifier.marker } : {}) };
+    const launchOptions = { promptTemplate: options.verifier ? undefined : settings.template ?? undefined, markInProgress: base.markInProgress, linearAccess: settings.agentLinearAccess, labels: { ...options.labels, ...setup.labels }, env: setup.env, ...(options.lead ? { lead: options.lead } : {}), ...(options.verifier ? { verifier: options.verifier.marker, verifierCheck: options.verifier.check } : {}) };
     const plan = { untrusted: setup.untrusted, plan: setup.policy };
     const started = (result: { agentId: string }) => recordStart(this.deps.tiers, { id: issueId, identifier: detail.issue.identifier }, setup.tier, result.agentId, model.provider);
     // A verifier reads the ticket's work where it lives: on the recorded branch when that can be
@@ -416,12 +422,9 @@ export class TicketStarter {
         return { ...result, warnings: [...result.warnings, ...shardWarnings], provider: model.provider, target, resumed: true, ...plan };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (options.verifier) {
-          // The recorded worktree and its branch are gone: the verifier still judges the ticket,
-          // read-only, in the checkout.
-          console.error(`[linear-tickets] ${detail.issue.identifier}: the verifier could not open the recorded branch (${message}); it reads the checkout instead`);
-          return await verifierInCheckout();
-        }
+        // A failed launch may already have created its worker. The steward reconciles the
+        // persisted marker; never launch a second verifier on an ambiguous failure.
+        if (options.verifier) throw error;
         if (options.resumeOnly || options.resume?.branch) throw new ResumeUnavailableError(`Could not continue ${detail.issue.identifier} on ${resume.branch}: ${message}`);
         // A deleted or merged branch cannot be continued; a fresh start is the useful fallback.
         console.error(`[linear-tickets] ${detail.issue.identifier}: resume failed, starting fresh: ${message}`);

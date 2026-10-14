@@ -2,6 +2,12 @@ import { z } from "zod";
 import { ownerAskSchema, decisionReceiptSchema, askQuestionSchema } from "./contracts";
 
 // Both browser and menu-bar clients operate on the existing revision-bound owner asks.
+// Browser-only source identity: the shared menu-bar contract remains unchanged.
+export const browserOwnerAskSchema = ownerAskSchema.extend({
+  sourceId: z.string().optional(),
+  deliveryUnknown: z.boolean().optional(),
+});
+export type BrowserOwnerAsk = z.infer<typeof browserOwnerAskSchema>;
 export const liveQuestionSchema = askQuestionSchema.extend({ allowEmpty: z.boolean().default(false) });
 export const liveDecisionSchema = z.object({
   agentId: z.string().min(1), requestId: z.string().min(1), revision: z.string().min(1),
@@ -10,30 +16,65 @@ export const liveDecisionSchema = z.object({
   kind: z.enum(["question", "permission"]),
   actions: z.array(z.object({ id: z.string(), label: z.string(), behavior: z.enum(["allow", "deny"]) })),
   deferredUntil: z.string().nullable(),
+  deliveryUnknown: z.boolean().optional(),
 });
 export type LiveDecision = z.infer<typeof liveDecisionSchema>;
 // The ticket steward's flow summary (steward.ts StewardSnapshot): what each in-scope open ticket
 // of the dispatch teams is waiting for, for the inbox page's Flow section. `at`: the pass it is
 // from; null before the first pass or while the steward is off. Absent from a host that does not
 // run the steward.
+export const recoveryTicketSchema = z.object({
+  identifier: z.string(), situation: z.string(), since: z.string(), reason: z.string(),
+  nextAction: z.string().nullable().optional(),
+  waitReason: z.string().nullable().optional(),
+  nextCheckAt: z.string().nullable().optional(),
+  responsibleGeneration: z.string().nullable().optional(),
+  lastVerifiedAdvancementAt: z.string().nullable().optional(),
+});
 export const stewardFlowSchema = z.object({
   at: z.string().nullable(),
   counts: z.record(z.string(), z.number().int()),
   oldest: z.array(z.object({ identifier: z.string(), situation: z.string(), since: z.string() })),
   error: z.string().nullable(),
+  tickets: z.array(recoveryTicketSchema).optional(),
+  control: z.object({
+    passStartedAt: z.string().nullable(), overduePassMs: z.number(),
+    maxUnattendedMs: z.number(), recoveryOutcomes: z.record(z.string(), z.number()),
+  }).optional(),
 });
 export type StewardFlow = z.infer<typeof stewardFlowSchema>;
 export const decisionHostSchema = z.object({
-  host: z.string(), asks: z.array(ownerAskSchema), live: z.array(liveDecisionSchema),
+  host: z.string(), asks: z.array(browserOwnerAskSchema), live: z.array(liveDecisionSchema),
   backendInstanceId: z.string().uuid().optional(),
   history: z.array(decisionReceiptSchema), updatedAt: z.string(), error: z.string().nullable(),
   flow: stewardFlowSchema.nullable().default(null),
 });
 export type DecisionHost = z.infer<typeof decisionHostSchema>;
+export type CuratedDecision = {
+  host: string;
+  target: "owner" | "live";
+  // Owner: [issueId, sourceId], live: [agentId, requestId].
+  id: string;
+  revision: string;
+  priority: "owner" | "review" | "waiting";
+  reason: string;
+  blockedWork: string;
+  flow?: z.infer<typeof recoveryTicketSchema>;
+};
+export type CurationStatus = {
+  intervalMs: number;
+  running: boolean;
+  refreshing: boolean;
+  lastRefreshAt: string | null;
+  nextRefreshAt: string | null;
+  error: string | null;
+};
 export type DecisionView = {
   hosts: DecisionHost[];
   canonicalHost: string | null;
   unreachable: string[];
+  tasks?: CuratedDecision[];
+  curation?: CurationStatus;
 };
 export type BrowserDecisionAction = {
   host: string;

@@ -45,7 +45,7 @@ export class DecisionLedger {
   get(id: string): DecisionRecord | undefined { return this.records[id]; }
 
   latest(issueId: string, revision: string): DecisionRecord | undefined {
-    return Object.values(this.records).reverse().find((record) => record.result && record.receipt.issueId === issueId && record.receipt.revision === revision);
+    return Object.values(this.records).reverse().find((record) => record.receipt.issueId === issueId && record.receipt.revision === revision);
   }
 
   history(): DecisionReceipt[] {

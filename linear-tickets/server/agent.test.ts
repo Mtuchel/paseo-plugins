@@ -1034,7 +1034,7 @@ test("needs-you completion follows confirmed session outcomes, including a deliv
   const h = harness({ pending, needsYou, checked: true, manual: true });
   t.after(h.cleanup);
   await h.store.put(link({ issueId: "sub-1" }));
-  assert.equal(await h.replies.respond({ agentId: "agent-1", requestId: "q", fingerprint: fingerprint(question), intentId: "D-needs-you", response: { behavior: "allow", updatedInput: { answers: { Response: "CSV" } } } }), "applied");
+  assert.equal(await h.replies.respond({ agentId: "agent-1", requestId: "q", fingerprint: fingerprint(question), intentId: "D-needs-you", canSubmit: () => true, response: { behavior: "allow", updatedInput: { answers: { Response: "CSV" } } } }), "applied");
   pending.splice(0);
   await h.store.patch("s1", { questions: { requestId: "q", request: question, index: 0, answers: {} } });
   h.replies.recordEffects({

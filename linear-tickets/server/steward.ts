@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { hostname } from "node:os";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import type { ActivationIntake } from "./activation-intake";
 import { dispatchLabels, type DispatchLabels } from "./dispatch";
@@ -20,10 +21,11 @@ import type { ReviewDeletions } from "./review-deletions";
 import { AWAY_REASON } from "./scheduler";
 import type { HostOwnership, RestartResult, SessionRouter, Succession } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
-import { classifyTicketAgents, WAITING_PLAN_REASON, type TicketStarter } from "./starter";
+import { classifyTicketAgents, issueAgents, WAITING_PLAN_REASON, type TicketStarter } from "./starter";
 import { paseoHome } from "./ticket-mcp";
-import type { TicketRoots, WatchedAgent, WatchdogFile, WatchdogStore } from "./watchdog";
+import { takeLease, releaseLease, type TicketRoots, type WatchedAgent, type WatchdogFile, type WatchdogStore } from "./watchdog";
 import { NEEDS_INPUT_STATE, type Writeback } from "./writeback";
+import { CONTROL_CHECK_MS, RECOVERY_REACTION_MS, DIAGNOSTIC_TIMEOUT_MS, DIAGNOSTIC_CAP, diagnosticBrief, recentDiagnostics, stageEvidence, stageAdvanced, type RecoveryDiagnostic, type Responsibility } from "./recovery-diagnostic";
 
 // The ticket steward (README, "Ticket steward"): one level-triggered reconciler for every in-scope
 // open ticket of the dispatch teams. The plugin's other loops are event- or domain-scoped — label
@@ -44,10 +46,10 @@ import { NEEDS_INPUT_STATE, type Writeback } from "./writeback";
 // in steward.json before it runs, like the watchdog's steps, so a restart never repeats one blindly.
 
 // How often the pass runs (the dispatch poll calls it every `dispatch.intervalSeconds`).
-export const STEWARD_POLL_MS = 2 * 60_000;
+export const STEWARD_POLL_MS = CONTROL_CHECK_MS;
 // A defect (a ticket in none of the five states) is acted on only after it has been seen this long,
 // so a start, a successor or a thread that is about to make the ticket move is waited for.
-export const DEFECT_GRACE_MS = 15 * 60_000;
+export const DEFECT_GRACE_MS = RECOVERY_REACTION_MS;
 // A ticket is restarted at most RESTART_CAP times within STEWARD_WINDOW_MS.
 export const RESTART_CAP = 3;
 export const STEWARD_WINDOW_MS = 24 * 60 * 60_000;
@@ -56,9 +58,9 @@ export const STEWARD_WINDOW_MS = 24 * 60 * 60_000;
 export const REFUSAL_CAP = 3;
 // A claim whose outcome was never written (a reload in the middle): nothing is repeated for this
 // long, then the claim is marked outcome-unknown and the facts decide again.
-export const CLAIM_GRACE_MS = 10 * 60_000;
+export const CLAIM_GRACE_MS = RECOVERY_REACTION_MS;
 // A verifier that has not reported within this long is escalated.
-export const VERIFY_TIMEOUT_MS = 45 * 60_000;
+export const VERIFY_TIMEOUT_MS = RECOVERY_REACTION_MS;
 // The status card of a head issue (a parent with sub-issues in scope) is refreshed at most this
 // often, and at most this many cards are written per pass.
 export const STATUS_CARD_MS = 30 * 60_000;
@@ -89,7 +91,8 @@ const LIVE_AGAIN_PREFIX = "an agent works on ";
 
 type Linear = Pick<LinearService,
   "stewardIssues" | "issueGroup" | "issueStatus" | "issueStatuses" | "issueCore" | "issueRef" | "addLabel" | "removeLabel" | "comment" | "upsertComment" | "createIssue" | "relate" | "complete" | "moveToReady" | "setDueDate" | "trustedAppIds">;
-type Sessions = Pick<SessionRouter, "restartFor" | "succeed" | "resumeVerifiedParent" | "prompt" | "watchdogRoots" | "watchdogThread" | "retireTurn" | "threadQueued" | "parentProgress" | "parentProgresses">;
+type Sessions = Pick<SessionRouter, "restartFor" | "succeed" | "resumeVerifiedParent" | "prompt" | "continueOperation" | "watchdogRoots" | "watchdogThread" | "retireTurn" | "threadQueued" | "parentProgress" | "parentProgresses">;
+type Continuation = Awaited<ReturnType<SessionRouter["continueOperation"]>>;
 
 export type StewardDeps = {
   // The durable store (steward.json); the daemon passes the default path.
@@ -125,6 +128,7 @@ export type StewardDeps = {
   deletions?: Pick<ReviewDeletions, "blocked">;
   focus?: Pick<Focus, "admits">;
   inspect?: ProcessInspector;
+  recoveryWait?: (issueId: string, identifier: string, urls: string[]) => Promise<string | null>;
   now?: () => number;
   // The verifier's structured verdicts, oldest first (ticket-mcp-source.ts `steward_verdict`).
   verdicts?: (issueId: string) => Promise<StewardVerdict[]>;
@@ -229,7 +233,7 @@ export function isDefect(situation: StewardSituation): boolean {
 
 // --- Facts and the classifier ---------------------------------------------------------------------
 
-export type StewardPullFacts = { url: string; merged: boolean; closed: boolean; missing: boolean; decision: string | null; replay: "due" | "asked" | null };
+export type StewardPullFacts = PullState & { url: string };
 
 // A deliberate wait, put there by the owner or the policy: no automatic mechanism may recover it
 // (the deleted retirement's fences and the watchdog's exclusion list, folded in here).
@@ -294,7 +298,7 @@ export type StewardFacts = {
   restarts: number;
   refusals: number;
   lastRefusal: string | null;
-  watchdog: "none" | "active" | "exhausted";
+  watchdog: "none" | "active" | "queued" | "exhausted";
   verifier: boolean;
   // The landed set that was already verified once, and the escalation of the current situation.
   verified: string | null;
@@ -325,6 +329,7 @@ export function classifyTicket(facts: StewardFacts): StewardSituation {
   if (facts.blocker) return "waiting-blocker";
   if (facts.parked) return "parked";
   if (facts.watchdog === "active") return "moving";
+  if (facts.watchdog === "queued") return "queued";
   // A start that waited for its turn stays queued and is retried; its budget is untouched.
   const queued = facts.queuedThread || facts.queuedAt !== null;
   if (queued) return facts.queuedTooLong ? "queued-too-long" : "queued";
@@ -398,6 +403,15 @@ export type StewardTicket = {
   applying: StewardApplying | null;
   parked: StewardParked | null;
   log: { at: string; action: string }[];
+  responsibility?: Responsibility;
+  diagnostic?: RecoveryDiagnostic | null;
+  diagnostics?: string[];
+  diagnosticRequested?: string | null;
+  continuation?: { agentId: string; operationId: string; text: string; at: string; status: Continuation["status"] } | null;
+  // A confirmed recovery result followed by a stage transition is a temporal proxy, not proof
+  // that recovery caused progress. Reconciliation of the same operation never opens it twice.
+  recoveryObservation?: { key: string; at: string; advancedAt?: string };
+  recoveryOutcomes?: Record<string, number>;
 };
 // The flow view: the counts of the last pass and the oldest tickets of each state.
 export type StewardFlow = {
@@ -424,6 +438,11 @@ function parseFile(text: string): StewardFile {
     if (!ticket || typeof ticket !== "object" || typeof ticket.situation !== "string" || !Array.isArray(ticket.restarts)) {
       throw new StewardStateError(`steward.json has a malformed entry for ${issueId}`);
     }
+    const responsibility = ticket.responsibility;
+    if (responsibility && (typeof responsibility.generation !== "string" || typeof responsibility.host !== "string" || !Number.isFinite(Date.parse(responsibility.nextCheckAt)) || !Number.isFinite(Date.parse(responsibility.observedAt)))) throw new StewardStateError(`steward.json has malformed responsibility for ${issueId}`);
+    const diagnostic = ticket.diagnostic;
+    if (diagnostic && (typeof diagnostic.marker !== "string" || typeof diagnostic.generation !== "string" || typeof diagnostic.host !== "string" || !Number.isFinite(Date.parse(diagnostic.at)) || !Number.isFinite(Date.parse(diagnostic.deadline)) || !["launching", "running", "applying", "waiting", "done"].includes(diagnostic.state))) throw new StewardStateError(`steward.json has malformed diagnosis for ${issueId}`);
+    if (ticket.diagnostics && (!Array.isArray(ticket.diagnostics) || ticket.diagnostics.some((at) => !Number.isFinite(Date.parse(at))))) throw new StewardStateError(`steward.json has malformed diagnostic budget for ${issueId}`);
   }
   return { version: 1, tickets: file.tickets as Record<string, StewardTicket>, flow: file.flow ?? null };
 }
@@ -595,7 +614,7 @@ export class RetiredLabels {
 // Design correction B: exactly four verdicts. `follow_up` is gone — the owner files no follow-up
 // issues for open tickets. `park` hands the ticket back to Linear as startable work: a blocking
 // relation and/or a due date, Todo, and the trigger label only when there is a blocker to wait for.
-export type StewardVerdictKind = "close" | "resume" | "park" | "ask_owner";
+export type StewardVerdictKind = "close" | "resume" | "park" | "ask_owner" | "continue" | "replace" | "wait";
 // What one verifier recorded through the `steward_verdict` tool: exactly one verdict, bound to the
 // verifier generation that issued it (`verifier`: the marker the steward started it with).
 export type StewardVerdict = {
@@ -611,9 +630,10 @@ export type StewardVerdict = {
   reason: string | null;
   question: string | null;
   options: string[] | null;
+  nextCheckAt?: string | null;
 };
 
-const VERDICT_KINDS: StewardVerdictKind[] = ["close", "resume", "park", "ask_owner"];
+const VERDICT_KINDS: StewardVerdictKind[] = ["close", "resume", "park", "ask_owner", "continue", "replace", "wait"];
 
 // A real calendar date: the shape alone accepts 2026-02-31, which Linear would refuse later and
 // which would park a ticket that nothing ever wakes.
@@ -634,6 +654,7 @@ export function parseVerdict(value: unknown): StewardVerdict | null {
     issueId: raw.issueId, at: raw.at, verifier: raw.verifier.trim().slice(0, 64), verdict,
     instruction: field("instruction", 4_000), blockedBy: field("blockedBy", 40), dueDate: field("dueDate", 10),
     reason: field("reason", 2_000), question: field("question", 2_000), options,
+    nextCheckAt: field("nextCheckAt", 40),
   };
   // A verdict that does not name what it needs is refused rather than applied as a guess: a park
   // without a blocker or a date would wait for nothing, forever.
@@ -641,6 +662,12 @@ export function parseVerdict(value: unknown): StewardVerdict | null {
   if (verdict === "park" && (!record.reason || (!record.blockedBy && !record.dueDate))) return null;
   if (verdict === "park" && record.dueDate && !calendarDate(record.dueDate)) return null;
   if (verdict === "ask_owner" && (!record.question || !record.options?.length)) return null;
+  if (!Number.isFinite(Date.parse(record.at))) return null;
+  if ((verdict === "continue" || verdict === "replace") && !record.instruction) return null;
+  if (verdict === "wait" && (!record.reason || !record.instruction || !record.nextCheckAt || !Number.isFinite(Date.parse(record.nextCheckAt)) || Date.parse(record.nextCheckAt) <= Date.parse(record.at) || Date.parse(record.nextCheckAt) - Date.parse(record.at) > RECOVERY_REACTION_MS)) return null;
+  const diagnostic = record.verifier.startsWith("diagnostic-");
+  if (diagnostic && (!["continue", "replace", "wait", "ask_owner"].includes(verdict) || (verdict === "ask_owner" && !record.reason))) return null;
+  if (!diagnostic && ["continue", "replace", "wait"].includes(verdict)) return null;
   return record;
 }
 
@@ -740,9 +767,22 @@ export type StewardSnapshot = {
   lastPassAt: string | null;
   lastError: string | null;
   counts: Record<string, number>;
-  tickets: { identifier: string; situation: StewardSituation; since: string; reason: string }[];
+  tickets: { identifier: string; situation: StewardSituation; since: string; reason: string; nextAction: string | null; waitReason: string | null; nextCheckAt: string | null; responsibleGeneration: string | null; lastVerifiedAdvancementAt: string | null }[];
+  control: { passStartedAt: string | null; overduePassMs: number; maxUnattendedMs: number; recoveryOutcomes: Record<string, number> };
   oldest: { identifier: string; situation: StewardSituation; since: string }[];
 };
+export type ResponsibilityView = { nextAction: string | null; waitReason: string | null; nextCheckAt: string | null; responsibleGeneration: string | null; lastVerifiedAdvancementAt: string | null };
+export type StewardFlowEntry = { state: StewardSituation; since: string; reason: string } & ResponsibilityView;
+
+function responsibilityView(ticket: StewardTicket): ResponsibilityView {
+  return {
+    nextAction: ticket.responsibility?.nextAction ?? null,
+    waitReason: ticket.responsibility?.waitReason ?? null,
+    nextCheckAt: ticket.responsibility?.nextCheckAt ?? null,
+    responsibleGeneration: ticket.responsibility?.generation ?? null,
+    lastVerifiedAdvancementAt: ticket.responsibility?.lastVerifiedAdvancementAt ?? null,
+  };
+}
 
 type Candidate = { issue: StewardIssue; facts: StewardFacts; situation: StewardSituation; ticket: StewardTicket };
 type Pass = { actions: number; cap: number; cards: number };
@@ -806,6 +846,9 @@ export class Steward {
   private lastPassAt: string | null = null;
   private lastError: string | null = null;
   private enabled = true;
+  private running = false;
+  private passStartedAt: string | null = null;
+  private readonly host = hostname();
 
   constructor(private readonly deps: StewardDeps) {}
 
@@ -842,7 +885,9 @@ export class Steward {
       const id = Object.keys(file.tickets).find((key) => key === issue || file.tickets[key].identifier === issue);
       if (!id) return null;
       const ticket = file.tickets[id];
-      file.tickets[id] = { ...ticket, restarts: [], refusals: [], resumedAt: null, escalated: null, verified: null, parked: null, ownerAt: this.iso() };
+      ticket.recoveryOutcomes ??= {};
+      ticket.recoveryOutcomes["owner-retry"] = (ticket.recoveryOutcomes["owner-retry"] ?? 0) + 1;
+      file.tickets[id] = { ...ticket, restarts: [], refusals: [], resumedAt: null, escalated: null, verified: null, parked: null, diagnosticRequested: null, diagnostics: [], continuation: ticket.continuation && ["queued", "sent", "unknown"].includes(ticket.continuation.status) ? ticket.continuation : null, ownerAt: this.iso() };
       console.log(`[linear-tickets] ${ticket.identifier}: started again by the owner; the steward's budgets begin anew`);
     });
   }
@@ -884,31 +929,39 @@ export class Steward {
     const ticket = (await this.deps.store.read()).tickets[issueId];
     if (!ticket) return false;
     if (ticket.claim?.state === "claimed" && this.clock() - Date.parse(ticket.claim.at) < CLAIM_GRACE_MS) return true;
-    return Boolean(ticket.verifier);
+    return Boolean(ticket.verifier || (ticket.diagnostic && ticket.diagnostic.state !== "done") || (ticket.continuation && ["queued", "unknown"].includes(ticket.continuation.status)));
   }
 
   // The flow view for the status RPC and the browser inbox: the counts of the last pass, the
   // oldest tickets of each state, and each tracked ticket's situation.
   async snapshot(): Promise<StewardSnapshot> {
     const file = await this.deps.store.read();
+    const now = this.clock();
+    const recoveryOutcomes: Record<string, number> = {};
+    let maxUnattendedMs = 0;
+    for (const ticket of Object.values(file.tickets)) {
+      if (ticket.situation !== "closed" && ticket.responsibility) maxUnattendedMs = Math.max(maxUnattendedMs, now - Date.parse(ticket.responsibility.nextCheckAt));
+      for (const [outcome, count] of Object.entries(ticket.recoveryOutcomes ?? {})) recoveryOutcomes[outcome] = (recoveryOutcomes[outcome] ?? 0) + count;
+    }
     return {
       enabled: this.enabled,
       active: Boolean(this.paseo),
       lastPassAt: this.lastPassAt,
       lastError: this.lastError,
       counts: file.flow?.counts ?? {},
-      tickets: Object.values(file.tickets).map((ticket) => ({ identifier: ticket.identifier, situation: ticket.situation, since: ticket.since, reason: ticket.log.at(-1)?.action ?? "" })),
+      tickets: Object.values(file.tickets).map((ticket) => ({ identifier: ticket.identifier, situation: ticket.situation, since: ticket.since, reason: ticket.log.at(-1)?.action ?? "", ...responsibilityView(ticket) })),
+      control: { passStartedAt: this.passStartedAt, overduePassMs: Math.max(0, now - Date.parse(this.lastPassAt ?? file.flow?.at ?? this.passStartedAt ?? this.iso()) - CONTROL_CHECK_MS), maxUnattendedMs, recoveryOutcomes },
       oldest: file.flow?.oldest ?? [],
     };
   }
 
   // The flow of the given tickets, for the browser inbox's detail pane.
-  async flowFor(issueIds: string[]): Promise<Map<string, { state: StewardSituation; since: string; reason: string }>> {
+  async flowFor(issueIds: string[]): Promise<Map<string, StewardFlowEntry>> {
     const file = await this.deps.store.read();
-    const result = new Map<string, { state: StewardSituation; since: string; reason: string }>();
+    const result = new Map<string, StewardFlowEntry>();
     for (const issueId of issueIds) {
       const ticket = file.tickets[issueId];
-      if (ticket) result.set(issueId, { state: ticket.situation, since: ticket.since, reason: ticket.log.at(-1)?.action ?? "" });
+      if (ticket) result.set(issueId, { state: ticket.situation, since: ticket.since, reason: ticket.log.at(-1)?.action ?? "", ...responsibilityView(ticket) });
     }
     return result;
   }
@@ -917,28 +970,27 @@ export class Steward {
   // Background priority: every read and write stops at its pool's reserve; a rate limit ends the
   // pass and the next one continues.
   async tick(paseo: PaseoApi, settings: PluginSettings): Promise<void> {
-    if (this.revoked) return;
+    if (this.revoked || this.running || this.clock() - this.lastPoll < STEWARD_POLL_MS) return;
     this.paseo = paseo;
-    await withPriority("background", "steward", async () => {
-      if (this.clock() - this.lastPoll < STEWARD_POLL_MS) return;
-      this.lastPoll = this.clock();
-      try {
-        await this.pass(paseo, settings, {});
-        this.lastPassAt = this.iso();
-        this.lastError = null;
-      } catch (error) {
-        if (error instanceof RateLimitedError) throw error;
-        this.lastError = message(error);
-        this.once("pass", `the steward pass failed: ${this.lastError}; the next pass retries`);
-      }
-    });
+    this.running = true;
+    this.lastPoll = this.clock();
+    this.passStartedAt = this.iso();
+    try {
+      await withPriority("background", "steward", () => this.pass(paseo, settings, {}));
+      this.lastPassAt = this.iso();
+      this.lastError = null;
+    } catch (error) {
+      this.lastError = message(error);
+      this.once("pass", `the steward pass failed: ${this.lastError}; the next pass retries`);
+    } finally { this.running = false; }
   }
 
   // The paused-poll exception (README, "Auto-dispatch"): while the background share is paused, a
   // queue blocker with a failed start is still retried, at interactive priority. One filtered read,
   // and only queue-blocker tickets are acted on.
   async tickQueueBlockers(paseo: PaseoApi, settings: PluginSettings): Promise<void> {
-    if (this.revoked) return;
+    if (this.revoked || this.running) return;
+    this.running = true;
     this.paseo = paseo;
     await withPriority("interactive", "queue-blocker steward", async () => {
       try {
@@ -947,10 +999,17 @@ export class Steward {
         if (error instanceof RateLimitedError) throw error;
         this.once("blockers", `the queue-blocker steward pass failed: ${message(error)}; the next one retries`);
       }
-    });
+    }).finally(() => { this.running = false; });
   }
 
   private async pass(paseo: PaseoApi, settings: PluginSettings, options: { queueBlockers?: boolean }): Promise<void> {
+    const instance = randomUUID();
+    if (!await takeLease(this.deps.store.path, instance)) return;
+    try { await this.runPass(paseo, settings, options); }
+    finally { await releaseLease(this.deps.store.path, instance); }
+  }
+
+  private async runPass(paseo: PaseoApi, settings: PluginSettings, options: { queueBlockers?: boolean }): Promise<void> {
     this.enabled = settings.steward.enabled;
     const store = this.deps.store;
     const file = await store.read();
@@ -1056,7 +1115,7 @@ export class Steward {
     const blocker = issue.blockers.find((candidate) => !finishedBlocker(candidate))?.identifier ?? null;
     const pullFacts: StewardPullFacts[] = pullUrls(issue, record ?? undefined).map((url) => {
       const state = input.pulls.get(url);
-      return { url, merged: state?.merged === true, closed: state?.closed === true, missing: state?.missing === true, decision: state?.decision ?? null, replay: state?.replay ?? null };
+      return { url, merged: state?.merged === true, closed: state?.closed === true, missing: state?.missing === true, decision: state?.decision ?? null, replay: state?.replay ?? null, headSha: state?.headSha ?? null, ci: state?.ci ?? null };
     });
     const openPulls = pullFacts.filter((pull) => !pull.merged && !pull.closed && !pull.missing);
     const landedPulls = pullFacts.filter((pull) => pull.merged);
@@ -1134,7 +1193,7 @@ export class Steward {
       restarts: recent(input.ticket?.restarts ?? [], now).length,
       refusals: (input.ticket?.refusals ?? []).filter((entry) => Number.isFinite(Date.parse(entry.at)) && now - Date.parse(entry.at) < STEWARD_WINDOW_MS).length,
       lastRefusal: input.ticket?.refusals?.at(-1)?.reason ?? null,
-      watchdog: cycle?.cycle ? "active" : cycle?.exhausted ? "exhausted" : "none",
+      watchdog: cycle?.cycle?.retiredAt ? "queued" : cycle?.cycle ? "active" : cycle?.exhausted ? "exhausted" : "none",
       verifier: Boolean(input.ticket?.verifier),
       verified: input.ticket?.verified ?? null,
       landedSignature: landedPulls.map((pull) => pull.url).sort().join(","),
@@ -1170,11 +1229,37 @@ export class Steward {
     // The situation's age: kept while it does not change, so the grace and the flow view can tell a
     // ticket that just got stuck from one that has been for hours.
     const since = previous.situation === situation ? previous.since : this.iso(now);
+    const root = await this.liveRoot(paseo, issue.id);
     await this.deps.store.update((file) => {
       const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
       ticket.situation = situation;
       ticket.since = since;
       ticket.at = this.iso(now);
+      const old = ticket.responsibility;
+      const stage = stageEvidence(issue, facts, old?.observedStage);
+      const agentId = root?.id ?? old?.agentId ?? null;
+      const changedOwner = !old || old.host !== this.host || old.agentId !== agentId;
+      const advanced = Boolean(old && stageAdvanced(old.observedStage, stage));
+      const nextAction = facts.deliberate ? `Recheck ${facts.deliberate}` : facts.blocker ? `Recheck blocker ${facts.blocker}` : facts.watchdog === "queued" ? "Recheck retired worker replacement admission" : ticket.diagnostic && ticket.diagnostic.state !== "done" ? "Read diagnostic verdict" : STEWARD_ACTION[situation] ?? "Verify stage advancement";
+      ticket.responsibility = {
+        generation: changedOwner ? randomUUID() : old.generation,
+        generationAt: changedOwner ? this.iso(now) : old.generationAt ?? old.observedAt,
+        agentId, host: this.host, nextAction,
+        waitReason: facts.deliberate ?? facts.blocker ?? (facts.watchdog === "queued" ? "Retired implementation worker; replacement admission pending" : ticket.queued?.reason ?? null),
+        nextCheckAt: this.iso(now + CONTROL_CHECK_MS),
+        observedStage: stage, observedAt: old?.observedAt ?? this.iso(now),
+        lastVerifiedAdvancementAt: advanced ? this.iso(now) : old?.lastVerifiedAdvancementAt ?? null,
+      };
+      if (advanced) {
+        if (ticket.recoveryObservation && !ticket.recoveryObservation.advancedAt && Date.parse(ticket.recoveryObservation.at) <= now) {
+          ticket.recoveryObservation.advancedAt = this.iso(now);
+          ticket.recoveryOutcomes ??= {};
+          ticket.recoveryOutcomes["advancement-after-recovery"] = (ticket.recoveryOutcomes["advancement-after-recovery"] ?? 0) + 1;
+        }
+        ticket.diagnosticRequested = null;
+        // Advancement does not cancel the router's independently drained delivery operation.
+        if (ticket.continuation && ["started", "cancelled"].includes(ticket.continuation.status)) ticket.continuation = null;
+      }
       // A queue entry that no longer describes the ticket is dropped; the ticket moved on.
       if (ticket.queued && situation !== "queued") ticket.queued = null;
       // A park whose blocker finished or whose date arrived is over: the record goes, and the
@@ -1188,6 +1273,8 @@ export class Steward {
       }
     });
     const stored = (await this.deps.store.read()).tickets[issue.id];
+    candidate.ticket = stored;
+    if ((this.enabled || (stored.diagnostic && stored.diagnostic.state !== "done")) && await this.recovery(paseo, settings, names, candidate, pass, now)) return;
     // A claim whose outcome is unknown is never repeated blindly: the ticket waits for the grace.
     if (stored?.claim?.state === "claimed") {
       this.once(`claim:${issue.id}`, `${issue.identifier}: the steward's ${stored.claim.action} is claimed but has no outcome yet; it is not repeated`);
@@ -1216,13 +1303,305 @@ export class Steward {
     if (!this.enabled) return;
     // A defect is acted on after the grace, so a start or a thread that is about to move the ticket
     // is waited for; the invariant's five states need nothing.
-    if (isDefect(situation) && now - Date.parse(since) < DEFECT_GRACE_MS) return;
+    if (isDefect(situation) && situation !== "idle" && now - Date.parse(since) < DEFECT_GRACE_MS) return;
     if (escalated) {
       this.once(`escalated:${issue.id}`, `${issue.identifier}: the steward already asked the owner (${key}); it waits for their answer`);
       return;
     }
     if (!this.cap(pass, candidate, action)) return;
     await this.act(paseo, settings, names, candidate, situation, action, now);
+  }
+
+  private async requestDiagnosis(issue: { id: string; identifier: string }, reason: string): Promise<void> {
+    await this.deps.store.update((file) => {
+      const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso());
+      ticket.diagnosticRequested ??= reason;
+    });
+  }
+
+  private async recordContinuation(issueId: string, outcome: Continuation): Promise<void> {
+    await this.deps.store.update((file) => {
+      const ticket = file.tickets[issueId];
+      if (!ticket?.continuation) return;
+      ticket.continuation.status = outcome.status;
+      if (["sent", "started"].includes(outcome.status) && ticket.recoveryObservation?.key !== ticket.continuation.operationId) {
+        ticket.recoveryObservation = { key: ticket.continuation.operationId, at: this.iso() };
+      }
+      if (ticket.responsibility) {
+        ticket.responsibility.nextAction = outcome.status === "unknown" ? "Diagnose ambiguous continuation delivery" : "Verify continuation advancement";
+        ticket.responsibility.waitReason = outcome.reason ?? `Continuation ${outcome.status}`;
+        ticket.responsibility.nextCheckAt = this.iso(this.clock() + CONTROL_CHECK_MS);
+      }
+    });
+  }
+
+  // Diagnostics never take over the implementation handover. Every effect re-reads authority.
+  private async diagnosticFence(paseo: PaseoApi, issue: StewardIssue, names: DispatchLabels, generation: string, inTurn = false): Promise<string | null> {
+    if (!this.alive() || !(await this.deps.settings.read()).steward.enabled) return "Recovery control is stopped";
+    if (await this.deps.owner(issue.id) !== "here") return "Another host owns recovery";
+    if (await this.deps.deletions?.blocked(issue.id)) return "Ticket deletion is pending";
+    const current = (await this.deps.store.read()).tickets[issue.id];
+    if (current?.responsibility?.generation !== generation || current.responsibility.host !== this.host) return "Responsible generation changed";
+    const appIds = await this.deps.linear.trustedAppIds();
+    const settings = await this.deps.settings.read();
+    const fresh = (await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: Object.values(names), appIds, ids: [issue.id] })).find((entry) => entry.id === issue.id);
+    if (!fresh) return "Current ticket evidence is unavailable";
+    if (CLOSED_TYPES.includes(fresh.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number])) return "Ticket is terminal";
+    const parent = await this.deps.sessions.parentProgress(issue.id);
+    if (parent?.phase === "paused" || parent?.phase === "closed") return "Parent responsibility is paused";
+    const authority = await this.ownerAuthorityFence(fresh, names, parent, inTurn);
+    if (authority) return authority;
+    const roots = (await this.deps.sessions.watchdogRoots()).get(issue.id)?.roots ?? [];
+    if (roots.some((agent) => agent.pendingPermissions?.length)) return "An implementation agent waits for permission";
+    if (roots.filter((agent) => LIVE_AGENT[agent.status]).some((agent) => agent.id !== current.responsibility?.agentId)) return "Implementation ownership changed";
+    const record = (await this.deps.handover.all()).find((item) => item.issueId === issue.id);
+    if (record?.waiting) return "The ticket waits for the owner";
+    if ((await this.deps.needsYou.allStrict()).some((entry) => entry.parentId === issue.id)) return "A Needs-you decision is open";
+    if (!this.deps.recoveryWait) return "The recovery PR authority reader is unavailable";
+    return this.deps.recoveryWait(issue.id, issue.identifier, pullUrls(fresh, record));
+  }
+
+  private async diagnosticWait(issueId: string, reason: string, nextAction = "Recheck recovery authority", nextCheckAt = this.iso(this.clock() + CONTROL_CHECK_MS)): Promise<void> {
+    await this.deps.store.update((file) => {
+      const responsibility = file.tickets[issueId]?.responsibility;
+      if (responsibility) Object.assign(responsibility, { waitReason: reason, nextAction, nextCheckAt });
+    });
+  }
+
+  private async finishDiagnostic(paseo: PaseoApi, issueId: string, diagnostic: RecoveryDiagnostic, outcome: string): Promise<void> {
+    const helperIds = diagnostic.agentId ? [diagnostic.agentId] : (await issueAgents(paseo, issueId)).filter((agent) => agent.labels?.[STEWARD_VERIFIER_LABEL] === diagnostic.marker).map((agent) => agent.id);
+    // A timed-out create is not a cancelled create. Keep its original marker reserved until
+    // an exact helper is discovered or the transport returns its identity, across reloads.
+    if (!helperIds.length && (diagnostic.launchPending || diagnostic.state === "launching")) {
+      await this.diagnosticWait(issueId, "Diagnostic create outcome unknown; original marker remains reserved", "Find and retire the original diagnostic helper");
+      return;
+    }
+    for (const id of helperIds) {
+      const helper = await paseo.agents.ref(id).refresh();
+      if (helper && !helper.agent.archivedAt) {
+        if (helper.agent.labels?.[STEWARD_VERIFIER_LABEL] !== diagnostic.marker) throw new Error("Diagnostic helper label changed; refusing archive");
+        await paseo.agents.ref(id).archive();
+      }
+    }
+    await this.deps.store.update((file) => {
+      const ticket = file.tickets[issueId];
+      if (ticket?.diagnostic?.marker !== diagnostic.marker || ticket.diagnostic.state === "done") return;
+      ticket.diagnostic = { ...ticket.diagnostic, state: "done", outcome, finishedAt: this.iso() };
+      ticket.diagnosticRequested = null;
+      ticket.recoveryOutcomes ??= {};
+      ticket.recoveryOutcomes[outcome] = (ticket.recoveryOutcomes[outcome] ?? 0) + 1;
+      if (outcome === "replaced") ticket.recoveryObservation = { key: diagnostic.marker, at: this.iso() };
+      ticket.log = [...ticket.log, { at: this.iso(), action: `diagnostic: ${outcome}` }].slice(-LOG_LIMIT);
+    });
+  }
+
+  private async recovery(paseo: PaseoApi, settings: PluginSettings, names: DispatchLabels & { trigger: string }, candidate: Candidate, pass: Pass, now: number): Promise<boolean> {
+    const { issue, facts, ticket } = candidate;
+    const responsibility = ticket.responsibility!;
+    let diagnostic = ticket.diagnostic;
+    const blocked = facts.terminal || facts.deliberate || facts.ownerWait === "live" || facts.blocker || facts.parked;
+    if (diagnostic && diagnostic.state !== "done" && responsibility.lastVerifiedAdvancementAt && Date.parse(responsibility.lastVerifiedAdvancementAt) > Date.parse(diagnostic.at)) {
+      await this.finishDiagnostic(paseo, issue.id, diagnostic, "advanced");
+      return true;
+    }
+    if (diagnostic && diagnostic.state !== "done" && (!this.enabled || blocked || diagnostic.generation !== responsibility.generation || diagnostic.host !== this.host)) {
+      await this.finishDiagnostic(paseo, issue.id, diagnostic, "cancelled-authority");
+      return true;
+    }
+    if (blocked || ticket.verifier) return false;
+    if (ticket.continuation && ticket.continuation.status !== "cancelled") {
+      const operation = ticket.continuation;
+      const outcome = await this.deps.sessions.continueOperation({ issueId: issue.id, agentId: operation.agentId, operationId: operation.operationId, text: operation.text });
+      await this.recordContinuation(issue.id, outcome);
+      operation.status = outcome.status;
+      if (outcome.status === "unknown" || (["queued", "sent"].includes(outcome.status) && now - Date.parse(operation.at) >= RECOVERY_REACTION_MS)) ticket.diagnosticRequested = `Continuation ${operation.operationId} remains ${outcome.status}; reconcile it, never replace its delivery identity`;
+      else if (outcome.status !== "cancelled" && now - Date.parse(operation.at) < RECOVERY_REACTION_MS && (!diagnostic || diagnostic.state === "done")) return true;
+    }
+    if (diagnostic && diagnostic.state !== "done") {
+      if (!diagnostic.agentId) {
+        const helpers = (await issueAgents(paseo, issue.id)).filter((agent) => agent.labels?.[STEWARD_VERIFIER_LABEL] === diagnostic!.marker);
+        if (helpers.length > 1) { await this.finishDiagnostic(paseo, issue.id, diagnostic, "duplicate-helper"); return true; }
+        if (helpers.length === 1) {
+          diagnostic = { ...diagnostic, agentId: helpers[0].id, launchPending: false, state: diagnostic.state === "launching" ? "running" : diagnostic.state };
+          await this.deps.store.update((file) => { if (file.tickets[issue.id].diagnostic?.marker === diagnostic!.marker) file.tickets[issue.id].diagnostic = diagnostic; });
+        }
+      }
+      const fence = await this.diagnosticFence(paseo, issue, names, diagnostic.generation);
+      if (fence) {
+        if (now >= Date.parse(diagnostic.deadline)) await this.finishDiagnostic(paseo, issue.id, diagnostic, "authority-wait");
+        await this.diagnosticWait(issue.id, fence);
+        return true;
+      }
+      if (diagnostic.state === "waiting") {
+        if (diagnostic.waitUntil && now < Date.parse(diagnostic.waitUntil)) {
+          await this.diagnosticWait(issue.id, diagnostic.reason, diagnostic.instruction ?? "Check diagnostic wait", diagnostic.waitUntil);
+          return true;
+        }
+        await this.finishDiagnostic(paseo, issue.id, diagnostic, "wait-expired");
+        await this.requestDiagnosis(issue, "The diagnostic's named wait expired without verified advancement");
+        return true;
+      }
+      const read = this.deps.verdicts ?? ((issueId: string) => readVerdicts(join(paseoHome(), "linear-tickets", STEWARD_VERDICT_DIRECTORY, issueId)));
+      const verdict = (await read(issue.id)).map(parseVerdict).find((entry): entry is StewardVerdict => entry !== null && entry.issueId === issue.id && entry.verifier === diagnostic!.marker && Date.parse(entry.at) >= Date.parse(diagnostic!.at) && Date.parse(entry.at) <= Math.min(now, Date.parse(diagnostic!.deadline)) && ["continue", "replace", "wait", "ask_owner"].includes(entry.verdict));
+      if (!diagnostic.agentId && (diagnostic.launchPending || diagnostic.state === "launching") && now >= Date.parse(diagnostic.deadline)) {
+        await this.diagnosticWait(issue.id, "Diagnostic create outcome unknown; do not repeat the launch", "Find the original diagnostic marker");
+        if (now >= Date.parse(diagnostic.deadline) + RECOVERY_REACTION_MS) await this.escalate(candidate, "Read-only diagnostic launch and bounded reconciliation have no confirmed outcome. Its original marker stays reserved; another launch could duplicate it.");
+        return true;
+      }
+      if (!verdict) {
+        if (now < Date.parse(diagnostic.deadline)) { await this.diagnosticWait(issue.id, "Read-only diagnosis is running", "Read diagnostic verdict", diagnostic.deadline); return true; }
+        await this.finishDiagnostic(paseo, issue.id, diagnostic, diagnostic.agentId ? "timeout" : "launch-unknown");
+        await this.requestDiagnosis(issue, "Bounded diagnosis produced no usable verdict");
+        return true;
+      }
+      const applyFence = await this.diagnosticFence(paseo, issue, names, diagnostic.generation);
+      if (applyFence) { await this.diagnosticWait(issue.id, applyFence); return true; }
+      if (diagnostic.dispatchedAt && verdict.verdict === "replace") {
+        await this.finishDiagnostic(paseo, issue.id, diagnostic, "replacement-outcome-unknown");
+        await this.requestDiagnosis(issue, "Replacement dispatch was claimed before a restart; never repeat blindly");
+        return true;
+      }
+      if (verdict.verdict === "wait") {
+        const until = verdict.nextCheckAt!;
+        if (Date.parse(until) <= now) {
+          await this.finishDiagnostic(paseo, issue.id, diagnostic, "wait-expired");
+          await this.requestDiagnosis(issue, "The diagnostic wait deadline already passed");
+          return true;
+        }
+        if (diagnostic.agentId) await this.archiveAgent(paseo, diagnostic.agentId);
+        await this.deps.store.update((file) => { file.tickets[issue.id].diagnostic = { ...diagnostic!, state: "waiting", decision: "wait", reason: verdict.reason!, instruction: verdict.instruction!, waitUntil: until }; });
+        await this.diagnosticWait(issue.id, verdict.reason!, verdict.instruction!, until);
+        return true;
+      }
+      if (verdict.verdict === "ask_owner") {
+        await this.escalate(candidate, verdict.question!, verdict.options ?? undefined);
+        await this.finishDiagnostic(paseo, issue.id, diagnostic, "ask-owner");
+        return true;
+      }
+      if (!this.cap(pass, candidate, verdict.verdict === "continue" ? "resume" : "succeed")) return true;
+      if (verdict.verdict === "continue") {
+        const root = await this.liveRoot(paseo, issue.id);
+        if (!root || root.id !== responsibility.agentId) {
+          await this.finishDiagnostic(paseo, issue.id, diagnostic, "continue-unavailable");
+          await this.requestDiagnosis(issue, "Continuation cannot safely reach its responsible worker");
+          return true;
+        }
+        if (ticket.continuation && ["queued", "sent", "unknown"].includes(ticket.continuation.status)) {
+          // The pass reconciled this exact operation above. Neither a new diagnostic verdict
+          // nor a transport acknowledgement authorizes another independently drained instruction.
+          await this.finishDiagnostic(paseo, issue.id, diagnostic, `continue-existing-${ticket.continuation.status}`);
+          await this.diagnosticWait(issue.id, `Continuation ${ticket.continuation.operationId} remains ${ticket.continuation.status}`, "Reconcile the existing continuation operation");
+          return true;
+        }
+        const operation = { agentId: root.id, operationId: diagnostic.marker, text: verdict.instruction!, at: diagnostic.at, status: "queued" as const };
+        await this.deps.store.update((file) => { file.tickets[issue.id].continuation = operation; });
+        const result = await this.deps.sessions.continueOperation({ issueId: issue.id, ...operation });
+        await this.recordContinuation(issue.id, result);
+        await this.finishDiagnostic(paseo, issue.id, diagnostic, `continue-${result.status}`);
+        return true;
+      }
+      // One corrective attempt per diagnosis, never a recovery-budget reset or a timed kill.
+      const workers = (await classifyTicketAgents(paseo, issue.id, now, this.deps.inspect)).live.filter((agent) => !agent.labels?.[STEWARD_VERIFIER_LABEL] && !agent.labels?.["paseo.parent-agent-id"]);
+      if (workers.length) {
+        await this.finishDiagnostic(paseo, issue.id, diagnostic, "replace-live-worker");
+        await this.requestDiagnosis(issue, "Replacement refused: an implementation worker is still live");
+        return true;
+      }
+      const record = (await this.deps.handover.all()).find((entry) => entry.issueId === issue.id);
+      if (!record?.branch) {
+        await this.finishDiagnostic(paseo, issue.id, diagnostic, "replace-no-recorded-branch");
+        await this.requestDiagnosis(issue, "Replacement requires the recorded branch; no new branch was created");
+        return true;
+      }
+      await this.deps.store.update((file) => { file.tickets[issue.id].diagnostic = { ...diagnostic!, state: "applying", decision: "replace", dispatchedAt: this.iso() }; });
+      const result = await this.deps.sessions.succeed(issue.id, issue.identifier, record.agentId, verdict.instruction!, async () => {
+        const veto = await this.diagnosticFence(paseo, issue, names, diagnostic!.generation, true);
+        if (veto) throw new Error(veto);
+      });
+      if ("agent" in result) await this.finishDiagnostic(paseo, issue.id, diagnostic, "replaced");
+      else if (result.kind === "wait") {
+        await this.deps.store.update((file) => { file.tickets[issue.id].diagnostic = { ...diagnostic!, state: "waiting", decision: "wait", reason: result.reason, instruction: "Recheck replacement admission and process absence", waitUntil: this.iso(now + RECOVERY_REACTION_MS) }; });
+        await this.diagnosticWait(issue.id, result.reason, "Recheck replacement admission", this.iso(now + CONTROL_CHECK_MS));
+      } else {
+        await this.finishDiagnostic(paseo, issue.id, diagnostic, "replace-refused");
+        await this.requestDiagnosis(issue, result.reason);
+      }
+      return true;
+    }
+    if (ticket.escalated && (!ticket.ownerAt || Date.parse(ticket.ownerAt) <= Date.parse(ticket.escalated.at))) return false;
+    if (diagnostic?.finishedAt && (!ticket.diagnosticRequested || diagnostic.outcome?.startsWith("continue-existing-")) && now - Date.parse(diagnostic.finishedAt) < RECOVERY_REACTION_MS) {
+      await this.diagnosticWait(issue.id, "Waiting for independently verified advancement after recovery", "Verify recovered stage", this.iso(Date.parse(diagnostic.finishedAt) + RECOVERY_REACTION_MS));
+      return true;
+    }
+    const advancementAt = Math.max(Date.parse(responsibility.lastVerifiedAdvancementAt ?? responsibility.observedAt), Date.parse(responsibility.generationAt ?? responsibility.observedAt));
+    const stageStuck = candidate.situation === "moving" && facts.watchdog !== "active" && now - advancementAt >= RECOVERY_REACTION_MS;
+    const needsDiagnosis = ticket.diagnosticRequested || stageStuck || candidate.situation === "idle-unresponsive" || (STEWARD_ACTION[candidate.situation] === "escalate" && now - Date.parse(ticket.since) >= DEFECT_GRACE_MS);
+    if (!needsDiagnosis) return false;
+    const fence = await this.diagnosticFence(paseo, issue, names, responsibility.generation);
+    if (fence) { await this.diagnosticWait(issue.id, fence); return true; }
+    const starts = recentDiagnostics(ticket.diagnostics ?? [], now);
+    if (starts.length >= DIAGNOSTIC_CAP) {
+      await this.escalate(candidate, `Bounded read-only diagnosis exhausted (${DIAGNOSTIC_CAP} in 24 hours); latest outcome: ${diagnostic?.outcome ?? ticket.diagnosticRequested ?? "no safe advance"}`);
+      return true;
+    }
+    if (!this.cap(pass, candidate, "verify")) return true;
+    const gate = this.deps.launcher.gate(issue.id);
+    if (!gate) { await this.diagnosticWait(issue.id, "A launch for this ticket is under way"); return true; }
+    try {
+      const current = (await this.deps.store.read()).tickets[issue.id];
+      if (current.diagnostic && current.diagnostic.state !== "done") return true;
+      const otherHelper = (await issueAgents(paseo, issue.id)).find((agent) => agent.labels?.["linear.coordination"] === "recovery-diagnostic");
+      if (otherHelper) { await this.diagnosticWait(issue.id, `Diagnostic helper ${short(otherHelper.id)} still exists; no duplicate is launched`); return true; }
+      if (!settings.agentLinearAccess) { await this.diagnosticWait(issue.id, "Diagnostic structured-verdict tooling is disabled"); return true; }
+      const admission = await this.deps.starter.admission(issue.id, paseo, settings, undefined, { control: true });
+      if (!admission.ok) { await this.diagnosticWait(issue.id, admission.reason, "Admit a bounded diagnostic"); return true; }
+      const freshFence = await this.diagnosticFence(paseo, issue, names, responsibility.generation);
+      if (freshFence) { await this.diagnosticWait(issue.id, freshFence); return true; }
+      const record = (await this.deps.handover.all()).find((entry) => entry.issueId === issue.id) ?? null;
+      const reason = ticket.diagnosticRequested ?? (stageStuck ? "No independently verified stage advancement for five minutes" : refusalReason(facts, candidate.situation));
+      const marker = `diagnostic-${randomUUID()}`;
+      const pending: RecoveryDiagnostic = { marker, generation: responsibility.generation, host: this.host, agentId: null, at: this.iso(), deadline: this.iso(this.clock() + DIAGNOSTIC_TIMEOUT_MS), reason, state: "launching", launchPending: true };
+      await this.deps.store.update((file) => {
+        file.tickets[issue.id].diagnostic = pending;
+        file.tickets[issue.id].diagnostics = [...starts, pending.at];
+        file.tickets[issue.id].diagnosticRequested = null;
+      });
+      let timer: NodeJS.Timeout | undefined;
+      const launch = this.deps.starter.start(issue.id, paseo, settings, {
+        retryHint: "Wait for the recorded diagnostic generation to reconcile",
+        labels: { [STEWARD_VERIFIER_LABEL]: marker, "linear.coordination": "recovery-diagnostic", "paseo.parent-agent-id": responsibility.agentId ?? "steward-diagnostic" },
+        verifier: {
+          brief: diagnosticBrief(issue, facts, ticket, record, reason), marker,
+          check: async () => {
+            const claimed = (await this.deps.store.read()).tickets[issue.id]?.diagnostic;
+            if (!claimed || claimed.marker !== marker || claimed.state === "done" || this.clock() >= Date.parse(claimed.deadline)) return "Diagnostic generation expired";
+            return this.diagnosticFence(paseo, issue, names, responsibility.generation);
+          },
+        },
+      }).then(async (started) => {
+        const current = (await this.deps.store.read()).tickets[issue.id];
+        const expired = !this.alive() || this.clock() >= Date.parse(pending.deadline) || current?.diagnostic?.marker !== marker || current.diagnostic.state === "done" || current.responsibility?.generation !== pending.generation;
+        if (expired) {
+          await this.finishDiagnostic(paseo, issue.id, { ...pending, agentId: started.agentId, launchPending: false }, "late-launch-retired");
+          return;
+        }
+        await this.deps.store.update((file) => {
+          if (file.tickets[issue.id].diagnostic?.marker === marker && file.tickets[issue.id].diagnostic?.state !== "done") file.tickets[issue.id].diagnostic = { ...pending, agentId: started.agentId, state: "running", launchPending: false };
+        });
+      }).catch(async (error: unknown) => {
+        await this.diagnosticWait(issue.id, `Diagnostic launch outcome unknown: ${message(error)}`, "Find original diagnostic generation");
+      });
+      // Timeout releases this control pass, not the remote create. The durable marker remains
+      // reserved and the late completion above retires only its exactly-labelled helper.
+      try {
+        await Promise.race([launch, new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, Math.max(0, Date.parse(pending.deadline) - this.clock()));
+          timer.unref?.();
+        })]);
+      } finally { clearTimeout(timer); }
+      void launch.catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: diagnostic reconciliation failed: ${message(error)}`));
+      return true;
+    } finally { gate.release(); }
   }
 
   // The per-pass action cap: starts, successors, resumes and verifiers wait for the next pass;
@@ -1252,6 +1631,7 @@ export class Steward {
       await this.deps.store.update((file) => {
         const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
         ticket.claim = { ...claim, state, ...(result ? { result: result.slice(0, 500) } : {}) };
+        if (state === "done" && (action === "restart" || action === "succeed")) ticket.recoveryObservation = { key: claim.marker, at: this.iso() };
         // A deferral is the ticket's queue entry (no budget was spent, the pass retries it); any
         // other outcome ends the entry.
         if (state === "deferred") ticket.queued = { situation, action, at: ticket.queued?.situation === situation ? ticket.queued.at : this.iso(now), reason: (result ?? "waiting for admission").slice(0, 300) };
@@ -1265,30 +1645,36 @@ export class Steward {
         case "start": {
           const result = await this.restart(paseo, names, candidate, now);
           await settle(result.state, result.reason);
-          if (result.permanent) await this.escalate(candidate, result.reason);
+          if (result.permanent) await this.requestDiagnosis(issue, result.reason);
           return;
         }
         case "succeed": {
           const result = await this.succeed(names, candidate);
           await settle(result.state, result.reason);
-          if (result.permanent) await this.escalate(candidate, result.reason);
+          if (result.permanent) await this.requestDiagnosis(issue, result.reason);
           return;
         }
         case "resume": {
           const root = await this.liveRoot(paseo, issue.id);
           if (!root) return settle("failed", "the live agent is gone");
-          const outcome = await this.deps.sessions.prompt(root.id, resumeText(issue.identifier, candidate.facts.idleMinutes ?? 0));
-          if (outcome === "busy" || outcome === "waiting" || outcome === "unavailable") return settle("failed", `the resume did not go out (${outcome})`);
+          const text = resumeText(issue.identifier, candidate.facts.idleMinutes ?? 0);
+          await this.deps.store.update((file) => {
+            file.tickets[issue.id].continuation = { agentId: root.id, operationId: claim.marker, text, at: this.iso(), status: "queued" };
+          });
+          const outcome = await this.deps.sessions.continueOperation({ issueId: issue.id, agentId: root.id, operationId: claim.marker, text });
+          await this.recordContinuation(issue.id, outcome);
+          if (outcome.status === "unknown") await this.requestDiagnosis(issue, "Continuation delivery is unknown; do not resend under a new operation id");
+          if (outcome.status === "cancelled") return settle("failed", outcome.reason ?? "continuation cancelled by its authority gates");
           await this.deps.store.update((file) => {
             const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
             ticket.resumedAt = this.iso();
           });
-          return settle("done", `resumed ${short(root.id)}`);
+          return settle("done", `continuation ${outcome.status} for ${short(root.id)}`);
         }
         case "verify": {
           const result = await this.verify(paseo, settings, candidate, now);
           await settle(result.state, result.reason);
-          if (result.permanent) await this.escalate(candidate, result.reason);
+          if (result.permanent) await this.requestDiagnosis(issue, result.reason);
           return;
         }
         case "archive": {
@@ -1300,8 +1686,8 @@ export class Steward {
           return settle("done", "cleared the wait for the owner");
         }
         case "escalate": {
-          await this.escalate(candidate, undefined);
-          return settle("done", "escalated");
+          await this.requestDiagnosis(issue, refusalReason(candidate.facts, situation));
+          return settle("done", "bounded diagnosis requested");
         }
         default: {
           const never: never = action;
@@ -1517,7 +1903,7 @@ export class Steward {
     // Only the verifier generation's own first verdict counts: a second record, or one another
     // ticket agent wrote, is ignored.
     const verdict = (await read(issue.id).catch(() => [] as StewardVerdict[]))
-      .filter((entry) => entry.verifier === verifier.marker && Date.parse(entry.at) >= Date.parse(verifier.at))
+      .filter((entry) => entry.issueId === issue.id && entry.verifier === verifier.marker && Date.parse(entry.at) >= Date.parse(verifier.at) && ["close", "resume", "park", "ask_owner"].includes(entry.verdict))
       .at(0) ?? null;
     // The journal's step for the effects a branch commits, and whether the consumed verifier's
     // landed set counts as verified (only a close says so).
@@ -1560,7 +1946,7 @@ export class Steward {
       // losing it and launching a fresh verifier over the same ticket.
       if (!await this.claimApplication(issue, verifier.marker, "timeout", now)) return;
       await this.archiveAgent(paseo, verifier.agentId);
-      await this.escalate(candidate, "the verifier did not report within 45 minutes");
+      await this.requestDiagnosis(issue, "The completion verifier did not report within five minutes");
       await this.step(issue, verifier.marker, "escalated", now);
       await this.consume(issue, null);
       return;
@@ -1590,7 +1976,7 @@ export class Steward {
         // is journaled before the verifier is consumed.
         if (!await this.claimApplication(issue, verifier.marker, "exhausted", now)) return;
         await this.archiveAgent(paseo, verifier.agentId);
-        await this.escalate(candidate, `the verifier asked for more work but the ticket's restart budget (${RESTART_CAP} in 24 hours) is spent`);
+        await this.requestDiagnosis(issue, `The verifier asked for more work but the ticket's restart budget (${RESTART_CAP} in 24 hours) is spent`);
         await this.step(issue, verifier.marker, "escalated", now);
         await this.consume(issue, candidate.facts.landedSignature || null);
         return;
@@ -1710,7 +2096,7 @@ export class Steward {
       ticket.applying = { marker, verdict: "exhausted", step: "claimed", at: this.iso(now) };
     });
     console.log(`[linear-tickets] ${issue.identifier}: steward: the verifier's successor cannot run (${reason})`);
-    await this.escalate(candidate, reason);
+    await this.requestDiagnosis(issue, reason);
     await this.step(issue, marker, "escalated", now);
     await this.consume(issue, null);
   }
@@ -2004,7 +2390,7 @@ export class Steward {
 
   private async liveRoot(paseo: PaseoApi, issueId: string): Promise<WatchedAgent | null> {
     const roots = await this.rootsOf(paseo, issueId);
-    return roots.filter((agent) => LIVE_AGENT[agent.status]).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ?? null;
+    return roots.filter((agent) => LIVE_AGENT[agent.status] && !agent.labels?.[STEWARD_VERIFIER_LABEL] && !agent.labels?.["paseo.parent-agent-id"]).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ?? null;
   }
 
   // ESCALATE: one owner-visible decision item on the ticket — the Needs input state, the needs-you
@@ -2026,6 +2412,8 @@ export class Steward {
     await this.deps.store.update((file) => {
       const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso());
       ticket.escalated = { key, signature: `${situation}:${why}`, at: this.iso() };
+      ticket.recoveryOutcomes ??= {};
+      ticket.recoveryOutcomes["owner-escalation"] = (ticket.recoveryOutcomes["owner-escalation"] ?? 0) + 1;
       ticket.log = [...ticket.log, { at: this.iso(), action: `escalated: ${why.slice(0, 200)}` }].slice(-LOG_LIMIT);
     });
     console.log(`[linear-tickets] ${issue.identifier}: steward: asked the owner to decide (${situation}: ${why})`);
@@ -2036,18 +2424,10 @@ export class Steward {
   // situation, and the mark -- instead of a bare owner mention. Deduplication is the watchdog's
   // (its report is queued once per cycle).
   async escalateExhausted(issueId: string, identifier: string, reason: string): Promise<void> {
-    const options = optionsFor("watchdog-exhausted");
-    const body = [
-      `**Paseo's ticket steward cannot move this ticket on** (watchdog-exhausted): ${reason}`,
-      "",
-      "Options:",
-      options.map((option, index) => `${String.fromCharCode(97 + index)}) ${option}`).join("\n"),
-      "",
-      "Its automatic recovery stops here until one of them is taken; adding the trigger label again gives the steward a fresh budget.",
-      "",
-      "<!-- paseo:steward:watchdog-exhausted -->",
-    ].join("\n");
-    await this.deps.writeback.escalate(issueId, identifier, `the ticket steward cannot move ${identifier} on (watchdog-exhausted)`, body);
+    await this.deps.store.update((file) => {
+      const ticket = this.deps.store.ticket(file, issueId, identifier, this.iso());
+      ticket.diagnosticRequested ??= reason;
+    });
   }
 
   // The flow view (README, "Ticket steward"): the counts of the last pass and the oldest tickets of

@@ -89,3 +89,58 @@ test("a resumed planner run's agent gets its run environment back from its run l
     assert.deepEqual(sessionEnv({}, { ...labels, "paseo.parent-agent-id": "run-agent" }, await envs.read("run-agent")), {});
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+test("a resumed diagnostic child cannot lose its read-only capability with missing or stale saved environment", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-diagnostic-env-"));
+  const labels = { "linear.issueId": ISSUE_ID, "linear.identifier": "ENG-42", "linear.coordination": "recovery-diagnostic", "paseo.parent-agent-id": "implementation" };
+  try {
+    const envs = new AgentEnvs(directory);
+    await envs.save("helper", { LINEAR_TICKETS_DIAGNOSTIC: "1", LINEAR_TICKETS_MCP: "ticket-bridge" });
+    const resumed = sessionEnv({}, labels, await envs.read("helper"));
+    assert.equal(resumed.LINEAR_TICKETS_DIAGNOSTIC, "1");
+    assert.equal(resumed.LINEAR_TICKETS_MCP, "ticket-bridge");
+    assert.equal(sessionEnv({}, labels, {}).LINEAR_TICKETS_DIAGNOSTIC, "1");
+    assert.equal(sessionEnv({}, labels, { LINEAR_TICKETS_DIAGNOSTIC: "0" }).LINEAR_TICKETS_DIAGNOSTIC, "1");
+    assert.equal(sessionEnv({ LINEAR_TICKETS_DIAGNOSTIC: "0" }, labels, {}).LINEAR_TICKETS_DIAGNOSTIC, "1");
+    assert.equal(sessionEnv({}, undefined, await envs.read("helper")).LINEAR_TICKETS_DIAGNOSTIC, "1");
+    assert.equal(sessionEnv({ LINEAR_TICKETS_ISSUE: "ENG-42" }, undefined, await envs.read("helper")).LINEAR_TICKETS_DIAGNOSTIC, "1");
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a verifier hold arriving during workspace setup prevents agent creation", async () => {
+  let held = false;
+  let created = false;
+  const paseo = {
+    projects: { list: async () => ({ projects: [{ projectId: "project-1", projectKind: "directory", projectRootPath: "/repo" }] }) },
+    workspaces: { create: async () => {
+      held = true;
+      return { agents: { create: async () => { created = true; return { id: "unexpected" }; } } };
+    } },
+  } as unknown as PaseoApi;
+  const launcher = new Launcher({ ...noMark, detail: async () => detail }, undefined, async () => "/s.mjs", undefined, async () => "/ctx/test.md", () => true);
+  await assert.rejects(launcher.start({ ...input, provider: "claude", modeId: "plan" }, paseo, {
+    linearAccess: true, readOnlyCheckout: true, verifier: "verifier-test",
+    verifierCheck: async () => held ? "owner stopped this ticket during launch" : null,
+  }), /owner stopped this ticket during launch/);
+  assert.equal(created, false);
+});
+
+test("diagnostic context collection never downloads attachments into the implementation checkout", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-diagnostic-checkout-"));
+  try {
+    let downloads = 0;
+    let created: PaseoWorkspaceAgentCreateOptions | undefined;
+    const paseo = {
+      projects: { list: async () => ({ projects: [{ projectId: "project-1", projectKind: "directory", projectRootPath: directory }] }) },
+      workspaces: { create: async () => ({ directory, agents: { create: async (options: PaseoWorkspaceAgentCreateOptions) => { created = options; return { id: "diagnostic" }; } } }) },
+    } as unknown as PaseoApi;
+    const launcher = new Launcher(
+      { ...noMark, detail: async () => ({ ...detail, context: "Read https://uploads.linear.app/owner/attachment.png" }) },
+      async () => { downloads++; throw new Error("Diagnostic must not download"); },
+      async () => "/s.mjs", undefined, async () => "/ctx/test.md", () => true, new AgentEnvs(directory),
+    );
+    await launcher.start(input, paseo, { linearAccess: true, readOnlyCheckout: true, verifier: "diagnostic-test" });
+    assert.equal(created?.env?.LINEAR_TICKETS_DIAGNOSTIC, "1");
+    assert.equal(downloads, 0);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

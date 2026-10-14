@@ -10,7 +10,7 @@ import { paseoHome, TICKET_MCP_ENV } from "./ticket-mcp";
 // environment, not the one the agent was created with. Without these the omp extension neither
 // gates the plan on its advisor review nor offers `record_plan_advice`, the Linear write guard and
 // the ticket tools, so the launch saves them per agent and the session_open hook gives them back.
-const TICKET_ENV = [PLAN_TICKET_ENV, PLAN_CONTEXT_ENV, TICKET_MCP_ENV];
+const TICKET_ENV = [PLAN_TICKET_ENV, PLAN_CONTEXT_ENV, TICKET_MCP_ENV, "LINEAR_TICKETS_DIAGNOSTIC"];
 
 export class AgentEnvs {
   constructor(private readonly directory = join(paseoHome(), "linear-tickets", "agent-env")) {}
@@ -46,6 +46,12 @@ export class AgentEnvs {
 // run's agent has no ticket: its tools hang on the run label (README, "Projects").
 export function sessionEnv(request: Record<string, string>, labels: Record<string, string> | undefined, saved: Record<string, string>): Record<string, string> {
   const added: Record<string, string> = {};
+  const diagnostic = labels?.["linear.coordination"] === "recovery-diagnostic" || labels?.["linear-tickets.steward"]?.startsWith("diagnostic-") || saved.LINEAR_TICKETS_DIAGNOSTIC === "1" || request.LINEAR_TICKETS_DIAGNOSTIC === "1";
+  // Saved capability is restored independently of label lookup; role labels cover a failed save.
+  if (diagnostic) {
+    for (const [name, value] of Object.entries(saved)) if (!request[name]) added[name] = value;
+    added.LINEAR_TICKETS_DIAGNOSTIC = "1";
+  }
   const policy = labels?.[PLAN_POLICY_LABEL];
   if (!request[PLAN_POLICY_ENV] && isPlanPolicy(policy)) added[PLAN_POLICY_ENV] = policy;
   const runId = labels?.["linear.plannerRun"];
@@ -57,7 +63,7 @@ export function sessionEnv(request: Record<string, string>, labels: Record<strin
     return added;
   }
   const identifier = labels?.["linear.identifier"];
-  if (request[PLAN_TICKET_ENV] || !labels?.["linear.issueId"] || !identifier || labels["paseo.parent-agent-id"]) return added;
-  for (const [name, value] of Object.entries({ [PLAN_TICKET_ENV]: identifier, ...saved })) if (!request[name]) added[name] = value;
+  if (request[PLAN_TICKET_ENV] || !labels?.["linear.issueId"] || !identifier || (labels["paseo.parent-agent-id"] && !diagnostic)) return added;
+  for (const [name, value] of Object.entries({ [PLAN_TICKET_ENV]: identifier, ...saved })) if (!request[name] && !(diagnostic && name === "LINEAR_TICKETS_DIAGNOSTIC")) added[name] = value;
   return added;
 }

@@ -142,6 +142,8 @@ export type PullRequestView = {
   reviews: { author: string; state: string; submittedAt: string; body: string; commit: string | null }[];
   lastCommitAt: string | null;
   checks: CheckRun[];
+  // False only when the detail response omitted CI evidence; [] otherwise means no checks.
+  checksComplete?: boolean;
   // GitHub's merge check against the base: "CONFLICTING" only when GitHub confirmed a conflict,
   // "MERGEABLE" when it confirmed none, null while it is still computing it (UNKNOWN) or did not
   // say. Only a confirmed conflict is ever acted on.
@@ -174,6 +176,8 @@ export type PullRequestView = {
 type Seen = {
   reviewedAt: string | null; decision: string | null; merged: boolean; held?: boolean; closed?: boolean; drops?: string[]; conflicts?: string[]; mainBroken?: string[]; dropHistory?: DropHistoryEntry[]; conflictStreak?: number; escalated?: boolean; cutover?: true; pending?: PendingDrop | null; queued?: PendingDrop[]; replay?: "due" | "asked"; nudges?: Partial<Record<Stage, string[]>>; activeAt?: string; missing?: boolean; advance?: "due";
   blockedAt?: string; actions?: ActionRecord[]; refusals?: Refusal[];
+  headSha?: string;
+  ci?: string;
   // The move of the open stack whose bottom this is off its orphaned `graphite-base/<n>` base
   // (see retargets).
   retarget?: RetargetRecord;
@@ -332,7 +336,7 @@ function rebind(seenByUrl: Record<string, Seen>, move: { url: string; from: stri
 type StopFlags = { paused: RateLimitedError | null; budget: GitHubPausedError | null; throttled: GitHubRateLimitedError | null };
 
 // A pull request's recorded state, as the steward's facts read it (steward.ts StewardPullFacts).
-export type PullState = { merged: boolean; closed: boolean; missing: boolean; decision: string | null; replay: "due" | "asked" | null };
+export type PullState = { merged: boolean; closed: boolean; missing: boolean; decision: string | null; replay: "due" | "asked" | null; headSha?: string | null; ci?: string | null };
 
 // Whether a ticket's stack landed: `open` while the stack policy would reopen it or reopened it,
 // `unknown` while its pull requests cannot be read. Read by the policy itself (reopenDone) and by
@@ -549,6 +553,7 @@ export async function viewPullRequest(url: string): Promise<PullRequestView> {
     reviews: (data.reviews ?? []).map((review) => ({ author: review.author?.login ?? "someone", state: review.state ?? "", submittedAt: review.submittedAt ?? "", body: review.body ?? "", commit: review.commit?.oid ?? null })).filter((review) => review.submittedAt),
     lastCommitAt: data.commits?.at(-1)?.committedDate ?? null,
     checks: [...latest.values()].map((entry) => entry.check),
+    checksComplete: Array.isArray(data.statusCheckRollup),
     mergeable: data.mergeable === "CONFLICTING" || data.mergeable === "MERGEABLE" ? data.mergeable : null,
   };
 }
@@ -1456,6 +1461,31 @@ export class PullRequestWatch {
     return this.running;
   }
 
+  // Independent recovery clock: never queue behind slow PR/CI reconciliation.
+  async watchdogPass(): Promise<void> {
+    if (!this.deps.watchdog) return;
+    const all = await this.deps.handover.all();
+    const mine = await this.ownedRecords(all);
+    const context = this.context(this.perPullRequest(mine, new Set()), undefined, all);
+    await this.deps.watchdog.pass({ records: mine, reserved: new Set(), pulls: (ticket) => this.ticketPulls(ticket, context) });
+  }
+
+  async recoveryWait(issueId: string, identifier: string, urls: string[] = []): Promise<string | null> {
+    try {
+      const all = await this.deps.handover.all();
+      const record = all.find((item) => item.issueId === issueId);
+      const context = this.context(all);
+      const pulls = await this.ticketPulls({ issueId, identifier: record?.identifier ?? identifier, worktree: record?.worktreePath ?? null, link: record?.links["Pull request"] ?? urls[0] ?? null }, context);
+      if (!pulls) return "the ticket's pull requests cannot be read";
+      if (pulls.some((pull) => pull.labels.some((label) => label.toLowerCase() === DO_NOT_MERGE_LABEL))) return "a ticket pull request carries do-not-merge";
+      for (const url of new Set([...urls, ...(record ? ownedPullRequests(record) : [])])) {
+        const view = await this.view(url);
+        if (view.labels.some((label) => label.toLowerCase() === DO_NOT_MERGE_LABEL)) return "a recorded pull request carries do-not-merge";
+      }
+      return null;
+    } catch { return "the ticket's pull request veto could not be checked"; }
+  }
+
   // One queue backstop run at a time (see queueBackstop); a tick while one runs joins it.
   backstop(): Promise<void> {
     this.backstopping ??= this.exclusive(() => withPriority("background", "queue backstop", () => githubUsage.run("queue backstop", () => this.queueBackstop()))).finally(() => { this.backstopping = null; });
@@ -1469,11 +1499,23 @@ export class PullRequestWatch {
   // The detail read, behind the cheap first look unless the caller injected its own `view`.
   private changer: ConditionalPullView | null = null;
 
-  private view(url: string): Promise<PullRequestView> {
-    if (this.deps.probe) return this.deps.probe.view(url);
-    if (this.deps.view) return this.deps.view(url);
-    this.changer ??= new ConditionalPullView({ get: ghGet, budget: githubBudget, read: viewPullRequest });
-    return this.changer.view(url);
+  private async view(url: string): Promise<PullRequestView> {
+    let view: PullRequestView;
+    if (this.deps.probe) view = await this.deps.probe.view(url);
+    else if (this.deps.view) view = await this.deps.view(url);
+    else {
+      this.changer ??= new ConditionalPullView({ get: ghGet, budget: githubBudget, read: viewPullRequest });
+      view = await this.changer.view(url);
+    }
+    if (this.currentSeen && view.headSha) {
+      const observed = entry(this.currentSeen, url);
+      if (observed.headSha !== view.headSha) delete observed.ci;
+      observed.headSha = view.headSha;
+      // Ignore heartbeat timestamps, run URLs and response ordering. Only check identities,
+      // states and conclusions on this head are delivery evidence.
+      if (view.checksComplete !== false) observed.ci = JSON.stringify(view.checks.map((check) => [check.name, check.state, check.conclusion]).sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]) || a[2].localeCompare(b[2])));
+    }
+    return view;
   }
 
   // The poll's and the backstop's reads, once per repo: the open pull requests, Graphite's drafts
@@ -3419,7 +3461,7 @@ export class PullRequestWatch {
     for (const url of urls) {
       const entry = seen[url];
       if (!entry) continue;
-      states.set(url, { merged: entry.merged, closed: entry.closed === true && !entry.merged, missing: entry.missing === true, decision: entry.decision ?? null, replay: entry.replay === "due" || entry.replay === "asked" ? entry.replay : null });
+      states.set(url, { merged: entry.merged, closed: entry.closed === true && !entry.merged, missing: entry.missing === true, decision: entry.decision ?? null, replay: entry.replay === "due" || entry.replay === "asked" ? entry.replay : null, headSha: entry.headSha ?? null, ci: entry.ci ?? null });
     }
     return states;
   }

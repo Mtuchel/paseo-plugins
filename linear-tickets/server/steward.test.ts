@@ -15,7 +15,9 @@ import { TicketStarter } from "./starter";
 import type { Launcher } from "./launch";
 import { detailSchema } from "../shared/contracts";
 import type { WatchdogFile } from "./watchdog";
-import type { HostOwnership, SessionRouter } from "./sessions";
+import { SessionRouter, SessionStore, type HostOwnership } from "./sessions";
+import { hostname } from "node:os";
+import { stageEvidence } from "./recovery-diagnostic";
 import { NeedsYouIssues } from "./needs-you";
 
 // The classifier's own tests: every fact set lands on exactly one situation, and the precedence
@@ -23,7 +25,7 @@ import { NeedsYouIssues } from "./needs-you";
 
 const T0 = Date.parse("2026-10-13T09:00:00.000Z");
 const at = (minutes: number) => new Date(T0 - minutes * 60_000).toISOString();
-const pull = (url: string, over: Partial<{ merged: boolean; closed: boolean; missing: boolean; decision: string | null; replay: "due" | "asked" | null }> = {}) =>
+const pull = (url: string, over: Partial<Omit<StewardFacts["openPulls"][number], "url">> = {}) =>
   ({ url, merged: false, closed: false, missing: false, decision: null, replay: null, ...over });
 
 // A ticket in the steward's most ordinary state: an open In Progress ticket with a live, working
@@ -316,6 +318,8 @@ async function passFixture(t: any, over: {
   verdicts?: (issueId: string) => Promise<any[]>;
   restart?: () => Promise<any>;
   succession?: () => Promise<any>;
+  succeed?: SessionRouter["succeed"];
+  queued?: SessionRouter["threadQueued"];
   admission?: { ok: boolean; reason?: string };
   completionPulls?: StackState | ((issueId: string) => StackState);
   listing?: any[];
@@ -326,10 +330,13 @@ async function passFixture(t: any, over: {
   needsYou?: { id: string; parentId: string; identifier: string }[];
   issueStatus?: (issueId: string) => Promise<IssueStatus | null>;
   start?: TicketStarter["start"];
+  onArchive?: (agentId: string) => void;
   issueGroup?: (issueId: string) => Promise<IssueGroup>;
   planned?: boolean;
   threadQueued?: boolean;
   watchdog?: WatchdogFile;
+  continuation?: (input: { issueId: string; agentId: string; operationId: string; text: string }) => Promise<{ status: "queued" | "sent" | "started" | "unknown" | "cancelled"; reason?: string }>;
+  recoveryWait?: () => Promise<string | null>;
   owner?: HostOwnership;
   gateReadError?: "watchdog" | "planned" | "thread" | "queue" | "handed";
   parentResume?: SessionRouter["resumeVerifiedParent"];
@@ -346,6 +353,7 @@ async function passFixture(t: any, over: {
     escalates: [] as string[], clears: [] as string[], prompts: [] as string[], relates: [] as string[],
     dueDates: [] as string[], moves: [] as string[], labels: [] as string[], archives: [] as string[],
     completionUrls: [] as string[][],
+    continuations: [] as { issueId: string; agentId: string; operationId: string; text: string }[],
     admissions: [] as unknown[][], startOptions: [] as Parameters<TicketStarter["start"]>[3][],
   };
   const clock = { now: over.clockNow ?? T0 + 5 * 60_000 };
@@ -362,8 +370,8 @@ async function passFixture(t: any, over: {
     agents: {
       list: async () => ({ ...page(), entries: (over.listing ?? []).map((agent) => ({ agent })) }),
       ref: (agentId: string) => ({
-        refresh: async () => ({ agent: { id: agentId, archivedAt: null, updatedAt: new Date(clock.now).toISOString() } }),
-        archive: async () => { calls.archives.push(agentId); },
+        refresh: async () => ({ agent: { id: agentId, archivedAt: null, updatedAt: new Date(clock.now).toISOString(), labels: over.listing?.find((agent) => agent.id === agentId)?.labels ?? (agentId === "v1" ? calls.startOptions.at(-1)?.labels : {}) } }),
+        archive: async () => { calls.archives.push(agentId); over.onArchive?.(agentId); },
       }),
     },
   };
@@ -405,7 +413,7 @@ async function passFixture(t: any, over: {
     sessions: {
       watchdogRoots: async () => roots,
       restartFor: async (issueId: string) => { calls.restarts.push(issueId); return over.restart ? await over.restart() : { kind: "started", agentId: "a9" }; },
-      succeed: async (issueId: string) => { calls.successions.push(issueId); return over.succession ? await over.succession() : { kind: "started", agent: { id: "a10", title: null, cwd: "" } }; },
+      succeed: async (...args: Parameters<SessionRouter["succeed"]>) => { calls.successions.push(args[0]); return over.succeed ? over.succeed(...args) : over.succession ? await over.succession() : { kind: "started", agent: { id: "a10", title: null, cwd: "" } }; },
       resumeVerifiedParent: async (...args: Parameters<SessionRouter["resumeVerifiedParent"]>) => {
         calls.parentResumes.push(args[0]);
         if (over.parentResume) return over.parentResume(...args);
@@ -413,8 +421,13 @@ async function passFixture(t: any, over: {
         return { kind: "started", agent: { id: "a10", title: null, cwd: "" } };
       },
       prompt: async () => { calls.prompts.push("resume"); return "sent"; },
+      continueOperation: async (input: { issueId: string; agentId: string; operationId: string; text: string }) => {
+        calls.continuations.push(input);
+        calls.prompts.push("resume");
+        return over.continuation ? over.continuation(input) : { status: "sent" };
+      },
       watchdogThread: async () => { if (over.gateReadError === "thread") throw new Error("thread store unreadable"); return over.thread ?? null; },
-      threadQueued: async () => { if (over.gateReadError === "queue") throw new Error("queue store unreadable"); return over.threadQueued ?? false; },
+      threadQueued: async (issueId: string, inTurn?: boolean) => { if (over.gateReadError === "queue") throw new Error("queue store unreadable"); return over.queued ? over.queued(issueId, inTurn) : over.threadQueued ?? false; },
       parentProgress: async (issueId: string) => over.parents?.find((parent) => parent.issueId === issueId) ?? null,
       parentProgresses: async () => over.parents ?? [],
       retireTurn: async (_issueId: string, work: () => Promise<number>) => work(),
@@ -442,6 +455,7 @@ async function passFixture(t: any, over: {
     owner: async () => over.owner ?? "here",
     pulls: async () => over.pullStates ?? new Map(),
     completionPulls: async (issueId: string, _identifier: string, urls: string[]) => { calls.completionUrls.push(urls); return typeof over.completionPulls === "function" ? over.completionPulls(issueId) : over.completionPulls ?? "settled"; },
+    recoveryWait: over.recoveryWait ?? (async () => null),
     intake: { claimsReady: async () => true } as any,
     doneTickets: new DoneTickets(),
     labels: { all: async () => [], add: async () => {}, remove: async () => {} } as any,
@@ -461,7 +475,7 @@ async function passFixture(t: any, over: {
 test("a claim written before the effect is not repeated after a reload, and is retried after the grace", async (t) => {
   const f = await passFixture(t, { issues: [ticketIssue()], records: [recordFor("i1", "ENG-1")] });
   // A pass that claimed a restart and died before the effect: only the claim is on disk.
-  await f.seed("i1", "ENG-1", { situation: "stalled", claim: { action: "restart", marker: "m1", at: at(1), state: "claimed" } });
+  await f.seed("i1", "ENG-1", { situation: "stalled", claim: { action: "restart", marker: "m1", at: new Date(f.clock.now - 60_000).toISOString(), state: "claimed" } });
   await f.pass();
   assert.deepEqual(f.calls.restarts, [], "the open claim is not repeated blindly");
   // A new instance over the same file (a reload) sees the claim too, and waits it out.
@@ -472,22 +486,25 @@ test("a claim written before the effect is not repeated after a reload, and is r
   assert.deepEqual(f.calls.restarts, ["i1"], "after the grace the restart is claimed and tried once");
 });
 
-test("a used-up restart budget escalates once, and a later pass does not ask again", async (t) => {
+test("an exhausted restart budget launches a bounded diagnosis instead of asking the owner", async (t) => {
   const f = await passFixture(t, { issues: [ticketIssue()], records: [recordFor("i1", "ENG-1")] });
   await f.seed("i1", "ENG-1", { situation: "restart-exhausted", restarts: [at(600), at(300), at(60)] });
   await f.pass();
-  assert.deepEqual(f.calls.escalates, ["i1"], "the exhausted budget reaches the owner");
-  assert.deepEqual(f.calls.restarts, [], "no fourth restart");
-  f.clock.now += 5 * 60_000;
-  await f.pass();
-  assert.deepEqual(f.calls.escalates, ["i1"], "the owner is asked once, not once per pass");
+  const diagnostic = (await f.ticket("i1"))?.diagnostic;
+  assert.equal(diagnostic?.state, "running");
+  assert.equal(diagnostic?.agentId, "v1");
+  assert.equal(Date.parse(diagnostic!.deadline) - Date.parse(diagnostic!.at), 5 * 60_000);
+  assert.deepEqual(f.calls.escalates, []);
+  assert.deepEqual(f.calls.restarts, []);
+  await f.build().tick(f.paseo, stewardSettings());
+  assert.equal(f.calls.starts.length, 1, "restart adopts the persisted diagnostic, never duplicates it");
 });
 
 test("an escalation the owner has not answered stands across passes and is never cleared", async (t) => {
   const f = await passFixture(t, { issues: [ticketIssue()], records: [recordFor("i1", "ENG-1")] });
-  await f.seed("i1", "ENG-1", { situation: "restart-exhausted", restarts: [at(600), at(300), at(60)] });
+  await f.seed("i1", "ENG-1", { situation: "restart-exhausted", restarts: [at(600), at(300), at(60)], diagnostics: [at(10), at(5)] });
   await f.pass();
-  assert.deepEqual(f.calls.escalates, ["i1"], "the decision is put in front of the owner");
+  assert.deepEqual(f.calls.escalates, ["i1"], "only an exhausted diagnostic budget reaches the owner");
   // The wait the escalation persisted is a decision wait: only the owner's answer or retry ends it.
   f.records.push(recordFor("i1", "ENG-1", [], { kind: "decision", at: new Date(f.clock.now).toISOString() }));
   f.clock.now += 40 * 60_000;
@@ -636,7 +653,8 @@ test("a resumed verdict honors the restart budget and the steward switch", async
   await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { agentId: "v1", marker: "m1", at: at(10) }, restarts: [at(600), at(300), at(60)] });
   await f.pass();
   assert.deepEqual(f.calls.successions, [], "the spent recovery budget is not bypassed by a verdict");
-  assert.deepEqual(f.calls.escalates, ["i1"], "the owner hears why the work stops");
+  assert.deepEqual(f.calls.escalates, [], "exhaustion requests diagnosis before asking the owner");
+  assert.ok((await f.ticket("i1"))?.diagnosticRequested);
   // The steward switch off: a verdict mutates nothing at all.
   const off = await passFixture(t, {
     issues: [ticketIssue()], records: [recordFor("i1", "ENG-1", [url])], pullStates: merged(url),
@@ -671,7 +689,7 @@ test("a verdict from a stale verifier generation is ignored", async (t) => {
     // The marker of an older verifier generation: its verdict answers a claim this host replaced.
     verdicts: async () => [{ issueId: "i1", at: new Date(f.clock.now).toISOString(), verifier: "older", verdict: "close", instruction: null, blockedBy: null, dueDate: null, reason: null, question: null, options: null }],
   });
-  await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { agentId: "v1", marker: "m1", at: at(10) } });
+  await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { agentId: "v1", marker: "m1", at: new Date(f.clock.now).toISOString() } });
   await f.pass();
   assert.deepEqual(f.calls.completed, [], "no close from another generation's verdict");
   assert.deepEqual(f.calls.escalates, [], "and no escalation either");
@@ -762,7 +780,7 @@ test("an interrupted verifier launch is adopted by its marker instead of losing 
 test("a pending verifier generation whose launch left no agent is dropped after the grace", async (t) => {
   const url = "https://github.com/o/r/pull/7";
   const fresh = await passFixture(t, { issues: [ticketIssue()], records: [recordFor("i1", "ENG-1", [url])], pullStates: merged(url) });
-  await fresh.seed("i1", "ENG-1", { situation: "verifying", verifier: { agentId: null, marker: "m1", at: at(2) } });
+  await fresh.seed("i1", "ENG-1", { situation: "verifying", verifier: { agentId: null, marker: "m1", at: new Date(fresh.clock.now - 2 * 60_000).toISOString() } });
   await fresh.pass();
   assert.equal((await fresh.ticket("i1"))?.verifier?.marker, "m1", "inside the grace the launch is still being confirmed");
   assert.deepEqual(fresh.calls.starts, [], "and nothing else is started beside it");
@@ -774,21 +792,17 @@ test("a pending verifier generation whose launch left no agent is dropped after 
   assert.equal(ticket?.refusals?.length, 1, "and counted as a refusal, not retried forever");
 });
 
-test("a timeout escalation is journaled: a failed call keeps the decision for the next pass", async (t) => {
+test("a completion verifier timeout durably requests recovery diagnosis without owner escalation", async (t) => {
   const url = "https://github.com/o/r/pull/7";
   const f = await passFixture(t, { issues: [ticketIssue()], records: [recordFor("i1", "ENG-1", [url])], pullStates: merged(url) });
   await f.seed("i1", "ENG-1", { situation: "verifying", verifier: { agentId: "v1", marker: "m1", at: at(60) } });
-  f.fail.escalate = true;
   await f.pass();
-  const half = await f.ticket("i1");
-  assert.equal(half?.applying?.verdict, "timeout", "the terminal outcome is journaled");
-  assert.equal(half?.applying?.step, "claimed", "before its owner-facing effect");
-  assert.equal(half?.verifier?.marker, "m1", "and the verifier is not consumed by a failed call");
-  f.fail.escalate = false;
-  f.clock.now += 20 * 60_000;
+  assert.equal((await f.ticket("i1"))?.verifier, null);
+  assert.ok((await f.ticket("i1"))?.diagnosticRequested);
+  assert.deepEqual(f.calls.escalates, []);
+  f.clock.now += 60_000;
   await f.pass();
-  assert.deepEqual(f.calls.escalates, ["i1"], "the retry commits the decision");
-  assert.equal((await f.ticket("i1"))?.verifier, null, "and only then consumes the verifier");
+  assert.equal((await f.ticket("i1"))?.diagnostic?.state, "running");
 });
 
 test("a verdict successor is charged, and its repeated failures reach the owner", async (t) => {
@@ -812,7 +826,8 @@ test("a verdict successor is charged, and its repeated failures reach the owner"
   await spent.seed("i1", "ENG-1", { situation: "verifying", verifier: VERIFIER, restarts: [at(600), at(300)], refusals: [{ at: at(120), reason: "a" }, { at: at(90), reason: "b" }] });
   await spent.pass();
   assert.deepEqual(spent.calls.successions, ["i1"], "the start was attempted once more");
-  assert.deepEqual(spent.calls.escalates, ["i1"], "and the owner is asked instead of retrying forever");
+  assert.deepEqual(spent.calls.escalates, [], "failure goes through bounded diagnosis first");
+  assert.ok((await spent.ticket("i1"))?.diagnosticRequested);
   assert.equal((await spent.ticket("i1"))?.verifier, null, "the verdict is consumed into the decision");
 });
 
@@ -1456,4 +1471,420 @@ test("unreadable watchdog handoff evidence cannot clear a parent's recorded owne
   assert.deepEqual(f.calls.completed, []);
   assert.equal((await f.ticket("i1"))?.verifier?.marker, VERIFIER.marker);
   await assert.rejects(f.build().parentResumeWait("i1"), /owner wait handoff unreadable/);
+});
+
+function diagnosticSeed(issue: StewardIssue, overrides: Record<string, unknown> = {}) {
+  return {
+    responsibility: {
+      generation: "generation-1", generationAt: at(30), host: hostname(), agentId: null,
+      nextAction: "Read diagnostic verdict", waitReason: null, nextCheckAt: at(0),
+      observedStage: stageEvidence(issue, facts()), observedAt: at(30), lastVerifiedAdvancementAt: null,
+    },
+    diagnostics: [at(0)],
+    diagnostic: { marker: "diagnostic-test", generation: "generation-1", host: hostname(), agentId: "helper", at: at(0), deadline: new Date(T0 + 5 * 60_000).toISOString(), reason: "No advancement", state: "running" },
+    ...overrides,
+  };
+}
+
+const diagnosticHelper = () => ({ id: "helper", status: "running", labels: { "linear-tickets.steward": "diagnostic-test", "linear.coordination": "recovery-diagnostic", "paseo.parent-agent-id": "steward-diagnostic" }, createdAt: at(0) });
+
+test("a retired replacement is queued, not evidence that the ticket is moving", () => {
+  assert.equal(classifyTicket(facts({ live: false, watchdog: "queued" })), "queued");
+});
+
+test("chat and tool heartbeat cannot reset verified stage advancement", async (t) => {
+  const issue = ticketIssue();
+  const root = { id: "worker", status: "running", createdAt: at(60), updatedAt: at(0) };
+  const f = await passFixture(t, { issues: [issue], roots: new Map([["i1", { roots: [root], ghosts: new Set<string>() }]]), clockNow: T0 });
+  await f.pass();
+  const initial = (await f.ticket("i1"))!.responsibility!;
+  assert.equal(initial.lastVerifiedAdvancementAt, null);
+  root.updatedAt = new Date(T0 + 5 * 60_000).toISOString();
+  f.clock.now += 5 * 60_000;
+  await f.pass();
+  const stuck = (await f.ticket("i1"))!;
+  assert.equal(stuck.responsibility?.generation, initial.generation);
+  assert.equal(stuck.responsibility?.lastVerifiedAdvancementAt, null);
+  assert.equal(stuck.diagnostic?.state, "running", "healthy liveness triggers read-only stage diagnosis, never a kill");
+  assert.deepEqual(f.calls.archives, [], "implementation worker remains alive");
+  issue.status = "In Review";
+  f.clock.now += 60_000;
+  await f.pass();
+  const advanced = (await f.ticket("i1"))!;
+  assert.equal(advanced.responsibility?.lastVerifiedAdvancementAt, new Date(f.clock.now).toISOString());
+  assert.equal(advanced.diagnostic?.outcome, "advanced");
+  assert.deepEqual(f.calls.archives, ["v1"], "only the diagnostic helper is retired");
+});
+
+test("ambiguous continuation reconciliation reuses its persisted operation across restart and requests diagnosis", async (t) => {
+  const issue = ticketIssue();
+  const root = { id: "worker", status: "running", createdAt: at(60), updatedAt: at(0) };
+  const f = await passFixture(t, {
+    issues: [issue], roots: new Map([["i1", { roots: [root], ghosts: new Set<string>() }]]),
+    continuation: async () => ({ status: "unknown", reason: "transport outcome unknown" }),
+  });
+  await f.seed("i1", "ENG-1", { continuation: { agentId: "worker", operationId: "resume-fixed", text: "Continue the existing branch", at: at(0), status: "unknown" } });
+  await f.pass();
+  await f.build().tick(f.paseo, stewardSettings());
+  assert.deepEqual(f.calls.continuations.map((operation) => operation.operationId), ["resume-fixed", "resume-fixed"]);
+  assert.equal((await f.ticket("i1"))?.diagnostic?.state, "running");
+  assert.equal(f.calls.starts.length, 1);
+  assert.deepEqual(f.calls.escalates, []);
+});
+
+test("a diagnostic wait has a named check and deadline surviving a restart", async (t) => {
+  const issue = ticketIssue();
+  const checkAt = new Date(T0 + 6 * 60_000).toISOString();
+  const f = await passFixture(t, {
+    issues: [issue], listing: [diagnosticHelper()], clockNow: T0 + 2 * 60_000,
+    verdicts: async () => [{ issueId: "i1", verifier: "diagnostic-test", at: new Date(T0 + 2 * 60_000).toISOString(), verdict: "wait", reason: "CI is running", instruction: "Recheck CI completion and recorded merge state", nextCheckAt: checkAt }],
+  });
+  await f.seed("i1", "ENG-1", diagnosticSeed(issue));
+  await f.pass();
+  const waiting = (await f.ticket("i1"))!;
+  assert.equal(waiting.diagnostic?.state, "waiting");
+  assert.equal(waiting.responsibility?.waitReason, "CI is running");
+  assert.equal(waiting.responsibility?.nextCheckAt, checkAt);
+  f.clock.now += 60_000;
+  await f.pass();
+  assert.equal((await f.ticket("i1"))?.diagnostic?.state, "waiting");
+  assert.deepEqual(f.calls.successions, []);
+  f.clock.now = Date.parse(checkAt);
+  await f.pass();
+  assert.equal((await f.ticket("i1"))?.diagnostic?.outcome, "wait-expired");
+  assert.ok((await f.ticket("i1"))?.diagnosticRequested);
+  assert.deepEqual(f.calls.escalates, []);
+});
+
+test("a stale generation, changed host, and owner Stop reject a diagnostic verdict", async (t) => {
+  for (const changed of ["generation", "host", "stop"] as const) {
+    const issue = ticketIssue();
+    const watchdog: WatchdogFile = { version: 1, tickets: {}, holds: changed === "stop" ? { i1: { agentId: null, at: at(0) } } : {} };
+    const f = await passFixture(t, {
+      issues: [issue], listing: [diagnosticHelper()], watchdog,
+      verdicts: async () => [{ issueId: "i1", verifier: "diagnostic-test", at: new Date(T0 + 60_000).toISOString(), verdict: "replace", instruction: "Finish the existing PR" }],
+    });
+    const seeded = diagnosticSeed(issue);
+    if (changed === "generation") seeded.diagnostic.generation = "old-generation";
+    if (changed === "host") seeded.diagnostic.host = "old-host";
+    await f.seed("i1", "ENG-1", seeded);
+    await f.pass();
+    assert.deepEqual(f.calls.successions, [], changed);
+    assert.deepEqual(f.calls.escalates, [], changed);
+    assert.equal((await f.ticket("i1"))?.diagnostic?.outcome, "cancelled-authority", changed);
+  }
+});
+
+test("a replace recommendation never kills a healthy implementation worker", async (t) => {
+  const issue = ticketIssue();
+  const worker = { id: "worker", status: "running", createdAt: at(60), updatedAt: at(0), labels: { "linear.issueId": "i1" } };
+  const f = await passFixture(t, {
+    issues: [issue], roots: new Map([["i1", { roots: [worker], ghosts: new Set<string>() }]]), listing: [diagnosticHelper(), worker],
+    verdicts: async () => [{ issueId: "i1", verifier: "diagnostic-test", at: new Date(T0 + 60_000).toISOString(), verdict: "replace", instruction: "Finish the existing PR" }],
+  });
+  const seeded = diagnosticSeed(issue);
+  await f.seed("i1", "ENG-1", { ...seeded, responsibility: { ...seeded.responsibility, agentId: "worker" } });
+  await f.pass();
+  assert.equal((await f.ticket("i1"))?.diagnostic?.outcome, "replace-live-worker");
+  assert.deepEqual(f.calls.successions, []);
+  assert.deepEqual(f.calls.archives, ["helper"]);
+});
+
+test("a claimed diagnostic replacement is not dispatched again after a crash", async (t) => {
+  const issue = ticketIssue();
+  const f = await passFixture(t, {
+    issues: [issue], listing: [diagnosticHelper()], records: [{ ...recordFor("i1", "ENG-1"), branch: "ticket-branch" }],
+    verdicts: async () => [{ issueId: "i1", verifier: "diagnostic-test", at: new Date(T0 + 60_000).toISOString(), verdict: "replace", instruction: "Finish the existing PR" }],
+  });
+  const seeded = diagnosticSeed(issue);
+  await f.seed("i1", "ENG-1", { ...seeded, diagnostic: { ...seeded.diagnostic, state: "applying", dispatchedAt: new Date(T0 + 2 * 60_000).toISOString() } });
+  await f.pass();
+  assert.deepEqual(f.calls.successions, []);
+  assert.equal((await f.ticket("i1"))?.diagnostic?.outcome, "replacement-outcome-unknown");
+});
+
+test("a diagnostic launch crash persists its generation and two control instances cannot duplicate it", async (t) => {
+  let entered!: () => void;
+  let release!: () => void;
+  const launching = new Promise<void>((resolve) => { entered = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const f = await passFixture(t, {
+    issues: [ticketIssue()],
+    start: async () => { entered(); await blocked; throw new Error("create outcome unknown"); },
+  });
+  await f.seed("i1", "ENG-1", { diagnosticRequested: "Recovery is exhausted" });
+  const first = f.build().tick(f.paseo, stewardSettings());
+  await launching;
+  const marker = (await f.ticket("i1"))?.diagnostic?.marker;
+  assert.ok(marker?.startsWith("diagnostic-"));
+  await f.build().tick(f.paseo, stewardSettings());
+  assert.equal(f.calls.startOptions.length, 1);
+  release();
+  await first;
+  await f.pass();
+  assert.equal((await f.ticket("i1"))?.diagnostic?.marker, marker);
+  assert.equal(f.calls.startOptions.length, 1, "ambiguous launch is reconciled, not repeated");
+  assert.deepEqual(f.calls.escalates, []);
+});
+
+test("fresh PR veto prevents diagnostic launch and leaves an explicit next check", async (t) => {
+  const f = await passFixture(t, { issues: [ticketIssue()], recoveryWait: async () => "An open PR carries do-not-merge" });
+  await f.seed("i1", "ENG-1", { diagnosticRequested: "No advancement" });
+  await f.pass();
+  const ticket = (await f.ticket("i1"))!;
+  assert.deepEqual(f.calls.startOptions, []);
+  assert.equal(ticket.responsibility?.waitReason, "An open PR carries do-not-merge");
+  assert.equal(ticket.responsibility?.nextCheckAt, new Date(f.clock.now + 60_000).toISOString());
+  f.clock.now += 3 * 60_000;
+  const snapshot = await f.build().snapshot();
+  assert.equal(snapshot.control.maxUnattendedMs, 2 * 60_000);
+});
+
+test("diagnostic launch timeout retains its marker across reload and retires only a late matching helper", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let entered!: () => void;
+  let release!: () => void;
+  let archived!: () => void;
+  const launching = new Promise<void>((resolve) => { entered = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const retired = new Promise<void>((resolve) => { archived = resolve; });
+  const f = await passFixture(t, {
+    issues: [ticketIssue()],
+    onArchive: (id) => { assert.equal(id, "v1"); archived(); },
+    start: async () => {
+      entered();
+      await blocked;
+      return { agentId: "v1", warnings: [], provider: "omp", target: "/checkout", resumed: true, untrusted: false, plan: null };
+    },
+  });
+  await f.seed("i1", "ENG-1", { diagnosticRequested: "No advancement" });
+  const first = f.build().tick(f.paseo, stewardSettings());
+  await launching;
+  const marker = (await f.ticket("i1"))!.diagnostic!.marker;
+  f.clock.now += 5 * 60_000;
+  t.mock.timers.tick(5 * 60_000);
+  await first;
+  assert.equal((await f.ticket("i1"))?.diagnostic?.launchPending, true);
+  await f.pass();
+  assert.equal((await f.ticket("i1"))?.diagnostic?.marker, marker);
+  assert.equal(f.calls.startOptions.length, 1, "timeout did not cancel or authorize a second create");
+  assert.deepEqual(f.calls.escalates, [], "bounded reconciliation runs before owner escalation");
+  release();
+  await retired;
+  assert.deepEqual(f.calls.archives, ["v1"]);
+  assert.deepEqual(f.calls.successions, []);
+});
+
+test("a diagnostic create rechecks owner Stop after context preparation", async (t) => {
+  const watchdog: WatchdogFile = { version: 1, tickets: {}, holds: {} };
+  let veto: string | null | undefined;
+  const f = await passFixture(t, {
+    issues: [ticketIssue()], watchdog,
+    start: async (_issueId, _paseo, _settings, options) => {
+      watchdog.holds.i1 = { agentId: null, at: at(0) };
+      veto = await options.verifier?.check?.();
+      throw new Error(veto ?? "missing launch fence");
+    },
+  });
+  await f.seed("i1", "ENG-1", { diagnosticRequested: "No advancement" });
+  await f.pass();
+  assert.equal(veto, "the owner stopped recovery for this ticket");
+  assert.deepEqual(f.calls.starts, []);
+  assert.deepEqual(f.calls.escalates, []);
+  assert.equal((await f.ticket("i1"))?.diagnostic?.launchPending, true);
+});
+
+test("diagnostic replacement enters the real router turn but still refuses a queued link arriving during admission", async (t) => {
+  for (const queuedAtAdmission of [false, true]) {
+    const issue = ticketIssue();
+    const directory = await mkdtemp(join(tmpdir(), "steward-router-turn-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const store = new SessionStore(join(directory, "sessions.json"));
+    let router!: SessionRouter;
+    const starts: string[] = [];
+    const f = await passFixture(t, {
+      issues: [issue], listing: [diagnosticHelper()], records: [{ ...recordFor("i1", "ENG-1"), branch: "recorded-branch" }],
+      succeed: (...args) => router.succeed(...args),
+      queued: (...args) => router.threadQueued(...args),
+      verdicts: async () => [{ issueId: "i1", verifier: "diagnostic-test", at: new Date(T0 + 60_000).toISOString(), verdict: "replace", instruction: "Finish the recorded branch" }],
+    });
+    // This isolated successor fixture supplies only the endpoints used by dispatch and its
+    // best-effort thread cleanup; unrelated router webhook endpoints are never exercised.
+    const routerDependencies = {
+      store,
+      api: { createSessionOnIssue: async () => "new-session", activity: async () => {}, updateSession: async () => {}, openSessions: async () => [], sessionStatuses: async () => new Map() },
+      linear: { issueStatus: async () => ({ status: "In Progress", statusType: "started" }), addLabel: async () => {}, removeLabel: async () => {} },
+      handover: { all: async () => f.records, resumeTarget: async () => ({ branch: "recorded-branch", worktreePath: null, handover: "Continue" }), handOff: async () => true },
+      settings: { read: async () => stewardSettings() },
+      launcher: { gate: () => ({ release: () => {} }) },
+      processLiveness: async () => "absent",
+      owner: async () => "here",
+      starter: {
+        admission: async () => {
+          assert.equal(await router.threadQueued("i1"), true, "the real exclusive turn is held");
+          assert.equal(await router.threadQueued("i1", true), false, "no actual link is queued yet");
+          if (queuedAtAdmission) await store.put({ sessionId: "queued-session", issueId: "i1", identifier: "ENG-1", agentId: null, createdAt: at(0), handled: [], review: null, offer: null, queued: true });
+          return { ok: true };
+        },
+        start: async () => { starts.push("recorded-branch"); return { agentId: "implementation", warnings: [], provider: "omp", target: "/checkout", resumed: true, untrusted: false, plan: null }; },
+      },
+    } as unknown as ConstructorParameters<typeof SessionRouter>[0];
+    router = new SessionRouter(routerDependencies);
+    Object.assign(router, { paseo: f.paseo });
+    await f.seed("i1", "ENG-1", diagnosticSeed(issue));
+    await f.pass();
+    assert.deepEqual(starts, queuedAtAdmission ? [] : ["recorded-branch"]);
+    if (!queuedAtAdmission) assert.equal((await f.ticket("i1"))?.diagnostic?.outcome, "replaced");
+    else assert.equal((await store.get("queued-session"))?.queued, true, "the in-turn exemption did not swallow a real queued link");
+    assert.equal(f.calls.escalates.length, 0);
+  }
+});
+
+test("continue verdict reconciles queued, sent and unknown operations across reload without a new instruction identity", async (t) => {
+  for (const status of ["queued", "sent", "unknown"] as const) {
+    const issue = ticketIssue();
+    const worker = { id: "worker", status: "running", createdAt: at(60), updatedAt: at(0) };
+    const f = await passFixture(t, {
+      issues: [issue], listing: [diagnosticHelper()], roots: new Map([["i1", { roots: [worker], ghosts: new Set<string>() }]]),
+      continuation: async () => ({ status }),
+      verdicts: async () => [{ issueId: "i1", verifier: "diagnostic-test", at: new Date(T0 + 60_000).toISOString(), verdict: "continue", instruction: "New diagnosis must not duplicate the pending instruction" }],
+    });
+    const seed = diagnosticSeed(issue);
+    const original = { operationId: "original-operation", agentId: "worker", text: "Original repair instruction", at: at(0), status };
+    await f.seed("i1", "ENG-1", { ...seed, responsibility: { ...seed.responsibility, agentId: "worker" }, continuation: original });
+    await f.pass();
+    await f.pass();
+    assert.equal((await f.ticket("i1"))?.continuation?.operationId, original.operationId, status);
+    assert.equal((await f.ticket("i1"))?.diagnostic?.outcome, `continue-existing-${status}`);
+    assert.deepEqual(f.calls.continuations.map((call) => [call.operationId, call.text]), [[original.operationId, original.text], [original.operationId, original.text]]);
+    // A real stage transition and an explicit owner retry do not cancel the router's drain.
+    issue.status = "In Review";
+    f.clock.now += 60_000;
+    await f.pass();
+    await f.build().ownerRetried("i1");
+    assert.equal((await f.ticket("i1"))?.continuation?.operationId, original.operationId);
+  }
+});
+
+test("a cancelled continuation permits a diagnostic instruction under its own identity", async (t) => {
+  const issue = ticketIssue();
+  const worker = { id: "worker", status: "running", createdAt: at(60), updatedAt: at(0) };
+  const f = await passFixture(t, {
+    issues: [issue], listing: [diagnosticHelper()], roots: new Map([["i1", { roots: [worker], ghosts: new Set<string>() }]]),
+    continuation: async (operation) => ({ status: operation.operationId === "old-operation" ? "cancelled" : "queued" }),
+    verdicts: async () => [{ issueId: "i1", verifier: "diagnostic-test", at: new Date(T0 + 60_000).toISOString(), verdict: "continue", instruction: "New permitted repair" }],
+  });
+  const seed = diagnosticSeed(issue);
+  await f.seed("i1", "ENG-1", { ...seed, responsibility: { ...seed.responsibility, agentId: "worker" }, continuation: { operationId: "old-operation", agentId: "worker", text: "Old repair", at: at(0), status: "queued" } });
+  await f.pass();
+  assert.deepEqual(f.calls.continuations.map((call) => [call.operationId, call.text]), [["old-operation", "Old repair"], ["diagnostic-test", "New permitted repair"]]);
+  assert.equal((await f.ticket("i1"))?.continuation?.operationId, "diagnostic-test");
+});
+
+test("PR head and CI transitions advance a live ticket while heartbeat-only updates do not", async (t) => {
+  const issue = ticketIssue();
+  const url = "https://github.com/o/r/pull/1";
+  const state = pull(url, { headSha: "head-a", ci: '[["unit","pending","pending"]]' });
+  const worker = { id: "worker", status: "running", createdAt: at(60), updatedAt: at(0) };
+  const f = await passFixture(t, { issues: [issue], clockNow: T0, records: [recordFor("i1", "ENG-1", [url])], pullStates: new Map([[url, state]]), roots: new Map([["i1", { roots: [worker], ghosts: new Set<string>() }]]) });
+  await f.pass();
+  f.clock.now += 4 * 60_000;
+  state.headSha = "head-b";
+  await f.pass();
+  assert.equal((await f.ticket("i1"))?.responsibility?.lastVerifiedAdvancementAt, new Date(f.clock.now).toISOString());
+  f.clock.now += 4 * 60_000;
+  state.ci = '[["unit","passed","success"]]';
+  await f.pass();
+  const ciAdvancedAt = new Date(f.clock.now).toISOString();
+  assert.equal((await f.ticket("i1"))?.responsibility?.lastVerifiedAdvancementAt, ciAdvancedAt);
+  assert.equal(f.calls.starts.length, 0, "real progress prevents premature diagnosis");
+  f.clock.now += 5 * 60_000;
+  worker.updatedAt = new Date(f.clock.now).toISOString();
+  await f.pass();
+  assert.equal((await f.ticket("i1"))?.responsibility?.lastVerifiedAdvancementAt, ciAdvancedAt);
+  assert.equal((await f.ticket("i1"))?.diagnostic?.state, "running", "chat-only liveness cannot hide a stalled delivery stage");
+});
+
+test("incomplete child observations preserve the last complete evidence and an active diagnostic across reload", async (t) => {
+  const child = childIssue("ENG-2", "c1", "started");
+  const issue = ticketIssue({ children: [child] });
+  const seed = diagnosticSeed(issue);
+  const verifiedAt = at(30);
+  const f = await passFixture(t, { issues: [issue], listing: [diagnosticHelper()], clockNow: T0 + 60_000 });
+  await f.seed("i1", "ENG-1", { ...seed, responsibility: { ...seed.responsibility, lastVerifiedAdvancementAt: verifiedAt }, diagnosticRequested: "Stage remains stuck" });
+  issue.childrenComplete = false;
+  for (const partial of [[], [childIssue("ENG-2", "c1", "completed")]]) {
+    issue.children = partial;
+    await f.pass();
+    const ticket = (await f.ticket("i1"))!;
+    assert.equal(ticket.responsibility?.lastVerifiedAdvancementAt, verifiedAt);
+    assert.equal(ticket.responsibility?.observedStage, seed.responsibility.observedStage);
+    assert.equal(ticket.diagnostic?.state, "running");
+    assert.equal(ticket.diagnosticRequested, "Stage remains stuck");
+    f.clock.now += 60_000;
+  }
+  issue.childrenComplete = true;
+  issue.children = [child];
+  await f.pass();
+  assert.equal((await f.ticket("i1"))?.responsibility?.lastVerifiedAdvancementAt, verifiedAt, "returning complete evidence is not progress");
+  issue.children = [childIssue("ENG-2", "c1", "completed")];
+  f.clock.now += 60_000;
+  await f.pass();
+  assert.equal((await f.ticket("i1"))?.responsibility?.lastVerifiedAdvancementAt, new Date(f.clock.now).toISOString());
+  assert.equal((await f.ticket("i1"))?.diagnostic?.outcome, "advanced");
+});
+
+test("recovery health counts explicit owner retries without treating them as verified progress", async (t) => {
+  const f = await passFixture(t, { issues: [ticketIssue()] });
+  await f.seed("i1", "ENG-1");
+  await f.build().ownerRetried("i1");
+  await f.build().ownerRetried("ENG-1");
+  const outcomes = (await f.build().snapshot()).control.recoveryOutcomes;
+  assert.equal(outcomes["owner-retry"], 2);
+  assert.equal(outcomes["advancement-after-recovery"], undefined);
+  assert.equal(outcomes["owner-escalation"], undefined);
+});
+
+test("recovery health counts advancement after acknowledged recovery once, not chat or repeat receipt reads", async (t) => {
+  const issue = ticketIssue();
+  const worker = { id: "worker", status: "running", createdAt: at(60), updatedAt: at(0) };
+  const f = await passFixture(t, {
+    issues: [issue], listing: [diagnosticHelper()], roots: new Map([["i1", { roots: [worker], ghosts: new Set<string>() }]]),
+    continuation: async () => ({ status: "sent" }),
+    verdicts: async () => [{ issueId: "i1", verifier: "diagnostic-test", at: new Date(T0 + 60_000).toISOString(), verdict: "continue", instruction: "Finish the existing implementation" }],
+  });
+  const seed = diagnosticSeed(issue);
+  await f.seed("i1", "ENG-1", { ...seed, responsibility: { ...seed.responsibility, agentId: "worker" } });
+  await f.pass();
+  f.clock.now += 60_000;
+  worker.updatedAt = new Date(f.clock.now).toISOString();
+  await f.pass();
+  assert.equal((await f.build().snapshot()).control.recoveryOutcomes["advancement-after-recovery"], undefined);
+  issue.status = "In Review";
+  f.clock.now += 60_000;
+  await f.pass();
+  assert.equal((await f.build().snapshot()).control.recoveryOutcomes["advancement-after-recovery"], 1);
+  issue.status = "Ready to merge";
+  f.clock.now += 60_000;
+  await f.pass();
+  assert.equal((await f.build().snapshot()).control.recoveryOutcomes["advancement-after-recovery"], 1, "the same acknowledged operation cannot claim a second recovery outcome");
+});
+
+test("recovery health counts owner escalation only after writeback confirms it", async (t) => {
+  const issue = ticketIssue();
+  const f = await passFixture(t, {
+    issues: [issue], listing: [diagnosticHelper()],
+    verdicts: async () => [{ issueId: "i1", verifier: "diagnostic-test", at: new Date(T0 + 60_000).toISOString(), verdict: "ask_owner", reason: "The required credential is unavailable to automation", question: "Authorize the required access?", options: ["A. Authorize access", "B. Keep the ticket on hold"] }],
+  });
+  await f.seed("i1", "ENG-1", diagnosticSeed(issue));
+  f.fail.escalate = true;
+  await f.pass();
+  assert.equal((await f.build().snapshot()).control.recoveryOutcomes["owner-escalation"], undefined);
+  f.fail.escalate = false;
+  await f.pass();
+  await f.pass();
+  const outcomes = (await f.build().snapshot()).control.recoveryOutcomes;
+  assert.equal(outcomes["owner-escalation"], 1);
+  assert.equal(outcomes["ask-owner"], 1);
+  assert.equal(outcomes["advancement-after-recovery"], undefined);
 });

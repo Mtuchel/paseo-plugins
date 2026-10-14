@@ -28,7 +28,7 @@ export const MAX_RUNNING_LIMIT = 50;
 export const DEFAULT_WRITEBACK: WritebackSettings = { status: false, summaries: false, blocked: false, pullRequests: false, mentions: false, autoResume: false, watchdog: true };
 // The watchdog's silence thresholds (README, "Silent and stuck agents"), in minutes.
 export type WatchdogTimings = { silentMinutes: number; steerGraceMinutes: number; recoveryGraceMinutes: number; idleMinutes: number };
-export const DEFAULT_WATCHDOG: WatchdogTimings = { silentMinutes: 45, steerGraceMinutes: 20, recoveryGraceMinutes: 20, idleMinutes: 120 };
+export const DEFAULT_WATCHDOG: WatchdogTimings = { silentMinutes: 5, steerGraceMinutes: 5, recoveryGraceMinutes: 5, idleMinutes: 5 };
 export const MIN_WATCHDOG_MINUTES = 1;
 export const MAX_WATCHDOG_MINUTES = 1440;
 // Draining a host (README, "Draining a host"): which host starts the agents Linear asks for.
@@ -80,7 +80,7 @@ export const MAX_SHARD_ROOTS = 12;
 // `maxActionsPerPass`: at most this many starts, successors, verifiers and resumes per pass, so a
 // backlog does not flood the capacity; closes, archives and escalations are not capped.
 export type StewardSettings = { enabled: boolean; queuedEscalateHours: number; idleMinutes: number; maxActionsPerPass: number };
-export const DEFAULT_STEWARD: StewardSettings = { enabled: true, queuedEscalateHours: 24, idleMinutes: 30, maxActionsPerPass: 5 };
+export const DEFAULT_STEWARD: StewardSettings = { enabled: true, queuedEscalateHours: 24, idleMinutes: 5, maxActionsPerPass: 5 };
 export const MIN_STEWARD_HOURS = 1;
 export const MAX_STEWARD_HOURS = 168;
 export const MIN_STEWARD_IDLE_MINUTES = 5;
@@ -246,7 +246,8 @@ export function normalizeWatchdog(value: unknown): WatchdogTimings {
   const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const [silentMinutes, steerGraceMinutes, recoveryGraceMinutes, idleMinutes] = (["silentMinutes", "steerGraceMinutes", "recoveryGraceMinutes", "idleMinutes"] as const).map((key) => {
     const raw = candidate[key];
-    return typeof raw === "number" && Number.isInteger(raw) && raw >= MIN_WATCHDOG_MINUTES && raw <= MAX_WATCHDOG_MINUTES ? raw : DEFAULT_WATCHDOG[key];
+    // Existing saved long thresholds must not disable the five-minute control reaction.
+    return typeof raw === "number" && Number.isInteger(raw) && raw >= MIN_WATCHDOG_MINUTES && raw <= MAX_WATCHDOG_MINUTES ? Math.min(raw, 5) : DEFAULT_WATCHDOG[key];
   });
   return { silentMinutes, steerGraceMinutes, recoveryGraceMinutes, idleMinutes };
 }
@@ -314,7 +315,7 @@ export function normalizeSteward(value: unknown): StewardSettings {
   return {
     enabled: typeof candidate.enabled === "boolean" ? candidate.enabled : DEFAULT_STEWARD.enabled,
     queuedEscalateHours: number("queuedEscalateHours", MIN_STEWARD_HOURS, MAX_STEWARD_HOURS),
-    idleMinutes: number("idleMinutes", MIN_STEWARD_IDLE_MINUTES, MAX_STEWARD_IDLE_MINUTES),
+    idleMinutes: Math.min(5, number("idleMinutes", MIN_STEWARD_IDLE_MINUTES, MAX_STEWARD_IDLE_MINUTES)),
     maxActionsPerPass: number("maxActionsPerPass", MIN_STEWARD_ACTIONS, MAX_STEWARD_ACTIONS),
   };
 }

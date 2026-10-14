@@ -229,7 +229,7 @@ test("the first multipart part holds the old question before its store write, an
   });
   const first = h.router.prompted("s1", { id: "p1", userId: OWNER, body: "sftp" });
   await writing;
-  assert.equal(await h.replies.respond({ agentId: "a1", requestId: twoPart.id, fingerprint: fingerprint(twoPart), intentId: "D-first-part", response: { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } } }), "owner-first");
+  assert.equal(await h.replies.respond({ agentId: "a1", requestId: twoPart.id, fingerprint: fingerprint(twoPart), intentId: "D-first-part", canSubmit: () => true, response: { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } } }), "owner-first");
   assert.ok(!h.calls.some((call) => call.startsWith("checked ")));
   releaseWrite!();
   await first;
@@ -254,8 +254,8 @@ test("seedHolds restores only nonclosed multipart vetoes from disk before deputy
   t.after(restarted.cleanup);
   await restarted.router.seedHolds();
   const response: AgentPermissionResponse = { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } };
-  assert.equal(await restarted.replies.respond({ agentId: "a1", requestId: twoPart.id, fingerprint: fingerprint(twoPart), intentId: "D-restored", response }), "owner-first");
-  assert.equal(await restarted.replies.respond({ agentId: "closed-agent", requestId: twoPart.id, fingerprint: fingerprint(twoPart), intentId: "D-closed", response }), "applied");
+  assert.equal(await restarted.replies.respond({ agentId: "a1", requestId: twoPart.id, fingerprint: fingerprint(twoPart), intentId: "D-restored", canSubmit: () => true, response }), "owner-first");
+  assert.equal(await restarted.replies.respond({ agentId: "closed-agent", requestId: twoPart.id, fingerprint: fingerprint(twoPart), intentId: "D-closed", canSubmit: () => true, response }), "applied");
   assert.equal(restarted.calls.filter((call) => call.startsWith("checked ")).length, 1);
 });
 
@@ -281,7 +281,7 @@ test("a new question cannot discard multipart progress or receive its old answer
   assert.ok(!h.calls.some((call) => /^(checked |respond |send )/.test(call)));
   assert.equal((await h.store.get("s1"))?.questions, null);
   pending.splice(0, 1, twoPart);
-  assert.equal(await h.replies.respond({ agentId: "a1", requestId: "q", fingerprint: fingerprint(twoPart), intentId: "D-released", response: { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } } }), "applied");
+  assert.equal(await h.replies.respond({ agentId: "a1", requestId: "q", fingerprint: fingerprint(twoPart), intentId: "D-released", canSubmit: () => true, response: { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } } }), "applied");
 });
 
 test("legacy multipart progress without a saved request never answers a newer question even without a checked connection", async (t) => {
@@ -308,7 +308,7 @@ test("superseding a multipart thread drops its saved progress and releases its d
   await h.router.closeSuperseded();
   assert.equal((await h.store.get("s1"))?.closed, true);
   assert.equal((await h.store.get("s1"))?.questions, null);
-  assert.equal(await h.replies.respond({ agentId: "a1", requestId: "q", fingerprint: fingerprint(twoPart), intentId: "D-superseded", response: { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } } }), "applied");
+  assert.equal(await h.replies.respond({ agentId: "a1", requestId: "q", fingerprint: fingerprint(twoPart), intentId: "D-superseded", canSubmit: () => true, response: { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } } }), "applied");
 });
 
 test("when a deputy resolved the multipart question, all collected parts become one correction and never answer the newer question", async (t) => {
@@ -320,7 +320,7 @@ test("when a deputy resolved the multipart question, all collected parts become 
   const h = routerHarness(pending, {}, [], async () => { submitted!(); await acknowledgement; });
   t.after(h.cleanup);
   await h.store.put(link);
-  const deputy = h.replies.respond({ agentId: "a1", requestId: "q", fingerprint: fingerprint(twoPart), intentId: "D-late-part", response: { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } } });
+  const deputy = h.replies.respond({ agentId: "a1", requestId: "q", fingerprint: fingerprint(twoPart), intentId: "D-late-part", canSubmit: () => true, response: { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } } });
   await onWire;
   await h.router.prompted("s1", { id: "p1", userId: OWNER, body: "sftp" });
   acknowledge!();
@@ -901,7 +901,7 @@ test("a parent control uses the held slot through admission without bypassing bl
   const h = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 1);
   assert.equal((await h.starter.admission("i1", h.paseo, settings)).ok, false);
   assert.equal((await h.starter.admission("i1", h.paseo, settings, undefined, { control: true })).ok, true);
-  assert.deepEqual(await h.starter.scheduler.counts(h.paseo), { running: 1, reserved: 1, waiting: 0 });
+  assert.deepEqual(await h.starter.scheduler.counts(h.paseo), { running: 1, reserved: 1, waiting: 1 }, "admitting the control must not erase the same ticket's implementation wait");
   const blocked = starterHarness({ creatorId: OWNER, labels: [], blockedBy: ["TUC-9"] }, 0);
   assert.equal((await blocked.starter.admission("i1", blocked.paseo, settings, undefined, { control: true })).ok, false);
   const away = starterHarness({ creatorId: OWNER, labels: [{ id: "a", name: "paseo-attended" }, { id: "p", name: "plan-ready" }], blockedBy: [] }, 0, APP, true);

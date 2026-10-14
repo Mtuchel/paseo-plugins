@@ -53,7 +53,7 @@ async function harness(t: TestContext, hooks: { beforeSubmit?: (record: ReplyRec
     return replies;
   };
   const replies = create();
-  const intent = (intentId: string) => ({ agentId: "a", requestId: q.id, fingerprint: fingerprint(q), intentId, response });
+  const intent = (intentId: string) => ({ agentId: "a", requestId: q.id, fingerprint: fingerprint(q), intentId, response, canSubmit: () => true });
   return { directory, sdk, replies, create, daemon, effects, sent, messages, evidence, corrections, needsYou, intent,
     pending: (requests: AgentPermissionRequest[]) => { pending = requests; },
     fail: (failure: Error | null) => { error = failure; },
@@ -349,4 +349,36 @@ test("triage cannot approve or deny a security permission, including approval-sh
   assert.deepEqual(h.sent, []);
   assert.deepEqual(h.messages, []);
   assert.deepEqual(h.needsYou, []);
+});
+
+test("revocation during the checked boundary's last await prevents sending and survives replay", async (t) => {
+  const paused = barrier(), resume = barrier();
+  const h = await harness(t, { beforeSubmit: async () => { paused.release(); await resume.promise; } });
+  let valid = true;
+  const pending = h.replies.respond({ ...h.intent("revoked"), canSubmit: () => valid });
+  await paused.promise;
+  valid = false;
+  resume.release();
+  assert.equal(await pending, "revoked");
+  assert.deepEqual(h.sent, []);
+  assert.equal(await h.create().outcome("revoked"), "revoked");
+  assert.equal(await h.create().respond(h.intent("revoked")), "revoked", "a new authorization cannot replay a revoked intent");
+  assert.deepEqual(h.sent, []);
+  const ownerAnswer = await h.replies.deliver(h.sdk, "a", "Vitest", owner("comment:after-revocation"));
+  assert.equal(ownerAnswer.delivered, true);
+  assert.deepEqual(h.sent, [{ agentId: "a", requestId: q.id, response: questionAnswer(q, "Vitest") }]);
+});
+
+test("revocation after a checked submission starts does not erase its confirmed outcome", async (t) => {
+  const h = await harness(t);
+  const entered = barrier(), resume = barrier();
+  let valid = true;
+  h.onSubmit(async () => { entered.release(); await resume.promise; });
+  const pending = h.replies.respond({ ...h.intent("on-wire"), canSubmit: () => valid });
+  await entered.promise;
+  valid = false;
+  resume.release();
+  assert.equal(await pending, "applied");
+  assert.equal(await h.create().outcome("on-wire"), "applied");
+  assert.deepEqual(h.sent.map((item) => item.requestId), ["q1"]);
 });

@@ -85,7 +85,7 @@ export type LogEntry =
   | { kind: "answer"; id: string; at: string; answers?: Record<string, string>; denyMessage?: string }
   | { kind: "owner-answer"; id: string; at: string; key: string; via: "linear-comment" | "linear-session" | "menu-bar"; userId: string; answers: Record<string, string> }
   | { kind: "deputy-prediction"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; selections: Record<string, string>; citations: Citation[] }
-  | { kind: "deputy-refusal"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; reason: string; category?: string }
+  | { kind: "deputy-refusal"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; reason: string; category?: string; key?: string }
   | { kind: "deputy-answer"; id: string; at: string; identifier: string; issueId: string; version: string; key: string; answers: Record<string, string>; citations: Citation[] }
   | { kind: "deputy-outcome"; id: string; at: string; key: "blocked" | "canceled" | "owner-won" | "unknown"; reason: string }
   | { kind: "deputy-override"; id: string; at: string; key: string; via: "linear-comment" | "linear-session" | "menu-bar"; userId: string; text: string; disposition: "delivered" | "failed"; detail?: string };

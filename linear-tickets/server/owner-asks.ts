@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { DecisionReceipt, OwnerAsk } from "../shared/contracts";
+import type { BrowserOwnerAsk } from "../shared/decision-inbox";
 import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService, OwnerAskComment, OwnerAskIssue } from "./linear";
 import { closeAnswered, type NeedsYouIssues } from "./needs-you";
@@ -37,6 +38,9 @@ export type ContinueOutcome = { kind: "started" | "live" | "deferred" | "failed"
 
 export type OwnerAsksDeps = {
   linear: Linear;
+  // Complete owner-decision issue scope, independent of live agents. When omitted the existing
+  // Linear reader supplies Needs input issues; parent may supply all open owner issues here.
+  issues?: () => Promise<OwnerAskIssue[]>;
   needsYou: NeedsYou;
   handover: Pick<Handover, "read">;
   // The existing activation claims identify a live peer owner, even without local agent history.
@@ -54,6 +58,7 @@ export type OwnerAsksDeps = {
   now?: () => number;
 };
 
+export type OwnerAskSnapshot = { asks: BrowserOwnerAsk[]; updatedAt: string; history: DecisionReceipt[]; coverage?: string[] };
 export type AnswerAskInput = { issueId: string; revision: string; answers: Record<string, string>; note?: string; done?: boolean };
 export type TriageAskInput = { issueId: string; revision: string; action: "research" | "delegate" | "defer" | "reopen"; note?: string; until?: string };
 export type AnswerAskResult = { delivered: "agent" | "continued" | "queued" | "comment" | "closed"; message: string };
@@ -79,7 +84,7 @@ const WAIT_COMMENT = /\) is waiting for (?:an answer|plan approval|permission):|
 export function asksOwner(body: string): boolean {
   // Historical menu-bar receipts also quote asks; neither receipt is a new owner question.
   if (/^Answered from (?:the menu bar|the decision inbox):/.test(body)) return false;
-  return WAIT_COMMENT.test(body) || ownerRequest(body) !== null;
+  return WAIT_COMMENT.test(body) || ownerRequest(body) !== null || /\?/.test(body);
 }
 
 // The markdown one ask is extracted from: a "Needs you" sub-issue and a manual task carry the ask
@@ -92,6 +97,19 @@ export function selectAskText(source: { needsYou: boolean; manual: boolean; wait
   // `comments` are newest first (Linear's `comments(first:)`).
   const asking = source.comments.find((comment) => asksOwner(comment.body));
   return asking?.body ?? issue.description;
+}
+
+// Preserve independent questions on the same ticket. A description and a comment are different
+// sources even when their wording matches; only an exact comment ID is deduplicated.
+export function selectAskSources(source: { needsYou: boolean; manual: boolean; waitCommentId: string | null; comments: OwnerAskComment[] }, issue: { description: string }): { sourceId: string; text: string }[] {
+  if (source.needsYou || source.manual) return [{ sourceId: "description", text: issue.description }];
+  const primary = selectAskText(source, issue);
+  const primaryComment = source.comments.find(comment => comment.id === source.waitCommentId)
+    ?? source.comments.find(comment => comment.body === primary);
+  const selected = new Map<string, string>([[primaryComment?.id ?? "description", primary]]);
+  if (asksOwner(issue.description)) selected.set("description", issue.description);
+  for (const comment of source.comments) if (asksOwner(comment.body)) selected.set(comment.id, comment.body);
+  return [...selected].map(([sourceId, text]) => ({ sourceId, text }));
 }
 
 // Where an answer goes from this host's view: the live agent that asked, a continuation of the
@@ -137,6 +155,10 @@ function extractionHash(draft: Draft): string {
   return askHash(JSON.stringify([EXTRACTION_VERSION, extractionInput(draft)]));
 }
 
+function extractionKey(draft: Draft): string {
+  return draft.sourceId === "description" ? draft.issue.id : `${draft.issue.id}-${askHash(draft.sourceId)}`;
+}
+
 function revision(draft: Draft, value: ExtractedAsk | null): string {
   return askHash(JSON.stringify([draft.issue.id, draft.ticketId, draft.sourceId, extractionInput(draft), value]));
 }
@@ -177,30 +199,33 @@ export class OwnerAsks {
   }
 
   // Everything waiting for the owner, from cache, without waiting for the model: an ask whose
-  // extraction has not finished is returned with `extracted: false` (kind "info", its title).
-  async snapshot(paseo: PaseoApi | null): Promise<{ asks: OwnerAsk[]; updatedAt: string; history: DecisionReceipt[] }> {
+  // extraction has not finished retains its manual classification when known, else kind "info".
+  async snapshot(paseo: PaseoApi | null): Promise<OwnerAskSnapshot> {
     const at = new Date(this.now()).toISOString();
     await this.ledger.load();
     const drafts = await this.collect(paseo);
-    const asks: OwnerAsk[] = [];
+    const asks: BrowserOwnerAsk[] = [];
     for (const draft of drafts) {
       const hash = extractionHash(draft);
-      let state = await this.extractionFor(draft.issue.id, hash);
+      const key = extractionKey(draft);
+      let state = await this.extractionFor(key, hash);
       if (!state) {
         state = { hash, value: null, attempts: 0, nextAt: 0, running: false };
-        this.extractions.set(draft.issue.id, state);
+        this.extractions.set(key, state);
       }
       if (!state.value && !state.running && state.attempts < MAX_ATTEMPTS && state.nextAt <= this.now()) {
-        this.enqueue({ issueId: draft.issue.id, hash, input: extractionInput(draft) });
+        this.enqueue({ issueId: key, hash, input: extractionInput(draft) });
       }
       const value = state.value;
       const sourceRevision = revision(draft, value);
       const decision = this.ledger.latest(draft.issue.id, sourceRevision);
-      if (decision && (decision.receipt.action === "answer" || decision.receipt.action === "done")) continue;
-      if (draft.request === "answered") continue;
+      if (decision?.result && (decision.receipt.action === "answer" || decision.receipt.action === "done")) continue;
+      if (draft.request === "answered" && (!decision || decision.result)) continue;
       const expired = decision?.disposition === "deferred" && Date.parse(decision.deferredUntil ?? "") <= this.now();
       asks.push({
         issueId: draft.issue.id,
+        sourceId: draft.sourceId,
+        deliveryUnknown: decision !== undefined && decision.result === null,
         revision: sourceRevision,
         ...classifyAttention(draft.text, value, draft.manual),
         disposition: expired ? null : decision?.disposition ?? null,
@@ -210,7 +235,7 @@ export class OwnerAsks {
         url: draft.issue.url,
         parentIdentifier: draft.issue.parentIdentifier,
         ticketIdentifier: draft.ticketIdentifier,
-        kind: value?.kind ?? "info",
+        kind: draft.manual ? "manual" : value?.kind ?? "info",
         summary: value?.summary ?? draft.issue.title,
         questions: value?.questions ?? [],
         source: draft.text.slice(0, MAX_SOURCE_CHARS),
@@ -222,7 +247,8 @@ export class OwnerAsks {
       });
     }
     asks.sort((a, b) => Number(b.attention === "owner" && !b.disposition) - Number(a.attention === "owner" && !a.disposition) || b.updatedAt.localeCompare(a.updatedAt));
-    return { asks, updatedAt: at, history: this.ledger.history() };
+    return { asks, updatedAt: at, history: this.ledger.history(),
+      coverage: this.deps.issues ? [] : ["Linear collection is limited to Needs input issues. The complete owner-decision issue reader is not configured."] };
   }
 
   async answer(input: AnswerAskInput, paseo: PaseoApi | null): Promise<AnswerAskResult> {
@@ -250,11 +276,18 @@ export class OwnerAsks {
     }
     // Re-read the source: edits to a comment can leave the ticket timestamp unchanged.
     // Never route a stale draft, even when its question keys match.
-    const draft = (await this.collect(paseo)).find((item) => item.issue.id === input.issueId);
-    if (!draft || draft.request === "answered") throw new Error("That ask is not waiting for you in Linear any more (or is not assigned to you), so nothing was answered.");
-    const state = await this.extractionFor(draft.issue.id, extractionHash(draft));
-    const value = state?.value ?? null;
-    if (!input.revision || revision(draft, value) !== input.revision) throw new Error("This ask changed. Refresh the inbox and answer the current revision; nothing was delivered.");
+    const candidates = (await this.collect(paseo, input.issueId)).filter(item => item.request !== "answered");
+    if (!candidates.length) throw new Error("That ask is not waiting for you in Linear any more (or is not assigned to you), so nothing was answered.");
+    let matched: { draft: Draft; value: ExtractedAsk | null } | undefined;
+    for (const candidate of candidates) {
+      const state = await this.extractionFor(extractionKey(candidate), extractionHash(candidate));
+      const value = state?.value ?? null;
+      if (revision(candidate, value) === input.revision) { matched = { draft: candidate, value }; break; }
+    }
+    if (!matched) throw new Error("This ask changed. Refresh the inbox and answer the current revision; nothing was delivered.");
+    const { draft, value } = matched;
+    const previous = this.ledger.latest(draft.issue.id, input.revision);
+    if (previous && !previous.result) throw new Error("Delivery for this source revision is unconfirmed. Inspect the ticket or agent before sending another answer; nothing was retried.");
     let response: string;
     if (triage) {
       const note = input.note?.trim() ?? "";
@@ -349,7 +382,7 @@ export class OwnerAsks {
       if (record.result?.delivered === "closed") await this.deps.needsYou.remove(record.close.issueId);
       else {
         const current = (await this.collect(paseo)).find((draft) => draft.issue.id === record.receipt.issueId);
-        const extracted = current ? await this.extractionFor(current.issue.id, extractionHash(current)) : undefined;
+        const extracted = current ? await this.extractionFor(extractionKey(current), extractionHash(current)) : undefined;
         if (current && revision(current, extracted?.value ?? null) === record.receipt.revision) {
           await closeAnswered(this.deps.needsYou, this.deps.linear, record.close.issueId);
         }
@@ -372,8 +405,10 @@ export class OwnerAsks {
     return issue.labels.some((name) => name.trim().toLowerCase() === manualLabel.trim().toLowerCase());
   }
 
-  private async collect(paseo: PaseoApi | null): Promise<Draft[]> {
-    const issues = await withPriority("interactive", CALLER, () => this.deps.linear.ownerAskIssues());
+  private async collect(paseo: PaseoApi | null, issueId?: string): Promise<Draft[]> {
+    const priority = issueId ? "interactive" : "background";
+    const inventory = await withPriority(priority, CALLER, () => this.deps.issues ? this.deps.issues() : this.deps.linear.ownerAskIssues());
+    const issues = issueId ? inventory.filter(issue => issue.id === issueId) : inventory;
     const [needsYou, labels, agents] = await Promise.all([
       this.deps.needsYou.all(),
       this.deps.labels(),
@@ -390,22 +425,19 @@ export class OwnerAsks {
     const comments = new Map<string, OwnerAskComment[]>();
     const asked = issues.filter((issue) => !isNeedsYou(issue) && !manual(issue));
     if (asked.length) {
-      for (const [id, list] of await withPriority("interactive", CALLER, () => this.deps.linear.ownerAskComments(asked.map((issue) => issue.id)))) comments.set(id, list);
+      for (const [id, list] of await withPriority(priority, CALLER, () => this.deps.linear.ownerAskComments(asked.map((issue) => issue.id)))) comments.set(id, list);
       // A wait comment older than the newest page is read on its own.
       for (const issue of asked) {
         const waiting = (await record(issue.id))?.waiting;
         if (!waiting?.commentId || comments.get(issue.id)?.some((comment) => comment.id === waiting.commentId)) continue;
-        const body = await withPriority("interactive", CALLER, () => this.deps.linear.commentBody(waiting.commentId!));
+        const body = await withPriority(priority, CALLER, () => this.deps.linear.commentBody(waiting.commentId!));
         if (body !== null) comments.set(issue.id, [...comments.get(issue.id) ?? [], { id: waiting.commentId, body, createdAt: "" }]);
       }
     }
     const drafts: Draft[] = [];
     for (const issue of issues) {
       const waiting = (await record(issue.id))?.waiting;
-      const text = selectAskText({ needsYou: isNeedsYou(issue), manual: manual(issue), waitCommentId: waiting?.commentId ?? null, comments: comments.get(issue.id) ?? [] }, issue);
-      const selectedComment = comments.get(issue.id)?.find((comment) => comment.id === waiting?.commentId)
-        ?? comments.get(issue.id)?.find((comment) => comment.body === text);
-      const sourceId = isNeedsYou(issue) || manual(issue) ? "description" : selectedComment?.id ?? "description";
+      const sources = selectAskSources({ needsYou: isNeedsYou(issue), manual: manual(issue), waitCommentId: waiting?.commentId ?? null, comments: comments.get(issue.id) ?? [] }, issue);
       const subIssue = isNeedsYou(issue) || manual(issue);
       const ticketId = subIssue && issue.parentId ? issue.parentId : issue.id;
       const ticketIdentifier = subIssue && issue.parentId ? issue.parentIdentifier ?? issue.identifier : issue.identifier;
@@ -413,8 +445,17 @@ export class OwnerAsks {
       const asking = needsYouById.get(issue.id)?.agentId ?? (issue.id === ticketId ? ticketRecord?.agentId ?? null : null);
       const remote = !manual(issue) && await this.deps.remoteAgent(ticketId);
       const route = remote ? { route: "continue" as const, agentId: null } : askRoute({ manual: manual(issue), asking, live: agents.live, history: Boolean(ticketRecord) || needsYouById.has(issue.id) || agents.issues.has(ticketId) });
-      const request = !subIssue && !remote && waiting?.kind === "request" && agents.asking && agents.newest.has(ticketId) ? agents.asking.has(ticketId) ? "pending" : "answered" : null;
-      drafts.push({ issue, manual: manual(issue), text, sourceId, needsYou: isNeedsYou(issue) ? issue.id : null, route: route.route, agentId: route.agentId, ticketAgentId: agents.newest.get(ticketId) ?? null, ticketId, ticketIdentifier, request });
+      for (const { text, sourceId } of sources) {
+        if (this.deps.issues && !subIssue && issue.status.toLowerCase() !== "needs input" && !asksOwner(text)) continue;
+        // Only the actual wait comment mirrors a live request. Another question on this issue
+        // must neither disappear with that request nor accidentally answer it.
+        const mirror = !subIssue && sourceId === waiting?.commentId && waiting?.kind === "request";
+        const request = mirror && !remote && agents.asking && agents.newest.has(ticketId) ? agents.asking.has(ticketId) ? "pending" : "answered" : null;
+        const separate = waiting?.kind === "request" && !mirror;
+        drafts.push({ issue, manual: manual(issue), text, sourceId, needsYou: isNeedsYou(issue) ? issue.id : null,
+          route: separate ? "comment" : route.route, agentId: separate ? null : route.agentId,
+          ticketAgentId: separate ? null : agents.newest.get(ticketId) ?? null, ticketId, ticketIdentifier, request });
+      }
     }
     return drafts;
   }

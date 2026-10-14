@@ -192,7 +192,12 @@ export async function gatherSources(readers: SourceReaders, question: Question, 
   }
 
   // 4. Owner answers the plugin delivered for the authenticated owner, with their questions.
-  const entries = await readers.ownerAnswers();
+  let entries: LogEntry[];
+  try {
+    entries = await readers.ownerAnswers();
+  } catch (error) {
+    return { sources, abstain: `earlier owner answers could not be read (${error instanceof Error ? error.message : error})` };
+  }
   const asked = new Map(entries.flatMap((entry) => entry.kind === "question" ? [[entry.id, entry] as const] : []));
   const answered = entries.flatMap((entry) => {
     const asking = entry.kind === "owner-answer" && entry.userId && entry.id !== question.id ? asked.get(entry.id) : undefined;

@@ -16,9 +16,9 @@ export type DeliveryOrigin = {
   intent?: "triage";
 };
 export type BoundAnswer = { requestId: string; request?: AgentPermissionRequest; response?: AgentPermissionResponse };
-type Status = "reserved" | "submitted" | "applied" | "rejected" | "owner-first" | "deputy-first" | "gone" | "unconfirmed" | "sent" | "unchecked";
+type Status = "reserved" | "submitted" | "applied" | "rejected" | "owner-first" | "deputy-first" | "gone" | "revoked" | "unconfirmed" | "sent" | "unchecked";
 export type DeliveryResult = {
-  status: Exclude<Status, "reserved" | "submitted" | "owner-first">;
+  status: Exclude<Status, "reserved" | "submitted" | "owner-first" | "revoked">;
   reply: string | null;
   delivered: boolean;
   request?: AgentPermissionRequest;
@@ -232,7 +232,7 @@ export class PermissionReplies implements PermissionArbiter {
       const known = (await this.records())[ref];
       if (known) return this.replay(known);
       const initial = { ...this.base(ref, input.agentId, "", { kind: "deputy", intentId: input.intentId }), kind: "answer" as const, requestId: input.requestId, fingerprint: input.fingerprint, response: input.response };
-      return this.lane(`${input.agentId}:${input.requestId}`, () => this.submit(null, initial));
+      return this.lane(`${input.agentId}:${input.requestId}`, () => this.submit(null, initial, input.canSubmit));
     });
     const outcome = this.arbitrated(record);
     if (!outcome) throw new Error(record.reason ?? "Paseo did not confirm the submission; it is not sent again");
@@ -243,11 +243,11 @@ export class PermissionReplies implements PermissionArbiter {
     return record ? this.arbitrated(record) : null;
   }
   private arbitrated(record: ReplyRecord): ArbitratedOutcome | null {
-    if (record.status === "applied" || record.status === "owner-first") return record.status;
+    if (record.status === "applied" || record.status === "owner-first" || record.status === "revoked") return record.status;
     return record.status === "gone" || record.status === "rejected" ? "gone" : null;
   }
 
-  private async submit(paseo: PaseoApi | null, original: ReplyRecord): Promise<ReplyRecord> {
+  private async submit(paseo: PaseoApi | null, original: ReplyRecord, canSubmit?: () => boolean): Promise<ReplyRecord> {
     let record = original;
     const requestId = record.requestId!;
     const key = `${record.agentId}:${requestId}`;
@@ -275,7 +275,8 @@ export class PermissionReplies implements PermissionArbiter {
       }
       if (this.stopped) throw new Error("the plugin unloaded before submitting the answer");
       if (record.responder.kind === "deputy" && ((this.owners.get(key) ?? 0) > 0 || this.holds.has(key))) return this.save({ ...record, status: "owner-first" });
-      // No await between the synchronous fence above and starting the external submission.
+      if (record.responder.kind === "deputy" && !canSubmit?.()) return this.save({ ...record, status: "revoked", reason: "the deputy authorization was revoked before submission" });
+      // No await between the synchronous owner/revocation fences and starting the external submission.
       if (daemon) await daemon.respondToPermissionAndWait(record.agentId, requestId, record.response, 60_000);
       else if (record.responder.kind === "deputy") throw new Error("no checked answer connection to the local Paseo daemon");
       else await sdk.agents.ref(record.agentId).respondToPermission({ requestId, response: record.response });
@@ -328,7 +329,7 @@ export class PermissionReplies implements PermissionArbiter {
     });
   }
   private result(record: ReplyRecord): DeliveryResult {
-    const status = record.status === "reserved" || record.status === "submitted" || record.status === "owner-first" ? "unconfirmed" : record.status;
+    const status = record.status === "reserved" || record.status === "submitted" || record.status === "owner-first" ? "unconfirmed" : record.status === "revoked" ? "rejected" : record.status;
     const delivered = status === "applied" || status === "unchecked" || status === "sent" || (status === "deputy-first" && Boolean(record.correctionDelivered));
     const reply = status === "rejected" || status === "gone" ? NOT_DELIVERED
       : status === "unconfirmed" ? unconfirmed(record.reason ?? "no confirmation was recorded") : record.reply ?? null;

@@ -179,7 +179,8 @@ const MANUAL_DIRECTORY = join(paseoHome, "linear-tickets", "manual-tasks");
 // or put the owner's decision in front of them). Each record carries the marker of the verifier
 // generation that wrote it, so a verdict is never taken for a later one.
 const VERDICT_DIRECTORY = issueId === null ? null : join(paseoHome, "linear-tickets", "steward-verdicts", issueId);
-const VERDICT_KINDS = ["close", "resume", "park", "ask_owner"];
+const DIAGNOSTIC = verifierArg?.startsWith("diagnostic-") === true;
+const VERDICT_KINDS = DIAGNOSTIC ? ["continue", "replace", "wait", "ask_owner"] : ["close", "resume", "park", "ask_owner"];
 const FINISHED_TYPES = ["completed", "canceled", "duplicate"];
 
 // Atomic, private (0600) JSON record: written to a temporary name, then renamed into place.
@@ -499,12 +500,13 @@ const tools = [
   },
   {
     name: "steward_verdict",
-    description: "Only for the verifier Paseo's ticket steward started: record exactly one verdict on whether this ticket's work is complete, then stop. Only the first verdict counts; a second call is refused. close: the landed work completes the ticket and nothing remains. resume: the ticket's agent must still do something (instruction). park: the ticket waits for another ticket (blockedBy, that ticket's identifier) and/or a date (dueDate, YYYY-MM-DD) — the reason says why — and the plugin moves it to Todo. ask_owner: only the owner can decide (question, options), for a missing decision, access or approval, never for work an agent can do.",
+    description: "For Paseo's verifier only. Recovery diagnosticians inspect supplied facts and repository files using read/glob/grep and allowlisted read-only ticket tools; no shell, eval, writes, nested tools or agent creation. Record one verdict and stop. A recovery diagnostic uses continue (instruction for the existing worker), replace (instruction, only after process absence), wait (reason, instruction naming the check, nextCheckAt within five minutes), or ask_owner (reason, question, options; owner-only decision/access/approval, never work an agent can do). A completion verifier uses close, resume, park or ask_owner. The generation's role constrains accepted verdicts.",
     inputSchema: {
       type: "object",
       properties: {
-        verdict: { type: "string", enum: VERDICT_KINDS, description: "close, resume, park or ask_owner." },
-        instruction: { type: "string", minLength: 1, maxLength: 4000, description: "resume: what the ticket's agent must still do." },
+        verdict: { type: "string", enum: VERDICT_KINDS, description: "The action this verifier generation recommends." },
+        instruction: { type: "string", minLength: 1, maxLength: 4000, description: "resume/continue/replace: concrete remaining work; wait: the check that ends the wait." },
+        nextCheckAt: { type: "string", maxLength: 40, description: "wait: ISO timestamp within five minutes." },
         blockedBy: { type: "string", pattern: "^[A-Za-z0-9-]{1,40}$", description: "park: the identifier of the ticket this one waits for, for example ENG-42." },
         dueDate: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$", description: "park: the date (YYYY-MM-DD) the wait is due, when it has one." },
         reason: { type: "string", minLength: 1, maxLength: 2000, description: "park: why the ticket is parked, and what ends the wait." },
@@ -524,13 +526,17 @@ const tools = [
       const reason = input.reason === undefined ? null : text(input.reason, "reason", 2000);
       const question = input.question === undefined ? null : text(input.question, "question", 2000);
       const options = input.options === undefined ? null : (Array.isArray(input.options) && input.options.length && input.options.length <= 6 ? input.options.map((option) => text(option, "option", 300)) : (() => { throw new Error("options must be 1 to 6 strings."); })());
+      const nextCheckAt = input.nextCheckAt === undefined ? null : text(input.nextCheckAt, "nextCheckAt", 40);
+      if (["continue", "replace"].includes(input.verdict) && !instruction) throw new Error(input.verdict + " needs a concrete instruction.");
+      if (input.verdict === "wait" && (!reason || !instruction || !nextCheckAt || !Number.isFinite(Date.parse(nextCheckAt)) || Date.parse(nextCheckAt) <= Date.now() || Date.parse(nextCheckAt) - Date.now() > 5 * 60000)) throw new Error("wait needs reason, check instruction and nextCheckAt within five minutes.");
+      if (DIAGNOSTIC && input.verdict === "ask_owner" && !reason) throw new Error("ask_owner needs evidence that bounded automatic diagnosis cannot safely advance.");
       if (input.verdict === "resume" && !instruction) throw new Error("resume needs instruction: what the agent must still do.");
       if (input.verdict === "park" && !reason) throw new Error("park needs reason: why the ticket is parked.");
       if (input.verdict === "ask_owner" && (!question || !options)) throw new Error("ask_owner needs question and options.");
       const names = await readdir(VERDICT_DIRECTORY).catch(() => []);
       const recorded = await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readFile(join(VERDICT_DIRECTORY, name), "utf8").then((raw) => JSON.parse(raw), () => null).catch(() => null)));
       if (recorded.some((record) => record && record.verifier === verifierArg)) throw new Error("A verdict was already recorded for this verifier; only the first one counts.");
-      await writePrivate(VERDICT_DIRECTORY, randomUUID() + ".json", { issueId, at: new Date().toISOString(), verifier: verifierArg, verdict: input.verdict, instruction, blockedBy, dueDate, reason, question, options });
+      await writePrivate(VERDICT_DIRECTORY, randomUUID() + ".json", { issueId, at: new Date().toISOString(), verifier: verifierArg, verdict: input.verdict, instruction, blockedBy, dueDate, reason, question, options, nextCheckAt });
       return { recorded: true, verdict: input.verdict, ticket: issueId };
     },
   },

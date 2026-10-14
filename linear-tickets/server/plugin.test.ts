@@ -1173,8 +1173,8 @@ test("the watchdog switch and thresholds save independently of auto-resume and a
     const watching = await settings.read();
     assert.equal(watching.writeback.watchdog, true);
     assert.equal(watching.writeback.autoResume, true, "the watchdog switch does not touch auto-resume");
-    await settings.patch({ watchdog: { idleMinutes: 90 } });
-    assert.deepEqual((await settings.read()).watchdog, { ...DEFAULT_WATCHDOG, idleMinutes: 90 });
+    await settings.patch({ watchdog: { idleMinutes: 3 } });
+    assert.deepEqual((await settings.read()).watchdog, { ...DEFAULT_WATCHDOG, idleMinutes: 3 });
     await settings.patch({ writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG });
     await assert.rejects(stat(path), { code: "ENOENT" });
   } finally { await rm(directory, { recursive: true, force: true }); }
@@ -1195,19 +1195,19 @@ test("watchdog threshold edits outside 1–1440 minutes are rejected and leave t
       await settings.patch({ watchdog: { [field]: 1 } });
       assert.equal((await settings.read()).watchdog[field], 1, `${field} accepts the minimum`);
       await settings.patch({ watchdog: { [field]: 1440 } });
-      assert.equal((await settings.read()).watchdog[field], 1440, `${field} accepts the maximum`);
+      assert.equal((await settings.read()).watchdog[field], 5, `${field} cannot postpone a control reaction beyond five minutes`);
     }
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("a malformed saved watchdog setting falls back to the defaults field by field", async () => {
+test("legacy saved recovery thresholds cannot postpone the five-minute control reaction", async () => {
   const directory = await mkdtemp(join(tmpdir(), "paseo-linear-watchdog-stored-"));
   const path = join(directory, "settings.json");
   try {
-    await writeFile(path, JSON.stringify({ watchdog: { silentMinutes: "x", idleMinutes: 0, steerGraceMinutes: 30 }, writeback: { watchdog: "no" } }));
+    await writeFile(path, JSON.stringify({ watchdog: { silentMinutes: 45, idleMinutes: 120, steerGraceMinutes: 20, recoveryGraceMinutes: 20 }, steward: { idleMinutes: 30 } }));
     const saved = await new Settings(path).read();
-    assert.deepEqual(saved.watchdog, { silentMinutes: 45, steerGraceMinutes: 30, recoveryGraceMinutes: 20, idleMinutes: 120 });
-    assert.equal(saved.writeback.watchdog, true, "only an explicit false turns the watchdog off");
+    assert.deepEqual(saved.watchdog, { silentMinutes: 5, steerGraceMinutes: 5, recoveryGraceMinutes: 5, idleMinutes: 5 });
+    assert.equal(saved.steward.idleMinutes, 5);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 

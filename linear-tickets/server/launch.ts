@@ -13,7 +13,7 @@ import { advisorNote, PLAN_CONTEXT_ENV, PLAN_POLICY_ENV, PLAN_REQUIRED_NOTE, PLA
 import { findProject, ProjectUnavailableError, readBranches } from "./projects";
 import { repoOrientation } from "./repo-orientation";
 import type { PluginSettings } from "./settings";
-import { ompExtensionInstalled, paseoHome, TICKET_MCP_ENV, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript, type TicketMcpServer } from "./ticket-mcp";
+import { ompDiagnosticGuardInstalled, ompExtensionInstalled, paseoHome, TICKET_MCP_ENV, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript, type TicketMcpServer } from "./ticket-mcp";
 import { shardDependencies, type ShardAssignor } from "./worktree-shards";
 
 import type { ReviewDeletions } from "./review-deletions";
@@ -31,7 +31,7 @@ export type PlannerStart = { runId: string; linearProjectId: string; projectName
 // marker of the steward's verifier generation this start belongs to (steward.ts); it reaches the
 // ticket MCP server's args, so the verdict the agent records is bound to that verifier.
 export type ResumeTarget = { branch: string; worktreePath: string | null; handover: string };
-type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess?: boolean; labels?: Record<string, string>; env?: Record<string, string>; resume?: ResumeTarget; lead?: string; verifier?: string; readOnlyCheckout?: boolean };
+type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess?: boolean; labels?: Record<string, string>; env?: Record<string, string>; resume?: ResumeTarget; lead?: string; verifier?: string; verifierCheck?: () => Promise<string | null>; readOnlyCheckout?: boolean };
 // A held per-ticket start gate (see Launcher.gate); `release` is idempotent.
 export type Gate = { release(): void };
 export const LEAD_INTRO = "Paseo started you because the pull request needs this now:";
@@ -93,7 +93,7 @@ export class Launcher {
     private readonly download?: Download,
     private readonly planContext: (requestId: string, prompt: string) => Promise<string> = writePlanContext,
     // Whether the plugin's omp extension is installed; it gives omp agents the ticket tools.
-    private readonly ompTools: () => boolean = ompExtensionInstalled,
+    private readonly ompTools: (diagnostic?: boolean) => boolean = (diagnostic) => diagnostic ? ompDiagnosticGuardInstalled() : ompExtensionInstalled(),
     // Where each agent's ticket environment is kept for its resumed sessions (agent-env.ts).
     private readonly envs: Pick<AgentEnvs, "save"> = new AgentEnvs(),
     // When set, returns why this ticket must not start here (README, "Draining a host"): the
@@ -237,11 +237,18 @@ export class Launcher {
     const warnings = [...detail.warnings, ...(first?.notes ?? []), ...(shard?.notes ?? [])];
     // A clone that has not fetched for a while would branch off a stale base; refresh it before
     // the worktree is created. Best effort and only for a fresh start (a resume keeps its worktree).
-    if (shard && !options.resume && shard.rootPath !== mapped.projectRootPath) {
+    if (!options.verifier?.startsWith("diagnostic-") && shard && !options.resume && shard.rootPath !== mapped.projectRootPath) {
       const refreshNote = await this.shards?.refresh(shard.rootPath);
       if (refreshNote) warnings.push(refreshNote);
     }
     if (await this.deletions?.blocked(detail.issue.id)) throw new Error("This ticket is paused for deletion; no agent was started.");
+    const diagnostic = options.verifier?.startsWith("diagnostic-") ?? false;
+    if (diagnostic && (!options.linearAccess || input.provider.split("/")[0] !== "omp" || !this.ompTools(true))) {
+      throw new Error("A recovery diagnostic requires ticket tools and the current read-only OMP diagnostic guard.");
+    }
+    if (diagnostic && options.resume && (!options.resume.worktreePath || !existsSync(options.resume.worktreePath))) {
+      throw new Error("The diagnostic's recorded worktree is unavailable; no checkout or branch will be created.");
+    }
     // Written before any creation so a failure here cannot leave a half-launched ticket.
     const mcpServers = options.linearAccess ? { [TICKET_MCP_NAME]: ticketMcpServer(await this.ticketScript(), detail.issue.id, undefined, undefined, options.verifier ?? null) } : undefined;
     onCreate();
@@ -297,7 +304,7 @@ export class Launcher {
     // Before the agent exists, so its first prompt can point at the local copies.
     let instructions = input.instructions;
     const cwd = workspace.directory ?? (project.projectKind === "git" ? null : project.projectRootPath);
-    if (this.download && cwd) {
+    if (!diagnostic && this.download && cwd) {
       try {
         const saved = await saveAttachments(cwd, detail.issue.identifier, detail.context, this.download);
         warnings.push(...saved.warnings);
@@ -307,9 +314,11 @@ export class Launcher {
       }
     }
     // Never fails the launch: without a readable checkout the scout, library-lookup and omp edit-anchor notes still apply.
-    const orientation = await repoOrientation({ cwd, git: project.projectKind === "git", provider: input.provider, detail });
-    warnings.push(...orientation.warnings);
-    instructions = [instructions.trim(), orientation.note].filter(Boolean).join("\n\n");
+    if (!diagnostic) {
+      const orientation = await repoOrientation({ cwd, git: project.projectKind === "git", provider: input.provider, detail });
+      warnings.push(...orientation.warnings);
+      instructions = [instructions.trim(), orientation.note].filter(Boolean).join("\n\n");
+    }
     // The agent that starts after its blockers builds on what they did. Blockers in review are kept
     // only when their pull requests are merged (`finishedBlockers` checks). Never fails the launch.
     const finished = detail.relations.related.filter((ticket) => ticket.direction === "blocked by" && (ticket.statusType === "completed" || inReviewState(ticket.status, ticket.statusType)));
@@ -346,12 +355,15 @@ export class Launcher {
         options.verifier || !options.lead ? "" : `${LEAD_INTRO}\n\n${options.lead}`,
       ].filter(Boolean).join("\n\n"),
       labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
-      env: { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier },
+      env: { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier, ...(diagnostic ? { LINEAR_TICKETS_DIAGNOSTIC: "1" } : {}) },
       mcpServers,
       warnings,
       ...(options.verifier ? { verifier: true } : {}),
       retry: "Check the workspace's agents before reopening this ticket to try again.",
-      blocked: async () => (await this.deletions?.blocked(detail.issue.id)) ? "This ticket is paused for deletion; no agent was started." : null,
+      blocked: async () => {
+        if (await this.deletions?.blocked(detail.issue.id)) return "This ticket is paused for deletion; no agent was started.";
+        return await options.verifierCheck?.() ?? null;
+      },
     });
     return { agentId: agent.id, warnings };
   }

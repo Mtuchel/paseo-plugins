@@ -13,11 +13,11 @@ import type { PluginSettings, Settings, WatchdogTimings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
 // The watchdog for silent and stuck ticket agents (README, "Silent and stuck agents"). It runs in
-// the pull request watch's two-minute poll, before any other recovery, and walks each ticket's
-// current root agent through bounded steps: a non-cancelling steer, a stop with a resume, a reload
-// with a resume, a replacement on the recorded branch, then one mention of the owner. A closed or
-// idle root gets one resume; a proven ghost is reloaded from its session at once (it has no process
-// that could end its turn) and replaced when that brings no progress. Every step is claimed in
+// an independent minute tick, ahead of the slower pull-request inventory. Silence first receives
+// a non-cancelling steer, then a bounded read-only diagnosis; elapsed time alone never authorizes
+// killing a healthy tool. A closed or idle root gets one resume; a proven ghost is reloaded from
+// its session and replaced only through the existing process/ownership guards.
+// Every step is claimed in
 // watchdog.json before it is taken, so a restart never repeats one blindly.
 
 export const WATCHDOG_CYCLES = 2;
@@ -36,7 +36,7 @@ const MINUTE = 60_000;
 // How long a quiet but excluded root is left before its exclusions are read again (README,
 // "Silent and stuck agents"): the deep check reads Linear and GitHub, whose hourly budgets the
 // plugin's other polls share.
-const EXCLUSION_RECHECK_MS = 15 * MINUTE;
+const EXCLUSION_RECHECK_MS = 5 * MINUTE;
 const DO_NOT_MERGE = "do-not-merge";
 const NEEDS_INPUT = "needs input";
 const TERMINAL = ["completed", "canceled", "duplicate"];
@@ -53,7 +53,7 @@ export type WatchdogEffect = Exclude<WatchdogAction, "mention">;
 
 // The steps of each kind, in order; the last is always the owner mention.
 const STEPS: Record<WatchdogKind, WatchdogAction[]> = {
-  silent: ["steer", "interrupt", "reload", "succeed", "mention"],
+  silent: ["steer", "mention"],
   idle: ["resume", "mention"],
   ghost: ["reload", "succeed", "mention"],
 };
@@ -112,6 +112,9 @@ export type WatchdogCycle = {
   // The predecessor was retired and proven gone then: the replacement only waits for its start (a
   // free slot, the route to the peer), which `retireBy` no longer bounds.
   retiredAt?: string | null;
+  waitReason?: string | null;
+  nextCheckAt?: string | null;
+  waitDeadline?: string | null;
 };
 // A ticket line or the owner mention still to post; `attempted` once a send may have gone out.
 export type WatchdogReport = { key: string; body: string; agentId: string | null; mention: boolean; attempted?: boolean };
@@ -577,6 +580,7 @@ const short = (id: string) => id.slice(0, 8);
 
 export class Watchdog {
   private revoked = false;
+  private running = false;
   private readonly instance = randomUUID();
   private readonly logged = new Map<string, string>();
   // A quiet root that an exclusion keeps out (a Done ticket, an owner wait, an open pull request)
@@ -605,7 +609,12 @@ export class Watchdog {
   }
 
   async pass(poll: WatchdogPoll): Promise<void> {
-    if (this.revoked) return;
+    if (this.revoked || this.running) return;
+    this.running = true;
+    try { await this.run(poll); } finally { this.running = false; }
+  }
+
+  private async run(poll: WatchdogPoll): Promise<void> {
     const settings = await this.deps.settings.read();
     if (!settings.writeback.watchdog) return;
     const path = this.deps.store.path;
@@ -821,6 +830,15 @@ export class Watchdog {
     // An explicit owner continuation or Stop ends the cycle.
     if ((ms(entry.ownerAt) ?? 0) > ms(cycle.startedAt)!) return this.endCycle(issueId, `${label}: the owner took over; cycle ${short(cycle.id)} ends`);
     if ((await this.deps.store.read()).holds[issueId]) return this.endCycle(issueId, `${label}: the owner stopped the agent; cycle ${short(cycle.id)} ends`);
+    if (cycle.stage === "succeed" && cycle.retiredAt && cycle.waitDeadline && now >= ms(cycle.waitDeadline)!) {
+      cycle = await this.patchCycle(issueId, identifier, { stage: "mention", dueAt: iso(now) });
+      await this.act(issueId, identifier, cycle, root, record, poll, settings);
+      return;
+    }
+    if (cycle.nextCheckAt && now < ms(cycle.nextCheckAt)!) return;
+    if (cycle.retiredAt && !cycle.waitDeadline) {
+      cycle = await this.patchCycle(issueId, identifier, { waitDeadline: iso(now + 5 * MINUTE), nextCheckAt: iso(now), waitReason: cycle.waitReason ?? "Replacement admission pending after retirement" });
+    }
     // A claim whose outcome was never recorded: the crash gap. Never repeated blindly.
     if (cycle.claim?.state === "claimed") {
       await this.reconcileGap(issueId, identifier, cycle, root);
@@ -919,6 +937,10 @@ export class Watchdog {
   private async act(issueId: string, identifier: string, cycle: WatchdogCycle, root: WatchedAgent | null, record: HandoverRecord | null, poll: WatchdogPoll, settings: PluginSettings): Promise<void> {
     const label = `${identifier}: watchdog`;
     const now = this.clock();
+    // Upgrade a persisted silent cycle without executing its old timed interrupt/reload ladder.
+    if (cycle.kind === "silent" && cycle.stage !== "steer" && cycle.stage !== "mention") {
+      cycle = await this.patchCycle(issueId, identifier, { stage: "mention", dueAt: iso(now) });
+    }
     // The final mention and a replacement past its retirement deadline answer to the same
     // exclusions as an effect: a ticket that meanwhile waits for the owner, closed or got vetoed
     // ends its cycle without a mention; one whose state cannot be read waits.
@@ -965,14 +987,17 @@ export class Watchdog {
       else this.once(`wait:${issueId}`, `${label}: the ${action} of cycle ${short(cycle.id)} waits: ${outcome.reason}`);
       return;
     }
-    // The predecessor is gone and only the start waits (a slot, the peer's route): like a queued
-    // ticket, it waits without a deadline and is logged once until the reason changes.
+    // Retirement is not advancement. Keep an explicit queue reason, a next check and a bounded
+    // deadline; the steward diagnoses a queue that cannot advance rather than calling it moving.
     if (outcome.kind === "failed" && outcome.retry && outcome.retired) {
       await this.deps.store.update((file) => {
         const ticket = this.deps.store.ticket(file, issueId, identifier);
         if (!ticket.cycle) return;
         ticket.cycle.claim = null;
         ticket.cycle.retiredAt ??= iso(this.clock());
+        ticket.cycle.waitReason = outcome.reason;
+        ticket.cycle.nextCheckAt = iso(this.clock() + MINUTE);
+        ticket.cycle.waitDeadline ??= iso(this.clock() + 5 * MINUTE);
       });
       this.once(`wait:${issueId}`, `${label}: ${short(cycle.rootId)} is retired; its replacement waits: ${outcome.reason}`);
       return;
@@ -1033,10 +1058,10 @@ export class Watchdog {
       ticket.cycle = null;
       if (ticket.exhausted) return false;
       ticket.exhausted = { at: iso(now), mentioned: true };
-      this.queueReport(ticket, `${cycleId}:mention`, WATCHDOG_MENTION, agentId, true);
+      this.queueReport(ticket, `${cycleId}:mention`, `Automatic recovery needs a bounded diagnosis: ${why}.`, agentId, true);
       return true;
     });
-    if (queued) console.log(`[linear-tickets] ${identifier}: watchdog: ${why}; the owner is asked to take over`);
+    if (queued) console.log(`[linear-tickets] ${identifier}: watchdog: ${why}; the steward diagnoses before asking the owner`);
     await this.flushReports(issueId);
   }
 

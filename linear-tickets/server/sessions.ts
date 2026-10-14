@@ -1,3 +1,4 @@
+import { Continuations, continuationMarker, continuationReceipt, type ContinueOperation, type ContinuationResult } from "./continuations";
 import { asCaller } from "./linear-usage";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -382,6 +383,7 @@ type Deps = {
   // Fresh owner/manual/parked authority for the verifier's implementation continuation.
   // Called inside this router's ticket turn; absence denies only resumeVerifiedParent.
   parentResumeWait?: (issueId: string) => Promise<string | null>;
+  recoveryWait?: (issueId: string) => Promise<string | null>;
   replies?: PermissionReplies;
   stop?: (agentId: string) => Promise<void>;
   // The owner's decisions in the panel, journaled before anything happens (plannotator.ts,
@@ -461,10 +463,15 @@ export class SessionRouter {
   private deputy: Pick<Deputy, "byRef" | "correct"> | null = null;
   private readonly replies: PermissionReplies;
   private readonly parents: ParentStore;
+  private readonly continuations: Continuations;
+  private continuationTimer: NodeJS.Timeout | null = null;
+  private drainingContinuations = false;
+  private continuationsStopped = false;
 
   constructor(private readonly deps: Deps) {
     this.replies = deps.replies ?? new PermissionReplies({ directory: dirname(deps.store.path), daemon: async () => null });
     this.parents = deps.parents ?? new ParentStore(dirname(deps.store.path));
+    this.continuations = new Continuations(join(dirname(deps.store.path), "continuations"));
   }
 
   recordDeputy(deputy: Pick<Deputy, "byRef" | "correct">): void {
@@ -485,11 +492,17 @@ export class SessionRouter {
     this.timer = setInterval(() => { void this.sweep(); }, SWEEP_MS);
     this.timer.unref?.();
     void this.sweep();
+    this.continuationTimer = setInterval(() => { void this.drainContinuations(); }, 60_000);
+    this.continuationTimer.unref?.();
+    void this.drainContinuations();
   }
 
   stop(): void {
+    this.continuationsStopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    clearInterval(this.continuationTimer ?? undefined);
+    this.continuationTimer = null;
     for (const state of this.live.values()) { if (state.timer) clearTimeout(state.timer); state.stop(); }
     this.live.clear();
   }
@@ -1561,6 +1574,83 @@ export class SessionRouter {
     return agentId === null ? null : this.deps.store.forAgent(agentId);
   }
 
+  async continuationStatus(operationId: string): Promise<ContinuationResult | null> {
+    const record = await this.continuations.get(operationId);
+    return record ? this.continueOperation(record) : null;
+  }
+
+  private async drainContinuations(): Promise<void> {
+    if (this.drainingContinuations) return;
+    this.drainingContinuations = true;
+    try {
+      const pending = await this.continuations.pending();
+      await Promise.all(pending.map((record) => this.continueOperation(record).catch((error: unknown) => {
+        console.error(`[linear-tickets] continuation ${record.operationId}: ${error instanceof Error ? error.message : error}`);
+      })));
+    } catch (error) {
+      console.error(`[linear-tickets] continuation ledger: ${error instanceof Error ? error.message : error}`);
+    } finally { this.drainingContinuations = false; }
+  }
+
+  continueOperation(input: ContinueOperation): Promise<ContinuationResult> {
+    return this.continuations.run(input, async (record, save) => {
+      if (record.status === "cancelled" || record.status === "started") return record;
+      const finish = async (result: ContinuationResult) => { await save(result); return result; };
+      if (!this.paseo) return { status: record.status, reason: "Paseo is not connected" };
+      // Rechecked inside prompt's ticket gate, immediately before the durable dispatch claim.
+      const authority = async (): Promise<string | null> => {
+        if (this.continuationsStopped) throw new Error("the plugin is unloading");
+        if ((await this.deps.watchdog?.read())?.holds[input.issueId]) return "owner stopped this ticket";
+        if (await this.deps.deletions?.blocked(input.issueId)) return "ticket is paused for deletion";
+        const owner = this.deps.owner ? await this.deps.owner(input.issueId) : "here";
+        if (owner === "elsewhere") return "another host owns this ticket";
+        if (owner !== "here") throw new Error("ticket ownership is unknown");
+        const recoveryWait = await this.deps.recoveryWait?.(input.issueId);
+        if (recoveryWait) throw new Error(recoveryWait);
+        const link = await this.deps.store.forAgent(input.agentId);
+        if (link && !link.closed && (link.questions || link.review || link.offer === "parked" || link.offer === "later")) throw new Error("the worker waits for an owner decision");
+        const status = await this.deps.linear.issueStatus(input.issueId);
+        if (["completed", "canceled", "duplicate"].includes(status.statusType.trim().toLowerCase())) return `ticket is ${status.status}`;
+        const agents = await issueAgents(this.paseo!, input.issueId);
+        if (agents.some((agent) => agent.id !== input.agentId && !agent.archivedAt && !agent.labels?.["paseo.parent-agent-id"] && !agent.labels?.["linear-tickets.steward"] && agent.status !== "closed" && !crashedProcess(agent))) return "a different worker generation owns this ticket";
+        return null;
+      };
+      try {
+        const veto = await authority();
+        if (veto) return finish({ status: "cancelled", reason: veto });
+        const found = await this.agent(input.agentId);
+        if (!found) return finish({ status: "cancelled", reason: "worker no longer exists" });
+        if (found.agent.labels?.["linear.issueId"] !== input.issueId) return finish({ status: "cancelled", reason: "worker belongs to another ticket" });
+        if (record.status === "unknown" || record.status === "sent") {
+          const receipt = await continuationReceipt(found.agent.persistence?.nativeHandle, continuationMarker(input.operationId)).catch(() => null);
+          return receipt ? finish({ status: receipt }) : record;
+        }
+        let claimed = false;
+        try {
+          const outcome = await this.prompt(input.agentId, `${input.text}\n\n${continuationMarker(input.operationId)}`, async () => {
+            const veto = await authority();
+            if (veto) { await finish({ status: "cancelled", reason: veto }); throw new Error(veto); }
+            await save({ status: "unknown", reason: "dispatch claimed; awaiting transport receipt" });
+            if (this.continuationsStopped) throw new Error("the plugin unloaded before dispatch");
+            claimed = true;
+          });
+          if (outcome === "sent") return finish({ status: "sent" });
+          if (outcome === "gone") return finish({ status: "cancelled", reason: "worker no longer available" });
+          return finish({ status: "queued", reason: `worker ${outcome}; next delivery check within one minute` });
+        } catch (error) {
+          const saved = await this.continuations.get(input.operationId);
+          if (saved?.status === "cancelled") return saved;
+          const reason = error instanceof Error ? error.message : String(error);
+          const rejectedBusy = /\bAgent is already processing\b/.test(reason);
+          return finish({ status: claimed && !rejectedBusy ? "unknown" : "queued", reason });
+        }
+      } catch (error) {
+        const saved = await this.continuations.get(input.operationId);
+        return { status: saved?.status ?? "unknown", reason: error instanceof Error ? error.message : String(error) };
+      }
+    });
+  }
+
   // Sends an idle agent a new message; a stopped one is loaded only after its ticket's terminal
   // OMP roots are confirmed absent. A live or unobservable orphan, or a held start gate, is `busy`.
   // Nothing is sent while the agent waits for the owner's answer or approval (`waiting`: the
@@ -2218,6 +2308,9 @@ export class SessionRouter {
       console.error(`[linear-tickets] ${issue.identifier}: ${step} failed: ${error instanceof Error ? error.message : error}`);
     });
     try {
+      if ((await this.deps.watchdog?.read())?.holds[issue.id]) return { kind: "wait", reason: "owner stopped this ticket" };
+      const recoveryWait = await this.deps.recoveryWait?.(issue.id);
+      if (recoveryWait) return { kind: "wait", reason: recoveryWait };
       if (verifiedParent) {
         const reason = await this.parentResumeReason(issue.id);
         if (reason) return { kind: "wait", reason };
@@ -2268,6 +2361,16 @@ export class SessionRouter {
         const reason = await this.parentResumeReason(issue.id);
         if (reason) return { kind: "wait", reason };
       }
+      if ((await this.deps.watchdog?.read())?.holds[issue.id]) return { kind: "wait", reason: "owner stopped this ticket" };
+      const finalWait = await this.deps.recoveryWait?.(issue.id);
+      if (finalWait) return { kind: "wait", reason: finalWait };
+      const finalProcessWait = await this.processWait(issue.id);
+      if (finalProcessWait) return { kind: "wait", reason: finalProcessWait };
+      const finalOwner = this.deps.owner ? await this.deps.owner(issue.id) : "here";
+      if (finalOwner !== "here") return { kind: "wait", reason: "local ticket ownership is not confirmed" };
+      const finalStatus = await this.deps.linear.issueStatus(issue.id);
+      if (["completed", "canceled", "duplicate"].includes(finalStatus.statusType.trim().toLowerCase())) return { kind: "impossible", reason: `ticket is ${finalStatus.status}` };
+      if (await this.deps.deletions?.blocked(issue.id)) return { kind: "wait", reason: "ticket is paused for deletion" };
       await onDispatch();
       console.log(`[linear-tickets] ${issue.identifier}: the pull request's message for ${gone} is claimed; starting a successor`);
       const running = dispatchLabels(settings.dispatch.label).running;
@@ -2306,7 +2409,7 @@ export class SessionRouter {
       const page = await this.paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
       for (const { agent } of page.entries) {
         const issueId = agent.labels?.["linear.issueId"];
-        if (!issueId || agent.labels?.["paseo.parent-agent-id"] || agent.archivedAt) continue;
+        if (!issueId || agent.labels?.["paseo.parent-agent-id"] || agent.labels?.["linear-tickets.steward"] || agent.archivedAt) continue;
         const ticket = tickets.get(issueId) ?? { issueId, identifier: agent.labels?.["linear.identifier"] ?? issueId, roots: [], ghosts: new Set<string>() };
         ticket.roots.push(agent);
         tickets.set(issueId, ticket);
