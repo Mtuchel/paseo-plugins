@@ -93,7 +93,7 @@ export class Launcher {
     private readonly download?: Download,
     private readonly planContext: (requestId: string, prompt: string) => Promise<string> = writePlanContext,
     // Whether the plugin's omp extension is installed; it gives omp agents the ticket tools.
-    private readonly ompTools: () => boolean = ompExtensionInstalled,
+    private readonly ompTools: (diagnostic?: boolean) => boolean = (diagnostic) => diagnostic ? ompDiagnosticGuardInstalled() : ompExtensionInstalled(),
     // Where each agent's ticket environment is kept for its resumed sessions (agent-env.ts).
     private readonly envs: Pick<AgentEnvs, "save"> = new AgentEnvs(),
     // When set, returns why this ticket must not start here (README, "Draining a host"): the
@@ -237,14 +237,17 @@ export class Launcher {
     const warnings = [...detail.warnings, ...(first?.notes ?? []), ...(shard?.notes ?? [])];
     // A clone that has not fetched for a while would branch off a stale base; refresh it before
     // the worktree is created. Best effort and only for a fresh start (a resume keeps its worktree).
-    if (shard && !options.resume && shard.rootPath !== mapped.projectRootPath) {
+    if (!options.verifier?.startsWith("diagnostic-") && shard && !options.resume && shard.rootPath !== mapped.projectRootPath) {
       const refreshNote = await this.shards?.refresh(shard.rootPath);
       if (refreshNote) warnings.push(refreshNote);
     }
     if (await this.deletions?.blocked(detail.issue.id)) throw new Error("This ticket is paused for deletion; no agent was started.");
     const diagnostic = options.verifier?.startsWith("diagnostic-") ?? false;
-    if (diagnostic && (!options.linearAccess || (input.provider.split("/")[0] === "omp" && !ompDiagnosticGuardInstalled()))) {
+    if (diagnostic && (!options.linearAccess || input.provider.split("/")[0] !== "omp" || !this.ompTools(true))) {
       throw new Error("A recovery diagnostic requires ticket tools and the current read-only OMP diagnostic guard.");
+    }
+    if (diagnostic && options.resume && (!options.resume.worktreePath || !existsSync(options.resume.worktreePath))) {
+      throw new Error("The diagnostic's recorded worktree is unavailable; no checkout or branch will be created.");
     }
     // Written before any creation so a failure here cannot leave a half-launched ticket.
     const mcpServers = options.linearAccess ? { [TICKET_MCP_NAME]: ticketMcpServer(await this.ticketScript(), detail.issue.id, undefined, undefined, options.verifier ?? null) } : undefined;
@@ -301,7 +304,7 @@ export class Launcher {
     // Before the agent exists, so its first prompt can point at the local copies.
     let instructions = input.instructions;
     const cwd = workspace.directory ?? (project.projectKind === "git" ? null : project.projectRootPath);
-    if (this.download && cwd) {
+    if (!diagnostic && this.download && cwd) {
       try {
         const saved = await saveAttachments(cwd, detail.issue.identifier, detail.context, this.download);
         warnings.push(...saved.warnings);
@@ -311,9 +314,11 @@ export class Launcher {
       }
     }
     // Never fails the launch: without a readable checkout the scout, library-lookup and omp edit-anchor notes still apply.
-    const orientation = await repoOrientation({ cwd, git: project.projectKind === "git", provider: input.provider, detail });
-    warnings.push(...orientation.warnings);
-    instructions = [instructions.trim(), orientation.note].filter(Boolean).join("\n\n");
+    if (!diagnostic) {
+      const orientation = await repoOrientation({ cwd, git: project.projectKind === "git", provider: input.provider, detail });
+      warnings.push(...orientation.warnings);
+      instructions = [instructions.trim(), orientation.note].filter(Boolean).join("\n\n");
+    }
     // The agent that starts after its blockers builds on what they did. Blockers in review are kept
     // only when their pull requests are merged (`finishedBlockers` checks). Never fails the launch.
     const finished = detail.relations.related.filter((ticket) => ticket.direction === "blocked by" && (ticket.statusType === "completed" || inReviewState(ticket.status, ticket.statusType)));

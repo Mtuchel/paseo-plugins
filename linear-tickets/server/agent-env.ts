@@ -46,9 +46,12 @@ export class AgentEnvs {
 // run's agent has no ticket: its tools hang on the run label (README, "Projects").
 export function sessionEnv(request: Record<string, string>, labels: Record<string, string> | undefined, saved: Record<string, string>): Record<string, string> {
   const added: Record<string, string> = {};
-  const diagnostic = labels?.["linear.coordination"] === "recovery-diagnostic" || labels?.["linear-tickets.steward"]?.startsWith("diagnostic-");
-  // A resumed helper keeps its capability even when saving the launch environment failed.
-  if (diagnostic) added.LINEAR_TICKETS_DIAGNOSTIC = "1";
+  const diagnostic = labels?.["linear.coordination"] === "recovery-diagnostic" || labels?.["linear-tickets.steward"]?.startsWith("diagnostic-") || saved.LINEAR_TICKETS_DIAGNOSTIC === "1" || request.LINEAR_TICKETS_DIAGNOSTIC === "1";
+  // Saved capability is restored independently of label lookup; role labels cover a failed save.
+  if (diagnostic) {
+    for (const [name, value] of Object.entries(saved)) if (!request[name]) added[name] = value;
+    added.LINEAR_TICKETS_DIAGNOSTIC = "1";
+  }
   const policy = labels?.[PLAN_POLICY_LABEL];
   if (!request[PLAN_POLICY_ENV] && isPlanPolicy(policy)) added[PLAN_POLICY_ENV] = policy;
   const runId = labels?.["linear.plannerRun"];

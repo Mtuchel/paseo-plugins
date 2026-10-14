@@ -150,7 +150,7 @@ test("a zero cap denies controls and previously reserved retries; one slot still
   assert.equal((await instance.admit(ticket("W-1"), paseo, max(1))).ok, false, "the queued control takes priority");
   assert.equal((await instance.admit(parent, paseo, max(1))).ok, true);
   assert.equal((await instance.admit(parent, paseo, max(0))).ok, false, "a zero lease also holds a retry");
-  instance.release(parent.issueId);
+  instance.release(parent.issueId, true);
   assert.equal((await instance.admit(ticket("W-1"), paseo, max(1))).ok, true, "no permanently withheld worker slot");
 });
 
@@ -282,4 +282,22 @@ test("a running implementation does not erase its diagnostic reservation or wait
   running.push({ issueId: "ticket", control: true });
   now = 6_000;
   assert.deepEqual(await instance.counts(paseo), { running: 2, reserved: 0, waiting: 1 });
+});
+
+test("same-ticket diagnostic and implementation reserve independent hard-cap slots", async () => {
+  let now = 0;
+  const running: { issueId: string; control: boolean }[] = [];
+  const instance = new Scheduler({ running: async () => [...running], projectOf: async () => null, now: () => now });
+  const worker = ticket("SAME");
+  const diagnostic = ticket("SAME", { control: true });
+  assert.equal((await instance.admit(diagnostic, paseo, max(2))).ok, true);
+  assert.equal((await instance.admit(worker, paseo, max(2))).ok, true);
+  assert.deepEqual(await instance.counts(paseo), { running: 0, reserved: 2, waiting: 0 });
+  assert.equal((await instance.admit(ticket("OTHER"), paseo, max(2))).ok, false);
+  running.push({ issueId: diagnostic.issueId, control: true });
+  now = 6_000;
+  assert.deepEqual(await instance.counts(paseo), { running: 1, reserved: 1, waiting: 1 });
+  assert.equal((await instance.admit(ticket("OTHER"), paseo, max(2))).ok, false);
+  instance.release(worker.issueId);
+  assert.equal((await instance.admit(ticket("OTHER"), paseo, max(2))).ok, true);
 });

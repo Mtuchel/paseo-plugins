@@ -1631,8 +1631,8 @@ export class SessionRouter {
             const veto = await authority();
             if (veto) { await finish({ status: "cancelled", reason: veto }); throw new Error(veto); }
             await save({ status: "unknown", reason: "dispatch claimed; awaiting transport receipt" });
-            claimed = true;
             if (this.continuationsStopped) throw new Error("the plugin unloaded before dispatch");
+            claimed = true;
           });
           if (outcome === "sent") return finish({ status: "sent" });
           if (outcome === "gone") return finish({ status: "cancelled", reason: "worker no longer available" });

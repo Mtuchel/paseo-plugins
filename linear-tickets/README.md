@@ -2917,14 +2917,19 @@ untouched. Reusing an operation ID with a different worker, ticket, or message i
 The watchdog also exposes a separate pass that does not acquire the PR poll's lock. Recovery
 diagnostic helpers use the control admission lane and never count as ticket implementation roots.
 A verifier launch that fails ambiguously is not retried in a second checkout.
+Control and implementation reservations have separate identities even for the same ticket;
+both consume the host's hard capacity limit. An unload before actual dispatch leaves a queued,
+retryable continuation rather than an uncertain send.
 
 Recovery diagnostics have an enforced read-only capability, not just a prompt instruction.
 OMP launches require the current installed `linear-tickets-plan-first.ts` extension; its
 diagnostic mode allows only file reads/searches, ticket read tools and `steward_verdict`.
 Shells, evaluation, writes, nested agents and unknown tools are blocked. The capability survives
-reloads through both the saved environment and diagnostic role labels. Claude diagnostics use
-plan mode; providers without an enforced read-only path are refused. The host, generation, Stop,
-permission, plan and PR fences are checked again immediately before creating the helper.
+reloads through both the saved environment and diagnostic role labels; an unreadable resumed
+agent's capabilities block its session open. Only OMP diagnostics are admitted: provider plan
+modes alone do not prohibit delegation. Diagnostic context collection neither downloads
+attachments nor creates replacement branches. The host, generation, Stop, permission, plan
+and PR fences are checked again immediately before creating the helper.
 
 **The five states.** Every in-scope open ticket is always in exactly one of them:
 

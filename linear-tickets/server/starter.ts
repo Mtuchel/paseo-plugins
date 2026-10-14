@@ -389,14 +389,14 @@ export class TicketStarter {
     const model = tierModel(settings, preference.model.split("/")[0], setup.tier?.tier ?? null, { provider: preference.model, ...(preference.thinkingOptionId ? { thinkingOptionId: preference.thinkingOptionId } : {}) });
     const diagnostic = options.verifier?.marker.startsWith("diagnostic-") ?? false;
     const diagnosticProvider = model.provider.split("/")[0];
-    if (diagnostic && diagnosticProvider !== "omp" && diagnosticProvider !== "claude") {
-      throw new Error(`Recovery diagnostics require an enforced read-only provider; ${diagnosticProvider} has no configured read-only mode.`);
+    if (diagnostic && diagnosticProvider !== "omp") {
+      throw new Error(`Recovery diagnostics require OMP's enforced read-only tool capability; ${diagnosticProvider} is not supported.`);
     }
     const base = {
       id: issueId,
       projectId: project.projectId,
       provider: model.provider,
-      modeId: diagnostic && diagnosticProvider === "claude" ? "plan" : setup.modeId,
+      modeId: setup.modeId,
       thinkingOptionId: model.thinkingOptionId,
       instructions: options.verifier ? setup.notes.join("\n\n") : [...setup.notes, QUESTIONS_NOTE].join("\n\n"),
       // A required plan goes to Planning on the agent's first turn (write-back), not In Progress.

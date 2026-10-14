@@ -349,6 +349,22 @@ test("an ambiguous continuation transport error never resends on reconciliation"
   } finally { h.router.stop(); await h.cleanup(); }
 });
 
+test("unload after saving a dispatch claim preserves a retryable unsent continuation", async (t) => {
+  const h = routerHarness({ agents: [ticketAgent("worker", "2026-02-01T00:00:00Z")], processLiveness: async () => "absent" });
+  const input = { issueId: ISSUE.id, agentId: "worker", operationId: "unloaded-claim", text: "continue" };
+  const ledger = h.router["continuations"];
+  const run = ledger.run.bind(ledger);
+  t.mock.method(ledger, "run", (operation: Parameters<typeof run>[0], work: Parameters<typeof run>[1]) => run(operation, (record, save) => work(record, async (result) => {
+    await save(result);
+    if (result.status === "unknown") h.router.stop();
+  })));
+  try {
+    assert.equal((await h.router.continueOperation(input)).status, "queued");
+    assert.equal((await ledger.get(input.operationId))?.status, "queued");
+    assert.deepEqual(h.daemon.sent, []);
+  } finally { h.router.stop(); await h.cleanup(); }
+});
+
 // A gate acquired and released proves the ticket's gate is free again (AC-19).
 function assertGateFree(gates: Launcher, issueId = ISSUE.id): void {
   const gate = gates.gate(issueId);

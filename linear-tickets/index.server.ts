@@ -559,9 +559,15 @@ export default function contribute(server: PluginServerContext) {
     // A new ticket agent gets its plan policy and ticket environment with its create request; a
     // resumed one (daemon restart, reload) gets them back from its labels and its saved launch
     // environment, so the omp extension keeps the same rules and tools (agent-env.ts).
-    const labels = request.env[PLAN_TICKET_ENV] ? undefined : await paseo.agents.ref(request.agentId).refresh()
-      .then((found) => found?.agent.labels, () => undefined);
-    const saved = labels ? await agentEnvs.read(request.agentId) : {};
+    const saved = await agentEnvs.read(request.agentId);
+    let labels: Record<string, string> | undefined;
+    if (request.reason === "resume") {
+      const found = await paseo.agents.ref(request.agentId).refresh();
+      if (!found) throw new Error("The resumed agent's capabilities cannot be verified; the session stays closed.");
+      labels = found.agent.labels;
+    } else if (!request.env[PLAN_TICKET_ENV]) {
+      labels = await paseo.agents.ref(request.agentId).refresh().then((found) => found?.agent.labels, () => undefined);
+    }
     const env = { ...(browser ? { PLANNOTATOR_BROWSER: browser } : {}), ...sessionEnv(request.env, labels, saved) };
     return Object.keys(env).length ? { ...request, env: { ...request.env, ...env } } : undefined;
   });
