@@ -105,6 +105,10 @@ export class DecisionCuration {
     if (this.dirty || this.lastRefreshAt === null || this.now() - this.lastRefreshAt >= CURATION_INTERVAL_MS) {
       do { await this.refresh(); } while (this.dirty);
     }
+    return this.current();
+  }
+
+  current(): DecisionView {
     const view = this.snapshot ?? { hosts: [], canonicalHost: null, unreachable: [] };
     return { ...view, tasks: curateDecisions(view, this.now()), curation: {
       intervalMs: CURATION_INTERVAL_MS, running: this.timer !== undefined, refreshing: this.flight !== null,

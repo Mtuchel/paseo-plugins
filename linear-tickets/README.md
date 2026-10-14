@@ -4287,11 +4287,17 @@ The canonical Linear host is local in activation `local` mode, or `activation.pe
 mode. An unavailable canonical host is reported, never silently replaced by another host's asks.
 The generated ask summary is the existing extraction, not a separate issue-impact or Haiku briefing.
 
-The curated task list collects immediately and every fifteen minutes even with no browser open.
-Background canonical collection awaits the full owner scan before publishing; it does not use the
-five-second interactive read deadline. Local and peer HTTP reads remain bounded while that scan
-runs, and the frontdoor can retain an explicitly stale snapshot until the new collection arrives.
-It groups owner decisions, unresolved source review, research/delegated waits and receipts.
+Linear owner sources collect immediately and every fifteen minutes even with no browser open.
+Background canonical collection awaits the full owner scan before publishing. Local and peer
+HTTP reads never await that scan: they return the collected owner sources, or an explicit
+collection-pending warning, alongside current live questions. A slow or quota-paused Linear
+scan cannot make a reachable decision host disappear or block forwarding a live answer.
+Live questions and peer reachability have a separate thirty-second, single-flight transport
+cache; they are not frozen for the fifteen-minute owner collection interval. Answer/config
+invalidation also fences in-flight transport reads, so they cannot republish an answered request.
+Concurrent peer reads share their request. Actual peer transport failures remain visible and
+are checked again on the next transport refresh, not the next Linear collection.
+The task list groups owner decisions, unresolved source review, research/delegated waits and receipts.
 Source counts are separate from steward ticket-state counts: `waiting-owner` is not a count of
 actionable questions. Per-host collection timestamps and incomplete/stale coverage stay visible.
 Standalone live questions without a Linear identifier remain included. Original lettered choices,

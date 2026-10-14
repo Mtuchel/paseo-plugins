@@ -407,20 +407,110 @@ test("owner reads share their collection while live questions stay fresh and exp
   assert.equal(h.ownerReads(), 2);
 });
 
+test("a slow canonical owner scan does not disconnect peer questions or checked answer delivery", async t => {
+  const server = await harness(t, "server087");
+  const local = await harness(t);
+  const serverInbox = server.create(() => PEER_BACKEND).inbox;
+  await serverInbox.view();
+  const input = await server.action("q1", serverInbox);
+  const entered = barrier(), release = barrier();
+  server.onOwnerRead(async () => { entered.release(); await release.promise; });
+  const collecting = serverInbox.refresh();
+  await entered.promise;
+  local.canonical("https://server.test:8444");
+  local.peers(["https://server.test:8444"]);
+  mockPeers(t, async (url, method, body, headers) => {
+    const target = new URL(url);
+    const result = await serverInbox.route({ method, path: target.pathname,
+      headers: { host: target.host, "content-type": "application/json", "x-review-action": headers.get("x-review-action") ?? "" },
+      body: body === null ? "" : JSON.stringify(body) });
+    assert.ok(result);
+    return new Response(result.body, { status: result.status, headers: result.headers });
+  });
+  try {
+    const view = await local.inbox.view();
+    assert.equal(view.canonicalHost, "server087");
+    assert.deepEqual(view.unreachable, []);
+    assert.equal(view.hosts.find(host => host.host === "server087")?.live[0].requestId, "q1");
+    const result = await local.post(input);
+    assert.equal(result.status, 200);
+    assert.equal(result.body.delivered, "agent");
+    assert.deepEqual(server.sent.map(item => item.requestId), ["q1"]);
+  } finally {
+    release.release();
+    await collecting;
+  }
+});
+
+test("transport refresh updates live questions without repeating the fifteen-minute owner scan", async t => {
+  const h = await harness(t);
+  await h.inbox.view();
+  h.agents[0].pendingPermissions = [{ ...question, id: "q2" }];
+  h.clock(h.now() + 30_001);
+  const view = await h.inbox.view();
+  assert.equal(view.hosts[0].live[0].requestId, "q2");
+  assert.equal(h.ownerReads(), 1);
+});
+
+test("a recovered canonical peer becomes reachable on the next transport refresh", async t => {
+  const h = await harness(t);
+  const peer = "https://server.test:8444";
+  h.canonical(peer); h.peers([peer]);
+  let reachable = false;
+  mockPeers(t, () => {
+    if (!reachable) throw new Error("connection refused");
+    return Response.json(peerSnapshot());
+  });
+  assert.deepEqual((await h.inbox.view()).unreachable, [peer]);
+  reachable = true;
+  h.clock(h.now() + 30_001);
+  const recovered = await h.inbox.view();
+  assert.equal(recovered.canonicalHost, "server087");
+  assert.deepEqual(recovered.unreachable, []);
+  assert.deepEqual(recovered.hosts[1].asks.map(ask => ask.revision), [ownerAsk.revision]);
+  assert.equal(recovered.hosts[0].error, null);
+  assert.equal(recovered.hosts[1].error, null);
+});
+
 test("background curation publishes complete owner sources after the interactive deadline", async (t) => {
   const h = await harness(t);
   const entered = barrier(), release = barrier();
   t.mock.timers.enable({ apis: ["setTimeout"] });
   h.onOwnerRead(async () => { entered.release(); await release.promise; });
-  const collecting = h.inbox.view();
+  const collecting = h.inbox.start();
+  t.after(() => h.inbox.stop());
   await entered.promise;
+  assert.equal((await h.inbox.view()).hosts[0].live[0].requestId, "q1");
   t.mock.timers.tick(6_000);
   await new Promise<void>(resolve => setImmediate(resolve));
   release.release();
-  const view = await collecting;
+  await collecting;
+  h.clock(h.now() + 30_001);
+  const view = await h.inbox.view();
   assert.deepEqual(view.hosts[0].asks.map(ask => ask.revision), [ownerAsk.revision]);
   assert.equal(view.hosts[0].error, null);
   assert.equal(view.tasks?.some(task => task.target === "owner" && task.revision === ownerAsk.revision), true);
+});
+
+test("an answer during a transport read cannot republish the answered request", async t => {
+  const h = await harness(t);
+  await h.inbox.start();
+  t.after(() => h.inbox.stop());
+  const input = await h.action();
+  const entered = barrier(), release = barrier();
+  const list = h.sdk.agents.list.bind(h.sdk.agents);
+  let hold = true;
+  t.mock.method(h.sdk.agents, "list", async (...args: Parameters<typeof list>) => {
+    const page = structuredClone(await list(...args));
+    if (hold) { hold = false; entered.release(); await release.promise; }
+    return page;
+  });
+  const reading = h.inbox.view();
+  await entered.promise;
+  assert.equal((await h.post(input)).status, 200);
+  release.release();
+  assert.deepEqual((await reading).hosts[0].live, []);
+  assert.deepEqual((await h.inbox.view()).hosts[0].live, []);
 });
 
 test("answering a live request revalidates owner sources instead of hiding every ask on its ticket", async t => {
@@ -451,7 +541,6 @@ test("a stalled Linear owner read does not prevent viewing live questions or mul
   const snapshot = await pending;
   assert.equal(snapshot.live[0].requestId, "q1");
   assert.deepEqual(snapshot.asks, []);
-  assert.match(snapshot.error!, /Owner asks unavailable/);
   release.release();
   await h.inbox.local();
   assert.equal(h.ownerReads(), 1);
