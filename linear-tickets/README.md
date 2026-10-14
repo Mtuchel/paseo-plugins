@@ -1850,18 +1850,18 @@ run at a time, taking turns with the poll:
    queue-conflict and gate checks still apply.
 5. Open stacks stranded on an orphaned `graphite-base/<n>` branch are moved onto `main` (see
    "Stranded stacks" below), only when the checkout's `main` has `tools/ci/retarget-orphan.mjs`.
-6. On the dispatch host only, `complex-review` pull requests Greptile never reviewed get a review
-   request (see "Greptile re-request" below), only when the checkout's `main` has
-   `tools/ci/greptile-retrigger.mjs`.
+6. On the dispatch host only, `complex-review` pull requests Greptile never reviewed get their one
+   review request (see "One Greptile review per PR" below), only when the checkout's `main` has
+   `tools/ci/greptile-request.mjs`.
 
 **When GitHub's budget runs out** (TUC-1880). A run stops at the first GitHub refusal or budget
-pause: the steps, repos and Greptile re-requests after it do not run (those repos count as failed
+pause: the steps, repos and Greptile requests after it do not run (those repos count as failed
 for the outage issue), and the actions keep their saved step. An enqueue whose answer the refusal
 cut off stays `started` and is reconciled from the Merge activity on the next run, so nothing is
 enqueued twice. A refusal is GitHub's answer to the plugin's own read, or a repo script whose
 stderr or JSON `error` says `API rate limit exceeded`, `secondary rate limit`, `HTTP 429` or
-`RATE_LIMITED` (for `greptile-retrigger.mjs` also one pull request's error; the requests it made
-before are recorded). With one `gh` login, a budget already below the 300-request reserve stops
+`RATE_LIMITED` (for `greptile-request.mjs` also one pull request's error; the request it made
+before is recorded). With one `gh` login, a budget already below the 300-request reserve stops
 the run before its first request, discovery's listing included. The backstop then waits for the
 reset and starts again 5 seconds after it, by itself, instead of on the next 10-minute tick; the
 ticks and the poll's kicks leave it alone until then. The time is, in order: the pause's own reset,
@@ -1945,29 +1945,38 @@ agent like a drop: a successor when it is gone, the ticket when none can start. 
 starts directly is not serialized with a move; the leases keep the push safe, the final base
 change has no compare-and-swap.
 
-**Greptile re-request.** Greptile reviews only `complex-review` pull requests that are not drafts,
-and misses a label added after publish (or is down), so such a pull request can wait forever for
-its first review (the ops digest's "complex-review: no Greptile review yet"). Per repo and run,
-`node tools/ci/greptile-retrigger.mjs --trigger [--follow <pr>]…` decides and posts: every open,
+**One Greptile review per PR.** A `complex-review` pull request gets exactly one Greptile review
+in its whole lifetime (TUC-2427); a fix diff never buys a second round, Astra re-checks it
+instead (the repository's `AGENTS.md`). Greptile reviews only pull requests that are not drafts
+and ignores a label CI adds to a published one; `.greptile/config.json` sets `autoReview: []`, so
+no event starts a review either, and without the repository's own request such a pull request
+waits forever for it (the ops digest's "complex-review: no Greptile review yet"). Per repo and
+run, `node tools/ci/greptile-request.mjs --trigger [--follow <pr>]…` decides and posts: every open,
 published `complex-review` pull request without a Greptile review gets one comment `@greptileai`
-(marked `<!-- greptile-retrigger:<head sha> -->`, from the bot) once 30 minutes have passed since
-it was published, labelled or last asked. The repo caps it from the markers on the pull request,
-so a restart or a lost state file never asks again: once per head, at most twice in any 24 hours,
-never after a Greptile review has been observed. Every request is also kept on the pull request's entry in
-`pr-watch.json` (`greptile`, evidence for the ops digest only, kept 14 days). **One writer:** only
-the host whose `dispatch.enabled` is on runs it (README "Several hosts" allows that on one host
-only), one backstop run at a time; every other host logs `greptile re-request: skipped, dispatch
-is off on this host` once and asks nobody. A script error, an undocumented exit or answer is that
-repo's failure, never a stop of the backstop; only GitHub's refusal stops it (see **When GitHub's
-budget runs out**).
+(marked `<!-- greptile-request:<head sha> -->`, from the bot) as soon as the backstop sees it
+(`--wait-minutes` defaults to 0). The repo claims it once with the git ref
+`refs/greptile-requests/<pr>` (creating it is atomic, so a racing run, a restart, a restack or a
+successor sends nothing; the pre-TUC-2427 `<!-- greptile-retrigger:… -->` marker reserves it
+too), counts the markers on the pull request, and never asks again after a Greptile review has
+been observed: one request per pull request lifetime. The claim is written before the comment, so
+an answer lost after the POST is never retried automatically; the owner may release the claim
+with `gh api -X DELETE repos/<owner>/<repo>/git/refs/greptile-requests/<n>` after a request
+provably failed, allowing at most one further request. Every request is also kept on the pull
+request's entry in `pr-watch.json` (`greptile`, evidence for the ops digest only, kept 14 days).
+**One writer:** only the host whose `dispatch.enabled` is on runs it (README "Several hosts"
+allows that on one host only), one backstop run at a time; every other host logs `greptile
+request: skipped, dispatch is off on this host` once and asks nobody. A script error, an
+undocumented exit or answer is that repo's failure, never a stop of the backstop; only GitHub's
+refusal stops it (see **When GitHub's budget runs out**).
 
-Once a request is 2 hours old without a review, the dispatch host files one Linear issue
+Once the one request is 2 hours old without a review, the dispatch host files one Linear issue
 **"Greptile is not reviewing"** (`server/greptile-outage.ts`, state in
 `$PASEO_HOME/linear-tickets/greptile-outage.json`): in the first auto-dispatch team, no project
 (so no ticket agent starts on it), Todo, assigned to the owner, priority High, mentioning the
-owner. It lists every pull request that waits (with when Greptile was last asked, or "not asked
-yet") and keeps the ones that no longer wait with their outcome (reviewed, closed, back to draft,
-label removed); the backstop passes the listed ones as `--follow`, and the list is synced once per
+owner. It lists every pull request that waits (with when Greptile was asked, or "not asked
+yet"; a claim whose request comment never went out reads as a lost POST) and keeps the ones
+that no longer wait with their outcome (reviewed, closed, back to draft, label removed); the
+backstop passes the listed ones as `--follow`, and the list is synced once per
 run after every repo, rewritten only when it changed. The issue is created under an id chosen and
 saved first, so a lost answer is looked up and retried under that id; with the state file lost,
 the open issue is found again by its `Marker: \`greptile-outage\`` line. Once a run read every
@@ -1976,7 +1985,7 @@ comment with each outcome and completes itself. A repo whose run failed (or stop
 budget) and a pull request that could not be read ("not read this run") keep it open. If you
 close it while pull requests still wait, it stays closed until a complete run finds none; a later
 outage files a new one. To switch it off, revert the plugin change (or the repo's script) and
-roll it out with `tools/plugin-rollout.mjs`; comments already posted, and reviews already started, stay.
+roll it out with `tools/plugin-rollout.mjs`; claims and comments already written stay.
 
 The poll and backstop also recover a missing handover PR link before deciding the ticket's next
 step. They identify the repository from the recorded worktree's validated GitHub origin, or
@@ -2025,7 +2034,7 @@ new message, the first that applies:
 | Draft | a draft with no new commit and no pull request activity for 30 minutes | run the background Sol review if not done, then publish only the reviewed part of the stack, bottom first: `git switch <branch> && node tools/ci/publish.mjs` once the branch and every branch below it are reviewed and each passed `verify:pre-pr --body-file` (`publish.mjs` is the only way to publish: it refuses until PR metadata is green and prints any owner question). **Exception (owner, Q-29, 2026-10-05):** a branch whose local `verify:pre-pr` was killed from outside, timed out, or failed twice only on tests unrelated to its change may be published without a passing receipt. Everything else still holds: only the reviewed part of the stack, bottom first; the branches above stay drafts. In order: (1) write the evidence into each such PR's `## Verification` section, outside code fences: `- CI is the proof: <killed \| timed out \| failed twice on unrelated tests> — <evidence>` (for `failed twice on unrelated tests`: `run 1: …; run 2: …; unrelated because …`); (2) make sure every branch up to this one is reviewed and none of the ticket's questions to the owner is still unanswered; (3) run `git switch <branch> && node tools/ci/publish.mjs --ci-proof`, which still checks everything else, and run it again until it publishes. CI is the proof; continue to the merge. |
 | Failed checks | a ready pull request whose latest run of a check failed (pending runs and `Graphite / mergeability_check` do not count) | the failed checks with links; fix, then `gt submit --stack` |
 | Base conflict | GitHub confirms the pull request conflicts with its base (`mergeable: CONFLICTING`; a mergeability GitHub is still computing never counts) | the branch, head and base; rebase only the agent's own stack onto the current base, run the checks and resubmit the way the repository's AGENTS.md prescribes; never `gt sync` or `gt restack`, never another ticket's branches, never an enqueue around the parent |
-| Changes requested | a reviewer's latest approving, change-requesting or dismissed review asks for changes (on any commit), or GitHub's review decision is "changes requested" | each such review and the unresolved review threads; address them, then `gt submit --stack` (for a review on an earlier commit: reply on its threads and re-request the review) |
+| Changes requested | a reviewer's latest approving, change-requesting or dismissed review asks for changes (on any commit), or GitHub's review decision is "changes requested" | each such review and the unresolved review threads; address them, then `gt submit --stack` (for a review on an earlier commit: reply on its threads and re-request the review — Greptile is never re-requested: the fix diff from its reviewed commit to the head goes to Astra's re-check, the repository's `AGENTS.md`) |
 | Findings | unresolved review threads a bot started (Greptile, any bot reviewer) | the findings; run the AGENTS.md review loop |
 
 The stages look at the ticket's recorded pull request and, where the repository's pull request
@@ -3925,13 +3934,15 @@ the script fresh. Other plugin changes in that pull keep their own reload steps.
   (`pr-watch.json`, `crash-recovery.json`), `false` when those records are readable and show
   neither, `null` (unknown) for another host's items or unreadable records. `auto` is `true` when
   the plugin acted on it (pull request nudges, drop handling, queue actions or a Greptile
-  re-request; agent restarts), `false` or `null` likewise. Both are read at that run, so later
+  request; agent restarts), `false` or `null` likewise. Both are read at that run, so later
   changes never rewrite old lines.
 
 `kind` is `item_kind()`: the section plus the detail without parenthesised parts, with `#N` for
-pull request references and `N` for every other number (`pulls: draft, not published`,
-`agents: running, no activity for N h`; the pulls line `complex-review: no Greptile review yet
-(Greptile re-requested 14:05)` stays `pulls: complex-review: no Greptile review yet`). Changing
+pull request references, `N` for every other number and the reviewed commit taken out of the
+Greptile fix-diff blocker (`pulls: draft, not published`,
+`agents: running, no activity for N h`; the pulls line `complex-review: the fix diff after
+Greptile's abc1234 needs Astra's re-check` stays `pulls: complex-review: the fix diff after
+Greptile's reviewed commit needs Astra's re-check`). Changing
 `item_kind()` starts new kinds; earlier lines keep their wording, and the review compares by the
 stored kind.
 

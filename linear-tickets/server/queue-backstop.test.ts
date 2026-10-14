@@ -126,7 +126,7 @@ test("enqueue-ready.mjs: stacks without their action, branch or heads are left o
   assert.deepEqual(readyArgs([419, 1501], ["ready:7@a1b2c3d"]), ["--ready-minutes", "10", "--exclude", "419", "--exclude", "1501", "--skip", "ready:7@a1b2c3d"]);
 });
 
-test("greptile-retrigger.mjs: exit 0 with all four lists; a wrong exit, a missing list, an unknown state or an entry without its number is an error", () => {  // TUC-1208 AC-4
+test("greptile-request.mjs: exit 0 with all four lists; a wrong exit, a missing list, an unknown state or an entry without its number is an error", () => {  // TUC-1208 AC-4, TUC-2427
   const pull = { pr: 419, url: "https://github.com/o/r/pull/419", title: "Add TUC-1", head: "a".repeat(40), since: "2026-10-07T10:00:00Z", triggers: ["2026-10-07T10:30:00Z"], state: "triggered", overdue: false };
   const answer = { pulls: [pull], followed: [{ pr: 12, state: "reviewed" }], triggered: [{ pr: 419, head: "a".repeat(40), at: "2026-10-07T10:30:00Z" }], errors: [{ pr: 13, error: "HTTP 502" }] };
   assert.deepEqual(parseRetrigger(out(0, answer)), answer);
@@ -135,6 +135,7 @@ test("greptile-retrigger.mjs: exit 0 with all four lists; a wrong exit, a missin
   assert.throws(() => parseRetrigger({ code: 0, stdout: "not json", stderr: "" }), BackstopScriptError);
   for (const field of ["pulls", "followed", "triggered", "errors"]) assert.throws(() => parseRetrigger(out(0, { ...answer, [field]: undefined })), BackstopScriptError, field);
   assert.throws(() => parseRetrigger(out(0, { ...answer, pulls: [{ ...pull, state: "asked" }] })), BackstopScriptError);
+  assert.throws(() => parseRetrigger(out(0, { ...answer, pulls: [{ ...pull, state: "capped" }] })), BackstopScriptError, "the old re-request cap's state does not exist any more");
   assert.throws(() => parseRetrigger(out(0, { ...answer, pulls: [{ ...pull, pr: null }] })), BackstopScriptError);
   for (const overdue of [undefined, "true", 1, null]) {
     assert.throws(() => parseRetrigger(out(0, { ...answer, pulls: [{ ...pull, overdue }] })), BackstopScriptError);

@@ -669,9 +669,11 @@ class ItemKindTest(unittest.TestCase):
                          "agents: in error: rate limit")
         self.assertEqual(self.kind("unbalanced ) and ( parens"), "pulls: unbalanced and parens")
 
-    def test_greptile_re_request_suffix_keeps_the_kind(self):  # TUC-1208 AC-6
-        self.assertEqual(self.kind("complex-review: no Greptile review yet (Greptile re-requested 14:05)"),
-                         "pulls: complex-review: no Greptile review yet")
+    def test_greptile_fix_check_kind_survives_the_reviewed_commit(self):  # TUC-2427
+        left = self.kind("complex-review: the fix diff after Greptile's abc123456 needs Astra's re-check")
+        right = self.kind("complex-review: the fix diff after Greptile's def987654 needs Astra's re-check")
+        self.assertEqual(left, right, "the reviewed commit is per pull request; the kind still groups them")
+        self.assertEqual(left, "pulls: complex-review: the fix diff after Greptile's reviewed commit needs Astra's re-check")
         self.assertEqual(self.kind("complex-review: no Greptile review yet"), "pulls: complex-review: no Greptile review yet")
 
 
@@ -1323,7 +1325,7 @@ class EvidenceTest(unittest.TestCase):
                             units=[{"unit": "pulls", "ok": True}, {"unit": "pulls", "ok": False, "category": "timeout"}])
         self.assertEqual(lines[0]["units"], {"pulls": False, "pulls/917": True, "pulls/918": True})
 
-    def test_a_greptile_re_request_counts_as_automation(self):  # TUC-1208 AC-7
+    def test_the_one_greptile_request_counts_as_automation(self):  # TUC-1208 AC-7, TUC-2427
         lines = self.events({"prWatch": {digest.PULL_URL.format(917): {"greptile": [{"head": "a" * 40, "at": WED_09_05}]},
                                          digest.PULL_URL.format(918): {"greptile": []}},
                              "crashes": {}})
