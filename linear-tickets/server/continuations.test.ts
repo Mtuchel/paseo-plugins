@@ -56,3 +56,31 @@ test("receipt requires a current-branch user marker, not an abandoned branch or 
     assert.equal(await continuationReceipt(file, marker), null);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test("overlapping plugin instances cannot dispatch the same operation concurrently", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "continuation-lease-"));
+  const input = { issueId: "ticket", agentId: "worker", operationId: "claim", text: "continue" };
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let dispatches = 0;
+  try {
+    const first = new Continuations(dir).run(input, async (_record, save) => {
+      await save({ status: "unknown" });
+      entered();
+      await blocked;
+      dispatches++;
+      await save({ status: "sent" });
+      return { status: "sent" };
+    });
+    await started;
+    const competing = await new Continuations(dir).run(input, async () => { dispatches++; return { status: "sent" }; });
+    assert.equal(competing.status, "unknown");
+    assert.equal(dispatches, 0);
+    release();
+    await first;
+    assert.equal(dispatches, 1);
+    assert.equal((await new Continuations(dir).get(input.operationId))?.status, "sent");
+  } finally { release(); await rm(dir, { recursive: true, force: true }); }
+});

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
+import { takeLease, releaseLease } from "./watchdog";
 
 export type ContinueOperation = { issueId: string; agentId: string; operationId: string; text: string };
 export type ContinuationResult = { status: "queued" | "sent" | "started" | "unknown" | "cancelled"; reason?: string };
@@ -47,19 +48,24 @@ export class Continuations {
   run(input: ContinueOperation, work: (record: ContinuationRecord, save: (result: ContinuationResult) => Promise<void>) => Promise<ContinuationResult>): Promise<ContinuationResult> {
     const existing = this.active.get(input.operationId);
     if (existing) return existing.then(() => this.run(input, work));
-    const run = (async () => {
-      let record = await this.get(input.operationId);
-      if (record && (record.issueId !== input.issueId || record.agentId !== input.agentId || record.text !== input.text)) throw new Error("Continuation identity was reused with different input.");
-      if (!record) {
-        record = { ...input, status: "queued", updatedAt: new Date().toISOString() };
-        await this.save(record);
-      }
-      const save = async (result: ContinuationResult) => {
-        if (record!.status === result.status && record!.reason === result.reason) return;
-        record = { ...record!, ...result, reason: result.reason, updatedAt: new Date().toISOString() };
-        await this.save(record);
-      };
-      return work(record, save);
+    const run = (async (): Promise<ContinuationResult> => {
+      const path = this.path(input.operationId);
+      const instance = randomUUID();
+      if (!await takeLease(path, instance)) return { status: "unknown", reason: "another sender holds this continuation operation" };
+      try {
+        let record = await this.get(input.operationId);
+        if (record && (record.issueId !== input.issueId || record.agentId !== input.agentId || record.text !== input.text)) throw new Error("Continuation identity was reused with different input.");
+        if (!record) {
+          record = { ...input, status: "queued", updatedAt: new Date().toISOString() };
+          await this.save(record);
+        }
+        const save = async (result: ContinuationResult) => {
+          if (record!.status === result.status && record!.reason === result.reason) return;
+          record = { ...record!, ...result, reason: result.reason, updatedAt: new Date().toISOString() };
+          await this.save(record);
+        };
+        return await work(record, save);
+      } finally { await releaseLease(path, instance); }
     })();
     this.active.set(input.operationId, run);
     void run.finally(() => { if (this.active.get(input.operationId) === run) this.active.delete(input.operationId); }).catch(() => {});

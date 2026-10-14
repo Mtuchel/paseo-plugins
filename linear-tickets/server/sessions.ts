@@ -466,6 +466,7 @@ export class SessionRouter {
   private readonly continuations: Continuations;
   private continuationTimer: NodeJS.Timeout | null = null;
   private drainingContinuations = false;
+  private continuationsStopped = false;
 
   constructor(private readonly deps: Deps) {
     this.replies = deps.replies ?? new PermissionReplies({ directory: dirname(deps.store.path), daemon: async () => null });
@@ -497,6 +498,7 @@ export class SessionRouter {
   }
 
   stop(): void {
+    this.continuationsStopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     clearInterval(this.continuationTimer ?? undefined);
@@ -1597,6 +1599,7 @@ export class SessionRouter {
       if (!this.paseo) return { status: record.status, reason: "Paseo is not connected" };
       // Rechecked inside prompt's ticket gate, immediately before the durable dispatch claim.
       const authority = async (): Promise<string | null> => {
+        if (this.continuationsStopped) throw new Error("the plugin is unloading");
         if ((await this.deps.watchdog?.read())?.holds[input.issueId]) return "owner stopped this ticket";
         if (await this.deps.deletions?.blocked(input.issueId)) return "ticket is paused for deletion";
         const owner = this.deps.owner ? await this.deps.owner(input.issueId) : "here";
@@ -1629,6 +1632,7 @@ export class SessionRouter {
             if (veto) { await finish({ status: "cancelled", reason: veto }); throw new Error(veto); }
             await save({ status: "unknown", reason: "dispatch claimed; awaiting transport receipt" });
             claimed = true;
+            if (this.continuationsStopped) throw new Error("the plugin unloaded before dispatch");
           });
           if (outcome === "sent") return finish({ status: "sent" });
           if (outcome === "gone") return finish({ status: "cancelled", reason: "worker no longer available" });

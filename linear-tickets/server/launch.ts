@@ -13,7 +13,7 @@ import { advisorNote, PLAN_CONTEXT_ENV, PLAN_POLICY_ENV, PLAN_REQUIRED_NOTE, PLA
 import { findProject, ProjectUnavailableError, readBranches } from "./projects";
 import { repoOrientation } from "./repo-orientation";
 import type { PluginSettings } from "./settings";
-import { ompExtensionInstalled, paseoHome, TICKET_MCP_ENV, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript, type TicketMcpServer } from "./ticket-mcp";
+import { ompDiagnosticGuardInstalled, ompExtensionInstalled, paseoHome, TICKET_MCP_ENV, TICKET_MCP_NAME, ticketMcpServer, writeTicketMcpScript, type TicketMcpServer } from "./ticket-mcp";
 import { shardDependencies, type ShardAssignor } from "./worktree-shards";
 
 import type { ReviewDeletions } from "./review-deletions";
@@ -31,7 +31,7 @@ export type PlannerStart = { runId: string; linearProjectId: string; projectName
 // marker of the steward's verifier generation this start belongs to (steward.ts); it reaches the
 // ticket MCP server's args, so the verdict the agent records is bound to that verifier.
 export type ResumeTarget = { branch: string; worktreePath: string | null; handover: string };
-type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess?: boolean; labels?: Record<string, string>; env?: Record<string, string>; resume?: ResumeTarget; lead?: string; verifier?: string; readOnlyCheckout?: boolean };
+type Options = { promptTemplate?: string; markInProgress?: boolean; linearAccess?: boolean; labels?: Record<string, string>; env?: Record<string, string>; resume?: ResumeTarget; lead?: string; verifier?: string; verifierCheck?: () => Promise<string | null>; readOnlyCheckout?: boolean };
 // A held per-ticket start gate (see Launcher.gate); `release` is idempotent.
 export type Gate = { release(): void };
 export const LEAD_INTRO = "Paseo started you because the pull request needs this now:";
@@ -242,6 +242,10 @@ export class Launcher {
       if (refreshNote) warnings.push(refreshNote);
     }
     if (await this.deletions?.blocked(detail.issue.id)) throw new Error("This ticket is paused for deletion; no agent was started.");
+    const diagnostic = options.verifier?.startsWith("diagnostic-") ?? false;
+    if (diagnostic && (!options.linearAccess || (input.provider.split("/")[0] === "omp" && !ompDiagnosticGuardInstalled()))) {
+      throw new Error("A recovery diagnostic requires ticket tools and the current read-only OMP diagnostic guard.");
+    }
     // Written before any creation so a failure here cannot leave a half-launched ticket.
     const mcpServers = options.linearAccess ? { [TICKET_MCP_NAME]: ticketMcpServer(await this.ticketScript(), detail.issue.id, undefined, undefined, options.verifier ?? null) } : undefined;
     onCreate();
@@ -346,12 +350,15 @@ export class Launcher {
         options.verifier || !options.lead ? "" : `${LEAD_INTRO}\n\n${options.lead}`,
       ].filter(Boolean).join("\n\n"),
       labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
-      env: { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier },
+      env: { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier, ...(diagnostic ? { LINEAR_TICKETS_DIAGNOSTIC: "1" } : {}) },
       mcpServers,
       warnings,
       ...(options.verifier ? { verifier: true } : {}),
       retry: "Check the workspace's agents before reopening this ticket to try again.",
-      blocked: async () => (await this.deletions?.blocked(detail.issue.id)) ? "This ticket is paused for deletion; no agent was started." : null,
+      blocked: async () => {
+        if (await this.deletions?.blocked(detail.issue.id)) return "This ticket is paused for deletion; no agent was started.";
+        return await options.verifierCheck?.() ?? null;
+      },
     });
     return { agentId: agent.id, warnings };
   }

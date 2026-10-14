@@ -2918,6 +2918,14 @@ The watchdog also exposes a separate pass that does not acquire the PR poll's lo
 diagnostic helpers use the control admission lane and never count as ticket implementation roots.
 A verifier launch that fails ambiguously is not retried in a second checkout.
 
+Recovery diagnostics have an enforced read-only capability, not just a prompt instruction.
+OMP launches require the current installed `linear-tickets-plan-first.ts` extension; its
+diagnostic mode allows only file reads/searches, ticket read tools and `steward_verdict`.
+Shells, evaluation, writes, nested agents and unknown tools are blocked. The capability survives
+reloads through both the saved environment and diagnostic role labels. Claude diagnostics use
+plan mode; providers without an enforced read-only path are refused. The host, generation, Stop,
+permission, plan and PR fences are checked again immediately before creating the helper.
+
 **The five states.** Every in-scope open ticket is always in exactly one of them:
 
 | State | What it means |

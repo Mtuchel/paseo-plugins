@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { chmod, link, lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +20,13 @@ export function paseoHome(): string {
 // README "Plan-first": the extension is installed by linking it into omp's extensions directory.
 export function ompExtensionInstalled(home = homedir()): boolean {
   return existsSync(join(home, ".omp", "agent", "extensions", "linear-tickets-plan-first.ts"));
+}
+
+export function ompDiagnosticGuardInstalled(home = homedir()): boolean {
+  try {
+    const source = readFileSync(join(home, ".omp", "agent", "extensions", "linear-tickets-plan-first.ts"), "utf8");
+    return source.includes("const RECOVERY_DIAGNOSTIC_GUARD = 1;") && source.includes("DIAGNOSTIC && RECOVERY_DIAGNOSTIC_GUARD");
+  } catch { return false; }
 }
 
 // New launch paths are content-addressed. Older saved paths become verified handles on cutover.

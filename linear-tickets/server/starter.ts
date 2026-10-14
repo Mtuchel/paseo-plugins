@@ -335,7 +335,7 @@ export class TicketStarter {
   // fresh branch (always the recorded one), the cheap tier, and instructions instead of the plan
   // notes, so a verifier never plans, implements or pushes. Its `marker` is the generation the
   // steward created for this check: it goes into the launch, so the verdict answers that verifier.
-  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string; resume?: ActivationResume; verifier?: { brief: string; marker: string } }): Promise<Started> {
+  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string; resume?: ActivationResume; verifier?: { brief: string; marker: string; check?: () => Promise<string | null> } }): Promise<Started> {
     if (await this.deps.deletions?.blocked(issueId)) throw new Error("This ticket is paused for deletion; no agent was started.");
     const detail: TicketDetail = await this.deps.linear.detail(issueId);
     const source = { projectId: detail.projectId, projectName: detail.issue.project, teamId: detail.teamId, teamName: detail.issue.team };
@@ -387,11 +387,16 @@ export class TicketStarter {
       ? { identifier: detail.issue.identifier, untrusted: true, policy: null, modeId: SAFE_MODES[preference.model.split("/")[0]] ?? undefined, notes: [options.verifier.brief], labels: {}, env: {}, tier: { tier: "cheap" as const, reason: "a steward verifier runs on the cheap tier" } }
       : await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, { tiers: this.deps.tiers, routes: this.deps.routes, settings });
     const model = tierModel(settings, preference.model.split("/")[0], setup.tier?.tier ?? null, { provider: preference.model, ...(preference.thinkingOptionId ? { thinkingOptionId: preference.thinkingOptionId } : {}) });
+    const diagnostic = options.verifier?.marker.startsWith("diagnostic-") ?? false;
+    const diagnosticProvider = model.provider.split("/")[0];
+    if (diagnostic && diagnosticProvider !== "omp" && diagnosticProvider !== "claude") {
+      throw new Error(`Recovery diagnostics require an enforced read-only provider; ${diagnosticProvider} has no configured read-only mode.`);
+    }
     const base = {
       id: issueId,
       projectId: project.projectId,
       provider: model.provider,
-      modeId: setup.modeId,
+      modeId: diagnostic && diagnosticProvider === "claude" ? "plan" : setup.modeId,
       thinkingOptionId: model.thinkingOptionId,
       instructions: options.verifier ? setup.notes.join("\n\n") : [...setup.notes, QUESTIONS_NOTE].join("\n\n"),
       // A required plan goes to Planning on the agent's first turn (write-back), not In Progress.
@@ -399,7 +404,7 @@ export class TicketStarter {
     };
     // The owner's prompt template describes the ticket work (branch, checks, pull request): a
     // verifier gets none of it — its whole prompt is the read-only brief.
-    const launchOptions = { promptTemplate: options.verifier ? undefined : settings.template ?? undefined, markInProgress: base.markInProgress, linearAccess: settings.agentLinearAccess, labels: { ...options.labels, ...setup.labels }, env: setup.env, ...(options.lead ? { lead: options.lead } : {}), ...(options.verifier ? { verifier: options.verifier.marker } : {}) };
+    const launchOptions = { promptTemplate: options.verifier ? undefined : settings.template ?? undefined, markInProgress: base.markInProgress, linearAccess: settings.agentLinearAccess, labels: { ...options.labels, ...setup.labels }, env: setup.env, ...(options.lead ? { lead: options.lead } : {}), ...(options.verifier ? { verifier: options.verifier.marker, verifierCheck: options.verifier.check } : {}) };
     const plan = { untrusted: setup.untrusted, plan: setup.policy };
     const started = (result: { agentId: string }) => recordStart(this.deps.tiers, { id: issueId, identifier: detail.issue.identifier }, setup.tier, result.agentId, model.provider);
     // A verifier reads the ticket's work where it lives: on the recorded branch when that can be

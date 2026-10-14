@@ -87,6 +87,15 @@ type ExtensionApi = {
 };
 
 const POLICY = process.env.LINEAR_TICKETS_PLAN;
+const DIAGNOSTIC = process.env.LINEAR_TICKETS_DIAGNOSTIC === "1";
+// Versioned launch capability: the plugin refuses diagnostic starts against an older extension.
+const RECOVERY_DIAGNOSTIC_GUARD = 1;
+const DIAGNOSTIC_TOOLS: Record<string, true> = {
+  read: true, grep: true, glob: true,
+  linear_ticket_get_ticket: true, linear_ticket_get_issue: true,
+  linear_ticket_get_comments: true, linear_ticket_search_issues: true,
+  linear_ticket_steward_verdict: true,
+};
 // Every ticket agent carries its ticket; the saved ticket prompt is optional (its save can fail).
 const TICKET = process.env.LINEAR_TICKETS_ISSUE;
 const CONTEXT = process.env.LINEAR_TICKETS_CONTEXT || null;
@@ -484,6 +493,9 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
   // A tool result reads like data, so the owner's request arrives as a harness message at the next
   // step; the blocked call only points to it.
   pi.on("tool_call", async (event, ctx) => {
+    if (DIAGNOSTIC && RECOVERY_DIAGNOSTIC_GUARD && !Object.hasOwn(DIAGNOSTIC_TOOLS, event.toolName)) {
+      return { block: true, reason: "Recovery diagnostics are read-only: use read, grep, glob, the ticket read tools, and linear_ticket_steward_verdict only. Shells, evaluation, writes, nested agents and all other tools are disabled." };
+    }
     const asked = await takeOwnerRequest();
     if (asked?.entered) {
       pi.sendMessage({ customType: MARKER, content: asked.message, display: true }, { deliverAs: "aside" });
