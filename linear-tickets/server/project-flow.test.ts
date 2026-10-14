@@ -519,6 +519,7 @@ test("Skip retires an unconfirmed creation, including an agent that appears only
 });
 
 test("Skip stops the run without an order: its tickets count as planned and are handed out", async (t) => {
+  const twoWorkerSlots = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 3 } };
   const r = await room(t, [issue(1), issue(2)]);
   const paseo = paseoWith(() => []);
   const run = (await r.flow.planNow("erp", settings, paseo)).planner!.runId;
@@ -532,7 +533,7 @@ test("Skip stops the run without an order: its tickets count as planned and are 
   assert.equal(await r.flow.applyPlan(run, "agent-1", "```project-order\n```", paseo, settings), false, "a late report of the skipped run is ignored");
   r.calls.length = 0;
   r.advance(HOUR);
-  await r.flow.tick(paseo, settings);
+  await r.flow.tick(paseo, twoWorkerSlots);
   assert.deepEqual(r.calls, ["delegate i1", "delegate i2"], "handed out unordered, and no second run starts");
   await assert.rejects(r.flow.skipPlan("erp", settings, paseo), /No planner is planning the work order of this project/);
 });
@@ -712,6 +713,7 @@ test("first-seen times are kept per ticket and pruned when one leaves the waitin
 });
 
 test("the approved work order is written as one project update, then planned tickets are handed out in order up to the agent limit", async (t) => {
+  const twoWorkerSlots = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 3 } };
   const r = await room(t, [issue(1, { priority: 4 }), issue(2, { priority: 1 }), issue(3), issue(4), issue(5)], ["running-elsewhere"]);
   const paseo = paseoWith(() => []);
   const run = (await r.flow.planNow("erp", settings, paseo)).planner!.runId;
@@ -731,8 +733,8 @@ test("the approved work order is written as one project update, then planned tic
   r.issues.splice(0, r.issues.length, issue(1, { priority: 4 }), issue(2, { priority: 1 }), issue(3), issue(4, { blockers: [{ id: "i3", identifier: "TUC-3", status: "Todo", statusType: "unstarted", delegateId: null, finished: false }] }), issue(5, { labels: ["paseo-hold"] }));
   r.calls.length = 0;
   r.advance(HOUR);
-  await r.flow.tick(paseo, settings);
-  assert.deepEqual(r.calls, ["delegate i2"], "one free slot of two: the urgent ticket; blocked and held tickets never");
+  await r.flow.tick(paseo, twoWorkerSlots);
+  assert.deepEqual(r.calls, ["delegate i2"], "one existing worker leaves one worker slot; the urgent ticket gets it, the control slot stays free, and blocked/held tickets never start");
 });
 
 test("a failed summary update does not keep an applied work order open", async (t) => {
@@ -804,12 +806,13 @@ test("a work order retried by a later read repeats only the changes that did not
 });
 
 test("while an approved order waits to be written, the tickets it blocks, holds or marks attended are not handed out", async (t) => {
+  const twoWorkerSlots = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 3 } };
   const r = await room(t, [issue(1), issue(2), issue(3), issue(4), issue(5)]);
   // TUC-1 to TUC-5 were planned before; the open run's order is approved, but Linear is down for its relation.
   await r.seed({ planned: ["i1", "i2", "i3", "i4", "i5"], planner: runRecord({ listed: ["i1", "i2", "i3", "i4", "i5"], tickets: 5,
     approved: { agentId: "agent-p", plan: "```project-order\nTUC-1 blocks TUC-2\nhold TUC-3: pricing first\nattended TUC-4: wording\n```" } }) });
   r.fail.unreached = "i1 blocks i2";
-  await r.flow.tick(paseoWith(() => []), settings);
+  await r.flow.tick(paseoWith(() => []), twoWorkerSlots);
   assert.deepEqual(r.updates, [], "the order is not written yet");
   assert.deepEqual(r.calls.filter((call) => call.startsWith("delegate")), ["delegate i1", "delegate i5"]);
 });
@@ -849,19 +852,20 @@ test("a work order links related tickets anywhere and closes a duplicate only wh
 });
 
 test("while the owner is away only an attended ticket with an approved plan waits; back, it goes first", async (t) => {
+  const twoWorkerSlots = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 3 } };
   // TUC-1 was marked attended by a work order and its plan is approved; TUC-2, someone else's, plans like any other.
   const attended = () => issue(1, { labels: ["paseo-attended", "plan-ready"] });
   const r = await room(t, [attended(), issue(2, { creatorId: "colleague" }), issue(3), issue(4), issue(5, { priority: 1 })]);
   await r.seed({ planned: ["i1", "i2", "i3", "i4", "i5"], planner: null });
   const paseo = paseoWith(() => []);
   r.setAway(true);
-  await r.flow.tick(paseo, settings);
-  assert.deepEqual(r.calls, ["delegate i2", "delegate i5"], "two slots: the urgent ticket and the oldest that needs nobody; TUC-1 waits");
+  await r.flow.tick(paseo, twoWorkerSlots);
+  assert.deepEqual(r.calls, ["delegate i2", "delegate i5"], "two worker slots plus control headroom: the urgent ticket and the oldest that needs nobody; TUC-1 waits");
   r.issues.splice(0, r.issues.length, attended(), issue(3, { priority: 2 }), issue(4, { priority: 2 }));
   r.setAway(false);
   r.calls.length = 0;
   r.advance(HOUR);
-  await r.flow.tick(paseo, settings);
+  await r.flow.tick(paseo, twoWorkerSlots);
   assert.deepEqual(r.calls, ["delegate i1", "delegate i3"], "present: the attended ticket goes before higher-priority ones, so TUC-4 waits");
 });
 

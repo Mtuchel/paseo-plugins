@@ -21,6 +21,9 @@ const IDLE_POLL_SECONDS = 60;
 const LAUNCH_ROOM = 20;
 
 type Linear = Pick<LinearService, "labeledIssues" | "addLabel" | "removeLabel" | "comment">;
+// Only accepted durable coordination consumes a trigger. Deferred groups never fall through
+// to launching a parent worker; not-group keeps ordinary ticket dispatch unchanged.
+export type GroupHandoff = "grouped" | "deferred" | "not-group";
 type Deps = {
   linear: Linear;
   starter: Pick<TicketStarter, "start" | "admission">;
@@ -30,9 +33,9 @@ type Deps = {
   // Called after each launch, e.g. to open the ticket's Linear agent session.
   // Returns true when the launch got a Linear agent session, whose panel replaces the start comment.
   afterLaunch?: (issueId: string, identifier: string, agentId: string) => Promise<boolean>;
-  // A ticket with open sub-issues is handed to Paseo as a group instead of starting an agent;
-  // true when it was (SessionRouter.handOffGroup).
-  handOff?: (issueId: string) => Promise<boolean>;
+  // `openChildren` avoids remote reads for untracked leaf tickets; tracked parents still handle
+  // explicit activation after their children finish or the owner previously stopped them.
+  handOff?: (issueId: string, openChildren: boolean) => Promise<GroupHandoff>;
   // Activation routing (activation.ts): a draining host forwards its label activations instead of
   // starting them, and the receiving host defers tickets the peer still claims.
   route?: ActivationSink;
@@ -242,12 +245,13 @@ export class Dispatcher {
     }
     // A ticket outside focus waits with its label (README, "Focus mode"), before anything is read.
     if (await this.deps.focus?.admits(issue.id, paseo)) return;
-    // A ticket with open sub-issues goes to Paseo as a group (README, "Groups"): its thread hands
-    // out the sub-issues, so the label comes off and no agent starts here. A failed check keeps the
-    // label for the next poll.
-    if (issue.openChildren && this.deps.handOff) {
+    // A group must explicitly accept responsibility before the shared trigger is consumed.
+    // Ownership denial keeps the trigger and never falls through to a parent worker.
+    if (this.deps.handOff) {
       try {
-        if (await this.deps.handOff(issue.id)) {
+        const handedOff = await this.deps.handOff(issue.id, issue.openChildren);
+        if (handedOff === "deferred") return;
+        if (handedOff === "grouped") {
           await linear.removeLabel(issue.id, trigger, issue.labels);
           this.record(issue.identifier, "grouped", "assigned to Paseo as a group; its sub-issues are handed out");
           return;

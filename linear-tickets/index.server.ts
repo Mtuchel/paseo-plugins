@@ -1,6 +1,7 @@
 import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, focusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setFocusRpc, setPresenceRpc, setSettingsRpc, skipPlanRpc, statusRpc, answerAskRpc, ownerAsksRpc, triageAskRpc, type CapacityState } from "./shared/contracts";
+import { parentsStatusRpc } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -47,6 +48,7 @@ import { OWNER_ASK_DIRECTORY, OwnerAsks } from "./server/owner-asks";
 import { QueuedLabels } from "./server/queued-labels";
 import { extractWithOmp } from "./server/owner-ask-extract";
 import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, SessionRouter, SessionStore, setAgentLabel, setAgentMode, stopAgentTurn, type HostOwnership } from "./server/sessions";
+import { ParentStore } from "./server/parents";
 import { SmallRoutes } from "./server/small-route";
 import { LimitResumeStore, UsageReader } from "./server/limit-resume";
 import { isUntrusted, planSetup, TicketStarter } from "./server/starter";
@@ -167,15 +169,17 @@ export default function contribute(server: PluginServerContext) {
   let attachedPaseo: PaseoApi | null = null;
   const route: ActivationSink = { take: async (request) => ((await settings.read()).activation.mode === "remote" ? drain.take(request) : intake.take(request)) };
   const sessionStore = new SessionStore();
+  const parents = new ParentStore();
   // The silent-agent watchdog's durable state (README, "Silent and stuck agents").
   const watchdogStore = new WatchdogStore();
   // Which host owns a ticket's automatic work, read only (SessionRouter.whileIdle, see
   // ticketOwnership): assigned once the activation routers exist below.
   let ticketOwner: (issueId: string) => Promise<HostOwnership> = async () => "unknown";
   const usage = new UsageReader();
-  const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, needsYou, route, deletions, watchdog: watchdogStore, replies,
+  const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, parents, needsYou, route, deletions, watchdog: watchdogStore, replies,
     limitResumes: new LimitResumeStore(), usage,
     owner: (issueId) => ticketOwner(issueId),
+    parentResumeWait: (issueId) => steward ? steward.parentResumeWait(issueId) : Promise.resolve("Parent verification authority is unavailable"),
     decideReview,
     decidePlan: (link, mode): Promise<string | null> => plannotator.decidePanel(link, mode),
     reviewOutcome: (review) => reviewOutcome(review),
@@ -250,7 +254,7 @@ export default function contribute(server: PluginServerContext) {
     intake, doneTickets, labels: new RetiredLabels(), deletions, focus, planned: waitingPlans,
   });
   const relay = new CommentRelay(linear, undefined, needsYou, route, replies);
-  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId) => sessions.handOffGroup(issueId), projects, steward, focus, parked: waitingPlans });
+  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId, openChildren) => sessions.handOffGroup(issueId, openChildren), projects, steward, focus, parked: waitingPlans });
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
   const decisions = new DecisionLog();
   writeback.recordDecisions(decisions);
@@ -573,6 +577,7 @@ export default function contribute(server: PluginServerContext) {
       return { ...status, steward: { enabled: false, lastPassAt: null, lastError: `the steward's state could not be read: ${error instanceof Error ? error.message : error}`, counts: {}, oldest: [] } };
     }
   });
+  server.handle(parentsStatusRpc, async () => ({ parents: await parents.all() }));
   server.handle(projectsStatusRpc, (_input, { paseo }) => { attach(paseo); return projects.status(); });
   server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { attach(paseo); return asCaller("project-flow", async () => projects.planNow(projectId, await settings.read(), paseo, true)); });
   server.handle(skipPlanRpc, async ({ projectId }, { paseo }) => { attach(paseo); return asCaller("project-flow", async () => projects.skipPlan(projectId, await settings.read(), paseo)); });

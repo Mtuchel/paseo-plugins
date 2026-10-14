@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -188,4 +188,38 @@ test("a task whose worktree was deleted runs its check in the repository's main 
     await cleanup();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("strict manual inventory distinguishes an absent directory from failed enumeration", async () => {
+  const h = await setup([]);
+  try {
+    await rm(h.directory, { recursive: true });
+    assert.deepEqual(await h.manual.tasksStrict(), []);
+    await writeFile(h.directory, "not a directory");
+    await assert.rejects(h.manual.tasksStrict(), { code: "ENOTDIR" });
+  } finally { await h.cleanup(); }
+});
+
+test("strict manual inventory never drops an unreadable or malformed registered task", async () => {
+  for (const fault of ["directory", "missing-record", "invalid-json", "invalid-shape", "wrong-id"] as const) {
+    const h = await setup([task("a")]);
+    const path = join(h.directory, "a.json");
+    try {
+      await rm(path);
+      if (fault === "directory") await mkdir(path);
+      if (fault === "missing-record") await symlink(join(h.directory, "missing"), path);
+      if (fault === "invalid-json") await writeFile(path, "{");
+      if (fault === "invalid-shape") await writeFile(path, JSON.stringify({ id: "a", parentId: "parent" }));
+      if (fault === "wrong-id") await writeFile(path, JSON.stringify(task("b")));
+      await assert.rejects(h.manual.tasksStrict(), fault);
+    } finally { await h.cleanup(); }
+  }
+});
+
+test("strict manual inventory retains task timing and completion-check evidence", async () => {
+  const entry = task("a", { when: "after_merge", check: "verify-runtime", verifiedFor: "2026-10-14T01:00:00Z" });
+  const h = await setup([entry]);
+  try {
+    assert.deepEqual(await h.manual.tasksStrict(), [entry]);
+  } finally { await h.cleanup(); }
 });

@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { dispatchLabels } from "./dispatch";
+import { z } from "zod";
 import type { IssueStatus, LinearService } from "./linear";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import type { Settings } from "./settings";
@@ -44,6 +45,15 @@ export type ManualTask = {
   verifiedAt: string | null;
   verifiedFor?: string | null;
 };
+
+const manualTaskSchema = z.object({
+  id: z.string().min(1), identifier: z.string().min(1), url: z.string(), title: z.string(),
+  parentId: z.string().min(1), parentIdentifier: z.string().min(1),
+  when: z.enum(["before_merge", "after_merge", "anytime"]),
+  check: z.string().nullable(), cwd: z.string(), repository: z.string().nullable().optional(),
+  createdAt: z.string().min(1), announced: z.boolean(), activated: z.boolean(),
+  verifiedAt: z.string().nullable(), verifiedFor: z.string().nullable().optional(),
+});
 export type CheckResult = { ok: boolean; code: number | null; output: string; cwd: string };
 type Linear = Pick<LinearService, "addLabel" | "comment" | "moveToReady" | "reopen" | "issueStatuses" | "viewerId" | "userUrl">;
 
@@ -106,6 +116,22 @@ export class ManualTasks {
     const names = await readdir(this.directory).catch(() => [] as string[]);
     const tasks = await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readFile(join(this.directory, name), "utf8").then((text) => JSON.parse(text) as ManualTask, () => null)));
     return tasks.filter((task): task is ManualTask => Boolean(task?.id && task.parentId)).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  // Completion authority: only an absent directory means no tasks. Failed enumeration, a
+  // registered record disappearing/unreadable, or malformed contents invalidate the inventory.
+  // The tolerant tasks() reader remains for background reconciliation, not completion.
+  async tasksStrict(): Promise<ManualTask[]> {
+    const names = await readdir(this.directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [] as string[];
+      throw error;
+    });
+    const tasks = await Promise.all(names.filter((name) => name.endsWith(".json")).map(async (name) => {
+      const task = manualTaskSchema.parse(JSON.parse(await readFile(join(this.directory, name), "utf8")));
+      if (`${task.id}.json` !== name) throw new Error(`Manual task record identity does not match ${name}`);
+      return task;
+    }));
+    return tasks.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   private async save(task: ManualTask): Promise<void> {

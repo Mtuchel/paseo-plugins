@@ -778,7 +778,7 @@ test("admission waits for unfinished blockers and for a free agent slot", async 
   const full = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 2);
   assert.match((await full.starter.admission("i1", full.paseo, settings) as { reason: string }).reason, /Queued: 2 of 2/);
   const room = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 1);
-  assert.deepEqual(await room.starter.admission("i1", room.paseo, settings), { ok: true });
+  assert.equal((await room.starter.admission("i1", room.paseo, settings)).ok, false, "the remaining slot is for parent verification");
   assert.deepEqual(await room.starter.admission("i1", room.paseo, { ...settings, dispatch: { ...settings.dispatch, maxRunning: 0 } }), { ok: true });
 });
 
@@ -847,8 +847,8 @@ test("the scheduler takes a working agent's project from the ticket read without
   const erp = waiting("TUC-1", "erp", 3);
   const none = waiting("TUC-3", null, 1);
   starter.scheduler.note([erp, none]);
-  const cap = { limit: 3, source: "settings" as const, lease: null };
-  // One agent each in erp and in no project: equal load, so urgency gives the one free slot to TUC-3.
+  const cap = { limit: 4, source: "settings" as const, lease: null };
+  // One agent each in erp and in no project: equal load, so urgency gives the one worker slot to TUC-3.
   // Had erp's agent been counted as no project, erp's ticket would have taken it.
   assert.deepEqual(await starter.scheduler.admit(none, paseo, cap), { ok: true });
   assert.deepEqual(reads.sort(), ["r1", "r2"]);
@@ -874,8 +874,9 @@ test("while the owner is away, only the implementation of an attended ticket wai
 });
 
 test("while the owner is away the starter ranks by the ticket's model: its label or its recorded tier", async (t) => {
-  // One running agent of two slots: one free. The rival ranks before every ticket here on today's
-  // order (Urgent, older), so only the night class lets a ticket pass it.
+  // One running agent of three slots: one worker slot and one control slot free. The rival ranks
+  // first by urgency and age, so only the night class lets a ticket pass it.
+  const three = { ...settings, dispatch: { ...settings.dispatch, maxRunning: 3 } };
   const rival: Candidate = { issueId: "rival", identifier: "TUC-9", projectId: null, priority: 1, unblocks: 0, createdAt: "2025-01-01T00:00:00Z", night: { planReady: true, tier: "strong" } };
   const directory = await mkdtemp(join(tmpdir(), "night-tiers-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -884,16 +885,49 @@ test("while the owner is away the starter ranks by the ticket's model: its label
 
   const labelled = starterHarness({ creatorId: OWNER, labels: [{ id: "r", name: "plan-ready" }, { id: "m", name: "model:cheap" }], blockedBy: [] }, 1, APP, true);
   labelled.starter.scheduler.note([rival]);
-  assert.deepEqual(await labelled.starter.admission("i1", labelled.paseo, settings), { ok: true }, "the model:cheap label decides");
+  assert.deepEqual(await labelled.starter.admission("i1", labelled.paseo, three), { ok: true }, "the model:cheap label decides");
 
   const recorded = starterHarness({ creatorId: OWNER, labels: [{ id: "r", name: "plan-ready" }], blockedBy: [] }, 1, APP, true, undefined, undefined, tiers);
   recorded.starter.scheduler.note([rival]);
-  assert.deepEqual(await recorded.starter.admission("i1", recorded.paseo, settings), { ok: true }, "the recorded cheap tier decides");
+  assert.deepEqual(await recorded.starter.admission("i1", recorded.paseo, three), { ok: true }, "the recorded cheap tier decides");
 
   const strong = starterHarness({ creatorId: OWNER, labels: [{ id: "r", name: "plan-ready" }, { id: "m", name: "model:strong" }], blockedBy: [] }, 1, APP, true);
   strong.starter.scheduler.note([rival]);
-  const refused = await strong.starter.admission("i1", strong.paseo, settings);
+  const refused = await strong.starter.admission("i1", strong.paseo, three);
   assert.match(refused.ok ? "" : refused.reason, /1 ticket ahead/, "on strong the ticket ranks as before, behind the urgent one");
+});
+
+test("a parent control uses the held slot through admission without bypassing blockers or presence", async () => {
+  const h = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 1);
+  assert.equal((await h.starter.admission("i1", h.paseo, settings)).ok, false);
+  assert.equal((await h.starter.admission("i1", h.paseo, settings, undefined, { control: true })).ok, true);
+  assert.deepEqual(await h.starter.scheduler.counts(h.paseo), { running: 1, reserved: 1, waiting: 0 });
+  const blocked = starterHarness({ creatorId: OWNER, labels: [], blockedBy: ["TUC-9"] }, 0);
+  assert.equal((await blocked.starter.admission("i1", blocked.paseo, settings, undefined, { control: true })).ok, false);
+  const away = starterHarness({ creatorId: OWNER, labels: [{ id: "a", name: "paseo-attended" }, { id: "p", name: "plan-ready" }], blockedBy: [] }, 0, APP, true);
+  assert.deepEqual(await away.starter.admission("i1", away.paseo, settings, undefined, { control: true }), { ok: false, reason: AWAY_REASON });
+});
+
+test("a reconstructed starter recognizes persisted control labels without an extra listing", async () => {
+  let lists = 0;
+  const paseo = { agents: { list: async () => {
+    lists++;
+    return {
+      entries: [{ agent: { id: "parent-agent", status: "running", labels: { "linear.issueId": "parent", "linear.coordination": "parent-verification" } } }],
+      pageInfo: { hasMore: false },
+    };
+  } } } as unknown as PaseoApi;
+  for (let reload = 0; reload < 2; reload++) {
+    const h = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
+    const [admission] = await Promise.all([
+      h.starter.admission("i1", paseo, settings),
+      h.starter.scheduler.counts(paseo),
+      h.starter.scheduler.counts(paseo),
+    ]);
+    assert.equal(admission.ok, true, "the persisted parent already uses the control slot");
+    assert.deepEqual(await h.starter.scheduler.counts(paseo), { running: 1, reserved: 1, waiting: 0 });
+    assert.equal(lists, reload + 1, "one shared snapshot per reconstructed scheduler");
+  }
 });
 
 test("every ticket starts plan-first; someone else's ticket is marked untrusted; omp keeps the usual mode so the planner never waits for approvals", async () => {

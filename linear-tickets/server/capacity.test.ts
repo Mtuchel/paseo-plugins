@@ -23,7 +23,7 @@ test("a lease below max agents caps new starts, and the queue names RAM and the 
   capacity.set(lease(2));
   const cap = capacity.limit(10);
   assert.deepEqual({ limit: cap.limit, source: cap.source }, { limit: 2, source: "ram" });
-  assert.deepEqual(await scheduler.admit(ticket("TUC-1"), paseo, cap), { ok: true });
+  assert.deepEqual(await scheduler.admit({ ...ticket("TUC-1"), control: true }, paseo, cap), { ok: true });
   assert.deepEqual(await scheduler.admit(ticket("TUC-2"), paseo, cap), { ok: false, reason: "Queued: RAM-limited, 2 of 2 slots used (80 GB budget, 6 GB free). It starts when memory frees up." });
 });
 
@@ -81,7 +81,7 @@ test("the capacity counts working, reserved and waiting tickets; the wait line l
   const { capacity, scheduler, advance } = room(["r1"]);
   capacity.set(lease(2));
   const cap = capacity.limit(0);
-  await scheduler.admit(ticket("TUC-1"), paseo, cap);
+  await scheduler.admit({ ...ticket("TUC-1"), control: true }, paseo, cap);
   await scheduler.admit(ticket("TUC-2"), paseo, cap);
   await scheduler.admit(ticket("TUC-3"), paseo, cap);
   assert.deepEqual(await scheduler.counts(paseo), { running: 1, reserved: 1, waiting: 2 });
@@ -89,4 +89,19 @@ test("the capacity counts working, reserved and waiting tickets; the wait line l
   advance(4 * 60_000);
   assert.deepEqual(scheduler.waitingIds(), [], "not asked for in 3 minutes: out of the line");
   assert.deepEqual(await scheduler.counts(paseo), { running: 1, reserved: 0, waiting: 0 });
+});
+
+test("control headroom follows the effective lease and its existing expiry fallback", async () => {
+  const { capacity, scheduler, advance } = room();
+  const parent = { ...ticket("P-1"), control: true };
+  capacity.set(lease(0, 30));
+  assert.equal((await scheduler.admit(parent, paseo, capacity.limit(3))).ok, false);
+  advance(30_000);
+  assert.equal((await scheduler.admit(parent, paseo, capacity.limit(3))).ok, true);
+  assert.equal((await scheduler.admit(ticket("W-1"), paseo, capacity.limit(3))).ok, true);
+  assert.equal((await scheduler.admit(ticket("W-2"), paseo, capacity.limit(3))).ok, true);
+  assert.equal((await scheduler.admit(ticket("W-3"), paseo, capacity.limit(3))).ok, false);
+  capacity.set(lease(1));
+  assert.equal((await scheduler.admit({ ...ticket("P-2"), control: true }, paseo, capacity.limit(3))).ok, false, "shrinking the lease never adds a process");
+  assert.deepEqual(await scheduler.counts(paseo), { running: 0, reserved: 3, waiting: 2 }, "already admitted work is not killed");
 });

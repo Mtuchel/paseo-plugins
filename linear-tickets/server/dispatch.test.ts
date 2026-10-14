@@ -3,17 +3,20 @@ import { test, type TestContext } from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { RpcInput } from "@getpaseo/plugin";
 import type { launchAgentRpc, TicketDetail } from "../shared/contracts";
-import { Dispatcher } from "./dispatch";
+import { Dispatcher, type GroupHandoff } from "./dispatch";
 import { Launcher } from "./launch";
 import { MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter, WAITING_PLAN_REASON } from "./starter";
 import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE } from "./plan-policy";
-import type { LabeledIssue } from "./linear";
+import type { IssueGroup, LabeledIssue } from "./linear";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ParkedPlans } from "./parked";
+import { SessionRouter, SessionStore } from "./sessions";
+import { ParentStore } from "./parents";
+import { WatchdogStore } from "./watchdog";
 
 const baseSettings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false,
@@ -82,7 +85,7 @@ function fakePaseo(activeAgents: { id: string; title: string }[] = []): PaseoApi
   } as unknown as PaseoApi;
 }
 
-function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = baseSettings, paseo = fakePaseo(), handOff?: (issueId: string) => Promise<boolean>, gates = new Launcher(linear as never)) {
+function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = baseSettings, paseo = fakePaseo(), handOff?: (issueId: string, openChildren: boolean) => Promise<GroupHandoff>, gates = new Launcher(linear as never)) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const launches: RpcInput<typeof launchAgentRpc>[] = [];
   const starter = new TicketStarter({
@@ -116,12 +119,128 @@ test("a labelled ticket with open sub-issues is handed to Paseo as a group: the 
   const linear = new FakeLinear({ "eng-1": ["paseo"], "eng-2": ["paseo"] });
   linear.parents.add("eng-1");
   const asked: string[] = [];
-  const { dispatcher, launches } = setup(t, linear, baseSettings, fakePaseo(), async (id) => { asked.push(id); return true; });
+  const { dispatcher, launches } = setup(t, linear, baseSettings, fakePaseo(), async (id, openChildren) => { asked.push(id); return openChildren ? "grouped" : "not-group"; });
   await dispatcher.tick();
-  assert.deepEqual(asked, ["eng-1"], "tickets without open sub-issues are not looked at");
+  assert.deepEqual(asked, ["eng-1", "eng-2"], "the cheap handoff hint also permits tracked parents without open children");
   assert.deepEqual([...linear.labels.get("eng-1")!], []);
   assert.deepEqual(launches.map((launch) => launch.id), ["eng-2"]);
   assert.deepEqual(dispatcher.snapshot().recent.map((item) => `${item.identifier} ${item.outcome}`), ["ENG-2 launched", "ENG-1 grouped"]);
+});
+
+async function groupDispatch(t: TestContext, owner: () => Promise<"here" | "elsewhere" | "unknown">) {
+  const directory = await mkdtemp(join(tmpdir(), "group-dispatch-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const group: IssueGroup = {
+    id: "eng-1", identifier: "ENG-1", status: "Todo", statusType: "unstarted", delegateId: null, finished: false,
+    children: [{ id: "eng-child", identifier: "ENG-2", status: "Todo", statusType: "unstarted", delegateId: null, finished: false, assigneeId: null, labels: [], blockers: [] }],
+  };
+  const linear = Object.assign(new FakeLinear({ "eng-1": ["paseo"] }), {
+    appUserId: async () => "paseo-app",
+    issueGroup: async () => structuredClone(group),
+    delegate: async (id: string, appId: string): Promise<void> => {
+      linear.writes.push(`delegate ${id}`);
+      if (id === group.id) group.delegateId = appId;
+      else group.children.find((child) => child.id === id)!.delegateId = appId;
+    },
+  });
+  linear.parents.add(group.id);
+  const store = new SessionStore(join(directory, "sessions.json"));
+  const parents = new ParentStore(directory);
+  const watchdog = new WatchdogStore(join(directory, "watchdog.json"));
+  const router = new SessionRouter({
+    linear: linear as never, store, parents, watchdog, owner, settings: { read: async () => baseSettings },
+    api: { activity: async () => {}, updateSession: async () => {} } as never,
+    starter: { admission: async () => ({ ok: true }), start: async () => { throw new Error("Group must not launch an implementation worker"); } },
+    handover: { resumeTarget: async () => null, handOff: async () => true },
+    launcher: new Launcher(linear as never),
+  });
+  const { dispatcher, launches } = setup(t, linear, baseSettings, fakePaseo(), (id, open) => router.handOffGroup(id, open));
+  t.after(() => { dispatcher.stop(); router.stop(); });
+  return { group, linear, store, parents, watchdog, router, dispatcher, launches };
+}
+
+test("a host denied group ownership preserves the shared activation and never starts a parent worker", async (t) => {
+  for (const denied of ["elsewhere", "unknown", "unreadable"] as const) await t.test(denied, async (t) => {
+    let local = false;
+    const h = await groupDispatch(t, async () => {
+      if (local) return "here";
+      if (denied === "unreadable") throw new Error("claims unavailable");
+      return denied;
+    });
+    await h.dispatcher.tick();
+    assert.equal(h.linear.labels.get("eng-1")?.has("paseo"), true);
+    assert.equal(h.launches.length, 0);
+    assert.equal(h.linear.writes.some((write) => write.startsWith("delegate ")), false);
+    assert.equal(await h.parents.get("eng-1"), null);
+    local = true;
+    await h.dispatcher.tick();
+    assert.equal(h.linear.labels.get("eng-1")?.has("paseo"), false);
+    assert.equal(h.launches.length, 0);
+    assert.deepEqual(h.linear.writes.filter((write) => write.startsWith("delegate ")), ["delegate eng-1", "delegate eng-child"]);
+    assert.equal((await h.parents.get("eng-1"))?.phase, "children");
+  });
+});
+
+test("an explicit trigger reactivates stopped or unassigned durable groups instead of consuming it without work", async (t) => {
+  for (const stopped of ["owner", "unassigned", "finished-children"] as const) await t.test(stopped, async (t) => {
+    const h = await groupDispatch(t, async () => "here");
+    if (stopped !== "unassigned") {
+      h.group.delegateId = "paseo-app";
+      await h.watchdog.hold("eng-1", null);
+    }
+    if (stopped === "finished-children") {
+      h.group.children[0].status = "Done"; h.group.children[0].statusType = "completed";
+      h.linear.parents.delete("eng-1");
+    }
+    await h.store.put({ sessionId: "old", agentId: null, issueId: "eng-1", identifier: "ENG-1",
+      createdAt: "2026-10-14T00:00:00.000Z", handled: [], review: null, offer: null, closed: true,
+      group: { delegated: true, stopped: stopped !== "unassigned" },
+    });
+    await h.router.advanceGroups();
+    assert.equal((await h.parents.get("eng-1"))?.phase, "closed");
+    await h.parents.update("eng-1", (current) => ({ ...current!, handedOut: ["eng-child"] }));
+    await h.dispatcher.tick();
+    assert.equal(h.linear.labels.get("eng-1")?.has("paseo"), false);
+    assert.equal(h.launches.length, 0);
+    assert.equal((await h.parents.get("eng-1"))?.phase, stopped === "finished-children" ? "verification" : "children");
+    assert.equal(Object.hasOwn((await h.watchdog.read()).holds, "eng-1"), false, "explicit continuation releases the durable owner Stop");
+    assert.equal((await h.store.get("old"))?.closed, true, "reactivation does not resurrect obsolete UI threads");
+    assert.deepEqual(h.linear.writes.filter((write) => write.startsWith("delegate ")),
+      stopped === "finished-children" ? [] : stopped === "owner" ? ["delegate eng-child"] : ["delegate eng-1", "delegate eng-child"]);
+  });
+});
+
+test("a denied explicit reactivation preserves both the trigger and the stopped responsibility", async (t) => {
+  const h = await groupDispatch(t, async () => "elsewhere");
+  await h.watchdog.hold("eng-1", null);
+  await h.store.put({ sessionId: "old", agentId: null, issueId: "eng-1", identifier: "ENG-1",
+    createdAt: "2026-10-14T00:00:00.000Z", handled: [], review: null, offer: null, closed: true,
+    group: { delegated: true, stopped: true },
+  });
+  await h.dispatcher.tick();
+  assert.equal(h.linear.labels.get("eng-1")?.has("paseo"), true);
+  assert.equal(Object.hasOwn((await h.watchdog.read()).holds, "eng-1"), true);
+  assert.equal((await h.parents.get("eng-1"))?.phase, "closed");
+  assert.equal((await h.store.get("old"))?.group?.stopped, true);
+  assert.equal(h.launches.length, 0);
+  assert.equal(h.linear.writes.some((write) => write.startsWith("delegate ")), false);
+});
+
+test("a failed durable Stop release preserves the activation and cannot hand out children", async (t) => {
+  const h = await groupDispatch(t, async () => "here");
+  h.group.delegateId = "paseo-app";
+  await h.watchdog.hold("eng-1", null);
+  await h.store.put({ sessionId: "old", agentId: null, issueId: "eng-1", identifier: "ENG-1",
+    createdAt: "2026-10-14T00:00:00.000Z", handled: [], review: null, offer: null, closed: true,
+    group: { delegated: true, stopped: true },
+  });
+  t.mock.method(h.watchdog, "continued", async () => { throw new Error("watchdog storage unavailable"); });
+  await h.dispatcher.tick();
+  assert.equal(h.linear.labels.get("eng-1")?.has("paseo"), true);
+  assert.equal(Object.hasOwn((await h.watchdog.read()).holds, "eng-1"), true);
+  assert.equal((await h.parents.get("eng-1"))?.phase, "closed");
+  assert.equal(h.linear.writes.some((write) => write.startsWith("delegate ")), false);
+  assert.equal(h.launches.length, 0);
 });
 
 test("a ticket without a saved project mapping is marked failed with the reason instead of launching", async (t) => {
