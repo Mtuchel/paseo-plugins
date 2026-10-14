@@ -299,9 +299,10 @@ export class BrowserDecisionInbox {
   view(): Promise<DecisionView> { return this.curation.view(); }
 
   private async collectView(): Promise<DecisionView> {
-    // Each curation pass collects Linear again; peer/local reads still share the short cache.
+    // The background scan owns full collection; interactive local/peer reads stay bounded.
     if (!this.ownerFlight) this.ownerCache = null;
     const [configuredPeers, canonicalPeer] = await Promise.all([this.deps.peers(), this.deps.canonicalPeer()]);
+    if (canonicalPeer === null) await this.ownerSnapshot();
     const localPromise = this.local(canonicalPeer === null);
     const sources = await Promise.all([...new Set(configuredPeers)].map(async (configured) => {
       try { const peer = peerOrigin(configured); return { configured, peer, snapshot: await this.readPeer(peer), error: null }; }
