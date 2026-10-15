@@ -3588,6 +3588,154 @@ test("the backstop's own low-budget pause stops it before its first GitHub reque
   assert.ok(h.github.listings.length > 0, "once the window reset, discovery reads again");
 });
 
+// --- TUC-2502: Linear's refusal backs off Linear's steps only; GitHub's still stops the run ------
+
+const OTHER_PR = "https://github.com/o/other/pull/5";
+const LINEAR_RESERVE = () => new RateLimitedError("app", Date.now() + 60_000, "reserve");
+const BACKGROUND_PAUSED = "Background Linear work is paused";
+const WAITS_FOR_GITHUB = "[linear-tickets] queue backstop waits until ";
+
+// Beside the watched ticket, two tickets without a pull request link whose discovery reads their
+// attachments in Linear (no git folder names their repo), which Linear's background reserve
+// refuses; and a second repo the backstop remembers. Every logged line goes to `logs`.
+async function linearRefused(t: TestContext, agent: Parameters<typeof harness>[1] = { dispatch: true }) {
+  const logs: string[] = [];
+  t.mock.method(console, "error", (...args: unknown[]) => { logs.push(args.join(" ")); });
+  t.mock.method(console, "log", (...args: unknown[]) => { logs.push(args.join(" ")); });
+  const h = harness(t, agent);
+  for (const identifier of ["TUC-2", "TUC-3"]) h.records.push({ ...h.records[0], issueId: identifier, identifier, branch: `mtuchel/${identifier.toLowerCase()}-x`, links: {} });
+  h.linear.issueFailure = LINEAR_RESERVE();
+  await h.state({ [OTHER_PR]: { reviewedAt: null, decision: null, merged: false } });
+  return { h, logs };
+}
+
+test("Linear refusing discovery stops discovery only: every repo still gets its Greptile request and its enqueue pass, and nothing waits for GitHub (TUC-2502 AC-1)", async (t) => {
+  const { h, logs } = await linearRefused(t);
+  await h.backstop();
+  assert.deepEqual(h.linear.issueReads, ["TUC-2"], "discovery backs off at the first refusal");
+  assert.ok(logs.some((line) => line.startsWith(`[linear-tickets] queue backstop discovery for TUC-2 stopped: ${BACKGROUND_PAUSED}`)));
+  assert.deepEqual(h.scripts.runs, [`${GREPTILE_REQUEST} --trigger`, READY_RUN, `${GREPTILE_REQUEST} --trigger`, READY_RUN]);
+  assert.deepEqual(h.scripts.outage.syncs.map((run) => run.map((found) => [found.repo, found.result])), [[[PLATFORM, "answer"], ["o/other", "answer"]]]);
+  assert.ok(!logs.some((line) => line.startsWith(WAITS_FOR_GITHUB)), "Linear's refusal arms no wait for GitHub's reset");
+});
+
+test("with Linear refusing discovery, GitHub refusing the Greptile request still stops the run and waits for GitHub (TUC-2502 AC-1)", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { h, logs } = await linearRefused(t);
+  h.scripts.greptile.answers = { [PLATFORM]: { code: 1, answer: { error: "gh: API rate limit exceeded for user ID 333775540. (HTTP 403)" } } };
+  await h.backstop();
+  assert.deepEqual(h.scripts.runs, [`${GREPTILE_REQUEST} --trigger`], "no enqueue pass, and the next repo's request does not run");
+  assert.deepEqual(h.scripts.outage.syncs.map((run) => run.map((found) => [found.repo, found.result])), [[[PLATFORM, "failed"], ["o/other", "failed"]]]);
+  assert.ok(logs.some((line) => line.startsWith(WAITS_FOR_GITHUB)));
+});
+
+test("a Linear refusal escaping one repo's backstop does not stop the next repo's request and enqueue pass (TUC-2502 AC-1)", async (t) => {
+  const logs: string[] = [];
+  t.mock.method(console, "error", (...args: unknown[]) => { logs.push(args.join(" ")); });
+  t.mock.method(console, "log", () => {});
+  const h = harness(t, { dispatch: true });
+  // A message about a pull request no record watches, for a ticket without a record: it goes to
+  // the ticket as a mention, which Linear refuses.
+  const pending = { key: "drop:#900:1600", reason: "", facts: "Fix the drop.", fix: "Fix the drop.", orphan: { tickets: ["TUC-9"] } };
+  await h.state({ [prUrl(1600)]: { reviewedAt: null, decision: null, merged: false, pending }, [OTHER_PR]: { reviewedAt: null, decision: null, merged: false } });
+  h.linear.byIssue["TUC-9"] = { id: "i9", identifier: "TUC-9", status: "In Progress", statusType: "started" };
+  h.linear.arrive = async () => { throw LINEAR_RESERVE(); };
+  await h.backstop();
+  assert.ok(logs.some((line) => line.startsWith(`[linear-tickets] queue backstop for ${PLATFORM} stopped: ${BACKGROUND_PAUSED}`)));
+  assert.deepEqual(h.scripts.runs, [`${GREPTILE_REQUEST} --trigger`, `${READY_RUN} --exclude 1600`, `${GREPTILE_REQUEST} --trigger`, READY_RUN], "the message's pull request stays out of the queue until it went out");
+  assert.deepEqual(h.scripts.outage.syncs.map((run) => run.map((found) => [found.repo, found.result])), [[[PLATFORM, "answer"], ["o/other", "answer"]]]);
+  assert.ok(!logs.some((line) => line.startsWith(WAITS_FOR_GITHUB)));
+  const saved = JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"));
+  assert.equal(saved[prUrl(1600)].pending.sending, false, "the refused message is sent on a later run");
+});
+
+test("with Linear refusing discovery, an unreadable before-merge gate still keeps its ticket's stack out of the queue while an ungated stack is enqueued (TUC-2502 AC-1)", async (t) => {
+  const { h } = await linearRefused(t);
+  h.gate.unreadable = true;
+  h.github.view = READY;
+  const ungated = { action: `ready:1501@${HEAD}`, top: 1501, branch: "mtuchel/no-ticket", prs: [1501], expect: `1501@${HEAD}`, tickets: [], result: "candidate" };
+  h.github.open = [listed(prUrl(1501), { ...READY, headBranch: "mtuchel/no-ticket" }, "Add [plugin] Retry the upload")];
+  h.scripts.ready = { stacks: [STACK, ungated], drops: [] };
+  await h.backstop();
+  assert.deepEqual(h.scripts.runs.filter((run) => run.startsWith(BACKSTOP_ENQUEUE)), [`${BACKSTOP_ENQUEUE} mtuchel/no-ticket --expect 1501@${HEAD} --action ${ungated.action} --comment-file /comments/${ungated.action}.md`]);
+});
+
+test("an enqueue notice Linear refuses waits for a later run while the enqueue pass goes on, and goes out once (TUC-2502 AC-2)", async (t) => {
+  t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
+  const h = harness(t);
+  h.github.view = READY;
+  // An earlier enqueue whose ticket comment is still due, and a stack ready now.
+  const earlier = {
+    id: `ready:1500@${HEAD}`, repo: PLATFORM, branch: "mtuchel/tuc-1-base", expect: `1500@${HEAD}`, prs: [1500], top: 1500, tickets: ["TUC-1"], why: "ready", at: new Date(h.scripts.now).toISOString(),
+    activityBoundary: null, steps: { enqueue: "enqueued", prComment: "done", linearComment: "due", note: "due" },
+  };
+  await h.state({ [prUrl(1500)]: { reviewedAt: null, decision: null, merged: false, actions: [earlier] } });
+  h.scripts.ready = { stacks: [STACK], drops: [] };
+  h.linear.arrive = async () => { throw LINEAR_RESERVE(); };
+  const refused = await h.backstop();
+  assert.deepEqual(h.scripts.runs, [READY_RUN, enqueueRun(STACK.action)], "the listing and the new stack's enqueue still ran");
+  assert.equal(count(refused, "prompt"), 0, "the agent's note waits for the ticket comment");
+  const saved = JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"));
+  assert.deepEqual([saved[prUrl(1500)].actions[0].steps.linearComment, saved[PR].actions[0].steps.linearComment], ["started", "started"]);
+  assert.deepEqual(h.linear.comments.i1 ?? [], [], "no ticket comment went out");
+
+  h.linear.arrive = async () => {};
+  await h.backstop();
+  await h.backstop();
+  const comments = h.linear.comments.i1 ?? [];
+  assert.deepEqual([1500, 419].map((pr) => comments.filter((body) => body.includes(`/pull/${pr})`)).length), [1, 1], "each notice goes out once");
+  assert.equal(count(h.scripts.runs, BACKSTOP_ENQUEUE), 0, "nothing is enqueued again");
+});
+
+test("a stranded-stack notice Linear refuses waits for a later run; the other moves and the listing go on, and no stack is moved twice (TUC-2502 AC-2)", async (t) => {
+  t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
+  const h = stranded(t);
+  h.scripts.retarget.list = [501, 502].map((pr) => ({ ...CANDIDATE, pr, expect: `${pr}@${sha("1")}`, range: [{ ...RANGE[0], pr }] }));
+  h.scripts.retarget.prepare = [501, 502].map((pr) => ({ code: 0, answer: { result: "prepared", ...PREPARED_MOVE, pr, range: [{ ...RANGE[0], pr }], new: { base: "main", heads: `${pr}@${sha("3")}` }, problems: [] } }));
+  h.linear.arrive = async () => { throw LINEAR_RESERVE(); };
+  const moves = (calls: string[]) => retargetCalls(calls).filter((call) => !call.startsWith("idle"));
+  assert.deepEqual(moves(await h.backstop()), [`retarget --prepare 501 --expect 501@${sha("1")}`, "retarget --apply 501", `retarget --prepare 502 --expect 502@${sha("1")}`, "retarget --apply 502"], "the first move's refused notice does not stop the second move");
+  assert.deepEqual(moves(await h.backstop()), [], "saved moves are not applied again");
+  assert.ok(h.scripts.runs.includes(`${RETARGET_ORPHAN} --list`), "the listing still runs after the saved moves' refused notices");
+  const saved = JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"));
+  assert.deepEqual([501, 502].map((pr) => saved[prUrl(pr)].retarget.linearComment), ["sending", "sending"]);
+
+  h.linear.arrive = async () => {};
+  assert.deepEqual(moves([...await h.backstop(), ...await h.backstop()]), [], "nothing is moved twice");
+  const comments = h.linear.comments.i1 ?? [];
+  assert.deepEqual([501, 502].map((pr) => comments.filter((body) => body.includes(`retarget:${pr}@`)).length), [1, 1], "each notice goes out once");
+});
+
+test("GitHub's refusal at the deferred notices still stops the run and waits for GitHub (TUC-2502 AC-2)", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const logs: string[] = [];
+  t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", (...args: unknown[]) => { logs.push(args.join(" ")); });
+  const githubRefuses = async () => { throw new GitHubRateLimitedError("GitHub is throttling gh"); };
+
+  const enqueue = harness(t, { dispatch: true });
+  enqueue.github.view = READY;
+  enqueue.scripts.outage.follow = new Map([["o/other", [5]]]);
+  await enqueue.state({ [prUrl(1500)]: { reviewedAt: null, decision: null, merged: false, actions: [{
+    id: `ready:1500@${HEAD}`, repo: PLATFORM, branch: "mtuchel/tuc-1-base", expect: `1500@${HEAD}`, prs: [1500], top: 1500, tickets: ["TUC-1"], why: "ready", at: new Date(enqueue.scripts.now).toISOString(),
+    activityBoundary: null, steps: { enqueue: "enqueued", prComment: "done", linearComment: "due", note: "due" },
+  }] } });
+  enqueue.linear.arrive = githubRefuses;
+  await enqueue.backstop();
+  assert.deepEqual(enqueue.scripts.runs, [`${GREPTILE_REQUEST} --trigger`], "the repo's enqueue pass and the next repo do not run");
+  assert.deepEqual(enqueue.scripts.outage.syncs[0].map((found) => [found.repo, found.result]), [[PLATFORM, "answer"], ["o/other", "failed"]]);
+  assert.equal(logs.filter((line) => line.startsWith(WAITS_FOR_GITHUB)).length, 1);
+
+  const moved = stranded(t);
+  moved.scripts.retarget.list = [501, 502].map((pr) => ({ ...CANDIDATE, pr, expect: `${pr}@${sha("1")}`, range: [{ ...RANGE[0], pr }] }));
+  moved.scripts.retarget.prepare = [501, 502].map((pr) => ({ code: 0, answer: { result: "prepared", ...PREPARED_MOVE, pr, range: [{ ...RANGE[0], pr }], new: { base: "main", heads: `${pr}@${sha("3")}` }, problems: [] } }));
+  moved.linear.arrive = githubRefuses;
+  assert.deepEqual(retargetCalls(await moved.backstop()).filter((call) => !call.startsWith("idle")), [`retarget --prepare 501 --expect 501@${sha("1")}`, "retarget --apply 501"], "the second move does not run");
+  assert.equal(logs.filter((line) => line.startsWith(WAITS_FOR_GITHUB)).length, 2);
+});
+
 test("Greptile evidence expires even on non-writers and when the script is absent (AC-4)", async (t) => {
   t.mock.method(console, "log", () => {});
   for (const dispatch of [false, true]) {

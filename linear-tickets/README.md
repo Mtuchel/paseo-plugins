@@ -1869,8 +1869,17 @@ the router's `try again after`, the refused response's headers, else — scripts
 probe through the same routing (a conditional `GET user`, free as a `304`, and GraphQL's
 `rateLimit`, 1 point) that takes the latest reset of a budget below the reserve, else 2 minutes.
 It logs `queue backstop waits until 17:23 UTC for GitHub's core budget reset (<the refusal>)` and
-`queue backstop resumes after GitHub's reset at 17:23 UTC`. Linear's rate limit keeps stopping a
-run until the next tick.
+`queue backstop resumes after GitHub's reset at 17:23 UTC`.
+
+**When Linear refuses** (TUC-2502). Linear's rate limit, its background reserve included, never
+stops the GitHub work: a refused discovery read ends discovery for that run (`queue backstop
+discovery for TUC-… stopped: …`), and every repo still gets its Greptile request and its backstop
+steps. A refused ticket comment of an enqueue stays `started` (its note to the agent waits for it),
+and a refused ticket notice of a stranded-stack move stays `sending`; both go out once on a later
+run, found by their marks, and the run goes on with the next action, move and the `enqueue-ready.mjs`
+listing. Any other refusal inside a repo's steps (a message to a ticket) ends that repo's remaining
+steps only (`queue backstop for <repo> stopped: …`). Nothing waits for a reset: the next tick
+tries Linear again. A before-merge gate that cannot be read still keeps its ticket out of the queue.
 
 Every enqueue is an action (`drop:<drop key>:<top>`, since one queue draft can test several
 stacks, or `ready:<top>@<heads>`) saved in `pr-watch.json` before each step: the number and last
