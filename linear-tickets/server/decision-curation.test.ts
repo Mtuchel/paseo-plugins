@@ -52,6 +52,20 @@ test("genuine owner tasks precede uncertain extraction and delegated work; defer
   assert.deepEqual(curateDecisions(input, NOW + 1).filter(task => task.priority === "owner").map(task => task.id), [ownerSourceId(deferred), ownerSourceId(ask)]);
 });
 
+test("attention counts use evidenced ownership, not extraction success or a question-shaped summary", () => {
+  const asks = (["owner", "info", "advisor", "dependency"] as const).flatMap(attention => [false, true].map(extracted => ({
+    ...ask, sourceId: `${attention}-${extracted}`, revision: `${attention}-${extracted}`,
+    attention, extracted, kind: "info" as const, summary: "Old progress question?",
+  })));
+  const tasks = curateDecisions(view(asks), NOW);
+  assert.deepEqual(tasks.filter(task => task.priority === "owner").map(task => task.id).sort(),
+    asks.filter(source => source.attention === "owner").map(ownerSourceId).sort());
+  assert.deepEqual(tasks.filter(task => task.priority === "review").map(task => task.id).sort(),
+    asks.filter(source => source.attention === "info").map(ownerSourceId).sort());
+  assert.equal(tasks.filter(task => task.priority === "waiting").length, 4);
+  assert.equal(tasks.length, asks.length, "nonurgent historical review remains discoverable");
+});
+
 test("recovery flow is evidence, not a synthetic owner ask or a claim of advancement", () => {
   const input = view();
   const queued = { identifier: "TUC-1", situation: "queued", since: new Date(NOW).toISOString(), reason: "Retired generation awaits replacement",

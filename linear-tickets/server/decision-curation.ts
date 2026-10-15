@@ -21,9 +21,12 @@ export function curateDecisions(view: DecisionView, now: number): CuratedDecisio
         && ["agent", "continued", "queued", "comment", "closed", "applied"].includes(receipt.delivery))) continue;
       const deferred = Boolean(ask.deferredUntil && Date.parse(ask.deferredUntil) > now);
       const waiting = deferred || ask.disposition === "research" || ask.disposition === "delegated";
-      const unresolved = ask.deliveryUnknown || (!ask.extracted && ask.kind !== "manual");
+      // Explicit server attention, not extraction success/kind/manual labels, owns urgency.
+      // Unknown history remains discoverable as nonurgent review even after extraction.
+      const priority = waiting ? "waiting" : ask.deliveryUnknown ? "review" : ask.attention === "owner" ? "owner"
+        : ask.attention === "advisor" || ask.attention === "dependency" ? "waiting" : "review";
       add({ host: host.host, target: "owner", id: ownerSourceId(ask), revision: ask.revision,
-        priority: waiting ? "waiting" : unresolved ? "review" : ask.attention !== "owner" ? "waiting" : ask.kind !== "info" ? "owner" : "review",
+        priority,
         reason: ask.attentionReason,
         blockedWork: ask.blockerIdentifier ? `${ask.ticketIdentifier} is blocked by ${ask.blockerIdentifier}.` : `${ask.ticketIdentifier} — no specific downstream blocker evidenced.`,
         flow: host.flow?.tickets?.find(ticket => ticket.identifier === ask.ticketIdentifier) });

@@ -2,7 +2,7 @@ import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
 import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, focusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setFocusRpc, setPresenceRpc, setSettingsRpc, skipPlanRpc, statusRpc, answerAskRpc, ownerAsksRpc, triageAskRpc, type CapacityState } from "./shared/contracts";
-import { deputyStatusRpc, parentsStatusRpc } from "./shared/contracts";
+import { deputyStatusRpc, parentsStatusRpc, reconcileDeputyRpc } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -683,6 +683,10 @@ export default function contribute(server: PluginServerContext) {
   };
   server.handle(getSettingsRpc, async () => settingsView(await settings.read()));
   server.handle(deputyStatusRpc, (input) => deputy.status(input));
+  server.handle(reconcileDeputyRpc, async (_input, { paseo }) => {
+    deputy.attach(paseo);
+    return deputy.reconcile();
+  });
   server.handle(setSettingsRpc, async (input, { paseo }) => {
     const saved = await settings.patch(input);
     attach(paseo);

@@ -23,6 +23,7 @@ const CLIENT = String.raw`
   let selected = null, selectedSnapshot = null, stale = false, busy = false, refreshing = false;
   let refreshError = '', lastUpdated = Date.now();
   const drafts = new Map(), results = new Map(), completed = new Set(), uncertain = new Set();
+  let reviewLimit = 50;
   const queue = document.getElementById('queue-list');
   const pane = document.getElementById('detail-content');
   const shell = document.querySelector('.shell');
@@ -62,19 +63,23 @@ const CLIENT = String.raw`
     return view.hosts.flatMap(host => host.history.map(receipt => ({host:host.host, backendInstanceId:host.backendInstanceId, target:'receipt', id:receipt.id, revision:receipt.revision, data:receipt})))
       .sort((a, b) => Date.parse(b.data.at) - Date.parse(a.data.at));
   }
-  function other(row) {
-    if (row.task) return row.task.priority === 'waiting';
+  function priority(row) {
     const data = row.data;
     const deferred = data.deferredUntil && Date.parse(data.deferredUntil) > Date.now();
-    return row.target === 'owner' ? data.attention !== 'owner' || (data.disposition && data.disposition !== 'deferred') || deferred : deferred;
+    if (deferred || row.task?.priority === 'waiting' || (row.target === 'owner' && ['research','delegated'].includes(data.disposition))) return 'waiting';
+    if (data.deliveryUnknown) return 'review';
+    if (row.target === 'live') return row.task?.priority || 'owner';
+    if (data.attention === 'advisor' || data.attention === 'dependency') return 'waiting';
+    return data.attention === 'owner' ? 'owner' : 'review';
   }
+  const other = row => priority(row) === 'waiting';
   function state(row) {
     const data = row.data;
     if (row.target === 'receipt') return data.action + ' · delivery: ' + data.delivery;
     if (data.deliveryUnknown) return 'Delivery unknown · inspect the original source';
     if (data.deferredUntil && Date.parse(data.deferredUntil) > Date.now()) return 'Deferred until ' + date(data.deferredUntil);
     if (row.target === 'live') return data.kind === 'permission' ? 'Permission · choose an original action' : 'Live question';
-    if (!data.extracted) return 'Unresolved extraction · original source retained';
+    if (!data.extracted) return data.attention === 'owner' ? 'Current owner wait · extraction unresolved' : 'Nonurgent source review · extraction unresolved';
     const labels = {owner:'Needs owner', advisor:'Advisor wait', dependency:'Dependency wait', info:'Information'};
     return [labels[data.attention], data.disposition, data.blockerIdentifier ? 'Blocked by ' + data.blockerIdentifier : ''].filter(Boolean).join(' · ');
   }
@@ -187,19 +192,23 @@ const CLIENT = String.raw`
     const matches = row => terms.every(term => JSON.stringify([row.host, row.data]).toLocaleLowerCase().includes(term));
     const all = rows();
     const groups = [
-      ['Needs your decision', all.filter(row => !other(row) && (row.task ? row.task.priority === 'owner' : row.target === 'live' || row.data.extracted))],
-      ['Needs source review', all.filter(row => !other(row) && (row.task ? row.task.priority === 'review' : row.target === 'owner' && !row.data.extracted))],
+      ['Needs your decision', all.filter(row => priority(row) === 'owner')],
+      ['Needs source review', all.filter(row => priority(row) === 'review')],
       ['Research, delegated & other waits', all.filter(other)],
       ['Recent receipts', receipts()]
     ];
     let found = 0;
     queue.innerHTML = groups.map(([title, items]) => {
       const filtered = items.filter(matches);
+      // Discovery can return thousands of historical sources. Keep all searchable/countable,
+      // without mounting the entire nonurgent backlog into the initial browser layout.
+      const visible = title === 'Needs source review' ? filtered.slice(0, reviewLimit) : filtered;
       found += filtered.length;
       if (terms.length && !filtered.length) return '';
       const empty = title === 'Recent receipts' ? 'No receipts in the returned history.' : 'No items in the received snapshot. Check host coverage above.';
       return '<section class="queue-section"><h2>' + title + '<span class="count">' + filtered.length + (terms.length ? ' of ' + items.length : '') + '</span></h2>' +
-        (filtered.length ? '<ul class="list">' + filtered.map(queueRow).join('') + '</ul>' : '<p class="empty">' + empty + '</p>') + '</section>';
+        (visible.length ? '<ul class="list">' + visible.map(queueRow).join('') + '</ul>' : '<p class="empty">' + empty + '</p>') +
+        (visible.length < filtered.length ? '<button type="button" data-more-review="true">Show next ' + Math.min(50, filtered.length - visible.length) + ' source reviews · ' + visible.length + ' of ' + filtered.length + ' shown</button>' : '') + '</section>';
     }).join('') + (terms.length && !found ? '<section class="queue-section"><p class="empty">No matching decisions or receipts. Try the ticket, host, title, or original source.</p></section>' : '');
     if (focused) [...queue.querySelectorAll('[data-key]')].find(element => element.dataset.key === focused)?.focus({preventScroll:true});
     coverage();
@@ -407,7 +416,7 @@ const CLIENT = String.raw`
     }
   }
   function baseAction(row, operation) {
-    return {host:row.host, ...(row.backendInstanceId ? {backendInstanceId:row.backendInstanceId} : {}), target:row.target, operation, revision:row.revision, ...(row.target === 'owner' ? {issueId:row.data.issueId} : {agentId:row.data.agentId, requestId:row.data.requestId})};
+    return {host:row.host, ...(row.backendInstanceId ? {backendInstanceId:row.backendInstanceId} : {}), target:row.target, operation, revision:row.revision, ...(row.target === 'owner' ? {issueId:row.data.issueId, ...(row.data.sourceId ? {sourceId:row.data.sourceId} : {})} : {agentId:row.data.agentId, requestId:row.data.requestId})};
   }
   function answers(row, saved) {
     const entries = row.data.questions.map((question, index) => {
@@ -475,6 +484,12 @@ const CLIENT = String.raw`
     return send(action, row);
   }
   queue.addEventListener('click', event => {
+    if (event.target.closest('[data-more-review]')) {
+      reviewLimit += 50;
+      renderQueue();
+      queue.querySelector('[data-more-review]')?.focus({preventScroll:true});
+      return;
+    }
     const button = event.target.closest('[data-key]');
     if (!button || busy) return;
     const row = [...rows(), ...receipts()].find(item => key(item) === button.dataset.key);

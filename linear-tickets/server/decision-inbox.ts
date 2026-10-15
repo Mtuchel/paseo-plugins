@@ -44,14 +44,14 @@ class InboxError extends Error {
 const actionSchema = z.object({
   host: z.string().min(1), target: z.enum(["owner", "live"]), operation: z.enum(["answer", "triage"]),
   backendInstanceId: z.string().uuid().optional(),
-  issueId: z.string().min(1).optional(), agentId: z.string().min(1).optional(), requestId: z.string().min(1).optional(),
+  issueId: z.string().min(1).optional(), sourceId: z.string().min(1).optional(), agentId: z.string().min(1).optional(), requestId: z.string().min(1).optional(),
   revision: z.string().min(1), answers: z.record(z.string(), z.string().max(4000)).optional(),
   note: z.string().max(4000).optional(), done: z.boolean().optional(),
   action: z.enum(["research", "delegate", "defer", "reopen"]).optional(), until: z.string().datetime({ offset: true }).optional(),
   actionId: z.string().min(1).optional(), behavior: z.enum(["allow", "deny"]).optional(),
 }).strict().superRefine((value, ctx) => {
   const invalid = (message: string) => ctx.addIssue({ code: "custom", message });
-  if (value.target === "owner" ? !value.issueId || value.agentId !== undefined || value.requestId !== undefined : !value.agentId || !value.requestId || value.issueId !== undefined) invalid("Identify exactly one owner ask or live request.");
+  if (value.target === "owner" ? !value.issueId || value.agentId !== undefined || value.requestId !== undefined : !value.agentId || !value.requestId || value.issueId !== undefined || value.sourceId !== undefined) invalid("Identify exactly one owner ask or live request.");
   if (value.operation === "triage") {
     if (!value.action || value.answers !== undefined || value.actionId !== undefined || value.behavior !== undefined || value.done !== undefined) invalid("Triage requires one action and no answer or permission fields.");
     if (value.action === "defer" ? !value.until : value.until !== undefined) invalid("Only Defer requires an expiry.");
@@ -410,8 +410,8 @@ export class BrowserDecisionInbox {
         if (await this.deps.canonicalPeer() !== null) throw new InboxError(409, "Owner asks can only be answered on the configured canonical host.");
         try {
           const result = input.operation === "answer"
-            ? await this.deps.ownerAsks.answer({ issueId: input.issueId!, revision: input.revision, answers: input.answers!, ...(input.note !== undefined ? { note: input.note } : {}), ...(input.done !== undefined ? { done: input.done } : {}) }, this.deps.paseo())
-            : await this.deps.ownerAsks.triage({ issueId: input.issueId!, revision: input.revision, action: input.action!, ...(input.note !== undefined ? { note: input.note } : {}), ...(input.until !== undefined ? { until: input.until } : {}) }, this.deps.paseo());
+            ? await this.deps.ownerAsks.answer({ issueId: input.issueId!, ...(input.sourceId !== undefined ? { sourceId: input.sourceId } : {}), revision: input.revision, answers: input.answers!, ...(input.note !== undefined ? { note: input.note } : {}), ...(input.done !== undefined ? { done: input.done } : {}) }, this.deps.paseo())
+            : await this.deps.ownerAsks.triage({ issueId: input.issueId!, ...(input.sourceId !== undefined ? { sourceId: input.sourceId } : {}), revision: input.revision, action: input.action!, ...(input.note !== undefined ? { note: input.note } : {}), ...(input.until !== undefined ? { until: input.until } : {}) }, this.deps.paseo());
           return json(200, result);
         } finally { this.ownerGeneration++; this.peerFlights.clear(); this.ownerCache = null; this.ownerFlight = null; this.transportFlight = null; }
       }

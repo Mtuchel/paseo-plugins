@@ -151,6 +151,7 @@ export class Deputy {
   private readonly inflight = new Set<Promise<unknown>>();
   private readonly evaluating = new Set<string>();
   private readonly revoked = new Set<string>();
+  private discoveryFlight: Promise<{ observed: number; skipped: number; failed: number }> | null = null;
 
   constructor(private readonly deps: Deps) {
     this.directory = deps.directory ?? DEPUTY_DIRECTORY();
@@ -240,7 +241,7 @@ export class Deputy {
     this.paseo = paseo;
     if (this.recovered || this.stopped) return;
     this.recovered = true;
-    this.background(this.recover());
+    this.background(this.reconcile());
   }
 
   stop(): void {
@@ -277,6 +278,58 @@ export class Deputy {
       return true;
     });
     if (created) this.background(this.lane(key, () => this.slot(() => this.evaluate(key))));
+  }
+
+  // Host-local, level-triggered discovery. Never interpret historical Linear text as a
+  // permission, reuse replay verdicts, or revive a terminal candidate. `observe` deduplicates
+  // exact identities; recovery handles only policy/settings-authorized reevaluation.
+  async reconcile(): Promise<{ observed: number; skipped: number; failed: number }> {
+    if (this.stopped) return { observed: 0, skipped: 0, failed: 0 };
+    await this.recover();
+    return this.discoverPending();
+  }
+
+  private discoverPending(): Promise<{ observed: number; skipped: number; failed: number }> {
+    if (this.discoveryFlight) return this.discoveryFlight;
+    const run = async () => {
+      const result = { observed: 0, skipped: 0, failed: 0 };
+      const paseo = this.paseo;
+      if (!paseo || this.stopped || (await this.deps.settings.read()).deputy.mode === "off") return result;
+      let cursor: string | undefined;
+      const cursors = new Set<string>();
+      do {
+        const page = await paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 100, ...(cursor ? { cursor } : {}) } });
+        for (const { agent: listed } of page.entries) {
+          if (!listed.pendingPermissions?.some(request => request.kind === "question")) continue;
+          try {
+            const refreshed = await paseo.agents.ref(listed.id).refresh();
+            if (!refreshed) { result.skipped++; continue; }
+            const agent = refreshed.agent;
+            const issueId = agent.labels?.["linear.issueId"];
+            const identifier = agent.labels?.["linear.identifier"];
+            if (agent.archivedAt || agent.status === "closed" || !issueId || !identifier || !agent.cwd) { result.skipped++; continue; }
+            for (const request of agent.pendingPermissions ?? []) {
+              if (request.kind !== "question") { result.skipped++; continue; }
+              await this.observe({ id: agent.id, cwd: agent.cwd, title: agent.title }, request, { issueId, identifier });
+              result.observed++;
+            }
+          } catch (error) {
+            result.failed++;
+            console.error(`[linear-tickets] deputy: discovering pending requests on ${listed.id} failed: ${message(error)}`);
+          }
+        }
+        if (!page.pageInfo.hasMore) break;
+        const next = page.pageInfo.nextCursor;
+        if (!next || cursors.has(next)) throw new Error("The daemon returned incomplete pending-agent pagination; undiscovered requests remain owner-visible.");
+        cursors.add(next);
+        cursor = next;
+      } while (!this.stopped);
+      return result;
+    };
+    const flight = run();
+    this.discoveryFlight = flight;
+    void flight.finally(() => { if (this.discoveryFlight === flight) this.discoveryFlight = null; }).catch(() => {});
+    return flight;
   }
 
   private async refuse(candidate: Candidate, version: string, reason: string, category?: string): Promise<void> {
@@ -834,6 +887,9 @@ export class Deputy {
   // Called only after the settings RPC has durably recorded any activation.
   // The keys are precisely the unsent work revoked by that settings write.
   async recheckPolicy(canceled: readonly string[], standingActivation = false): Promise<void> {
-    if (!this.stopped) await this.recover(canceled.length ? new Set(canceled) : undefined, standingActivation);
+    if (!this.stopped) {
+      await this.recover(canceled.length ? new Set(canceled) : undefined, standingActivation);
+      await this.discoverPending();
+    }
   }
 }

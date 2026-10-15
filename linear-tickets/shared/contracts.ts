@@ -333,6 +333,18 @@ export const deputyStatusRpc = defineRpc({
   }),
 });
 
+// Host-owner requested reconciliation, not an answer API. Only fresh pending daemon
+// questions enter the existing deputy pipeline; counts are observations, never approvals.
+export const reconcileDeputyRpc = defineRpc({
+  name: "linear.reconcile-deputy",
+  input: z.object({}),
+  output: z.object({
+    observed: z.number().int().nonnegative(),
+    skipped: z.number().int().nonnegative(),
+    failed: z.number().int().nonnegative(),
+  }),
+});
+
 
 // What the auto-dispatcher did most recently, for the ticket surface's status line.
 export const dispatchStatusSchema = z.object({
@@ -656,10 +668,9 @@ export const pullRequestsSnapshotSchema = z.object({
   landedRecently: z.array(landedCommitSchema),
 });
 export type PullRequestsSnapshot = z.infer<typeof pullRequestsSnapshotSchema>;
-// The owner's asks in Linear's "Needs input" state (README, "Owner asks"), read for the Paseo
-// Agents menu bar app as multiple-choice cards. One RPC answers from cache at once; the model
-// extraction of each ask runs in the background (server/owner-asks.ts), so an ask arrives with
-// `extracted: false` (kind "info", summary = title) until it is done.
+// All-status decision source discovery. `owner` is evidenced current human attention; explicit
+// `info` may be unresolved historical review even before extraction. Stable source identity
+// survives RPC validation; revisions fence source, timeline and extraction changes.
 export const askOptionSchema = z.object({ label: z.string().min(1), description: z.string().default("") });
 export const askQuestionSchema = z.object({
   // Stable within one ask ("q1", "q2", …); keys the menu bar's answers by.
@@ -671,6 +682,7 @@ export const askQuestionSchema = z.object({
 });
 export const ownerAskSchema = z.object({
   issueId: z.string().min(1),
+  sourceId: z.string().min(1).optional(),
   revision: z.string().min(1),
   attention: z.enum(["owner", "advisor", "dependency", "info"]),
   attentionReason: z.string(),
@@ -724,6 +736,7 @@ export const answerAskRpc = defineRpc({
   name: "linear.answer-ask",
   input: z.object({
     issueId: z.string().min(1),
+    sourceId: z.string().min(1).optional(),
     revision: z.string().min(1),
     // Question key → chosen option label(s) (multi-select joined with ", ") or free text.
     answers: z.record(z.string(), z.string()),
@@ -737,6 +750,7 @@ export const triageAskRpc = defineRpc({
   name: "linear.triage-ask",
   input: z.object({
     issueId: z.string().min(1),
+    sourceId: z.string().min(1).optional(),
     revision: z.string().min(1),
     action: z.enum(["research", "delegate", "defer", "reopen"]),
     note: z.string().max(4000).default(""),

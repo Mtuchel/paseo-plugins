@@ -85,9 +85,10 @@ const sources: Source[] = [
   { id: "principles:decision-queue.md:Q-3", kind: "principles", title: "queue", revision: "bbb", text: "Proposal: switch every module to vitest for watch mode.", decisive: false },
   { id: "memory:m1", kind: "memory", title: "Remembered", revision: "m1", text: "The owner once said vitest is nicer to use day to day.", decisive: false },
 ];
+const TECHNICAL_OUTCOME = { scope: "technical", effects: "Technical implementation only; no consequential business/user workflow or permission change." };
 function answer(body: Record<string, unknown>): string {
   const selections = body.selections && typeof body.selections === "object" ? Object.entries(body.selections) : [];
-  const actions = Object.fromEntries(selections.map(([part, option]) => [part, { option, risk: "low", effects: `Use ${option} for the local test runner`, reason: "Authorized by the cited approved plan", authority: "specific" }]));
+  const actions = Object.fromEntries(selections.map(([part, option]) => [part, { option, risk: "low", effects: `Use ${option} for the local test runner`, outcome: TECHNICAL_OUTCOME, reason: "Authorized by the cited approved plan", authority: "specific" }]));
   return JSON.stringify({ risk: "low", riskReason: "", decision: "answer", reason: "", actions, ...body });
 }
 
@@ -145,7 +146,7 @@ test("standing delegation is always citable, while proposals, superseded decisio
   assert.equal(snapshot.sources.find((source) => source.kind === "memory")?.decisive, false);
   const unrelated = await gatherSources(readers(), { ...asked, text: "xyzzy", planApproved: false }, null);
   const authority = unrelated.sources.find((source) => source.id === "standing-policy:engineering")!;
-  const result = checkVerdict(answer({ selections: { Runner: "node:test" }, actions: { Runner: { option: "node:test", risk: "low", effects: "Local behavioral test runner, no production changes", reason: "Routine engineering within the authorized outcome", authority: "standing" } }, citations: [{ part: "Runner", source: authority.id, quote: authority.text }] }), parts, unrelated.sources);
+  const result = checkVerdict(answer({ selections: { Runner: "node:test" }, actions: { Runner: { option: "node:test", risk: "low", effects: "Local behavioral test runner, no production changes", outcome: TECHNICAL_OUTCOME, reason: "Routine engineering within the authorized outcome", authority: "standing" } }, citations: [{ part: "Runner", source: authority.id, quote: authority.text }] }), parts, unrelated.sources);
   assert.ok(result.ok && result.standing, "standing authority survives zero keyword overlap and need not dictate the exact runner");
   assert.equal(unrelated.sources.some((source) => source.kind === "plan"), false, "no unapproved plan authority");
 });
@@ -274,11 +275,13 @@ async function harness(t: TestContext, deputy: Partial<DeputySettings> = {}, opt
   const said: string[] = [];
   const sent: string[] = [];
   const responses: string[] = [];
-  const daemon = { pending: options.pending ?? [question()], archived: false };
+  const daemon = { pending: options.pending ?? [question()], archived: false, inventory: false };
+  const currentAgent = (id: string) => ({ id, cwd: "/repo", title: "TUC-1: Add module", status: "running", createdAt: "2026-10-01T00:00:00Z", archivedAt: daemon.archived ? "2026-10-02T00:00:00Z" : null, labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" }, pendingPermissions: daemon.pending });
   const paseo = {
     agents: {
+      list: async () => ({ entries: daemon.inventory ? [{ agent: currentAgent("a1") }] : [], pageInfo: { hasMore: false } }),
       ref: (id: string) => ({
-        refresh: async () => ({ agent: { id, status: "running", archivedAt: daemon.archived ? "2026-10-02T00:00:00Z" : null, labels: { "linear.issueId": "i1" }, pendingPermissions: daemon.pending } }),
+        refresh: async () => ({ agent: currentAgent(id) }),
         send: async (text: string) => { sent.push(`${id}: ${text}`); },
         respondToPermission: async () => { responses.push("untagged"); },
       }),
@@ -1160,7 +1163,7 @@ for (const change of ["off", "model"] as const) {
 }
 
 test("each selected action requires its own low-consequence assessment and exact offered actor", () => {
-  const base = { option: "node:test", risk: "low", effects: "Local runner only", reason: "Approved technical implementation", authority: "specific" };
+  const base = { option: "node:test", risk: "low", effects: "Local runner only", outcome: TECHNICAL_OUTCOME, reason: "Approved technical implementation", authority: "specific" };
   for (const actions of [
     {}, { Runner: { ...base, option: "vitest" } },
     { Runner: { ...base, risk: "production-write" } },
@@ -1174,11 +1177,59 @@ test("each selected action requires its own low-consequence assessment and exact
   assert.equal(checkVerdict(answer({ selections: { Run: "Agent runs trigger" }, actions: { Run: { ...base, option: "Agent runs trigger" } }, citations: [{ source: "plan#2", quote: "Tests use the node:test runner" }] }), actorParts, sources).ok, false, "delegation does not create an unoffered answer");
 });
 
+test("preparing a PR cannot launder newly chosen business workflow effects, including one unsafe part in a mixed request", () => {
+  const authority = standingSources();
+  const engineering = authority.find(source => source.id === "standing-policy:engineering")!;
+  const businessParts: Part[] = [
+    { key: "Intake", question: "Keep intake off?", options: ["Keep off"], effects: {} },
+    { key: "Fields", question: "May staff edit invoice amount/VAT/currency? Build AC3 as a PR; historical approved scope is unavailable.", options: ["Build AC3"], effects: {} },
+    { key: "Save", question: "Change immediate record creation to mandatory check-before-save? Build AC4 as code only.", options: ["Build AC4"], effects: {} },
+  ];
+  const selections = { Intake: "Keep off", Fields: "Build AC3", Save: "Build AC4" };
+  const action = (option: string, scope: string) => ({ option, risk: "low", effects: "Only prepare a PR; no business data is entered today", outcome: { scope, effects: scope === "technical" ? "Leave intake disabled" : "Choose editable financial fields or change when business records are saved" }, reason: "Proposed task names an AC; approval is not available", authority: "standing" });
+  const actions = { Intake: action("Keep off", "technical"), Fields: action("Build AC3", "new-workflow-choice"), Save: action("Build AC4", "new-workflow-choice") };
+  const citations = businessParts.map(part => ({ part: part.key, source: engineering.id, quote: engineering.text }));
+  const result = checkVerdict(answer({ selections, actions, citations }), businessParts, authority);
+  assert.ok(!result.ok && result.abstention === "owner-boundary");
+  const missingScope = { ...actions, Fields: { ...actions.Fields, outcome: undefined } };
+  assert.equal(checkVerdict(answer({ selections, actions: missingScope, citations }), businessParts, authority).ok, false, "the old code-only assessment is not valid current-policy evidence");
+  const unknownScope = { ...actions, Fields: action("Build AC3", "unknown") };
+  const unknown = checkVerdict(answer({ selections, actions: unknownScope, citations }), businessParts, authority);
+  assert.ok(!unknown.ok && unknown.abstention === "investigate");
+});
+
+test("approved behavior-preserving invoice repair remains delegated, but baseline evidence must be real and cited for that part", () => {
+  const authority = standingSources();
+  const engineering = authority.find(source => source.id === "standing-policy:engineering")!;
+  const baseline: Source = { id: "plan:invoice", kind: "plan", title: "Approved invoice workflow", revision: "approved-1", decisive: true,
+    text: "Approved workflow: the linking drawer already permits staff to edit invoice number/date/amount/VAT/currency. Preserve existing save timing and validation while fixing the stale displayed amount." };
+  const invoiceParts: Part[] = [{ key: "Repair", question: "Fix the stale amount display without changing approved edit rights, required values or saving behavior?", options: ["Fix stale display"], effects: {} }];
+  const outcome = { scope: "preserves-authorized-workflow", effects: "Restore the existing displayed amount; no new edit rights, save timing or validation policy", source: baseline.id, quote: baseline.text };
+  const action = { option: "Fix stale display", risk: "low", effects: "Behavior-preserving invoice UI repair", outcome, reason: "Engineering inside the cited approved baseline", authority: "standing" };
+  const citations = [{ part: "Repair", source: engineering.id, quote: engineering.text }, { part: "Repair", source: baseline.id, quote: baseline.text }];
+  const evaluate = (current: unknown, listed = citations, evidence = [...authority, baseline]) => checkVerdict(answer({ selections: { Repair: "Fix stale display" }, actions: { Repair: current }, citations: listed }), invoiceParts, evidence);
+  const accepted = evaluate(action);
+  assert.ok(accepted.ok && accepted.standing);
+  assert.equal(evaluate(action, citations.slice(0, 1)).ok, false);
+  assert.equal(evaluate(action, citations, authority).ok, false);
+  assert.equal(evaluate({ ...action, outcome: { ...outcome, source: engineering.id, quote: engineering.text } }).ok, false, "standing engineering does not invent a workflow baseline");
+  assert.equal(evaluate({ ...action, outcome: { ...outcome, quote: "The owner approved all invoice changes." } }).ok, false);
+  const approvedChange: Source = { ...baseline, id: "plan:approved-change", text: "Owner approved: replace immediate invoice creation with mandatory check-before-save review and allow staff to correct the listed financial fields before saving." };
+  const changeParts: Part[] = [{ key: "Save", question: "Implement the specifically approved check-before-save workflow?", options: ["Implement approved workflow"], effects: {} }];
+  const changeOutcome = { scope: "authorized-workflow-change", effects: "Mandatory invoice review before creation under the cited approval", source: approvedChange.id, quote: approvedChange.text };
+  const change = { ...action, option: "Implement approved workflow", outcome: changeOutcome };
+  const changeCitations = [{ part: "Save", source: engineering.id, quote: engineering.text }, { part: "Save", source: approvedChange.id, quote: approvedChange.text }];
+  const checkChange = (current: unknown) => checkVerdict(answer({ selections: { Save: "Implement approved workflow" }, actions: { Save: current }, citations: changeCitations }), changeParts, [...authority, approvedChange]);
+  assert.equal(checkChange(change).ok, false, "consequential behavior changes cannot use standing-only activation");
+  const specificallyApproved = checkChange({ ...change, authority: "specific" });
+  assert.ok(specificallyApproved.ok && !specificallyApproved.standing);
+});
+
 test("a boundary-only citation cannot activate standing delegation, and mixed authority retains the empirical gate", () => {
   const authority = standingSources();
   const engineering = authority.find((source) => source.id === "standing-policy:engineering")!;
   const boundaries = authority.find((source) => source.id === "standing-policy:boundaries")!;
-  const action = { option: "node:test", risk: "low", effects: "Local runner only", reason: "Routine engineering", authority: "standing" };
+  const action = { option: "node:test", risk: "low", effects: "Local runner only", outcome: TECHNICAL_OUTCOME, reason: "Routine engineering", authority: "standing" };
   const boundaryOnly = checkVerdict(answer({ selections: { Runner: "node:test" }, actions: { Runner: action }, citations: [{ source: boundaries.id, quote: boundaries.text }] }), parts, authority);
   assert.equal(boundaryOnly.ok, false);
   const mixedParts = [...parts, { key: "Second", question: "Second runner?", options: ["node:test", "vitest"], effects: {} }];
@@ -1209,6 +1260,52 @@ test("complete plan constraints and authenticated owner overrides cannot be filt
   assert.deepEqual(oversized.sources, [], "overflow refuses rather than silently dropping a hold");
 });
 
+for (const entry of ["startup", "activation"] as const) {
+  test(`${entry} discovers an already-pending exact request without a re-ask, evaluates fresh once and preserves full checked grace`, async t => {
+    const h = await standingHarness(t);
+    await h.settle();
+    assert.deepEqual(await readCandidates(h.directory), {});
+    let evaluations = 0;
+    const evaluate = h.deps.evaluate;
+    h.deps.evaluate = async (...args) => { evaluations++; return evaluate(...args); };
+    h.daemon.inventory = true;
+    let deputy = h.deputy;
+    if (entry === "startup") {
+      h.deputy.stop();
+      deputy = new Deputy(h.deps);
+      t.after(() => deputy.stop());
+      deputy.attach(h.paseo);
+    } else {
+      h.settings.deputy.mode = "off";
+      const canceled = await deputy.settingsChanged();
+      assert.deepEqual(await deputy.reconcile(), { observed: 0, skipped: 0, failed: 0 });
+      h.settings.deputy.mode = "live";
+      await deputy.recheckPolicy(canceled, true);
+    }
+    await Promise.all([deputy.reconcile(), deputy.reconcile(), deputy.reconcile()]);
+    await deputy.idle();
+    const waiting = (await readCandidates(h.directory))["a1:r1"];
+    assert.equal(waiting.status, "waiting");
+    assert.equal(waiting.version, VERSION);
+    assert.equal(waiting.requestId, h.daemon.pending[0].id);
+    assert.deepEqual(waiting.request, h.daemon.pending[0]);
+    assert.equal(evaluations, 1);
+    assert.deepEqual(h.calls, []);
+    h.advance(4 * 60_000);
+    await deputy.idle();
+    assert.deepEqual(h.calls, [], "discovery does not borrow grace from earlier history");
+    h.advance(60_000);
+    await deputy.idle();
+    assert.equal(h.calls.length, 1);
+    assert.equal((await readCandidates(h.directory))["a1:r1"].status, "applied");
+    await deputy.reconcile();
+    await deputy.idle();
+    assert.equal(evaluations, 1, "a daemon still listing the request cannot resurrect terminal work");
+    assert.equal(h.calls.length, 1);
+    assert.equal(shadowEvidence(await h.log.entries(), VERSION).pairs.length, 0);
+  });
+}
+
 async function standingHarness(t: TestContext, audit = true) {
   const checked = arbiter();
   const h = await harness(t, { mode: "live", standingPolicy: AUTONOMY_POLICY_REVISION }, { arbiter: checked.value });
@@ -1216,7 +1313,7 @@ async function standingHarness(t: TestContext, audit = true) {
     const source = input.sources.find((source) => source.id === "standing-policy:engineering")!;
     return checkVerdict(answer({
       selections: { Runner: "node:test" },
-      actions: { Runner: { option: "node:test", risk: "low", effects: "Choose a local behavioral test runner; no production write", reason: "Routine engineering under current standing delegation", authority: "standing" } },
+      actions: { Runner: { option: "node:test", risk: "low", effects: "Choose a local behavioral test runner; no production write", outcome: TECHNICAL_OUTCOME, reason: "Routine engineering under current standing delegation", authority: "standing" } },
       citations: [{ source: source.id, quote: source.text }],
     }), input.parts, input.sources);
   };
@@ -1387,7 +1484,7 @@ test("exact offered labels are preserved, while visually ambiguous whitespace du
   const source = standingSources().find((source) => source.id === "standing-policy:engineering")!;
   const result = (label: string) => checkVerdict(answer({
     selections: { Runner: label },
-    actions: { Runner: { option: label, risk: "low", effects: "Local bounded technical work", reason: "Standing engineering authority", authority: "standing" } },
+    actions: { Runner: { option: label, risk: "low", effects: "Local bounded technical work", outcome: TECHNICAL_OUTCOME, reason: "Standing engineering authority", authority: "standing" } },
     citations: [{ source: source.id, quote: source.text }],
   }), eligibility.parts, [source]);
   assert.equal(result("Continue").ok, false, "the checked answer must not silently rewrite an offered label");

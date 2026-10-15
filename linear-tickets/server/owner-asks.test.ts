@@ -6,9 +6,10 @@ import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { HandoverRecord } from "./handover";
 import type { OwnerAskComment, OwnerAskIssue } from "./linear";
-import { answerText, asksOwner, askRoute, deliveryText, OwnerAsks, selectAskText, selectAskSources, type AnswerAskInput, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
-import type { OwnerAsk } from "../shared/contracts";
-import type { Extraction } from "./owner-ask-extract";
+import { answerText, askRoute, deliveryText, OwnerAsks, selectAskSources, type AnswerAskInput, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
+import { answerAskRpc, ownerAsksRpc, triageAskRpc, type OwnerAsk } from "../shared/contracts";
+import type { BrowserOwnerAsk } from "../shared/decision-inbox";
+import { checkExtraction, type ExtractInput, type Extraction } from "./owner-ask-extract";
 import type { DeliveryOrigin, DeliveryResult } from "./permission-replies";
 
 const at = "2026-10-09T12:00:00.000Z";
@@ -35,7 +36,7 @@ type Harness = {
   state: {
     issues: OwnerAskIssue[]; comments: Map<string, OwnerAskComment[]>;
     needsYou: { id: string; identifier: string; parentId: string; agentId: string }[];
-    records: Map<string, HandoverRecord | null>; now: number; extraction: () => Promise<Extraction>;
+    records: Map<string, HandoverRecord | null>; now: number; extraction: (input: ExtractInput) => Promise<Extraction>;
   };
 };
 
@@ -45,7 +46,7 @@ async function setup(options: {
   needsYou?: { id: string; identifier: string; parentId: string; agentId: string }[];
   records?: Map<string, HandoverRecord | null>;
   agents?: { id: string; status: string; createdAt: string; issueId?: string; pending?: boolean }[];
-  extraction?: () => Promise<Extraction>;
+  extraction?: (input: ExtractInput) => Promise<Extraction>;
   continueOutcome?: ContinueOutcome;
   queueError?: string;
 } = { issues: [] }): Promise<Harness> {
@@ -78,7 +79,7 @@ async function setup(options: {
     remoteAgent: async () => false,
     labels: async () => ({ needsYou: "paseo-needs-you", manual: "paseo-manual" }),
     resolveModel: async () => "omp/test-model",
-    extract: async (input) => { extractedWith.push({ identifier: input.identifier, kind: input.kind }); return state.extraction(); },
+    extract: async (input) => { extractedWith.push({ identifier: input.identifier, kind: input.kind }); return state.extraction(input); },
     deliver: async (_paseo, agentId, message, origin) => {
       delivered.push({ agentId, message, origin });
       return { status: "applied", reply: null, delivered: true, at } as DeliveryResult;
@@ -124,13 +125,13 @@ const untilAsync = async (check: () => Promise<boolean>, timeoutMs = 5_000): Pro
   throw new Error("the condition was not met in time");
 };
 
-// The first ask, re-read until the background extraction has landed in it.
-const untilAsk = async (h: Harness, predicate: (ask: OwnerAsk) => boolean): Promise<OwnerAsk> => {
+// Re-read the requested source until its background extraction has landed.
+const untilAsk = async (h: Harness, predicate: (ask: BrowserOwnerAsk) => boolean): Promise<BrowserOwnerAsk> => {
   const deadline = Date.now() + 5_000;
-  let ask: OwnerAsk | undefined;
+  let ask: BrowserOwnerAsk | undefined;
   while (Date.now() < deadline) {
-    ask = (await h.ownerAsks.snapshot(h.paseo)).asks[0];
-    if (ask && predicate(ask)) return ask;
+    ask = (await h.ownerAsks.snapshot(h.paseo)).asks.find(predicate);
+    if (ask) return ask;
     await new Promise((resolve) => setImmediate(resolve));
   }
   throw new Error(`the ask never reached the expected state: ${JSON.stringify(ask)}`);
@@ -145,29 +146,6 @@ const inputFor = async (h: Harness, issueId = "i1", answers: Record<string, stri
   return { issueId, revision: ask!.revision, answers, ...extra };
 };
 
-test("the ask text comes from the description for Needs-you and manual issues, the wait comment, the newest asking comment, else the description", () => {
-  const comments = [comment("c3", "A later status update.", "2026-10-09T11:00:00.000Z"), comment("c2", waitComment), comment("c1", "An older note.")];
-  assert.equal(selectAskText({ needsYou: true, manual: false, waitCommentId: "c2", comments }, { description: "sub-issue text" }), "sub-issue text");
-  assert.equal(selectAskText({ needsYou: false, manual: true, waitCommentId: "c2", comments }, { description: "manual text" }), "manual text");
-  assert.equal(selectAskText({ needsYou: false, manual: false, waitCommentId: "c2", comments }, { description: "ticket text" }), waitComment);
-  assert.equal(selectAskText({ needsYou: false, manual: false, waitCommentId: null, comments }, { description: "ticket text" }), waitComment, "the newest comment that asks the owner wins, not the newest comment");
-  assert.equal(selectAskText({ needsYou: false, manual: false, waitCommentId: null, comments: [comment("c1", "A status update.")] }, { description: "ticket text" }), "ticket text");
-  assert.equal(selectAskText({ needsYou: false, manual: false, waitCommentId: "gone", comments: [] }, { description: "ticket text" }), "ticket text");
-  assert.equal(asksOwner("Nothing for you here."), false);
-  assert.equal(asksOwner("**TUC-1** (Paseo) is waiting for an answer: which one?"), true);
-  assert.equal(asksOwner("Please reply yes and I'll proceed once you decide."), true, "the same detector write-back uses for a turn that ended by asking");
-});
-
-test("delivery receipts quoting an old ask never replace a newer owner question", () => {
-  const current = "**TUC-1** (Paseo) is waiting for an answer: choose the warehouse for the replacement.";
-  const comments = [
-    comment("browser-receipt", `Answered from the decision inbox: ${waitComment}`),
-    comment("historical-receipt", `Answered from the menu bar: ${waitComment}`),
-    comment("current", current),
-  ];
-  assert.equal(selectAskText({ needsYou: false, manual: false, waitCommentId: null, comments },
-    { description: "Previous ticket context" }), current);
-});
 
 test("the answer goes to the live asking agent, to a continuation when the ticket's agent is gone, and to a comment otherwise", () => {
   assert.deepEqual(askRoute({ manual: false, asking: "a1", live: new Set(["a1"]), history: true }), { route: "agent", agentId: "a1" });
@@ -305,7 +283,7 @@ test("an edited wait comment and a new comment with identical wording change the
   assert.deepEqual(h.events, []);
 });
 
-test("an ask repeating a live agent's request goes once the request is answered and cannot be answered again", async (t) => {
+test("a retired request loses urgency without deleting its source or authorizing a repeated answer", async (t) => {
   const record = (kind: "request" | "turn-end"): HandoverRecord => ({ issueId: "i1", identifier: "TUC-1616", agentId: "a1", agentTitle: "agent", branch: null, worktreePath: null, lastCommit: null, summaries: [], links: {}, status: "waiting", progressCommentId: null, resumedFrom: null, updatedAt: at, waiting: { previousStateId: "ip", commentId: "c1", kind, at } });
   const agents = [{ id: "a1", status: "idle", createdAt: at, issueId: "i1", pending: true }];
   const h = await setup({
@@ -318,12 +296,82 @@ test("an ask repeating a live agent's request goes once the request is answered 
   const input = await inputFor(h);
   assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).asks.map((ask) => [ask.issueId, ask.route, ask.mirrorsLiveRequest]), [["i1", "agent", true]]);
   agents[0].pending = false;
-  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).asks, [], "the question was answered; Linear has not caught up yet");
+  const retired = (await h.ownerAsks.snapshot(h.paseo)).asks;
+  assert.deepEqual(retired.map(ask => [ask.sourceId, ask.attention, ask.mirrorsLiveRequest]), [["c1", "info", false]]);
+  assert.equal(retired[0].source, waitComment, "original request remains available for source review");
   await assert.rejects(h.ownerAsks.answer(input, h.paseo), /not waiting for you/);
   assert.deepEqual(h.delivered, []);
   // A wait the agent opened by ending its turn with a question has no request to answer: it stays.
   h.state.records.set("i1", record("turn-end"));
   assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).asks.map((ask) => [ask.issueId, ask.mirrorsLiveRequest]), [["i1", false]]);
+});
+
+test("independently current business evidence survives a retired request without resurrecting its dispatch", async t => {
+  const question = "Which contracted quantity is authorized for this shipment?";
+  const corroboration = "Source c1 still needs the owner's contracted quantity decision; no quantity has been authorized.";
+  const h = await setup({
+    issues: [issue({ title: "Shipment", status: "In progress", description: "", labels: [], parentId: null })],
+    comments: new Map([["i1", [comment("c1", question), comment("c2", corroboration, at)]]]),
+    records: new Map([["i1", { issueId: "i1", identifier: "TUC-1616", agentId: "a1", agentTitle: "agent",
+      branch: null, worktreePath: null, lastCommit: null, summaries: [], links: {}, status: "waiting",
+      progressCommentId: null, resumedFrom: null, updatedAt: at,
+      waiting: { previousStateId: "ip", commentId: "c1", kind: "request", at } }]]),
+    agents: [{ id: "a1", status: "idle", createdAt: at, issueId: "i1", pending: false }],
+    extraction: async input => checkExtraction(JSON.stringify({
+      kind: "info", summary: "The contract fact is unresolved, independently of the old daemon request.",
+      assessment: input.context?.sourceId === "c1" ? {
+        state: "owner", ownerBoundary: "business", reason: "A later source explicitly confirms the original contract decision remains unresolved.",
+        evidence: [{ sourceId: "c1", quote: question }, { sourceId: "c2", quote: corroboration }],
+      } : { state: "info", reason: "Corroborates the original decision.", evidence: [{ sourceId: "c2", quote: corroboration }] },
+    }), input.text, input.context),
+  });
+  t.after(() => h.ownerAsks.stop());
+  let current: OwnerAsk | undefined;
+  await untilAsync(async () => {
+    current = (await h.ownerAsks.snapshot(h.paseo)).asks.find(ask => ask.sourceId === "c1" && ask.extracted);
+    return current !== undefined;
+  });
+  assert.equal(current?.attention, "owner");
+  assert.equal(current?.mirrorsLiveRequest, false);
+  await assert.rejects(h.ownerAsks.answer({
+    issueId: "i1", sourceId: "c1", revision: current!.revision, answers: {}, note: "Must not reuse the retired request",
+  }, h.paseo), /not waiting for you/);
+  assert.deepEqual(h.delivered, []);
+  assert.deepEqual(h.continued, []);
+  assert.deepEqual(h.events, []);
+  assert.deepEqual((await h.ownerAsks.snapshot(h.paseo)).history, []);
+});
+
+test("an unrelated pending live request cannot veto cited resolution of an older wait source", async t => {
+  const old = "Which contract quantity applies to this shipment?";
+  const answer = "For source original: Which contract quantity applies to this shipment? Owner answered 12 pallets; this request is resolved.";
+  const h = await setup({
+    issues: [issue({ title: "Shipment", description: "", labels: [], parentId: null })],
+    comments: new Map([["i1", [comment("original", old), comment("answer", answer, at)]]]),
+    records: new Map([["i1", { issueId: "i1", identifier: "TUC-1616", agentId: "a1", agentTitle: "agent",
+      branch: null, worktreePath: null, lastCommit: null, summaries: [], links: {}, status: "waiting",
+      progressCommentId: null, resumedFrom: null, updatedAt: at,
+      waiting: { previousStateId: "ip", commentId: "original", kind: "request", at } }]]),
+    agents: [{ id: "a1", status: "idle", createdAt: at, issueId: "i1", pending: true }],
+    extraction: async input => checkExtraction(JSON.stringify({
+      kind: "info", summary: "Earlier source resolved; no assumption about another live request.",
+      assessment: input.context?.sourceId === "original" ? {
+        state: "resolved", reason: "Later owner answer explicitly identifies this original question.",
+        relatedSourceId: "answer", evidence: [{ sourceId: "original", quote: old }, { sourceId: "answer", quote: answer }],
+      } : { state: "info", reason: "Resolution receipt.", evidence: [{ sourceId: "answer", quote: answer }] },
+    }), input.text, input.context),
+  });
+  t.after(() => h.ownerAsks.stop());
+  let asks: OwnerAsk[] = [];
+  await untilAsync(async () => {
+    asks = (await h.ownerAsks.snapshot(h.paseo)).asks;
+    return asks.length === 2 && asks.every(ask => ask.extracted);
+  });
+  assert.equal(asks.find(ask => ask.sourceId === "original")?.attention, "info");
+  const original = asks.find(ask => ask.sourceId === "original")!;
+  await assert.rejects(h.ownerAsks.answer({ issueId: "i1", sourceId: "original", revision: original.revision, answers: {}, note: "Re-answer old quantity" }, h.paseo), /reconciled/);
+  assert.deepEqual(h.delivered, []);
+  assert.deepEqual(h.events, []);
 });
 
 test("pending-to-extracted transition changes revision; unknown question keys never become free-form approvals", async (t) => {
@@ -642,9 +690,8 @@ test("normal issue questions and recovery comments remain independent without a 
 
 test("source collection deduplicates comment IDs, not wording or ticket identity", () => {
   const text = "Which policy?";
-  const sources = selectAskSources({ needsYou: false, manual: false, waitCommentId: "c1",
-    comments: [comment("c1", text), comment("c1", text), comment("c2", text)] }, { description: text });
-  assert.deepEqual(sources.map(source => source.sourceId), ["c1", "description", "c2"]);
+  const sources = selectAskSources({ comments: [comment("c1", text), comment("c1", text), comment("c2", text)] }, { description: text });
+  assert.deepEqual(sources.map(source => source.sourceId), ["description", "c1", "c2"]);
 });
 
 test("an unconfirmed owner delivery remains visible and cannot be bypassed by changing the answer", async t => {
@@ -662,17 +709,17 @@ test("an unconfirmed owner delivery remains visible and cannot be bypassed by ch
   assert.equal(deliveries, 1);
 });
 
-test("manual actions remain classified and visible while extraction is unresolved", async t => {
-  const h = await setup({ issues: [issue({ title: "Rotate the owner credential", labels: ["paseo-manual"], description: "Rotate the credential in the owner console." })],
+test("a manual label alone does not make unresolved extraction urgent human work", async t => {
+  const h = await setup({ issues: [issue({ title: "Scoped staging setup", labels: ["paseo-manual"], description: "Use the existing scoped staging role." })],
     extraction: async () => ({ ok: false, reason: "extraction unavailable" }) });
   t.after(() => h.ownerAsks.stop());
   const snapshot = await h.ownerAsks.snapshot(null);
   assert.deepEqual(snapshot.asks.map(ask => ({ kind: ask.kind, attention: ask.attention, extracted: ask.extracted, source: ask.source })),
-    [{ kind: "manual", attention: "owner", extracted: false, source: "Rotate the credential in the owner console." }]);
+    [{ kind: "manual", attention: "info", extracted: false, source: "Use the existing scoped staging role." }]);
 });
 
 test("owner inbox shows new Linear questions within a minute without rescanning every menu refresh", async t => {
-  const h = await setup({ issues: [issue({ title: "Rollout policy", labels: [], parentId: null, status: "In Progress", description: "Rollout discussion" })],
+  const h = await setup({ issues: [issue({ title: "Rollout policy", labels: [], parentId: null, status: "In Progress", description: "" })],
     comments: new Map([["i1", [comment("c1", "Which rollout policy?")]]]) });
   t.after(() => h.ownerAsks.stop());
   let inventoryReads = 0;
@@ -693,4 +740,128 @@ test("owner inbox shows new Linear questions within a minute without rescanning 
   h.state.now += 31_000;
   assert.deepEqual(new Set((await h.ownerAsks.snapshot(null)).asks.map(ask => ask.sourceId)), new Set(["c1", "c2"]));
   assert.deepEqual([inventoryReads, commentReads], [3, 3]);
+});
+
+test("all-status snapshot separates historical discovery from source-evidenced owner urgency", async t => {
+  const historical = [
+    comment("progress", "Why stop now? The agent continues the approved staging checks."),
+    comment("plan", "Plan ready for advisor review; nothing needed from you yet."),
+    comment("old-relay", "**TUC-1616** (Paseo) is waiting for an answer:\n\nWhich delivery date should the supplier contract use?", "2026-10-01T09:00:00.000Z"),
+    comment("resolution", 'Resolved source old-relay: "Which delivery date should the supplier contract use?" Owner chose November 1.', "2026-10-02T09:00:00.000Z"),
+    comment("business", "Owner decision still required: which package quantity is contracted?", "2026-10-01T10:00:00.000Z"),
+    comment("identity", "The owner must complete personal SSO with physical security key; waiting on that identity step.", "2026-10-01T11:00:00.000Z"),
+    comment("unknown", "Could this have been the previous workflow?"),
+    comment("echo", "Owner decision still required: which package quantity is contracted?", "2026-10-02T10:00:00.000Z"),
+    comment("later", "Implementation progress: another unrelated check passed.", "2026-10-03T09:00:00.000Z"),
+  ];
+  const h = await setup({ issues: [issue({ title: "Contract delivery", description: "", labels: [], parentId: null, status: "In Progress" })],
+    comments: new Map([["i1", historical]]), extraction: async input => {
+      const id = input.context!.sourceId;
+      if (id === "unknown") return { ok: false, reason: "unclassified archival source" };
+      const owner = id === "business" || id === "identity";
+      const state = id === "old-relay" ? "resolved" : owner ? "owner" : "info";
+      const evidence = [{ sourceId: id, quote: input.text }];
+      if (id === "old-relay") evidence.push({ sourceId: "resolution", quote: historical.find(c => c.id === "resolution")!.body });
+      return checkExtraction(JSON.stringify({ kind: owner ? "decision" : "info", summary: input.text,
+        questions: owner ? [{ question: input.text, options: [] }] : [],
+        assessment: { state, reason: owner ? "A current business or personal identity decision is explicitly still outstanding." : "Timeline evidence concerns only this source.",
+          ownerBoundary: id === "business" ? "business" : id === "identity" ? "identity" : null,
+          evidence, ...(id === "old-relay" ? { relatedSourceId: "resolution" } : {}) } }), input.text, input.context);
+    } });
+  t.after(() => h.ownerAsks.stop());
+  h.deps.issues = async () => h.state.issues;
+  const first = await h.ownerAsks.snapshot(null);
+  assert.ok(first.asks.every(ask => ask.attention !== "owner"), "historical text and ? alone cannot notify while extraction is pending");
+  await untilAsync(async () => (await h.ownerAsks.snapshot(null)).asks.filter(ask => ask.sourceId !== "unknown" && ask.sourceId !== "echo").every(ask => ask.extracted));
+  const snapshot = await h.ownerAsks.snapshot(null);
+  assert.deepEqual(snapshot.asks.filter(ask => ask.attention === "owner").map(ask => ask.sourceId).sort(), ["business", "identity"]);
+  assert.deepEqual(new Set(snapshot.asks.map(ask => ask.sourceId)), new Set(historical.map(c => c.id)), "original sources remain traceable, not ledger-completed");
+  assert.match(snapshot.asks.find(ask => ask.sourceId === "old-relay")!.attentionReason, /resolved|resolution/i);
+  assert.match(snapshot.asks.find(ask => ask.sourceId === "echo")!.attentionReason, /echo|duplicate/i);
+  assert.match(snapshot.asks.find(ask => ask.sourceId === "unknown")!.attentionReason, /review|currentness/i);
+  assert.equal(snapshot.asks.find(ask => ask.sourceId === "unknown")!.attention, "info");
+  assert.deepEqual(snapshot.history, []);
+  assert.deepEqual(h.events, []);
+  const validated = ownerAsksRpc.output.parse(snapshot);
+  assert.deepEqual(validated.asks.map(ask => ask.sourceId), snapshot.asks.map(ask => ask.sourceId), "validated RPC retains per-source identity");
+  const business = validated.asks.find(ask => ask.sourceId === "business")!;
+  const mismatched = answerAskRpc.input.parse({ issueId: "i1", sourceId: "identity", revision: business.revision, answers: { q1: "50" } });
+  await assert.rejects(h.ownerAsks.answer(mismatched, null), /changed|source/i);
+  const triage = triageAskRpc.input.parse({ issueId: "i1", sourceId: "identity", revision: business.revision, action: "defer", until: "2026-10-10T12:00:00.000Z" });
+  await assert.rejects(h.ownerAsks.triage(triage, null), /changed|source/i);
+  const relay = snapshot.asks.find(ask => ask.sourceId === "old-relay")!;
+  await assert.rejects(h.ownerAsks.answer({ issueId: "i1", sourceId: relay.sourceId, revision: relay.revision, answers: {}, note: "Approve" }, null), /reconciled|resolved|source/i);
+  await h.ownerAsks.answer({ issueId: "i1", sourceId: business.sourceId, revision: business.revision, answers: { q1: "50" } }, null);
+  const retained = (await h.ownerAsks.snapshot(null)).asks;
+  assert.equal(retained.find(ask => ask.sourceId === "identity")!.attention, "owner", "one answer never completes another independent source");
+  await assert.rejects(h.ownerAsks.answer({ ...mismatched, sourceId: "identity" }, null), /source|changed/i, "receipt retries cannot bypass a supplied source identity");
+});
+
+test("exact current owner wait remains urgent on extraction failure; status/manual labels alone do not", async t => {
+  const waiting: HandoverRecord = { issueId: "i1", identifier: "TUC-1616", agentId: "gone", agentTitle: "agent", branch: null,
+    worktreePath: null, lastCommit: null, summaries: [], links: {}, status: "waiting", progressCommentId: null, resumedFrom: null,
+    updatedAt: at, waiting: { previousStateId: "ip", commentId: "live", kind: "request", at } };
+  const h = await setup({ issues: [issue({ title: "Contract quantity", description: "", labels: [], parentId: null, status: "Todo" }),
+    issue({ id: "manual", title: "Staging setup", description: "Agent can configure the scoped staging access.", labels: ["paseo-manual"], parentId: null })],
+    comments: new Map([["i1", [comment("live", "Which contract quantity is correct?"), comment("old", "Which old technical plan?")]]]),
+    records: new Map([["i1", waiting]]), extraction: async () => ({ ok: false, reason: "offline" }) });
+  t.after(() => h.ownerAsks.stop());
+  h.deps.issues = async () => h.state.issues;
+  const snapshot = await h.ownerAsks.snapshot(null);
+  assert.deepEqual(snapshot.asks.filter(ask => ask.attention === "owner").map(ask => ask.sourceId), ["live"]);
+  assert.ok(snapshot.asks.every(ask => !ask.extracted));
+  assert.equal(snapshot.asks.find(ask => ask.issueId === "manual")!.attention, "info", "manual label is not evidence of human-only work");
+  waiting.status = "working";
+  const revised = (await h.ownerAsks.snapshot(null, true)).asks.find(ask => ask.sourceId === "live")!;
+  assert.equal(revised.attention, "info", "revoked wait does not retain urgent admission");
+  assert.notEqual(revised.revision, snapshot.asks.find(ask => ask.sourceId === "live")!.revision);
+  await assert.rejects(h.ownerAsks.answer({ issueId: "i1", sourceId: "live", revision: snapshot.asks[0].revision, answers: {}, note: "50" }, null), /changed/);
+  assert.deepEqual(h.events, []);
+});
+
+test("an unchanged source's confirmed answer does not resurrect when unrelated timeline context changes", async t => {
+  const h = await setup({ issues: [issue({ title: "Business questions", description: "", labels: [], parentId: null, status: "Todo" })],
+    comments: new Map([["i1", [comment("first", "Which contracted quantity?"), comment("second", "Which supplier contract applies?")]]]) });
+  t.after(() => h.ownerAsks.stop());
+  await untilAsync(async () => (await h.ownerAsks.snapshot(null)).asks.every(ask => ask.extracted));
+  const first = (await h.ownerAsks.snapshot(null)).asks.find(ask => ask.sourceId === "first")!;
+  await h.ownerAsks.answer({ issueId: "i1", sourceId: "first", revision: first.revision, answers: { q1: "You or the team" } }, null);
+  h.state.comments.get("i1")!.push(comment("progress", "Unrelated implementation checks passed.", "2026-10-09T12:01:00Z"));
+  const updated = await h.ownerAsks.snapshot(null, true);
+  assert.equal(updated.asks.some(ask => ask.sourceId === "first"), false);
+  assert.ok(updated.asks.some(ask => ask.sourceId === "second"));
+  assert.equal(updated.history.length, 1);
+  assert.equal(h.events.filter(event => event.startsWith("comment ")).length, 1);
+});
+
+test("unconfirmed source delivery cannot be bypassed after a timeline-driven revision change", async t => {
+  const h = await setup({ issues: [issue({ title: "Business question", description: "Which contracted quantity?", labels: [], parentId: null, status: "Todo" })] });
+  t.after(() => h.ownerAsks.stop());
+  let sends = 0;
+  h.deps.linear.comment = async () => { sends++; throw new Error("delivery result unknown"); };
+  const original = await inputFor(h);
+  await assert.rejects(h.ownerAsks.answer({ ...original, sourceId: "description" }, null), /unknown/);
+  h.state.comments.set("i1", [comment("progress", "Unrelated tests passed.", "2026-10-09T12:01:00Z")]);
+  await h.ownerAsks.snapshot(null, true);
+  const current = await untilAsk(h, ask => ask.sourceId === "description" && ask.extracted);
+  assert.notEqual(current.revision, original.revision);
+  assert.equal(current.deliveryUnknown, true);
+  await assert.rejects(h.ownerAsks.answer({ issueId: "i1", sourceId: "description", revision: current.revision, answers: { q1: "You or the team" } }, null), /unconfirmed/);
+  assert.equal(sends, 1);
+});
+
+test("captured TUC-835 report excerpt with a query-string URL remains nonurgent review when extraction fails", async t => {
+  // Exact excerpts from source 072c92ff-8f17-428f-a1e0-dd7797fed533 in the
+  // preserved 2026-10-15 incident snapshot; no unprovided chronology is inferred.
+  const source = "No different/exact_failed/compare_failed rows returned; absent groups are not failure-free coverage proof. No new owner instruction. [Sentry dashboard](https://tuchel-sohn-gmbh.sentry.io/explore/metrics/?project=4512091960836176&statsPeriod=14d).\n\nNo owner decision is pending.";
+  const h = await setup({ issues: [issue({ identifier: "TUC-835", title: "Monitoring", description: "", parentId: null, labels: [], status: "In Progress" })],
+    comments: new Map([["i1", [comment("072c92ff-8f17-428f-a1e0-dd7797fed533", source)]]]),
+    extraction: async () => ({ ok: false, reason: "offline historical extraction" }) });
+  t.after(() => h.ownerAsks.stop());
+  const snapshot = ownerAsksRpc.output.parse(await h.ownerAsks.snapshot(null));
+  assert.deepEqual(snapshot.asks.map(ask => ({ sourceId: ask.sourceId, attention: ask.attention, extracted: ask.extracted })),
+    [{ sourceId: "072c92ff-8f17-428f-a1e0-dd7797fed533", attention: "info", extracted: false }]);
+  assert.match(snapshot.asks[0].attentionReason, /review/);
+  assert.deepEqual(snapshot.history, []);
+  assert.deepEqual(h.events, []);
 });
