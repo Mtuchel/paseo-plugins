@@ -19,7 +19,11 @@ function barrier() {
 }
 async function harness(t: TestContext, hooks: { beforeSubmit?: (record: ReplyRecord) => Promise<void>; checked?: boolean } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "permission-replies-"));
-  t.after(() => rm(directory, { recursive: true, force: true }));
+  const instances: PermissionReplies[] = [];
+  t.after(async () => {
+    await Promise.all(instances.map((replies) => replies.stop()));
+    await rm(directory, { recursive: true, force: true });
+  });
   let pending: AgentPermissionRequest[] = [q];
   let error: Error | null = null;
   let submit: (() => Promise<void>) | null = null;
@@ -50,6 +54,7 @@ async function harness(t: TestContext, hooks: { beforeSubmit?: (record: ReplyRec
     const replies = new PermissionReplies({ directory, daemon, beforeSubmit: hooks.beforeSubmit });
     replies.attach(sdk);
     replies.recordEffects(effects);
+    instances.push(replies);
     return replies;
   };
   const replies = create();
@@ -71,8 +76,11 @@ test("simultaneous activity replays route Q1 once and never send into Q2, includ
   const duplicate = h.replies.deliver(h.sdk, "a", "Vitest", owner("comment:c1"));
   gate.release();
   assert.deepEqual(await duplicate, await first);
+  await h.replies.recoverEffects();
   h.pending([{ ...q, id: "q2" }]);
-  const replay = await h.create().deliver(h.sdk, "a", "Vitest", owner("comment:c1"));
+  const restarted = h.create();
+  const replay = await restarted.deliver(h.sdk, "a", "Vitest", owner("comment:c1"));
+  await restarted.recoverEffects();
   assert.equal(replay.status, "applied");
   assert.deepEqual(h.sent.map((item) => item.requestId), ["q1"]);
   assert.equal(h.evidence.length, 1);
@@ -161,10 +169,13 @@ test("post-send effects replay original request, answers and timestamp without a
   const h = await harness(t);
   h.replies.recordEffects({ ...h.effects, ownerAnswered: async () => { throw new Error("evidence storage offline"); } });
   assert.equal((await h.replies.deliver(h.sdk, "a", "Node", owner("comment:evidence"))).status, "applied");
+  await h.replies.recoverEffects();
   const recorded = (await h.replies.records())["comment:evidence"];
   assert.equal(recorded.status, "applied");
   h.pending([{ ...q, id: "q2", title: "New question" }]);
-  const result = await h.create().deliver(h.sdk, "a", "Vitest", owner("comment:evidence"));
+  const restarted = h.create();
+  const result = await restarted.deliver(h.sdk, "a", "Vitest", owner("comment:evidence"));
+  await restarted.recoverEffects();
   assert.equal(result.status, "applied");
   assert.deepEqual(h.evidence, [{ request: q, response, at: recorded.at }]);
   assert.equal(h.sent.length, 1);
@@ -175,6 +186,7 @@ test("parallel writes on different agents preserve both records and effects", as
   h.onSubmit(async () => {});
   // Both refreshes capture Q1; the final submissions share disk writes, not the agent lane.
   await Promise.all([h.replies.deliver(h.sdk, "a", "Node", owner("comment:a")), h.replies.deliver(h.sdk, "b", "Node", owner("comment:b"))]);
+  await h.replies.recoverEffects();
   const records = await h.replies.records();
   assert.equal(records["comment:a"].agentId, "a");
   assert.equal(records["comment:b"].agentId, "b");
@@ -264,6 +276,7 @@ test("unchecked and unverified answers retain precedence/replay protection but n
   const h = await harness(t);
   const result = await h.replies.deliver(h.sdk, "a", "Node", { ref: "activation:forwarded", responder: { kind: "linear-unverified", via: "activation", ref: "activation:forwarded" } });
   assert.equal(result.status, "applied");
+  await h.replies.recoverEffects();
   assert.deepEqual(h.evidence, []);
   assert.deepEqual(h.needsYou, ["agent"]);
 });
@@ -314,6 +327,7 @@ test("restart recovers unfinished confirmed effects without a caller replay or n
   const h = await harness(t);
   h.replies.recordEffects({ ...h.effects, ownerAnswered: async () => { throw new Error("evidence offline"); }, needsYou: async () => { throw new Error("Linear offline"); } });
   await h.replies.deliver(h.sdk, "a", "Node", owner("session:claimed"));
+  await h.replies.recoverEffects();
   const at = (await h.replies.records())["session:claimed"].at;
   h.pending([{ ...q, id: "q2" }]);
   const restarted = h.create();
@@ -381,4 +395,186 @@ test("revocation after a checked submission starts does not erase its confirmed 
   assert.equal(await pending, "applied");
   assert.equal(await h.create().outcome("on-wire"), "applied");
   assert.deepEqual(h.sent.map((item) => item.requestId), ["q1"]);
+});
+
+test("applied receipts and concurrent replays settle while evidence and Linear closing remain open", { timeout: 5_000 }, async (t) => {
+  const evidenceEntered = barrier(), evidenceGate = barrier();
+  const closingEntered = barrier(), closingGate = barrier();
+  t.after(() => { evidenceGate.release(); closingGate.release(); });
+  const h = await harness(t);
+  let evidenceCalls = 0, closingCalls = 0;
+  h.replies.recordEffects({
+    ...h.effects,
+    ownerAnswered: async (...args) => {
+      evidenceCalls++;
+      evidenceEntered.release();
+      await evidenceGate.promise;
+      await h.effects.ownerAnswered(...args);
+    },
+    needsYou: async (...args) => {
+      closingCalls++;
+      closingEntered.release();
+      await closingGate.promise;
+      await h.effects.needsYou(...args);
+    },
+  });
+  const origin = owner("comment:slow-effects");
+  try {
+    const receipt = await h.replies.deliver(h.sdk, "a", "Node", origin);
+    assert.equal(receipt.status, "applied");
+    assert.equal(receipt.delivered, true);
+    await evidenceEntered.promise;
+    const persisted = (await h.replies.records())[origin.ref];
+    assert.equal(persisted.status, "applied");
+    assert.equal(persisted.effects.evidence, false);
+    h.pending([{ ...q, id: "q2" }]);
+    const recovery = h.replies.recoverEffects();
+    const receipts = await Promise.all([
+      h.replies.recorded(origin.ref),
+      h.replies.deliver(h.sdk, "a", "Vitest", origin),
+    ]);
+    assert.deepEqual(receipts, [receipt, receipt]);
+    assert.equal(evidenceCalls, 1);
+    assert.equal(closingCalls, 0);
+    evidenceGate.release();
+    await closingEntered.promise;
+    assert.deepEqual(await h.replies.recorded(origin.ref), receipt);
+    assert.equal(closingCalls, 1);
+    assert.equal((await h.replies.records())[origin.ref].effects.needsYou, false);
+    closingGate.release();
+    await recovery;
+    assert.deepEqual(h.evidence, [{ request: q, response, at: receipt.at }]);
+    assert.deepEqual(h.needsYou, ["i1"]);
+    assert.deepEqual(h.sent.map((entry) => entry.requestId), ["q1"]);
+    assert.deepEqual((await h.replies.records())[origin.ref].effects, { evidence: true, correction: false, needsYou: true });
+  } finally {
+    evidenceGate.release();
+    closingGate.release();
+  }
+});
+
+test("shutdown drains started evidence, fences closing, and restart recovers without resubmission", { timeout: 5_000 }, async (t) => {
+  const entered = barrier(), gate = barrier();
+  t.after(() => gate.release());
+  const h = await harness(t);
+  h.replies.recordEffects({
+    ...h.effects,
+    ownerAnswered: async (...args) => { entered.release(); await gate.promise; await h.effects.ownerAnswered(...args); },
+  });
+  const origin = owner("comment:shutdown");
+  try {
+    const receipt = await h.replies.deliver(h.sdk, "a", "Node", origin);
+    await entered.promise;
+    let stopped = false;
+    const stopping = h.replies.stop().then(() => { stopped = true; });
+    assert.deepEqual(await h.replies.recorded(origin.ref), receipt);
+    assert.equal(stopped, false, "shutdown must drain the effect already in progress");
+    gate.release();
+    await stopping;
+    assert.deepEqual(h.needsYou, [], "no new effect may start after stop");
+    const saved = (await h.replies.records())[origin.ref];
+    assert.equal(saved.effects.evidence, true);
+    assert.equal(saved.effects.needsYou, false);
+    h.pending([{ ...q, id: "q2" }]);
+    const restarted = h.create();
+    await restarted.recoverEffects();
+    assert.deepEqual(await restarted.deliver(h.sdk, "a", "changed", origin), receipt);
+    await restarted.recoverEffects();
+    assert.deepEqual(h.evidence, [{ request: q, response, at: receipt.at }]);
+    assert.deepEqual(h.needsYou, ["i1"]);
+    assert.deepEqual(h.sent.map((entry) => entry.requestId), ["q1"]);
+  } finally { gate.release(); }
+});
+
+test("late correction receipts still wait for checked correction delivery", { timeout: 5_000 }, async (t) => {
+  const entered = barrier(), gate = barrier();
+  t.after(() => gate.release());
+  const h = await harness(t);
+  await h.replies.respond(h.intent("d1"));
+  h.replies.recordEffects({
+    ...h.effects,
+    correctLate: async (agentId, requestId, text) => { entered.release(); await gate.promise; return h.effects.correctLate(agentId, requestId, text); },
+  });
+  let settled = false;
+  const pending = h.replies.deliver(h.sdk, "a", "Vitest", owner("comment:checked-correction"),
+    { requestId: q.id, request: q, response: questionAnswer(q, "Vitest") }).then((result) => { settled = true; return result; });
+  try {
+    await entered.promise;
+    assert.equal(settled, false);
+    const saved = (await h.replies.records())["comment:checked-correction"];
+    assert.equal(saved.status, "deputy-first");
+    assert.equal(saved.correctionDelivered, undefined);
+    assert.equal(settled, false, "the stored deputy-first marker is not a checked correction receipt");
+    gate.release();
+    const result = await pending;
+    assert.equal(result.delivered, true);
+    assert.match(result.reply!, /your correction/);
+    assert.deepEqual(h.corrections, ["Vitest"]);
+    assert.equal(h.sent.length, 1);
+  } finally { gate.release(); }
+});
+
+test("restart recovery can remain in Linear closing while stored applied receipts are replayed", { timeout: 5_000 }, async (t) => {
+  const entered = barrier(), gate = barrier();
+  t.after(() => gate.release());
+  const h = await harness(t);
+  t.mock.method(console, "error", () => {});
+  h.replies.recordEffects({ ...h.effects, needsYou: async () => { throw new Error("Linear offline"); } });
+  const origin = owner("comment:restart-closing");
+  const receipt = await h.replies.deliver(h.sdk, "a", "Node", origin);
+  await h.replies.recoverEffects();
+  await h.replies.stop();
+  h.pending([{ ...q, id: "q2" }]);
+  const restarted = h.create();
+  let closingCalls = 0;
+  restarted.recordEffects({
+    ...h.effects,
+    needsYou: async (...args) => {
+      closingCalls++;
+      entered.release();
+      await gate.promise;
+      await h.effects.needsYou(...args);
+    },
+  });
+  const recovery = restarted.recoverEffects();
+  try {
+    await entered.promise;
+    const anotherRecovery = restarted.recoverEffects();
+    assert.deepEqual(await restarted.recorded(origin.ref), receipt);
+    assert.deepEqual(await restarted.deliver(h.sdk, "a", "changed replay", origin), receipt);
+    assert.equal(closingCalls, 1);
+    assert.deepEqual(h.sent.map((entry) => entry.requestId), ["q1"]);
+    assert.deepEqual(h.evidence, [{ request: q, response, at: receipt.at }]);
+    gate.release();
+    await Promise.all([recovery, anotherRecovery]);
+    assert.deepEqual(h.needsYou, ["i1"]);
+    assert.equal((await restarted.records())[origin.ref].effects.needsYou, true);
+  } finally { gate.release(); }
+});
+
+test("shutdown during checked submission records confirmation but leaves effects for restart", async (t) => {
+  const h = await harness(t);
+  const entered = barrier(), gate = barrier();
+  h.onSubmit(async () => { entered.release(); await gate.promise; });
+  const origin = owner("comment:stop-on-wire");
+  const pending = h.replies.deliver(h.sdk, "a", "Node", origin);
+  await entered.promise;
+  const stopping = h.replies.stop();
+  gate.release();
+  await assert.rejects(h.replies.deliver(h.sdk, "a", "Vitest", owner("comment:after-stop")), /plugin unloaded/);
+  await assert.rejects(h.replies.respond(h.intent("after-stop")), /plugin unloaded/);
+  const receipt = await pending;
+  await stopping;
+  assert.equal(receipt.status, "applied");
+  assert.deepEqual(h.evidence, []);
+  assert.deepEqual(h.needsYou, []);
+  const records = await h.replies.records();
+  assert.equal(records["comment:after-stop"], undefined);
+  assert.equal(records["deputy:after-stop"], undefined);
+  const restarted = h.create();
+  await restarted.recoverEffects();
+  assert.deepEqual(await restarted.recorded(origin.ref), receipt);
+  assert.deepEqual(h.evidence, [{ request: q, response, at: receipt.at }]);
+  assert.deepEqual(h.needsYou, ["i1"]);
+  assert.deepEqual(h.sent.map((entry) => entry.requestId), ["q1"]);
 });

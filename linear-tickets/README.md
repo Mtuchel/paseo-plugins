@@ -4292,18 +4292,27 @@ Background canonical collection awaits the full owner scan before publishing. Lo
 HTTP reads never await that scan: they return the collected owner sources, or an explicit
 collection-pending warning, alongside current live questions. A slow or quota-paused Linear
 scan cannot make a reachable decision host disappear or block forwarding a live answer.
-Live questions and peer reachability have a separate thirty-second, single-flight transport
-cache; they are not frozen for the fifteen-minute owner collection interval. Answer/config
-invalidation also fences in-flight transport reads, so they cannot republish an answered request.
-Concurrent peer reads share their request. Actual peer transport failures remain visible and
-are checked again on the next transport refresh, not the next Linear collection.
+Live questions and peer reachability have a separate thirty-second transport cache; they are
+not frozen for the fifteen-minute owner collection interval. Each peer refreshes independently:
+interactive reads return local decisions without waiting for a slow peer. Cold or expired peer
+snapshots are withheld with an unavailable/refreshing warning until collection finishes; they
+are never presented as current actionable decisions. Background collection still awaits coverage.
+Answer/config invalidation fences in-flight transport reads, so they cannot republish an answered
+request. Concurrent peer reads share their request. Actual peer transport failures remain visible
+and are checked again on the next transport refresh, not the next Linear collection.
+The combined frontdoor snapshot also collects plan-review peers independently; a slow review
+peer cannot delay the decision inbox. Expired review rows are withheld, and forwarding invalidates
+that peer's cached rows while retaining the target backend and review-generation fences.
+The frontdoor rechecks incomplete coverage after its two-second minimum snapshot gap, rather
+than holding a cold partial snapshot until the next thirty-second expiry. Notification collection
+still waits for peer coverage, so a routine refresh does not forget and re-announce waiting reviews.
 The task list groups owner decisions, unresolved source review, research/delegated waits and receipts.
 Source counts are separate from steward ticket-state counts: `waiting-owner` is not a count of
 actionable questions. Per-host collection timestamps and incomplete/stale coverage stay visible.
 Standalone live questions without a Linear identifier remain included. Original lettered choices,
 tradeoffs and scoped research/delegation controls remain attached to the exact source revision.
 The separate inbox frontdoor must be rebuilt and restarted on both hosts when deploying page
-changes; plugin reload alone does not publish new browser HTML.
+or frontdoor changes; plugin reload alone does not publish them.
 
 `GET /api/decisions/local` returns this host only; `GET /api/decisions` combines the configured
 hosts without recursive peer reads. `POST /api/decisions/action` accepts an explicit owner-ask or
@@ -4320,6 +4329,12 @@ provider's editor and “Done selecting” completes the selection. No option is
 Browser refresh preserves drafts only for an unchanged source. A changed or missing request pauses
 its old form until the owner explicitly selects the current source. Unconfirmed delivery is not
 automatically retried. A receipt confirms delivery or queueing, not downstream completion.
+For checked live answers, confirmation returns after the daemon acknowledgement is durably
+recorded as applied. Owner-answer evidence and closing the Linear “Needs you” issue run afterward,
+coalesced per receipt. Their durable completion flags allow recovery without resubmitting an answer;
+recovery waits for bookkeeping, and plugin shutdown drains already-started work before replacement.
+A late correction still waits for its own delivery result; an unconfirmed answer is never promoted
+to confirmed just to return faster.
 Browser live-question deferrals persist privately on the question's host and do not answer or
 restart an agent; they are separate from the native app's local live-question snoozes. Linear
 triage and actual answers are shared with the menu bar, which remains available in parallel.

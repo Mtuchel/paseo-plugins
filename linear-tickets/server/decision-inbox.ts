@@ -132,6 +132,7 @@ export class BrowserDecisionInbox {
   private transportCache: { view: DecisionView; at: number; generation: number } | null = null;
   private transportFlight: Promise<DecisionView> | null = null;
   private readonly peerFlights = new Map<string, Promise<DecisionHost>>();
+  private readonly peerCache = new Map<string, { snapshot: DecisionHost | null; error: string | null; at: number; generation: number }>();
 
   constructor(private readonly deps: BrowserDecisionInboxDeps) {
     this.host = deps.host ?? hostname().replace(/\.local$/, "");
@@ -146,6 +147,7 @@ export class BrowserDecisionInbox {
   stop(): void { this.curation.stop(); }
   refresh(): Promise<void> {
     this.ownerGeneration++;
+    this.peerFlights.clear();
     this.ownerCache = null;
     this.ownerFlight = null;
     this.transportFlight = null;
@@ -174,6 +176,7 @@ export class BrowserDecisionInbox {
         try { return await this.action(parsed.data); }
         finally {
           this.ownerGeneration++;
+          this.peerFlights.clear();
           this.ownerCache = null;
           this.ownerFlight = null;
           this.transportFlight = null;
@@ -304,8 +307,22 @@ export class BrowserDecisionInbox {
       if (!parsed.success) throw new Error("The peer returned an invalid decision snapshot.");
       return parsed.data;
     }, READ_TIMEOUT_MS);
+    const generation = this.ownerGeneration;
     this.peerFlights.set(peer, flight);
-    try { return await flight; }
+    try {
+      const snapshot = await flight;
+      if (generation === this.ownerGeneration) {
+        this.peerCache.set(peer, { snapshot, error: null, at: this.now(), generation });
+        this.transportCache = null;
+      }
+      return snapshot;
+    } catch (error) {
+      if (generation === this.ownerGeneration) {
+        this.peerCache.set(peer, { snapshot: null, error: reasonOf(error), at: this.now(), generation });
+        this.transportCache = null;
+      }
+      throw error;
+    }
     finally { if (this.peerFlights.get(peer) === flight) this.peerFlights.delete(peer); }
   }
 
@@ -338,11 +355,25 @@ export class BrowserDecisionInbox {
     const [configuredPeers, canonicalPeer] = await Promise.all([this.deps.peers(), this.deps.canonicalPeer()]);
     if (collectOwners && canonicalPeer === null) await this.ownerSnapshot();
     const localPromise = this.local(canonicalPeer === null);
-    const sources = await Promise.all([...new Set(configuredPeers)].map(async (configured) => {
-      try { const peer = peerOrigin(configured); return { configured, peer, snapshot: await this.readPeer(peer), error: null }; }
-      catch (error) { return { configured, peer: null, snapshot: null, error: reasonOf(error) }; }
-    }));
+    const peers = [...new Set(configuredPeers)].map(configured => {
+      try { return { configured, peer: peerOrigin(configured), error: null }; }
+      catch (error) { return { configured, peer: null, error: reasonOf(error) }; }
+    });
+    const reads = peers.flatMap(({ peer }) => {
+      if (!peer) return [];
+      const cached = this.peerCache.get(peer);
+      if (!collectOwners && cached?.generation === this.ownerGeneration && this.now() - cached.at < TRANSPORT_CACHE_MS) return [];
+      return [this.readPeer(peer).catch(() => null)];
+    });
+    // Background collection can wait for coverage. Interactive reads never wait for another host.
+    if (collectOwners) await Promise.all(reads);
     const local = await localPromise;
+    const sources = peers.map(({ configured, peer, error }) => {
+      const cached = peer ? this.peerCache.get(peer) : undefined;
+      const current = cached?.generation === this.ownerGeneration && this.now() - cached.at < TRANSPORT_CACHE_MS;
+      return { configured, peer, snapshot: current ? cached.snapshot : null,
+        error: error ?? (current ? cached.error : "Refreshing this host; no current snapshot is available.") };
+    });
     const hosts: DecisionHost[] = [local];
     const unreachable: string[] = [];
     let canonicalHost: string | null = canonicalPeer === null ? this.host : null;
@@ -382,7 +413,7 @@ export class BrowserDecisionInbox {
             ? await this.deps.ownerAsks.answer({ issueId: input.issueId!, revision: input.revision, answers: input.answers!, ...(input.note !== undefined ? { note: input.note } : {}), ...(input.done !== undefined ? { done: input.done } : {}) }, this.deps.paseo())
             : await this.deps.ownerAsks.triage({ issueId: input.issueId!, revision: input.revision, action: input.action!, ...(input.note !== undefined ? { note: input.note } : {}), ...(input.until !== undefined ? { until: input.until } : {}) }, this.deps.paseo());
           return json(200, result);
-        } finally { this.ownerGeneration++; this.ownerCache = null; this.ownerFlight = null; this.transportFlight = null; }
+        } finally { this.ownerGeneration++; this.peerFlights.clear(); this.ownerCache = null; this.ownerFlight = null; this.transportFlight = null; }
       }
       return this.liveAction(input);
     }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, request, type IncomingMessage } from "node:http";
 import { connect, type AddressInfo, type Socket } from "node:net";
@@ -7,11 +7,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
+import { setImmediate } from "node:timers/promises";
 import { DecisionJournal, FencedError, type ResolveAction, type RouteSnapshot } from "./decision-journal";
 import type { PipelineReview } from "./plan-pipeline";
 import type { OpenedEvent } from "./plannotator";
 import { ReviewLinks, type DecideReview, type ReviewLinksOptions } from "./review-links";
 import { planDetails } from "./review-page";
+import { INBOX_AUTH_HEADER } from "./inbox-transport";
 
 const ORIGIN = "https://host.tail1.ts.net:8444";
 const PEER_BACKEND = "db47bd0b-5709-4e0f-a3a4-8b4d65a34622";
@@ -57,6 +59,37 @@ async function withLinks(run: (links: ReviewLinks, get: (path: string, method?: 
     await rm(directory, { recursive: true, force: true });
   }
 }
+
+test("the combined frontdoor snapshot does not wait for a slow review peer", { timeout: 2_000 }, async () => {
+  const peer = createServer();
+  peer.on("request", (_request, response) => {
+    // Deliberately never answer: the local decision snapshot must not wait for the peer timeout.
+    response.on("error", () => {});
+  });
+  peer.listen(0, "127.0.0.1");
+  await once(peer, "listening");
+  const address = peer.address();
+  assert.ok(address && typeof address !== "string");
+  try {
+    await withLinks(async links => {
+      const response = await fetch(`http://127.0.0.1:${links.listeningPort}/_inbox/snapshot`, {
+        headers: { [INBOX_AUTH_HEADER]: "test-secret" },
+      });
+      assert.equal(response.status, 200);
+      const snapshot = await response.json();
+      assert.equal(snapshot.decisions.canonicalHost, "local-decisions");
+      assert.deepEqual(snapshot.inbox.unreachable, [`127.0.0.1:${address.port}`]);
+      assert.deepEqual(snapshot.inbox.open, []);
+    }, undefined, {
+      peers: async () => [`http://127.0.0.1:${address.port}`],
+      inbox: { credential: async () => "test-secret",
+        decisions: async () => ({ hosts: [], canonicalHost: "local-decisions", unreachable: [] }) },
+    });
+  } finally {
+    peer.closeAllConnections();
+    await new Promise<void>(resolve => peer.close(() => resolve()));
+  }
+});
 
 const PAGE = `<!doctype html>${"<p>A plan review page.</p>".repeat(40_000)}`;
 
@@ -491,12 +524,22 @@ const PEER_INBOX = {
   decided: [],
 };
 
+async function pageWithPeer(get: (path: string) => Promise<Response>, agentId: string): Promise<string> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    const page = await (await get("/")).text();
+    if (page.includes(`data-agent="${agentId}"`)) return page;
+    assert.ok(Date.now() < deadline, `Peer review ${agentId} was not published after collection`);
+    await setImmediate();
+  }
+}
+
 test("the inbox lists a peer host's waiting reviews among this host's, newest first, names each row's host, and says which peer did not answer", async () => {
   await withPeer(PEER_INBOX, async (peer) => {
     await withLinks(async (links, get, live) => {
       live.add(50_001);
       await links.opened("agent-1", opened(50_001), { identifier: "TUC-1", model: "claude/opus" });
-      const page = await (await get("/")).text();
+      const page = await pageWithPeer(get, "agent-9");
       const [waiting] = page.split("Recently decided");
       assert.deepEqual([...waiting.matchAll(/data-agent="([^"]+)"/g)].map((match) => match[1]), ["agent-9", "agent-1"], "rows a page could not render safely are left out");
       assert.match(waiting, /href="https:\/\/server087\.tail1\.ts\.net:8444\/review\/agent-9"/);
@@ -579,6 +622,64 @@ test("each review that starts waiting is pushed once to the subscribed browsers;
       sent.push(`${subscription.endpoint} ${message.title} ${message.url} ${message.count}`);
     },
   });
+});
+
+test("refreshing peer reviews does not announce the same waiting review again", async t => {
+  const originalFetch = globalThis.fetch;
+  const gate = new EventEmitter();
+  let hold = false;
+  let clock = Date.parse("2026-01-01T10:00:00Z");
+  const sent: string[] = [];
+  t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    if (String(input) !== "https://peer.test/api/inbox") return originalFetch(input, init);
+    if (hold) { gate.emit("entered"); await once(gate, "release"); }
+    return Response.json(PEER_INBOX);
+  });
+  await withLinks(async (links, get) => {
+    await action(links, "/api/push/subscribe", { endpoint: "https://push.example/1", keys: { p256dh: "p", auth: "a" } });
+    await links.announce();
+    for (let round = 0; round < 2; round++) {
+      clock += 31_000;
+      hold = true;
+      const entered = once(gate, "entered");
+      const announcing = links.announce();
+      await entered;
+      hold = false;
+      gate.emit("release");
+      await announcing;
+      await pageWithPeer(get, "agent-9");
+      await links.announce();
+    }
+    assert.deepEqual(sent, [], "unchanged peer reviews retain their notification history during refresh");
+  }, undefined, { peers: async () => ["https://peer.test"], now: () => new Date(clock),
+    sendPush: async (_subscription, message) => { sent.push(message.title); } });
+});
+
+test("a peer read started during a forwarded mutation cannot restore its old waiting row", async t => {
+  const originalFetch = globalThis.fetch;
+  const gate = new EventEmitter();
+  let applied = false;
+  t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    if (!String(input).startsWith("https://peer.test/")) return originalFetch(input, init);
+    if (init?.method === "POST") {
+      gate.emit("entered");
+      await once(gate, "release");
+      applied = true;
+      return Response.json({ ok: true });
+    }
+    return Response.json({ ...PEER_INBOX, open: applied ? [] : PEER_INBOX.open });
+  });
+  await withLinks(async (links, get) => {
+    await pageWithPeer(get, "agent-9");
+    const entered = once(gate, "entered");
+    const sending = action(links, "/api/reviews/agent-9/decision", { approve: true, reviewId: "review-9", backendInstanceId: PEER_BACKEND });
+    await entered;
+    try {
+      await pageWithPeer(get, "agent-9");
+    } finally { gate.emit("release"); }
+    assert.equal((await sending).status, 200);
+    assert.doesNotMatch(await (await get("/")).text(), /data-agent="agent-9"/);
+  }, undefined, { peers: async () => ["https://peer.test"] });
 });
 
 // A review replaced in the same millisecond, or one republished on its old URL: the registry is
@@ -886,7 +987,7 @@ const PEER_APPLYING = {
 test("a peer's being-applied rows render with their host, and a peer answer without any parses", async () => {
   await withPeer(PEER_APPLYING, async (peer) => {
     await withLinks(async (links, get) => {
-      const page = await (await get("/")).text();
+      const page = await pageWithPeer(get, "agent-9");
       const [waiting, rest] = page.split("Being applied");
       const [applying] = rest.split("Recently decided");
       assert.match(waiting, /Nothing to review/, "the peer's applied review is not waiting");
@@ -900,7 +1001,7 @@ test("a peer's being-applied rows render with their host, and a peer answer with
     await withLinks(async (links, get) => {
       const answer = await (await get("/api/inbox")).json() as { applying: unknown };
       assert.deepEqual(answer.applying, [], "this host is applying nothing itself");
-      const page = await (await get("/")).text();
+      const page = await pageWithPeer(get, "agent-9");
       assert.match(page, /TUC-9/, "a peer answer without applying parses as before");
       assert.doesNotMatch(page, /Being applied/);
     }, undefined, { peers: async () => [peer] });

@@ -739,7 +739,7 @@ export default function contribute(server: PluginServerContext) {
     // The bridge stops admitting decisions and lets every admitted one finish (each call is
     // bounded) before anything it uses closes; only then does the journal's lease move on.
     await plannotator.stop();
-    replies.stop();
+    await replies.stop();
     clearTimeout(startSoon);
     clearInterval(usageTimer);
     planningSmoke.stop();

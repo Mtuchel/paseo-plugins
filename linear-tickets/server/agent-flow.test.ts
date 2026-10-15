@@ -94,7 +94,7 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
   // daemon's server id is cached, post "Open in Paseo" links mid-test. Tests call sweep() themselves.
   Object.assign(router, { paseo });
   replies.attach(paseo);
-  return { router, store, replies, calls, feeds, paseo, directory, cleanup: () => rm(directory, { recursive: true, force: true }) };
+  return { router, store, replies, calls, feeds, paseo, directory, cleanup: async () => { await replies.stop(); await rm(directory, { recursive: true, force: true }); } };
 }
 
 const link = { sessionId: "s1", agentId: "a1", issueId: "i1", identifier: "TUC-1", createdAt: "2026-01-01T00:00:00Z", handled: [], review: null, offer: null };
@@ -203,9 +203,11 @@ test("an already-claimed session replay completes confirmed evidence without ans
   });
   await h.store.put(link);
   await h.router.prompted("s1", { id: "claimed", userId: OWNER, body: "Node" });
+  await h.replies.recoverEffects();
   pending.splice(0, pending.length, twoPart);
   offline = false;
   await h.router.prompted("s1", { id: "claimed", userId: OWNER, body: "Node" });
+  await h.replies.recoverEffects();
   assert.deepEqual(evidence, [single]);
   assert.equal((await h.store.get("s1"))?.questions, null);
   assert.equal(h.calls.filter(call => call.startsWith("checked ")).length, 1);

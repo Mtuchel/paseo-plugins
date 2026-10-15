@@ -428,6 +428,7 @@ test("a slow canonical owner scan does not disconnect peer questions or checked 
     return new Response(result.body, { status: result.status, headers: result.headers });
   });
   try {
+    await local.inbox.refresh();
     const view = await local.inbox.view();
     assert.equal(view.canonicalHost, "server087");
     assert.deepEqual(view.unreachable, []);
@@ -470,6 +471,50 @@ test("a recovered canonical peer becomes reachable on the next transport refresh
   assert.deepEqual(recovered.hosts[1].asks.map(ask => ask.revision), [ownerAsk.revision]);
   assert.equal(recovered.hosts[0].error, null);
   assert.equal(recovered.hosts[1].error, null);
+});
+
+test("a stalled peer cannot delay local questions, delivery, or the post-answer refresh", { timeout: 2_000 }, async t => {
+  const h = await harness(t);
+  const peer = "https://slow.test:8444";
+  h.canonical(peer); h.peers([peer]);
+  const release = barrier();
+  mockPeers(t, async () => { await release.promise; return Response.json(peerSnapshot()); });
+  try {
+    const before = await h.inbox.view();
+    assert.equal(before.hosts[0].live[0].requestId, "q1");
+    assert.equal(before.canonicalHost, null);
+    assert.deepEqual(before.unreachable, [peer]);
+    assert.equal((await h.post(await h.action())).body.delivered, "agent");
+    const after = await h.inbox.view();
+    assert.deepEqual(after.hosts[0].live, []);
+    assert.deepEqual(after.unreachable, [peer]);
+    release.release();
+    await h.inbox.refresh();
+    const recovered = await h.inbox.view();
+    assert.equal(recovered.canonicalHost, "server087");
+    assert.deepEqual(recovered.unreachable, []);
+    assert.deepEqual(recovered.hosts[0].live, []);
+    assert.deepEqual(h.sent.map(item => item.requestId), ["q1"]);
+  } finally { release.release(); h.inbox.stop(); }
+});
+
+test("expired peer decisions are withheld while their refresh is blocked", { timeout: 2_000 }, async t => {
+  const h = await harness(t);
+  const peer = "https://slow.test:8444";
+  h.canonical(peer); h.peers([peer]);
+  const release = barrier();
+  let hold = false;
+  mockPeers(t, async () => { if (hold) await release.promise; return Response.json(peerSnapshot()); });
+  try {
+    await h.inbox.refresh();
+    assert.equal((await h.inbox.view()).canonicalHost, "server087");
+    hold = true;
+    h.clock(h.now() + 30_001);
+    const expired = await h.inbox.view();
+    assert.equal(expired.canonicalHost, null);
+    assert.deepEqual(expired.hosts[1].asks, []);
+    assert.deepEqual(expired.unreachable, [peer]);
+  } finally { release.release(); h.inbox.stop(); }
 });
 
 test("background curation publishes complete owner sources after the interactive deadline", async (t) => {
