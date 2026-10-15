@@ -32,7 +32,8 @@ import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, type ProcessAgent, type
 import { WATCHDOG_LABEL, type TicketRoots, type WatchdogOutcome, type WatchdogRequest, type WatchdogStore } from "./watchdog";
 import type { ReviewDeletions } from "./review-deletions";
 import { DecisionPendingError, FencedError } from "./decision-journal";
-import { availability, candidates, claims, finishPending, incidentFor, LIMIT_SPACING, limitError, limitSchedule, limitTime, normalizeModel, updateEpisode, type LimitPending, type LimitResumeStore, type UsageReader } from "./limit-resume";
+import { candidates, normalizeModel } from "../shared/model-fallbacks";
+import { availability, claims, finishPending, incidentFor, LIMIT_SPACING, limitError, limitSchedule, limitTime, updateEpisode, type LimitPending, type LimitResumeStore, type UsageReader } from "./limit-resume";
 import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
 
 const exec = promisify(execFile);

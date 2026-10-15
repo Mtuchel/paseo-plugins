@@ -18,7 +18,8 @@ import { withPriority } from "./rate-budget";
 import type { PluginSettings, Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 import { activeModel } from "./model";
-import { availability, candidates, LIMIT_DAY, LIMIT_SPACING, limitError, limitSchedule, limitTime, normalizeModel, type UsageReader } from "./limit-resume";
+import { candidates, normalizeModel } from "../shared/model-fallbacks";
+import { availability, LIMIT_DAY, LIMIT_SPACING, limitError, limitSchedule, limitTime, type UsageReader } from "./limit-resume";
 import { PLAN_APPROVED_STATE, planStage } from "./plan-policy";
 
 // Projects carrying the trigger label move forward on their own (README, "Projects"):

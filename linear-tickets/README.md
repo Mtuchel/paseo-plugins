@@ -906,6 +906,15 @@ session that is not on the strong model. It is a guard against accidental routin
 shell can still write those files, a launch that never recorded the strong model is not blocked,
 and `escalate_model` lifts the block by moving the agent to the
 strong model — a cheap session that turns out to need the tests changed asks for the strong model.
+The owner-approved Opus 5.5 → GPT-6.1 Sol/high substitution also counts as strong for this test
+guard, but only when that launch model's configured `retry.fallbackChains` contains
+`openai-codex/gpt-6.1-sol:high` and the acting session currently reports thinking `high`. The
+extension reads that setting through the existing read-only `omp config get` command before a
+protected substitute write (five-second bound, no positive cache); unreadable/invalid configuration,
+unknown or different thinking, and an unrelated chain do not grant authority. Exact and prefix
+selectors follow the same shared matching rules as model drift and usage recovery. Flash and
+arbitrary other fallback targets remain blocked even if configured. The live model, thinking,
+launch authority and protected paths are read again after the asynchronous lookup.
 A cheap plan's premises — the existing functions, fields, behavior and data shapes it builds on —
 are verified against the current code by a cheap scout before the plan is submitted, so an
 implementation round is not spent on a wrong premise. The agent calls `escalate_model` with a

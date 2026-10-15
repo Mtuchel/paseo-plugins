@@ -86,3 +86,23 @@ test("isStrongModel needs the launch's own model, and a launch that recorded non
   assert.equal(blockedTestWrite(TESTS, "write", { path: "server/report.test.ts" }, FLASH, null), null, "a launch that recorded no strong model (a resume, an older plugin) is allowed");
   assert.equal(blockedTestWrite(TESTS, "write", { path: "server/report.ts" }, FLASH, SPEC), null);
 });
+
+test("only the configured owner-approved Sol/high substitute gains strong test-writing authority", () => {
+  const sol = { provider: "openai-codex", id: "gpt-6.1-sol" };
+  const chains = { "anthropic/claude-opus-5-5": ["openai-codex/gpt-6.1-sol:high", "lithos/deepseek-ai/DeepSeek-V4.1-Flash-ultra:max", "openai-codex/arbitrary:high"] };
+  const input = { path: "server/report.test.ts" };
+  const blocked = (model: typeof OPUS, thinking: string | undefined, configured = chains) =>
+    blockedTestWrite(TESTS, "write", input, model, SPEC, { chains: configured, thinking });
+  assert.equal(blocked(FLASH, "high"), input.path, "a configured cheap fallback never gets the capability");
+  assert.equal(blocked(OPUS, "low"), null, "the exact launch strong model stays allowed");
+  assert.equal(blocked(sol, "high"), null);
+  assert.equal(blocked(sol, "medium"), input.path);
+  assert.equal(blocked(sol, undefined), input.path, "unknown live reasoning cannot prove the approved capability");
+  assert.equal(blocked({ provider: "openai-codex", id: "arbitrary" }, "high"), input.path);
+  assert.equal(blockedTestWrite(TESTS, "write", input, sol, SPEC, { chains: null, thinking: "high" }), input.path);
+  assert.equal(blockedTestWrite(TESTS, "write", input, sol, SPEC, { chains: {}, thinking: "high" }), input.path);
+  assert.equal(blockedTestWrite(TESTS, "write", input, sol, SPEC, { chains: { "anthropic/claude-opus-5-5": ["openai-codex/gpt-6.1-sol"] }, thinking: "high" }), input.path, "an unpinned fallback is not the approved high capability");
+  assert.equal(blockedTestWrite(TESTS, "write", input, sol, SPEC, { chains: { "anthropic/claude-fable-5": ["openai-codex/gpt-6.1-sol:high"] }, thinking: "high" }), input.path, "another model's chain grants nothing");
+  assert.equal(blockedTestWrite(TESTS, "write", input, sol, SPEC, { chains: { slow: ["openai-codex/gpt-6.1-sol:high"] }, thinking: "high" }), input.path, "role names are not configured model selectors");
+  assert.equal(blockedTestWrite(TESTS, "write", input, sol, SPEC, { chains: { "omp/anthropic/*": ["omp/openai-codex/gpt-6.1-sol:high"] }, thinking: "high" }), null, "existing provider-prefix and wildcard selector conventions are shared");
+});

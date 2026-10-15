@@ -3,12 +3,14 @@
 // job of writing them failing first, and the cheap model must not edit them afterwards. The plugin
 // writes the plan's paths for that agent (`server/acceptance-tests.ts`); the omp extension
 // (`omp/linear-tickets-plan-first.ts`) reads them and refuses a write from a session that is not on
-// the strong model. Both sides use the rules below, so this module imports nothing (the omp
-// extension loads it from outside the plugin's build).
+// the strong model. Both sides share the rules below and the dependency-free fallback selector module
+// (the omp extension loads these from outside the plugin's build).
 //
 // A guard against accidental routing, not isolation: `bash` can still write those files, and the
 // `escalate_model` tool lifts the block by moving the agent to the strong model, which is the point
 // — a cheap session that turns out to need the tests changed asks for the strong model.
+import { fallbackSpecs, type FallbackChains } from "./model-fallbacks";
+
 export const STRONG_MODEL_ENV = "LINEAR_TICKETS_STRONG_MODEL";
 
 // What the plugin wrote for one implementing agent: the ticket it belongs to and the plan's test
@@ -64,22 +66,25 @@ export function protectedWrite(tests: AcceptanceTests | null | undefined, toolNa
   return null;
 }
 
-// Whether the acting session runs the plan's strong model. `spec`: the launch model the plugin set
-// (`LINEAR_TICKETS_STRONG_MODEL`, e.g. `omp/anthropic/claude-opus-5-5`); the session's live model
-// comes from omp in its own `provider/id` form, without the Paseo provider prefix. A fallback
-// chain may have moved either side, so an unknown spec never counts as strong (the guard below
-// then allows, deliberately).
-export function isStrongModel(current: { provider?: string; id?: string } | undefined | null, spec: string | null | undefined): boolean {
+// Only the owner-approved strong substitution is a capability, not every configured fallback.
+// In particular, routing a strong model to Flash must not grant Flash test-writing authority.
+export type StrongFallback = { chains: FallbackChains | null; thinking: string | undefined };
+export function isStrongModel(current: { provider?: string; id?: string } | undefined | null, spec: string | null | undefined, fallback?: StrongFallback): boolean {
   const wanted = (spec ?? "").trim().replace(/^omp\//, "");
   if (!wanted || !current?.id) return false;
-  return `${current.provider ?? ""}/${current.id}` === wanted;
+  const running = `${current.provider ?? ""}/${current.id}`;
+  if (running === wanted) return true;
+  return wanted === "anthropic/claude-opus-5-5"
+    && running === "openai-codex/gpt-6.1-sol"
+    && fallback?.thinking === "high"
+    && Boolean(fallback.chains && fallbackSpecs(fallback.chains, wanted).includes("openai-codex/gpt-6.1-sol:high"));
 }
 
 // The protected path a session may not write, or null. A session on the strong model may write the
 // tests (it is the model that wrote them), and so may one whose launch did not record the strong
 // model: the guard exists to catch accidental routing, and a wrong refusal would stop exactly the
 // work it protects.
-export function blockedTestWrite(tests: AcceptanceTests | null | undefined, toolName: string, input: Record<string, unknown> | undefined, current: { provider?: string; id?: string } | undefined | null, spec: string | null | undefined): string | null {
-  if (!spec || isStrongModel(current, spec)) return null;
+export function blockedTestWrite(tests: AcceptanceTests | null | undefined, toolName: string, input: Record<string, unknown> | undefined, current: { provider?: string; id?: string } | undefined | null, spec: string | null | undefined, fallback?: StrongFallback): string | null {
+  if (!spec || isStrongModel(current, spec, fallback)) return null;
   return protectedWrite(tests, toolName, input);
 }

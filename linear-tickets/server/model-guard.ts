@@ -1,6 +1,7 @@
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import type { Tier } from "../shared/plan-model";
-import { candidates, normalizeModel, ompFallbackChains, type FallbackChains } from "./limit-resume";
+import { candidates, normalizeModel, type FallbackChains } from "../shared/model-fallbacks";
+import { ompFallbackChains } from "./limit-resume";
 import type { PluginSettings, Settings } from "./settings";
 
 // Ticket agents run the model of their tier (README, "Model tiers"): the launch model while they
