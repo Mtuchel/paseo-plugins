@@ -6,7 +6,7 @@
 // No imports beyond ./plan-risk and ./plan-model: Paseo's shared bundle refuses Node modules, and
 // the omp extension imports it from outside the plugin's build.
 
-import { strongRequired, routeRisk, TIERS, type Tier } from "./plan-model";
+import { readTier, strongRequired, routeRisk, type Tier } from "./plan-model";
 import { MAX_IMPACT, REVERSIBILITY, type Impact, type Reversibility } from "./plan-risk";
 
 export const SMALL_ROUTE_ENV = "LINEAR_TICKETS_SMALL_ROUTE";
@@ -86,7 +86,7 @@ export function parseRouteFacts(value: unknown): { facts: RouteFacts } | { probl
     crossPackageContract: read("crossPackageContract", flag),
     newRule: read("newRule", flag),
     ownerDecisionNeeded: read("ownerDecisionNeeded", flag),
-    tier: read("tier", (raw) => (TIERS as readonly unknown[]).includes(raw) ? raw as Tier : null),
+    tier: read("tier", readTier),
     tierReason: read("tierReason", words),
     reach: read("reach", words),
     reason: read("reason", words),

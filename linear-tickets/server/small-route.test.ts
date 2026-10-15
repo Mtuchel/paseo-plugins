@@ -187,6 +187,24 @@ test("AC-3: a failed step resumes on the next sweep without repeating earlier st
   });
 });
 
+test("a route recorded on the dropped standard tier carries on as strong, in its record and when its attempt resumes", async () => {
+  await harness(async ({ routes, fail, labels, directory }) => {
+    fail.add("comment-after");
+    await assert.rejects(routes.handle(event(), AGENT), /comment-after failed/);
+    // As written before the standard tier was dropped: the route request, the recorded tier, the route.
+    const attemptPath = join(directory, "small-route", "attempts", `${ROUTE}.json`);
+    const attempt = JSON.parse(await readFile(attemptPath, "utf8")) as { facts: RouteFacts; steps: Record<string, unknown> };
+    await writeFile(attemptPath, JSON.stringify({ ...attempt, facts: { ...attempt.facts, tier: "standard" }, steps: { ...attempt.steps, record: "standard" } }));
+    const routePath = join(directory, "small-route", "routes", "issue-1.json");
+    const route = JSON.parse(await readFile(routePath, "utf8")) as { facts: RouteFacts };
+    await writeFile(routePath, JSON.stringify({ ...route, tier: "standard", facts: { ...route.facts, tier: "standard" } }));
+    const read = await routes.get("issue-1");
+    assert.deepEqual({ tier: read?.tier, facts: read?.facts.tier }, { tier: "strong", facts: "strong" });
+    await routes.sweep();
+    assert.deepEqual(labels, ["no-plan", "model:strong"]);
+  });
+});
+
 test("AC-3: a model:strong label keeps the strong tier; the route never downgrades it", async () => {
   await harness(async ({ routes, labels, tiers }) => {
     labels.push("model:strong");
