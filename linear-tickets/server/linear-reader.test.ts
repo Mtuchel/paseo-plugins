@@ -407,6 +407,21 @@ test("owner collection refuses a repeating issue cursor instead of claiming comp
   await assert.rejects(linear.ownerAskIssues(true), /repeated owner-issue cursor/);
 });
 
+test("owner comment inventory covers a large inbox in two bounded reads without mixing tickets", async () => {
+  const ids = Array.from({ length: 26 }, (_, index) => `issue-${index}`);
+  const batchSizes: number[] = [];
+  const { linear } = service(undefined, (_query, variables) => {
+    const entries = Object.entries(variables).filter(([name]) => /^i\d+$/.test(name));
+    batchSizes.push(entries.length);
+    return Object.fromEntries(entries.map(([name, id]) => [`t${name.slice(1)}`, groupConnection([{
+      comments: groupConnection([{ id: `ask-${id}`, body: `Decision for ${id}?`, createdAt: "2026-10-15T00:00:00Z" }]),
+    }])]));
+  });
+  const found = await linear.ownerAskComments(ids);
+  assert.deepEqual(batchSizes, [25, 1]);
+  assert.deepEqual(ids.map(id => found.get(id)?.[0]?.id), ids.map(id => `ask-${id}`));
+});
+
 test("owner comment inventory reaches an old unresolved question while other issues finish early", async () => {
   const recent = Array.from({ length: 50 }, (_, i) => ({ id: `recent-${i}`, body: "Progress update", createdAt: "2026-10-14T00:00:00Z" }));
   const oldAsk = { id: "old-question", body: "A: EU region or B: US region?", createdAt: "2026-10-01T00:00:00Z" };
