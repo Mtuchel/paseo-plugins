@@ -2336,28 +2336,32 @@ export class PullRequestWatch {
     // Whether this host runs the repo-wide half of the backstop (see backstopHost).
     const repoWide = await this.backstopHost();
     // Set once GitHub's budget stopped the run: the rest neither runs nor counts as read, and the
-    // outage issue still gets its one sync with those repos failed. A GitHub stop then waits for
-    // GitHub's reset (armResume); Linear's limit keeps the next tick. A budget already paused when
-    // the run starts stops it before its first request.
-    let stopped: Error | null = null;
-    const stops = (error: unknown): error is Error => error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError;
+    // outage issue still gets its one sync with those repos failed; the run then waits for GitHub's
+    // reset (armResume). A budget already paused when the run starts stops it before its first
+    // request. Linear's limit never stops the GitHub work (TUC-2502): a refused discovery read ends
+    // discovery for this run, and a refusal inside a repo's steps ends only that repo's steps (a
+    // refused ticket notice waits for a later run, see advanceAction and retargets); every repo
+    // still gets its Greptile request and its backstop steps, and the next tick tries Linear again.
+    let githubStop: Error | null = null;
+    const stops = (error: unknown): error is Error => error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError;
     try {
       (this.deps.backstop?.budget ?? githubBudget).admit("background");
     } catch (error) {
       if (!(error instanceof GitHubPausedError)) throw error;
       console.error(`[linear-tickets] queue backstop stopped before its first GitHub request: ${error.message}`);
-      stopped = error;
+      githubStop = error;
     }
-    for (const record of stopped ? [] : records) {
+    for (const record of githubStop ? [] : records) {
       try {
         await this.discover(record, context);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[linear-tickets] queue backstop discovery for ${record.identifier} stopped: ${message}`);
         if (stops(error)) {
-          stopped = error;
+          githubStop = error;
           break;
         }
+        if (error instanceof RateLimitedError) break;
       }
     }
     // Greptile request evidence expires like the other backstop memory, on every host and run.
@@ -2380,24 +2384,24 @@ export class PullRequestWatch {
     const greptile: RetriggerResult[] = [];
     for (const repo of new Set([...repos, ...follow.keys()])) {
       if (writer) {
-        if (stopped) greptile.push({ repo, result: "failed", error: stopped.message });
+        if (githubStop) greptile.push({ repo, result: "failed", error: githubStop.message });
         else {
           try {
             greptile.push(await this.greptileRequest(repo, follow.get(repo) ?? [], seenByUrl, context));
           } catch (error) {
             // Only GitHub's refusal escapes the request: the repo failed, and the run stops.
-            stopped = error as Error;
-            greptile.push({ repo, result: "failed", error: stopped.message });
+            githubStop = error as Error;
+            greptile.push({ repo, result: "failed", error: githubStop.message });
           }
         }
       }
-      if (stopped || !repos.has(repo)) continue;
+      if (githubStop || !repos.has(repo)) continue;
       try {
         await this.backstopRepo(repo, seenByUrl, context, save, repoWide);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[linear-tickets] queue backstop for ${repo} stopped: ${message}`);
-        if (stops(error)) stopped = error;
+        if (stops(error)) githubStop = error;
       }
     }
     await save();
@@ -2408,7 +2412,7 @@ export class PullRequestWatch {
         console.error(`[linear-tickets] greptile outage issue: ${error instanceof Error ? error.message : error}`);
       }
     }
-    if (stopped && !(stopped instanceof RateLimitedError)) await this.armResume(stopped);
+    if (githubStop) await this.armResume(githubStop);
   }
 
   private hasScript(checkout: string, script: string): boolean {
@@ -2435,9 +2439,9 @@ export class PullRequestWatch {
   // One repo's Greptile request (TUC-2427): the repo's script decides and posts the one request a
   // pull request gets in its lifetime (never a second after its review); `follow` are the pull
   // requests the outage issue lists. The request it made is kept on the pull request's entry as
-  // evidence. A failure is the repo's `failed` answer, except GitHub's refusal (of the run, or of
-  // its request, after the request it made is kept): that stops the backstop run, which waits for
-  // the reset.
+  // evidence. It reads nothing from Linear, so Linear's limit never holds it back (TUC-2502). A
+  // failure is the repo's `failed` answer, except GitHub's refusal (of the run, or of its request,
+  // after the request it made is kept): that stops the backstop run, which waits for the reset.
   private async greptileRequest(repo: string, follow: number[], seenByUrl: Record<string, Seen>, context: RunContext): Promise<RetriggerResult> {
     const keep = (run: RetriggerRun) => {
       for (const found of run.triggered) {
@@ -2689,14 +2693,23 @@ export class PullRequestWatch {
     if (steps.linearComment === "due" || steps.linearComment === "started") {
       const mark = ticketMarker(action.id);
       steps.linearComment = "started";
-      for (const { identifier, issueId } of await this.issueIds(action.tickets, context.records)) {
-        if ((action.linearDone ?? []).includes(identifier)) continue;
-        // Looked up before it goes out, and recorded only once Linear confirmed it: a comment whose
-        // answer was lost (a restart, a request that failed after it reached Linear) is found by
-        // its mark and not posted again; one that never went out is posted on the next run.
-        if (!await this.deps.linear.hasComment(issueId, mark)) await this.deps.linear.comment(issueId, `${enqueuedComment(action)}\n\n${mark}`);
-        action.linearDone = [...(action.linearDone ?? []), identifier];
+      try {
+        for (const { identifier, issueId } of await this.issueIds(action.tickets, context.records)) {
+          if ((action.linearDone ?? []).includes(identifier)) continue;
+          // Looked up before it goes out, and recorded only once Linear confirmed it: a comment whose
+          // answer was lost (a restart, a request that failed after it reached Linear) is found by
+          // its mark and not posted again; one that never went out is posted on the next run.
+          if (!await this.deps.linear.hasComment(issueId, mark)) await this.deps.linear.comment(issueId, `${enqueuedComment(action)}\n\n${mark}`);
+          action.linearDone = [...(action.linearDone ?? []), identifier];
+          await save();
+        }
+      } catch (error) {
+        if (!(error instanceof RateLimitedError)) throw error;
+        // Linear's limit: the comment stays `started` and goes out on a later run (found by its
+        // mark), the note waits for it, and the backstop's GitHub work goes on (TUC-2502).
         await save();
+        console.error(`[linear-tickets] queue backstop: the ticket comment of ${action.id} waits for Linear: ${error.message}`);
+        return;
       }
       steps.linearComment = "done";
       await save();
@@ -2815,7 +2828,15 @@ export class PullRequestWatch {
       try {
         await work();
       } catch (error) {
-        if (error instanceof RateLimitedError || error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) throw error;
+        if (error instanceof GitHubPausedError || error instanceof GitHubRateLimitedError) throw error;
+        // Linear's limit ends only this move's Linear step: a done move's ticket notice stays
+        // `sending` and goes out on a later run (found by its marker), never moved again (TUC-2502).
+        if (error instanceof RateLimitedError) {
+          console.error(move.step === "done"
+            ? `[linear-tickets] queue backstop: the stack of ${pullUrl(repo, move.pr)} is on main; its ticket notice waits for Linear: ${error.message}`
+            : `[linear-tickets] queue backstop: moving the stack of ${pullUrl(repo, move.pr)} onto main waits for Linear: ${error.message}`);
+          return;
+        }
         console.error(`[linear-tickets] queue backstop: moving the stack of ${pullUrl(repo, move.pr)} onto main stopped: ${error instanceof Error ? error.message : error}`);
       }
     };
