@@ -12,9 +12,11 @@ export type LaunchPreference = { model: string; modeId?: string; thinkingOptionI
 // A lower model tier's model per provider (README, "Model tiers"); a provider without one
 // implements plans of that tier on its launch model.
 export type TierModel = { model: string; thinkingOptionId?: string };
-export const DEFAULT_CHEAP_MODELS: Record<string, TierModel> = { omp: { model: "omp/deepseek/deepseek-flash", thinkingOptionId: "max" } };
-// GPT-6.1 Sol runs on the OpenAI account, apart from the launch model's Claude account.
-export const DEFAULT_STANDARD_MODELS: Record<string, TierModel> = { omp: { model: "omp/openai-codex/gpt-6.1-sol", thinkingOptionId: "high" } };
+// The cheap tier's default: DeepSeek V4.1 Flash Ultra through the Lithos account, thinking max
+// (2026-10-15). It replaced `omp/deepseek/deepseek-flash` after the measured comparison (equal
+// tool-error rate, ~$0.003–0.01 per edit against Opus's $0.27); the official DeepSeek API stays the
+// fallback through omp's `retry.fallbackChains` (host config, model-guard.ts excludes those).
+export const DEFAULT_CHEAP_MODELS: Record<string, TierModel> = { omp: { model: "omp/lithos/deepseek-ai/DeepSeek-V4.1-Flash-ultra", thinkingOptionId: "max" } };
 // Auto-dispatch starts an agent for every open ticket carrying `label` in one of `teamKeys`,
 // whoever it is assigned to. No teams means nothing is dispatched, even when enabled.
 // `maxRunning`: at most this many ticket agents work at once (0 = no limit); others wait their turn.
@@ -104,9 +106,8 @@ export type PluginSettings = {
   steward: StewardSettings;
   // Plans rated at or below the threshold are approved without the owner (README, "Plan risk and auto-approval").
   autoApprove: AutoApprovePolicy;
-  // The cheap and standard tiers' models per provider; `{}` turns that tier's own model off.
+  // The cheap tier's model per provider; `{}` turns that tier's own model off.
   cheapModels: Record<string, TierModel>;
-  standardModels: Record<string, TierModel>;
   // Other hosts' review inboxes (https://<host>.<tailnet>.ts.net:8444) this host's inbox also lists.
   reviewPeers: string[];
   // Activation routing (README, "Draining a host"); the secret is a separate host-local file.
@@ -132,7 +133,6 @@ type SettingsFile = {
   steward?: Partial<StewardSettings>;
   autoApprove?: Partial<AutoApprovePolicy>;
   cheapModels?: Record<string, TierModel>;
-  standardModels?: Record<string, TierModel>;
   reviewPeers?: string[];
   activation?: { mode?: unknown; peer?: unknown };
   backstop?: { run?: unknown };
@@ -421,9 +421,9 @@ export type SettingsPatch = {
   watchdog?: Partial<WatchdogTimings>;
   steward?: Partial<StewardSettings>;
   autoApprove?: Partial<AutoApprovePolicy>;
-  // Sets one provider's model for the cheap or standard tier; `model: null` removes it (that
-  // tier then implements on the provider's launch model).
-  tierModel?: { tier: "cheap" | "standard"; provider: string; model: string | null; thinkingOptionId?: string };
+  // Sets one provider's model for the cheap tier; `model: null` removes it (that tier then
+  // implements on the provider's launch model).
+  tierModel?: { tier: "cheap"; provider: string; model: string | null; thinkingOptionId?: string };
   // Activation routing; `secret` is write-only (the host-local file) and `null`/`""` removes it.
   activation?: { mode?: "local" | "remote"; peer?: string | null; secret?: string | null };
   // Queue backstop: which host runs its repo-wide half (README, "Queue backstop").
@@ -487,7 +487,6 @@ export class Settings {
       steward: normalizeSteward(value.steward),
       autoApprove: normalizeAutoApprove(value.autoApprove),
       cheapModels: normalizeTierModels(value.cheapModels, DEFAULT_CHEAP_MODELS),
-      standardModels: normalizeTierModels(value.standardModels, DEFAULT_STANDARD_MODELS),
       reviewPeers: normalizeReviewPeers(value.reviewPeers),
       activation: normalizeActivation(value.activation),
       backstop: normalizeBackstop(value.backstop),
@@ -536,11 +535,10 @@ export class Settings {
     }
     if (patch.tierModel) {
       const { tier, provider, model, thinkingOptionId } = patch.tierModel;
-      const key = tier === "cheap" ? "cheapModels" : "standardModels";
-      const models = { ...current[key] };
+      const models = { ...current.cheapModels };
       if (model) models[provider] = { model, ...(thinkingOptionId ? { thinkingOptionId } : {}) };
       else delete models[provider];
-      next[key] = normalizeTierModels(models, {});
+      next.cheapModels = normalizeTierModels(models, {});
     }
     if (patch.activation) {
       const { secret, ...change } = patch.activation;
@@ -570,12 +568,11 @@ export class Settings {
     const customSteward = JSON.stringify(value.steward) !== JSON.stringify(DEFAULT_STEWARD);
     const customAutoApprove = JSON.stringify(value.autoApprove) !== JSON.stringify(DEFAULT_AUTO_APPROVE);
     const customCheapModels = JSON.stringify(value.cheapModels) !== JSON.stringify(DEFAULT_CHEAP_MODELS);
-    const customStandardModels = JSON.stringify(value.standardModels) !== JSON.stringify(DEFAULT_STANDARD_MODELS);
     const customActivation = JSON.stringify(value.activation) !== JSON.stringify(DEFAULT_ACTIVATION);
     const customDeputy = JSON.stringify(value.deputy) !== JSON.stringify(DEFAULT_DEPUTY);
     const customBackstop = JSON.stringify(value.backstop) !== JSON.stringify(DEFAULT_BACKSTOP);
     const customWorktreeShards = JSON.stringify(value.worktreeShards) !== JSON.stringify(DEFAULT_WORKTREE_SHARDS);
-    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customWatchdog && !customSteward && !customAutoApprove && !customCheapModels && !customStandardModels && !value.reviewPeers.length && !customActivation && !customDeputy && !customBackstop && !customWorktreeShards) {
+    if (!value.template && !value.markInProgress && !value.showClosed && !value.lastProvider && !Object.keys(value.launchPreferences).length && !hasMappings && value.agentLinearAccess && !customDispatch && !customWriteback && !customWatchdog && !customSteward && !customAutoApprove && !customCheapModels && !value.reviewPeers.length && !customActivation && !customDeputy && !customBackstop && !customWorktreeShards) {
       await rm(this.path, { force: true });
       return value;
     }
@@ -596,7 +593,6 @@ export class Settings {
     if (customSteward) fileValue.steward = value.steward;
     if (customAutoApprove) fileValue.autoApprove = value.autoApprove;
     if (customCheapModels) fileValue.cheapModels = value.cheapModels;
-    if (customStandardModels) fileValue.standardModels = value.standardModels;
     if (value.reviewPeers.length) fileValue.reviewPeers = value.reviewPeers;
     if (customActivation) fileValue.activation = value.activation;
     if (customBackstop) fileValue.backstop = value.backstop;

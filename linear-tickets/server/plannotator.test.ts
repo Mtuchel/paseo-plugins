@@ -79,7 +79,7 @@ test("the plan document states the decision and feedback above the plan", () => 
 
 const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true,
-  dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true }, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
+  dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true }, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
 };
 
 // `ticket`: who wrote the ticket and its labels, for the risk policy's checks. `documents`: the
@@ -312,7 +312,7 @@ test("with review links, the agent's stable link is posted instead of the review
   });
 });
 
-const MODEL = (tier: string) => `## Model\n\n- Tier: ${tier} — one report column\n- Strong steps: none — routine\n\n`;
+const MODEL = (tier: string) => `## Model\n\n- Tier: ${tier} — one report column\n- Strong steps: none — routine\n- Acceptance tests: server/report.test.ts — the new column\n\n`;
 const RISKY = (impact: number, newRule = "no — a one-off column") => `# Plan\n\n1. Add the column to the report.\n\n${MODEL("strong")}## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: ${impact} — read-only report\n- Reversibility: revert — no data written\n- Feature flag: no\n- Migration: no\n- Auth: no\n- New rule: ${newRule}\n- Failure mode: the report shows a wrong column; sales notices on the next export\n- Advisor rating: impact ${impact}, reversibility revert\n- Recommendation: auto — nothing for the owner to decide\n\n## Advisor review\n\nGPT-6 Astra, 1 round, agreed.\n`;
 
 // Runs one review: the extension's advised event for `advisedPlan`, then the hand-off of `shownPlan`.
@@ -968,18 +968,23 @@ test("the owner's review feedback is logged for the decision candidates; the ris
 // Tier decisions as the bridge records them, and the agents it sends back to planning.
 function tierFake(calls: string[]) {
   const recorded: string[] = [];
+  const tests: string[] = [];
   const tiers = {
     store: { record: async (issue: { identifier: string }, event: { tier: string; source: string; reason: string; agentId: string | null }) => { recorded.push(`${issue.identifier} ${event.source} ${event.tier} ${event.agentId}: ${event.reason}`); return null as never; } },
     apply: async (agentId: string) => { calls.push(`apply ${agentId}`); },
     replan: async (agent: { id: string; identifier: string }, message: string) => { calls.push(`replan ${agent.id} ${agent.identifier}: ${message.split("\n\n")[0]}`); },
+    tests: {
+      save: async (agentId: string, value: { identifier: string; paths: string[] }) => { tests.push(`save ${agentId} ${value.identifier} ${value.paths.join(", ")}`); },
+      clear: async (agentId: string) => { tests.push(`clear ${agentId}`); },
+    },
   };
-  return { recorded, tiers };
+  return { recorded, tests, tiers };
 }
 
-test("an approved standard plan sets the ticket's tier; an escalation from it records the strong tier first, then relabels, switches and tells the owner", async () => {
+test("an approved plan whose tier line names the dropped standard tier reads as strong: the ticket takes the strong label, its acceptance tests are not protected, and an escalation records the strong tier first, then relabels, switches and tells the owner", async () => {
   const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" }, { creatorId: "owner", labels: ["model:cheap"] });
-  const { recorded, tiers } = tierFake(calls);
-  const plan = "# Plan\n1. Add the column\n\n## Model\n\n- Tier: standard — one column with a filter\n- Strong steps: none — routine\n";
+  const { recorded, tests, tiers } = tierFake(calls);
+  const plan = "# Plan\n1. Add the column\n\n## Model\n\n- Tier: standard — one column with a filter\n- Strong steps: none — routine\n- Acceptance tests: none — a one-column report needs no test file\n";
   await withEvents([
     { type: "decided", agentId: "agent-1", approved: true, planContent: plan, at: "2026-01-01T10:05:00Z" },
     { type: "escalated", agentId: "agent-1", reason: "the migration test still fails after two fixes", at: "2026-01-01T11:00:00Z" },
@@ -991,14 +996,54 @@ test("an approved standard plan sets the ticket's tier; an escalation from it re
     bridge.stop();
   });
   assert.deepEqual(recorded, [
-    "TUC-25 plan standard agent-1: one column with a filter",
+    "TUC-25 plan strong agent-1: one column with a filter",
     "TUC-25 escalated strong agent-1: the migration test still fails after two fixes",
   ]);
+  // An in-flight plan from before the cutover keeps the strong model, so its tests are not the
+  // cheap agent's to write: nothing is protected.
+  assert.deepEqual(tests, ["clear agent-1"]);
   assert.deepEqual(calls, [
-    "row agent-1: Plan approved in Plannotator", "labels issue-1 +model:standard -l0", "apply agent-1",
+    "row agent-1: Plan approved in Plannotator", "labels issue-1 +model:strong -l0", "apply agent-1",
     "stage issue-1 Plan approved", "state issue-1 In Progress", "+plan-ready issue-1", "-plan-rework issue-1", "document issue-1 Plan: TUC-25", "comment issue-1: ✅ **Plan approved** in Plannotator — [plan](https://linear.app/doc/1)",
     "labels issue-1 +model:strong -l0", "apply agent-1", "comment issue-1: ⬆️ **Escalated to the strong model tier: the migration test still fails after two fixes**",
   ]);
+});
+
+test("an approved cheap plan protects its acceptance tests for the implementing agent: the strong model writes them first and the cheap agent must not edit them", async () => {
+  const cheap = "# Plan\n1. Add the column\n\n## Model\n\n- Tier: cheap — one column\n- Strong steps: 3 — the migration\n- Acceptance tests: server/report.test.ts, client/report.test.ts — the column and its filter\n";
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" }, { creatorId: "owner", labels: ["plan-ready"] });
+  const { recorded, tests, tiers } = tierFake(calls);
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, planContent: cheap, at: "2026-01-01T10:05:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+    bridge.useTiers(tiers);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.deepEqual(recorded, ["TUC-25 plan cheap agent-1: one column"]);
+  assert.deepEqual(tests, ["save agent-1 TUC-25 server/report.test.ts, client/report.test.ts"], "the strong model writes these first; the cheap agent must not edit them");
+  assert.deepEqual(calls, [
+    "row agent-1: Plan approved in Plannotator", "labels issue-1 +model:cheap", "apply agent-1",
+    "stage issue-1 Plan approved", "state issue-1 In Progress", "+plan-ready issue-1", "-plan-rework issue-1", "document issue-1 Plan: TUC-25", "comment issue-1: ✅ **Plan approved** in Plannotator — [plan](https://linear.app/doc/1)",
+  ]);
+});
+
+test("a plan on the strong tier protects nothing: its own agent writes its tests", async () => {
+  const strong = "# Plan\n1. Add the column\n\n## Model\n\n- Tier: strong — the design is the work\n- Strong steps: 1 — the design itself\n- Acceptance tests: server/report.test.ts — the new column\n";
+  // The ticket carries a cheap label; the plan raises it, so the implementing agent is the strong
+  // model itself and its writes are not blocked (`tier === planned.tier` alone would save them).
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" }, { creatorId: "owner", labels: ["model:cheap"] });
+  const { recorded, tests, tiers } = tierFake(calls);
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, planContent: strong, at: "2026-01-01T10:05:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+    bridge.useTiers(tiers);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.deepEqual(recorded, ["TUC-25 plan strong agent-1: the design is the work"]);
+  assert.deepEqual(tests, ["clear agent-1"]);
+  assert.ok(calls.includes("labels issue-1 +model:strong -l0"));
 });
 
 test("an approved plan that names no tier records none and sends its agent back to planning for it", async () => {
@@ -1040,9 +1085,13 @@ async function submit(plan: string, approvedDocument?: string) {
 test("a ticket plan without a usable model tier goes back to its planner, never to the owner", async () => {
   const cases: [string, string, RegExp][] = [
     ["no section", RISKY(1).replace(MODEL("strong"), ""), /^false Paseo sent this plan back before review\. The plan has no "## Model" section\./],
-    ["no tier line", RISKY(1).replace("- Tier: strong — one report column\n", ""), /has no readable "- Tier: <cheap \| standard \| strong> — <why>" line/],
-    ["below strong at impact 3", RISKY(3).replace("Tier: strong", "Tier: standard"), /"- Tier: standard" is not allowed for this plan \(impact 3 in "## Risk and impact"\): write "- Tier: strong — <why>"\./],
-    ["cheap with a migration", RISKY(1).replace("Tier: strong", "Tier: cheap").replace("- Migration: no", "- Migration: yes — a new column"), /"- Tier: cheap" is not allowed for this plan \(a migration in/],
+    ["no tier line", RISKY(1).replace("- Tier: strong — one report column\n", ""), /has no readable "- Tier: <cheap \| strong> — <why>" line/],
+    ["no strong steps line", RISKY(1).replace("- Strong steps: none — routine\n", ""), /has no "- Strong steps: <none \| step numbers> — <why>" line/],
+    ["no acceptance tests line", RISKY(1).replace("- Acceptance tests: server\/report.test.ts — the new column\n", ""), /has no "- Acceptance tests: <none \| test file paths> — <why>" line/],
+    ["an acceptance tests line with no reason", RISKY(1).replace("- Acceptance tests: server/report.test.ts — the new column", "- Acceptance tests: server/report.test.ts"), /"- Acceptance tests" gives no reason after the dash/],
+    ["the dropped standard tier", RISKY(1).replace("Tier: strong", "Tier: standard"), /"- Tier: standard" is no longer a tier: the standard implementation tier was dropped/],
+    ["cheap at impact 3", RISKY(3).replace("Tier: strong", "Tier: cheap"), /"- Tier: cheap" is not allowed for this plan \(impact 3 in "## Risk and impact"\): write "- Tier: strong — <why>"\./],
+    ["cheap with a migration and no strong step", RISKY(1).replace("Tier: strong", "Tier: cheap").replace("- Migration: no", "- Migration: yes — a new column"), /names a migration, which single steps of the plan carry, but "- Strong steps" names no step/],
   ];
   for (const [name, plan, problem] of cases) {
     const { calls, decisions, tabs } = await submit(plan);

@@ -21,7 +21,7 @@ const iso = (at: number) => new Date(at).toISOString();
 const settings = (change: Partial<PluginSettings> = {}): PluginSettings => ({
   template: null, markInProgress: false, showClosed: false, lastProvider: "omp", launchPreferences: {}, projectMappings: {}, agentLinearAccess: false,
   dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE,
-  cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS, ...change,
+  cheapModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS, ...change,
 });
 
 const agent = (id: string, change: Partial<WatchedAgent> = {}): WatchedAgent => ({

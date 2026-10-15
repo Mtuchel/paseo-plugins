@@ -27,7 +27,7 @@ async function harness() {
     pauseStart: null as null | (() => Promise<void>), commentFailure: "none" as "none" | "before" | "after",
     pauseRecipient: null as null | (() => Promise<void>), onUsage: null as null | (() => void),
     starts: [] as { id: string; fresh: boolean | undefined }[], messages: [] as string[], comments: [] as string[], stopped: [] as string[], sent: [] as string[],
-    settings: { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: false, dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, autoResume: true }, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS } as PluginSettings,
+    settings: { template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: false, dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, autoResume: true }, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS } as PluginSettings,
     agents: [{ id: "a0", status: "error", createdAt: iso(T0), cwd: "/repo/wt", labels: { "linear.issueId": "i1" }, archivedAt: null as string | null }],
   };
   const sessions = new SessionStore(join(directory, "sessions.json"));

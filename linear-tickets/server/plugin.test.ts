@@ -10,7 +10,7 @@ import type { PaseoApi, PaseoWorkspaceAgentCreateOptions, PaseoWorkspaceCreateOp
 import { buildContext, buildPrompt, issuePage, normalizeIssue, connection, relationships, stateHistorySpans, ticketRelations } from "./context";
 import { Credentials } from "./credentials";
 import { Launcher, safeBranchName } from "./launch";
-import { DEFAULT_WORKTREE_SHARDS, Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_CHEAP_MODELS, DEFAULT_STANDARD_MODELS, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP } from "./settings";
+import { DEFAULT_WORKTREE_SHARDS, Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_CHEAP_MODELS, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { LinearService, postGraphQL, ADD_LABEL_QUERY, CREATE_LABEL_QUERY, LABEL_BY_NAME_QUERY, resolveReviewState, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
 import { LinearBroker } from "./linear-broker";
@@ -47,7 +47,7 @@ const detail = { issue: normalizeIssue(rawIssue), teamId: "team-1", projectId: "
 const input = { id: "ENG-42", projectId: "project-1", provider: "test/model", instructions: "Add a regression check.", markInProgress: false, requestId: "5f6f1154-5838-4439-b981-b3c9d9831488" };
 // Test fakes that exercise neither the state transition nor finished blockers: no-op stubs keep the contract strict.
 const noMark = { markInProgress: async () => ({ changed: false }), finishedBlockers: async () => [] };
-const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: DEFAULT_CHEAP_MODELS, standardModels: DEFAULT_STANDARD_MODELS, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS };
+const automationDefaults = { dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: DEFAULT_CHEAP_MODELS, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS };
 
 test("agent status reports each credential's dimensions, pause and hourly callers separately", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
@@ -365,19 +365,26 @@ test("the mark-in-progress setting round-trips without disturbing the saved temp
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("a tier's model per provider is set and removed through settings; removing the default is remembered", async () => {
+test("the cheap tier's model per provider is set and removed through settings; the default is DeepSeek Flash ultra with thinking max, and an emptied tier is remembered", async () => {
   const directory = await mkdtemp(join(tmpdir(), "paseo-linear-settings-tiers-"));
   const path = join(directory, "settings.json");
   try {
     const settings = new Settings(path);
-    assert.deepEqual((await settings.read()).standardModels, { omp: { model: "omp/openai-codex/gpt-6.1-sol", thinkingOptionId: "high" } });
-    await settings.patch({ tierModel: { tier: "standard", provider: "claude", model: "claude/sonnet", thinkingOptionId: "high" } });
-    assert.deepEqual((await settings.read()).standardModels, { omp: { model: "omp/openai-codex/gpt-6.1-sol", thinkingOptionId: "high" }, claude: { model: "claude/sonnet", thinkingOptionId: "high" } });
-    assert.deepEqual((await settings.read()).cheapModels, DEFAULT_CHEAP_MODELS, "the other tier is untouched");
-    await settings.patch({ tierModel: { tier: "standard", provider: "omp", model: null } });
-    assert.deepEqual((await new Settings(path).read()).standardModels, { claude: { model: "claude/sonnet", thinkingOptionId: "high" } });
-    await settings.patch({ tierModel: { tier: "standard", provider: "claude", model: null } });
-    assert.deepEqual((await new Settings(path).read()).standardModels, {}, "an emptied tier stays empty instead of falling back to the defaults");
+    assert.deepEqual(DEFAULT_CHEAP_MODELS, { omp: { model: "omp/lithos/deepseek-ai/DeepSeek-V4.1-Flash-ultra", thinkingOptionId: "max" } }, "README, Model tiers: the cheap tier's default");
+    assert.deepEqual((await settings.read()).cheapModels, DEFAULT_CHEAP_MODELS);
+    await settings.patch({ tierModel: { tier: "cheap", provider: "claude", model: "claude/sonnet", thinkingOptionId: "high" } });
+    assert.deepEqual((await settings.read()).cheapModels, { omp: { model: "omp/lithos/deepseek-ai/DeepSeek-V4.1-Flash-ultra", thinkingOptionId: "max" }, claude: { model: "claude/sonnet", thinkingOptionId: "high" } });
+    await settings.patch({ tierModel: { tier: "cheap", provider: "omp", model: null } });
+    assert.deepEqual((await new Settings(path).read()).cheapModels, { claude: { model: "claude/sonnet", thinkingOptionId: "high" } });
+    await settings.patch({ tierModel: { tier: "cheap", provider: "claude", model: null } });
+    assert.deepEqual((await new Settings(path).read()).cheapModels, {}, "an emptied tier stays empty instead of falling back to the defaults");
+    // A settings file from before the cutover: the dropped `standardModels` is ignored, not
+    // applied, and a later write cleans the file out.
+    await writeFile(path, JSON.stringify({ standardModels: { omp: { model: "omp/openai-codex/gpt-6.1-sol", thinkingOptionId: "high" } } }), { mode: 0o600 });
+    const legacy = new Settings(path);
+    assert.deepEqual((await legacy.read()).cheapModels, DEFAULT_CHEAP_MODELS);
+    await legacy.patch({ markInProgress: false });
+    await assert.rejects(readFile(path), { code: "ENOENT" });
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 

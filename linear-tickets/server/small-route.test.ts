@@ -20,7 +20,7 @@ const FACTS: RouteFacts = {
 const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: "omp", launchPreferences: { omp: { model: "omp/opus", modeId: "full" } },
   projectMappings: {}, agentLinearAccess: false,
-  dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true }, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
+  dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true }, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
 };
 const AGENT: RouteAgent = { id: "agent-1", issueId: "issue-1", identifier: "TUC-7", provider: "omp", planPolicy: "required", planDecisionOpen: false };
 
@@ -125,7 +125,8 @@ test("AC-3: the plugin refuses with the reason and does nothing when the ticket 
 
 test("AC-3: an impact above today's auto-approval threshold, a non-omp agent or an open plan decision is refused", async () => {
   for (const [name, facts, agent] of [
-    ["impact", { ...FACTS, impact: 2, tier: "standard" }, AGENT],
+    // The tier is not what refuses this one: impact 2 is above the owner's auto-approval threshold.
+    ["impact", { ...FACTS, impact: 2, tier: "cheap" }, AGENT],
     ["claude", FACTS, { ...AGENT, provider: "claude" }],
     ["plan decision", FACTS, { ...AGENT, planDecisionOpen: true }],
   ] as const) {

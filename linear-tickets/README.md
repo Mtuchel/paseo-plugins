@@ -465,10 +465,10 @@ list and the launch flow.
 
 The last successful model, mode, and reasoning choices are stored in the same per-host
 settings file. They update automatically and do not need a separate settings toggle. The cheap
-and standard model tiers' models per provider (`cheapModels`, `standardModels`, see
-[Model tiers](#model-tiers)) have no toggle either: set them with `linear.set-settings`
-(`tierModel: { tier, provider, model, thinkingOptionId }`, `model: null` removes one) or edit
-`$PASEO_HOME/linear-tickets/settings.json`.
+model tier's model per provider (`cheapModels`, see [Model tiers](#model-tiers)) has no toggle
+either: set it with `linear.set-settings`
+(`tierModel: { tier: "cheap", provider, model, thinkingOptionId }`, `model: null` removes one) or
+edit `$PASEO_HOME/linear-tickets/settings.json`.
 
 ## Customizing the launch prompt
 
@@ -843,22 +843,34 @@ tier its implementation runs on, in a required `## Model` section ([`shared/plan
 ```markdown
 ## Model
 
-- Tier: <cheap | standard | strong> — <why>
+- Tier: <cheap | strong> — <why>
 - Strong steps: <none | step numbers> — <why>
+- Acceptance tests: <none | test file paths> — <why>
 ```
 
-`cheap` is for well-specified work where every step is spelled out; `standard` for ordinary work
-that needs more care than that but none of the strong reasons; `strong` needs a reason: work
-spanning four or more layers, interface design, several call sites that must agree on one
-computation, a gap between a check and the write it guards, or more than 15–20 files. A plan
-rated (planner or advisor, the higher) above impact 2, not reversible by a revert, or with a
-migration, an auth change or a new rule always takes `strong`. The omp gate refuses to record the
-advisor review without a readable section or with a lower tier such a plan cannot take. The
-GPT-6 Astra advisor checks the choice like the rest of the plan. A planner run's work order
+`cheap` is the default: the judgment a ticket needs is spent on writing its plan, and a plan that
+settles its contracts — the exact signatures it adds or changes, which function is authoritative
+for a computation, the invariants that hold, the expected behavior — does not need the launch
+model to carry them out. What used to be the strong reasons is now what the plan settles: a change
+spanning four or more layers, an interface others build on, several call sites that must agree on
+one computation, a gap between a check and the write it guards, or more than 15–20 files. `strong`
+is picked only when the plan's rating requires it (below), the approach itself cannot be settled
+up front (open diagnosis, the design is the work), or the strong steps would be most of the work.
+Two rules are not the plan's to choose: a plan rated (planner or advisor, the higher) above impact
+2 or one a revert does not undo takes `strong`, and a plan below strong has to name the step that
+carries a migration, an auth change or a new rule. That step used to force the whole ticket and
+made one careful step pay Opus for every mechanical step around it: 445 of 603 tickets were
+implemented fully on Opus since 2026-10-05, while the measured cheap tier escalated 6% of its
+tickets and its tool-error rate equalled Opus's. The omp gate refuses to record the advisor review
+without a readable section, with a lower tier such a plan cannot take, or below strong without the
+step that carries one: `- Strong steps` must name the step numbers that write the migration, the
+auth check or the rule.
+The GPT-6 Astra advisor checks the choice like the rest of the plan. A planner run's work order
 carries no tier: each ticket's own plan picks one.
 
-The section is never assumed. A ticket plan that reaches review without a readable section (or
-with a tier its rating rules out) goes straight back to its planner with what to fix; neither the
+The section is never assumed. A ticket plan that reaches review without a readable section, with a
+lower tier its rating rules out, without an `- Acceptance tests` line, or below strong without the
+strong step its rating names, goes straight back to its planner with what to fix; neither the
 owner nor the risk policy sees it. An approved plan without one, from before the section was
 required, does not implement on a default tier: its agent (or the next one launched for it) goes
 back to planning for the section only. When the resubmitted plan differs from the approved
@@ -866,24 +878,40 @@ document only by the added section, the plugin approves it without the owner; an
 reviewed like a new plan. A `model:` label or an earlier decided tier on the ticket is a tier and
 skips this.
 
+Every boundary that has to act before a plan is reviewed again reads a dropped tier name as its
+conservative current one: `- Tier: standard` in an in-flight plan, a `model:standard` label and a
+tier record from before the cutover all mean `strong`, so the ticket keeps the strong model until
+its plan is replanned or the plugin writes its tier again. A plan *submitted* with
+`- Tier: standard` is refused and goes back to its planner instead.
+
 When the approved plan is implemented, the agent starts on the strongest of: the ticket's
-`model:cheap` / `model:standard` / `model:strong` label (one Linear label group `model`, so one per
-ticket; set by the plugin on approval; change it to
-override), the ticket's latest decided tier (an approved plan or an escalation; an escalation
-stays), and the plan's tier, which its risk rating raises to `strong` when a rule above requires
-it. The cheap tier runs the provider's model in `cheapModels` (default for omp:
-`deepseek/deepseek-flash`, thinking `max`), the standard tier the one in `standardModels` (default
-for omp: `openai-codex/gpt-6.1-sol`, thinking `high`, on the OpenAI account rather than the launch
-model's Claude account); a provider without one implements on the launch model. After
+`model:cheap` / `model:strong` label (one Linear label group `model`, so one per ticket; set by the
+plugin on approval; change it to override), the ticket's latest decided tier (an approved plan or
+an escalation; an escalation stays), and the plan's tier, which its risk rating raises to `strong`
+when a rule above requires it. The cheap tier runs the provider's model in `cheapModels` (default
+for omp: `lithos/deepseek-ai/DeepSeek-V4.1-Flash-ultra`, thinking `max`, through the Lithos
+account, with the official `deepseek/deepseek-flash` API behind it in omp's
+`retry.fallbackChains`); a provider without one implements on the launch model. After
 **Approve & split**, each sub-issue plans again and picks its own tier; a sub-issue of a strong
 plan, or of a step the plan lists under `Strong steps`, gets `model:strong` first, so its own plan
 cannot lower it.
 
-On the cheap or standard tier, the agent hands the plan's strong steps to subagents on the strong
-model (omp: `model: "@slow"`), and calls `escalate_model` with a reason when the same check still
-fails after two honest fix attempts, the work needs judgment the plan did not settle, or a review
-finds a design problem. The plugin then switches the agent to the strong model within seconds,
-records the reason and posts it in the ticket's panel. Subagents cannot call it.
+On the cheap tier, the agent hands the plan's strong steps to subagents on the strong model (omp:
+`model: "@slow"`), and the plan's acceptance tests are written first by the strong model: it has a
+strong subagent write them failing from the plan's acceptance criteria, then makes them pass
+without editing them. The plugin wrote those paths for the agent when the plan was approved (and
+at every launch of an approved cheap plan), and the omp extension refuses the write to them from a
+session that is not on the strong model. It is a guard against accidental routing, not isolation: a
+shell can still write those files, a launch that never recorded the strong model is not blocked,
+and `escalate_model` lifts the block by moving the agent to the
+strong model — a cheap session that turns out to need the tests changed asks for the strong model.
+A cheap plan's premises — the existing functions, fields, behavior and data shapes it builds on —
+are verified against the current code by a cheap scout before the plan is submitted, so an
+implementation round is not spent on a wrong premise. The agent calls `escalate_model` with a
+reason when the same check still fails after two honest fix attempts, the work needs judgment the
+plan did not settle, or a review finds a design problem. The plugin then switches the agent to the
+strong model within seconds, records the reason and posts it in the ticket's panel. Subagents
+cannot call it.
 
 Worker allocation is slice-specific on **every** tier, including strong ticket owners. Keep
 Opus ownership/planning, Astra advice and independent Sol review unchanged. Use the cheap worker
@@ -901,8 +929,20 @@ restriction, and does not change the existing tier maps or reviewer routing.
 Every decision (plan, start, escalation) is kept per ticket in
 `$PASEO_HOME/linear-tickets/model-tiers/`. `npm run tier-report [-- --since 2026-10-01]` compares
 the tiers each ticket started implementing on, from those records and the handover records:
-tickets per tier (cheap, standard, strong), escalations, failures, and how many reached a pull
-request.
+tickets per tier (cheap, strong), how many escalated (their reasons are listed below the tables),
+how many cheap plans named strong steps, failures, and how many reached a pull request. A second
+table averages the review work per pull request the watch still knows (`pr-watch.json`): fix rounds
+(its `red`, `changes` and `findings` nudges), each nudge stage, and the Greptile requests the
+backstop made — then every cheap-tier ticket is listed with its fix rounds for a spot check.
+
+**Sessions outside tickets.** Your own Paseo session — one that is not a ticket agent
+(`PASEO_AGENT_ID` set, no `LINEAR_TICKETS_ISSUE`) — gets the same Flash-first routing from the omp
+extension, once per session, in its first prompt (`sessionRoutingNote`, [`shared/plan-model.ts`](shared/plan-model.ts)):
+implementation runs on the cheap model unless a step needs the strong model, premises are verified
+by a cheap scout first, strong steps and acceptance tests go to `@slow` subagents, and a session
+that itself runs on a strong model frames, settles contracts and writes the acceptance tests
+itself. Subagent sessions and ticket agents get no such note: a ticket's plan already carries its
+routing.
 
 Claude starts in `plan` mode and Codex in `auto`; omp keeps your usual mode (its `write` mode asks
 before every shell command, reads included) and starts in Plannotator's planning phase instead.
@@ -1236,7 +1276,7 @@ chosen for launches in the plugin and implements on its [model tier](#model-tier
 Plannotator's plan mode switches back to the model it saved when planning began once a plan is
 approved; the plugin notices within seconds (at most 20 s), switches the agent to its tier's model
 and says so in the ticket's panel. To use another model for ticket work, change the launch model
-or `cheapModels` / `standardModels` in the plugin, or the ticket's `model:` label; changing it on one agent in Paseo
+or `cheapModels` in the plugin, or the ticket's `model:` label; changing it on one agent in Paseo
 is undone.
 
 OMP's own fallback is left alone. When an account nears its usage reserve, omp switches the session
@@ -1309,10 +1349,10 @@ line. Parent-verification controls rank ahead of workers. Among workers, a free 
    free worker slot ahead of other workers, whatever its project's load or the night order. It still
    waits for a free slot: a full *max agents* or memory lease holds it like any ticket;
 1. while you are away, the night order first: a ticket whose approved plan implements on the cheap
-   model tier, then one on the standard tier, then everything else — a strong implementation, a
-   ticket whose tier the plugin does not know before it starts, and one that still plans (see
-   *Model tiers* and *Present and away*). The class only orders the line: nothing waits because of
-   it, so with nothing cheaper waiting a slot goes to the rest;
+   model tier, then everything else — a strong implementation, a ticket whose tier the plugin does
+   not know before it starts, and one that still plans (see *Model tiers* and *Present and away*).
+   The class only orders the line: nothing waits because of it, so with nothing cheaper waiting a
+   slot goes to the rest;
 2. the project with the fewest agents working, so one project gets every slot while nothing
    else waits, and a ticket of another project gets the next free slot;
 3. then tickets that may need you (see *Present and away*), so the time you are around is used
@@ -1348,9 +1388,9 @@ agent/liveness enumeration as workers. Concurrent refreshes share that enumerati
 **Present and away.** Planning never waits: every ticket plans at any time, also at night. A plan
 that needs you is parked (see **Parked plans**) and takes no slot, so the plans are ready for your
 review when you are back. While you are away, the line also starts what can finish without you
-first: a ticket whose approved plan implements on the cheap model tier, then one on the standard
-tier, and only then a ticket that still plans, a strong implementation or one whose tier the plugin
-does not know before the start (see *Who starts next*). That tier is the ticket's `model:` label or
+first: a ticket whose approved plan implements on the cheap model tier, and only then a ticket that
+still plans, a strong implementation or one whose tier the plugin does not know before the start
+(see *Who starts next*). That tier is the ticket's `model:` label or
 the tier store's record of it (see *Model tiers*), never the plan document, which is only read when
 the agent starts; so a plan that is the first to name the tier ranks with the rest. While you are
 away, only the implementation of a ticket that may need you during the run waits: one that carries
@@ -3143,11 +3183,13 @@ Every ticket label the plugin sets, and what removes it:
 | `plan-ready` | an approval (machine flag: the next agent implements the plan; agent starts, away mode, focus mode, the night order and the deputy read it) | the next plan submission or a send-back |
 | `plan-rework` | a send-back | the next plan submission or an approval |
 | `no-plan` | the small-ticket route | the route undone by your `plan`, or an approved plan replacing the route |
-| `model:cheap`, `model:standard`, `model:strong` | an approved plan, the small-ticket route, an escalation, a strong split step | swapped in one write when the tier changes; never cleared |
+| `model:cheap`, `model:strong` | an approved plan, the small-ticket route, an escalation, a strong split step | swapped in one write when the tier changes; never cleared |
 
-The three `model:` labels belong to the Linear label group `model`, so a ticket carries at most
+The two `model:` labels belong to the Linear label group `model`, so a ticket carries at most
 one tier. The plugin swaps them in one write (add the new one, remove the others), which works with
 or without the group, and creates a missing tier label inside the group when the group exists.
+`model:standard`, the label of the dropped middle tier, is read as `model:strong` and is removed
+the next time the plugin writes the ticket's tier (see [Model tiers](#model-tiers)).
 
 ### One-time correction (`scripts/plan-stages-migration.ts`)
 

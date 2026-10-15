@@ -65,7 +65,7 @@ test("a resumed planner run's agent gets its run environment back from its run l
     const settings: PluginSettings = {
       template: null, markInProgress: false, showClosed: false, lastProvider: "omp", launchPreferences: { omp: { model: "omp/opus", modeId: "full" } },
       projectMappings: { "project:lp-1": { projectId: "p1", label: "App", baseBranch: "refs/heads/main" } }, agentLinearAccess: true,
-      dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
+      dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
     };
     const launcher = new Launcher({ ...noMark, detail: async () => detail }, undefined, async () => "/s.mjs", undefined, async () => "/ctx/run-agent.md", () => true, envs);
     const run = { runId: "run-1", linearProjectId: "lp-1", projectName: "App", teamId: "team-1", requestId: "7c9e6c3d-1111-4222-8333-444455556666", brief: "Plan the work order of App." };

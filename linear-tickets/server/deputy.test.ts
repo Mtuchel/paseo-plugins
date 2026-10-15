@@ -224,7 +224,7 @@ async function harness(t: TestContext, deputy: Partial<DeputySettings> = {}, opt
   const log = new DecisionLog(join(directory, "decisions"));
   const settings: PluginSettings = {
     template: null, markInProgress: false, showClosed: false, lastProvider: null, launchPreferences: {}, projectMappings: {}, agentLinearAccess: true,
-    dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP,
+    dispatch: DEFAULT_DISPATCH, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP,
     deputy: { ...DEFAULT_DEPUTY, model: "omp/test-model", principlesRepository: "/repo/platform", ...deputy },
     worktreeShards: DEFAULT_WORKTREE_SHARDS,
   };

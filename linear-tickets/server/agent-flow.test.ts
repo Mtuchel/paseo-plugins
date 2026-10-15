@@ -33,7 +33,7 @@ const APP = "paseo-app";
 const settings: PluginSettings = {
   template: null, markInProgress: false, showClosed: false, lastProvider: "omp", launchPreferences: { omp: { model: "omp/opus", modeId: "full" } },
   projectMappings: { "team:t1": { projectId: "p1", label: "Team", baseBranch: "refs/heads/main" } }, agentLinearAccess: false,
-  dispatch: { ...DEFAULT_DISPATCH, maxRunning: 2 }, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, standardModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
+  dispatch: { ...DEFAULT_DISPATCH, maxRunning: 2 }, writeback: DEFAULT_WRITEBACK, watchdog: DEFAULT_WATCHDOG, steward: DEFAULT_STEWARD, autoApprove: DEFAULT_AUTO_APPROVE, cheapModels: {}, reviewPeers: [], activation: DEFAULT_ACTIVATION, backstop: DEFAULT_BACKSTOP, deputy: DEFAULT_DEPUTY, worktreeShards: DEFAULT_WORKTREE_SHARDS,
 };
 
 const twoPart: AgentPermissionRequest = {
@@ -939,12 +939,12 @@ test("every ticket starts plan-first; someone else's ticket is marked untrusted;
   const h = starterHarness({ creatorId: "customer", labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, settings, { retryHint: "retry" });
   assert.deepEqual({ untrusted: started.untrusted, plan: started.plan }, { untrusted: true, plan: "required" });
-  assert.deepEqual(h.launches[0], { provider: "omp/opus", thinkingOptionId: undefined, modeId: "full", instructions: `${UNTRUSTED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
+  assert.deepEqual(h.launches[0], { provider: "omp/opus", thinkingOptionId: undefined, modeId: "full", instructions: `${UNTRUSTED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_STRONG_MODEL: "omp/opus" }, markInProgress: false });
   const mine = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
   const own = await mine.starter.start("i1", mine.paseo, settings, { retryHint: "retry" });
   assert.deepEqual({ untrusted: own.untrusted, plan: own.plan }, { untrusted: false, plan: "required" });
   // The owner's own ticket is offered the small-ticket route (README, "Small-ticket route").
-  assert.deepEqual(mine.launches[0], { provider: "omp/opus", thinkingOptionId: undefined, modeId: "full", instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${smallRouteNote()}\n\n${MODEL_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_SMALL_ROUTE: "1" }, markInProgress: false });
+  assert.deepEqual(mine.launches[0], { provider: "omp/opus", thinkingOptionId: undefined, modeId: "full", instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${smallRouteNote()}\n\n${MODEL_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_SMALL_ROUTE: "1", LINEAR_TICKETS_STRONG_MODEL: "omp/opus" }, markInProgress: false });
 });
 
 test("AC-3: only an omp planner of an eligible ticket is offered the small-ticket route", async () => {
@@ -1007,7 +1007,7 @@ test("a plan starts in the provider's safe mode, and not in progress", async () 
   const h = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, { ...settings, markInProgress: true, lastProvider: "claude", launchPreferences: { claude: { model: "claude/opus", modeId: "default" } } }, { retryHint: "retry" });
   assert.deepEqual({ untrusted: started.untrusted, plan: started.plan }, { untrusted: false, plan: "required" });
-  assert.deepEqual(h.launches[0], { provider: "claude/opus", thinkingOptionId: undefined, modeId: "plan", instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("claude")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
+  assert.deepEqual(h.launches[0], { provider: "claude/opus", thinkingOptionId: undefined, modeId: "plan", instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("claude")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_STRONG_MODEL: "claude/opus" }, markInProgress: false });
 });
 
 test("a plan-first ticket is not marked in progress; once its plan is approved (plan-ready) the next agent implements it in the usual mode", async () => {
@@ -1029,13 +1029,14 @@ test("a plan-first ticket is not marked in progress; once its plan is approved (
 });
 
 test("an approved plan on the cheap tier launches on the provider's cheap model; a model:strong label overrides it", async () => {
-  const cheapPlan = "# Plan\n1. Add the column\n\n## Model\n\n- Tier: cheap — one column\n- Strong steps: 2 — the migration\n";
+  const cheapPlan = "# Plan\n1. Add the column\n\n## Model\n\n- Tier: cheap — one column\n- Strong steps: 2 — the migration\n- Acceptance tests: server/report.test.ts — the new column\n";
   const tiered = { ...settings, cheapModels: { omp: { model: "omp/deepseek/deepseek-flash", thinkingOptionId: "max" } } };
   const ready = { id: "r", name: "plan-ready" };
   const cheap = starterHarness({ creatorId: OWNER, labels: [ready], blockedBy: [] }, 0, APP, false, cheapPlan);
   await cheap.starter.start("i1", cheap.paseo, tiered, { retryHint: "retry" });
   assert.deepEqual({ provider: cheap.launches[0].provider, thinking: cheap.launches[0].thinkingOptionId, labels: cheap.launches[0].labels }, { provider: "omp/deepseek/deepseek-flash", thinking: "max", labels: { "linear.tier": "cheap" } });
-  assert.match(cheap.launches[0].instructions, /cheap model tier.*Strong steps: 2 — the migration.*escalate_model/s);
+  assert.match(cheap.launches[0].instructions, /cheap model tier.*Strong steps: 2 — the migration.*acceptance tests \(server\/report\.test\.ts\) are written first, by the strong model.*escalate_model/s);
+  assert.equal(cheap.launches[0].env?.LINEAR_TICKETS_STRONG_MODEL, "omp/opus", "the guard's strong model travels with the launch");
   const unset = starterHarness({ creatorId: OWNER, labels: [ready], blockedBy: [] }, 0, APP, false, cheapPlan);
   await unset.starter.start("i1", unset.paseo, settings, { retryHint: "retry" });
   assert.equal(unset.launches[0].provider, "omp/opus", "no cheap model for the provider: the launch model");
@@ -1047,15 +1048,14 @@ test("an approved plan on the cheap tier launches on the provider's cheap model;
 const READY = { id: "r", name: "plan-ready" };
 const RISK = (impact: number) => `## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: ${impact} — orders\n- Reversibility: revert — none\n- Feature flag: no\n- Migration: no\n- Auth: no\n- New rule: no — none\n- Failure mode: a wrong column\n- Advisor rating: impact ${impact}, reversibility revert\n- Recommendation: auto — none\n`;
 
-test("an approved standard plan launches on the provider's standard model; a risk rating that requires strong launches on the launch model", async () => {
-  const standardPlan = (impact: number) => `# Plan\n1. Add the column\n\n## Model\n\n- Tier: standard — a column with a filter\n- Strong steps: none — routine\n\n${RISK(impact)}`;
-  const tiered = { ...settings, standardModels: { omp: { model: "omp/openai-codex/gpt-6.1-sol", thinkingOptionId: "high" } } };
-  const standard = starterHarness({ creatorId: OWNER, labels: [READY], blockedBy: [] }, 0, APP, false, standardPlan(2));
-  await standard.starter.start("i1", standard.paseo, tiered, { retryHint: "retry" });
-  assert.deepEqual({ provider: standard.launches[0].provider, thinking: standard.launches[0].thinkingOptionId, labels: standard.launches[0].labels }, { provider: "omp/openai-codex/gpt-6.1-sol", thinking: "high", labels: { "linear.tier": "standard" } });
-  assert.match(standard.launches[0].instructions, /standard model tier.*escalate_model/s);
-  const risky = starterHarness({ creatorId: OWNER, labels: [READY], blockedBy: [] }, 0, APP, false, standardPlan(3));
-  await risky.starter.start("i1", risky.paseo, tiered, { retryHint: "retry" });
+test("a legacy standard plan line reads as strong and launches on the launch model; a risk rating that requires strong does too", async () => {
+  const legacyPlan = (impact: number) => `# Plan\n1. Add the column\n\n## Model\n\n- Tier: standard — a column with a filter\n- Strong steps: none — routine\n\n${RISK(impact)}`;
+  const legacy = starterHarness({ creatorId: OWNER, labels: [READY], blockedBy: [] }, 0, APP, false, legacyPlan(2));
+  await legacy.starter.start("i1", legacy.paseo, settings, { retryHint: "retry" });
+  assert.deepEqual({ provider: legacy.launches[0].provider, labels: legacy.launches[0].labels }, { provider: "omp/opus", labels: { "linear.tier": "strong" } }, "the standard tier was dropped: an in-flight plan keeps the strong model");
+  assert.match(legacy.launches[0].instructions, /implements on the strong model tier.*Worker allocation is slice-specific/s, "the strong tier's note, without an escalation sentence");
+  const risky = starterHarness({ creatorId: OWNER, labels: [READY], blockedBy: [] }, 0, APP, false, legacyPlan(3));
+  await risky.starter.start("i1", risky.paseo, settings, { retryHint: "retry" });
   assert.deepEqual({ provider: risky.launches[0].provider, labels: risky.launches[0].labels }, { provider: "omp/opus", labels: { "linear.tier": "strong" } }, "impact 3 always implements on the strong tier");
 });
 
@@ -1063,7 +1063,7 @@ test("an approved plan that names no tier goes back to planning for its model se
   const h = starterHarness({ creatorId: OWNER, labels: [READY], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, { ...settings, markInProgress: true }, { retryHint: "retry" });
   assert.equal(started.plan, "required");
-  assert.deepEqual({ provider: h.launches[0].provider, labels: h.launches[0].labels, env: h.launches[0].env, markInProgress: h.launches[0].markInProgress }, { provider: "omp/opus", labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required" }, markInProgress: false });
+  assert.deepEqual({ provider: h.launches[0].provider, labels: h.launches[0].labels, env: h.launches[0].env, markInProgress: h.launches[0].markInProgress }, { provider: "omp/opus", labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_STRONG_MODEL: "omp/opus" }, markInProgress: false });
   assert.ok(h.launches[0].instructions.startsWith(tierMissingNote("TUC-1", { url: "https://linear.app/doc/plan", content: "# Plan\n1. Add the table" })));
   assert.ok(h.launches[0].instructions.includes(MODEL_NOTE));
   assert.ok(!h.launches[0].instructions.includes(OVERLAP_NOTE), "the approved plan already looked for overlaps");

@@ -34,7 +34,8 @@ import { BrowserDecisionInbox } from "./server/decision-inbox";
 import { closeInternalDaemon, internalDaemon, modelSetter, ownConnection } from "./server/connection";
 import { ModelGuard } from "./server/model-guard";
 import { recordStart, TIER_AGENT_LABEL, tierModel, TierStore } from "./server/model-tiers";
-import { isTier } from "./shared/plan-model";
+import { AcceptanceTestsStore } from "./server/acceptance-tests";
+import { readTier } from "./shared/plan-model";
 import { GreptileOutage } from "./server/greptile-outage";
 import { HealthMonitor } from "./server/health";
 import { KnownStates } from "./server/known-states";
@@ -126,6 +127,10 @@ export default function contribute(server: PluginServerContext) {
   const presence = new Presence();
   // Model tiers (README, "Model tiers"): the tier each ticket implements on.
   const tiers = new TierStore();
+  // The acceptance tests a cheap-tier plan protects for its implementing agent (README, "Model
+  // tiers"): written by the plugin at the plan's approval and at every start, read by the omp
+  // extension, which refuses that agent's edits to them.
+  const acceptanceTests = new AcceptanceTestsStore();
   // Focus mode (README, "Focus mode"): while on, every start path admits only the tickets in focus.
   // Its phases also read the parked plans and the peer's claims (both built below).
   const focus = new Focus({ linear, settings, parked: { all: () => parking.plans.all() }, intake: { claimedTickets: (): Promise<Set<string> | null> => intake.claimedTickets() } });
@@ -148,7 +153,7 @@ export default function contribute(server: PluginServerContext) {
   // plugin writes, so a ticket Paseo reopens counts its agent again at once.
   const doneTickets = new DoneTickets();
   linear.onStateWritten((issueId, state) => doneTickets.written(issueId, state.type, Date.now()));
-  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, routes: smallRoutes, deletions, shards, focus, parked: waitingPlans, doneTickets });
+  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, acceptanceTests, routes: smallRoutes, deletions, shards, focus, parked: waitingPlans, doneTickets });
   // The decision journal (README, "Decision journal"): every owner decision on a plan is written
   // here first and carried out by the bridge's worker; the inbox lists what is being applied.
   const decisionJournal = new DecisionJournal();
@@ -491,16 +496,16 @@ export default function contribute(server: PluginServerContext) {
   });
   let attached = false;
   // Ticket agents run their tier's model: the launch model while planning and on the strong tier
-  // (Plannotator restores its pre-planning model on approval), the cheap or standard model on those tiers.
+  // (Plannotator restores its pre-planning model on approval), the cheap model on the cheap tier.
   const modelGuard = new ModelGuard(settings, modelSetter, async (change) => {
     const link = await sessions.sessionFor(change.agentId);
-    if (link) await sessions.say(link.sessionId, "thought", change.tier === "cheap" || change.tier === "standard" ? `Switched to the ${change.tier} model tier: ${change.to} (was ${change.from}).` : `Model restored to ${change.to} (it had switched to ${change.from}).`);
+    if (link) await sessions.say(link.sessionId, "thought", change.tier === "cheap" ? `Switched to the ${change.tier} model tier: ${change.to} (was ${change.from}).` : `Model restored to ${change.to} (it had switched to ${change.from}).`);
   }, async (agent) => {
     const issueId = agent.labels["linear.issueId"];
     const label = agent.labels[TIER_AGENT_LABEL];
-    return (issueId ? await tiers.forAgent(issueId, agent.id) : null) ?? (isTier(label) ? label : null);
+    return (issueId ? await tiers.forAgent(issueId, agent.id) : null) ?? readTier(label);
   });
-  plannotator.useTiers({ store: tiers, apply: (agentId) => modelGuard.apply(agentId), replan: (agent, message) => planRequests.send(agent, message) });
+  plannotator.useTiers({ store: tiers, apply: (agentId) => modelGuard.apply(agentId), replan: (agent, message) => planRequests.send(agent, message), tests: acceptanceTests });
   // The central Plannotator host starts once, after the hook it runs for each parked review exists.
   const startHost = async () => { if (await plannotatorHook() && !stopped) await plannotatorHost.start(); };
   let holdSeed: Promise<void> | null = null;
@@ -698,6 +703,12 @@ export default function contribute(server: PluginServerContext) {
     await steward!.ownerRetried(input.id);
     const result = await launcher.start(launch, paseo, { promptTemplate: template ?? undefined, markInProgress, linearAccess: agentLinearAccess, labels: setup.labels, env: setup.env });
     await recordStart(tiers, { id: input.id, identifier: setup.identifier }, setup.tier, result.agentId, model.provider);
+    // Like every other start path (starter.ts): the approved plan's acceptance tests are protected
+    // for the agent that implements them.
+    if (setup.tests.length) {
+      await acceptanceTests.save(result.agentId, { identifier: setup.identifier, paths: setup.tests })
+        .catch((error: unknown) => console.error(`[linear-tickets] ${setup.identifier}: saving the plan's acceptance tests failed: ${error instanceof Error ? error.message : error}`));
+    }
     // Started by hand while focus is on: in flight now, so its successors start too.
     await focus.include(input.id, setup.identifier);
     await openSession(input.id, input.id, result.agentId);

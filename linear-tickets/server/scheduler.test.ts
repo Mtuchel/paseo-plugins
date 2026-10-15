@@ -70,7 +70,7 @@ test("a queue blocker takes the next free slot ahead of a lighter project, urgen
   assert.deepEqual(await full.admit(blocker, paseo, max(1)), { ok: false, reason: "Queued: 1 of 1 ticket agents are working. It starts when one finishes." }, "a full limit holds it");
 });
 
-test("while the owner is away a cheap implementation goes first, then a standard one, then the rest", async () => {
+test("while the owner is away a cheap implementation goes first, then everything else together", async () => {
   const strong = impl("TUC-1", "strong", { priority: 1, createdAt: "2025-01-01T00:00:00Z" });
   const planning = ticket("TUC-2", { priority: 1, createdAt: "2024-01-01T00:00:00Z", night: { planReady: false, tier: null } });
   const cheap = impl("TUC-3", "cheap", { priority: 4, createdAt: "2026-06-01T00:00:00Z" });
@@ -78,12 +78,13 @@ test("while the owner is away a cheap implementation goes first, then a standard
   instance.note([strong, planning, cheap]);
   assert.deepEqual(await instance.admit(cheap, paseo, max(1)), { ok: true }, "the newer, lower-priority cheap implementation takes the one slot");
 
-  const standard = impl("TUC-4", "standard", { priority: 4 });
-  const { instance: byStandard } = scheduler([], true);
-  byStandard.note([strong, planning, standard]);
-  const refused = await byStandard.admit(strong, paseo, max(1));
-  assert.match(refused.ok ? "" : refused.reason, /2 tickets ahead/, "the standard implementation and the older planning ticket rank ahead of the urgent strong one");
-  assert.deepEqual(await byStandard.admit(standard, paseo, max(1)), { ok: true });
+  // The dropped `standard` tier's class went with it: a stronger implementation now ranks inside
+  // the rest, so priority and age decide between it and a planning ticket.
+  const { instance: rest } = scheduler([], true);
+  rest.note([strong, planning]);
+  const refused = await rest.admit(strong, paseo, max(1));
+  assert.match(refused.ok ? "" : refused.reason, /1 ticket ahead/, "the older planning ticket ranks ahead of the urgent strong one");
+  assert.deepEqual(await rest.admit(planning, paseo, max(1)), { ok: true });
 });
 
 test("a night class holds no slot back: a strong implementation or a planning ticket starts when nothing cheaper waits", async () => {
@@ -114,8 +115,8 @@ test("while the owner is present the night class is ignored and priority and age
 
 test("the night input reads the tier from the model: label and the tier store record", () => {
   assert.deepEqual(nightInput(["plan-ready", "model:cheap"], null), { planReady: true, tier: "cheap" });
-  assert.deepEqual(nightInput(["plan-ready"], record(["plan", "standard"])), { planReady: true, tier: "standard" });
-  assert.deepEqual(nightInput(["Model:Standard", "plan-ready"], record(["plan", "cheap"])), { planReady: true, tier: "standard" }, "the strongest of the two, as launchTier does");
+  assert.deepEqual(nightInput(["plan-ready"], record(["plan", "strong"])), { planReady: true, tier: "strong" });
+  assert.deepEqual(nightInput(["Model:Standard", "plan-ready"], record(["plan", "cheap"])), { planReady: true, tier: "strong" }, "the strongest of the two, as launchTier does: a legacy label reads as strong");
   assert.deepEqual(nightInput(["plan-ready"], record(["start", "cheap"])), { planReady: true, tier: null }, "a recorded start alone decides nothing");
   assert.deepEqual(nightInput(["model:cheap"], null), { planReady: false, tier: "cheap" }, "a planning start ranks in class 2 whatever it carries");
   assert.deepEqual(nightInput([], null), { planReady: false, tier: null });
