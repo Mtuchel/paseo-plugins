@@ -13,7 +13,7 @@ import { planPolicy } from "./plan-policy";
 //    while it waits, every stack's merge-queue run waits with it, so it takes the next worker slot
 //    ahead of every other worker, whatever its project's load or the night order;
 // 1. while the owner is away, the night class first (see Night): a ticket whose approved plan
-//    implements on the cheap tier, then one on the standard tier, then the rest — so the work that
+//    implements on the cheap tier, then the rest — so the work that
 //    can finish without the owner starts first. The class only orders the line; nothing waits
 //    because of it;
 // 2. the project with the fewest agents working first, so one project takes every slot only
@@ -73,11 +73,12 @@ type Deps = {
 };
 
 // The class a waiting ticket ranks in while the owner is away (README, "Who starts next"): 0 a
-// cheap implementation, 1 a standard one, 2 everything else — a strong implementation, one whose
-// tier is not known here, a ticket that still plans, one whose site passed no input.
+// cheap implementation, 2 everything else — a strong implementation, one whose tier is not known
+// here, a ticket that still plans, one whose site passed no input. The `standard` tier was dropped
+// on 2026-10-15, and its former class 1 with it: those tickets read as strong (`readTier`).
 function nightClass(candidate: Candidate): number {
   if (!candidate.night?.planReady) return 2;
-  return candidate.night.tier === "cheap" ? 0 : candidate.night.tier === "standard" ? 1 : 2;
+  return candidate.night.tier === "cheap" ? 0 : 2;
 }
 
 export function rankWaiting(waiting: Candidate[], load: Map<string | null, number>, slots: number, away = false): Candidate[] {

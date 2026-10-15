@@ -29,7 +29,7 @@ test("an inbox approval consumes the owner's reserve through the production deci
   let approved = false;
   const review = createServer((request, response) => {
     if (request.method === "POST" && request.url === "/api/approve") approved = true;
-    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ plan: "# Plan\n\n## Model\n\n- Tier: strong — owner decisions\n- Strong steps: all — budget admission\n" }));
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ plan: "# Plan\n\n## Model\n\n- Tier: strong — owner decisions\n- Strong steps: all — budget admission\n- Acceptance tests: none — the budget itself is the subject\n" }));
   });
   review.listen(0, "127.0.0.1");
   await once(review, "listening");

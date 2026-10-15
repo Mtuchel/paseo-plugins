@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
+import { STRONG_MODEL_ENV } from "../shared/acceptance-tests";
 import type { TicketDetail } from "../shared/contracts";
 import { mappedBaseBranch, mappingLabel, savedMapping, type ProjectMapping } from "../shared/mapping";
 import { modelSteps, planTier, type Tier } from "../shared/plan-model";
+import type { AcceptanceTestsStore } from "./acceptance-tests";
 import { Capacity } from "./capacity";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -35,6 +37,9 @@ type Deps = {
   capacity?: Capacity;
   presence?: Pick<Presence, "away">;
   tiers?: Pick<TierStore, "get" | "record">;
+  // The acceptance tests a cheap-tier plan protects for its implementing agent (README, "Model
+  // tiers"): saved when that agent starts, so the omp extension can refuse its edits to them.
+  acceptanceTests?: Pick<AcceptanceTestsStore, "save">;
   // The small-ticket route's records (README, "Small-ticket route").
   routes?: Pick<SmallRoutes, "get">;
   deletions?: Pick<ReviewDeletions, "blocked">;
@@ -116,8 +121,11 @@ export function isUntrusted(state: { creatorId: string | null; labels: { name: s
   return !state.creatorId || (state.creatorId !== ownerId && !appIds.includes(state.creatorId)) || hasLabel(state.labels, "feedback");
 }
 
-// `tier`: the model tier an implementing launch runs on (null while the ticket plans), and why.
-export type PlanSetup = { identifier: string; untrusted: boolean; policy: PlanPolicy | null; modeId: string | undefined; notes: string[]; labels: Record<string, string>; env: Record<string, string>; tier: { tier: Tier; reason: string } | null };
+// `tier`: the model tier an implementing launch runs on (null while the ticket plans), why, and the
+// strong steps its plan named with it. `tests`: the acceptance-test paths a cheap-tier plan wants
+// protected for the implementing agent (empty for a strong plan, a route, or no approved plan yet);
+// `server/acceptance-tests.ts` saves them under the agent's id.
+export type PlanSetup = { identifier: string; untrusted: boolean; policy: PlanPolicy | null; modeId: string | undefined; notes: string[]; labels: Record<string, string>; env: Record<string, string>; tier: { tier: Tier; reason: string; strongSteps?: string | null } | null; tests: string[] };
 
 // What a ticket's launch looks like under its plan policy: mode, instructions, model tier, and the
 // agent label and environment the omp extension and write-back read. Shared by every launch path.
@@ -167,12 +175,19 @@ export async function planSetup(
       policy ? MODEL_NOTE : "",
       policy ? advisorNote(providerKey) : approvedPlanNote(state.identifier, plan),
       policy && !tierMissing ? sentBackPlanNote(state.identifier, plan) : "",
-      tier ? tierNote(tier, tier === planned?.tier ? planned.strongSteps : null) : "",
+      tier ? tierNote(tier, tier === planned?.tier ? planned : null) : "",
       MISSED_REACH_NOTE,
     ].filter(Boolean),
     labels: { ...(policy ? { [PLAN_POLICY_LABEL]: policy } : {}), ...(tier ? { [TIER_AGENT_LABEL]: tier } : {}) },
-    env: { ...(policy ? { [PLAN_POLICY_ENV]: policy } : {}), ...(offer ? { [SMALL_ROUTE_ENV]: "1" } : {}) },
-    tier: tier ? { tier, reason: tier === planned?.tier ? planned.reason || "the approved plan" : "raised by the ticket's model label or an earlier escalation" } : null,
+    // `STRONG_MODEL_ENV` for every ticket launch: the acceptance-test guard needs the strong model's
+    // name to tell a cheap session from the strong subagent the tests belong to (agent-env.ts keeps
+    // it across a resume; the session_open hook gives it back).
+    env: { ...(policy ? { [PLAN_POLICY_ENV]: policy } : {}), ...(offer ? { [SMALL_ROUTE_ENV]: "1" } : {}), [STRONG_MODEL_ENV]: provider },
+    tier: tier ? { tier, reason: tier === planned?.tier ? planned.reason || "the approved plan" : "raised by the ticket's model label or an earlier escalation", ...(tier === planned?.tier ? { strongSteps: planned.strongSteps } : {}) } : null,
+    // The plan's own tests are protected only when the plan's own tier is the cheap one: a label or
+    // an escalation that raised the ticket to strong hands its implementation to the strong model,
+    // which writes what it needs.
+    tests: tier === "cheap" && tier === planned?.tier ? planned.acceptanceTests ?? [] : [],
   };
 }
 
@@ -192,6 +207,8 @@ function smallRouteSetup(identifier: string, route: RouteRecord, tier: Tier, usu
     labels: { [PLAN_POLICY_LABEL]: SMALL_ROUTE_POLICY, [TIER_AGENT_LABEL]: tier },
     env: {},
     tier: { tier, reason: tier === route.tier ? route.facts.tierReason : "raised by the ticket's model label or an earlier escalation" },
+    // A route has no plan and no `Acceptance tests` line, so it protects nothing.
+    tests: [],
   };
 }
 
@@ -384,7 +401,7 @@ export class TicketStarter {
       // A verifier reads and judges only: the provider's safe (read-only) mode, the cheap tier, the
       // read-only brief as its whole instructions, no plan policy. `SAFE_MODES` is the same mapping
       // the planner runs take; a provider without one keeps the owner's usual mode.
-      ? { identifier: detail.issue.identifier, untrusted: true, policy: null, modeId: SAFE_MODES[preference.model.split("/")[0]] ?? undefined, notes: [options.verifier.brief], labels: {}, env: {}, tier: { tier: "cheap" as const, reason: "a steward verifier runs on the cheap tier" } }
+      ? { identifier: detail.issue.identifier, untrusted: true, policy: null, modeId: SAFE_MODES[preference.model.split("/")[0]] ?? undefined, notes: [options.verifier.brief], labels: {}, env: {}, tier: { tier: "cheap" as const, reason: "a steward verifier runs on the cheap tier" }, tests: [] }
       : await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, { tiers: this.deps.tiers, routes: this.deps.routes, settings });
     const model = tierModel(settings, preference.model.split("/")[0], setup.tier?.tier ?? null, { provider: preference.model, ...(preference.thinkingOptionId ? { thinkingOptionId: preference.thinkingOptionId } : {}) });
     const diagnostic = options.verifier?.marker.startsWith("diagnostic-") ?? false;
@@ -406,7 +423,17 @@ export class TicketStarter {
     // verifier gets none of it — its whole prompt is the read-only brief.
     const launchOptions = { promptTemplate: options.verifier ? undefined : settings.template ?? undefined, markInProgress: base.markInProgress, linearAccess: settings.agentLinearAccess, labels: { ...options.labels, ...setup.labels }, env: setup.env, ...(options.lead ? { lead: options.lead } : {}), ...(options.verifier ? { verifier: options.verifier.marker, verifierCheck: options.verifier.check } : {}) };
     const plan = { untrusted: setup.untrusted, plan: setup.policy };
-    const started = (result: { agentId: string }) => recordStart(this.deps.tiers, { id: issueId, identifier: detail.issue.identifier }, setup.tier, result.agentId, model.provider);
+    const started = async (result: { agentId: string }) => {
+      await recordStart(this.deps.tiers, { id: issueId, identifier: detail.issue.identifier }, setup.tier, result.agentId, model.provider);
+      // The plan's acceptance tests go with the agent's id, so the omp extension can tell a cheap
+      // session's edits to them from the strong subagent's: saved at every start of an approved
+      // cheap plan, a resumed or restarted agent opens with the same guard. Best-effort, like the
+      // tier record: a failed save leaves the guard off, not the launch.
+      if (setup.tests.length) {
+        await this.deps.acceptanceTests?.save(result.agentId, { identifier: detail.issue.identifier, paths: setup.tests })
+          .catch((error: unknown) => console.error(`[linear-tickets] ${detail.issue.identifier}: saving the plan's acceptance tests for agent ${result.agentId.slice(0, 8)} failed: ${error instanceof Error ? error.message : error}`));
+      }
+    };
     // A verifier reads the ticket's work where it lives: on the recorded branch when that can be
     // opened, otherwise in the mapped checkout — never a fresh branch or worktree of its own, and
     // never the "no recorded branch" refusal ladder that would leave a finished parent unverifiable.

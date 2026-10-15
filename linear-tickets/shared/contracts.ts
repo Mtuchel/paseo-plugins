@@ -253,9 +253,8 @@ const settingsOutputSchema = z.object({
   writeback: writebackSettingsSchema,
   watchdog: watchdogSettingsSchema,
   autoApprove: autoApproveSettingsSchema,
-  // README, "Model tiers": the cheap and standard tiers' models per provider.
+  // README, "Model tiers": the cheap tier's models per provider.
   cheapModels: tierModelsSchema,
-  standardModels: tierModelsSchema,
   // README, "Draining a host".
   activation: activationSettingsSchema,
   // README, "Queue backstop": which host runs its repo-wide half.
@@ -285,9 +284,9 @@ export const setSettingsRpc = defineRpc({
     // Omitted fields keep their saved values, so an older partial client preserves them.
     watchdog: watchdogSettingsSchema.partial().optional(),
     autoApprove: autoApproveSettingsSchema.partial().optional(),
-    // One provider's model for the cheap or standard tier; `model: null` removes it.
+    // One provider's model for the cheap tier; `model: null` removes it.
     tierModel: z.object({
-      tier: z.enum(["cheap", "standard"]),
+      tier: z.enum(["cheap"]),
       provider: z.string().min(1).max(500),
       model: z.string().min(1).max(500).nullable(),
       thinkingOptionId: z.string().min(1).max(500).optional(),

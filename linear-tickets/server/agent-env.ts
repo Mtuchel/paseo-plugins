@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { STRONG_MODEL_ENV } from "../shared/acceptance-tests";
 import { isPlanPolicy, PLAN_CONTEXT_ENV, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_TICKET_ENV } from "./plan-policy";
 import { paseoHome, TICKET_MCP_ENV } from "./ticket-mcp";
 
@@ -10,7 +11,9 @@ import { paseoHome, TICKET_MCP_ENV } from "./ticket-mcp";
 // environment, not the one the agent was created with. Without these the omp extension neither
 // gates the plan on its advisor review nor offers `record_plan_advice`, the Linear write guard and
 // the ticket tools, so the launch saves them per agent and the session_open hook gives them back.
-const TICKET_ENV = [PLAN_TICKET_ENV, PLAN_CONTEXT_ENV, TICKET_MCP_ENV, "LINEAR_TICKETS_DIAGNOSTIC"];
+// `STRONG_MODEL_ENV` rides along for the acceptance-test guard: a resumed cheap agent must still
+// know which model may write its plan's tests.
+const TICKET_ENV = [PLAN_TICKET_ENV, PLAN_CONTEXT_ENV, TICKET_MCP_ENV, STRONG_MODEL_ENV, "LINEAR_TICKETS_DIAGNOSTIC"];
 
 export class AgentEnvs {
   constructor(private readonly directory = join(paseoHome(), "linear-tickets", "agent-env")) {}

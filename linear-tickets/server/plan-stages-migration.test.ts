@@ -136,34 +136,38 @@ test("review-victims: lists Paseo app moves into Plan review before the cutoff w
   await assert.rejects(runReviewVictims({ linear: { ...linear, trustedAppIds: async () => [] }, host: evidence, teamKeys: ["TUC"], cutoff: "2026-10-11T00:00:00.000Z", apply: [] }), /unknown on this host/);
 });
 
-test("model-labels: duplicates on closed and other teams' issues keep the strongest before grouping; grouping waits for --hosts-ready; ungroup reverses it", async () => {
+test("model-labels: duplicates on closed and other teams' issues keep the strongest before grouping; the dropped tier's label is not a tier label; grouping waits for --hosts-ready; ungroup reverses it", async () => {
   const catalog = (): CatalogLabel[] => [
     { id: "model:cheap", name: "model:cheap", isGroup: false, parentId: null, teamId: null },
     { id: "model:standard", name: "model:standard", isGroup: false, parentId: null, teamId: null },
-    { id: "model:strong", name: "Model:Strong", isGroup: false, parentId: null, teamId: null },
+    { id: "model:strong", name: "model:strong", isGroup: false, parentId: null, teamId: null },
   ];
   const tickets = () => [
     ticket(1, "Done", ["model:cheap", "Model:Strong"]),
     ticket(2, "In Progress", ["model:standard", "model:cheap", "paseo"]),
     ticket(3, "Todo", ["model:cheap"]),
   ];
+  // This correction ran once, before the standard tier was dropped. `model:standard` names a tier
+  // that no longer exists, so it is not a tier label to this pass: TUC-2 carries one and is not a
+  // duplicate. The label is read as strong wherever a tier is read (README, "Model tiers") and the
+  // plugin's one-write tier swap removes it the next time it labels that ticket.
   const dry = fakeLinear(tickets(), catalog());
   const listed = await runModelLabels({ linear: dry.linear, apply: false, hostsReady: false, ungroup: false });
   assert.deepEqual(dry.writes, []);
-  assert.deepEqual(listed.duplicates.map((row) => `${row.identifier} keep ${row.keep}`), ["TUC-1 keep model:strong", "TUC-2 keep model:standard"]);
+  assert.deepEqual(listed.duplicates.map((row) => `${row.identifier} keep ${row.keep}`), ["TUC-1 keep model:strong"]);
   const labels = catalog();
   const gated = fakeLinear(tickets(), labels);
   const report = await runModelLabels({ linear: gated.linear, apply: true, hostsReady: false, ungroup: false });
-  assert.deepEqual(gated.writes, ["TUC-1 + -model:cheap", "TUC-2 + -model:cheap"]);
+  assert.deepEqual(gated.writes, ["TUC-1 + -model:cheap"]);
   assert.ok(report.group.some((line) => line.includes("--hosts-ready is missing")));
   const ready = fakeLinear(tickets(), labels);
   await runModelLabels({ linear: ready.linear, apply: true, hostsReady: true, ungroup: false });
-  assert.deepEqual(ready.writes.filter((write) => !write.startsWith("TUC-")), ["create model (group)", "group model:cheap", "group model:standard", "group Model:Strong"]);
+  assert.deepEqual(ready.writes.filter((write) => !write.startsWith("TUC-")), ["create model (group)", "group model:cheap", "group model:strong"]);
   const again = await runModelLabels({ linear: ready.linear, apply: true, hostsReady: true, ungroup: false });
   assert.deepEqual(again.group, ["already grouped: every workspace tier label is in the model group"]);
   const undo = fakeLinear([], labels);
   await runModelLabels({ linear: undo.linear, apply: true, hostsReady: false, ungroup: true });
-  assert.deepEqual(undo.writes, ["ungroup model:cheap", "ungroup model:standard", "ungroup Model:Strong"]);
+  assert.deepEqual(undo.writes, ["ungroup model:cheap", "ungroup model:strong"]);
   assert.ok(labels.every((label) => label.isGroup || label.parentId === null));
 });
 

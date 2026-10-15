@@ -37,8 +37,23 @@
 //   the tier its implementation runs on; and a ticket plan follows the part layout of the owner's
 //   Plannotator planning instructions (shared/plan-layout.ts), whether or not they reached the agent.
 // - LINEAR_TICKETS_ISSUE=<ticket>: `escalate_model` (README, "Model tiers") lets a ticket agent on
-//   the cheap or standard tier ask for the strong model; it drops an `escalated` event and the
-//   plugin switches the agent's model. Subagents cannot call it.
+//   the cheap tier ask for the strong model; it drops an `escalated` event and the plugin switches
+//   the agent's model. Subagents cannot call it.
+// - LINEAR_TICKETS_ISSUE=<ticket>: acceptance tests (README, "Model tiers"). A cheap plan's tests
+//   are written first by the strong model; the plugin saves their paths per agent
+//   (<PASEO_HOME>/linear-tickets/acceptance-tests/<agent id>) and the strong model's name in
+//   LINEAR_TICKETS_STRONG_MODEL, and a write to those paths from a session (the agent or one of its
+//   `task` subagents) whose live model is not that strong model is blocked. `ctx.models.current()`
+//   is per session: omp builds each subagent's extension context on the child session's own model.
+//   A `model: "@slow"` subagent passes because the `slow` role is the launch's strong model on
+//   every host (anthropic/claude-opus-5-5); a host whose role differs gets the block, which names
+//   the way out. `bash` writes are not checked: a guard against accidental routing, not isolation.
+// - PASEO_AGENT_ID set, LINEAR_TICKETS_ISSUE not (a Paseo session the plugin did not start for a
+//   ticket): its first prompt carries the Flash-first routing note (shared/plan-model.ts
+//   `sessionRoutingNote`), once per session, never for `task` subagents. Returned as a
+//   before_agent_start `message`: omp's extension runner collects every extension's message and
+//   only a `systemPrompt` replaces anything (omp 18.10.4 ExtensionRunner.emitBeforeAgentStart), so
+//   Plannotator's planning framing on the same prompt stays.
 // - LINEAR_TICKETS_ISSUE=<ticket>: Linear writes (README, "Agent access to Linear"). The user-level
 //   Linear MCP server acts as the owner, so ticket agents and their subagents may call only its read
 //   tools, named below; every other tool of that server is blocked, whether called directly
@@ -60,13 +75,15 @@ import { promisify } from "node:util";
 import { ADVISOR_MODEL, ADVISOR_SECTION, ADVISOR_THINKING, advisorSteps, RECORD_ADVICE_TOOL } from "../shared/plan-advisor";
 import { combinedRating, parsePlanRisk, sectionBody } from "../shared/plan-risk";
 import { parsePlanSections, ruleMismatch, sectionSteps } from "../shared/plan-sections";
-import { ESCALATE_TOOL, parsePlanModel } from "../shared/plan-model";
+import { ESCALATE_TOOL, parsePlanModel, sessionRouting, TIERS } from "../shared/plan-model";
+import { blockedTestWrite, STRONG_MODEL_ENV, writtenPaths, type AcceptanceTests } from "../shared/acceptance-tests";
 import { layoutProblem, requiredParts } from "../shared/plan-layout";
 import { decisionText, parseDecision, parseRouteFacts, routeRefusals, SMALL_ROUTE_ENV, SMALL_ROUTE_TOOL, SMALL_ROUTE_WAIT_MS, smallRouteNote, type RouteDecision } from "../shared/small-route";
 
 type Phase = "idle" | "planning" | "executing";
 type Entry = { type: string; customType?: string; data?: { reason?: string; path?: string; hash?: string }; message?: { role?: string } };
-type Context = { cwd?: string; agent?: { kind?: string }; sessionManager: { getBranch(): Entry[]; getArtifactsDir?(): string } };
+type Model = { provider?: string; id?: string };
+type Context = { cwd?: string; agent?: { kind?: string }; models?: { current(): Model | undefined }; sessionManager: { getBranch(): Entry[]; getArtifactsDir?(): string } };
 type ToolResult = { content: { type: "text"; text: string }[]; details?: Record<string, unknown> };
 type Params = Record<string, string | undefined>;
 type Field = { describe(text: string): Field; optional(): unknown };
@@ -77,7 +94,8 @@ type Schema = {
   enum(values: [string, ...string[]]): Field;
 };
 type ExtensionApi = {
-  on(event: "session_start" | "session_switch" | "session_branch" | "session_tree" | "before_agent_start" | "turn_start", handler: (event: unknown, ctx: Context) => Promise<void> | void): void;
+  on(event: "session_start" | "session_switch" | "session_branch" | "session_tree" | "turn_start", handler: (event: unknown, ctx: Context) => Promise<void> | void): void;
+  on(event: "before_agent_start", handler: (event: unknown, ctx: Context) => Promise<{ message: { customType: string; content: string; display: boolean } } | void> | { message: { customType: string; content: string; display: boolean } } | void): void;
   on(event: "tool_call", handler: (event: { toolName: string; toolCallId?: string; input?: Record<string, unknown> }, ctx: Context) => Promise<{ block: true; reason: string } | undefined>): void;
   events: { emit(channel: string, data: unknown): void };
   appendEntry(customType: string, data: unknown): void;
@@ -113,6 +131,10 @@ const MARKER = "linear-tickets.plan-first";
 const ADVICE_MARKER = "linear-tickets.plan-advice";
 // The session left planning by the small-ticket route (server/plan-pipeline-source.ts reads it).
 const ROUTE_MARKER = "linear-tickets.small-route";
+// The routing note went to this session (sessionRouting); a resumed session does not get it again.
+const ROUTING_MARKER = "linear-tickets.session-routing";
+// The acceptance tests the plugin protects for this agent (server/acceptance-tests.ts).
+const ACCEPTANCE_TESTS = AGENT_ID ? join(HOME, "linear-tickets", "acceptance-tests", AGENT_ID) : null;
 const ROUTE_POLL_MS = 500;
 const SUBMIT_TOOL = "plannotator_submit_plan";
 const VERDICTS = ["agreed", "disagreements", "unavailable"] as const;
@@ -344,6 +366,18 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
   // The owner's `plan` request was taken in this session (also kept as a MARKER entry for resumes):
   // the small-ticket route stays closed.
   let ownerRequested = false;
+  // The routing note went to this session (also kept as a ROUTING_MARKER entry for resumes).
+  let routed = false;
+  // The acceptance tests the plugin protects for this agent, read at each write: the plugin saves
+  // or clears them when a plan is approved or the agent is (re)launched. null: none protected.
+  const acceptanceTests = (): AcceptanceTests | null => {
+    if (!ACCEPTANCE_TESTS) return null;
+    try {
+      const saved: unknown = JSON.parse(readFileSync(ACCEPTANCE_TESTS, "utf8"));
+      if (!saved || typeof saved !== "object" || !("paths" in saved) || !Array.isArray(saved.paths)) return null;
+      return { identifier: "identifier" in saved && typeof saved.identifier === "string" ? saved.identifier : "", paths: saved.paths.filter((path): path is string => typeof path === "string") };
+    } catch { return null; }
+  };
   // Plan (absolute path, or local:// URI) → sha256 of the text the advisor's review was recorded for.
   const advised = new Map<string, string>();
   // omp's local:// plans as last written: the Plannotator bridge submits them from the same cache
@@ -471,6 +505,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const marks = entries.filter((entry) => entry.type === "custom" && entry.customType === MARKER);
     launched = marks.length > 0 || entries.some((entry) => entry.type === "message" && entry.message?.role === "assistant");
     ownerRequested = marks.some((entry) => entry.data?.reason === "owner");
+    routed = entries.some((entry) => entry.type === "custom" && entry.customType === ROUTING_MARKER);
     restoreAdvice(entries);
   });
   for (const event of ["session_switch", "session_branch", "session_tree"] as const) {
@@ -490,6 +525,15 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     if (await planMode("enter") === "planning") pi.appendEntry(MARKER, { reason: "launch", policy: POLICY, at: new Date().toISOString() });
   });
 
+  // Paseo sessions outside the ticket flow get the same routing a ticket's plan settles.
+  pi.on("before_agent_start", (_event, ctx) => {
+    const note = sessionRouting({ ticket: TICKET, agentId: AGENT_ID, kind: ctx?.agent?.kind, model: ctx?.models?.current(), routed });
+    if (!note) return;
+    routed = true;
+    pi.appendEntry(ROUTING_MARKER, { at: new Date().toISOString() });
+    return { message: { customType: ROUTING_MARKER, content: note, display: false } };
+  });
+
   // A tool result reads like data, so the owner's request arrives as a harness message at the next
   // step; the blocked call only points to it.
   pi.on("tool_call", async (event, ctx) => {
@@ -506,6 +550,10 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const linearTool = linearWrite(event.toolName, input);
     if (linearTool) {
       return { block: true, reason: `Stopped by the linear-tickets plugin: ${linearTool} would act as the owner. Ticket agents change Linear only through the ${TICKET_TOOL_PREFIX}* tools, which write as Paseo: comments and relations on any issue, status and links on your ticket and the issues you created, create_issue for follow-ups. Reading with the Linear tools is fine. For anything else in Linear, ask the owner (or add a manual task).` };
+    }
+    const testWrite = writtenPaths(event.toolName, input).length ? blockedTestWrite(acceptanceTests(), event.toolName, input, ctx?.models?.current(), process.env[STRONG_MODEL_ENV]) : null;
+    if (testWrite) {
+      return { block: true, reason: `Stopped by the linear-tickets plugin: ${testWrite} is one of this plan's acceptance tests, which the strong model writes. Make the implementation pass it; if the test itself is wrong, hand the change to a subagent on the strong model (the \`task\` tool with \`model: "@slow"\`) with the reason, or call \`${ESCALATE_TOOL}\` when the work needs the strong model.` };
     }
     if (event.toolName === "write" || event.toolName === "edit") {
       // omp gives an edit's targets as `paths` (hashline patches) or `path`; an apply_patch edit
@@ -571,7 +619,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
   if (TICKET) pi.registerTool({
     name: ESCALATE_TOOL,
     label: "Escalate Model",
-    description: "Ask the plugin to move this ticket to the strong model tier when you run on the cheap or standard tier and the work needs more: the same check still fails after two honest fix attempts, the change turns out to need judgment the plan did not settle (several layers, an interface others build on, call sites that must agree, a check-then-write gap, many files), or a review found a design problem. The plugin switches your model within seconds and records the reason on the ticket; carry on with the work afterwards. Not for routine failures you can fix.",
+    description: "Ask the plugin to move this ticket to the strong model tier when you run on the cheap tier and the work needs more: the same check still fails after two honest fix attempts, the change turns out to need judgment the plan did not settle (several layers, an interface others build on, call sites that must agree, a check-then-write gap, many files), or a review found a design problem. The plugin switches your model within seconds and records the reason on the ticket; carry on with the work afterwards. Not for routine failures you can fix.",
     parameters: pi.zod.object({ reason: pi.zod.string() }),
     loadMode: "essential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -600,7 +648,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       crossPackageContract: yesNo(),
       newRule: yesNo(),
       ownerDecisionNeeded: yesNo(),
-      tier: pi.zod.enum(["cheap", "standard", "strong"]),
+      tier: pi.zod.enum([...TIERS]),
       tierReason: pi.zod.string(),
       reach: pi.zod.string().describe("The `Reach:` bullet your pull request body will carry: where else what you change is used, or why nowhere."),
       reason: pi.zod.string().describe("Why this ticket is small and low-risk, in one or two sentences."),

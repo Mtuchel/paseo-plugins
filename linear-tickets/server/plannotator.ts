@@ -3,6 +3,7 @@ import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
+import type { AcceptanceTestsStore } from "./acceptance-tests";
 import type { IssueState, LinearService } from "./linear";
 import type { PluginSettings, Settings } from "./settings";
 import { PLANNOTATOR_OPEN_SOURCE } from "./plannotator-open-source";
@@ -80,7 +81,7 @@ export type EscalatedEvent = { type: "escalated"; agentId: string | null; reason
 type PlannotatorEvent = OpenedEvent | DecidedEvent | AdvisedEvent | EscalatedEvent | RouteEvent;
 // Model tiers (README, "Model tiers"): where tier decisions are recorded, the model guard's
 // immediate switch of one agent, and sending a working agent back to planning (plan-requests.ts).
-export type Tiers = { store: Pick<TierStore, "record">; apply: (agentId: string) => Promise<unknown>; replan: (agent: { id: string; issueId: string; identifier: string }, message: string) => Promise<void> };
+export type Tiers = { store: Pick<TierStore, "record">; apply: (agentId: string) => Promise<unknown>; replan: (agent: { id: string; issueId: string; identifier: string }, message: string) => Promise<void>; tests?: Pick<AcceptanceTestsStore, "save" | "clear"> };
 type Linear = Pick<LinearService, "comment" | "commentById" | "upsertIssueDocument" | "issueDocument" | "moveToStateNamed" | "moveToReady" | "moveToPlanStage" | "issueStatus" | "addLabel" | "removeLabel" | "changeLabels" | "labelCatalog" | "createLabel" | "issueState" | "viewerId" | "appUserId" | "trustedAppIds" | "createIssue" | "issueById" | "addBlocker" | "delegate">;
 type Sessions = Pick<SessionRouter, "sessionFor" | "plan" | "ask" | "say" | "said" | "expectReview" | "clearReview" | "parked" | "queueable" | "requeueSession" | "holdSession" | "groupSession">;
 // What the risk policy made of an opened review: `line` tells the owner, in the panel and on Linear;
@@ -505,15 +506,23 @@ export class PlannotatorBridge {
       const reason = tier === planned?.tier ? planned.reason || "the approved plan" : "raised by the ticket's model label";
       const launch = provider ? settings.launchPreferences[provider] : undefined;
       const model = provider && launch ? tierModel(settings, provider, tier, { provider: launch.model }).provider : null;
-      await tiers.store.record(issue, { tier, source: "plan", reason, agentId: attempt.agentId, model });
+      await tiers.store.record(issue, { tier, source: "plan", reason, agentId: attempt.agentId, model, strongSteps: tier === planned?.tier ? planned.strongSteps : null });
       console.log(`[linear-tickets] ${issue.identifier}: implementing on the ${tier} tier (${reason})`);
-      return { tier, reason, model, labels: state.labels };
-    }) as { tier: Tier | null; reason?: string; model?: string | null; labels?: { id: string; name: string }[] };
+      return { tier, reason, model, labels: state.labels, tests: tier === "cheap" && tier === planned?.tier ? planned.acceptanceTests ?? [] : [] };
+    }) as { tier: Tier | null; reason?: string; model?: string | null; labels?: { id: string; name: string }[]; tests?: string[] };
     const tier = recorded.tier;
     if (!tier) {
       if (sessionId) await steps.optional("tier-note", () => this.sessions!.say(sessionId, "thought", "The approved plan names no model tier: back to planning to add its `## Model` section."));
       return;
     }
+    // The plan's acceptance tests are protected for the agent that implements it (README, "Model
+    // tiers"): saved here, at the approval, so a cheap agent that is already implementing is guarded
+    // from its next write on; a strong tier (or a plan that names no tests) clears an earlier save.
+    const tests = recorded.tests ?? [];
+    await steps.optional("tier-tests", async () => {
+      if (tests.length) await tiers.tests?.save(attempt.agentId, { identifier: issue.identifier, paths: tests });
+      else await tiers.tests?.clear(attempt.agentId);
+    });
     if (settings.writeback.status) await steps.optional("tier-label", () => this.labelTier(issue.id, tier, recorded.labels ?? []));
     await steps.optional("tier-switch", () => tiers.apply(attempt.agentId));
     if (sessionId) await steps.optional("tier-note", () => this.sessions!.say(sessionId, "thought", `Implementing on the ${tier} model tier${recorded.model ? ` (${recorded.model})` : ""}: ${recorded.reason}.`));
