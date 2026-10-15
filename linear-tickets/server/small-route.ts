@@ -9,7 +9,7 @@ import { planRequestsDirectory } from "./plan-requests";
 // starter.ts imports this module; its trust rule (isUntrusted) comes in through `untrusted`.
 import { launchTier, writeTierLabel, type TierStore } from "./model-tiers";
 import { paseoHome } from "./ticket-mcp";
-import { TIERS, type Tier } from "../shared/plan-model";
+import { readTier, type Tier } from "../shared/plan-model";
 import { decisionText, NO_PLAN_LABEL, parseDecision, parseRouteFacts, routeRefusals, SMALL_ROUTE_MAX_LINES, type RouteDecision, type RouteFacts } from "../shared/small-route";
 
 // The small-ticket route (README, "Small-ticket route"; TUC-1854), the plugin's side. The omp
@@ -120,6 +120,15 @@ export class SmallRoutes {
     try { return JSON.parse(await readFile(path, "utf8")) as T; } catch { return null; }
   }
 
+  // Routes and attempts written before the standard tier was dropped (#199) still name it: read
+  // every stored tier through readTier, so they carry on as strong like the plan and label reads.
+  private async readAttempt(path: string): Promise<Attempt | null> {
+    const attempt = await this.readJson<Attempt>(path);
+    if (!attempt) return null;
+    const record = "record" in attempt.steps ? { record: readTier(attempt.steps.record) ?? "strong" } : {};
+    return { ...attempt, facts: { ...attempt.facts, tier: readTier(attempt.facts.tier) ?? "strong" }, steps: { ...attempt.steps, ...record } };
+  }
+
   private async writeJson(path: string, value: unknown): Promise<void> {
     await mkdir(join(path, ".."), { recursive: true, mode: 0o700 });
     const temporary = `${path}.${randomUUID()}.tmp`;
@@ -138,7 +147,8 @@ export class SmallRoutes {
 
   // The route a ticket is implemented on, or null.
   async get(issueId: string): Promise<RouteRecord | null> {
-    return this.readJson<RouteRecord>(this.path("routes", issueId));
+    const route = await this.readJson<RouteRecord>(this.path("routes", issueId));
+    return route && { ...route, tier: readTier(route.tier) ?? "strong", facts: { ...route.facts, tier: readTier(route.facts.tier) ?? "strong" } };
   }
 
   // The decision that stands for an attempt: publishes this one unless one exists. null: unreadable.
@@ -172,7 +182,7 @@ export class SmallRoutes {
     if (!agent.issueId) return;
     const issueId = agent.issueId;
     await this.serial(issueId, async () => {
-      let attempt = await this.readJson<Attempt>(this.path("attempts", event.routeId));
+      let attempt = await this.readAttempt(this.path("attempts", event.routeId));
       if (!attempt) {
         const parsed = parseRouteFacts(event.facts);
         if ("problem" in parsed) {
@@ -249,10 +259,10 @@ export class SmallRoutes {
   async sweep(): Promise<void> {
     const names = (await readdir(join(this.directory, "attempts")).catch(() => [] as string[])).filter((name) => name.endsWith(".json") && !name.startsWith("."));
     for (const name of names) {
-      const attempt = await this.readJson<Attempt>(join(this.directory, "attempts", name));
+      const attempt = await this.readAttempt(join(this.directory, "attempts", name));
       if (!attempt || ["closed", "reverted"].includes(attempt.state)) continue;
       await this.serial(attempt.issueId, async () => {
-        const current = await this.readJson<Attempt>(join(this.directory, "attempts", name));
+        const current = await this.readAttempt(join(this.directory, "attempts", name));
         if (!current) return;
         // A pending attempt is decided by its event while the tool still waits.
         if (current.state === "pending") {
@@ -398,7 +408,7 @@ export class SmallRoutes {
     const names = (await readdir(join(this.directory, "attempts")).catch(() => [] as string[])).filter((name) => name.endsWith(".json") && !name.startsWith("."));
     const open: Attempt[] = [];
     for (const name of names) {
-      const attempt = await this.readJson<Attempt>(join(this.directory, "attempts", name));
+      const attempt = await this.readAttempt(join(this.directory, "attempts", name));
       if (attempt?.issueId === issueId && !["closed", "reverted"].includes(attempt.state)) open.push(attempt);
     }
     return open;

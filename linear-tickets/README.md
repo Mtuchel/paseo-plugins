@@ -879,8 +879,9 @@ reviewed like a new plan. A `model:` label or an earlier decided tier on the tic
 skips this.
 
 Every boundary that has to act before a plan is reviewed again reads a dropped tier name as its
-conservative current one: `- Tier: standard` in an in-flight plan, a `model:standard` label and a
-tier record from before the cutover all mean `strong`, so the ticket keeps the strong model until
+conservative current one: `- Tier: standard` in an in-flight plan, a `model:standard` label, a
+tier record and a small-ticket route (its record, a resumed attempt, a route request) from before
+the cutover all mean `strong`, so the ticket keeps the strong model until
 its plan is replanned or the plugin writes its tier again. A plan *submitted* with
 `- Tier: standard` is refused and goes back to its planner instead.
 
