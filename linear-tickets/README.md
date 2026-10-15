@@ -4695,7 +4695,9 @@ not start (see *Waiting their turn*), and the menu bar shows `queued` with the r
 true` completes a `paseo-manual` issue and a "Needs you" sub-issue only when no other independent
 source remains unsettled; unknown/unclassified history blocks whole-issue completion. An ordinary
 answer settles its selected source only. Completion after the last confirmed source answer also
-checks the other sources' receipts or cited reconciliation; it does not invent bulk answers.
+checks the unchanged material source scope and other sources' receipts or cited reconciliation;
+posting that answer's own receipt does not count as a material source edit. Failed completion
+can retry its pending effect without reposting the answer. It does not invent bulk answers.
 The shared reply arbiter, including receipt recovery, leaves completion for the durable
 `owner-ask:` namespace to this source-aware inbox path. On a
 parent ticket it only records the comment and leaves the state to the agent, whose next turn settles
@@ -4705,8 +4707,10 @@ result instead of repeating delivery, including after a restart. An unconfirmed 
 replayed automatically; its error asks the owner to inspect the ticket or agent. A delivered answer,
 including a queued continuation, fences an unchanged material source scope across unrelated timeline
 or extraction revisions. Scope includes title, parent/ticket identity, source kind and enclosing
-description as well as the source text. Changed business scope requires a fresh explicit answer,
-even when its question words are unchanged; independent questions are not suppressed. Legacy
+description as well as the source text. That material scope is also part of every source revision,
+including parent-only changes on an ordinary ticket; exact-revision receipt lookup cannot bypass
+it. Changed business scope requires a fresh explicit answer, even when its question words are
+unchanged; independent questions are not suppressed. Legacy
 body-only receipts cannot approve another revision and retain only conservative unknown-delivery
 fences across revisions.
 Unknown delivery remains fenced across context/extraction changes and cannot be resent by

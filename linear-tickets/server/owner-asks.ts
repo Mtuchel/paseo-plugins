@@ -6,7 +6,7 @@ import type { DecisionReceipt, OwnerAsk } from "../shared/contracts";
 import type { BrowserOwnerAsk } from "../shared/decision-inbox";
 import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService, OwnerAskComment, OwnerAskIssue } from "./linear";
-import { closeAnswered, type NeedsYouIssues } from "./needs-you";
+import type { NeedsYouIssues } from "./needs-you";
 import { askHash, EXTRACTION_VERSION, MAX_SOURCE_CHARS, type AskQuestion, type ExtractInput, type Extraction, type ExtractedAsk } from "./owner-ask-extract";
 import type { DeliveryOrigin, DeliveryResult } from "./permission-replies";
 import { LIVE_AGENT } from "./process-liveness";
@@ -135,7 +135,7 @@ function extractionKey(draft: Draft): string {
 }
 
 function revision(draft: Draft, value: ExtractedAsk | null): string {
-  return askHash(JSON.stringify([draft.issue.id, draft.ticketId, draft.sourceId, extractionInput(draft), value]));
+  return askHash(JSON.stringify([draft.issue.id, draft.ticketId, draft.sourceId, sourceScope(draft), extractionInput(draft), value]));
 }
 
 function sourceScope(draft: Draft): string {
@@ -392,9 +392,15 @@ export class OwnerAsks {
       else {
         const drafts = (await this.collect(paseo, undefined, true)).filter(draft => draft.issue.id === record.receipt.issueId);
         const current = drafts.find(draft => record.sourceId === undefined || record.sourceId === draft.sourceId);
-        const extracted = current ? await this.extractionFor(extractionKey(current), extractionHash(current)) : undefined;
-        if (current && revision(current, extracted?.value ?? null) === record.receipt.revision && await this.sourcesSettled(drafts)) {
-          await closeAnswered(this.deps.needsYou, this.deps.linear, record.close.issueId);
+        // Posting our answer changes timeline/extraction context, not the source's material scope.
+        // Legacy receipts without that scope retain the stricter exact-revision completion fence.
+        const unchanged = current && (record.sourceScope !== undefined
+          ? record.sourceId === current.sourceId && record.sourceHash === askHash(current.text) && record.sourceScope === sourceScope(current)
+          : revision(current, (await this.extractionFor(extractionKey(current), extractionHash(current)))?.value ?? null) === record.receipt.revision);
+        if (unchanged && await this.sourcesSettled(drafts)) {
+          // This is a durable retryable effect, not the shared best-effort closure helper.
+          await this.deps.linear.complete(record.close.issueId);
+          await this.deps.needsYou.remove(record.close.issueId);
         }
       }
       record = { ...record, close: { ...record.close, done: true } };

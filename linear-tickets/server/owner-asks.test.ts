@@ -647,10 +647,10 @@ test("an unfinished completion effect cannot close a revised ask when its delive
   });
   t.after(() => h.ownerAsks.stop());
   const input = await inputFor(h);
-  const remove = h.deps.needsYou.remove;
-  h.deps.needsYou.remove = async () => { throw new Error("Tracking store unavailable"); };
-  await assert.rejects(h.ownerAsks.answer(input, h.paseo), /Tracking store unavailable/);
-  h.deps.needsYou.remove = remove;
+  const complete = h.deps.linear.complete;
+  h.deps.linear.complete = async () => { throw new Error("Completion unavailable"); };
+  await assert.rejects(h.ownerAsks.answer(input, h.paseo));
+  h.deps.linear.complete = complete;
   h.state.issues[0] = { ...h.state.issues[0], description: "May I deploy a different production change?" };
   const reloaded = new OwnerAsks(h.deps);
   t.after(() => reloaded.stop());
@@ -921,6 +921,41 @@ test("answering one Needs-you source leaves independent requests visible and clo
   assert.equal((await h.ownerAsks.snapshot(null)).history.length, 2, "two real answers, not a bulk ledger completion");
 });
 
+for (const retryClose of [false, true]) {
+  test(`the last comment answer closes its Needs-you issue with its real receipt in the timeline${retryClose ? " after a failed close and exact retry" : ""}`, async t => {
+    const h = await setup({ issues: [issue()], comments: new Map([["i1", [comment("business", "Which contracted quantity?")]]]),
+      needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }] });
+    t.after(() => h.ownerAsks.stop());
+    let receipts = 0;
+    h.deps.linear.comment = async (issueId, body) => {
+      h.events.push(`comment ${issueId}: ${body}`);
+      h.state.comments.set(issueId, [...h.state.comments.get(issueId) ?? [], comment(`receipt-${++receipts}`, body, new Date(NOW + receipts * 1000).toISOString())]);
+    };
+    let failClose = retryClose;
+    h.deps.linear.complete = async issueId => {
+      if (failClose) throw new Error("Linear completion temporarily unavailable");
+      h.events.push(`complete ${issueId}`);
+    };
+    const description = await untilAsk(h, ask => ask.sourceId === "description" && ask.extracted);
+    await h.ownerAsks.answer({ issueId: "i1", sourceId: "description", revision: description.revision, answers: { q1: "Agent does it" } }, null);
+    assert.deepEqual(h.events.filter(event => event.startsWith("complete ")), [], "the independent business question remains unanswered");
+    const last = await untilAsk(h, ask => ask.sourceId === "business" && ask.extracted);
+    const input = { issueId: "i1", sourceId: "business", revision: last.revision, answers: { q1: "You or the team" } };
+    if (retryClose) {
+      await assert.rejects(h.ownerAsks.answer(input, null), /completion temporarily unavailable/);
+      failClose = false;
+    }
+    await h.ownerAsks.answer(input, null);
+    await h.ownerAsks.answer(input, null);
+    assert.equal(receipts, 2, "exact retries never post a second answer receipt");
+    assert.equal(h.state.comments.get("i1")?.filter(entry => entry.body.startsWith("Answered from the decision inbox:")).length, 2, "the completion check consumed the actual returned receipt timeline");
+    assert.deepEqual(h.events.filter(event => event.startsWith("complete ")), ["complete i1"], "the final settled source closes once, despite nonmaterial receipt context changes");
+    assert.ok(h.events.includes("needsYou.remove i1"));
+    assert.deepEqual((await h.ownerAsks.snapshot(null, true)).asks, []);
+    assert.equal((await h.ownerAsks.snapshot(null)).history.length, 2);
+  });
+}
+
 test("an unclassified independent source blocks whole-issue completion even when the owner answers another part", async t => {
   const h = await setup({ issues: [issue()], comments: new Map([["i1", [comment("unknown", "Historical context not yet classified")]]]),
     needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }] });
@@ -957,5 +992,32 @@ for (const legacy of [false, true]) for (const change of ["title", "parent"] as 
     assert.equal(h.events.filter(event => event.startsWith("comment ")).length, 1, "an exact old receipt replay never delivers into the changed scope");
     await reloaded.answer({ issueId: "i1", sourceId: "description", revision: current!.revision, answers: { q1: "You or the team" } }, null);
     assert.equal(h.events.filter(event => event.startsWith("comment ")).length, 2, "the new material scope needs its own explicit answer");
+  });
+}
+
+for (const parentField of ["parentId", "parentIdentifier"] as const) {
+  test(`an ordinary ticket ${parentField}-only change cannot reuse an exact-revision answer receipt`, async t => {
+    const h = await setup({ issues: [issue({ title: "Staging rollout", description: "Approve this rollout?", labels: [] })] });
+    t.after(() => h.ownerAsks.stop());
+    const first = await inputFor(h);
+    await h.ownerAsks.answer(first, null);
+    const original = h.state.issues[0];
+    h.state.issues[0] = { ...original, [parentField]: parentField === "parentId" ? "new-parent" : "TUC-NEW-PARENT" };
+    const reloaded = new OwnerAsks(h.deps);
+    t.after(() => reloaded.stop());
+    assert.equal((await reloaded.snapshot(null)).asks.length, 1, "unchanged title/kind/body cannot hide a materially reparented ticket under its old exact receipt");
+    let current: BrowserOwnerAsk | undefined;
+    await untilAsync(async () => { current = (await reloaded.snapshot(null)).asks.find(ask => ask.extracted); return current !== undefined; });
+    assert.notEqual(current!.revision, first.revision, "parent scope is part of the consumer revision, even for an ordinary ticket");
+    assert.equal(current!.title, original.title);
+    assert.equal(h.state.issues[0].description, original.description);
+    assert.deepEqual(h.state.issues[0].labels, original.labels);
+    await assert.rejects(reloaded.answer({ ...first, answers: { q1: "You or the team" } }, null), /ask changed/);
+    assert.equal(h.events.filter(event => event.startsWith("comment ")).length, 1);
+    const input = { issueId: "i1", sourceId: "description", revision: current!.revision, answers: { q1: "You or the team" } };
+    await reloaded.answer(input, null);
+    await reloaded.answer(input, null);
+    assert.equal(h.events.filter(event => event.startsWith("comment ")).length, 2, "the new parent scope has its own explicit exactly-once owner answer");
+    assert.equal((await reloaded.snapshot(null)).history.length, 2);
   });
 }
