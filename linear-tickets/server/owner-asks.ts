@@ -31,6 +31,9 @@ const RETRY_DELAYS_MS = [15_000, 60_000, 300_000];
 const CALLER = "owner-asks";
 const AGENT_PAGE = 200;
 
+// Menu-bar polls must not rescan every open issue and its comments on each refresh.
+// A decision always bypasses this cache before delivery; external edits appear within a minute.
+const LINEAR_SOURCE_CACHE_MS = 60_000;
 type Linear = Pick<LinearService, "ownerAskIssues" | "ownerAskIssuesByIds" | "ownerAskComments" | "commentBody" | "comment" | "complete" | "viewerId">;
 type NeedsYou = Pick<NeedsYouIssues, "all" | "remove">;
 
@@ -185,6 +188,11 @@ export class OwnerAsks {
   private readonly ledger: DecisionLedger;
   private running = 0;
   private stopped = false;
+  private sourceGeneration = 0;
+  private issueCache: { expiresAt: number; value: OwnerAskIssue[] } | null = null;
+  private issueFlight: Promise<OwnerAskIssue[]> | null = null;
+  private commentCache: { expiresAt: number; ids: string; value: Map<string, OwnerAskComment[]> } | null = null;
+  private commentFlight: { ids: string; promise: Promise<Map<string, OwnerAskComment[]>> } | null = null;
 
   constructor(private readonly deps: OwnerAsksDeps) {
     this.directory = deps.directory ?? OWNER_ASK_DIRECTORY();
@@ -193,6 +201,7 @@ export class OwnerAsks {
   }
 
   stop(): void {
+    this.invalidateSources();
     this.stopped = true;
     for (const timer of this.retries) clearTimeout(timer);
     this.retries.clear();
@@ -200,10 +209,10 @@ export class OwnerAsks {
 
   // Everything waiting for the owner, from cache, without waiting for the model: an ask whose
   // extraction has not finished retains its manual classification when known, else kind "info".
-  async snapshot(paseo: PaseoApi | null): Promise<OwnerAskSnapshot> {
+  async snapshot(paseo: PaseoApi | null, fresh = false): Promise<OwnerAskSnapshot> {
     const at = new Date(this.now()).toISOString();
     await this.ledger.load();
-    const drafts = await this.collect(paseo);
+    const drafts = await this.collect(paseo, undefined, fresh);
     const asks: BrowserOwnerAsk[] = [];
     for (const draft of drafts) {
       const hash = extractionHash(draft);
@@ -252,13 +261,18 @@ export class OwnerAsks {
   }
 
   async answer(input: AnswerAskInput, paseo: PaseoApi | null): Promise<AnswerAskResult> {
-    const result = await this.ledger.run(() => this.decide(input, paseo));
-    if (result.delivered === "local") throw new Error("An answer cannot be a local inbox-only action.");
-    return { ...result, delivered: result.delivered };
+    try {
+      const result = await this.ledger.run(() => this.decide(input, paseo));
+      if (result.delivered === "local") throw new Error("An answer cannot be a local inbox-only action.");
+      return { ...result, delivered: result.delivered };
+    } finally {
+      this.invalidateSources();
+    }
   }
 
-  triage(input: TriageAskInput, paseo: PaseoApi | null): Promise<TriageAskResult> {
-    return this.ledger.run(() => this.decide(input, paseo));
+  async triage(input: TriageAskInput, paseo: PaseoApi | null): Promise<TriageAskResult> {
+    try { return await this.ledger.run(() => this.decide(input, paseo)); }
+    finally { this.invalidateSources(); }
   }
 
   private async decide(input: AnswerAskInput | TriageAskInput, paseo: PaseoApi | null): Promise<TriageAskResult> {
@@ -381,7 +395,7 @@ export class OwnerAsks {
     if (record.close && !record.close.done) {
       if (record.result?.delivered === "closed") await this.deps.needsYou.remove(record.close.issueId);
       else {
-        const current = (await this.collect(paseo)).find((draft) => draft.issue.id === record.receipt.issueId);
+        const current = (await this.collect(paseo, undefined, true)).find((draft) => draft.issue.id === record.receipt.issueId);
         const extracted = current ? await this.extractionFor(extractionKey(current), extractionHash(current)) : undefined;
         if (current && revision(current, extracted?.value ?? null) === record.receipt.revision) {
           await closeAnswered(this.deps.needsYou, this.deps.linear, record.close.issueId);
@@ -404,10 +418,51 @@ export class OwnerAsks {
   private isManual(issue: OwnerAskIssue, manualLabel: string): boolean {
     return issue.labels.some((name) => name.trim().toLowerCase() === manualLabel.trim().toLowerCase());
   }
+  private invalidateSources(): void {
+    this.sourceGeneration++;
+    this.issueCache = null;
+    this.issueFlight = null;
+    this.commentCache = null;
+    this.commentFlight = null;
+  }
 
-  private async collect(paseo: PaseoApi | null, issueId?: string): Promise<Draft[]> {
-    const priority = issueId ? "interactive" : "background";
-    const inventory = await withPriority(priority, CALLER, () => this.deps.issues ? this.deps.issues() : this.deps.linear.ownerAskIssues());
+  private async cachedIssues(): Promise<OwnerAskIssue[]> {
+    if (this.issueCache && this.issueCache.expiresAt > this.now()) return this.issueCache.value;
+    if (this.issueFlight) return this.issueFlight;
+    const generation = this.sourceGeneration;
+    const flight = withPriority("background", CALLER, () => this.deps.issues ? this.deps.issues() : this.deps.linear.ownerAskIssues());
+    this.issueFlight = flight;
+    try {
+      const value = await flight;
+      if (generation === this.sourceGeneration) this.issueCache = { expiresAt: this.now() + LINEAR_SOURCE_CACHE_MS, value };
+      return value;
+    } finally {
+      if (this.issueFlight === flight) this.issueFlight = null;
+    }
+  }
+
+  private async cachedComments(ids: string[]): Promise<Map<string, OwnerAskComment[]>> {
+    const key = ids.join("\0");
+    if (this.commentCache?.ids === key && this.commentCache.expiresAt > this.now()) return this.commentCache.value;
+    if (this.commentFlight?.ids === key) return this.commentFlight.promise;
+    const generation = this.sourceGeneration;
+    const promise = withPriority("background", CALLER, () => this.deps.linear.ownerAskComments(ids));
+    const flight = { ids: key, promise };
+    this.commentFlight = flight;
+    try {
+      const value = await promise;
+      if (generation === this.sourceGeneration) this.commentCache = { expiresAt: this.now() + LINEAR_SOURCE_CACHE_MS, ids: key, value };
+      return value;
+    } finally {
+      if (this.commentFlight === flight) this.commentFlight = null;
+    }
+  }
+
+  private async collect(paseo: PaseoApi | null, issueId?: string, fresh = false): Promise<Draft[]> {
+    const priority = issueId || fresh ? "interactive" : "background";
+    const inventory = issueId || fresh
+      ? await withPriority(priority, CALLER, () => this.deps.issues ? this.deps.issues() : this.deps.linear.ownerAskIssues())
+      : await this.cachedIssues();
     const issues = issueId ? inventory.filter(issue => issue.id === issueId) : inventory;
     const [needsYou, labels, agents] = await Promise.all([
       this.deps.needsYou.all(),
@@ -425,7 +480,11 @@ export class OwnerAsks {
     const comments = new Map<string, OwnerAskComment[]>();
     const asked = issues.filter((issue) => !isNeedsYou(issue) && !manual(issue));
     if (asked.length) {
-      for (const [id, list] of await withPriority(priority, CALLER, () => this.deps.linear.ownerAskComments(asked.map((issue) => issue.id)))) comments.set(id, list);
+      const ids = asked.map(issue => issue.id);
+      const source = issueId || fresh
+        ? await withPriority(priority, CALLER, () => this.deps.linear.ownerAskComments(ids))
+        : await this.cachedComments(ids);
+      for (const [id, list] of source) comments.set(id, list);
       // A wait comment older than the newest page is read on its own.
       for (const issue of asked) {
         const waiting = (await record(issue.id))?.waiting;

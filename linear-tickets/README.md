@@ -3336,6 +3336,14 @@ No tokens, query bodies or ticket text appear in the report.
   `webhooks` (delivered since the plugin loaded), `sweepReads`, `sweepSkips` and `webhookReads`;
   `sweepSkips` against `sweepReads + sweepSkips` is how much of the saving the webhooks actually
   cover.
+- **Menu-bar owner reads reuse Linear sources for at most 60 seconds.** Its 15-second refresh
+  still reads current local agent state and decision receipts. Only the paginated owner issue
+  inventory and matching comment batches are shared across polls; failures are never cached.
+  Browser owner collections bypass this cache. Answer and triage actions re-read Linear before
+  delivery and invalidate the cache afterward; completion revalidates before closing a ticket.
+- **Review card metadata refreshes every 15 minutes per identifier.** The label catalog still
+  refreshes every five minutes. Decisions and deletion always bypass display metadata and
+  check the exact current issue identity from Linear.
 - **Waiting threads are read in batches.** Every sweep checks each queued thread (waiting for
   blockers, a slot, or a live OMP worker of its ticket to exit) for a session that ended in Linear
   and, once nothing local holds it, for a ticket moved to Done or Canceled. These reads used to
@@ -3457,6 +3465,21 @@ No tokens, query bodies or ticket text appear in the report.
   ticket, is dropped from the outbox with its log line. An entry already attached on Linear
   before this check existed and now rejected gets `; already attached on Linear; remove it by
   hand` in that line.
+
+### Plugin availability monitor (server087)
+
+The independently supervised `ops/paseo-plugin-recovery.py` runs from the user-level
+`paseo-plugin-recovery.timer` every two minutes. It checks the local plugin status and the
+governor's recent `linear.capacity` RPC observation, **without calling Linear**. A budget pause,
+an intentionally disabled plugin, a stopped Paseo daemon or a stale/unknown observation cannot
+trigger a restart. After three consecutive definite failures it attempts one plugin reload,
+checks local RPC again, and restarts Paseo only if the reload fails. Attempts are limited to
+two per rolling day, at least an hour apart. It holds the rollout lock, so an intentional
+rollout cannot be mistaken for a failed load. State and the reason for its last action are in
+`~/.paseo/linear-tickets/plugin-recovery.json`; inspect with
+`systemctl --user status paseo-plugin-recovery.timer` and
+`journalctl --user -u paseo-plugin-recovery.service --since today`. To disable automatic
+recovery: `systemctl --user disable --now paseo-plugin-recovery.timer`.
 
 ### GitHub usage
 
@@ -4371,9 +4394,10 @@ manual work—not just "Needs input"—are read with the owner's credential. Iss
 issue's comments are paginated to completion. Failed or incomplete collection is reported as
 incomplete coverage, not an empty successful inbox. Descriptions, source comments, this host's
 `needs-you/` records and handover records provide distinct revision-bound decision sources.
-The plugin's wait comment is read directly when necessary. Comment edits are re-read even
-when the ticket's `updatedAt` has not changed. Equal ticket IDs or wording alone do not merge
-independent decisions, and unanswered extraction remains visible for source review.
+The plugin's wait comment is read directly when necessary. Comment edits are visible within
+60 seconds even when the ticket's `updatedAt` has not changed; the browser's periodic owner
+collection and answer validation read them immediately. Equal ticket IDs or wording alone do
+not merge independent decisions, and unanswered extraction remains visible for source review.
 An ask's ticket is the parent of a "Needs you" sub-issue or manual task, else the issue itself (a ticket under an epic is
 still its own ticket). Each ask carries its route from this host's view: `agent` (the live asking
 agent), `continue` (the ticket's agent is gone: an answer starts a continuation agent through the

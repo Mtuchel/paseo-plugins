@@ -7,7 +7,7 @@ import { ReviewIssueInfos } from "./review-issue-info";
 const ISSUE_ID = "3b241101-e2bb-4255-8caf-4136c566a962";
 const AREA_ID = "3692d838-bf25-40cf-a1f1-96193846b21d";
 const PURCHASING_ID = "e9e963f8-284e-4a52-a4d2-84decf0f9de0";
-const TTL = 5 * 60_000;
+const TTL = 15 * 60_000;
 const catalog: CatalogLabel[] = [
   { id: AREA_ID, name: "Area", isGroup: true, parentId: null, teamId: null },
   { id: PURCHASING_ID, name: "Purchasing", isGroup: false, parentId: AREA_ID, teamId: null },
@@ -70,13 +70,16 @@ test("review lookup verifies the exact current identifier and UUID before return
   assert.deepEqual(await infos.forIdentifier(" tuc-630 ", { fresh: true }), { issueId: ISSUE_ID, areas: ["Purchasing"] });
 });
 
-test("verified metadata has a per-identifier five-minute TTL and shares the catalog across identifiers", async () => {
+test("review display metadata stays cached across short inbox refreshes and revalidates later", async () => {
   const { h, infos } = harness();
   await infos.forIdentifier("TUC-630");
   h.time = 60_000;
   await infos.forIdentifier("TUC-631");
   assert.equal(h.catalogReads, 1);
   h.labels = [{ id: "sales", name: "Sales" }];
+  h.time = 5 * 60_000;
+  assert.deepEqual((await infos.forIdentifier("TUC-630"))?.areas, ["Purchasing"]);
+  assert.equal(h.reads, 2, "display enrichment does not refetch when only the label catalog expires");
   h.time = TTL - 1;
   assert.deepEqual((await infos.forIdentifier("TUC-630"))?.areas, ["Purchasing"]);
   assert.equal(h.reads, 2);

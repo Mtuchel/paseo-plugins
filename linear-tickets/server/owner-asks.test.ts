@@ -670,3 +670,27 @@ test("manual actions remain classified and visible while extraction is unresolve
   assert.deepEqual(snapshot.asks.map(ask => ({ kind: ask.kind, attention: ask.attention, extracted: ask.extracted, source: ask.source })),
     [{ kind: "manual", attention: "owner", extracted: false, source: "Rotate the credential in the owner console." }]);
 });
+
+test("owner inbox shows new Linear questions within a minute without rescanning every menu refresh", async t => {
+  const h = await setup({ issues: [issue({ title: "Rollout policy", labels: [], parentId: null, status: "In Progress", description: "Rollout discussion" })],
+    comments: new Map([["i1", [comment("c1", "Which rollout policy?")]]]) });
+  t.after(() => h.ownerAsks.stop());
+  let inventoryReads = 0;
+  let commentReads = 0;
+  h.deps.issues = async () => { inventoryReads++; return h.state.issues; };
+  h.deps.linear.ownerAskComments = async ids => {
+    commentReads++;
+    return new Map(ids.map(id => [id, h.state.comments.get(id) ?? []]));
+  };
+  assert.deepEqual((await h.ownerAsks.snapshot(null)).asks.map(ask => ask.sourceId), ["c1"]);
+  h.state.comments.set("i1", [comment("c2", "Which new approval is needed?"), comment("c1", "Which rollout policy?")]);
+  h.state.now += 30_000;
+  assert.deepEqual((await h.ownerAsks.snapshot(null)).asks.map(ask => ask.sourceId), ["c1"]);
+  assert.deepEqual([inventoryReads, commentReads], [1, 1]);
+  assert.deepEqual(new Set((await h.ownerAsks.snapshot(null, true)).asks.map(ask => ask.sourceId)), new Set(["c1", "c2"]),
+    "the browser's explicit collection bypasses the menu cache");
+  assert.deepEqual([inventoryReads, commentReads], [2, 2]);
+  h.state.now += 31_000;
+  assert.deepEqual(new Set((await h.ownerAsks.snapshot(null)).asks.map(ask => ask.sourceId)), new Set(["c1", "c2"]));
+  assert.deepEqual([inventoryReads, commentReads], [3, 3]);
+});

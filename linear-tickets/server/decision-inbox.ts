@@ -201,7 +201,7 @@ export class BrowserDecisionInbox {
       const checkedAt = this.now();
       const updatedAt = new Date(checkedAt).toISOString();
       let result: NonNullable<BrowserDecisionInbox["ownerCache"]>;
-      try { result = { snapshot: await this.deps.ownerAsks.snapshot(this.deps.paseo()), checkedAt, error: null }; }
+      try { result = { snapshot: await this.deps.ownerAsks.snapshot(this.deps.paseo(), true), checkedAt, error: null }; }
       catch (error) { result = { snapshot: this.ownerCache?.snapshot ?? { asks: [], history: [], updatedAt }, checkedAt, error: `Owner asks unavailable (checked ${updatedAt}): ${reasonOf(error)}` }; }
       if (generation === this.ownerGeneration) this.ownerCache = result;
       return result;
