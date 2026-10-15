@@ -1287,3 +1287,33 @@ test("the planning/coding transitions pick the named started state and leave fin
   assert.deepEqual(await run({ name: "Done", type: "completed" }, "In Progress"), { result: { changed: false }, updates: [] });
   assert.match((await run({ name: "Todo", type: "unstarted" }, "Coding")).result.note ?? "", /no started state named "Coding"/);
 });
+
+test("template migration is compare-and-swap and cannot overwrite a concurrent custom template or unrelated settings", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-template-migration-"));
+  try {
+    const settings = new Settings(join(directory, "settings.json"));
+    const old = "Custom workflow: {{ticket}}\nAsk after the second queue drop.\n{{context}}";
+    await settings.patch({ template: old, markInProgress: true });
+    const migrated = "Custom workflow: {{ticket}}\nContinue technical repair under standing authority.\n{{context}}";
+    await settings.patch({ expectedTemplate: old, template: migrated });
+    await assert.rejects(settings.patch({ expectedTemplate: old, template: "stale replacement", markInProgress: false }));
+    const current = await settings.read();
+    assert.equal(current.template, migrated);
+    assert.equal(current.markInProgress, true, "a failed migration is atomic for the whole patch");
+    await settings.patch({ expectedTemplate: migrated, template: "" });
+    assert.equal((await settings.read()).template, null, "an explicit empty replacement restores the source default");
+    assert.equal((await settings.read()).markInProgress, true);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("standing activation never migrates an old or malformed revision to current authority", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-standing-revision-"));
+  try {
+    const path = join(directory, "settings.json");
+    await writeFile(path, JSON.stringify({ deputy: { ...DEFAULT_DEPUTY, mode: "live", standingPolicy: "owner-autonomy-previous", model: "openai-codex/gpt-6.1-sol" } }));
+    const settings = new Settings(path);
+    assert.equal((await settings.read()).deputy.standingPolicy, null);
+    await assert.rejects(settings.patch(JSON.parse('{"deputy":{"standingPolicy":"owner-autonomy-previous"}}')));
+    assert.equal((await settings.read()).deputy.standingPolicy, null);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

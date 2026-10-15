@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { STRONG_MODEL_ENV } from "../shared/acceptance-tests";
 import type { TicketDetail } from "../shared/contracts";
+import { AUTONOMY_NOTE } from "../shared/autonomy-policy";
 import { mappedBaseBranch, mappingLabel, savedMapping, type ProjectMapping } from "../shared/mapping";
 import { modelSteps, planTier, type Tier } from "../shared/plan-model";
 import type { AcceptanceTestsStore } from "./acceptance-tests";
@@ -73,9 +74,9 @@ export const MODEL_NOTE = modelSteps();
 // place the plan missed is filed, not quietly added to the ticket (README, "Plan-first").
 export const MISSED_REACH_NOTE = "A place the plan missed that you find while implementing (another page, role, record, export or repository that uses what this ticket changes): when the work is small and its code is already in this ticket's scope, fix it here — that is not extra scope. A substantial finding — a defect, a data, security or money risk, or a missing guarantee a user or another system relies on — becomes a follow-up ticket (the linear_ticket tool `create_issue`, related to this ticket; at most 3 per ticket, filed in Backlog; without the tool, list it for the owner in your final comment). Minor findings (polish, docs, naming, refactors, ideas) go into your final comment, not a ticket.";
 const MAX_PLAN_NOTE_CHARS = 20_000;
-// A question request moves the ticket to "Needs input" and notifies the owner, so one ask beats
-// five, and an ask only written into the final reply is easy to miss.
-export const QUESTIONS_NOTE = "Anything you need from the owner (an answer, a decision, an approval such as to push or to add a label, a secret or setting, or a manual step only they can do) goes into a question request, never only into your final message: the question request is what moves the ticket to Needs input and notifies the owner. When you have the linear_ticket tool add_manual_task, register manual steps (secrets, settings, actions in other systems) with it instead. Collect all of it and ask together in one question request instead of one at a time. Plan approval goes through the plan review, not a question.";
+// Delegate routine technical completion; only real consequence/identity boundaries
+// open an owner question. Scoped staging setup is not a manual-task default.
+export const QUESTIONS_NOTE = `${AUTONOMY_NOTE}\n\nOnly genuinely unresolved owner-bound decisions go into a question request, never only the final reply. Investigate facts and coordinate first; collect remaining owner questions together. Do not ask the owner to push the task's own branch, choose a model, repair a routine fixture, or acquire/use authorized scoped staging access. Perform safe scoped setup yourself using approved credential channels without printing secrets. Use add_manual_task only for a step that actually requires the owner's identity or retained authority, not merely because it is outside the PR. Plan approval still goes through plan review, not a question.`;
 
 // The approved plan's text for the agent's instructions, or where to read it.
 function approvedPlanText(plan: { url: string; content: string } | null): string {

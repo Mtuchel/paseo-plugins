@@ -1,7 +1,8 @@
 import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
+import { randomUUID } from "node:crypto";
 import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, focusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setFocusRpc, setPresenceRpc, setSettingsRpc, skipPlanRpc, statusRpc, answerAskRpc, ownerAsksRpc, triageAskRpc, type CapacityState } from "./shared/contracts";
-import { parentsStatusRpc } from "./shared/contracts";
+import { deputyStatusRpc, parentsStatusRpc } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -52,7 +53,7 @@ import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, SessionRouter, 
 import { ParentStore } from "./server/parents";
 import { SmallRoutes } from "./server/small-route";
 import { LimitResumeStore, UsageReader } from "./server/limit-resume";
-import { isUntrusted, planSetup, TicketStarter } from "./server/starter";
+import { isUntrusted, planSetup, QUESTIONS_NOTE, TicketStarter } from "./server/starter";
 import { ShardAssignor } from "./server/worktree-shards";
 import { PLAN_TICKET_ENV } from "./server/plan-policy";
 import { AgentEnvs, sessionEnv } from "./server/agent-env";
@@ -676,16 +677,24 @@ export default function contribute(server: PluginServerContext) {
     return {
       ...saved,
       activation: { ...saved.activation, secretConfigured: Boolean(await readActivationSecret()) },
-      deputy: { ...saved.deputy, recallConfigured: Boolean(await recallAccess(deputyDirectory)), live: { ready: !blockers.length, blockers } },
+      deputy: { ...saved.deputy, recallConfigured: Boolean(await recallAccess(deputyDirectory)), live: { ready: !blockers.length, blockers, standingPolicyReady: saved.deputy.standingPolicy !== null && !(await deputy.liveBlockers(saved, true)).length } },
       builtin: DEFAULT_PROMPT_TEMPLATE,
     };
   };
   server.handle(getSettingsRpc, async () => settingsView(await settings.read()));
+  server.handle(deputyStatusRpc, (input) => deputy.status(input));
   server.handle(setSettingsRpc, async (input, { paseo }) => {
     const saved = await settings.patch(input);
     attach(paseo);
     if (input.dispatch) dispatcher.wake();
-    if (input.deputy) await deputy.settingsChanged();
+    const policyChanged = input.deputy !== undefined || input.template !== undefined;
+    const revoked = policyChanged ? await deputy.settingsChanged() : [];
+    if (input.deputy?.standingPolicy !== undefined) {
+      // An explicit host-owner settings write, not an inferred model/identity
+      // claim. Dispatch requires both this audit and the revision-bound setting.
+      await decisions.append({ kind: "deputy-activation", id: `settings:${randomUUID()}`, key: randomUUID(), at: new Date().toISOString(), policy: saved.deputy.standingPolicy, via: "settings-rpc", mode: saved.deputy.mode });
+    }
+    if (policyChanged) await deputy.recheckPolicy(revoked, Boolean(input.deputy?.standingPolicy));
     return settingsView(saved);
   });
   server.handle(launchAgentRpc, async (input, { paseo }) => {
@@ -696,7 +705,7 @@ export default function contribute(server: PluginServerContext) {
     const { template, agentLinearAccess } = current;
     const setup = await planSetup(linear, input.id, input.provider, input.modeId, { tiers, routes: smallRoutes, settings: current });
     const model = tierModel(current, input.provider.split("/")[0], setup.tier?.tier ?? null, { provider: input.provider, ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}) });
-    const launch = { ...input, ...model, modeId: setup.modeId, instructions: [...setup.notes, input.instructions.trim()].filter(Boolean).join("\n\n") };
+    const launch = { ...input, ...model, modeId: setup.modeId, instructions: [...setup.notes, QUESTIONS_NOTE, input.instructions.trim()].filter(Boolean).join("\n\n") };
     const markInProgress = input.markInProgress && setup.policy !== "required";
     // The owner's own start ends any steward incident of the ticket first (README, "Ticket
     // steward"), so a failure of it is a new round with fresh retries.

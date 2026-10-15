@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { dispatchLabels } from "./dispatch";
@@ -12,7 +13,7 @@ import type { IssueCore, LinearService } from "./linear";
 import type { NeedsYouIssues } from "./needs-you";
 import { PLAN_POLICY_LABEL, PLANNING_STATE, planStage } from "./plan-policy";
 import { logQuietly, questionEntry, type DecisionLog } from "./owner-decisions";
-import type { Deputy } from "./deputy";
+import { fingerprint, type Deputy } from "./deputy";
 import { ticketPullRequest, type PullRequestCheck } from "./pull-request-check";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import type { SessionRouter } from "./sessions";
@@ -195,9 +196,9 @@ export class Writeback {
   private recovered = false;
   // Where the owner's answers to questions are kept for the weekly decision candidates.
   private decisions: Pick<DecisionLog, "append" | "answer"> | null = null;
-  // The deputy for agent questions (README, "Deputy for agent questions"), shown each question
-  // after the owner was, and told when a request is resolved.
-  private deputy: Pick<Deputy, "observe" | "resolved"> | null = null;
+  // Answer UI stays visible. Only interrupting ticket mentions wait: at most
+  // 15 s for initial availability, then confirmed live evaluation/grace.
+  private deputy: Pick<Deputy, "observe" | "resolved" | "ownerNotificationDelay"> | null = null;
 
   // `needsYou`: where waits on closed tickets keep their sub-issues; without it such a wait only
   // labels and comments on the closed ticket. `checkPullRequest`: whether a pull request URL from
@@ -208,7 +209,7 @@ export class Writeback {
     this.decisions = log;
   }
 
-  recordDeputy(deputy: Pick<Deputy, "observe" | "resolved">): void {
+  recordDeputy(deputy: Pick<Deputy, "observe" | "resolved" | "ownerNotificationDelay">): void {
     this.deputy = deputy;
   }
 
@@ -676,12 +677,14 @@ export class Writeback {
   }
 
   permissionRequested({ agent, request }: PluginLifecycleEvents["agent.permission_requested"], paseo: PaseoApi): Promise<void> {
+    const notificationCeiling = Date.now() + 10 * 60_000;
     return this.run("permission_requested", agent, paseo, async ({ issueId, identifier }, settings, context) => {
       // Logged first and whatever the write-back settings: an answer given in the Paseo app leaves
       // no other trace, and the answer is joined to this entry by id, even after a plugin reload.
       const question = questionEntry(agent.id, request, { id: issueId, identifier });
       const log = this.decisions;
       if (question && log) await logQuietly(() => log.append(question), `question on ${identifier}`);
+      await this.deputy?.observe(agent, request, { issueId, identifier });
       // Providers sometimes resolve a request themselves within moments (for example after a
       // plan approval switches the mode); only requests still pending after a short wait are shown.
       await new Promise((resolve) => setTimeout(resolve, this.settleMs));
@@ -699,11 +702,28 @@ export class Writeback {
         });
         return asked;
       })) ?? false;
-      // The owner sees the question first; the deputy only starts looking at it now, in the
-      // background, and never answers before the owner's grace period ends.
-      const observe = () => this.deputy?.observe(agent, request, { issueId, identifier });
-      if (!settings.writeback.blocked) { await observe(); return; }
-      // Posted even with the agent panel: only a mention reaches the owner's inbox and phone.
+      if (!settings.writeback.blocked) return;
+      await context.once("deputy-notification-window", async () => {
+        if (!this.deputy) return;
+        // Read-only lookups time out fail-open. Retries and state transitions
+        // never renew the total cap captured when the event first arrived.
+        while (Date.now() < notificationCeiling) {
+          const remaining = await Promise.race([
+            this.deputy.ownerNotificationDelay(agent.id, request.id).catch(() => 0),
+            delay(Math.min(2_000, notificationCeiling - Date.now()), 0, { ref: false }),
+          ]);
+          if (remaining <= 0 || Date.now() >= notificationCeiling) break;
+          await delay(Math.min(1_000, remaining, notificationCeiling - Date.now()));
+        }
+      });
+      const latest = await paseo.agents.ref(agent.id).refresh().catch(() => null);
+      if (Array.isArray(latest?.agent.pendingPermissions)) {
+        const pending = latest.agent.pendingPermissions.find((pending) => pending.id === request.id);
+        if (!pending || pending.kind && fingerprint(pending) !== fingerprint(request)) return;
+        // An older id-only snapshot cannot establish a changed payload: fail
+        // open to the owner, never hide urgency based on missing evidence.
+      }
+      // Unanswered/refused/unknown at the bound: notify normally, never hide it.
       const what = request.kind === "question" ? "an answer" : request.kind === "plan" ? "plan approval" : "permission";
       const subject = request.title || request.name;
       const description = request.description ? `\n\n${truncateSummary(request.description)}` : "";
@@ -713,7 +733,6 @@ export class Writeback {
         ? `\n\nReply here with ${request.kind === "question" ? "“@paseo <your answer>”" : "“@paseo approve” or “@paseo deny <reason>”"}.`
         : "";
       await this.markWaiting({ id: issueId, identifier }, agent, settings, subject, `**${agent.title ?? "Paseo agent"}** (Paseo) is waiting for ${what}: ${subject}${description}${options}${hint}`, inSession, "request", context);
-      await observe();
     });
   }
 

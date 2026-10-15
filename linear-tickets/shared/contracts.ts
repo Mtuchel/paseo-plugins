@@ -1,5 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
+import { AUTONOMY_POLICY_REVISION } from "./autonomy-policy";
 
 // The built-in launch prompt, expressed as a template. Users can replace it
 // with their own; {{context}} is required, {{ticket}}, {{instructions}} and {{linear_access}} optional.
@@ -16,7 +17,7 @@ export const DEFAULT_PROMPT_TEMPLATE = [
 // What the agent is told about changing Linear. With access on, the agent holds tools scoped to its
 // ticket and the issues it created (README, "Agent access to Linear"); a template without
 // {{linear_access}} gets this appended.
-export const LINEAR_ACCESS_NOTE = "You can read and update Linear through the linear_ticket tools (in omp: linear_ticket_<tool>), which write as Paseo. get_ticket, get_issue and search_issues read any issue; get_comments pages through an issue's full comment history, including comments a trimmed ticket snapshot left out. add_comment and add_relation work on any issue; set_status and link_url on this ticket and the issues you created; update_issue edits the text of issues you created. create_issue files a substantial follow-up related to this ticket in Backlog (at most 3 per ticket), or a sub-issue of it in Todo: check with search_issues first that the work is not filed yet. Other Linear tools act as the owner: use them only to read. Post a short comment when you start, and a final comment with what changed, how it was verified, the pull request link and the manual tasks still open. Attach the pull request with link_url and move the ticket to its review state (for example In Review) once a pull request is open. Every step a person must do outside the pull request (environment variables, secrets, Railway/Linear/GitHub/Paseo settings, webhooks, integrations) goes through add_manual_task, one task per coherent step, never only into a comment; give it a check command whenever one can prove the step is done. You close this ticket yourself, so the owner never has to: once it meets its definition of done and your final comment is posted, move it to its completed state (for example Done) with set_status, unless a merged pull request already closed it. Work outside a repository, and pull requests that only mention the ticket (for example \"Part of\"), close nothing on their own. A step left for a person after that goes into add_manual_task and does not keep the ticket open. If the work turns out to be unnecessary (already done elsewhere, obsolete, or a duplicate), move the ticket to its canceled or duplicate state with set_status and the reason instead. Never close the ticket while your instructions limit you to investigating or planning. If you are blocked, say why in a comment. On any other ticket, only comment or add relations.";
+export const LINEAR_ACCESS_NOTE = "You can read and update Linear through the linear_ticket tools (in omp: linear_ticket_<tool>), which write as Paseo. get_ticket, get_issue and search_issues read any issue; get_comments pages through an issue's full comment history, including comments a trimmed ticket snapshot left out. add_comment and add_relation work on any issue; set_status and link_url on this ticket and the issues you created; update_issue edits the text of issues you created. create_issue files a substantial follow-up related to this ticket in Backlog (at most 3 per ticket), or a sub-issue of it in Todo: check with search_issues first that the work is not filed yet. Other Linear tools act as the owner: use them only to read. Post a short comment when you start, and a final comment with what changed, how it was verified, the pull request link and the manual tasks still open. Attach the pull request with link_url and move the ticket to its review state (for example In Review) once a pull request is open. Perform safe authorized setup, including least-privilege task-scoped staging access, yourself through approved credential channels without exposing secrets. Only steps a person genuinely must perform because of retained business/security authority or identity go through add_manual_task, one task per coherent step, never only into a comment; give it a check command whenever one can prove the step is done. Environment variables, settings and staging access are not intrinsically owner-only. You close this ticket yourself, so the owner never has to: once it meets its definition of done and your final comment is posted, move it to its completed state (for example Done) with set_status, unless a merged pull request already closed it. Work outside a repository, and pull requests that only mention the ticket (for example \"Part of\"), close nothing on their own. A step left for a person after that goes into add_manual_task and does not keep the ticket open. If the work turns out to be unnecessary (already done elsewhere, obsolete, or a duplicate), move it to its canceled or duplicate state with set_status and the reason instead. Never close the ticket while your instructions limit you to investigating or planning. If you are blocked, say why in a comment. On any other ticket, only comment or add relations.";
 export const NO_LINEAR_ACCESS_NOTE = "Do not post comments or change Linear status unless the user explicitly asks.";
 
 export const issueSchema = z.object({
@@ -226,10 +227,12 @@ const deputySettingsSchema = z.object({
   graceMinutes: z.number().int(),
   model: z.string().max(200).nullable(),
   principlesRepository: z.string().max(500).nullable(),
+  // Explicit owner opt-in for this exact standing policy; never inferred from replay.
+  standingPolicy: z.union([z.literal(AUTONOMY_POLICY_REVISION), z.null()]),
 });
 const deputyViewSchema = deputySettingsSchema.extend({
   recallConfigured: z.boolean(),
-  live: z.object({ ready: z.boolean(), blockers: z.array(z.string()) }),
+  live: z.object({ ready: z.boolean(), blockers: z.array(z.string()), standingPolicyReady: z.boolean() }),
 });
 export type DispatchSettingsValue = z.infer<typeof dispatchSettingsSchema>;
 export type WritebackSettingsValue = z.infer<typeof writebackSettingsSchema>;
@@ -273,6 +276,7 @@ export const setSettingsRpc = defineRpc({
   name: "linear.set-settings",
   input: z.object({
     template: z.string().max(8000).optional(),
+    expectedTemplate: z.string().max(8000).nullable().optional(),
     markInProgress: z.boolean().optional(),
     showClosed: z.boolean().optional(),
     agentLinearAccess: z.boolean().optional(),
@@ -309,6 +313,26 @@ export const setSettingsRpc = defineRpc({
   }),
   output: settingsOutputSchema,
 });
+
+// Native clients may suppress urgency (never answer/override visibility) only
+// while this host's exact raw request matches and the fixed expiry has not passed.
+export const deputyStatusRpc = defineRpc({
+  name: "linear.deputy-status",
+  input: z.object({ agentId: z.string().min(1).optional(), permissionId: z.string().min(1).optional() }),
+  output: z.object({
+    mode: z.enum(["off", "shadow", "live"]),
+    policyVersion: z.string().nullable(),
+    updatedAt: z.string(),
+    candidates: z.array(z.object({
+      agentId: z.string(), permissionId: z.string(), requestFingerprint: z.string(),
+      // Opaque daemon JSON: retain unknown fields for exact native request comparison.
+      request: z.custom<object>((value) => value !== null && typeof value === "object" && !Array.isArray(value)), state: z.string(),
+      observedAt: z.string(), updatedAt: z.string(), expiresAt: z.string().nullable(),
+      suppressUrgency: z.boolean(),
+    })),
+  }),
+});
+
 
 // What the auto-dispatcher did most recently, for the ticket surface's status line.
 export const dispatchStatusSchema = z.object({

@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { MAX_PROJECT_MAPPINGS, type ProjectMapping } from "../shared/mapping";
 import { type AutoApprovePolicy, DEFAULT_AUTO_APPROVE, MAX_IMPACT } from "../shared/plan-risk";
+import { AUTONOMY_POLICY_REVISION } from "../shared/autonomy-policy";
 import { writeActivationSecret } from "./activation";
 
 export const MAX_TEMPLATE_LENGTH = 8_000;
@@ -58,8 +59,8 @@ export const MAX_DISPATCH_TEAMS = 20;
 // OMP model (none: every question stays with the owner); `principlesRepository`: the local
 // tuchel-platform checkout whose `origin/main` holds `docs/principles/`.
 export type DeputyMode = "off" | "shadow" | "live";
-export type DeputySettings = { mode: DeputyMode; graceMinutes: number; model: string | null; principlesRepository: string | null };
-export const DEFAULT_DEPUTY: DeputySettings = { mode: "off", graceMinutes: 5, model: null, principlesRepository: null };
+export type DeputySettings = { mode: DeputyMode; graceMinutes: number; model: string | null; principlesRepository: string | null; standingPolicy: typeof AUTONOMY_POLICY_REVISION | null };
+export const DEFAULT_DEPUTY: DeputySettings = { mode: "off", graceMinutes: 5, model: null, principlesRepository: null, standingPolicy: null };
 export const MIN_DEPUTY_GRACE_MINUTES = 1;
 export const MAX_DEPUTY_GRACE_MINUTES = 120;
 const DEPUTY_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}$/;
@@ -352,11 +353,12 @@ export function normalizeDeputy(value: unknown): DeputySettings {
     graceMinutes: typeof grace === "number" && Number.isInteger(grace) && grace >= MIN_DEPUTY_GRACE_MINUTES && grace <= MAX_DEPUTY_GRACE_MINUTES ? grace : DEFAULT_DEPUTY.graceMinutes,
     model: DEPUTY_MODEL.test(model) ? model : null,
     principlesRepository: repository.startsWith("/") && repository.length <= 500 ? repository : null,
+    standingPolicy: candidate.standingPolicy === AUTONOMY_POLICY_REVISION ? candidate.standingPolicy : null,
   };
 }
 
 // A user edit is rejected rather than silently repaired, so the settings form can say why.
-function validDeputy(value: { mode?: unknown; graceMinutes?: unknown; model?: unknown; principlesRepository?: unknown }): DeputySettings {
+function validDeputy(value: { mode?: unknown; graceMinutes?: unknown; model?: unknown; principlesRepository?: unknown; standingPolicy?: unknown }): DeputySettings {
   if (!["off", "shadow", "live"].includes(String(value.mode))) throw new Error("The deputy mode must be off, shadow or live.");
   const grace = value.graceMinutes;
   if (typeof grace !== "number" || !Number.isInteger(grace) || grace < MIN_DEPUTY_GRACE_MINUTES || grace > MAX_DEPUTY_GRACE_MINUTES) {
@@ -364,6 +366,7 @@ function validDeputy(value: { mode?: unknown; graceMinutes?: unknown; model?: un
   }
   if (value.model !== null && (typeof value.model !== "string" || !DEPUTY_MODEL.test(value.model.trim()))) throw new Error("The deputy's evaluator model must be an OMP model id such as openai-codex/gpt-6.1-sol, or null.");
   if (value.principlesRepository !== null && (typeof value.principlesRepository !== "string" || !value.principlesRepository.trim().startsWith("/"))) throw new Error("The principles repository must be an absolute path to a tuchel-platform checkout, or null.");
+  if (value.standingPolicy !== null && value.standingPolicy !== AUTONOMY_POLICY_REVISION) throw new Error(`The standing-policy activation must be null or ${AUTONOMY_POLICY_REVISION}; a new revision requires explicit activation.`);
   return normalizeDeputy(value);
 }
 
@@ -410,6 +413,8 @@ export function validWorktreeShards(value: { enabled?: unknown; pools?: unknown 
 
 export type SettingsPatch = {
   template?: string;
+  // Optional compare-and-swap guard for a persisted host-template migration.
+  expectedTemplate?: string | null;
   markInProgress?: boolean;
   showClosed?: boolean;
   agentLinearAccess?: boolean;
@@ -511,6 +516,7 @@ export class Settings {
 
   private async patchNow(patch: SettingsPatch): Promise<PluginSettings> {
     const current = await this.read();
+    if (patch.expectedTemplate !== undefined && current.template !== patch.expectedTemplate) throw new Error("The launch template changed since it was read; refresh settings before migrating it. Nothing was written.");
     const next: PluginSettings = {
       ...current,
       template: patch.template === undefined ? current.template : normalizeTemplate(patch.template),

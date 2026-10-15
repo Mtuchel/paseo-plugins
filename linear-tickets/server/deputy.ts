@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
+import { AUTONOMY_POLICY_REVISION } from "../shared/autonomy-policy";
 import { dispatchLabels } from "./dispatch";
 import { assessRisk, type Part } from "./deputy-risk";
 import { evidenceSummary, shadowEvidence } from "./deputy-evidence";
@@ -16,14 +17,10 @@ import type { PluginSettings, Settings } from "./settings";
 import { isUntrusted } from "./starter";
 import { paseoHome } from "./ticket-mcp";
 
-// The deputy for agent questions (README, "Deputy for agent questions"). After the existing settle
-// window and owner prompt, every question of a ticket agent becomes a candidate, kept on disk per
-// (agent, request): risk first, knowledge second, then a prediction. In shadow mode that is all:
-// the prediction is logged and the owner answers as before. In live mode the owner keeps a grace
-// period; only after it, and only if nothing changed and every gate still holds, may the deputy
-// answer — through the plugin's checked answer connection, with plugin-local owner precedence
-// and a confirmed result. Without that connection live mode is blocked. Corrections of a deputy
-// answer go to the agent that got it, never into a newer question.
+// Request-bound deputy decisions. Structural/trust eligibility precedes isolated
+// semantic selection. Live answers retain grace, current-policy evidence, exact
+// request freshness and the checked owner-priority arbiter. Restart equivalence
+// retires stale work; it never transfers a selection to another request.
 
 export const DEPUTY_DIRECTORY = () => join(paseoHome(), "linear-tickets", "deputy");
 const KEEP_MS = 14 * 24 * 60 * 60 * 1000;
@@ -66,11 +63,14 @@ export type Candidate = {
   reason?: string;
   version?: string;
   refusalCategory?: string;
-  // The exact evaluator input last refused for lack of knowledge. Unchanged evidence is not
-  // sent to the model again; unavailable sources/evaluators are checked at most every five minutes.
+  // Unchanged evidence is not sent to an abstaining model again; unavailable
+  // sources/evaluators are checked at most every five minutes.
   evidenceFingerprint?: string;
   retryAt?: string;
   graceDeadline?: string;
+  eligible?: boolean;
+  standing?: boolean;
+  activation?: string;
   selections?: Record<string, string>;
   citations?: Citation[];
   intentId?: string;
@@ -148,6 +148,7 @@ export class Deputy {
   private readonly queued: (() => void)[] = [];
   // Work started in the background (evaluations, dispatches), for tests and orderly shutdown.
   private readonly inflight = new Set<Promise<unknown>>();
+  private readonly revoked = new Set<string>();
 
   constructor(private readonly deps: Deps) {
     this.directory = deps.directory ?? DEPUTY_DIRECTORY();
@@ -247,8 +248,8 @@ export class Deputy {
     this.retryTimer = null;
   }
 
-  // A question still pending after the settle window, once the owner was shown it. Returns at once:
-  // the evaluation runs in the background and never delays or replaces the owner's prompt.
+  // Observe before the settle window. Evaluation is background work; the
+  // owner's ordinary question/answer surface remains available throughout.
   async observe(agent: { id: string; cwd: string; title?: string | null }, request: AgentPermissionRequest, link: { issueId: string; identifier: string }): Promise<void> {
     if (request.kind !== "question" || this.stopped) return;
     const { mode } = (await this.deps.settings.read()).deputy;
@@ -257,6 +258,18 @@ export class Deputy {
     const at = new Date(this.now()).toISOString();
     const created = await this.change((store) => {
       if (store[key]) return false;
+      // Equivalent unanswered requests after a restart get one active evaluation,
+      // but NEVER inherit an answer, intent, deadline or evidence from the old id.
+      for (const previous of Object.values(store)) {
+        if (previous.agentId === agent.id && previous.issueId === link.issueId && previous.cwd === agent.cwd && previous.fingerprint === fingerprint(request) && (OPEN.includes(previous.status) || previous.status === "refused")) {
+          this.revoked.add(previous.key);
+          this.unschedule(previous.key);
+          previous.status = "canceled";
+          previous.reason = "an equivalent question was reissued with a new request identity; fresh evaluation required";
+          previous.updatedAt = at;
+          previous.retryAt = undefined;
+        }
+      }
       store[key] = { key, ref: refFor(key), agentId: agent.id, requestId: request.id, issueId: link.issueId, identifier: link.identifier, agentTitle: agent.title ?? null, cwd: agent.cwd, request, fingerprint: fingerprint(request), mode, observedAt: at, updatedAt: at, status: "evaluating" };
       return true;
     });
@@ -274,7 +287,7 @@ export class Deputy {
 
   // Risk first, then knowledge, as of now: the parts the deputy may pick for and the sources it may
   // cite, or why the question stays with the owner.
-  private async assess(candidate: Candidate, settings: PluginSettings): Promise<{ ok: true; parts: Part[]; sources: Source[] } | { ok: false; reason: string; category: string }> {
+  private async assess(candidate: Candidate, settings: PluginSettings): Promise<{ ok: true; parts: Part[]; sources: Source[]; context: string } | { ok: false; reason: string; category: string }> {
     let state;
     try {
       state = await this.deps.linear.issueState(candidate.issueId);
@@ -287,20 +300,22 @@ export class Deputy {
     } catch (error) {
       return { ok: false, reason: `the ticket's authorship could not be checked (${message(error)})`, category: "source-unavailable" };
     }
-    // The ticket's plan is approved (plan-ready); before that a question decides the plan.
+    // Planning and attended are context, not blanket owner gates.
     const planApproved = planPolicy(state.labels) === null;
     const risk = assessRisk(candidate.request, { trusted, planning: !planApproved, attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()) });
     if (!risk.ok) return { ok: false, reason: risk.reason, category: risk.category };
     const snapshot = await gatherSources(this.deps.readers, { id: candidate.key, issueId: candidate.issueId, identifier: candidate.identifier, cwd: candidate.cwd, text: questionText(candidate.request), planApproved }, settings.deputy.principlesRepository);
     if (snapshot.abstain) return { ok: false, reason: snapshot.abstain, category: "source-unavailable" };
-    return { ok: true, parts: risk.parts, sources: snapshot.sources };
+    const holds = state.labels.map((label) => label.name).filter((name) => /(?:^|-)hold$|^do-not-merge$/i.test(name)).sort();
+    const context = [candidate.request.title, candidate.request.description, `Ticket context: ${JSON.stringify({ planning: !planApproved, attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()), canceled: state.statusType === "canceled", holds })}. Standing delegation does not release holds or cancellations.`].filter(Boolean).join("\n\n");
+    return { ok: true, parts: risk.parts, sources: snapshot.sources, context };
   }
 
   private async evaluate(key: string, retry = false): Promise<void> {
     const generation = this.settingsGeneration;
     let candidate = (await this.readStore())[key];
     if (!candidate || this.stopped || (retry ? !this.retryable(candidate) : candidate.status !== "evaluating")) return;
-    if (retry && !await this.stillPending(candidate)) return;
+    if (!await this.stillPending(candidate)) return;
     const settings = await this.deps.settings.read();
     const { mode, model } = settings.deputy;
     if (mode === "off") { await this.patch(key, { status: "canceled", reason: "the deputy was switched off" }); return; }
@@ -308,7 +323,7 @@ export class Deputy {
     const assessed = await this.assess(candidate, settings);
     if (!assessed.ok) { await this.refuse(candidate, version, assessed.reason, assessed.category); return; }
     if (!model) { await this.refuse(candidate, version, "no evaluator model is configured (deputy.model)", "no-evaluator"); return; }
-    const input: EvaluationInput = { identifier: candidate.identifier, parts: assessed.parts, context: candidate.request.description ?? "", sources: assessed.sources };
+    const input: EvaluationInput = { identifier: candidate.identifier, parts: assessed.parts, context: assessed.context, sources: assessed.sources };
     const evidenceFingerprint = createHash("sha256").update(JSON.stringify([version, input])).digest("hex");
     if (retry && candidate.refusalCategory === "no-knowledge" && candidate.evidenceFingerprint === evidenceFingerprint) {
       await this.patch(key, { retryAt: new Date(this.now() + SETTLEMENT_RETRY_MS).toISOString() });
@@ -316,9 +331,10 @@ export class Deputy {
       return;
     }
     candidate = { ...candidate, mode, version, evidenceFingerprint };
-    await this.patch(key, { status: "evaluating", mode, version, evidenceFingerprint, retryAt: undefined });
+    await this.patch(key, { status: "evaluating", eligible: true, mode, version, evidenceFingerprint, retryAt: undefined });
     const verdict = await this.deps.evaluate(input, model)
       .catch((error: unknown): Verdict => ({ ok: false, reason: `the evaluator failed: ${message(error)}`, category: "evaluator-unavailable" }));
+    if (this.revoked.has(key) || (await this.readStore())[key]?.status !== "evaluating") return;
     if (!verdict.ok) { await this.refuse(candidate, version, verdict.reason, verdict.category ?? "no-knowledge"); return; }
     const now = await this.deps.settings.read();
     if (now.deputy.mode === "off") { await this.patch(key, { status: "canceled", reason: "the deputy was switched off" }); return; }
@@ -326,16 +342,17 @@ export class Deputy {
     // reply into knowledge for a new prediction of the very question it already answered.
     if (this.stopped || !await this.stillPending(candidate)) return;
     if (generation !== this.settingsGeneration) { await this.outcome(candidate, "canceled", "the deputy settings changed during evaluation"); return; }
+    if ((await this.readStore())[key]?.status !== "evaluating") return;
     // Recorded once, before any dispatch: the evidence compares it with the owner's later answer.
-    await this.deps.log.append({ kind: "deputy-prediction", id: key, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version, mode: candidate.mode, selections: verdict.selections, citations: verdict.citations });
+    await this.deps.log.append({ kind: "deputy-prediction", id: key, key: version, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version, mode: candidate.mode, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing });
     const latest = (await this.readStore())[key];
     if (!latest || latest.status !== "evaluating") return;
     if (now.deputy.mode !== "live") {
-      await this.patch(key, { status: "predicted", reason: undefined, refusalCategory: undefined, version, selections: verdict.selections, citations: verdict.citations });
+      await this.patch(key, { status: "predicted", reason: undefined, refusalCategory: undefined, version, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing });
       return;
     }
     const graceDeadline = new Date(Date.parse(candidate.observedAt) + now.deputy.graceMinutes * 60_000).toISOString();
-    const waiting = await this.patch(key, { status: "waiting", reason: undefined, refusalCategory: undefined, version, selections: verdict.selections, citations: verdict.citations, graceDeadline });
+    const waiting = await this.patch(key, { status: "waiting", reason: undefined, refusalCategory: undefined, version, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing, graceDeadline });
     if (waiting) this.schedule(waiting, generation);
   }
 
@@ -355,16 +372,58 @@ export class Deputy {
     this.timers.delete(key);
   }
 
-  // Why live answers are not allowed now; empty when they are.
-  async liveBlockers(settings: PluginSettings): Promise<string[]> {
+  // Generic authority retains the empirical gate. The independently audited,
+  // revision-bound opt-in bypasses ONLY that gate, ONLY for standing selections.
+  async liveBlockers(settings: PluginSettings, standing = false): Promise<string[]> {
     const blockers: string[] = [];
     if (!settings.deputy.model) blockers.push("no evaluator model is configured");
     else {
-      const evidence = shadowEvidence(await this.deps.log.entries(), policyVersion(settings.deputy.model));
-      if (!evidence.ready) blockers.push(`not enough shadow evidence for ${evidence.version}: ${evidenceSummary(evidence)}`);
+      const entries = await this.deps.log.entries();
+      const activation = entries.filter((entry) => entry.kind === "deputy-activation").at(-1);
+      const authorized = standing && settings.deputy.standingPolicy === AUTONOMY_POLICY_REVISION && activation?.policy === AUTONOMY_POLICY_REVISION;
+      const evidence = shadowEvidence(entries, policyVersion(settings.deputy.model));
+      if (!authorized && !evidence.ready) blockers.push(`not enough shadow evidence for ${evidence.version}: ${evidenceSummary(evidence)}`);
     }
     if (!await this.arbiter()) blockers.push(CHECKED_CONNECTION_MISSING);
     return blockers;
+  }
+
+  // Read-only transport contract for native urgency suppression. A caller must
+  // compare `request` with its local raw request, keep answer/override UI visible,
+  // fail open on any error, and never extend these fixed deadlines on a poll.
+  async status(filter: { agentId?: string; permissionId?: string } = {}) {
+    const settings = await this.deps.settings.read();
+    const now = this.now();
+    const version = settings.deputy.model ? policyVersion(settings.deputy.model) : null;
+    const candidates = [];
+    for (const candidate of await this.candidates()) {
+      if ((filter.agentId && candidate.agentId !== filter.agentId) || (filter.permissionId && candidate.requestId !== filter.permissionId)) continue;
+      let suppressUrgency = false;
+      let expiresAt: string | null = null;
+      const deadline = candidate.status === "evaluating" ? Date.parse(candidate.observedAt) + 150_000 : candidate.graceDeadline ? Date.parse(candidate.graceDeadline) + 10_000 : NaN;
+      if (!this.stopped && !this.revoked.has(candidate.key) && candidate.eligible && candidate.mode === "live" && settings.deputy.mode === "live" && candidate.version === version && ["evaluating", "waiting", "dispatching"].includes(candidate.status) && deadline > now && !(await this.liveBlockers(settings, candidate.status === "evaluating" || candidate.standing === true)).length) {
+        // No stale id-only suppression, no mutation of candidate state on reads.
+        const found = await this.paseo?.agents.ref(candidate.agentId).refresh();
+        const agent = found?.agent;
+        const request = agent?.pendingPermissions?.find((request) => request.id === candidate.requestId);
+        if (agent && !agent.archivedAt && agent.status !== "closed" && agent.labels?.["linear.issueId"] === candidate.issueId && request && fingerprint(request) === candidate.fingerprint) {
+          suppressUrgency = true;
+          expiresAt = new Date(deadline).toISOString();
+        }
+      }
+      candidates.push({ agentId: candidate.agentId, permissionId: candidate.requestId, requestFingerprint: candidate.fingerprint, request: candidate.request, state: candidate.status, observedAt: candidate.observedAt, updatedAt: candidate.updatedAt, expiresAt, suppressUrgency });
+    }
+    return { mode: settings.deputy.mode, policyVersion: version, updatedAt: new Date(now).toISOString(), candidates };
+  }
+
+  async ownerNotificationDelay(agentId: string, requestId: string): Promise<number> {
+    const snapshot = await this.status({ agentId, permissionId: requestId });
+    const candidate = snapshot.candidates[0];
+    if (candidate?.suppressUrgency && candidate.expiresAt) return Math.max(0, Date.parse(candidate.expiresAt) - this.now());
+    // Owner-authorized notification-only initial debounce. This is NOT trusted
+    // suppression: all question/answer UI stays visible, and the clock is fixed.
+    if (snapshot.mode === "live" && snapshot.policyVersion && candidate?.state === "evaluating" && !(await this.liveBlockers(await this.deps.settings.read(), true)).length) return Math.max(0, Date.parse(candidate.observedAt) + 15_000 - this.now());
+    return 0;
   }
 
   private async outcome(candidate: Candidate, status: "blocked" | "canceled" | "owner-won" | "unknown" | "resolved", reason: string): Promise<void> {
@@ -390,13 +449,13 @@ export class Deputy {
     const pending = (agent.pendingPermissions ?? []).find((request) => request.id === candidate.requestId);
     if (!pending) { await this.outcome(candidate, "resolved", "the request was answered or withdrawn during the grace period"); return; }
     if (fingerprint(pending) !== candidate.fingerprint) { await this.outcome(candidate, "canceled", "the request changed since the prediction"); return; }
-    const blockers = await this.liveBlockers(settings);
+    const blockers = await this.liveBlockers(settings, candidate.standing === true);
     if (blockers.length) { await this.outcome(candidate, "blocked", blockers.join("; ")); return; }
-    // Risk and knowledge again: the ticket may be attended or untrusted now, and every cited
-    // passage must still be in today's sources.
+    // Ticket constraints and knowledge again; every cited passage must still be
+    // in today's sources and the complete evaluator input must be unchanged.
     const assessed = await this.assess(candidate, settings);
     if (!assessed.ok) { await this.outcome(candidate, "canceled", `the question no longer qualifies: ${assessed.reason}`); return; }
-    const input: EvaluationInput = { identifier: candidate.identifier, parts: assessed.parts, context: candidate.request.description ?? "", sources: assessed.sources };
+    const input: EvaluationInput = { identifier: candidate.identifier, parts: assessed.parts, context: assessed.context, sources: assessed.sources };
     const evidenceFingerprint = createHash("sha256").update(JSON.stringify([candidate.version, input])).digest("hex");
     // Quotes alone are insufficient: amended policy can retain the quote, and a new
     // blocking-only source can contradict it. Legacy predictions without a snapshot fail closed.
@@ -407,7 +466,9 @@ export class Deputy {
     if (!arbiter) { await this.outcome(candidate, "blocked", CHECKED_CONNECTION_MISSING); return; }
     const intentId = randomUUID();
     // Recorded before the write: a reload in between finds the intent and never submits it again.
-    await this.patch(key, { status: "dispatching", intentId });
+    const audit = (await this.deps.log.entries()).filter((entry) => entry.kind === "deputy-activation").at(-1);
+    const activation = candidate.standing && settings.deputy.standingPolicy === AUTONOMY_POLICY_REVISION && audit?.policy === AUTONOMY_POLICY_REVISION ? AUTONOMY_POLICY_REVISION : undefined;
+    await this.patch(key, { status: "dispatching", intentId, activation });
     const answers: Record<string, string> = {};
     questionsOf(pending).forEach((item, index) => {
       const part = questionKey(item, index);
@@ -415,13 +476,13 @@ export class Deputy {
     });
     if (this.stopped) { await this.outcome({ ...candidate, intentId }, "canceled", "the plugin stopped before the answer was submitted"); return; }
     const latest = (await this.deps.settings.read()).deputy;
-    if (latest.mode !== "live" || !latest.model || policyVersion(latest.model) !== candidate.version || latest.principlesRepository !== settings.deputy.principlesRepository || latest.graceMinutes !== settings.deputy.graceMinutes) {
+    if (latest.mode !== "live" || !latest.model || policyVersion(latest.model) !== candidate.version || latest.principlesRepository !== settings.deputy.principlesRepository || latest.graceMinutes !== settings.deputy.graceMinutes || latest.standingPolicy !== settings.deputy.standingPolicy) {
       await this.outcome({ ...candidate, intentId }, "canceled", "the deputy settings changed before submission");
       return;
     }
     // PermissionReplies calls this synchronously AFTER its own awaits, immediately before
     // invoking the checked daemon send. A settings notification cannot queue behind this lane.
-    const canSubmit = () => !this.stopped && generation === this.settingsGeneration;
+    const canSubmit = () => !this.stopped && generation === this.settingsGeneration && !this.revoked.has(key);
     let result: ArbitratedOutcome;
     try {
       result = await arbiter.respond({ agentId: candidate.agentId, requestId: candidate.requestId, fingerprint: candidate.fingerprint, intentId, response: { behavior: "allow", updatedInput: { answers } }, canSubmit });
@@ -429,7 +490,7 @@ export class Deputy {
       await this.outcome({ ...candidate, intentId }, "unknown", `the daemon did not confirm the answer (${message(error)}); it is not submitted again`);
       return;
     }
-    await this.settle({ ...candidate, intentId }, result);
+    await this.settle({ ...candidate, intentId, activation }, result);
   }
 
   private async settle(candidate: Candidate, result: ArbitratedOutcome): Promise<void> {
@@ -437,7 +498,7 @@ export class Deputy {
       if (result === "owner-first") { await this.outcome(candidate, "owner-won", "the owner answered first"); return; }
       if (result === "revoked") { await this.outcome(candidate, "canceled", "the deputy authorization was revoked before submission"); return; }
       if (result === "gone") { await this.outcome(candidate, "resolved", "the request was gone when the answer arrived"); return; }
-      await this.deps.log.append({ kind: "deputy-answer", id: candidate.key, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version: candidate.version ?? "", key: candidate.intentId ?? "", answers: candidate.selections ?? {}, citations: candidate.citations ?? [] });
+      await this.deps.log.append({ kind: "deputy-answer", id: candidate.key, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version: candidate.version ?? "", key: candidate.intentId ?? "", answers: candidate.selections ?? {}, citations: candidate.citations ?? [], ...(candidate.activation ? { activation: candidate.activation } : {}) });
       const applied = await this.patch(candidate.key, { status: "applied", notice: { comment: false, session: false, commentId: null } });
       if (applied) await this.notify(applied);
     } catch (error) {
@@ -482,6 +543,7 @@ export class Deputy {
   }
 
   private async stillPending(candidate: Candidate): Promise<boolean> {
+    if (this.revoked.has(candidate.key)) return false;
     let entries: LogEntry[];
     try {
       entries = await this.deps.log.entries();
@@ -551,7 +613,9 @@ export class Deputy {
 
   // After a reload: candidates continue where they were, checked against the requests that are
   // actually pending. An interrupted dispatch is never submitted again.
-  private async recover(): Promise<void> {
+  private async recover(restartKeys?: ReadonlySet<string>, standingActivation = false): Promise<void> {
+    const settings = await this.deps.settings.read();
+    const version = settings.deputy.model ? policyVersion(settings.deputy.model) : "no-evaluator";
     let refusals: Map<string, Extract<LogEntry, { kind: "deputy-refusal" }>> | undefined;
     for (const candidate of await this.candidates()) {
       try {
@@ -569,6 +633,20 @@ export class Deputy {
             return;
           }
           if (this.owesSettlement(current)) { this.retrySettlement(); return; }
+          const changedPolicy = (current.version !== version || current.mode !== settings.deputy.mode) && ["refused", "predicted", "waiting", "evaluating", "blocked"].includes(current.status);
+          const revokedHere = current.status === "canceled" && restartKeys?.has(current.key);
+          const newlyAuthorized = standingActivation && current.status === "blocked" && current.standing === true;
+          if (settings.deputy.mode !== "off" && (changedPolicy || revokedHere || newlyAuthorized)) {
+            // Reevaluate exact still-pending requests after a policy/mode change
+            // or this settings write's revocation/standing activation. Never
+            // promote old selections, grace or intents; never revive arbitrary
+            // canceled work, answered requests or interrupted dispatches.
+            this.unschedule(current.key);
+            if (!await this.stillPending(current)) return;
+            await this.patch(current.key, { status: "evaluating", mode: settings.deputy.mode, observedAt: new Date(this.now()).toISOString(), version: undefined, eligible: false, standing: undefined, activation: undefined, selections: undefined, citations: undefined, evidenceFingerprint: undefined, graceDeadline: undefined, refusalCategory: undefined, retryAt: undefined, reason: undefined, intentId: undefined });
+            this.background(this.lane(current.key, () => this.slot(() => this.evaluate(current.key))));
+            return;
+          }
           if (current.status === "refused") {
             // Existing candidates predate persisted categories. Recover only the journaled
             // refusal matching this candidate; never infer safety from the question's words.
@@ -584,9 +662,7 @@ export class Deputy {
             return;
           }
           if (current.status !== "evaluating" && current.status !== "waiting") return;
-          const found = await this.paseo?.agents.ref(current.agentId).refresh().catch(() => null);
-          const pending = found?.agent.pendingPermissions?.some((request) => request.id === current.requestId);
-          if (!pending) { await this.outcome(current, "resolved", "the request was no longer pending after a reload"); return; }
+          if (!await this.stillPending(current)) return;
           if (current.status === "waiting") this.schedule(current);
           else this.background(this.lane(current.key, () => this.slot(() => this.evaluate(current.key))));
         });
@@ -696,16 +772,27 @@ export class Deputy {
 
   // Every settings notification revokes unsent work synchronously. The later durable
   // cancellation may wait for a candidate lane, but the final checked-send guard never does.
-  async settingsChanged(): Promise<void> {
+  async settingsChanged(): Promise<string[]> {
     this.settingsGeneration++;
     const { mode } = (await this.deps.settings.read()).deputy;
+    const canceled: string[] = [];
     for (const candidate of await this.candidates()) {
       if (candidate.status !== "waiting" && candidate.status !== "evaluating" && !(mode === "off" && this.retryable(candidate))) continue;
       this.unschedule(candidate.key);
       await this.lane(candidate.key, async () => {
         const current = (await this.readStore())[candidate.key];
-        if (current && (current.status === "waiting" || current.status === "evaluating" || (mode === "off" && this.retryable(current)))) await this.outcome(current, "canceled", "the deputy settings changed");
+        if (current && (current.status === "waiting" || current.status === "evaluating" || (mode === "off" && this.retryable(current)))) {
+          await this.outcome(current, "canceled", "the deputy settings changed");
+          canceled.push(current.key);
+        }
       });
     }
+    return canceled;
+  }
+
+  // Called only after the settings RPC has durably recorded any activation.
+  // The keys are precisely the unsent work revoked by that settings write.
+  async recheckPolicy(canceled: readonly string[], standingActivation = false): Promise<void> {
+    if (!this.stopped) await this.recover(canceled.length ? new Set(canceled) : undefined, standingActivation);
   }
 }
