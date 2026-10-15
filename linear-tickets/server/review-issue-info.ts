@@ -4,7 +4,8 @@ import { UUID, type LinearService } from "./linear";
 export type ReviewIssueInfo = { issueId: string; areas: string[] };
 type Reader = Pick<LinearService, "issueMetadata" | "labelCatalog">;
 type Entry = { value: ReviewIssueInfo | null; expiresAt: number; retryAt: number };
-const TTL = 5 * 60_000;
+const INFO_TTL = 15 * 60_000;
+const CATALOG_TTL = 5 * 60_000;
 const FAILURE_DELAY = 30_000;
 const MAX_ENTRIES = 500;
 const IDENTIFIER = /^[A-Z][A-Z0-9_]*-\d+$/;
@@ -56,12 +57,12 @@ export class ReviewIssueInfos {
     try {
       const state = await this.linear.issueMetadata(key);
       if (state.identifier !== key || !UUID.test(state.id)) {
-        this.save(key, { value: null, expiresAt: this.now() + TTL, retryAt: 0 });
+        this.save(key, { value: null, expiresAt: this.now() + INFO_TTL, retryAt: 0 });
         return null;
       }
       const areasOf = await this.areasOf(fresh);
       const value = { issueId: state.id, areas: areasOf(state.labels) };
-      this.save(key, { value, expiresAt: this.now() + TTL, retryAt: 0 });
+      this.save(key, { value, expiresAt: this.now() + INFO_TTL, retryAt: 0 });
       return value;
     } catch {
       const previous = this.cache.get(key);
@@ -76,7 +77,7 @@ export class ReviewIssueInfos {
     if (!fresh && this.catalogRetryAt > this.now()) throw new Error("Linear label catalog refresh is throttled.");
     const read = this.linear.labelCatalog().then((catalog) => {
       const areasOf = areaLabels(catalog);
-      this.catalog = { areasOf, expiresAt: this.now() + TTL };
+      this.catalog = { areasOf, expiresAt: this.now() + CATALOG_TTL };
       this.catalogRetryAt = 0;
       return areasOf;
     }).catch((error: unknown) => {

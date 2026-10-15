@@ -1,0 +1,11 @@
+[Unit]
+Description=Check linear-tickets plugin health every two minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=20s
+Unit=paseo-plugin-recovery.service
+
+[Install]
+WantedBy=timers.target
