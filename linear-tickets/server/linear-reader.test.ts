@@ -402,6 +402,26 @@ test("owner collection uses the owner's credential and reaches normal asks beyon
   assert.deepEqual(asks.map(item => item.id), ["i1", "i2", "i3", "i4", "i5", "i6", "i7"]);
 });
 
+test("owner issue inventory reads 201 issues in three pages without dropping the last decision", async () => {
+  const issues = Array.from({ length: 201 }, (_, index) => ({
+    ...issue, id: `issue-${index}`, identifier: `TUC-${index}`,
+    description: index === 200 ? "Approve the final issue?" : "",
+  }));
+  let requests = 0;
+  const { linear } = service(undefined, (query, variables) => {
+    assert.equal(query, OWNER_ASKS_QUERY);
+    assert.equal(variables.first, 100);
+    const start = variables.after === null ? 0 : Number(variables.after);
+    const end = Math.min(start + Number(variables.first), issues.length);
+    requests++;
+    return { issues: groupConnection(issues.slice(start, end), end < issues.length ? String(end) : null) };
+  });
+  const found = await linear.ownerAskIssues(true);
+  assert.equal(requests, 3);
+  assert.equal(found.length, 201);
+  assert.equal(found.at(-1)?.description, "Approve the final issue?");
+});
+
 test("owner collection refuses a repeating issue cursor instead of claiming completeness", async () => {
   const { linear } = service(undefined, () => ({ issues: groupConnection([issue], "repeated") }));
   await assert.rejects(linear.ownerAskIssues(true), /repeated owner-issue cursor/);

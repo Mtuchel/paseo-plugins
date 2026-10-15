@@ -941,7 +941,7 @@ export type OwnerAskIssue = {
   status: string; statusType: string; parentId: string | null; parentIdentifier: string | null; labels: string[];
 };
 export type OwnerAskComment = { id: string; body: string; createdAt: string };
-export const OWNER_ASKS_PAGE = 50;
+export const OWNER_ASKS_PAGE = 100;
 const OWNER_ASK_FIELDS = `id identifier title url updatedAt description state { name type } parent { id identifier } labels(first: 50) { nodes { name } }`;
 export const OWNER_ASKS_QUERY = `query ownerAskIssues($first: Int!, $after: String, $filter: IssueFilter) {
   issues(first: $first, after: $after, includeArchived: false, orderBy: updatedAt, filter: $filter) {
