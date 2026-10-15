@@ -19,8 +19,9 @@ const exec = promisify(execFile);
 // - `backstop-enqueue.mjs`: the one enqueue path of the automation;
 // - `retarget-orphan.mjs`: moves an open stack stranded on an orphaned `graphite-base/<n>` branch
 //   onto `main` (TUC-1209), in the plugin's private clone;
-// - `greptile-retrigger.mjs`: re-requests a missing first Greptile review of `complex-review`
-//   pull requests, capped by the repo (TUC-1208); run only on the dispatch host.
+// - `greptile-request.mjs`: makes the one Greptile review request a `complex-review` pull
+//   request gets in its lifetime, reserved by the repo's own claim ref (TUC-2427); run only on
+//   the dispatch host.
 // Every script prints one JSON line on stdout. This module is the only place that reads those
 // shapes: a stdout that is not that JSON, or an exit code the script does not document, is an
 // error, and an error never counts as an enqueue.
@@ -29,7 +30,7 @@ export const WAIT_QUEUE = "tools/ci/wait-queue.mjs";
 export const ENQUEUE_READY = "tools/ci/enqueue-ready.mjs";
 export const BACKSTOP_ENQUEUE = "tools/ci/backstop-enqueue.mjs";
 export const RETARGET_ORPHAN = "tools/ci/retarget-orphan.mjs";
-export const GREPTILE_RETRIGGER = "tools/ci/greptile-retrigger.mjs";
+export const GREPTILE_REQUEST = "tools/ci/greptile-request.mjs";
 // At most this many stacks are prepared or moved per repo and run: each move restarts the checks of
 // every pull request of its stack, so a backlog clears over several runs.
 export const RETARGET_PER_RUN = 3;
@@ -716,26 +717,27 @@ export function openReplayText(move: Pick<RetargetRecord, "repo" | "pr" | "base"
   ].join("\n");
 }
 
-// --- greptile-retrigger.mjs -----------------------------------------------------------------
+// --- greptile-request.mjs (the one lifetime request) ----------------------------------------
 
-// The repo decides whether a pull request is asked (30 minutes after publish or label, once per
-// head, twice per 24 hours, never after a Greptile review); the plugin only runs it with
+// The repo decides whether an open, published `complex-review` PR gets its one lifetime
+// request, immediately when unreviewed and unclaimed; the plugin only runs it with
 // `--trigger` and follows the pull requests an open outage issue lists (see greptile-outage.ts).
-export const RETRIGGER_STATES = ["waiting", "due", "triggered", "requested", "capped", "failed"] as const;
+export const RETRIGGER_STATES = ["waiting", "due", "triggered", "requested", "failed"] as const;
 export type RetriggerState = (typeof RETRIGGER_STATES)[number];
 export const FOLLOW_STATES = ["reviewed", "closed", "draft", "unlabelled", "waiting", "unread"] as const;
 export type FollowState = (typeof FOLLOW_STATES)[number];
-// An open, published `complex-review` pull request without a Greptile review. `triggers`: when the
-// marker comments asked Greptile (ISO, any head); `overdue`: one of them is 2 hours old.
+// An open, published `complex-review` pull request without its Greptile review. `triggers`: when
+// the marker comments asked Greptile (ISO, any head, at most one request); `overdue`: the one
+// request is 2 hours old without a review, or the claim carries no request comment (a lost POST).
 export type RetriggerPull = { pr: number; url: string; title: string; head: string; since: string; triggers: string[]; state: RetriggerState; overdue: boolean };
 export type RetriggerRun = { pulls: RetriggerPull[]; followed: { pr: number; state: FollowState }[]; triggered: { pr: number; head: string; at: string }[]; errors: { pr: number | null; error: string }[] };
 
 const entries = (found: Record<string, unknown>, field: string): Record<string, unknown>[] => {
   const list = found[field];
-  if (!Array.isArray(list)) throw new BackstopScriptError(`${GREPTILE_RETRIGGER} printed no ${field}`);
+  if (!Array.isArray(list)) throw new BackstopScriptError(`${GREPTILE_REQUEST} printed no ${field}`);
   return list.map((item) => {
     const entry = record(item);
-    if (!entry) throw new BackstopScriptError(`${GREPTILE_RETRIGGER} printed a malformed ${field} entry`);
+    if (!entry) throw new BackstopScriptError(`${GREPTILE_REQUEST} printed a malformed ${field} entry`);
     return entry;
   });
 };
@@ -746,9 +748,9 @@ const entries = (found: Record<string, unknown>, field: string): Record<string, 
 // one of its requests (an `errors` entry), throws GitHubRateLimitedError once the requests already
 // made are known (`partial`): the backstop records them and stops.
 export function parseRetrigger(output: ScriptOutput): RetriggerRun {
-  const found = answer(GREPTILE_RETRIGGER, output);
-  if (output.code !== 0) failed(GREPTILE_RETRIGGER, output, found, `${GREPTILE_RETRIGGER} exited ${output.code}: ${text(found.error).slice(0, 300)}`);
-  const malformed = (field: string): never => { throw new BackstopScriptError(`${GREPTILE_RETRIGGER} printed a malformed ${field} entry`); };
+  const found = answer(GREPTILE_REQUEST, output);
+  if (output.code !== 0) failed(GREPTILE_REQUEST, output, found, `${GREPTILE_REQUEST} exited ${output.code}: ${text(found.error).slice(0, 300)}`);
+  const malformed = (field: string): never => { throw new BackstopScriptError(`${GREPTILE_REQUEST} printed a malformed ${field} entry`); };
   const pulls = entries(found, "pulls").map((item): RetriggerPull => {
     const pr = count(item.pr);
     const state = RETRIGGER_STATES.find((known) => known === item.state) ?? null;
@@ -767,11 +769,11 @@ export function parseRetrigger(output: ScriptOutput): RetriggerRun {
   const errors = entries(found, "errors").map((item) => ({ pr: count(item.pr), error: text(item.error) || "unknown error" }));
   const run = { pulls, followed, triggered, errors };
   const refused = errors.find((item) => isRefusal(item.error));
-  if (refused) throw new RetriggerRefusedError(`GitHub refused ${GREPTILE_RETRIGGER}'s requests${refused.pr ? ` (#${refused.pr})` : ""}: ${refused.error.slice(0, 300)}`, run);
+  if (refused) throw new RetriggerRefusedError(`GitHub refused ${GREPTILE_REQUEST}'s requests${refused.pr ? ` (#${refused.pr})` : ""}: ${refused.error.slice(0, 300)}`, run);
   return run;
 }
 
-// GitHub refused some of a Greptile re-request run's requests; `partial` is what the run did.
+// GitHub refused some of a Greptile request run's requests; `partial` is what the run did.
 export class RetriggerRefusedError extends GitHubRateLimitedError {
   constructor(message: string, readonly partial: RetriggerRun) {
     super(message);

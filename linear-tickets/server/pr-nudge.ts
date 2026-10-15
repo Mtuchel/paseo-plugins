@@ -16,6 +16,8 @@ export const DRAFT_IDLE_MS = 30 * 60 * 1000;
 // reports on it; the agent cannot fix it by pushing.
 const QUEUE_CHECK = "Graphite / mergeability_check";
 const DECISIVE = ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"];
+// Greptile's review login (REST and gh's `pr view` JSON), as the repo's review-state matches it.
+const GREPTILE = /^greptile-apps(\[bot\])?$/;
 
 // The step, for a panel line and the owner's escalation: "… the agent to <step>".
 export const STAGE_STEP: Record<Stage, string> = {
@@ -91,13 +93,19 @@ export async function stalledStage(view: PullRequestView, url: string, now: numb
       `@${review.author} requested changes on [the pull request](${url})${review.commit && review.commit !== view.headSha ? ` at \`${review.commit.slice(0, 7)}\`, before the latest commits` : ""}:`,
       ...(review.body.trim() ? [`> ${excerpt(review.body, 1500)}`] : []),
     ]);
-    const earlier = requested.filter((review) => review.commit && review.commit !== view.headSha).map((review) => `@${review.author}`);
+    const earlier = requested.filter((review) => review.commit && review.commit !== view.headSha);
+    const reviewers = earlier.filter((review) => !GREPTILE.test(review.author)).map((review) => `@${review.author}`);
+    // Greptile's one review per PR lifetime is never re-requested: after its review, the fix diff
+    // from that reviewed commit to the head goes to Astra (the repository's AGENTS.md).
+    const greptile = earlier.find((review) => GREPTILE.test(review.author));
+    const reviewed = greptile?.commit?.slice(0, 7);
     return { stage: "changes", key: unsent.join(" "), text: [
       ...(summaries.length ? summaries : [`GitHub reports changes requested on [the pull request](${url}).`]),
       ...(open.length ? ["", "Unresolved review threads:", ...threadLines(open)] : []),
       "",
       "Next step: address them, then `gt submit --stack`.",
-      ...(earlier.length ? [`Where the new commits already address a review, reply on its threads and re-request a review from ${earlier.join(", ")}.`] : []),
+      ...(reviewers.length ? [`Where the new commits already address a review, reply on its threads and re-request a review from ${reviewers.join(", ")}.`] : []),
+      ...(greptile && reviewed ? [`Greptile is not re-requested (one review per PR lifetime): hand Astra the fix diff \`${reviewed}..${head}\` (AGENTS.md), never another \`@greptileai\`.`] : []),
     ].join("\n") };
   }
   if (claimed("findings", key)) return null;

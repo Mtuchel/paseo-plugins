@@ -77,7 +77,7 @@ test("the issue opens only once a request is 2 hours old, once, with every waiti
   await outage().sync([answer("o/r", [pull("o/r", 1, false)])]);
   assert.equal(linear.creates.length, 0, "not before 2 hours");
 
-  const run = [answer("o/r", [pull("o/r", 1, true), pull("o/r", 2, false), pull("o/r", 3, false, [])])];
+  const run = [answer("o/r", [pull("o/r", 1, true), pull("o/r", 2, false), pull("o/r", 3, false, []), pull("o/r", 4, true, [])])];
   await outage().sync(run);
   await outage().sync(run);
   assert.equal(linear.creates.length, 1, "opened once");
@@ -86,9 +86,10 @@ test("the issue opens only once a request is 2 hours old, once, with every waiti
   assert.deepEqual({ ...fields, id: "uuid" }, { id: "uuid", teamId: "team", projectId: null, title: OUTAGE_TITLE, assigneeId: "owner", priority: 2, ready: true });
   assert.ok(description.startsWith(OUTAGE_MARKER), description);
   assert.ok(description.includes(OWNER), "mentions the owner");
-  assert.ok(description.includes(`- [#1 PR 1](${url("o/r", 1)}) — Greptile re-requested 10:05 (1×)`), description);
-  assert.ok(description.includes(`- [#2 PR 2](${url("o/r", 2)}) — Greptile re-requested 10:05 (1×)`), description);
+  assert.ok(description.includes(`- [#1 PR 1](${url("o/r", 1)}) — the one request went out 10:05`), description);
+  assert.ok(description.includes(`- [#2 PR 2](${url("o/r", 2)}) — the one request went out 10:05`), description);
   assert.ok(description.includes(`- [#3 PR 3](${url("o/r", 3)}) — not asked yet`), description);
+  assert.ok(description.includes(`- [#4 PR 4](${url("o/r", 4)}) — the one request is claimed without a comment (a lost POST)`), description);
   assert.equal(linear.updates, 0, "an unchanged list is not written again");
 });
 
@@ -100,7 +101,7 @@ test("a failed repo keeps the issue open with its pull requests not read; outcom
   await outage().sync([answer("o/r", [], [{ pr: 1, state: "reviewed" }]), { repo: "o/x", result: "failed", error: "exit 1" }]);
   const [issue] = linear.open();
   assert.ok(issue, "nothing completes while a repo failed");
-  assert.ok(issue.description.includes(`[#7 PR 7](${url("o/x", 7)}) — Greptile re-requested 10:05 (1×) (not read this run)`), issue.description);
+  assert.ok(issue.description.includes(`[#7 PR 7](${url("o/x", 7)}) — the one request went out 10:05 (not read this run)`), issue.description);
   assert.ok(issue.description.includes(`[#1 PR 1](${url("o/r", 1)}) — reviewed`), issue.description);
   assert.deepEqual([...(await outage().follow())], [["o/r", []], ["o/x", [7]]], "resolved PRs stop being followed, but their repo is still read");
 

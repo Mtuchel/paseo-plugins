@@ -6,9 +6,9 @@ import type { FollowState, RetriggerRun } from "./queue-backstop";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
-// The Greptile outage issue (TUC-1208, README "Queue backstop"): once a pull request waits 2 hours
-// after the queue backstop asked Greptile, one issue "Greptile is not reviewing" lists every
-// pull request that waits for its first Greptile review. It is updated, never filed twice, and
+// The Greptile outage issue (TUC-1208, README "Queue backstop"): once the queue backstop's one
+// request (TUC-2427) is 2 hours old without a review, one issue "Greptile is not reviewing" lists
+// every pull request that waits for its Greptile review. It is updated, never filed twice, and
 // completes itself once a run read every repo and every listed pull request has an outcome.
 // Only the dispatch host runs it (see PullRequestWatch.queueBackstop), one run at a time.
 
@@ -21,13 +21,15 @@ const PULL_URL = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/;
 const LISTED_LINE = /^- \[#\d+ ?([^\]\n]*)\]\((https:\/\/github\.com\/[^/\s)]+\/[^/\s)]+\/pull\/\d+)\)/gm;
 const BERLIN = new Intl.DateTimeFormat("de-DE", { timeZone: "Europe/Berlin", hour: "2-digit", minute: "2-digit" });
 
-// One repo's answer of `greptile-retrigger.mjs` in a backstop run: `failed` when it threw, exited 1
+// One repo's answer of `greptile-request.mjs` in a backstop run: `failed` when it threw, exited 1
 // or the run stopped before it (rate limit); `skipped` when the repo has no checkout or no script.
 export type RetriggerResult = { repo: string; result: "answer"; run: RetriggerRun } | { repo: string; result: "failed"; error: string } | { repo: string; result: "skipped" };
 
 type Outcome = Exclude<FollowState, "waiting" | "unread">;
-// A listed pull request: `outcome` null while it waits, else why it no longer does.
-type Listed = { title: string; triggers: string[]; outcome: Outcome | null };
+// A listed pull request: `outcome` null while it waits, else why it no longer does. `overdue`
+// (the script's answer): the one request is 2 hours old without a review, or the claim carries
+// no request comment (a lost POST); absent in an entry written before TUC-2427.
+type Listed = { title: string; triggers: string[]; outcome: Outcome | null; overdue?: boolean };
 // `reserved`: the id chosen for the issue before its create, until Linear confirmed it (a lost
 // answer is looked up, and retried, under the same id). `dismissed`: a person closed the issue
 // while pull requests still waited; it is left alone until a complete run finds none waiting.
@@ -55,7 +57,7 @@ export function outageDescription(state: Pick<OutageState, "listed">, unread: Se
   const waiting = urls.filter((url) => state.listed[url].outcome === null).map((url) => {
     const entry = state.listed[url];
     const last = entry.triggers.map((at) => Date.parse(at)).filter(Number.isFinite).sort((a, b) => a - b).at(-1);
-    const asked = last === undefined ? "not asked yet" : `Greptile re-requested ${BERLIN.format(last)} (${entry.triggers.length}×)`;
+    const asked = last !== undefined ? `the one request went out ${BERLIN.format(last)}` : entry.overdue ? "the one request is claimed without a comment (a lost POST)" : "not asked yet";
     return `- ${pullLink(url, entry.title)} — ${asked}${unread.has(url) ? " (not read this run)" : ""}`;
   });
   const finished = urls.flatMap((url) => {
@@ -65,7 +67,7 @@ export function outageDescription(state: Pick<OutageState, "listed">, unread: Se
   return [
     OUTAGE_MARKER,
     "",
-    `${mention} Greptile has not answered the queue backstop's review request (\`@greptileai\`) for 2 hours. These \`complex-review\` pull requests wait for their first Greptile review, so they cannot merge. Paseo updates this list every 10 minutes and completes this issue once none waits any more.`,
+    `${mention} Greptile has not answered the queue backstop's one review request (\`@greptileai\`) for 2 hours. These \`complex-review\` pull requests wait for their one Greptile review, so they cannot merge. Paseo updates this list every 10 minutes and completes this issue once none waits any more.`,
     "",
     "**Waiting for Greptile**",
     "",
@@ -140,7 +142,7 @@ export class GreptileOutage {
     const complete = results.every((found) => found.result === "answer") && [...listedRepos].every((repo) => answers.has(repo)) && ![...answers.values()].some((run) => run.errors.length > 0 || run.followed.some((item) => item.state === "unread")) && unread.size === 0;
     const overdue = [...waiting.values()].some((pull) => pull.overdue);
     const list = (urls: Iterable<[string, Waiting]>) => {
-      for (const [url, pull] of urls) state.listed[url] ??= { title: pull.title, triggers: pull.triggers, outcome: null };
+      for (const [url, pull] of urls) state.listed[url] ??= { title: pull.title, triggers: pull.triggers, outcome: null, overdue: pull.overdue };
     };
 
     // 1. A reservation is resolved first; a lost state file is recovered by the marker.
@@ -178,6 +180,7 @@ export class GreptileOutage {
       if (now) {
         entry.outcome = null;
         entry.title = now.title || entry.title;
+        entry.overdue = now.overdue;
         if (now.triggers.length) entry.triggers = now.triggers;
       } else if (found && found !== "waiting" && found !== "unread") entry.outcome = found;
     }

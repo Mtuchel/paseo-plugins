@@ -1222,12 +1222,15 @@ NOTIFY_MAX_CHARS = 20000  # hard cap: a too-large comment fails, and then pendin
 
 def item_kind(payload):
     """A coarse kind for summing items up and for the history: the section plus the detail with
-    parenthesised specifics (nested ones too) removed, PR references as `#N` and every other
-    number as `N`. Changing it starts new kinds in the history (earlier lines keep theirs)."""
+    parenthesised specifics (nested ones too) removed, the reviewed commit in a Greptile fix-diff
+    blocker replaced (it is per pull request, the kind still groups them, TUC-2427), PR
+    references as `#N` and every other number as `N`. Changing it starts new kinds in the
+    history (earlier lines keep theirs)."""
     detail = str(payload.get("detail") or "")
     while re.search(r"\([^()]*\)", detail):
         detail = re.sub(r"\([^()]*\)", "", detail)
     detail = detail.replace("(", "").replace(")", "")
+    detail = re.sub(r"after Greptile's [0-9a-f]{7,40}", "after Greptile's reviewed commit", detail)
     detail = re.sub(r"#\d+", "#N", detail)
     detail = re.sub(r"\d+", "N", detail)
     detail = re.sub(r"\s+", " ", detail).strip(" ,;")
@@ -1301,10 +1304,10 @@ def item_host(payload, host):
 def item_evidence(key, payload, at, host, evidence):
     """(owner, auto) as observed at this run. owner: the item waits on the owner, or its pull
     request watch / crash record escalated to the owner. auto: the watch nudged, handled a drop,
-    ran a queue action or re-requested a Greptile review, or the agent was restarted (crash
-    recovery, or the limit-resume store where the incident resolved `started`; a pending,
-    cancelled or claimed one earns nothing). None: unknown (another host's item, an unreadable
-    record file, a kind without a record). Only these two flags leave the records."""
+    ran a queue action or made the backstop's one Greptile review request, or the agent was
+    restarted (crash recovery, or the limit-resume store where the incident resolved `started`; a
+    pending, cancelled or claimed one earns nothing). None: unknown (another host's item, an
+    unreadable record file, a kind without a record). Only these two flags leave the records."""
     waiting = True if payload.get("group") == "waiting" else None
     sources = evidence.get("plannerRecovery") or {}
     planner = sources.get("" if at == host else at)
