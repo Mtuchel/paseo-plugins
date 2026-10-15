@@ -4384,7 +4384,10 @@ archived in `deputy/reports/`, so cases outlive the log's 60 days.
 **Recall access.** `deputy/recall.json` (`{ "url", "bank", "token" }`, `0600`), else omp's
 `hindsight.apiUrl` with bank `omp` and `HINDSIGHT_API_TOKEN` in the daemon's environment. The
 token stays on the host: never in settings, prompts, citations or reports. `deputy.recallConfigured`
-says whether access exists.
+says whether access exists. Only an absent optional `recall.json` with no fallback token means
+no recall source. An unreadable or invalid existing file (including missing credentials/invalid
+URL), or an unusable configured token fallback, blocks the deputy rather than dropping possible
+owner constraints. Diagnostics never echo configuration contents or credentials.
 
 **Settings and explicit authorized activation.** Read `linear.get-settings`, then use the
 authenticated plugin RPC, not a direct file edit, for the opt-in:
@@ -4408,8 +4411,9 @@ by default; this source change does not enable a running host.
 After recording the audit, relevant settings/template changes freshly reevaluate exact still-pending
 work revoked by that write; a current-version shadow prediction is also reevaluated when mode
 changes. Explicit standing activation can reconsider a blocked standing prediction, but cannot
-promote it directly. Sources, selection and the full grace period start afresh. Arbitrary canceled
-work, answered/changed requests and interrupted/unknown dispatches are not revived.
+promote it directly. Sources, selection and the full grace period start afresh, including an
+in-flight evaluation that notices revocation before the settings handler reaches its lane.
+Arbitrary canceled work, answered/changed requests and interrupted/unknown dispatches are not revived.
 
 **Persisted launch-template migration.** Updating `DEFAULT_PROMPT_TEMPLATE` or source notes does
 not rewrite an existing `settings.json` template. On each host read `linear.get-settings` and
@@ -4447,7 +4451,9 @@ Only exact current requests with trusted eligible live handling can return
 `suppressUrgency: true`: evaluating expires at the original observation +150 s;
 waiting/dispatching at grace deadline +10 s settlement allowance. Polls never renew these
 deadlines. A terminal/refused/unhandled/off/shadow/no-evaluator/error/stale or relinked request
-fails open. Status is read-only and never sends an answer.
+fails open. After asynchronous gate/daemon reads, status rechecks current settings, revocation
+and candidate state; a concurrent refusal or off switch cannot keep the earlier suppression.
+Status is read-only and never sends an answer.
 
 An initial **notification-only** checking debounce may retry missing/evaluating-false evidence
 within one fixed 15 s window (poll 1 s, RPC timeout 2 s). During checking the ordinary urgent,
@@ -4457,14 +4463,19 @@ interrupting urgency. Preserve answer/override controls, fail open immediately o
 shadow/no-policy/errors, use a short freshness lease and a 10-minute total cap, and never renew
 the initial deadline. Source/network latency can exceed 15 s; no measured host latency guarantee
 is implied. Plugin ticket mentions use the same bounded initial check, then confirmed handling
-only; if unanswered at the deadline or refused they notify normally.
+only; if unanswered at the deadline or refused they notify normally. A failed deputy observation
+(for example candidate persistence failure) is logged locally and never prevents the session's
+owner question, Needs input state or owner mention, and cannot defer that notification.
 
 **Safe current-policy replay.** The exported evaluator API is
 `evaluateWithOmp({identifier, parts, context, sources}, model, privateDirectory)`; `standingSources()`
 returns actual complete standing authority. Use isolated temporary directories and no live
 `Deputy`, daemon, `PermissionReplies`, activation or decision-journal writes. For the historical
-exact question corpus, preserve exact keys/options and explicitly label task/plan/environment
-context as unavailable; question claims and invented task facts are not source evidence.
+exact question corpus, preserve raw `header` (falling back to logged `key` only when absent),
+exact keys/options/descriptions, and normalize raw `multi:true` to unsupported multi-select.
+Carry zero-based `recommended` indexes and their actual offered labels as advisory question
+metadata, not new choices or authority. Explicitly label task/plan/environment context as
+unavailable; question claims and invented task facts are not source evidence.
 Inspect checked selections/refusals and semantic boundary reasons, not a target acceptance
 ratio. A replay is exploratory safety/coverage evidence, **not real-time shadow readiness**.
 Abstentions may report `owner-boundary`, `technical-reframe` (delegated technical work but no
@@ -4476,8 +4487,8 @@ guidance side channel. The parent runs the historical last-2000 replay after ind
 and before rollout. A replay harness can inject the existing `runOmp`-compatible runner through
 the fourth `evaluateWithOmp` argument; output must identify a custom runner rather than claim
 unverified provider execution. For resumable offline caching, key the complete evaluation input,
-model/thinking, system prompt and evaluator/validator source revision; recheck cached raw model
-output with current `checkVerdict`, and never write replay rows to the live decision journal.
+model/thinking, system prompt and evaluator/validator AND normalization source revision; recheck
+cached raw model output with current `checkVerdict`, and never write replay rows to the live journal.
 
 **Off switch.** `"deputy": { "mode": "off" }` stops new evaluations and ends candidates waiting
 for their grace period at once; `shadow` ends waiting live candidates too. Neither undoes an

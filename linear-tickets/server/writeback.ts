@@ -684,7 +684,15 @@ export class Writeback {
       const question = questionEntry(agent.id, request, { id: issueId, identifier });
       const log = this.decisions;
       if (question && log) await logQuietly(() => log.append(question), `question on ${identifier}`);
-      await this.deputy?.observe(agent, request, { issueId, identifier });
+      let observed = false;
+      try {
+        await this.deputy?.observe(agent, request, { issueId, identifier });
+        observed = Boolean(this.deputy);
+      } catch (error) {
+        // Candidate persistence is not owner-delivery infrastructure. Without
+        // successful observation, no deputy state may defer this notification.
+        console.error(`[linear-tickets] deputy observation for ${identifier} failed:`, error instanceof Error ? error.message : error);
+      }
       // Providers sometimes resolve a request themselves within moments (for example after a
       // plan approval switches the mode); only requests still pending after a short wait are shown.
       await new Promise((resolve) => setTimeout(resolve, this.settleMs));
@@ -704,7 +712,7 @@ export class Writeback {
       })) ?? false;
       if (!settings.writeback.blocked) return;
       await context.once("deputy-notification-window", async () => {
-        if (!this.deputy) return;
+        if (!this.deputy || !observed) return;
         // Read-only lookups time out fail-open. Retries and state transitions
         // never renew the total cap captured when the event first arrived.
         while (Date.now() < notificationCeiling) {

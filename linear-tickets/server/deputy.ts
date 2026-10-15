@@ -141,6 +141,7 @@ export class Deputy {
   // An unsent intent keeps its original generation even if settings change away and back.
   private settingsGeneration = 0;
   private storeQueue: Promise<unknown> = Promise.resolve();
+  private candidateRevision = 0;
   private readonly lanes = new Map<string, Promise<unknown>>();
   private readonly timers = new Map<string, NodeJS.Timeout>();
   private retryTimer: NodeJS.Timeout | null = null;
@@ -148,6 +149,7 @@ export class Deputy {
   private readonly queued: (() => void)[] = [];
   // Work started in the background (evaluations, dispatches), for tests and orderly shutdown.
   private readonly inflight = new Set<Promise<unknown>>();
+  private readonly evaluating = new Set<string>();
   private readonly revoked = new Set<string>();
 
   constructor(private readonly deps: Deps) {
@@ -168,6 +170,7 @@ export class Deputy {
   }
 
   private change<T>(work: (store: Record<string, Candidate>) => T): Promise<T> {
+    this.candidateRevision++;
     const run = async () => {
       const store = await this.readStore();
       const result = work(store);
@@ -312,6 +315,12 @@ export class Deputy {
   }
 
   private async evaluate(key: string, retry = false): Promise<void> {
+    this.evaluating.add(key);
+    try { await this.evaluateCandidate(key, retry); }
+    finally { this.evaluating.delete(key); }
+  }
+
+  private async evaluateCandidate(key: string, retry: boolean): Promise<void> {
     const generation = this.settingsGeneration;
     let candidate = (await this.readStore())[key];
     if (!candidate || this.stopped || (retry ? !this.retryable(candidate) : candidate.status !== "evaluating")) return;
@@ -392,7 +401,9 @@ export class Deputy {
   // compare `request` with its local raw request, keep answer/override UI visible,
   // fail open on any error, and never extend these fixed deadlines on a poll.
   async status(filter: { agentId?: string; permissionId?: string } = {}) {
-    const settings = await this.deps.settings.read();
+    const generation = this.settingsGeneration;
+    const read = await this.deps.settings.read();
+    const settings = { ...read, deputy: { ...read.deputy } };
     const now = this.now();
     const version = settings.deputy.model ? policyVersion(settings.deputy.model) : null;
     const candidates = [];
@@ -413,7 +424,32 @@ export class Deputy {
       }
       candidates.push({ agentId: candidate.agentId, permissionId: candidate.requestId, requestFingerprint: candidate.fingerprint, request: candidate.request, state: candidate.status, observedAt: candidate.observedAt, updatedAt: candidate.updatedAt, expiresAt, suppressUrgency });
     }
-    return { mode: settings.deputy.mode, policyVersion: version, updatedAt: new Date(now).toISOString(), candidates };
+    // Async gate/daemon reads may overlap refusals, revocations or settings
+    // writes. Drain earlier writes and validate one final store snapshot; any
+    // subsequently queued mutation invalidates this read, even before its I/O.
+    const queue = this.storeQueue;
+    await queue;
+    const revision = this.candidateRevision;
+    const currentSettings = await this.deps.settings.read();
+    const currentStore = await this.readStore();
+    const currentVersion = currentSettings.deputy.model ? policyVersion(currentSettings.deputy.model) : null;
+    const stable = !this.stopped && generation === this.settingsGeneration && queue === this.storeQueue && revision === this.candidateRevision
+      && JSON.stringify(currentSettings.deputy) === JSON.stringify(settings.deputy) && currentSettings.template === settings.template;
+    for (const entry of candidates) {
+      const key = `${entry.agentId}:${entry.permissionId}`;
+      const current = currentStore[key];
+      if (!stable || this.revoked.has(key) || !current || current.status !== entry.state || current.updatedAt !== entry.updatedAt
+        || current.fingerprint !== entry.requestFingerprint || !current.eligible || current.mode !== "live" || current.version !== currentVersion
+        || !entry.expiresAt || Date.parse(entry.expiresAt) <= this.now()) {
+        entry.suppressUrgency = false;
+        entry.expiresAt = null;
+      }
+      if (current) {
+        entry.state = current.status;
+        entry.updatedAt = current.updatedAt;
+      }
+    }
+    return { mode: currentSettings.deputy.mode, policyVersion: currentVersion, updatedAt: new Date(this.now()).toISOString(), candidates };
   }
 
   async ownerNotificationDelay(agentId: string, requestId: string): Promise<number> {
@@ -634,7 +670,8 @@ export class Deputy {
           }
           if (this.owesSettlement(current)) { this.retrySettlement(); return; }
           const changedPolicy = (current.version !== version || current.mode !== settings.deputy.mode) && ["refused", "predicted", "waiting", "evaluating", "blocked"].includes(current.status);
-          const revokedHere = current.status === "canceled" && restartKeys?.has(current.key);
+          const revokedHere = current.status === "canceled" && restartKeys?.has(current.key)
+            && ["the deputy settings changed", "the deputy settings changed during evaluation", "the deputy was switched off"].includes(current.reason ?? "");
           const newlyAuthorized = standingActivation && current.status === "blocked" && current.standing === true;
           if (settings.deputy.mode !== "off" && (changedPolicy || revokedHere || newlyAuthorized)) {
             // Reevaluate exact still-pending requests after a policy/mode change
@@ -773,21 +810,25 @@ export class Deputy {
   // Every settings notification revokes unsent work synchronously. The later durable
   // cancellation may wait for a candidate lane, but the final checked-send guard never does.
   async settingsChanged(): Promise<string[]> {
+    // Preserve evaluation identities before the first await: those evaluations
+    // may observe this generation change and cancel themselves before our lane.
+    const canceled = new Set(this.evaluating);
     this.settingsGeneration++;
     const { mode } = (await this.deps.settings.read()).deputy;
-    const canceled: string[] = [];
-    for (const candidate of await this.candidates()) {
+    const candidates = await this.candidates();
+    for (const candidate of candidates) {
       if (candidate.status !== "waiting" && candidate.status !== "evaluating" && !(mode === "off" && this.retryable(candidate))) continue;
+      canceled.add(candidate.key);
       this.unschedule(candidate.key);
       await this.lane(candidate.key, async () => {
         const current = (await this.readStore())[candidate.key];
         if (current && (current.status === "waiting" || current.status === "evaluating" || (mode === "off" && this.retryable(current)))) {
           await this.outcome(current, "canceled", "the deputy settings changed");
-          canceled.push(current.key);
+          canceled.add(current.key);
         }
       });
     }
-    return canceled;
+    return [...canceled];
   }
 
   // Called only after the settings RPC has durably recorded any activation.

@@ -677,7 +677,7 @@ export default function contribute(server: PluginServerContext) {
     return {
       ...saved,
       activation: { ...saved.activation, secretConfigured: Boolean(await readActivationSecret()) },
-      deputy: { ...saved.deputy, recallConfigured: Boolean(await recallAccess(deputyDirectory)), live: { ready: !blockers.length, blockers, standingPolicyReady: saved.deputy.standingPolicy !== null && !(await deputy.liveBlockers(saved, true)).length } },
+      deputy: { ...saved.deputy, recallConfigured: Boolean(await recallAccess(deputyDirectory).catch(() => null)), live: { ready: !blockers.length, blockers, standingPolicyReady: saved.deputy.standingPolicy !== null && !(await deputy.liveBlockers(saved, true)).length } },
       builtin: DEFAULT_PROMPT_TEMPLATE,
     };
   };

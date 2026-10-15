@@ -309,15 +309,36 @@ export type RecallAccess = { url: string; bank: string; token: string };
 // user), else omp's configured `hindsight.apiUrl` with bank `omp` and HINDSIGHT_API_TOKEN. The
 // token never leaves this host: not in settings, prompts, citations or reports.
 export async function recallAccess(directory: string, env = process.env): Promise<RecallAccess | null> {
-  const stored: unknown = await readFile(join(directory, "recall.json"), "utf8").then((content) => JSON.parse(content), () => null);
-  if (stored && typeof stored === "object" && "url" in stored && "token" in stored && typeof stored.url === "string" && typeof stored.token === "string" && stored.token) {
-    return { url: stored.url.replace(/\/+$/, ""), bank: "bank" in stored && typeof stored.bank === "string" && stored.bank ? stored.bank : "omp", token: stored.token };
+  const content = await readFile(join(directory, "recall.json"), "utf8").catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error("Hindsight recall configuration is unreadable");
+  });
+  if (content !== null) {
+    let stored: unknown;
+    try { stored = JSON.parse(content); }
+    catch { throw new Error("Hindsight recall configuration is invalid JSON"); }
+    if (!stored || typeof stored !== "object" || !("url" in stored) || typeof stored.url !== "string" || !("token" in stored) || typeof stored.token !== "string" || !stored.token.trim()
+      || ("bank" in stored && (typeof stored.bank !== "string" || !stored.bank.trim()))) {
+      throw new Error("Hindsight recall configuration requires a valid URL, token and optional bank");
+    }
+    let url: URL;
+    try { url = new URL(stored.url); }
+    catch { throw new Error("Hindsight recall configuration has an invalid URL"); }
+    if (!["http:", "https:"].includes(url.protocol)) throw new Error("Hindsight recall configuration requires an HTTP URL");
+    return { url: stored.url.replace(/\/+$/, ""), bank: "bank" in stored ? stored.bank as string : "omp", token: stored.token };
   }
   const token = env.HINDSIGHT_API_TOKEN;
   if (!token) return null;
-  const config = await readFile(join(homedir(), ".omp", "agent", "config.yml"), "utf8").catch(() => "");
+  const config = await readFile(join(homedir(), ".omp", "agent", "config.yml"), "utf8").catch(() => {
+    throw new Error("Hindsight token is configured but its OMP configuration is unreadable");
+  });
   const url = /^hindsight:\s*\n(?:[ \t]+.*\n)*?[ \t]+apiUrl:\s*["']?([^"'\s]+)/m.exec(config)?.[1];
-  return url ? { url: url.replace(/\/+$/, ""), bank: "omp", token } : null;
+  if (!url) throw new Error("Hindsight token is configured but its API URL is missing or invalid");
+  let parsed: URL;
+  try { parsed = new URL(url); }
+  catch { throw new Error("Hindsight configured API URL is invalid"); }
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Hindsight configured API URL must use HTTP");
+  return { url: url.replace(/\/+$/, ""), bank: "omp", token };
 }
 
 export async function recall(access: RecallAccess | null, query: string): Promise<Memory[]> {

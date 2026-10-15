@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -12,7 +12,7 @@ import { checkVerdict, policyVersion } from "./deputy-evaluator";
 import { LIVE_MIN_CASES, shadowEvidence } from "./deputy-evidence";
 import { renderReport, verdict, waitStats } from "./deputy-report";
 import { assessRisk, type Part } from "./deputy-risk";
-import { gatherSources, registerEntries, standingSources, type Source, type SourceReaders } from "./deputy-sources";
+import { gatherSources, hostReaders, recallAccess, registerEntries, standingSources, type Source, type SourceReaders } from "./deputy-sources";
 import type { IssueState } from "./linear";
 import { DecisionLog, type LogEntry } from "./owner-decisions";
 import { PermissionReplies } from "./permission-replies";
@@ -158,6 +158,32 @@ test("an unreadable source that should exist makes the deputy abstain rather tha
   assert.match((await gatherSources(readers({ plan: async () => null }), asked, "/repo/platform")).abstain ?? "", /no plan document/, "a plan-ready ticket without its plan");
   assert.match((await gatherSources(readers({ plan: async () => ({ url: "https://linear.app/doc/plan", content: "# Draft\n\nTests use node:test." }) }), asked, "/repo/platform")).abstain ?? "", /not marked approved/);
   assert.match((await gatherSources(readers({ ownerAnswers: async () => { throw new Error("journal unavailable"); } }), asked, "/repo/platform")).abstain ?? "", /earlier owner answers/);
+});
+
+test("only truly absent optional recall permits an authority snapshot; unreadable and invalid configured recall refuse", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "deputy-recall-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const previousToken = process.env.HINDSIGHT_API_TOKEN;
+  delete process.env.HINDSIGHT_API_TOKEN;
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.HINDSIGHT_API_TOKEN;
+    else process.env.HINDSIGHT_API_TOKEN = previousToken;
+  });
+  const host = hostReaders({ linear: { issueDocument: async () => null }, log: { entries: async () => [] }, home: directory, directory, template: async () => "" });
+  const snapshot = () => gatherSources(readers({ recall: host.recall }), asked, "/repo/platform");
+  assert.equal(await recallAccess(directory, {}), null);
+  assert.equal((await snapshot()).abstain, null, "missing optional configuration is not a source failure");
+  await mkdir(join(directory, "recall.json"));
+  assert.match((await snapshot()).abstain ?? "", /Hindsight.*unreadable/, "a configured path that cannot be read must not become no recall");
+  await rm(join(directory, "recall.json"), { recursive: true });
+  for (const config of ["{secret-not-valid-json", "null", "{}", JSON.stringify({ url: "not-a-url", token: "private-test-token" }), JSON.stringify({ url: "https://recall.invalid", token: "" })]) {
+    await writeFile(join(directory, "recall.json"), config);
+    const result = await snapshot();
+    assert.match(result.abstain ?? "", /Hindsight.*(invalid|requires)/);
+    assert.ok(!result.abstain?.includes("secret-not-valid-json") && !result.abstain?.includes("private-test-token"), "source failure diagnostics cannot echo credentials");
+  }
+  await writeFile(join(directory, "recall.json"), JSON.stringify({ url: "https://recall.invalid/", bank: "test", token: "private-test-token" }));
+  assert.deepEqual(await recallAccess(directory, {}), { url: "https://recall.invalid", bank: "test", token: "private-test-token" });
 });
 
 test("a decision that is not binding stays so in every excerpt: its subsections and the cut-off rest of a long one", async () => {
@@ -1428,5 +1454,100 @@ for (const stale of ["resolved", "changed"] as const) {
     await h.settle();
     assert.equal(h.calls.length, 0);
     assert.equal((await h.deputy.status()).candidates[0].suppressUrgency, false);
+  });
+}
+
+for (const pause of ["settings-read", "candidate-lane"] as const) {
+  test(`settings revocation retains an in-flight evaluation that self-cancels during ${pause}, then starts fresh grace`, async (t) => {
+    const h = await standingHarness(t);
+    const evaluating = signal();
+    const finish = signal();
+    let calls = 0;
+    const evaluate = h.deps.evaluate;
+    h.deps.evaluate = async (...args) => {
+      if (++calls === 1) { evaluating.resolve(); await finish.promise; }
+      return evaluate(...args);
+    };
+    await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+    await evaluating.promise;
+    const oldObserved = (await h.candidate()).observedAt;
+    h.advance(60_000);
+    const readEntered = signal();
+    const finishRead = signal();
+    if (pause === "settings-read") {
+      let reads = 0;
+      t.mock.method(h.deps.settings, "read", async () => {
+        if (++reads === 1) { readEntered.resolve(); await finishRead.promise; }
+        return h.settings;
+      });
+    } else {
+      const candidates = h.deputy.candidates.bind(h.deputy);
+      t.mock.method(h.deputy, "candidates", async () => {
+        const snapshot = await candidates();
+        readEntered.resolve();
+        return snapshot;
+      });
+    }
+    const changing = h.deputy.settingsChanged();
+    await readEntered.promise;
+    finish.resolve();
+    await h.settle();
+    assert.equal((await h.candidate()).status, "canceled", "the old generation cannot publish its successful model result");
+    finishRead.resolve();
+    const revoked = await changing;
+    assert.ok(revoked.includes("a1:r1"), "self-cancellation must not erase this settings write's restart identity");
+    await h.deputy.recheckPolicy(revoked);
+    await h.settle();
+    const current = await h.candidate();
+    assert.equal(calls, 2, "the old successful answer is not reused");
+    assert.equal(current.status, "waiting");
+    assert.notEqual(current.observedAt, oldObserved);
+    assert.equal(Date.parse(current.graceDeadline!), h.deps.now!() + 5 * 60_000);
+    h.advance(4 * 60_000);
+    await h.settle();
+    assert.equal(h.calls.length, 0);
+    h.advance(60_000);
+    await h.settle();
+    assert.equal(h.calls.length, 1);
+  });
+}
+
+for (const change of ["refusal", "off", "revoke"] as const) {
+  test(`urgency status fails open when ${change} occurs during daemon refresh`, async (t) => {
+    const h = await standingHarness(t);
+    const evaluating = signal();
+    const finishEvaluation = signal();
+    if (change === "refusal") {
+      h.deps.evaluate = async () => {
+        evaluating.resolve();
+        await finishEvaluation.promise;
+        return { ok: false, category: "owner-reserved", reason: "Selected action requires owner authority" };
+      };
+    }
+    await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+    if (change === "refusal") await evaluating.promise;
+    else await h.settle();
+    const refreshing = signal();
+    const finishRefresh = signal();
+    const ref = h.paseo.agents.ref.bind(h.paseo.agents);
+    t.mock.method(h.paseo.agents, "ref", (id: string) => {
+      const handle = ref(id);
+      return { ...handle, refresh: async () => { refreshing.resolve(); await finishRefresh.promise; return handle.refresh(); } };
+    });
+    const pendingStatus = h.deputy.status({ agentId: "a1", permissionId: "r1" });
+    await refreshing.promise;
+    if (change === "refusal") {
+      finishEvaluation.resolve();
+      await h.settle();
+    } else {
+      if (change === "off") h.settings.deputy.mode = "off";
+      await h.deputy.settingsChanged();
+    }
+    finishRefresh.resolve();
+    const status = await pendingStatus;
+    assert.equal(status.candidates[0].suppressUrgency, false);
+    assert.equal(status.candidates[0].expiresAt, null);
+    assert.equal(status.candidates[0].state, change === "refusal" ? "refused" : "canceled");
+    assert.equal(status.mode, change === "off" ? "off" : "live");
   });
 }

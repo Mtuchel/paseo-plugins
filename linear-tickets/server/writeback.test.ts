@@ -1093,6 +1093,28 @@ test("a failing decision log never stops the waiting write-back", async () => {
   assert.match(String(errors.mock.calls[0]?.arguments[0]), /decision log: question on issue-1 failed: disk full/);
 });
 
+test("failed deputy observation delivers the owner question and urgency without suppression", async (t) => {
+  const linear = new FakeLinear();
+  const request = { id: "q-observe-failed", provider: "omp", name: "ask", kind: "question" as const, title: "Which runner?" };
+  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" }, pendingPermissions: [request] } }) }) } } as unknown as PaseoApi;
+  const asked: unknown[] = [];
+  const bridge = { sessions: { sessionFor: async () => ({ sessionId: "s1" }), askQuestion: async (_session: string, question: unknown) => { asked.push(question); } } };
+  const writeback = new Writeback(linear, { read: async () => allOn }, bridge as never, 0, outboxPath());
+  let suppressionChecks = 0;
+  writeback.recordDeputy({
+    observe: async () => { throw Object.assign(new Error("candidate persistence unavailable"), { code: "EACCES" }); },
+    resolved: async () => {},
+    ownerNotificationDelay: async () => { suppressionChecks++; return 60_000; },
+  });
+  const errors = t.mock.method(console, "error", () => {});
+  await writeback.permissionRequested({ agent: root, request }, paseo);
+  assert.deepEqual(asked, [request], "the answerable session question survives deputy persistence failure");
+  assert.ok(linear.writes.includes("move issue-1 Needs input"));
+  assert.ok(linear.writes.some((write) => write.startsWith("new comment:") && write.includes("https://linear.app/acme/profiles/owner")), "normal owner mention survives");
+  assert.equal(suppressionChecks, 0, "an unsuccessful observation cannot establish suppression authority");
+  assert.ok(errors.mock.calls.some((call) => String(call.arguments[0]).includes("deputy observation") && String(call.arguments[1]).includes("candidate persistence unavailable")));
+});
+
 // A finished ticket's agent archived (steward.ts archives it; this is the write-back that follows):
 // the final report goes back to the ticket and the running label comes off.
 test("the archive of a finished ticket's agent writes the final report back and removes the running label", { timeout: 10_000 }, async (t) => {
