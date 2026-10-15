@@ -138,6 +138,18 @@ function revision(draft: Draft, value: ExtractedAsk | null): string {
   return askHash(JSON.stringify([draft.issue.id, draft.ticketId, draft.sourceId, extractionInput(draft), value]));
 }
 
+function sourceScope(draft: Draft): string {
+  return askHash(JSON.stringify({
+    issueId: draft.issue.id, identifier: draft.issue.identifier, title: draft.issue.title,
+    parentId: draft.issue.parentId, parentIdentifier: draft.issue.parentIdentifier,
+    ticketId: draft.ticketId, ticketIdentifier: draft.ticketIdentifier,
+    kind: draft.needsYou ? "needs-you" : draft.manual ? "manual" : "ticket",
+    sourceKind: draft.sourceId === "description" ? "description" : "comment",
+    // A comment's unchanged words do not authorize a changed enclosing business scope.
+    description: draft.issue.description, text: draft.text,
+  }));
+}
+
 function scopedText(draft: Draft, value: ExtractedAsk | null, sourceRevision: string, action: DecisionReceipt["action"], response: string): string {
   return [
     `Decision inbox — ${draft.issue.identifier}, ticket ${draft.ticketIdentifier}, source revision ${sourceRevision}.`,
@@ -200,7 +212,7 @@ export class OwnerAsks {
       }
       const value = state.value;
       const sourceRevision = revision(draft, value);
-      const sourceDecision = this.ledger.forSource(draft.issue.id, draft.sourceId, askHash(draft.text));
+      const sourceDecision = this.ledger.forSource(draft.issue.id, draft.sourceId, askHash(draft.text), sourceScope(draft));
       const decision = this.ledger.latest(draft.issue.id, sourceRevision) ?? sourceDecision;
       if (decision?.result && (decision.receipt.action === "answer" || decision.receipt.action === "done")) continue;
       const expired = decision?.disposition === "deferred" && Date.parse(decision.deferredUntil ?? "") <= this.now();
@@ -278,7 +290,7 @@ export class OwnerAsks {
     const { draft, value } = matched;
     const assessment = checkAssessment(value?.assessment, draft.context);
     if (draft.context.duplicateOf || (!draft.context.liveRequest && (assessment?.state === "resolved" || assessment?.state === "superseded"))) throw new Error("This exact source was reconciled as an echo, resolved or superseded request. Review the cited current source; nothing was delivered.");
-    const previous = this.ledger.latest(draft.issue.id, input.revision) ?? this.ledger.forSource(draft.issue.id, draft.sourceId, askHash(draft.text));
+    const previous = this.ledger.latest(draft.issue.id, input.revision) ?? this.ledger.forSource(draft.issue.id, draft.sourceId, askHash(draft.text), sourceScope(draft));
     if (previous && !previous.result) throw new Error("Delivery for this source revision is unconfirmed. Inspect the ticket or agent before sending another action; nothing was retried.");
     if (previous?.result && (previous.receipt.action === "answer" || previous.receipt.action === "done")) throw new Error("This exact source already has a confirmed owner answer; nothing was delivered again.");
     let response: string;
@@ -301,12 +313,15 @@ export class OwnerAsks {
       if (!response && !input.done) throw new Error("Nothing to answer: choose an option or write the answer.");
       if (input.done) response = `Owner explicitly marked ${draft.issue.identifier} done.${response ? `\n${response}` : ""}`;
     }
+    if (!triage && input.done && (draft.manual || draft.needsYou) && !await this.sourcesSettled(await this.collect(paseo, draft.issue.id), draft.sourceId)) {
+      throw new Error("Other independent or unclassified sources remain unsettled. Answer or review those sources before marking this issue done; nothing was completed.");
+    }
     const scope = scopedText(draft, value, input.revision, action, response);
     // Keep an explicit approval/denial at the front for the established cross-host permission
     // relay, followed by its full scope. Triage never uses an approval-shaped prefix.
     const text = !triage && !input.done ? `${deliveryText({ questions: value?.questions ?? [] }, input)}\n\n${scope}` : scope;
     const record: DecisionRecord = {
-      sourceId: draft.sourceId, sourceHash: askHash(draft.text),
+      sourceId: draft.sourceId, sourceHash: askHash(draft.text), sourceScope: sourceScope(draft),
       receipt: { id: key, issueId: draft.issue.id, identifier: draft.issue.identifier, revision: input.revision, action, text, at: new Date(this.now()).toISOString(), delivery: "unconfirmed" },
       result: null,
       disposition: action === "research" ? "research" : action === "delegate" ? "delegated" : action === "defer" ? "deferred" : null,
@@ -375,9 +390,10 @@ export class OwnerAsks {
     if (record.close && !record.close.done) {
       if (record.result?.delivered === "closed") await this.deps.needsYou.remove(record.close.issueId);
       else {
-        const current = (await this.collect(paseo, undefined, true)).find((draft) => draft.issue.id === record.receipt.issueId && (record.sourceId === undefined || record.sourceId === draft.sourceId));
+        const drafts = (await this.collect(paseo, undefined, true)).filter(draft => draft.issue.id === record.receipt.issueId);
+        const current = drafts.find(draft => record.sourceId === undefined || record.sourceId === draft.sourceId);
         const extracted = current ? await this.extractionFor(extractionKey(current), extractionHash(current)) : undefined;
-        if (current && revision(current, extracted?.value ?? null) === record.receipt.revision) {
+        if (current && revision(current, extracted?.value ?? null) === record.receipt.revision && await this.sourcesSettled(drafts)) {
           await closeAnswered(this.deps.needsYou, this.deps.linear, record.close.issueId);
         }
       }
@@ -390,6 +406,27 @@ export class OwnerAsks {
       await this.ledger.put(key, record);
     }
     return record.result!;
+  }
+
+  // An answer belongs to one source, not its entire issue. Unknown history blocks
+  // completion; only real receipts or cited reconciliation can settle another source.
+  private async sourcesSettled(drafts: Draft[], selectedSource?: string): Promise<boolean> {
+    const answered = (draft: Draft) => {
+      const receipt = this.ledger.forSource(draft.issue.id, draft.sourceId, askHash(draft.text), sourceScope(draft));
+      return Boolean(receipt?.result && (receipt.receipt.action === "answer" || receipt.receipt.action === "done"));
+    };
+    for (const draft of drafts) {
+      if (draft.sourceId === selectedSource || answered(draft)) continue;
+      const canonical = draft.context.duplicateOf ? drafts.find(item => item.sourceId === draft.context.duplicateOf) : undefined;
+      if (canonical && (canonical.sourceId === selectedSource || answered(canonical))) continue;
+      const extraction = await this.extractionFor(extractionKey(draft), extractionHash(draft));
+      const receipt = this.ledger.latest(draft.issue.id, revision(draft, extraction?.value ?? null));
+      if (receipt?.result && (receipt.receipt.action === "answer" || receipt.receipt.action === "done")) continue;
+      const assessment = checkAssessment(extraction?.value?.assessment, draft.context);
+      if (assessment && ["info", "resolved", "superseded"].includes(assessment.state) && !draft.context.liveRequest) continue;
+      return false;
+    }
+    return drafts.length > 0;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -497,7 +534,7 @@ export class OwnerAsks {
         // exact question/options snapshot. Direct live cards retain their own fail-open path;
         // this historical source must still admit exact later resolution evidence.
         const context = askContext(sourceId, timeline, waiting?.commentId ?? null, currentWait && request !== "retired", false);
-        const separate = waiting?.kind === "request" && !mirror;
+        const separate = (subIssue && !currentWait) || (waiting?.kind === "request" && !mirror);
         drafts.push({ issue, manual: manual(issue), text, sourceId, context, needsYou: isNeedsYou(issue) ? issue.id : null,
           route: separate ? "comment" : route.route, agentId: separate ? null : route.agentId,
           ticketAgentId: separate ? null : agents.newest.get(ticketId) ?? null, ticketId, ticketIdentifier, request });

@@ -348,7 +348,9 @@ export class PermissionReplies implements PermissionArbiter {
         });
         if (!record.effects.correction) record = { ...record, reply: "The deputy had already answered this question, and your correction could not be passed on. Tell the agent directly." };
       }
-      if (!this.stopped && !record.intent && !record.effects.needsYou && (record.status === "applied" || record.status === "unchecked" || record.status === "sent" || (record.status === "deputy-first" && record.correctionDelivered))) {
+      // The durable owner-ask namespace owns source-aware completion in OwnerAsks.
+      // Neither its live answer nor recovery may close independent sources via agent affinity.
+      if (!this.stopped && !record.ref.startsWith("owner-ask:") && !record.intent && !record.effects.needsYou && (record.status === "applied" || record.status === "unchecked" || record.status === "sent" || (record.status === "deputy-first" && record.correctionDelivered))) {
         await attempt("closing the Needs you sub-issue", async () => {
           await effects.needsYou(record.agentId, record.issueId);
           record = await this.save({ ...record, effects: { ...record.effects, needsYou: true } });

@@ -4447,6 +4447,15 @@ plugin startup. Call `linear.reconcile-deputy` with `{}` on **both actual agent 
 supported bounded inventory pass after activation. Its `{ observed, skipped, failed }` counts
 are observation attempts, not approvals or answers; collection failures are reported. Concurrent
 passes share discovery and candidates retain per-request evaluation/dispatch serialization.
+The shared daemon initialization attaches the checked reply SDK and awaits successful persisted
+multipart owner-hold restoration before any startup, settings or explicit-RPC deputy recovery,
+inventory or observation. Deferred restoration cannot grant dispatch; failure refuses deputy
+work and a later attaching operation retries restoration. Only a missing optional session file
+means no stored holds; unreadable/invalid files and malformed multipart identities fail closed,
+and a repaired file can be re-read. Ordinary owner delivery retains its failure path.
+Inventory writes the existing idempotent exact question/ticket/parts journal entry
+before observing, so later authenticated answers and overrides remain ticket-bound source
+evidence; discovery never manufactures owner answers.
 Off mode evaluates nothing. Current-policy recovery freshly verifies pending identity, sources,
 trust and settings; old-version refusals/selections do not block eligible fresh evaluation.
 The full grace and checked once-only delivery gates still apply. Terminal owner-resolved,
@@ -4669,6 +4678,12 @@ old extraction labels cannot silently restore urgency after this policy change.
 revision must match; mismatched receipt retries and stale or reconciled sources reject without
 delivery. Legacy callers may omit `sourceId` but must still supply the exact revision. Refresh
 and choose again after a change.
+
+Independent comments on a Needs-you/manual sub-issue do **not** inherit the description's agent
+route. Unless they are the actual tracked wait source, answers remain scoped comments only:
+an identical `Yes` label cannot consent to a different live question. The original tracked
+source retains its established live/continuation route.
+
 `answers` maps question keys to exact option labels or free text, and answers like an
 `@paseo` reply: to the live agent that asked through the checked relay path (its pending question is
 answered, else the text is a prompt), else a continuation agent on the ticket (the answer is its
@@ -4677,14 +4692,23 @@ continuation cannot start now (no free agent slot, blockers, a start or a proces
 hand-over held), the answer joins the wait line instead of failing: the plugin opens a thread on
 the ticket that waits with the answer as its message, exactly like an `@paseo` thread that could
 not start (see *Waiting their turn*), and the menu bar shows `queued` with the reason. `done:
-true` completes a `paseo-manual` issue and a "Needs you" sub-issue and moves them to Done; on a
+true` completes a `paseo-manual` issue and a "Needs you" sub-issue only when no other independent
+source remains unsettled; unknown/unclassified history blocks whole-issue completion. An ordinary
+answer settles its selected source only. Completion after the last confirmed source answer also
+checks the other sources' receipts or cited reconciliation; it does not invent bulk answers.
+The shared reply arbiter, including receipt recovery, leaves completion for the durable
+`owner-ask:` namespace to this source-aware inbox path. On a
 parent ticket it only records the comment and leaves the state to the agent, whose next turn settles
 the wait. Every answer records "Answered from the decision inbox: …" on the issue. The durable ledger
 binds each action to its source revision and exact answer/scope. An exact retry returns its recorded
 result instead of repeating delivery, including after a restart. An unconfirmed delivery is never
 replayed automatically; its error asks the owner to inspect the ticket or agent. A delivered answer,
-including a queued continuation, fences that unchanged source across unrelated timeline or
-extraction revisions. A genuinely changed source returns; independent questions are not suppressed.
+including a queued continuation, fences an unchanged material source scope across unrelated timeline
+or extraction revisions. Scope includes title, parent/ticket identity, source kind and enclosing
+description as well as the source text. Changed business scope requires a fresh explicit answer,
+even when its question words are unchanged; independent questions are not suppressed. Legacy
+body-only receipts cannot approve another revision and retain only conservative unknown-delivery
+fences across revisions.
 Unknown delivery remains fenced across context/extraction changes and cannot be resent by
 changing an answer, source ID or action.
 Failures throw a sentence the menu bar shows.

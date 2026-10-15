@@ -270,6 +270,11 @@ export default function contribute(server: PluginServerContext) {
   const deputyDirectory = DEPUTY_DIRECTORY();
   const deputy = new Deputy({
     settings, log: decisions, linear, sessions,
+    ready: async () => {
+      if (!attachedPaseo) throw new Error("No daemon connection for owner-question restoration.");
+      replies.attach(attachedPaseo);
+      await restoreOwnerHolds();
+    },
     readers: hostReaders({ linear, log: decisions, home: paseoHome(), directory: deputyDirectory, template: async () => (await settings.read()).template ?? DEFAULT_PROMPT_TEMPLATE }),
     evaluate: (input, model) => evaluateWithOmp(input, model, deputyDirectory),
     directory: deputyDirectory,
@@ -523,13 +528,22 @@ export default function contribute(server: PluginServerContext) {
       .catch((error: unknown) => console.error("[linear-tickets] steward control pass failed:", error))
       .finally(() => { stewardRun = null; });
   };
+  const restoreOwnerHolds = (): Promise<void> => {
+    if (!holdSeed) {
+      const seed = sessions.seedHolds();
+      holdSeed = seed;
+      void seed.catch(() => { if (holdSeed === seed) holdSeed = null; });
+    }
+    return holdSeed;
+  };
+  let recoveredReplyEffects = false;
   const attach = (paseo: PaseoApi) => {
     const first = !attached;
     attached = true;
     attachedPaseo = paseo;
     replies.attach(paseo);
-    holdSeed ??= sessions.seedHolds();
-    void holdSeed.then(() => {
+    const ready = restoreOwnerHolds();
+    void ready.then(() => {
       if (stopped) return;
       browserDecisions.start();
       if (!controlTimer) {
@@ -539,7 +553,10 @@ export default function contribute(server: PluginServerContext) {
       }
       asCaller("deputy", () => deputy.attach(paseo));
       asCaller("session-sweep", () => sessions.attach(paseo));
-      if (first) asCaller("session-sweep", () => { void replies.recoverEffects().catch((error: unknown) => console.error(`[linear-tickets] recovering permission reply effects failed: ${error instanceof Error ? error.message : error}`)); });
+      if (!recoveredReplyEffects) asCaller("session-sweep", () => {
+        recoveredReplyEffects = true;
+        void replies.recoverEffects().catch((error: unknown) => console.error(`[linear-tickets] recovering permission reply effects failed: ${error instanceof Error ? error.message : error}`));
+      });
     }).catch((error: unknown) => console.error(`[linear-tickets] restoring owner question holds failed: ${error instanceof Error ? error.message : error}`));
     if (!stopped) {
       // The checked backend and the inbox frontdoor's private credential before the listener: a
@@ -560,6 +577,7 @@ export default function contribute(server: PluginServerContext) {
     asCaller("model-guard", () => modelGuard.attach(paseo));
     asCaller("plan-requests", () => planRequests.attach(paseo));
     void startAgent();
+    return ready;
   };
   const cacheIdentity = async () => {
     const connection = await credentials.read();
@@ -684,12 +702,12 @@ export default function contribute(server: PluginServerContext) {
   server.handle(getSettingsRpc, async () => settingsView(await settings.read()));
   server.handle(deputyStatusRpc, (input) => deputy.status(input));
   server.handle(reconcileDeputyRpc, async (_input, { paseo }) => {
-    deputy.attach(paseo);
+    await attach(paseo);
     return deputy.reconcile();
   });
   server.handle(setSettingsRpc, async (input, { paseo }) => {
     const saved = await settings.patch(input);
-    attach(paseo);
+    const ready = attach(paseo);
     if (input.dispatch) dispatcher.wake();
     const policyChanged = input.deputy !== undefined || input.template !== undefined;
     const revoked = policyChanged ? await deputy.settingsChanged() : [];
@@ -698,7 +716,10 @@ export default function contribute(server: PluginServerContext) {
       // claim. Dispatch requires both this audit and the revision-bound setting.
       await decisions.append({ kind: "deputy-activation", id: `settings:${randomUUID()}`, key: randomUUID(), at: new Date().toISOString(), policy: saved.deputy.standingPolicy, via: "settings-rpc", mode: saved.deputy.mode });
     }
-    if (policyChanged) await deputy.recheckPolicy(revoked, Boolean(input.deputy?.standingPolicy));
+    if (policyChanged) {
+      await ready;
+      await deputy.recheckPolicy(revoked, Boolean(input.deputy?.standingPolicy));
+    }
     return settingsView(saved);
   });
   server.handle(launchAgentRpc, async (input, { paseo }) => {

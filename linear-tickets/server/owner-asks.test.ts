@@ -10,7 +10,7 @@ import { answerText, askRoute, deliveryText, OwnerAsks, selectAskSources, type A
 import { answerAskRpc, ownerAsksRpc, triageAskRpc, type OwnerAsk } from "../shared/contracts";
 import type { BrowserOwnerAsk } from "../shared/decision-inbox";
 import { checkExtraction, type ExtractInput, type Extraction } from "./owner-ask-extract";
-import type { DeliveryOrigin, DeliveryResult } from "./permission-replies";
+import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./permission-replies";
 
 const at = "2026-10-09T12:00:00.000Z";
 const NOW = Date.parse(at);
@@ -865,3 +865,97 @@ test("captured TUC-835 report excerpt with a query-string URL remains nonurgent 
   assert.deepEqual(snapshot.history, []);
   assert.deepEqual(h.events, []);
 });
+
+test("an independent Needs-you comment cannot consent to another live question with the same Yes label", async t => {
+  const production = "May I DROP the production database?";
+  const research = "May I investigate the staging fixture?";
+  const h = await setup({
+    issues: [issue({ description: `${production}\nYes / No` })],
+    comments: new Map([["i1", [comment("independent", `${research}\nYes / No`), comment("unanswered", "Which supplier contract applies?")]]]),
+    needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }],
+    agents: [{ id: "a1", status: "running", createdAt: at, issueId: "p1", pending: true }],
+    extraction: async input => ({ ok: true, value: { kind: "decision", summary: input.text, questions: [{ key: "q1", question: input.text.split("\n")[0], options: [{ label: "Yes", description: "" }, { label: "No", description: "" }], multiSelect: false }] } }),
+  });
+  t.after(() => h.ownerAsks.stop());
+  const pending = { id: "real-production-request", provider: "omp", name: "ask", kind: "question" as const,
+    input: { questions: [{ question: production, options: [{ label: "Yes" }, { label: "No" }] }] } };
+  const responses: unknown[] = [];
+  const replies = new PermissionReplies({ directory: join(h.directory, "replies"), daemon: async () => ({
+    respondToPermissionAndWait: async (_agent, id, response) => { assert.equal(id, pending.id); responses.push(response); },
+  }) });
+  let wholeIssueEffects = 0;
+  replies.recordEffects({
+    ownerAnswered: async () => {},
+    correctLate: async () => ({ delivered: false, reply: "" }),
+    needsYou: async () => { wholeIssueEffects++; },
+  });
+  t.after(() => replies.stop());
+  const paseo = { agents: { list: h.paseo.agents.list, ref: () => ({ refresh: async () => ({ agent: { pendingPermissions: [pending] } }) }) } } as unknown as PaseoApi;
+  h.deps.deliver = (sdk, agent, message, origin) => replies.deliver(sdk, agent, message, origin);
+  await untilAsync(async () => (await h.ownerAsks.snapshot(paseo)).asks.every(ask => ask.extracted));
+  const independent = (await h.ownerAsks.snapshot(paseo)).asks.find(ask => ask.sourceId === "independent")!;
+  assert.equal((await h.ownerAsks.answer({ issueId: "i1", sourceId: independent.sourceId, revision: independent.revision, answers: { q1: "Yes" } }, paseo)).delivered, "comment");
+  assert.deepEqual(responses, [], "no daemon consent from an independently scoped comment");
+  assert.match(h.events.find(event => event.startsWith("comment ")) ?? "", /Source ID: independent/);
+  const description = await untilAsk(h, ask => ask.sourceId === "description" && ask.extracted);
+  await h.ownerAsks.answer({ issueId: "i1", sourceId: "description", revision: description.revision, answers: { q1: "Yes" } }, paseo);
+  assert.equal(responses.length, 1, "the legitimate original source still reaches its live request");
+  await replies.recoverEffects();
+  assert.equal(wholeIssueEffects, 0, "shared reply recovery must not close the whole issue by agent affinity");
+  assert.deepEqual(h.events.filter(event => /^(complete|needsYou.remove) /.test(event)), []);
+  assert.deepEqual((await h.ownerAsks.snapshot(paseo)).asks.map(ask => ask.sourceId), ["unanswered"]);
+});
+
+test("answering one Needs-you source leaves independent requests visible and closes only after the final answer", async t => {
+  const h = await setup({ issues: [issue()], comments: new Map([["i1", [comment("business", "Which contracted quantity?")]]]),
+    needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }] });
+  t.after(() => h.ownerAsks.stop());
+  await untilAsync(async () => (await h.ownerAsks.snapshot(null)).asks.every(ask => ask.extracted));
+  const first = (await h.ownerAsks.snapshot(null)).asks.find(ask => ask.sourceId === "business")!;
+  await h.ownerAsks.answer({ issueId: "i1", sourceId: "business", revision: first.revision, answers: { q1: "You or the team" } }, null);
+  assert.deepEqual(h.events.filter(event => /^(complete|needsYou.remove) /.test(event)), []);
+  const remaining = (await h.ownerAsks.snapshot(null)).asks;
+  assert.deepEqual(remaining.map(ask => ask.sourceId), ["description"]);
+  await h.ownerAsks.answer({ issueId: "i1", sourceId: "description", revision: remaining[0].revision, answers: { q1: "Agent does it" } }, null);
+  assert.deepEqual(new Set(h.events.filter(event => /^(complete|needsYou.remove) /.test(event))), new Set(["complete i1", "needsYou.remove i1"]));
+  assert.equal((await h.ownerAsks.snapshot(null)).history.length, 2, "two real answers, not a bulk ledger completion");
+});
+
+test("an unclassified independent source blocks whole-issue completion even when the owner answers another part", async t => {
+  const h = await setup({ issues: [issue()], comments: new Map([["i1", [comment("unknown", "Historical context not yet classified")]]]),
+    needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }] });
+  t.after(() => h.ownerAsks.stop());
+  const extract = h.state.extraction;
+  h.state.extraction = input => input.context?.sourceId === "unknown" ? Promise.resolve({ ok: false, reason: "unclassified history" }) : extract(input);
+  const original = await inputFor(h);
+  await assert.rejects(h.ownerAsks.answer({ ...original, done: true }, null), /independent|unsettled/i);
+  await h.ownerAsks.answer(original, null);
+  assert.deepEqual(h.events.filter(event => /^(complete|needsYou.remove) /.test(event)), []);
+  assert.equal((await h.ownerAsks.snapshot(null)).asks.find(ask => ask.sourceId === "unknown")?.extracted, false);
+});
+
+for (const legacy of [false, true]) for (const change of ["title", "parent"] as const) {
+  test(`${legacy ? "legacy body-only" : "scoped"} answered-source receipt cannot approve a changed ${change}`, async t => {
+    const h = await setup({ issues: [issue({ title: "Staging rollout", description: "Approve this rollout?", labels: [] })] });
+    t.after(() => h.ownerAsks.stop());
+    const first = await inputFor(h);
+    await h.ownerAsks.answer(first, null);
+    if (legacy) {
+      const path = join(h.directory, "decisions.json");
+      const ledger = JSON.parse(await readFile(path, "utf8")) as { records: Record<string, { sourceScope?: string }> };
+      for (const record of Object.values(ledger.records)) delete record.sourceScope;
+      await writeFile(path, JSON.stringify(ledger));
+    }
+    h.state.issues[0] = { ...h.state.issues[0], ...(change === "title" ? { title: "Production rollout" } : { title: "Needs you: Staging rollout", parentId: "production", parentIdentifier: "TUC-PROD" }) };
+    const reloaded = new OwnerAsks(h.deps);
+    t.after(() => reloaded.stop());
+    assert.equal((await reloaded.snapshot(null)).asks.length, 1, "an old answer is not authority for the changed business scope");
+    let current: BrowserOwnerAsk | undefined;
+    await untilAsync(async () => { current = (await reloaded.snapshot(null)).asks.find(ask => ask.extracted); return current !== undefined; });
+    assert.notEqual(current!.revision, first.revision);
+    await reloaded.answer(first, null);
+    assert.equal(h.events.filter(event => event.startsWith("comment ")).length, 1, "an exact old receipt replay never delivers into the changed scope");
+    await reloaded.answer({ issueId: "i1", sourceId: "description", revision: current!.revision, answers: { q1: "You or the team" } }, null);
+    assert.equal(h.events.filter(event => event.startsWith("comment ")).length, 2, "the new material scope needs its own explicit answer");
+  });
+}

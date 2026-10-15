@@ -212,7 +212,21 @@ export class SessionStore {
 
   // One shared read: two concurrent first loads would each replace the map and drop the other's writes.
   private load(): Promise<Record<string, SessionLink>> {
-    return this.loading ??= readFile(this.path, "utf8").then((text) => JSON.parse(text) as Record<string, SessionLink>, () => ({})).then((links) => (this.links = links));
+    return this.loading ??= readFile(this.path, "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return "{}";
+      throw error;
+    }).then((text) => {
+      const links: unknown = JSON.parse(text);
+      if (!links || typeof links !== "object" || Array.isArray(links) || Object.values(links).some(link => !link || typeof link !== "object" || Array.isArray(link))) throw new Error("Invalid persisted agent session links");
+      for (const link of Object.values(links) as SessionLink[]) {
+        if (link.closed !== undefined && typeof link.closed !== "boolean") throw new Error("Invalid persisted agent session closed flag");
+        if (link.closed || link.questions === undefined || link.questions === null) continue;
+        if (typeof link.agentId !== "string" || !link.agentId.trim() || typeof link.questions !== "object" || Array.isArray(link.questions)
+          || typeof link.questions.requestId !== "string" || !link.questions.requestId.trim()
+          || (link.questions.request !== undefined && link.questions.request.id !== link.questions.requestId)) throw new Error("Invalid persisted multipart owner question");
+      }
+      return this.links = links as Record<string, SessionLink>;
+    }).catch((error: unknown) => { this.loading = null; throw error; });
   }
 
   private persist(): Promise<void> {

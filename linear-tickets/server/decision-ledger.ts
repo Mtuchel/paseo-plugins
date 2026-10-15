@@ -8,6 +8,8 @@ const decisionRecordSchema = z.object({
   receipt: decisionReceiptSchema,
   sourceId: z.string().optional(),
   sourceHash: z.string().optional(),
+  // Material title/parent/ticket/source scope, independent of unrelated timeline progress.
+  sourceScope: z.string().optional(),
   result: z.object({ delivered: z.enum(["agent", "continued", "queued", "comment", "closed", "local"]), message: z.string() }).nullable(),
   disposition: z.enum(["research", "delegated", "deferred"]).nullable(),
   deferredUntil: z.string().datetime().nullable(),
@@ -50,10 +52,11 @@ export class DecisionLedger {
     return Object.values(this.records).reverse().find((record) => record.receipt.issueId === issueId && record.receipt.revision === revision);
   }
 
-  // A later unrelated timeline event must not resurrect an explicitly answered source or
-  // bypass an unknown delivery. Edits/new source IDs still require a fresh explicit decision.
-  forSource(issueId: string, sourceId: string, sourceHash: string): DecisionRecord | undefined {
-    return Object.values(this.records).reverse().find(record => record.receipt.issueId === issueId && record.sourceId === sourceId && record.sourceHash === sourceHash);
+  // Never carry consent across material scope changes. Legacy body-only receipts can
+  // conservatively retain an unknown-delivery fence, but cannot approve another revision.
+  forSource(issueId: string, sourceId: string, sourceHash: string, sourceScope: string): DecisionRecord | undefined {
+    return Object.values(this.records).reverse().find(record => record.receipt.issueId === issueId && record.sourceId === sourceId && record.sourceHash === sourceHash
+      && (record.sourceScope === sourceScope || (record.sourceScope === undefined && record.result === null)));
   }
 
   history(): DecisionReceipt[] {

@@ -10,7 +10,7 @@ import { evidenceSummary, shadowEvidence } from "./deputy-evidence";
 import { policyVersion, type EvaluationInput, type Verdict } from "./deputy-evaluator";
 import { gatherSources, verifyCitation, type Source, type SourceReaders } from "./deputy-sources";
 import type { LinearService } from "./linear";
-import { logQuietly, type Citation, type DecisionLog, type LogEntry } from "./owner-decisions";
+import { logQuietly, questionEntry, type Citation, type DecisionLog, type LogEntry } from "./owner-decisions";
 import { hasLabel, planPolicy } from "./plan-policy";
 import { questionKey, questionsOf } from "./relay";
 import type { PluginSettings, Settings } from "./settings";
@@ -126,6 +126,8 @@ type Deps = {
   readers: SourceReaders;
   evaluate(input: EvaluationInput, model: string): Promise<Verdict>;
   arbiter?: () => Promise<PermissionArbiter | null>;
+  // No recovery, inventory or newly observed request may outrun persisted owner holds.
+  ready?: () => Promise<void>;
   directory?: string;
   now?: () => number;
 };
@@ -258,6 +260,7 @@ export class Deputy {
     if (request.kind !== "question" || this.stopped) return;
     const { mode } = (await this.deps.settings.read()).deputy;
     if (mode === "off") return;
+    await this.deps.ready?.();
     const key = `${agent.id}:${request.id}`;
     const at = new Date(this.now()).toISOString();
     const created = await this.change((store) => {
@@ -310,6 +313,8 @@ export class Deputy {
             if (agent.archivedAt || agent.status === "closed" || !issueId || !identifier || !agent.cwd) { result.skipped++; continue; }
             for (const request of agent.pendingPermissions ?? []) {
               if (request.kind !== "question") { result.skipped++; continue; }
+              const entry = questionEntry(agent.id, request, { id: issueId, identifier }, new Date(this.now()).toISOString());
+              if (entry) await this.deps.log.append(entry);
               await this.observe({ id: agent.id, cwd: agent.cwd, title: agent.title }, request, { issueId, identifier });
               result.observed++;
             }
@@ -703,6 +708,7 @@ export class Deputy {
   // After a reload: candidates continue where they were, checked against the requests that are
   // actually pending. An interrupted dispatch is never submitted again.
   private async recover(restartKeys?: ReadonlySet<string>, standingActivation = false): Promise<void> {
+    await this.deps.ready?.();
     const settings = await this.deps.settings.read();
     const version = settings.deputy.model ? policyVersion(settings.deputy.model) : "no-evaluator";
     let refusals: Map<string, Extract<LogEntry, { kind: "deputy-refusal" }>> | undefined;

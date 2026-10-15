@@ -1306,6 +1306,57 @@ for (const entry of ["startup", "activation"] as const) {
   });
 }
 
+test("startup inventory journals the exact question once and authenticated owner correction remains future source evidence", async t => {
+  const h = await standingHarness(t);
+  await h.settle();
+  h.daemon.inventory = true;
+  await Promise.all([h.deputy.reconcile(), h.deputy.reconcile()]);
+  await h.settle();
+  const entries = await h.log.entries();
+  assert.deepEqual(entries.filter(entry => entry.kind === "question").map(entry => ({ ...entry, at: "captured" })), [{
+    kind: "question", id: "a1:r1", at: "captured", issueId: "i1", identifier: "TUC-1",
+    questions: [
+      { key: "Runner", question: "Runner: Which test runner should the new module's tests use?", options: ["node:test", "vitest"] },
+      { key: "Comment", question: "Comment: Optional comment", options: [] },
+    ],
+  }]);
+  assert.equal(entries.some(entry => entry.kind === "owner-answer"), false, "inventory is not an owner answer");
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal((await h.deputy.correctLate("a1", "r1", "Owner hold: do not switch runners until the current release is complete.", {
+    activityId: "owner-correction", via: "linear-comment", userId: OWNER,
+  })).delivered, true);
+  await h.deputy.reconcile();
+  const sources = await gatherSources(readers({ ownerAnswers: () => h.log.entries() }), { ...asked, id: "later-agent:later-request", text: "xyzzy" }, null);
+  assert.equal(sources.abstain, null);
+  assert.ok(sources.sources.some(source => source.kind === "owner-answer" && source.decisive && source.text === "Owner hold: do not switch runners until the current release is complete."));
+  assert.equal((await h.log.entries()).filter(entry => entry.kind === "question").length, 1);
+  assert.equal((await h.log.entries()).filter(entry => entry.kind === "owner-answer").length, 0);
+});
+
+test("observation and recovery cannot evaluate until persisted owner holds are successfully restored", async t => {
+  const h = await standingHarness(t);
+  await h.settle();
+  const gate = signal();
+  let fail = true;
+  const deputy = new Deputy({ ...h.deps, ready: async () => { await gate.promise; if (fail) throw new Error("owner hold restore failed"); } });
+  t.after(() => deputy.stop());
+  deputy.attach(h.paseo);
+  const observed = deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  const rejected = assert.rejects(observed, /owner hold restore failed/);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(await readCandidates(h.directory), {});
+  assert.deepEqual(h.calls, []);
+  gate.resolve();
+  await rejected;
+  await deputy.idle();
+  assert.deepEqual(await readCandidates(h.directory), {});
+  fail = false;
+  await deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await deputy.idle();
+  assert.equal((await h.candidate()).status, "waiting");
+});
+
 async function standingHarness(t: TestContext, audit = true) {
   const checked = arbiter();
   const h = await harness(t, { mode: "live", standingPolicy: AUTONOMY_POLICY_REVISION }, { arbiter: checked.value });

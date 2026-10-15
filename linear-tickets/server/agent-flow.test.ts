@@ -261,6 +261,38 @@ test("seedHolds restores only nonclosed multipart vetoes from disk before deputy
   assert.equal(restarted.calls.filter((call) => call.startsWith("checked ")).length, 1);
 });
 
+for (const invalid of ["unreadable", "malformed-json", "invalid-root", "invalid-closed", "missing-request-id", "mismatched-request-id"] as const) {
+  test(`persisted ${invalid} owner holds fail closed and a repaired file can restore exact owner priority`, async t => {
+    const h = routerHarness([twoPart], {}, [], true);
+    t.after(h.cleanup);
+    await mkdir(h.directory, { recursive: true });
+    const questions = { requestId: twoPart.id, request: twoPart, index: 1, answers: { transfer: "SFTP" } };
+    const persisted = { ...link, questions };
+    if (invalid === "unreadable") await mkdir(h.store.path);
+    else await writeFile(h.store.path, invalid === "malformed-json" ? "{" : JSON.stringify(
+      invalid === "invalid-root" ? [] : { s1: invalid === "invalid-closed" ? { ...persisted, closed: "true" }
+        : invalid === "missing-request-id" ? { ...persisted, questions: { index: 1, answers: {} } }
+        : { ...persisted, questions: { ...questions, requestId: "other" } } }));
+    await assert.rejects(h.router.seedHolds());
+    assert.deepEqual(h.calls.filter(call => call.startsWith("checked ")), []);
+    await rm(h.store.path, { recursive: true, force: true });
+    await writeFile(h.store.path, JSON.stringify({ s1: persisted }));
+    await h.router.seedHolds();
+    const response: AgentPermissionResponse = { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } };
+    assert.equal(await h.replies.respond({ agentId: "a1", requestId: twoPart.id, fingerprint: fingerprint(twoPart), intentId: `D-${invalid}`, canSubmit: () => true, response }), "owner-first");
+    assert.deepEqual(h.calls.filter(call => call.startsWith("checked ")), []);
+  });
+}
+
+test("an absent optional session file does not invent an owner hold", async t => {
+  const h = routerHarness([twoPart], {}, [], true);
+  t.after(h.cleanup);
+  await h.router.seedHolds();
+  const response: AgentPermissionResponse = { behavior: "allow", updatedInput: { answers: { transfer: "Mail", format: "XML", Comment: "" } } };
+  assert.equal(await h.replies.respond({ agentId: "a1", requestId: twoPart.id, fingerprint: fingerprint(twoPart), intentId: "D-no-session", canSubmit: () => true, response }), "applied");
+  assert.equal(h.calls.filter(call => call.startsWith("checked ")).length, 1);
+});
+
 test("a new question cannot discard multipart progress or receive its old answer, and the old hold is released", async (t) => {
   const newer: AgentPermissionRequest = { ...twoPart, id: "newer", input: { questions: [{ question: "Deploy?", header: "deploy", options: [{ label: "Yes" }, { label: "No" }] }] } };
   const pending = [twoPart];
