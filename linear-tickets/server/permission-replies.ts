@@ -74,6 +74,7 @@ export class PermissionReplies implements PermissionArbiter {
   private readonly now: () => number;
   private storeQueue: Promise<unknown> = Promise.resolve();
   private readonly flights = new Map<string, Promise<ReplyRecord>>();
+  private readonly effectFlights = new Map<string, Promise<ReplyRecord>>();
   private readonly lanes = new Map<string, Promise<unknown>>();
   // Unbound text must finish replay lookup and request selection before a deputy can pass
   // its final fence. Waiting for admission (not vetoing on it) avoids an old replay blocking Q2.
@@ -89,7 +90,13 @@ export class PermissionReplies implements PermissionArbiter {
     this.now = deps.now ?? Date.now;
   }
   recordEffects(effects: Effects): void { this.effects = effects; }
-  stop(): void { this.stopped = true; }
+  async stop(): Promise<void> {
+    this.stopped = true;
+    // Finish already-started work before a replacement instance can write this ledger.
+    // Flights reaching finish after this fence cannot start another effect.
+    await Promise.allSettled([...this.flights.values(), ...this.effectFlights.values()]);
+    await this.storeQueue;
+  }
   holdForOwner(agentId: string, requestId: string): void { this.holds.add(`${agentId}:${requestId}`); }
   releaseOwner(agentId: string, requestId: string): void { this.holds.delete(`${agentId}:${requestId}`); }
   async available(): Promise<PermissionArbiter | null> { return !this.stopped && await this.daemon() ? this : null; }
@@ -103,7 +110,7 @@ export class PermissionReplies implements PermissionArbiter {
     const run = async () => {
       const records = await this.records();
       const cutoff = this.now() - KEEP_MS;
-      for (const [ref, record] of Object.entries(records)) if (Date.parse(record.at) < cutoff && !this.flights.has(ref)) delete records[ref];
+      for (const [ref, record] of Object.entries(records)) if (Date.parse(record.at) < cutoff && !this.flights.has(ref) && !this.effectFlights.has(ref)) delete records[ref];
       const result = work(records);
       await mkdir(this.directory, { recursive: true, mode: 0o700 });
       const temp = `${this.path}.${randomUUID()}.tmp`;
@@ -163,7 +170,8 @@ export class PermissionReplies implements PermissionArbiter {
     if (running) return this.result(await running);
     const known = (await this.records())[ref];
     if (!known) return null;
-    return this.result(await this.single(ref, async () => this.finish(await this.replay(known))));
+    if (this.stopped) return this.result(known);
+    return this.result(await this.single(ref, async () => this.receipt(await this.replay(known))));
   }
 
   // Claims in the session store can outlive a crash before evidence/needs-you completion.
@@ -175,18 +183,25 @@ export class PermissionReplies implements PermissionArbiter {
       const delivered = record.status === "applied" || record.status === "unchecked" || record.status === "sent" || (record.status === "deputy-first" && record.correctionDelivered);
       if ((record.status === "applied" && record.responder.kind === "owner" && !record.effects.evidence)
         || (record.status === "deputy-first" && !record.effects.correction)
-        || (delivered && !record.effects.needsYou)) await this.recorded(record.ref);
+        || (delivered && !record.effects.needsYou)) {
+        // Receipt lookup no longer waits for bookkeeping. Recovery must join the
+        // effect flight itself, including when a delivery is still recording its receipt.
+        const running = this.flights.get(record.ref);
+        if (running) await running;
+        await this.finish(record);
+      }
     }
   }
 
   deliver(paseo: PaseoApi, agentId: string, message: string, origin: DeliveryOrigin, bound?: BoundAnswer): Promise<DeliveryResult> {
+    if (this.stopped) return Promise.reject(new Error("the plugin unloaded before sending"));
     // A bound multipart final answer takes over its hold synchronously before any disk work.
     const key = bound ? `${agentId}:${bound.requestId}` : null;
     if (key) this.owners.set(key, (this.owners.get(key) ?? 0) + 1);
     const admitted = key || this.flights.has(origin.ref) ? () => {} : this.admit(agentId);
     const work = this.single(origin.ref, async () => {
       const known = (await this.records())[origin.ref];
-      if (known) { admitted(); return this.finish(await this.replay(known)); }
+      if (known) { admitted(); return this.receipt(await this.replay(known)); }
       let record = await this.save({ ...this.base(origin.ref, agentId, message, origin.responder, origin.issueId), intent: origin.intent });
       const handle = paseo.agents.ref(agentId);
       const pending = bound ? [] : (await handle.refresh())?.agent.pendingPermissions ?? [];
@@ -217,7 +232,7 @@ export class PermissionReplies implements PermissionArbiter {
           record = await this.save({ ...record, status: "sent" });
         } catch (error) { record = await this.save({ ...record, status: "unconfirmed", reason: reasonOf(error) }); }
       }
-      return this.finish(record);
+      return this.receipt(record);
     });
     return work.then((record) => this.result(record)).finally(() => { admitted(); if (key) this.leaveOwner(key); });
   }
@@ -227,6 +242,7 @@ export class PermissionReplies implements PermissionArbiter {
   }
 
   async respond(input: Parameters<PermissionArbiter["respond"]>[0]): Promise<ArbitratedOutcome> {
+    if (this.stopped) throw new Error("the plugin unloaded before submitting the answer");
     const ref = `deputy:${input.intentId}`;
     const record = await this.single(ref, async () => {
       const known = (await this.records())[ref];
@@ -289,15 +305,28 @@ export class PermissionReplies implements PermissionArbiter {
   private paseo: PaseoApi | null = null;
   attach(paseo: PaseoApi): void { this.paseo = paseo; }
 
+  private receipt(record: ReplyRecord): ReplyRecord | Promise<ReplyRecord> {
+    // Only a durable checked receipt is independent of bookkeeping. A late
+    // correction still needs finish() to establish whether it was delivered.
+    if (record.status !== "applied") return this.finish(record);
+    void this.finish(record).catch((error: unknown) => {
+      console.error(`[linear-tickets] completing effects after ${record.ref} failed; a replay completes them: ${reasonOf(error)}`);
+    });
+    return record;
+  }
+
   // Effects are outside the submission lane: deputy dispatch holds its candidate lane while
   // waiting for respond(). Replaying uses only this stored Q1 data, never current Q2 state.
   // A failed effect never changes what happened to the answer: it is logged, its flag stays
   // unset, and a replay of the same activity completes it.
-  private async finish(original: ReplyRecord): Promise<ReplyRecord> {
-    return this.lane(`effects:${original.ref}`, async () => {
+  private finish(original: ReplyRecord): Promise<ReplyRecord> {
+    const running = this.effectFlights.get(original.ref);
+    if (running) return running;
+    if (this.stopped) return Promise.resolve(original);
+    const result = Promise.resolve().then(async () => {
       let record = (await this.records())[original.ref] ?? original;
       const effects = this.effects;
-      if (!effects) return record;
+      if (!effects || this.stopped) return record;
       const attempt = async (name: string, work: () => Promise<void>) => {
         try { await work(); }
         catch (error) { console.error(`[linear-tickets] ${name} after ${record.ref} (${record.status}) failed; a replay completes it: ${reasonOf(error)}`); }
@@ -309,7 +338,7 @@ export class PermissionReplies implements PermissionArbiter {
           record = await this.save({ ...record, effects: { ...record.effects, evidence: true } });
         });
       }
-      if (!record.intent && record.status === "deputy-first" && !record.effects.correction) {
+      if (!this.stopped && !record.intent && record.status === "deputy-first" && !record.effects.correction) {
         const responder = record.responder;
         await attempt("passing on the owner's correction", async () => {
           const correction = responder.kind === "owner"
@@ -319,7 +348,7 @@ export class PermissionReplies implements PermissionArbiter {
         });
         if (!record.effects.correction) record = { ...record, reply: "The deputy had already answered this question, and your correction could not be passed on. Tell the agent directly." };
       }
-      if (!record.intent && !record.effects.needsYou && (record.status === "applied" || record.status === "unchecked" || record.status === "sent" || (record.status === "deputy-first" && record.correctionDelivered))) {
+      if (!this.stopped && !record.intent && !record.effects.needsYou && (record.status === "applied" || record.status === "unchecked" || record.status === "sent" || (record.status === "deputy-first" && record.correctionDelivered))) {
         await attempt("closing the Needs you sub-issue", async () => {
           await effects.needsYou(record.agentId, record.issueId);
           record = await this.save({ ...record, effects: { ...record.effects, needsYou: true } });
@@ -327,6 +356,10 @@ export class PermissionReplies implements PermissionArbiter {
       }
       return record;
     });
+    this.effectFlights.set(original.ref, result);
+    const clear = () => { if (this.effectFlights.get(original.ref) === result) this.effectFlights.delete(original.ref); };
+    void result.then(clear, clear);
+    return result;
   }
   private result(record: ReplyRecord): DeliveryResult {
     const status = record.status === "reserved" || record.status === "submitted" || record.status === "owner-first" ? "unconfirmed" : record.status === "revoked" ? "rejected" : record.status;

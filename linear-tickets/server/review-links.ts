@@ -201,6 +201,10 @@ const ResolveRequest = z.object({ entryId: z.string().min(1).max(200), action: z
 const RecheckRequest = z.object({ reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
 const DeleteRequest = z.object({ identifier: z.string(), reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
 const ErrorAnswer = z.object({ error: z.string(), outcomeUnknown: z.boolean().optional() });
+type PeerInboxSnapshot = { peer: string; host: string; pipeline: HostPipeline } & (
+  | { backendInstanceId?: string; open: InboxRow[]; decided: InboxRow[]; applying: InboxRow[] }
+  | { unreachable: true; applying: InboxRow[] }
+);
 
 // A peer's rows; a row this inbox could not render is left out, not the whole peer.
 function peerRows(rows: unknown[], host: string, backendInstanceId?: string): InboxRow[] {
@@ -257,6 +261,8 @@ export class ReviewLinks {
   private readonly misses = new Map<string, number>();
   // The peer each listed review belongs to, from the last inbox load: where its decision goes.
   private readonly peerOf = new Map<string, { origin: string; backendInstanceId?: string }>();
+  private readonly peerSnapshots = new Map<string, { value: PeerInboxSnapshot; at: number }>();
+  private readonly peerReads = new Map<string, Promise<void>>();
   private readonly port: number;
   private readonly file: string;
   private readonly sweepMs: number;
@@ -533,7 +539,7 @@ export class ReviewLinks {
   async announce(): Promise<void> {
     if (!this.origin) return;
     const origin = this.origin;
-    const view = await this.view();
+    const view = await this.view(true);
     await this.push.announce(view.open.map((row) => ({
       key: `${row.agentId}@${row.since}`,
       title: `Plan review: ${row.name}`,
@@ -725,14 +731,20 @@ export class ReviewLinks {
 
   private async forward(agentId: string, operation: string, body: { backendInstanceId?: string; [field: string]: unknown }): Promise<void> {
     let peer = this.peerOf.get(agentId);
-    if (!peer) { await this.view(); peer = this.peerOf.get(agentId); }
+    if (!peer) { await this.view(true); peer = this.peerOf.get(agentId); }
     if (!peer) throw new DecisionError(404, "This review is not listed any more.");
     const displayed = body.backendInstanceId;
     if (!displayed || displayed !== peer.backendInstanceId) throw new DecisionError(409, "The target inbox backend is missing or changed since this page was displayed; no action was forwarded. Reload the page.");
+    this.peerSnapshots.delete(peer.origin);
+    this.peerReads.delete(peer.origin);
     const response = await fetch(`${peer.origin}/api/reviews/${encodeURIComponent(agentId)}/${operation}`, {
       method: "POST", headers: { "content-type": "application/json", "x-review-action": "1", [INBOX_DISPLAYED_HEADER]: displayed },
       body: JSON.stringify(body), signal: AbortSignal.timeout(60_000), redirect: "error",
-    }).catch((error: unknown) => { throw new DecisionError(502, `${new URL(peer.origin).hostname} did not answer; the action's outcome is unknown: ${error instanceof Error ? error.message : error}`, true); });
+    }).catch((error: unknown) => { throw new DecisionError(502, `${new URL(peer.origin).hostname} did not answer; the action's outcome is unknown: ${error instanceof Error ? error.message : error}`, true); })
+      .finally(() => {
+        this.peerSnapshots.delete(peer.origin);
+        this.peerReads.delete(peer.origin);
+      });
     if (response.ok) return;
     const answer = ErrorAnswer.safeParse(await response.json().catch(() => null));
     throw new DecisionError(response.status, answer.success ? answer.data.error : `${new URL(peer.origin).hostname} answered HTTP ${response.status}.`, answer.success && answer.data.outcomeUnknown === true);
@@ -810,22 +822,46 @@ export class ReviewLinks {
     }
   }
 
-  // This host's rows plus every peer's; a peer that does not answer is named, not fatal.
-  private async view(): Promise<InboxView> {
-    const own = await this.rows();
+  private async readPeerInbox(peer: string): Promise<PeerInboxSnapshot> {
+    try {
+      const response = await fetch(`${peer}/api/inbox`, { signal: AbortSignal.timeout(PEER_TIMEOUT_MS) });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const answer = PeerInbox.parse(await response.json());
+      const status = PipelineHost.safeParse(answer.pipeline);
+      const pipeline: HostPipeline = status.success
+        ? { ...status.data, host: answer.host, rows: status.data.rows.map((row) => ({ ...row, host: answer.host })) }
+        : { host: answer.host, checkedAt: null, lastArrivalAt: null, rows: [], error: "Plan monitoring is unavailable on this host." };
+      return { peer, host: answer.host, backendInstanceId: answer.backendInstanceId, open: peerRows(answer.open, answer.host, answer.backendInstanceId), decided: peerRows(answer.decided, answer.host, answer.backendInstanceId), applying: peerRows(answer.applying ?? [], answer.host, answer.backendInstanceId), pipeline };
+    } catch { return this.unavailablePeer(peer); }
+  }
+
+  private unavailablePeer(peer: string) {
+    return { peer, host: peerName(peer), unreachable: true as const, applying: [], pipeline: {
+      host: peerName(peer), checkedAt: null, lastArrivalAt: null, rows: [],
+      error: "Host unavailable or refreshing; plan progress is unknown.",
+    } satisfies HostPipeline };
+  }
+
+  // The frontdoor captures review and decision views together. A slow review peer must not
+  // delay decision receipts or local inbox reads. Expired peer rows are withheld, not actionable.
+  private async view(waitForPeers = false): Promise<InboxView> {
     const peers = await this.peers().catch(() => []);
-    const answers = await Promise.all(peers.map(async (peer) => {
-      try {
-        const response = await fetch(`${peer}/api/inbox`, { signal: AbortSignal.timeout(PEER_TIMEOUT_MS) });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const answer = PeerInbox.parse(await response.json());
-        const status = PipelineHost.safeParse(answer.pipeline);
-        const pipeline: HostPipeline = status.success
-          ? { ...status.data, host: answer.host, rows: status.data.rows.map((row) => ({ ...row, host: answer.host })) }
-          : { host: answer.host, checkedAt: null, lastArrivalAt: null, rows: [], error: "Plan monitoring is unavailable on this host." };
-        return { peer, host: answer.host, backendInstanceId: answer.backendInstanceId, open: peerRows(answer.open, answer.host, answer.backendInstanceId), decided: peerRows(answer.decided, answer.host, answer.backendInstanceId), applying: peerRows(answer.applying ?? [], answer.host, answer.backendInstanceId), pipeline };
-      } catch { return { peer, host: peerName(peer), unreachable: true as const, applying: [], pipeline: { host: peerName(peer), checkedAt: null, lastArrivalAt: null, rows: [], error: "Host unreachable; plan progress is unknown." } satisfies HostPipeline }; }
-    }));
+    for (const peer of peers) {
+      const cached = this.peerSnapshots.get(peer);
+      if (this.peerReads.has(peer) || (cached && this.now().getTime() - cached.at < 30_000)) continue;
+      const read = this.readPeerInbox(peer).then(value => {
+        if (this.peerReads.get(peer) === read) this.peerSnapshots.set(peer, { value, at: this.now().getTime() });
+      }).finally(() => { if (this.peerReads.get(peer) === read) this.peerReads.delete(peer); });
+      this.peerReads.set(peer, read);
+    }
+    // Notifications and cold action discovery need complete coverage; interactive
+    // snapshots publish whichever hosts have finished without waiting.
+    if (waitForPeers) await Promise.all(peers.map(peer => this.peerReads.get(peer)));
+    const own = await this.rows();
+    const answers = peers.map(peer => {
+      const cached = this.peerSnapshots.get(peer);
+      return cached && this.now().getTime() - cached.at < 30_000 ? cached.value : this.unavailablePeer(peer);
+    });
     const open = [...own.open];
     const decided = [...own.decided];
     const applying = [...own.applying];

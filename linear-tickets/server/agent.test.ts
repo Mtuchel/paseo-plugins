@@ -297,7 +297,7 @@ function harness(options: { owner?: (issueId: string) => Promise<"here" | "elsew
   if (options.groups || options.manual) Object.assign(router, { paseo });
   else if (options.attach ?? true) router.attach(paseo);
   router.stop();
-  return { router, store, replies, answered, calls, paseo, directory, cleanup: () => rm(directory, { recursive: true, force: true }) };
+  return { router, store, replies, answered, calls, paseo, directory, cleanup: async () => { await replies.stop(); await rm(directory, { recursive: true, force: true }); } };
 }
 
 const link = (change: Partial<SessionLink> = {}): SessionLink => ({ sessionId: "s1", agentId: "agent-1", issueId: "i1", identifier: "TUC-1", createdAt: "2026-01-01T00:00:00Z", handled: [], review: null, offer: null, ...change });
@@ -810,6 +810,7 @@ test("a mention to a running agent that waits on a question answers it, like a r
   const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ question: "Format?", header: "Response", options: [{ label: "CSV" }] }] } };
   const h = harness({ activeAgent: { id: "agent-1", title: "TUC-1: Fix" }, pending: [question], checked: true });
   await h.router.created({ id: "s3", creatorId: OWNER, issueId: "i1", issue: { identifier: "TUC-1" }, comment: { body: "@paseo csv" } });
+  await h.replies.recoverEffects();
   assert.equal(h.calls[0], `checked q ${JSON.stringify({ behavior: "allow", updatedInput: { answers: { Response: "CSV" } } })}`);
   assert.deepEqual(h.answered.map(({ agentId, request, activity }) => `${agentId} ${request.id} ${activity.via} ${activity.activityId} ${activity.userId}`), [`agent-1 q linear-session s3 ${OWNER}`]);
   await h.cleanup();
@@ -830,6 +831,7 @@ test("session question outcomes show durable rejection or uncertainty and count 
     await h.store.put(link());
     const activity = { id: "answer-1", userId: OWNER, body: "csv" };
     await h.router.prompted("s1", activity);
+    await h.replies.recoverEffects();
     assert.equal(h.answered.length, item.evidence, item.error ?? "confirmed");
     if (item.reply) assert.ok(h.calls.some((call) => item.reply!.test(call)), JSON.stringify(h.calls));
     else {
@@ -856,6 +858,7 @@ test("session replies without an author remain allowed but unattributed, and a n
     t.after(h.cleanup);
     await h.store.put(link());
     await h.router.prompted("s1", { id: "answer-1", userId, body: "CSV" });
+    await h.replies.recoverEffects();
     assert.deepEqual(h.answered, []);
     assert.equal(h.calls.filter((call) => call.startsWith("checked ")).length, userId === "someone-else" ? 0 : 1);
     if (userId === "someone-else") assert.ok(h.calls.includes("error:Only the workspace owner can steer Paseo agents."));
@@ -893,6 +896,7 @@ test("queued session answers retain verified authors or a stable unverified orig
       await patch(sessionId, change);
     });
     await h.router.startQueued();
+    await h.replies.recoverEffects();
     assert.equal(h.calls.filter((call) => call.startsWith("checked ")).length, 1);
     assert.equal(h.answered.length, pendingFrom?.userId ? 1 : 0);
     const firstOrigin = deliveries.mock.calls[0].arguments[3];
@@ -1023,6 +1027,7 @@ test("needs-you completion follows confirmed session outcomes, including a deliv
     t.after(h.cleanup);
     await h.store.put(link({ issueId: "sub-1" }));
     await h.router.prompted("s1", { id: "answer-1", userId: OWNER, body: "CSV" });
+    await h.replies.recoverEffects();
     assert.equal((await needsYou.all()).length, error ? 1 : 0);
     assert.equal(h.calls.includes("complete sub-1"), !error);
   }

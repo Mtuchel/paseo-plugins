@@ -226,7 +226,11 @@ class Frontdoor implements InboxFrontdoor {
     if (this.flight) return this.flight;
     const now = Date.now();
     const probeDue = now - this.lastProbeAt >= this.probeMs;
-    const snapshotDue = !this.fresh || now - this.lastSnapshotAt >= this.refreshMs;
+    // Partial host coverage is a live snapshot, not a backend outage. Recheck it soon so
+    // completed background peer reads are published before their own cache expires.
+    const incomplete = this.cache?.snapshot.inbox.unreachable.length || this.cache?.snapshot.decisions.unreachable.length;
+    const refreshMs = incomplete ? Math.min(this.refreshMs, MIN_SNAPSHOT_GAP_MS) : this.refreshMs;
+    const snapshotDue = !this.fresh || now - this.lastSnapshotAt >= refreshMs;
     if (!probeDue && !snapshotDue) return;
     const flight = (async () => {
       if (probeDue) {
@@ -236,7 +240,7 @@ class Frontdoor implements InboxFrontdoor {
         this.state = probe;
         if (probe.state !== "ready" || changed || probe.instanceId !== this.cache?.snapshot.instanceId) this.fresh = false;
       }
-      if (this.state.state !== "ready" || this.fresh && Date.now() - this.lastSnapshotAt < this.refreshMs) return;
+      if (this.state.state !== "ready" || this.fresh && Date.now() - this.lastSnapshotAt < refreshMs) return;
       if (!force && Date.now() - this.lastSnapshotAttemptAt < MIN_SNAPSHOT_GAP_MS) return;
       this.lastSnapshotAttemptAt = Date.now();
       const snapshot = await this.fetchSnapshot();

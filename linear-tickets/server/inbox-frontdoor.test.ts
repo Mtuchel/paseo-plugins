@@ -173,6 +173,31 @@ function withFrontdoor(fake: Fake, run: (frontdoor: InboxFrontdoor, directory: s
   })();
 }
 
+test("partial peer coverage is republished before the normal snapshot cache expires", async t => {
+  let clock = 1_000_000;
+  t.mock.method(Date, "now", () => clock);
+  const fake = await fakeBackend();
+  let complete = false;
+  fake.settings.hold = (request, response) => {
+    if (request.path !== "/_inbox/snapshot") return false;
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+      protocolVersion: 1, instanceId: fake.settings.instance, capturedAt: new Date().toISOString(),
+      inbox: { ...inboxView(), unreachable: complete ? [] : ["slow-review-host"] },
+      decisions: { ...decisionView(), unreachable: complete ? [] : ["slow-decision-host"] },
+    }));
+    return true;
+  };
+  await withFrontdoor(fake, async frontdoor => {
+    const initial = jsonBody((await call(frontdoor.port, "GET", "/api/decisions")).text);
+    assert.deepEqual(initial.unreachable, ["slow-decision-host"]);
+    complete = true;
+    clock += 5_000;
+    const refreshed = jsonBody((await call(frontdoor.port, "GET", "/api/decisions")).text);
+    assert.deepEqual(refreshed.unreachable, []);
+    assert.equal((await readAvailability(frontdoor.port)).readOnly, false);
+  }, { refreshMs: 30_000, probeDeadlineMs: 10_000, snapshotDeadlineMs: 10_000 });
+});
+
 test("close drains an admitted snapshot read before its cache can be removed", async () => {
   const fake = await fakeBackend();
   let captured!: (response: ServerResponse) => void;
