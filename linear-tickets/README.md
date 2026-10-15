@@ -3338,7 +3338,8 @@ No tokens, query bodies or ticket text appear in the report.
   cover.
 - **Menu-bar owner reads reuse Linear sources for at most 60 seconds.** Its 15-second refresh
   still reads current local agent state and decision receipts. Only the paginated owner issue
-  inventory and matching comment batches are shared across polls; failures are never cached.
+  inventory and matching comment batches are shared across polls; each comment request covers
+  up to 25 issues instead of 10, still paging every issue to completion. Failures are never cached.
   Browser owner collections bypass this cache. Answer and triage actions re-read Linear before
   delivery and invalidate the cache afterward; completion revalidates before closing a ticket.
 - **Review card metadata refreshes every 15 minutes per identifier.** The label catalog still

@@ -955,7 +955,7 @@ export const OWNER_ASKS_BY_ID_QUERY = `query ownerAskIssuesById($ids: [ID!]!, $f
   }
 }`;
 // Every comment page, newest first, batched across issues without truncating older asks.
-export const OWNER_ASK_COMMENT_BATCH = 10;
+export const OWNER_ASK_COMMENT_BATCH = 25;
 export const OWNER_ASK_COMMENTS = 50;
 export function ownerAskCommentsQuery(count: number): string {
   const indexes = Array.from({ length: count }, (_, index) => index);
