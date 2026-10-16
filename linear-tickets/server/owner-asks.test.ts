@@ -1088,3 +1088,72 @@ test("completed-answer cleanup cannot remove a replacement owner registration af
   assert.equal(h.continued.length, 1);
   assert.deepEqual(h.events.filter(event => event.startsWith("complete ")), ["complete i1"], "old exact retries do not complete reopened owner work");
 });
+
+for (const action of ["answer", "Done", "research"] as const) {
+  for (const fault of ["unreadable blocker", "invalid asking agent", "numeric selected generation", "array blocker generation"] as const) {
+    test(`${action} checks strict registration authority before effects with a matching display revision: ${fault}`, async t => {
+      const h = await setup({ issues: [issue()], agents: [{ id: "a1", status: "running", createdAt: at, issueId: "p1" }] });
+      t.after(() => h.ownerAsks.stop());
+      const directory = join(h.directory, "needs-you");
+      await mkdir(directory, { mode: 0o700 });
+      const selected = { id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1", registrationId: "selected-generation" };
+      const blocker = { id: "other", identifier: "TUC-OTHER", parentId: "other-parent", agentId: "other-agent", registrationId: "blocker-generation" };
+      await writeFile(join(directory, "i1.json"), JSON.stringify(fault === "invalid asking agent" ? { ...selected, agentId: 42 }
+        : fault === "numeric selected generation" ? { ...selected, registrationId: 42 } : selected));
+      const blockerPath = join(directory, "other.json");
+      if (fault === "unreadable blocker") await mkdir(blockerPath);
+      else await writeFile(blockerPath, JSON.stringify(fault === "array blocker generation" ? { ...blocker, registrationId: ["blocker-generation"] } : blocker));
+      h.deps.needsYou = new NeedsYouIssues(directory);
+      // Use the actual resilient background display while the fault is present: rejection
+      // must come from authority verification, not a revision manufactured before corruption.
+      const input = { ...await inputFor(h), sourceId: "description", ...(action === "Done" ? { done: true } : {}) };
+      const invoke = (current: AnswerAskInput) => action === "research"
+        ? h.ownerAsks.triage({ issueId: current.issueId, sourceId: current.sourceId, revision: current.revision, action: "research", note: "Collect evidence only; do not decide or close." }, h.paseo)
+        : h.ownerAsks.answer(current, h.paseo);
+      let refusal: unknown;
+      try { await invoke(input); } catch (error) { refusal = error; }
+      assert.deepEqual({ delivered: h.delivered.length, continued: h.continued.length, queued: h.queued.length, effects: h.events },
+        { delivered: 0, continued: 0, queued: 0, effects: [] }, "invalid tracking must stop before answer dispatch, completion, cleanup or receipt posting");
+      assert.ok(refusal, "a matching display revision cannot authorize an unreadable or invalid registration");
+      await rm(blockerPath, { recursive: true, force: true });
+      await writeFile(blockerPath, JSON.stringify(blocker));
+      await writeFile(join(directory, "i1.json"), JSON.stringify(selected));
+      const repaired = { ...await inputFor(h), sourceId: "description", ...(action === "Done" ? { done: true } : {}) };
+      if (fault === "numeric selected generation") {
+        assert.notEqual(repaired.revision, input.revision);
+        await assert.rejects(invoke(input), /ask changed/, "repair of material identity still requires the current displayed revision");
+      } else assert.equal(repaired.revision, input.revision, "nonmaterial record repair permits retrying the exact original request");
+      const result = await invoke(repaired);
+      assert.equal(result.delivered, action === "Done" ? "closed" : "agent");
+      assert.equal(h.delivered.length, action === "Done" ? 0 : 1);
+      assert.deepEqual(h.events.filter(event => event.startsWith("complete ")), action === "research" ? [] : ["complete i1"]);
+    });
+  }
+}
+
+test("Done rechecks strict tracking before whole-issue completion after the first authority read succeeds", async t => {
+  const h = await setup({ issues: [issue()] });
+  t.after(() => h.ownerAsks.stop());
+  const directory = join(h.directory, "needs-you");
+  const tracking = new NeedsYouIssues(directory);
+  await tracking.add({ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" });
+  h.deps.needsYou = tracking;
+  const input = { ...await inputFor(h), sourceId: "description", done: true };
+  const strict = tracking.allStrict.bind(tracking);
+  let introduceFault = true;
+  tracking.allStrict = async () => {
+    const registered = await strict();
+    if (introduceFault) {
+      introduceFault = false;
+      await writeFile(join(directory, "other.json"), JSON.stringify({ id: "other", identifier: "TUC-OTHER", parentId: "other-parent", agentId: "other-agent", registrationId: 42 }));
+    }
+    return registered;
+  };
+  let refusal: unknown;
+  try { await h.ownerAsks.answer(input, h.paseo); } catch (error) { refusal = error; }
+  assert.equal(h.events.length, 0, "a registration invalidated between authority reads must stop before Linear completion");
+  assert.ok(refusal);
+  await rm(join(directory, "other.json"), { force: true });
+  assert.equal((await h.ownerAsks.answer(input, h.paseo)).delivered, "closed");
+  assert.deepEqual(h.events.filter(event => event.startsWith("complete ")), ["complete i1"]);
+});

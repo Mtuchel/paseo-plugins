@@ -503,7 +503,7 @@ export class OwnerAsks {
       : await this.cachedIssues();
     const issues = issueId ? inventory.filter(issue => issue.id === issueId) : inventory;
     const [needsYou, labels, agents] = await Promise.all([
-      fresh ? this.deps.needsYou.allStrict() : this.deps.needsYou.all(),
+      issueId || fresh ? this.deps.needsYou.allStrict() : this.deps.needsYou.all(),
       this.deps.labels(),
       this.agentIndex(paseo),
     ]);

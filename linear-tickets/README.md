@@ -4738,9 +4738,11 @@ issue's replacement registration is not deleted. Registration and checked remova
 mutation lane, and fresh registrations receive a new identity even when issue, parent, agent and
 question text are unchanged. That identity participates in the material source scope, so the
 replacement cannot inherit old consent. Legacy completion progress without a saved tracking
-identity cannot remove an existing registration without verification. Fresh answer/completion
-authority reads the strict tracking inventory; unreadable or invalid records fail closed.
-This does not invent bulk answers.
+identity cannot remove an existing registration without verification. Every issue-specific answer,
+Done and triage collection, plus fresh completion collection, reads the strict tracking inventory
+before dispatch or completion; unreadable or invalid records fail closed. Only background display
+uses tolerant tracking reads. Repairing invalid tracking permits retry, but material identity
+changes still require a fresh source revision. This does not invent bulk answers.
 The shared reply arbiter, including receipt recovery, leaves completion for the durable
 `owner-ask:` namespace to this source-aware inbox path. On a
 parent ticket it only records the comment and leaves the state to the agent, whose next turn settles
