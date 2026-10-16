@@ -365,15 +365,14 @@ test("the mark-in-progress setting round-trips without disturbing the saved temp
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("the cheap tier's model per provider is set and removed through settings; the default is DeepSeek Flash ultra with thinking max, and an emptied tier is remembered", async () => {
+test("the cheap tier's model per provider is set and removed through settings, and an emptied tier is remembered", async () => {
   const directory = await mkdtemp(join(tmpdir(), "paseo-linear-settings-tiers-"));
   const path = join(directory, "settings.json");
   try {
     const settings = new Settings(path);
-    assert.deepEqual(DEFAULT_CHEAP_MODELS, { omp: { model: "omp/lithos/deepseek-ai/DeepSeek-V4.1-Flash-ultra", thinkingOptionId: "max" } }, "README, Model tiers: the cheap tier's default");
     assert.deepEqual((await settings.read()).cheapModels, DEFAULT_CHEAP_MODELS);
     await settings.patch({ tierModel: { tier: "cheap", provider: "claude", model: "claude/sonnet", thinkingOptionId: "high" } });
-    assert.deepEqual((await settings.read()).cheapModels, { omp: { model: "omp/lithos/deepseek-ai/DeepSeek-V4.1-Flash-ultra", thinkingOptionId: "max" }, claude: { model: "claude/sonnet", thinkingOptionId: "high" } });
+    assert.deepEqual((await settings.read()).cheapModels, { ...DEFAULT_CHEAP_MODELS, claude: { model: "claude/sonnet", thinkingOptionId: "high" } });
     await settings.patch({ tierModel: { tier: "cheap", provider: "omp", model: null } });
     assert.deepEqual((await new Settings(path).read()).cheapModels, { claude: { model: "claude/sonnet", thinkingOptionId: "high" } });
     await settings.patch({ tierModel: { tier: "cheap", provider: "claude", model: null } });

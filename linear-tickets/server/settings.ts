@@ -13,11 +13,11 @@ export type LaunchPreference = { model: string; modeId?: string; thinkingOptionI
 // A lower model tier's model per provider (README, "Model tiers"); a provider without one
 // implements plans of that tier on its launch model.
 export type TierModel = { model: string; thinkingOptionId?: string };
-// The cheap tier's default: DeepSeek V4.1 Flash Ultra through the Lithos account, thinking max
+// The cheap tier's default: DeepSeek V4.1 Flash through the Lithos account, thinking max
 // (2026-10-15). It replaced `omp/deepseek/deepseek-flash` after the measured comparison (equal
 // tool-error rate, ~$0.003–0.01 per edit against Opus's $0.27); the official DeepSeek API stays the
 // fallback through omp's `retry.fallbackChains` (host config, model-guard.ts excludes those).
-export const DEFAULT_CHEAP_MODELS: Record<string, TierModel> = { omp: { model: "omp/lithos/deepseek-ai/DeepSeek-V4.1-Flash-ultra", thinkingOptionId: "max" } };
+export const DEFAULT_CHEAP_MODELS: Record<string, TierModel> = { omp: { model: "omp/lithos/deepseek-ai/DeepSeek-V4.1-Flash", thinkingOptionId: "max" } };
 // Auto-dispatch starts an agent for every open ticket carrying `label` in one of `teamKeys`,
 // whoever it is assigned to. No teams means nothing is dispatched, even when enabled.
 // `maxRunning`: at most this many ticket agents work at once (0 = no limit); others wait their turn.

@@ -55,9 +55,9 @@ extension({
 } as never);
 
 const OPUS = { provider: "anthropic", id: "claude-opus-5-5" };
-const FLASH = { provider: "lithos", id: "deepseek-ai/DeepSeek-V4.1-Flash-ultra" };
+const FLASH = { provider: "lithos", id: "deepseek-ai/DeepSeek-V4.1-Flash" };
 const SOL = { provider: "openai-codex", id: "gpt-6.1-sol" };
-const CHAIN = { value: { "anthropic/claude-opus-5-5": ["openai-codex/gpt-6.1-sol:high", "lithos/deepseek-ai/DeepSeek-V4.1-Flash-ultra:max", "openai-codex/arbitrary:high"] } };
+const CHAIN = { value: { "anthropic/claude-opus-5-5": ["openai-codex/gpt-6.1-sol:high", "lithos/deepseek-ai/DeepSeek-V4.1-Flash:max", "openai-codex/arbitrary:high"] } };
 const store = new AcceptanceTestsStore(acceptanceTestsDirectory(root));
 
 async function write(path: string, model: typeof OPUS, kind?: string, level = "max") {

@@ -13,7 +13,7 @@ import { AcceptanceTestsStore, acceptanceTestsDirectory } from "./acceptance-tes
 // the rules themselves and the store's own behavior.
 
 const OPUS = { provider: "anthropic", id: "claude-opus-5-5" };
-const FLASH = { provider: "lithos", id: "deepseek-ai/DeepSeek-V4.1-Flash-ultra" };
+const FLASH = { provider: "lithos", id: "deepseek-ai/DeepSeek-V4.1-Flash" };
 const SPEC = "omp/anthropic/claude-opus-5-5";
 const TESTS: AcceptanceTests = { identifier: "TUC-7", paths: ["server/report.test.ts", "client/report.test.tsx"] };
 
@@ -89,7 +89,7 @@ test("isStrongModel needs the launch's own model, and a launch that recorded non
 
 test("only the configured owner-approved Sol/high substitute gains strong test-writing authority", () => {
   const sol = { provider: "openai-codex", id: "gpt-6.1-sol" };
-  const chains = { "anthropic/claude-opus-5-5": ["openai-codex/gpt-6.1-sol:high", "lithos/deepseek-ai/DeepSeek-V4.1-Flash-ultra:max", "openai-codex/arbitrary:high"] };
+  const chains = { "anthropic/claude-opus-5-5": ["openai-codex/gpt-6.1-sol:high", "lithos/deepseek-ai/DeepSeek-V4.1-Flash:max", "openai-codex/arbitrary:high"] };
   const input = { path: "server/report.test.ts" };
   const blocked = (model: typeof OPUS, thinking: string | undefined, configured = chains) =>
     blockedTestWrite(TESTS, "write", input, model, SPEC, { chains: configured, thinking });
