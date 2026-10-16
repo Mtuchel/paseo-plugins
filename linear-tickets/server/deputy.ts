@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { AUTONOMY_POLICY_REVISION } from "../shared/autonomy-policy";
@@ -93,7 +94,7 @@ export function overrideCommand(message: string): { ref: string; text: string } 
 
 export function fingerprint(request: AgentPermissionRequest): string {
   // Provider routing and custom-answer capability are part of the action.
-  // Old fingerprints fail closed; current-version predictions get fresh evidence.
+  // Legacy pending candidates migrate only after a fresh full raw-request match.
   if (request.kind !== "question") return createHash("sha256").update(JSON.stringify(request)).digest("hex").slice(0, 24);
   return createHash("sha256").update(JSON.stringify({ kind: request.kind, title: request.title ?? "", description: request.description ?? "", input: request.input, provider: request.provider, name: request.name, metadata: request.metadata })).digest("hex").slice(0, 24);
 }
@@ -684,7 +685,7 @@ export class Deputy {
     return candidate.status === "refused" && RETRYABLE_REFUSALS[candidate.refusalCategory ?? ""] === true;
   }
 
-  private async stillPending(candidate: Candidate): Promise<boolean> {
+  private async stillPending(candidate: Candidate, requireRawMatch = false): Promise<boolean> {
     if (this.revoked.has(candidate.key)) return false;
     let entries: LogEntry[];
     try {
@@ -709,7 +710,7 @@ export class Deputy {
       await this.outcome(candidate, "resolved", "the request is no longer pending on the linked agent");
       return false;
     }
-    if (fingerprint(pending) !== candidate.fingerprint) {
+    if (fingerprint(pending) !== candidate.fingerprint || (requireRawMatch && !isDeepStrictEqual(pending, candidate.request))) {
       await this.outcome(candidate, "canceled", "the request changed since it was observed");
       return false;
     }
@@ -791,14 +792,22 @@ export class Deputy {
           const revokedHere = current.status === "canceled" && restartKeys?.has(current.key)
             && ["the deputy settings changed", "the deputy settings changed during evaluation", "the deputy was switched off"].includes(current.reason ?? "");
           const newlyAuthorized = standingActivation && current.status === "blocked" && current.standing === true;
-          if (settings.deputy.mode !== "off" && (changedPolicy || revokedHere || newlyAuthorized)) {
+          // Recognize only the pre-capability question hash, never an arbitrary
+          // mismatch or terminal history. A fresh full raw match below also fences
+          // provider/metadata/input fields that the legacy hash did not cover.
+          const requestFingerprint = fingerprint(current.request);
+          const legacyFingerprint = ["refused", "predicted", "waiting", "evaluating", "blocked"].includes(current.status)
+            && current.request.kind === "question" && current.fingerprint !== requestFingerprint
+            && current.fingerprint === createHash("sha256").update(JSON.stringify({ kind: current.request.kind, title: current.request.title ?? "", description: current.request.description ?? "", questions: questionsOf(current.request) })).digest("hex").slice(0, 24);
+          if (settings.deputy.mode !== "off" && (changedPolicy || revokedHere || newlyAuthorized || legacyFingerprint)) {
             // Reevaluate exact still-pending requests after a policy/mode change
             // or this settings write's revocation/standing activation. Never
             // promote old selections, grace or intents; never revive arbitrary
             // canceled work, answered requests or interrupted dispatches.
             this.unschedule(current.key);
-            if (!await this.stillPending(current)) return;
-            await this.patch(current.key, { status: "evaluating", mode: settings.deputy.mode, observedAt: new Date(this.now()).toISOString(), version: undefined, eligible: false, standing: undefined, continuation: undefined, activation: undefined, selections: undefined, citations: undefined, evidenceFingerprint: undefined, graceDeadline: undefined, refusalCategory: undefined, retryAt: undefined, reason: undefined, intentId: undefined });
+            const rechecked = legacyFingerprint ? { ...current, fingerprint: requestFingerprint } : current;
+            if (!await this.stillPending(rechecked, legacyFingerprint)) return;
+            await this.patch(current.key, { status: "evaluating", fingerprint: rechecked.fingerprint, mode: settings.deputy.mode, observedAt: new Date(this.now()).toISOString(), version: undefined, eligible: false, standing: undefined, continuation: undefined, activation: undefined, selections: undefined, citations: undefined, evidenceFingerprint: undefined, graceDeadline: undefined, refusalCategory: undefined, retryAt: undefined, reason: undefined, intentId: undefined });
             this.background(this.lane(current.key, () => this.slot(() => this.evaluate(current.key))));
             return;
           }

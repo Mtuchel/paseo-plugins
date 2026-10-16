@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +8,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { AUTONOMY_POLICY_REVISION } from "../shared/autonomy-policy";
-import { Deputy, fingerprint, overrideCommand, readCandidates, type ArbitratedOutcome, type PermissionArbiter } from "./deputy";
+import { Deputy, fingerprint, overrideCommand, readCandidates, type ArbitratedOutcome, type Candidate, type PermissionArbiter } from "./deputy";
 import { checkVerdict, policyVersion, type EvaluationInput } from "./deputy-evaluator";
 import { TECHNICAL_CONTINUATION, TECHNICAL_CONTINUATION_TEMPLATE, supportsTechnicalContinuation, type TechnicalContinuation } from "./deputy-continuation";
 import { LIVE_MIN_CASES, shadowEvidence } from "./deputy-evidence";
@@ -2360,4 +2361,131 @@ test("continuation resolution echoes do not become another question's ticket con
   assert.equal(result.sources.some(source => source.id === `resolution:${id}` || source.id === `owner-answer:${id}`), false);
   const stats = waitStats([question, echo], { since: "2026-10-07T09:00:00Z", until: "2026-10-07T10:00:00Z" }, 1);
   assert.deepEqual([stats.resolved, stats.ownerAnswers, stats.unresolved], [0, 0, [id]]);
+});
+
+async function persistedLegacyContinuation(t: TestContext, status: Candidate["status"]) {
+  const h = await continuationHarness(t);
+  await h.settle();
+  h.deputy.stop();
+  const request = structuredClone(h.request);
+  const candidate: Candidate = {
+    key: `a1:${request.id}`, ref: "D-15a8b436", agentId: "a1", requestId: request.id,
+    issueId: "i1", identifier: "TUC-2108", agentTitle: h.agent.title, cwd: h.agent.cwd,
+    request, fingerprint: createHash("sha256").update(JSON.stringify({ kind: request.kind, title: request.title ?? "", description: request.description ?? "", questions: questionsOf(request) })).digest("hex").slice(0, 24),
+    mode: "live", observedAt: "2026-10-07T09:00:00Z", updatedAt: "2026-10-07T09:01:00Z",
+    status, version: "deputy-17-ticket-own-history/owner-autonomy-2026-10-15-v3/omp/test-model/high",
+    reason: "old verdict", refusalCategory: "no-knowledge", eligible: true, standing: true,
+    selections: { Response: "Agent: gebundener Astra-Recheck (Recommended)" }, citations: [],
+    evidenceFingerprint: "old-evidence", graceDeadline: "2026-10-07T09:05:00Z",
+    intentId: "discard-this-unsent-intent",
+  };
+  await writeFile(join(h.directory, "candidates.json"), JSON.stringify({ [candidate.key]: candidate }));
+  h.daemon.inventory = true;
+  const restart = () => {
+    const deputy = new Deputy(h.deps);
+    t.after(() => deputy.stop());
+    deputy.attach(h.paseo);
+    return deputy;
+  };
+  return { ...h, legacy: candidate, restart };
+}
+
+for (const status of ["refused", "waiting"] as const) {
+  test(`legacy fingerprint migration reevaluates persisted ${status} with fresh full grace before checked continuation`, async t => {
+    const h = await persistedLegacyContinuation(t, status);
+    let evaluations = 0;
+    const evaluate = h.deps.evaluate;
+    h.deps.evaluate = async (input, model) => {
+      evaluations++;
+      const cleared = await h.candidate();
+      assert.equal(cleared.intentId, undefined);
+      assert.equal(cleared.selections, undefined);
+      assert.equal(cleared.graceDeadline, undefined);
+      assert.notEqual(cleared.evidenceFingerprint, h.legacy.evidenceFingerprint);
+      return evaluate(input, model);
+    };
+    const restarted = h.restart();
+    await restarted.reconcile();
+    await restarted.idle();
+    const fresh = await h.candidate();
+    assert.equal(fresh.status, "waiting");
+    assert.equal(fresh.version, VERSION);
+    assert.equal(fresh.fingerprint, fingerprint(h.request));
+    assert.equal(fresh.graceDeadline, "2026-10-07T10:05:00.000Z");
+    assert.equal(evaluations, 1);
+    h.advance(5 * 60_000 - 1);
+    await restarted.idle();
+    assert.deepEqual(h.submitted, []);
+    h.advance(1);
+    await restarted.idle();
+    assert.deepEqual(h.submitted, [{ behavior: "allow", updatedInput: { answers: { Response: TECHNICAL_CONTINUATION } } }]);
+    assert.notEqual((await h.candidate()).intentId, h.legacy.intentId);
+    await restarted.reconcile();
+    await restarted.idle();
+    assert.equal(h.submitted.length, 1);
+    assert.equal(evaluations, 1);
+  });
+}
+
+for (const change of ["raw-input", "raw-envelope", "metadata", "provider", "gone", "already-answered", "unknown-hash"] as const) {
+  test(`legacy fingerprint migration refuses ${change} instead of treating it as an unchanged request`, async t => {
+    const h = await persistedLegacyContinuation(t, "waiting");
+    if (change === "raw-input") h.daemon.pending = [{ ...h.request, input: { ...h.request.input, undisplayedCapability: true } }];
+    if (change === "raw-envelope") h.daemon.pending = [Object.assign({ ...h.request }, { unrecognizedRouting: true })];
+    if (change === "metadata") h.daemon.pending = [{ ...h.request, metadata: { ...h.request.metadata, ompAsk: false } }];
+    if (change === "provider") h.daemon.pending = [{ ...h.request, provider: "unknown-provider" }];
+    if (change === "gone") h.daemon.pending = [];
+    if (change === "already-answered") await h.log.append({ kind: "owner-answer", id: h.legacy.key, at: "2026-10-07T09:59:00Z", key: "owner-already-answered", via: "menu-bar", userId: OWNER, answers: { Response: "Keep the release held" } });
+    if (change === "unknown-hash") await writeFile(join(h.directory, "candidates.json"), JSON.stringify({ [h.legacy.key]: { ...h.legacy, fingerprint: "unrecognized-hash" } }));
+    let evaluations = 0;
+    h.deps.evaluate = async () => { evaluations++; throw new Error("must not evaluate changed or unknown legacy request"); };
+    const restarted = h.restart();
+    await restarted.reconcile();
+    await restarted.idle();
+    h.advance(10 * 60_000);
+    await restarted.idle();
+    await restarted.observe(h.agent, h.daemon.pending[0] ?? h.request, { issueId: "i1", identifier: "TUC-2108" });
+    await restarted.idle();
+    assert.equal(evaluations, 0);
+    assert.equal((await h.candidate()).status, ["gone", "already-answered"].includes(change) ? "resolved" : "canceled");
+    assert.deepEqual(h.submitted, []);
+  });
+}
+
+for (const status of ["canceled", "applied", "resolved", "owner-answered", "owner-won", "unknown"] as const) {
+  test(`legacy fingerprint migration never resurrects terminal ${status}`, async t => {
+    const h = await persistedLegacyContinuation(t, status);
+    let evaluations = 0;
+    h.deps.evaluate = async () => { evaluations++; throw new Error("terminal candidate must not be reevaluated"); };
+    const restarted = h.restart();
+    await restarted.reconcile();
+    await restarted.idle();
+    h.advance(10 * 60_000);
+    await restarted.idle();
+    assert.equal((await h.candidate()).status, status);
+    assert.equal(evaluations, 0);
+    assert.deepEqual(h.submitted, []);
+  });
+}
+
+test("legacy fingerprint migration waits for owner-hold restoration and retains checked owner priority", async t => {
+  const h = await persistedLegacyContinuation(t, "waiting");
+  const restore = signal();
+  let restored = false;
+  let evaluations = 0;
+  const evaluate = h.deps.evaluate;
+  h.deps.ready = async () => { await restore.promise; h.replies.holdForOwner("a1", h.request.id); restored = true; };
+  h.deps.evaluate = async (input, model) => { assert.equal(restored, true); evaluations++; return evaluate(input, model); };
+  const restarted = h.restart();
+  await Promise.resolve();
+  assert.equal(evaluations, 0);
+  assert.equal((await h.candidate()).fingerprint, h.legacy.fingerprint);
+  restore.resolve();
+  await restarted.reconcile();
+  await restarted.idle();
+  assert.equal(evaluations, 1);
+  h.advance(5 * 60_000);
+  await restarted.idle();
+  assert.equal((await h.candidate()).status, "owner-won");
+  assert.deepEqual(h.submitted, []);
 });

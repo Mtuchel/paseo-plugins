@@ -4435,6 +4435,15 @@ refusal/prediction is reevaluated only after the exact unanswered request is fre
 old selections, citations, intent and grace are discarded. An equivalent new request ID retires
 the old candidate and gets fresh evaluation/grace, never a copied answer. Interrupted/unknown
 dispatches are never replayed. Unavailable sources/evaluators retry at most every five minutes.
+Pre-rollout unsent candidates using the known older question hash migrate only after a fresh
+daemon read verifies the same still-pending request ID on the linked agent and the **complete
+stored raw request** matches, including provider/name, metadata and custom-answer capability.
+Matching only the old hash is insufficient. Recovery discards the old verdict, evidence, dispatch
+intent and deadline, then reevaluates current policy with a full new grace period. Unknown hash
+formats, changed raw payloads and withdrawn or already-answered requests do not migrate.
+Terminal/applied/canceled history is not revived; interrupted dispatches retain their existing
+receipt-only settlement path. Persisted owner holds must be restored before recovery and still
+veto the checked submission.
 Dispatch fingerprints the complete evaluator input, including blocking-only sources. Changed
 input invalidates the prediction even if an old quotation remains. The pending-request fingerprint
 includes raw input, provider/name and metadata, so custom-answer capability changes also invalidate
