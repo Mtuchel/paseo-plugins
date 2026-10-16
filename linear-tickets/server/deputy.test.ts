@@ -2489,3 +2489,104 @@ test("legacy fingerprint migration waits for owner-hold restoration and retains 
   assert.equal((await h.candidate()).status, "owner-won");
   assert.deepEqual(h.submitted, []);
 });
+
+async function interruptedLegacyMigration(t: TestContext, status: "refused" | "waiting", outage: "refresh-null" | "refresh-throws" | "decision-log") {
+  const h = await persistedLegacyContinuation(t, status);
+  let unavailable = true;
+  const ref = h.paseo.agents.ref.bind(h.paseo.agents);
+  t.mock.method(h.paseo.agents, "ref", (...args: Parameters<typeof ref>) => {
+    const agent = ref(...args);
+    return { ...agent, refresh: async () => {
+      if (unavailable && outage === "refresh-null") return null;
+      if (unavailable && outage === "refresh-throws") throw new Error("daemon unavailable during migration");
+      return agent.refresh();
+    } };
+  });
+  const entries = h.log.entries.bind(h.log);
+  h.log.entries = async () => {
+    if (unavailable && outage === "decision-log") throw new Error("decision log unavailable during migration");
+    return entries();
+  };
+  let evaluations = 0;
+  const evaluate = h.deps.evaluate;
+  h.deps.evaluate = async (input, model) => { evaluations++; return evaluate(input, model); };
+  const restarted = h.restart();
+  await restarted.reconcile();
+  await restarted.idle();
+  const deferred = await h.candidate();
+  assert.equal(deferred.status, "refused");
+  assert.equal(deferred.refusalCategory, "source-unavailable");
+  assert.equal(deferred.fingerprint, h.legacy.fingerprint);
+  assert.equal(deferred.retryAt, "2026-10-07T10:05:00.000Z");
+  assert.equal(evaluations, 0);
+  assert.deepEqual(h.submitted, []);
+  return { ...h, restarted, evaluations: () => evaluations, repair: () => { unavailable = false; } };
+}
+
+for (const status of ["refused", "waiting"] as const) {
+  for (const outage of ["refresh-null", "refresh-throws", "decision-log"] as const) {
+    test(`legacy fingerprint migration retries ${status} after ${outage} with verified raw request and full new grace`, async t => {
+      const h = await interruptedLegacyMigration(t, status, outage);
+      h.repair();
+      h.advance(5 * 60_000 - 1);
+      await h.restarted.idle();
+      assert.equal(h.evaluations(), 0);
+      assert.equal((await h.candidate()).fingerprint, h.legacy.fingerprint);
+      h.advance(1);
+      await h.restarted.idle();
+      const fresh = await h.candidate();
+      assert.equal(fresh.status, "waiting");
+      assert.equal(fresh.fingerprint, fingerprint(h.request));
+      assert.equal(fresh.version, VERSION);
+      assert.equal(fresh.graceDeadline, "2026-10-07T10:10:00.000Z");
+      assert.equal(fresh.intentId, undefined);
+      assert.equal(h.evaluations(), 1);
+      h.advance(5 * 60_000 - 1);
+      await h.restarted.idle();
+      assert.deepEqual(h.submitted, []);
+      h.advance(1);
+      await h.restarted.idle();
+      assert.equal((await h.candidate()).status, "applied");
+      assert.notEqual((await h.candidate()).intentId, h.legacy.intentId);
+      assert.deepEqual(h.submitted, [{ behavior: "allow", updatedInput: { answers: { Response: TECHNICAL_CONTINUATION } } }]);
+      await h.restarted.reconcile();
+      h.advance(5 * 60_000);
+      await h.restarted.idle();
+      assert.equal(h.submitted.length, 1);
+      assert.equal(h.evaluations(), 1);
+    });
+  }
+}
+
+for (const boundary of ["raw-envelope", "metadata", "gone", "canceled", "answered"] as const) {
+  test(`legacy fingerprint migration retry preserves ${boundary} boundary after an unavailable initial check`, async t => {
+    const h = await interruptedLegacyMigration(t, "waiting", "refresh-null");
+    h.repair();
+    if (boundary === "raw-envelope") h.daemon.pending = [Object.assign({ ...h.request }, { unrecognizedRouting: true })];
+    if (boundary === "metadata") h.daemon.pending = [{ ...h.request, metadata: { ...h.request.metadata, ompAsk: false } }];
+    if (boundary === "gone") h.daemon.pending = [];
+    if (boundary === "canceled") await writeFile(join(h.directory, "candidates.json"), JSON.stringify({ [h.legacy.key]: { ...await h.candidate(), status: "canceled", reason: "owner canceled this work" } }));
+    if (boundary === "answered") await h.log.append({ kind: "owner-answer", id: h.legacy.key, at: "2026-10-07T10:04:00Z", key: "owner-answered-during-outage", via: "menu-bar", userId: OWNER, answers: { Response: "Keep the release held" } });
+    h.advance(5 * 60_000);
+    await h.restarted.idle();
+    h.advance(5 * 60_000);
+    await h.restarted.idle();
+    assert.equal((await h.candidate()).status, ["gone", "answered"].includes(boundary) ? "resolved" : "canceled");
+    assert.equal(h.evaluations(), 0);
+    assert.deepEqual(h.submitted, []);
+  });
+}
+
+test("legacy fingerprint migration retry retains owner hold restored during the outage", async t => {
+  const h = await interruptedLegacyMigration(t, "waiting", "decision-log");
+  h.repair();
+  h.replies.holdForOwner("a1", h.request.id);
+  h.advance(5 * 60_000);
+  await h.restarted.idle();
+  assert.equal((await h.candidate()).status, "waiting");
+  h.advance(5 * 60_000);
+  await h.restarted.idle();
+  assert.equal((await h.candidate()).status, "owner-won");
+  assert.equal(h.evaluations(), 1);
+  assert.deepEqual(h.submitted, []);
+});

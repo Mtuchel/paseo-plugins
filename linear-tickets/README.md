@@ -4441,6 +4441,10 @@ stored raw request** matches, including provider/name, metadata and custom-answe
 Matching only the old hash is insufficient. Recovery discards the old verdict, evidence, dispatch
 intent and deadline, then reevaluates current policy with a full new grace period. Unknown hash
 formats, changed raw payloads and withdrawn or already-answered requests do not migrate.
+If the daemon refresh or recorded-answer check is unavailable, recovery keeps the legacy
+fingerprint and records a retryable refusal; it never persists an unverified migration. The
+five-minute refusal retry repeats the same fresh complete-raw-request verification before
+migrating, discarding old evidence/intent/grace and starting a full new grace period.
 Terminal/applied/canceled history is not revived; interrupted dispatches retain their existing
 receipt-only settlement path. Persisted owner holds must be restored before recovery and still
 veto the checked submission.

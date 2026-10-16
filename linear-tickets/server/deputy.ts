@@ -401,6 +401,17 @@ export class Deputy {
     const generation = this.settingsGeneration;
     let candidate = (await this.readStore())[key];
     if (!candidate || this.stopped || (retry ? !this.retryable(candidate) : candidate.status !== "evaluating")) return;
+    // Refusal retries enter evaluation directly, without startup recovery.
+    // An interrupted legacy migration must repeat its full raw verification
+    // before the normal current-format freshness checks can run.
+    const legacyFingerprint = this.legacyFingerprint(candidate);
+    if (legacyFingerprint) {
+      const { mode } = (await this.deps.settings.read()).deputy;
+      if (mode === "off") { await this.patch(key, { status: "canceled", reason: "the deputy was switched off" }); return; }
+      const migrated = await this.resetEvaluation(candidate, mode, legacyFingerprint);
+      if (!migrated) return;
+      candidate = migrated;
+    }
     // A prior prediction's grace and retry category survive interrupted evaluation.
     // A refreshed answer must not borrow that earlier prediction's elapsed grace.
     const freshGrace = Boolean(candidate.graceDeadline) && RETRYABLE_REFUSALS[candidate.refusalCategory ?? ""] === true;
@@ -685,6 +696,24 @@ export class Deputy {
     return candidate.status === "refused" && RETRYABLE_REFUSALS[candidate.refusalCategory ?? ""] === true;
   }
 
+  private legacyFingerprint(candidate: Candidate): string | null {
+    // Recognize only the pre-capability question hash, never an arbitrary
+    // mismatch or terminal history. The caller must verify the complete raw
+    // request freshly before persisting the returned current-format hash.
+    if (!["refused", "predicted", "waiting", "evaluating", "blocked"].includes(candidate.status) || candidate.request.kind !== "question") return null;
+    const current = fingerprint(candidate.request);
+    if (candidate.fingerprint === current) return null;
+    const legacy = createHash("sha256").update(JSON.stringify({ kind: candidate.request.kind, title: candidate.request.title ?? "", description: candidate.request.description ?? "", questions: questionsOf(candidate.request) })).digest("hex").slice(0, 24);
+    return candidate.fingerprint === legacy ? current : null;
+  }
+
+  private async resetEvaluation(candidate: Candidate, mode: Candidate["mode"], nextFingerprint: string | null): Promise<Candidate | null> {
+    this.unschedule(candidate.key);
+    const rechecked = nextFingerprint ? { ...candidate, fingerprint: nextFingerprint } : candidate;
+    if (!await this.stillPending(rechecked, nextFingerprint !== null)) return null;
+    return this.patch(candidate.key, { status: "evaluating", fingerprint: rechecked.fingerprint, mode, observedAt: new Date(this.now()).toISOString(), version: undefined, eligible: false, standing: undefined, continuation: undefined, activation: undefined, selections: undefined, citations: undefined, evidenceFingerprint: undefined, graceDeadline: undefined, refusalCategory: undefined, retryAt: undefined, reason: undefined, intentId: undefined });
+  }
+
   private async stillPending(candidate: Candidate, requireRawMatch = false): Promise<boolean> {
     if (this.revoked.has(candidate.key)) return false;
     let entries: LogEntry[];
@@ -792,22 +821,13 @@ export class Deputy {
           const revokedHere = current.status === "canceled" && restartKeys?.has(current.key)
             && ["the deputy settings changed", "the deputy settings changed during evaluation", "the deputy was switched off"].includes(current.reason ?? "");
           const newlyAuthorized = standingActivation && current.status === "blocked" && current.standing === true;
-          // Recognize only the pre-capability question hash, never an arbitrary
-          // mismatch or terminal history. A fresh full raw match below also fences
-          // provider/metadata/input fields that the legacy hash did not cover.
-          const requestFingerprint = fingerprint(current.request);
-          const legacyFingerprint = ["refused", "predicted", "waiting", "evaluating", "blocked"].includes(current.status)
-            && current.request.kind === "question" && current.fingerprint !== requestFingerprint
-            && current.fingerprint === createHash("sha256").update(JSON.stringify({ kind: current.request.kind, title: current.request.title ?? "", description: current.request.description ?? "", questions: questionsOf(current.request) })).digest("hex").slice(0, 24);
+          const legacyFingerprint = this.legacyFingerprint(current);
           if (settings.deputy.mode !== "off" && (changedPolicy || revokedHere || newlyAuthorized || legacyFingerprint)) {
             // Reevaluate exact still-pending requests after a policy/mode change
             // or this settings write's revocation/standing activation. Never
             // promote old selections, grace or intents; never revive arbitrary
             // canceled work, answered requests or interrupted dispatches.
-            this.unschedule(current.key);
-            const rechecked = legacyFingerprint ? { ...current, fingerprint: requestFingerprint } : current;
-            if (!await this.stillPending(rechecked, legacyFingerprint)) return;
-            await this.patch(current.key, { status: "evaluating", fingerprint: rechecked.fingerprint, mode: settings.deputy.mode, observedAt: new Date(this.now()).toISOString(), version: undefined, eligible: false, standing: undefined, continuation: undefined, activation: undefined, selections: undefined, citations: undefined, evidenceFingerprint: undefined, graceDeadline: undefined, refusalCategory: undefined, retryAt: undefined, reason: undefined, intentId: undefined });
+            if (!await this.resetEvaluation(current, settings.deputy.mode, legacyFingerprint)) return;
             this.background(this.lane(current.key, () => this.slot(() => this.evaluate(current.key))));
             return;
           }
