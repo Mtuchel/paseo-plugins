@@ -4726,8 +4726,11 @@ hand-over held), the answer joins the wait line instead of failing: the plugin o
 the ticket that waits with the answer as its message, exactly like an `@paseo` thread that could
 not start (see *Waiting their turn*), and the menu bar shows `queued` with the reason. `done:
 true` completes a `paseo-manual` issue and a "Needs you" sub-issue only when no other independent
-source remains unsettled; unknown/unclassified history blocks whole-issue completion. An ordinary
-answer settles its selected source only. Completion after the last confirmed source answer also
+source remains unsettled. The completion read must also re-match the selected source's accepted
+revision, including registration identity and material scope: a same-ID replacement or edit
+requires fresh consent, not exclusion merely by source ID. Unknown/unclassified history blocks
+whole-issue completion. An ordinary answer settles its selected source only.
+Completion after the last confirmed source answer also
 checks the unchanged material source scope and other sources' receipts or cited reconciliation;
 posting that answer's own receipt does not count as a material source edit. Failed completion
 can retry its pending effect without reposting the answer. Successful completion is durably

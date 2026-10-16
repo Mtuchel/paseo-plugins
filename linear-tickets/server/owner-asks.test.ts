@@ -1157,3 +1157,58 @@ test("Done rechecks strict tracking before whole-issue completion after the firs
   assert.equal((await h.ownerAsks.answer(input, h.paseo)).delivered, "closed");
   assert.deepEqual(h.events.filter(event => event.startsWith("complete ")), ["complete i1"]);
 });
+
+for (const change of ["replacement generation", "body edit without timestamp change", "parent-only edit", "title-only edit"] as const) {
+  test(`Done rejects a selected source changed between authority reads: ${change}`, async t => {
+    const h = await setup({ issues: [issue()] });
+    t.after(() => h.ownerAsks.stop());
+    const tracking = new NeedsYouIssues(join(h.directory, "needs-you"));
+    const registration = { id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" };
+    await tracking.add(registration);
+    h.deps.needsYou = tracking;
+    h.deps.linear.complete = async id => {
+      h.events.push(`complete ${id}`);
+      h.state.issues = h.state.issues.filter(item => item.id !== id);
+    };
+    h.deps.linear.comment = async (id, body) => {
+      h.events.push(`comment ${id}`);
+      h.state.comments.set(id, [...h.state.comments.get(id) ?? [], comment(`receipt-${h.events.length}`, body)]);
+    };
+    const input = { ...await inputFor(h), sourceId: "description", done: true };
+    const strict = tracking.allStrict.bind(tracking);
+    const initial = await strict();
+    let replace = true;
+    tracking.allStrict = async () => {
+      const registered = await strict();
+      if (replace) {
+        replace = false;
+        // The initial admission receives A; the completion read must inspect the real B.
+        if (change === "replacement generation") await tracking.add(registration);
+        else h.state.issues = [issue(change === "body edit without timestamp change"
+          ? { description: `${issue().description}\n\nThe selected request now has a different business requirement.` }
+          : change === "parent-only edit" ? { parentId: "p2" } : { title: "Needs you: a different business scope" })];
+      }
+      return registered;
+    };
+    let refusal: unknown;
+    try { await h.ownerAsks.answer(input, h.paseo); } catch (error) { refusal = error; }
+    assert.deepEqual({ delivered: h.delivered.length, continued: h.continued.length, queued: h.queued.length, effects: h.events },
+      { delivered: 0, continued: 0, queued: 0, effects: [] }, "old consent cannot complete or dispatch a changed selected source");
+    assert.ok(refusal);
+    assert.equal(h.state.issues.some(item => item.id === "i1"), true, "replacement owner work must remain open");
+    const currentTracking = await strict();
+    if (change === "replacement generation") assert.notEqual(currentTracking[0]!.registrationId, initial[0]!.registrationId);
+    else assert.deepEqual(currentTracking, initial);
+    const visible = await untilAsk(h, ask => ask.sourceId === "description" && ask.extracted && ask.revision !== input.revision);
+    assert.equal(visible.attention, "owner");
+    assert.equal(visible.deliveryUnknown, false, "refusal must not reserve the old decision or conceal the new work");
+    await assert.rejects(h.ownerAsks.answer(input, h.paseo));
+    assert.equal(h.events.length, 0);
+    const current = { ...input, revision: visible.revision };
+    assert.equal((await h.ownerAsks.answer(current, h.paseo)).delivered, "closed");
+    await h.ownerAsks.answer(current, h.paseo);
+    assert.deepEqual(h.events, ["complete i1", "comment i1"]);
+    assert.deepEqual(await strict(), []);
+    assert.equal(h.state.issues.length, 0);
+  });
+}

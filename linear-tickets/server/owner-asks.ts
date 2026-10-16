@@ -314,8 +314,17 @@ export class OwnerAsks {
       if (!response && !input.done) throw new Error("Nothing to answer: choose an option or write the answer.");
       if (input.done) response = `Owner explicitly marked ${draft.issue.identifier} done.${response ? `\n${response}` : ""}`;
     }
-    if (!triage && input.done && (draft.manual || draft.needsYou) && !await this.sourcesSettled(await this.collect(paseo, draft.issue.id), draft.sourceId)) {
-      throw new Error("Other independent or unclassified sources remain unsettled. Answer or review those sources before marking this issue done; nothing was completed.");
+    if (!triage && input.done && (draft.manual || draft.needsYou)) {
+      const currentDrafts = await this.collect(paseo, draft.issue.id);
+      const current = currentDrafts.find(item => item.sourceId === draft.sourceId && item.request !== "retired");
+      const currentState = current ? await this.extractionFor(extractionKey(current), extractionHash(current)) : undefined;
+      // A stable source ID is not consent for a replacement registration or edited scope.
+      if (!current || revision(current, currentState?.value ?? null) !== input.revision) {
+        throw new Error("This ask changed. Refresh the inbox and answer the current revision; nothing was delivered.");
+      }
+      if (!await this.sourcesSettled(currentDrafts, current.sourceId)) {
+        throw new Error("Other independent or unclassified sources remain unsettled. Answer or review those sources before marking this issue done; nothing was completed.");
+      }
     }
     const scope = scopedText(draft, value, input.revision, action, response);
     // Keep an explicit approval/denial at the front for the established cross-host permission
