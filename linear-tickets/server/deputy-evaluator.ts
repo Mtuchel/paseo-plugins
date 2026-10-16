@@ -103,7 +103,7 @@ export function checkVerdict(raw: string, parts: Part[], sources: Source[]): Ver
     for (const key of ["preservation", "ownerArtifacts", "acceptance", "gates"]) {
       const rawAssessment = integrity[key];
       const assessment = rawAssessment && typeof rawAssessment === "object" && !Array.isArray(rawAssessment) ? Object.fromEntries(Object.entries(rawAssessment)) : {};
-      if (typeof assessment.reason !== "string" || !assessment.reason.trim() || !["not-implicated", "satisfied", "unknown", "violated"].includes(String(assessment.state))) return { ok: false, category: "unknown", abstention: "investigate", reason: `no current ${key} assessment for “${part.key}”` };
+      if (typeof assessment.reason !== "string" || !assessment.reason.trim() || typeof assessment.state !== "string" || !["not-implicated", "satisfied", "unknown", "violated"].includes(assessment.state)) return { ok: false, category: "unknown", abstention: "investigate", reason: `no current ${key} assessment for “${part.key}”` };
       if (assessment.state === "unknown") return { ok: false, category: "unknown", abstention: "investigate", reason: `the ${key} prerequisite for “${part.key}” is unknown` };
       if (assessment.state === "violated") return { ok: false, category: "owner-reserved", abstention: "technical-reframe", reason: `the selected action for “${part.key}” violates ${key}` };
       if (assessment.state === "satisfied") {

@@ -4310,7 +4310,7 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    cannot use the standing-only activation shortcut. Missing/unknown outcome scope abstains;
    a new unapproved workflow choice remains an owner boundary.
    V3 additionally requires `integrity.preservation`, `.ownerArtifacts`, `.acceptance` and `.gates`
-   for **each** selected part. Each includes a reason and state: `not-implicated` (no affected
+   for **each** selected part. Each includes a reason and primitive string state: `not-implicated` (no affected
    requirement/material prerequisite), `satisfied`, `unknown` or `violated`. Missing, unknown or
    violated assessments refuse the request even under a top-level low-risk summary.
    `satisfied` needs decisive **non-standing** prerequisite evidence, verified verbatim and cited

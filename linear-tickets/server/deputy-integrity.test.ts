@@ -69,6 +69,32 @@ test("every selected part needs all current integrity assessments; old or malfor
   }
 });
 
+for (const key of keys) {
+  for (const state of ["unknown", "violated", "satisfied", "not-implicated"]) {
+    test(`${key} requires a primitive integrity state instead of [${state}]`, () => {
+      const result = assess({ ...intact, [key]: { state: [state], reason: "A JSON array is not a validated prerequisite state." } });
+      assert.equal(result.ok, false, "malformed state must not grant standing authority or bypass prerequisite proof");
+      assert.ok(!result.ok && result.abstention === "investigate");
+    });
+  }
+}
+
+test("integrity state, reason and prerequisite citations reject other malformed JSON field types", () => {
+  const proof: Source = { id: "checked:prerequisite", kind: "plan", title: "Verified prerequisite evidence", revision: "verified-1", decisive: true, text: "The selected action's current material prerequisite is fulfilled with its recorded evidence." };
+  const proofCitation = { part: part.key, source: proof.id, quote: proof.text };
+  for (const key of keys) {
+    for (const state of [null, false, true, 0, [], {}, { toString: "satisfied" }, { valueOf: "violated" }]) {
+      assert.equal(assess({ ...intact, [key]: { state, reason: "The field must retain its validated primitive type." } }).ok, false);
+    }
+    for (const reason of [null, false, 0, [], ["Explained"], {}]) {
+      assert.equal(assess({ ...intact, [key]: { state: "not-implicated", reason } }).ok, false);
+    }
+    for (const [source, quote] of [[[proof.id], proof.text], [proof.id, [proof.text]]]) {
+      assert.equal(assess({ ...intact, [key]: { state: "satisfied", reason: "Satisfied with verified evidence", source, quote } }, [proof], [citation, proofCitation]).ok, false);
+    }
+  }
+});
+
 test("ordinary technical actions and nonbinding preparation need no invented approval or prerequisite proof", () => {
   for (const effects of [
     "Repair merge-buffer enumeration; preserve all existing behavior and verification gates",
