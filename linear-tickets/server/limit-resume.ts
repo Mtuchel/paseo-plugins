@@ -1,10 +1,9 @@
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
-import { promisify } from "node:util";
 import { z } from "zod";
 import { paseoHome } from "./ticket-mcp";
 import { normalizeModel, type FallbackChains } from "../shared/model-fallbacks";
@@ -77,7 +76,6 @@ export function limitSchedule(recovery: Availability["recovery"] | null | undefi
   return { basis, resumeAt };
 }
 
-const exec = promisify(execFile);
 const reportSchema = z.object({ provider: z.string(), fetchedAt: z.union([z.number(), z.string()]).optional(), limits: z.array(z.object({ scope: z.object({ tier: z.string().optional() }).optional(), amount: z.object({ usedFraction: z.number().optional(), remainingFraction: z.number().optional() }).optional(), status: z.string().optional(), window: z.object({ resetsAt: z.union([z.number(), z.string()]).optional() }).optional() })) });
 
 // `retry.fallbackChains` on its own: the models omp's own fallback may run instead of a model —
@@ -92,7 +90,7 @@ export function ompFallbackChains(): Promise<FallbackChains | null> {
   fallbackUntil = Date.now() + 5 * MINUTE;
   fallbackRead = (async () => {
     const binary = (process.env.PATH ?? "").split(delimiter).map((directory) => join(directory, "omp")).find(existsSync) ?? join(homedir(), ".local", "bin", "omp");
-    const { stdout } = await exec(binary, ["config", "get", "retry.fallbackChains", "--json"], { timeout: 10_000 });
+    const { stdout } = await execFile(binary, ["config", "get", "retry.fallbackChains", "--json"], { timeout: 10_000 });
     // A key nobody set answers without `value`; anything that is not that JSON cannot be read.
     const parsed = z.object({ value: z.record(z.string(), z.array(z.string())).optional() }).safeParse(JSON.parse(stdout));
     if (!parsed.success) throw new Error("retry.fallbackChains has an unknown shape");
@@ -128,8 +126,8 @@ export class UsageReader {
       if (this.deps.config) return this.deps.config();
       const binary = (process.env.PATH ?? "").split(delimiter).map((directory) => join(directory, "omp")).find(existsSync) ?? join(homedir(), ".local", "bin", "omp");
       const [url, chains, token] = await Promise.all([
-        exec(binary, ["config", "get", "auth.broker.url"], { timeout: 10_000 }),
-        exec(binary, ["config", "get", "retry.fallbackChains", "--json"], { timeout: 10_000 }),
+        execFile(binary, ["config", "get", "auth.broker.url"], { timeout: 10_000 }),
+        execFile(binary, ["config", "get", "retry.fallbackChains", "--json"], { timeout: 10_000 }),
         readFile(join(homedir(), ".omp", "auth-broker.token"), "utf8"),
       ]);
       const parsed = z.object({ value: z.record(z.string(), z.array(z.string())) }).parse(JSON.parse(chains.stdout));

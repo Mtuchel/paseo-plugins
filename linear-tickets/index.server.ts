@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { PlannotatorBridge, writeOpenScript, type OwnerOrigin } from "./server/plannotator";
 import { DecisionJournal } from "./server/decision-journal";
 import { ParkedPlans, PlannotatorHost } from "./server/parked";
+import { stopChildProcessHelper } from "./server/child-processes";
 import { reviewOutcome } from "./server/review-outcome";
 import { Writeback } from "./server/writeback";
 import { DecisionLog } from "./server/owner-decisions";
@@ -803,5 +804,8 @@ export default function contribute(server: PluginServerContext) {
     await broker.stop();
     await linearUsage.stop();
     githubUsage.stop();
+    // Last: every waiting child process call above is finished. The children the helper started
+    // keep running, as they did when the plugin exited (README, "Plugin child processes").
+    stopChildProcessHelper();
   };
 }

@@ -1,15 +1,12 @@
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { promisify } from "node:util";
 import { githubShimDir } from "./github-cli";
 import { githubUsage, nodeBinary } from "./github-usage";
 import { GitHubRateLimitedError } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
-
-const exec = promisify(execFile);
 
 // The queue backstop (TUC-615): the repo's scripts decide, the plugin only runs them. They live in
 // the repo's tools/ci and are run from a trusted checkout of `origin/main`:
@@ -70,7 +67,7 @@ function failedRun(error: unknown): ScriptOutput {
 export const runNodeScript: ScriptRunner = async (cwd, script, args, env) => {
   try {
     const path = githubUsage.install() ? `${githubUsage.meterDir}:${TOOL_PATH}` : TOOL_PATH;
-    const { stdout, stderr } = await exec(nodeBinary(), [script, ...args], { cwd, timeout: SCRIPT_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, PATH: path, ...env } });
+    const { stdout, stderr } = await execFile(nodeBinary(), [script, ...args], { cwd, timeout: SCRIPT_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, PATH: path, ...env } });
     return { code: 0, stdout, stderr };
   } catch (error) {
     return failedRun(error);
@@ -79,7 +76,7 @@ export const runNodeScript: ScriptRunner = async (cwd, script, args, env) => {
 
 export const runGit: GitRunner = async (args) => {
   try {
-    return (await exec("git", args, { timeout: 5 * 60 * 1000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, PATH: TOOL_PATH } })).stdout.trim();
+    return (await execFile("git", args, { timeout: 5 * 60 * 1000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, PATH: TOOL_PATH } })).stdout.trim();
   } catch (error) {
     throw new Error(`git ${args.join(" ")} failed: ${failedRun(error).stderr.trim()}`);
   }
@@ -106,7 +103,7 @@ export async function inEnqueueClone(checkout: string, run: (clone: string) => P
 
 export async function runIsolatedEnqueue(checkout: string, args: string[], env: Record<string, string>): Promise<ScriptOutput> {
   return inEnqueueClone(checkout, async (clone) => {
-    await exec("gt", ["init", "--trunk", "main", "--no-interactive"], { cwd: clone, timeout: 60_000, env: { ...process.env, PATH: TOOL_PATH } });
+    await execFile("gt", ["init", "--trunk", "main", "--no-interactive"], { cwd: clone, timeout: 60_000, env: { ...process.env, PATH: TOOL_PATH } });
     return runNodeScript(clone, resolve(checkout, BACKSTOP_ENQUEUE), args, env);
   });
 }

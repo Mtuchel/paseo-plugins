@@ -1,18 +1,15 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { accessSync, constants, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 import { hostname } from "node:os";
-import { promisify } from "node:util";
+import { execFile } from "./child-processes";
 import { accountOf, appendUsage, meteredArgs, meterShape, METER_ENV, responseOf, splitIncluded, usageDir, withoutDir, type AccountBasis, type UsageResponse } from "./gh-meter-core.mjs";
 import { githubCli, githubRouted } from "./github-cli";
 import { currentCallerName } from "./linear-usage";
 import { locatePluginScript } from "./planning-smoke";
 import { paseoHome } from "./ticket-mcp";
-
-const exec = promisify(execFile);
 
 // README "GitHub usage": every GitHub call the plugin makes (ghJson, in-process) or starts (the
 // repo scripts, through the gh-meter wrapper) is recorded by caller in a day file, so a report
@@ -89,7 +86,7 @@ export class GitHubUsage {
   async exec(cli: string, args: string[], options: { timeout: number; maxBuffer: number }): Promise<MeteredOutput> {
     const shape = meterShape(args);
     if (shape.local) {
-      const { stdout, stderr } = await exec(cli, args, options);
+      const { stdout, stderr } = await execFile(cli, args, options);
       return { stdout, stderr, headers: null };
     }
     const call = randomBytes(6).toString("hex");
@@ -116,7 +113,7 @@ export class GitHubUsage {
       return { stdout: shape.mode === "include" ? split.body : stdout, headers: split.block?.headers ?? null };
     };
     try {
-      const { stdout, stderr } = await exec(cli, meteredArgs(args, shape), { ...options, env: { ...process.env, [METER_ENV.call]: call } });
+      const { stdout, stderr } = await execFile(cli, meteredArgs(args, shape), { ...options, env: { ...process.env, [METER_ENV.call]: call } });
       return { ...finish(stdout, stderr, 0), stderr };
     } catch (error) {
       const found = error && typeof error === "object" ? error as { stdout?: unknown; stderr?: unknown; code?: unknown; signal?: unknown } : {};

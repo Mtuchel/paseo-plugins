@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn } from "./child-processes";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -52,8 +52,9 @@ export const runSmokeScript: SmokeRunner = (script, signal) => new Promise((reso
   const timer = setTimeout(() => { timedOut = true; stop(); }, RUN_TIMEOUT_MS);
   timer.unref?.();
   signal.addEventListener("abort", stop, { once: true });
-  child.stdout.on("data", (chunk: Buffer) => { if (stdout.length < OUTPUT_BYTES) stdout += chunk.toString("utf8"); });
-  child.stderr.on("data", (chunk: Buffer) => { if (stderr.length < OUTPUT_BYTES) stderr += chunk.toString("utf8"); });
+  // The stdio slots above pipe both streams, so they are Readables.
+  child.stdout!.on("data", (chunk: Buffer) => { if (stdout.length < OUTPUT_BYTES) stdout += chunk.toString("utf8"); });
+  child.stderr!.on("data", (chunk: Buffer) => { if (stderr.length < OUTPUT_BYTES) stderr += chunk.toString("utf8"); });
   const done = (code: number | null) => {
     clearTimeout(timer);
     clearTimeout(killer);

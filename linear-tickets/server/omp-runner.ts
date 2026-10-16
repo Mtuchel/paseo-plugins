@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn } from "./child-processes";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -61,7 +61,9 @@ export const runOmp: OmpRunner = (binary, args, { cwd, env }) => new Promise((re
   let timedOut = false;
   let overflow = false;
   const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, DEADLINE_MS);
-  child.stdout.on("data", (chunk: Buffer) => {
+  // The stdout slot is "pipe": the helper's SpawnedChild types it Readable | null without node's
+  // stdio-narrowing overloads.
+  child.stdout!.on("data", (chunk: Buffer) => {
     size += chunk.length;
     if (size > MAX_STDOUT_BYTES) { overflow = true; child.kill("SIGKILL"); return; }
     chunks.push(chunk);

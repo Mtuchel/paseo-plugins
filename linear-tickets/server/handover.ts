@@ -1,14 +1,12 @@
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import type { ActivationResume } from "./activation";
 import type { ResumeTarget } from "./launch";
 import type { LinearService } from "./linear";
 import { paseoHome } from "./ticket-mcp";
 
-const exec = promisify(execFile);
 const MAX_SUMMARY = 1_500;
 const KEPT_SUMMARIES = 3;
 const KEPT_FORMER_AGENTS = 20;
@@ -102,7 +100,7 @@ export type AgentUrl = (agentId: string) => Promise<string | null>;
 const PASEO_WEB = "https://app.paseo.sh/h/";
 
 export async function readGitState(cwd: string): Promise<GitState> {
-  const git = async (args: string[]) => (await exec("git", ["-C", cwd, ...args], { timeout: 10_000 })).stdout.trim();
+  const git = async (args: string[]) => (await execFile("git", ["-C", cwd, ...args], { timeout: 10_000 })).stdout.trim();
   const [branch, lastCommit] = await Promise.all([git(["rev-parse", "--abbrev-ref", "HEAD"]).catch(() => ""), git(["log", "-1", "--format=%h %s"]).catch(() => "")]);
   return { branch: branch && branch !== "HEAD" ? branch : null, lastCommit: lastCommit || null };
 }
@@ -111,7 +109,7 @@ export async function readGitState(cwd: string): Promise<GitState> {
 // its commit (the full SHA, so the receiving host can require exactly that commit) and whether
 // uncommitted changes sit next to it. Null when any of it cannot be read.
 async function readWorkState(cwd: string): Promise<{ branch: string | null; commit: string; dirty: boolean } | null> {
-  const git = async (args: string[]) => (await exec("git", ["-C", cwd, ...args], { timeout: 10_000 })).stdout.trim();
+  const git = async (args: string[]) => (await execFile("git", ["-C", cwd, ...args], { timeout: 10_000 })).stdout.trim();
   const [branch, commit, status] = await Promise.all([
     git(["rev-parse", "--abbrev-ref", "HEAD"]).catch(() => null),
     git(["rev-parse", "HEAD"]).catch(() => null),

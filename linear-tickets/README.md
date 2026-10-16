@@ -5081,6 +5081,39 @@ If agent creation returns an uncertain failure, the same request is not retried
 automatically: check the project's workspaces and agent list before reopening the ticket to
 start again. This retry cache does not survive a plugin or daemon restart.
 
+## Plugin child processes
+
+Every child process the plugin starts - `gh`, `git`, `ps`, `node`, the planning smoke script - runs
+through one small long-lived helper program, started on first use with the plugin's own runtime
+(`process.execPath`, as Electron-as-Node when the plugin itself runs that way). Forking a process
+copies its page tables, so what a fork costs grows with the forking process's memory: on server087
+the plugin holds 3.4 GB RSS and each fork it made itself blocked its event loop for about 93 ms (a
+50 MB node process forks in 2.9 ms), and a 40-second CPU profile of that plugin spent 23.9 seconds
+inside synchronous `spawn` - every route and RPC (the decision inbox, the owner asks) waited behind
+those forks. The helper holds a few megabytes, so starting it stays cheap.
+
+The helper program is part of the bundle (`server/child-process-helper-source.ts`, the same
+source-string pattern as `PLANNOTATOR_HOST_SOURCE`), not a file looked up on disk: the plugin is
+evaluated from memory, so a helper read from a checkout could be an older or newer version than the
+bundle that starts it and its message protocol would not match - or nothing would be found at all.
+The plugin runs the bundle's own source as `--input-type=module -e` over an IPC channel with
+advanced serialization, so `stdout`/`stderr` cross as the bytes the child wrote and both ends are
+the same runtime.
+
+`server/child-processes.ts` gives the plugin `execFile` and `spawn` with the semantics of the
+`node:child_process` ones - the same options (a child's stdio is three slots: stdin `ignore` or a
+file, stdout/stderr `ignore`, `pipe` or a file), results, errors and event order - because the helper
+runs the real `execFile`/`spawn`: node's own timeouts, `maxBuffer` caps, kill signals and stream
+handling apply, and output crosses the channel as the bytes the child wrote. The helper exits when
+the plugin exits or reloads, leaving the children it started running (exactly as the plugin used
+to), and a call made while it is gone starts a new one; the plugin's disposal fails calls that are
+still in flight (`stopChildProcessHelper`). While nothing is in flight and no child is held, neither
+the helper nor its channel keeps the plugin - or a test run - alive.
+
+The programs the plugin only writes down for other processes (`PLANNOTATOR_OPEN_SOURCE`,
+`PLANNOTATOR_HOST_SOURCE`) and the standalone scripts under `scripts/` do not go through the helper:
+they are already separate processes of their own.
+
 ## Validation
 
 `npm run typecheck` checks both entrypoints against Paseo's SDK. `npm test` covers
@@ -5099,7 +5132,11 @@ and the weekly ops review (history reading, coverage, per-kind numbers, dedupe, 
 and reopens, the review lock, create reservations) against a fake Linear, the checked answer path
 (owner precedence, replay protection, refusals) with the refs it takes from forwarded and queued
 activations, and the cutover's activation routing (claims, deferral, delivery over the wire)
-between two host fixtures. It also runs the ops
+between two host fixtures, and the plugin's child process helper against the helper program the
+bundle embeds (stdout/stderr and error fields, timeouts that kill, `maxBuffer` overflow, buffer
+encoding, cwd/env, aborted signals, spawn streaming, kills, a helper that dies mid-call, a clean
+exit).
+It also runs the ops
 digest's Python tests (`python3 -m unittest discover -s ops -p 'test_*.py'`).
 Live account authentication and agent execution require your configured host and key.
 

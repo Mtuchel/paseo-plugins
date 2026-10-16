@@ -1,13 +1,10 @@
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import { resolve } from "node:path";
-import { promisify } from "node:util";
 import type { PaseoApi } from "@getpaseo/client";
 import type { HandoverRecord } from "./handover";
 import type { PluginSettings, WorktreeShardSettings } from "./settings";
-
-const exec = promisify(execFile);
 
 // README, "Worktree shards". One repository's ticket worktrees live under a single git directory
 // by default, and every filesystem event there (a `config` rewrite, a packed-refs lock) costs the
@@ -100,7 +97,7 @@ export type ShardAssignment = { projectId: string; rootPath: string; label: stri
 
 type Git = (args: string[], cwd: string) => Promise<string>;
 
-const git: Git = async (args, cwd) => (await exec("git", ["-C", cwd, ...args], { timeout: 15_000, maxBuffer: 8 * 1024 * 1024 })).stdout;
+const git: Git = async (args, cwd) => (await execFile("git", ["-C", cwd, ...args], { timeout: 15_000, maxBuffer: 8 * 1024 * 1024 })).stdout;
 
 // A clone's remote-tracking refs must not be stale when a new ticket branches off them; a clone
 // that fetched within this window is left alone (other launches and its own agents keep it fresh).

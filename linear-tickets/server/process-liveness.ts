@@ -1,10 +1,8 @@
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { readlink, realpath } from "node:fs/promises";
 import { basename, isAbsolute } from "node:path";
-import { promisify } from "node:util";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 
-const exec = promisify(execFile);
 const MAX_PAGES = 100;
 const MAX_PROCESSES = 256;
 const CLOSED_PROCESS = /\bprocess (exited|is closed)\b/i;
@@ -79,14 +77,14 @@ export type ProcessInspector = {
 };
 
 // Every liveness check in this process reads the machine through it (see ProcessTable).
-const processTable = new ProcessTable(async () => (await exec("ps", ["-ww", "-eo", "pid=,args="], { timeout: 5_000, maxBuffer: 8 * 1024 * 1024 })).stdout);
+const processTable = new ProcessTable(async () => (await execFile("ps", ["-ww", "-eo", "pid=,args="], { timeout: 5_000, maxBuffer: 8 * 1024 * 1024 })).stdout);
 
 const inspector: ProcessInspector = {
   processes: (reference = 0) => processTable.at(reference),
   cwd: async (pid) => {
     if (process.platform === "linux") return (await readlink(`/proc/${pid}/cwd`)).replace(/ \(deleted\)$/, "");
     if (process.platform === "darwin") {
-      const { stdout } = await exec("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], { timeout: 2_000, maxBuffer: 64 * 1024 });
+      const { stdout } = await execFile("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], { timeout: 2_000, maxBuffer: 64 * 1024 });
       const paths = stdout.split("\n").filter((line) => line.startsWith("n"));
       if (paths.length === 1 && isAbsolute(paths[0].slice(1))) return paths[0].slice(1);
     }

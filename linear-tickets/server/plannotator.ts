@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn } from "./child-processes";
 import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";

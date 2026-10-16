@@ -1,9 +1,6 @@
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import { promisify } from "node:util";
-
-const exec = promisify(execFile);
 
 export const MAX_ATTACHMENTS = 20;
 export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -96,7 +93,7 @@ export async function saveAttachments(cwd: string, identifier: string, context: 
 async function excludeFromGit(cwd: string): Promise<void> {
   let relative: string;
   try {
-    relative = (await exec("git", ["-C", cwd, "rev-parse", "--git-path", "info/exclude"], { timeout: 15_000 })).stdout.trim();
+    relative = (await execFile("git", ["-C", cwd, "rev-parse", "--git-path", "info/exclude"], { timeout: 15_000 })).stdout.trim();
   } catch {
     return; // Not a git checkout: nothing to exclude from.
   }
