@@ -32,7 +32,8 @@ node tools/plugin-rollout.mjs linear-tickets
 ```
 
 After a config change, add `--force`. The tool pulls, installs, runs the build
-check, and reloads only when needed. A CLI timeout does not cancel a load:
+check, and reloads only when needed, driving the Paseo the daemon runs rather
+than the `paseo` on PATH. A CLI timeout does not cancel a load:
 the tool waits for the latest lifecycle outcome and confirms `running` before
 recording success. A superseded ready event is not a successful rollout.
 At the deadline, it leaves the load alone; the next rollout settles it first.
@@ -52,6 +53,12 @@ node ../tools/paseo-build.mjs .   # Paseo's own plugin build (the daemon's load 
 A plugin that excludes the installed Paseo (`peer-agents` today) is checked
 against a supported Paseo with `PASEO_SERVER_DIR` (see AGENTS.md, "Checks").
 A change under `tools/` also runs `node --test tools/` at the repository root.
+
+The build check runs the Paseo the running daemon runs — the install its own
+command line names (`~/.paseo/runtime-patches/<commit>` on the rollout hosts),
+`paseo` on PATH only when no daemon runs — so a host whose `paseo` is another
+install needs no PATH workaround. `PASEO_BIN` and `PASEO_SERVER_DIR` override
+that.
 
 ## Adding a plugin
 
