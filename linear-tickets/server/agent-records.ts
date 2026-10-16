@@ -76,6 +76,61 @@ export async function oldestRecord(directory: string): Promise<string | null> {
   return oldest === null ? null : new Date(oldest).toISOString();
 }
 
+// The deputy's evidence (deputy-sources.ts) reads the same records strictly: a record it cannot
+// list, read, parse or use throws instead of vanishing, because a vanished record would let the
+// plugin's own writing pass as the owner's own words. The tolerant readers above stay for the
+// weekly review display and the comment relay, where a lost record is missing context rather than
+// misattributed authority. Nothing here is pruned or aged out: a record that is still kept proves
+// who wrote a comment, however old it is.
+async function recordFolders(directory: string): Promise<string[]> {
+  const root = join(directory, "agent-comments");
+  const entries = await readdir(root, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return []; // No record was ever written on this host.
+    throw error;
+  });
+  const folders: string[] = [];
+  for (const entry of entries) {
+    if (entry.name !== PLUGIN && !UUID.test(entry.name)) continue; // Neither the plugin's nor an agent's record folder: ignore it.
+    // A known record folder that is no longer a folder (a file, a symlink) has lost the records
+    // under it: reading it as absent would let the plugin's own writing pass as the owner's own.
+    if (!entry.isDirectory()) throw new Error(`the comment record folder ${entry.name} is not a folder`);
+    folders.push(join(root, entry.name));
+  }
+  return folders;
+}
+
+// Every record kept in one folder, or a throw: the format always carries the comment id and the
+// timestamp it was written at, so a record missing either one is damage, not an absent record.
+async function strictRecords(folder: string): Promise<{ id: string; at: number }[]> {
+  return Promise.all((await readdir(folder)).filter((name) => name.endsWith(".json")).map(async (name) => {
+    const raw = await readFile(join(folder, name), "utf8");
+    let value: unknown;
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      throw new Error(`the comment record ${name} is not valid JSON`);
+    }
+    const entry = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+    const at = text(entry.createdAt) ? Date.parse(entry.createdAt) : Number.NaN;
+    if (!text(entry.id) || Number.isNaN(at)) throw new Error(`the comment record ${name} has no comment id or no readable timestamp`);
+    return { id: entry.id, at };
+  }));
+}
+
+// The provenance of the plugin's own writing, read strictly, for the deputy's evidence: the ids of
+// every recorded comment and when the oldest kept record was written, from one snapshot over the
+// records together (two reads could tear: one seeing a record the other does not).
+export type RecordProvenance = { recorded: string[]; recordsFrom: string | null };
+export async function strictRecordProvenance(directory: string): Promise<RecordProvenance> {
+  const ids = new Set<string>();
+  let oldest: number | null = null;
+  for (const folder of await recordFolders(directory)) for (const record of await strictRecords(folder)) {
+    ids.add(record.id);
+    if (oldest === null || record.at < oldest) oldest = record.at;
+  }
+  return { recorded: [...ids].sort(), recordsFrom: oldest === null ? null : new Date(oldest).toISOString() };
+}
+
 export async function recordPluginComment(directory: string, id: string, issueId: string, now = new Date()): Promise<void> {
   const folder = join(directory, "agent-comments", PLUGIN);
   await mkdir(folder, { recursive: true, mode: 0o700 });

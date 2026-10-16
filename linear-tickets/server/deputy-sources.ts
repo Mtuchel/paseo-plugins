@@ -5,9 +5,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { AUTONOMY_POLICY, AUTONOMY_POLICY_REVISION } from "../shared/autonomy-policy";
-import type { LinearService } from "./linear";
+import { strictRecordProvenance } from "./agent-records";
+import type { LinearService, TicketComment } from "./linear";
 import type { Citation, CitationKind, DecisionLog, LogEntry } from "./owner-decisions";
-import { normalize } from "./owner-decisions";
+import { answerText, normalize } from "./owner-decisions";
 
 // Standing delegation, complete approved-plan/local-rule constraints, and relevant
 // register/README/history excerpts. Missing configured evidence fails closed;
@@ -17,10 +18,15 @@ import { normalize } from "./owner-decisions";
 // 1. the ticket's approved plan (its "Plan:" document, approved in Plannotator, on a plan-ready ticket);
 // 2. `docs/principles/` (approved.md, decisions.md, decision-queue.md) at one `origin/main` commit;
 // 3. the plugin README, the launch template and the agent repository's AGENTS.md;
-// 4. earlier owner answers the plugin itself delivered for the authenticated owner;
-// 5. Hindsight recall.
-// Open proposals (the decision queue), rejected or superseded decisions and memories can only
-// block an answer (`decisive: false`); recall rank is not authority.
+// 4. earlier owner answers the plugin itself delivered for the authenticated owner, whole on this
+//    ticket and relevance-ranked elsewhere;
+// 5. the ticket's own complete comment history, its recorded resolutions and Hindsight recall.
+// The ticket's own comment history and recorded resolutions can only block an answer
+// (`decisive: false`): a comment leaves no evidence that the authenticated owner's own account
+// wrote it instead of the plugin with that key, and a resolution the daemon reports attributes no
+// responder. Only an answer the plugin delivered for the authenticated owner, bound to the request
+// it answered, authorizes anything. Open proposals (the decision queue), rejected or superseded
+// decisions and memories block the same way; recall rank is not authority.
 
 export type Source = { id: string; kind: CitationKind; title: string; revision: string; url?: string; text: string; decisive: boolean };
 export type Snapshot = { sources: Source[]; abstain: string | null };
@@ -29,6 +35,14 @@ export type PlanDocument = { url: string; content: string };
 export type Principles = { commit: string; files: Record<string, string> };
 export type RuleDocument = { id: string; title: string; text: string; url?: string };
 export type Memory = { id: string; text: string; at?: string };
+// One ticket's complete Linear history and the identity to read it against: `ownerId` is the
+// connected key's own user (Linear's own viewer, never a configured id), `recorded` the comment
+// ids the plugin and its agents wrote with that key (agent-records.ts), and `recordsFrom` when the
+// oldest kept record was written — null without one, so nothing can be told apart from the owner's
+// own comments. A history or a record that cannot be read throws: gatherSources turns that into an
+// abstention, because a silently shortened history or a lost record would pass off the plugin's own
+// writing as the owner's words.
+export type TicketHistory = { ownerId: string; comments: TicketComment[]; recorded: string[]; recordsFrom: string | null };
 
 // Each reader throws when its source exists but cannot be read; null/empty means there is none.
 export type SourceReaders = {
@@ -36,6 +50,7 @@ export type SourceReaders = {
   principles(repository: string): Promise<Principles>;
   rules(cwd: string): Promise<RuleDocument[]>;
   ownerAnswers(): Promise<LogEntry[]>;
+  ticketHistory(issueId: string): Promise<TicketHistory>;
   recall(query: string): Promise<Memory[]>;
 };
 
@@ -226,7 +241,12 @@ export async function gatherSources(readers: SourceReaders, question: Question, 
     const body = asking.questions.map((item) => [`Question: ${item.question}`, item.options.length ? `Options: ${item.options.join(" / ")}` : "", `Owner answered: ${entry.answers[item.key] || "(nothing)"}`].filter(Boolean).join("\n")).join("\n\n");
     return [{ entry, asking, body }];
   });
-  const scored = answered.map((found) => {
+  // The ticket's own answers are current constraints on it, so they are kept whole whatever words
+  // they share with this question; other tickets' answers only supplement the general knowledge.
+  for (const { entry, asking, body } of answered.filter((found) => found.asking.issueId === question.issueId)) {
+    sources.push({ id: `owner-answer:${entry.id}`, kind: "owner-answer", title: `Owner answer on ${asking.identifier}, ${entry.at.slice(0, 10)} (${entry.via})`, revision: entry.at, text: body, decisive: true });
+  }
+  const scored = answered.filter((found) => found.asking.issueId !== question.issueId).map((found) => {
     const own = terms(found.body);
     let score = 0;
     for (const word of words) if (own.has(word)) score++;
@@ -236,7 +256,61 @@ export async function gatherSources(readers: SourceReaders, question: Question, 
     add({ id: `owner-answer:${entry.id}`, kind: "owner-answer", title: `Owner answer on ${asking.identifier}, ${entry.at.slice(0, 10)} (${entry.via})`, revision: entry.at, text: body, decisive: true });
   }
 
-  // 5. Recall: context that can only block.
+  // 5. The ticket's own recorded resolutions and its complete Linear comment history. Both are
+  // current constraints and can only block: the daemon attributes no responder for a resolution,
+  // and a comment leaves no evidence that the authenticated owner's own account wrote it rather
+  // than the plugin holding that key. Neither is ever authority for granting anything.
+  // A resolution is this ticket's when the log still pairs it with its question, or — a recovered
+  // or pruned question, the TUC-1270 shape — when its request id carries this candidate's agent id
+  // (`<agent>:<request>`, owner-decisions.ts). Unknown provenance can only hold an answer back.
+  const agent = question.id.includes(":") ? question.id.slice(0, question.id.indexOf(":")) : "";
+  const onTicket = (id: string) => asked.has(id) ? asked.get(id)?.issueId === question.issueId : Boolean(agent) && id.startsWith(`${agent}:`);
+  // Ids whose resolution the plugin itself made (`deputy-answer`) or delivered for the owner
+  // (`owner-answer`, in the same convention as deputy-evidence.ts and deputy-report.ts): the
+  // `answer` entry of that id is the daemon's echo of the same resolution and already evidence of
+  // its own kind, so re-reading it would let the deputy's own answer write its own constraint.
+  const resolved = new Set(entries.flatMap((entry) => entry.kind === "deputy-answer" || (entry.kind === "owner-answer" && entry.userId.trim()) ? [entry.id] : []));
+  for (const entry of entries) {
+    if (entry.kind !== "answer" || entry.id === question.id || resolved.has(entry.id) || !onTicket(entry.id)) continue;
+    const asking = asked.get(entry.id);
+    const text = asking ? answerText(asking, entry) : [
+      "The question this resolution answered is no longer in the log; the daemon recorded:",
+      ...(entry.denyMessage !== undefined
+        ? [`Declined${entry.denyMessage ? `: ${entry.denyMessage}` : ""}`]
+        : Object.entries(entry.answers ?? {}).map(([key, value]) => `${key}: ${value || "(nothing)"}`)),
+    ].join("\n");
+    sources.push({
+      id: `resolution:${entry.id}`, kind: "resolution",
+      title: `Recorded resolution on ${asking?.identifier ?? question.identifier}, ${entry.at.slice(0, 10)} — no responder attributed, not authority`,
+      revision: entry.at, text, decisive: false,
+    });
+  }
+  let history: TicketHistory;
+  try {
+    history = await readers.ticketHistory(question.issueId);
+  } catch (error) {
+    return { sources, abstain: `the ticket's complete comment history or the plugin's own comment records could not be read (${error instanceof Error ? error.message : error})` };
+  }
+  const recorded = new Set(history.recorded);
+  // Comments the plugin and its agents wrote with the owner's key are detected by their own record
+  // (agent-records.ts), not by their wording. Before the oldest kept record nothing can be told
+  // apart, so an older comment stays evidence that may constrain — marked as unattributable.
+  // A comment Linear attributes to no user (`user: null`: an app or bot actor wrote it) is read as
+  // valid but is not the owner's words: it is no evidence at all, and never authority.
+  const recordsFrom = history.recordsFrom === null ? null : Date.parse(history.recordsFrom);
+  for (const comment of history.comments) {
+    if (!comment.authorId || comment.authorId !== history.ownerId || recorded.has(comment.id)) continue;
+    const attributed = recordsFrom !== null && Date.parse(comment.createdAt) >= recordsFrom;
+    sources.push({
+      id: `owner-comment:${comment.id}`, kind: "owner-comment",
+      title: attributed
+        ? `Owner's own comment on ${question.identifier}, ${comment.createdAt.slice(0, 10)} (complete history)`
+        : `Comment on ${question.identifier}, ${comment.createdAt.slice(0, 10)} — ${recordsFrom === null ? "no comment records are kept on this host" : "older than the kept comment records"}, so it may be the plugin's own writing`,
+      revision: hash(`${comment.updatedAt}\n${comment.body}`), ...(comment.url ? { url: comment.url } : {}), text: comment.body, decisive: false,
+    });
+  }
+
+  // 6. Recall: context that can only block.
   let memories: Memory[];
   try {
     memories = await readers.recall(question.text);
@@ -257,7 +331,7 @@ export function verifyCitation(sources: Source[], sourceId: unknown, quote: unkn
   if (typeof sourceId !== "string" || typeof quote !== "string") return "a citation has no source id or quote";
   const source = sources.find((known) => known.id === sourceId);
   if (!source) return `the citation names an unknown source ${JSON.stringify(sourceId).slice(0, 80)}`;
-  if (!source.decisive) return `${source.id} cannot decide an answer (${source.kind === "memory" ? "a memory" : "an open proposal or a decision that is not binding"})`;
+  if (!source.decisive) return `${source.id} cannot decide an answer (${source.kind === "memory" ? "a memory" : source.kind === "resolution" ? "a recorded resolution no responder was attributed for" : source.kind === "owner-comment" ? "a comment on the ticket, which cannot be established as written by the owner personally" : "an open proposal or a decision that is not binding"})`;
   const wanted = normalize(quote);
   if (wanted.length < 12) return `the quote from ${source.id} is too short to decide anything`;
   if (!normalize(source.text).includes(wanted)) return `the quote is not verbatim in ${source.id}`;
@@ -363,8 +437,10 @@ export async function recall(access: RecallAccess | null, query: string): Promis
 
 // The readers on this host: the ticket's "Plan:" document, the principles register, the plugin
 // README, the effective launch template (custom or built-in) and the agent repository's
-// AGENTS.md, the decision log and Hindsight recall.
-export function hostReaders(deps: { linear: Pick<LinearService, "issueDocument">; log: Pick<DecisionLog, "entries">; home: string; directory: string; template: () => Promise<string> }): SourceReaders {
+// AGENTS.md, the decision log, the ticket's complete Linear history with the plugin's own comment
+// records, and Hindsight recall.
+export function hostReaders(deps: { linear: Pick<LinearService, "issueDocument" | "viewerId" | "issueCommentHistory">; log: Pick<DecisionLog, "entries">; home: string; directory: string; template: () => Promise<string> }): SourceReaders {
+  const records = join(deps.home, "linear-tickets");
   return {
     plan: (issueId, identifier) => deps.linear.issueDocument(issueId, `Plan: ${identifier}`),
     principles: (repository) => readPrinciples(repository),
@@ -374,6 +450,17 @@ export function hostReaders(deps: { linear: Pick<LinearService, "issueDocument">
       return [await pluginReadme(deps.home), template, ...(instructions ? [instructions] : [])];
     },
     ownerAnswers: () => deps.log.entries(),
+    // Whose words a comment is: Linear's own author beside the identity of the connected key
+    // (never a configured id) and the plugin's own records of what it wrote with that key. The
+    // comments are read first: a history that cannot be read whole must abstain rather than pass
+    // as one that holds no owner constraint. The records are read strictly too: an unreadable
+    // record would let a comment the plugin wrote with the owner's key pass as the owner's own.
+    ticketHistory: async (issueId) => {
+      const ownerId = await deps.linear.viewerId();
+      const comments = await deps.linear.issueCommentHistory(issueId);
+      const provenance = await strictRecordProvenance(records);
+      return { ownerId, comments, recorded: provenance.recorded, recordsFrom: provenance.recordsFrom };
+    },
     recall: async (query) => {
       const access = await recallAccess(deps.directory);
       return access ? recall(access, query) : [];

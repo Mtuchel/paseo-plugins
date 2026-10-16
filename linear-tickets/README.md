@@ -4286,11 +4286,28 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    IDs, regardless of keywords. Relevant register/README excerpts and attributed earlier owner
    answers supplement them. The complete approved plan, repository instructions and effective
    launch template are included whole so a nonmatching hold remains visible. Authenticated current-ticket
-   overrides remain authoritative even if correction delivery failed. Open proposals,
-   rejected/superseded/withdrawn/deferred decisions and memories can block but never authorize.
+   overrides remain authoritative even if correction delivery failed, and the ticket's own owner
+   answers are kept whole whatever words they share with the question, not relevance-filtered.
+   The ticket's own complete Linear comment history and the resolutions the daemon recorded on it
+   are read whole as well and can only block (`owner-comment`, `resolution`): a resolution names
+   no responder, and a comment carries no evidence that the owner's own account wrote it rather
+   than the plugin holding the connected key. A comment Linear attributes to no user (`user: null`:
+   an app or bot actor wrote it) is read as valid, but it is no owner's words and never evidence
+   either; a comment whose author the read did not return refuses the history. Comments the plugin
+   and its agents wrote with that key are excluded by their own record (`agent-records.ts`), which
+   the deputy reads strictly, in one snapshot per assessment: a record it cannot read - or a record
+   folder that is no longer a folder - abstains rather than quietly dropping the exclusion, and a
+   kept record is honored however old it is. That is why a comment older
+   than the oldest kept record stays visible but is marked as possibly written with the key; the
+   deputy never guesses authorship from wording. Neither kind ever authorizes a selection:
+   the ticket's history can hold work back, not grant it. Open proposals,
+   rejected/superseded/withdrawn/deferred decisions and memories block the same way.
    An unconfigured optional principles repository or recall service is not a failure; a
-   configured unreadable source, required missing/unapproved plan, or complete source snapshot
-   exceeding the input budget makes the deputy abstain rather than silently drop constraints.
+   configured unreadable source, a ticket history that cannot be read whole (failed read, an
+   unreadable comment record or more pages than one ticket's history read allows), required
+   missing/unapproved plan, or complete
+   source snapshot exceeding the input budget makes the deputy abstain rather than silently drop
+   constraints.
 3. **Semantic selection.** One isolated OMP call (`deputy.model`, thinking `high`, 150 s deadline)
    chooses a safe capable offered completion/research/preparation path before considering a
    pause. It assesses the **selected actions**, individually and together, including descriptions,
@@ -4387,16 +4404,18 @@ block, without Paseo, Linear or GitHub credentials in its environment. A tool ev
 unreadable/oversized answer, abstention or failed check refuses the whole request. Citations
 retain source ID, revision and quote.
 
-Evidence is versioned as `deputy-16-executable-actors/owner-autonomy-2026-10-15-v3/<model>/high`.
+Evidence is versioned as `deputy-17-ticket-own-history/owner-autonomy-2026-10-15-v3/<model>/high`.
 Old-policy predictions never satisfy current empirical readiness. On restart, an old-version
 refusal/prediction is reevaluated only after the exact unanswered request is freshly verified;
 old selections, citations, intent and grace are discarded. An equivalent new request ID retires
 the old candidate and gets fresh evaluation/grace, never a copied answer. Interrupted/unknown
 dispatches are never replayed. Unavailable sources/evaluators retry at most every five minutes.
 Dispatch fingerprints the complete evaluator input, including blocking-only sources. Changed
-input cancels even if an old quotation remains. Settings changes synchronously revoke unsent
-work, including change-away/change-back; the checked arbiter checks revocation after async
-admission immediately before sending. A response already on the wire retains its real outcome.
+input cancels even if an old quotation remains — a ticket comment the owner edited, deleted or
+wrote during the grace period cancels the prediction instead of being outrun. Settings changes
+synchronously revoke unsent work, including change-away/change-back; the checked arbiter checks
+revocation after async admission immediately before sending. A response already on the wire
+retains its real outcome.
 
 **Modes** (`deputy.mode`):
 

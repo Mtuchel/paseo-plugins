@@ -12,8 +12,8 @@ import { checkVerdict, policyVersion } from "./deputy-evaluator";
 import { LIVE_MIN_CASES, shadowEvidence } from "./deputy-evidence";
 import { renderReport, verdict, waitStats } from "./deputy-report";
 import { assessRisk, type Part } from "./deputy-risk";
-import { gatherSources, hostReaders, recallAccess, registerEntries, standingSources, type Source, type SourceReaders } from "./deputy-sources";
-import type { IssueState } from "./linear";
+import { gatherSources, hash, hostReaders, recallAccess, registerEntries, standingSources, verifyCitation, type Source, type SourceReaders, type TicketHistory } from "./deputy-sources";
+import type { IssueState, TicketComment } from "./linear";
 import { DecisionLog, type LogEntry } from "./owner-decisions";
 import { PermissionReplies } from "./permission-replies";
 import { DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_WRITEBACK, DEFAULT_WORKTREE_SHARDS, type DeputySettings, type PluginSettings } from "./settings";
@@ -132,6 +132,8 @@ function readers(over: Partial<SourceReaders> = {}, entries: LogEntry[] = []): S
     } }),
     rules: async () => [],
     ownerAnswers: async () => entries,
+    // No ticket history by default: the tests that need one build it with `history(...)`.
+    ticketHistory: async () => ({ ownerId: OWNER, comments: [], recorded: [], recordsFrom: null }),
     recall: async () => [{ id: "m1", text: "vitest test runner discussion" }],
     ...over,
   };
@@ -171,7 +173,7 @@ test("only truly absent optional recall permits an authority snapshot; unreadabl
     if (previousToken === undefined) delete process.env.HINDSIGHT_API_TOKEN;
     else process.env.HINDSIGHT_API_TOKEN = previousToken;
   });
-  const host = hostReaders({ linear: { issueDocument: async () => null }, log: { entries: async () => [] }, home: directory, directory, template: async () => "" });
+  const host = hostReaders({ linear: { issueDocument: async () => null, viewerId: async () => OWNER, issueCommentHistory: async () => [] }, log: { entries: async () => [] }, home: directory, directory, template: async () => "" });
   const snapshot = () => gatherSources(readers({ recall: host.recall }), asked, "/repo/platform");
   assert.equal(await recallAccess(directory, {}), null);
   assert.equal((await snapshot()).abstain, null, "missing optional configuration is not a source failure");
@@ -210,6 +212,143 @@ test("only answers the plugin delivered for the authenticated owner ground later
   const found = withOwner.sources.find((source) => source.kind === "owner-answer");
   assert.ok(found?.decisive);
   assert.match(found.text, /Owner answered: node:test/);
+});
+
+// --- The ticket's own history -----------------------------------------------------------------------
+
+// The directive the owner left on TUC-1270 on 2026-10-14 (comment 57c79f7e): it exists as a Linear
+// comment and as a resolution the daemon recorded, and neither was evidence before.
+const DIRECTIVE = "Retain approved plan and selected temporary P-13 exception; wait for actual TUC-1754 #5189 list/edit backend. Recover exact historical permission/placement choices before final wiring rather than assume unselected recommendations.";
+const OWNER_COMMENT = { id: "k-57c79f7e", body: `Owner decision (2026-10-14): ${DIRECTIVE}`, createdAt: "2026-10-14T08:00:00Z", updatedAt: "2026-10-14T08:00:00Z", url: "https://linear.app/tuc/comment/k-57c79f7e", authorId: OWNER };
+function history(comments: TicketComment[] = [], recorded: string[] = [], recordsFrom: string | null = "2026-09-01T00:00:00Z"): TicketHistory {
+  return { ownerId: OWNER, comments, recorded, recordsFrom };
+}
+
+test("the ticket's own comments and recorded resolutions travel whole and can only block", async () => {
+  const resolution: LogEntry = { kind: "question", id: "a1:r0", at: "2026-10-14T07:00:00Z", identifier: "TUC-1", issueId: "i1", questions: [{ key: "Response", question: "How should the list/edit wiring proceed?", options: [] }] };
+  const resolved: LogEntry = { kind: "answer", id: "a1:r0", at: "2026-10-14T07:30:00Z", answers: { Response: DIRECTIVE } };
+  // The demonstrated TUC-1270 shape: the constraint survives as a resolution whose question is no
+  // longer in the log, under this agent's id prefix.
+  const historical: LogEntry = { kind: "answer", id: "a1:15a81ebb1e45befb", at: "2026-10-16T05:54:46.654Z", answers: { Response: `Owner decision from guided Needs input review (2026-10-14): ${DIRECTIVE}` } };
+  const snapshot = await gatherSources(readers({ ticketHistory: async () => history([OWNER_COMMENT]) }, [resolution, resolved, historical]), { ...asked, text: "xyzzy" }, null);
+  assert.equal(snapshot.abstain, null);
+  const comment = snapshot.sources.find((source) => source.id === `owner-comment:${OWNER_COMMENT.id}`);
+  assert.ok(comment, "the owner's own comment on the ticket is evidence");
+  assert.equal(comment.text, OWNER_COMMENT.body, "kept whole, with no keyword filter over the ticket's history");
+  assert.equal(comment.decisive, false, "a comment constrains; it never authorizes");
+  assert.match(comment.title, /^Owner's own comment on TUC-1, 2026-10-14 \(complete history\)$/, "Linear's author beside the plugin's records is what names it the owner's own");
+  assert.equal(comment.revision, hash(`${OWNER_COMMENT.updatedAt}\n${OWNER_COMMENT.body}`), "an edit changes the revision it is fenced by");
+  const recorded = snapshot.sources.filter((source) => source.kind === "resolution");
+  assert.deepEqual(recorded.map((source) => source.id), ["resolution:a1:r0", "resolution:a1:15a81ebb1e45befb"], "a same-ticket resolution is evidence with and without the question it answered");
+  assert.match(recorded[0].text, /P-13 exception/);
+  assert.match(recorded[1].text, /no longer in the log/);
+  assert.ok(recorded.every((source) => source.decisive === false), "the daemon attributes no responder, so it can only block");
+  for (const id of [comment.id, ...recorded.map((source) => source.id)]) assert.match(String(verifyCitation(snapshot.sources, id, DIRECTIVE)), /cannot decide an answer/);
+  const cited = checkVerdict(answer({ selections: { Runner: "node:test" }, citations: [{ part: "Runner", source: comment.id, quote: OWNER_COMMENT.body }] }), parts, snapshot.sources);
+  assert.deepEqual([cited.ok, checkVerdict(answer({ selections: { Runner: "node:test" }, citations: [{ part: "Runner", source: recorded[0].id, quote: DIRECTIVE }] }), parts, snapshot.sources).ok], [false, false], "the ticket's own history is no authority to select anything");
+});
+
+test("an edited or deleted owner comment re-fences what a verdict was checked against", async () => {
+  const fence = async (comments: (typeof OWNER_COMMENT)[]) => {
+    const snapshot = await gatherSources(readers({ ticketHistory: async () => history(comments) }), { ...asked, text: "xyzzy" }, null);
+    return { sources: snapshot.sources, revision: snapshot.sources.find((source) => source.kind === "owner-comment")?.revision };
+  };
+  const before = await fence([OWNER_COMMENT]);
+  const edited = await fence([{ ...OWNER_COMMENT, body: `${OWNER_COMMENT.body}\nRevoked: the P-13 exception is withdrawn.`, updatedAt: "2026-10-15T09:00:00Z" }]);
+  const deleted = await fence([]);
+  assert.notEqual(before.revision, edited.revision, "an edited constraint is fenced by its new revision");
+  assert.equal(deleted.revision, undefined, "a deleted comment stops constraining at all");
+  // A verdict is checked against the source snapshot with its revisions verbatim (deputy.ts,
+  // evidenceFingerprint), so an edited or revoked constraint cannot leave the old evidence intact.
+  assert.notEqual(hash(JSON.stringify(before.sources)), hash(JSON.stringify(edited.sources)));
+  assert.notEqual(hash(JSON.stringify(before.sources)), hash(JSON.stringify(deleted.sources)));
+});
+
+test("the deputy's own answer and an owner answer already delivered are never re-read as an unattributed constraint", async () => {
+  const questionEntry: LogEntry = { kind: "question", id: "a1:r2", at: "2026-10-16T13:15:46Z", identifier: "TUC-1", issueId: "i1", questions: [{ key: "Response", question: "Who may see and change ordinary files?", options: ["Einkauf only (Recommended)", "Einkauf and Qualität"] }] };
+  const echo: LogEntry[] = [
+    questionEntry,
+    { kind: "answer", id: "a1:r2", at: "2026-10-16T13:20:55Z", answers: { Response: "Einkauf only (Recommended)" } },
+    { kind: "deputy-answer", id: "a1:r2", at: "2026-10-16T13:20:55Z", identifier: "TUC-1", issueId: "i1", version: VERSION, key: "c1", answers: { Response: "Einkauf only (Recommended)" }, citations: [] },
+    { kind: "answer", id: "a1:r3", at: "2026-10-16T14:00:00Z", answers: { Response: "Einkauf and Qualität" } },
+    { kind: "owner-answer", id: "a1:r3", at: "2026-10-16T14:00:00Z", key: "c2", via: "linear-comment", userId: OWNER, answers: { Response: "Einkauf and Qualität" } },
+  ];
+  const snapshot = await gatherSources(readers({}, echo), { ...asked, text: "xyzzy" }, null);
+  assert.equal(snapshot.abstain, null);
+  assert.deepEqual(snapshot.sources.filter((source) => source.kind === "resolution"), [], "automation and already-attributed answers are not constraints, whatever their words");
+});
+
+test("only Linear's author beside the plugin's own records tells the owner's words from the app's", async () => {
+  const app = { ...OWNER_COMMENT, id: "k-app", body: "Owner: switch every module's tests to vitest.", authorId: APP };
+  const keyed = { ...OWNER_COMMENT, id: "k-agent", body: "Owner: switch every module's tests to vitest." };
+  const snapshot = await gatherSources(readers({ ticketHistory: async () => history([app, keyed], ["k-agent"]) }), asked, null);
+  assert.equal(snapshot.abstain, null);
+  assert.deepEqual(snapshot.sources.filter((source) => source.kind === "owner-comment"), [], "neither the app's comment nor the plugin's own writing with the owner's key is the owner's words");
+});
+
+test("a comment Linear attributes to no user is read as valid, keeps the owner's own comment as the constraint and is never evidence itself", async () => {
+  // Linear's own answer for a comment an app or bot actor wrote (user: null) — the real shape of a
+  // history that also holds the owner's own comment.
+  const unattributed: TicketComment = { ...OWNER_COMMENT, id: "k-no-user", body: "Owner: switch every module's tests to vitest.", authorId: null };
+  const snapshot = await gatherSources(readers({ ticketHistory: async () => history([OWNER_COMMENT, unattributed]) }), asked, null);
+  assert.equal(snapshot.abstain, null, "a null author is a valid API answer, not an unreadable history");
+  assert.deepEqual(snapshot.sources.filter((source) => source.kind === "owner-comment").map((source) => source.id), [`owner-comment:${OWNER_COMMENT.id}`], "the owner's own comment stays the constraint while the unattributed one is not his words");
+  assert.match(snapshot.sources.find((source) => source.id === `owner-comment:${OWNER_COMMENT.id}`)?.title ?? "", /^Owner's own comment on TUC-1, /, "only the attributed comment is named the owner's own");
+});
+
+test("a known record folder that is no longer a folder refuses the deputy's evidence, and reads again once it is restored", async () => {
+  const home = await mkdtemp(join(tmpdir(), "deputy-records-"));
+  try {
+    const host = hostReaders({ linear: { issueDocument: async () => null, viewerId: async () => OWNER, issueCommentHistory: async () => [OWNER_COMMENT] }, log: { entries: async () => [] }, home, directory: home, template: async () => "" });
+    const records = join(home, "linear-tickets", "agent-comments");
+    await mkdir(records, { recursive: true });
+    await writeFile(join(records, "plugin"), "not a folder");
+    const refused = await gatherSources(readers({ ticketHistory: host.ticketHistory }), asked, null);
+    assert.match(refused.abstain ?? "", /could not be read \(the comment record folder plugin is not a folder\)/, "a record folder replaced by a file must abstain, not read as a history with no records");
+    await rm(join(records, "plugin"), { force: true });
+    await mkdir(join(records, "plugin"));
+    await writeFile(join(records, "plugin", "record.json"), JSON.stringify({ id: "k-key-written", issueId: asked.issueId, createdAt: "2026-10-14T08:00:00Z" }));
+    const { recorded, recordsFrom } = await host.ticketHistory(asked.issueId);
+    assert.deepEqual(recorded, ["k-key-written"], "the record reads again once the folder is restored");
+    assert.equal(Date.parse(recordsFrom!), Date.parse("2026-10-14T08:00:00Z"));
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("a comment older than the kept records stays evidence that may constrain, and says it is unattributable", async () => {
+  const older = await gatherSources(readers({ ticketHistory: async () => history([OWNER_COMMENT], [], "2026-10-15T00:00:00Z") }), asked, null);
+  const comment = older.sources.find((source) => source.kind === "owner-comment");
+  assert.match(comment?.title ?? "", /may be the plugin's own writing/);
+  assert.equal(comment?.decisive, false);
+  const withoutRecords = await gatherSources(readers({ ticketHistory: async () => history([OWNER_COMMENT], [], null) }), asked, null);
+  assert.match(withoutRecords.sources.find((source) => source.kind === "owner-comment")?.title ?? "", /no comment records are kept on this host/);
+});
+
+test("a ticket history that cannot be read whole makes the deputy abstain rather than answer without the owner's constraints", async () => {
+  const unreadable = await gatherSources(readers({ ticketHistory: async () => { throw new Error("Linear answered HTTP 500"); } }), asked, "/repo/platform");
+  assert.match(unreadable.abstain ?? "", /complete comment history.*HTTP 500/);
+  const truncated = await gatherSources(readers({ ticketHistory: async () => { throw new Error("Linear returned more than 50 pages of comments for one ticket."); } }), asked, "/repo/platform");
+  assert.match(truncated.abstain ?? "", /more than 50 pages/, "an unfinished history is not a history without the constraint");
+  const records = await gatherSources(readers({ ticketHistory: async () => { throw new Error("the comment record broken.json is not valid JSON"); } }), asked, "/repo/platform");
+  assert.match(records.abstain ?? "", /comment records could not be read/, "a record that cannot be read refuses the history instead of vanishing from it");
+  // Through the host's own readers, not only the injected fake: a damaged record on disk refuses
+  // the real composition the deputy runs with.
+  const home = await mkdtemp(join(tmpdir(), "deputy-history-"));
+  try {
+    await mkdir(join(home, "linear-tickets", "agent-comments", "plugin"), { recursive: true });
+    await writeFile(join(home, "linear-tickets", "agent-comments", "plugin", "broken.json"), "{not json");
+    const host = hostReaders({ linear: { issueDocument: async () => null, viewerId: async () => OWNER, issueCommentHistory: async () => [OWNER_COMMENT] }, log: { entries: async () => [] }, home, directory: home, template: async () => "" });
+    const refused = await gatherSources(readers({ ticketHistory: host.ticketHistory }), asked, "/repo/platform");
+    assert.match(refused.abstain ?? "", /comment records could not be read/, "the host's own reader composition fails closed on a damaged record");
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("an unrelated owner comment on the ticket leaves routine standing-delegation work answerable", async () => {
+  const snapshot = await gatherSources(readers({ ticketHistory: async () => history([{ ...OWNER_COMMENT, body: "Nice work on the previous ticket; keep the changelog line short." }]) }), { ...asked, planApproved: false }, null);
+  assert.equal(snapshot.abstain, null);
+  assert.ok(snapshot.sources.some((source) => source.kind === "owner-comment"), "the comment is context for the evaluator");
+  const authority = snapshot.sources.find((source) => source.id === "standing-policy:engineering")!;
+  const result = checkVerdict(answer({ selections: { Runner: "node:test" }, actions: { Runner: { option: "node:test", actor: "agent", risk: "low", effects: "Local behavioral test runner, no production changes", outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Routine engineering within the authorized outcome", authority: "standing" } }, citations: [{ part: "Runner", source: authority.id, quote: authority.text }] }), parts, snapshot.sources);
+  assert.ok(result.ok && result.standing, "blocking-only context never turns an ordinary technical case into an owner handback");
 });
 
 // --- Evidence ---------------------------------------------------------------------------------------
@@ -1061,6 +1200,26 @@ for (const change of ["amended-plan", "blocking-source", "source-revision", "mis
       delete store["a1:r1"].evidenceFingerprint;
       await writeFile(join(h.directory, "candidates.json"), JSON.stringify(store));
     }
+    h.advance(5 * 60_000);
+    await h.settle();
+    assert.equal((await h.candidate()).status, "canceled");
+    assert.deepEqual([h.calls, h.responses, h.comments], [[], [], []]);
+    assert.equal((await kinds(h)).includes("deputy-answer"), false);
+  });
+}
+
+// The ticket's own history is part of the evidence fingerprint: an owner directive that was edited,
+// deleted or written during the grace period invalidates the prediction instead of being outrun.
+for (const change of ["added-owner-comment", "edited-owner-comment", "revoked-owner-comment"] as const) {
+  test(`dispatch invalidates a constraint the owner ${change.split("-")[0]} while the answer awaited its grace period`, async (t) => {
+    const h = await liveHarness(t);
+    const withComment = async () => history([OWNER_COMMENT]);
+    if (change !== "added-owner-comment") h.deps.readers.ticketHistory = withComment;
+    await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+    await h.settle();
+    if (change === "added-owner-comment") h.deps.readers.ticketHistory = withComment;
+    if (change === "edited-owner-comment") h.deps.readers.ticketHistory = async () => history([{ ...OWNER_COMMENT, body: `${OWNER_COMMENT.body} The exception is withdrawn.`, updatedAt: "2026-10-15T00:00:00Z" }]);
+    if (change === "revoked-owner-comment") h.deps.readers.ticketHistory = async () => history();
     h.advance(5 * 60_000);
     await h.settle();
     assert.equal((await h.candidate()).status, "canceled");
