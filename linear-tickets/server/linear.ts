@@ -965,6 +965,17 @@ export function ownerAskCommentsQuery(count: number): string {
   }`).join("\n  ");
   return `query ownerAskComments(${declarations}) {\n  ${fields}\n}`;
 }
+// Comments created or edited since a time, across many issues at once: owner-ask collection
+// reads these instead of every page of every issue's history (owner-asks.ts). Linear accepted
+// the 568 open issue ids of server087's inventory in one filter (2026-10-16); larger inventories
+// are split so one filter never grows without bound.
+export const OWNER_ASK_CHANGE_IDS = 500;
+export const OWNER_ASK_COMMENT_CHANGES_QUERY = `query ownerAskCommentChanges($filter: CommentFilter!, $after: String) {
+  comments(first: 100, after: $after, filter: $filter) {
+    nodes { id body createdAt issue { id } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
 function ownerAskIssue(node: Record<string, unknown>): OwnerAskIssue {
   const parent = record(node.parent ?? {});
   return {
@@ -2277,6 +2288,33 @@ export class LinearService {
       }
     }
     return comments;
+  }
+
+  // Every comment on `ids` created or edited at or after `since`, by issue (issues without one
+  // are absent). A deleted comment is not reported; callers re-read whole histories for that.
+  async ownerAskCommentChanges(ids: string[], since: string): Promise<Map<string, OwnerAskComment[]>> {
+    const changes = new Map<string, OwnerAskComment[]>();
+    for (let start = 0; start < ids.length; start += OWNER_ASK_CHANGE_IDS) {
+      const filter = { updatedAt: { gte: since }, issue: { id: { in: ids.slice(start, start + OWNER_ASK_CHANGE_IDS) } } };
+      const cursors = new Set<string>();
+      let after: string | null = null;
+      do {
+        const found = connection(record(record(await this.read(OWNER_ASK_COMMENT_CHANGES_QUERY, { filter, after })).comments));
+        for (const node of found.nodes) {
+          const entry = record(node);
+          const id = label(entry.id);
+          const issueId = label(record(entry.issue ?? {}).id);
+          if (!id || !issueId) continue;
+          const list = changes.get(issueId) ?? [];
+          list.push({ id, body: label(entry.body), createdAt: label(entry.createdAt) });
+          changes.set(issueId, list);
+        }
+        after = found.hasNextPage ? found.endCursor || null : null;
+        if (found.hasNextPage && (!after || cursors.has(after) || cursors.size >= WINDOW_PAGES)) throw new Error("Linear returned an incomplete or repeated owner-question comment cursor.");
+        if (after) cursors.add(after);
+      } while (after);
+    }
+    return changes;
   }
 
   // Every page of a connection read with the key (at most WINDOW_PAGES), for the windowed reads below.

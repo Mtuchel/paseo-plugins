@@ -4719,13 +4719,21 @@ decision receipts; `linear.answer-ask` answers an exact revision of one ask. Rea
 approve, complete or reassign anything in Linear.
 
 **What is read.** All open issues assigned to the owner, including normal issue decisions and
-manual work—not just "Needs input"—are read with the owner's credential. Issue pages and each
-issue's comments are paginated to completion. Failed or incomplete collection is reported as
+manual work—not just "Needs input"—are read with the owner's credential. Issue pages are
+paginated to completion. An issue's comments are read to completion when it joins that inventory;
+after that the plugin keeps them in memory and each collection reads only the comments created or
+edited since the previous one (`updatedAt`, with five minutes' overlap), one request for up to 500
+issues. Every 30 minutes, and after a reload, every history is read again, which drops deleted
+comments; an answer reads its own issue's whole history. Re-reading every history on each
+collection took 74 requests on server087 (568 open issues, 13,363 comments on 2026-10-16), about
+1,300 an hour, and made owner asks the largest Linear caller on both pools.
+Failed or incomplete collection is reported as
 incomplete coverage, not an empty successful inbox. Descriptions, source comments, this host's
 `needs-you/` records and handover records provide distinct revision-bound decision sources.
 The plugin's wait comment is read directly when necessary. Comment edits are visible within
 60 seconds even when the ticket's `updatedAt` has not changed; the browser's periodic owner
-collection and answer validation read them immediately. Every source has a stable `sourceId`;
+collection and answer validation read them immediately. Answers keep the stored comments: the
+next collection reads only the changes. Every source has a stable `sourceId`;
 equal ticket IDs do not merge independent decisions. Unclassified historical text remains in
 explicit nonurgent source review, not a presumed current owner wait.
 An ask's ticket is the parent of a "Needs you" sub-issue or manual task, else the issue itself (a ticket under an epic is
