@@ -1257,9 +1257,62 @@ test("complete plan constraints and authenticated owner overrides cannot be filt
   assert.ok(snapshot.sources.some((source) => source.kind === "plan" && source.text.includes(hold)));
   assert.ok(snapshot.sources.some((source) => source.id === "rules:agents-md" && source.text === hold));
   assert.ok(snapshot.sources.some((source) => source.kind === "owner-answer" && source.text === hold && source.decisive));
-  const oversized = await gatherSources(readers({ plan: async () => ({ url: "https://linear.app/doc/plan", content: `> **Approved** in Plannotator\n${"constraint ".repeat(10_000)}` }) }), asked, null);
+  // Well past the evaluator's 250,000-char budget: the guard refuses rather than dropping the hold.
+  const oversized = await gatherSources(readers({ plan: async () => ({ url: "https://linear.app/doc/plan", content: `> **Approved** in Plannotator\n${"constraint ".repeat(30_000)}` }) }), asked, null);
   assert.match(oversized.abstain ?? "", /budget/);
   assert.deepEqual(oversized.sources, [], "overflow refuses rather than silently dropping a hold");
+});
+
+// The complete live snapshots the previous 40,000 budget refused, measured on the serving host on
+// 2026-10-16: 24 of 24 refused questions carried 72,391-182,231 chars, the approved plan up to
+// 100,967, the repository's AGENTS.md 10,467, the launch template 7,001 and the standing policy
+// 8,893. The budget guards the evaluator's input (gpt-6.1-sol: 500K tokens in), so a complete
+// real-sized snapshot must travel whole instead of leaving every ticket with the owner.
+const measured = { plan: 100_967, agents: 10_467, template: 7_001 };
+const filler = "The planning service sizes each production order from the line's throughput per packaging format. ";
+const sized = (prefix: string, chars: number) => `${prefix}${filler.repeat(Math.ceil(chars / filler.length))}`.slice(0, chars);
+
+test("a complete real-sized authority snapshot above the old 40k budget travels whole", async () => {
+  const hold = "Owner security hold: do not expose the recovery vault.";
+  const plan = sized(`> **Approved** in Plannotator on 2026-10-15 19:33 UTC for TUC-25. Replaced on every review round; the decision comments on the ticket keep the history.\n> **Planned with:** \`omp/test-model\`\n\n---\n\n# TUC-25\n\n## Unrelated authority\n${hold}\n\n`, measured.plan);
+  const agents = sized("# Repository instructions\n\nRead every applicable AGENTS.md and run the repository's checked-in tools.\n\n", measured.agents);
+  const readme = Array.from({ length: 10 }, (_, index) => `## Test runner ${index}\n\nThe module's tests use the node:test runner.\n`).join("\n");
+  const snapshot = await gatherSources(readers({
+    plan: async () => ({ url: "https://linear.app/doc/plan", content: plan }),
+    rules: async () => [
+      { id: "plugin-readme", title: "linear-tickets README", text: readme },
+      { id: "launch-template", title: "Launch template (the prompt every ticket agent starts with)", text: sized("Work on Linear ticket {{ticket}} in the current workspace.\n\n", measured.template) },
+      { id: "agents-md", title: "AGENTS.md (/repo)", text: agents },
+    ],
+    recall: async () => Array.from({ length: 5 }, (_, index) => ({ id: `m${index}`, text: sized("Remembered context ", 2_400) })),
+  }), asked, "/repo/platform");
+  const total = snapshot.sources.reduce((sum, source) => sum + source.text.length, 0);
+  assert.equal(snapshot.abstain, null, "a complete real-sized snapshot must not refuse");
+  assert.ok(total > 40_000, `the regression is anchored to the old budget, got ${total}`);
+  const complete = snapshot.sources.find((source) => source.id === "plan:approved")!;
+  assert.equal(complete.text.length, measured.plan, "the complete approved plan travels whole");
+  assert.ok(complete.text.includes(hold), "a nonmatching hold deep in the plan stays visible");
+  assert.equal(snapshot.sources.find((source) => source.id === "rules:agents-md")?.text, agents, "the repository's AGENTS.md travels whole");
+  assert.equal(snapshot.sources.find((source) => source.id === "rules:launch-template")?.text.length, measured.template, "the effective launch template travels whole");
+  assert.equal(snapshot.sources.filter((source) => source.kind === "memory").length, 5, "every configured blocking-only memory is present");
+});
+
+test("the complete-snapshot budget is finite and exact: 250,000 chars pass, one character more fails closed", async () => {
+  const budget = 250_000;
+  const sizing = (planChars: number, agentsChars: number) => readers({
+    plan: async () => ({ url: "https://linear.app/doc/plan", content: sized("> **Approved** in Plannotator\n\n", planChars) }),
+    rules: async () => [{ id: "agents-md", title: "Repository constraints", text: sized("# Repository instructions\n\n", agentsChars) }],
+  });
+  // The plan and the repository instructions are added whole, so the plan size sets the total.
+  const base = await gatherSources(sizing(1_000, measured.agents), asked, "/repo/platform");
+  const baseTotal = base.sources.reduce((sum, source) => sum + source.text.length, 0);
+  const exact = budget - baseTotal + 1_000;
+  const at = await gatherSources(sizing(exact, measured.agents), asked, "/repo/platform");
+  assert.equal(at.sources.reduce((sum, source) => sum + source.text.length, 0), budget, "the budget is inclusive");
+  assert.equal(at.abstain, null);
+  const over = await gatherSources(sizing(exact + 1, measured.agents), asked, "/repo/platform");
+  assert.match(over.abstain ?? "", /budget/);
+  assert.deepEqual(over.sources, [], "one character over refuses rather than dropping a constraint");
 });
 
 for (const entry of ["startup", "activation"] as const) {
@@ -1705,3 +1758,64 @@ for (const change of ["refusal", "off", "revoke"] as const) {
     assert.equal(status.mode, change === "off" ? "off" : "live");
   });
 }
+
+test("ordinary reconciliation discovers another request without waiting for an owned evaluator and coalesces inventory", async t => {
+  const h = await harness(t, { mode: "shadow" });
+  await h.settle();
+  const entered = signal();
+  const release = signal();
+  t.after(() => release.resolve());
+  const evaluate = h.deps.evaluate;
+  h.deps.evaluate = async (...args) => {
+    if (args[0].parts[0].options.includes("vitest")) {
+      entered.resolve();
+      await release.promise;
+    }
+    return evaluate(...args);
+  };
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await entered.promise;
+  h.daemon.pending.push(question("r2", ["node:test", "jest"]));
+  h.daemon.inventory = true;
+  const list = h.paseo.agents.list.bind(h.paseo.agents);
+  let inventories = 0;
+  t.mock.method(h.paseo.agents, "list", async (...args: Parameters<typeof list>) => {
+    inventories++;
+    return list(...args);
+  });
+  const results = await Promise.all([h.deputy.reconcile(), h.deputy.reconcile(), h.deputy.reconcile()]);
+  assert.deepEqual(results, Array.from({ length: 3 }, () => ({ observed: 2, skipped: 0, failed: 0 })));
+  assert.equal(inventories, 1);
+  const pending = await readCandidates(h.directory);
+  assert.equal(pending["a1:r1"].status, "evaluating", "the first evaluator is still gated");
+  assert.equal(pending["a1:r2"].requestId, "r2", "unrelated pending work was discovered before the first evaluator finished");
+  release.resolve();
+  await h.settle();
+  assert.equal(h.evaluations(), 2, "the owned evaluation was not duplicated by recovery");
+  assert.deepEqual(h.responses, []);
+});
+
+test("a coalesced reconciliation failure reaches every caller and a repaired hold source can retry", async t => {
+  const h = await harness(t, { mode: "shadow" });
+  await h.settle();
+  h.daemon.inventory = true;
+  const entered = signal();
+  const release = signal();
+  t.after(() => release.resolve());
+  h.deps.ready = async () => { entered.resolve(); await release.promise; throw new Error("owner holds unreadable"); };
+  const attempts = [h.deputy.reconcile(), h.deputy.reconcile(), h.deputy.reconcile()];
+  const outcomes = Promise.allSettled(attempts);
+  await entered.promise;
+  release.resolve();
+  for (const outcome of await outcomes) {
+    assert.equal(outcome.status, "rejected");
+    if (outcome.status === "rejected") assert.match(outcome.reason.message, /owner holds unreadable/);
+  }
+  assert.deepEqual(await readCandidates(h.directory), {});
+  h.deps.ready = async () => {};
+  assert.deepEqual(await h.deputy.reconcile(), { observed: 1, skipped: 0, failed: 0 });
+  await h.settle();
+  assert.equal(h.evaluations(), 1);
+  assert.equal((await h.candidate()).status, "predicted");
+  assert.deepEqual(h.responses, []);
+});
