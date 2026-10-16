@@ -3440,10 +3440,14 @@ No tokens, query bodies or ticket text appear in the report.
   619, `writeback.turn-ended` 262,944 in 534, `status change` 129,978 in 261,
   `writeback.archived` 6,474 in 13).
 - **Three priorities reserve room for owner intent on both dimensions.**
-  - Background work leaves **20%**: auto-dispatch, comment relay, project flow, the steward,
+  - Background work leaves **10%**: auto-dispatch, comment relay, project flow, the steward,
     health, label rules, manual tasks, plan requests, PR watch, queue backstop, state labels
     and the session sweep. Polls resume as the budget refills; the sweep skips its whole round
     while paused. Auto-dispatch shows `paused: …`, and persistent pauses are logged once per pool/cause.
+    Until 2026-10-16 background work left 20%. On 2026-10-16 the hosts' background reads held
+    both pools at that line (app 4,700–5,200 of 5,000 and key 2,300–2,500 of 2,500 requests an
+    hour), and auto-dispatch launched no agent for hours while 15% of each pool stayed unused
+    above the interactive reserve.
   - Interactive agent work leaves **5%**: progress write-backs, session replies, sidebar reads and
     crash recovery's ticket check and owner comment (see **Crashed agents**).
   - Owner work may use the final **5%**: plan approval/send-back (review page, inbox and Linear
@@ -3462,7 +3466,7 @@ No tokens, query bodies or ticket text appear in the report.
   reserve admission runs before the single probe slot: background or interactive work below
   its reserve cannot steal the owner's probe. Only one eligible request probes; a network
   failure releases its slot, an answered success clears the block, and a limited probe doubles
-  the backoff up to 15 minutes. Background still waits for its 20% share to refill.
+  the backoff up to 15 minutes. Background still waits for its 10% share to refill.
   Rate-limit refusals of Plannotator events and plan follow-ups retry at the advertised resume
   time without consuming an attempt; already-created tickets and relations stay recorded.
   Non-parked decisions are deduplicated only after delivery succeeds, so a refused hand-off

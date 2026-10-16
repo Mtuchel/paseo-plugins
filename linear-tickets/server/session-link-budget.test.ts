@@ -25,7 +25,7 @@ test("a refused background session link stays undelivered and is retried after r
     "x-ratelimit-requests-limit": "5000", "x-ratelimit-requests-remaining": "4500",
     "x-ratelimit-complexity-limit": "2000000", "x-ratelimit-complexity-remaining": String(points),
   }), false);
-  sample(380_000);
+  sample(180_000);
   const writes: Record<string, unknown>[] = [];
   t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body));
@@ -38,7 +38,7 @@ test("a refused background session link stays undelivered and is retried after r
   await assert.rejects(deliver(), RateLimitedError);
   assert.equal(writes.length, 0);
   assert.equal((await store.get("s1"))?.paseoLinked, undefined);
-  sample(420_000);
+  sample(220_000);
   await deliver();
   assert.equal((await store.get("s1"))?.paseoLinked, "agent-1");
   assert.deepEqual(writes, [{ addedExternalUrls: [{ label: "Open in Paseo", url: "https://app.paseo.sh/h/fixture-server/agent/agent-1" }] }]);

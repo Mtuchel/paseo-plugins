@@ -61,7 +61,7 @@ test("agent status reports each credential's dimensions, pause and hourly caller
     "x-ratelimit-complexity-limit": String(pointLimit), "x-ratelimit-complexity-remaining": String(pointsLeft),
     "x-complexity": "12",
   });
-  await withPriority("owner", "app decision", async () => rateBudget.acquire("app").done(headers(5000, 2_000_000, 380_000), false));
+  await withPriority("owner", "app decision", async () => rateBudget.acquire("app").done(headers(5000, 2_000_000, 180_000), false));
   await withPriority("owner", "key decision", async () => rateBudget.acquire("key").done(headers(2500, 3_000_000, 600_000), false));
   const rpc: { read?: (input: object, context: { paseo: PaseoApi }) => Promise<unknown> } = {};
   const cleanup = contribute({
@@ -76,7 +76,7 @@ test("agent status reports each credential's dimensions, pause and hourly caller
   const key = result.budget.pools.find((entry) => entry.pool === "key")!;
   assert.equal(app.requests?.limit, 5000);
   assert.equal(app.points?.limit, 2_000_000);
-  assert.ok(app.points!.remaining >= 380_000 && app.points!.remaining < 400_000);
+  assert.ok(app.points!.remaining >= 180_000 && app.points!.remaining < 200_000);
   assert.ok(app.pausedUntil.background! > Date.now());
   assert.equal(app.pausedUntil.interactive, null);
   assert.equal(key.requests?.limit, 2500);
