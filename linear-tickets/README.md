@@ -2114,9 +2114,8 @@ sent the whole stack is read and checked; it falls back to the recorded pull req
 the log says why once, when the branches are not one plain chain (a base branch without an open
 pull request, a branch two open pull requests share, two of the ticket's pull requests on one
 branch, a cycle), when a member cannot be read or no longer matches the listing (state, head,
-branch, base), or when a hold covers any member: `do-not-merge`, an escalation of a member to you
-after it waited out your answer (see **Stalled pull requests**), a merge queue message still to
-deliver, the head a
+branch, base), or when a hold covers any member: `do-not-merge`, a persisted escalation from an
+older version, a merge queue message still to deliver, the head a
 genuine drop left, or another ticket's record linking it (compared by repository and number,
 whatever the URL's spelling). While the stack is deferred its other pull requests are not
 nudged, so a permission wait of theirs starts from zero once they are again. In a repository
@@ -2197,14 +2196,11 @@ pending, before any dispatch claim, send, reload or launch. The check never kill
 removes a worktree or changes a branch.
 
 **Waiting for your answer.** An agent waiting for your answer or approval takes no message, so
-the pull request waits with it. When a nudge, fix request or replacement request has waited 60
-minutes for such an agent, you get one comment, "The agent has waited over 60 minutes for your
-answer while the pull request waits for it to …", and the message counts as claimed: that stall
-key is not nudged again while the answer is pending (a new stall of the same stage is a new
-step and is nudged like any other), and the drop's range and the replacement request then only
-reach the log. The wait is kept in
-`pr-watch.json` across polls, restarts and a busy or disconnected agent, and starts again for a
-new head, review or stage, or once a message went out.
+the pull request waits with it. Elapsed time never posts a reminder or marks a nudge, fix request
+or replacement request as delivered. The original owner question remains the place to answer.
+Pending repairs survive polls and plugin restarts through their existing delivery state; once
+the agent can take messages, the still-applicable repair is delivered and claimed normally.
+A waiting member still holds connected-stack nudges, so they resume bottom-first after the answer.
 
 **One start per ticket.** Every automatic start (the trigger label, a new thread on the ticket,
 the automatic resume, a successor) takes the ticket's start gate
@@ -3101,9 +3097,10 @@ through the control lane; they do not become implementation roots.
 
 **Where to see it.** The flow summary — the counts per state, the oldest ticket of each state and
 the pass's health — is in the browser decision inbox page's **Flow** section
-(`https://<host>:8444/decisions`) and in the plugin's dispatch status RPC. Every open parent in
-scope keeps one status card on the ticket itself ("Paseo's ticket steward: *n* of *m* sub-issues
-finished") with its members and what each of them is, refreshed at most every 30 minutes.
+(`https://<host>:8444/decisions`) and in the plugin's dispatch status RPC. Monitoring stays in
+that view and the durable local journal: no periodic parent status cards or unchanged-stall
+comments are published to Linear. Bounded recovery and one-time actionable owner escalations
+remain active; an unanswered escalation is not posted again.
 
 **Settings.** `steward.enabled` (default true; off stops every repair, the states are still computed
 and shown), `steward.queuedEscalateHours` (24: a ticket waiting in the queue longer is escalated),

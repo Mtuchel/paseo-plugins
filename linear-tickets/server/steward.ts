@@ -61,10 +61,6 @@ export const REFUSAL_CAP = 3;
 export const CLAIM_GRACE_MS = RECOVERY_REACTION_MS;
 // A verifier that has not reported within this long is escalated.
 export const VERIFY_TIMEOUT_MS = RECOVERY_REACTION_MS;
-// The status card of a head issue (a parent with sub-issues in scope) is refreshed at most this
-// often, and at most this many cards are written per pass.
-export const STATUS_CARD_MS = 30 * 60_000;
-export const STATUS_CARDS_PER_PASS = 3;
 // A recorded wait whose ending event was lost is cleared after this long without a live agent
 // (writeback.ts WAIT_NO_AGENT_GRACE_MS, unchanged).
 const WAIT_NO_AGENT_GRACE_MS = 10 * 60_000;
@@ -75,8 +71,6 @@ const DO_NOT_MERGE = "do-not-merge";
 // (label-repair.ts's rule, unchanged).
 const RESTART_TYPES = new Set(["triage", "backlog", "unstarted"]);
 const RESTART_STARTED_STATES = new Set(["in progress"]);
-// The mark of the steward's status card in a head issue's comment.
-const CARD_MARK = "<!-- paseo:steward-flow -->";
 // Where the verifier's structured verdicts land (`ticket-mcp-source.ts` writes them in the agent's
 // own process; the steward reads them here).
 export const STEWARD_VERDICT_DIRECTORY = "steward-verdicts";
@@ -90,7 +84,7 @@ const STEWARD_ANCHOR = "steward";
 const LIVE_AGAIN_PREFIX = "an agent works on ";
 
 type Linear = Pick<LinearService,
-  "stewardIssues" | "issueGroup" | "issueStatus" | "issueStatuses" | "issueCore" | "issueRef" | "addLabel" | "removeLabel" | "comment" | "upsertComment" | "createIssue" | "relate" | "complete" | "moveToReady" | "setDueDate" | "trustedAppIds">;
+  "stewardIssues" | "issueGroup" | "issueStatus" | "issueStatuses" | "issueCore" | "issueRef" | "addLabel" | "removeLabel" | "comment" | "createIssue" | "relate" | "complete" | "moveToReady" | "setDueDate" | "trustedAppIds">;
 type Sessions = Pick<SessionRouter, "restartFor" | "succeed" | "resumeVerifiedParent" | "prompt" | "continueOperation" | "watchdogRoots" | "watchdogThread" | "retireTurn" | "threadQueued" | "parentProgress" | "parentProgresses">;
 type Continuation = Awaited<ReturnType<SessionRouter["continueOperation"]>>;
 
@@ -395,8 +389,6 @@ export type StewardTicket = {
   escalated: { key: string; signature: string; at: string } | null;
   // The owner's own continuation (the trigger label, the sidebar): budgets and escalations restart.
   ownerAt: string | null;
-  // The steward's status card on this ticket, when it has one.
-  card: { commentId: string; at: string } | null;
   // An admission deferral the pass retries (see StewardQueued), a verdict being applied, and a
   // verifier's park.
   queued: StewardQueued | null;
@@ -487,7 +479,7 @@ export class StewardStore {
   ticket(file: StewardFile, issueId: string, identifier: string, at: string): StewardTicket {
     file.tickets[issueId] ??= {
       identifier, situation: "moving", since: at, at, claim: null, restarts: [], refusals: [], resumedAt: null,
-      verifier: null, verified: null, escalated: null, ownerAt: null, card: null, queued: null, applying: null, parked: null, log: [],
+      verifier: null, verified: null, escalated: null, ownerAt: null, queued: null, applying: null, parked: null, log: [],
     };
     if (identifier && identifier !== issueId) file.tickets[issueId].identifier = identifier;
     return file.tickets[issueId];
@@ -785,7 +777,7 @@ function responsibilityView(ticket: StewardTicket): ResponsibilityView {
 }
 
 type Candidate = { issue: StewardIssue; facts: StewardFacts; situation: StewardSituation; ticket: StewardTicket };
-type Pass = { actions: number; cap: number; cards: number };
+type Pass = { actions: number; cap: number };
 // What one action came to: `done` (the effect went out), `deferred` (nothing was attempted —
 // admission waits; the ticket stays queued and the pass retries, no budget spent), `failed` (it did
 // not run; `permanent`: the owner is asked at once rather than after REFUSAL_CAP refusals).
@@ -1054,7 +1046,7 @@ export class Steward {
     // The `<trigger>-running` labels an archive still owes: settled from the pass's own agent
     // reading, before this pass's effects add new debt.
     await this.settleLabels(paseo, names, roots);
-    const pass: Pass = { actions: 0, cap: settings.steward.maxActionsPerPass, cards: 0 };
+    const pass: Pass = { actions: 0, cap: settings.steward.maxActionsPerPass };
     for (const candidate of candidates) {
       if (!this.alive()) return;
       try {
@@ -1065,12 +1057,9 @@ export class Steward {
       }
     }
     if (options.queueBlockers) return;
-    // The flow view, and the status card of each head issue in scope.
-    await this.flowView(candidates, pass);
-    for (const candidate of candidates) {
-      if (!this.alive()) return;
-      if (candidate.issue.children.length) await this.statusCard(candidate, candidates, pass).catch((error: unknown) => this.once(`card:${candidate.issue.id}`, `${candidate.issue.identifier}: the steward's status card failed: ${message(error)}; the next pass retries`));
-    }
+    // The flow view (the counts of this pass and the oldest tickets of each state) for the browser
+    // inbox and the status RPC.
+    await this.flowView(candidates);
   }
 
   // Whether a ticket is inside the steward's scope: open, of a *configured* dispatch team, and
@@ -2432,8 +2421,7 @@ export class Steward {
 
   // The flow view (README, "Ticket steward"): the counts of the last pass and the oldest tickets of
   // each state, for the browser inbox and the status RPC.
-  private async flowView(candidates: Candidate[], pass: Pass): Promise<void> {
-    void pass;
+  private async flowView(candidates: Candidate[]): Promise<void> {
     const counts: Record<string, number> = {};
     for (const situation of STEWARD_SITUATIONS) counts[situation] = 0;
     for (const candidate of candidates) counts[candidate.situation] = (counts[candidate.situation] ?? 0) + 1;
@@ -2444,32 +2432,6 @@ export class Steward {
       .map((candidate) => ({ identifier: candidate.issue.identifier, situation: candidate.situation, since: candidate.ticket.since }));
     await this.deps.store.update((file) => {
       file.flow = { at: this.iso(), counts, oldest };
-    });
-  }
-
-  // The status card of a head issue: its members and what each of them is (the steward's state, or
-  // its workflow state when the steward has none), refreshed at most every STATUS_CARD_MS and for
-  // at most STATUS_CARDS_PER_PASS head issues per pass.
-  private async statusCard(candidate: Candidate, candidates: Candidate[], pass: Pass): Promise<void> {
-    const { issue } = candidate;
-    if (pass.cards >= STATUS_CARDS_PER_PASS) return;
-    const stored = (await this.deps.store.read()).tickets[issue.id];
-    if (stored?.card && this.clock() - Date.parse(stored.card.at) < STATUS_CARD_MS) return;
-    pass.cards++;
-    const byIssue = new Map(candidates.map((item) => [item.issue.id, item]));
-    const lines = issue.children.map((child) => `- ${child.identifier}: ${byIssue.get(child.id)?.situation ?? child.status}`);
-    const open = issue.children.filter((child) => !CLOSED_TYPES.includes(child.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number])).length;
-    const body = [
-      `**Paseo's ticket steward: ${issue.children.length - open} of ${issue.children.length} sub-issues finished.**${open ? " The coordinator continues the unfinished children." : " Parent acceptance and required deployment/runtime evidence still need verification before completion."}`,
-      "",
-      ...lines,
-      "",
-      CARD_MARK,
-    ].join("\n");
-    const commentId = await this.deps.linear.upsertComment(issue.id, body, stored?.card?.commentId ?? null);
-    await this.deps.store.update((file) => {
-      const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso());
-      ticket.card = { commentId, at: this.iso() };
     });
   }
 }
@@ -2496,7 +2458,7 @@ function pullUrls(issue: StewardIssue, record: HandoverRecord | undefined): stri
 function newTicket(identifier: string, at: string): StewardTicket {
   return {
     identifier, situation: "moving", since: at, at, claim: null, restarts: [], refusals: [], resumedAt: null,
-    verifier: null, verified: null, escalated: null, ownerAt: null, card: null, queued: null, applying: null, parked: null, log: [],
+    verifier: null, verified: null, escalated: null, ownerAt: null, queued: null, applying: null, parked: null, log: [],
   };
 }
 

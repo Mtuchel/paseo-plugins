@@ -89,9 +89,6 @@ const POLICY_PER_POLL = 3;
 // path. The drop fix requests close it with "; never because of a drop count", the stage nudges
 // with "; never just wait", the stack-cap message with "; never because of the count".
 const OWNER_POLICY = "Ask the owner only for a decision that can break something (data, production or staging, migrations, security, reverting someone else's landed work) or that changes how CI works in general (required checks, CI selection, quarantine, queue settings), through the ticket's normal question path (the deputy answers first)";
-// How long an agent may wait for the owner's answer while a message of its pull request waits for
-// it, before the owner is reminded once (README, "Stalled pull requests").
-const PERMISSION_WAIT_MS = 60 * 60 * 1000;
 // The owner's veto: such a pull request is never nudged.
 const DO_NOT_MERGE_LABEL = "do-not-merge";
 // Check conclusions that do not fail a pull request.
@@ -156,18 +153,20 @@ export type PullRequestView = {
 // conflict-only ones, `mainBroken` the main-broken ones. `dropHistory`: the range's last
 // DROP_HISTORY drops (time, class, key, failed job families, failing tests), which a fix request
 // carries; `conflictStreak`: the range's consecutive conflict-only drops, which asks for the
-// hotspot every fifth one. `escalated`: a message of the pull request waited out the owner's
-// permission wait (every pull request of the range is marked, see claimDrop); `cutover`: the
-// TUC-1777 cutover cleared an old drop-count handover here and gave the newest drop back once, so a
-// later load never does so again. `pending`: the claimed drop (or refused enqueue) still to be
-// delivered, `queued` the messages routed to the same pull request while it was, delivered in turn
+// hotspot every fifth one. `escalated`: the range was handed to the owner by a rule the plugin no
+// longer has (an old drop cap, or a message whose agent waited the old permission wait out); every
+// pull request of the range is marked (see claimDrop) and it stays held. Nothing escalates anew.
+// `cutover`: the TUC-1777 cutover cleared an old drop-count handover here and gave the newest drop
+// back once, so a later load never does so again. `pending`: the claimed drop (or refused enqueue)
+// still to be delivered, `queued` the messages routed to the same pull request while it was,
+// delivered in turn
 // after it (see route). `replay`: closed without merging, `due` until the closure was looked at once,
 // `asked` once the agent was told to open a replacement pull request (see replace). `nudges`: per
 // stage, one key per nudge, the head, or for requested changes the reviews it covered,
-// space-separated (see stalledStage); a message the agent waited out the owner's permission wait on
-// is claimed with its key too, so that key is not nudged again while the answer is pending (no
-// count stops the stage's other stalls, TUC-1777). `activeAt`: the last change, drop or
-// nudge seen. `missing`: GitHub has no pull request at the link (a made-up or mistyped URL); it is
+// space-separated (see stalledStage), each claimed right before its message goes out, so a stage the
+// agent took no message on is claimed again on the next poll; no count stops the stage's other
+// stalls (TUC-1777). `activeAt`: the last change, drop or nudge seen.
+// `missing`: GitHub has no pull request at the link (a made-up or mistyped URL); it is
 // never read again, so a later pull request that takes the number is not mistaken for the ticket's.
 // `advance`: landed, `due` until the ticket's next open pull request was looked for (see advance).
 // The queue backstop's state (see queueBackstop): `blockedAt`, the head a genuine drop (or a drop
@@ -185,9 +184,6 @@ type Seen = {
   // (TUC-2427: one per lifetime): evidence for the ops digest only, the repo keeps its own
   // claim; kept as long as the backstop's actions.
   greptile?: { head: string; at: string }[];
-  // Since when the agent has waited for the owner's answer while the message `key` waited for it
-  // (see waitFor): `stage:<stage>:<key>`, `drop:<key>` or `replay:<head>`.
-  waits?: Record<string, string>;
 };
 // One claimed drop of a range, for the history a fix request carries (TUC-1777): when it was
 // claimed, its class, its claim key and the failing signature the judgment read — the failed check
@@ -831,9 +827,10 @@ export function activityBullets(body: string | null): Bullet[] {
   });
 }
 
-// A message of the pull request waited out the owner's permission wait (see waitFor): the range is
-// held until the owner answers. Drop counts never escalate anything (TUC-1777), so only that mark
-// and the cutover's `cutover` marker can be in the state.
+// The range was handed to the owner by a rule the plugin no longer has (an old drop cap, or the old
+// permission wait of a message): it is held until the owner answers. Drop counts never escalate
+// anything (TUC-1777), so only such state from before and the cutover's `cutover` marker can be in
+// the state, and nothing escalates anew.
 function escalated(seen: Seen | undefined): boolean {
   return Boolean(seen?.escalated);
 }
@@ -1926,7 +1923,7 @@ export class PullRequestWatch {
     // A Done ticket whose stack has not landed goes back to work first, so its agent's crash is
     // restarted like any started ticket's in the same poll (see reopenDone).
     await this.reopenDone(mine, states, reserved, context, seenByUrl, stopped);
-    await this.crashPass(mine, states, reserved, seenByUrl, views, moves);
+    await this.crashPass(mine, reserved, views, moves);
     // The steward (steward.ts) runs here, after the passes whose effects it must see -- the stack
     // policy's reopens, crash recovery's restarts: one level-triggered pass over every in-scope open
     // ticket of the dispatch teams, repairing the tickets none of them moved with exactly one action
@@ -3088,13 +3085,13 @@ export class PullRequestWatch {
 
   // Delivers a claimed drop: the fix request to the agent while it exists; for a gone agent, to a
   // successor (see succession), else to the ticket, which goes back to coding for the next agent.
-  // It waits for a later poll while the agent is in a turn or waits for
-  // the owner (who is reminded once after PERMISSION_WAIT_MS, see waitFor), Paseo is not connected,
-  // a successor cannot start yet, or the agent already got a message this poll (`reserved`).
-  // `sending` is saved right before a message goes out (or a successor starts with it), so one
-  // whose result was lost (a restart) is never sent again; `delivered` records it right after,
-  // before the best-effort session line. A crashed agent is restarted and gets the fix request with
-  // its resume (delivered); when the restart fails, the request goes to the ticket.
+  // It waits for a later poll while the agent is in a turn or waits for the owner (an owner wait
+  // claims and reminds nothing, so the request stays pending until the agent takes messages), Paseo
+  // is not connected, a successor cannot start yet, or the agent already got a message this poll
+  // (`reserved`). `sending` is saved right before a message goes out (or a successor starts with
+  // it), so one whose result was lost (a restart) is never sent again; `delivered` records it right
+  // after, before the best-effort session line. A crashed agent is restarted and gets the fix
+  // request with its resume (delivered); when the restart fails, the request goes to the ticket.
   private async deliver(record: HandoverRecord, url: string, labels: string[], pending: PendingDrop, seenByUrl: Record<string, Seen>, save: () => Promise<void>, reserved: Set<string>, delivered: () => Promise<void>): Promise<void> {
     if (pending.sending) {
       console.error(`[linear-tickets] ${record.identifier}: the message about the merge queue drop of ${url} may already have gone out; it is not sent again`);
@@ -3116,15 +3113,6 @@ export class PullRequestWatch {
       let gone = record.status === "archived";
       if (!gone) {
         const outcome = await this.deps.sessions.prompt(record.agentId, fix, toAgent, this.recovery(record, reserved, dispatch, undefined, url));
-        if (this.waitFor(seenByUrl, url, `drop:${pending.key}`, outcome)) {
-          // The agent waited out the owner's answer: the message is claimed as escalated, which
-          // holds the range until the owner answers, before the reminder goes out.
-          seenByUrl[url] = { ...seenByUrl[url], escalated: true, waits: undefined };
-          await dispatch();
-          await this.waitedOut(record, url, step);
-          await delivered();
-          return;
-        }
         if (outcome === "sent" || outcome === "restarted" || outcome === "reloaded") await delivered();
         if (outcome === "sent") await this.tell(record, "thought", `${pending.subject ?? `The merge queue dropped the pull request (${pending.reason})`}. The agent was asked to fix it.`);
         else if (outcome !== "crashed") await this.crashLine(record, outcome, step);
@@ -3138,7 +3126,7 @@ export class PullRequestWatch {
       const next = gone ? await this.succession(record, labels, fix, toAgent) : null;
       if (next?.kind === "started") {
         await delivered().catch((error: unknown) => console.error(`[linear-tickets] ${record.identifier}: recording the drop of ${url} as delivered failed: ${error instanceof Error ? error.message : error}`));
-        await this.succeeded(record, next.agent, seenByUrl, url, reserved, step);
+        await this.succeeded(record, next.agent, reserved, step);
         return;
       }
       if (next && next.kind !== "impossible") return;
@@ -3159,9 +3147,9 @@ export class PullRequestWatch {
   // every member checked out (see stackMembers), each member is a candidate, bottom first, whatever
   // the link's position: a blocked parent, or a blocked branch above the link, gets its step though
   // the ticket links another pull request. The first member whose step went, or tried to go, to the
-  // agent ends the pass, so a busy or waiting agent is asked about one pull request per poll and
-  // the owner is reminded of one wait; a member whose step claimed nothing (no stall, a hold, a
-  // crashed agent waiting for its restart) lets the next member go.
+  // agent ends the pass, so a busy or waiting agent is asked about one pull request per poll; a
+  // member whose step claimed nothing (no stall, a hold, a crashed agent waiting for its restart)
+  // lets the next member go.
   // Otherwise only the link is nudged, as before. Members are only nudged: their reviews are not
   // mirrored into the ticket, their drops not claimed, and the link stays where it is.
   private async nudgeStack(record: HandoverRecord, url: string, view: PullRequestView, seenByUrl: Record<string, Seen>, save: () => Promise<void>, context: RunContext, reserved: Set<string>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
@@ -3193,9 +3181,6 @@ export class PullRequestWatch {
       if (why !== null && this.deferredStacks.get(url) !== why) console.error(`[linear-tickets] ${record.identifier}: only ${url} is nudged; its connected stack is deferred: ${why}`);
       if (why === null) this.deferredStacks.delete(url);
       else this.deferredStacks.set(url, why);
-      for (const other of why === null ? [] : ticket) {
-        if (!context.records.some((item) => pullKey(item.links["Pull request"] ?? "") === pullKey(other))) this.clearWaits(seenByUrl, other, "stage:");
-      }
       return null;
     };
     const members: { url: string; view: PullRequestView }[] = [];
@@ -3252,22 +3237,16 @@ export class PullRequestWatch {
     const source = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
     if (!source || reserved.has(this.slot(record))) return false;
     const [, repo, number] = source;
-    // A stage the agent is not nudged for now (open blockers, vetoed or queued) has nothing to be
-    // reminded of: a later wait on it starts from zero.
     if ((await this.deps.manualTasks?.openBlockers(record.issueId))?.length) {
-      this.clearWaits(seenByUrl, url, "stage:");
       return false;
     }
     const claimedOn = (stage: Stage) => seenByUrl[url]?.nudges?.[stage] ?? [];
     if (!await this.nudgeable(repo, Number(number), view, drafts)) {
-      this.clearWaits(seenByUrl, url, "stage:");
       return false;
     }
     // A crashed agent got none of its nudges: its stage is claimed again on the same head.
     const crashed = record.status !== "archived" && Boolean(await this.deps.sessions.crashed(record.agentId));
     const found = await stalledStage(view, url, Date.now(), (stage, key) => !crashed && claimedOn(stage).some((entry) => entry.split(" ").includes(key)), () => this.github().reviewThreads(repo, Number(number)));
-    // A stage that no longer stalls has nothing left for the owner to be reminded of.
-    if (!found) this.clearWaits(seenByUrl, url, "stage:");
     if (!found || (!crashed && claimedOn(found.stage).includes(found.key))) return false;
     const { stage, text, key } = found;
     const before = seenByUrl[url]?.nudges ?? {};
@@ -3295,15 +3274,6 @@ export class PullRequestWatch {
       ].join("\n");
       if (record.status !== "archived") {
         const outcome = await this.deps.sessions.prompt(record.agentId, prompt, toAgent, this.recovery(record, reserved, claim, undefined, url));
-        if (this.waitFor(seenByUrl, url, `stage:${stage}:${key}`, outcome)) {
-          // The agent waits for the owner's answer, so the step is claimed here — a later stall
-          // under this key is not nudged again — and the owner is reminded once. No count holds
-          // the stage's other stalls back (TUC-1777).
-          seenByUrl[url] = { ...entry(seenByUrl, url), nudges: { ...before, [stage]: [...heads, key] }, waits: undefined, activeAt: new Date().toISOString() };
-          await save();
-          await this.waitedOut(record, url, STAGE_STEP[stage]);
-          return true;
-        }
         if (outcome === "sent") await this.tell(record, "thought", `The pull request is waiting for the agent to ${STAGE_STEP[stage]}; it was asked to.`);
         // A crash the message itself could not restart is the crash pass's line to report (see
         // crashLine): nothing repeats here while the agent waits for its restart.
@@ -3314,7 +3284,7 @@ export class PullRequestWatch {
       if (next?.kind === "started") {
         // The claim stands: what follows the start is only logged when it fails.
         claimed = false;
-        await this.succeeded(record, next.agent, seenByUrl, url, reserved, STAGE_STEP[stage]);
+        await this.succeeded(record, next.agent, reserved, STAGE_STEP[stage]);
         return true;
       }
       if (next && next.kind !== "impossible") return true;
@@ -3400,13 +3370,6 @@ export class PullRequestWatch {
       let gone = record.status === "archived";
       if (!gone) {
         const outcome = await this.deps.sessions.prompt(record.agentId, text, toAgent, this.recovery(record, reserved, toAgent, undefined, url));
-        if (this.waitFor(seenByUrl, url, `replay:${view.headSha}`, outcome)) {
-          // Claimed as asked before the reminder goes out, so it never goes out twice.
-          seenByUrl[url] = { ...seenByUrl[url], replay: "asked", waits: undefined, activeAt: new Date().toISOString() };
-          await save();
-          await this.waitedOut(record, url, step);
-          return;
-        }
         if (outcome === "sent") await this.tell(record, "thought", "The pull request was closed because the branch below it landed; the agent was asked to open its replacement.");
         else if (outcome !== "crashed") await this.crashLine(record, outcome, step);
         if (outcome !== "gone" && outcome !== "crashed") return;
@@ -3419,7 +3382,7 @@ export class PullRequestWatch {
       if (next?.kind === "started") {
         // The claim stands: what follows the start is only logged when it fails.
         claimed = false;
-        await this.succeeded(record, next.agent, seenByUrl, url, reserved, step);
+        await this.succeeded(record, next.agent, reserved, step);
         return;
       }
       if (next && next.kind !== "impossible") return;
@@ -3437,12 +3400,11 @@ export class PullRequestWatch {
   // of a running ticket. Its ticket checks and the owner's one comment go at interactive priority
   // as `crash-recovery`; the reload and the resume need no Linear call. A failure for one agent, a
   // refused Linear request included, is logged and the pass goes on with the next agent.
-  // `states`: the poll's one batch read of the tickets' states (see observeStates), shared with the
-  // stack policy's pass. `moves`: the journaled pull request moves (see rebindMoved).
-  private async crashPass(all: HandoverRecord[], states: Map<string, IssueStatus> | null, reserved: Set<string>, seenByUrl: Record<string, Seen>, views: Map<string, Promise<PullRequestView>>, moves: PullTransfer[]): Promise<void> {
+  // `moves`: the journaled pull request moves (see rebindMoved).
+  private async crashPass(all: HandoverRecord[], reserved: Set<string>, views: Map<string, Promise<PullRequestView>>, moves: PullTransfer[]): Promise<void> {
     await withPriority("interactive", "crash-recovery", async () => {
       await this.pendingResumes(all, reserved, moves);
-      await this.crashedAgents(all, reserved, seenByUrl, views);
+      await this.crashedAgents(all, reserved, views);
     });
   }
 
@@ -3693,7 +3655,7 @@ export class PullRequestWatch {
         return acted;
       }
       const claim = async () => { reopen.sending = true; await save(); };
-      await this.policySend(record, reopen.message, "land the pull requests of its stack that are still open", claim, async () => { reopen.message = undefined; reopen.sending = undefined; await save(); }, reserved, seenByUrl);
+      await this.policySend(record, reopen.message, "land the pull requests of its stack that are still open", claim, async () => { reopen.message = undefined; reopen.sending = undefined; await save(); }, reserved);
       // Only a notice that went out (or is with a restart, successor or the ticket) counts toward
       // POLICY_PER_POLL: a busy or reserved agent keeps its notice for a later poll without holding
       // the other Done tickets back.
@@ -3729,7 +3691,7 @@ export class PullRequestWatch {
         if (ticket.cap === signature) continue;
         const claim = async () => { ticket.cap = signature; this.policy[record.issueId] = ticket; await writeState(this.policyPath, this.policy); };
         try {
-          await this.policySend(record, capNotice(open, bottom), "land the reviewed bottom range before stacking more", claim, claim, reserved, seenByUrl);
+          await this.policySend(record, capNotice(open, bottom), "land the reviewed bottom range before stacking more", claim, claim, reserved);
         } catch (error) {
           // A message that failed outright was not sent: the next poll asks again.
           delete ticket.cap;
@@ -3763,7 +3725,7 @@ export class PullRequestWatch {
   // waiting agent claims nothing (the next poll decides again), a crashed one waits for its restart
   // with the message as its resume, a gone one starts a successor with it, and when neither can it
   // goes to the ticket as before.
-  private async policySend(record: HandoverRecord, text: string, step: string, claim: () => Promise<void>, done: () => Promise<void>, reserved: Set<string>, seenByUrl: Record<string, Seen>): Promise<void> {
+  private async policySend(record: HandoverRecord, text: string, step: string, claim: () => Promise<void>, done: () => Promise<void>, reserved: Set<string>): Promise<void> {
     if (reserved.has(this.slot(record))) return;
     const toAgent = async () => { reserved.add(this.slot(record)); await claim(); };
     if (record.status !== "archived") {
@@ -3784,7 +3746,7 @@ export class PullRequestWatch {
     const next = await this.succession(record, [], text, toAgent);
     if (next?.kind === "started") {
       await done();
-      await this.succeeded(record, next.agent, seenByUrl, record.links["Pull request"] ?? "", reserved, step);
+      await this.succeeded(record, next.agent, reserved, step);
       return;
     }
     if (next && next.kind !== "impossible") return;
@@ -3861,7 +3823,7 @@ export class PullRequestWatch {
   // limit-resume handling (`limit`), and neither counts as a restart (see crashKind). Every crashed
   // agent this pass looked at is reserved for the poll, restarted or not: a nudge, drop fix or
   // replacement must not reload one the ticket check, the backoff or a successor held back.
-  private async crashedAgents(all: HandoverRecord[], reserved: Set<string>, seenByUrl: Record<string, Seen>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
+  private async crashedAgents(all: HandoverRecord[], reserved: Set<string>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
     for (const record of all) {
       // A record without an agent (Handover.transfer) has no process that could crash.
       if (!hasAgent(record) || record.status === "archived" || reserved.has(record.agentId) || this.crashes[record.agentId]?.successor) continue;
@@ -3899,7 +3861,7 @@ export class PullRequestWatch {
         if (this.crashes[record.agentId]?.setup) await this.saveCrash(record.agentId, { setup: undefined });
         if (this.crashes[record.agentId]?.limit) await this.saveCrash(record.agentId, { limit: undefined });
         if ((this.crashes[record.agentId]?.restarts ?? 0) >= STAGE_NUDGES) {
-          await this.succeedCrashed(record, state.status, error, reserved, seenByUrl, views);
+          await this.succeedCrashed(record, state.status, error, reserved, views);
           continue;
         }
         if (!this.restartDue(this.crashes[record.agentId])) {
@@ -3922,11 +3884,11 @@ export class PullRequestWatch {
   // A crashed agent that reached STAGE_NUDGES restarts is not reloaded again — its session itself
   // may be broken — so a successor takes its ticket over (TUC-1777), with the pending resume as
   // its lead (else the resume the restart would have sent). The crash is marked before the start
-  // (so no later pass restarts or succeeds this agent again) and the ticket's waits are cleared.
+  // (so no later pass restarts or succeeds this agent again).
   // No successor possible — a `do-not-merge` pull request or one whose veto cannot be checked,
   // automatic starts switched off, no recorded branch, a refused start — hands the ticket back as
   // for a gone agent (one comment to the owner); one that waits is decided again on the next poll.
-  private async succeedCrashed(record: AgentRecord, status: string, error: string, reserved: Set<string>, seenByUrl: Record<string, Seen>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
+  private async succeedCrashed(record: AgentRecord, status: string, error: string, reserved: Set<string>, views: Map<string, Promise<PullRequestView>>): Promise<void> {
     const crash = this.crashes[record.agentId];
     const lead = crash?.resume?.text ?? crashResume(error, `Your ticket ${record.identifier} is in ${status}. Continue the lifecycle step you were on.`);
     const url = record.links["Pull request"];
@@ -3948,7 +3910,6 @@ export class PullRequestWatch {
     const next = await this.succession(record, labels, lead, claim);
     if (next?.kind === "started") {
       reserved.add(next.agent.id);
-      if (url) this.clearWaits(seenByUrl, url);
       await this.tell({ ...record, agentId: next.agent.id }, "thought", `The agent crashed ${crash?.restarts ?? STAGE_NUDGES} times in all; Paseo started a successor (agent ${next.agent.id.slice(0, 8)}) and asked it to resume and continue the step it was on.`);
       return;
     }
@@ -4121,36 +4082,10 @@ export class PullRequestWatch {
 
   // After a successor started with the message: it takes no other message this poll, a resume the
   // gone agent had pending no longer goes out, and the ticket's panel says so (best effort).
-  private async succeeded(record: HandoverRecord, agent: { id: string }, seenByUrl: Record<string, Seen>, url: string, reserved: Set<string>, step: string): Promise<void> {
+  private async succeeded(record: HandoverRecord, agent: { id: string }, reserved: Set<string>, step: string): Promise<void> {
     reserved.add(agent.id);
-    this.clearWaits(seenByUrl, url);
     await this.dropResume(record.agentId);
     await this.tell({ ...record, agentId: agent.id }, "thought", `The agent was gone; Paseo started a successor (agent ${agent.id.slice(0, 8)})${record.branch ? ` on ${record.branch}` : ""} and asked it to ${step}.`);
-  }
-
-  // Tracks how long the agent has waited for the owner's answer (`waiting`) while the message `key`
-  // of this pull request waited for it. The start is kept across polls, plugin restarts and `busy`,
-  // `unavailable` or `crashed` answers; anything else (the message went out, or the agent is gone)
-  // clears it, and another message's wait replaces it. True once `waiting` lasted
-  // PERMISSION_WAIT_MS: the caller claims the message as escalated, then reminds the owner.
-  private waitFor(seenByUrl: Record<string, Seen>, url: string, key: string, outcome: PromptOutcome): boolean {
-    const since = outcome === "waiting" ? seenByUrl[url]?.waits?.[key] ?? new Date(this.clock()).toISOString()
-      : outcome === "busy" || outcome === "unavailable" || outcome === "crashed" ? seenByUrl[url]?.waits?.[key]
-      : undefined;
-    seenByUrl[url] = { ...entry(seenByUrl, url), waits: since ? { [key]: since } : undefined };
-    return outcome === "waiting" && since !== undefined && this.clock() - Date.parse(since) >= PERMISSION_WAIT_MS;
-  }
-
-  // Drops the permission wait of the pull request, or only one of this kind (`stage:`, `drop:`, `replay:`).
-  private clearWaits(seenByUrl: Record<string, Seen>, url: string, kind = ""): void {
-    const waits = seenByUrl[url]?.waits;
-    if (waits && Object.keys(waits).some((key) => key.startsWith(kind))) seenByUrl[url] = { ...seenByUrl[url], waits: undefined };
-  }
-
-  // The one reminder after a permission wait (see waitFor); the message is claimed before it.
-  private async waitedOut(record: HandoverRecord, url: string, step: string): Promise<void> {
-    console.log(`[linear-tickets] ${record.identifier}: agent ${record.agentId?.slice(0, 8) ?? "(none)"} waited over ${PERMISSION_WAIT_MS / 60_000} minutes for the owner's answer; reminding the owner`);
-    await this.mention(record.issueId, `The agent has waited over ${PERMISSION_WAIT_MS / 60_000} minutes for your answer while [the pull request](${url}) waits for it to ${step}. Answer it in the ticket's thread, or take over.`);
   }
 
   private clock(): number {

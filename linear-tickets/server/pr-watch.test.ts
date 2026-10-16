@@ -3095,100 +3095,41 @@ test("a live agent of the ticket takes the gone agent's record and gets the mess
 });
 
 const HOUR = 60 * MINUTE;
-const WAITED = (step: string) => `comment ${OWNER} The agent has waited over 60 minutes for your answer while [the pull request](${PR}) waits for it to ${step}. Answer it in the ticket's thread, or take over.`;
 
-test("a stage waiting 60 minutes for the owner's answer reminds the owner once; restarts and busy polls keep the timer", async (t) => {
+test("owner waits stay quiet across hours and reloads and deliver the pending stage after the answer", async (t) => {
   t.mock.method(console, "log", () => {});
   const h = harness(t);
-  const start = h.scripts.now;
   h.github.view = { ...READY, checks: [failing("PR code")] };
   h.paseo.answer = async () => "waiting";
   assert.deepEqual(await h.poll(), []);
-  h.scripts.now = start + 30 * MINUTE;
-  h.paseo.answer = async () => "busy";
-  assert.deepEqual(await h.poll(), [], "busy keeps the wait");
-  await h.restart();
-  h.paseo.answer = async () => "unavailable";
-  assert.deepEqual(await h.poll(), [], "so does a disconnected Paseo, after a restart");
-  h.paseo.answer = async () => "waiting";
-  h.scripts.now = start + 59 * MINUTE;
-  assert.deepEqual(await h.poll(), []);
-  h.scripts.now = start + HOUR;
-  assert.deepEqual(await h.poll(), [WAITED("fix the failing checks")]);
-  h.scripts.now = start + 3 * HOUR;
-  assert.deepEqual(await h.poll(), [], "once");
+  for (let tick = 0; tick < 3; tick++) {
+    h.scripts.now += HOUR;
+    await h.restart();
+    assert.deepEqual(await h.poll(), [], "an existing question never gets a timed reminder");
+  }
   h.paseo.answer = async () => "sent";
-  h.github.view = { ...READY, headSha: "h2", checks: [failing("PR code")] };
-  const nudged = await h.poll();
-  assert.ok((promptOf(nudged) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`), "a new stall of the stage is nudged again: no count stops it");
-  assert.equal(nudged.at(-1), "say thought The pull request is waiting for the agent to fix the failing checks; it was asked to.");
-  assert.deepEqual(await h.poll(), [], "and the same head is not nudged twice while the answer is pending");
+  assert.match(promptOf(await h.poll()) ?? "", /PR code/, "the unchanged failed check is delivered after the owner answers");
+  assert.deepEqual(await h.poll(), [], "the delivered stage is not repeated");
 });
 
-test("a message that went out, a new head or another stage starts the permission wait again from zero", async (t) => {
+test("queue-drop and replay requests survive a long owner wait without comments or delivery claims", async (t) => {
   t.mock.method(console, "log", () => {});
-  const h = harness(t);
-  const start = h.scripts.now;
-  h.github.view = { ...READY, checks: [failing("PR code")] };
-  h.paseo.answer = async () => "waiting";
-  await h.poll();
-  h.scripts.now = start + 50 * MINUTE;
-  h.paseo.answer = async () => "sent";
-  assert.ok((promptOf(await h.poll()) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`), "answered before the hour: sent");
-  h.github.view = { ...READY, headSha: "h2", checks: [failing("PR code")] };
-  h.paseo.answer = async () => "waiting";
-  assert.deepEqual(await h.poll(), [], "a new head waits from now");
-  h.scripts.now = start + 50 * MINUTE + 59 * MINUTE;
-  assert.deepEqual(await h.poll(), []);
-  // The checks pass on the same head, and a bot's finding holds it instead: another stage.
-  h.github.view = { ...READY, headSha: "h2" };
-  h.github.threads = [FINDING];
-  assert.deepEqual(await h.poll(), [], "another stage waits from now");
-  h.scripts.now += 59 * MINUTE;
-  assert.deepEqual(await h.poll(), []);
-  h.scripts.now += MINUTE;
-  assert.deepEqual(await h.poll(), [WAITED("resolve the review findings")]);
-});
-
-test("a stage the owner vetoed meanwhile waits from zero once the veto is lifted", async (t) => {
-  t.mock.method(console, "log", () => {});
-  const h = harness(t);
-  const start = h.scripts.now;
-  h.github.view = { ...READY, checks: [failing("PR code")] };
-  h.paseo.answer = async () => "waiting";
-  assert.deepEqual(await h.poll(), []);
-  h.scripts.now = start + 50 * MINUTE;
-  h.github.view = { ...READY, checks: [failing("PR code")], labels: ["do-not-merge"] };
-  assert.deepEqual(await h.poll(), [], "vetoed: no nudge and no reminder");
-  h.scripts.now = start + 90 * MINUTE;
-  h.github.view = { ...READY, checks: [failing("PR code")] };
-  assert.deepEqual(await h.poll(), [], "the same stage waits again, from now");
-  h.scripts.now = start + 90 * MINUTE + 59 * MINUTE;
-  assert.deepEqual(await h.poll(), []);
-  h.scripts.now = start + 150 * MINUTE;
-  assert.deepEqual(await h.poll(), [WAITED("fix the failing checks")]);
-});
-
-test("a drop's fix request or a replay request waiting 60 minutes for the owner's answer escalates once", async (t) => {
-  t.mock.method(console, "log", () => {});
-  const drop = harness(t);
-  drop.github.view = { ...drop.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
-  drop.paseo.answer = async () => "waiting";
-  assert.deepEqual(await drop.poll(), []);
-  drop.scripts.now += HOUR;
-  assert.deepEqual(await drop.poll(), [WAITED("fix the merge queue drop")]);
-  drop.paseo.answer = async () => "sent";
-  assert.deepEqual(await drop.poll(), [], "escalated: the fix request is not sent after all");
-
-  const replay = harness(t);
-  replay.github.view = { ...OPEN_PR, state: "CLOSED", baseBranch: PARENT };
-  replay.github.deleted = [PARENT];
-  replay.paseo.answer = async () => "waiting";
-  assert.deepEqual(await replay.poll(), []);
-  replay.scripts.now += HOUR;
-  assert.deepEqual(await replay.poll(), [WAITED("open the replacement pull request")]);
-  replay.paseo.answer = async () => "sent";
-  assert.deepEqual(await replay.poll(), [], "asked");
+  for (const kind of ["drop", "replay"]) {
+    const h = harness(t);
+    if (kind === "drop") h.github.view = { ...h.github.view, mergeActivity: activity(QUEUED, CONFLICT) };
+    else {
+      h.github.view = { ...OPEN_PR, state: "CLOSED", baseBranch: PARENT };
+      h.github.deleted = [PARENT];
+    }
+    h.paseo.answer = async () => "waiting";
+    assert.deepEqual(await h.poll(), []);
+    h.scripts.now += 3 * HOUR;
+    await h.restart();
+    assert.deepEqual(await h.poll(), [], `${kind}: waiting is not a new owner question`);
+    h.paseo.answer = async () => "sent";
+    assert.match(promptOf(await h.poll()) ?? "", kind === "drop" ? /gt restack/ : /gt track mtuchel\/tuc-1-fix --parent main/, `${kind}: the pending repair still reaches the agent`);
+    assert.deepEqual(await h.poll(), [], `${kind}: successful delivery is claimed once`);
+  }
 });
 
 test("the backstop's enqueued note waits while the agent waits for the owner, and goes out once it takes messages", async (t) => {
@@ -3891,7 +3832,7 @@ test("TUC-1265: base conflicts on new heads keep being nudged, every third asks 
   waiting.paseo.answer = async () => "waiting";
   assert.deepEqual(await waiting.poll(), []);
   waiting.scripts.now = start + HOUR;
-  assert.deepEqual(await waiting.poll(), [`comment ${OWNER} The agent has waited over 60 minutes for your answer while [the pull request](${prUrl(418)}) waits for it to resolve the base conflict. Answer it in the ticket's thread, or take over.`]);
+  assert.deepEqual(await waiting.poll(), [], "an existing owner wait stays quiet");
   await waiting.restart();
   waiting.paseo.answer = async () => "sent";
   stackOf(waiting, 2, {}, { headSha: "w2", mergeable: "CONFLICTING" });
@@ -3985,7 +3926,7 @@ test("TUC-1265: a linked pull request whose title names no ticket keeps linked-o
   assert.deepEqual(prompted(await h.poll()), [PR], "the link itself is still nudged");
 });
 
-test("TUC-1265: an agent waiting for the owner holds the whole stack's repairs, and the owner is reminded of one wait", async (t) => {
+test("TUC-1265: an owner wait quietly holds the whole stack and preserves bottom-first delivery", async (t) => {
   t.mock.method(console, "log", () => {});
   const h = harness(t);
   const start = h.scripts.now;
@@ -3993,11 +3934,11 @@ test("TUC-1265: an agent waiting for the owner holds the whole stack's repairs, 
   h.paseo.answer = async () => "waiting";
   assert.deepEqual(await h.poll(), []);
   h.scripts.now = start + HOUR;
-  assert.deepEqual(await h.poll(), [`comment ${OWNER} The agent has waited over 60 minutes for your answer while [the pull request](${prUrl(417)}) waits for it to fix the failing checks. Answer it in the ticket's thread, or take over.`], "only the bottom's wait");
+  assert.deepEqual(await h.poll(), [], "the owner already has the question");
   const state = await saved(h);
   assert.equal(state[prUrl(418)]?.nudges, undefined, "the middle was not even tried");
   h.paseo.answer = async () => "sent";
-  assert.deepEqual(prompted(await h.poll()), [prUrl(418)], "the bottom's waited-out stall is claimed; the middle goes next");
+  assert.deepEqual(prompted(await h.poll()), [prUrl(417)], "the bottom's pending repair goes first after the answer");
 });
 
 test("TUC-1265: a member the stack held back starts its permission wait from zero once the hold lifts", async (t) => {
@@ -4015,7 +3956,7 @@ test("TUC-1265: a member the stack held back starts its permission wait from zer
   h.scripts.now = start + HOUR;
   assert.deepEqual(await h.poll(), [], "the veto lifted: the wait starts again instead of reminding the owner");
   h.scripts.now = start + 2 * HOUR;
-  assert.equal(count(await h.poll(), `comment ${OWNER} The agent has waited over 60 minutes`), 1);
+  assert.deepEqual(await h.poll(), [], "elapsed time does not repeat the owner's question");
 });
 
 test("TUC-1265: members compare by repo and number whatever the URL's spelling, and a fork's same-named branch is never a member", async (t) => {

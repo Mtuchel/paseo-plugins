@@ -353,6 +353,7 @@ async function passFixture(t: any, over: {
     escalates: [] as string[], clears: [] as string[], prompts: [] as string[], relates: [] as string[],
     dueDates: [] as string[], moves: [] as string[], labels: [] as string[], archives: [] as string[],
     completionUrls: [] as string[][],
+    comments: [] as string[], cards: [] as string[],
     continuations: [] as { issueId: string; agentId: string; operationId: string; text: string }[],
     admissions: [] as unknown[][], startOptions: [] as Parameters<TicketStarter["start"]>[3][],
   };
@@ -403,7 +404,8 @@ async function passFixture(t: any, over: {
       issueRef: async (identifier: string) => (identifier === "ENG-2" ? { id: "i2", identifier: "ENG-2" } : null),
       addLabel: async (_id: string, name: string) => { calls.labels.push(`+${name}`); },
       removeLabel: async (_id: string, name: string) => { calls.labels.push(`-${name}`); },
-      comment: async () => {}, upsertComment: async () => "c1",
+      comment: async (issueId: string) => { calls.comments.push(issueId); },
+      upsertComment: async (issueId: string) => { calls.cards.push(issueId); return "c1"; },
       createIssue: async () => ({ id: "f1", identifier: "ENG-99" }),
       relate: async (blocker: string, blocked: string) => { calls.relates.push(`${blocker}->${blocked}`); },
       complete: async (id: string) => { if (fail.complete) throw new Error("Linear did not confirm the write."); calls.completed.push(id); },
@@ -471,6 +473,22 @@ async function passFixture(t: any, over: {
   const ticket = async (issueId: string) => (await store.read()).tickets[issueId];
   return { store, calls, clock, paseo, seed, ticket, records, roots, admission, fail, build, pass: async (cap?: number) => await build().tick(paseo, stewardSettings(cap ?? over.cap, over.teams)) };
 }
+
+test("parent monitoring stays in the durable flow view without periodic Linear comments", async (t) => {
+  const issue = ticketIssue({ children: [childIssue("ENG-2", "i2", "started")] });
+  const f = await passFixture(t, { issues: [issue], records: [recordFor("i1", "ENG-1")] });
+  await f.seed("i1", "ENG-1", { situation: "stalled", since: at(120) });
+  await f.pass();
+  assert.deepEqual(f.calls.restarts, ["i1"], "quiet monitoring still recovers stopped work");
+  f.roots.set("i1", { roots: [{ id: "a1", status: "running", updatedAt: new Date(f.clock.now).toISOString(), createdAt: at(60) }], ghosts: new Set<string>() });
+  for (let tick = 0; tick < 3; tick++) {
+    f.clock.now += 31 * 60_000;
+    await f.pass();
+  }
+  assert.deepEqual(f.calls.cards, [], "elapsed time and reloads never publish status cards");
+  assert.deepEqual(f.calls.comments, [], "recovery checks never publish routine comments");
+  assert.ok((await f.build().snapshot()).tickets.some((ticket) => ticket.identifier === "ENG-1"), "the persistent attention surface retains the ticket");
+});
 
 test("a claim written before the effect is not repeated after a reload, and is retried after the grace", async (t) => {
   const f = await passFixture(t, { issues: [ticketIssue()], records: [recordFor("i1", "ENG-1")] });
