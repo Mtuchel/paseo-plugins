@@ -10,7 +10,7 @@ import type { NeedsYouIssue, NeedsYouIssues } from "./needs-you";
 import { askHash, EXTRACTION_VERSION, MAX_SOURCE_CHARS, type AskQuestion, type ExtractInput, type Extraction, type ExtractedAsk } from "./owner-ask-extract";
 import type { DeliveryOrigin, DeliveryResult } from "./permission-replies";
 import { LIVE_AGENT } from "./process-liveness";
-import { withPriority } from "./rate-budget";
+import { withPriority, type Priority } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
 import { askContext, askTimeline, checkAssessment, type AskContext } from "./owner-ask-admission";
 import { classifyAttention } from "./owner-ask-attention";
@@ -31,7 +31,17 @@ const AGENT_PAGE = 200;
 // Menu-bar polls must not rescan every open issue and its comments on each refresh.
 // A decision always bypasses this cache before delivery; external edits appear within a minute.
 const LINEAR_SOURCE_CACHE_MS = 60_000;
-type Linear = Pick<LinearService, "ownerAskIssues" | "ownerAskIssuesByIds" | "ownerAskComments" | "commentBody" | "comment" | "complete" | "viewerId">;
+// Comments stay in memory between collections. A collection reads only the comments created or
+// edited since the previous one (one request for the whole inventory), and an issue's whole
+// history only when it joins the inventory. Re-reading every history on each collection cost 74
+// requests on server087 (568 open issues, 13,363 comments; 2026-10-16) and made owner-asks the
+// largest Linear caller on both pools. The overlap covers clock skew between this host and
+// Linear (a comment's updatedAt can precede its createdAt). A change read cannot see a deleted
+// comment, so every history is read again after COMMENT_FULL_READ_MS.
+const COMMENT_CHANGE_OVERLAP_MS = 5 * 60_000;
+const COMMENT_FULL_READ_MS = 30 * 60_000;
+type Linear = Pick<LinearService, "ownerAskIssues" | "ownerAskIssuesByIds" | "ownerAskComments" | "ownerAskCommentChanges" | "commentBody" | "comment" | "complete" | "viewerId">;
+type CommentStore = { byIssue: Map<string, OwnerAskComment[]>; readAt: number; fullAt: number; expiresAt: number };
 type NeedsYou = Pick<NeedsYouIssues, "all" | "allStrict" | "remove">;
 
 export type ContinueOutcome = { kind: "started" | "live" | "deferred" | "failed" | "forwarded" | "skipped"; reason?: string; peer?: string };
@@ -177,8 +187,9 @@ export class OwnerAsks {
   private sourceGeneration = 0;
   private issueCache: { expiresAt: number; value: OwnerAskIssue[] } | null = null;
   private issueFlight: Promise<OwnerAskIssue[]> | null = null;
-  private commentCache: { expiresAt: number; ids: string; value: Map<string, OwnerAskComment[]> } | null = null;
-  private commentFlight: { ids: string; promise: Promise<Map<string, OwnerAskComment[]>> } | null = null;
+  private commentStore: CommentStore | null = null;
+  // Comment reads run one at a time, so a change read always starts from the store it extends.
+  private commentReads: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly deps: OwnerAsksDeps) {
     this.directory = deps.directory ?? OWNER_ASK_DIRECTORY();
@@ -402,7 +413,8 @@ export class OwnerAsks {
     let record = original;
     if (record.close && !record.close.done) {
       if (!record.close.completed && record.result?.delivered !== "closed") {
-        const drafts = (await this.collect(paseo, undefined, true)).filter(draft => draft.issue.id === record.receipt.issueId);
+        // That issue alone: a whole-history read also sees a receipt Linear deleted.
+        const drafts = await this.collect(paseo, record.receipt.issueId);
         const current = drafts.find(draft => record.sourceId === undefined || record.sourceId === draft.sourceId);
         // Posting our answer changes timeline/extraction context, not the source's material scope.
         // Legacy receipts without that scope retain the stricter exact-revision completion fence.
@@ -465,12 +477,12 @@ export class OwnerAsks {
   private isManual(issue: OwnerAskIssue, manualLabel: string): boolean {
     return issue.labels.some((name) => name.trim().toLowerCase() === manualLabel.trim().toLowerCase());
   }
+  // The comment store keeps its contents: the next collection reads the changes since then.
   private invalidateSources(): void {
     this.sourceGeneration++;
     this.issueCache = null;
     this.issueFlight = null;
-    this.commentCache = null;
-    this.commentFlight = null;
+    if (this.commentStore) this.commentStore.expiresAt = 0;
   }
 
   private async cachedIssues(): Promise<OwnerAskIssue[]> {
@@ -488,21 +500,44 @@ export class OwnerAsks {
     }
   }
 
-  private async cachedComments(ids: string[]): Promise<Map<string, OwnerAskComment[]>> {
-    const key = ids.join("\0");
-    if (this.commentCache?.ids === key && this.commentCache.expiresAt > this.now()) return this.commentCache.value;
-    if (this.commentFlight?.ids === key) return this.commentFlight.promise;
+  // A background (menu) read takes the store while it is fresh and holds every issue, also when
+  // it queued behind another read; an interactive read always asks Linear for the changes.
+  private readComments(ids: string[], priority: Priority): Promise<Map<string, OwnerAskComment[]>> {
+    const read = this.commentReads.catch(() => undefined).then(() => {
+      const store = this.commentStore;
+      if (priority === "background" && store && store.expiresAt > this.now() && ids.every(id => store.byIssue.has(id))) {
+        return new Map(ids.map(id => [id, store.byIssue.get(id)!]));
+      }
+      return withPriority(priority, CALLER, () => this.syncComments(ids));
+    });
+    this.commentReads = read;
+    return read;
+  }
+
+  // `ids` is the whole inventory: issues that left it leave the store.
+  private async syncComments(ids: string[]): Promise<Map<string, OwnerAskComment[]>> {
+    const startedAt = this.now();
     const generation = this.sourceGeneration;
-    const promise = withPriority("background", CALLER, () => this.deps.linear.ownerAskComments(ids));
-    const flight = { ids: key, promise };
-    this.commentFlight = flight;
-    try {
-      const value = await promise;
-      if (generation === this.sourceGeneration) this.commentCache = { expiresAt: this.now() + LINEAR_SOURCE_CACHE_MS, ids: key, value };
-      return value;
-    } finally {
-      if (this.commentFlight === flight) this.commentFlight = null;
+    const store = this.commentStore && startedAt - this.commentStore.fullAt < COMMENT_FULL_READ_MS ? this.commentStore : null;
+    const known = store ? ids.filter(id => store.byIssue.has(id)) : [];
+    const added = store ? ids.filter(id => !store.byIssue.has(id)) : ids;
+    const changes = store && known.length
+      ? await this.deps.linear.ownerAskCommentChanges(known, new Date(store.readAt - COMMENT_CHANGE_OVERLAP_MS).toISOString())
+      : new Map<string, OwnerAskComment[]>();
+    const histories = added.length ? await this.deps.linear.ownerAskComments(added) : new Map<string, OwnerAskComment[]>();
+    const byIssue = new Map<string, OwnerAskComment[]>();
+    for (const id of ids) {
+      const stored = store?.byIssue.get(id) ?? [];
+      const history = histories.get(id);
+      const changed = changes.get(id);
+      if (!history && !changed) { byIssue.set(id, stored); continue; }
+      // Newest first, as askTimeline orders them, so the cards keep their order across reads.
+      byIssue.set(id, [...new Map((history ?? [...stored, ...changed!]).map(comment => [comment.id, comment])).values()]
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id)));
     }
+    this.commentStore = { byIssue, readAt: startedAt, fullAt: store?.fullAt ?? startedAt,
+      expiresAt: generation === this.sourceGeneration ? this.now() + LINEAR_SOURCE_CACHE_MS : 0 };
+    return new Map(ids.map(id => [id, byIssue.get(id)!]));
   }
 
   private async collect(paseo: PaseoApi | null, issueId?: string, fresh = false): Promise<Draft[]> {
@@ -528,9 +563,11 @@ export class OwnerAsks {
     const asked = issues;
     if (asked.length) {
       const ids = asked.map(issue => issue.id);
-      const source = issueId || fresh
+      // One issue (a decision) reads its whole history: exact, deletions included. The inventory
+      // reads the store, extended by the changes since its last read.
+      const source = issueId
         ? await withPriority(priority, CALLER, () => this.deps.linear.ownerAskComments(ids))
-        : await this.cachedComments(ids);
+        : await this.readComments(ids, priority);
       for (const [id, list] of source) comments.set(id, list);
       // A wait comment older than the newest page is read on its own.
       for (const issue of asked) {

@@ -458,6 +458,28 @@ test("an incomplete comment cursor rejects the owner inventory rather than dropp
   await assert.rejects(linear.ownerAskComments([ID_A]), /incomplete or repeated comment cursor/);
 });
 
+test("owner comment changes cover a large inventory in bounded filters, follow pages and group by issue", async () => {
+  const ids = Array.from({ length: 501 }, (_, index) => `issue-${index}`);
+  const filters: { ids: number; since: string; after: unknown }[] = [];
+  const { linear } = service(undefined, (_query, variables) => {
+    const filter = variables.filter as { updatedAt: { gte: string }; issue: { id: { in: string[] } } };
+    filters.push({ ids: filter.issue.id.in.length, since: filter.updatedAt.gte, after: variables.after });
+    const node = (id: string, issueId: string) => ({ id, body: `Edited ${id}?`, createdAt: "2026-10-16T00:00:00Z", issue: { id: issueId } });
+    if (filter.issue.id.in.includes("issue-500")) return { comments: groupConnection([node("last", "issue-500")]) };
+    return variables.after === null
+      ? { comments: groupConnection([node("a", "issue-0"), node("b", "issue-1")], "page-2") }
+      : { comments: groupConnection([node("c", "issue-0")]) };
+  });
+  const found = await linear.ownerAskCommentChanges(ids, "2026-10-16T00:00:00.000Z");
+  assert.deepEqual(filters, [
+    { ids: 500, since: "2026-10-16T00:00:00.000Z", after: null },
+    { ids: 500, since: "2026-10-16T00:00:00.000Z", after: "page-2" },
+    { ids: 1, since: "2026-10-16T00:00:00.000Z", after: null },
+  ]);
+  assert.deepEqual(Object.fromEntries([...found].map(([id, list]) => [id, list.map(comment => comment.id)])),
+    { "issue-0": ["a", "c"], "issue-1": ["b"], "issue-500": ["last"] });
+});
+
 // TUC-1324: status moves and label removal read the ticket without its relations. A real
 // LinearService whose app answers reads and writes; `sent` lists each operation sent on either
 // pool (state writes with their target), and the 498-point ISSUE_STATE_QUERY is refused outright.

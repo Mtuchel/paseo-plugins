@@ -70,6 +70,8 @@ async function setup(options: {
       ownerAskIssues: async () => state.issues,
       ownerAskIssuesByIds: async () => state.issues,
       ownerAskComments: async (ids) => new Map(ids.map((id) => [id, state.comments.get(id) ?? []])),
+      // Every comment present counts as changed; like Linear, a deleted one is not reported.
+      ownerAskCommentChanges: async (ids) => new Map(ids.flatMap((id) => state.comments.has(id) ? [[id, state.comments.get(id)!] as const] : [])),
       commentBody: async (id) => [...state.comments.values()].flat().find((entry) => entry.id === id)?.body ?? null,
       comment: async (issueId, body) => { events.push(`comment ${issueId}: ${body}`); },
       complete: async (issueId) => { events.push(`complete ${issueId}`); },
@@ -724,23 +726,64 @@ test("owner inbox shows new Linear questions within a minute without rescanning 
     comments: new Map([["i1", [comment("c1", "Which rollout policy?")]]]) });
   t.after(() => h.ownerAsks.stop());
   let inventoryReads = 0;
-  let commentReads = 0;
+  let historyReads = 0;
+  const changeReads: string[] = [];
   h.deps.issues = async () => { inventoryReads++; return h.state.issues; };
   h.deps.linear.ownerAskComments = async ids => {
-    commentReads++;
+    historyReads++;
+    return new Map(ids.map(id => [id, h.state.comments.get(id) ?? []]));
+  };
+  h.deps.linear.ownerAskCommentChanges = async (ids, since) => {
+    changeReads.push(since);
     return new Map(ids.map(id => [id, h.state.comments.get(id) ?? []]));
   };
   assert.deepEqual((await h.ownerAsks.snapshot(null)).asks.map(ask => ask.sourceId), ["c1"]);
   h.state.comments.set("i1", [comment("c2", "Which new approval is needed?"), comment("c1", "Which rollout policy?")]);
   h.state.now += 30_000;
   assert.deepEqual((await h.ownerAsks.snapshot(null)).asks.map(ask => ask.sourceId), ["c1"]);
-  assert.deepEqual([inventoryReads, commentReads], [1, 1]);
+  assert.deepEqual([inventoryReads, historyReads, changeReads.length], [1, 1, 0]);
   assert.deepEqual(new Set((await h.ownerAsks.snapshot(null, true)).asks.map(ask => ask.sourceId)), new Set(["c1", "c2"]),
     "the browser's explicit collection bypasses the menu cache");
-  assert.deepEqual([inventoryReads, commentReads], [2, 2]);
+  assert.deepEqual([inventoryReads, historyReads, changeReads], [2, 1, [new Date(NOW - 5 * 60_000).toISOString()]],
+    "a known issue's history is not read again: only the changes since the last read, with a five-minute overlap");
   h.state.now += 31_000;
   assert.deepEqual(new Set((await h.ownerAsks.snapshot(null)).asks.map(ask => ask.sourceId)), new Set(["c1", "c2"]));
-  assert.deepEqual([inventoryReads, commentReads], [3, 3]);
+  assert.deepEqual([inventoryReads, historyReads, changeReads.length], [3, 1, 1], "the explicit collection's comment read serves the menu for a minute");
+});
+
+test("owner-ask comments: changes merge into the kept history, a new issue reads its own, deletions leave on the half-hourly whole read", async t => {
+  const h = await setup({ issues: [issue({ title: "Rollout policy", labels: [], parentId: null, status: "In Progress", description: "" })],
+    comments: new Map([["i1", [comment("c1", "Which rollout policy?"), comment("c0", "Which region first?", "2026-10-09T09:00:00.000Z")]]]) });
+  t.after(() => h.ownerAsks.stop());
+  const historiesRead: string[][] = [];
+  const sources = async () => new Map((await h.ownerAsks.snapshot(null, true)).asks.map(ask => [ask.sourceId, ask.source]));
+  h.deps.linear.ownerAskComments = async ids => {
+    historiesRead.push(ids);
+    return new Map(ids.map(id => [id, h.state.comments.get(id) ?? []]));
+  };
+  // Linear reports only what changed: an edit of c1 and a new c2, not the untouched c0.
+  let changed: OwnerAskComment[] = [];
+  h.deps.linear.ownerAskCommentChanges = async ids => new Map(ids.includes("i1") && changed.length ? [["i1", changed]] : []);
+  assert.deepEqual([...await sources()], [["c1", "Which rollout policy?"], ["c0", "Which region first?"]]);
+
+  changed = [comment("c1", "Which rollout policy for EU?"), comment("c2", "Which approver?", "2026-10-09T11:00:00.000Z")];
+  h.state.comments.set("i1", [...changed, comment("c0", "Which region first?", "2026-10-09T09:00:00.000Z")]);
+  h.state.issues = [...h.state.issues, issue({ id: "i2", identifier: "TUC-2", title: "Billing", labels: [], parentId: null, status: "In Progress", description: "" })];
+  h.state.comments.set("i2", [comment("d1", "Which invoice cadence?")]);
+  h.state.now += 61_000;
+  assert.deepEqual(new Map([...await sources()].filter(([id]) => id !== "d1")),
+    new Map([["c2", "Which approver?"], ["c1", "Which rollout policy for EU?"], ["c0", "Which region first?"]]),
+    "edits replace a comment's text; untouched history is kept without a re-read");
+  assert.ok((await sources()).has("d1"), "the issue that joined the inventory shows its comments");
+  assert.deepEqual(historiesRead, [["i1"], ["i2"]], "only the new issue's history is read");
+
+  changed = [];
+  h.state.comments.set("i1", [comment("c2", "Which approver?", "2026-10-09T11:00:00.000Z")]);
+  h.state.now += 10 * 60_000;
+  assert.ok((await sources()).has("c0"), "a change read cannot see a deletion");
+  h.state.now += 20 * 60_000;
+  assert.deepEqual([...(await sources()).keys()].filter(id => id?.startsWith("c")), ["c2"], "the whole read half an hour later drops deleted comments");
+  assert.deepEqual(historiesRead.at(-1), ["i1", "i2"]);
 });
 
 test("all-status snapshot separates historical discovery from source-evidenced owner urgency", async t => {
