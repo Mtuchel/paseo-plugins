@@ -307,6 +307,8 @@ test("canonical peer failure is visible and never reads local Linear asks", asyn
   assert.deepEqual(view.hosts.map((host) => host.asks), [[], []]);
   assert.match(view.hosts[0].error!, /Canonical owner asks unavailable/);
   assert.match(view.hosts[1].error!, /connection refused/);
+  assert.equal(view.reading, undefined);
+  assert.equal(view.canonicalReading, undefined);
   assert.equal(view.hosts[0].live[0].requestId, "q1");
   assert.deepEqual(calls.map((call) => call.url), [`${peer}/api/decisions/local`]);
   const localRoute = await h.inbox.route({ method: "GET", path: "/api/decisions/local", headers: {}, body: "" });
@@ -522,6 +524,16 @@ test("expired peer decisions are withheld while their refresh is blocked", { tim
     assert.equal(expired.canonicalHost, null);
     assert.deepEqual(expired.hosts[1].asks, []);
     assert.deepEqual(expired.unreachable, [peer]);
+    // The withheld host is being read, not failed: no failure note until that read ends.
+    assert.deepEqual(expired.reading, [peer]);
+    assert.equal(expired.canonicalReading, true);
+    assert.equal(expired.hosts[0].error, null);
+    release.release();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const landed = await h.inbox.view();
+    assert.equal(landed.canonicalHost, "server087");
+    assert.deepEqual(landed.unreachable, []);
+    assert.equal(landed.reading, undefined);
   } finally { release.release(); h.inbox.stop(); }
 });
 

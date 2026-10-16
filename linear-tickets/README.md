@@ -4775,8 +4775,12 @@ recollection that carries the new asks, so no read waits for it.
 Live questions and peer reachability have a separate thirty-second transport cache; they are
 not frozen for the fifteen-minute owner collection interval. Each peer refreshes independently:
 interactive reads return local decisions without waiting for a slow peer. Cold or expired peer
-snapshots are withheld with an unavailable/refreshing warning until collection finishes; they
-are never presented as current actionable decisions. Background collection still awaits coverage.
+snapshots are withheld until their read lands; they are never presented as current actionable
+decisions. While that read is still under way the view names the host in `reading` (and sets
+`canonicalReading` for the canonical owner-ask host): the page shows "Reading decisions from …"
+instead of an unavailable warning and asks again after two seconds rather than on its
+thirty-second cycle. Only a read that ended without a usable snapshot is reported as unavailable,
+with its reason. Background collection still awaits coverage.
 Answer/config invalidation fences in-flight transport reads, so they cannot republish an answered
 request. Concurrent peer reads share their request. Actual peer transport failures remain visible
 and are checked again on the next transport refresh, not the next Linear collection.

@@ -567,10 +567,14 @@ export class BrowserDecisionInbox {
     const sources = peers.map(({ configured, peer, error }) => {
       const cached = peer ? this.peerCache.get(peer) : undefined;
       const current = cached?.generation === this.ownerGeneration && this.now() - cached.at < TRANSPORT_CACHE_MS;
-      return { configured, peer, snapshot: current ? cached.snapshot : null,
+      // No current snapshot yet, but its read is under way: a page shows that host as being read,
+      // not as failed, and asks again once the read can have landed.
+      const reading = !error && !current && peer !== null && this.peerFlights.has(peer);
+      return { configured, peer, reading, snapshot: current ? cached.snapshot : null,
         error: error ?? (current ? cached.error : "Refreshing this host; no current snapshot is available.") };
     });
     const unreachable: string[] = [];
+    const reading: string[] = [];
     let canonicalHost: string | null = canonicalPeer === null ? this.host : null;
     let canonicalOrigin: string | null = null;
     if (canonicalPeer !== null) {
@@ -582,6 +586,7 @@ export class BrowserDecisionInbox {
     for (const source of sources) {
       if (!source.snapshot || identities.has(source.snapshot.host)) {
         unreachable.push(source.configured);
+        if (source.reading) reading.push(source.configured);
         hosts.push({ host: source.configured, asks: [], live: [], history: [], updatedAt: new Date(this.now()).toISOString(), error: `Decision source ${source.configured} unavailable: ${source.error ?? "duplicate host identity"}`, flow: null });
         continue;
       }
@@ -594,11 +599,14 @@ export class BrowserDecisionInbox {
         sourceReviews: canonical ? source.snapshot.sourceReviews : undefined,
         history: canonical ? source.snapshot.history : source.snapshot.history.filter((receipt) => receipt.id.startsWith(PREFIX)) });
     }
+    // A canonical host whose first read is still under way is named by canonicalReading; the
+    // failure note below is reserved for a read that ended without a usable snapshot.
+    const canonicalReading = canonicalPeer !== null && canonicalHost === null && canonicalOrigin !== null && sources.some((source) => source.reading && source.peer === canonicalOrigin);
     if (canonicalPeer !== null && canonicalHost === null) {
       if (!unreachable.includes(canonicalPeer)) unreachable.push(canonicalPeer);
-      local = { ...local, error: [local.error, `Canonical owner asks unavailable from ${canonicalPeer}; no local Linear fallback is used.`].filter(Boolean).join("\n") };
+      if (!canonicalReading) local = { ...local, error: [local.error, `Canonical owner asks unavailable from ${canonicalPeer}; no local Linear fallback is used.`].filter(Boolean).join("\n") };
     }
-    return { hosts: [local, ...hosts], canonicalHost, unreachable };
+    return { hosts: [local, ...hosts], canonicalHost, unreachable, ...(reading.length ? { reading } : {}), ...(canonicalReading ? { canonicalReading } : {}) };
   }
 
   private async action(input: BrowserDecisionAction) {
