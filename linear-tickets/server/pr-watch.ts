@@ -221,8 +221,9 @@ type PolicyState = Record<string, PolicyTicket>;
 export type QueueDraft = { number: number; title: string; body: string; state: string; headSha: string; base: string };
 // An open pull request of the repo, from one listing per repo and poll; `trunk` is the repo's
 // default branch; `headRepo` the `owner/name` its branch lives in (another one for a fork, null
-// once the fork is gone).
-export type OpenPull = { number: number; url: string; title: string; headBranch: string; headRepo: string | null; headSha: string; baseBranch: string; trunk: string; draft: boolean; labels: string[] };
+// once the fork is gone). `updatedAt`: the listing's `updated_at`, the same value the pull request
+// read as an issue carries, absent when the listing does not say (see ConditionalPullView.listed).
+export type OpenPull = { number: number; url: string; title: string; headBranch: string; headRepo: string | null; headSha: string; baseBranch: string; trunk: string; draft: boolean; labels: string[]; updatedAt?: string };
 // The GitHub reads beyond the pull request itself, and the queue backstop's pull request comments;
 // `repo` is `owner/name`.
 export type GitHubReader = {
@@ -625,17 +626,29 @@ function statusFingerprint(body: unknown): string {
 }
 
 // One watched pull request's cheap first look. `viewPullRequest` is one GraphQL query per pull
-// request per poll; this class asks REST first, so a quiet pull request costs the GraphQL
-// budget nothing: the pull request read as an issue, then its comments, reviews and the head's
-// checks, are read conditionally (their stable ETags make an unchanged resource answer 304, which
-// GitHub does not meter), and the detail read runs only when one of them changed, when the merge
-// queue is mid-attempt, or when the cached view is older than STALE_VIEW_MS. Every REST request
-// passes the GitHub budget first, at the caller's priority: the single-login reserve (see
-// rate-budget.ts) where the router is not installed.
+// request per poll; this class asks REST first, so a quiet pull request costs the GraphQL budget
+// nothing. The poll's own listing of the repository's open pull requests decides first (`listed`):
+// a pull request the listing shows at the same head and the same last change as the cached view,
+// with every check of that head finished, is served without a single request. Otherwise the pull
+// request read as an issue is compared, then its comments, reviews and the head's checks are (their
+// stable ETags make an unchanged resource answer 304, which GitHub does not meter), and the detail
+// read runs only when one of them changed, when the merge queue is mid-attempt, or when the cached
+// view is older than STALE_VIEW_MS. Every REST request passes the GitHub budget first, at the
+// caller's priority: the single-login reserve (see rate-budget.ts) where the router is not
+// installed.
 export class ConditionalPullView {
   private readonly views = new Map<string, CachedView>();
+  // The repository's open pull requests as the poll's own listing read them (see listed).
+  private readonly listings = new Map<string, Map<string, { headSha: string; updatedAt: string }>>();
 
   constructor(private readonly deps: { get: RestGet; budget: GitHubBudget; read: (url: string) => Promise<PullRequestView>; now?: () => number }) {}
+
+  // What the poll's listing (one `openPullRequests` request per repo and poll) says about the
+  // repository's open pull requests: `view` serves a cached view that it matches without a request.
+  // A repository whose listing has no pull requests replaces the last one.
+  listed(repo: string, pulls: readonly OpenPull[]): void {
+    this.listings.set(repo, new Map(pulls.filter((pull) => typeof pull.updatedAt === "string").map((pull) => [pull.url, { headSha: pull.headSha, updatedAt: pull.updatedAt! }])));
+  }
 
   async view(url: string): Promise<PullRequestView> {
     const source = PULL_URL.exec(url);
@@ -643,12 +656,27 @@ export class ConditionalPullView {
     const [, repo, number] = source;
     const cached = this.views.get(url);
     try {
+      // The listing the caller already paid for names this pull request's head and its last change
+      // (`updated_at`). When the cached view was read at the same head and the same last change and
+      // left every check of that head finished, nothing the probes below watch can have moved since:
+      // a comment (new or edited in place), a review, a label or a push all move `updated_at`, and a
+      // finished head has no check left to conclude. The view is then served without one request;
+      // `stale` still reads it in full at its age, and anything unsettled or moved takes the probes.
+      const listing = this.listings.get(repo)?.get(url);
+      const movedHead = cached !== undefined && listing !== undefined && listing.headSha !== cached.view.headSha;
+      const served = cached !== undefined && listing !== undefined && !movedHead
+        && listing.updatedAt === cached.view.updatedAt
+        && cached.view.checksComplete !== false && cached.view.checks.length > 0 && cached.view.checks.every((check) => check.state !== "pending")
+        && !this.stale(cached);
+      if (served) return cached.view;
       const issue = await this.conditional(`repos/${repo}/issues/${number}`, cached?.issue ?? null, issueFingerprint);
-      if (!cached || issue.changed || this.stale(cached)) return await this.read(url, repo, number, issue.probe);
+      // A head the listing moved away from is evidence of its own (the poll's own read of the
+      // repository): it is read in full even when the issue's `updated_at` did not move with it.
+      if (cached === undefined || issue.changed || this.stale(cached) || movedHead) return await this.read(url, repo, number, issue.probe);
       // The rest is only watched while the pull request is open; a closed or merged one is decided
       // by the resource itself, whose state transition already forced the read above.
       const rest = cached.view.state === "OPEN" ? await this.probeRest(repo, number, cached.view, cached.rest) : null;
-      if (rest?.changed) return await this.read(url, repo, number, issue.probe);
+      if (rest?.changed) return await this.read(url, repo, number, issue.probe, rest.probe);
       // Nothing changed: the last view is served as is, only its probe state moves forward.
       this.views.set(url, { ...cached, issue: issue.probe, rest: rest?.probe ?? cached.rest });
       return cached.view;
@@ -659,12 +687,16 @@ export class ConditionalPullView {
     }
   }
 
-  // The detail read, with the rest of the pull request seeded right after, so the poll that follows
-  // compares them instead of reading the pull request again.
-  private async read(url: string, repo: string, number: string, issue: Probe): Promise<PullRequestView> {
+  // The detail read, with the probe state to store alongside it: the reads of the probe pass that
+  // just ran (the four resources, a moment before this read), and otherwise the four resources read
+  // here. The next pass then compares against them instead of reading them a second time.
+  private async read(url: string, repo: string, number: string, issue: Probe, rest: RestProbe | null = null): Promise<PullRequestView> {
     const view = await this.deps.read(url);
-    const rest = view.state === "OPEN" ? (await this.probeRest(repo, number, view, null)).probe : null;
-    this.views.set(url, { view, issue, rest, readAt: this.deps.now?.() ?? Date.now() });
+    // A probe pass that read another head's checks does not describe this view: its checks are read
+    // again by the next pass rather than compared against what they were.
+    const stored = rest && (!rest.checks || rest.checks.sha === view.headSha) ? rest : null;
+    const probed = view.state === "OPEN" ? (stored ?? (await this.probeRest(repo, number, view, null)).probe) : null;
+    this.views.set(url, { view, issue, rest: probed, readAt: this.deps.now?.() ?? Date.now() });
     if (this.views.size > MAX_VIEWS) {
       const oldest = [...this.views].sort((a, b) => a[1].readAt - b[1].readAt)[0];
       if (oldest) this.views.delete(oldest[0]);
@@ -753,7 +785,7 @@ export const githubReader: GitHubReader = {
     return status === "identical" || status === "ahead";
   },
   async openPullRequests(repo) {
-    const open = await ghJson(["api", "--paginate", `repos/${repo}/pulls?state=open&per_page=100`, "--jq", "[.[] | {number, url: .html_url, title, headBranch: .head.ref, headRepo: .head.repo.full_name, headSha: .head.sha, baseBranch: .base.ref, trunk: .base.repo.default_branch, draft, labels: [.labels[].name]}]"], pages<OpenPull>);
+    const open = await ghJson(["api", "--paginate", `repos/${repo}/pulls?state=open&per_page=100`, "--jq", "[.[] | {number, url: .html_url, title, headBranch: .head.ref, headRepo: .head.repo.full_name, headSha: .head.sha, baseBranch: .base.ref, trunk: .base.repo.default_branch, draft, labels: [.labels[].name], updatedAt: .updated_at}]"], pages<OpenPull>);
     return open.sort((a, b) => b.number - a.number);
   },
   async branchExists(repo, branch) {
@@ -1496,14 +1528,26 @@ export class PullRequestWatch {
   // The detail read, behind the cheap first look unless the caller injected its own `view`.
   private changer: ConditionalPullView | null = null;
 
+  // The daemon's cheap first look, shared by every poll and its listing (`listed`); the injected
+  // `probe`/`view` seams replace it, so tests never construct it.
+  private firstLook(): ConditionalPullView {
+    this.changer ??= new ConditionalPullView({ get: ghGet, budget: githubBudget, read: viewPullRequest });
+    return this.changer;
+  }
+
+  // The poll's listing of a repository's open pull requests, passed on to the cheap first look (see
+  // ConditionalPullView.listed): the head and the last change it read decide, per pull request,
+  // whether the cached view can answer the poll without a request.
+  private listed(repo: string, pulls: OpenPull[]): void {
+    if (this.deps.probe || this.deps.view) return;
+    this.firstLook().listed(repo, pulls);
+  }
+
   private async view(url: string): Promise<PullRequestView> {
     let view: PullRequestView;
     if (this.deps.probe) view = await this.deps.probe.view(url);
     else if (this.deps.view) view = await this.deps.view(url);
-    else {
-      this.changer ??= new ConditionalPullView({ get: ghGet, budget: githubBudget, read: viewPullRequest });
-      view = await this.changer.view(url);
-    }
+    else view = await this.firstLook().view(url);
     if (this.currentSeen && view.headSha) {
       const observed = entry(this.currentSeen, url);
       if (observed.headSha !== view.headSha) delete observed.ci;
@@ -1547,6 +1591,9 @@ export class PullRequestWatch {
       pulls: (repo) => {
         const listing = pulls.get(repo) ?? this.github().openPullRequests(repo);
         pulls.set(repo, listing);
+        // The listing also feeds the cheap first look, before the poll's per-pull-request reads; a
+        // failed listing stays the caller's to report (this derived promise ignores its rejection).
+        listing.then((open) => this.listed(repo, open), () => {});
         return listing;
       },
       drafts: (repo) => {

@@ -2792,7 +2792,7 @@ test("an unchanged pull request answers 304 and never reaches the detail read", 
   assert.equal(counted.reads, 1, "the pull request was read in detail once");
   assert.equal(second, first, "the second poll served the cached view");
   assert.deepEqual(rest.calls.filter((call) => call.path === ISSUE_PATH).map((call) => call.etag), [null, `"${ISSUE_PATH}#0"`], "the second look is conditional on the first ETag");
-  assert.equal(rest.calls.filter((call) => call.etag === null).length, 5, "only the first poll's five reads are unconditional");
+  assert.equal(rest.calls.filter((call) => call.etag === null).length, 5, "only the first poll's reads are unconditional: the issue probe and the four the detail read seeds the next pass with");
 });
 
 test("a new head SHA reaches the detail read again", async () => {
@@ -2845,6 +2845,89 @@ test("a new review reaches the detail read again", async () => {
   const view = await withPriority("background", "pr watch", () => reader.view(PR));
   assert.equal(counted.reads, 2);
   assert.equal(view.reviews.length, 1);
+});
+
+// ---- The poll's own listing (see ConditionalPullView.listed): one request per repo and poll carries
+// every open pull request's head and `updated_at`, so a pull request it shows at the cached view's
+// head and last change, with every check of that head finished, is served without one request. -----
+const settledView = (state: ProbeState, head = HEAD): PullRequestView => ({ ...OPEN_PR, headSha: head, updatedAt: state.updatedAt, checks: [{ ...RUNNING_CI, state: "passed", conclusion: "success" }] });
+const asListing = (view: PullRequestView): OpenPull[] => [{ ...listed(PR, view), updatedAt: view.updatedAt }];
+
+test("the poll's listing serves a settled unchanged pull request without a request", async () => {
+  const state = probeState();
+  const rest = restFake(restSeed(state));
+  const { reader, counted } = probeReader(rest, () => settledView(state));
+  const first = await withPriority("background", "pr watch", () => reader.view(PR));
+  const requests = rest.calls.length;
+  reader.listed(REPO, asListing(settledView(state)));
+  const second = await withPriority("background", "pr watch", () => reader.view(PR));
+  assert.equal(second, first, "the cached view is served");
+  assert.equal(counted.reads, 1, "the detail read did not run again");
+  assert.equal(rest.calls.length, requests, "not one request: the listing was enough");
+});
+
+test("a pending check keeps the probes running, and the probe pass seeds them for the next look", async () => {
+  const state = probeState();
+  const rest = restFake(restSeed(state));
+  const view = { ...OPEN_PR, updatedAt: state.updatedAt }; // checks: the CI still runs
+  const { reader, counted } = probeReader(rest, () => view);
+  const first = await withPriority("background", "pr watch", () => reader.view(PR));
+  const requests = rest.calls.length;
+  reader.listed(REPO, asListing(view));
+  assert.equal(await withPriority("background", "pr watch", () => reader.view(PR)), first, "no check concluded: the last view stands");
+  assert.equal(counted.reads, 1, "and no detail read ran");
+  assert.deepEqual(rest.calls.slice(requests).map((call) => call.etag), [`"${ISSUE_PATH}#0"`, `"${COMMENTS_PATH}#0"`, `"${REVIEWS_PATH}#0"`, `"${checkRunsPath(HEAD)}#0"`, `"repos/${REPO}/commits/${HEAD}/status#0"`], "the issue probe and the four resources the detail read seeded: every later probe is conditional");
+});
+
+test("a moved last change in the listing costs the issue probe and the detail read", async () => {
+  const state = probeState();
+  const rest = restFake(restSeed(state));
+  const { reader, counted } = probeReader(rest, () => settledView(state));
+  await withPriority("background", "pr watch", () => reader.view(PR));
+  const requests = rest.calls.length;
+  // A new comment moves the issue's `updated_at`, which the next listing carries.
+  state.updatedAt = "2026-10-04T21:20:00Z";
+  rest.bump(ISSUE_PATH);
+  reader.listed(REPO, asListing(settledView(state)));
+  const view = await withPriority("background", "pr watch", () => reader.view(PR));
+  assert.equal(counted.reads, 2, "the detail read ran again");
+  assert.equal(view.updatedAt, state.updatedAt);
+  assert.equal(rest.calls.length - requests, 5, "the issue probe that named the change, then the detail read and the four it seeds");
+});
+
+test("a head the listing moved away from is read in full although the issue did not move", async () => {
+  const state = probeState();
+  const rest = restFake(restSeed(state));
+  let view = settledView(state);
+  const { reader, counted } = probeReader(rest, () => view);
+  await withPriority("background", "pr watch", () => reader.view(PR));
+  const requests = rest.calls.length;
+  view = settledView(state, "9f8e7d6c5b4a9f8e7d6c5b4a9f8e7d6c5b4a9f8e");
+  reader.listed(REPO, asListing(view));
+  const next = await withPriority("background", "pr watch", () => reader.view(PR));
+  assert.equal(next.headSha, view.headSha, "the new head reached the poll");
+  assert.equal(counted.reads, 2, "the head moved");
+  assert.equal(rest.calls.length - requests, 5, "the issue probe answered 304; the listing's own head forced the read, which seeds the four in turn");
+});
+
+test("an aged view is read in full again, and the fresh read arms the gate once more", async () => {
+  const state = probeState();
+  const rest = restFake(restSeed(state));
+  const settled = settledView(state);
+  const clock = { now: Date.now() };
+  const counted = { reads: 0 };
+  const reader = new ConditionalPullView({ get: rest.get, budget: new GitHubBudget(() => clock.now, 300), read: async () => { counted.reads++; return settled; }, now: () => clock.now });
+  await withPriority("background", "pr watch", () => reader.view(PR));
+  clock.now += 2 * 60 * 60 * 1000; // past STALE_VIEW_MS: the safety net reads it again
+  reader.listed(REPO, asListing(settled));
+  const requests = rest.calls.length;
+  assert.equal(await withPriority("background", "pr watch", () => reader.view(PR)), settled);
+  assert.equal(counted.reads, 2, "the aged view is read in full although the listing and the issue probe both said nothing moved");
+  assert.deepEqual(rest.calls.slice(requests).map((call) => call.path), [ISSUE_PATH, COMMENTS_PATH, REVIEWS_PATH, checkRunsPath(HEAD), `repos/${REPO}/commits/${HEAD}/status`], "the issue probe, then the four the read seeds the next pass with");
+  const requests2 = rest.calls.length;
+  assert.equal(await withPriority("background", "pr watch", () => reader.view(PR)), settled);
+  assert.equal(rest.calls.length, requests2, "the fresh read arms the listing gate again: the next poll needs no request");
+  assert.equal(counted.reads, 2);
 });
 
 test("the shared REST reserve pauses the first look before it sends anything", async () => {

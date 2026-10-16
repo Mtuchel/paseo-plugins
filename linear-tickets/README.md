@@ -1743,12 +1743,17 @@ them, nudging them and recovering agents for them; its records and the history i
 are kept, not deleted or moved, and the count of the records left alone is logged once.
 
 **Pull request reviews.** Every 2 minutes the plugin looks at each ticket's pull request, but reads
-it in full — one `gh pr view` GraphQL query — only when something actually changed. The first look is
-REST and conditional: the pull request read as an issue (`repos/…/issues/<n>`; the single-pull
+it in full — one `gh pr view` GraphQL query — only when something actually changed. The poll's own
+listing of the repository's open pull requests (one request per repository and poll, the same
+listing that names the records) decides first: a pull request it shows at the head and the
+`updated_at` of the cached view, with every check of that head finished, is served without any
+request at all. Everything else takes the first look, REST and conditional: the pull request read as
+an issue (`repos/…/issues/<n>`; the single-pull
 endpoint's ETag moves on every request, the issue resource's does not), its comments (Graphite edits
 its Merge activity comment in place), its reviews, and the head's check runs and combined status. An
 unchanged resource answers `304 Not Modified`, which GitHub does not meter, so a quiet pull request
-costs the GraphQL budget nothing; the detail read runs only when one of them moved, while the
+costs the GraphQL budget nothing; the detail read runs only when one of them moved, when the
+listing's own head moved away from the cached view, while the
 merge queue is testing the pull request (its comment can end the attempt at any poll), or when the
 cached view is older than 10 minutes. The detail read includes GitHub's mergeability against the
 base; a base that moved without touching the pull request shows its conflict at that 10-minute
@@ -2230,7 +2235,11 @@ and refuse their own replacement starts (2026-10-08: 26 of 43 counted agents wer
 restart reported `Queued: RAM-limited, 43 of 40 slots used`). The log names each
 ghost (`agent … shows running but its OMP process is gone`). Only proven absence counts: an agent
 without a recorded session file or worktree, or a process table that cannot be read completely,
-keeps the agent live until the next poll.
+keeps the agent live until the next poll. The table behind this is read once and shared: checks that
+run within five seconds of one another (the planner's refresh, a sweep's per-agent looks, a start's
+admission, a stop's decision) use the same read, and no check judges an agent the table was not read
+after — an agent started or reloaded since it was read forces a fresh one, so a just-started agent is
+never called a ghost and one is never stopped on a stale table.
 
 Finished agents are archived (TUC-1834), in every two-minute poll of the pull request watch, right
 after the stack policy reopened what it reopens: an agent of a Done, Canceled or duplicate ticket
@@ -3620,7 +3629,10 @@ instead of two:
 - A repository is polled at most every 2 minutes, and only while a client asked for it in the
   last 10 minutes: with the app closed, the plugin sends GitHub nothing. Reads are REST only
   (GraphQL stays with `gh pr` and `gt`) and conditional, so an unchanged page answers
-  `304 Not Modified` and costs no budget.
+  `304 Not Modified` and costs no budget. A pull request whose head and `updated_at` the fresh
+  listing shows unchanged, whose checks are settled (none running or empty) and which is not in
+  the merge queue, keeps the detail read from the last 10 minutes instead of being read again;
+  anything running, in the queue, or moved is read with every pass.
 - The account router owns both accounts' request budgets and picks the read account per call
   ([GitHub automation identity](#github-automation-identity)); the plugin records no quota of
   its own, and a refusal says which budgets are spent and when they resume. Without the router
@@ -3634,9 +3646,11 @@ instead of two:
   (`paused until 17:23 UTC`), as every GitHub pause message does. Labelling is not held back by
   the reserve.
 - The [pull request watch](#pull-request-reviews) reads the same way: through the router's read
-  account where it is installed, under the single-login reserve where it is not; its conditional
-  first look (the issue resource, its comments and reviews, the head's checks) keeps a quiet pull
-  request to its cached view rather than reading it in full.
+  account where it is installed, under the single-login reserve where it is not; its own listing of
+  the repository's open pull requests serves a pull request that has not moved (same head, same
+  `updated_at`, checks settled) without a request at all, and its conditional first look (the issue
+  resource, its comments and reviews, the head's checks) keeps every other quiet pull request to its
+  cached view rather than reading it in full.
 
 ## Manual tasks
 
