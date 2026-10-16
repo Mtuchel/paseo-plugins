@@ -722,3 +722,125 @@ test("unknown live delivery stays visible and cannot be retried with a different
   assert.equal(different.body.outcomeUnknown, true);
   assert.equal(h.sent.length, 1);
 });
+
+// Owner sources that only need nonurgent review stay with the canonical host and are read in
+// pages; the feeds every page and peer reads carry only what needs action, plus the review count.
+function sourceReview(n: number, title: string): OwnerAsk {
+  return { ...ownerAsk, issueId: `info-${n}`, revision: `info-r${n}`, attention: "info", attentionReason: "Source to review",
+    kind: "info", identifier: `TUC-${100 + n}`, ticketIdentifier: `TUC-${100 + n}`, title, summary: title, questions: [], source: `${title} source`, extracted: false };
+}
+const actionable: OwnerAsk[] = [
+  ownerAsk,
+  { ...ownerAsk, issueId: "adv", revision: "adv-r1", attention: "advisor", attentionReason: "Advisor" },
+  { ...ownerAsk, issueId: "dep", revision: "dep-r1", attention: "dependency", attentionReason: "Blocked", blockerIdentifier: "TUC-9" },
+  { ...sourceReview(9, "Deferred note"), disposition: "deferred", deferredUntil: "2026-10-20T00:00:00.000Z" },
+  { ...sourceReview(8, "Researching note"), disposition: "research" },
+];
+const reviews = [sourceReview(1, "Alpha note"), sourceReview(2, "Beta note"), sourceReview(3, "Beta other")];
+async function reviewsRoute(inbox: BrowserDecisionInbox, path: string, search = "") {
+  const response = await inbox.route({ method: "GET", path, search, headers: {}, body: "" });
+  assert.ok(response);
+  return { status: response.status, body: JSON.parse(response.body) as Record<string, unknown> };
+}
+
+test("the canonical feed carries every actionable owner ask in full and only counts source reviews", async (t) => {
+  const h = await harness(t, "laptop", [actionable[0], reviews[0], actionable[1], reviews[1], actionable[2], actionable[3], reviews[2], actionable[4]]);
+  await h.inbox.refresh();
+  const local = await h.inbox.local();
+  assert.deepEqual(local.asks.map(ask => ask.revision), actionable.map(ask => ask.revision));
+  assert.equal(local.sourceReviews, 3);
+  const view = await h.inbox.view();
+  assert.deepEqual(view.hosts[0].asks.map(ask => ask.revision), actionable.map(ask => ask.revision));
+  assert.equal(view.hosts[0].sourceReviews, 3);
+  const served = await reviewsRoute(h.inbox, "/api/decisions/local");
+  assert.equal(served.body.sourceReviews, 3);
+});
+
+test("the canonical host pages its source reviews in source order, bounded and searchable", async (t) => {
+  const h = await harness(t, "laptop", [...actionable, ...reviews]);
+  await h.inbox.refresh();
+  for (const path of ["/api/decisions/reviews", "/api/decisions/reviews/local"]) {
+    const first = await reviewsRoute(h.inbox, path, "?offset=0&limit=2");
+    assert.equal(first.status, 200);
+    assert.equal(first.body.host, "laptop");
+    assert.equal(first.body.total, 3);
+    assert.equal(first.body.offset, 0);
+    assert.deepEqual((first.body.asks as OwnerAsk[]).map(ask => ask.revision), ["info-r1", "info-r2"]);
+    const rest = await reviewsRoute(h.inbox, path, "?offset=2&limit=2");
+    assert.deepEqual((rest.body.asks as OwnerAsk[]).map(ask => ask.revision), ["info-r3"]);
+    assert.equal(rest.body.total, 3);
+    const defaults = await reviewsRoute(h.inbox, path);
+    assert.deepEqual((defaults.body.asks as OwnerAsk[]).map(ask => ask.revision), ["info-r1", "info-r2", "info-r3"]);
+    const searched = await reviewsRoute(h.inbox, path, "?q=BETA%20note");
+    assert.equal(searched.body.total, 1);
+    assert.deepEqual((searched.body.asks as OwnerAsk[]).map(ask => ask.revision), ["info-r2"]);
+    const past = await reviewsRoute(h.inbox, path, "?offset=10");
+    assert.equal(past.status, 200);
+    assert.deepEqual(past.body.asks, []);
+    for (const bad of ["?limit=0", "?limit=101", "?offset=-1", "?offset=abc", "?limit=2.5"]) {
+      assert.equal((await reviewsRoute(h.inbox, path, bad)).status, 400, `${path}${bad}`);
+    }
+  }
+  assert.equal((await h.inbox.route({ method: "POST", path: "/api/decisions/reviews", search: "", headers: {}, body: "" }))?.status, 405);
+});
+
+test("source reviews are unavailable, not empty, while the canonical owner collection is pending", async (t) => {
+  const h = await harness(t, "laptop", reviews);
+  const blocked = barrier();
+  h.onOwnerRead(() => blocked.promise);
+  t.after(() => blocked.release());
+  const pending = await reviewsRoute(h.inbox, "/api/decisions/reviews");
+  assert.equal(pending.status, 503);
+  assert.match(String(pending.body.error), /being collected/);
+});
+
+test("a non-canonical host reads source review pages from the canonical peer and never from local Linear", async (t) => {
+  const h = await harness(t);
+  const peer = "https://server087.test:8444";
+  h.canonical(peer); h.peers([peer]);
+  const page = { host: "server087", backendInstanceId: PEER_BACKEND, updatedAt: "2026-10-12T00:00:00.000Z", total: 51, offset: 50, asks: [sourceReview(2, "Beta note")] };
+  let answer: () => Response = () => Response.json(page);
+  const calls = mockPeers(t, () => answer());
+  const read = await reviewsRoute(h.inbox, "/api/decisions/reviews", "?offset=50&limit=50&q=beta");
+  assert.equal(read.status, 200);
+  assert.deepEqual(read.body, page);
+  assert.deepEqual(calls.map(call => call.url), [`${peer}/api/decisions/reviews/local?offset=50&limit=50&q=beta`]);
+  assert.equal(h.ownerReads(), 0);
+  assert.equal((await reviewsRoute(h.inbox, "/api/decisions/reviews/local")).status, 404, "only the canonical host serves its own pages");
+  assert.equal(calls.length, 1, "the canonical-only route never proxies");
+  answer = () => Response.json({ ...page, asks: [{ ...sourceReview(2, "Beta note"), untrustedExtra: true }] });
+  const malformed = await reviewsRoute(h.inbox, "/api/decisions/reviews");
+  assert.equal(malformed.status, 503);
+  assert.match(String(malformed.body.error), /invalid source review page/);
+  answer = () => Response.json({ error: "busy" }, { status: 503 });
+  const failed = await reviewsRoute(h.inbox, "/api/decisions/reviews");
+  assert.equal(failed.status, 503);
+  assert.match(String(failed.body.error), /HTTP 503/);
+  assert.equal(h.ownerReads(), 0);
+});
+
+test("the canonical peer's source review count reaches the view, and a peer without it still parses", async (t) => {
+  const h = await harness(t);
+  const peer = "https://server087.test:8444";
+  h.canonical(peer); h.peers([peer]);
+  let count: number | undefined = 7;
+  mockPeers(t, () => Response.json(count === undefined ? peerSnapshot() : { ...peerSnapshot(), sourceReviews: count }));
+  const view = await h.inbox.view();
+  assert.equal(view.canonicalHost, "server087");
+  assert.equal(view.hosts[1].sourceReviews, 7);
+  count = undefined;
+  await h.inbox.refresh();
+  const older = await h.inbox.view();
+  assert.equal(older.canonicalHost, "server087");
+  assert.equal(older.hosts[1].sourceReviews, undefined);
+});
+
+test("a paged source review is answered through the canonical owner action", async (t) => {
+  const h = await harness(t, "laptop", reviews);
+  await h.inbox.refresh();
+  const page = await reviewsRoute(h.inbox, "/api/decisions/reviews", "?limit=1");
+  const row = (page.body.asks as OwnerAsk[])[0];
+  const result = await h.post({ host: page.body.host, target: "owner", operation: "answer", issueId: row.issueId, revision: row.revision, answers: {}, note: "Seen" });
+  assert.equal(result.status, 200);
+  assert.deepEqual(h.ownerActions.map(action => action.input), [{ issueId: "info-1", revision: "info-r1", answers: {}, note: "Seen" }]);
+});

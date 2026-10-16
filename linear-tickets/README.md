@@ -4770,9 +4770,18 @@ The separate inbox frontdoor must be rebuilt and restarted on both hosts when de
 or frontdoor changes; plugin reload alone does not publish them.
 
 `GET /api/decisions/local` returns this host only; `GET /api/decisions` combines the configured
-hosts without recursive peer reads. `POST /api/decisions/action` accepts an explicit owner-ask or
-live-request action and routes only to known hosts. Like review mutations, it requires JSON,
-`x-review-action: 1`, and a matching browser Origin; cross-site requests are refused.
+hosts without recursive peer reads. Both carry every actionable owner source in full (owner,
+advisor and dependency attention, research/delegated/deferred dispositions, unknown delivery) and
+only the count of nonurgent source reviews (`attention: info`, no disposition) as `sourceReviews`.
+Those sources stay with the canonical host: `GET /api/decisions/reviews?offset=&limit=&q=` returns
+one page (`limit` 1–100, default 50; `q` all-terms search) with the matching `total`. A peer host
+proxies it to the canonical host's `GET /api/decisions/reviews/local`, which only the canonical
+host serves; while its first collection runs it answers 503 rather than an empty list. Shipping
+every source in the feed (14k sources, 28 MB) exceeded the frontdoor's 16 MiB answer cap and the
+five-second peer read, so the whole canonical host disappeared. `POST /api/decisions/action`
+accepts an explicit owner-ask or live-request action and routes only to known hosts; paged source
+reviews use it unchanged. Like review mutations, it requires JSON, `x-review-action: 1`, and a
+matching browser Origin; cross-site requests are refused.
 
 Owner answers and research/delegation/defer/reopen use the same revision-bound `OwnerAsks` backend
 as the menu bar. Live answers bind the displayed agent, request, and full source revision to the
@@ -4952,8 +4961,9 @@ owner wait. Explicit `info` means nonurgent review even when `extracted: false`;
 completion, approval or deferral. Browser owner priority/counts follow attention rather than an
 old task priority, manual label, generated summary or extraction status. Unknown history stays
 discoverable under **Needs source review**. Advisor/dependency waits stay separate and nonurgent.
-The browser initially renders 50 source-review rows, with explicit load-more controls and the full
-review count. Search still covers every discovered source, including rows not yet rendered.
+The browser loads source reviews 50 at a time from the canonical host, with explicit load-more
+controls and the full review count. Search runs on the canonical host, so it still covers every
+discovered source, including pages not yet loaded.
 The direct live permission fail-open/answer UI and deputy owner boundaries remain unchanged.
 
 An explicitly evidenced blocking ticket can supply `blockerIdentifier`. The menu bar groups

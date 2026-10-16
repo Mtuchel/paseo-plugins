@@ -23,7 +23,10 @@ const CLIENT = String.raw`
   let selected = null, selectedSnapshot = null, stale = false, busy = false, refreshing = false;
   let refreshError = '', lastUpdated = Date.now();
   const drafts = new Map(), results = new Map(), completed = new Set(), uncertain = new Set();
-  let reviewLimit = 50;
+  // Withheld nonurgent source reviews never ship in the feed: they arrive here in server pages,
+  // browsed, searched and answered like any owner ask. reviewQuery is the query the loaded
+  // pages answer; reviewOffset is how many server sources those pages have consumed.
+  let pagedRows = [], reviewTotal = null, reviewOffset = 0, reviewQuery = null, reviewLoading = false, reviewError = '', reviewErrorAppend = false, reviewGeneration = 0, reviewTimer = 0, reviewSource = null;
   const queue = document.getElementById('queue-list');
   const pane = document.getElementById('detail-content');
   const shell = document.querySelector('.shell');
@@ -44,6 +47,9 @@ const CLIENT = String.raw`
       return '<a href="' + escape(parsed.href) + '" target="_blank" rel="noopener noreferrer">' + escape(label) + '</a>';
     } catch { return ''; }
   }
+  // Host plus source identity: the same source must never appear twice, whether it reaches the
+  // page in the feed or in a page of withheld source reviews.
+  const sourceKey = row => JSON.stringify([row.host, row.data.issueId, row.data.sourceId || row.revision]);
   function rows() {
     const items = [];
     for (const host of view.hosts) {
@@ -52,18 +58,92 @@ const CLIENT = String.raw`
       }
       for (const live of host.live) items.push({host:host.host, backendInstanceId:host.backendInstanceId, target:'live', id:JSON.stringify([live.agentId, live.requestId]), revision:live.revision, data:live});
     }
-    if (!view.tasks) return items.filter(row => !completed.has(key(row)));
-    const bySource = new Map(items.map(row => [JSON.stringify([row.host, row.target, row.id, row.revision]), row]));
-    return view.tasks.flatMap(task => {
-      const row = bySource.get(JSON.stringify([task.host, task.target, task.id, task.revision]));
-      return row && !completed.has(key(row)) ? [{...row, task}] : [];
-    });
+    let base;
+    if (!view.tasks) base = items.filter(row => !completed.has(key(row)));
+    else {
+      const bySource = new Map(items.map(row => [JSON.stringify([row.host, row.target, row.id, row.revision]), row]));
+      base = view.tasks.flatMap(task => {
+        const row = bySource.get(JSON.stringify([task.host, task.target, task.id, task.revision]));
+        return row && !completed.has(key(row)) ? [{...row, task}] : [];
+      });
+    }
+    // View rows first, then loaded review pages: a source already carried by the feed never
+    // doubles through a page.
+    const seen = new Set(base.map(sourceKey));
+    return [...base, ...pagedRows.filter(row => !completed.has(key(row)) && !seen.has(sourceKey(row)))];
+  }
+  // Paged source reviews: one owner row per loaded ask, identical to a view owner ask row so
+  // selection, detail, receipts and actions work unchanged. paged marks the server-paged rows.
+  function pagedRow(page, ask) {
+    return {host:page.host, ...(page.backendInstanceId ? {backendInstanceId:page.backendInstanceId} : {}), target:'owner', id:JSON.stringify([ask.issueId, ask.sourceId || ask.revision]), revision:ask.revision, data:ask, paged:true, reason:ask.attentionReason || ''};
+  }
+  const searchQuery = () => search.value.trim().slice(0, 200);
+  const reviewNeeded = () => pagedRows.length > 0 || view.hosts.some(host => (host.sourceReviews || 0) > 0);
+  // The server total counts every matching withheld source, loaded or not; until a page answer
+  // for the current query arrives, the hosts' withheld counts are the only ones known.
+  function reviewCount() {
+    if (reviewTotal !== null && reviewQuery === searchQuery()) return reviewTotal;
+    return view.hosts.reduce((sum, host) => sum + (host.sourceReviews || 0), 0);
+  }
+  const reviewHasMore = () => reviewTotal !== null && reviewQuery === searchQuery() && reviewOffset < reviewTotal;
+  // Which owner collection the withheld sources come from. The owner sources change only when the
+  // canonical host recollects, so a routine 30-second refresh keeps the pages already loaded.
+  const withheldSource = () => view.hosts.filter(host => (host.sourceReviews || 0) > 0).map(host => host.host + '@' + host.updatedAt + '#' + host.sourceReviews).join(' ');
+  // One page per request, always offset 0 for a reload. The generation discards a response that a
+  // newer request superseded; a discarded response changes nothing, so the rows, the total and
+  // the error always describe the same query.
+  async function loadReviews(append = false) {
+    if (!reviewNeeded()) {
+      // The feed reports nothing withheld any more: drop a stale error or page with the reason.
+      if (reviewError || reviewTotal !== null) {
+        reviewError = ''; reviewTotal = null; reviewOffset = 0; reviewQuery = null;
+        renderQueue();
+      }
+      return;
+    }
+    const query = searchQuery();
+    if (append && (reviewLoading || !reviewHasMore())) return;
+    const generation = ++reviewGeneration;
+    reviewLoading = true;
+    reviewError = '';
+    reviewErrorAppend = append;
+    renderQueue();
+    try {
+      const response = await fetch('/api/decisions/reviews?offset=' + (append ? reviewOffset : 0) + '&limit=50' + (query ? '&q=' + encodeURIComponent(query) : ''), {cache:'no-store', headers:{accept:'application/json'}});
+      const page = await response.json();
+      if (generation !== reviewGeneration) return;
+      if (!response.ok) throw new Error(page && typeof page.error === 'string' ? page.error : 'Source review load failed (' + response.status + ').');
+      if (!page || typeof page.host !== 'string' || !Array.isArray(page.asks) || !Number.isFinite(page.total)) throw new Error('The source review page is unavailable.');
+      const loaded = page.asks.filter(ask => ask && typeof ask === 'object').map(ask => pagedRow(page, ask));
+      pagedRows = append ? pagedRows.concat(loaded) : loaded;
+      if (!append) reviewSource = withheldSource();
+      reviewOffset = (Number.isFinite(page.offset) ? page.offset : 0) + page.asks.length;
+      reviewTotal = page.total;
+      reviewQuery = query;
+    } catch (error) {
+      if (generation !== reviewGeneration) return;
+      reviewError = error instanceof Error ? error.message : 'Source review load failed.';
+    } finally {
+      if (generation === reviewGeneration) {
+        reviewLoading = false;
+        renderQueue();
+        refreshSelection();
+      }
+    }
+  }
+  function scheduleReviews() {
+    clearTimeout(reviewTimer);
+    reviewTimer = setTimeout(() => { void loadReviews(false); }, 250);
+  }
+  function refocusReview() {
+    queue.querySelector(reviewError ? '[data-retry-review]' : '[data-more-review]')?.focus({preventScroll:true});
   }
   function receipts() {
     return view.hosts.flatMap(host => host.history.map(receipt => ({host:host.host, backendInstanceId:host.backendInstanceId, target:'receipt', id:receipt.id, revision:receipt.revision, data:receipt})))
       .sort((a, b) => Date.parse(b.data.at) - Date.parse(a.data.at));
   }
   function priority(row) {
+    if (row.paged) return 'review';
     const data = row.data;
     const deferred = data.deferredUntil && Date.parse(data.deferredUntil) > Date.now();
     if (deferred || row.task?.priority === 'waiting' || (row.target === 'owner' && ['research','delegated'].includes(data.disposition))) return 'waiting';
@@ -161,12 +241,13 @@ const CLIENT = String.raw`
     if (view.curation?.running && view.curation.nextRefreshAt && Date.now() - Date.parse(view.curation.nextRefreshAt) > 30000) warnings.push('Scheduled collection is overdue. The received task list may be stale.');
     const element = document.getElementById('coverage');
     element.classList.toggle('warning', warnings.length > 0);
-    const sources = view.hosts.map(host => '<p><b>' + escape(host.host) + '</b> · ' + host.asks.length + ' owner sources · ' + host.live.length + ' live requests<br>Source snapshot: ' + escape(date(host.updatedAt)) + '</p>').join('');
+    const withheld = view.hosts.reduce((sum, host) => sum + (host.sourceReviews || 0), 0);
+    const sources = view.hosts.map(host => '<p><b>' + escape(host.host) + '</b> · ' + host.asks.length + ' owner sources · ' + host.live.length + ' live requests' + (host.sourceReviews ? ' · ' + host.sourceReviews + ' sources to review' : '') + '<br>Source snapshot: ' + escape(date(host.updatedAt)) + '</p>').join('');
     const retained = rows();
     const unresolved = retained.filter(row => row.target === 'owner' && !row.data.extracted).length;
     const expanded = element.querySelector('#source-coverage')?.open;
     element.innerHTML = (warnings.length ? '<b>Incomplete or stale coverage</b>' + warnings.map(text => '<p>' + escape(text) + '</p>').join('') : '') +
-      '<details id="source-coverage"' + (expanded ? ' open' : '') + '><summary>' + retained.length + ' source tasks · ' + unresolved + ' unresolved · coverage</summary>' + sources +
+      '<details id="source-coverage"' + (expanded ? ' open' : '') + '><summary>' + retained.length + ' source tasks · ' + unresolved + ' unresolved' + (withheld ? ' · ' + withheld + ' sources to review' : '') + ' · coverage</summary>' + sources +
       '<p>Collected every 15 minutes, even with this page closed. Retained after exact-source deduplication and confirmed answers; includes waits and unresolved extraction, not just immediately actionable decisions.</p>' +
       (view.canonicalHost ? '<p>Canonical Linear source: ' + escape(view.canonicalHost) + '</p>' : '') +
       '<details><summary>Ticket flow — not decision counts</summary>' + flow() + '</details></details>';
@@ -183,7 +264,7 @@ const CLIENT = String.raw`
     return '<li><button type="button" class="row" data-key="' + escape(key(row)) + '" aria-current="' + (selected && key(selected) === key(row) ? 'true' : 'false') + '">' +
       '<span class="meta">' + escape(meta) + '</span><span class="title">' + escape(title) + '</span>' +
       (data.summary ? '<span class="summary">' + escape(data.summary) + '</span>' : '') +
-      (row.task?.reason ? '<span class="summary">' + escape(row.task.reason) + '</span>' : '') +
+      (row.task?.reason || row.reason ? '<span class="summary">' + escape(row.task?.reason || row.reason) + '</span>' : '') +
       '<span class="state">' + escape(state(row)) + '</span></button></li>';
   }
   function renderQueue() {
@@ -197,19 +278,30 @@ const CLIENT = String.raw`
       ['Research, delegated & other waits', all.filter(other)],
       ['Recent receipts', receipts()]
     ];
-    let found = 0;
+    let found = 0, reviewShown = false;
     queue.innerHTML = groups.map(([title, items]) => {
       const filtered = items.filter(matches);
-      // Discovery can return thousands of historical sources. Keep all searchable/countable,
-      // without mounting the entire nonurgent backlog into the initial browser layout.
-      const visible = title === 'Needs source review' ? filtered.slice(0, reviewLimit) : filtered;
       found += filtered.length;
-      if (terms.length && !filtered.length) return '';
+      const review = title === 'Needs source review';
+      if (terms.length && !filtered.length && !(review && (reviewLoading || reviewError || reviewNeeded()))) return '';
       const empty = title === 'Recent receipts' ? 'No receipts in the returned history.' : 'No items in the received snapshot. Check host coverage above.';
+      if (review) {
+        // The withheld backlog is read fifty sources at a time from the server; the count reports
+        // every matching source, loaded or not, and loaded pages are never sliced again here.
+        const viewPart = filtered.filter(row => !row.paged), pagedPart = filtered.filter(row => row.paged);
+        const count = viewPart.length + reviewCount();
+        const visible = [...viewPart, ...pagedPart];
+        reviewShown = count > 0;
+        return '<section class="queue-section"><h2>' + title + '<span class="count">' + count + '</span></h2>' +
+          (visible.length ? '<ul class="list">' + visible.map(queueRow).join('') + '</ul>' : '') +
+          (reviewLoading ? '<p class="empty" role="status">Loading source reviews…</p>' : '') +
+          (reviewError ? '<p class="empty">Source reviews unavailable: ' + escape(reviewError) + '</p><button type="button" data-retry-review="true">Retry source reviews</button>' : '') +
+          (!visible.length && !reviewLoading && !reviewError ? '<p class="empty">' + empty + '</p>' : '') +
+          (!reviewLoading && !reviewError && reviewHasMore() ? '<button type="button" data-more-review="true">Show next ' + Math.min(50, reviewTotal - reviewOffset) + ' source reviews · ' + reviewOffset + ' of ' + reviewTotal + ' loaded</button>' : '') + '</section>';
+      }
       return '<section class="queue-section"><h2>' + title + '<span class="count">' + filtered.length + (terms.length ? ' of ' + items.length : '') + '</span></h2>' +
-        (visible.length ? '<ul class="list">' + visible.map(queueRow).join('') + '</ul>' : '<p class="empty">' + empty + '</p>') +
-        (visible.length < filtered.length ? '<button type="button" data-more-review="true">Show next ' + Math.min(50, filtered.length - visible.length) + ' source reviews · ' + visible.length + ' of ' + filtered.length + ' shown</button>' : '') + '</section>';
-    }).join('') + (terms.length && !found ? '<section class="queue-section"><p class="empty">No matching decisions or receipts. Try the ticket, host, title, or original source.</p></section>' : '');
+        (filtered.length ? '<ul class="list">' + filtered.map(queueRow).join('') + '</ul>' : '<p class="empty">' + empty + '</p>') + '</section>';
+    }).join('') + (terms.length && !found && !reviewShown ? '<section class="queue-section"><p class="empty">No matching decisions or receipts. Try the ticket, host, title, or original source.</p></section>' : '');
     if (focused) [...queue.querySelectorAll('[data-key]')].find(element => element.dataset.key === focused)?.focus({preventScroll:true});
     coverage();
   }
@@ -248,7 +340,7 @@ const CLIENT = String.raw`
     if (selected.target === 'receipt') { renderReceipt(selected); return; }
     const row = selected, data = row.data, saved = draft(row);
     const permission = row.target === 'live' && data.kind === 'permission';
-    const why = row.task?.reason || (row.target === 'owner' ? data.attentionReason || 'No owner-attention reason was supplied.' : permission ? 'The agent is waiting for an explicit permission decision.' : 'The agent is waiting for your answer to its original questions.');
+    const why = row.task?.reason || row.reason || (row.target === 'owner' ? data.attentionReason || 'No owner-attention reason was supplied.' : permission ? 'The agent is waiting for an explicit permission decision.' : 'The agent is waiting for your answer to its original questions.');
     // Receipts have issue IDs, not live request IDs. Never invent a live-request join.
     const history = receipts().filter(receipt => receipt.host === row.host && (row.target === 'live' || (receipt.data.issueId === data.issueId && receipt.data.revision === row.revision)));
     const links = safeLink(row.target === 'owner' ? data.url : data.issueUrl, 'Open Linear ticket') + (row.target === 'live' ? safeLink(data.agentUrl, 'Open agent') : '');
@@ -387,8 +479,9 @@ const CLIENT = String.raw`
     coverage(); updateSafety();
   }
   async function refresh() {
-    if (refreshing || busy) return;
+    if (refreshing || busy) return false;
     refreshing = true;
+    let replaced = false;
     coverage();
     try {
       const response = await fetch('/api/decisions', {cache:'no-store', headers:{accept:'application/json'}});
@@ -407,6 +500,7 @@ const CLIENT = String.raw`
       view = next;
       refreshError = '';
       lastUpdated = Date.now();
+      replaced = true;
     } catch (error) {
       refreshError = error instanceof Error ? error.message : 'Decision refresh failed.';
     } finally {
@@ -414,6 +508,10 @@ const CLIENT = String.raw`
       renderQueue();
       refreshSelection();
     }
+    // Page 1 restarts at 0 only when the withheld set may have changed (a new owner collection), or
+    // when the last page read failed; otherwise the loaded pages stay.
+    if (replaced && (reviewError || reviewTotal === null || reviewSource !== withheldSource())) void loadReviews(false);
+    return replaced;
   }
   function baseAction(row, operation) {
     return {host:row.host, ...(row.backendInstanceId ? {backendInstanceId:row.backendInstanceId} : {}), target:row.target, operation, revision:row.revision, ...(row.target === 'owner' ? {issueId:row.data.issueId, ...(row.data.sourceId ? {sourceId:row.data.sourceId} : {})} : {agentId:row.data.agentId, requestId:row.data.requestId})};
@@ -464,6 +562,9 @@ const CLIENT = String.raw`
       busy = false;
       updateSafety();
       await refresh();
+      // The action changed the withheld set whether or not the view snapshot followed it yet:
+      // restart the pages unless the refresh already did.
+      if (!reviewLoading) void loadReviews(false);
     }
   }
   function answerAction(done = false) {
@@ -485,9 +586,11 @@ const CLIENT = String.raw`
   }
   queue.addEventListener('click', event => {
     if (event.target.closest('[data-more-review]')) {
-      reviewLimit += 50;
-      renderQueue();
-      queue.querySelector('[data-more-review]')?.focus({preventScroll:true});
+      void loadReviews(true).then(refocusReview);
+      return;
+    }
+    if (event.target.closest('[data-retry-review]')) {
+      void loadReviews(reviewErrorAppend).then(refocusReview);
       return;
     }
     const button = event.target.closest('[data-key]');
@@ -544,7 +647,7 @@ const CLIENT = String.raw`
     const button = [...queue.querySelectorAll('[data-key]')].find(element => selected && element.dataset.key === key(selected));
     (button || search).focus({preventScroll:true});
   });
-  search.addEventListener('input', renderQueue);
+  search.addEventListener('input', () => { renderQueue(); scheduleReviews(); });
   document.getElementById('refresh').addEventListener('click', () => { void refresh(); });
   addEventListener('focus', () => { void checkAvailability(); void refresh(); });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { void checkAvailability(); void refresh(); } });
@@ -553,6 +656,7 @@ const CLIENT = String.raw`
   setInterval(() => { if (!document.hidden) void checkAvailability(); }, 5000);
   renderQueue();
   renderDetail();
+  void loadReviews(false);
 })();
 `;
 
@@ -567,7 +671,7 @@ export function decisionPage(view: DecisionView, availability?: InboxAvailabilit
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Decision inbox</title><style>${STYLE}</style></head>
 <body><a class="skip" href="#detail">Skip to selected decision</a>
 <div class="shell"><aside class="queue" aria-label="Decision queue">
-<header class="queue-header"><div class="top"><h1>Decision tasks</h1><button id="refresh" type="button">Check updates</button></div><p id="refresh-state" class="muted" role="status" aria-live="polite"></p><p class="muted">Original choices, explicit answers. Research or delegate first when it is already within scope.</p><label class="search" for="search">Search decisions &amp; history</label><input id="search" type="search" placeholder="Ticket, title, host, or source" autocomplete="off"></header>
+<header class="queue-header"><div class="top"><h1>Decision tasks</h1><button id="refresh" type="button">Check updates</button></div><p id="refresh-state" class="muted" role="status" aria-live="polite"></p><p class="muted">Original choices, explicit answers. Research or delegate first when it is already within scope.</p><label class="search" for="search">Search decisions &amp; history</label><input id="search" type="search" maxlength="200" placeholder="Ticket, title, host, or source" autocomplete="off"></header>
 <div id="coverage" class="coverage" role="status" aria-live="polite"></div><div id="queue-list"></div>
 </aside><main id="detail" class="detail" tabindex="-1" aria-label="Selected decision"><div class="detail-inner"><nav class="detail-nav" aria-label="Inbox navigation"><button id="back" class="back" type="button">Back to decisions</button><a href="/">Plan review inbox</a></nav><div id="detail-content"></div></div></main></div>
 <noscript><p class="coverage warning">JavaScript is required to load decisions and send explicit answers. No actions are sent without it.</p></noscript>

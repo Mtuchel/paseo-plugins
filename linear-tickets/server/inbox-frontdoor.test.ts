@@ -60,6 +60,9 @@ async function fakeBackend(options: { instance?: string; port?: number } = {}): 
           return json(200, { host: "laptop", open: [], decided: [], applying: [], pipeline: null });
         case "/api/decisions/local":
           return json(200, decisionView());
+        case "/api/decisions/reviews":
+        case "/api/decisions/reviews/local":
+          return json(200, { host: "laptop", updatedAt: "2026-01-01T09:00:00.000Z", total: 0, offset: 0, asks: [] });
         case "/api/push/key":
           return json(200, { publicKey: "key" });
         case "/activation":
@@ -250,6 +253,20 @@ test("serves the existing pages from a live snapshot and forwards what it checke
     assert.equal(forwarded[0].headers.origin, ORIGIN);
     assert.equal(forwarded[0].headers.host, HOST);
     assert.equal(forwarded[0].headers["x-review-action"], "1");
+  });
+});
+
+// Source review pages are read live from the backend with their query, never from the snapshot.
+test("source review pages are forwarded with their paging query", async () => {
+  const fake = await fakeBackend();
+  await withFrontdoor(fake, async (frontdoor) => {
+    await until(async () => (await readAvailability(frontdoor.port)).stale === false);
+    for (const path of ["/api/decisions/reviews?offset=50&limit=50&q=beta", "/api/decisions/reviews/local?offset=0&limit=2"]) {
+      const answer = await call(frontdoor.port, "GET", path);
+      assert.equal(answer.status, 200, answer.text);
+      assert.equal(jsonBody(answer.text).total, 0);
+      assert.equal(fake.calls.filter((item) => item.path === path).length, 1, path);
+    }
   });
 });
 
