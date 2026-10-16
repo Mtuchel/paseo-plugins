@@ -4535,7 +4535,11 @@ pending structured questions, and observe the current exact requests even if the
 plugin startup. Call `linear.reconcile-deputy` with `{}` on **both actual agent hosts** for a
 supported bounded inventory pass after activation. Its `{ observed, skipped, failed }` counts
 are observation attempts, not approvals or answers; collection failures are reported. Concurrent
-passes share discovery and candidates retain per-request evaluation/dispatch serialization.
+ordinary passes share recovery and discovery. Terminal history is skipped before recovery lanes
+and whole-store reads; an already-owned current evaluation does not block discovering another
+request. Restored evaluations, unfinished dispatch settlement and exact settings-authorized
+restarts still recover. Candidates retain per-request evaluation/dispatch serialization.
+Settings changes remain separate and may wait for an active evaluation's cancellation lane.
 The shared daemon initialization attaches the checked reply SDK and awaits successful persisted
 multipart owner-hold restoration before any startup, settings or explicit-RPC deputy recovery,
 inventory or observation. Deferred restoration cannot grant dispatch; failure refuses deputy
@@ -4549,6 +4553,12 @@ Off mode evaluates nothing. Current-policy recovery freshly verifies pending ide
 trust and settings; old-version refusals/selections do not block eligible fresh evaluation.
 The full grace and checked once-only delivery gates still apply. Terminal owner-resolved,
 arbitrarily canceled, changed or unknown-dispatch candidates are never blindly resurrected.
+
+Complete source snapshots have a finite 250,000-character budget. Repository instructions,
+effective launch constraints and approved plans are not truncated to fit; exceeding the budget
+refuses evaluation with no partial authority snapshot. This accommodates measured Core
+snapshots up to 194,231 characters including the bounded recall allowance; the previous
+40,000-character limit refused all 24 sampled current requests before any model evaluation.
 
 **Linear-only delivery boundary.** A comment or continuation ask without a currently pending
 daemon structured question has no autonomous checked deputy delivery path. Historical Linear

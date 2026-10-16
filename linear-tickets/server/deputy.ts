@@ -154,6 +154,7 @@ export class Deputy {
   private readonly evaluating = new Set<string>();
   private readonly revoked = new Set<string>();
   private discoveryFlight: Promise<{ observed: number; skipped: number; failed: number }> | null = null;
+  private reconciliationFlight: Promise<{ observed: number; skipped: number; failed: number }> | null = null;
 
   constructor(private readonly deps: Deps) {
     this.directory = deps.directory ?? DEPUTY_DIRECTORY();
@@ -288,8 +289,14 @@ export class Deputy {
   // exact identities; recovery handles only policy/settings-authorized reevaluation.
   async reconcile(): Promise<{ observed: number; skipped: number; failed: number }> {
     if (this.stopped) return { observed: 0, skipped: 0, failed: 0 };
-    await this.recover();
-    return this.discoverPending();
+    if (this.reconciliationFlight) return this.reconciliationFlight;
+    const flight = (async () => {
+      await this.recover();
+      return this.discoverPending();
+    })();
+    this.reconciliationFlight = flight;
+    void flight.finally(() => { if (this.reconciliationFlight === flight) this.reconciliationFlight = null; }).catch(() => {});
+    return flight;
   }
 
   private discoverPending(): Promise<{ observed: number; skipped: number; failed: number }> {
@@ -713,6 +720,17 @@ export class Deputy {
     const version = settings.deputy.model ? policyVersion(settings.deputy.model) : "no-evaluator";
     let refusals: Map<string, Extract<LogEntry, { kind: "deputy-refusal" }>> | undefined;
     for (const candidate of await this.candidates()) {
+      // Terminal history needs neither a lane nor another whole-store read.
+      // Keep unfinished effects and exact settings-authorized restart keys.
+      if (candidate.status !== "dispatching" && !this.owesSettlement(candidate)
+        && !["refused", "predicted", "waiting", "evaluating", "blocked"].includes(candidate.status)
+        && !(candidate.status === "canceled" && restartKeys?.has(candidate.key))) continue;
+      // A current in-process evaluation owns its fresh checks and continuation.
+      // Waiting behind its model call would prevent discovery of unrelated asks.
+      // Restored evaluations and explicit settings recovery still take the lane.
+      if (!restartKeys && !standingActivation && candidate.status === "evaluating"
+        && candidate.mode === settings.deputy.mode && (!candidate.version || candidate.version === version)
+        && this.lanes.has(candidate.key)) continue;
       try {
         await this.lane(candidate.key, async () => {
           const current = (await this.readStore())[candidate.key];

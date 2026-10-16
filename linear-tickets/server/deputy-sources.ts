@@ -42,7 +42,11 @@ export type SourceReaders = {
 export type Question = { id: string; issueId: string; identifier: string; cwd: string; text: string; planApproved: boolean };
 
 const SECTION_CHARS = 2_400;
-const TOTAL_CHARS = 40_000;
+// Preserve complete constraints: measured Core snapshots reach 182,231 characters,
+// or 194,231 with the bounded recall allowance. The former 40,000 limit refused
+// all 24 sampled live requests. 250,000 remains finite and fits the configured
+// Sol 6.1 500K-token context alongside its system prompt; overflow still refuses.
+const TOTAL_CHARS = 250_000;
 const PER_SOURCE = { principles: 6, queue: 3, rules: 6, answers: 5, memories: 5 };
 const STOP = new Set("about above after again agent also because been before being below between both but can cannot could does doing down during each from further have having here how into its itself just more most must need only other over same should some such than that their them then there these they this those through under until very want what when where which while will with would your yours yourself the and for are was were not you our out any all".split(" "));
 
