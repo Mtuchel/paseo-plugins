@@ -179,6 +179,7 @@ test("polls at most every two minutes, conditionally: unchanged pages answer 304
   pulls.read("o/r");
   await pulls.settled("o/r");
   const firstRound = github.state.calls.length;
+  assert.equal(firstRound, 10); // two list pages, five detail requests, two queue comments and the landed commits
   time.now += 60_000;
   pulls.read("o/r");
   pulls.tick();
@@ -188,7 +189,11 @@ test("polls at most every two minutes, conditionally: unchanged pages answer 304
   pulls.tick();
   await pulls.settled("o/r");
   const secondRound = github.state.calls.slice(firstRound);
-  assert.equal(secondRound.length, firstRound);
+  // The queue draft's checks had settled and nothing about it moved: its two requests are skipped,
+  // so this pass makes 8 of the first pass's 10 (13's head has no check runs, so its workflow page
+  // is skipped in both passes).
+  assert.equal(secondRound.length, firstRound - 2);
+  assert.ok(!secondRound.some((call) => call.path.includes("s12")), secondRound.map((call) => call.path).join("\n"));
   assert.ok(secondRound.every((call) => call.etag !== null));
   const snapshot = pulls.read("o/r");
   assert.equal(snapshot.fetchedAt, at(8, 32));
@@ -284,4 +289,170 @@ test("labelling stops at the first PR GitHub refuses; the labels it answered wit
   // Labelled externally-merged without being in the queue.
   assert.equal(bump?.hasStaleQueueLabel, true);
   assert.equal(github.state.calls.length, calls);
+});
+
+// The per-pull-request detail requests a pass makes: the check-runs page per head, the workflow runs
+// too for a head that has check runs (with no runs there is no superseded suite to drop), and
+// Graphite's Merge activity comments per ready pull request.
+const expectedDetail = (heads: { withRuns: string[]; withoutRuns: string[] }, ready: number[]): string[] =>
+  [
+    ...heads.withRuns.flatMap((sha) => [`repos/o/r/commits/${sha}/check-runs?per_page=100`, `repos/o/r/actions/runs?head_sha=${sha}&per_page=100`]),
+    ...heads.withoutRuns.map((sha) => `repos/o/r/commits/${sha}/check-runs?per_page=100`),
+    ...ready.map((number) => `repos/o/r/issues/${number}/comments?per_page=100`),
+  ].sort();
+const detailPaths = (paths: string[]): string[] => paths.filter((path) => path.includes("/commits/s") || path.includes("head_sha=") || path.includes("/comments"));
+
+test("an unchanged pull request with settled checks is read in detail again only after ten minutes", async (t) => {
+  const github = fakeGitHub();
+  // Every head here has check runs, so the workflow pages are read too: 10's checks settle but
+  // Graphite holds it in the queue, 12's draft head failed, 13's lint passed.
+  github.state.checks.s10 = [run("unit")];
+  github.state.checks.s13 = [run("lint")];
+  const { board: pulls, time } = board(github);
+  t.after(() => pulls.stop());
+  pulls.read("o/r");
+  await pulls.settled("o/r");
+  const before = pulls.read("o/r");
+  const first = github.state.calls.map((call) => call.path);
+  assert.equal(first.length, 11); // two list pages, six detail reads, two queue comments and the landed commits
+  assert.deepEqual(detailPaths(first).sort(), expectedDetail({ withRuns: ["s10", "s13", "s12"], withoutRuns: [] }, [10, 13]));
+  assert.ok(first.includes("repos/o/r/pulls?state=open&per_page=100") && first.some((path) => path.includes("commits?sha=main&since=")), first.join("\n"));
+
+  let from = first.length;
+  time.now += 120_000; // 8:32: 12 and 13 are settled, unqueued and unmoved, so their details are reused; 10 is in the queue and stays loud.
+  pulls.tick();
+  await pulls.settled("o/r");
+  const second = github.state.calls.slice(from);
+  assert.equal(second.length, 6); // two list pages, 10's checks and queue comment, and the landed commits
+  assert.deepEqual(detailPaths(second.map((call) => call.path)).sort(), expectedDetail({ withRuns: ["s10"], withoutRuns: [] }, [10]));
+  assert.ok(second.every((call) => call.etag !== null));
+  const after = pulls.read("o/r");
+  assert.equal(after.fetchedAt, at(8, 32));
+  // What the reuse skipped is exactly what the pass before it put in the view.
+  assert.deepEqual({ pulls: after.pulls, queueDrafts: after.queueDrafts, landedRecently: after.landedRecently }, { pulls: before.pulls, queueDrafts: before.queueDrafts, landedRecently: before.landedRecently });
+
+  from = github.state.calls.length;
+  time.now += 8 * 60_000; // 8:40: exactly ten minutes after the reads at 8:30, still inside DETAIL_MS.
+  pulls.tick();
+  await pulls.settled("o/r");
+  const third = github.state.calls.slice(from);
+  assert.equal(third.length, 6);
+  assert.deepEqual(detailPaths(third.map((call) => call.path)).sort(), expectedDetail({ withRuns: ["s10"], withoutRuns: [] }, [10]));
+
+  from = github.state.calls.length;
+  time.now += 120_000; // 8:42: eleven minutes past those reads, so every settled detail is read again.
+  pulls.read("o/r"); // The ask also keeps the repository polled past the ten-minute activity window.
+  await pulls.settled("o/r");
+  const fourth = github.state.calls.slice(from);
+  assert.equal(fourth.length, 11);
+  assert.deepEqual(detailPaths(fourth.map((call) => call.path)).sort(), expectedDetail({ withRuns: ["s10", "s13", "s12"], withoutRuns: [] }, [10, 13]));
+});
+
+test("a pull request whose head, updated_at or checks moved is read in detail every pass", async (t) => {
+  const github = fakeGitHub();
+  // 13's checks settle, 14 joins the repository with no checks yet, and 10's are still running (it
+  // is not queued here, so only its running checks hold it loud); 12's draft head has failed.
+  github.state.checks.s13 = [run("lint")];
+  delete github.state.comments[10];
+  github.state.pages[1].push({
+    number: 14, title: "Add TUC-9 [api] Settled export", draft: false, html_url: "https://github.com/o/r/pull/14", created_at: at(6), updated_at: at(7),
+    user: { login: "Mtuchel" }, head: { ref: "b14", sha: "s14" }, base: { ref: "main", sha: "m", repo: { default_branch: "main" } }, labels: [],
+  });
+  const { board: pulls, time } = board(github);
+  t.after(() => pulls.stop());
+  const detailAt = (from: number) => detailPaths(github.state.calls.slice(from).map((call) => call.path)).sort();
+  pulls.read("o/r");
+  await pulls.settled("o/r");
+  let from = github.state.calls.length;
+  assert.equal(from, 13); // two list pages, ten detail reads and the landed commits
+  assert.deepEqual(detailPaths(github.state.calls.map((call) => call.path)).sort(), expectedDetail({ withRuns: ["s10", "s13", "s12"], withoutRuns: ["s14"] }, [10, 13, 14]));
+  // 14's head has no check runs, and a suite cannot be superseded without runs, so its workflow page is not read.
+  assert.ok(github.state.calls.some((call) => call.path.includes("head_sha=s10")), github.state.calls.map((call) => call.path).join("\n"));
+  assert.ok(!github.state.calls.some((call) => call.path.includes("head_sha=s14")), github.state.calls.map((call) => call.path).join("\n"));
+
+  time.now += 120_000; // 8:32: 12 and 13 are quiet; 10 (checks running) and 14 (none yet) are read.
+  pulls.tick();
+  await pulls.settled("o/r");
+  assert.deepEqual(detailAt(from), expectedDetail({ withRuns: ["s10"], withoutRuns: ["s14"] }, [10, 14]));
+
+  from = github.state.calls.length;
+  time.now += 120_000; // 8:34: 13's updated_at moved with its head unchanged, so its detail is read again.
+  github.state.pages[1][1].updated_at = at(8, 25);
+  pulls.tick();
+  await pulls.settled("o/r");
+  assert.deepEqual(detailAt(from), expectedDetail({ withRuns: ["s10", "s13"], withoutRuns: ["s14"] }, [10, 13, 14]));
+  // The list record the view shows is this pass's; only the detail read was held back.
+  assert.equal(pulls.read("o/r").pulls.find((pull) => pull.number === 13)?.updatedAt, at(8, 25));
+
+  from = github.state.calls.length;
+  time.now += 120_000; // 8:36: 12's head moved; 13 did not move and is left alone again.
+  github.state.pages[1][0].head.sha = "s12b";
+  github.state.checks.s12b = [run("e2e", { conclusion: "failure" })];
+  pulls.tick();
+  await pulls.settled("o/r");
+  assert.deepEqual(detailAt(from), expectedDetail({ withRuns: ["s10", "s12b"], withoutRuns: ["s14"] }, [10, 14]));
+
+  from = github.state.calls.length;
+  time.now += 120_000; // 8:38: nothing moved.
+  pulls.tick();
+  await pulls.settled("o/r");
+  assert.deepEqual(detailAt(from), expectedDetail({ withRuns: ["s10"], withoutRuns: ["s14"] }, [10, 14]));
+
+  from = github.state.calls.length;
+  time.now += 9 * 60_000; // 8:47: eleven minutes past 12's read (8:36), thirteen past 13's (8:34).
+  pulls.read("o/r"); // The ask also keeps the repository polled past the ten-minute activity window.
+  await pulls.settled("o/r");
+  assert.deepEqual(detailAt(from), expectedDetail({ withRuns: ["s10", "s13", "s12b"], withoutRuns: ["s14"] }, [10, 13, 14]));
+});
+
+test("every detail settled, unqueued and unmoved: a pass reads the repository itself only", async (t) => {
+  const github = fakeGitHub();
+  // 10's checks settle and its queue comment is gone, 13's lint passed, 12's draft head failed: no
+  // detail has anything to say that the pass before it did not already put in the view.
+  github.state.checks.s10 = [run("unit")];
+  github.state.checks.s13 = [run("lint")];
+  delete github.state.comments[10];
+  const { board: pulls, time } = board(github);
+  t.after(() => pulls.stop());
+  pulls.read("o/r");
+  await pulls.settled("o/r");
+  const before = pulls.read("o/r");
+  const from = github.state.calls.length;
+  assert.equal(from, 11); // two list pages, six detail reads, two queue comments and the landed commits
+
+  time.now += 120_000; // 8:32: nothing moved.
+  pulls.tick();
+  await pulls.settled("o/r");
+  const second = github.state.calls.slice(from);
+  assert.equal(second.length, 3); // the two list pages and the landed commits
+  assert.deepEqual(detailPaths(second.map((call) => call.path)), []);
+  assert.ok(second.every((call) => call.etag !== null));
+  // What the quiet pass skipped is exactly what the pass before it put in the view.
+  const after = pulls.read("o/r");
+  assert.equal(after.fetchedAt, at(8, 32));
+  assert.deepEqual({ pulls: after.pulls, queueDrafts: after.queueDrafts, landedRecently: after.landedRecently }, { pulls: before.pulls, queueDrafts: before.queueDrafts, landedRecently: before.landedRecently });
+});
+
+test("a closed pull request's detail is not kept: reopening it reads it again", async (t) => {
+  const github = fakeGitHub();
+  github.state.checks.s13 = [run("lint")]; // 13's checks settle, so its detail is reusable.
+  const { board: pulls, time } = board(github);
+  t.after(() => pulls.stop());
+  pulls.read("o/r");
+  await pulls.settled("o/r");
+  // 13 is closed: the open page no longer carries it, and the pass that follows keeps only what it saw.
+  const reopened = github.state.pages[1].splice(1, 1)[0];
+  time.now += 120_000;
+  pulls.tick();
+  await pulls.settled("o/r");
+  assert.deepEqual(pulls.read("o/r").pulls.map((pull) => pull.number), [10, 11]);
+
+  const from = github.state.calls.length;
+  github.state.pages[1].push(reopened); // Reopened with the head it was closed with, four minutes after its read.
+  time.now += 120_000;
+  pulls.tick();
+  await pulls.settled("o/r");
+  // 12's settled, unqueued detail is still reused; 13 is read again although its head and age would
+  // still have allowed reuse, because the pass that did not see it dropped its detail.
+  assert.deepEqual(detailPaths(github.state.calls.slice(from).map((call) => call.path)).sort(), expectedDetail({ withRuns: ["s10", "s13"], withoutRuns: [] }, [10, 13]));
 });

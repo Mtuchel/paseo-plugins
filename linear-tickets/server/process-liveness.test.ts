@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { setImmediate } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
-import { ghostAgents, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
+import { ghostAgents, ProcessTable, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 
 const ISSUE = "issue-1";
 const HANDLE = "/home/mirko/.omp/agent/sessions/worktree/2026-10-05T11-05-57-212Z_01a10bbd-e6dc-7761-93d1-081ca47d9501.jsonl";
@@ -160,4 +161,97 @@ test("an inspection that fails anywhere reports no ghost", async () => {
 test("one live agent in a worktree does not hide another agent's absence elsewhere", async () => {
   const elsewhere = quiet({ id: "root-2", cwd: "/repo/worktree-2", persistence: { provider: "omp", sessionId: "s2", nativeHandle: "/sessions/s2.jsonl" }, runtimeInfo: undefined });
   assert.deepEqual(await ghosts([quiet(), elsewhere], inspection(`2100185 omp --mode rpc-ui --session ${HANDLE}\n`)), ["root-2"]);
+});
+
+// ---- One `ps` table per window (see ProcessTable): the ghost check, the ticket check beside it, the
+// planner refresh and the starter's admission all ask the same machine seconds apart, and every ask
+// forks this process. They share one read inside the window, one at a time, and no absence may be
+// decided from a table older than the records the check judges (a process started a moment ago). ---
+
+test("checks inside the window share one process listing, one at a time", async () => {
+  const clock = { now: NOW };
+  let reads = 0;
+  // Executor form: the plugin's lib is ES2023, without Promise.withResolvers. Each read is held
+  // until the test answers it, so the wait for the read in flight is observable.
+  const held: ((output: string) => void)[] = [];
+  const table = new ProcessTable(async () => { reads++; return await new Promise<string>((done) => { held.push(done); }); }, () => clock.now);
+  const expected = `2100185 omp --mode rpc-ui --session ${HANDLE}\n`;
+  const first = table.at();
+  const second = table.at();
+  await setImmediate();
+  assert.equal(reads, 1, "the second check waits for the read in flight instead of forking again");
+  assert.equal(held.length, 1, "one read in flight");
+  held.shift()!(expected);
+  assert.equal(await first, expected);
+  assert.equal(await second, expected);
+  assert.equal(await table.at(), expected, "still inside the window");
+  assert.equal(reads, 1);
+  clock.now += 6_000;
+  const third = table.at();
+  await setImmediate();
+  assert.equal(reads, 2, "past the window the next check reads again");
+  held.shift()!(expected);
+  assert.equal(await third, expected);
+});
+
+test("a table read before a record cannot judge that record: the check reads again", async () => {
+  const clock = { now: NOW };
+  let reads = 0;
+  const table = new ProcessTable(async () => { reads++; return `${reads}\n`; }, () => clock.now);
+  const older = Date.parse("2026-10-06T09:59:00Z");
+  assert.equal(await table.at(older), "1\n");
+  assert.equal(await table.at(older), "1\n", "a record older than the read: the window is enough");
+  assert.equal(reads, 1, "one `ps` served both checks");
+  assert.equal(await table.at(Date.parse("2026-10-06T10:00:01Z")), "2\n", "the record moved after the table was read");
+  assert.equal(reads, 2, "a newer record is never judged from the older table");
+});
+
+test("a failed listing is never served from the window", async () => {
+  let reads = 0;
+  const table = new ProcessTable(async () => {
+    reads++;
+    if (reads === 1) throw new Error("ps failed");
+    return "2100185 omp --mode rpc-ui\n";
+  }, () => NOW);
+  await assert.rejects(() => table.at());
+  assert.equal(await table.at(), "2100185 omp --mode rpc-ui\n", "the next check reads the machine again");
+  assert.equal(reads, 2);
+});
+
+test("the ghost check hands the newest record it judges to the table", async () => {
+  const references: number[] = [];
+  const inspect: ProcessInspector = {
+    processes: async (reference = 0) => { references.push(reference); return `2100185 omp --mode rpc-ui --session ${HANDLE}\n`; },
+    cwd: async () => "/repo/worktree",
+    canonicalPath: async (path) => path,
+  };
+  const started = "2026-10-06T09:59:59.000Z";
+  const other = quiet({ id: "root-2", updatedAt: started, persistence: { provider: "omp", sessionId: "s2", nativeHandle: "/sessions/s2.jsonl" } });
+  assert.deepEqual(await ghosts([quiet(), other], inspect), [], "root-1's session answers; root-2 may still be starting");
+  assert.deepEqual(references, [Date.parse(started)], "the newest record, not the suspect's");
+});
+
+test("checks seconds apart share one `ps` through the table", async () => {
+  const clock = { now: NOW };
+  let reads = 0;
+  const table = new ProcessTable(async () => { reads++; return `2100185 omp --mode rpc-ui --session ${HANDLE}\n`; }, () => clock.now);
+  const inspect: ProcessInspector = { processes: (reference = 0) => table.at(reference), cwd: async () => "/repo/worktree", canonicalPath: async (path) => path };
+  assert.deepEqual(await ghosts([quiet()], inspect), [], "the ghost check");
+  assert.equal(await ticketProcessLiveness(daemon([worker({ updatedAt: "2026-10-06T09:59:00Z" })]), ISSUE, [], inspect), "alive", "the ticket check beside it");
+  assert.equal(reads, 1, "one `ps` served both: no record either of them judges is newer than it");
+});
+
+test("a process started after the shared table was read is seen by the check that judges it", async () => {
+  const clock = { now: NOW };
+  const running: string[] = [];
+  const table = new ProcessTable(async () => (running.length ? `${running.join("\n")}\n` : ""), () => clock.now);
+  const inspect: ProcessInspector = { processes: (reference = 0) => table.at(reference), cwd: async () => "/repo/worktree", canonicalPath: async (path) => path };
+  const dead = worker({ id: "dead", status: "closed", updatedAt: "2026-10-06T09:00:00Z" });
+  assert.equal(await ticketProcessLiveness(daemon([dead]), ISSUE, [], inspect), "absent", "no process carries the ticket");
+  // The daemon starts its worker now: the process appears, and a record names it a moment later.
+  running.push("2100186 node /usr/local/lib/paseo/omp.mjs --mode=rpc-ui");
+  clock.now += 1_000;
+  const started = worker({ id: "worker-2", status: "running", updatedAt: new Date(clock.now).toISOString(), persistence: null, runtimeInfo: undefined, cwd: "/repo/worktree" });
+  assert.equal(await ticketProcessLiveness(daemon([dead, started]), ISSUE, [], inspect), "alive",
+    "the table read before the record (which a check without a reference would still have judged by) cannot hide the process in its worktree");
 });

@@ -9,19 +9,80 @@ const MAX_PAGES = 100;
 const MAX_PROCESSES = 256;
 const CLOSED_PROCESS = /\bprocess (exited|is closed)\b/i;
 
+// How long one `ps` table may serve further checks. Several checks ask for the same machine seconds
+// apart (every ghost check of one session sweep, the planner refresh beside it, the starter's
+// admission), and every read is a `ps` fork of this process; they share one table inside this
+// window. Five seconds is also what the sharing can add to a check before a process the caller's own
+// agent list does not name (a subagent started in a worktree, say) is seen.
+const PROCESS_TABLE_MS = 5_000;
+
+// The process table every check reads through, shared (one `ps` at a time, the last one served for
+// PROCESS_TABLE_MS). `at(reference)`: the table handed back was read at or after `reference`, in ms.
+// The rule callers live by, because a wrong table is a stopped or duplicated agent:
+//
+//   * A process cannot be older than the record that names it: the daemon writes an agent's record
+//     when it starts (or reloads) its process, so `updatedAt` is never later than that process.
+//   * Therefore a table read at or after the newest `updatedAt` among the agents a check is about
+//     cannot miss a just-started process of theirs, and only such a table may decide an absence.
+//   * Every caller passes that newest record as `reference` (see referenceOf): an agent whose record
+//     moved since the last `ps` re-reads the table, so a destructive decision (a ghost stopped,
+//     replaced or not counted, a ticket without workers) never rests on a table older than the facts
+//     it is judging. A caller without a reference (`0`) only needs the window.
+//
+// A failed read is never served: the next check reads again.
+export class ProcessTable {
+  private cached: { at: number; table: Promise<string> } | null = null;
+
+  constructor(private readonly read: () => Promise<string>, private readonly now: () => number = Date.now, private readonly ttlMs: number = PROCESS_TABLE_MS) {}
+
+  async at(reference = 0): Promise<string> {
+    const cached = this.cached;
+    // `at` is when the read was queued, a lower bound for the moment the table describes: the
+    // snapshot is taken after it, so a table that qualifies was read at or after `reference`.
+    if (cached && cached.at >= reference && this.now() - cached.at <= this.ttlMs) return cached.table;
+    // One `ps` at a time: a check that needs a newer table waits for the read in flight first, so a
+    // burst of checks never runs two listings at once (and reuses the newer one when it qualifies).
+    const queued = (cached ? cached.table.catch(() => undefined) : Promise.resolve()).then(() => this.read());
+    const entry = { at: this.now(), table: queued };
+    this.cached = entry;
+    return queued.catch((error: unknown) => {
+      if (this.cached === entry) this.cached = null;
+      throw error;
+    });
+  }
+}
+
+// The newest record among the agents a check is about: nothing about an agent whose record carries
+// no readable time can be bounded, so such an agent (one with an id) makes the table must be current.
+function referenceOf(agents: Iterable<ProcessAgent>, now: number): number {
+  let reference = 0;
+  for (const agent of agents) {
+    if (!agent.id) continue;
+    const at = agent.updatedAt ? Date.parse(agent.updatedAt) : NaN;
+    if (!Number.isFinite(at)) return now;
+    reference = Math.max(reference, at);
+  }
+  return reference;
+}
+
 export type ProcessAgent = Partial<Pick<PaseoAgent, "id" | "provider" | "cwd" | "status" | "lastError" | "archivedAt" | "labels" | "runtimeInfo" | "persistence" | "updatedAt">>;
 export type ProcessLiveness = "absent" | "alive" | "unknown";
 
 // No daemon status, JSONL timestamp or missing open file can prove a provider process exited.
 // Throws mean unobservable, including a process that disappeared during inspection: retry later.
 export type ProcessInspector = {
-  processes: () => Promise<string>;
+  // The process table, read at or after `reference` (ms since the epoch): the newest record the
+  // check judges (see ProcessTable). A caller that does not pass one gets the shared window.
+  processes: (reference?: number) => Promise<string>;
   cwd: (pid: number) => Promise<string>;
   canonicalPath: (path: string) => Promise<string>;
 };
 
+// Every liveness check in this process reads the machine through it (see ProcessTable).
+const processTable = new ProcessTable(async () => (await exec("ps", ["-ww", "-eo", "pid=,args="], { timeout: 5_000, maxBuffer: 8 * 1024 * 1024 })).stdout);
+
 const inspector: ProcessInspector = {
-  processes: async () => (await exec("ps", ["-ww", "-eo", "pid=,args="], { timeout: 5_000, maxBuffer: 8 * 1024 * 1024 })).stdout,
+  processes: (reference = 0) => processTable.at(reference),
   cwd: async (pid) => {
     if (process.platform === "linux") return (await readlink(`/proc/${pid}/cwd`)).replace(/ \(deleted\)$/, "");
     if (process.platform === "darwin") {
@@ -101,7 +162,10 @@ export async function ticketProcessLiveness(paseo: PaseoApi, issueId: string, ex
       && Boolean(agent.archivedAt || agent.status === "closed"
         || (agent.status === "error" && agent.lastError && CLOSED_PROCESS.test(agent.lastError))));
     if (!candidates.length) return "absent";
-    const processes = rpcProcesses(await inspect.processes());
+    // The table must be as new as every record of this ticket, not just the dead candidates': a
+    // worker started a moment ago is in the same worktree and would be missed by an older table
+    // (see ProcessTable). Callers start an agent on "absent", so this is the destructive direction.
+    const processes = rpcProcesses(await inspect.processes(referenceOf(agents.values(), Date.now())));
     if (!processes.length) return "absent";
     const sessions = new Set<string>();
     const handles = new Set<string>();
@@ -146,7 +210,9 @@ const GHOST_GRACE_MS = 5 * 60_000;
 // The ids of `agents` that are ghosts: OMP, unarchived, idle or running, quiet for GHOST_GRACE_MS,
 // and no rpc-ui process carries their session or runs in their worktree. Absence must be proven:
 // an agent without a complete native handle or cwd is never a ghost, and an inspection that fails
-// anywhere (ps, a cwd, a path) reports none, so the next poll looks again.
+// anywhere (ps, a cwd, a path) reports none, so the next poll looks again. The process table must be
+// at least as new as every record handed in (see ProcessTable): a process one of them started may be
+// the very process that keeps a suspect alive, and callers stop, replace or do not count a ghost.
 export async function ghostAgents(agents: ProcessAgent[], now: number, inspect: ProcessInspector = inspector): Promise<Set<string>> {
   const suspects = agents.filter((agent) => agent.id && agent.provider === "omp" && !agent.archivedAt
     && (agent.status === "idle" || agent.status === "running")
@@ -155,7 +221,7 @@ export async function ghostAgents(agents: ProcessAgent[], now: number, inspect: 
     && agent.cwd && isAbsolute(agent.cwd));
   if (!suspects.length) return new Set();
   try {
-    const processes = rpcProcesses(await inspect.processes());
+    const processes = rpcProcesses(await inspect.processes(referenceOf(agents, now)));
     const ghosts = new Set(suspects.map((agent) => agent.id!));
     const byWorktree = new Map<string, string[]>();
     for (const agent of suspects) {

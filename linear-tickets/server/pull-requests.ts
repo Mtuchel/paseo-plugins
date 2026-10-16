@@ -7,10 +7,15 @@ import { githubBudget, GitHubPausedError, GitHubRateLimitedError, refusalHeaders
 // REST through the routed gh CLI (github-cli.ts): the account router decides which read account
 // serves each call; without it, the owner's gh login reads as before. Conditional requests (an
 // unchanged resource answers 304 and costs no budget), at most every 2 minutes per repository,
-// and only while a client asked for it in the last 10 minutes. GraphQL stays reserved for `gh pr`
-// and `gt`.
+// and only while a client asked for it in the last 10 minutes. A pull request that did not move
+// (same head, same `updated_at`), whose checks have settled and which is not in the Graphite queue
+// is not read in detail again for DETAIL_MS; anything running, empty, or in the queue is read every
+// pass. GraphQL stays reserved for `gh pr` and `gt`.
 const REFRESH_MS = 2 * 60 * 1000;
 const ACTIVE_MS = 10 * 60 * 1000;
+// A settled detail read is reused for this long. A check re-run or a check a workflow adds later
+// never moves the pull request resource, so the bound is what picks those up.
+const DETAIL_MS = 10 * 60 * 1000;
 const TICK_MS = 15 * 1000;
 // gh processes at once: one per request, on a machine running many agents.
 const CONCURRENCY = 4;
@@ -277,7 +282,14 @@ const workflowRunsJson = z.object({ workflow_runs: z.array(z.object({ id: z.numb
 const commentsJson = z.array(z.object({ user: z.object({ login: z.string() }).nullable(), body: z.string().nullish() }));
 const commitsJson = z.array(z.object({ sha: z.string(), commit: z.object({ message: z.string(), committer: z.object({ date: z.string() }).nullable() }) }));
 
-type Repo = { snapshot: PullRequestsSnapshot; askedAt: number; attemptAt: number; running: Promise<void> | null; reader: ConditionalReader };
+// The detail read of one pull request: the head and list record it was read for, when, and what it
+// answered. A list record that moved (`updated_at` is bumped by a comment, a review or a label) is
+// not reused: the comment it carries can be the queue's next event.
+type Detail = { sha: string; updatedAt: string; readAt: number; checks: CheckSummary | null; queue: QueueActivity | null };
+
+// `details` holds the last detail read per open pull request number; only the numbers the last pass
+// saw stay in it, so a closed pull request cannot grow it.
+type Repo = { snapshot: PullRequestsSnapshot; askedAt: number; attemptAt: number; running: Promise<void> | null; reader: ConditionalReader; details: Map<number, Detail> };
 
 export class PullRequestBoard {
   private readonly repos = new Map<string, Repo>();
@@ -360,6 +372,7 @@ export class PullRequestBoard {
       attemptAt: -Infinity,
       running: null,
       reader: new ConditionalReader(this.get, this.budget),
+      details: new Map(),
     };
     this.repos.set(repository, repo);
     if (this.repos.size > MAX_REPOSITORIES) {
@@ -386,9 +399,13 @@ export class PullRequestBoard {
   private async refresh(repository: string, repo: Repo): Promise<void> {
     repo.reader.begin();
     try {
-      const fetched = await this.fetch(repository, repo.reader);
+      const fetched = await this.fetch(repository, repo, repo.reader);
       repo.reader.sweep();
-      repo.snapshot = { ...repo.snapshot, ...fetched, fetchedAt: iso(this.now()), error: null, rateLimited: null };
+      const { details, ...data } = fetched;
+      // Only a complete pass replaces the details (dropping what it did not see); a failed pass
+      // leaves them where they were.
+      repo.details = details;
+      repo.snapshot = { ...repo.snapshot, ...data, fetchedAt: iso(this.now()), error: null, rateLimited: null };
     } catch (error) {
       repo.reader.abandon();
       repo.snapshot = error instanceof GitHubPausedError
@@ -397,7 +414,7 @@ export class PullRequestBoard {
     }
   }
 
-  private async fetch(repository: string, reader: ConditionalReader): Promise<Pick<PullRequestsSnapshot, "pulls" | "queueDrafts" | "landedRecently">> {
+  private async fetch(repository: string, repo: Repo, reader: ConditionalReader): Promise<Pick<PullRequestsSnapshot, "pulls" | "queueDrafts" | "landedRecently"> & { details: Map<number, Detail> }> {
     const now = this.now();
     const open = await reader.pages(`repos/${repository}/pulls?state=open&per_page=100`, 5, (json) => pullsJson.parse(json).map((pull): PullRecord => ({
       number: pull.number,
@@ -418,9 +435,33 @@ export class PullRequestBoard {
     // Drafts run no code CI and are never queued: only ready pull requests and queue drafts are
     // looked at in detail.
     const ready = sources.filter((pull) => !pull.draft);
+    const detail = [...ready, ...drafts];
+    // Reuse: a pull request that did not move (same head, same updated_at), whose last detail read
+    // settled and which is not in the queue, is read once per DETAIL_MS. Anything running or not
+    // started yet, anything that moved, and anything in the queue is read every pass.
+    const reused = new Map<number, Detail>();
+    for (const pull of detail) {
+      const last = repo.details.get(pull.number);
+      if (
+        last
+        && last.sha === pull.head.sha
+        && last.updatedAt === pull.updatedAt
+        && now - last.readAt <= DETAIL_MS
+        && last.checks !== null
+        && (last.checks.state === "passed" || last.checks.state === "failed")
+        && !(last.queue?.inQueue ?? false)
+      ) reused.set(pull.number, last);
+    }
+    // A reused pull request issues no request at all; every other one is read as before, its queue
+    // comments only when it is ready.
+    const checksOf = async (pull: PullRecord): Promise<CheckSummary> => reused.get(pull.number)?.checks ?? await this.checks(repository, reader, pull.head.sha);
+    const queueOf = async (pull: PullRecord): Promise<QueueActivity | null> => {
+      const last = reused.get(pull.number);
+      return last ? last.queue : await this.queue(repository, reader, pull.number, now);
+    };
     const [checks, queues, landedRecently] = await Promise.all([
-      Promise.all([...ready, ...drafts].map(async (pull) => [pull.number, await this.checks(repository, reader, pull.head.sha)] as const)),
-      Promise.all(ready.map(async (pull) => [pull.number, await this.queue(repository, reader, pull.number, now)] as const)),
+      Promise.all(detail.map(async (pull) => [pull.number, await checksOf(pull)] as const)),
+      Promise.all(ready.map(async (pull) => [pull.number, await queueOf(pull)] as const)),
       this.landed(repository, reader, open[0]?.trunk ?? "main", now),
     ]);
     const checkMap = new Map(checks);
@@ -429,6 +470,8 @@ export class PullRequestBoard {
       pulls: sources.map((pull) => pullEntry(pull, checkMap.get(pull.number) ?? null, queueMap.get(pull.number) ?? null)),
       queueDrafts: drafts.map((pull) => pullEntry(pull, checkMap.get(pull.number) ?? null, null)),
       landedRecently,
+      // The details of this pass by number: a reused read as it stands, a repeated one replaced.
+      details: new Map(detail.map((pull): [number, Detail] => [pull.number, reused.get(pull.number) ?? { sha: pull.head.sha, updatedAt: pull.updatedAt, readAt: now, checks: checkMap.get(pull.number) ?? null, queue: queueMap.get(pull.number) ?? null }])),
     };
   }
 
@@ -441,6 +484,9 @@ export class PullRequestBoard {
       htmlUrl: run.html_url ?? null,
       suite: run.check_suite?.id ?? null,
     })));
+    // No runs on the head: a superseded suite can only remove runs, so the summary is the empty one
+    // and the `actions/runs` page is skipped.
+    if (runs.length === 0) return checkSummary([]);
     const workflows = await reader.pages(`repos/${repository}/actions/runs?head_sha=${sha}&per_page=100`, 2, (json) => workflowRunsJson.parse(json).workflow_runs.map((run): WorkflowRunRecord => ({
       id: run.id,
       workflowId: run.workflow_id,
