@@ -721,6 +721,50 @@ test("a manual label alone does not make unresolved extraction urgent human work
     [{ kind: "manual", attention: "info", extracted: false, source: "Use the existing scoped staging role." }]);
 });
 
+test("overlapping menu reads share work but explicit refresh and owner-action invalidation read current sources", async t => {
+  const h = await setup({ issues: [issue({ title: "Original scope" })] });
+  h.ownerAsks.stop();
+  t.after(() => rm(h.directory, { recursive: true, force: true }));
+  let release!: () => void;
+  let entered!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let reads = 0;
+  h.deps.handover.read = async () => {
+    if (++reads === 1) { entered(); await held; }
+    return null;
+  };
+  const first = h.ownerAsks.snapshot(null);
+  await started;
+  const shared = h.ownerAsks.snapshot(null);
+  h.state.issues = [issue({ title: "Changed material scope" })];
+  const refreshed = await h.ownerAsks.snapshot(null, true);
+  assert.equal(refreshed.asks[0].title, "Changed material scope");
+  await assert.rejects(h.ownerAsks.answer({ issueId: "i1", revision: "stale", answers: {} }, null), /ask changed/);
+  const current = await h.ownerAsks.snapshot(null);
+  assert.equal(current.asks[0].title, "Changed material scope");
+  release();
+  const [original, joined] = await Promise.all([first, shared]);
+  assert.equal(original.asks[0].title, "Original scope");
+  assert.deepEqual(joined, original);
+  assert.equal(reads, 4, "the two overlapping menu reads must not duplicate collection");
+  assert.deepEqual(h.events, []);
+  assert.equal((await h.ownerAsks.snapshot(null)).asks[0].revision, current.asks[0].revision);
+});
+
+test("failed shared collection does not prevent a repaired inbox from being read", async t => {
+  const h = await setup({ issues: [issue()] });
+  h.ownerAsks.stop();
+  t.after(() => rm(h.directory, { recursive: true, force: true }));
+  h.deps.handover.read = async () => { throw new Error("temporary read failure"); };
+  await assert.rejects(h.ownerAsks.snapshot(null), /temporary read failure/);
+  h.deps.handover.read = async () => null;
+  const repaired = await h.ownerAsks.snapshot(null);
+  assert.equal(repaired.asks[0].sourceId, "description");
+  assert.equal(repaired.asks[0].source, h.state.issues[0].description);
+  assert.deepEqual(h.events, []);
+});
+
 test("owner inbox shows new Linear questions within a minute without rescanning every menu refresh", async t => {
   const h = await setup({ issues: [issue({ title: "Rollout policy", labels: [], parentId: null, status: "In Progress", description: "" })],
     comments: new Map([["i1", [comment("c1", "Which rollout policy?")]]]) });

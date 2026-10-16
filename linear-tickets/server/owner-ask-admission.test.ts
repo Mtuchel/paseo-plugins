@@ -40,6 +40,23 @@ test("exact relay echoes share a stable canonical source but altered choices and
   }
 });
 
+test("edited questions and changed wait ownership cannot inherit a previous echo classification", () => {
+  const timeline = askTimeline("", [
+    { id: "original", body: question, createdAt: "2026-10-01T10:00:00Z" },
+    { id: "echo", body: question, createdAt: "2026-10-02T10:00:00Z" },
+  ]);
+  const original = timeline.find(source => source.sourceId === "original")!;
+  const echo = timeline.find(source => source.sourceId === "echo")!;
+  assert.equal(askContext("echo", timeline, null, false, false).duplicateOf, "original");
+  echo.text = `${question}\nDoes the contract include delivery?`;
+  assert.equal(askContext("echo", timeline, null, false, false).duplicateOf, null);
+  echo.text = question;
+  assert.equal(askContext("echo", timeline, "echo", true, true).duplicateOf, null);
+  assert.equal(askContext("original", timeline, "echo", false, false).duplicateOf, "echo");
+  original.createdAt = "2026-10-03T10:00:00Z";
+  assert.equal(askContext("original", timeline, null, false, false).duplicateOf, "echo");
+});
+
 test("capped timeline is explicitly incomplete and cannot silently promote historical owner urgency", () => {
   const timeline = askTimeline("", [...comments, { id: "huge", body: "x".repeat(40_000), createdAt: "2026-10-04T00:00:00Z" }]);
   const capped = askContext("ask", timeline, null, false, false);
