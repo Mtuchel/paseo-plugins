@@ -343,6 +343,7 @@ test("comment outcomes count only confirmed owners and close Needs you only afte
     const h = setup([{ id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", pending: [question] }], { sub: [comment("c1", "@paseo CSV")] }, join(directory, "cursor.json"), needsYou, true);
     if (failure) h.failAnswer(new Error(failure));
     await h.relay.poll(h.paseo);
+    await h.replies.recoverEffects();
     assert.deepEqual(h.answers, failure ? [] : [`a q linear-comment c1 ${ME}`]);
     assert.deepEqual((await needsYou.all()).map(entry => entry.id), failure ? ["sub"] : []);
     assert.ok(h.events.includes(`react c1 ${failure ? "x" : "eyes"}`));
