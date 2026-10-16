@@ -4222,7 +4222,7 @@ The directional aim of 5–10% owner decisions is observational, **never a quota
 Plan, tool and mode approvals remain outside this question-answer path.
 
 **Authority and consequences.** The versioned owner contract is
-`shared/autonomy-policy.ts` (`owner-autonomy-2026-10-15-v2`). Routine engineering, independent
+`shared/autonomy-policy.ts` (`owner-autonomy-2026-10-15-v3`). Routine engineering, independent
 review, repairing prerequisites, meaningful fixture/test maintenance, the documented lifecycle
 on the task's own branches, and safe capable model fallback are delegated. Unavailable Opus 5.5
 does not require an owner exception: use available `openai-codex/gpt-6.1-sol`, high thinking.
@@ -4246,6 +4246,27 @@ financial values, validation or check-before-save/record-creation timing need ev
 authority; an AC number or unavailable historical plan is not approval. Safe parts of a multipart
 request do not license its unresolved business parts. An evidenced behavior-preserving invoice
 repair remains technical delegation; financial vocabulary alone does not prohibit it.
+
+The complete standing passages also preserve Git/work ownership, owner-only artifacts and
+verification integrity. Record branch/HEAD/tree before writes. A temporary unverified patch is
+not durable recovery for deleting the sole uncommitted copy; shared user work may not be
+auto-committed/stashed or edited/installed over without established safe ownership. Isolation
+must preserve the required user overlay. Verified complete durable preservation permits owned
+cleanup; retention or a technical reframe does not inherently require an owner decision.
+
+Delegated test retirement is not permission to mint a personal owner approval or owner-only
+label/receipt. Core's current `approved-test-change` restriction still forbids agent
+self-application. Truthful standing-authority records and coverage-preserving removal of obsolete
+wording/mock-echo tests remain allowed. This does **not** reserve ordinary authorized
+least-privilege reversible staging grants to the owner.
+
+Honest “unproven” disclosure does not satisfy an acceptance requirement or authorize closing
+incomplete work. Collect proof, keep requirements intact, or establish supported documented N/A.
+A gate's semantic scope still binds when its parser has a loophole: hiding required coverage in
+ungated prose is not compliant slicing. Reviewed technical gate repair and fulfilled technical
+closeout remain delegated. Concrete nonbinding logistics/business recommendations for later
+approval remain allowed when they make no connection/permission mutation and claim no approval;
+this does not license implementing an unapproved consequential workflow as mergeable code.
 
 **Evaluation order.** The question is logged and observed before write-back's settle window.
 Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (directory `0700`, file
@@ -4288,6 +4309,17 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    Specifically approved consequential workflow changes require `specific` authority, so they
    cannot use the standing-only activation shortcut. Missing/unknown outcome scope abstains;
    a new unapproved workflow choice remains an owner boundary.
+   V3 additionally requires `integrity.preservation`, `.ownerArtifacts`, `.acceptance` and `.gates`
+   for **each** selected part. Each includes a reason and state: `not-implicated` (no affected
+   requirement/material prerequisite), `satisfied`, `unknown` or `violated`. Missing, unknown or
+   violated assessments refuse the request even under a top-level low-risk summary.
+   `satisfied` needs decisive **non-standing** prerequisite evidence, verified verbatim and cited
+   for that same part. A larger cited passage may cover a proof only when it contains that complete
+   verified quote; unrelated or partial text from the same source does not qualify. Standing authority
+   cannot manufacture a checkpoint, user-work ownership, personal owner consent, fulfilled acceptance
+   or a gate exception. These are checked source
+   bindings, not a claim that JSON assertions mechanically prove their semantic truth; isolated
+   evaluator review and current-policy boundary replay remain required.
 
 The evaluator has no tools, MCP servers, extensions, skills, rules, memory or saved session. It
 runs from an empty directory with private isolated configuration and the owner's `auth:` broker
@@ -4295,7 +4327,7 @@ block, without Paseo, Linear or GitHub credentials in its environment. A tool ev
 unreadable/oversized answer, abstention or failed check refuses the whole request. Citations
 retain source ID, revision and quote.
 
-Evidence is versioned as `deputy-6-outcomes/owner-autonomy-2026-10-15-v2/<model>/high`.
+Evidence is versioned as `deputy-7-integrity/owner-autonomy-2026-10-15-v3/<model>/high`.
 Old-policy predictions never satisfy current empirical readiness. On restart, an old-version
 refusal/prediction is reevaluated only after the exact unanswered request is freshly verified;
 old selections, citations, intent and grace are discarded. An equivalent new request ID retires
@@ -4325,10 +4357,11 @@ admission immediately before sending. A response already on the wire retains its
 - **Specific/mixed authority:** at least 30 real current-version shadow predictions paired with
   attributed owner answers, at least 90% agreement, exactly as below.
 - **Explicit owner-authorized standing activation:** `deputy.standingPolicy` must equal
-  `owner-autonomy-2026-10-15-v2`, and the latest private `deputy-activation` audit entry must record
+  `owner-autonomy-2026-10-15-v3`, and the latest private `deputy-activation` audit entry must record
   that same revision through `linear.set-settings`. This bypasses **only** the empirical threshold,
   **only** when every selected action has checked current positive standing-policy authority.
-  Default is `null`; an unknown/old revision normalizes to `null`, never silently upgrades.
+  Default is `null`; an unknown/old non-null revision normalizes to `null` **and mode `off`**,
+  never silently upgrades or falls through to live empirical dispatch.
   A missing/revoked audit fails closed. Normal 60-day journal retention also bounds the audit:
   explicitly reassert the authorized opt-in through the RPC to renew it when required.
 
@@ -4419,15 +4452,15 @@ authenticated plugin RPC, not a direct file edit, for the opt-in:
   "deputy": {
     "mode": "live",
     "model": "openai-codex/gpt-6.1-sol",
-    "standingPolicy": "owner-autonomy-2026-10-15-v2"
+    "standingPolicy": "owner-autonomy-2026-10-15-v3"
   }
 }
 ```
 
 Send to `linear.set-settings` on **each actual agent host** only after independent safety review
-and current-policy boundary replay. A v1 opt-in is not silently upgraded: v2 requires this new
-explicit audited opt-in. Offline cache keys must include current policy, implementation and
-complete evaluator input; a v1 replay verdict cannot authorize or satisfy readiness under v2.
+and current-policy boundary replay. V1/v2 opt-ins normalize off: v3 requires a new explicit
+audited opt-in. Offline cache keys must include current policy, implementation and complete
+evaluator input; v1/v2 replay verdicts cannot authorize or satisfy readiness under v3.
 The RPC persists settings, revokes unsent work and appends a private activation audit. An audit
 write failure is reported, not forged; retry the explicit RPC. Read back settings and
 `deputy.live.standingPolicyReady`; a false generic `live.ready` remains truthful until real paired

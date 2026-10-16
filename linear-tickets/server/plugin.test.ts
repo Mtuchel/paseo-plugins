@@ -1306,14 +1306,18 @@ test("template migration is compare-and-swap and cannot overwrite a concurrent c
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("standing activation never migrates an old or malformed revision to current authority", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "paseo-standing-revision-"));
-  try {
-    const path = join(directory, "settings.json");
-    await writeFile(path, JSON.stringify({ deputy: { ...DEFAULT_DEPUTY, mode: "live", standingPolicy: "owner-autonomy-previous", model: "openai-codex/gpt-6.1-sol" } }));
-    const settings = new Settings(path);
-    assert.equal((await settings.read()).deputy.standingPolicy, null);
-    await assert.rejects(settings.patch(JSON.parse('{"deputy":{"standingPolicy":"owner-autonomy-previous"}}')));
-    assert.equal((await settings.read()).deputy.standingPolicy, null);
-  } finally { await rm(directory, { recursive: true, force: true }); }
-});
+for (const oldPolicy of ["owner-autonomy-2026-10-15-v1", "owner-autonomy-2026-10-15-v2", "owner-autonomy-previous"]) {
+  test(`standing activation ${oldPolicy} is off, never silently migrated to current authority`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "paseo-standing-revision-"));
+    try {
+      const path = join(directory, "settings.json");
+      await writeFile(path, JSON.stringify({ deputy: { ...DEFAULT_DEPUTY, mode: "live", standingPolicy: oldPolicy, model: "openai-codex/gpt-6.1-sol" } }));
+      const settings = new Settings(path);
+      assert.equal((await settings.read()).deputy.standingPolicy, null);
+      assert.equal((await settings.read()).deputy.mode, "off", "a retired standing opt-in cannot fall through to live generic dispatch");
+      await assert.rejects(settings.patch(JSON.parse(JSON.stringify({ deputy: { standingPolicy: oldPolicy } }))));
+      assert.equal((await settings.read()).deputy.standingPolicy, null);
+      assert.equal((await settings.read()).deputy.mode, "off");
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+}

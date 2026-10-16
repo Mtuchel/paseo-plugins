@@ -86,9 +86,10 @@ const sources: Source[] = [
   { id: "memory:m1", kind: "memory", title: "Remembered", revision: "m1", text: "The owner once said vitest is nicer to use day to day.", decisive: false },
 ];
 const TECHNICAL_OUTCOME = { scope: "technical", effects: "Technical implementation only; no consequential business/user workflow or permission change." };
+const INTACT_INTEGRITY = Object.fromEntries(["preservation", "ownerArtifacts", "acceptance", "gates"].map(key => [key, { state: "not-implicated", reason: "This bounded local action leaves the requirement intact and claims no exception or missing prerequisite." }]));
 function answer(body: Record<string, unknown>): string {
   const selections = body.selections && typeof body.selections === "object" ? Object.entries(body.selections) : [];
-  const actions = Object.fromEntries(selections.map(([part, option]) => [part, { option, risk: "low", effects: `Use ${option} for the local test runner`, outcome: TECHNICAL_OUTCOME, reason: "Authorized by the cited approved plan", authority: "specific" }]));
+  const actions = Object.fromEntries(selections.map(([part, option]) => [part, { option, risk: "low", effects: `Use ${option} for the local test runner`, outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Authorized by the cited approved plan", authority: "specific" }]));
   return JSON.stringify({ risk: "low", riskReason: "", decision: "answer", reason: "", actions, ...body });
 }
 
@@ -146,7 +147,7 @@ test("standing delegation is always citable, while proposals, superseded decisio
   assert.equal(snapshot.sources.find((source) => source.kind === "memory")?.decisive, false);
   const unrelated = await gatherSources(readers(), { ...asked, text: "xyzzy", planApproved: false }, null);
   const authority = unrelated.sources.find((source) => source.id === "standing-policy:engineering")!;
-  const result = checkVerdict(answer({ selections: { Runner: "node:test" }, actions: { Runner: { option: "node:test", risk: "low", effects: "Local behavioral test runner, no production changes", outcome: TECHNICAL_OUTCOME, reason: "Routine engineering within the authorized outcome", authority: "standing" } }, citations: [{ part: "Runner", source: authority.id, quote: authority.text }] }), parts, unrelated.sources);
+  const result = checkVerdict(answer({ selections: { Runner: "node:test" }, actions: { Runner: { option: "node:test", risk: "low", effects: "Local behavioral test runner, no production changes", outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Routine engineering within the authorized outcome", authority: "standing" } }, citations: [{ part: "Runner", source: authority.id, quote: authority.text }] }), parts, unrelated.sources);
   assert.ok(result.ok && result.standing, "standing authority survives zero keyword overlap and need not dictate the exact runner");
   assert.equal(unrelated.sources.some((source) => source.kind === "plan"), false, "no unapproved plan authority");
 });
@@ -1163,7 +1164,7 @@ for (const change of ["off", "model"] as const) {
 }
 
 test("each selected action requires its own low-consequence assessment and exact offered actor", () => {
-  const base = { option: "node:test", risk: "low", effects: "Local runner only", outcome: TECHNICAL_OUTCOME, reason: "Approved technical implementation", authority: "specific" };
+  const base = { option: "node:test", risk: "low", effects: "Local runner only", outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Approved technical implementation", authority: "specific" };
   for (const actions of [
     {}, { Runner: { ...base, option: "vitest" } },
     { Runner: { ...base, risk: "production-write" } },
@@ -1186,7 +1187,7 @@ test("preparing a PR cannot launder newly chosen business workflow effects, incl
     { key: "Save", question: "Change immediate record creation to mandatory check-before-save? Build AC4 as code only.", options: ["Build AC4"], effects: {} },
   ];
   const selections = { Intake: "Keep off", Fields: "Build AC3", Save: "Build AC4" };
-  const action = (option: string, scope: string) => ({ option, risk: "low", effects: "Only prepare a PR; no business data is entered today", outcome: { scope, effects: scope === "technical" ? "Leave intake disabled" : "Choose editable financial fields or change when business records are saved" }, reason: "Proposed task names an AC; approval is not available", authority: "standing" });
+  const action = (option: string, scope: string) => ({ option, risk: "low", effects: "Only prepare a PR; no business data is entered today", outcome: { scope, effects: scope === "technical" ? "Leave intake disabled" : "Choose editable financial fields or change when business records are saved" }, integrity: INTACT_INTEGRITY, reason: "Proposed task names an AC; approval is not available", authority: "standing" });
   const actions = { Intake: action("Keep off", "technical"), Fields: action("Build AC3", "new-workflow-choice"), Save: action("Build AC4", "new-workflow-choice") };
   const citations = businessParts.map(part => ({ part: part.key, source: engineering.id, quote: engineering.text }));
   const result = checkVerdict(answer({ selections, actions, citations }), businessParts, authority);
@@ -1205,7 +1206,7 @@ test("approved behavior-preserving invoice repair remains delegated, but baselin
     text: "Approved workflow: the linking drawer already permits staff to edit invoice number/date/amount/VAT/currency. Preserve existing save timing and validation while fixing the stale displayed amount." };
   const invoiceParts: Part[] = [{ key: "Repair", question: "Fix the stale amount display without changing approved edit rights, required values or saving behavior?", options: ["Fix stale display"], effects: {} }];
   const outcome = { scope: "preserves-authorized-workflow", effects: "Restore the existing displayed amount; no new edit rights, save timing or validation policy", source: baseline.id, quote: baseline.text };
-  const action = { option: "Fix stale display", risk: "low", effects: "Behavior-preserving invoice UI repair", outcome, reason: "Engineering inside the cited approved baseline", authority: "standing" };
+  const action = { option: "Fix stale display", risk: "low", effects: "Behavior-preserving invoice UI repair", outcome, integrity: INTACT_INTEGRITY, reason: "Engineering inside the cited approved baseline", authority: "standing" };
   const citations = [{ part: "Repair", source: engineering.id, quote: engineering.text }, { part: "Repair", source: baseline.id, quote: baseline.text }];
   const evaluate = (current: unknown, listed = citations, evidence = [...authority, baseline]) => checkVerdict(answer({ selections: { Repair: "Fix stale display" }, actions: { Repair: current }, citations: listed }), invoiceParts, evidence);
   const accepted = evaluate(action);
@@ -1229,7 +1230,7 @@ test("a boundary-only citation cannot activate standing delegation, and mixed au
   const authority = standingSources();
   const engineering = authority.find((source) => source.id === "standing-policy:engineering")!;
   const boundaries = authority.find((source) => source.id === "standing-policy:boundaries")!;
-  const action = { option: "node:test", risk: "low", effects: "Local runner only", outcome: TECHNICAL_OUTCOME, reason: "Routine engineering", authority: "standing" };
+  const action = { option: "node:test", risk: "low", effects: "Local runner only", outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Routine engineering", authority: "standing" };
   const boundaryOnly = checkVerdict(answer({ selections: { Runner: "node:test" }, actions: { Runner: action }, citations: [{ source: boundaries.id, quote: boundaries.text }] }), parts, authority);
   assert.equal(boundaryOnly.ok, false);
   const mixedParts = [...parts, { key: "Second", question: "Second runner?", options: ["node:test", "vitest"], effects: {} }];
@@ -1364,7 +1365,7 @@ async function standingHarness(t: TestContext, audit = true) {
     const source = input.sources.find((source) => source.id === "standing-policy:engineering")!;
     return checkVerdict(answer({
       selections: { Runner: "node:test" },
-      actions: { Runner: { option: "node:test", risk: "low", effects: "Choose a local behavioral test runner; no production write", outcome: TECHNICAL_OUTCOME, reason: "Routine engineering under current standing delegation", authority: "standing" } },
+      actions: { Runner: { option: "node:test", risk: "low", effects: "Choose a local behavioral test runner; no production write", outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Routine engineering under current standing delegation", authority: "standing" } },
       citations: [{ source: source.id, quote: source.text }],
     }), input.parts, input.sources);
   };
@@ -1393,6 +1394,10 @@ test("explicit audited standing activation dispatches only checked standing acti
 test("standing config alone, an audit alone, and a revoked activation cannot authorize dispatch", async (t) => {
   const h = await standingHarness(t, false);
   assert.notDeepEqual(await h.deputy.liveBlockers(h.settings, true), []);
+  for (const policy of ["owner-autonomy-2026-10-15-v1", "owner-autonomy-2026-10-15-v2"]) {
+    await h.log.append({ kind: "deputy-activation", id: policy, key: policy, at: "2026-10-07T09:58:00Z", policy, via: "settings-rpc", mode: "live" });
+    assert.notDeepEqual(await h.deputy.liveBlockers(h.settings, true), [], "old activation audits cannot authorize the current standing policy");
+  }
   await h.log.append({ kind: "deputy-activation", id: "activation", key: "activation", at: "2026-10-07T09:59:00Z", policy: AUTONOMY_POLICY_REVISION, via: "settings-rpc", mode: "live" });
   h.settings.deputy.standingPolicy = null;
   assert.notDeepEqual(await h.deputy.liveBlockers(h.settings, true), []);
@@ -1535,7 +1540,7 @@ test("exact offered labels are preserved, while visually ambiguous whitespace du
   const source = standingSources().find((source) => source.id === "standing-policy:engineering")!;
   const result = (label: string) => checkVerdict(answer({
     selections: { Runner: label },
-    actions: { Runner: { option: label, risk: "low", effects: "Local bounded technical work", outcome: TECHNICAL_OUTCOME, reason: "Standing engineering authority", authority: "standing" } },
+    actions: { Runner: { option: label, risk: "low", effects: "Local bounded technical work", outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Standing engineering authority", authority: "standing" } },
     citations: [{ source: source.id, quote: source.text }],
   }), eligibility.parts, [source]);
   assert.equal(result("Continue").ok, false, "the checked answer must not silently rewrite an offered label");

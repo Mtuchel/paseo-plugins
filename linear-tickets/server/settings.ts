@@ -348,8 +348,9 @@ export function normalizeDeputy(value: unknown): DeputySettings {
   const grace = candidate.graceMinutes;
   const model = typeof candidate.model === "string" ? candidate.model.trim() : "";
   const repository = typeof candidate.principlesRepository === "string" ? candidate.principlesRepository.trim() : "";
+  const staleStanding = candidate.standingPolicy !== undefined && candidate.standingPolicy !== null && candidate.standingPolicy !== AUTONOMY_POLICY_REVISION;
   return {
-    mode: candidate.mode === "shadow" || candidate.mode === "live" ? candidate.mode : "off",
+    mode: !staleStanding && (candidate.mode === "shadow" || candidate.mode === "live") ? candidate.mode : "off",
     graceMinutes: typeof grace === "number" && Number.isInteger(grace) && grace >= MIN_DEPUTY_GRACE_MINUTES && grace <= MAX_DEPUTY_GRACE_MINUTES ? grace : DEFAULT_DEPUTY.graceMinutes,
     model: DEPUTY_MODEL.test(model) ? model : null,
     principlesRepository: repository.startsWith("/") && repository.length <= 500 ? repository : null,
