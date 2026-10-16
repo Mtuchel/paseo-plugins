@@ -4304,6 +4304,10 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    refuses, and missing/unknown/malformed actors require investigation. A human audit handoff
    is not autonomous merely because an agent heartbeat waits afterward. Ordinary attribution
    to an already authorized tool account is distinct from forging a personal owner approval.
+   Mandatory owner handback on a conditional technical failure is mixed execution too; selecting
+   the label cannot rewrite that branch. Only labels reach the working agent: hidden evaluator
+   reasoning cannot supply revision instructions or other required free text. Such choices
+   require a technical reframe, not a fabricated answer.
    When there is no safe exact offered choice, the deputy transparently abstains; there is no
    checked corrective-guidance/reframing side channel in this implementation. No coverage quota
    can fabricate a selection or missing business fact.
@@ -4331,6 +4335,10 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    recoverability. Conditional factual reporting may proceed after collecting the required
    evidence; that authorization neither invents present measurements nor claims acceptance.
    Citations must name supplied source IDs, never synthetic `QUESTION` or context identifiers.
+   Bounded coordination does not grant every possible subsequent incident-remediation action.
+   Future measurement and diagnosis-first correction may collect missing facts without claiming
+   present proof; independent business holds remain intact. A current tool-role limitation alone
+   is not proof that the owner personally must perform the work.
 
 The evaluator has no tools, MCP servers, extensions, skills, rules, memory or saved session. It
 runs from an empty directory with private isolated configuration and the owner's `auth:` broker
@@ -4338,7 +4346,7 @@ block, without Paseo, Linear or GitHub credentials in its environment. A tool ev
 unreadable/oversized answer, abstention or failed check refuses the whole request. Citations
 retain source ID, revision and quote.
 
-Evidence is versioned as `deputy-8-executable-actions/owner-autonomy-2026-10-15-v3/<model>/high`.
+Evidence is versioned as `deputy-9-literal-delivery/owner-autonomy-2026-10-15-v3/<model>/high`.
 Old-policy predictions never satisfy current empirical readiness. On restart, an old-version
 refusal/prediction is reevaluated only after the exact unanswered request is freshly verified;
 old selections, citations, intent and grace are discarded. An equivalent new request ID retires
