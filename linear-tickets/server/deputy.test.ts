@@ -1184,6 +1184,119 @@ test("a journal outage after evaluation cannot strand the candidate or permit an
   assert.deepEqual(h.responses, []);
 });
 
+test("changed evidence gets a fresh evaluation and full new grace before one checked answer", async (t) => {
+  const h = await liveHarness(t);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.deps.readers.recall = async () => [{ id: "fresh-context", text: "The module remains an isolated technical repair." }];
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal(h.calls.length, 0, "the stale prediction cannot dispatch");
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal(h.evaluations(), 2, "changed evidence must be evaluated rather than reusing the answer");
+  h.advance(5 * 60_000 - 1);
+  await h.settle();
+  assert.equal(h.calls.length, 0, "the refreshed prediction receives a complete new grace period");
+  h.advance(1);
+  await h.settle();
+  assert.deepEqual(h.calls.map(call => call.requestId), ["r1"]);
+  assert.equal(h.responses.length, 0, "delivery remains checked, never an untagged response");
+  const predictions = (await h.log.entries()).filter(entry => entry.kind === "deputy-prediction" && entry.id === "a1:r1");
+  assert.equal(predictions.length, 2, "both evidence-bound predictions remain auditable");
+});
+
+test("a replacement question cannot be resurrected by a delayed evidence-refusal write after restart", async (t) => {
+  const h = await liveHarness(t);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  const entered = signal();
+  const release = signal();
+  const append = h.log.append.bind(h.log);
+  t.mock.method(h.log, "append", async (entry: LogEntry) => {
+    if (entry.kind === "deputy-refusal" && entry.category === "evidence-changed") {
+      entered.resolve();
+      await release.promise;
+    }
+    await append(entry);
+  });
+  h.deps.readers.recall = async () => [];
+  h.advance(5 * 60_000);
+  await entered.promise;
+  h.daemon.pending = [question(), question("r2")];
+  await h.deputy.observe(h.agent, question("r2"), { issueId: "i1", identifier: "TUC-1" });
+  release.resolve();
+  await h.settle();
+  h.deputy.stop();
+  const restarted = new Deputy(h.deps);
+  t.after(() => restarted.stop());
+  restarted.attach(h.paseo);
+  await restarted.idle();
+  for (let step = 0; step < 3; step++) {
+    h.advance(5 * 60_000);
+    await restarted.idle();
+  }
+  assert.deepEqual(h.calls.map(call => call.requestId), ["r2"]);
+});
+
+test("evidence-refresh recovery after restart keeps a fresh grace before checked delivery", async (t) => {
+  const h = await liveHarness(t);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.deps.readers.recall = async () => [];
+  h.advance(5 * 60_000);
+  await h.settle();
+  h.deputy.stop();
+  const restarted = new Deputy(h.deps);
+  t.after(() => restarted.stop());
+  restarted.attach(h.paseo);
+  await restarted.idle();
+  h.advance(5 * 60_000);
+  await restarted.idle();
+  assert.equal(h.evaluations(), 2);
+  h.advance(5 * 60_000 - 1);
+  await restarted.idle();
+  assert.equal(h.calls.length, 0);
+  h.advance(1);
+  await restarted.idle();
+  assert.deepEqual(h.calls.map(call => call.requestId), ["r1"]);
+});
+
+test("refreshed evidence can refuse an earlier answer rather than inheriting its permission", async (t) => {
+  const h = await liveHarness(t);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.deps.readers.ticketHistory = async () => history([OWNER_COMMENT]);
+  let reviewedCurrentConstraint = false;
+  h.deps.evaluate = async input => {
+    reviewedCurrentConstraint = input.sources.some(source => source.text.includes(OWNER_COMMENT.body));
+    return { ok: false, category: "owner-boundary", reason: "The current owner constraint reserves this action." };
+  };
+  h.advance(5 * 60_000);
+  await h.settle();
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal(reviewedCurrentConstraint, true);
+  h.advance(60 * 60_000);
+  await h.settle();
+  assert.deepEqual([h.calls, h.responses, h.comments], [[], [], []]);
+  assert.equal((await h.candidate()).refusalCategory, "owner-boundary");
+});
+
+test("an owner answer during evidence refresh prevents reevaluation and delivery", async (t) => {
+  const h = await liveHarness(t);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.deps.readers.recall = async () => [];
+  h.advance(5 * 60_000);
+  await h.settle();
+  await h.deputy.ownerAnswered("a1", question(), { behavior: "allow", updatedInput: { answers: { Runner: "vitest" } } }, { via: "linear-comment", activityId: "refresh-owner", userId: OWNER }, new Date(h.deps.now!()).toISOString());
+  h.advance(30 * 60_000);
+  await h.settle();
+  assert.equal(h.evaluations(), 1);
+  assert.deepEqual(h.calls, []);
+});
+
 for (const change of ["amended-plan", "blocking-source", "source-revision", "missing-fingerprint"] as const) {
   test(`dispatch invalidates ${change} even when the original citation remains verbatim`, async (t) => {
     const h = await liveHarness(t);
@@ -1202,7 +1315,6 @@ for (const change of ["amended-plan", "blocking-source", "source-revision", "mis
     }
     h.advance(5 * 60_000);
     await h.settle();
-    assert.equal((await h.candidate()).status, "canceled");
     assert.deepEqual([h.calls, h.responses, h.comments], [[], [], []]);
     assert.equal((await kinds(h)).includes("deputy-answer"), false);
   });
@@ -1222,7 +1334,6 @@ for (const change of ["added-owner-comment", "edited-owner-comment", "revoked-ow
     if (change === "revoked-owner-comment") h.deps.readers.ticketHistory = async () => history();
     h.advance(5 * 60_000);
     await h.settle();
-    assert.equal((await h.candidate()).status, "canceled");
     assert.deepEqual([h.calls, h.responses, h.comments], [[], [], []]);
     assert.equal((await kinds(h)).includes("deputy-answer"), false);
   });
