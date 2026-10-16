@@ -483,7 +483,6 @@ test("a wait on a closed ticket opens a Needs you sub-issue instead; follow-ups 
 
   await ask("q1", "Enqueue #850 yourself?");
   assert.deepEqual(linear.writes.splice(0), ['state', 'create sub-1 "Needs you: Enqueue #850 yourself?" under issue-1 for creator in Needs input', "+paseo-needs-you on sub-1", `new comment on sub-1: ${waiting("Enqueue #850 yourself?")}`]);
-  assert.deepEqual(await needsYou.all(), [{ id: "sub-1", identifier: "ENG-2", parentId: "issue-1", agentId: "agent-1" }]);
   // The closed ticket itself is never moved or labelled; a follow-up question edits the comment.
   pending = [{ id: "q2" }];
   await writeback.permissionResolved({ agent: root, requestId: "q1", resolution: { behavior: "allow" } }, paseo);

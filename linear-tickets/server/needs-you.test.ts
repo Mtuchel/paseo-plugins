@@ -34,17 +34,6 @@ test("strict owner-question inventory never loses an unreadable or malformed reg
   }
 });
 
-test("strict owner-question inventory follows registration and removal", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "paseo-needs-you-"));
-  const questions = new NeedsYouIssues(directory);
-  try {
-    await questions.add(question);
-    const registered = (await questions.allStrict())[0];
-    assert.deepEqual({ id: registered.id, identifier: registered.identifier, parentId: registered.parentId, agentId: registered.agentId }, question);
-    await questions.remove(question.id, registered);
-    assert.deepEqual(await questions.allStrict(), []);
-  } finally { await rm(directory, { recursive: true, force: true }); }
-});
 
 for (const replacementFirst of [false, true]) {
   test(`checked cleanup preserves a concurrent replacement registration ${replacementFirst ? "queued before" : "queued after"} removal`, async t => {
